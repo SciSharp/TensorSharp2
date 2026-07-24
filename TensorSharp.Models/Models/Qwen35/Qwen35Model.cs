@@ -3636,16 +3636,21 @@ namespace TensorSharp.Models
 
             // Cache position tensors across attention layers in the same forward pass.
             // All attention layers share (seqLen, startPos); only numHeads differs (Q vs K).
+            // Under TP the position tensor is a kernel input, so it must live on
+            // DATA's GPU. Only the default-allocator (rank 0 / single-GPU) copy is
+            // cached; other ranks build a fresh one on their own GPU per call.
             Tensor posTensor;
             bool isQ = (numHeads == Config.NumHeads);
+            var dataAlloc = data.Storage.Allocator;
+            bool onDefaultAlloc = ReferenceEquals(dataAlloc, _allocator);
 
-            if (_cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
+            if (onDefaultAlloc && _cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
             {
                 posTensor = isQ ? _cachedRoPEPosQ : _cachedRoPEPosK;
                 if (posTensor == null || (int)posTensor.Sizes[0] != seqLen * numHeads)
                     posTensor = null;
             }
-            else
+            else if (onDefaultAlloc)
             {
                 _cachedRoPEPosQ?.Dispose();
                 _cachedRoPEPosK?.Dispose();
@@ -3655,7 +3660,12 @@ namespace TensorSharp.Models
                 _cachedRoPEPosStartPos = startPos;
                 posTensor = null;
             }
+            else
+            {
+                posTensor = null; // per-rank GPU: never cached
+            }
 
+            bool freshForRank = false;
             if (posTensor == null)
             {
                 int totalRows = seqLen * numHeads;
@@ -3663,9 +3673,16 @@ namespace TensorSharp.Models
                 for (int s = 0; s < seqLen; s++)
                     for (int h = 0; h < numHeads; h++)
                         positions[s * numHeads + h] = startPos + s;
-                posTensor = CreateIntTensor(positions, totalRows);
-                if (isQ) _cachedRoPEPosQ = posTensor;
-                else _cachedRoPEPosK = posTensor;
+                posTensor = CreateIntTensorOn(dataAlloc, positions, totalRows);
+                if (onDefaultAlloc)
+                {
+                    if (isQ) _cachedRoPEPosQ = posTensor;
+                    else _cachedRoPEPosK = posTensor;
+                }
+                else
+                {
+                    freshForRank = true;
+                }
             }
 
             // In-place RoPE: avoids allocating a new tensor per call
@@ -3673,6 +3690,8 @@ namespace TensorSharp.Models
             Ops.RoPEEx(reshaped, reshaped, posTensor, ropeDim, 2, 0,
                 Config.RopeBase, 1.0f / Config.RopeScale,
                 0.0f, 1.0f, 0.0f, 0.0f);
+            if (freshForRank)
+                posTensor.Dispose();
             return data;
         }
 

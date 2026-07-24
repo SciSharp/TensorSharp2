@@ -46,6 +46,14 @@ namespace TensorSharp.Models
         private Tensor[][] _tpConvState;     // [layer][rank]: [convKernel-1, qkvDim/tp]
         private int[] _tpConvWriteIdx;       // [layer] — identical on all ranks
 
+        // Per-rank copies of REPLICATED weights that are read directly by a
+        // per-rank device kernel (ssm_norm for the GDN kernel, Q/K RMSNorm
+        // weights for attention). Those weights live on GPU 0; a rank-r kernel
+        // reading them is a cross-GPU access (fault without peer / wrong data
+        // with peer), so each rank gets a lazily-cached copy on its own GPU.
+        // Keyed by (weight, rank); rank 0 aliases the original.
+        private System.Collections.Generic.Dictionary<(Tensor, int), Tensor> _tpReplicaCache;
+
         // ====================================================================
         // Block-cyclic head mapping
         // ====================================================================
@@ -1027,9 +1035,10 @@ namespace TensorSharp.Models
                 DeinterleaveQGate(qFull, out qTensor, out gateTensor, numHeadsPerGpu, headDim, seqLen, alloc);
                 qFull.Dispose();
 
-                // QK norm (per-GPU, replicated weights).
-                qTensor = ApplyQKNormCached(qTensor, _attnQNormW[layer], numHeadsPerGpu, seqLen);
-                kTensor = ApplyQKNormCached(kTensor, _attnKNormW[layer], numKVHeadsPerGpu, seqLen);
+                // QK norm (per-GPU). The RMSNorm weight is replicated on GPU 0;
+                // use a rank-local copy so the kernel doesn't read it cross-GPU.
+                qTensor = ApplyQKNormCached(qTensor, ReplicaOnRank(_attnQNormW[layer], r), numHeadsPerGpu, seqLen);
+                kTensor = ApplyQKNormCached(kTensor, ReplicaOnRank(_attnKNormW[layer], r), numKVHeadsPerGpu, seqLen);
 
                 // RoPE: per-axis MRoPE when multimodal positions are staged for
                 // this forward, otherwise the scalar position RoPE. MRoPE positions
@@ -1219,7 +1228,7 @@ namespace TensorSharp.Models
                     GetTpShardTensor(_ssmConv1dKey[layer], r),
                     GetTpShardTensor(_ssmDtBiasKey[layer], r),
                     GetTpShardTensor(_ssmAKey[layer], r),
-                    _ssmNormW[layer],  // replicated
+                    ReplicaOnRank(_ssmNormW[layer], r),  // replicated, but resident on rank r's GPU
                     seqLen,
                     localPackedDim,
                     localQkvDim,
@@ -1260,6 +1269,27 @@ namespace TensorSharp.Models
             if (_weights.TryGetValue(weightName, out var w))
                 return w;
             throw new KeyNotFoundException($"TP weight '{weightName}' not found.");
+        }
+
+        /// <summary>
+        /// A replicated weight resident on rank r's GPU, so a per-rank kernel
+        /// that reads it directly never crosses GPUs. Rank 0 aliases the
+        /// original; other ranks get a lazily-cached copy. Cheap for the small
+        /// norm weights this is used for.
+        /// </summary>
+        private Tensor ReplicaOnRank(Tensor weight, int rank)
+        {
+            if (rank == 0 || weight == null)
+                return weight;
+
+            _tpReplicaCache ??= new System.Collections.Generic.Dictionary<(Tensor, int), Tensor>();
+            var key = (weight, rank);
+            if (!_tpReplicaCache.TryGetValue(key, out var copy))
+            {
+                copy = ReplicateTensorToRank(weight, rank);
+                _tpReplicaCache[key] = copy;
+            }
+            return copy;
         }
 
         // ====================================================================
@@ -1598,6 +1628,15 @@ namespace TensorSharp.Models
                         _tpConvState[l]?[r]?.Dispose();
                     }
                 }
+            }
+
+            if (_tpReplicaCache != null)
+            {
+                // Every cached entry is a rank >= 1 copy (rank 0 aliases the
+                // original weight and is never stored), so all are ours to free.
+                foreach (var copy in _tpReplicaCache.Values)
+                    copy?.Dispose();
+                _tpReplicaCache.Clear();
             }
         }
     }

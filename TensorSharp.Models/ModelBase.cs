@@ -1776,6 +1776,19 @@ namespace TensorSharp.Models
             return tensor;
         }
 
+        /// <summary>
+        /// Create an int tensor on a specific GPU. Use this (with the consuming
+        /// tensor's allocator) for anything read by a per-rank TP kernel — e.g.
+        /// RoPE position tensors — so a rank-r kernel doesn't read a GPU-0 tensor
+        /// across GPUs (illegal access without peer / wrong data with peer).
+        /// </summary>
+        protected static Tensor CreateIntTensorOn(IAllocator allocator, int[] data, params long[] sizes)
+        {
+            var tensor = new Tensor(allocator, DType.Int32, sizes);
+            tensor.SetElementsAsInt(data);
+            return tensor;
+        }
+
         protected float[] TensorToFloatArray(Tensor t)
         {
             if (t.IsContiguous())

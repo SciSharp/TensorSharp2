@@ -1501,7 +1501,7 @@ namespace TensorSharp.Models
             for (int s = 0; s < seqLen; s++)
                 for (int h = 0; h < numHeads; h++)
                     positions[s * numHeads + h] = startPos + s;
-            using var posTensor = CreateIntTensor(positions, totalRows);
+            using var posTensor = CreateIntTensorOn(data.Storage.Allocator, positions, totalRows);
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
             Tensor result = Ops.RoPEEx(
