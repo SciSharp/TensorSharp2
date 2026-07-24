@@ -495,8 +495,15 @@ namespace TensorSharp.Models
             _qDim = Config.NumHeads * Config.HeadDim;
             _kDim = Config.NumKVHeads * Config.HeadDim;
 
+            // Also check the TP-sharded dictionaries: under tensor parallelism the
+            // fused attn_qkv has already been moved out of _quantWeights into
+            // _tpQuantWeights before this runs, so a plain lookup would wrongly
+            // report the (always-fused) GptOss QKV as separate and the forward
+            // would ask for the nonexistent attn_q.weight.
             _isQkvFused = _quantWeights.ContainsKey("blk.0.attn_qkv.weight") ||
-                           _weights.ContainsKey("blk.0.attn_qkv.weight");
+                           _weights.ContainsKey("blk.0.attn_qkv.weight") ||
+                           _tpQuantWeights.ContainsKey("blk.0.attn_qkv.weight") ||
+                           _tpWeights.ContainsKey("blk.0.attn_qkv.weight");
 
             _layerNames = new string[numLayers][];
             for (int l = 0; l < numLayers; l++)

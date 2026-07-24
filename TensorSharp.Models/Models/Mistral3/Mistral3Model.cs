@@ -180,8 +180,17 @@ namespace TensorSharp.Models
             for (int l = 0; l < numLayers; l++)
             {
                 string p = $"blk.{l}.";
-                bool fused = _quantWeights.ContainsKey(p + "attn_qkv.weight") ||
-                             _weights.ContainsKey(p + "attn_qkv.weight");
+                // Check the TP-sharded dictionaries too: under tensor parallelism
+                // ShardMistral3WeightsForTP (which runs before PrecomputeConstants)
+                // has already moved the fused attn_qkv out of _quantWeights into
+                // _tpQuantWeights, so a plain _quantWeights lookup would wrongly
+                // mark fused layers as "separate" and the forward would ask for the
+                // now-consumed attn_q.weight.
+                string qkvName = p + "attn_qkv.weight";
+                bool fused = _quantWeights.ContainsKey(qkvName) ||
+                             _weights.ContainsKey(qkvName) ||
+                             _tpQuantWeights.ContainsKey(qkvName) ||
+                             _tpWeights.ContainsKey(qkvName);
                 _layerQkvFused[l] = fused;
 
                 if (fused)
