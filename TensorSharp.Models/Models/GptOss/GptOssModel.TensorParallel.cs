@@ -769,6 +769,8 @@ namespace TensorSharp.Models
             string prefix = $"blk.{layer}.";
 
             int numExperts = _numExperts;
+            int nUsed = _numExpertsUsed;
+            float invG = 1f / GlobalTpDegree;
             var results = new Tensor[tp];
 
             // Router (replicated — identical routing on all ranks). Compute it ONCE
@@ -783,102 +785,143 @@ namespace TensorSharp.Models
             float[] routePtr = TensorToFloatArray(routerLogitsT);
             routerLogitsT.Dispose();
 
-            // Per-token top-k expert selection (SelectGptOssTopKExperts treats its
-            // whole input as one token's logits, so it must be fed exactly one
-            // token's numExperts-length row — feeding the flattened batch made it
-            // return out-of-range expert indices).
-            var perTokenExperts = new int[seqLen][];
-            var perTokenWeights = new float[seqLen][];
+            // Per-token top-k selection, then group assignments by expert (identical
+            // on every rank). SelectGptOssTopKExperts treats its whole input as ONE
+            // token's logits, so feed it exactly one token's numExperts-length row —
+            // feeding the flattened batch made it return out-of-range expert indices.
+            int totalAssignments = seqLen * nUsed;
+            var selectedExperts = new int[totalAssignments];
+            var routeWeights = new float[totalAssignments];
             var tokenLogits = new float[numExperts];
             for (int s = 0; s < seqLen; s++)
             {
                 Array.Copy(routePtr, s * numExperts, tokenLogits, 0, numExperts);
                 var (te, tw) = SelectGptOssTopKExperts(tokenLogits);
-                perTokenExperts[s] = te;
-                perTokenWeights[s] = tw;
+                for (int k = 0; k < nUsed; k++)
+                {
+                    selectedExperts[s * nUsed + k] = te[k];
+                    routeWeights[s * nUsed + k] = tw[k];
+                }
             }
+
+            // Bucket token assignments by expert so each expert runs a single fat
+            // matmul over its assigned tokens (mirrors the non-TP MoEForwardBatched).
+            var expertCounts = new int[numExperts];
+            for (int a = 0; a < totalAssignments; a++)
+                expertCounts[selectedExperts[a]]++;
+            var expertOffsets = new int[numExperts];
+            for (int e = 1; e < numExperts; e++)
+                expertOffsets[e] = expertOffsets[e - 1] + expertCounts[e - 1];
+            var tokenMap = new int[totalAssignments];
+            var weightMap = new float[totalAssignments];
+            var fillPos = (int[])expertOffsets.Clone();
+            for (int s = 0; s < seqLen; s++)
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int e = selectedExperts[s * nUsed + k];
+                    int pos = fillPos[e]++;
+                    tokenMap[pos] = s;
+                    weightMap[pos] = routeWeights[s * nUsed + k];
+                }
+
+            long rowBytes = (long)hiddenSize * sizeof(float);
 
             for (int r = 0; r < tp; r++)
             {
                 var alloc = _tpGroup.GetAllocator(r);
                 var localInput = normed[r];
 
-                // Accumulate expert outputs (partial down; AllReduced below).
+                // Partial per-rank output (row-parallel down is AllReduced below).
+                // Gather/scatter run host-side (explicit token offsets), so the row
+                // accumulation is unambiguous; EnsureDeviceCurrent pushes the result
+                // to the device before the P2P AllReduce (which reads device ptrs).
                 var output = new Tensor(alloc, DType.Float32, seqLen, hiddenSize);
-                Ops.Fill(output, 0f);
 
-                for (int s = 0; s < seqLen; s++)
+                unsafe
                 {
-                    // token s's hidden row [1, hidden] on rank r's GPU, and the
-                    // matching destination row (a view sharing output's storage).
-                    Tensor tokenInput;
-                    Tensor tokRowView = null;
-                    if (seqLen == 1)
+                    float* inPtr = GetFloatPtr(localInput);   // rank-r hidden state (host)
+                    float* outPtr = GetFloatPtr(output);      // host accumulator
+                    for (long z = 0; z < (long)seqLen * hiddenSize; z++)
+                        outPtr[z] = 0f;
+
+                    for (int e = 0; e < numExperts; e++)
                     {
-                        tokenInput = localInput;
-                    }
-                    else
-                    {
-                        tokRowView = localInput.Narrow(0, s, 1);
-                        tokenInput = Ops.NewContiguous(tokRowView);
-                    }
-                    Tensor outRow = seqLen == 1 ? output : output.Narrow(0, s, 1);
+                        int count = expertCounts[e];
+                        if (count == 0) continue;
+                        int offset = expertOffsets[e];
 
-                    int[] topExperts = perTokenExperts[s];
-                    float[] routeWeights = perTokenWeights[s];
+                        string gateUpKey = prefix + $"ffn_gate_up_exps.{e}.weight";
+                        string gateUpBiasKey = prefix + $"ffn_gate_up_exps.{e}.bias";
+                        string downKey = prefix + $"ffn_down_exps.{e}.weight";
+                        string downBiasKey = prefix + $"ffn_down_exps.{e}.bias";
 
-                    for (int k = 0; k < _numExpertsUsed; k++)
-                    {
-                        int expertIdx = topExperts[k];
-                        float weight = routeWeights[k];
+                        // Gather this expert's tokens into a [count, hidden] batch.
+                        var batchInput = new Tensor(alloc, DType.Float32, count, hiddenSize);
+                        float* bPtr = GetFloatPtr(batchInput);
+                        for (int i = 0; i < count; i++)
+                        {
+                            int tokenIdx = tokenMap[offset + i];
+                            Buffer.MemoryCopy(inPtr + (long)tokenIdx * hiddenSize,
+                                bPtr + (long)i * hiddenSize, rowBytes, rowBytes);
+                        }
 
-                        string gateUpKey = prefix + $"ffn_gate_up_exps.{expertIdx}.weight";
-                        string gateUpBiasKey = prefix + $"ffn_gate_up_exps.{expertIdx}.bias";
-                        string downKey = prefix + $"ffn_down_exps.{expertIdx}.weight";
-                        string downBiasKey = prefix + $"ffn_down_exps.{expertIdx}.bias";
-
-                        // Column-parallel gate_up + bias.
-                        Tensor gateUp = TpExpertLinear(tokenInput, gateUpKey, r, 1);
+                        // Column-parallel gate_up + per-rank bias shard.
+                        Tensor gateUp = TpExpertLinear(batchInput, gateUpKey, r, count);
+                        batchInput.Dispose();
                         AddTpBiasToTensor(gateUp, gateUpBiasKey, r);
 
                         // Clamped SiLU GLU activation.
                         int halfDim = (int)(gateUp.Sizes[1] / 2);
-                        using var gView = gateUp.Narrow(1, 0, halfDim);
-                        Tensor gate = Ops.NewContiguous(gView);
-                        using var uView = gateUp.Narrow(1, halfDim, halfDim);
-                        Tensor up = Ops.NewContiguous(uView);
-                        gateUp.Dispose();
+                        using (var gView = gateUp.Narrow(1, 0, halfDim))
+                        using (var uView = gateUp.Narrow(1, halfDim, halfDim))
+                        {
+                            Tensor gate = Ops.NewContiguous(gView);
+                            Tensor up = Ops.NewContiguous(uView);
+                            gateUp.Dispose();
 
-                        ApplyClampedSiLUGlu(gate, up);
-                        up.Dispose();
+                            ApplyClampedSiLUGlu(gate, up);
+                            up.Dispose();
 
-                        // Row-parallel down (partial result, no AllReduce yet).
-                        Tensor downOut = TpExpertLinear(gate, downKey, r, 1);
-                        gate.Dispose();
+                            // Row-parallel down (partial result, AllReduced later).
+                            Tensor downOut = TpExpertLinear(gate, downKey, r, count);
+                            gate.Dispose();
 
-                        // Weighted accumulate into token s's output row.
-                        Ops.Mul(downOut, downOut, weight);
-                        // Replicated down bias: add weight*bias once across the upcoming
-                        // AllReduce by contributing weight/GlobalTpDegree on each of the
-                        // GlobalTpDegree ranks (local GPUs x nodes) so the AllReduce sum
-                        // reproduces weight*bias exactly once.
-                        AddReplicatedBiasScaled(downOut, downBiasKey, weight / GlobalTpDegree);
-                        Ops.Add(outRow, outRow, downOut);
-                        downOut.Dispose();
-                    }
-
-                    if (seqLen != 1)
-                    {
-                        outRow.Dispose();
-                        tokenInput.Dispose();
-                        tokRowView.Dispose();
+                            // Scatter weighted rows back into their tokens' output rows.
+                            // The down bias is replicated (full hidden): add weight*bias
+                            // scaled by 1/GlobalTpDegree so the upcoming AllReduce sum
+                            // over all ranks reproduces weight*bias exactly once.
+                            float* dPtr = GetFloatPtr(downOut);
+                            float* dbPtr = _weights.TryGetValue(downBiasKey, out var downBiasT)
+                                ? GetFloatPtr(downBiasT) : null;
+                            for (int i = 0; i < count; i++)
+                            {
+                                int tokenIdx = tokenMap[offset + i];
+                                float w = weightMap[offset + i];
+                                float* dst = outPtr + (long)tokenIdx * hiddenSize;
+                                float* srcRow = dPtr + (long)i * hiddenSize;
+                                if (dbPtr != null)
+                                {
+                                    float wb = w * invG;
+                                    for (int d = 0; d < hiddenSize; d++)
+                                        dst[d] += w * srcRow[d] + wb * dbPtr[d];
+                                }
+                                else
+                                {
+                                    for (int d = 0; d < hiddenSize; d++)
+                                        dst[d] += w * srcRow[d];
+                                }
+                            }
+                            downOut.Dispose();
+                        }
                     }
                 }
 
+                // Host buffer is authoritative — push to device for the P2P AllReduce.
+                output.EnsureDeviceCurrent();
                 results[r] = output;
             }
 
-            // AllReduce across ranks.
+            // AllReduce across ranks (sums the row-parallel down partials + biases).
             _tpGroup.AllReduce(results);
 
             return results;
