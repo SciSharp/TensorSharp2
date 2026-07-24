@@ -490,8 +490,10 @@ namespace TensorSharp.Models
             int totalSeqLen = startPos + seqLen;
             float scale = 1.0f / MathF.Sqrt(headDim);
 
-            // Slice sinks for this rank's heads.
-            float[] fullSinks = _tpSinks?[layer];
+            // Use _layerSinks directly — _tpSinks was populated during
+            // InitGptOssTpKVCache which runs BEFORE _layerSinks is loaded,
+            // so the copied references are all null.
+            float[] fullSinks = _layerSinks?[layer];
 
             var results = new Tensor[tp];
 
