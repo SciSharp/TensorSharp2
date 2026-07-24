@@ -5756,16 +5756,24 @@ namespace TensorSharp.Models
         {
             // Cache the position tensor: all local layers in a forward pass
             // share the same (seqLen, startPos), only numHeads differs (Q vs K).
+            // Under TP the position tensor is a kernel INPUT, so it must live on
+            // the same GPU as `data` — a shared GPU-0 copy read from a rank-1
+            // kernel is a cross-GPU access that faults without peer (A16 vGPU)
+            // or corrupts positions on no-P2P cards. Only the default-allocator
+            // (single-GPU / rank 0) copy is cached; other ranks build a fresh
+            // one on their own GPU and dispose it after use.
             Tensor posTensor;
             bool isQ = (numHeads == Config.NumHeads);
+            var dataAlloc = data.Storage.Allocator;
+            bool onDefaultAlloc = ReferenceEquals(dataAlloc, _allocator);
 
-            if (_cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
+            if (onDefaultAlloc && _cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
             {
                 posTensor = isQ ? _cachedRoPEPosQ : _cachedRoPEPosK;
                 if (posTensor == null || (int)posTensor.Sizes[0] != seqLen * numHeads)
                     posTensor = null;
             }
-            else
+            else if (onDefaultAlloc)
             {
                 _cachedRoPEPosQ?.Dispose();
                 _cachedRoPEPosK?.Dispose();
@@ -5775,7 +5783,12 @@ namespace TensorSharp.Models
                 _cachedRoPEPosStartPos = startPos;
                 posTensor = null;
             }
+            else
+            {
+                posTensor = null; // per-rank GPU: never cached, always fresh
+            }
 
+            bool freshForRank = false;
             if (posTensor == null)
             {
                 int totalRows = seqLen * numHeads;
@@ -5783,14 +5796,24 @@ namespace TensorSharp.Models
                 for (int s = 0; s < seqLen; s++)
                     for (int h = 0; h < numHeads; h++)
                         positions[s * numHeads + h] = startPos + s;
-                posTensor = CreateIntTensor(positions, totalRows);
-                if (isQ) _cachedRoPEPosQ = posTensor;
-                else _cachedRoPEPosK = posTensor;
+                posTensor = new Tensor(dataAlloc, DType.Int32, totalRows);
+                posTensor.SetElementsAsInt(positions);
+                if (onDefaultAlloc)
+                {
+                    if (isQ) _cachedRoPEPosQ = posTensor;
+                    else _cachedRoPEPosK = posTensor;
+                }
+                else
+                {
+                    freshForRank = true;
+                }
             }
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
             Ops.RoPEEx(reshaped, reshaped, posTensor, headDim, 2, 0,
                 ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            if (freshForRank)
+                posTensor.Dispose();
             return data;
         }
 
