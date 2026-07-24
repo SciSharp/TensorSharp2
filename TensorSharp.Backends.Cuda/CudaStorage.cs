@@ -187,8 +187,21 @@ namespace TensorSharp.Cuda
             }
             else
             {
+                // Cross-GPU copy. cuMemcpyDtoD assumes both pointers live in a
+                // peer-accessible address space; on GPUs without P2P (e.g.
+                // virtualized A16 vGPU profiles, or hosts where peer access
+                // isn't enabled) it either raises CUDA error 700 (illegal memory
+                // access) or silently transfers wrong data. cuMemcpyPeer takes
+                // explicit source/destination contexts and works with OR without
+                // peer access — the driver stages through host when P2P is
+                // unavailable — so it is correct on every topology.
                 src.SynchronizeDeviceWork();
-                CudaDriverApi.cuMemcpyDtoD(dst, source, new UIntPtr((ulong)byteCount)).ThrowOnError();
+                AllocatorImpl.Context.MakeCurrent();
+                CudaDriverApi.cuMemcpyPeerAsync(
+                    dst, AllocatorImpl.Context.Handle,
+                    source, src.AllocatorImpl.Context.Handle,
+                    new UIntPtr((ulong)byteCount),
+                    AllocatorImpl.Stream.Handle).ThrowOnError();
             }
 
             MarkDeviceModified();
