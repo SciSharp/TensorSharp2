@@ -820,8 +820,22 @@ namespace TensorSharp.Models
                 switch (_layerTypes[l])
                 {
                     case LayerType.Attention:
-                        ResetCacheTensor(_kvCacheK[l]);
-                        ResetCacheTensor(_kvCacheV[l]);
+                        // Under TP the non-TP _kvCacheK/_kvCacheV are null; the sharded
+                        // attention cache lives in _tpKvCacheK/_tpKvCacheV per rank.
+                        if (IsTensorParallel)
+                        {
+                            if (_tpKvCacheK?[l] != null)
+                                for (int r = 0; r < _tpKvCacheK[l].Length; r++)
+                                {
+                                    ResetCacheTensor(_tpKvCacheK[l][r]);
+                                    ResetCacheTensor(_tpKvCacheV[l][r]);
+                                }
+                        }
+                        else
+                        {
+                            ResetCacheTensor(_kvCacheK[l]);
+                            ResetCacheTensor(_kvCacheV[l]);
+                        }
                         break;
                     case LayerType.Mamba2:
                         Array.Clear(_convState[l]);

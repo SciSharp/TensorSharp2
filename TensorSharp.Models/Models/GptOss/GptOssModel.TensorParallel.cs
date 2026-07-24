@@ -768,23 +768,24 @@ namespace TensorSharp.Models
             int hiddenSize = Config.HiddenSize;
             string prefix = $"blk.{layer}.";
 
-            // Router (replicated — identical routing on all ranks).
             var results = new Tensor[tp];
+
+            // Router (replicated — identical routing on all ranks). Compute it ONCE
+            // on rank 0's GPU, where the (unsharded) router weight lives. normed[*]
+            // are replicas of the same hidden state, so the routing decision is
+            // identical on every rank. Computing it per-rank (matmul of rank-r input
+            // against the GPU-0 router weight) is a cross-GPU access → CUDA error 700
+            // on hardware without peer access.
+            Tensor routerLogitsT = LinearForward(normed[0], wn[6]);
+            AddBiasToTensor(routerLogitsT, wn[7]);
+            float[] routePtr = TensorToFloatArray(routerLogitsT);
+            routerLogitsT.Dispose();
+            var (topExperts, routeWeights) = SelectGptOssTopKExperts(routePtr);
 
             for (int r = 0; r < tp; r++)
             {
                 var alloc = _tpGroup.GetAllocator(r);
                 var localInput = normed[r];
-
-                // Router logits + bias (replicated).
-                Tensor routerLogits = LinearForward(localInput, wn[6]);
-                AddBiasToTensor(routerLogits, wn[7]);
-
-                // TopK-then-softmax routing.
-                float[] routePtr = TensorToFloatArray(routerLogits);
-                routerLogits.Dispose();
-
-                var (topExperts, routeWeights) = SelectGptOssTopKExperts(routePtr);
 
                 // Accumulate expert outputs.
                 var output = new Tensor(alloc, DType.Float32, seqLen, hiddenSize);

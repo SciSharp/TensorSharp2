@@ -128,7 +128,9 @@ namespace TensorSharp.Models
             {
                 // attn_qkv exists only on attention layers; the call no-ops
                 // otherwise. Mamba2 layers stay replicated (not sharded).
-                ShardConcatenatedColumnParallel($"{_layerPrefixes[layer]}attn_qkv.weight",
+                // NB: _layerPrefixes isn't populated until InitLayerInfo (which
+                // runs after sharding), so use the literal prefix here.
+                ShardConcatenatedColumnParallel($"blk.{layer}.attn_qkv.weight",
                     _layerNumHeads[layer] * headDim,     // Q
                     _layerNumKVHeads[layer] * headDim,   // K
                     _layerNumKVHeads[layer] * headDim);  // V
@@ -309,8 +311,21 @@ namespace TensorSharp.Models
                 }
             }
 
-            // Mamba2 state: replicated on rank 0 only (host-side float arrays
-            // are already allocated by InitMamba2Buffers). No per-rank copies needed.
+            // Mamba2 state: replicated (weights aren't sharded under TP), so the
+            // host-side recurrent state arrays are the same full size as the non-TP
+            // path. InitCaches (which normally allocates these) is skipped under TP,
+            // so allocate them here for every Mamba2 layer.
+            int convDim = Math.Max(0, _ssmDConv - 1);
+            int convChannels = _ssmDInner + 2 * _ssmNGroup * _ssmDState;
+            int ssmStateSize = _ssmDState * _ssmHeadDim * _ssmNHead;
+            _convState = new float[Config.NumLayers][];
+            _ssmState = new float[Config.NumLayers][];
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.Mamba2) continue;
+                _convState[l] = new float[convDim * convChannels];
+                _ssmState[l] = new float[ssmStateSize];
+            }
 
             Console.WriteLine($"  Nemotron TP caches initialized: {tp} GPUs");
         }

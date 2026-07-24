@@ -331,20 +331,26 @@ namespace TensorSharp.Models
 
         protected override void ResetKVCacheCore()
         {
+            // Setting _cacheSeqLen = 0 is the functional reset: subsequent forwards
+            // overwrite the cache from position 0. Under TP the non-TP _kvCacheK/_kvCacheV
+            // arrays are null (TP uses _tpKvCacheK/_tpKvCacheV, whose tensors get overwritten
+            // on the next forward), so guard the tensor-clearing loop against null.
+            _cacheSeqLen = 0;
+            _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
+            _forwardCount = 0;
+            _forwardSw.Reset();
+            if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 ResetCacheTensor(_kvCacheK[l]);
                 ResetCacheTensor(_kvCacheV[l]);
             }
-            _cacheSeqLen = 0;
-            _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
-            _forwardCount = 0;
-            _forwardSw.Reset();
         }
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
             base.TruncateKVCacheCore(tokenCount);
+            if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 InvalidateTensorDeviceCache(_kvCacheK[l]);

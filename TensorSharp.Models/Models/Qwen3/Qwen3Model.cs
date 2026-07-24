@@ -229,28 +229,33 @@ namespace TensorSharp.Models
 
         protected override void ResetKVCacheCore()
         {
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                ResetCacheTensor(_kvCacheK[l]);
-                ResetCacheTensor(_kvCacheV[l]);
-            }
+            // Setting _cacheSeqLen = 0 is the functional reset. Under TP the non-TP
+            // _kvCacheK/_kvCacheV arrays are null (TP uses _tpKvCacheK/_tpKvCacheV,
+            // overwritten on the next forward), so guard the tensor loop against null.
             _cacheSeqLen = 0;
             _kvCacheHostDirty = false;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
+            if (_kvCacheK == null) return;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                ResetCacheTensor(_kvCacheK[l]);
+                ResetCacheTensor(_kvCacheV[l]);
+            }
         }
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
             EnsureKvCacheHostSynchronized();
             base.TruncateKVCacheCore(tokenCount);
+            _kvCacheHostDirty = false;
+            if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 InvalidateTensorDeviceCache(_kvCacheK[l]);
                 InvalidateTensorDeviceCache(_kvCacheV[l]);
             }
-            _kvCacheHostDirty = false;
         }
 
         public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
