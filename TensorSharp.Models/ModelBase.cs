@@ -2986,7 +2986,10 @@ namespace TensorSharp.Models
             if (seqLen == 1)
                 return data.View(numHeads, 1, headDim);
 
-            var result = new Tensor(_allocator, data.ElementType, numHeads, seqLen, headDim);
+            // Allocate the head-first result on DATA's GPU, not _allocator (GPU 0).
+            // Under TP, `data` lives on rank r's GPU; a GPU-0 result would make the
+            // reshape kernel read across GPUs (fault without peer, wrong data with).
+            var result = new Tensor(data.Storage.Allocator, data.ElementType, numHeads, seqLen, headDim);
             if (CudaFusedOps.TryFlatToHeadFirst(result, data, numHeads, seqLen, headDim))
                 return result;
             if (MlxFusedOps.TryFlatToHeadFirst(result, data, numHeads, seqLen, headDim))
@@ -3138,7 +3141,7 @@ namespace TensorSharp.Models
             long rowBytes = ManagedQuantizedOps.RowSize(ggmlType, headDim);
 
             cache.Storage.EnsureHostReadable();
-            var f32 = new Tensor(_allocator, DType.Float32, outHeads, totalSeqLen, headDim);
+            var f32 = new Tensor(cache.Storage.Allocator, DType.Float32, outHeads, totalSeqLen, headDim);
             float* dstBase = GetFloatPtr(f32);
             byte* srcBase = (byte*)TensorComputePrimitives.GetStoragePointer(cache);
 
@@ -3166,7 +3169,7 @@ namespace TensorSharp.Models
             int headDim = (int)cache.Sizes[2];
             int outHeads = numKVHeads * groupSize;
 
-            var f32 = new Tensor(_allocator, DType.Float32, outHeads, totalSeqLen, headDim);
+            var f32 = new Tensor(cache.Storage.Allocator, DType.Float32, outHeads, totalSeqLen, headDim);
             float* dstBase = GetFloatPtr(f32);
             ushort* srcBase = TensorComputePrimitives.GetHalfPointer(cache);
 
