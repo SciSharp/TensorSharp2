@@ -159,6 +159,31 @@ namespace TensorSharp.Cuda
             CopyDeviceFrom(src, 0, 0, ByteLength);
         }
 
+        // Cached device-pair peer accessibility. On topologies without P2P
+        // (vGPU, no-NVLink consumer cards) a direct device-to-device copy is
+        // invalid and must go through host memory instead.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), bool> _peerAccessCache = new();
+
+        private static bool CanAccessPeer(int srcDevice, int dstDevice)
+        {
+            if (srcDevice == dstDevice)
+                return true;
+            return _peerAccessCache.GetOrAdd((srcDevice, dstDevice), key =>
+            {
+                try
+                {
+                    int fwd = 0, rev = 0;
+                    CudaDriverApi.cuDeviceCanAccessPeer(out fwd, key.Item1, key.Item2);
+                    CudaDriverApi.cuDeviceCanAccessPeer(out rev, key.Item2, key.Item1);
+                    return fwd == 1 && rev == 1;
+                }
+                catch
+                {
+                    return false; // conservative: stage through host
+                }
+            });
+        }
+
         internal void CopyDeviceFrom(CudaStorage src, long destinationByteOffset, long sourceByteOffset, long byteCount)
         {
             if (src == null)
@@ -187,21 +212,38 @@ namespace TensorSharp.Cuda
             }
             else
             {
-                // Cross-GPU copy. cuMemcpyDtoD assumes both pointers live in a
-                // peer-accessible address space; on GPUs without P2P (e.g.
-                // virtualized A16 vGPU profiles, or hosts where peer access
-                // isn't enabled) it either raises CUDA error 700 (illegal memory
-                // access) or silently transfers wrong data. cuMemcpyPeer takes
-                // explicit source/destination contexts and works with OR without
-                // peer access — the driver stages through host when P2P is
-                // unavailable — so it is correct on every topology.
+                // Cross-GPU copy. Direct device-to-device (cuMemcpyDtoD, and even
+                // cuMemcpyPeer) requires the two devices to be peer-accessible.
+                // On GPUs without P2P — virtualized vGPU profiles (A16-16Q) or
+                // consumer/workstation cards without NVLink — that raises CUDA
+                // error 700 (illegal memory access) or silently transfers wrong
+                // data. Use a direct peer copy only when the devices can access
+                // each other; otherwise stage explicitly through host memory,
+                // which works on every topology.
                 src.SynchronizeDeviceWork();
-                AllocatorImpl.Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyPeerAsync(
-                    dst, AllocatorImpl.Context.Handle,
-                    source, src.AllocatorImpl.Context.Handle,
-                    new UIntPtr((ulong)byteCount),
-                    AllocatorImpl.Stream.Handle).ThrowOnError();
+                if (CanAccessPeer(src.AllocatorImpl.DeviceId, AllocatorImpl.DeviceId))
+                {
+                    AllocatorImpl.Context.MakeCurrent();
+                    CudaDriverApi.cuMemcpyPeerAsync(
+                        dst, AllocatorImpl.Context.Handle,
+                        source, src.AllocatorImpl.Context.Handle,
+                        new UIntPtr((ulong)byteCount),
+                        AllocatorImpl.Stream.Handle).ThrowOnError();
+                }
+                else
+                {
+                    byte[] stage = new byte[byteCount];
+                    unsafe
+                    {
+                        fixed (byte* stagePtr = stage)
+                        {
+                            src.AllocatorImpl.Context.MakeCurrent();
+                            CudaDriverApi.cuMemcpyDtoH((IntPtr)stagePtr, source, new UIntPtr((ulong)byteCount)).ThrowOnError();
+                            AllocatorImpl.Context.MakeCurrent();
+                            CudaDriverApi.cuMemcpyHtoD(dst, (IntPtr)stagePtr, new UIntPtr((ulong)byteCount)).ThrowOnError();
+                        }
+                    }
+                }
             }
 
             MarkDeviceModified();
