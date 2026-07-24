@@ -768,6 +768,7 @@ namespace TensorSharp.Models
             int hiddenSize = Config.HiddenSize;
             string prefix = $"blk.{layer}.";
 
+            int numExperts = _numExperts;
             var results = new Tensor[tp];
 
             // Router (replicated — identical routing on all ranks). Compute it ONCE
@@ -778,66 +779,100 @@ namespace TensorSharp.Models
             // on hardware without peer access.
             Tensor routerLogitsT = LinearForward(normed[0], wn[6]);
             AddBiasToTensor(routerLogitsT, wn[7]);
+            // Row-major [seqLen, numExperts]: each token routes independently.
             float[] routePtr = TensorToFloatArray(routerLogitsT);
             routerLogitsT.Dispose();
-            var (topExperts, routeWeights) = SelectGptOssTopKExperts(routePtr);
+
+            // Per-token top-k expert selection (SelectGptOssTopKExperts treats its
+            // whole input as one token's logits, so it must be fed exactly one
+            // token's numExperts-length row — feeding the flattened batch made it
+            // return out-of-range expert indices).
+            var perTokenExperts = new int[seqLen][];
+            var perTokenWeights = new float[seqLen][];
+            var tokenLogits = new float[numExperts];
+            for (int s = 0; s < seqLen; s++)
+            {
+                Array.Copy(routePtr, s * numExperts, tokenLogits, 0, numExperts);
+                var (te, tw) = SelectGptOssTopKExperts(tokenLogits);
+                perTokenExperts[s] = te;
+                perTokenWeights[s] = tw;
+            }
 
             for (int r = 0; r < tp; r++)
             {
                 var alloc = _tpGroup.GetAllocator(r);
                 var localInput = normed[r];
 
-                // Accumulate expert outputs.
+                // Accumulate expert outputs (partial down; AllReduced below).
                 var output = new Tensor(alloc, DType.Float32, seqLen, hiddenSize);
                 Ops.Fill(output, 0f);
 
-                for (int k = 0; k < _numExpertsUsed; k++)
+                for (int s = 0; s < seqLen; s++)
                 {
-                    int expertIdx = topExperts[k];
-                    float weight = routeWeights[k];
-
-                    string gateUpKey = prefix + $"ffn_gate_up_exps.{expertIdx}.weight";
-                    string gateUpBiasKey = prefix + $"ffn_gate_up_exps.{expertIdx}.bias";
-                    string downKey = prefix + $"ffn_down_exps.{expertIdx}.weight";
-                    string downBiasKey = prefix + $"ffn_down_exps.{expertIdx}.bias";
-
-                    // Column-parallel gate_up + bias.
-                    Tensor gateUp = TpExpertLinear(localInput, gateUpKey, r, seqLen);
-                    AddTpBiasToTensor(gateUp, gateUpBiasKey, r);
-
-                    // Clamped SiLU GLU activation.
-                    int halfDim = (int)(gateUp.Sizes[1] / 2);
-                    Tensor gate, up;
+                    // token s's hidden row [1, hidden] on rank r's GPU, and the
+                    // matching destination row (a view sharing output's storage).
+                    Tensor tokenInput;
+                    Tensor tokRowView = null;
                     if (seqLen == 1)
                     {
-                        gate = gateUp.Narrow(1, 0, halfDim);
-                        up = gateUp.Narrow(1, halfDim, halfDim);
+                        tokenInput = localInput;
                     }
                     else
                     {
-                        using var gView = gateUp.Narrow(1, 0, halfDim);
-                        gate = Ops.NewContiguous(gView);
-                        using var uView = gateUp.Narrow(1, halfDim, halfDim);
-                        up = Ops.NewContiguous(uView);
+                        tokRowView = localInput.Narrow(0, s, 1);
+                        tokenInput = Ops.NewContiguous(tokRowView);
                     }
-                    gateUp.Dispose();
+                    Tensor outRow = seqLen == 1 ? output : output.Narrow(0, s, 1);
 
-                    ApplyClampedSiLUGlu(gate, up);
-                    up.Dispose();
+                    int[] topExperts = perTokenExperts[s];
+                    float[] routeWeights = perTokenWeights[s];
 
-                    // Row-parallel down (partial result, no AllReduce yet).
-                    Tensor downOut = TpExpertLinear(gate, downKey, r, seqLen);
-                    gate.Dispose();
+                    for (int k = 0; k < _numExpertsUsed; k++)
+                    {
+                        int expertIdx = topExperts[k];
+                        float weight = routeWeights[k];
 
-                    // Weighted accumulate.
-                    Ops.Mul(downOut, downOut, weight);
-                    // Replicated down bias: add weight*bias once across the upcoming
-                    // AllReduce by contributing weight/GlobalTpDegree on each of the
-                    // GlobalTpDegree ranks (local GPUs x nodes) so the AllReduce sum
-                    // reproduces weight*bias exactly once.
-                    AddReplicatedBiasScaled(downOut, downBiasKey, weight / GlobalTpDegree);
-                    Ops.Add(output, output, downOut);
-                    downOut.Dispose();
+                        string gateUpKey = prefix + $"ffn_gate_up_exps.{expertIdx}.weight";
+                        string gateUpBiasKey = prefix + $"ffn_gate_up_exps.{expertIdx}.bias";
+                        string downKey = prefix + $"ffn_down_exps.{expertIdx}.weight";
+                        string downBiasKey = prefix + $"ffn_down_exps.{expertIdx}.bias";
+
+                        // Column-parallel gate_up + bias.
+                        Tensor gateUp = TpExpertLinear(tokenInput, gateUpKey, r, 1);
+                        AddTpBiasToTensor(gateUp, gateUpBiasKey, r);
+
+                        // Clamped SiLU GLU activation.
+                        int halfDim = (int)(gateUp.Sizes[1] / 2);
+                        using var gView = gateUp.Narrow(1, 0, halfDim);
+                        Tensor gate = Ops.NewContiguous(gView);
+                        using var uView = gateUp.Narrow(1, halfDim, halfDim);
+                        Tensor up = Ops.NewContiguous(uView);
+                        gateUp.Dispose();
+
+                        ApplyClampedSiLUGlu(gate, up);
+                        up.Dispose();
+
+                        // Row-parallel down (partial result, no AllReduce yet).
+                        Tensor downOut = TpExpertLinear(gate, downKey, r, 1);
+                        gate.Dispose();
+
+                        // Weighted accumulate into token s's output row.
+                        Ops.Mul(downOut, downOut, weight);
+                        // Replicated down bias: add weight*bias once across the upcoming
+                        // AllReduce by contributing weight/GlobalTpDegree on each of the
+                        // GlobalTpDegree ranks (local GPUs x nodes) so the AllReduce sum
+                        // reproduces weight*bias exactly once.
+                        AddReplicatedBiasScaled(downOut, downBiasKey, weight / GlobalTpDegree);
+                        Ops.Add(outRow, outRow, downOut);
+                        downOut.Dispose();
+                    }
+
+                    if (seqLen != 1)
+                    {
+                        outRow.Dispose();
+                        tokenInput.Dispose();
+                        tokRowView.Dispose();
+                    }
                 }
 
                 results[r] = output;
