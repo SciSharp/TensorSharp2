@@ -39,6 +39,14 @@ namespace TensorSharp.Cuda
 
         public int WorldSize => _worldSize;
 
+        // Device pointer to a tensor's storage. NOTE: Storage.PtrAtElement returns
+        // a HOST pointer and marks the storage host-dirty (it's the "raw host write"
+        // checkout), so it must NOT be used for device-to-device / peer copies —
+        // doing so passes a host address where CUDA expects a device address
+        // (CUDA_ERROR_INVALID_VALUE) and corrupts the tensor's dirty state,
+        // clobbering the reduced result on the next EnsureDeviceCurrent.
+        private static IntPtr DevicePtr(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(0);
+
         private static bool[] EnablePeerAccess(CudaAllocator[] allocators)
         {
             int n = allocators.Length;
@@ -109,8 +117,8 @@ namespace TensorSharp.Cuda
             _allocators[0].Context.MakeCurrent();
             for (int i = 1; i < _worldSize; i++)
             {
-                IntPtr srcPtr = tensors[i].Storage.PtrAtElement(0);
-                IntPtr dstPtr = tensors[0].Storage.PtrAtElement(0);
+                IntPtr srcPtr = DevicePtr(tensors[i]);
+                IntPtr dstPtr = DevicePtr(tensors[0]);
 
                 if (CanAccessPeer(0, i))
                 {
@@ -137,11 +145,11 @@ namespace TensorSharp.Cuda
             _allocators[0].Synchronize();
 
             // Phase 2: Broadcast from GPU 0 to all other GPUs.
-            IntPtr resultPtr = tensors[0].Storage.PtrAtElement(0);
+            IntPtr resultPtr = DevicePtr(tensors[0]);
             for (int i = 1; i < _worldSize; i++)
             {
                 _allocators[i].Context.MakeCurrent();
-                IntPtr dstPtr = tensors[i].Storage.PtrAtElement(0);
+                IntPtr dstPtr = DevicePtr(tensors[i]);
 
                 if (CanAccessPeer(i, 0))
                 {
@@ -169,7 +177,7 @@ namespace TensorSharp.Cuda
             fixed (float* hostPtr = hostBuf)
             {
                 _allocators[src.Storage.Allocator.DeviceId].Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyDtoH((IntPtr)hostPtr, src.Storage.PtrAtElement(0),
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)hostPtr, DevicePtr(src),
                     new UIntPtr((ulong)byteCount)).ThrowOnError();
 
                 _allocators[0].Context.MakeCurrent();
@@ -177,9 +185,10 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuMemcpyHtoD(_stagingBuffer, (IntPtr)hostPtr,
                     new UIntPtr((ulong)byteCount)).ThrowOnError();
 
+                IntPtr dstDevPtr = DevicePtr(dst);
                 _allocators[0].Kernels.LaunchBinaryF32(
-                    dst.Storage.PtrAtElement(0), _stagingBuffer,
-                    dst.Storage.PtrAtElement(0),
+                    dstDevPtr, _stagingBuffer,
+                    dstDevPtr,
                     elementCount, 0,
                     _allocators[0].Stream.Handle);
             }
@@ -192,12 +201,12 @@ namespace TensorSharp.Cuda
             fixed (float* hostPtr = hostBuf)
             {
                 _allocators[0].Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyDtoH((IntPtr)hostPtr, src.Storage.PtrAtElement(0),
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)hostPtr, DevicePtr(src),
                     new UIntPtr((ulong)byteCount)).ThrowOnError();
 
                 int dstDevice = dst.Storage.Allocator.DeviceId;
                 _allocators[dstDevice].Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyHtoD(dst.Storage.PtrAtElement(0), (IntPtr)hostPtr,
+                CudaDriverApi.cuMemcpyHtoD(DevicePtr(dst), (IntPtr)hostPtr,
                     new UIntPtr((ulong)byteCount)).ThrowOnError();
             }
         }
