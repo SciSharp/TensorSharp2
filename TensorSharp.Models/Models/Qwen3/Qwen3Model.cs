@@ -386,6 +386,12 @@ namespace TensorSharp.Models
             if (tokens == null || tokens.Length <= 1)
                 return ForwardCore(tokens);
 
+            // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
+            // layer loop and non-sharded weights, which are unavailable under
+            // tensor parallelism. Route through ForwardCore → ForwardTP instead.
+            if (IsTensorParallel)
+                return ForwardCore(tokens);
+
             int chunkSize = ResolvePrefillChunkSize();
             int lastIdx = tokens.Length - 1;
 
