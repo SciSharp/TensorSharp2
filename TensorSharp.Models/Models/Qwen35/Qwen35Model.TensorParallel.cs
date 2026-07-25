@@ -206,14 +206,30 @@ namespace TensorSharp.Models
         ///   [ Q+gate (2*numHeads*headDim) | K (numKVHeads*headDim) | V (numKVHeads*headDim) ]
         /// so a generic contiguous split would give rank 0 mostly Q rows and no
         /// K/V. See <see cref="ShardConcatenatedColumnParallel"/>.
+        /// When the fused weight was never created (mixed quant types prevented
+        /// fusion), falls back to <see cref="ShardSeparateColumnParallel"/> which
+        /// reads the individual Q/K/V weights directly, avoiding a full F32
+        /// intermediate that can OOM on memory-constrained hosts.
         /// </summary>
         private void ShardFusedQkvForTP(string weightName)
         {
             int headDim = Config.HeadDim;
-            ShardConcatenatedColumnParallel(weightName,
-                2 * Config.NumHeads * headDim,   // Q + gate interleaved per head
-                Config.NumKVHeads * headDim,     // K
-                Config.NumKVHeads * headDim);    // V
+            int qDim = 2 * Config.NumHeads * headDim;
+            int kDim = Config.NumKVHeads * headDim;
+            int vDim = Config.NumKVHeads * headDim;
+
+            if (_quantWeights.ContainsKey(weightName) || _weights.ContainsKey(weightName))
+            {
+                ShardConcatenatedColumnParallel(weightName, qDim, kDim, vDim);
+            }
+            else
+            {
+                // Derive the layer prefix from the fused name (blk.N.attn_qkv.weight → blk.N.).
+                string prefix = weightName.Substring(0, weightName.IndexOf("attn_qkv", StringComparison.Ordinal));
+                ShardSeparateColumnParallel(weightName,
+                    new[] { prefix + "attn_q.weight", prefix + "attn_k.weight", prefix + "attn_v.weight" },
+                    new[] { qDim, kDim, vDim });
+            }
         }
 
         /// <summary>

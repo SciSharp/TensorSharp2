@@ -483,11 +483,14 @@ namespace TensorSharp.Models
                 {
                     fused++;
                 }
-                else if (TryFuseWeightsToFloat32(prefix + "attn_qkv.weight", sources))
+                else if (!IsTensorParallel &&
+                         TryFuseWeightsToFloat32(prefix + "attn_qkv.weight", sources))
                 {
                     // Mixed quant types (e.g. UD-Q4_K_XL) prevent in-place quant
-                    // fusion; dequantize to F32 so the fused key exists for both
-                    // the TP shard path and the non-TP layer-key cache.
+                    // fusion; dequantize to F32 so the fused key exists for the
+                    // non-TP layer-key cache. Under TP the shard path reads the
+                    // separate Q/K/V weights directly (ShardSeparateColumnParallel),
+                    // avoiding a full-model F32 intermediate that can OOM.
                     for (int i = 0; i < sources.Length; i++)
                     {
                         if (_quantWeights.Remove(sources[i], out var qw))

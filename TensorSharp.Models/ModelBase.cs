@@ -2597,6 +2597,112 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Column-parallel shard from SEPARATE source weights that were never
+        /// fused (e.g. Q/K/V with mismatched quant types that prevented
+        /// <see cref="ShardConcatenatedColumnParallel"/>). Each source is
+        /// dequantized (if quantized) and sliced per-rank on the fly, so no
+        /// full-model F32 intermediate is ever materialised. The per-rank
+        /// results are stored under <paramref name="fusedName"/> in
+        /// <see cref="_tpWeights"/>; source weights are removed and disposed.
+        /// </summary>
+        protected void ShardSeparateColumnParallel(string fusedName, string[] sourceNames, int[] segmentDims)
+        {
+            if (!IsTensorParallel) return;
+            if (sourceNames.Length != segmentDims.Length)
+                throw new ArgumentException("sourceNames and segmentDims must have the same length.");
+
+            int tp = TpDegree;
+            int globalTp = GlobalTpDegree;
+            int rankOffset = TpRankOffset;
+
+            // Resolve sources and common input dim.
+            int inDim = -1;
+            var quants = new QuantizedWeight[sourceNames.Length];
+            var tensors = new Tensor[sourceNames.Length];
+            for (int s = 0; s < sourceNames.Length; s++)
+            {
+                if (_quantWeights.TryGetValue(sourceNames[s], out quants[s]))
+                {
+                    int d = (int)quants[s].Ne0;
+                    if (inDim < 0) inDim = d; else if (inDim != d) return;
+                }
+                else if (_weights.TryGetValue(sourceNames[s], out tensors[s]))
+                {
+                    int d = (int)tensors[s].Sizes[1];
+                    if (inDim < 0) inDim = d; else if (inDim != d) return;
+                }
+                else
+                {
+                    return; // source missing — nothing to shard
+                }
+            }
+
+            var shards = new Tensor[tp];
+            for (int r = 0; r < tp; r++)
+            {
+                int globalRank = rankOffset + r;
+                int totalRows = 0;
+                foreach (int segDim in segmentDims)
+                    totalRows += segDim / globalTp;
+
+                var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, totalRows, inDim);
+
+                unsafe
+                {
+                    float* dstBase = GetFloatPtr(shard);
+                    long dstRow = 0;
+
+                    for (int s = 0; s < sourceNames.Length; s++)
+                    {
+                        int perRank = segmentDims[s] / globalTp;
+                        int srcStart = globalRank * perRank;
+
+                        if (quants[s] != null)
+                        {
+                            var qw = quants[s];
+                            long rowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                            byte* srcBase = (byte*)qw.Data.ToPointer();
+                            for (int row = 0; row < perRank; row++)
+                                NativeDequant.DequantizeToFloat32Native(
+                                    qw.GgmlType,
+                                    (IntPtr)(srcBase + (long)(srcStart + row) * rowBytes),
+                                    (IntPtr)(dstBase + (dstRow + row) * inDim),
+                                    inDim);
+                        }
+                        else
+                        {
+                            float* srcPtr = GetFloatPtr(tensors[s]);
+                            long bytes = (long)perRank * inDim * sizeof(float);
+                            Buffer.MemoryCopy(
+                                srcPtr + (long)srcStart * inDim,
+                                dstBase + dstRow * inDim,
+                                bytes, bytes);
+                        }
+                        dstRow += perRank;
+                    }
+                }
+
+                shards[r] = shard;
+            }
+
+            _tpWeights[fusedName] = shards;
+
+            for (int s = 0; s < sourceNames.Length; s++)
+            {
+                if (quants[s] != null)
+                {
+                    _quantWeights.Remove(sourceNames[s]);
+                    quants[s].Dispose();
+                }
+                else
+                {
+                    _weights.Remove(sourceNames[s]);
+                    tensors[s].Dispose();
+                }
+            }
+        }
+
+        /// <summary>
         /// Column-parallel shard of a 1-D bias whose length is the concatenation
         /// of several logical segments (fused QKV bias [Q|K|V], fused gate_up
         /// bias [gate|up], …). The bias must be regrouped exactly like the
