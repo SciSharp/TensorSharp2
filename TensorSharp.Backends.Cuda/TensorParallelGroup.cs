@@ -136,6 +136,9 @@ namespace TensorSharp.Cuda
                 _allocators[i].Synchronize();
         }
 
+        /// <summary>Single-node: all GPUs share the process, no barrier needed.</summary>
+        public void Barrier() { }
+
         // Single-node group: there are no worker nodes, so the driver/worker
         // control channel is never used. (NodeCount == 1.)
         public void BroadcastControl(int op, int[] payload) =>

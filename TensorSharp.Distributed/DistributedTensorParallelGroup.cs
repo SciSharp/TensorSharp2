@@ -115,6 +115,13 @@ namespace TensorSharp.Distributed
             _localGroup.Synchronize();
         }
 
+        /// <summary>Block until every node has reached this point.</summary>
+        public void Barrier()
+        {
+            _localGroup.Synchronize();
+            _tcp.Barrier();
+        }
+
         /// <summary>Driver (node 0) broadcasts a control op + payload to worker nodes.</summary>
         public void BroadcastControl(int op, int[] payload) => _tcp.BroadcastControl(op, payload);
 

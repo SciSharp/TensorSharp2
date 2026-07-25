@@ -4439,6 +4439,13 @@ namespace TensorSharp.Models
             }
 
             int safeToken = (Config?.VocabSize ?? 0) > 1 ? 1 : 0;
+
+            if (_tpGroup != null && _tpGroup.NodeCount > 1)
+            {
+                Console.WriteLine("  Waiting for all nodes to finish loading...");
+                _tpGroup.Barrier();
+            }
+
             Console.WriteLine("  Warming up kernels (decode + prefill)...");
 
             long decodeStart = Stopwatch.GetTimestamp();

@@ -47,6 +47,12 @@ namespace TensorSharp.Cuda
         void Synchronize();
 
         /// <summary>
+        /// Block until every node in the group has reached this point.
+        /// Single-node groups return immediately.
+        /// </summary>
+        void Barrier();
+
+        /// <summary>
         /// Driver→worker control channel for multi-node lockstep execution.
         /// The driver node (global rank offset 0) calls this to broadcast an
         /// op code plus an int payload (e.g. the tokens for a forward pass) to
