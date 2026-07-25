@@ -178,6 +178,13 @@ namespace TensorSharp.Models
                 ShardFusedQkvForTP($"blk.{layer}.attn_qkv.weight");
             }
 
+            // --- GDN layers: segmented sharding ---
+            // Run BEFORE the dense FFN sharding so the large F32 recurrent
+            // input packs (dequantized during fusion for mixed-quant models)
+            // are sharded and their full-size sources freed early, reducing
+            // peak host memory during the subsequent gate_up sharding.
+            ShardGdnWeightsForTP();
+
             // --- Dense FFN layers: column/row parallel ---
             // ffn_down.weight is row-parallel. ffn_gate_up.weight is a plain
             // [gate | up] concatenation, so it needs the same segment-aware
@@ -193,9 +200,6 @@ namespace TensorSharp.Models
                     Console.WriteLine($"    Gate+Up sharding: layer {layer} ({layer + 1}/{TotalLayerCount})");
                 ShardFusedGateUpColumnParallel($"blk.{layer}.ffn_gate_up.weight");
             }
-
-            // --- GDN layers: segmented sharding ---
-            ShardGdnWeightsForTP();
 
             // --- MoE layers: tensor-parallel experts ---
             if (_numExperts > 0)
