@@ -34,6 +34,7 @@ namespace TensorSharp.Distributed
         private const byte MsgAllReduceResult     = 0x02;
         private const byte MsgBarrierAck          = 0x03;
         private const byte MsgControl             = 0x04;
+        private const byte MsgHeartbeat           = 0x05;
 
         private readonly int _rank;
         private readonly int _worldSize;
@@ -42,6 +43,13 @@ namespace TensorSharp.Distributed
         private readonly NetworkStream[] _streams;
         private readonly object _sendLock = new();
         private bool _disposed;
+
+        // Periodic heartbeat keeps the receive timeout from firing while a peer
+        // is legitimately busy (e.g. still loading weights or running a slow
+        // warmup forward pass). The heartbeat interval must be well below the
+        // receive timeout; 15 s works with the 300 s default timeout.
+        private System.Threading.Timer _heartbeatTimer;
+        private const int HeartbeatIntervalMs = 15_000;
 
         // Reusable receive buffer to avoid per-call allocation.
         private byte[] _recvBuffer = Array.Empty<byte>();
@@ -128,6 +136,9 @@ namespace TensorSharp.Distributed
                 throw;
             }
 
+            _heartbeatTimer = new System.Threading.Timer(SendHeartbeats, null,
+                HeartbeatIntervalMs, HeartbeatIntervalMs);
+
             Console.WriteLine($"[TcpCommunicator] Rank {rank}/{_worldSize} connected to all peers.");
         }
 
@@ -153,7 +164,7 @@ namespace TensorSharp.Distributed
             string s = Environment.GetEnvironmentVariable("TENSORSHARP_TP_RECV_TIMEOUT_SECONDS");
             if (!string.IsNullOrWhiteSpace(s) && int.TryParse(s, out int secs) && secs > 0)
                 return secs * 1000;
-            return 120_000;
+            return 300_000;
         }
 
         /// <summary>
@@ -333,6 +344,17 @@ namespace TensorSharp.Distributed
             Barrier();
         }
 
+        private void SendHeartbeats(object _)
+        {
+            if (_disposed) return;
+            for (int r = 0; r < _worldSize; r++)
+            {
+                if (r == _rank || _streams[r] == null) continue;
+                try { SendMessage(r, MsgHeartbeat, Array.Empty<byte>()); }
+                catch { /* peer gone — the next real op will surface the error */ }
+            }
+        }
+
         /// <summary>
         /// Block until all nodes have reached this point. Uses a simple
         /// gather-then-release protocol through node 0.
@@ -386,21 +408,28 @@ namespace TensorSharp.Distributed
         {
             var stream = _streams[srcRank];
 
-            // Read 4-byte length header.
-            byte[] header = ReadExact(stream, 4);
-            int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(header);
+            while (true)
+            {
+                // Read 4-byte length header.
+                byte[] header = ReadExact(stream, 4);
+                int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(header);
 
-            if (payloadLen < 1)
-                throw new InvalidOperationException("Received message with empty payload (missing type byte).");
+                if (payloadLen < 1)
+                    throw new InvalidOperationException("Received message with empty payload (missing type byte).");
 
-            // Read type byte + payload.
-            byte[] full = ReadExact(stream, payloadLen);
-            byte msgType = full[0];
-            byte[] payload = new byte[payloadLen - 1];
-            if (payload.Length > 0)
-                Array.Copy(full, 1, payload, 0, payload.Length);
+                // Read type byte + payload.
+                byte[] full = ReadExact(stream, payloadLen);
+                byte msgType = full[0];
 
-            return (msgType, payload);
+                if (msgType == MsgHeartbeat)
+                    continue; // discard keepalive, keep waiting for the real message
+
+                byte[] payload = new byte[payloadLen - 1];
+                if (payload.Length > 0)
+                    Array.Copy(full, 1, payload, 0, payload.Length);
+
+                return (msgType, payload);
+            }
         }
 
         private static byte[] ReadExact(NetworkStream stream, int count)
@@ -433,6 +462,8 @@ namespace TensorSharp.Distributed
         {
             if (_disposed) return;
             _disposed = true;
+
+            _heartbeatTimer?.Dispose();
 
             for (int r = 0; r < _worldSize; r++)
             {
