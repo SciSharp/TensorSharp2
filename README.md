@@ -56,6 +56,8 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 **Linux + NVIDIA with Tensor Parallelism**
 
 ```bash
+#On runpod's ubuntu 24.02 we need ot make sure Cuda libraries are correctly set:-
+LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
 git clone https://github.com/zhongkaifu/TensorSharp.git
 cd TensorSharp
 wget https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true -O gemma-4-E4B-it-Q8_0.gguf
