@@ -466,23 +466,43 @@ namespace TensorSharp.Models
         private unsafe void FuseAttentionProjectionWeights()
         {
             int fused = 0;
+            int fusedF32 = 0;
             for (int layer = 0; layer < TotalLayerCount; layer++)
             {
                 if (_isRecurrent[layer])
                     continue;
 
                 string prefix = $"blk.{layer}.";
-                if (TryFuseWeights(prefix + "attn_qkv.weight", keepSources: false,
+                string[] sources =
+                {
                     prefix + "attn_q.weight",
                     prefix + "attn_k.weight",
-                    prefix + "attn_v.weight"))
+                    prefix + "attn_v.weight",
+                };
+                if (TryFuseWeights(prefix + "attn_qkv.weight", keepSources: false, sources))
                 {
                     fused++;
+                }
+                else if (TryFuseWeightsToFloat32(prefix + "attn_qkv.weight", sources))
+                {
+                    // Mixed quant types (e.g. UD-Q4_K_XL) prevent in-place quant
+                    // fusion; dequantize to F32 so the fused key exists for both
+                    // the TP shard path and the non-TP layer-key cache.
+                    for (int i = 0; i < sources.Length; i++)
+                    {
+                        if (_quantWeights.Remove(sources[i], out var qw))
+                            qw.Dispose();
+                        else if (_weights.Remove(sources[i], out var w))
+                            w.Dispose();
+                    }
+                    fusedF32++;
                 }
             }
 
             if (fused > 0)
                 Console.WriteLine($"  Fused projections: {fused} Q+K+V");
+            if (fusedF32 > 0)
+                Console.WriteLine($"  Fused projections: {fusedF32} Q+K+V (dequantized to F32; mixed source quant types)");
         }
 
         private unsafe void FuseRecurrentInputWeights()
