@@ -4333,8 +4333,13 @@ namespace TensorSharp.Models
             }
 
             int safeToken = (Config?.VocabSize ?? 0) > 1 ? 1 : 0;
+            Console.WriteLine("  Warming up kernels (decode + prefill)...");
+
+            long decodeStart = Stopwatch.GetTimestamp();
             Forward(new[] { safeToken });
             ResetKVCache();
+            double decodeMs = (Stopwatch.GetTimestamp() - decodeStart) * 1000.0 / Stopwatch.Frequency;
+            Console.WriteLine($"    Decode warmup: {decodeMs:F1} ms");
 
             // Prime the MULTI-TOKEN prefill path. The 1-token Forward above only
             // warms the decode-shaped graph; on CUDA/GGML a real prompt takes the
@@ -4424,8 +4429,11 @@ namespace TensorSharp.Models
 
                 try
                 {
+                    long prefillStart = Stopwatch.GetTimestamp();
                     ForwardRefill(warmupPrompt);
                     Forward(new[] { safeToken });
+                    double prefillMs = (Stopwatch.GetTimestamp() - prefillStart) * 1000.0 / Stopwatch.Frequency;
+                    Console.WriteLine($"    Prefill warmup ({warmupLength} tokens): {prefillMs:F1} ms");
                 }
                 catch (Exception ex)
                 {

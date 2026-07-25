@@ -81,12 +81,15 @@ namespace TensorSharp.Distributed
                 // Lower-ranked node initiates the connection to higher-ranked nodes.
                 // Higher-ranked nodes accept. This gives exactly one connection per pair.
 
+                int recvTimeoutMs = ResolveReceiveTimeoutMs();
+
                 // Initiate outbound connections to higher-ranked peers.
                 for (int r = rank + 1; r < _worldSize; r++)
                 {
                     var client = ConnectWithRetry(endpoints[r], r, deadline);
                     _peers[r] = client;
                     _streams[r] = client.GetStream();
+                    _streams[r].ReadTimeout = recvTimeoutMs;
 
                     // Handshake: tell the remote peer our rank so it can
                     // map this connection to the correct slot.
@@ -104,6 +107,7 @@ namespace TensorSharp.Distributed
                     var client = _listener.AcceptTcpClient();
                     client.NoDelay = true;
                     var stream = client.GetStream();
+                    stream.ReadTimeout = recvTimeoutMs;
 
                     byte[] rankBytes = ReadExact(stream, 4);
                     int remoteRank = BinaryPrimitives.ReadInt32LittleEndian(rankBytes);
@@ -136,6 +140,20 @@ namespace TensorSharp.Distributed
             if (!string.IsNullOrWhiteSpace(s) && int.TryParse(s, out int secs) && secs > 0)
                 return TimeSpan.FromSeconds(secs);
             return TimeSpan.FromSeconds(120);
+        }
+
+        /// <summary>
+        /// Per-receive timeout for blocking reads. If a peer does not deliver a
+        /// message within this window the receive throws instead of hanging
+        /// indefinitely (the OS TCP keepalive default is often 2+ hours).
+        /// Override with TENSORSHARP_TP_RECV_TIMEOUT_SECONDS.
+        /// </summary>
+        private static int ResolveReceiveTimeoutMs()
+        {
+            string s = Environment.GetEnvironmentVariable("TENSORSHARP_TP_RECV_TIMEOUT_SECONDS");
+            if (!string.IsNullOrWhiteSpace(s) && int.TryParse(s, out int secs) && secs > 0)
+                return secs * 1000;
+            return 120_000;
         }
 
         /// <summary>
@@ -391,7 +409,19 @@ namespace TensorSharp.Distributed
             int offset = 0;
             while (offset < count)
             {
-                int n = stream.Read(buf, offset, count - offset);
+                int n;
+                try
+                {
+                    n = stream.Read(buf, offset, count - offset);
+                }
+                catch (IOException ex) when (ex.InnerException is SocketException se
+                    && (se.SocketErrorCode == SocketError.TimedOut || se.SocketErrorCode == SocketError.WouldBlock))
+                {
+                    throw new TimeoutException(
+                        $"Timed out waiting for a peer message ({count} bytes expected, {offset} received). " +
+                        "The remote node may be stuck, still loading, or unreachable. " +
+                        "Adjust with TENSORSHARP_TP_RECV_TIMEOUT_SECONDS.", ex);
+                }
                 if (n == 0)
                     throw new EndOfStreamException("Peer closed the connection.");
                 offset += n;
