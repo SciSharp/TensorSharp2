@@ -1384,44 +1384,52 @@ namespace TensorSharp.Models
                 float[] routePtr = TensorToFloatArray(routerData);
                 routerData.Dispose();
 
-                // Top-K selection (identical on all ranks because router is replicated
-                // and post-AllReduce hidden is bitwise identical).
-                var (topExperts, routeWeights) = SelectTopKExperts(routePtr, _numExpertsUsed);
-
                 // Accumulate expert outputs.
                 var output = new Tensor(alloc, DType.Float32, seqLen, hiddenSize);
                 Ops.Fill(output, 0f);
 
-                int expertFfnPerGpu = _expertFfnLength / GlobalTpDegree;
-
-                for (int k = 0; k < _numExpertsUsed; k++)
+                // Per-token routing: each token selects its own top-K experts.
+                for (int t = 0; t < seqLen; t++)
                 {
-                    int expertIdx = topExperts[k];
-                    float weight = routeWeights[k];
+                    // Extract this token's router logits (numExperts elements).
+                    float[] tokenLogits = new float[_numExperts];
+                    Array.Copy(routePtr, t * _numExperts, tokenLogits, 0, _numExperts);
 
-                    string gateKey = prefix + $"ffn_gate_exps.{expertIdx}.weight";
-                    string upKey = prefix + $"ffn_up_exps.{expertIdx}.weight";
-                    string downKey = prefix + $"ffn_down_exps.{expertIdx}.weight";
+                    var (topExperts, routeWeights) = SelectTopKExperts(tokenLogits, _numExpertsUsed);
 
-                    // Column-parallel gate/up (per-rank shard).
-                    Tensor gateOut = TpExpertLinear(localInput, gateKey, r, seqLen);
-                    Tensor upOut = TpExpertLinear(localInput, upKey, r, seqLen);
+                    // Extract this token's input row [1, hiddenSize].
+                    using var tokenInput = localInput.Narrow(0, t, 1);
 
-                    // SiLU·mul.
-                    Ops.SiLUMul(gateOut, gateOut, upOut);
-                    upOut.Dispose();
+                    for (int k = 0; k < _numExpertsUsed; k++)
+                    {
+                        int expertIdx = topExperts[k];
+                        float weight = routeWeights[k];
 
-                    // Row-parallel down (per-rank shard, partial result).
-                    Tensor downOut = TpExpertLinear(gateOut, downKey, r, seqLen);
-                    gateOut.Dispose();
+                        string gateKey = prefix + $"ffn_gate_exps.{expertIdx}.weight";
+                        string upKey = prefix + $"ffn_up_exps.{expertIdx}.weight";
+                        string downKey = prefix + $"ffn_down_exps.{expertIdx}.weight";
 
-                    // Weighted accumulate: output += weight * downOut
-                    Ops.Mul(downOut, downOut, weight);
-                    Ops.Add(output, output, downOut);
-                    downOut.Dispose();
+                        // Column-parallel gate/up (per-rank shard).
+                        Tensor gateOut = TpExpertLinear(tokenInput, gateKey, r, 1);
+                        Tensor upOut = TpExpertLinear(tokenInput, upKey, r, 1);
+
+                        // SiLU·mul.
+                        Ops.SiLUMul(gateOut, gateOut, upOut);
+                        upOut.Dispose();
+
+                        // Row-parallel down (per-rank shard, partial result).
+                        Tensor downOut = TpExpertLinear(gateOut, downKey, r, 1);
+                        gateOut.Dispose();
+
+                        // Weighted accumulate into the token's output row.
+                        Ops.Mul(downOut, downOut, weight);
+                        using var outputRow = output.Narrow(0, t, 1);
+                        Ops.Add(outputRow, outputRow, downOut);
+                        downOut.Dispose();
+                    }
                 }
 
-                // Shared experts (if present).
+                // Shared experts (if present) — apply to ALL tokens.
                 if (_hasSharedExperts != null && _hasSharedExperts[layer])
                 {
                     Tensor sharedGate = TpExpertLinear(localInput, prefix + "ffn_gate_shexp.weight", r, seqLen);

@@ -2783,7 +2783,12 @@ namespace TensorSharp.Models
         {
             int tp = TpDegree;
             var result = new Tensor[tp];
-            result[0] = tensor;
+            // Clone for rank 0 too — the caller may dispose the original
+            // tensor after broadcasting, and sharing the storage would leave
+            // rank 0 with a dangling reference.
+            var alloc0 = _tpGroup.GetAllocator(0);
+            result[0] = new Tensor(alloc0, tensor.ElementType, tensor.Sizes);
+            Ops.Copy(result[0], tensor);
             for (int r = 1; r < tp; r++)
                 result[r] = ReplicateTensorToRank(tensor, r);
             return result;
