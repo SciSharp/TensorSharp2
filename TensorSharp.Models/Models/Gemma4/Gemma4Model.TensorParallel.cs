@@ -614,19 +614,34 @@ namespace TensorSharp.Models
                     // attention against the own or donor cache.
                     if (!isShared)
                     {
+                        // SWA caches are circular: wrap the write position.
+                        int cachePos = isLocal
+                            ? startPos % (int)_tpKvCacheK[layer][r].Sizes[1]
+                            : startPos;
                         CopyToCacheDecode(_tpKvCacheK[layer][r], kTensor, _tpKvCacheV[layer][r], vTensor,
-                            numKVHeadsPerGpu, headDim, startPos);
+                            numKVHeadsPerGpu, headDim, cachePos);
                         kTensor.Dispose();
                         vTensor.Dispose();
                     }
 
-                    int attendLen = isLocal ? Math.Min(totalSeqLen, _slidingWindow) : totalSeqLen;
-                    int attendStart = totalSeqLen - attendLen;
-
                     var attnResult = new Tensor(alloc, DType.Float32, 1, numHeadsPerGpu * headDim);
-                    AttentionDecodeWithWindow(qTensor, _tpKvCacheK[kvCacheLayer][r], _tpKvCacheV[kvCacheLayer][r], attnResult,
-                        numHeadsPerGpu, numKVHeadsPerGpu, headDim, headDim,
-                        attendStart, totalSeqLen, 1f);
+
+                    if (isLocal)
+                    {
+                        // SWA: circular decode attention.
+                        int cacheLen = (int)_tpKvCacheK[kvCacheLayer][r].Sizes[1];
+                        int attendLen = Math.Min(totalSeqLen, _slidingWindow);
+                        AttentionDecodeCircular(qTensor, _tpKvCacheK[kvCacheLayer][r], _tpKvCacheV[kvCacheLayer][r], attnResult,
+                            numHeadsPerGpu, numKVHeadsPerGpu, headDim, headDim,
+                            startPos, attendLen, cacheLen, 1f);
+                    }
+                    else
+                    {
+                        // Global: linear decode attention.
+                        AttentionDecodeWithWindow(qTensor, _tpKvCacheK[kvCacheLayer][r], _tpKvCacheV[kvCacheLayer][r], attnResult,
+                            numHeadsPerGpu, numKVHeadsPerGpu, headDim, headDim,
+                            0, totalSeqLen, 1f);
+                    }
                     qTensor.Dispose();
 
                     results[r] = attnResult;
@@ -639,6 +654,7 @@ namespace TensorSharp.Models
 
                     // Own layers project + cache their K/V; KV-sharing layers
                     // reuse the donor's already-cached K/V.
+                    Tensor freshKHeads = null, freshVHeads = null;
                     if (!isShared)
                     {
                         Tensor kHeads = ReshapeToHeads(kTensor, numKVHeadsPerGpu, seqLen, headDim);
@@ -646,24 +662,71 @@ namespace TensorSharp.Models
                         Tensor vHeads = ReshapeToHeads(vTensor, numKVHeadsPerGpu, seqLen, headDim);
                         vTensor.Dispose();
 
-                        CopyToCache(_tpKvCacheK[layer][r], kHeads, startPos, seqLen);
-                        CopyToCache(_tpKvCacheV[layer][r], vHeads, startPos, seqLen);
-                        kHeads.Dispose();
-                        vHeads.Dispose();
+                        if (isLocal)
+                        {
+                            int cacheLen = (int)_tpKvCacheK[layer][r].Sizes[1];
+                            CopyToCacheCircular(_tpKvCacheK[layer][r], kHeads, startPos, seqLen, cacheLen);
+                            CopyToCacheCircular(_tpKvCacheV[layer][r], vHeads, startPos, seqLen, cacheLen);
+                            // Keep fresh K/V for direct attention below.
+                            freshKHeads = kHeads;
+                            freshVHeads = vHeads;
+                        }
+                        else
+                        {
+                            CopyToCache(_tpKvCacheK[layer][r], kHeads, startPos, seqLen);
+                            CopyToCache(_tpKvCacheV[layer][r], vHeads, startPos, seqLen);
+                            kHeads.Dispose();
+                            vHeads.Dispose();
+                        }
                     }
 
                     int groupSize = numHeadsPerGpu / numKVHeadsPerGpu;
-                    Tensor kExpanded = ExpandKVHeads(_tpKvCacheK[kvCacheLayer][r], groupSize, totalSeqLen);
-                    Tensor vExpanded = ExpandKVHeads(_tpKvCacheV[kvCacheLayer][r], groupSize, totalSeqLen);
+                    Tensor kExpanded, vExpanded;
+                    int kvAttendLen;
+
+                    if (freshKHeads != null)
+                    {
+                        // SWA non-shared: attend the freshly computed K/V directly.
+                        // The causal+window mask restricts each query to its window.
+                        kExpanded = ExpandKVHeads(freshKHeads, groupSize, seqLen);
+                        vExpanded = ExpandKVHeads(freshVHeads, groupSize, seqLen);
+                        freshKHeads.Dispose();
+                        freshVHeads.Dispose();
+                        kvAttendLen = seqLen;
+                    }
+                    else if (isLocal)
+                    {
+                        // SWA shared: gather the attend window from the donor's
+                        // circular cache into a linear buffer.
+                        int cacheLen = (int)_tpKvCacheK[kvCacheLayer][r].Sizes[1];
+                        int attendLen = Math.Min(totalSeqLen, _slidingWindow);
+                        int attendStart = totalSeqLen - attendLen;
+                        var linK = new Tensor(alloc, DType.Float32, numKVHeadsPerGpu, attendLen, headDim);
+                        var linV = new Tensor(alloc, DType.Float32, numKVHeadsPerGpu, attendLen, headDim);
+                        GatherCircularToLinear(_tpKvCacheK[kvCacheLayer][r], linK, attendStart, attendLen, cacheLen, numKVHeadsPerGpu, headDim);
+                        GatherCircularToLinear(_tpKvCacheV[kvCacheLayer][r], linV, attendStart, attendLen, cacheLen, numKVHeadsPerGpu, headDim);
+                        kExpanded = ExpandKVHeads(linK, groupSize, attendLen);
+                        vExpanded = ExpandKVHeads(linV, groupSize, attendLen);
+                        linK.Dispose();
+                        linV.Dispose();
+                        kvAttendLen = attendLen;
+                    }
+                    else
+                    {
+                        // Global: linear cache, full history.
+                        kExpanded = ExpandKVHeads(_tpKvCacheK[kvCacheLayer][r], groupSize, totalSeqLen);
+                        vExpanded = ExpandKVHeads(_tpKvCacheV[kvCacheLayer][r], groupSize, totalSeqLen);
+                        kvAttendLen = totalSeqLen;
+                    }
 
                     using var kT = kExpanded.Transpose(1, 2);
-                    var scores = new Tensor(alloc, DType.Float32, numHeadsPerGpu, seqLen, totalSeqLen);
+                    var scores = new Tensor(alloc, DType.Float32, numHeadsPerGpu, seqLen, kvAttendLen);
                     Ops.AddmmBatch(scores, 0, scores, 1f, qHeads, kT);
                     qHeads.Dispose();
                     kExpanded.Dispose();
 
                     int windowSize = isLocal ? _slidingWindow : 0;
-                    ApplyCausalMask(scores, seqLen, totalSeqLen, windowSize);
+                    ApplyCausalMask(scores, seqLen, kvAttendLen, windowSize);
                     Ops.Softmax(scores, scores);
 
                     var attnOutTensor = new Tensor(alloc, DType.Float32, numHeadsPerGpu, seqLen, headDim);
@@ -679,6 +742,51 @@ namespace TensorSharp.Models
             }
 
             return results;
+        }
+
+        /// <summary>
+        /// Gather a contiguous logical range [start, start+length) from a
+        /// circular head-first cache [numHeads, cacheSize, headDim] into a
+        /// linear buffer [numHeads, length, headDim]. Handles the wrap-around.
+        /// </summary>
+        private unsafe void GatherCircularToLinear(Tensor cache, Tensor result,
+            int start, int length, int cacheSize, int numHeads, int headDim)
+        {
+            if (CudaFusedOps.TryGatherCircularHeadFirst(result, cache, start, length, cacheSize))
+                return;
+
+            float* src = GetFloatPtr(cache);
+            float* dst = GetFloatPtr(result);
+            for (int h = 0; h < numHeads; h++)
+            {
+                float* srcHead = src + (long)h * cacheSize * headDim;
+                float* dstHead = dst + (long)h * length * headDim;
+                int firstSlot = ((start % cacheSize) + cacheSize) % cacheSize;
+
+                if (firstSlot + length <= cacheSize)
+                {
+                    Buffer.MemoryCopy(
+                        srcHead + (long)firstSlot * headDim,
+                        dstHead,
+                        (long)length * headDim * 4,
+                        (long)length * headDim * 4);
+                }
+                else
+                {
+                    int tailLen = cacheSize - firstSlot;
+                    Buffer.MemoryCopy(
+                        srcHead + (long)firstSlot * headDim,
+                        dstHead,
+                        (long)tailLen * headDim * 4,
+                        (long)tailLen * headDim * 4);
+                    int headLen = length - tailLen;
+                    Buffer.MemoryCopy(
+                        srcHead,
+                        dstHead + (long)tailLen * headDim,
+                        (long)headLen * headDim * 4,
+                        (long)headLen * headDim * 4);
+                }
+            }
         }
 
         private Tensor ApplyGemma4QKNormTP(Tensor data, string weightName, int numHeads, int headDim, int seqLen, int rank)
