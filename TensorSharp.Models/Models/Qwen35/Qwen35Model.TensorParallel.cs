@@ -245,10 +245,18 @@ namespace TensorSharp.Models
             int qkvDim = 2 * qkDim + vDim;
             int packedDim = qkvDim + vDim + 2 * _numVHeads; // Q+K+V + Z + beta + alpha
 
+            int recurrentTotal = 0, recurrentDone = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (_isRecurrent[l]) recurrentTotal++;
+
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 if (!_isRecurrent[layer])
                     continue;
+
+                recurrentDone++;
+                if (recurrentDone == 1 || recurrentDone % 12 == 0 || recurrentDone == recurrentTotal)
+                    Console.WriteLine($"    GDN sharding: layer {layer} ({recurrentDone}/{recurrentTotal})");
 
                 string prefix = $"blk.{layer}.";
 
