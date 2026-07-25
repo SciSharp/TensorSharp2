@@ -188,7 +188,11 @@ namespace TensorSharp.Models
                 rowParallelPatterns: new[] { "ffn_down.weight" });
 
             for (int layer = 0; layer < TotalLayerCount; layer++)
+            {
+                if (layer == 0 || (layer + 1) % 16 == 0 || layer + 1 == TotalLayerCount)
+                    Console.WriteLine($"    Gate+Up sharding: layer {layer} ({layer + 1}/{TotalLayerCount})");
                 ShardFusedGateUpColumnParallel($"blk.{layer}.ffn_gate_up.weight");
+            }
 
             // --- GDN layers: segmented sharding ---
             ShardGdnWeightsForTP();
