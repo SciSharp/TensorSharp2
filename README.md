@@ -53,7 +53,9 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 **Linux + NVIDIA** — prefix the `dotnet run` with `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` and use `--backend ggml_cuda`.
 **AMD / Intel / NVIDIA Vulkan** — set `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` and use `--backend ggml_vulkan`.
 
-```Linux + Nvidia
+**Windows + NVIDIA (PowerShell)**
+
+```bash
 git clone https://github.com/zhongkaifu/TensorSharp.git
 cd TensorSharp
 wget https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true -O gemma-4-E4B-it-Q8_0.gguf
