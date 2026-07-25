@@ -54,6 +54,29 @@ namespace TensorSharp.Distributed
         // Reusable receive buffer to avoid per-call allocation.
         private byte[] _recvBuffer = Array.Empty<byte>();
 
+        // Reusable send buffer for AllReduce TCP exchanges.
+        private byte[] _allReduceSendBuf = Array.Empty<byte>();
+
+        // The barrier after AllReduce guards against a slow peer that has not
+        // yet entered its matching AllReduce. After the first successful
+        // AllReduce both nodes are proven to be in lockstep, and TCP ordering
+        // guarantees subsequent messages arrive in order, so the barrier is
+        // retired to halve the per-token message count.
+        private bool _barrierRetired;
+
+        // Dedicated I/O thread for AllReduce TCP exchanges. The compute thread
+        // submits a buffer and blocks on _arComplete; the I/O thread performs
+        // the network exchange and signals completion. This decouples TCP
+        // latency from the compute thread's call stack and lets the JIT keep
+        // the hot forward-pass code resident.
+        private Thread _ioThread;
+        private readonly ManualResetEventSlim _arRequest = new(false);
+        private readonly ManualResetEventSlim _arComplete = new(false);
+        private float[] _arBuffer;
+        private int _arLength;
+        private Exception _arError;
+        private volatile bool _ioShutdown;
+
         /// <param name="rank">This node's rank (0..worldSize-1).</param>
         /// <param name="endpoints">
         /// Endpoints for every node in the group, indexed by rank.
@@ -139,6 +162,9 @@ namespace TensorSharp.Distributed
             _heartbeatTimer = new System.Threading.Timer(SendHeartbeats, null,
                 HeartbeatIntervalMs, HeartbeatIntervalMs);
 
+            _ioThread = new Thread(IoLoop) { IsBackground = true, Name = $"TP-IO-rank{rank}" };
+            _ioThread.Start();
+
             Console.WriteLine($"[TcpCommunicator] Rank {rank}/{_worldSize} connected to all peers.");
         }
 
@@ -215,14 +241,49 @@ namespace TensorSharp.Distributed
         /// In-place AllReduce (sum) across all nodes. The buffer is modified
         /// to contain the element-wise sum of all nodes' inputs.
         /// All nodes must call this concurrently with the same buffer length.
+        /// The TCP exchange runs on a dedicated I/O thread; the calling
+        /// (compute) thread blocks until the result is ready.
         /// </summary>
-        public unsafe void AllReduce(Span<float> buffer)
+        public void AllReduce(float[] buffer, int length)
         {
-            int byteCount = buffer.Length * sizeof(float);
+            _arBuffer = buffer;
+            _arLength = length;
+            _arError = null;
+            _arComplete.Reset();
+            _arRequest.Set();
+            _arComplete.Wait();
+            if (_arError != null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(_arError).Throw();
+        }
+
+        private void IoLoop()
+        {
+            while (true)
+            {
+                _arRequest.Wait();
+                if (_ioShutdown) break;
+                _arRequest.Reset();
+
+                try
+                {
+                    AllReduceCore(_arBuffer, _arLength);
+                }
+                catch (Exception ex)
+                {
+                    _arError = ex;
+                }
+
+                _arComplete.Set();
+            }
+        }
+
+        private unsafe void AllReduceCore(float[] buffer, int length)
+        {
+            int byteCount = length * sizeof(float);
+            EnsureAllReduceSendBuffer(byteCount);
 
             if (_rank == 0)
             {
-                // Node 0: receive partials from all other nodes and accumulate.
                 for (int r = 1; r < _worldSize; r++)
                 {
                     var (msgType, payload) = ReceiveMessage(r);
@@ -234,27 +295,23 @@ namespace TensorSharp.Distributed
                     fixed (byte* payPtr = payload)
                     {
                         float* src = (float*)payPtr;
-                        for (int i = 0; i < buffer.Length; i++)
+                        for (int i = 0; i < length; i++)
                             bufPtr[i] += src[i];
                     }
                 }
 
-                // Broadcast the reduced result to all other nodes.
-                byte[] resultBytes = new byte[byteCount];
                 fixed (float* bufPtr = buffer)
-                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)bufPtr, resultBytes, 0, byteCount);
+                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)bufPtr, _allReduceSendBuf, 0, byteCount);
 
                 for (int r = 1; r < _worldSize; r++)
-                    SendMessage(r, MsgAllReduceResult, resultBytes);
+                    SendMessage(r, MsgAllReduceResult, _allReduceSendBuf, byteCount);
             }
             else
             {
-                // Non-zero node: send partial to node 0, then receive the result.
-                byte[] partialBytes = new byte[byteCount];
                 fixed (float* bufPtr = buffer)
-                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)bufPtr, partialBytes, 0, byteCount);
+                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)bufPtr, _allReduceSendBuf, 0, byteCount);
 
-                SendMessage(0, MsgAllReduceContribute, partialBytes);
+                SendMessage(0, MsgAllReduceContribute, _allReduceSendBuf, byteCount);
 
                 var (msgType, payload) = ReceiveMessage(0);
                 if (msgType != MsgAllReduceResult)
@@ -265,8 +322,17 @@ namespace TensorSharp.Distributed
                     System.Runtime.InteropServices.Marshal.Copy(payload, 0, (IntPtr)bufPtr, byteCount);
             }
 
-            // Barrier so all nodes have the result before any proceeds.
-            Barrier();
+            if (!_barrierRetired)
+            {
+                Barrier();
+                _barrierRetired = true;
+            }
+        }
+
+        private void EnsureAllReduceSendBuffer(int byteCount)
+        {
+            if (_allReduceSendBuf.Length >= byteCount) return;
+            _allReduceSendBuf = new byte[byteCount];
         }
 
         /// <summary>
@@ -388,8 +454,13 @@ namespace TensorSharp.Distributed
 
         private void SendMessage(int destRank, byte msgType, byte[] payload)
         {
+            SendMessage(destRank, msgType, payload, payload.Length);
+        }
+
+        private void SendMessage(int destRank, byte msgType, byte[] payload, int payloadLen)
+        {
             var stream = _streams[destRank];
-            int totalLen = 1 + payload.Length;
+            int totalLen = 1 + payloadLen;
 
             byte[] header = new byte[4];
             BinaryPrimitives.WriteInt32LittleEndian(header, totalLen);
@@ -398,8 +469,8 @@ namespace TensorSharp.Distributed
             {
                 stream.Write(header, 0, 4);
                 stream.WriteByte(msgType);
-                if (payload.Length > 0)
-                    stream.Write(payload, 0, payload.Length);
+                if (payloadLen > 0)
+                    stream.Write(payload, 0, payloadLen);
                 stream.Flush();
             }
         }
@@ -464,6 +535,10 @@ namespace TensorSharp.Distributed
             _disposed = true;
 
             _heartbeatTimer?.Dispose();
+
+            _ioShutdown = true;
+            _arRequest.Set();
+            _ioThread?.Join(2000);
 
             for (int r = 0; r < _worldSize; r++)
             {

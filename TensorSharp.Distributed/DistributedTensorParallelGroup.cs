@@ -25,8 +25,12 @@ namespace TensorSharp.Distributed
         private readonly int _nodeCount;
         private bool _disposed;
 
-        // Reusable host buffer for GPU↔network transfers.
+        // Reusable host buffers for GPU↔network transfers. Pinned so the
+        // kernel can DMA directly to/from the NIC without an extra copy.
         private float[] _hostBuffer = Array.Empty<float>();
+        private float[] _resultBuffer = Array.Empty<float>();
+        private System.Runtime.InteropServices.GCHandle _hostPin;
+        private System.Runtime.InteropServices.GCHandle _resultPin;
 
         /// <param name="localDegree">Number of GPUs on this node.</param>
         /// <param name="nodeId">This node's ID (0..nodeCount-1).</param>
@@ -82,32 +86,31 @@ namespace TensorSharp.Distributed
 
             // Phase 2: Copy rank-0 GPU data to host buffer.
             int elementCount = (int)tensors[0].Storage.ElementCount;
-            EnsureHostBuffer(elementCount);
+            EnsureBuffers(elementCount);
 
             var hostData = tensors[0].GetElementsAsFloat(elementCount);
             Array.Copy(hostData, _hostBuffer, elementCount);
 
             // Phase 3: TCP AllReduce across nodes (modifies _hostBuffer in-place).
-            _tcp.AllReduce(_hostBuffer.AsSpan(0, elementCount));
+            // Runs on the dedicated I/O thread inside TcpCommunicator.
+            _tcp.AllReduce(_hostBuffer, elementCount);
 
             // Phase 4: Broadcast the reduced result from host to all local GPUs.
-            var resultSlice = new float[elementCount];
-            Array.Copy(_hostBuffer, resultSlice, elementCount);
+            // Reuse _resultBuffer to avoid a per-call allocation.
+            Array.Copy(_hostBuffer, _resultBuffer, elementCount);
 
             for (int r = 0; r < Degree; r++)
             {
-                tensors[r].SetElementsAsFloat(resultSlice);
-                // SetElementsAsFloat only marks the host buffer dirty; force the
-                // upload now so downstream GPU kernels (including fused kernels
-                // that read the raw device pointer) see the reduced values
-                // rather than the stale pre-reduction partial. Without this the
-                // multi-node result never reaches the device and generation is
-                // garbage, even though single-node (device-to-device) works.
+                tensors[r].SetElementsAsFloat(_resultBuffer);
                 tensors[r].EnsureDeviceCurrent();
             }
 
-            // Sync all local GPUs so the result is visible.
-            _localGroup.Synchronize();
+            // For multi-GPU nodes, sync so every GPU sees the result before
+            // the next layer reads it. Single-GPU nodes (Degree==1) already
+            // synchronised inside EnsureDeviceCurrent; the extra Synchronize
+            // was a redundant full-device barrier on every AllReduce.
+            if (Degree > 1)
+                _localGroup.Synchronize();
         }
 
         public void Synchronize()
@@ -128,17 +131,30 @@ namespace TensorSharp.Distributed
         /// <summary>Worker node blocks for the next control message from the driver.</summary>
         public (int op, int[] payload) ReceiveControl() => _tcp.ReceiveControl();
 
-        private void EnsureHostBuffer(int elementCount)
+        private void EnsureBuffers(int elementCount)
         {
             if (_hostBuffer.Length >= elementCount)
                 return;
+
+            if (_hostPin.IsAllocated) _hostPin.Free();
+            if (_resultPin.IsAllocated) _resultPin.Free();
+
             _hostBuffer = new float[elementCount];
+            _resultBuffer = new float[elementCount];
+
+            _hostPin = System.Runtime.InteropServices.GCHandle.Alloc(_hostBuffer,
+                System.Runtime.InteropServices.GCHandleType.Pinned);
+            _resultPin = System.Runtime.InteropServices.GCHandle.Alloc(_resultBuffer,
+                System.Runtime.InteropServices.GCHandleType.Pinned);
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
+
+            if (_hostPin.IsAllocated) _hostPin.Free();
+            if (_resultPin.IsAllocated) _resultPin.Free();
 
             _tcp?.Dispose();
             _localGroup?.Dispose();
