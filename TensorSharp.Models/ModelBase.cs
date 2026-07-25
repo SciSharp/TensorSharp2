@@ -2331,6 +2331,9 @@ namespace TensorSharp.Models
             var colPatterns = new List<string>(columnParallelPatterns);
             var rowPatterns = new List<string>(rowParallelPatterns);
 
+            if (tp > 1 || globalTp > 1)
+                Console.WriteLine($"  ShardWeightsForTP: tp={tp} globalTp={globalTp} rankOffset={rankOffset} colPatterns=[{string.Join(",", colPatterns)}] rowPatterns=[{string.Join(",", rowPatterns)}]");
+
             // Shard quantized weights.
             var quantToRemove = new List<string>();
             var colParallelOwners = new List<QuantizedWeight>();
@@ -2377,6 +2380,10 @@ namespace TensorSharp.Models
                     long dstRowBytes = (ne0PerShard / blockSize) * typeSize;
                     long totalBytesPerShard = qw.Ne1 * dstRowBytes;
                     long blockBytesPerShard = blocksPerShard * typeSize;
+
+                    if (quantToRemove.Count < 2)
+                        Console.WriteLine($"    Row-parallel quant debug: {name} origNe0={qw.Ne0} origNe1={qw.Ne1} globalTp={globalTp} blockSize={blockSize} blocksPerRow={blocksPerRow} blocksPerShard={blocksPerShard} ne0PerShard={ne0PerShard} totalBytesPerShard={totalBytesPerShard}");
+
 
                     for (int lr = 0; lr < tp; lr++)
                     {
@@ -2838,20 +2845,55 @@ namespace TensorSharp.Models
             long preloadedBytes = 0;
             int preloadedCount = 0;
 
+            long tpTotalBytes = 0;
+            int tpTotalCount = 0;
+            int tpDebugPrinted = 0;
+            foreach (var kv in _tpQuantWeights)
+            {
+                foreach (var s in kv.Value)
+                {
+                    tpTotalBytes += s.RawBytes;
+                    tpTotalCount++;
+                }
+                if (tpDebugPrinted < 3)
+                {
+                    var firstShard = kv.Value[0];
+                    Console.WriteLine($"    TP debug: {kv.Key} shards={kv.Value.Length} shardRawBytes={firstShard.RawBytes} ne0={firstShard.Ne0} ne1={firstShard.Ne1} type={firstShard.GgmlType}");
+                    tpDebugPrinted++;
+                }
+            }
+            Console.WriteLine($"  TP sharded weights to preload: {tpTotalCount} shards, {tpTotalBytes / 1024 / 1024} MB total");
+
             foreach (var kv in _tpQuantWeights)
             {
                 var shards = kv.Value;
                 bool retain = !kernelsAvailable || ShouldRetainCudaHostQuantWeight(kv.Key);
+                // MoE expert weights are very numerous (hundreds of experts × layers)
+                // and only a few are active per token.  Skip device preload for
+                // per-expert weights to keep GPU memory available for KV cache and
+                // attention.  The CPU fallback path in AddmmQuantManaged serves them.
+                bool isExpertWeight = kv.Key.Contains("_exps.");
                 for (int r = 0; r < shards.Length; r++)
                 {
                     var qw = shards[r];
                     if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
                         continue;
 
+                    if (isExpertWeight)
+                        continue; // keep on host for CPU fallback
+
                     var alloc = _tpGroup.GetAllocator(r);
                     IntPtr cacheKey = qw.EnsureDeviceCacheKey();
-                    CudaQuantizedOps.PreloadQuantizedWeight(
-                        alloc, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    try
+                    {
+                        CudaQuantizedOps.PreloadQuantizedWeight(
+                            alloc, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    }
+                    catch (Exception ex) when (ex.Message.Contains("out of memory"))
+                    {
+                        Console.WriteLine($"  Skipping TP device preload for {kv.Key} rank={r} ({qw.RawBytes / 1024 / 1024} MB) — GPU {r} out of memory, keeping host copy for CPU fallback.");
+                        continue;
+                    }
                     preloadedBytes += qw.RawBytes;
                     preloadedCount++;
                     if (!retain)
@@ -2862,6 +2904,16 @@ namespace TensorSharp.Models
             // Also preload any remaining non-sharded quantized weights (e.g. embedding).
             if (_allocator is CudaAllocator cudaAllocator)
             {
+                long remainingTotalBytes = 0;
+                int remainingCount = 0;
+                foreach (var kv in _quantWeights)
+                {
+                    remainingTotalBytes += kv.Value.RawBytes;
+                    remainingCount++;
+                }
+                if (remainingCount > 0)
+                    Console.WriteLine($"  TP non-sharded quantized weights remaining: {remainingCount} tensors, {remainingTotalBytes / 1024 / 1024} MB");
+
                 foreach (var kv in _quantWeights)
                 {
                     var qw = kv.Value;
@@ -2869,8 +2921,19 @@ namespace TensorSharp.Models
                         continue;
 
                     IntPtr cacheKey = qw.EnsureDeviceCacheKey();
-                    CudaQuantizedOps.PreloadQuantizedWeight(
-                        cudaAllocator, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    try
+                    {
+                        CudaQuantizedOps.PreloadQuantizedWeight(
+                            cudaAllocator, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    }
+                    catch (Exception ex) when (ex.Message.Contains("out of memory"))
+                    {
+                        // GPU is full — keep the host copy so the CPU fallback
+                        // path (EmbeddingManagedQuantized / AddmmQuantManaged)
+                        // can serve this weight from host memory.
+                        Console.WriteLine($"  Skipping device preload for {kv.Key} ({qw.RawBytes / 1024 / 1024} MB) — GPU out of memory, keeping host copy for CPU fallback.");
+                        continue;
+                    }
                     preloadedBytes += qw.RawBytes;
                     preloadedCount++;
                     if (kernelsAvailable && !ShouldRetainCudaHostQuantWeight(kv.Key))
@@ -2881,13 +2944,14 @@ namespace TensorSharp.Models
             _cudaQuantWeightsPrepared = true;
 
             // Only dispose the GGUF file when no external host views remain
-            // (column-parallel shards may still reference mmap'd data).
+            // (column-parallel shards may still reference mmap'd data) and
+            // no TP shards were kept on host (expert CPU fallback).
             bool anyHostViewsRemain = false;
             foreach (var kv in _tpQuantWeights)
             {
                 foreach (var qw in kv.Value)
                 {
-                    if (qw.HasExternalHostView && qw.HasHostData)
+                    if (qw.HasHostData)
                     {
                         anyHostViewsRemain = true;
                         break;
@@ -2899,7 +2963,7 @@ namespace TensorSharp.Models
             {
                 foreach (QuantizedWeight qw in _quantWeights.Values)
                 {
-                    if (qw.HasExternalHostView && qw.HasHostData)
+                    if (qw.HasHostData)
                     {
                         anyHostViewsRemain = true;
                         break;
