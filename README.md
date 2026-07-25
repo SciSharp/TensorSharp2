@@ -53,7 +53,7 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 **Linux + NVIDIA** — prefix the `dotnet run` with `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` and use `--backend ggml_cuda`.
 **AMD / Intel / NVIDIA Vulkan** — set `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` and use `--backend ggml_vulkan`.
 
-**Windows + NVIDIA (PowerShell)**
+**Linux + NVIDIA with Tensor Parallelism**
 
 ```bash
 git clone https://github.com/zhongkaifu/TensorSharp.git
