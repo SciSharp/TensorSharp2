@@ -131,9 +131,11 @@ namespace TensorSharp.Distributed
         /// <summary>Worker node blocks for the next control message from the driver.</summary>
         public (int op, int[] payload) ReceiveControl() => _tcp.ReceiveControl();
 
+        private int _bufferSize;
+
         private void EnsureBuffers(int elementCount)
         {
-            if (_hostBuffer.Length >= elementCount)
+            if (_bufferSize == elementCount)
                 return;
 
             if (_hostPin.IsAllocated) _hostPin.Free();
@@ -141,6 +143,7 @@ namespace TensorSharp.Distributed
 
             _hostBuffer = new float[elementCount];
             _resultBuffer = new float[elementCount];
+            _bufferSize = elementCount;
 
             _hostPin = System.Runtime.InteropServices.GCHandle.Alloc(_hostBuffer,
                 System.Runtime.InteropServices.GCHandleType.Pinned);
