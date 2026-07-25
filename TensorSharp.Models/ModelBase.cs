@@ -1539,6 +1539,11 @@ namespace TensorSharp.Models
             if (_allocator is not CudaAllocator cudaAllocator)
                 return;
 
+            // When CUDA kernels are unavailable (PTX load failed), device-side
+            // quantized matmul/embedding will fail and every op falls back to
+            // the CPU dequant path.  Keep all host data alive in that case.
+            bool kernelsAvailable = CudaQuantizedOps.AreKernelsAvailable(cudaAllocator);
+
             long preloadedBytes = 0;
             int preloadedCount = 0;
             int mappedHostViews = 0;
@@ -1548,8 +1553,9 @@ namespace TensorSharp.Models
                     mappedHostViews++;
             }
 
-            foreach (QuantizedWeight qw in _quantWeights.Values)
+            foreach (var kv in _quantWeights)
             {
+                var qw = kv.Value;
                 if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
                     continue;
 
@@ -1566,9 +1572,12 @@ namespace TensorSharp.Models
                 preloadedCount++;
 
                 bool wasMappedView = qw.HasExternalHostView;
-                qw.ReleaseHostData();
-                if (wasMappedView)
-                    mappedHostViews--;
+                if (kernelsAvailable && !ShouldRetainCudaHostQuantWeight(kv.Key))
+                {
+                    qw.ReleaseHostData();
+                    if (wasMappedView)
+                        mappedHostViews--;
+                }
             }
 
             _cudaQuantWeightsPrepared = true;
@@ -2819,12 +2828,20 @@ namespace TensorSharp.Models
             if (_backend != BackendType.Cuda || _tpQuantWeights.Count == 0)
                 return;
 
+            // When CUDA kernels are unavailable (PTX load failed), device-side
+            // quantized matmul will fail and every op falls back to the CPU
+            // dequant path.  In that case we MUST keep the host data alive
+            // regardless of ShouldRetainCudaHostQuantWeight.
+            bool kernelsAvailable = _allocator is CudaAllocator primaryAlloc
+                && CudaQuantizedOps.AreKernelsAvailable(primaryAlloc);
+
             long preloadedBytes = 0;
             int preloadedCount = 0;
 
             foreach (var kv in _tpQuantWeights)
             {
                 var shards = kv.Value;
+                bool retain = !kernelsAvailable || ShouldRetainCudaHostQuantWeight(kv.Key);
                 for (int r = 0; r < shards.Length; r++)
                 {
                     var qw = shards[r];
@@ -2837,15 +2854,17 @@ namespace TensorSharp.Models
                         alloc, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
                     preloadedBytes += qw.RawBytes;
                     preloadedCount++;
-                    qw.ReleaseHostData();
+                    if (!retain)
+                        qw.ReleaseHostData();
                 }
             }
 
             // Also preload any remaining non-sharded quantized weights (e.g. embedding).
             if (_allocator is CudaAllocator cudaAllocator)
             {
-                foreach (QuantizedWeight qw in _quantWeights.Values)
+                foreach (var kv in _quantWeights)
                 {
+                    var qw = kv.Value;
                     if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
                         continue;
 
@@ -2854,7 +2873,8 @@ namespace TensorSharp.Models
                         cudaAllocator, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
                     preloadedBytes += qw.RawBytes;
                     preloadedCount++;
-                    qw.ReleaseHostData();
+                    if (kernelsAvailable && !ShouldRetainCudaHostQuantWeight(kv.Key))
+                        qw.ReleaseHostData();
                 }
             }
 

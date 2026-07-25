@@ -238,7 +238,7 @@ namespace TensorSharp.Cuda
                 IntPtr srcPtr = DevicePtr(tensors[i]);
                 IntPtr dstPtr = DevicePtr(tensors[0]);
 
-                if (CanAccessPeer(0, i))
+                if (CanAccessPeer(0, i) && _allocators[0].Kernels != null)
                 {
                     // P2P copy: GPU i → GPU 0 staging, then add.
                     EnsureStagingBuffer(byteCount);
@@ -299,25 +299,31 @@ namespace TensorSharp.Cuda
 
         private unsafe void AllReduceViaHost(Tensor dst, Tensor src, int elementCount, long byteCount)
         {
-            // Copy src (GPU i) → host → dst (GPU 0), then add on GPU 0.
-            var hostBuf = new float[elementCount];
-            fixed (float* hostPtr = hostBuf)
+            // Copy src (GPU i) → host, copy dst (GPU 0) → host, add on host,
+            // then upload result back to GPU 0.  When CUDA kernels are
+            // unavailable we cannot use LaunchBinaryF32 on device, so the
+            // entire reduce happens on the CPU.
+            int srcDevice = ((CudaStorage)src.Storage).DeviceId;
+            int dstDevice = ((CudaStorage)dst.Storage).DeviceId;
+            var srcBuf = new float[elementCount];
+            var dstBuf = new float[elementCount];
+            fixed (float* srcPtr = srcBuf)
+            fixed (float* dstPtr = dstBuf)
             {
-                _allocators[src.Storage.Allocator.DeviceId].Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyDtoH((IntPtr)hostPtr, DevicePtr(src),
+                _allocators[srcDevice].Context.MakeCurrent();
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)srcPtr, DevicePtr(src),
                     new UIntPtr((ulong)byteCount)).ThrowOnError();
+
+                _allocators[dstDevice].Context.MakeCurrent();
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)dstPtr, DevicePtr(dst),
+                    new UIntPtr((ulong)byteCount)).ThrowOnError();
+
+                for (int j = 0; j < elementCount; j++)
+                    dstBuf[j] += srcBuf[j];
 
                 _allocators[0].Context.MakeCurrent();
-                EnsureStagingBuffer(byteCount);
-                CudaDriverApi.cuMemcpyHtoD(_stagingBuffer, (IntPtr)hostPtr,
+                CudaDriverApi.cuMemcpyHtoD(DevicePtr(dst), (IntPtr)dstPtr,
                     new UIntPtr((ulong)byteCount)).ThrowOnError();
-
-                IntPtr dstDevPtr = DevicePtr(dst);
-                _allocators[0].Kernels.LaunchBinaryF32(
-                    dstDevPtr, _stagingBuffer,
-                    dstDevPtr,
-                    elementCount, 0,
-                    _allocators[0].Stream.Handle);
             }
         }
 
