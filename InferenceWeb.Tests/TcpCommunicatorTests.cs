@@ -44,8 +44,8 @@ public class TcpCommunicatorTests
             var buf0 = new float[] { 1f, 2f, 3f, 4f };
             var buf1 = new float[] { 10f, 20f, 30f, 40f };
 
-            var t0 = new Thread(() => c0.AllReduce(buf0));
-            var t1 = new Thread(() => c1.AllReduce(buf1));
+            var t0 = new Thread(() => c0.AllReduce(buf0, buf0.Length));
+            var t1 = new Thread(() => c1.AllReduce(buf1, buf1.Length));
             t0.Start(); t1.Start();
             t0.Join(10_000); t1.Join(10_000);
 
@@ -73,8 +73,8 @@ public class TcpCommunicatorTests
                 buf1[i] = i * 0.002f;
             }
 
-            var t0 = new Thread(() => c0.AllReduce(buf0));
-            var t1 = new Thread(() => c1.AllReduce(buf1));
+            var t0 = new Thread(() => c0.AllReduce(buf0, buf0.Length));
+            var t1 = new Thread(() => c1.AllReduce(buf1, buf1.Length));
             t0.Start(); t1.Start();
             t0.Join(30_000); t1.Join(30_000);
 
@@ -160,9 +160,9 @@ public class TcpCommunicatorTests
             var buf1 = new float[] { 10f, 20f };
             var buf2 = new float[] { 100f, 200f };
 
-            var ta0 = new Thread(() => c0.AllReduce(buf0));
-            var ta1 = new Thread(() => c1.AllReduce(buf1));
-            var ta2 = new Thread(() => c2.AllReduce(buf2));
+            var ta0 = new Thread(() => c0.AllReduce(buf0, buf0.Length));
+            var ta1 = new Thread(() => c1.AllReduce(buf1, buf1.Length));
+            var ta2 = new Thread(() => c2.AllReduce(buf2, buf2.Length));
             ta0.Start(); ta1.Start(); ta2.Start();
             ta0.Join(10_000); ta1.Join(10_000); ta2.Join(10_000);
 
@@ -188,8 +188,8 @@ public class TcpCommunicatorTests
                 var buf0 = new float[] { v, v * 2 };
                 var buf1 = new float[] { v * 10, v * 20 };
 
-                var t0 = new Thread(() => c0.AllReduce(buf0));
-                var t1 = new Thread(() => c1.AllReduce(buf1));
+                var t0 = new Thread(() => c0.AllReduce(buf0, buf0.Length));
+                var t1 = new Thread(() => c1.AllReduce(buf1, buf1.Length));
                 t0.Start(); t1.Start();
                 t0.Join(10_000); t1.Join(10_000);
 
