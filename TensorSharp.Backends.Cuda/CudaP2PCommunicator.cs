@@ -52,6 +52,15 @@ namespace TensorSharp.Cuda
             int n = allocators.Length;
             var enabled = new bool[n * n];
 
+            // TENSORSHARP_TP_DISABLE_P2P=1 → leave every pair disabled so all
+            // cross-GPU transfers stage through host memory, matching the
+            // behaviour of no-peer hardware (A16 vGPU, consumer cards) exactly.
+            if (CudaStorage.DisableP2P)
+            {
+                Console.WriteLine("  TP: P2P disabled by TENSORSHARP_TP_DISABLE_P2P; all cross-GPU transfers use host staging.");
+                return enabled;
+            }
+
             for (int i = 0; i < n; i++)
             {
                 for (int j = 0; j < n; j++)
@@ -75,7 +84,106 @@ namespace TensorSharp.Cuda
                 }
             }
 
+            // Verify that P2P DMA actually round-trips correctly. Some platforms
+            // (L4 behind certain PCIe switches, IOMMU-enabled hosts, constrained
+            // BAR1) report canAccessPeer=1 and accept cuCtxEnablePeerAccess, yet
+            // cuMemcpyPeerAsync silently transfers corrupt data. Write a known
+            // pattern on GPU i, peer-copy to GPU j, read back and compare.
+            // Failed pairs are demoted to host-staged transfers permanently.
+            for (int i = 0; i < n; i++)
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    if (i == j || !enabled[i * n + j]) continue;
+
+                    if (!VerifyP2PRoundTrip(allocators, i, j))
+                    {
+                        Console.WriteLine(
+                            $"  TP: P2P DMA self-test FAILED for GPU {i} → GPU {j} " +
+                            $"(cuDeviceCanAccessPeer=1 but data is corrupt). " +
+                            $"Falling back to host-staged transfers for this pair.");
+                        enabled[i * n + j] = false;
+                        CudaStorage.MarkPeerAccessFailed(
+                            allocators[i].DeviceId, allocators[j].DeviceId);
+                    }
+                }
+            }
+
             return enabled;
+        }
+
+        /// <summary>
+        /// Allocate a small buffer on GPU <paramref name="src"/>, fill it with a
+        /// known pattern, peer-copy it to GPU <paramref name="dst"/>, read the
+        /// result back to the host and verify every byte. Returns false when the
+        /// round-trip corrupts data — the exact failure mode seen on some L4
+        /// PCIe topologies where the driver reports P2P as available but the
+        /// platform silently breaks the DMA.
+        /// </summary>
+        private static unsafe bool VerifyP2PRoundTrip(CudaAllocator[] allocators, int src, int dst)
+        {
+            const int testBytes = 4096;
+            IntPtr srcBuf = IntPtr.Zero;
+            IntPtr dstBuf = IntPtr.Zero;
+
+            try
+            {
+                // Allocate on source GPU and write a recognisable pattern.
+                allocators[src].Context.MakeCurrent();
+                CudaDriverApi.cuMemAlloc(out srcBuf, new UIntPtr(testBytes)).ThrowOnError();
+
+                var pattern = new byte[testBytes];
+                for (int k = 0; k < testBytes; k++)
+                    pattern[k] = (byte)((k * 7 + src * 31 + dst * 17) & 0xFF);
+
+                fixed (byte* p = pattern)
+                    CudaDriverApi.cuMemcpyHtoD(srcBuf, (IntPtr)p, new UIntPtr(testBytes)).ThrowOnError();
+
+                // Allocate on destination GPU (zero-fill so a failed copy is visible).
+                allocators[dst].Context.MakeCurrent();
+                CudaDriverApi.cuMemAlloc(out dstBuf, new UIntPtr(testBytes)).ThrowOnError();
+                CudaDriverApi.cuMemsetD8(dstBuf, 0, new UIntPtr(testBytes)).ThrowOnError();
+
+                // Peer copy: src GPU → dst GPU, enqueued on dst's stream.
+                CudaDriverApi.cuMemcpyPeerAsync(
+                    dstBuf, allocators[dst].Context.Handle,
+                    srcBuf, allocators[src].Context.Handle,
+                    new UIntPtr(testBytes),
+                    allocators[dst].Stream.Handle).ThrowOnError();
+
+                allocators[dst].Stream.Synchronize();
+
+                // Read back and compare.
+                var readback = new byte[testBytes];
+                fixed (byte* r = readback)
+                    CudaDriverApi.cuMemcpyDtoH((IntPtr)r, dstBuf, new UIntPtr(testBytes)).ThrowOnError();
+
+                for (int k = 0; k < testBytes; k++)
+                {
+                    if (readback[k] != pattern[k])
+                        return false;
+                }
+
+                return true;
+            }
+            catch
+            {
+                // Any CUDA error during the self-test → treat P2P as broken.
+                return false;
+            }
+            finally
+            {
+                if (srcBuf != IntPtr.Zero)
+                {
+                    allocators[src].Context.MakeCurrent();
+                    CudaDriverApi.cuMemFree(srcBuf);
+                }
+                if (dstBuf != IntPtr.Zero)
+                {
+                    allocators[dst].Context.MakeCurrent();
+                    CudaDriverApi.cuMemFree(dstBuf);
+                }
+            }
         }
 
         private bool CanAccessPeer(int from, int to) => _p2pEnabled[from * _worldSize + to];
@@ -109,7 +217,17 @@ namespace TensorSharp.Cuda
             long byteCount = tensors[0].Storage.ByteLength;
             int elementCount = (int)tensors[0].Storage.ElementCount;
 
-            // Synchronize all GPUs to ensure partial results are complete.
+            // Flush any pending HOST writes to the device before we read the raw
+            // device pointers below. A partial that was accumulated host-side (any
+            // GetFloatPtr/PtrAtElement checkout marks the storage host-dirty) still
+            // has a STALE device buffer until this runs, and we would reduce the
+            // stale contents. Mirrors CudaStorage.CopyDeviceFrom, which does the
+            // same before a cross-device copy.
+            for (int i = 0; i < _worldSize; i++)
+                ((CudaStorage)tensors[i].Storage).EnsureDeviceCurrent();
+
+            // Synchronize all GPUs to ensure partial results are complete
+            // (this also flushes the async HtoD uploads issued just above).
             for (int i = 0; i < _worldSize; i++)
                 _allocators[i].Synchronize();
 
@@ -168,6 +286,15 @@ namespace TensorSharp.Cuda
             // Final sync so all GPUs have the reduced result.
             for (int i = 0; i < _worldSize; i++)
                 _allocators[i].Synchronize();
+
+            // Every tensor's DEVICE buffer was just rewritten through raw pointers,
+            // which bypasses the storage's dirty tracking. Without this the flags
+            // still claim host and device agree (EnsureDeviceCurrent clears BOTH),
+            // so the next SyncHostFromDevice short-circuits on !deviceDirty and
+            // hands back the pre-AllReduce host contents — silently discarding the
+            // reduced result. Mark device-authoritative so host reads re-fetch.
+            for (int i = 0; i < _worldSize; i++)
+                ((CudaStorage)tensors[i].Storage).MarkDeviceModified();
         }
 
         private unsafe void AllReduceViaHost(Tensor dst, Tensor src, int elementCount, long byteCount)

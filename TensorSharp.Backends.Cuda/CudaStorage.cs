@@ -164,10 +164,35 @@ namespace TensorSharp.Cuda
         // invalid and must go through host memory instead.
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), bool> _peerAccessCache = new();
 
+        /// <summary>
+        /// Force all cross-GPU transfers through host staging, bypassing P2P
+        /// entirely. Set TENSORSHARP_TP_DISABLE_P2P=1 to make peer-capable
+        /// hardware take exactly the code path that no-peer hardware (A16 vGPU
+        /// profiles, consumer cards) takes. Slower, but useful for isolating
+        /// whether a multi-GPU defect lives in the P2P DMA path.
+        /// </summary>
+        internal static readonly bool DisableP2P =
+            string.Equals(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DISABLE_P2P"), "1", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Called by <see cref="CudaP2PCommunicator"/> when the P2P DMA self-test
+        /// detects that a device pair reports peer-accessible but the actual
+        /// cuMemcpyPeer round-trip produces corrupt data (seen on some L4 PCIe
+        /// topologies where IOMMU, BAR1 sizing, or switch configuration silently
+        /// breaks P2P DMA). Forces the pair through host staging permanently.
+        /// </summary>
+        internal static void MarkPeerAccessFailed(int deviceA, int deviceB)
+        {
+            _peerAccessCache[(deviceA, deviceB)] = false;
+            _peerAccessCache[(deviceB, deviceA)] = false;
+        }
+
         private static bool CanAccessPeer(int srcDevice, int dstDevice)
         {
             if (srcDevice == dstDevice)
                 return true;
+            if (DisableP2P)
+                return false;
             return _peerAccessCache.GetOrAdd((srcDevice, dstDevice), key =>
             {
                 try
