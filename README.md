@@ -53,6 +53,16 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 **Linux + NVIDIA** — prefix the `dotnet run` with `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` and use `--backend ggml_cuda`.
 **AMD / Intel / NVIDIA Vulkan** — set `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` and use `--backend ggml_vulkan`.
 
+```Linux + Nvidia
+git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+wget https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true -O gemma-4-E4B-it-Q8_0.gguf
+bash TensorSharp.GGML.Native/build-linux.sh
+dotnet build -c Release
+TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --interactive --max-tokens 20000 --tp 2
+```
+
+
 Host the same model as a server (browser UI at <http://localhost:5000/index.html>, plus Ollama/OpenAI APIs):
 
 ```bash

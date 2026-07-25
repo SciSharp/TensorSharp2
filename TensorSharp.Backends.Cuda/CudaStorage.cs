@@ -130,7 +130,13 @@ namespace TensorSharp.Cuda
 
             lock (sync)
             {
-                if (!deviceDirty)
+                // Fast path: device hasn't been written AND the host mirror already
+                // exists → the host copy is current, nothing to do.
+                // When hostBuffer is still null (device-only storage that was never
+                // checked out to the host) we MUST fall through and allocate + copy,
+                // otherwise GetElementAsFloat / PtrAtElement dereference a null
+                // hostBuffer → NullReferenceException.
+                if (!deviceDirty && hostBuffer != IntPtr.Zero)
                     return;
 
                 long t0 = CudaProfileCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
