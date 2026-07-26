@@ -438,12 +438,6 @@ namespace TensorSharp.Models
                     ? ExtractPerLayerSlice(perLayerInputs, layer, seqLen)
                     : null;
                 hidden = Gemma4TransformerBlockTP(hidden, layer, seqLen, startPos, perLayerInput, exceptPositions);
-                if ((layer == 0 || layer == 14 || layer == 29) && _forwardCount <= 1)
-                {
-                    using var row = hidden[0].Narrow(0, 0, 1);
-                    var dbg = row.GetElementsAsFloat(Math.Min(8, (int)hidden[0].Sizes[1]));
-                    Console.WriteLine($"  [TP-DBG] layer{layer} rank0 first8: {string.Join(", ", dbg.Select(v => v.ToString("F4")))}");
-                }
                 perLayerInput?.Dispose();
             }
 
@@ -451,13 +445,6 @@ namespace TensorSharp.Models
 
             // Final norm + LM head on GPU 0 only.
             Tensor normed = RMSNormOp(hidden[0], "output_norm.weight");
-            if (_forwardCount <= 1)
-            {
-                var hdbg = hidden[0].GetElementsAsFloat(Math.Min(16, (int)hidden[0].Sizes[1]));
-                double norm = 0;
-                foreach (var v in hdbg) norm += v * v;
-                Console.WriteLine($"  [TP-DBG] pre-norm hidden first8: {string.Join(", ", hdbg.Take(8).Select(v => v.ToString("F4")))} partialL2={Math.Sqrt(norm):F2}");
-            }
             for (int r = 0; r < tp; r++)
                 hidden[r].Dispose();
 
@@ -481,16 +468,6 @@ namespace TensorSharp.Models
 
             if (_finalLogitSoftcap > 0f)
                 ApplyLogitSoftcap(logitsTensor);
-
-            if (_forwardCount <= 1)
-            {
-                var ldbg = logitsTensor.GetElementsAsFloat(Math.Min(10, Config.VocabSize));
-                int topIdx = 0; float topVal = float.MinValue;
-                var allLogits = logitsTensor.GetElementsAsFloat(Config.VocabSize);
-                for (int i = 0; i < allLogits.Length; i++)
-                    if (allLogits[i] > topVal) { topVal = allLogits[i]; topIdx = i; }
-                Console.WriteLine($"  [TP-DBG] logits first10: {string.Join(", ", ldbg.Select(v => v.ToString("F2")))} argmax={topIdx} val={topVal:F2}");
-            }
 
             long t3 = Stopwatch.GetTimestamp();
             if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
@@ -564,14 +541,6 @@ namespace TensorSharp.Models
 
             // 4. Row-parallel output projection + AllReduce.
             Tensor reducedAttn = TpRowParallelLinear(attnOut, $"{prefix}.attn_output.weight");
-            if (layer == 0 && _forwardCount <= 1)
-            {
-                int n = Math.Min(8, (int)reducedAttn.Sizes[1]);
-                var adbg = reducedAttn.GetElementsAsFloat(n);
-                var parts = new string[n];
-                for (int i = 0; i < n; i++) parts[i] = adbg[i].ToString("F4");
-                Console.WriteLine($"  [TP-DBG] L0 attnOut first8: {string.Join(", ", parts)}");
-            }
             for (int r = 0; r < tp; r++)
                 attnOut[r].Dispose();
 
@@ -587,8 +556,6 @@ namespace TensorSharp.Models
                 hidden[r].Dispose();
 
             // 6. FFN (dense or MoE).
-            if (layer == 0 && _forwardCount <= 1)
-                Console.WriteLine($"  [TP-DBG] L0 HasMoE={HasMoE(layer)} routerInWeights={_weights.ContainsKey("blk.0.ffn_gate_inp.weight")} routerInQuant={_quantWeights.ContainsKey("blk.0.ffn_gate_inp.weight")} numExperts={_numExperts}");
             Tensor[] ffnOut = HasMoE(layer)
                 ? Gemma4MoEBlockTP(postAttnNormed, layer, seqLen, prefix)
                 : Gemma4DenseFFNBlockTP(postAttnNormed, layer, seqLen, prefix);
@@ -1171,15 +1138,6 @@ namespace TensorSharp.Models
 
             // AllReduce MoE results.
             _tpGroup.AllReduce(moeResults);
-
-            if (layer == 0 && _forwardCount <= 1)
-            {
-                int n = Math.Min(8, (int)moeResults[0].Sizes[1]);
-                var mdbg = moeResults[0].GetElementsAsFloat(n);
-                var parts = new string[n];
-                for (int i = 0; i < n; i++) parts[i] = mdbg[i].ToString("F4");
-                Console.WriteLine($"  [TP-DBG] L0 moeOut first8: {string.Join(", ", parts)}");
-            }
 
             // Apply post_ffw_norm_2 to MoE output
             string postNorm2Key = $"{prefix}.post_ffw_norm_2.weight";

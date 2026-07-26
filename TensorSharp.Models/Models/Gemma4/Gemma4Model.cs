@@ -1431,15 +1431,6 @@ namespace TensorSharp.Models
             }
             else
             {
-                if (_forwardCount <= 1)
-                {
-                    int n = Math.Min(8, (int)hidden.Sizes[1]);
-                    var hdbg = hidden.GetElementsAsFloat(n);
-                    double norm = 0;
-                    var parts = new string[n];
-                    for (int i = 0; i < n; i++) { norm += hdbg[i] * hdbg[i]; parts[i] = hdbg[i].ToString("F4"); }
-                    Console.WriteLine($"  [noTP-DBG] pre-norm hidden first8: {string.Join(", ", parts)} partialL2={Math.Sqrt(norm):F2}");
-                }
                 Tensor normed = RMSNormOp(hidden, "output_norm.weight");
                 hidden.Dispose();
                 lastHidden = normed;
