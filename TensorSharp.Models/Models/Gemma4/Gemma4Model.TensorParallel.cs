@@ -378,6 +378,28 @@ namespace TensorSharp.Models
             // Gemma4 scales embeddings by sqrt(hidden_size).
             ScaleEmbedding(hidden0);
 
+            // Inject pending vision/audio embeddings on rank 0 before
+            // broadcasting (mirrors the non-TP ForwardComputeCore). Without
+            // this, multimodal prompts silently drop the image/audio under TP.
+            if (_pendingVisionEmbeddingsList.Count > 0)
+            {
+                foreach (var (emb, pos) in _pendingVisionEmbeddingsList)
+                {
+                    InjectVisionEmbeddings(hidden0, emb, pos, startPos);
+                    emb.Dispose();
+                }
+                _pendingVisionEmbeddingsList.Clear();
+            }
+            if (_pendingAudioEmbeddingsList.Count > 0)
+            {
+                foreach (var (emb, pos) in _pendingAudioEmbeddingsList)
+                {
+                    InjectVisionEmbeddings(hidden0, emb, pos, startPos);
+                    emb.Dispose();
+                }
+                _pendingAudioEmbeddingsList.Clear();
+            }
+
             // Per-Layer Embedding (PLE): a per-layer input combining a token
             // embedding and a projection of the (initial) hidden state, injected
             // at the end of every block. Computed once from the embedding — the
@@ -965,82 +987,110 @@ namespace TensorSharp.Models
             denseFFNOut.Dispose();
 
             // Step 2: MoE FFN (tensor-parallel experts)
-            // Router is replicated — every rank computes identical routing.
+            // Router is replicated — compute routing on rank 0 (identical input
+            // on every rank after AllReduce + broadcast). MoERoute applies the
+            // full preprocessing chain: unweighted RMSNorm, 1/sqrt(hidden)
+            // scaling, learned ffn_gate_inp.scale, projection, softmax, top-K.
+            var (routingWeightsFlat, selectedExpertsFlat) = MoERoute(denseNormed[0], prefix, seqLen);
+
+            // Apply pre_ffw_norm_2 to get the expert FFN input (the non-TP path
+            // normalizes hiddenState with this weight before feeding experts).
+            string moeNormKey = $"{prefix}.pre_ffw_norm_2.weight";
+            if (!_weights.ContainsKey(moeNormKey))
+                moeNormKey = $"{prefix}.ffn_pre_norm_2.weight";
+            Tensor[] moeInput = TpRMSNorm(denseNormed, moeNormKey);
+
             var moeResults = new Tensor[tp];
             for (int r = 0; r < tp; r++)
             {
                 var alloc = _tpGroup.GetAllocator(r);
-                var localInput = denseNormed[r]; // Use post-norm-1 output as MoE input
-
-                // Router logits (replicated weight).
-                Tensor routerLogits = LinearForward(localInput, $"{prefix}.ffn_gate_inp.weight");
-                float[] routePtr = TensorToFloatArray(routerLogits);
-                routerLogits.Dispose();
-
-                // Top-K selection.
-                var (topExperts, routeWeights) = SelectGemma4TopKExperts(routePtr);
 
                 // Accumulate expert outputs.
                 var output = new Tensor(alloc, DType.Float32, seqLen, hiddenSize);
                 Ops.Fill(output, 0f);
 
-                for (int k = 0; k < _numExpertsUsed; k++)
+                // Per-token expert routing: each token may select different
+                // experts, so process one token at a time (matches the non-TP
+                // MoEForward which also iterates per token).
+                for (int s = 0; s < seqLen; s++)
                 {
-                    int expertIdx = topExperts[k];
-                    float weight = routeWeights[k];
-
-                    // Check for fused gate_up first
-                    string fusedGateUpKey = prefix + $"ffn_gate_up_exps.{expertIdx}.weight";
-                    Tensor gateOut;
-                    if (_tpQuantWeights.ContainsKey(fusedGateUpKey) || _tpWeights.ContainsKey(fusedGateUpKey))
+                    Tensor tokenInput;
+                    if (seqLen == 1)
                     {
-                        Tensor fusedOut = TpExpertLinear(localInput, fusedGateUpKey, r, seqLen);
-                        int expertHalf = (int)(fusedOut.Sizes[1] / 2);
-                        Tensor gatePart, upPart;
-                        if (seqLen == 1)
-                        {
-                            gatePart = fusedOut.Narrow(1, 0, expertHalf);
-                            upPart = fusedOut.Narrow(1, expertHalf, expertHalf);
-                        }
-                        else
-                        {
-                            using var gView = fusedOut.Narrow(1, 0, expertHalf);
-                            gatePart = Ops.NewContiguous(gView);
-                            using var uView = fusedOut.Narrow(1, expertHalf, expertHalf);
-                            upPart = Ops.NewContiguous(uView);
-                        }
-                        fusedOut.Dispose();
-                        Ops.GELUMul(gatePart, gatePart, upPart);
-                        upPart.Dispose();
-                        gateOut = gatePart;
+                        tokenInput = moeInput[r];
                     }
                     else
                     {
-                        string gateKey = prefix + $"ffn_gate_exps.{expertIdx}.weight";
-                        string upKey = prefix + $"ffn_up_exps.{expertIdx}.weight";
-                        Tensor g = TpExpertLinear(localInput, gateKey, r, seqLen);
-                        Tensor u = TpExpertLinear(localInput, upKey, r, seqLen);
-                        Ops.GELUMul(g, g, u);
-                        u.Dispose();
-                        gateOut = g;
+                        using var slice = moeInput[r].Narrow(0, s, 1);
+                        tokenInput = Ops.NewContiguous(slice);
                     }
 
-                    string downKey = prefix + $"ffn_down_exps.{expertIdx}.weight";
-                    Tensor downOut = TpExpertLinear(gateOut, downKey, r, seqLen);
-                    gateOut.Dispose();
+                    for (int k = 0; k < _numExpertsUsed; k++)
+                    {
+                        int flatIdx = s * _numExpertsUsed + k;
+                        int expertIdx = selectedExpertsFlat[flatIdx];
+                        float weight = routingWeightsFlat[flatIdx];
 
-                    // Apply per-expert scale if present
-                    float expertScale = GetGemma4ExpertScale(layer, expertIdx);
-                    Ops.Mul(downOut, downOut, weight * expertScale);
-                    Ops.Add(output, output, downOut);
-                    downOut.Dispose();
+                        // Check for fused gate_up first
+                        string fusedGateUpKey = prefix + $"ffn_gate_up_exps.{expertIdx}.weight";
+                        Tensor gateOut;
+                        if (_tpQuantWeights.ContainsKey(fusedGateUpKey) || _tpWeights.ContainsKey(fusedGateUpKey))
+                        {
+                            Tensor fusedOut = TpExpertLinear(tokenInput, fusedGateUpKey, r, 1);
+                            int expertHalf = (int)(fusedOut.Sizes[1] / 2);
+                            using var gView = fusedOut.Narrow(1, 0, expertHalf);
+                            Tensor gatePart = Ops.NewContiguous(gView);
+                            using var uView = fusedOut.Narrow(1, expertHalf, expertHalf);
+                            Tensor upPart = Ops.NewContiguous(uView);
+                            fusedOut.Dispose();
+                            Ops.GELUMul(gatePart, gatePart, upPart);
+                            upPart.Dispose();
+                            gateOut = gatePart;
+                        }
+                        else
+                        {
+                            string gateKey = prefix + $"ffn_gate_exps.{expertIdx}.weight";
+                            string upKey = prefix + $"ffn_up_exps.{expertIdx}.weight";
+                            Tensor g = TpExpertLinear(tokenInput, gateKey, r, 1);
+                            Tensor u = TpExpertLinear(tokenInput, upKey, r, 1);
+                            Ops.GELUMul(g, g, u);
+                            u.Dispose();
+                            gateOut = g;
+                        }
+
+                        string downKey = prefix + $"ffn_down_exps.{expertIdx}.weight";
+                        Tensor downOut = TpExpertLinear(gateOut, downKey, r, 1);
+                        gateOut.Dispose();
+
+                        // Apply per-expert scale if present
+                        float expertScale = GetGemma4ExpertScale(layer, expertIdx);
+                        Ops.Mul(downOut, downOut, weight * expertScale);
+
+                        // Accumulate into the correct token row.
+                        if (seqLen == 1)
+                        {
+                            Ops.Add(output, output, downOut);
+                        }
+                        else
+                        {
+                            using var outRow = output.Narrow(0, s, 1);
+                            Ops.Add(outRow, outRow, downOut);
+                        }
+                        downOut.Dispose();
+                    }
+
+                    if (seqLen > 1)
+                        tokenInput.Dispose();
                 }
 
                 moeResults[r] = output;
             }
 
             for (int r = 0; r < tp; r++)
+            {
                 denseNormed[r].Dispose();
+                moeInput[r].Dispose();
+            }
 
             // AllReduce MoE results.
             _tpGroup.AllReduce(moeResults);

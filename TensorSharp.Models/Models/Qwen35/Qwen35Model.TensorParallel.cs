@@ -785,6 +785,8 @@ namespace TensorSharp.Models
 
         private void InitTpCaches(int initialSeqLen, int maxSeqLen)
         {
+            _maxContextLength = maxSeqLen;
+            _initialKvCacheCapacity = initialSeqLen;
             int tp = TpDegree;
 
             // --- Full-attention KV caches ---
