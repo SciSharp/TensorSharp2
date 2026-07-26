@@ -182,21 +182,16 @@ namespace TensorSharp.Models
                 var shards = new QuantizedWeight[tp];
                 for (int r = 0; r < tp; r++)
                 {
-                    IntPtr srcPtr = IntPtr.Add(qw.Data, (int)((TpRankOffset + r) * bytesPerShard));
-                    IntPtr shardPtr = QuantizedWeight.AllocateBuffer(bytesPerShard);
-                    unsafe
-                    {
-                        Buffer.MemoryCopy(
-                            srcPtr.ToPointer(), shardPtr.ToPointer(),
-                            bytesPerShard, bytesPerShard);
-                    }
-                    shards[r] = new QuantizedWeight(
-                        shardPtr, bytesPerShard, qw.GgmlType, qw.Ne0, rowsPerShard);
+                    IntPtr shardPtr = IntPtr.Add(qw.Data, (int)((TpRankOffset + r) * bytesPerShard));
+                    shards[r] = QuantizedWeight.CreateExternalView(
+                        shardPtr, bytesPerShard, qw.GgmlType, qw.Ne0, rowsPerShard, qw);
                 }
 
                 _tpQuantWeights[weightName] = shards;
                 _quantWeights.Remove(weightName);
-                qw.Dispose();
+                // Keep qw alive: shards are external views into its buffer.
+                // Disposing here would leave dangling pointers (the expert
+                // weights are NOT preloaded to GPU — they're served from host).
             }
             else if (_weights.TryGetValue(weightName, out var w))
             {
@@ -1034,18 +1029,18 @@ namespace TensorSharp.Models
             denseFFNOut.Dispose();
 
             // Step 2: MoE FFN (tensor-parallel experts)
-            // Router is replicated — compute routing on rank 0 (identical input
-            // on every rank after AllReduce + broadcast). MoERoute applies the
-            // full preprocessing chain: unweighted RMSNorm, 1/sqrt(hidden)
-            // scaling, learned ffn_gate_inp.scale, projection, softmax, top-K.
-            var (routingWeightsFlat, selectedExpertsFlat) = MoERoute(denseNormed[0], prefix, seqLen);
+            // Dense FFN and MoE operate in PARALLEL on the same input (hidden),
+            // mirroring the non-TP path where both MoEForward(attnOut, ...) and
+            // FFNGelu(attnOut, ...) receive the same pre-FFN hidden state.
+            // Router is replicated — compute routing on rank 0.
+            var (routingWeightsFlat, selectedExpertsFlat) = MoERoute(hidden[0], prefix, seqLen);
 
             // Apply pre_ffw_norm_2 to get the expert FFN input (the non-TP path
             // normalizes hiddenState with this weight before feeding experts).
             string moeNormKey = $"{prefix}.pre_ffw_norm_2.weight";
             if (!_weights.ContainsKey(moeNormKey))
                 moeNormKey = $"{prefix}.ffn_pre_norm_2.weight";
-            Tensor[] moeInput = TpRMSNorm(denseNormed, moeNormKey);
+            Tensor[] moeInput = TpRMSNorm(hidden, moeNormKey);
 
             var moeResults = new Tensor[tp];
             for (int r = 0; r < tp; r++)
