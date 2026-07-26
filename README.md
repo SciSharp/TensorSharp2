@@ -53,14 +53,20 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 **Linux + NVIDIA** — prefix the `dotnet run` with `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` and use `--backend ggml_cuda`.
 **AMD / Intel / NVIDIA Vulkan** — set `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` and use `--backend ggml_vulkan`.
 
-**Linux + NVIDIA with Tensor Parallelism**
+**Linux (Ubuntu) + NVIDIA with Tensor Parallelism**
 
+Make sure Cuda is installed first, then:-
 ```bash
 #On runpod's ubuntu 24.02 we need ot make sure Cuda libraries are correctly set:-
 LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
+#For old Ubuntu versions you might need this:-
+add-apt-repository ppa:dotnet/backports
+
+apt update && apt install dotnet-sdk-10.0
 git clone https://github.com/zhongkaifu/TensorSharp.git
 cd TensorSharp
-wget https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true -O gemma-4-E4B-it-Q8_0.gguf
+mkdir models
+wget https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true -O models/gemma-4-E4B-it-Q8_0.gguf
 bash TensorSharp.GGML.Native/build-linux.sh
 dotnet build -c Release
 TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --interactive --max-tokens 20000 --tp 2
