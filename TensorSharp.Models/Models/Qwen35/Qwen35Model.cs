@@ -1414,6 +1414,33 @@ namespace TensorSharp.Models
         /// Text-only multi-token prefill on the direct cuda backend only; every
         /// other case runs the loop directly.
         /// </summary>
+        // Prefill graph capture's value is amortizing per-op kernel-launch
+        // overhead, which matters when per-kernel compute is small (short
+        // chunks); its cost is the whole per-op loop's peak activation set,
+        // stolen from the pool for the entry's lifetime. Above this length the
+        // trade flips AND the cost compounds badly on a large hybrid model: a
+        // server/benchmark that visits many different (seqLen, startPos) shapes
+        // (real chunked prefill always does -- MaxPrefillChunkSize splits long
+        // prompts, and every KV-cache resize changes the key's kvPtr) keeps
+        // capturing and evicting large entries, each capture itself costing 2x
+        // (one plain warm-up run, one captured run) plus teardown. Measured on
+        // Qwen3.6-27B-UD-IQ2_XXS (RTX 3080 16GB): a 5-length x N-iter prefill
+        // sweep through the engine/scheduler path took >20 minutes and pushed
+        // the process to ~15.3GB dedicated + ~3.1GB shared (WDDM spillover,
+        // PCIe-speed) VRAM with capture on; the identical sweep with capture
+        // off completed in under a minute at 200-320 tok/s and no VRAM
+        // spillover. TS_CUDA_PREFILL_GRAPH_MAX_SEQLEN overrides; 0 = unlimited
+        // (restores the old always-try-to-capture behavior).
+        private static readonly int CudaPrefillGraphMaxSeqLen = ReadCudaPrefillGraphMaxSeqLen();
+
+        private static int ReadCudaPrefillGraphMaxSeqLen()
+        {
+            string s = Environment.GetEnvironmentVariable("TS_CUDA_PREFILL_GRAPH_MAX_SEQLEN");
+            if (!string.IsNullOrEmpty(s) && int.TryParse(s, out int v) && v >= 0)
+                return v;
+            return 512;
+        }
+
         private Tensor RunCudaPrefillLayerLoop(Tensor hidden, int seqLen, int startPos)
         {
             bool graphable = _backend == BackendType.Cuda
@@ -1421,6 +1448,8 @@ namespace TensorSharp.Models
                 && _kvCacheK != null && _isRecurrent != null;
             if (graphable && seqLen == 1 && CudaPrefillGraphCache.DecodeEnabled)
                 return RunCudaDecodeLayerLoop(hidden, startPos);
+            if (CudaPrefillGraphMaxSeqLen > 0 && seqLen > CudaPrefillGraphMaxSeqLen)
+                graphable = false;
             if (!graphable || seqLen <= 1 || !CudaPrefillGraphCache.Enabled)
             {
                 return RunPerOpLayerLoop(hidden, seqLen, startPos);
@@ -4253,6 +4282,21 @@ namespace TensorSharp.Models
 
             bool routeRowsAreLogits = _normTopKProb;
 
+            // Direct-CUDA on-device MoE decode: router + expert FFN + shared expert
+            // entirely on the GPU (no per-expert host readback), so the decode layer
+            // loop stays CUDA-graph capturable. Requires the normalized top-k softmax
+            // routing (== the on-device ts_moe_router_f32); other routings fall through
+            // to the host path below. routerLogits stays alive on a fall-through.
+            if (_backend == BackendType.Cuda && routeRowsAreLogits && CanUseQwenCudaMoEOnDevice(layer)
+                && (seqLen == 1 || s_qwenCudaMoePrefillOnDevice))
+            {
+                Tensor onDevice = seqLen == 1
+                    ? TryCudaMoEForwardOnDevice(input, routerLogits, layer)
+                    : TryCudaMoEForwardPrefillOnDevice(input, routerLogits, layer, seqLen);
+                if (onDevice != null)
+                    return onDevice;
+            }
+
             // Device-routing fast path: skip the per-MoE-layer routerData
             // host sync entirely. Compute top-K + softmax on the device and
             // feed the resulting [K] int32 + [1, K] float32 device tensors
@@ -4294,6 +4338,21 @@ namespace TensorSharp.Models
             }
 
             float* routePtr = GetFloatPtr(routerData);
+
+            // Direct CUDA prefill: retain host top-k grouping, but gather input
+            // rows and scatter weighted expert outputs on device. This preserves
+            // the legacy expert-batched math while removing its per-expert
+            // activation round-trips.
+            if (_backend == BackendType.Cuda && seqLen > 1)
+            {
+                Tensor groupedCuda = TryCudaMoEForwardPrefillGrouped(
+                    input, routePtr, routeRowsAreLogits, layer, seqLen);
+                if (groupedCuda != null)
+                {
+                    routerData.Dispose();
+                    return groupedCuda;
+                }
+            }
 
             // GGML stacked-MoE fast path (CUDA / CPU / Metal). Route top-K on
             // host, then run EVERY routed expert for ALL tokens through ONE
@@ -5438,6 +5497,9 @@ namespace TensorSharp.Models
             _cudaPrefillGraphs = null;
             _cudaDecodeDynParams?.Dispose();
             _cudaDecodeDynParams = null;
+
+            // Free the on-device MoE decode pointer tables (device u64 buffers).
+            FreeQwenCudaMoETables();
 
             VisionEncoder?.Dispose();
             foreach (var (visionEmbeddings, _) in _visionEmbeddingsList)
