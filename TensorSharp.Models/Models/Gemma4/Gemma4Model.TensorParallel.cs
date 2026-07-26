@@ -102,12 +102,16 @@ namespace TensorSharp.Models
             // Attention + FFN row-parallel weights. attn_q.weight (KV-sharing
             // layers, which only project Q) is a single column segment, so the
             // generic contiguous column split is correct for it.
+            // attn_k/attn_v are also column-parallel: when the fused attn_qkv
+            // cannot be created (Q/K/V have different output dims, e.g. E4B
+            // Q=2048 vs K/V=512), the TP forward runs three separate column-
+            // parallel projections and concatenates the results.
             // The fused attn_qkv ([Q|K|V]) and ffn_gate_up ([gate|up]) are
             // handled below with segment-aware sharding — a contiguous split
             // would mix whole segments across ranks and corrupt the per-rank
             // [Q_r|K_r|V_r] / [gate_r|up_r] layout the forward pass expects.
             ShardWeightsForTensorParallelism(
-                columnParallelPatterns: new[] { "attn_q.weight" },
+                columnParallelPatterns: new[] { "attn_q.weight", "attn_k.weight", "attn_v.weight" },
                 rowParallelPatterns: new[] { "attn_output.weight", "ffn_down.weight" });
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
@@ -482,10 +486,36 @@ namespace TensorSharp.Models
 
             // 2. Column-parallel projection. KV-sharing layers only project Q
             // (they read K/V from their donor layer's cache); all other layers
-            // use the fused QKV projection.
-            Tensor[] qkvFused = isShared
-                ? TpColumnParallelLinear(normed[0], $"{prefix}.attn_q.weight")
-                : TpColumnParallelLinear(normed[0], $"{prefix}.attn_qkv.weight");
+            // use the fused QKV projection when available, or fall back to
+            // three separate column-parallel projections (E4B: Q/K/V have
+            // different output dims so FuseQKVWeights cannot merge them).
+            Tensor[] qkvFused;
+            if (isShared)
+            {
+                qkvFused = TpColumnParallelLinear(normed[0], $"{prefix}.attn_q.weight");
+            }
+            else if (_tpWeights.ContainsKey($"{prefix}.attn_qkv.weight") ||
+                     _tpQuantWeights.ContainsKey($"{prefix}.attn_qkv.weight"))
+            {
+                qkvFused = TpColumnParallelLinear(normed[0], $"{prefix}.attn_qkv.weight");
+            }
+            else
+            {
+                Tensor[] qPart = TpColumnParallelLinear(normed[0], $"{prefix}.attn_q.weight");
+                Tensor[] kPart = TpColumnParallelLinear(normed[0], $"{prefix}.attn_k.weight");
+                Tensor[] vPart = TpColumnParallelLinear(normed[0], $"{prefix}.attn_v.weight");
+                qkvFused = new Tensor[tp];
+                for (int r = 0; r < tp; r++)
+                {
+                    var alloc = _tpGroup.GetAllocator(r);
+                    long totalDim = qPart[r].Sizes[1] + kPart[r].Sizes[1] + vPart[r].Sizes[1];
+                    qkvFused[r] = new Tensor(alloc, qPart[r].ElementType, seqLen, totalDim);
+                    Ops.Concat(qkvFused[r], 1, qPart[r], kPart[r], vPart[r]);
+                    qPart[r].Dispose();
+                    kPart[r].Dispose();
+                    vPart[r].Dispose();
+                }
+            }
             for (int r = 0; r < tp; r++)
                 normed[r].Dispose();
 
