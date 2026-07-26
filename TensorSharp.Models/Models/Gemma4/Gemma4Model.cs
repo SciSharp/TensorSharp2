@@ -1431,6 +1431,15 @@ namespace TensorSharp.Models
             }
             else
             {
+                if (_forwardCount <= 1)
+                {
+                    int n = Math.Min(8, (int)hidden.Sizes[1]);
+                    var hdbg = hidden.GetElementsAsFloat(n);
+                    double norm = 0;
+                    var parts = new string[n];
+                    for (int i = 0; i < n; i++) { norm += hdbg[i] * hdbg[i]; parts[i] = hdbg[i].ToString("F4"); }
+                    Console.WriteLine($"  [noTP-DBG] pre-norm hidden first8: {string.Join(", ", parts)} partialL2={Math.Sqrt(norm):F2}");
+                }
                 Tensor normed = RMSNormOp(hidden, "output_norm.weight");
                 hidden.Dispose();
                 lastHidden = normed;
@@ -4131,11 +4140,15 @@ namespace TensorSharp.Models
             string routerKey = $"blk.{layer}.ffn_gate_inp.weight";
             if (!_weights.ContainsKey(routerKey) && !_quantWeights.ContainsKey(routerKey))
                 return false;
-            // Check for expert weights (could be original 3D tensor or split per-expert)
+            // Check for expert weights (could be original 3D tensor or split per-expert).
+            // Under TP the per-expert weights are moved to _tpQuantWeights/_tpWeights
+            // during sharding, so also check those dictionaries.
             string downKey3D = $"blk.{layer}.ffn_down_exps.weight";
             string downKey0 = $"blk.{layer}.ffn_down_exps.0.weight";
             return _weights.ContainsKey(downKey3D) || _quantWeights.ContainsKey(downKey3D) ||
-                   _weights.ContainsKey(downKey0) || _quantWeights.ContainsKey(downKey0);
+                   _weights.ContainsKey(downKey0) || _quantWeights.ContainsKey(downKey0) ||
+                   _tpQuantWeights.ContainsKey(downKey3D) || _tpQuantWeights.ContainsKey(downKey0) ||
+                   _tpWeights.ContainsKey(downKey3D) || _tpWeights.ContainsKey(downKey0);
         }
 
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos,
