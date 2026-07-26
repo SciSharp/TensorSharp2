@@ -385,10 +385,15 @@ namespace TensorSharp.Models
             // Inject pending vision/audio embeddings on rank 0 before
             // broadcasting (mirrors the non-TP ForwardComputeCore). Without
             // this, multimodal prompts silently drop the image/audio under TP.
+            HashSet<int> exceptPositions = null;
             if (_pendingVisionEmbeddingsList.Count > 0)
             {
+                exceptPositions = new HashSet<int>();
                 foreach (var (emb, pos) in _pendingVisionEmbeddingsList)
                 {
+                    int numTokens = (int)emb.Sizes[0];
+                    for (int i = 0; i < numTokens; i++)
+                        exceptPositions.Add(startPos + pos + i);
                     InjectVisionEmbeddings(hidden0, emb, pos, startPos);
                     emb.Dispose();
                 }
@@ -396,8 +401,12 @@ namespace TensorSharp.Models
             }
             if (_pendingAudioEmbeddingsList.Count > 0)
             {
+                exceptPositions ??= new HashSet<int>();
                 foreach (var (emb, pos) in _pendingAudioEmbeddingsList)
                 {
+                    int numTokens = (int)emb.Sizes[0];
+                    for (int i = 0; i < numTokens; i++)
+                        exceptPositions.Add(startPos + pos + i);
                     InjectVisionEmbeddings(hidden0, emb, pos, startPos);
                     emb.Dispose();
                 }
@@ -421,7 +430,7 @@ namespace TensorSharp.Models
                 Tensor perLayerInput = perLayerInputs != null
                     ? ExtractPerLayerSlice(perLayerInputs, layer, seqLen)
                     : null;
-                hidden = Gemma4TransformerBlockTP(hidden, layer, seqLen, startPos, perLayerInput);
+                hidden = Gemma4TransformerBlockTP(hidden, layer, seqLen, startPos, perLayerInput, exceptPositions);
                 perLayerInput?.Dispose();
             }
 
@@ -467,7 +476,7 @@ namespace TensorSharp.Models
         }
 
         private Tensor[] Gemma4TransformerBlockTP(Tensor[] hidden, int layer, int seqLen, int startPos,
-            Tensor perLayerInput)
+            Tensor perLayerInput, HashSet<int> exceptPositions = null)
         {
             string prefix = $"blk.{layer}";
             int tp = TpDegree;
@@ -521,7 +530,7 @@ namespace TensorSharp.Models
 
             // 3. Per-GPU attention.
             Tensor[] attnOut = Gemma4AttentionTP(qkvFused, layer, seqLen, startPos,
-                isLocal, isShared, headDim, numHeadsPerGpu, numKVHeadsPerGpu);
+                isLocal, isShared, headDim, numHeadsPerGpu, numKVHeadsPerGpu, exceptPositions);
 
             // 4. Row-parallel output projection + AllReduce.
             Tensor reducedAttn = TpRowParallelLinear(attnOut, $"{prefix}.attn_output.weight");
@@ -592,7 +601,8 @@ namespace TensorSharp.Models
         }
 
         private Tensor[] Gemma4AttentionTP(Tensor[] qkvFused, int layer, int seqLen, int startPos,
-            bool isLocal, bool isShared, int headDim, int numHeadsPerGpu, int numKVHeadsPerGpu)
+            bool isLocal, bool isShared, int headDim, int numHeadsPerGpu, int numKVHeadsPerGpu,
+            HashSet<int> exceptPositions = null)
         {
             int tp = TpDegree;
             int qDimPerGpu = numHeadsPerGpu * headDim;
@@ -778,7 +788,7 @@ namespace TensorSharp.Models
                     kExpanded.Dispose();
 
                     int windowSize = isLocal ? _slidingWindow : 0;
-                    ApplyCausalMask(scores, seqLen, kvAttendLen, windowSize);
+                    ApplyCausalMask(scores, seqLen, kvAttendLen, windowSize, exceptPositions);
                     Ops.Softmax(scores, scores);
 
                     var attnOutTensor = new Tensor(alloc, DType.Float32, numHeadsPerGpu, seqLen, headDim);
