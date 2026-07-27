@@ -301,8 +301,8 @@ namespace TensorSharp.Models
             }
         }
 
-        public NemotronModel(string ggufPath, BackendType backend)
-            : base(ggufPath, backend)
+        public NemotronModel(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+            : base(ggufPath, backend, tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "nemotron_h";
             Config = new ModelConfig { Architecture = arch };
@@ -395,13 +395,28 @@ namespace TensorSharp.Models
             if (_numExperts == 0)
                 FuseFFNWeights();
             FuseQKVWeights();
-            PrepareCudaQuantizedWeightsForInference();
+
+            if (IsTensorParallel)
+            {
+                ValidateNemotronTpConstraints();
+                ShardNemotronWeightsForTP();
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            }
+            else
+            {
+                PrepareCudaQuantizedWeightsForInference();
+            }
 
             int maxContextLength = ResolveConfiguredContextLength();
             int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
             if (initialCacheLength < maxContextLength)
                 Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
-            InitCaches(initialCacheLength, maxContextLength);
+
+            if (IsTensorParallel)
+                InitNemotronTpCaches(initialCacheLength, maxContextLength);
+            else
+                InitCaches(initialCacheLength, maxContextLength);
+
             InitMamba2Buffers();
             InitLayerInfo();
             CacheMamba2ConvWeights();
@@ -798,15 +813,29 @@ namespace TensorSharp.Models
 
         #endregion
 
-        public override void ResetKVCache()
+        protected override void ResetKVCacheCore()
         {
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 switch (_layerTypes[l])
                 {
                     case LayerType.Attention:
-                        ResetCacheTensor(_kvCacheK[l]);
-                        ResetCacheTensor(_kvCacheV[l]);
+                        // Under TP the non-TP _kvCacheK/_kvCacheV are null; the sharded
+                        // attention cache lives in _tpKvCacheK/_tpKvCacheV per rank.
+                        if (IsTensorParallel)
+                        {
+                            if (_tpKvCacheK?[l] != null)
+                                for (int r = 0; r < _tpKvCacheK[l].Length; r++)
+                                {
+                                    ResetCacheTensor(_tpKvCacheK[l][r]);
+                                    ResetCacheTensor(_tpKvCacheV[l][r]);
+                                }
+                        }
+                        else
+                        {
+                            ResetCacheTensor(_kvCacheK[l]);
+                            ResetCacheTensor(_kvCacheV[l]);
+                        }
                         break;
                     case LayerType.Mamba2:
                         Array.Clear(_convState[l]);
@@ -1228,10 +1257,16 @@ namespace TensorSharp.Models
             return 2048;
         }
 
-        public override float[] ForwardRefill(int[] tokens)
+        protected override float[] ForwardRefillCore(int[] tokens)
         {
             if (tokens == null || tokens.Length <= 1)
-                return Forward(tokens);
+                return ForwardCore(tokens);
+
+            // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
+            // layer loop and non-sharded weights, which are unavailable under
+            // tensor parallelism. Route through ForwardCore → ForwardTP instead.
+            if (IsTensorParallel)
+                return ForwardCore(tokens);
 
             // Multimodal embeddings carry absolute insert positions within the
             // current Forward call's hidden tensor, so chunked prefill would
@@ -1242,7 +1277,7 @@ namespace TensorSharp.Models
             int lastIdx = tokens.Length - 1;
 
             if (hasMultimodal || tokens.Length <= chunkSize)
-                return Forward(tokens);
+                return ForwardCore(tokens);
 
             for (int pos = 0; pos < lastIdx; pos += chunkSize)
             {
@@ -1251,7 +1286,7 @@ namespace TensorSharp.Models
                 Array.Copy(tokens, pos, chunk, 0, chunkLen);
                 PrefillWithoutLogits(chunk);
             }
-            return Forward(new[] { tokens[lastIdx] });
+            return ForwardCore(new[] { tokens[lastIdx] });
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -1297,8 +1332,11 @@ namespace TensorSharp.Models
             _forwardSw.Stop();
         }
 
-        public override float[] Forward(int[] tokens)
+        protected override float[] ForwardCore(int[] tokens)
         {
+            if (IsTensorParallel)
+                return ForwardTP(tokens);
+
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -3130,6 +3168,7 @@ namespace TensorSharp.Models
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)
                 foreach (var t in _kvCacheV) t?.Dispose();
+            DisposeNemotronTpState();
             DisposeTensorArray(_mamba2NativeDecodeProjected);
             DisposeTensorArray(_mamba2NativeDecodeHidden);
             if (IsGgmlBackend)

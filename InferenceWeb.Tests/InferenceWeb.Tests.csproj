@@ -23,6 +23,7 @@
     <ProjectReference Include="..\TensorSharp.Server\TensorSharp.Server.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.MLX\TensorSharp.Backends.MLX.csproj" />
+    <ProjectReference Include="..\TensorSharp.Distributed\TensorSharp.Distributed.csproj" />
   </ItemGroup>
   <PropertyGroup>
     <MlxNativeInstallDir>$(MSBuildProjectDirectory)/../TensorSharp.Backends.MLX/Native/dist</MlxNativeInstallDir>

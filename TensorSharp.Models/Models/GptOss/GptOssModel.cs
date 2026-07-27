@@ -162,8 +162,8 @@ namespace TensorSharp.Models
         private float[][] _layerDownBiasStacked;    // shape [hidden_dim * num_experts] per layer
         private int _layerStackedReady;             // 1 once InitMoeStackedWeights has run
 
-        public GptOssModel(string ggufPath, BackendType backend)
-            : base(ggufPath, backend)
+        public GptOssModel(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+            : base(ggufPath, backend, tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "gpt-oss";
             Config = new ModelConfig { Architecture = arch };
@@ -196,12 +196,28 @@ namespace TensorSharp.Models
             float[][] preFuseUpBias = SnapshotPerExpertBiases("ffn_up_exps", _expertFfnLength);
             FuseExpertGateUpWeights();
             FuseQKVWeights();
-            PrepareCudaQuantizedWeightsForInference();
+
+            if (IsTensorParallel)
+            {
+                ValidateGptOssTpConstraints();
+                ShardGptOssWeightsForTP();
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            }
+            else
+            {
+                PrepareCudaQuantizedWeightsForInference();
+            }
+
             int maxContextLength = ResolveConfiguredContextLength();
             int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
             if (initialCacheLength < maxContextLength)
                 Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
-            InitKVCache(initialCacheLength, maxContextLength);
+
+            if (IsTensorParallel)
+                InitGptOssTpKVCache(initialCacheLength, maxContextLength);
+            else
+                InitKVCache(initialCacheLength, maxContextLength);
+
             PrecomputeConstants();
             InitMoeStackedWeights(preFuseGateBias, preFuseUpBias);
         }
@@ -479,8 +495,15 @@ namespace TensorSharp.Models
             _qDim = Config.NumHeads * Config.HeadDim;
             _kDim = Config.NumKVHeads * Config.HeadDim;
 
+            // Also check the TP-sharded dictionaries: under tensor parallelism the
+            // fused attn_qkv has already been moved out of _quantWeights into
+            // _tpQuantWeights before this runs, so a plain lookup would wrongly
+            // report the (always-fused) GptOss QKV as separate and the forward
+            // would ask for the nonexistent attn_q.weight.
             _isQkvFused = _quantWeights.ContainsKey("blk.0.attn_qkv.weight") ||
-                           _weights.ContainsKey("blk.0.attn_qkv.weight");
+                           _weights.ContainsKey("blk.0.attn_qkv.weight") ||
+                           _tpQuantWeights.ContainsKey("blk.0.attn_qkv.weight") ||
+                           _tpWeights.ContainsKey("blk.0.attn_qkv.weight");
 
             _layerNames = new string[numLayers][];
             for (int l = 0; l < numLayers; l++)
@@ -630,22 +653,27 @@ namespace TensorSharp.Models
             Console.WriteLine($"Expanded GPT-OSS attention cache to {newCapacity} tokens.");
         }
 
-        public override void ResetKVCache()
+        protected override void ResetKVCacheCore()
         {
+            // Setting _cacheSeqLen = 0 is the functional reset. Under TP the non-TP
+            // _kvCacheK/_kvCacheV arrays are null (TP uses _tpKvCacheK/_tpKvCacheV,
+            // overwritten on the next forward), so guard the tensor loop against null.
+            _cacheSeqLen = 0;
+            _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
+            _forwardCount = 0;
+            _forwardSw.Reset();
+            if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 ResetCacheTensor(_kvCacheK[l]);
                 ResetCacheTensor(_kvCacheV[l]);
             }
-            _cacheSeqLen = 0;
-            _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
-            _forwardCount = 0;
-            _forwardSw.Reset();
         }
 
-        public override void TruncateKVCache(int tokenCount)
+        protected override void TruncateKVCacheCore(int tokenCount)
         {
-            base.TruncateKVCache(tokenCount);
+            base.TruncateKVCacheCore(tokenCount);
+            if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 InvalidateTensorDeviceCache(_kvCacheK[l]);
@@ -705,16 +733,22 @@ namespace TensorSharp.Models
             return FusedAttnMaxSeqLen;
         }
 
-        public override float[] ForwardRefill(int[] tokens)
+        protected override float[] ForwardRefillCore(int[] tokens)
         {
             if (tokens == null || tokens.Length <= 1)
-                return Forward(tokens);
+                return ForwardCore(tokens);
+
+            // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
+            // TransformerBlock and non-sharded weights, which are unavailable
+            // under tensor parallelism. Route through ForwardCore → ForwardTP.
+            if (IsTensorParallel)
+                return ForwardCore(tokens);
 
             int chunkSize = ResolvePrefillChunkSize();
             int lastIdx = tokens.Length - 1;
 
             if (tokens.Length <= chunkSize)
-                return Forward(tokens);
+                return ForwardCore(tokens);
 
             for (int pos = 0; pos < lastIdx; pos += chunkSize)
             {
@@ -723,7 +757,7 @@ namespace TensorSharp.Models
                 Array.Copy(tokens, pos, chunk, 0, chunkLen);
                 PrefillWithoutLogits(chunk);
             }
-            return Forward(new[] { tokens[lastIdx] });
+            return ForwardCore(new[] { tokens[lastIdx] });
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -757,8 +791,11 @@ namespace TensorSharp.Models
             _forwardSw.Stop();
         }
 
-        public override float[] Forward(int[] tokens)
+        protected override float[] ForwardCore(int[] tokens)
         {
+            if (IsTensorParallel)
+                return ForwardTP(tokens);
+
             // Long prompts (seqLen > the fused-attention cap) are chunked so the
             // attention always runs on the fused on-device kernel rather than the
             // per-op host path that builds an O(seqLen^2) scores tensor per layer
@@ -1482,7 +1519,7 @@ namespace TensorSharp.Models
             for (int s = 0; s < seqLen; s++)
                 for (int h = 0; h < numHeads; h++)
                     positions[s * numHeads + h] = startPos + s;
-            using var posTensor = CreateIntTensor(positions, totalRows);
+            using var posTensor = CreateIntTensorOn(data.Storage.Allocator, positions, totalRows);
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
             Tensor result = Ops.RoPEEx(
@@ -1943,6 +1980,7 @@ namespace TensorSharp.Models
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)
                 foreach (var t in _kvCacheV) t?.Dispose();
+            DisposeGptOssTpState();
             if (_layerSinksMlx != null)
                 foreach (var t in _layerSinksMlx) t?.Dispose();
             if (_sinksHandles != null)

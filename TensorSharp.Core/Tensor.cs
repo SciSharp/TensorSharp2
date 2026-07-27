@@ -283,6 +283,17 @@ namespace TensorSharp
             storage.SetElementsAsFloat(storageOffset, value);
         }
 
+        /// <summary>
+        /// Ensure the backing device buffer reflects pending host writes. No-op
+        /// for host storages. Call after writing values via
+        /// <see cref="SetElementsAsFloat(float[])"/> when the tensor will next be
+        /// read by GPU kernels (e.g. the distributed AllReduce result path).
+        /// </summary>
+        public void EnsureDeviceCurrent()
+        {
+            storage.EnsureDeviceCurrent();
+        }
+
         public void SetElementsAsHalf(half[] value)
         {
             storage.SetElementsAsHalf(storageOffset, value);

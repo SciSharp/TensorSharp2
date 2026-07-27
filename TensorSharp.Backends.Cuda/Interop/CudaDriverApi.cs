@@ -162,7 +162,23 @@ namespace TensorSharp.Cuda.Interop
         public static extern int cuEventRecord(IntPtr hEvent, IntPtr hStream);
 
         [DllImport(LibName)]
+        public static extern int cuEventSynchronize(IntPtr hEvent);
+
+        [DllImport(LibName)]
         public static extern int cuStreamWaitEvent(IntPtr hStream, IntPtr hEvent, uint flags);
+
+        // ---- Peer-to-Peer (multi-GPU) ----
+        [DllImport(LibName)]
+        public static extern int cuDeviceCanAccessPeer(out int canAccessPeer, int dev, int peerDev);
+
+        [DllImport(LibName)]
+        public static extern int cuCtxEnablePeerAccess(IntPtr peerContext, uint flags);
+
+        [DllImport(LibName)]
+        public static extern int cuMemcpyPeerAsync(
+            IntPtr dstDevice, IntPtr dstContext,
+            IntPtr srcDevice, IntPtr srcContext,
+            UIntPtr byteCount, IntPtr hStream);
 
         // CUstream flags
         public const uint CU_STREAM_DEFAULT = 0;

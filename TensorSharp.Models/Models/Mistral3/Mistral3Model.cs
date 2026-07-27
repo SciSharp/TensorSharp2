@@ -61,8 +61,8 @@ namespace TensorSharp.Models
         private Mistral3VisionEncoder _visionEncoder;
         private List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
 
-        public Mistral3Model(string ggufPath, BackendType backend)
-            : base(ggufPath, backend)
+        public Mistral3Model(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+            : base(ggufPath, backend, tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "mistral3";
             Config = new ModelConfig { Architecture = arch };
@@ -99,13 +99,27 @@ namespace TensorSharp.Models
             LoadWeights();
             FuseQKVWeights();
             FuseGateUpWeights();
-            PrepareCudaQuantizedWeightsForInference();
+
+            if (IsTensorParallel)
+            {
+                ShardMistral3WeightsForTP();
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            }
+            else
+            {
+                PrepareCudaQuantizedWeightsForInference();
+            }
 
             int maxContextLength = ResolveConfiguredContextLength();
             int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
             if (initialCacheLength < maxContextLength)
                 Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
-            InitKVCache(initialCacheLength, maxContextLength);
+
+            if (IsTensorParallel)
+                InitTpKVCache(initialCacheLength, maxContextLength);
+            else
+                InitKVCache(initialCacheLength, maxContextLength);
+
             PrecomputeConstants();
         }
 
@@ -166,8 +180,17 @@ namespace TensorSharp.Models
             for (int l = 0; l < numLayers; l++)
             {
                 string p = $"blk.{l}.";
-                bool fused = _quantWeights.ContainsKey(p + "attn_qkv.weight") ||
-                             _weights.ContainsKey(p + "attn_qkv.weight");
+                // Check the TP-sharded dictionaries too: under tensor parallelism
+                // ShardMistral3WeightsForTP (which runs before PrecomputeConstants)
+                // has already moved the fused attn_qkv out of _quantWeights into
+                // _tpQuantWeights, so a plain _quantWeights lookup would wrongly
+                // mark fused layers as "separate" and the forward would ask for the
+                // now-consumed attn_q.weight.
+                string qkvName = p + "attn_qkv.weight";
+                bool fused = _quantWeights.ContainsKey(qkvName) ||
+                             _weights.ContainsKey(qkvName) ||
+                             _tpQuantWeights.ContainsKey(qkvName) ||
+                             _tpWeights.ContainsKey(qkvName);
                 _layerQkvFused[l] = fused;
 
                 if (fused)
@@ -306,22 +329,28 @@ namespace TensorSharp.Models
             Console.WriteLine($"Expanded Mistral3 attention cache to {newCapacity} tokens.");
         }
 
-        public override void ResetKVCache()
+        protected override void ResetKVCacheCore()
         {
+            // Setting _cacheSeqLen = 0 is the functional reset: subsequent forwards
+            // overwrite the cache from position 0. Under TP the non-TP _kvCacheK/_kvCacheV
+            // arrays are null (TP uses _tpKvCacheK/_tpKvCacheV, whose tensors get overwritten
+            // on the next forward), so guard the tensor-clearing loop against null.
+            _cacheSeqLen = 0;
+            _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
+            _forwardCount = 0;
+            _forwardSw.Reset();
+            if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 ResetCacheTensor(_kvCacheK[l]);
                 ResetCacheTensor(_kvCacheV[l]);
             }
-            _cacheSeqLen = 0;
-            _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
-            _forwardCount = 0;
-            _forwardSw.Reset();
         }
 
-        public override void TruncateKVCache(int tokenCount)
+        protected override void TruncateKVCacheCore(int tokenCount)
         {
-            base.TruncateKVCache(tokenCount);
+            base.TruncateKVCacheCore(tokenCount);
+            if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 InvalidateTensorDeviceCache(_kvCacheK[l]);
@@ -393,10 +422,16 @@ namespace TensorSharp.Models
             return 2048;
         }
 
-        public override float[] ForwardRefill(int[] tokens)
+        protected override float[] ForwardRefillCore(int[] tokens)
         {
             if (tokens == null || tokens.Length <= 1)
-                return Forward(tokens);
+                return ForwardCore(tokens);
+
+            // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
+            // layer loop and non-sharded weights, which are unavailable under
+            // tensor parallelism. Route through ForwardCore → ForwardTP instead.
+            if (IsTensorParallel)
+                return ForwardCore(tokens);
 
             // Multimodal embeddings carry absolute insert positions within the
             // current Forward call's hidden tensor, so chunked prefill would
@@ -407,7 +442,7 @@ namespace TensorSharp.Models
             int lastIdx = tokens.Length - 1;
 
             if (hasMultimodal || tokens.Length <= chunkSize)
-                return Forward(tokens);
+                return ForwardCore(tokens);
 
             for (int pos = 0; pos < lastIdx; pos += chunkSize)
             {
@@ -416,7 +451,7 @@ namespace TensorSharp.Models
                 Array.Copy(tokens, pos, chunk, 0, chunkLen);
                 PrefillWithoutLogits(chunk);
             }
-            return Forward(new[] { tokens[lastIdx] });
+            return ForwardCore(new[] { tokens[lastIdx] });
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -449,8 +484,11 @@ namespace TensorSharp.Models
             _forwardSw.Stop();
         }
 
-        public override float[] Forward(int[] tokens)
+        protected override float[] ForwardCore(int[] tokens)
         {
+            if (IsTensorParallel)
+                return ForwardTP(tokens);
+
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -781,7 +819,7 @@ namespace TensorSharp.Models
             for (int s = 0; s < seqLen; s++)
                 for (int h = 0; h < numHeads; h++)
                     positions[s * numHeads + h] = startPos + s;
-            using var posTensor = CreateIntTensor(positions, totalRows);
+            using var posTensor = CreateIntTensorOn(data.Storage.Allocator, positions, totalRows);
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
             Tensor result = Ops.RoPEEx(
@@ -854,6 +892,13 @@ namespace TensorSharp.Models
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)
                 foreach (var t in _kvCacheV) t?.Dispose();
+
+            if (_tpKvCacheK != null)
+                foreach (var layer in _tpKvCacheK)
+                    foreach (var t in layer) t?.Dispose();
+            if (_tpKvCacheV != null)
+                foreach (var layer in _tpKvCacheV)
+                    foreach (var t in layer) t?.Dispose();
 
             base.Dispose();
         }

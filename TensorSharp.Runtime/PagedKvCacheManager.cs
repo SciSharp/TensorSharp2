@@ -13,6 +13,7 @@ using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Logging;
+using TensorSharp.Runtime.Redis;
 
 namespace TensorSharp.Runtime
 {
@@ -38,6 +39,7 @@ namespace TensorSharp.Runtime
         private readonly ILogger _logger;
         private readonly PagedKvBlockStore _ramTier;
         private readonly SsdKvBlockTier _ssdTier;
+        private readonly RedisKvBlockTier _redisTier;
         private readonly string _fingerprint;
         private readonly IKvBlockCodec _codec;
         private long _hitTokens;
@@ -69,6 +71,21 @@ namespace TensorSharp.Runtime
             if (!config.Enabled)
                 return;
 
+            if (!string.IsNullOrWhiteSpace(config.RedisUrl))
+            {
+                try
+                {
+                    var redisConnection = new RedisConnection(config.RedisUrl, _logger);
+                    _redisTier = new RedisKvBlockTier(redisConnection, _fingerprint, config.RedisTtl, _logger);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(LogEventIds.PagedKvCacheTierInit,
+                        ex, "Failed to initialize Redis KV cache tier at {Url}; Redis tier disabled.", config.RedisUrl);
+                    _redisTier = null;
+                }
+            }
+
             if (!string.IsNullOrWhiteSpace(config.SsdDirectory))
             {
                 try
@@ -83,9 +100,15 @@ namespace TensorSharp.Runtime
                 }
             }
 
-            Action<KvBlockHash, byte[]> spillCallback = _ssdTier != null
-                ? (h, b) => _ssdTier.EnqueueWrite(h, b)
-                : null;
+            Action<KvBlockHash, byte[]> spillCallback = null;
+            if (_redisTier != null || _ssdTier != null)
+            {
+                spillCallback = (h, b) =>
+                {
+                    _redisTier?.EnqueueWrite(h, b);
+                    _ssdTier?.EnqueueWrite(h, b);
+                };
+            }
             _ramTier = new PagedKvBlockStore(config.MaxRamBytes, spillCallback);
         }
 
@@ -100,6 +123,8 @@ namespace TensorSharp.Runtime
             ramMaxBytes: _ramTier?.MaxBytes ?? 0,
             ssdBytes: _ssdTier?.ResidentBytes ?? 0,
             ssdBlocks: _ssdTier?.Count ?? 0,
+            redisBytes: _redisTier?.ResidentBytes ?? 0,
+            redisBlocks: _redisTier?.Count ?? 0,
             hitTokens: Interlocked.Read(ref _hitTokens),
             missTokens: Interlocked.Read(ref _missTokens),
             capturedBlocks: Interlocked.Read(ref _capturedBlocks));
@@ -112,12 +137,17 @@ namespace TensorSharp.Runtime
         {
             _ramTier?.Clear();
             _ssdTier?.Clear();
+            _redisTier?.Clear();
             Interlocked.Exchange(ref _hitTokens, 0);
             Interlocked.Exchange(ref _missTokens, 0);
             Interlocked.Exchange(ref _capturedBlocks, 0);
         }
 
-        public void Dispose() => _ssdTier?.Dispose();
+        public void Dispose()
+        {
+            _ssdTier?.Dispose();
+            _redisTier?.Dispose();
+        }
 
         /// <summary>
         /// Return how many leading blocks of <paramref name="inputTokens"/> are
@@ -307,6 +337,12 @@ namespace TensorSharp.Runtime
         {
             if (_ramTier.TryGet(hash, out payload))
                 return true;
+            if (_redisTier != null && _redisTier.TryRead(hash, out payload))
+            {
+                // Promote Redis hit back into RAM so subsequent lookups are fast.
+                _ramTier.Put(hash, payload);
+                return true;
+            }
             if (_ssdTier != null && _ssdTier.TryRead(hash, out payload))
             {
                 // Promote disk hit back into RAM so subsequent lookups are fast.
@@ -325,6 +361,8 @@ namespace TensorSharp.Runtime
         long ramMaxBytes,
         long ssdBytes,
         int ssdBlocks,
+        long redisBytes,
+        int redisBlocks,
         long hitTokens,
         long missTokens,
         long capturedBlocks);

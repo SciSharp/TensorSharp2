@@ -64,6 +64,7 @@ namespace TensorSharp.Models
         {
             get
             {
+                if (IsTensorParallel) return false;
                 string optOut = Environment.GetEnvironmentVariable("TS_GEMMA4_BATCHED");
                 if (string.Equals(optOut, "0", StringComparison.Ordinal) ||
                     string.Equals(optOut, "false", StringComparison.OrdinalIgnoreCase))

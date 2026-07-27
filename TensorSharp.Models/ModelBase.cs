@@ -11,6 +11,7 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -348,6 +349,26 @@ namespace TensorSharp.Models
         protected readonly Dictionary<string, Tensor> _weights = new();
         protected readonly Dictionary<string, QuantizedWeight> _quantWeights = new();
 
+        // ---- Tensor Parallelism ----
+        protected readonly Cuda.ITensorParallelGroup _tpGroup;
+        protected int TpDegree => _tpGroup?.Degree ?? 1;
+        protected bool IsTensorParallel => _tpGroup != null && _tpGroup.IsActive;
+
+        /// <summary>Total GPUs across all nodes (for weight shard sizing).</summary>
+        protected int GlobalTpDegree => _tpGroup?.GlobalDegree ?? 1;
+
+        /// <summary>First global rank on this node (for selecting local weight shards).</summary>
+        protected int TpRankOffset => _tpGroup?.GlobalRankOffset ?? 0;
+
+        /// <summary>Number of nodes in the distributed group (1 for local-only).</summary>
+        protected int TpNodeCount => _tpGroup?.NodeCount ?? 1;
+
+        /// <summary>Per-GPU sharded quantized weights, keyed by weight name.</summary>
+        protected readonly Dictionary<string, QuantizedWeight[]> _tpQuantWeights = new();
+
+        /// <summary>Per-GPU sharded F32 weights, keyed by weight name.</summary>
+        protected readonly Dictionary<string, Tensor[]> _tpWeights = new();
+
         /// <summary>
         /// Stacked-along-experts views of MoE expert weight tensors keyed by
         /// the original GGUF tensor name (e.g. <c>"blk.0.ffn_gate_exps.weight"</c>).
@@ -459,7 +480,7 @@ namespace TensorSharp.Models
         protected int _forwardCount;
         protected Stopwatch _forwardSw = new Stopwatch();
 
-        protected ModelBase(string ggufPath, BackendType backend)
+        protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
         {
             _backend = backend;
             // The pure-C# CPU backend must never touch native (ggml P/Invoke) dequant — route
@@ -469,6 +490,12 @@ namespace TensorSharp.Models
             NativeDequant.PreferManaged = backend == BackendType.Cpu;
             ExecutionPlan = new BackendExecutionPlan(backend);
             MultimodalInjector = new ModelMultimodalInjector(this);
+
+            if (tpGroup != null)
+                _tpGroup = tpGroup;
+            else if (tpDegree > 1 && backend == BackendType.Cuda)
+                _tpGroup = new Cuda.TensorParallelGroup(tpDegree);
+
             switch (backend)
             {
                 case BackendType.GgmlCpu:
@@ -488,7 +515,7 @@ namespace TensorSharp.Models
                     _allocator = new GgmlAllocator(_ggmlContext, 0);
                     break;
                 case BackendType.Cuda:
-                    _allocator = new CudaAllocator(0);
+                    _allocator = _tpGroup != null ? _tpGroup.GetAllocator(0) : new CudaAllocator(0);
                     break;
                 case BackendType.Mlx:
                     MlxBackend.Register();
@@ -1587,6 +1614,11 @@ namespace TensorSharp.Models
 
             cudaAllocator.LogVram("before direct-CUDA quant weight preload");
 
+            // When CUDA kernels are unavailable (PTX load failed), device-side
+            // quantized matmul/embedding will fail and every op falls back to
+            // the CPU dequant path.  Keep all host data alive in that case.
+            bool kernelsAvailable = CudaQuantizedOps.AreKernelsAvailable(cudaAllocator);
+
             long preloadedBytes = 0;
             int preloadedCount = 0;
             int mappedHostViews = 0;
@@ -1596,8 +1628,9 @@ namespace TensorSharp.Models
                     mappedHostViews++;
             }
 
-            foreach (QuantizedWeight qw in _quantWeights.Values)
+            foreach (var kv in _quantWeights)
             {
+                var qw = kv.Value;
                 if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
                     continue;
 
@@ -1614,9 +1647,12 @@ namespace TensorSharp.Models
                 preloadedCount++;
 
                 bool wasMappedView = qw.HasExternalHostView;
-                qw.ReleaseHostData();
-                if (wasMappedView)
-                    mappedHostViews--;
+                if (kernelsAvailable && !ShouldRetainCudaHostQuantWeight(kv.Key))
+                {
+                    qw.ReleaseHostData();
+                    if (wasMappedView)
+                        mappedHostViews--;
+                }
             }
 
             _cudaQuantWeightsPrepared = true;
@@ -1822,6 +1858,19 @@ namespace TensorSharp.Models
         protected Tensor CreateIntTensor(int[] data, params long[] sizes)
         {
             var tensor = new Tensor(_allocator, DType.Int32, sizes);
+            tensor.SetElementsAsInt(data);
+            return tensor;
+        }
+
+        /// <summary>
+        /// Create an int tensor on a specific GPU. Use this (with the consuming
+        /// tensor's allocator) for anything read by a per-rank TP kernel — e.g.
+        /// RoPE position tensors — so a rank-r kernel doesn't read a GPU-0 tensor
+        /// across GPUs (illegal access without peer / wrong data with peer).
+        /// </summary>
+        protected static Tensor CreateIntTensorOn(IAllocator allocator, int[] data, params long[] sizes)
+        {
+            var tensor = new Tensor(allocator, DType.Int32, sizes);
             tensor.SetElementsAsInt(data);
             return tensor;
         }
@@ -2333,6 +2382,791 @@ namespace TensorSharp.Models
             return output;
         }
 
+        #region Tensor Parallelism
+
+        /// <summary>
+        /// Shard linear weights across GPUs for tensor parallelism. Call after
+        /// <see cref="LoadWeights"/> and any weight fusion (e.g. FuseQKVWeights).
+        ///
+        /// Column-parallel weights (QKV, gate_up) are split along the output
+        /// dimension (ne1 / Sizes[0]): each GPU gets outDim/tp consecutive rows.
+        /// Row-parallel weights (output, down) are split along the input
+        /// dimension (ne0 / Sizes[1]): each GPU gets inDim/tp columns.
+        ///
+        /// Replicated weights (norms, embeddings) are not sharded — every GPU
+        /// keeps the full copy via the existing <see cref="_weights"/> dictionary.
+        /// </summary>
+        protected void ShardWeightsForTensorParallelism(
+            IEnumerable<string> columnParallelPatterns,
+            IEnumerable<string> rowParallelPatterns)
+        {
+            if (!IsTensorParallel) return;
+
+            int tp = TpDegree;
+            int globalTp = GlobalTpDegree;
+            int rankOffset = TpRankOffset;
+            var colPatterns = new List<string>(columnParallelPatterns);
+            var rowPatterns = new List<string>(rowParallelPatterns);
+
+            if (tp > 1 || globalTp > 1)
+                Console.WriteLine($"  ShardWeightsForTP: tp={tp} globalTp={globalTp} rankOffset={rankOffset} colPatterns=[{string.Join(",", colPatterns)}] rowPatterns=[{string.Join(",", rowPatterns)}]");
+
+            // Shard quantized weights.
+            var quantToRemove = new List<string>();
+            var colParallelOwners = new List<QuantizedWeight>();
+            foreach (var kv in _quantWeights)
+            {
+                string name = kv.Key;
+                bool isCol = colPatterns.Any(p => name.Contains(p));
+                bool isRow = !isCol && rowPatterns.Any(p => name.Contains(p));
+                if (!isCol && !isRow) continue;
+
+                var qw = kv.Value;
+                var shards = new QuantizedWeight[tp];
+
+                if (isCol)
+                {
+                    // Split along ne1 (output dim): consecutive rows.
+                    long rowsPerShard = qw.Ne1 / globalTp;
+                    long rowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                    long bytesPerShard = rowsPerShard * rowBytes;
+
+                    for (int lr = 0; lr < tp; lr++)
+                    {
+                        int globalRank = rankOffset + lr;
+                        IntPtr shardPtr = new IntPtr((long)qw.Data + globalRank * bytesPerShard);
+                        shards[lr] = QuantizedWeight.CreateExternalView(
+                            shardPtr, bytesPerShard, qw.GgmlType, qw.Ne0, rowsPerShard, qw);
+                    }
+
+                    // Keep the original owner alive: column-parallel shards
+                    // are external views into its buffer. Disposing it here
+                    // would leave the shards with dangling pointers.
+                    colParallelOwners.Add(qw);
+                }
+                else
+                {
+                    // Split along ne0 (input dim): extract block-aligned columns per row.
+                    var type = (GgmlTensorType)qw.GgmlType;
+                    long blockSize = GgufFile.GetBlockSize(type);
+                    long typeSize = GgufFile.GetTypeSize(type);
+                    long blocksPerRow = qw.Ne0 / blockSize;
+                    long blocksPerShard = blocksPerRow / globalTp;
+                    long ne0PerShard = blocksPerShard * blockSize;
+                    long srcRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                    long dstRowBytes = (ne0PerShard / blockSize) * typeSize;
+                    long totalBytesPerShard = qw.Ne1 * dstRowBytes;
+                    long blockBytesPerShard = blocksPerShard * typeSize;
+
+                    if (quantToRemove.Count < 2)
+                        Console.WriteLine($"    Row-parallel quant debug: {name} origNe0={qw.Ne0} origNe1={qw.Ne1} globalTp={globalTp} blockSize={blockSize} blocksPerRow={blocksPerRow} blocksPerShard={blocksPerShard} ne0PerShard={ne0PerShard} totalBytesPerShard={totalBytesPerShard}");
+
+
+                    for (int lr = 0; lr < tp; lr++)
+                    {
+                        int globalRank = rankOffset + lr;
+                        IntPtr shardPtr = QuantizedWeight.AllocateBuffer(totalBytesPerShard);
+                        unsafe
+                        {
+                            byte* src = (byte*)qw.Data.ToPointer();
+                            byte* dst = (byte*)shardPtr.ToPointer();
+                            long srcBlockOffset = globalRank * blocksPerShard * typeSize;
+                            for (long row = 0; row < qw.Ne1; row++)
+                            {
+                                Buffer.MemoryCopy(
+                                    src + row * srcRowBytes + srcBlockOffset,
+                                    dst + row * dstRowBytes,
+                                    dstRowBytes,
+                                    blockBytesPerShard);
+                            }
+                        }
+                        shards[lr] = new QuantizedWeight(shardPtr, totalBytesPerShard,
+                            qw.GgmlType, ne0PerShard, qw.Ne1);
+                    }
+                }
+
+                _tpQuantWeights[name] = shards;
+                quantToRemove.Add(name);
+            }
+
+            // Remove original unsharded quantized weights that have been sharded.
+            // Column-parallel owners are kept alive because their shards are
+            // external views into the original buffer; only row-parallel
+            // originals (whose shards own independent copies) are disposed.
+            foreach (var name in quantToRemove)
+            {
+                var qw = _quantWeights[name];
+                if (!colParallelOwners.Contains(qw))
+                    qw.Dispose();
+                _quantWeights.Remove(name);
+            }
+
+            // Shard F32 weights.
+            var f32ToRemove = new List<string>();
+            foreach (var kv in _weights)
+            {
+                string name = kv.Key;
+                bool isCol = colPatterns.Any(p => name.Contains(p));
+                bool isRow = !isCol && rowPatterns.Any(p => name.Contains(p));
+                if (!isCol && !isRow) continue;
+
+                var w = kv.Value;
+                var shards = new Tensor[tp];
+
+                if (isCol)
+                {
+                    // Split along dim 0 (output dim).
+                    long shardSize = w.Sizes[0] / globalTp;
+                    for (int lr = 0; lr < tp; lr++)
+                    {
+                        int globalRank = rankOffset + lr;
+                        var view = w.Narrow(0, globalRank * shardSize, shardSize);
+                        shards[lr] = Ops.NewContiguous(view);
+                        view.Dispose();
+                    }
+                }
+                else
+                {
+                    // Split along dim 1 (input dim).
+                    long shardSize = w.Sizes[1] / globalTp;
+                    for (int lr = 0; lr < tp; lr++)
+                    {
+                        int globalRank = rankOffset + lr;
+                        var view = w.Narrow(1, globalRank * shardSize, shardSize);
+                        shards[lr] = Ops.NewContiguous(view);
+                        view.Dispose();
+                    }
+                }
+
+                _tpWeights[name] = shards;
+                f32ToRemove.Add(name);
+            }
+
+            foreach (var name in f32ToRemove)
+            {
+                _weights[name].Dispose();
+                _weights.Remove(name);
+            }
+
+            Console.WriteLine($"  TP sharded: {quantToRemove.Count} quantized + {f32ToRemove.Count} F32 weights across {tp} GPUs.");
+        }
+
+        /// <summary>
+        /// Output dimension (row count) of a possibly-quantized weight, or 0 if
+        /// the weight is not present in either weight dictionary.
+        /// </summary>
+        protected int GetFusedOutputDim(string weightName)
+        {
+            if (_quantWeights.TryGetValue(weightName, out var qw))
+                return (int)qw.Ne1;
+            if (_weights.TryGetValue(weightName, out var w))
+                return (int)w.Sizes[0];
+            return 0;
+        }
+
+        /// <summary>
+        /// Shard a column-parallel weight whose output dimension is the
+        /// concatenation of several logical segments — e.g. a fused QKV
+        /// projection [Q | K | V] or a fused FFN [gate | up].
+        ///
+        /// The generic <see cref="ShardWeightsForTensorParallelism"/> column
+        /// split assigns each rank one CONTIGUOUS block of output rows. For a
+        /// concatenated weight that mixes whole segments across ranks (rank 0
+        /// gets all of Q/gate, rank 1 gets all of K+V/up), which is wrong: the
+        /// forward pass re-splits each rank's shard expecting it to contain that
+        /// rank's slice of EVERY segment, i.e. [seg0_r | seg1_r | …].
+        ///
+        /// This method instead gathers, for each rank, its 1/tp slice of every
+        /// segment in order, producing the per-rank layout the forward pass
+        /// expects. Every segment dim must be divisible by the global TP degree
+        /// (enforced by the per-model ValidateTpConstraints for head counts and
+        /// intermediate sizes). No-op if the weight is not present.
+        /// </summary>
+        protected void ShardConcatenatedColumnParallel(string weightName, params int[] segmentDims)
+        {
+            if (!IsTensorParallel) return;
+
+            int tp = TpDegree;
+            int globalTp = GlobalTpDegree;
+            int rankOffset = TpRankOffset;
+
+            // Output-row indices for a global rank: its 1/tp slice of each segment.
+            int[] BuildRows(int globalRank)
+            {
+                var idx = new List<int>();
+                int baseOff = 0;
+                foreach (int segDim in segmentDims)
+                {
+                    int perRank = segDim / globalTp;
+                    int start = baseOff + globalRank * perRank;
+                    for (int i = 0; i < perRank; i++)
+                        idx.Add(start + i);
+                    baseOff += segDim;
+                }
+                return idx.ToArray();
+            }
+
+            if (_quantWeights.TryGetValue(weightName, out var qw))
+            {
+                long rowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                var shards = new QuantizedWeight[tp];
+                for (int r = 0; r < tp; r++)
+                {
+                    int[] rows = BuildRows(rankOffset + r);
+                    long totalBytes = rows.Length * rowBytes;
+                    IntPtr shardPtr = QuantizedWeight.AllocateBuffer(totalBytes);
+                    unsafe
+                    {
+                        byte* src = (byte*)qw.Data.ToPointer();
+                        byte* dst = (byte*)shardPtr.ToPointer();
+                        for (int row = 0; row < rows.Length; row++)
+                            Buffer.MemoryCopy(
+                                src + (long)rows[row] * rowBytes,
+                                dst + (long)row * rowBytes,
+                                rowBytes, rowBytes);
+                    }
+                    shards[r] = new QuantizedWeight(shardPtr, totalBytes,
+                        qw.GgmlType, qw.Ne0, rows.Length);
+                }
+
+                _tpQuantWeights[weightName] = shards;
+                _quantWeights.Remove(weightName);
+                qw.Dispose();
+            }
+            else if (_weights.TryGetValue(weightName, out var w))
+            {
+                int inDim = (int)w.Sizes[1];
+                var shards = new Tensor[tp];
+                for (int r = 0; r < tp; r++)
+                {
+                    int[] rows = BuildRows(rankOffset + r);
+                    var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, rows.Length, inDim);
+                    unsafe
+                    {
+                        float* srcPtr = GetFloatPtr(w);
+                        float* dstPtr = GetFloatPtr(shard);
+                        for (int row = 0; row < rows.Length; row++)
+                            Buffer.MemoryCopy(
+                                srcPtr + (long)rows[row] * inDim,
+                                dstPtr + (long)row * inDim,
+                                (long)inDim * 4, (long)inDim * 4);
+                    }
+                    shards[r] = shard;
+                }
+
+                _tpWeights[weightName] = shards;
+                _weights.Remove(weightName);
+                w.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Shard a fused [gate | up] FFN projection as two equal column-parallel
+        /// segments, deriving the half size from the weight itself. No-op if the
+        /// weight is not present (e.g. a MoE layer with no dense gate_up).
+        /// </summary>
+        protected void ShardFusedGateUpColumnParallel(string weightName)
+        {
+            int fullDim = GetFusedOutputDim(weightName);
+            if (fullDim <= 0) return;
+            int half = fullDim / 2;
+            ShardConcatenatedColumnParallel(weightName, half, half);
+        }
+
+        /// <summary>
+        /// Column-parallel shard from SEPARATE source weights that were never
+        /// fused (e.g. Q/K/V with mismatched quant types that prevented
+        /// <see cref="ShardConcatenatedColumnParallel"/>). Each source is
+        /// dequantized (if quantized) and sliced per-rank on the fly, so no
+        /// full-model F32 intermediate is ever materialised. The per-rank
+        /// results are stored under <paramref name="fusedName"/> in
+        /// <see cref="_tpWeights"/>; source weights are removed and disposed.
+        /// </summary>
+        protected void ShardSeparateColumnParallel(string fusedName, string[] sourceNames, int[] segmentDims)
+        {
+            if (!IsTensorParallel) return;
+            if (sourceNames.Length != segmentDims.Length)
+                throw new ArgumentException("sourceNames and segmentDims must have the same length.");
+
+            int tp = TpDegree;
+            int globalTp = GlobalTpDegree;
+            int rankOffset = TpRankOffset;
+
+            // Resolve sources and common input dim.
+            int inDim = -1;
+            var quants = new QuantizedWeight[sourceNames.Length];
+            var tensors = new Tensor[sourceNames.Length];
+            for (int s = 0; s < sourceNames.Length; s++)
+            {
+                if (_quantWeights.TryGetValue(sourceNames[s], out quants[s]))
+                {
+                    int d = (int)quants[s].Ne0;
+                    if (inDim < 0) inDim = d; else if (inDim != d) return;
+                }
+                else if (_weights.TryGetValue(sourceNames[s], out tensors[s]))
+                {
+                    int d = (int)tensors[s].Sizes[1];
+                    if (inDim < 0) inDim = d; else if (inDim != d) return;
+                }
+                else
+                {
+                    return; // source missing — nothing to shard
+                }
+            }
+
+            var shards = new Tensor[tp];
+            for (int r = 0; r < tp; r++)
+            {
+                int globalRank = rankOffset + r;
+                int totalRows = 0;
+                foreach (int segDim in segmentDims)
+                    totalRows += segDim / globalTp;
+
+                var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, totalRows, inDim);
+
+                unsafe
+                {
+                    float* dstBase = GetFloatPtr(shard);
+                    long dstRow = 0;
+
+                    for (int s = 0; s < sourceNames.Length; s++)
+                    {
+                        int perRank = segmentDims[s] / globalTp;
+                        int srcStart = globalRank * perRank;
+
+                        if (quants[s] != null)
+                        {
+                            var qw = quants[s];
+                            long rowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                            byte* srcBase = (byte*)qw.Data.ToPointer();
+                            for (int row = 0; row < perRank; row++)
+                                NativeDequant.DequantizeToFloat32Native(
+                                    qw.GgmlType,
+                                    (IntPtr)(srcBase + (long)(srcStart + row) * rowBytes),
+                                    (IntPtr)(dstBase + (dstRow + row) * inDim),
+                                    inDim);
+                        }
+                        else
+                        {
+                            float* srcPtr = GetFloatPtr(tensors[s]);
+                            long bytes = (long)perRank * inDim * sizeof(float);
+                            Buffer.MemoryCopy(
+                                srcPtr + (long)srcStart * inDim,
+                                dstBase + dstRow * inDim,
+                                bytes, bytes);
+                        }
+                        dstRow += perRank;
+                    }
+                }
+
+                shards[r] = shard;
+            }
+
+            _tpWeights[fusedName] = shards;
+
+            for (int s = 0; s < sourceNames.Length; s++)
+            {
+                if (quants[s] != null)
+                {
+                    _quantWeights.Remove(sourceNames[s]);
+                    quants[s].Dispose();
+                }
+                else
+                {
+                    _weights.Remove(sourceNames[s]);
+                    tensors[s].Dispose();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Column-parallel shard of a 1-D bias whose length is the concatenation
+        /// of several logical segments (fused QKV bias [Q|K|V], fused gate_up
+        /// bias [gate|up], …). The bias must be regrouped exactly like the
+        /// weight it accompanies (<see cref="ShardConcatenatedColumnParallel"/>),
+        /// otherwise each rank would add the wrong bias slice to its outputs.
+        /// No-op if the bias is not present.
+        /// </summary>
+        protected void ShardConcatenatedBiasColumnParallel(string biasName, params int[] segmentDims)
+        {
+            if (!IsTensorParallel) return;
+            if (!_weights.TryGetValue(biasName, out var bias)) return;
+
+            int tp = TpDegree;
+            int globalTp = GlobalTpDegree;
+            int rankOffset = TpRankOffset;
+
+            int[] BuildRows(int globalRank)
+            {
+                var idx = new List<int>();
+                int baseOff = 0;
+                foreach (int segDim in segmentDims)
+                {
+                    int perRank = segDim / globalTp;
+                    int start = baseOff + globalRank * perRank;
+                    for (int i = 0; i < perRank; i++)
+                        idx.Add(start + i);
+                    baseOff += segDim;
+                }
+                return idx.ToArray();
+            }
+
+            var shards = new Tensor[tp];
+            for (int r = 0; r < tp; r++)
+            {
+                int[] rows = BuildRows(rankOffset + r);
+                var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, rows.Length);
+                unsafe
+                {
+                    float* srcPtr = GetFloatPtr(bias);
+                    float* dstPtr = GetFloatPtr(shard);
+                    for (int i = 0; i < rows.Length; i++)
+                        dstPtr[i] = srcPtr[rows[i]];
+                }
+                shards[r] = shard;
+            }
+
+            _tpWeights[biasName] = shards;
+            _weights.Remove(biasName);
+            bias.Dispose();
+        }
+
+        /// <summary>
+        /// Column-parallel shard of a fused [gate | up] bias as two equal
+        /// segments, deriving the half length from the bias itself.
+        /// </summary>
+        protected void ShardFusedGateUpBiasColumnParallel(string biasName)
+        {
+            if (!_weights.TryGetValue(biasName, out var bias)) return;
+            int total = (int)bias.ElementCount();
+            int half = total / 2;
+            ShardConcatenatedBiasColumnParallel(biasName, half, half);
+        }
+
+        /// <summary>
+        /// Column-parallel linear forward: each GPU computes its output slice
+        /// using its weight shard. Input is replicated across all GPUs.
+        /// Returns one output tensor per GPU, each with outDim/tp columns.
+        /// </summary>
+        protected Tensor[] TpColumnParallelLinear(Tensor input, string weightName)
+        {
+            int tp = TpDegree;
+            var results = new Tensor[tp];
+            long t0 = Stopwatch.GetTimestamp();
+
+            if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
+            {
+                int seqLen = (int)input.Sizes[0];
+                for (int r = 0; r < tp; r++)
+                {
+                    var qw = qShards[r];
+                    int outDim = (int)qw.Ne1;
+                    var alloc = _tpGroup.GetAllocator(r);
+                    results[r] = new Tensor(alloc, DType.Float32, seqLen, outDim);
+                    AddmmQuantManaged(results[r], ReplicateTensorToRank(input, r), qw);
+                }
+            }
+            else if (_tpWeights.TryGetValue(weightName, out var wShards))
+            {
+                int seqLen = (int)input.Sizes[0];
+                for (int r = 0; r < tp; r++)
+                {
+                    var w = wShards[r];
+                    int outDim = (int)w.Sizes[0];
+                    var alloc = _tpGroup.GetAllocator(r);
+                    using var wT = w.Transpose();
+                    results[r] = new Tensor(alloc, DType.Float32, seqLen, outDim);
+                    var localInput = ReplicateTensorToRank(input, r);
+                    Ops.Addmm(results[r], 0, results[r], 1.0f, localInput, wT);
+                    if (!ReferenceEquals(localInput, input)) localInput.Dispose();
+                }
+            }
+            else
+            {
+                throw new KeyNotFoundException($"TP column-parallel weight '{weightName}' not found in sharded weights.");
+            }
+
+            _linearTicks += Stopwatch.GetTimestamp() - t0;
+            return results;
+        }
+
+        /// <summary>
+        /// Row-parallel linear forward: each GPU computes a partial result using
+        /// its weight shard, then AllReduce sums the partials. Returns the
+        /// reduced result (replicated on all GPUs); the caller typically uses
+        /// the rank-0 tensor and disposes the rest.
+        /// </summary>
+        protected Tensor TpRowParallelLinear(Tensor[] inputs, string weightName)
+        {
+            int tp = TpDegree;
+            var partials = new Tensor[tp];
+            long t0 = Stopwatch.GetTimestamp();
+
+            if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
+            {
+                for (int r = 0; r < tp; r++)
+                {
+                    var qw = qShards[r];
+                    int seqLen = (int)inputs[r].Sizes[0];
+                    int outDim = (int)qw.Ne1;
+                    var alloc = _tpGroup.GetAllocator(r);
+                    partials[r] = new Tensor(alloc, DType.Float32, seqLen, outDim);
+                    AddmmQuantManaged(partials[r], inputs[r], qw);
+                }
+            }
+            else if (_tpWeights.TryGetValue(weightName, out var wShards))
+            {
+                for (int r = 0; r < tp; r++)
+                {
+                    var w = wShards[r];
+                    int seqLen = (int)inputs[r].Sizes[0];
+                    int outDim = (int)w.Sizes[0];
+                    var alloc = _tpGroup.GetAllocator(r);
+                    using var wT = w.Transpose();
+                    partials[r] = new Tensor(alloc, DType.Float32, seqLen, outDim);
+                    Ops.Addmm(partials[r], 0, partials[r], 1.0f, inputs[r], wT);
+                }
+            }
+            else
+            {
+                throw new KeyNotFoundException($"TP row-parallel weight '{weightName}' not found in sharded weights.");
+            }
+
+            _linearTicks += Stopwatch.GetTimestamp() - t0;
+
+            _tpGroup.AllReduce(partials);
+
+            // Dispose non-zero-rank tensors; caller uses rank-0 result.
+            for (int r = 1; r < tp; r++)
+                partials[r].Dispose();
+
+            return partials[0];
+        }
+
+        /// <summary>
+        /// Ensure a tensor is available on the given rank's GPU. If the tensor
+        /// is already on that GPU (rank 0 typically), returns it as-is.
+        /// Otherwise copies it to the target GPU.
+        /// </summary>
+        protected Tensor ReplicateTensorToRank(Tensor tensor, int rank)
+        {
+            if (rank == 0) return tensor;
+
+            var alloc = _tpGroup.GetAllocator(rank);
+            var copy = new Tensor(alloc, tensor.ElementType, tensor.Sizes);
+            Ops.Copy(copy, tensor);
+            return copy;
+        }
+
+        /// <summary>
+        /// Broadcast a rank-0 tensor to all other GPUs. Returns an array where
+        /// element 0 is the original tensor and elements 1..tp-1 are copies.
+        /// </summary>
+        protected Tensor[] BroadcastTensorToAllRanks(Tensor tensor)
+        {
+            int tp = TpDegree;
+            var result = new Tensor[tp];
+            // Clone for rank 0 too — the caller may dispose the original
+            // tensor after broadcasting, and sharing the storage would leave
+            // rank 0 with a dangling reference.
+            var alloc0 = _tpGroup.GetAllocator(0);
+            result[0] = new Tensor(alloc0, tensor.ElementType, tensor.Sizes);
+            Ops.Copy(result[0], tensor);
+            for (int r = 1; r < tp; r++)
+                result[r] = ReplicateTensorToRank(tensor, r);
+            return result;
+        }
+
+        /// <summary>
+        /// TP-aware RMSNorm: runs independently on each GPU (replicated weights).
+        /// </summary>
+        protected Tensor[] TpRMSNorm(Tensor[] inputs, string weightName)
+        {
+            int tp = TpDegree;
+            var results = new Tensor[tp];
+            var alpha = _weights[weightName];
+
+            for (int r = 0; r < tp; r++)
+            {
+                int rows = (int)inputs[r].Sizes[0];
+                int dim = (int)(inputs[r].ElementCount() / rows);
+                Tensor input2d = inputs[r].Sizes.Length != 2 ? inputs[r].View(rows, dim) : null;
+                Tensor src = input2d ?? inputs[r];
+
+                var alloc = _tpGroup.GetAllocator(r);
+                Tensor alphaLocal = ReplicateTensorToRank(alpha, r);
+                results[r] = Ops.RMSNorm(null, src, alphaLocal, null, Config.Eps);
+
+                if (!ReferenceEquals(alphaLocal, alpha)) alphaLocal.Dispose();
+                input2d?.Dispose();
+            }
+
+            return results;
+        }
+
+        /// <summary>
+        /// TP-aware residual add: hidden[r] += residual[r] on each GPU.
+        /// </summary>
+        protected void TpResidualAdd(Tensor[] hidden, Tensor[] residual)
+        {
+            for (int r = 0; r < TpDegree; r++)
+                Ops.Add(hidden[r], hidden[r], residual[r]);
+        }
+
+        /// <summary>
+        /// Preload TP-sharded quantized weights onto their respective GPUs.
+        /// Each shard is uploaded to the GPU that will use it, then the host
+        /// copy is released.
+        /// </summary>
+        protected void PrepareCudaQuantizedWeightsForInferenceTP()
+        {
+            if (_backend != BackendType.Cuda || _tpQuantWeights.Count == 0)
+                return;
+
+            // When CUDA kernels are unavailable (PTX load failed), device-side
+            // quantized matmul will fail and every op falls back to the CPU
+            // dequant path.  In that case we MUST keep the host data alive
+            // regardless of ShouldRetainCudaHostQuantWeight.
+            bool kernelsAvailable = _allocator is CudaAllocator primaryAlloc
+                && CudaQuantizedOps.AreKernelsAvailable(primaryAlloc);
+
+            long preloadedBytes = 0;
+            int preloadedCount = 0;
+
+            long tpTotalBytes = 0;
+            int tpTotalCount = 0;
+            int tpDebugPrinted = 0;
+            foreach (var kv in _tpQuantWeights)
+            {
+                foreach (var s in kv.Value)
+                {
+                    tpTotalBytes += s.RawBytes;
+                    tpTotalCount++;
+                }
+                if (tpDebugPrinted < 3)
+                {
+                    var firstShard = kv.Value[0];
+                    Console.WriteLine($"    TP debug: {kv.Key} shards={kv.Value.Length} shardRawBytes={firstShard.RawBytes} ne0={firstShard.Ne0} ne1={firstShard.Ne1} type={firstShard.GgmlType}");
+                    tpDebugPrinted++;
+                }
+            }
+            Console.WriteLine($"  TP sharded weights to preload: {tpTotalCount} shards, {tpTotalBytes / 1024 / 1024} MB total");
+
+            foreach (var kv in _tpQuantWeights)
+            {
+                var shards = kv.Value;
+                bool retain = !kernelsAvailable || ShouldRetainCudaHostQuantWeight(kv.Key);
+                // MoE expert weights are very numerous (hundreds of experts × layers)
+                // and only a few are active per token.  Skip device preload for
+                // per-expert weights to keep GPU memory available for KV cache and
+                // attention.  The CPU fallback path in AddmmQuantManaged serves them.
+                bool isExpertWeight = kv.Key.Contains("_exps.");
+                for (int r = 0; r < shards.Length; r++)
+                {
+                    var qw = shards[r];
+                    if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
+                        continue;
+
+                    if (isExpertWeight)
+                        continue; // keep on host for CPU fallback
+
+                    var alloc = _tpGroup.GetAllocator(r);
+                    IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                    try
+                    {
+                        CudaQuantizedOps.PreloadQuantizedWeight(
+                            alloc, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    }
+                    catch (Exception ex) when (ex.Message.Contains("out of memory"))
+                    {
+                        Console.WriteLine($"  Skipping TP device preload for {kv.Key} rank={r} ({qw.RawBytes / 1024 / 1024} MB) — GPU {r} out of memory, keeping host copy for CPU fallback.");
+                        continue;
+                    }
+                    preloadedBytes += qw.RawBytes;
+                    preloadedCount++;
+                    if (!retain)
+                        qw.ReleaseHostData();
+                }
+            }
+
+            // Also preload any remaining non-sharded quantized weights (e.g. embedding).
+            if (_allocator is CudaAllocator cudaAllocator)
+            {
+                long remainingTotalBytes = 0;
+                int remainingCount = 0;
+                foreach (var kv in _quantWeights)
+                {
+                    remainingTotalBytes += kv.Value.RawBytes;
+                    remainingCount++;
+                }
+                if (remainingCount > 0)
+                    Console.WriteLine($"  TP non-sharded quantized weights remaining: {remainingCount} tensors, {remainingTotalBytes / 1024 / 1024} MB");
+
+                foreach (var kv in _quantWeights)
+                {
+                    var qw = kv.Value;
+                    if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
+                        continue;
+
+                    IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                    try
+                    {
+                        CudaQuantizedOps.PreloadQuantizedWeight(
+                            cudaAllocator, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    }
+                    catch (Exception ex) when (ex.Message.Contains("out of memory"))
+                    {
+                        // GPU is full — keep the host copy so the CPU fallback
+                        // path (EmbeddingManagedQuantized / AddmmQuantManaged)
+                        // can serve this weight from host memory.
+                        Console.WriteLine($"  Skipping device preload for {kv.Key} ({qw.RawBytes / 1024 / 1024} MB) — GPU out of memory, keeping host copy for CPU fallback.");
+                        continue;
+                    }
+                    preloadedBytes += qw.RawBytes;
+                    preloadedCount++;
+                    if (kernelsAvailable && !ShouldRetainCudaHostQuantWeight(kv.Key))
+                        qw.ReleaseHostData();
+                }
+            }
+
+            _cudaQuantWeightsPrepared = true;
+
+            // Only dispose the GGUF file when no external host views remain
+            // (column-parallel shards may still reference mmap'd data) and
+            // no TP shards were kept on host (expert CPU fallback).
+            bool anyHostViewsRemain = false;
+            foreach (var kv in _tpQuantWeights)
+            {
+                foreach (var qw in kv.Value)
+                {
+                    if (qw.HasHostData)
+                    {
+                        anyHostViewsRemain = true;
+                        break;
+                    }
+                }
+                if (anyHostViewsRemain) break;
+            }
+            if (!anyHostViewsRemain)
+            {
+                foreach (QuantizedWeight qw in _quantWeights.Values)
+                {
+                    if (qw.HasHostData)
+                    {
+                        anyHostViewsRemain = true;
+                        break;
+                    }
+                }
+            }
+            if (!anyHostViewsRemain)
+                _gguf?.Dispose();
+
+            if (preloadedCount > 0)
+                Console.WriteLine($"  TP CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} shards (host copies released)");
+        }
+
+        #endregion
+
 
         protected void RMSNormInPlace(Tensor data, Tensor alpha, int numHeads, int headDim, float eps)
         {
@@ -2437,7 +3271,10 @@ namespace TensorSharp.Models
             if (seqLen == 1)
                 return data.View(numHeads, 1, headDim);
 
-            var result = new Tensor(_allocator, data.ElementType, numHeads, seqLen, headDim);
+            // Allocate the head-first result on DATA's GPU, not _allocator (GPU 0).
+            // Under TP, `data` lives on rank r's GPU; a GPU-0 result would make the
+            // reshape kernel read across GPUs (fault without peer, wrong data with).
+            var result = new Tensor(data.Storage.Allocator, data.ElementType, numHeads, seqLen, headDim);
             if (CudaFusedOps.TryFlatToHeadFirst(result, data, numHeads, seqLen, headDim))
                 return result;
             if (MlxFusedOps.TryFlatToHeadFirst(result, data, numHeads, seqLen, headDim))
@@ -2601,7 +3438,7 @@ namespace TensorSharp.Models
             long rowBytes = ManagedQuantizedOps.RowSize(ggmlType, headDim);
 
             cache.Storage.EnsureHostReadable();
-            var f32 = new Tensor(_allocator, DType.Float32, outHeads, totalSeqLen, headDim);
+            var f32 = new Tensor(cache.Storage.Allocator, DType.Float32, outHeads, totalSeqLen, headDim);
             float* dstBase = GetFloatPtr(f32);
             byte* srcBase = (byte*)TensorComputePrimitives.GetStoragePointer(cache);
 
@@ -2629,7 +3466,7 @@ namespace TensorSharp.Models
             int headDim = (int)cache.Sizes[2];
             int outHeads = numKVHeads * groupSize;
 
-            var f32 = new Tensor(_allocator, DType.Float32, outHeads, totalSeqLen, headDim);
+            var f32 = new Tensor(cache.Storage.Allocator, DType.Float32, outHeads, totalSeqLen, headDim);
             float* dstBase = GetFloatPtr(f32);
             ushort* srcBase = TensorComputePrimitives.GetHalfPointer(cache);
 
@@ -3537,9 +4374,116 @@ namespace TensorSharp.Models
             }
         }
 
-        public abstract float[] Forward(int[] tokens);
-        public virtual float[] ForwardRefill(int[] tokens) => Forward(tokens);
-        public abstract void ResetKVCache();
+        // ====================================================================
+        // Forward / cache entry points.
+        //
+        // These are template methods: models implement the *Core variants; the
+        // public methods add the multi-node tensor-parallel driver hook. When
+        // this process is the distributed DRIVER (node 0 of a >1-node group,
+        // after BeginDistributedDriver), each call first broadcasts its op +
+        // tokens to the worker nodes so they run the identical forward pass in
+        // lockstep (their per-layer AllReduces line up with the driver's).
+        // On single-node and worker processes the hook is inert.
+        // ====================================================================
+        private const int TpControlForward       = 1;
+        private const int TpControlForwardRefill = 2;
+        private const int TpControlReset         = 3;
+        private const int TpControlShutdown      = 4;
+        private const int TpControlTruncate      = 5;
+
+        private bool _distributedDriver;
+
+        /// <summary>True when this process is a worker node in a multi-node TP group.</summary>
+        public bool IsDistributedWorker =>
+            _tpGroup != null && _tpGroup.NodeCount > 1 && _tpGroup.GlobalRankOffset > 0;
+
+        /// <summary>
+        /// Start acting as the distributed driver. After this call every
+        /// Forward/ForwardRefill/ResetKVCache broadcasts to the worker nodes.
+        /// Call once, on the driver node (global rank offset 0), AFTER
+        /// <see cref="WarmUpKernels"/> (warmup runs symmetrically on every node
+        /// and must not broadcast).
+        /// </summary>
+        public void BeginDistributedDriver()
+        {
+            if (_tpGroup != null && _tpGroup.NodeCount > 1 && _tpGroup.GlobalRankOffset == 0)
+                _distributedDriver = true;
+        }
+
+        public float[] Forward(int[] tokens)
+        {
+            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlForward, tokens);
+            return ForwardCore(tokens);
+        }
+
+        public float[] ForwardRefill(int[] tokens)
+        {
+            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlForwardRefill, tokens);
+            return ForwardRefillCore(tokens);
+        }
+
+        public void ResetKVCache()
+        {
+            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlReset, Array.Empty<int>());
+            ResetKVCacheCore();
+        }
+
+        protected abstract float[] ForwardCore(int[] tokens);
+        protected virtual float[] ForwardRefillCore(int[] tokens) => ForwardCore(tokens);
+        protected abstract void ResetKVCacheCore();
+
+        /// <summary>
+        /// Worker-node event loop for multi-node tensor parallelism. Blocks,
+        /// mirroring the driver's op stream (forward / refill / reset) so this
+        /// node contributes its weight shards to every AllReduce, until the
+        /// driver broadcasts shutdown (or the connection drops). Returns
+        /// immediately on single-node groups.
+        /// </summary>
+        public void RunDistributedWorkerLoop()
+        {
+            if (_tpGroup == null || _tpGroup.NodeCount <= 1)
+                return;
+
+            Console.WriteLine(
+                $"[TP worker] ready — mirroring driver forward passes (global rank offset {_tpGroup.GlobalRankOffset}).");
+
+            try
+            {
+                while (true)
+                {
+                    var (op, payload) = _tpGroup.ReceiveControl();
+                    switch (op)
+                    {
+                        case TpControlForward:       ForwardCore(payload); break;
+                        case TpControlForwardRefill: ForwardRefillCore(payload); break;
+                        case TpControlReset:         ResetKVCacheCore(); break;
+                        case TpControlTruncate:      TruncateKVCacheCore(payload.Length > 0 ? payload[0] : 0); break;
+                        case TpControlShutdown:
+                            Console.WriteLine("[TP worker] shutdown received; exiting worker loop.");
+                            return;
+                        default:
+                            throw new InvalidOperationException($"Unknown TP control op {op}.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[TP worker] loop ended: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Driver-side shutdown: tell worker nodes to leave their loops. Safe to
+        /// call when not the driver (no-op). Invoked from Dispose so every exit
+        /// path releases the workers.
+        /// </summary>
+        private void SignalDistributedWorkersShutdown()
+        {
+            if (!_distributedDriver) return;
+            try { _tpGroup.BroadcastControl(TpControlShutdown, Array.Empty<int>()); }
+            catch { /* workers may already be gone; ignore */ }
+            _distributedDriver = false;
+        }
 
         // Pipelined greedy decode (overridden by models that support it,
         // e.g. Qwen35Model on MLX). When SupportsPipelinedGreedy is true,
@@ -3584,8 +4528,20 @@ namespace TensorSharp.Models
             }
 
             int safeToken = (Config?.VocabSize ?? 0) > 1 ? 1 : 0;
+
+            if (_tpGroup != null && _tpGroup.NodeCount > 1)
+            {
+                Console.WriteLine("  Waiting for all nodes to finish loading...");
+                _tpGroup.Barrier();
+            }
+
+            Console.WriteLine("  Warming up kernels (decode + prefill)...");
+
+            long decodeStart = Stopwatch.GetTimestamp();
             Forward(new[] { safeToken });
             ResetKVCache();
+            double decodeMs = (Stopwatch.GetTimestamp() - decodeStart) * 1000.0 / Stopwatch.Frequency;
+            Console.WriteLine($"    Decode warmup: {decodeMs:F1} ms");
 
             // Prime the MULTI-TOKEN prefill path. The 1-token Forward above only
             // warms the decode-shaped graph; on CUDA/GGML a real prompt takes the
@@ -3685,8 +4641,11 @@ namespace TensorSharp.Models
 
                 try
                 {
+                    long prefillStart = Stopwatch.GetTimestamp();
                     ForwardRefill(warmupPrompt);
                     Forward(new[] { safeToken });
+                    double prefillMs = (Stopwatch.GetTimestamp() - prefillStart) * 1000.0 / Stopwatch.Frequency;
+                    Console.WriteLine($"    Prefill warmup ({warmupLength} tokens): {prefillMs:F1} ms");
                 }
                 catch (Exception ex)
                 {
@@ -3862,7 +4821,13 @@ namespace TensorSharp.Models
         /// Subsequent Forward calls will append starting at this position.
         /// Subclasses MUST override to invalidate device (GPU/Metal) caches.
         /// </summary>
-        public virtual void TruncateKVCache(int tokenCount)
+        public void TruncateKVCache(int tokenCount)
+        {
+            if (_distributedDriver) _tpGroup.BroadcastControl(TpControlTruncate, new[] { tokenCount });
+            TruncateKVCacheCore(tokenCount);
+        }
+
+        protected virtual void TruncateKVCacheCore(int tokenCount)
         {
             Console.WriteLine($"[KV cache] Truncating from {_cacheSeqLen} to {tokenCount}");
             _cacheSeqLen = tokenCount;
@@ -4048,6 +5013,11 @@ namespace TensorSharp.Models
 
         public virtual void Dispose()
         {
+            // Release any distributed worker nodes before tearing down the TP
+            // group, so every driver exit path (normal or exception) lets the
+            // workers leave their loops cleanly.
+            SignalDistributedWorkersShutdown();
+
             if (MultimodalInjector is IDisposable multimodalInjector)
                 multimodalInjector.Dispose();
 
@@ -4098,26 +5068,44 @@ namespace TensorSharp.Models
 
             _gguf?.Dispose();
 
+            // Dispose TP sharded weights.
+            foreach (var shards in _tpQuantWeights.Values)
+                foreach (var qw in shards) qw?.Dispose();
+            _tpQuantWeights.Clear();
+
+            foreach (var shards in _tpWeights.Values)
+                foreach (var w in shards) w?.Dispose();
+            _tpWeights.Clear();
+
+            _tpGroup?.Dispose();
+
             if (_allocator is IDisposable allocatorDisposable)
                 allocatorDisposable.Dispose();
         }
 
-        public static ModelBase Create(string ggufPath, BackendType backend)
+        public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
         {
+            if (tpGroup == null && tpDegree <= 1)
+            {
+                string envTp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
+                if (int.TryParse(envTp, out int envTpDegree) && envTpDegree > 1)
+                    tpDegree = envTpDegree;
+            }
+
             using var probe = new GgufFile(ggufPath);
             string arch = probe.GetString("general.architecture") ?? "qwen3";
 
             return arch switch
             {
-                "qwen3" => new Qwen3Model(ggufPath, backend),
-                "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend),
-                "gemma3" => new Gemma3Model(ggufPath, backend),
-                "gemma4" => new Gemma4Model(ggufPath, backend),
+                "qwen3" => new Qwen3Model(ggufPath, backend, tpDegree, tpGroup),
+                "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend, tpDegree, tpGroup),
+                "gemma3" => new Gemma3Model(ggufPath, backend, tpDegree, tpGroup),
+                "gemma4" => new Gemma4Model(ggufPath, backend, tpDegree, tpGroup),
                 "diffusion-gemma" or "diffusion_gemma" => new DiffusionGemmaModel(ggufPath, backend),
                 "qwen_image" or "qwen-image" => new QwenImage.QwenImageModel(ggufPath, backend),
-                "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend),
-                "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend),
-                "mistral3" => new Mistral3Model(ggufPath, backend),
+                "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend, tpDegree, tpGroup),
+                "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend, tpDegree, tpGroup),
+                "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };
         }

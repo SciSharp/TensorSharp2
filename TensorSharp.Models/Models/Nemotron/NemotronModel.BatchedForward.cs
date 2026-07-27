@@ -79,7 +79,7 @@ namespace TensorSharp.Models
         /// the <c>TS_NEMO_BATCHED</c> opt-out so <c>ExecutionPlanner</c>
         /// routes to the per-seq fallback up front instead of via a
         /// NotSupportedException round trip.</summary>
-        public bool BatchedForwardAvailable => NemoBatchedOptIn();
+        public bool BatchedForwardAvailable => NemoBatchedOptIn() && !IsTensorParallel;
 
         // ----- Phase 2: per-layer paged K/V + per-slot Mamba2 state pool -----
         //

@@ -341,8 +341,8 @@ namespace TensorSharp.Models
         private long _mlxEvalBoundaryTicks;
         private long _mlxCacheEvalTicks;
 
-        public Qwen35Model(string ggufPath, BackendType backend)
-            : base(ggufPath, backend)
+        public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+            : base(ggufPath, backend, tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "qwen35";
             Config = new ModelConfig { Architecture = arch };
@@ -435,12 +435,28 @@ namespace TensorSharp.Models
             DetectMoeLayers();
             BuildLayerKeys();
             InitMoeBuffers();
-            PrepareCudaQuantizedWeightsForInference();
+
+            if (IsTensorParallel)
+            {
+                ValidateTpConstraints();
+                ShardQwen35WeightsForTP();
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            }
+            else
+            {
+                PrepareCudaQuantizedWeightsForInference();
+            }
+
             int maxContextLength = ResolveConfiguredContextLength();
             int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
             if (initialCacheLength < maxContextLength)
                 Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
-            InitCaches(initialCacheLength, maxContextLength);
+
+            if (IsTensorParallel)
+                InitTpCaches(initialCacheLength, maxContextLength);
+            else
+                InitCaches(initialCacheLength, maxContextLength);
+
             PrecomputeRoPE();
             InitGDNBuffers();
             CacheRecurrentWeights();
@@ -450,46 +466,159 @@ namespace TensorSharp.Models
         private unsafe void FuseAttentionProjectionWeights()
         {
             int fused = 0;
+            int fusedF32 = 0;
             for (int layer = 0; layer < TotalLayerCount; layer++)
             {
                 if (_isRecurrent[layer])
                     continue;
 
                 string prefix = $"blk.{layer}.";
-                if (TryFuseWeights(prefix + "attn_qkv.weight", keepSources: false,
+                string[] sources =
+                {
                     prefix + "attn_q.weight",
                     prefix + "attn_k.weight",
-                    prefix + "attn_v.weight"))
+                    prefix + "attn_v.weight",
+                };
+                if (TryFuseWeights(prefix + "attn_qkv.weight", keepSources: false, sources))
                 {
                     fused++;
+                }
+                else if (!IsTensorParallel &&
+                         TryFuseWeightsToFloat32(prefix + "attn_qkv.weight", sources))
+                {
+                    // Mixed quant types (e.g. UD-Q4_K_XL) prevent in-place quant
+                    // fusion; dequantize to F32 so the fused key exists for the
+                    // non-TP layer-key cache. Under TP the shard path reads the
+                    // separate Q/K/V weights directly (ShardSeparateColumnParallel),
+                    // avoiding a full-model F32 intermediate that can OOM.
+                    for (int i = 0; i < sources.Length; i++)
+                    {
+                        if (_quantWeights.Remove(sources[i], out var qw))
+                            qw.Dispose();
+                        else if (_weights.Remove(sources[i], out var w))
+                            w.Dispose();
+                    }
+                    fusedF32++;
                 }
             }
 
             if (fused > 0)
                 Console.WriteLine($"  Fused projections: {fused} Q+K+V");
+            if (fusedF32 > 0)
+                Console.WriteLine($"  Fused projections: {fusedF32} Q+K+V (dequantized to F32; mixed source quant types)");
         }
 
         private unsafe void FuseRecurrentInputWeights()
         {
             int fused = 0;
+            int fusedF32 = 0;
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 if (!_isRecurrent[layer])
                     continue;
 
                 string prefix = $"blk.{layer}.";
-                if (TryFuseWeights(prefix + "ssm_in_proj.weight", keepSources: true,
+                string[] sources =
+                {
                     prefix + "attn_qkv.weight",
                     prefix + "attn_gate.weight",
                     prefix + "ssm_beta.weight",
-                    prefix + "ssm_alpha.weight"))
+                    prefix + "ssm_alpha.weight",
+                };
+                if (TryFuseWeights(prefix + "ssm_in_proj.weight", keepSources: true, sources))
                 {
                     fused++;
+                }
+                else if (IsTensorParallel &&
+                         TryFuseWeightsToFloat32(prefix + "ssm_in_proj.weight", sources))
+                {
+                    // The same-type quant fusion can't run when the sources have
+                    // mismatched ggml types — e.g. an aggressively quantized model
+                    // (IQ2_XXS/…) whose ssm_beta/ssm_alpha stay F32 while attn_qkv
+                    // is 2-bit. The fused ssm_in_proj is only consumed by the TP
+                    // recurrent path (non-TP uses the separate source weights), so
+                    // build an F32 pack there instead of leaving it missing (which
+                    // crashed TP with "ssm_in_proj not found in sharded weights").
+                    fusedF32++;
                 }
             }
 
             if (fused > 0)
                 Console.WriteLine($"  Fused projections: {fused} recurrent input packs");
+            if (fusedF32 > 0)
+                Console.WriteLine($"  Fused projections: {fusedF32} recurrent input packs (dequantized to F32 for TP; mixed source quant types)");
+        }
+
+        /// <summary>
+        /// Build a fused projection as one F32 tensor by dequantizing (quantized
+        /// sources) or copying (F32 sources) each in order along the output
+        /// dimension. Fallback for <see cref="TryFuseWeights"/> when the sources
+        /// have mismatched ggml types and cannot be packed in-place. Sources are
+        /// left in place. Returns false if any source is absent or the input
+        /// dimensions disagree. The result is F32, so this trades memory for
+        /// compatibility — used only where the fused pack is required (TP).
+        /// </summary>
+        private unsafe bool TryFuseWeightsToFloat32(string fusedName, params string[] weightNames)
+        {
+            if (weightNames == null || weightNames.Length < 2)
+                return false;
+
+            int inDim = -1;
+            long totalRows = 0;
+            var quant = new QuantizedWeight[weightNames.Length];
+            var f32 = new Tensor[weightNames.Length];
+            for (int i = 0; i < weightNames.Length; i++)
+            {
+                if (_quantWeights.TryGetValue(weightNames[i], out quant[i]))
+                {
+                    int d = (int)quant[i].Ne0;
+                    if (inDim < 0) inDim = d; else if (inDim != d) return false;
+                    totalRows += quant[i].Ne1;
+                }
+                else if (_weights.TryGetValue(weightNames[i], out f32[i]))
+                {
+                    int d = (int)f32[i].Sizes[1];
+                    if (inDim < 0) inDim = d; else if (inDim != d) return false;
+                    totalRows += f32[i].Sizes[0];
+                }
+                else
+                {
+                    return false; // missing source
+                }
+            }
+
+            var fused = new Tensor(_allocator, DType.Float32, totalRows, inDim);
+            float* dstBase = GetFloatPtr(fused);
+            long rowOffset = 0;
+            for (int i = 0; i < weightNames.Length; i++)
+            {
+                if (quant[i] != null)
+                {
+                    var qw = quant[i];
+                    long rowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                    byte* srcBase = (byte*)qw.Data.ToPointer();
+                    for (long row = 0; row < qw.Ne1; row++)
+                        NativeDequant.DequantizeToFloat32Native(
+                            qw.GgmlType,
+                            (IntPtr)(srcBase + row * rowBytes),
+                            (IntPtr)(dstBase + (rowOffset + row) * inDim),
+                            inDim);
+                    rowOffset += qw.Ne1;
+                }
+                else
+                {
+                    var w = f32[i];
+                    long rows = w.Sizes[0];
+                    float* srcPtr = GetFloatPtr(w);
+                    long bytes = rows * inDim * sizeof(float);
+                    Buffer.MemoryCopy(srcPtr, dstBase + rowOffset * inDim, bytes, bytes);
+                    rowOffset += rows;
+                }
+            }
+
+            InvalidateTensorDeviceCache(fused);
+            _weights[fusedName] = fused;
+            return true;
         }
 
         private unsafe bool TryFuseWeights(string fusedName, bool keepSources, params string[] weightNames)
@@ -999,8 +1128,18 @@ namespace TensorSharp.Models
         protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
             => !_stackedExpertMemberNames.Contains(weightName);
 
-        public override void ResetKVCache()
+        protected override void ResetKVCacheCore()
         {
+            if (IsTensorParallel)
+            {
+                ResetTpKVCache();
+                _cacheSeqLen = 0;
+                _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
+                _forwardCount = 0;
+                _forwardSw.Reset();
+                return;
+            }
+
             for (int l = 0; l < TotalLayerCount; l++)
             {
                 if (!_isRecurrent[l])
@@ -1696,13 +1835,19 @@ namespace TensorSharp.Models
             }
         }
 
-        public override float[] ForwardRefill(int[] tokens)
+        protected override float[] ForwardRefillCore(int[] tokens)
         {
             // Prefill runs the recurrent state on the host; re-seed the fused
             // decode's device-resident GDN state afterwards.
             InvalidateFullDecodeState();
             if (tokens == null || tokens.Length <= 1)
-                return Forward(tokens);
+                return ForwardCore(tokens);
+
+            // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
+            // layer loop and non-sharded weights, which are unavailable under
+            // tensor parallelism. Route through ForwardCore → ForwardTP instead.
+            if (IsTensorParallel)
+                return ForwardCore(tokens);
 
             // Multimodal embeddings carry positions relative to the current
             // Forward call's hidden tensor; chunked prefill would need to
@@ -1712,7 +1857,7 @@ namespace TensorSharp.Models
             int lastIdx = tokens.Length - 1;
 
             if (hasMultimodal || tokens.Length <= chunkSize)
-                return Forward(tokens);
+                return ForwardCore(tokens);
 
             for (int pos = 0; pos < lastIdx; pos += chunkSize)
             {
@@ -1721,7 +1866,7 @@ namespace TensorSharp.Models
                 Array.Copy(tokens, pos, chunk, 0, chunkLen);
                 PrefillWithoutLogits(chunk);
             }
-            return Forward(new[] { tokens[lastIdx] });
+            return ForwardCore(new[] { tokens[lastIdx] });
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -1767,8 +1912,11 @@ namespace TensorSharp.Models
             _forwardSw.Stop();
         }
 
-        public override float[] Forward(int[] tokens)
+        protected override float[] ForwardCore(int[] tokens)
         {
+            if (IsTensorParallel)
+                return ForwardTP(tokens);
+
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -3540,16 +3688,21 @@ namespace TensorSharp.Models
 
             // Cache position tensors across attention layers in the same forward pass.
             // All attention layers share (seqLen, startPos); only numHeads differs (Q vs K).
+            // Under TP the position tensor is a kernel input, so it must live on
+            // DATA's GPU. Only the default-allocator (rank 0 / single-GPU) copy is
+            // cached; other ranks build a fresh one on their own GPU per call.
             Tensor posTensor;
             bool isQ = (numHeads == Config.NumHeads);
+            var dataAlloc = data.Storage.Allocator;
+            bool onDefaultAlloc = ReferenceEquals(dataAlloc, _allocator);
 
-            if (_cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
+            if (onDefaultAlloc && _cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
             {
                 posTensor = isQ ? _cachedRoPEPosQ : _cachedRoPEPosK;
                 if (posTensor == null || (int)posTensor.Sizes[0] != seqLen * numHeads)
                     posTensor = null;
             }
-            else
+            else if (onDefaultAlloc)
             {
                 _cachedRoPEPosQ?.Dispose();
                 _cachedRoPEPosK?.Dispose();
@@ -3559,7 +3712,12 @@ namespace TensorSharp.Models
                 _cachedRoPEPosStartPos = startPos;
                 posTensor = null;
             }
+            else
+            {
+                posTensor = null; // per-rank GPU: never cached
+            }
 
+            bool freshForRank = false;
             if (posTensor == null)
             {
                 int totalRows = seqLen * numHeads;
@@ -3567,9 +3725,16 @@ namespace TensorSharp.Models
                 for (int s = 0; s < seqLen; s++)
                     for (int h = 0; h < numHeads; h++)
                         positions[s * numHeads + h] = startPos + s;
-                posTensor = CreateIntTensor(positions, totalRows);
-                if (isQ) _cachedRoPEPosQ = posTensor;
-                else _cachedRoPEPosK = posTensor;
+                posTensor = CreateIntTensorOn(dataAlloc, positions, totalRows);
+                if (onDefaultAlloc)
+                {
+                    if (isQ) _cachedRoPEPosQ = posTensor;
+                    else _cachedRoPEPosK = posTensor;
+                }
+                else
+                {
+                    freshForRank = true;
+                }
             }
 
             // In-place RoPE: avoids allocating a new tensor per call
@@ -3577,6 +3742,8 @@ namespace TensorSharp.Models
             Ops.RoPEEx(reshaped, reshaped, posTensor, ropeDim, 2, 0,
                 Config.RopeBase, 1.0f / Config.RopeScale,
                 0.0f, 1.0f, 0.0f, 0.0f);
+            if (freshForRank)
+                posTensor.Dispose();
             return data;
         }
 
@@ -5490,6 +5657,7 @@ namespace TensorSharp.Models
                 foreach (var cache in _mlxAttentionCache) cache?.Dispose();
 
             DisposeGdnState();
+            DisposeTpState();
 
             _moeTokenInput?.Dispose();
             _moeGateBuf?.Dispose();

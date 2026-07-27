@@ -46,8 +46,8 @@ namespace TensorSharp.Models.QwenImage
             LoadWeights();
         }
 
-        public override float[] Forward(int[] tokens) => throw new NotSupportedException();
-        public override void ResetKVCache() { }
+        protected override float[] ForwardCore(int[] tokens) => throw new NotSupportedException();
+        protected override void ResetKVCacheCore() { }
 
         /// <summary>
         /// Encode patchified pixel values into merged image embeddings.

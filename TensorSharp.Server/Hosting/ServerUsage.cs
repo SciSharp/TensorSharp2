@@ -171,6 +171,15 @@ namespace TensorSharp.Server.Hosting
                 new OptionHelp("--paged-kv-quant-bits <b>",
                     "Quantize spilled KV blocks: 0 (off), 4, or 8 bits. Default: 0.",
                     "--paged-kv-quant-bits 8"),
+                new OptionHelp("--paged-kv-redis-url <url>",
+                    "Redis connection string for a shared KV cache tier (e.g. localhost:6379). Default: disabled.",
+                    "--paged-kv-redis-url localhost:6379"),
+                new OptionHelp("--paged-kv-redis-ttl <min>",
+                    "TTL in minutes for Redis KV entries (0 = no TTL). Default: 1440.",
+                    "--paged-kv-redis-ttl 60"),
+                new OptionHelp("--redis-url <url>",
+                    "Redis connection string for both the KV cache tier and the Responses API store.",
+                    "--redis-url localhost:6379"),
             }),
             ("Scheduling", new[]
             {

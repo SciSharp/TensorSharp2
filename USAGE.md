@@ -153,6 +153,17 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prom
 # Compare hardcoded fallback templates against GGUF Jinja2 templates for every
 # *.gguf file in a directory (useful when adding new architectures)
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
+
+# Tensor parallelism: split a model across 2 CUDA GPUs in one process
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --backend cuda --tp 2
+
+# Distributed tensor parallelism: 2 nodes × 2 GPUs each (4 GPUs total)
+# Node 0:
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
+    --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+# Node 1:
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
+    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 ```
 
 **Command-line options:**
@@ -211,6 +222,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 | `--qwen-image-vl <path>` | Override the resolved Qwen2.5-VL-7B text-encoder GGUF. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen2.5-VL mmproj (vision grounding) GGUF. |
 | `--qwen-image-lora <path>` | Qwen-Image-Edit Lightning distillation LoRA (`.safetensors`), merged into the DiT at load time. Auto-derives the step count (e.g. 4 or 8) and switches CFG to 1.0. Env: `TS_QWEN_IMAGE_LORA`. |
+| `--tp <N>` | Tensor parallelism degree — split the model across N CUDA GPUs in a single process (default: `1`). Requires `--backend cuda`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
+| `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. Requires `--tp-peers`. |
+| `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. |
 | `--test` | Run built-in tokenizer + Qwen3 chat-template + ollama-comparison tests |
 | `--test-templates <dir>` | Validate hardcoded chat templates against GGUF Jinja2 templates for every *.gguf in `<dir>` |
 | `--config <path>` | Read options from a JSON config file (command-line options override it). Supports `${variables}` and auto-downloading models via `{ "path": ..., "urls": [...] }`. Repeatable. See [Configuration file](#configuration-file-cli--server). |
@@ -366,6 +380,9 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--paged-kv-ssd-dir <dir>` | Legacy standalone paged-KV SSD cold-tier directory. |
 | `--paged-kv-ssd-mb <N>` | Legacy standalone paged-KV SSD cap. |
 | `--paged-kv-quant-bits <0\|4\|8>` | Legacy standalone paged-KV block quantization accepted by the server (`4`/`8` = symmetric). The runtime env var also accepts `2` for affine min+scale, and the CLI accepts `0\|2\|4\|8`. |
+| `--redis-url <url>` | Redis connection string enabling both the shared KV cache tier and the Responses API store (e.g. `localhost:6379`). Sets both `TS_KV_CACHE_REDIS_URL` and `TS_RESPONSES_STORE_REDIS_URL`. |
+| `--paged-kv-redis-url <url>` | Redis connection string for the shared KV cache tier only (e.g. `localhost:6379`). Env: `TS_KV_CACHE_REDIS_URL`. |
+| `--paged-kv-redis-ttl <min>` | TTL in minutes for Redis KV cache entries; `0` = no TTL (default: `1440`, i.e. 24 hours). Env: `TS_KV_CACHE_REDIS_TTL_MINUTES`. |
 
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
 `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`,
@@ -392,6 +409,12 @@ server-wide defaults; the defaults only fill in fields the client omits.
 | `TENSORSHARP_LOG_LEVEL` | Minimum log level for both console and file loggers: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` (default: `Information`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
+| `TENSORSHARP_TP_DEGREE` | Tensor parallelism degree — number of local CUDA GPUs to split the model across (default: `1`). Used by `TensorSharp.Server` (which has no `--tp` CLI flag) and as a fallback in `ModelBase.Create`. Requires `--backend cuda`. |
+| `TENSORSHARP_TP_NODE_ID` | This node's 0-based ID for multi-node distributed tensor parallelism. Must be set together with `TENSORSHARP_TP_PEERS`. |
+| `TENSORSHARP_TP_PEERS` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Must be set together with `TENSORSHARP_TP_NODE_ID`. |
+| `TS_KV_CACHE_REDIS_URL` | Redis connection string for the shared KV cache tier (e.g. `localhost:6379`). When set, KV cache blocks are persisted to Redis for cross-session reuse. CLI: `--redis-url` or `--paged-kv-redis-url`. |
+| `TS_KV_CACHE_REDIS_TTL_MINUTES` | TTL in minutes for Redis KV cache entries; `0` = no TTL (default: `1440`). CLI: `--paged-kv-redis-ttl`. |
+| `TS_RESPONSES_STORE_REDIS_URL` | Redis connection string for the OpenAI Responses API store. When set, `RedisResponsesStore` replaces the in-memory store. CLI: `--redis-url`. |
 | `DIFFUSION_STEPS` | Server-side DiffusionGemma denoising steps per block (default: `48`; CLI equivalent is `--diffusion-steps`) |
 | `DIFFUSION_MAX_BATCH` | Maximum concurrent DiffusionGemma requests batched by the Web UI diffusion scheduler (default: `2`) |
 
@@ -467,6 +490,107 @@ Sampling parameter precedence (highest wins):
 3. `TENSORSHARP_*` environment variables listed above.
 4. Built-in `SamplingConfig` defaults (`temperature=1.0`, `top_k=0`, `top_p=1.0`, `min_p=0`, `repeat_penalty=1.0`, presence/frequency penalties `0`, `seed=-1`, no stop sequences).
 
+## Tensor Parallelism & Distributed Inference
+
+TensorSharp supports **tensor parallelism (TP)** — splitting a single model across
+multiple GPUs using the Megatron-LM column/row-parallel pattern — and
+**distributed (multi-node) tensor parallelism**, where TP spans multiple
+machines connected over a TCP peer-to-peer network.
+
+### Local tensor parallelism (single process, multiple GPUs)
+
+Split the model across N CUDA GPUs within one process. Each GPU holds `1/N` of
+the sharded weights (column-parallel QKV/gate/up, row-parallel output/down) plus
+a full copy of replicated weights (norms, embeddings, LM head). Per-GPU KV
+caches are independent; AllReduce (via CUDA P2P copies + elementwise-add kernel)
+reconverges the hidden state after each row-parallel projection.
+
+```bash
+# CLI: 2-GPU tensor parallelism
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2
+
+# Server: via environment variable (the server has no --tp CLI flag)
+TENSORSHARP_TP_DEGREE=2 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model <model.gguf> --backend cuda
+
+# Config JSON
+{ "tp": 2, "backend": "cuda", "model": "<model.gguf>" }
+```
+
+### Distributed tensor parallelism (multi-node, peer-to-peer TCP)
+
+Distribute TP across multiple machines. Each node runs its own process with its
+own local GPUs; nodes communicate over a TCP mesh using a length-prefixed
+framing protocol. AllReduce is hierarchical: local P2P within each node, then
+TCP across node representatives, then broadcast back — minimizing network
+traffic to `1/tp_local` of the data per collective.
+
+```bash
+# 2 nodes × 2 GPUs each (4 GPUs total)
+# Node 0:
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
+    --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+
+# Node 1:
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
+    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+
+# Server: via environment variables
+# Node 0:
+TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=0 \
+TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
+    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda
+
+# Node 1:
+TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=1 \
+TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
+    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda
+
+# Config JSON (per node)
+{ "tp": 2, "tp-node-id": 0, "tp-peers": "192.168.1.10:9500,192.168.1.11:9500", "backend": "cuda" }
+```
+
+Every node must use the same `--tp-peers` list (or `TENSORSHARP_TP_PEERS` env
+var) and a unique `--tp-node-id` (or `TENSORSHARP_TP_NODE_ID`). The port
+(`9500` in the examples) is not a default — it must be specified explicitly and
+must be reachable between all nodes.
+
+### Supported architectures
+
+| Architecture | TP status | Notes |
+|---|---|---|
+| Qwen 3 | ✅ | Reference implementation |
+| Mistral 3 | ✅ | Fused/separate QKV, YaRN RoPE |
+| Gemma 3 | ✅ | Separate Q/K/V, GELU, sliding window |
+| Gemma 4 | ✅ | Dense + MoE expert slicing, per-layer head dims |
+| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership, MoE expert slicing |
+| GPT OSS | ✅ | MoE expert slicing, attention sinks, YaRN |
+| Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing |
+| DiffusionGemma | — | Not applicable (diffusion model) |
+| Qwen-Image-Edit | — | Not applicable (image generation) |
+
+### Constraints
+
+- **CUDA backend only** (`--backend cuda`). GGML, MLX, and Vulkan backends are single-device by design.
+- `numHeads`, `numKVHeads`, and `intermediateSize` must be divisible by the TP degree.
+- Quantized row-parallel splits require `ne0` divisible by `tp × blockSize`.
+- Batched/continuous-batching forward under TP is implemented for Qwen 3 and Mistral 3; MoE models (Gemma 4, Qwen 3.5/3.6, GPT OSS, Nemotron-H) fall back to per-sequence forward under TP.
+
+### Redis-backed shared state
+
+The server can optionally persist KV cache blocks and the OpenAI Responses API
+store to Redis, enabling cross-session KV reuse and durable response storage:
+
+```bash
+# Enable Redis for both KV cache and Responses API
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda \
+    --redis-url localhost:6379
+
+# KV cache tier only, with a 12-hour TTL
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda \
+    --paged-kv-redis-url localhost:6379 --paged-kv-redis-ttl 720
+```
+
 ## Feature × environment variable matrix
 
 Quick reference for which environment variables (and matching CLI flags) gate each major feature. Variables in **bold** are required to turn the feature on; everything else is a tunable for a feature that's already enabled by default.
@@ -506,6 +630,22 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Gemma 4 fused verify / draft kernels (ggml) | ON | `TS_GMTP_NO_FUSED=1` falls back to per-op | — |
 | Gemma 4 dense fast rollback on partial accept | ON | `TS_GMTP_NO_FAST_ROLLBACK=1` restores kept-prefix rollback | — |
 | Gemma 4 verify trunk path | linear (solo) | `TS_GMTP_BATCHED_TRUNK=1` runs the batched paged trunk | — |
+
+#### Tensor parallelism & distributed inference
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Local tensor parallelism (multi-GPU, single process) | OFF (`1` GPU) | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N` (CLI only) |
+| Distributed TP node ID (multi-node) | unset (disabled) | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N` (CLI only) |
+| Distributed TP peer endpoints | unset (disabled) | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2` (CLI only) |
+
+#### Redis shared state (server)
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Redis KV cache tier | OFF | **`TS_KV_CACHE_REDIS_URL`** | `--redis-url` or `--paged-kv-redis-url` |
+| Redis KV cache entry TTL | `1440` min (24 h) | `TS_KV_CACHE_REDIS_TTL_MINUTES` (`0` = no TTL) | `--paged-kv-redis-ttl` |
+| Redis Responses API store | OFF (in-memory) | **`TS_RESPONSES_STORE_REDIS_URL`** | `--redis-url` |
 
 #### Backends
 

@@ -25,6 +25,7 @@ using TensorSharp.Server.Hosting;
 using TensorSharp.Server.Logging;
 using TensorSharp.Server.ProtocolAdapters;
 using TensorSharp.Server.Responses;
+using TensorSharp.Runtime.Redis;
 
 const string ListenAddress = "http://0.0.0.0:5000";
 const long MaxRequestBodyBytes = 500L * 1024L * 1024L;
@@ -72,6 +73,10 @@ string configuredBackendInput = ServerOptionsBuilder.ReadConfiguredBackendInput(
 // Translate --paged-kv* flags into env vars before startup logging reads
 // PagedKvCacheConfig.FromEnvironment().
 bool pagedKvFlagsApplied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(args);
+// Translate --redis-url into TS_KV_CACHE_REDIS_URL and
+// TS_RESPONSES_STORE_REDIS_URL so a single flag enables Redis for both the
+// paged KV cache tier and the Responses API store.
+bool redisFlagsApplied = ServerOptionsBuilder.ApplyRedisCliFlags(args);
 // Translate --continuous-batching / --no-continuous-batching into env vars
 // that gate BatchExecutor (TS_SCHED_DISABLE_BATCHED) and Qwen3.5 ForwardBatch
 // (TS_QWEN35_BATCHED). Must run before InferenceEngine constructs its
@@ -131,7 +136,22 @@ builder.Services.AddTensorSharpRequestLogging(options =>
 builder.Services.AddSingleton<WebUiAdapter>();
 builder.Services.AddSingleton<OllamaAdapter>();
 builder.Services.AddSingleton<OpenAIChatAdapter>();
-builder.Services.AddSingleton<IResponsesStore, InMemoryResponsesStore>();
+// Responses API store: use Redis when TS_RESPONSES_STORE_REDIS_URL is set,
+// otherwise fall back to the bounded in-memory cache.
+string responsesRedisUrl = Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL")?.Trim();
+if (!string.IsNullOrEmpty(responsesRedisUrl))
+{
+    builder.Services.AddSingleton<IResponsesStore>(sp =>
+    {
+        var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.Responses.RedisResponsesStore");
+        var redis = new RedisConnection(responsesRedisUrl, logger);
+        return new RedisResponsesStore(redis, logger);
+    });
+}
+else
+{
+    builder.Services.AddSingleton<IResponsesStore, InMemoryResponsesStore>();
+}
 builder.Services.AddSingleton<OpenAIResponsesAdapter>();
 
 WebRootSetup.Resolve(builder.Environment, baseDirectory);
@@ -153,6 +173,14 @@ if (pagedKvFlagsApplied)
         pagedCfg.Enabled, pagedCfg.BlockSize, pagedCfg.MaxRamBytes / (1024 * 1024),
         string.IsNullOrEmpty(pagedCfg.SsdDirectory) ? "(disabled)" : pagedCfg.SsdDirectory,
         pagedCfg.MaxSsdBytes / (1024 * 1024));
+}
+
+if (redisFlagsApplied)
+{
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Redis configured via CLI: kvCacheUrl={KvRedisUrl} responsesStoreUrl={ResponsesRedisUrl}",
+        Environment.GetEnvironmentVariable("TS_KV_CACHE_REDIS_URL") ?? "(disabled)",
+        Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL") ?? "(disabled)");
 }
 
 if (mtpSpecFlagsApplied)

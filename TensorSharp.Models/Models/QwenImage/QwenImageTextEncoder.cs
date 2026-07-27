@@ -283,9 +283,9 @@ namespace TensorSharp.Models.QwenImage
             return dst;
         }
 
-        public override float[] Forward(int[] tokens) =>
+        protected override float[] ForwardCore(int[] tokens) =>
             throw new NotSupportedException("Use EncodeHidden().");
-        public override void ResetKVCache() { }
+        protected override void ResetKVCacheCore() { }
 
         // ---- fused whole-trunk path (TSGgml_QwenTeTrunk) --------------------------------
         // The per-op loop above pays ~10 device<->host round-trips per layer (M-RoPE, bias

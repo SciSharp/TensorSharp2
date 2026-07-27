@@ -27,7 +27,7 @@ namespace TensorSharp.Models
     /// - Tied token embedding / output weights
     /// - Final logit softcapping (model-dependent)
     /// </summary>
-    public class Gemma3Model : ModelBase
+    public partial class Gemma3Model : ModelBase
     {
         private const int GlobalCacheInterval = 6;
 
@@ -50,7 +50,7 @@ namespace TensorSharp.Models
         private Gemma3VisionEncoder _visionEncoder;
         private List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
 
-        public Gemma3Model(string ggufPath, BackendType backend) : base(ggufPath, backend)
+        public Gemma3Model(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null) : base(ggufPath, backend, tpDegree, tpGroup)
         {
             Config = new ModelConfig { Architecture = _gguf.GetString("general.architecture") };
             ParseBaseConfig();
@@ -86,9 +86,31 @@ namespace TensorSharp.Models
                 Console.WriteLine("  Output tied to token_embd.weight");
 
             FuseGateUpWeights();
-            PrepareCudaQuantizedWeightsForInference();
+
+            if (IsTensorParallel)
+            {
+                ShardGemma3WeightsForTP();
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            }
+            else
+            {
+                PrepareCudaQuantizedWeightsForInference();
+            }
+
             PrecomputeRoPE();
-            InitKVCache(ResolveConfiguredContextLength());
+
+            int maxContextLength = ResolveConfiguredContextLength();
+            if (IsTensorParallel)
+            {
+                int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+                if (initialCacheLength < maxContextLength)
+                    Console.WriteLine($"Initial {_backend} TP KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
+                InitTpKVCache(initialCacheLength, maxContextLength);
+            }
+            else
+            {
+                InitKVCache(maxContextLength);
+            }
         }
 
         private bool IsGlobalLayer(int layer) => (layer + 1) % GlobalCacheInterval == 0;
@@ -126,7 +148,7 @@ namespace TensorSharp.Models
             }
         }
 
-        public override void ResetKVCache()
+        protected override void ResetKVCacheCore()
         {
             _cacheSeqLen = 0;
             if (_kvCacheK != null)
@@ -140,11 +162,17 @@ namespace TensorSharp.Models
                     ResetCacheTensor(v);
                 }
             }
+            if (_tpKvCacheK != null)
+                foreach (var layer in _tpKvCacheK)
+                    foreach (var k in layer) ResetCacheTensor(k);
+            if (_tpKvCacheV != null)
+                foreach (var layer in _tpKvCacheV)
+                    foreach (var v in layer) ResetCacheTensor(v);
         }
 
-        public override void TruncateKVCache(int tokenCount)
+        protected override void TruncateKVCacheCore(int tokenCount)
         {
-            base.TruncateKVCache(tokenCount);
+            base.TruncateKVCacheCore(tokenCount);
             if (_kvCacheK != null)
             {
                 foreach (var k in _kvCacheK)
@@ -152,6 +180,12 @@ namespace TensorSharp.Models
                 foreach (var v in _kvCacheV)
                     InvalidateTensorDeviceCache(v);
             }
+            if (_tpKvCacheK != null)
+                foreach (var layer in _tpKvCacheK)
+                    foreach (var k in layer) InvalidateTensorDeviceCache(k);
+            if (_tpKvCacheV != null)
+                foreach (var layer in _tpKvCacheV)
+                    foreach (var v in layer) InvalidateTensorDeviceCache(v);
         }
 
         public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
@@ -202,8 +236,11 @@ namespace TensorSharp.Models
 
         public Gemma3VisionEncoder VisionEncoder => _visionEncoder;
 
-        public override float[] Forward(int[] tokens)
+        protected override float[] ForwardCore(int[] tokens)
         {
+            if (IsTensorParallel)
+                return ForwardTP(tokens);
+
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -518,7 +555,7 @@ namespace TensorSharp.Models
             for (int s = 0; s < seqLen; s++)
                 for (int h = 0; h < numHeads; h++)
                     positions[s * numHeads + h] = startPos + s;
-            using var posTensor = CreateIntTensor(positions, totalRows);
+            using var posTensor = CreateIntTensorOn(data.Storage.Allocator, positions, totalRows);
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
             Tensor result = Ops.RoPEEx(
@@ -641,6 +678,12 @@ namespace TensorSharp.Models
                 foreach (var k in _kvCacheK) k?.Dispose();
             if (_kvCacheV != null)
                 foreach (var v in _kvCacheV) v?.Dispose();
+            if (_tpKvCacheK != null)
+                foreach (var layer in _tpKvCacheK)
+                    foreach (var t in layer) t?.Dispose();
+            if (_tpKvCacheV != null)
+                foreach (var layer in _tpKvCacheV)
+                    foreach (var t in layer) t?.Dispose();
             base.Dispose();
         }
     }

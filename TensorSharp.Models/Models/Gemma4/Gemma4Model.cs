@@ -392,7 +392,7 @@ namespace TensorSharp.Models
             _pendingAudioEmbeddingsList.Add((embeddings, insertPosition));
         }
 
-        public Gemma4Model(string ggufPath, BackendType backend) : base(ggufPath, backend)
+        public Gemma4Model(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null) : base(ggufPath, backend, tpDegree, tpGroup)
         {
             Config = new ModelConfig { Architecture = _gguf.GetString("general.architecture") };
             ParseBaseConfig();
@@ -489,13 +489,29 @@ namespace TensorSharp.Models
             FuseGateUpWeights();
             FuseExpertGateUpWeights();
             CacheMoEStackedWeights();
-            PrepareCudaQuantizedWeightsForInference();
+
+            if (IsTensorParallel)
+            {
+                ValidateGemma4TpConstraints();
+                ShardGemma4WeightsForTP();
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            }
+            else
+            {
+                PrepareCudaQuantizedWeightsForInference();
+            }
+
             PrecomputeRoPE();
             int maxContextLength = ResolveConfiguredContextLength();
             int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
             if (initialCacheLength < maxContextLength)
                 Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens for global layers (grows on demand up to {maxContextLength}).");
-            InitKVCache(initialCacheLength, maxContextLength);
+
+            if (IsTensorParallel)
+                InitGemma4TpKVCache(initialCacheLength, maxContextLength);
+            else
+                InitKVCache(initialCacheLength, maxContextLength);
+
             BuildGemma4DecodeArrays();
         }
 
@@ -850,7 +866,7 @@ namespace TensorSharp.Models
             }
         }
 
-        public override void ResetKVCache()
+        protected override void ResetKVCacheCore()
         {
             _cacheSeqLen = 0;
             _kvCacheHostDirty = false;
@@ -876,11 +892,11 @@ namespace TensorSharp.Models
             }
         }
 
-        public override void TruncateKVCache(int tokenCount)
+        protected override void TruncateKVCacheCore(int tokenCount)
         {
             DisposeSwaPrevWindows();
             EnsureKvCacheHostSynchronized();
-            base.TruncateKVCache(tokenCount);
+            base.TruncateKVCacheCore(tokenCount);
             _kvCacheHostDirty = false;
             if (_kvCacheK == null) return;
             var invalidated = new HashSet<int>();
@@ -1085,8 +1101,11 @@ namespace TensorSharp.Models
             _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));
         }
 
-        public override float[] Forward(int[] tokens)
+        protected override float[] ForwardCore(int[] tokens)
         {
+            if (IsTensorParallel)
+                return ForwardTP(tokens);
+
             // On MLX, every public op routes through MlxWorker.Shared.Invoke
             // which costs ~25┬Ás per round-trip. Decode dispatches ~600 MLX
             // calls per token across 42 layers, so the per-call hand-off
@@ -1095,11 +1114,11 @@ namespace TensorSharp.Models
             // IsOnWorkerThread and run inline, eliminating ~15 ms / token of
             // queue overhead. Other backends are unaffected.
             if (_backend == BackendType.Mlx && !MlxWorker.Shared.IsOnWorkerThread)
-                return MlxWorker.Shared.Invoke(() => ForwardCore(tokens));
-            return ForwardCore(tokens);
+                return MlxWorker.Shared.Invoke(() => ForwardComputeCore(tokens));
+            return ForwardComputeCore(tokens);
         }
 
-        private float[] ForwardCore(int[] tokens)
+        private float[] ForwardComputeCore(int[] tokens)
         {
             _forwardSw.Start();
             int seqLen = tokens.Length;
@@ -1754,10 +1773,16 @@ namespace TensorSharp.Models
             return prefillChunkSize;
         }
 
-        public override float[] ForwardRefill(int[] tokens)
+        protected override float[] ForwardRefillCore(int[] tokens)
         {
             if (tokens == null || tokens.Length <= 1 || !_canUseFusedDecode)
-                return Forward(tokens);
+                return ForwardCore(tokens);
+
+            // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
+            // layer loop and non-sharded weights, which are unavailable under
+            // tensor parallelism. Route through ForwardCore → ForwardTP instead.
+            if (IsTensorParallel)
+                return ForwardCore(tokens);
 
             int lastIdx = tokens.Length - 1;
 
@@ -1788,13 +1813,13 @@ namespace TensorSharp.Models
                     Array.Copy(tokens, pos, chunk, 0, chunkLen);
                     PrefillWithoutLogits(chunk);
                 }
-                return Forward(new[] { tokens[lastIdx] });
+                return ForwardCore(new[] { tokens[lastIdx] });
             }
 
             var prefixTokens = new int[lastIdx];
             Array.Copy(tokens, prefixTokens, lastIdx);
             PrefillWithoutLogits(prefixTokens);
-            return Forward(new[] { tokens[lastIdx] });
+            return ForwardCore(new[] { tokens[lastIdx] });
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -4106,11 +4131,15 @@ namespace TensorSharp.Models
             string routerKey = $"blk.{layer}.ffn_gate_inp.weight";
             if (!_weights.ContainsKey(routerKey) && !_quantWeights.ContainsKey(routerKey))
                 return false;
-            // Check for expert weights (could be original 3D tensor or split per-expert)
+            // Check for expert weights (could be original 3D tensor or split per-expert).
+            // Under TP the per-expert weights are moved to _tpQuantWeights/_tpWeights
+            // during sharding, so also check those dictionaries.
             string downKey3D = $"blk.{layer}.ffn_down_exps.weight";
             string downKey0 = $"blk.{layer}.ffn_down_exps.0.weight";
             return _weights.ContainsKey(downKey3D) || _quantWeights.ContainsKey(downKey3D) ||
-                   _weights.ContainsKey(downKey0) || _quantWeights.ContainsKey(downKey0);
+                   _weights.ContainsKey(downKey0) || _quantWeights.ContainsKey(downKey0) ||
+                   _tpQuantWeights.ContainsKey(downKey3D) || _tpQuantWeights.ContainsKey(downKey0) ||
+                   _tpWeights.ContainsKey(downKey3D) || _tpWeights.ContainsKey(downKey0);
         }
 
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos,
@@ -6530,16 +6559,24 @@ namespace TensorSharp.Models
         {
             // Cache the position tensor: all local layers in a forward pass
             // share the same (seqLen, startPos), only numHeads differs (Q vs K).
+            // Under TP the position tensor is a kernel INPUT, so it must live on
+            // the same GPU as `data` — a shared GPU-0 copy read from a rank-1
+            // kernel is a cross-GPU access that faults without peer (A16 vGPU)
+            // or corrupts positions on no-P2P cards. Only the default-allocator
+            // (single-GPU / rank 0) copy is cached; other ranks build a fresh
+            // one on their own GPU and dispose it after use.
             Tensor posTensor;
             bool isQ = (numHeads == Config.NumHeads);
+            var dataAlloc = data.Storage.Allocator;
+            bool onDefaultAlloc = ReferenceEquals(dataAlloc, _allocator);
 
-            if (_cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
+            if (onDefaultAlloc && _cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
             {
                 posTensor = isQ ? _cachedRoPEPosQ : _cachedRoPEPosK;
                 if (posTensor == null || (int)posTensor.Sizes[0] != seqLen * numHeads)
                     posTensor = null;
             }
-            else
+            else if (onDefaultAlloc)
             {
                 _cachedRoPEPosQ?.Dispose();
                 _cachedRoPEPosK?.Dispose();
@@ -6549,7 +6586,12 @@ namespace TensorSharp.Models
                 _cachedRoPEPosStartPos = startPos;
                 posTensor = null;
             }
+            else
+            {
+                posTensor = null; // per-rank GPU: never cached, always fresh
+            }
 
+            bool freshForRank = false;
             if (posTensor == null)
             {
                 int totalRows = seqLen * numHeads;
@@ -6557,14 +6599,24 @@ namespace TensorSharp.Models
                 for (int s = 0; s < seqLen; s++)
                     for (int h = 0; h < numHeads; h++)
                         positions[s * numHeads + h] = startPos + s;
-                posTensor = CreateIntTensor(positions, totalRows);
-                if (isQ) _cachedRoPEPosQ = posTensor;
-                else _cachedRoPEPosK = posTensor;
+                posTensor = new Tensor(dataAlloc, DType.Int32, totalRows);
+                posTensor.SetElementsAsInt(positions);
+                if (onDefaultAlloc)
+                {
+                    if (isQ) _cachedRoPEPosQ = posTensor;
+                    else _cachedRoPEPosK = posTensor;
+                }
+                else
+                {
+                    freshForRank = true;
+                }
             }
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
             Ops.RoPEEx(reshaped, reshaped, posTensor, headDim, 2, 0,
                 ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            if (freshForRank)
+                posTensor.Dispose();
             return data;
         }
 
@@ -7629,6 +7681,7 @@ namespace TensorSharp.Models
                 emb?.Dispose();
             _pendingAudioEmbeddingsList.Clear();
             DisposeSwaPrevWindows();
+            DisposeGemma4TpState();
             // Free any per-request fused-decode cache holders before tearing
             // down the active cache (the active holder's arrays ARE _kvCacheK and
             // are disposed by the loop below).

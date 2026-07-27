@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+    <IsPackable>true</IsPackable>
+    <Nullable>disable</Nullable>
+    <Description>Peer-to-peer TCP distributed tensor parallelism for TensorSharp, enabling multi-node inference without external coordination services.</Description>
+    <PackageTags>$(TensorSharpPackageTags);distributed;tcp;multi-node;tensor-parallelism</PackageTags>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
+    <ProjectReference Include="..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
+  </ItemGroup>
+</Project>

@@ -41,8 +41,8 @@ namespace TensorSharp.Models
         private bool _canUseNativeLayerDecode;
         private bool _kvCacheHostDirty;
 
-        public Qwen3Model(string ggufPath, BackendType backend)
-            : base(ggufPath, backend)
+        public Qwen3Model(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+            : base(ggufPath, backend, tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "qwen3";
             Config = new ModelConfig { Architecture = arch };
@@ -59,12 +59,27 @@ namespace TensorSharp.Models
             LoadWeights();
             FuseQKVWeights();
             FuseGateUpWeights();
-            PrepareCudaQuantizedWeightsForInference();
+
+            if (IsTensorParallel)
+            {
+                ShardQwen3WeightsForTP();
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            }
+            else
+            {
+                PrepareCudaQuantizedWeightsForInference();
+            }
+
             int maxContextLength = ResolveConfiguredContextLength();
             int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
             if (initialCacheLength < maxContextLength)
                 Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
-            InitKVCache(initialCacheLength, maxContextLength);
+
+            if (IsTensorParallel)
+                InitTpKVCache(initialCacheLength, maxContextLength);
+            else
+                InitKVCache(initialCacheLength, maxContextLength);
+
             PrecomputeConstants();
             BuildModelDecodeArrays();
             DetermineNativeLayerDecodeAvailability();
@@ -212,30 +227,35 @@ namespace TensorSharp.Models
             Console.WriteLine($"Expanded Qwen3 attention cache to {newCapacity} tokens.");
         }
 
-        public override void ResetKVCache()
+        protected override void ResetKVCacheCore()
         {
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                ResetCacheTensor(_kvCacheK[l]);
-                ResetCacheTensor(_kvCacheV[l]);
-            }
+            // Setting _cacheSeqLen = 0 is the functional reset. Under TP the non-TP
+            // _kvCacheK/_kvCacheV arrays are null (TP uses _tpKvCacheK/_tpKvCacheV,
+            // overwritten on the next forward), so guard the tensor loop against null.
             _cacheSeqLen = 0;
             _kvCacheHostDirty = false;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
+            if (_kvCacheK == null) return;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                ResetCacheTensor(_kvCacheK[l]);
+                ResetCacheTensor(_kvCacheV[l]);
+            }
         }
 
-        public override void TruncateKVCache(int tokenCount)
+        protected override void TruncateKVCacheCore(int tokenCount)
         {
             EnsureKvCacheHostSynchronized();
-            base.TruncateKVCache(tokenCount);
+            base.TruncateKVCacheCore(tokenCount);
+            _kvCacheHostDirty = false;
+            if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 InvalidateTensorDeviceCache(_kvCacheK[l]);
                 InvalidateTensorDeviceCache(_kvCacheV[l]);
             }
-            _kvCacheHostDirty = false;
         }
 
         public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
@@ -278,8 +298,11 @@ namespace TensorSharp.Models
             return true;
         }
 
-        public override float[] Forward(int[] tokens)
+        protected override float[] ForwardCore(int[] tokens)
         {
+            if (IsTensorParallel)
+                return ForwardTP(tokens);
+
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -358,10 +381,16 @@ namespace TensorSharp.Models
             return 2048;
         }
 
-        public override float[] ForwardRefill(int[] tokens)
+        protected override float[] ForwardRefillCore(int[] tokens)
         {
             if (tokens == null || tokens.Length <= 1)
-                return Forward(tokens);
+                return ForwardCore(tokens);
+
+            // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
+            // layer loop and non-sharded weights, which are unavailable under
+            // tensor parallelism. Route through ForwardCore → ForwardTP instead.
+            if (IsTensorParallel)
+                return ForwardCore(tokens);
 
             int chunkSize = ResolvePrefillChunkSize();
             int lastIdx = tokens.Length - 1;
@@ -369,7 +398,7 @@ namespace TensorSharp.Models
             // For short prompts stay on the single-pass Forward — the extra
             // PrefillWithoutLogits/Forward split is pure overhead.
             if (tokens.Length <= chunkSize)
-                return Forward(tokens);
+                return ForwardCore(tokens);
 
             for (int pos = 0; pos < lastIdx; pos += chunkSize)
             {
@@ -378,7 +407,7 @@ namespace TensorSharp.Models
                 Array.Copy(tokens, pos, chunk, 0, chunkLen);
                 PrefillWithoutLogits(chunk);
             }
-            return Forward(new[] { tokens[lastIdx] });
+            return ForwardCore(new[] { tokens[lastIdx] });
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -666,7 +695,7 @@ namespace TensorSharp.Models
             for (int s = 0; s < seqLen; s++)
                 for (int h = 0; h < numHeads; h++)
                     positions[s * numHeads + h] = startPos + s;
-            using var posTensor = CreateIntTensor(positions, totalRows);
+            using var posTensor = CreateIntTensorOn(data.Storage.Allocator, positions, totalRows);
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
             Tensor result = Ops.RoPEEx(
@@ -841,6 +870,13 @@ namespace TensorSharp.Models
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)
                 foreach (var t in _kvCacheV) t?.Dispose();
+
+            if (_tpKvCacheK != null)
+                foreach (var layer in _tpKvCacheK)
+                    foreach (var t in layer) t?.Dispose();
+            if (_tpKvCacheV != null)
+                foreach (var layer in _tpKvCacheV)
+                    foreach (var t in layer) t?.Dispose();
 
             base.Dispose();
         }

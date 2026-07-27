@@ -168,8 +168,8 @@ namespace TensorSharp.Models.QwenImage
             FreeF32Copies();
         }
 
-        public override float[] Forward(int[] tokens) => throw new NotSupportedException("Use Predict().");
-        public override void ResetKVCache() { }
+        protected override float[] ForwardCore(int[] tokens) => throw new NotSupportedException("Use Predict().");
+        protected override void ResetKVCacheCore() { }
 
         // The native per-block path (TS_QWEN_DIT_NATIVE=1) streams each block's weights
         // from the GGUF mmap into small device slots per call, so the ~7 GB whole-model

@@ -14,6 +14,7 @@
 - **Continuous batching & paged KV cache** -- vLLM-style block-paged KV pool with block-hash prefix sharing across requests, iteration-level scheduler that admits / preempts sequences mid-batch, optional SSD-backed tier for very large KV working sets, and a native fused paged-attention kernel (`TSGgml_PagedAttentionForward`) that drives `ggml_flash_attn_ext` on Metal/CUDA/Vulkan. Enabled by default in `TensorSharp.Server`; opt-out with `--no-continuous-batching`. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 - **MTP / NextN speculative decoding** -- multi-token-prediction draft heads accelerate solo (non-concurrent) decode. Qwen 3.6 ships its NextN block fused into the trunk GGUF; Gemma 4 loads a separate EAGLE-style `gemma4-assistant` draft GGUF via `--mtp-draft-model` whose draft layers attend the target's own KV cache. The draft proposes up to `--mtp-draft` tokens per step (kept while draft confidence ≥ `--mtp-pmin`) and the trunk verifies them in a single batched forward; the request's own sampler — penalties included — drives both drafting and verification, so output is identical to standard decode. Opt in with the server's `--mtp-spec` flag (off by default; `TensorSharp.Cli` has no MTP flags — set the `TS_MTP_*` env vars there). On ggml backends fused multi-token-verify / draft-step kernels make it a clear win; the pure-C# `cuda` backend runs a fully GPU-resident per-op verify/draft and is also a win. CPU / MLX stay on standard decode. Env: `TS_MTP_*` (shared) and `TS_GMTP_*` (Gemma 4 tuning).
 - **Batched / parallel inference** -- `IBatchedPagedModel.ForwardBatch` implementations for Mistral 3, Gemma 4, GPT OSS, Qwen 3, Qwen 3.5/3.6-family, and Nemotron-H all run by default and pack N sequences into a single forward pass with paged K/V scatter and per-sequence attention via the native kernel. Gemma 4, Qwen 3.5/3.6, GPT OSS, and Nemotron-H expose a per-family `TS_<FAMILY>_BATCHED=0` escape hatch (`TS_GEMMA4_BATCHED=0`, `TS_QWEN35_BATCHED=0`, `TS_GPTOSS_BATCHED=0`, `TS_NEMOTRON_BATCHED=0`) to fall back to the per-sequence KV-swap path for A/B comparison or regression isolation; Qwen 3 and Mistral 3 have no per-family switch — use the global `TS_SCHED_DISABLE_BATCHED=1`.
+- **Tensor parallelism & distributed inference** -- split a model across multiple CUDA GPUs (Megatron-LM column/row-parallel pattern) with `--tp N` (CLI) or `TENSORSHARP_TP_DEGREE` (server), and extend across machines with peer-to-peer TCP clustering (`--tp-node-id` / `--tp-peers`). Hierarchical AllReduce minimizes inter-node traffic. Supports all autoregressive architectures (Qwen 3, Mistral 3, Gemma 3/4, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H) with architecture-specific strategies for MoE expert slicing, GatedDeltaNet per-rank V-head ownership, and Mamba2 replication. Optional Redis-backed KV cache and Responses API store for shared state. → [Tensor Parallelism](USAGE.md#tensor-parallelism--distributed-inference)
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
 - **Chat templates** -- auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture
@@ -72,6 +73,47 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/gemma-4-E4B-
 | CPU / GGML CPU / MLX | standard decode (verify can't keep up) | standard decode |
 
 Tuning: `--mtp-draft` (default `8`) bounds tokens drafted per step; `--mtp-pmin` (default `0.75`) is the minimum draft-head confidence to keep a token (drafting stops at the first low-confidence token). Gemma 4 draft-path A/B switches are the `TS_GMTP_*` env vars (see the **MTP / speculative-decoding tunables** table under [Web Application](USAGE.md#web-application)). Per-architecture mechanics are in the [Qwen 3.5/3.6 card](docs/models/qwen35.md) and the [Gemma 4 card](docs/models/gemma4.md).
+
+## Tensor Parallelism & Distributed Inference
+
+Tensor parallelism (TP) splits a single model across multiple CUDA GPUs using the
+Megatron-LM column/row-parallel pattern. Each transformer block runs
+column-parallel projections (QKV, gate/up) that split output heads or
+intermediate dimensions across GPUs, independent per-GPU attention or activation
+computation, and row-parallel projections (output, down) followed by an AllReduce
+that reconverges the hidden state. Norms, embeddings, and the LM head are
+replicated.
+
+**Local TP** runs within a single process: one thread issues commands to all GPUs
+sequentially, and CUDA streams provide the actual parallelism. Enable with
+`--tp N` (CLI) or `TENSORSHARP_TP_DEGREE=N` (server).
+
+**Distributed TP** extends across machines via a peer-to-peer TCP mesh. Each node
+runs its own process with its own local GPUs; AllReduce is hierarchical — local
+P2P within each node, TCP across node representatives, then broadcast back — so
+only `1/tp_local` of the data crosses the network. Enable with `--tp-node-id` and
+`--tp-peers` (CLI) or `TENSORSHARP_TP_NODE_ID` and `TENSORSHARP_TP_PEERS`
+(server).
+
+Architecture-specific strategies handle heterogeneous layers:
+
+| Architecture | Strategy |
+|---|---|
+| Dense transformers (Qwen 3, Mistral 3, Gemma 3) | Standard column/row-parallel QKV + FFN |
+| MoE (Gemma 4, GPT OSS, Qwen 3.5/3.6, Nemotron-H) | Expert slicing — each GPU holds `1/tp` of every expert's weights; router is replicated |
+| GatedDeltaNet SSM (Qwen 3.5/3.6) | Block-cyclic V-head assignment — each rank runs its own GDN kernel on its V-head subset with independent delta/conv state; no cross-rank communication for the recurrent path |
+| Mamba2 SSM (Nemotron-H) | Replicated on rank 0, result broadcast to all ranks |
+
+TP requires the `cuda` backend (GGML, MLX, and Vulkan are single-device by
+design). Batched/continuous-batching forward under TP is implemented for Qwen 3
+and Mistral 3; MoE models fall back to per-sequence forward under TP.
+
+The server also supports optional **Redis-backed shared state**: a shared KV
+cache tier (`--redis-url` / `TS_KV_CACHE_REDIS_URL`) for cross-session KV reuse,
+and a Redis-backed Responses API store (`TS_RESPONSES_STORE_REDIS_URL`) for
+durable response storage.
+
+Full configuration reference and examples: [Usage → Tensor Parallelism & Distributed Inference](USAGE.md#tensor-parallelism--distributed-inference).
 
 ## Tool Calling / Function Calling
 

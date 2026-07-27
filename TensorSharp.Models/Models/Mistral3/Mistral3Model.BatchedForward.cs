@@ -40,6 +40,9 @@ namespace TensorSharp.Models
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
         {
             if (ctx == null) throw new ArgumentNullException(nameof(ctx));
+            if (IsTensorParallel)
+                return ForwardBatchTP(ctx);
+
             int numSeqs = ctx.Sequences.Count;
             if (numSeqs == 0) return Array.Empty<float[]>();
 

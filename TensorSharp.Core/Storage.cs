@@ -39,6 +39,17 @@ namespace TensorSharp
             return GetCurrentRefCount() == 1;
         }
 
+        /// <summary>
+        /// Ensure the device copy of this storage reflects any pending host-side
+        /// writes (e.g. after <see cref="SetElementsAsFloat(long, float[])"/>).
+        /// No-op for host-only storages; GPU storages upload the host buffer so
+        /// subsequent kernels — including fused kernels that read the raw device
+        /// pointer without a lazy sync — observe the written values. Used by the
+        /// distributed AllReduce, which writes reduced results back through the
+        /// host buffer.
+        /// </summary>
+        public virtual void EnsureDeviceCurrent() { }
+
         public abstract IntPtr PtrAtElement(long index);
 
 

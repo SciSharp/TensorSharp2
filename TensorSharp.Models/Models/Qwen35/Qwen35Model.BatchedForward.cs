@@ -108,7 +108,7 @@ namespace TensorSharp.Models
         /// the <c>TS_QWEN35_BATCHED</c> / <c>--no-continuous-batching</c>
         /// opt-out so <c>ExecutionPlanner</c> routes to the per-seq fallback
         /// up front instead of via a NotSupportedException round trip.</summary>
-        public bool BatchedForwardAvailable => IsBatchedPathEnabled();
+        public bool BatchedForwardAvailable => IsBatchedPathEnabled() && !IsTensorParallel;
 
         // ====================================================================
         // N=1 fast path (BatchExecutor): when only ONE sequence is scheduled,

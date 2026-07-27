@@ -374,6 +374,11 @@ namespace TensorSharp.Cuda
         public static bool Q80Mmq2Enabled { get; set; } =
             !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q80_MMQ2"), "0", StringComparison.Ordinal);
 
+        public static bool AreKernelsAvailable(CudaAllocator allocator)
+        {
+            return allocator != null && allocator.Kernels != null;
+        }
+
         public static bool SupportsQuantizedType(int ggmlType)
         {
             return ggmlType == 2 ||  // Q4_0

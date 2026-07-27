@@ -66,7 +66,7 @@ namespace TensorSharp.Models
         /// the <c>TS_GPTOSS_BATCHED</c> opt-out so <c>ExecutionPlanner</c>
         /// routes to the per-seq fallback up front instead of via a
         /// NotSupportedException round trip.</summary>
-        public bool BatchedForwardAvailable => GptOssBatchedOptIn();
+        public bool BatchedForwardAvailable => GptOssBatchedOptIn() && !IsTensorParallel;
 
         // Per-layer paged K/V buffers (vLLM block layout:
         // [numBlocks * blockSize * numKvHeads * headDim] per layer).

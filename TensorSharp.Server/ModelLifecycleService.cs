@@ -11,6 +11,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using Microsoft.Extensions.Logging;
+using TensorSharp.Cuda;
 
 namespace TensorSharp.Server
 {
@@ -83,7 +84,17 @@ namespace TensorSharp.Server
             var loadSw = Stopwatch.StartNew();
             try
             {
-                _model = ModelBase.Create(modelPath, _backend);
+                // Check for distributed TP configuration via environment variables.
+                Cuda.ITensorParallelGroup tpGroup = null;
+                var distConfig = TensorSharp.Distributed.DistributedTpConfig.TryFromEnvironment(
+                    localDegree: GetLocalTpDegree());
+                if (distConfig != null)
+                {
+                    tpGroup = new TensorSharp.Distributed.DistributedTensorParallelGroup(
+                        distConfig.LocalDegree, distConfig.NodeId, distConfig.PeerEndpoints);
+                }
+
+                _model = ModelBase.Create(modelPath, _backend, tpGroup: tpGroup);
                 _loadedModelPath = modelPath;
 
                 if (!string.IsNullOrEmpty(mmProjPath) && File.Exists(mmProjPath))
@@ -204,6 +215,14 @@ namespace TensorSharp.Server
             {
                 return 0;
             }
+        }
+
+        private static int GetLocalTpDegree()
+        {
+            string envTp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
+            if (int.TryParse(envTp, out int degree) && degree > 1)
+                return degree;
+            return 1;
         }
     }
 }

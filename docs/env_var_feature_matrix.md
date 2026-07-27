@@ -133,6 +133,37 @@ server CLI flags.
 | `TS_GMTP_NO_FAST_ROLLBACK` | Gemma 4 | Restore kept-prefix rollback instead of dense fast rollback on partial accept | OFF | not registered | no |
 | `TS_GMTP_BATCHED_TRUNK` | Gemma 4 | Run the verify trunk through the batched paged path instead of the linear trunk | OFF | not registered | no |
 
+## Out-of-Matrix Tensor Parallelism & Distributed Inference Knobs
+
+These variables configure tensor parallelism (splitting a model across multiple
+CUDA GPUs) and distributed multi-node TP over a peer-to-peer TCP mesh. They are
+not registered in `EnvVarMatrix.All` and are not swept by the default TestMatrix
+config — TP requires the direct `cuda` backend and multiple GPUs, which the
+standard single-GPU test harness does not exercise. `TENSORSHARP_TP_DEGREE` is
+also settable via the CLI's `--tp` flag; `TENSORSHARP_TP_NODE_ID` and
+`TENSORSHARP_TP_PEERS` via `--tp-node-id` and `--tp-peers`.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TENSORSHARP_TP_DEGREE` | all autoregressive models, `cuda` backend | Number of local CUDA GPUs to split the model across (Megatron-LM column/row-parallel) | `1` (single GPU) | not registered | no |
+| `TENSORSHARP_TP_NODE_ID` | all autoregressive models, `cuda` backend | This node's 0-based ID for multi-node distributed TP; must be set with `TENSORSHARP_TP_PEERS` | unset (disabled) | not registered | no |
+| `TENSORSHARP_TP_PEERS` | all autoregressive models, `cuda` backend | Comma-separated `host:port` list of all nodes in the distributed TP cluster; must be set with `TENSORSHARP_TP_NODE_ID` | unset (disabled) | not registered | no |
+
+## Out-of-Matrix Redis Shared-State Knobs
+
+These variables configure optional Redis-backed shared state in
+`TensorSharp.Server`: a shared KV cache tier for cross-session reuse and a
+Redis-backed OpenAI Responses API store. They are not registered in
+`EnvVarMatrix.All`. `TS_KV_CACHE_REDIS_URL` is also settable via `--redis-url`
+or `--paged-kv-redis-url`; `TS_KV_CACHE_REDIS_TTL_MINUTES` via
+`--paged-kv-redis-ttl`; `TS_RESPONSES_STORE_REDIS_URL` via `--redis-url`.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_KV_CACHE_REDIS_URL` | `TensorSharp.Server` | Redis connection string for the shared KV cache tier; when set, KV blocks are persisted to Redis for cross-session reuse | unset (disabled) | not registered | no |
+| `TS_KV_CACHE_REDIS_TTL_MINUTES` | `TensorSharp.Server` | TTL in minutes for Redis KV cache entries; `0` = no TTL | `1440` (24 h) | not registered | no |
+| `TS_RESPONSES_STORE_REDIS_URL` | `TensorSharp.Server` | Redis connection string for the OpenAI Responses API store; when set, `RedisResponsesStore` replaces the in-memory store | unset (disabled, in-memory) | not registered | no |
+
 ## Out-of-Matrix General Runtime Knobs
 
 These variables are real runtime knobs, but they are not registered in

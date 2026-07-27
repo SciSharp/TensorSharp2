@@ -39,6 +39,18 @@ namespace TensorSharp.Runtime
         /// are deleted in LRU order once this is exceeded.</summary>
         public long MaxSsdBytes { get; init; } = 16L * 1024 * 1024 * 1024;
 
+        /// <summary>Optional Redis connection string (e.g.
+        /// <c>localhost:6379</c>). When non-null, blocks evicted from the
+        /// in-memory tier are also written to Redis, and lookups check Redis
+        /// before falling through to the SSD tier. Redis provides a shared
+        /// cache across multiple server instances.</summary>
+        public string RedisUrl { get; init; }
+
+        /// <summary>TTL applied to each Redis KV entry. <c>null</c> means no
+        /// explicit expiry (Redis maxmemory policy governs eviction).
+        /// Default 24 hours.</summary>
+        public TimeSpan? RedisTtl { get; init; } = TimeSpan.FromHours(24);
+
         /// <summary>
         /// Read configuration from environment variables:
         ///   TS_KV_PAGED_CACHE=1            - enable the manager
@@ -46,6 +58,8 @@ namespace TensorSharp.Runtime
         ///   TS_KV_CACHE_MAX_RAM_MB=&lt;mb&gt;- in-memory tier cap (default 1024)
         ///   TS_KV_CACHE_SSD_DIR=&lt;path&gt; - enable SSD spill tier rooted at path
         ///   TS_KV_CACHE_MAX_SSD_MB=&lt;mb&gt;- SSD tier cap (default 16384)
+        ///   TS_KV_CACHE_REDIS_URL=&lt;url&gt; - enable Redis tier with connection string
+        ///   TS_KV_CACHE_REDIS_TTL_MINUTES=&lt;min&gt; - Redis entry TTL (default 1440, 0 = no TTL)
         /// Any value that fails to parse falls back to the documented default.
         /// </summary>
         public static PagedKvCacheConfig FromEnvironment()
@@ -57,6 +71,12 @@ namespace TensorSharp.Runtime
             if (string.IsNullOrWhiteSpace(ssdDir))
                 ssdDir = null;
             long maxSsdBytes = ReadLong("TS_KV_CACHE_MAX_SSD_MB", 16 * 1024) * 1024L * 1024L;
+
+            string redisUrl = Environment.GetEnvironmentVariable("TS_KV_CACHE_REDIS_URL");
+            if (string.IsNullOrWhiteSpace(redisUrl))
+                redisUrl = null;
+            int redisTtlMinutes = ReadInt("TS_KV_CACHE_REDIS_TTL_MINUTES", 1440);
+            TimeSpan? redisTtl = redisTtlMinutes > 0 ? TimeSpan.FromMinutes(redisTtlMinutes) : null;
 
             if (blockSize <= 0)
                 blockSize = 256;
@@ -72,6 +92,8 @@ namespace TensorSharp.Runtime
                 MaxRamBytes = maxRamBytes,
                 SsdDirectory = ssdDir,
                 MaxSsdBytes = maxSsdBytes,
+                RedisUrl = redisUrl,
+                RedisTtl = redisTtl,
             };
         }
 

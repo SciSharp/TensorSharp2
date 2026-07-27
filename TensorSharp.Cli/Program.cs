@@ -22,6 +22,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Cli.Logging;
 using TensorSharp.Cpu;
+using TensorSharp.Cuda;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Cli
@@ -140,6 +141,9 @@ namespace TensorSharp.Cli
             // GgmlNative reads when the ggml_vulkan backend initializes.
             int? gpuDeviceOverride = null;
             bool listGpus = false;
+            int tpDegree = 1;
+            int tpNodeId = -1;          // -1 = not set; distributed mode requires >= 0
+            string tpPeers = null;      // comma-separated host:port list for distributed TP
             string systemPrompt = null;
             int warmupInferenceRuns = 0;
             // DiffusionGemma sampler knobs (used only for the diffusion-gemma architecture).
@@ -186,6 +190,9 @@ namespace TensorSharp.Cli
                     case "--max-tokens": maxTokens = int.Parse(args[++i]); break;
                     case "--test": runTest = true; break;
                     case "--backend": backendStr = args[++i].ToLowerInvariant(); break;
+                    case "--tp": tpDegree = int.Parse(args[++i]); break;
+                    case "--tp-node-id": tpNodeId = int.Parse(args[++i]); break;
+                    case "--tp-peers": tpPeers = args[++i]; break;
                     case "--gpu-device":
                     {
                         string gpuStr = args[++i];
@@ -350,6 +357,7 @@ namespace TensorSharp.Cli
                     "[--prompt <text>] [--cfg F] [--diffusion-steps N] [--diffusion-seed N] " +
                     "[--qwen-image-vae <vae.gguf>] [--qwen-image-vl <qwen2.5-vl.gguf>] [--qwen-image-mmproj <mmproj.gguf>] [--qwen-image-lora <lora.safetensors>] [--offload-cpu] " +
                     "[--max-tokens N] [--test] [--backend cpu|cuda|mlx|ggml_cpu|ggml_metal|ggml_cuda|ggml_vulkan] " +
+                    "[--tp N] [--tp-node-id N --tp-peers host1:port1,host2:port2,...] " +
                     "[--gpu-device N] [--list-gpus] " +
                     "[--interactive] [--system <text>] [--system-file <path>] " +
                     "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
@@ -424,7 +432,18 @@ namespace TensorSharp.Cli
                 "Loading model {ModelFile} on backend {Backend} kvCacheDtype={KvCacheDtype} (path={ModelPath})",
                 Path.GetFileName(modelPath), backend, requestedDtype, modelPath);
             var modelLoadSw = Stopwatch.StartNew();
-            using var model = ModelBase.Create(modelPath, backend);
+
+            // Build a distributed TP group when --tp-node-id and --tp-peers are provided.
+            Cuda.ITensorParallelGroup tpGroup = null;
+            if (tpNodeId >= 0 && !string.IsNullOrEmpty(tpPeers))
+            {
+                var peerEndpoints = TensorSharp.Distributed.DistributedTpConfig.ParsePeers(tpPeers);
+                int localDegree = tpDegree > 1 ? tpDegree : 1;
+                tpGroup = new TensorSharp.Distributed.DistributedTensorParallelGroup(localDegree, tpNodeId, peerEndpoints);
+                tpDegree = localDegree;
+            }
+
+            using var model = ModelBase.Create(modelPath, backend, tpDegree, tpGroup);
             modelLoadSw.Stop();
             _log.LogInformation(LogEventIds.ModelLoadCompleted,
                 "Loaded model {ModelFile} architecture={Architecture} contextLength={ContextLength} kvCacheDtype={KvCacheDtype} elapsedMs={ElapsedMs:F1}",
@@ -455,6 +474,22 @@ namespace TensorSharp.Cli
             warmupSw.Stop();
             _log.LogInformation(LogEventIds.HostConfiguration,
                 "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
+
+            // Multi-node tensor parallelism: warmup ran identically (in lockstep)
+            // on every node. From here on only the driver (node 0) runs the
+            // generation logic and owns sampling/IO; the other nodes become
+            // workers that mirror the driver's forward passes so their weight
+            // shards contribute to every AllReduce. Worker nodes never reach the
+            // interactive/batch code below — they loop until the driver exits.
+            if (tpGroup != null && tpGroup.NodeCount > 1)
+            {
+                if (model.IsDistributedWorker)
+                {
+                    model.RunDistributedWorkerLoop();
+                    return;
+                }
+                model.BeginDistributedDriver();
+            }
 
             if (mmProjPath != null)
             {

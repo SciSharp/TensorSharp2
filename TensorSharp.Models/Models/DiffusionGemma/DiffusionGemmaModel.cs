@@ -2527,14 +2527,14 @@ namespace TensorSharp.Models
         // ===================================================================================
         //  IModelArchitecture contract
         // ===================================================================================
-        public override float[] Forward(int[] tokens)
+        protected override float[] ForwardCore(int[] tokens)
         {
             throw new NotSupportedException(
                 "DiffusionGemma is a diffusion model and does not support autoregressive Forward(). " +
                 "Use DiffusionGemmaSampler.Generate() / the diffusion run mode.");
         }
 
-        public override void ResetKVCache()
+        protected override void ResetKVCacheCore()
         {
             // no KV cache in the unified diffusion forward
         }

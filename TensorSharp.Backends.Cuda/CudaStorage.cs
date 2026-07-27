@@ -89,7 +89,7 @@ namespace TensorSharp.Cuda
             return AddBytes(deviceBuffer, checked(index * ElementType.Size()));
         }
 
-        internal void EnsureDeviceCurrent()
+        public override void EnsureDeviceCurrent()
         {
             ThrowIfDisposed();
             if (ByteLength == 0)
@@ -130,7 +130,13 @@ namespace TensorSharp.Cuda
 
             lock (sync)
             {
-                if (!deviceDirty)
+                // Fast path: device hasn't been written AND the host mirror already
+                // exists → the host copy is current, nothing to do.
+                // When hostBuffer is still null (device-only storage that was never
+                // checked out to the host) we MUST fall through and allocate + copy,
+                // otherwise GetElementAsFloat / PtrAtElement dereference a null
+                // hostBuffer → NullReferenceException.
+                if (!deviceDirty && hostBuffer != IntPtr.Zero)
                     return;
 
                 long t0 = CudaProfileCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -157,6 +163,56 @@ namespace TensorSharp.Cuda
                 throw new ArgumentException("CUDA device copy requires equal byte lengths.", nameof(src));
 
             CopyDeviceFrom(src, 0, 0, ByteLength);
+        }
+
+        // Cached device-pair peer accessibility. On topologies without P2P
+        // (vGPU, no-NVLink consumer cards) a direct device-to-device copy is
+        // invalid and must go through host memory instead.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int), bool> _peerAccessCache = new();
+
+        /// <summary>
+        /// Force all cross-GPU transfers through host staging, bypassing P2P
+        /// entirely. Set TENSORSHARP_TP_DISABLE_P2P=1 to make peer-capable
+        /// hardware take exactly the code path that no-peer hardware (A16 vGPU
+        /// profiles, consumer cards) takes. Slower, but useful for isolating
+        /// whether a multi-GPU defect lives in the P2P DMA path.
+        /// </summary>
+        internal static readonly bool DisableP2P =
+            string.Equals(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DISABLE_P2P"), "1", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Called by <see cref="CudaP2PCommunicator"/> when the P2P DMA self-test
+        /// detects that a device pair reports peer-accessible but the actual
+        /// cuMemcpyPeer round-trip produces corrupt data (seen on some L4 PCIe
+        /// topologies where IOMMU, BAR1 sizing, or switch configuration silently
+        /// breaks P2P DMA). Forces the pair through host staging permanently.
+        /// </summary>
+        internal static void MarkPeerAccessFailed(int deviceA, int deviceB)
+        {
+            _peerAccessCache[(deviceA, deviceB)] = false;
+            _peerAccessCache[(deviceB, deviceA)] = false;
+        }
+
+        private static bool CanAccessPeer(int srcDevice, int dstDevice)
+        {
+            if (srcDevice == dstDevice)
+                return true;
+            if (DisableP2P)
+                return false;
+            return _peerAccessCache.GetOrAdd((srcDevice, dstDevice), key =>
+            {
+                try
+                {
+                    int fwd = 0, rev = 0;
+                    CudaDriverApi.cuDeviceCanAccessPeer(out fwd, key.Item1, key.Item2);
+                    CudaDriverApi.cuDeviceCanAccessPeer(out rev, key.Item2, key.Item1);
+                    return fwd == 1 && rev == 1;
+                }
+                catch
+                {
+                    return false; // conservative: stage through host
+                }
+            });
         }
 
         internal void CopyDeviceFrom(CudaStorage src, long destinationByteOffset, long sourceByteOffset, long byteCount)
@@ -187,8 +243,38 @@ namespace TensorSharp.Cuda
             }
             else
             {
+                // Cross-GPU copy. Direct device-to-device (cuMemcpyDtoD, and even
+                // cuMemcpyPeer) requires the two devices to be peer-accessible.
+                // On GPUs without P2P — virtualized vGPU profiles (A16-16Q) or
+                // consumer/workstation cards without NVLink — that raises CUDA
+                // error 700 (illegal memory access) or silently transfers wrong
+                // data. Use a direct peer copy only when the devices can access
+                // each other; otherwise stage explicitly through host memory,
+                // which works on every topology.
                 src.SynchronizeDeviceWork();
-                CudaDriverApi.cuMemcpyDtoD(dst, source, new UIntPtr((ulong)byteCount)).ThrowOnError();
+                if (CanAccessPeer(src.AllocatorImpl.DeviceId, AllocatorImpl.DeviceId))
+                {
+                    AllocatorImpl.Context.MakeCurrent();
+                    CudaDriverApi.cuMemcpyPeerAsync(
+                        dst, AllocatorImpl.Context.Handle,
+                        source, src.AllocatorImpl.Context.Handle,
+                        new UIntPtr((ulong)byteCount),
+                        AllocatorImpl.Stream.Handle).ThrowOnError();
+                }
+                else
+                {
+                    byte[] stage = new byte[byteCount];
+                    unsafe
+                    {
+                        fixed (byte* stagePtr = stage)
+                        {
+                            src.AllocatorImpl.Context.MakeCurrent();
+                            CudaDriverApi.cuMemcpyDtoH((IntPtr)stagePtr, source, new UIntPtr((ulong)byteCount)).ThrowOnError();
+                            AllocatorImpl.Context.MakeCurrent();
+                            CudaDriverApi.cuMemcpyHtoD(dst, (IntPtr)stagePtr, new UIntPtr((ulong)byteCount)).ThrowOnError();
+                        }
+                    }
+                }
             }
 
             MarkDeviceModified();

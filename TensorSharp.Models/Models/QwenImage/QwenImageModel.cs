@@ -236,10 +236,10 @@ namespace TensorSharp.Models.QwenImage
         private QwenImagePipeline GetPipeline() => _pipeline ??= new QwenImagePipeline(this);
 
         // ---- IModelArchitecture autoregressive surface: not applicable to an image model ----
-        public override float[] Forward(int[] tokens) =>
+        protected override float[] ForwardCore(int[] tokens) =>
             throw new NotSupportedException("QwenImageModel is an image-editing model; use EditImage().");
 
-        public override void ResetKVCache() { /* no autoregressive KV cache */ }
+        protected override void ResetKVCacheCore() { /* no autoregressive KV cache */ }
 
         // The base warmup runs a dummy autoregressive Forward(); skip it for the image model
         // (the diffusion nets are loaded lazily on the first EditImage call).

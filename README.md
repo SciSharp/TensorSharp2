@@ -25,6 +25,7 @@
 - **⚡ Trades wins with llama.cpp — from pure .NET.** On identical GGUF files and the same GPU, TensorSharp matches or beats `llama.cpp` on the workloads that matter: Gemma 4 E4B and 2-bit Qwen 3.6 35B-A3B MoE prefill **1.28×** faster on CUDA with first tokens **1.27×** sooner (multi-turn up to **1.49×**); Gemma 4 12B decodes **1.21×** faster on Vulkan (up to **1.32×** on long context). → [Benchmarks](#benchmarks)
 - **🚀 Continuous batching & paged KV cache.** vLLM-style paged KV pool with block-hash prefix sharing and an iteration-level scheduler, on by default in the server. → [deep dive](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
 - **🔮 MTP / NextN speculative decoding.** Multi-token-prediction draft heads accelerate solo decode on Qwen 3.6 (embedded NextN block) and Gemma 4 (separate `gemma4-assistant` draft GGUF) — the draft proposes, the trunk verifies in one batched forward, output identical to standard decode. → [Speculative decoding](FEATURES.md#mtp--nextn-speculative-decoding)
+- **🔗 Tensor parallelism & distributed clustering.** Split a model across multiple CUDA GPUs (`--tp N`) and extend across machines with peer-to-peer TCP clustering (`--tp-node-id` / `--tp-peers`). Megatron-LM column/row-parallel pattern with hierarchical AllReduce; supports all autoregressive architectures including MoE expert slicing and GatedDeltaNet per-rank V-head ownership. Optional Redis-backed KV cache and Responses API store. → [Tensor Parallelism](USAGE.md#tensor-parallelism--distributed-inference)
 - **🎨 Qwen-Image-Edit image editing.** Prompt + input image → edited image, driving a 60-block MMDiT with a Qwen-Image VAE and Qwen2.5-VL-7B text encoder. CUDA-graph-captured DiT, FlowMatch-Euler true-CFG denoise, live Web UI previews, and Lightning-LoRA fast paths. Beat `stable-diffusion.cpp` **1.19×** on a warm 4-step edit. → [Qwen-Image-Edit card](docs/models/qwenimage.md)
 - **🌫️ DiffusionGemma text diffusion.** Block-wise EntropyBound denoising over a Gemma-4-derived MoE backbone, with CLI flags and a Web UI denoising preview stream. → [DiffusionGemma card](docs/models/diffusiongemma.md)
 - **🖼️ Multimodal.** Image / video / audio (Gemma 4); image input for Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni; PDF documents via CLI and Web UI. → [Multimodal](FEATURES.md#multimodal-support)
@@ -67,6 +68,26 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 **macOS (Apple Silicon)** — drop the CUDA env var and use `--backend ggml_metal`.
 **Linux + NVIDIA** — prefix the `dotnet run` with `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` and use `--backend ggml_cuda`.
 **AMD / Intel / NVIDIA Vulkan** — set `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` and use `--backend ggml_vulkan`.
+
+**Linux (Ubuntu) + NVIDIA with Tensor Parallelism**
+
+Make sure Cuda is installed first, then:-
+```bash
+#On runpod's ubuntu 24.02 we need ot make sure Cuda libraries are correctly set:-
+LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
+#For old Ubuntu versions you might need this:-
+add-apt-repository ppa:dotnet/backports
+
+apt update && apt install dotnet-sdk-10.0
+git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+mkdir models
+wget https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true -O models/gemma-4-E4B-it-Q8_0.gguf
+bash TensorSharp.GGML.Native/build-linux.sh
+dotnet build -c Release
+TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --interactive --max-tokens 20000 --tp 2
+```
+
 
 Host the same model as a server (browser UI at <http://localhost:5000/index.html>, plus Ollama/OpenAI APIs):
 
@@ -171,6 +192,7 @@ New here? The sections above are all you need to get running. Everything else is
 | Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, Nemotron-H Omni image input; PDF documents (CLI `--pdf` + Web UI). |
 | Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (default on; opt-out `--no-continuous-batching`). |
 | Speculative decoding | MTP / NextN draft heads on Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); off by default, opt-in via the server's `--mtp-spec`. |
+| Tensor parallelism | Megatron-LM column/row-parallel TP across CUDA GPUs (`--tp N` / `TENSORSHARP_TP_DEGREE`); distributed multi-node TP via peer-to-peer TCP (`--tp-node-id` / `--tp-peers`). All autoregressive architectures. Optional Redis-backed KV cache and Responses API store. |
 | Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning. |
 | Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI shapes. |
 
