@@ -43,6 +43,13 @@ namespace TensorSharp.Cuda
             return new CudaContext(context, deviceId, device);
         }
 
+        /// <summary>
+        /// True once the primary context has been released. Releasing it already
+        /// freed every allocation made against it, so finalizers that run after
+        /// teardown must not try to make it current or free through it.
+        /// </summary>
+        public bool IsDisposed => Volatile.Read(ref context) == IntPtr.Zero;
+
         public void MakeCurrent()
         {
             if (context == IntPtr.Zero)

@@ -56,6 +56,11 @@ namespace TensorSharp.Models
             if (_backend != BackendType.Cuda || !s_qwenCudaMoeOnDeviceEnabled
                 || _numExperts <= 0 || _allocator is not CudaAllocator cudaAllocator)
                 return;
+            // Under TP the expert weights were moved into _tpQuantWeights and the
+            // originals these arrays point at are already disposed. The per-rank
+            // tables in Qwen35Model.TensorParallelMoE.cs serve that path instead.
+            if (IsTensorParallel)
+                return;
             if (_expertGateQW == null || _expertUpQW == null || _expertDownQW == null)
                 return;
 

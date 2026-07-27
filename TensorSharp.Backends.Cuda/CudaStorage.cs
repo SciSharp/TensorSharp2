@@ -37,10 +37,25 @@ namespace TensorSharp.Cuda
             {
                 if (deviceBuffer != IntPtr.Zero)
                 {
-                    AllocatorImpl.Context.MakeCurrent();
-                    AllocatorImpl.ReturnDeviceMemory(deviceBuffer, deviceAllocationBytes);
-                    deviceBuffer = IntPtr.Zero;
-                    deviceAllocationBytes = 0;
+                    // A storage that outlives its context reaches here from the GC
+                    // finalizer thread at process exit, after the primary context was
+                    // released. Releasing the context already freed every allocation
+                    // made against it, so making it current (or returning the buffer
+                    // to a pool whose device memory is gone) would throw
+                    // ObjectDisposedException out of a finalizer and abort the
+                    // process. Just drop the pointer.
+                    if (AllocatorImpl.Context.IsDisposed)
+                    {
+                        deviceBuffer = IntPtr.Zero;
+                        deviceAllocationBytes = 0;
+                    }
+                    else
+                    {
+                        AllocatorImpl.Context.MakeCurrent();
+                        AllocatorImpl.ReturnDeviceMemory(deviceBuffer, deviceAllocationBytes);
+                        deviceBuffer = IntPtr.Zero;
+                        deviceAllocationBytes = 0;
+                    }
                 }
 
                 if (hostBuffer != IntPtr.Zero)
