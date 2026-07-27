@@ -13,6 +13,7 @@
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 块池，跨请求的块级哈希前缀共享，迭代级调度器（可在批内动态加入/抢占序列），可选的 SSD 冷层用于超大 KV 工作集，原生融合分页注意力内核（`TSGgml_PagedAttentionForward`，在 Metal/CUDA/Vulkan 上驱动 `ggml_flash_attn_ext`）。`TensorSharp.Server` 默认启用，可用 `--no-continuous-batching` 关闭。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
 - **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列（无并发）decode。Qwen 3.6 将 NextN 块内嵌在主干 GGUF 中；Gemma 4 通过 `--mtp-draft-model` 加载独立的 EAGLE 风格 `gemma4-assistant` 草稿 GGUF，其草稿层读取目标模型自身的 KV 缓存。草稿头每步最多提议 `--mtp-draft` 个 token（草稿置信度 ≥ `--mtp-pmin` 时保留），主干用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，因此输出与标准 decode 完全一致。服务端通过 `--mtp-spec` 启用（默认关闭）；CLI 没有 MTP 参数，需设置 `TS_MTP_*` 环境变量。ggml 后端有融合的多 token 验证 / 草稿步内核，是明确收益；纯 C# `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿，同样有收益；CPU / MLX 保持标准 decode。环境变量：`TS_MTP_*`（通用）与 `TS_GMTP_*`（Gemma 4 调优）。
+- **张量并行与分布式推理** —— 用 `--tp N`（CLI）或 `TENSORSHARP_TP_DEGREE`（服务端）把一个模型按 Megatron-LM 列/行并行范式切分到多张 CUDA GPU 上，再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。分层 AllReduce 把跨网络流量降到最低。支持全部自回归架构（Qwen 3、Mistral 3、Gemma 3/4、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H），并针对 MoE 专家切分、GatedDeltaNet 按 rank V-head 归属、Mamba2 复制等异构层提供各自的策略。服务端还可选用 Redis 支撑的共享 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
 - **批处理 / 并行推理** —— 已为 Mistral 3、Gemma 4、GPT OSS、Qwen 3、Qwen 3.5/3.6-family、Nemotron-H 默认启用 `IBatchedPagedModel.ForwardBatch`，能在一次前向传播中打包 N 个序列，使用 `slotMapping` 进行分页 K/V 写入，并通过原生内核做按序列注意力。Gemma 4、Qwen 3.5/3.6、GPT OSS 与 Nemotron-H 提供各自的 `TS_<FAMILY>_BATCHED=0` 兜底开关；Qwen 3 与 Mistral 3 没有家族专属开关，请用全局 `TS_SCHED_DISABLE_BATCHED=1` 强制回到按序列 KV-swap 路径。
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
@@ -72,6 +73,52 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/gemma-4-E4B-
 | CPU / GGML CPU / MLX | 标准 decode（验证跟不上） | 标准 decode |
 
 调优：`--mtp-draft`（默认 `8`）限制每步起草的 token 数；`--mtp-pmin`（默认 `0.75`）是保留 token 所需的最低草稿置信度（遇到第一个低置信 token 即停止起草）。Gemma 4 草稿路径 A/B 开关为 `TS_GMTP_*` 环境变量（见 [Web 应用](USAGE_zh-cn.md#web-应用) 下的 **MTP / 投机解码调优变量** 表）。各架构具体机制见 [Qwen 3.5/3.6 卡片](docs/models/qwen35_zh-cn.md) 与 [Gemma 4 卡片](docs/models/gemma4_zh-cn.md)。
+
+## 张量并行与分布式推理
+
+TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范式把单个模型切
+分到多张 GPU 上——以及**分布式（多节点）张量并行**，让 TP 跨越多台通过 TCP 点
+对点网络互联的机器。
+
+每个 transformer block 依次执行：列并行投影（QKV、gate/up，按输出头或中间维度
+切分到各 GPU）→ 各 GPU 独立完成注意力或激活计算 → 行并行投影（output、down），
+随后由一次 AllReduce 把隐藏状态重新汇聚。归一化层、词嵌入与 LM head 在各 rank
+上复制。
+
+**本地 TP** 在单个进程内运行：由一个线程顺序向所有 GPU 下发命令，真正的并行由
+CUDA stream 提供。用 `--tp N`（CLI）或 `TENSORSHARP_TP_DEGREE=N`（服务端）启用。
+
+**分布式 TP** 通过点对点 TCP 网格跨机器扩展。每个节点运行自己的进程、管理自己
+的本地 GPU；AllReduce 是分层的——先在节点内做本地 P2P 归约，再由各节点代表之间
+走 TCP，最后广播回来——因此只有 `1/tp_local` 的数据需要穿过网络。用
+`--tp-node-id` 与 `--tp-peers`（CLI）或 `TENSORSHARP_TP_NODE_ID` 与
+`TENSORSHARP_TP_PEERS`（服务端）启用。
+
+针对异构层的架构专属策略：
+
+| 架构 | 策略 |
+|---|---|
+| 稠密 transformer（Qwen 3、Mistral 3、Gemma 3） | 标准列/行并行 QKV + FFN |
+| MoE（Gemma 4、GPT OSS、Qwen 3.5/3.6、Nemotron-H） | 专家切分——每张 GPU 持有每个专家权重的 `1/tp`；router 复制 |
+| GatedDeltaNet SSM（Qwen 3.5/3.6） | 块循环 V-head 分配——各 rank 在自己的 V-head 子集上运行 GDN 内核，delta/conv 状态相互独立；循环路径无需跨 rank 通信 |
+| Mamba2 SSM（Nemotron-H） | 在 rank 0 上复制计算，结果广播给所有 rank |
+
+TP 需要 `cuda` 后端（GGML、MLX、Vulkan 在设计上都是单设备）。TP 下的批处理 /
+连续批处理前向目前实现于 Qwen 3 与 Mistral 3；MoE 模型在 TP 下回退到按序列前向。
+
+本地集合通信优先使用 CUDA 点对点（P2P）DMA，但启动时会对每一对支持 P2P 的设备
+做一次往返自检，任何回读数据损坏的设备对（在部分 L4 PCIe 拓扑上出现过）都会被
+永久降级；因此在 P2P 不可用的主机（A16 vGPU 配置、大多数消费级显卡）上会自动改
+走主机内存中转。诊断开关：`TENSORSHARP_TP_DISABLE_P2P=1`（所有跨 GPU 拷贝一律走
+主机中转）与 `TENSORSHARP_TP_HOST_ALLREDUCE=1`（本地 AllReduce 在 CPU 上完成）。
+多节点的连接与接收窗口分别由 `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS`（默认
+120 秒）与 `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS`（默认 300 秒）控制。
+
+服务端还支持可选的 **Redis 共享状态**：共享 KV 缓存层
+（`--redis-url` / `TS_KV_CACHE_REDIS_URL`）用于跨会话复用 KV，以及 Redis 支撑的
+Responses API 存储（`TS_RESPONSES_STORE_REDIS_URL`）用于持久化响应。
+
+完整配置参考与示例：[用法 → 张量并行与分布式推理](USAGE_zh-cn.md#张量并行与分布式推理)。
 
 ## 工具调用 / 函数调用
 

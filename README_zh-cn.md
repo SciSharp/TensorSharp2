@@ -25,6 +25,7 @@ Zhongkai Fu 所著的 **[From Tensors to Tokens: Building a Multimodal LLM Infer
 - **⚡ 与 llama.cpp 互有胜负——用纯 .NET 做到。** 在相同 GGUF 文件、相同 GPU 上，TensorSharp 在关键负载上追平乃至超越 `llama.cpp`：Gemma 4 E4B 与 2-bit 量化的 Qwen 3.6 35B-A3B MoE 在 CUDA 上 prefill 快 **1.28×**、首 token 早 **1.27×**（多轮最高 **1.49×**）；Gemma 4 12B 在 Vulkan 上 decode 快 **1.21×**（长上下文最高 **1.32×**）。→ [性能数据](#性能数据)
 - **🚀 连续批处理 & 分页 KV 缓存。** vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
 - **🔮 MTP / NextN 投机解码。** 多 token 预测草稿头加速单序列 decode：Qwen 3.6（内嵌 NextN 块）与 Gemma 4（独立 `gemma4-assistant` 草稿 GGUF）——草稿提议、主干一次批量前向验证，输出与标准 decode 完全一致。→ [投机解码](FEATURES_zh-cn.md#mtp--nextn-投机解码)
+- **🔗 张量并行与分布式集群。** 用 `--tp N` 把一个模型切分到多张 CUDA GPU 上，再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。采用 Megatron-LM 列/行并行范式与分层 AllReduce；支持全部自回归架构，包括 MoE 专家切分与 GatedDeltaNet 的按 rank V-head 归属。可选 Redis 支撑的 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
 - **🎨 Qwen-Image-Edit 图像编辑。** 提示词 + 输入图像 → 编辑后的图像，驱动 60 块 MMDiT，配以 Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器。CUDA 图捕获的整 DiT、FlowMatch-Euler true-CFG 去噪、Web UI 实时预览，以及 Lightning-LoRA 快速路径。热态 4 步编辑比 `stable-diffusion.cpp` 快 **1.19×**。→ [Qwen-Image-Edit 卡片](docs/models/qwenimage_zh-cn.md)
 - **🌫️ DiffusionGemma 文本扩散。** 基于 Gemma-4 派生 MoE backbone 的分块 EntropyBound 去噪，提供 CLI 参数与 Web UI 实时去噪预览。→ [DiffusionGemma 卡片](docs/models/diffusiongemma_zh-cn.md)
 - **🖼️ 多模态。** 图像 / 视频 / 音频（Gemma 4）；图像输入（Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni）；CLI 与 Web UI 支持 PDF。→ [多模态](FEATURES_zh-cn.md#多模态支持)
@@ -67,6 +68,43 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 **macOS（Apple Silicon）** —— 去掉 CUDA 环境变量，使用 `--backend ggml_metal`。
 **Linux + NVIDIA** —— 在 `dotnet run` 前加 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON`，使用 `--backend ggml_cuda`。
 **AMD / Intel / NVIDIA Vulkan** —— 设置 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON`，使用 `--backend ggml_vulkan`。
+
+**Linux（Ubuntu）+ 多张 NVIDIA GPU —— 张量并行**
+
+张量并行把一个模型切分到 N 张 GPU 上，运行在 Direct `cuda` 后端。请先安装 CUDA 工具包，然后：
+
+```bash
+# 在 RunPod 的 Ubuntu 24.04 镜像上，需要先让动态链接器找到 CUDA 兼容库：
+export LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
+# 较旧的 Ubuntu 版本需要从 backports PPA 安装 .NET 10 SDK：
+add-apt-repository ppa:dotnet/backports
+
+apt update && apt install dotnet-sdk-10.0
+git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+mkdir models
+wget "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -O models/gemma-4-E4B-it-Q8_0.gguf
+bash TensorSharp.GGML.Native/build-linux.sh
+dotnet build -c Release
+
+# 单进程内使用 2 张 GPU
+TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf \
+    --backend cuda --interactive --max-tokens 20000 --tp 2
+```
+
+只需再加上节点 ID 与共享的 peer 列表，同一个模型就能跨机器扩展 —— 2 节点 × 2 GPU 即全局 TP 度为 4：
+
+```bash
+# 节点 0
+TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --tp 2 \
+    --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+# 节点 1（peer 列表相同，节点 ID 不同）
+TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --tp 2 \
+    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+```
+
+服务端通过 `TENSORSHARP_TP_DEGREE`、`TENSORSHARP_TP_NODE_ID`、`TENSORSHARP_TP_PEERS`
+接受同样的配置。完整参考：**[张量并行与分布式推理](USAGE_zh-cn.md#张量并行与分布式推理)**。
 
 将同一模型作为服务托管（浏览器 UI 在 <http://localhost:5000/index.html>，另有 Ollama/OpenAI API）：
 
@@ -171,6 +209,7 @@ TensorSharp 在 CUDA 的 prefill / 首 token 延迟上明显领先（多轮 pref
 | 多模态 | Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 图像输入；PDF（CLI `--pdf` + Web UI）。 |
 | 连续批处理 | vLLM 风格分页 KV 缓存、基于内容哈希的前缀共享、迭代级调度器（默认启用，`--no-continuous-batching` 关闭）。 |
 | 投机解码 | Qwen 3.6（内嵌）与 Gemma 4（独立草稿 GGUF）的 MTP / NextN 草稿头；默认关闭，服务端通过 `--mtp-spec` 启用。 |
+| 张量并行 | 跨 CUDA GPU 的 Megatron-LM 列/行并行 TP（`--tp N` / `TENSORSHARP_TP_DEGREE`）；通过点对点 TCP 的多节点分布式 TP（`--tp-node-id` / `--tp-peers`），采用分层 AllReduce，CUDA P2P 不可用时自动回退到主机中转。覆盖全部自回归架构。可选 Redis 支撑的 KV 缓存与 Responses API 存储。 |
 | 服务端模型范围 | 通过 `--model` 显式托管单个 GGUF；可通过 `--mmproj` 显式指定投影器；不扫描目录。 |
 | 可观测性 | 结构化每轮日志、队列状态，以及 Web UI / Ollama / OpenAI 中的 KV 缓存复用指标。 |
 

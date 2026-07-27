@@ -412,6 +412,10 @@ server-wide defaults; the defaults only fill in fields the client omits.
 | `TENSORSHARP_TP_DEGREE` | Tensor parallelism degree — number of local CUDA GPUs to split the model across (default: `1`). Used by `TensorSharp.Server` (which has no `--tp` CLI flag) and as a fallback in `ModelBase.Create`. Requires `--backend cuda`. |
 | `TENSORSHARP_TP_NODE_ID` | This node's 0-based ID for multi-node distributed tensor parallelism. Must be set together with `TENSORSHARP_TP_PEERS`. |
 | `TENSORSHARP_TP_PEERS` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Must be set together with `TENSORSHARP_TP_NODE_ID`. |
+| `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | How long each node keeps retrying outbound connections to its peers before giving up (default: `120`). Raise it when nodes are started far apart by hand or by a slow orchestrator. |
+| `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` | Per-receive timeout for a blocking read from a peer (default: `300`). A stalled peer fails the collective instead of hanging on the OS TCP keepalive (often 2+ hours). |
+| `TENSORSHARP_TP_DISABLE_P2P` | Set to `1` to force every cross-GPU transfer through host staging instead of CUDA peer-to-peer DMA. Slower, but reproduces the code path taken by hardware without peer access (A16 vGPU profiles, some consumer cards) and isolates P2P-specific defects. |
+| `TENSORSHARP_TP_HOST_ALLREDUCE` | Set to `1` to run the local AllReduce through host memory (device→host, sum, host→device) instead of the device-to-device P2P path. Diagnostic fallback that mirrors the known-good multi-node reduce. |
 | `TS_KV_CACHE_REDIS_URL` | Redis connection string for the shared KV cache tier (e.g. `localhost:6379`). When set, KV cache blocks are persisted to Redis for cross-session reuse. CLI: `--redis-url` or `--paged-kv-redis-url`. |
 | `TS_KV_CACHE_REDIS_TTL_MINUTES` | TTL in minutes for Redis KV cache entries; `0` = no TTL (default: `1440`). CLI: `--paged-kv-redis-ttl`. |
 | `TS_RESPONSES_STORE_REDIS_URL` | Redis connection string for the OpenAI Responses API store. When set, `RedisResponsesStore` replaces the in-memory store. CLI: `--redis-url`. |
@@ -576,6 +580,28 @@ must be reachable between all nodes.
 - Quantized row-parallel splits require `ne0` divisible by `tp × blockSize`.
 - Batched/continuous-batching forward under TP is implemented for Qwen 3 and Mistral 3; MoE models (Gemma 4, Qwen 3.5/3.6, GPT OSS, Nemotron-H) fall back to per-sequence forward under TP.
 
+### Cluster tuning & diagnostics
+
+Local AllReduce prefers CUDA peer-to-peer DMA. At startup the group enables peer
+access for every device pair that reports it, then runs a round-trip self-test:
+some topologies (L4 behind certain PCIe switches, IOMMU-enabled hosts, small
+BAR1 windows) advertise peer access but silently transfer corrupt data, and any
+pair that fails the test is demoted to host staging permanently. Hardware
+without peer access at all (A16 vGPU profiles, most consumer cards) simply
+stages through host memory from the start.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TENSORSHARP_TP_DISABLE_P2P=1` | off | Force every cross-GPU transfer through host memory, exactly as no-peer hardware does. Use it to check whether a multi-GPU defect lives in the P2P DMA path. |
+| `TENSORSHARP_TP_HOST_ALLREDUCE=1` | off | Run the local AllReduce as device→host, sum on the CPU, host→device. Slower, but matches the multi-node reduce exactly — useful for isolating P2P correctness issues. |
+| `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | `120` | How long a node retries outbound connections to its peers. Nodes are usually launched by hand seconds or minutes apart, so a peer's listener may not be up yet; raise this for slow orchestrators. |
+| `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS=N` | `300` | Per-receive timeout on a peer socket. Without it a stalled peer would block on the OS TCP keepalive (often 2+ hours) instead of failing the collective. |
+
+Startup logs make the topology explicit: the local group prints
+`Tensor parallelism: N GPUs (<device names>)`, P2P demotions print a
+`TP: P2P disabled…` / self-test warning, and every distributed node prints
+`[TcpCommunicator] Rank r/N connected to all peers.` once the mesh is complete.
+
 ### Redis-backed shared state
 
 The server can optionally persist KV cache blocks and the OpenAI Responses API
@@ -638,6 +664,10 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Local tensor parallelism (multi-GPU, single process) | OFF (`1` GPU) | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N` (CLI only) |
 | Distributed TP node ID (multi-node) | unset (disabled) | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N` (CLI only) |
 | Distributed TP peer endpoints | unset (disabled) | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2` (CLI only) |
+| Peer connect retry window (multi-node) | `120` s | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |
+| Per-receive timeout (multi-node) | `300` s | `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS=N` | — |
+| Force host-staged cross-GPU copies | OFF (P2P when available) | `TENSORSHARP_TP_DISABLE_P2P=1` | — |
+| Force host-staged local AllReduce | OFF (device-to-device) | `TENSORSHARP_TP_HOST_ALLREDUCE=1` | — |
 
 #### Redis shared state (server)
 

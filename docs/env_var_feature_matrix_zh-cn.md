@@ -124,6 +124,36 @@ NextN 块；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）。投机仅对单�
 | `TS_GMTP_NO_FAST_ROLLBACK` | Gemma 4 | 部分接受时恢复保留前缀回滚，而非稠密快速回滚 | 关闭 | 未注册 | 否 |
 | `TS_GMTP_BATCHED_TRUNK` | Gemma 4 | 验证主干走批量分页路径，而非线性主干 | 关闭 | 未注册 | 否 |
 
+## 矩阵外的张量并行 / 分布式推理变量
+
+这些变量配置张量并行（把单个模型切分到多张 CUDA GPU）以及基于点对点 TCP 网格的多
+节点分布式 TP。它们未注册在 `EnvVarMatrix.All` 中，也不在默认 TestMatrix 配置里扫
+描——TP 需要直连 `cuda` 后端与多张 GPU，而标准的单 GPU 测试环境无法覆盖。
+`TENSORSHARP_TP_DEGREE` 也可通过 CLI 的 `--tp` 参数设置；`TENSORSHARP_TP_NODE_ID`
+与 `TENSORSHARP_TP_PEERS` 分别对应 `--tp-node-id` 与 `--tp-peers`。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `TENSORSHARP_TP_DEGREE` | 全部自回归模型，`cuda` 后端 | 把模型切分到本机多少张 CUDA GPU（Megatron-LM 列/行并行） | `1`（单 GPU） | 未注册 | 否 |
+| `TENSORSHARP_TP_NODE_ID` | 全部自回归模型，`cuda` 后端 | 多节点分布式 TP 中本节点的 0 起始编号；必须与 `TENSORSHARP_TP_PEERS` 一起设置 | 未设置（关闭） | 未注册 | 否 |
+| `TENSORSHARP_TP_PEERS` | 全部自回归模型，`cuda` 后端 | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔）；必须与 `TENSORSHARP_TP_NODE_ID` 一起设置 | 未设置（关闭） | 未注册 | 否 |
+| `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 仅分布式 TP | 各节点向 peer 重试连接多久后放弃 | `120` 秒 | 未注册 | 否 |
+| `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` | 仅分布式 TP | peer 套接字的单次接收超时；卡住的 peer 会让集合通信失败而不是一直挂起 | `300` 秒 | 未注册 | 否 |
+| `TENSORSHARP_TP_DISABLE_P2P` | 本地 TP，`cuda` 后端 | `1` 表示所有跨 GPU 传输一律经主机中转，不使用 CUDA 点对点 DMA（与 A16 vGPU 等无 P2P 硬件一致） | 关闭（通过 DMA 自检的设备对使用 P2P） | 未注册 | 否 |
+| `TENSORSHARP_TP_HOST_ALLREDUCE` | 本地 TP，`cuda` 后端 | `1` 表示本地 AllReduce 走主机内存（设备→主机、求和、主机→设备）而非设备到设备路径——诊断兜底 | 关闭（设备到设备） | 未注册 | 否 |
+
+## 矩阵外的 Redis 共享状态变量
+
+这些变量为 `TensorSharp.Server` 配置可选的 Redis 共享状态：用于跨会话复用的共享 KV
+缓存层，以及持久化的 OpenAI Responses API 存储。它们未注册在 `EnvVarMatrix.All`
+中，也不在默认 TestMatrix 配置里扫描。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `TS_KV_CACHE_REDIS_URL` | 仅服务端 | 共享 KV 缓存层的 Redis 连接串；设置后 KV 块持久化到 Redis 以便跨会话复用 | 未设置（关闭） | 未注册 | 否 |
+| `TS_KV_CACHE_REDIS_TTL_MINUTES` | 仅服务端 | Redis KV 缓存条目的 TTL（分钟）；`0` = 不过期 | `1440`（24 小时） | 未注册 | 否 |
+| `TS_RESPONSES_STORE_REDIS_URL` | 仅服务端 | Responses API 存储的 Redis 连接串；设置后取代内存存储 | 未设置（关闭） | 未注册 | 否 |
+
 ## 矩阵外的通用运行时开关
 
 这些变量是真实运行时开关，但目前未注册到 `EnvVarMatrix.All`，也不在默认

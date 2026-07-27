@@ -162,6 +162,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
 | `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16`、`q8_0` 或 `q4_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径。 |
+| `--tp <N>` | 张量并行度 —— 在单个进程内把模型切分到 N 张 CUDA GPU 上（默认：`1`）。需要 `--backend cuda`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
+| `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |
+| `--tp-peers <list>` | 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。所有节点必须使用完全相同的列表。必须与 `--tp-node-id` 一起使用。 |
 | `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
 | `--system <text>` | 用于初始化交互式会话的系统提示词（在 REPL 中可用 `/system` 覆盖） |
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
@@ -379,6 +382,16 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
+| `TENSORSHARP_TP_DEGREE` | 张量并行度 —— 把模型切分到本机多少张 CUDA GPU 上（默认：`1`）。`TensorSharp.Server` 使用该变量（服务端没有 `--tp` 命令行参数），同时也是 `ModelBase.Create` 的兜底来源。需要 `--backend cuda`。 |
+| `TENSORSHARP_TP_NODE_ID` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `TENSORSHARP_TP_PEERS` 一起设置。 |
+| `TENSORSHARP_TP_PEERS` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `TENSORSHARP_TP_NODE_ID` 一起设置。 |
+| `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 各节点向 peer 发起连接的重试窗口（默认：`120` 秒）。若节点由人工或较慢的编排系统间隔较久启动，可调大该值。 |
+| `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` | 从 peer 阻塞读取的单次接收超时（默认：`300` 秒）。有了它，卡住的 peer 会让集合通信直接失败，而不是挂在操作系统的 TCP keepalive（往往 2 小时以上）上。 |
+| `TENSORSHARP_TP_DISABLE_P2P` | 设为 `1` 后，所有跨 GPU 传输都经主机内存中转，不使用 CUDA 点对点 DMA。速度更慢，但可复现无 P2P 硬件（A16 vGPU 配置、部分消费级显卡）的代码路径，便于定位 P2P 相关缺陷。 |
+| `TENSORSHARP_TP_HOST_ALLREDUCE` | 设为 `1` 后，本地 AllReduce 走主机内存（设备→主机、求和、主机→设备），而非设备到设备路径。这是与已知可靠的多节点归约完全一致的诊断兜底路径。 |
+| `TS_KV_CACHE_REDIS_URL` | 共享 KV 缓存层的 Redis 连接串（例如 `localhost:6379`）。设置后，KV 缓存块会持久化到 Redis 以便跨会话复用。CLI：`--redis-url` 或 `--paged-kv-redis-url`。 |
+| `TS_KV_CACHE_REDIS_TTL_MINUTES` | Redis KV 缓存条目的 TTL（分钟）；`0` = 不过期（默认：`1440`）。CLI：`--paged-kv-redis-ttl`。 |
+| `TS_RESPONSES_STORE_REDIS_URL` | OpenAI Responses API 存储的 Redis 连接串。设置后由 `RedisResponsesStore` 取代内存存储。CLI：`--redis-url`。 |
 | `DIFFUSION_STEPS` | 服务端 DiffusionGemma 每个 block 的去噪步数（默认：`48`；CLI 对应 `--diffusion-steps`） |
 | `DIFFUSION_MAX_BATCH` | Web UI 扩散调度器可批处理的最大并发 DiffusionGemma 请求数（默认：`2`） |
 
@@ -454,6 +467,123 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 3. 上面列出的 `TENSORSHARP_*` 环境变量。
 4. `SamplingConfig` 内置默认值（`temperature=1.0`、`top_k=0`、`top_p=1.0`、`min_p=0`、`repeat_penalty=1.0`、存在/频率惩罚均为 `0`、`seed=-1`、无停止序列）。
 
+## 张量并行与分布式推理
+
+TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范式把单个模型切分
+到多张 GPU 上——以及**分布式（多节点）张量并行**，让 TP 跨越多台通过 TCP 点对点
+网络互联的机器。
+
+### 本地张量并行（单进程，多 GPU）
+
+在一个进程内把模型切分到 N 张 CUDA GPU 上。每张 GPU 持有 `1/N` 的切分权重（列
+并行的 QKV / gate / up，行并行的 output / down），外加一份完整的复制权重（归一
+化层、词嵌入、LM head）。各 GPU 的 KV 缓存彼此独立；每次行并行投影之后由
+AllReduce（CUDA P2P 拷贝 + 逐元素加法内核）把隐藏状态重新汇聚。
+
+```bash
+# CLI：2 GPU 张量并行
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2
+
+# 服务端：通过环境变量（服务端没有 --tp 命令行参数）
+TENSORSHARP_TP_DEGREE=2 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model <model.gguf> --backend cuda
+
+# 配置文件 JSON
+{ "tp": 2, "backend": "cuda", "model": "<model.gguf>" }
+```
+
+### 分布式张量并行（多节点，点对点 TCP）
+
+把 TP 扩展到多台机器。每个节点运行自己的进程、管理自己的本地 GPU；节点之间通过
+带长度前缀的分帧协议在 TCP 网格上通信。AllReduce 是分层的：先在节点内做本地
+P2P 归约，再由各节点代表之间走 TCP，最后广播回来——每次集合通信只有 `1/tp_local`
+的数据需要穿过网络。
+
+```bash
+# 2 节点 × 每节点 2 GPU（共 4 GPU）
+# 节点 0：
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
+    --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+
+# 节点 1：
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
+    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+
+# 服务端：通过环境变量
+# 节点 0：
+TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=0 \
+TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
+    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda
+
+# 节点 1：
+TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=1 \
+TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
+    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda
+
+# 配置文件 JSON（每个节点一份）
+{ "tp": 2, "tp-node-id": 0, "tp-peers": "192.168.1.10:9500,192.168.1.11:9500", "backend": "cuda" }
+```
+
+所有节点必须使用完全相同的 `--tp-peers` 列表（或 `TENSORSHARP_TP_PEERS` 环境变
+量），并各自使用唯一的 `--tp-node-id`（或 `TENSORSHARP_TP_NODE_ID`）。示例中的端
+口（`9500`）不是默认值——必须显式指定，且在所有节点之间可达。
+
+### 支持的架构
+
+| 架构 | TP 状态 | 说明 |
+|---|---|---|
+| Qwen 3 | ✅ | 参考实现 |
+| Mistral 3 | ✅ | 融合 / 分离 QKV，YaRN RoPE |
+| Gemma 3 | ✅ | 分离 Q/K/V，GELU，滑动窗口 |
+| Gemma 4 | ✅ | 稠密 + MoE 专家切分，逐层 head 维度 |
+| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属，MoE 专家切分 |
+| GPT OSS | ✅ | MoE 专家切分，attention sink，YaRN |
+| Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算，MoE 专家切分 |
+| DiffusionGemma | — | 不适用（扩散模型） |
+| Qwen-Image-Edit | — | 不适用（图像生成） |
+
+### 约束
+
+- **仅支持 CUDA 后端**（`--backend cuda`）。GGML、MLX、Vulkan 在设计上都是单设备。
+- `numHeads`、`numKVHeads` 与 `intermediateSize` 必须能被 TP 度整除。
+- 量化权重的行并行切分要求 `ne0` 能被 `tp × blockSize` 整除。
+- TP 下的批处理 / 连续批处理前向目前实现于 Qwen 3 与 Mistral 3；MoE 模型（Gemma 4、Qwen 3.5/3.6、GPT OSS、Nemotron-H）在 TP 下回退到按序列前向。
+
+### 集群调优与诊断
+
+本地 AllReduce 优先使用 CUDA 点对点（P2P）DMA。启动时，并行组会为每一对报告支持
+P2P 的设备启用 peer access，随后做一次往返自检：部分拓扑（挂在某些 PCIe 交换机
+后的 L4、开启 IOMMU 的主机、BAR1 窗口过小）虽然声称支持 P2P，却会静默传输损坏数
+据——任何未通过自检的设备对都会被永久降级为主机中转。完全不支持 peer access 的
+硬件（A16 vGPU 配置、大多数消费级显卡）则一开始就走主机内存中转。
+
+| 变量 | 默认值 | 作用 |
+|---|---|---|
+| `TENSORSHARP_TP_DISABLE_P2P=1` | 关闭 | 所有跨 GPU 传输一律经主机内存中转，与无 P2P 硬件的路径完全一致。用于判断某个多 GPU 缺陷是否出在 P2P DMA 路径上。 |
+| `TENSORSHARP_TP_HOST_ALLREDUCE=1` | 关闭 | 本地 AllReduce 改为设备→主机、CPU 求和、主机→设备。更慢，但与多节点归约路径完全一致，便于隔离 P2P 正确性问题。 |
+| `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | `120` | 节点向 peer 重试连接的时长。节点通常由人工间隔数秒到数分钟启动，peer 的监听端可能尚未就绪；编排系统较慢时可调大。 |
+| `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS=N` | `300` | peer 套接字的单次接收超时。否则卡住的 peer 会一直阻塞到操作系统 TCP keepalive 超时（往往 2 小时以上），而不是让集合通信失败。 |
+
+启动日志会明确给出拓扑：本地并行组打印
+`Tensor parallelism: N GPUs (<设备名>)`，P2P 降级会打印 `TP: P2P disabled…` 或自
+检告警，每个分布式节点在网格建立完成后打印
+`[TcpCommunicator] Rank r/N connected to all peers.`。
+
+### Redis 支撑的共享状态
+
+服务端可以选择把 KV 缓存块与 OpenAI Responses API 存储持久化到 Redis，从而实现跨
+会话的 KV 复用与持久化的响应存储：
+
+```bash
+# 同时为 KV 缓存与 Responses API 启用 Redis
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda \
+    --redis-url localhost:6379
+
+# 仅启用 KV 缓存层，TTL 设为 12 小时
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda \
+    --paged-kv-redis-url localhost:6379 --paged-kv-redis-ttl 720
+```
+
 ## 功能 × 环境变量矩阵
 
 每个主要功能由哪些环境变量（以及对应的 CLI 参数）控制的速查矩阵。**加粗**的变量是该功能的开关；其余的是该功能默认启用后的调优参数。
@@ -493,6 +623,26 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | Gemma 4 融合验证 / 草稿内核（ggml） | 开启 | `TS_GMTP_NO_FUSED=1` 回退到逐算子 | — |
 | Gemma 4 部分接受时的稠密快速回滚 | 开启 | `TS_GMTP_NO_FAST_ROLLBACK=1` 恢复保留前缀回滚 | — |
 | Gemma 4 验证主干路径 | 线性（单序列） | `TS_GMTP_BATCHED_TRUNK=1` 走批量分页主干 | — |
+
+#### 张量并行与分布式推理
+
+| 功能 | 默认 | 环境变量 | CLI 等价参数 |
+|---|---|---|---|
+| 本地张量并行（单进程，多 GPU） | 关闭（`1` 张 GPU） | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N`（仅 CLI） |
+| 分布式 TP 节点编号（多节点） | 未设置（关闭） | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N`（仅 CLI） |
+| 分布式 TP peer 端点 | 未设置（关闭） | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2`（仅 CLI） |
+| peer 连接重试窗口（多节点） | `120` 秒 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |
+| 单次接收超时（多节点） | `300` 秒 | `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS=N` | — |
+| 强制跨 GPU 拷贝走主机中转 | 关闭（可用时使用 P2P） | `TENSORSHARP_TP_DISABLE_P2P=1` | — |
+| 强制本地 AllReduce 走主机中转 | 关闭（设备到设备） | `TENSORSHARP_TP_HOST_ALLREDUCE=1` | — |
+
+#### Redis 共享状态（仅服务端）
+
+| 功能 | 默认 | 环境变量 | CLI 等价参数 |
+|---|---|---|---|
+| Redis KV 缓存层 | 关闭 | **`TS_KV_CACHE_REDIS_URL`** | `--redis-url` 或 `--paged-kv-redis-url` |
+| Redis KV 缓存条目 TTL | `1440` 分钟（24 小时） | `TS_KV_CACHE_REDIS_TTL_MINUTES`（`0` = 不过期） | `--paged-kv-redis-ttl` |
+| Redis Responses API 存储 | 关闭（内存） | **`TS_RESPONSES_STORE_REDIS_URL`** | `--redis-url` |
 
 #### 后端
 
