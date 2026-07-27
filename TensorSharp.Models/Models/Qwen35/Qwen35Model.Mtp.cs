@@ -80,6 +80,19 @@ namespace TensorSharp.Models
             bool hasProj = _mtpEhProjQW != null || _mtpEhProjF32 != null;
             bool hasAttn = _attnQkvQW[_mtpLayerIdx] != null || _attnQkvF32[_mtpLayerIdx] != null
                 || _attnQQW[_mtpLayerIdx] != null || _attnQF32[_mtpLayerIdx] != null;
+            if (IsTensorParallel)
+            {
+                // Under tensor parallelism the fused Q/K/V (or separate Q) projections
+                // are moved out of _quantWeights/_weights into per-rank shard tables,
+                // so the per-layer cached arrays above stay null even though the MTP
+                // attention block is fully sharded and usable. Consult the TP shard
+                // tables, keyed by the same weight names the TP forward path uses.
+                hasAttn = hasAttn
+                    || _tpQuantWeights.ContainsKey(_attnQkvKey[_mtpLayerIdx])
+                    || _tpWeights.ContainsKey(_attnQkvKey[_mtpLayerIdx])
+                    || _tpQuantWeights.ContainsKey(_attnQKey[_mtpLayerIdx])
+                    || _tpWeights.ContainsKey(_attnQKey[_mtpLayerIdx]);
+            }
             HasMtp = _numNextnLayers == 1 && hasProj && _mtpEnormW != null && _mtpHnormW != null
                 && hasAttn && _attnNormW[_mtpLayerIdx] != null && _postAttnNormW[_mtpLayerIdx] != null;
 
