@@ -108,6 +108,17 @@ TP requires the `cuda` backend (GGML, MLX, and Vulkan are single-device by
 design). Batched/continuous-batching forward under TP is implemented for Qwen 3
 and Mistral 3; MoE models fall back to per-sequence forward under TP.
 
+Local collectives prefer CUDA peer-to-peer DMA, but the group self-tests every
+peer-capable device pair at startup and permanently demotes any pair whose
+round-trip comes back corrupt (seen on some L4 PCIe topologies), so hosts
+without working P2P — A16 vGPU profiles, most consumer cards — fall back to host
+staging automatically. Diagnostic overrides: `TENSORSHARP_TP_DISABLE_P2P=1`
+(stage every cross-GPU copy through host memory) and
+`TENSORSHARP_TP_HOST_ALLREDUCE=1` (run the local AllReduce on the CPU).
+Multi-node connect and receive windows are tuned with
+`TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` (default 120 s) and
+`TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` (default 300 s).
+
 The server also supports optional **Redis-backed shared state**: a shared KV
 cache tier (`--redis-url` / `TS_KV_CACHE_REDIS_URL`) for cross-session KV reuse,
 and a Redis-backed Responses API store (`TS_RESPONSES_STORE_REDIS_URL`) for

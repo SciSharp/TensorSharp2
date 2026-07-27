@@ -148,6 +148,10 @@ also settable via the CLI's `--tp` flag; `TENSORSHARP_TP_NODE_ID` and
 | `TENSORSHARP_TP_DEGREE` | all autoregressive models, `cuda` backend | Number of local CUDA GPUs to split the model across (Megatron-LM column/row-parallel) | `1` (single GPU) | not registered | no |
 | `TENSORSHARP_TP_NODE_ID` | all autoregressive models, `cuda` backend | This node's 0-based ID for multi-node distributed TP; must be set with `TENSORSHARP_TP_PEERS` | unset (disabled) | not registered | no |
 | `TENSORSHARP_TP_PEERS` | all autoregressive models, `cuda` backend | Comma-separated `host:port` list of all nodes in the distributed TP cluster; must be set with `TENSORSHARP_TP_NODE_ID` | unset (disabled) | not registered | no |
+| `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | distributed TP only | How long each node retries outbound connections to its peers before failing | `120` seconds | not registered | no |
+| `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` | distributed TP only | Per-receive timeout on a peer socket; a stalled peer fails the collective instead of hanging | `300` seconds | not registered | no |
+| `TENSORSHARP_TP_DISABLE_P2P` | local TP, `cuda` backend | `1` forces every cross-GPU transfer through host staging instead of CUDA peer-to-peer DMA (matches no-peer hardware such as A16 vGPU profiles) | off (P2P used when the pair passes the DMA self-test) | not registered | no |
+| `TENSORSHARP_TP_HOST_ALLREDUCE` | local TP, `cuda` backend | `1` runs the local AllReduce through host memory (device→host, sum, host→device) instead of the device-to-device path — diagnostic fallback | off (device-to-device) | not registered | no |
 
 ## Out-of-Matrix Redis Shared-State Knobs
 

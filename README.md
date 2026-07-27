@@ -69,24 +69,45 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 **Linux + NVIDIA** — prefix the `dotnet run` with `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` and use `--backend ggml_cuda`.
 **AMD / Intel / NVIDIA Vulkan** — set `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` and use `--backend ggml_vulkan`.
 
-**Linux (Ubuntu) + NVIDIA with Tensor Parallelism**
+**Linux (Ubuntu) + multiple NVIDIA GPUs — tensor parallelism**
 
-Make sure Cuda is installed first, then:-
+Tensor parallelism splits one model across N GPUs and runs on the direct
+`cuda` backend. Install the CUDA toolkit first, then:
+
 ```bash
-#On runpod's ubuntu 24.02 we need ot make sure Cuda libraries are correctly set:-
-LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
-#For old Ubuntu versions you might need this:-
+# On RunPod's Ubuntu 24.04 images, point the loader at the CUDA compat libraries first:
+export LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:$LD_LIBRARY_PATH
+# On older Ubuntu releases the .NET 10 SDK comes from the backports PPA:
 add-apt-repository ppa:dotnet/backports
 
 apt update && apt install dotnet-sdk-10.0
 git clone https://github.com/zhongkaifu/TensorSharp.git
 cd TensorSharp
 mkdir models
-wget https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true -O models/gemma-4-E4B-it-Q8_0.gguf
+wget "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -O models/gemma-4-E4B-it-Q8_0.gguf
 bash TensorSharp.GGML.Native/build-linux.sh
 dotnet build -c Release
-TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --interactive --max-tokens 20000 --tp 2
+
+# 2 GPUs in one process
+TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf \
+    --backend cuda --interactive --max-tokens 20000 --tp 2
 ```
+
+Scale the same model across machines by adding a node ID and the shared peer
+list — 2 nodes × 2 GPUs gives a global TP degree of 4:
+
+```bash
+# Node 0
+TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --tp 2 \
+    --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+# Node 1 (same peer list, different node ID)
+TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --backend cuda --tp 2 \
+    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+```
+
+The server takes the same configuration through `TENSORSHARP_TP_DEGREE`,
+`TENSORSHARP_TP_NODE_ID`, and `TENSORSHARP_TP_PEERS`. Full reference:
+**[Tensor Parallelism & Distributed Inference](USAGE.md#tensor-parallelism--distributed-inference)**.
 
 
 Host the same model as a server (browser UI at <http://localhost:5000/index.html>, plus Ollama/OpenAI APIs):
@@ -192,7 +213,7 @@ New here? The sections above are all you need to get running. Everything else is
 | Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, Nemotron-H Omni image input; PDF documents (CLI `--pdf` + Web UI). |
 | Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (default on; opt-out `--no-continuous-batching`). |
 | Speculative decoding | MTP / NextN draft heads on Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); off by default, opt-in via the server's `--mtp-spec`. |
-| Tensor parallelism | Megatron-LM column/row-parallel TP across CUDA GPUs (`--tp N` / `TENSORSHARP_TP_DEGREE`); distributed multi-node TP via peer-to-peer TCP (`--tp-node-id` / `--tp-peers`). All autoregressive architectures. Optional Redis-backed KV cache and Responses API store. |
+| Tensor parallelism | Megatron-LM column/row-parallel TP across CUDA GPUs (`--tp N` / `TENSORSHARP_TP_DEGREE`); distributed multi-node TP via peer-to-peer TCP (`--tp-node-id` / `--tp-peers`), with hierarchical AllReduce and automatic host-staging fallback when CUDA P2P is unavailable. All autoregressive architectures. Optional Redis-backed KV cache and Responses API store. |
 | Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning. |
 | Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI shapes. |
 

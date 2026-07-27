@@ -24,7 +24,7 @@
     <thead><tr><th>Your hardware</th><th>Recommended</th><th>Flag</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td><strong>Apple Silicon (Mac)</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>Default on macOS. <code>mlx</code> is an alternative Apple-Silicon GPU path.</td></tr>
-      <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>Most-tested NVIDIA path. <code>cuda</code> is the direct PTX/cuBLAS backend for experimentation.</td></tr>
+      <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>Most-tested NVIDIA path. <code>cuda</code> is the direct PTX/cuBLAS backend for experimentation — and the one that supports <a href="distributed.html">multi-GPU tensor parallelism</a>.</td></tr>
       <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>Vendor-neutral GPU path via ggml-vulkan (cooperative-matrix accelerated where the driver supports it). Built automatically when the machine has a Vulkan runtime; opt out with <code>--no-vulkan</code>.</td></tr>
       <tr><td><strong>No GPU / portability / debugging</strong></td><td>Pure C# CPU</td><td><code>cpu</code></td><td>No native dependencies. For faster CPU inference use <code>ggml_cpu</code> (native kernels).</td></tr>
     </tbody>
@@ -62,6 +62,7 @@
 
   <h3 id="cuda">Direct CUDA</h3>
   <p><code>--backend cuda</code> is a pure-C# path using the CUDA Driver API, cuBLAS GEMM, and PTX kernels for common float32 ops (fill, unary/binary/ternary, activations, RMSNorm, softmax, RoPE/RoPEEx, SDPA, GQA prefill/decode, causal mask, gather/concat) plus native quantized matmul/get-rows for supported quant types. Unsupported ops route through CPU fallbacks while preserving tensor semantics. It is also the pure-C# backend where <a href="advanced.html#mtp">MTP speculative decoding</a> is profitable.</p>
+  <p>It is likewise the <strong>only backend that supports tensor parallelism</strong>: <code>--tp N</code> shards one model across N CUDA GPUs, and <code>--tp-node-id</code> / <code>--tp-peers</code> extend the group across machines. The GGML, Vulkan, and MLX paths are single-device by design — on a multi-GPU host they pick one device (<code>--gpu-device</code> for Vulkan) rather than splitting the model. → <a href="distributed.html">Multi-GPU &amp; Multi-Node</a></p>
 
   <h3 id="cpu">CPU backends</h3>
   <ul>

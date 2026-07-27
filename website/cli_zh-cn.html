@@ -191,6 +191,9 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--think</code></td><td>启用思考 / 推理模式（思维链）。</td></tr>
       <tr><td><code>--tools &lt;path&gt;</code></td><td>含工具 / 函数定义的 JSON 文件。</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>渲染提示词 + 分词后退出（不生成）。</td></tr>
+      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 在单个进程内把模型切分到 N 张 CUDA GPU 上（默认：1）。需要 <code>--backend cuda</code>。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
+      <tr><td><code>--tp-node-id &lt;N&gt;</code></td><td>多节点分布式张量并行中本节点的 0 起始编号。需与 <code>--tp-peers</code> 一起使用。</td></tr>
+      <tr><td><code>--tp-peers &lt;list&gt;</code></td><td>集群中所有节点的 <code>host:port</code> 列表，逗号分隔（例如 <code>192.168.1.10:9500,192.168.1.11:9500</code>）。所有节点必须完全一致；端口没有默认值，且需在节点之间可达。</td></tr>
       <tr><td><code>--config &lt;path&gt;</code></td><td>从 JSON <a href="#config">配置文件</a>读取参数（命令行参数会覆盖它）。支持 <code>${变量}</code> 与模型自动下载。可重复。</td></tr>
     </tbody>
   </table>

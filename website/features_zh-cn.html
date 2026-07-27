@@ -29,6 +29,7 @@
     <div class="card"><div class="ic">📦</div><h3>原生量化计算</h3><p>Q4_K_M、Q8_0、MXFP4、IQ2_XXS 等在 matmul 中直接运算，无需反量化到 FP32。</p></div>
     <div class="card"><div class="ic">🔀</div><h3>连续批处理</h3><p>vLLM 式分页 KV 缓存，跨请求前缀共享。</p></div>
     <div class="card"><div class="ic">⏩</div><h3>推测解码</h3><p>MTP / NextN 草稿头无损加速单序列解码。</p></div>
+    <a class="card" href="distributed_zh-cn.html"><div class="ic">🔗</div><h3>多 GPU 与多节点</h3><p>张量并行把一个模型切分到多张 CUDA GPU 上，并通过 TCP 网格跨机器扩展。</p></a>
     <div class="card"><div class="ic">🔌</div><h3>Ollama 与 OpenAI API</h3><p>面向现有工具的即插即用端点，外加浏览器聊天 UI。</p></div>
   </div>
 
@@ -60,6 +61,7 @@
     <li><strong>GPU 加速</strong> —— GGML Metal（macOS）、GGML CUDA（Windows/Linux + NVIDIA）、GGML Vulkan（Windows/Linux + AMD/Intel/NVIDIA）、直接 CUDA/cuBLAS 后端，以及面向 Apple Silicon 的 MLX 后端 —— 均带 CPU 回退。→ <a href="backends_zh-cn.html">后端</a></li>
     <li><strong>连续批处理与分页 KV 缓存</strong> —— 块分页 KV 池、块哈希前缀共享、可在批中接纳 / 抢占序列的迭代级调度器、可选 SSD 后备层，以及原生融合分页注意力内核。→ <a href="advanced_zh-cn.html#continuous-batching">深入了解</a></li>
     <li><strong>批量 / 并行推理</strong> —— 将 N 个序列打包进一次前向，配以分页 K/V 散写（Mistral 3、Gemma 4、GPT OSS、Qwen 3 / 3.5 / 3.6、Nemotron-H）。</li>
+    <li><strong>张量并行与分布式推理</strong> —— 用 <code>--tp N</code> 把一个模型切分到 N 张 CUDA GPU 上（Megatron-LM 列/行并行，归一化层 / 词嵌入 / LM head 复制），并通过点对点 TCP 网格（<code>--tp-node-id</code> / <code>--tp-peers</code>）把并行组扩展到多台机器。分层 AllReduce 让每次集合通信只有 <code>1/tp_local</code> 的数据上网；MoE 专家切分、GatedDeltaNet 按 rank 的 V-head 归属与 Mamba2 复制覆盖了各类异构层。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></li>
     <li><strong>MTP / NextN 推测解码</strong> —— 多 token 预测草稿头加速单序列解码；因请求自身的采样器同时驱动草稿与验证，故无损。→ <a href="advanced_zh-cn.html#mtp">推测解码</a></li>
     <li><strong>原生量化计算</strong> —— 量化权重直接用于 matmul，无需展开为 FP32，节省内存与带宽。</li>
     <li><strong>优化的纯 C# CPU 后端</strong> —— 托管 GEMM 快路径，外加 RMSNorm、RoPE、softmax 与融合激活的融合 SIMD 内核。</li>

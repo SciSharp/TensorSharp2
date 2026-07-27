@@ -69,6 +69,7 @@
     <a class="card" href="code-api_zh-cn.html"><div class="ic">🧩</div><h3>C# 库</h3><p>将引擎直接嵌入你的 .NET 应用。</p></a>
     <a class="card" href="api-reference_zh-cn.html"><div class="ic">📚</div><h3>API 参考</h3><p>可搜索的参数、环境变量、端点与类型表。</p></a>
     <a class="card" href="models_zh-cn.html"><div class="ic">🧠</div><h3>模型</h3><p>支持的架构、下载、多模态与推理能力。</p></a>
+    <a class="card" href="distributed_zh-cn.html"><div class="ic">🔗</div><h3>多 GPU 与多节点</h3><p>跨 CUDA GPU、跨机器的张量并行。</p></a>
     <a class="card" href="glossary_zh-cn.html"><div class="ic">📖</div><h3>术语表与 FAQ</h3><p>初识大模型？这里有通俗的定义和常见问题。</p></a>
   </div>
 
@@ -111,6 +112,7 @@ TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Cli -c R
     <div class="card"><div class="ic">🖥️</div><h3>随处可运行</h3><p>NVIDIA (CUDA)、AMD / Intel / NVIDIA (Vulkan)、Apple Silicon (Metal/MLX) 或纯 CPU —— 均带自动回退。</p></div>
     <div class="card"><div class="ic">🧠</div><h3>现代模型支持</h3><p>Gemma、Qwen、GPT-OSS、Nemotron-H、Mistral，外加视觉、音频、PDF 文档、推理与工具调用。</p></div>
     <div class="card"><div class="ic">⚙️</div><h3>用 .NET 构建</h3><p>原生 C# 引擎，可嵌入你的应用，而不只是一个黑盒二进制。</p></div>
+    <a class="card" href="distributed_zh-cn.html"><div class="ic">🔗</div><h3>不止一张 GPU</h3><p>张量并行用 <code>--tp N</code> 把模型切分到多张 CUDA GPU 上；一台机器不够时，还可通过点对点 TCP 网格跨机器扩展。</p></a>
     <a class="card" href="benchmarks_zh-cn.html#head-to-head"><div class="ic">🏁</div><h3>对比 llama.cpp 的基准</h3><p>在相同 GGUF 文件与相同 GPU 上与 C++ 引擎互有胜负 —— 在当前的 CUDA + Vulkan 对比运行中（可通过 <code>benchmarks/engine_comparison</code> 复现）：Gemma 4 E4B 与 2-bit 量化的 Qwen 3.6 35B-A3B MoE 在 CUDA 上 prefill 快 1.28×、首 token 早 1.27×，多轮提示的 prefill 在每个模型上都更快（最高 1.49×），Gemma 4 12B 在 Vulkan 上 decode 快 1.21×。</p></a>
   </div>
 
