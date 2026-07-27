@@ -39,6 +39,9 @@
       <tr><td><strong>Tool / function calling</strong></td><td>The model can ask your application to run a function (e.g. "get_weather") and use the result. → <a href="models.html#toolcalling">Tool calling</a></td></tr>
       <tr><td><strong>Continuous batching</strong></td><td>Serving many users at once by interleaving their requests on a single hosted model, instead of one at a time. → <a href="advanced.html#continuous-batching">Deep dive</a></td></tr>
       <tr><td><strong>Speculative decoding</strong></td><td>A small "draft" head guesses several tokens; the main model verifies them in one pass — faster output, identical result. → <a href="advanced.html#mtp">MTP</a></td></tr>
+      <tr><td><strong>Tensor parallelism (TP)</strong></td><td>Splitting <em>one</em> model across several GPUs so each holds a slice of every layer's weights — used when a model is too big for one card. Distinct from running several copies of a model. → <a href="distributed.html">Multi-GPU &amp; Multi-Node</a></td></tr>
+      <tr><td><strong>AllReduce</strong></td><td>The collective step where every GPU in a parallel group sums its partial result with the others, so all of them end up holding the same value. TensorSharp runs it after each row-parallel projection.</td></tr>
+      <tr><td><strong>Node / rank</strong></td><td>In a distributed run, a <em>node</em> is one machine and a <em>rank</em> is one GPU's position in the parallel group. Global degree = local GPUs × nodes.</td></tr>
       <tr><td><strong>Projector (mmproj)</strong></td><td>A companion file that lets a multimodal model understand images/audio. Place it next to the model or pass <code>--mmproj</code>.</td></tr>
       <tr><td><strong>Sampling</strong></td><td>How the next token is chosen from the model's probabilities. <em>Temperature</em>, <em>top-p</em>, and <em>top-k</em> control creativity vs. determinism. → <a href="http-api.html#sampling">Sampling</a></td></tr>
     </tbody>

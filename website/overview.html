@@ -93,6 +93,7 @@
       <tr><td>Multimodal</td><td>Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input. PDF documents via Web UI upload and CLI <code>--pdf</code> (text extracted and inlined; scanned pages rendered as images for vision models).</td></tr>
       <tr><td>Continuous batching</td><td>vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (on by default; opt-out via <code>--no-continuous-batching</code>).</td></tr>
       <tr><td>Speculative decoding</td><td>MTP / NextN draft heads for Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); off by default, opt-in via the server's <code>--mtp-spec</code> flag (env <code>TS_MTP_SPEC</code>).</td></tr>
+      <tr><td>Tensor parallelism</td><td>Megatron-LM column/row-parallel TP across CUDA GPUs (<code>--tp N</code> / <code>TENSORSHARP_TP_DEGREE</code>) and multi-node distributed TP over a peer-to-peer TCP mesh (<code>--tp-node-id</code> / <code>--tp-peers</code>), for every autoregressive architecture. Optional Redis-backed shared KV cache and Responses API store. → <a href="distributed.html">Multi-GPU &amp; Multi-Node</a></td></tr>
       <tr><td>Observability</td><td>Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI response shapes.</td></tr>
     </tbody>
   </table>

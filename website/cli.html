@@ -191,6 +191,9 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--think</code></td><td>Enable thinking / reasoning mode (chain-of-thought).</td></tr>
       <tr><td><code>--tools &lt;path&gt;</code></td><td>JSON file with tool / function definitions.</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>Render the prompt + tokenization and exit (no generation).</td></tr>
+      <tr><td><code>--tp &lt;N&gt;</code></td><td>Tensor parallelism degree — split the model across N CUDA GPUs in one process (default: 1). Requires <code>--backend cuda</code>. → <a href="distributed.html">Multi-GPU &amp; Multi-Node</a></td></tr>
+      <tr><td><code>--tp-node-id &lt;N&gt;</code></td><td>This node's 0-based ID for multi-node distributed tensor parallelism. Use together with <code>--tp-peers</code>.</td></tr>
+      <tr><td><code>--tp-peers &lt;list&gt;</code></td><td>Comma-separated <code>host:port</code> list of every node in the cluster (e.g. <code>192.168.1.10:9500,192.168.1.11:9500</code>). Identical on all nodes; the port is not a default and must be reachable between them.</td></tr>
       <tr><td><code>--config &lt;path&gt;</code></td><td>Read options from a JSON <a href="#config">config file</a> (command-line options override it). Supports <code>${variables}</code> and auto-downloading models. Repeatable.</td></tr>
     </tbody>
   </table>

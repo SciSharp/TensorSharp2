@@ -83,6 +83,16 @@ window.SEARCH_INDEX_ZH = [
   { t: "内存优化", p: "高级", u: "advanced.html#memory", s: "零拷贝 mmap 权重、最佳匹配池、SSD KV 溢出、KV 编解码器。", k: "memory 内存 mmap 占用 ram turboquant q2 q4 q8 paged-kv-quant-bits kv 编解码器" },
   { t: "DiffusionGemma 文本扩散", p: "高级", u: "advanced.html#diffusion", s: "在 Gemma-4 MoE 主干上的块式 EntropyBound 去噪。", k: "diffusion 扩散 去噪 文本生成" },
 
+  { t: "多 GPU 与多节点", p: "分布式", u: "distributed.html", s: "张量并行把一个模型切分到多张 CUDA GPU 上，并通过点对点 TCP 网格跨机器扩展。", k: "tensor parallelism tp 张量并行 多 GPU 多节点 分布式 集群 megatron 切分 扩容 --tp" },
+  { t: "张量并行的工作原理", p: "分布式", u: "distributed.html#how", s: "列并行 QKV 与 gate/up、各 rank 独立注意力、行并行 output/down 加一次 AllReduce；归一化层、词嵌入与 LM head 复制。", k: "megatron 列并行 行并行 allreduce 切分 rank 复制 集合通信" },
+  { t: "本地张量并行（--tp N）", p: "分布式", u: "distributed.html#local", s: "用 --tp N 在单进程内把模型切分到 N 张 CUDA GPU；服务端使用 TENSORSHARP_TP_DEGREE。", k: "tp degree 并行度 多 GPU 单进程 cuda stream TENSORSHARP_TP_DEGREE 配置文件" },
+  { t: "跨机器的分布式 TP", p: "分布式", u: "distributed.html#multinode", s: "点对点 TCP 网格 + 分层 AllReduce：每个节点使用 --tp-node-id 与共用的 --tp-peers host:port 列表。", k: "多节点 集群 tcp peers 节点编号 9500 分层 allreduce 网络 TENSORSHARP_TP_PEERS TENSORSHARP_TP_NODE_ID" },
+  { t: "TP 支持的架构", p: "分布式", u: "distributed.html#architectures", s: "覆盖全部自回归架构：MoE 专家切分、GatedDeltaNet 按 rank 的 V-head、Mamba2 在 rank 0 上复制。", k: "qwen gemma gptoss nemotron mistral moe 专家切分 gateddeltanet mamba2 支持" },
+  { t: "TP 的要求与约束", p: "分布式", u: "distributed.html#constraints", s: "仅限 Direct cuda 后端；head 数与中间维度必须被 TP 度整除；MoE 在 TP 下回退到按序列前向。", k: "要求 限制 整除 numHeads numKVHeads intermediateSize ne0 blockSize 批处理" },
+  { t: "TP 调优与诊断", p: "分布式", u: "distributed.html#tuning", s: "P2P 自检与自动主机中转回退，以及 TENSORSHARP_TP_* 的连接、接收、P2P 与 AllReduce 开关。", k: "TENSORSHARP_TP_DISABLE_P2P TENSORSHARP_TP_HOST_ALLREDUCE 连接超时 接收超时 p2p dma vgpu a16 l4 bar1 iommu" },
+  { t: "集群内的共享状态（Redis）", p: "分布式", u: "distributed.html#shared-state", s: "Redis 支撑的 KV 缓存层与 Responses API 存储，实现跨进程复用与持久化。", k: "redis kv 缓存层 responses 存储 TS_KV_CACHE_REDIS_URL TS_RESPONSES_STORE_REDIS_URL --redis-url ttl" },
+  { t: "多 GPU 故障排查", p: "分布式", u: "distributed.html#troubleshooting", s: "设备数报错、后端选错、维度无法整除、节点等待 peer，以及多 GPU 输出乱码。", k: "排查 调试 卡住 乱码 损坏 更慢 CUDA_VISIBLE_DEVICES 防火墙 端口" },
+
   { t: "同台对比 vs llama.cpp", p: "基准测试", u: "benchmarks.html#head-to-head", s: "纯 .NET 的 TensorSharp 在相同 GGUF + GPU 下、CUDA 与 Vulkan 两个后端上与 llama.cpp 互有胜负：E4B 与 2-bit Qwen 3.6 35B-A3B MoE 在 CUDA 上 prefill 1.28× / TTFT 1.27×（多轮最高 1.49×）；12B 在 Vulkan 上 decode 1.21×；四个模型中有三个的 CUDA decode 持平或更快。", k: "llama.cpp 对比 更快 加速 几何平均 moe prefill ttft 多轮 decode 持平 cuda vulkan vs versus" },
   { t: "基准测试", p: "基准测试", u: "benchmarks.html#head-to-head", s: "在相同 GGUF 文件与硬件上对比 llama.cpp 的同台评测。", k: "performance 性能 数字 吞吐 每秒 token" },
   { t: "测试", p: "基准测试", u: "benchmarks.html#testing", s: "xUnit 单元测试与服务器集成测试。", k: "tests 测试 xunit 集成 ci" },

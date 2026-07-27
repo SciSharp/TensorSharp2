@@ -137,6 +137,10 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
       <tr><td><code>TENSORSHARP_REPEAT_PENALTY</code>、<code>…_PRESENCE_PENALTY</code>、<code>…_FREQUENCY_PENALTY</code>、<code>…_SEED</code></td><td>默认惩罚与随机种子。</td></tr>
       <tr><td><code>TENSORSHARP_LOG_LEVEL</code> / <code>…_LOG_DIR</code> / <code>…_LOG_FILE</code></td><td>日志级别、目录与文件开关（CLI 同样遵循）。</td></tr>
       <tr><td><code>DIFFUSION_STEPS</code> / <code>DIFFUSION_MAX_BATCH</code></td><td>DiffusionGemma 每块去噪步数 / 批处理的最大并发扩散请求数。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td>把托管模型切分到本机多少张 CUDA GPU 上（默认：<code>1</code>）。服务端没有 <code>--tp</code> 参数，因此该变量是在这里启用张量并行的唯一方式。需要 <code>--backend cuda</code>。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
+      <tr><td><code>TENSORSHARP_TP_NODE_ID</code> / <code>TENSORSHARP_TP_PEERS</code></td><td>把张量并行扩展到多台机器：本节点的 0 起始编号，以及所有节点共用的逗号分隔 <code>host:port</code> 列表。两者必须同时设置。</td></tr>
+      <tr><td><code>TS_KV_CACHE_REDIS_URL</code> / <code>TS_KV_CACHE_REDIS_TTL_MINUTES</code></td><td>把分页 KV 块持久化到 Redis，实现跨会话（乃至跨进程）复用，以及条目 TTL（分钟，默认 <code>1440</code>；<code>0</code> = 不过期）。CLI：<code>--redis-url</code> / <code>--paged-kv-redis-url</code> / <code>--paged-kv-redis-ttl</code>。</td></tr>
+      <tr><td><code>TS_RESPONSES_STORE_REDIS_URL</code></td><td>用 Redis 而非进程内存承载 OpenAI Responses API 存储。CLI：<code>--redis-url</code>。</td></tr>
     </tbody>
   </table>
   </div>

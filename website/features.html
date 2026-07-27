@@ -29,6 +29,7 @@
     <div class="card"><div class="ic">📦</div><h3>Native quantized compute</h3><p>Q4_K_M, Q8_0, MXFP4, IQ2_XXS and more run in matmul without dequantizing to FP32.</p></div>
     <div class="card"><div class="ic">🔀</div><h3>Continuous batching</h3><p>vLLM-style paged KV cache with cross-request prefix sharing.</p></div>
     <div class="card"><div class="ic">⏩</div><h3>Speculative decoding</h3><p>MTP / NextN draft heads accelerate solo decode losslessly.</p></div>
+    <a class="card" href="distributed.html"><div class="ic">🔗</div><h3>Multi-GPU &amp; multi-node</h3><p>Tensor parallelism splits one model across CUDA GPUs, and across machines over a TCP mesh.</p></a>
     <div class="card"><div class="ic">🔌</div><h3>Ollama &amp; OpenAI APIs</h3><p>Drop-in endpoints for existing tooling, plus a browser chat UI.</p></div>
   </div>
 
@@ -60,6 +61,7 @@
     <li><strong>GPU-accelerated</strong> — GGML Metal (macOS), GGML CUDA (Windows/Linux + NVIDIA), GGML Vulkan (Windows/Linux + AMD/Intel/NVIDIA), a direct CUDA/cuBLAS backend, and an MLX backend for Apple Silicon — all with CPU fallbacks. → <a href="backends.html">Backends</a></li>
     <li><strong>Continuous batching &amp; paged KV cache</strong> — block-paged KV pool with block-hash prefix sharing, an iteration-level scheduler that admits/preempts sequences mid-batch, optional SSD-backed tier, and a native fused paged-attention kernel. → <a href="advanced.html#continuous-batching">Deep dive</a></li>
     <li><strong>Batched / parallel inference</strong> — N sequences packed into a single forward pass with paged K/V scatter (Mistral 3, Gemma 4, GPT OSS, Qwen 3 / 3.5 / 3.6, Nemotron-H).</li>
+    <li><strong>Tensor parallelism &amp; distributed inference</strong> — split one model across N CUDA GPUs with <code>--tp N</code> (Megatron-LM column/row-parallel, replicated norms/embeddings/LM head), and extend the group across machines with a peer-to-peer TCP mesh (<code>--tp-node-id</code> / <code>--tp-peers</code>). Hierarchical AllReduce keeps only <code>1/tp_local</code> of each collective on the network; MoE expert slicing, GatedDeltaNet per-rank V-head ownership, and Mamba2 replication cover the heterogeneous layers. → <a href="distributed.html">Multi-GPU &amp; Multi-Node</a></li>
     <li><strong>MTP / NextN speculative decoding</strong> — multi-token-prediction draft heads accelerate solo decode; lossless because the request's own sampler drives both draft and verify. → <a href="advanced.html#mtp">Speculative decoding</a></li>
     <li><strong>Native quantized compute</strong> — quantized weights are used directly in matmul without expanding to FP32, saving memory and bandwidth.</li>
     <li><strong>Optimized pure C# CPU backend</strong> — managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, and fused activations.</li>

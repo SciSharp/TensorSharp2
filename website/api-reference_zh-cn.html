@@ -69,6 +69,8 @@
       <tr><td><code>--bench-kvcache / --bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准。</td></tr>
       <tr><td><code>--warmup-runs &lt;N&gt;</code></td><td>计时前丢弃的前向次数（默认 0）。</td></tr>
       <tr><td><code>--test / --test-templates &lt;dir&gt;</code></td><td>内置分词器/模板测试；对照 GGUF Jinja2 校验模板。</td></tr>
+      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 在单个进程内把模型切分到 N 张 CUDA GPU 上（默认 1；需要 <code>--backend cuda</code>）。</td></tr>
+      <tr><td><code>--tp-node-id &lt;N&gt;</code> / <code>--tp-peers &lt;list&gt;</code></td><td>多节点分布式 TP：本节点的 0 起始编号，以及所有节点共用的逗号分隔 <code>host:port</code> 列表。</td></tr>
       <tr><td><code>--log-level / --log-dir / --log-file / --log-console</code></td><td>日志级别、目录，以及文件/控制台开关。</td></tr>
     </tbody>
   </table>
@@ -130,6 +132,12 @@
       <tr><td><code>TS_QWEN_IMAGE_VAE / TS_QWEN_IMAGE_TE / TS_QWEN_IMAGE_MMPROJ</code></td><td>Qwen-Image-Edit 伴随文件路径（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
       <tr><td><code>TS_QWEN_IMAGE_LORA / TS_QWEN_IMAGE_LORA_SCALE</code></td><td>合并进 DiT 的 Lightning LoRA <code>.safetensors</code> / 缩放覆盖。</td></tr>
       <tr><td><code>TS_QWEN_DIT_CACHE / TS_QWEN_DIT_CACHE_MODE</code></td><td>整步 DiT 缓存：<code>0</code> 禁用 / 模式 <code>easycache</code>、<code>fbc</code>、<code>both</code>、<code>off</code>。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td>本地张量并行度 —— 模型切分到多少张 CUDA GPU（= CLI 的 <code>--tp</code>；也是服务端设置该项的唯一方式）。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_NODE_ID / TENSORSHARP_TP_PEERS</code></td><td>多节点分布式 TP：0 起始的节点编号与所有节点共用的 <code>host:port</code> 列表（= <code>--tp-node-id</code> / <code>--tp-peers</code>）。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS / _RECV_TIMEOUT_SECONDS</code></td><td>分布式 TP 网格的 peer 连接重试窗口（120 秒）与单次接收超时（300 秒）。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DISABLE_P2P / TENSORSHARP_TP_HOST_ALLREDUCE</code></td><td><code>1</code> 强制跨 GPU 拷贝 / 本地 AllReduce 走主机内存，而非 CUDA P2P（诊断用）。</td></tr>
+      <tr><td><code>TS_KV_CACHE_REDIS_URL / TS_KV_CACHE_REDIS_TTL_MINUTES</code></td><td>Redis 支撑的共享 KV 缓存层及其条目 TTL（默认 1440 分钟；<code>0</code> = 不过期）。</td></tr>
+      <tr><td><code>TS_RESPONSES_STORE_REDIS_URL</code></td><td>Redis 支撑的 OpenAI Responses API 存储（取代内存存储）。</td></tr>
       <tr><td><code>TS_GGML_VULKAN_DEVICE</code></td><td><code>ggml_vulkan</code> 使用的 Vulkan 设备索引（= <code>--gpu-device</code>）。</td></tr>
       <tr><td><code>TS_FUSED_QKNORM_ROPE</code></td><td><code>0</code> 禁用 direct <code>cuda</code> 后端中 Qwen 3.5/3.6 文本 prefill 的融合 QK-Norm + RoPE kernel（默认开启）。</td></tr>
       <tr><td><code>TS_JSON_FORCE_OPEN</code></td><td><code>0</code> 关闭结构化输出的首 token <code>{</code> 约束（<code>json_object</code> / <code>json_schema</code> 默认开启）。</td></tr>

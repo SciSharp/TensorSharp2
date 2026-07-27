@@ -24,8 +24,9 @@
       { page: "code-api", label: { en: "C# Library / Code", zh: "C# 库 / 代码" } },
     ]},
     { group: { en: "Deep dive", zh: "深入了解" }, items: [
-      { page: "advanced",   label: { en: "Advanced Features", zh: "高级功能" } },
-      { page: "benchmarks", label: { en: "Benchmarks & Testing", zh: "基准测试" } },
+      { page: "advanced",    label: { en: "Advanced Features", zh: "高级功能" } },
+      { page: "distributed", label: { en: "Multi-GPU & Multi-Node", zh: "多 GPU 与多节点" } },
+      { page: "benchmarks",  label: { en: "Benchmarks & Testing", zh: "基准测试" } },
     ]},
     { group: { en: "Reference", zh: "参考" }, items: [
       { page: "api-reference", label: { en: "API Reference", zh: "API 参考" } },

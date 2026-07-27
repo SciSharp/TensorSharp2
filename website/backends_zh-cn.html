@@ -24,7 +24,7 @@
     <thead><tr><th>你的硬件</th><th>推荐</th><th>参数</th><th>说明</th></tr></thead>
     <tbody>
       <tr><td><strong>Apple Silicon（Mac）</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>macOS 默认。<code>mlx</code> 是另一条 Apple Silicon GPU 路径。</td></tr>
-      <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>测试最充分的 NVIDIA 路径。<code>cuda</code> 是用于实验的直接 PTX/cuBLAS 后端。</td></tr>
+      <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>测试最充分的 NVIDIA 路径。<code>cuda</code> 是用于实验的直接 PTX/cuBLAS 后端 —— 也是支持<a href="distributed_zh-cn.html">多 GPU 张量并行</a>的那一个。</td></tr>
       <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>与厂商无关的 GPU 路径（ggml-vulkan，驱动支持时启用 cooperative-matrix 加速）。当主机存在 Vulkan 运行时时会在原生构建时自动启用；用 <code>--no-vulkan</code> 退出。</td></tr>
       <tr><td><strong>无 GPU / 可移植 / 调试</strong></td><td>纯 C# CPU</td><td><code>cpu</code></td><td>无原生依赖。要更快的 CPU 推理请用 <code>ggml_cpu</code>（原生内核）。</td></tr>
     </tbody>
@@ -62,6 +62,7 @@
 
   <h3 id="cuda">直接 CUDA</h3>
   <p><code>--backend cuda</code> 是一条纯 C# 路径，使用 CUDA Driver API、cuBLAS GEMM，以及常见 float32 运算的 PTX 内核（fill、一元/二元/三元、激活、RMSNorm、softmax、RoPE/RoPEEx、SDPA、GQA prefill/decode、因果掩码、gather/concat），外加受支持量化类型的原生量化 matmul/get-rows。未支持的运算在保留张量语义的前提下走 CPU 回退。它也是<a href="advanced_zh-cn.html#mtp">MTP 推测解码</a>能获益的纯 C# 后端。</p>
+  <p>它同样是<strong>唯一支持张量并行的后端</strong>：<code>--tp N</code> 把一个模型切分到 N 张 CUDA GPU 上，<code>--tp-node-id</code> / <code>--tp-peers</code> 则把并行组扩展到多台机器。GGML、Vulkan 与 MLX 路径在设计上都是单设备 —— 在多 GPU 主机上它们只会选择其中一张卡（Vulkan 用 <code>--gpu-device</code>），而不会切分模型。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></p>
 
   <h3 id="cpu">CPU 后端</h3>
   <ul>
