@@ -46,14 +46,6 @@ namespace TensorSharp.Models
         private Tensor[][] _tpConvState;     // [layer][rank]: [convKernel-1, qkvDim/tp]
         private int[] _tpConvWriteIdx;       // [layer] — identical on all ranks
 
-        // Per-rank copies of REPLICATED weights that are read directly by a
-        // per-rank device kernel (ssm_norm for the GDN kernel, Q/K RMSNorm
-        // weights for attention). Those weights live on GPU 0; a rank-r kernel
-        // reading them is a cross-GPU access (fault without peer / wrong data
-        // with peer), so each rank gets a lazily-cached copy on its own GPU.
-        // Keyed by (weight, rank); rank 0 aliases the original.
-        private System.Collections.Generic.Dictionary<(Tensor, int), Tensor> _tpReplicaCache;
-
         // ====================================================================
         // Block-cyclic head mapping
         // ====================================================================
@@ -730,6 +722,17 @@ namespace TensorSharp.Models
                 long blocksPerRow = qw.Ne0 / blockSize;
                 long blocksPerShard = blocksPerRow / globalTp;
                 long ne0PerShard = blocksPerShard * blockSize;
+                // A row-parallel split can only cut on quant-block boundaries. If the
+                // blocks per row do not divide evenly the shards would silently drop
+                // the remainder (and at tp > blocksPerRow they would be empty),
+                // producing a model that loads fine and generates garbage.
+                if (blocksPerShard <= 0 || blocksPerRow % globalTp != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"TP degree {globalTp} cannot row-split '{weightName}': {blocksPerRow} " +
+                        $"{(GgmlTensorType)qw.GgmlType} blocks per row (block size {blockSize}, ne0 {qw.Ne0}) " +
+                        $"is not divisible by {globalTp}. Use a TP degree that divides the block count.");
+                }
                 long srcRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
                 long dstRowBytes = (ne0PerShard / blockSize) * typeSize;
                 long totalBytesPerShard = qw.Ne1 * dstRowBytes;
@@ -1006,17 +1009,17 @@ namespace TensorSharp.Models
             // 3. Per-GPU attention.
             Tensor[] attnOut = FullAttentionTP(qkvFused, layer, seqLen, startPos);
 
-            // 4. Row-parallel output projection + AllReduce.
-            Tensor reducedAttn = TpRowParallelLinear(attnOut, _attnOutputKey[layer]);
+            // 4. Row-parallel output projection + AllReduce. AllReduce leaves the
+            // sum on every rank, so the residual can be added in place without a
+            // second broadcast from rank 0.
+            Tensor[] attnReduced = TpRowParallelLinearAllRanks(attnOut, _attnOutputKey[layer]);
             for (int r = 0; r < tp; r++)
                 attnOut[r].Dispose();
 
-            // 5. Residual add.
-            Tensor[] attnReplicated = BroadcastTensorToAllRanks(reducedAttn);
-            TpResidualAdd(hidden, attnReplicated);
-            for (int r = 1; r < tp; r++)
-                attnReplicated[r].Dispose();
-            reducedAttn.Dispose();
+            // 5. Residual add (hidden stays replicated: identical inputs + identical addend).
+            TpResidualAdd(hidden, attnReduced);
+            for (int r = 0; r < tp; r++)
+                attnReduced[r].Dispose();
 
             // 6. FFN (dense or MoE).
             hidden = FFNBlockTP(hidden, layer, seqLen);
@@ -1212,17 +1215,15 @@ namespace TensorSharp.Models
             for (int r = 0; r < tp; r++)
                 packedInput[r].Dispose();
 
-            // 4. Row-parallel ssm_out + AllReduce.
-            Tensor reducedGdn = TpRowParallelLinear(gatedOut, _ssmOutKey[layer]);
+            // 4. Row-parallel ssm_out + AllReduce (result already on every rank).
+            Tensor[] gdnReduced = TpRowParallelLinearAllRanks(gatedOut, _ssmOutKey[layer]);
             for (int r = 0; r < tp; r++)
                 gatedOut[r].Dispose();
 
             // 5. Residual add.
-            Tensor[] gdnReplicated = BroadcastTensorToAllRanks(reducedGdn);
-            TpResidualAdd(hidden, gdnReplicated);
-            for (int r = 1; r < tp; r++)
-                gdnReplicated[r].Dispose();
-            reducedGdn.Dispose();
+            TpResidualAdd(hidden, gdnReduced);
+            for (int r = 0; r < tp; r++)
+                gdnReduced[r].Dispose();
 
             // 6. FFN (dense or MoE).
             hidden = FFNBlockTP(hidden, layer, seqLen);
@@ -1299,9 +1300,11 @@ namespace TensorSharp.Models
         {
             if (_tpWeights.TryGetValue(weightName, out var shards))
                 return shards[rank];
-            // Fall back to replicated weight (e.g. ssm_norm).
+            // Fall back to a replicated weight (e.g. ssm_norm). It lives on rank 0,
+            // so hand back a copy resident on THIS rank's GPU — the caller feeds it
+            // straight to a rank-r kernel.
             if (_weights.TryGetValue(weightName, out var w))
-                return w;
+                return ReplicaOnRank(w, rank);
             throw new KeyNotFoundException($"TP weight '{weightName}' not found.");
         }
 
@@ -1311,20 +1314,7 @@ namespace TensorSharp.Models
         /// original; other ranks get a lazily-cached copy. Cheap for the small
         /// norm weights this is used for.
         /// </summary>
-        private Tensor ReplicaOnRank(Tensor weight, int rank)
-        {
-            if (rank == 0 || weight == null)
-                return weight;
-
-            _tpReplicaCache ??= new System.Collections.Generic.Dictionary<(Tensor, int), Tensor>();
-            var key = (weight, rank);
-            if (!_tpReplicaCache.TryGetValue(key, out var copy))
-            {
-                copy = ReplicateTensorToRank(weight, rank);
-                _tpReplicaCache[key] = copy;
-            }
-            return copy;
-        }
+        private Tensor ReplicaOnRank(Tensor weight, int rank) => TpReplicatedWeight(weight, rank);
 
         // ====================================================================
         // FFN block under TP (dense or MoE)
@@ -1373,17 +1363,15 @@ namespace TensorSharp.Models
                 gateResults[r] = gate;
             }
 
-            // 4. Row-parallel down + AllReduce.
-            Tensor ffnOut = TpRowParallelLinear(gateResults, _ffnDownKey[layer]);
+            // 4. Row-parallel down + AllReduce (result already on every rank).
+            Tensor[] ffnReduced = TpRowParallelLinearAllRanks(gateResults, _ffnDownKey[layer]);
             for (int r = 0; r < tp; r++)
                 gateResults[r].Dispose();
 
             // 5. Residual add.
-            Tensor[] ffnReplicated = BroadcastTensorToAllRanks(ffnOut);
-            TpResidualAdd(hidden, ffnReplicated);
-            for (int r = 1; r < tp; r++)
-                ffnReplicated[r].Dispose();
-            ffnOut.Dispose();
+            TpResidualAdd(hidden, ffnReduced);
+            for (int r = 0; r < tp; r++)
+                ffnReduced[r].Dispose();
 
             return hidden;
         }
@@ -1401,22 +1389,71 @@ namespace TensorSharp.Models
             // 1. Post-attention norm (replicated).
             Tensor[] normed = TpRMSNorm(hidden, _postAttnNormKey[layer]);
 
-            // 2. Router (replicated — every rank computes identical routing).
-            // The router weight is NOT sharded; it stays in _weights.
+            // 2. Router. The router weight is NOT sharded — it lives on rank 0 —
+            // so the logits are computed ONCE there and replicated. Running
+            // LinearForward per rank would mix a rank-r input with the rank-0
+            // weight and a rank-0 output in a single kernel launch: a cross-device
+            // dereference that faults the context (CUDA 719) or silently returns
+            // garbage. Computing once is also the only way to guarantee every rank
+            // routes each token to the same experts.
             var results = new Tensor[tp];
+
+            Tensor rank0Logits = LinearForward(normed[0], _ffnGateInpKey[layer]);
+            Tensor[] routerLogitsPerRank = BroadcastTensorToAllRanks(rank0Logits);
+            rank0Logits.Dispose();
+
+            // 2a. Fully on-device fused MoE per rank (device-resident expert shards,
+            // no host round-trip). Each rank returns its partial contribution.
+            bool allOnDevice = true;
+            for (int r = 0; r < tp; r++)
+            {
+                Tensor devOut = TryMoEForwardTpOnDevice(normed[r], routerLogitsPerRank[r], layer, r, seqLen);
+                if (devOut == null)
+                {
+                    allOnDevice = false;
+                    break;
+                }
+                // TryMoEForwardTpOnDevice consumed (disposed) routerLogitsPerRank[r].
+                routerLogitsPerRank[r] = null;
+                results[r] = devOut;
+            }
+
+            if (allOnDevice)
+            {
+                for (int r = 0; r < tp; r++)
+                    normed[r].Dispose();
+                return FinishMoEBlockTP(hidden, results, tp);
+            }
+
+            // Fused path unavailable — undo the partial attempt and fall back to the
+            // host loop below.
+            for (int r = 0; r < tp; r++)
+            {
+                results[r]?.Dispose();
+                results[r] = null;
+            }
+
+            // Host fallback: the routing decision is derived once from the rank-0
+            // logits and shared by every rank, so all ranks stay in lockstep.
+            // If the fused path already consumed rank 0's copy before bailing out on a
+            // later rank, recompute it here — and own it, so it is disposed below
+            // rather than leaked.
+            Tensor routerSource = routerLogitsPerRank[0];
+            if (routerSource == null)
+            {
+                routerSource = BroadcastRouterLogitsForFallback(normed[0], layer);
+                routerLogitsPerRank[0] = routerSource;
+            }
+            Tensor routerData = _normTopKProb ? routerSource : Ops.Softmax(null, routerSource);
+            float[] routePtr = TensorToFloatArray(routerData);
+            if (!ReferenceEquals(routerData, routerSource)) routerData.Dispose();
+            for (int r = 0; r < tp; r++)
+                routerLogitsPerRank[r]?.Dispose();
 
             for (int r = 0; r < tp; r++)
             {
                 var alloc = _tpGroup.GetAllocator(r);
                 var localInput = normed[r];
-
-                // Router logits (replicated weight, identical on all ranks).
-                Tensor routerLogits = LinearForward(localInput, _ffnGateInpKey[layer]);
-                Tensor routerData = _normTopKProb ? routerLogits : Ops.Softmax(null, routerLogits);
-                if (!_normTopKProb) routerLogits.Dispose();
-
-                float[] routePtr = TensorToFloatArray(routerData);
-                routerData.Dispose();
 
                 // Accumulate expert outputs.
                 var output = new Tensor(alloc, DType.Float32, seqLen, hiddenSize);
@@ -1473,13 +1510,17 @@ namespace TensorSharp.Models
                     Tensor sharedDown = TpExpertLinear(sharedGate, prefix + "ffn_down_shexp.weight", r, seqLen);
                     sharedGate.Dispose();
 
-                    // Shared expert gate (sigmoid scalar).
+                    // Shared expert gate (sigmoid scalar). The gate vector is
+                    // replicated on rank 0, so the dot product is evaluated against
+                    // the rank-0 input — identical on every rank — and the resulting
+                    // scalar scales this rank's partial. Reading it with a rank-r
+                    // input would pair a rank-r pointer with a rank-0 pointer.
                     if (_hasSharedExpertGate != null && _hasSharedExpertGate[layer])
                     {
                         var gateVec = _ffnGateInpShexpVec?[layer];
                         if (gateVec != null)
                         {
-                            float gateVal = ComputeSharedExpertGate(localInput, gateVec);
+                            float gateVal = ComputeSharedExpertGate(normed[0], gateVec);
                             Ops.Mul(sharedDown, sharedDown, gateVal);
                         }
                         Ops.Add(output, output, sharedDown);
@@ -1497,22 +1538,37 @@ namespace TensorSharp.Models
             for (int r = 0; r < tp; r++)
                 normed[r].Dispose();
 
-            // 3. AllReduce across ranks (sum partial expert results).
+            return FinishMoEBlockTP(hidden, results, tp);
+        }
+
+        /// <summary>
+        /// Shared tail of the TP MoE block: AllReduce the per-rank partial expert
+        /// outputs, add the residual and re-replicate the hidden state for the next
+        /// layer.
+        /// </summary>
+        private Tensor[] FinishMoEBlockTP(Tensor[] hidden, Tensor[] results, int tp)
+        {
+            // AllReduce across ranks (sum partial expert results). This leaves the
+            // identical sum on every rank.
             _tpGroup.AllReduce(results);
 
-            // 4. Residual add.
+            // Residual add. `hidden` entered replicated and every rank adds the same
+            // reduced value, so it stays replicated — the block used to follow this
+            // with a full BroadcastTensorToAllRanks(hidden[0]), re-sending a value
+            // each rank already held.
             TpResidualAdd(hidden, results);
-            for (int r = 1; r < tp; r++)
+            for (int r = 0; r < tp; r++)
                 results[r].Dispose();
 
-            // results[0] is now the reduced output, added into hidden[0].
-            // But we need hidden to be replicated for the next layer.
-            Tensor[] replicated = BroadcastTensorToAllRanks(hidden[0]);
-            for (int r = 0; r < tp; r++)
-                hidden[r].Dispose();
-
-            return replicated;
+            return hidden;
         }
+
+        /// <summary>
+        /// Router logits on rank 0 for the host fallback, used only when the fused
+        /// device path consumed the pre-broadcast copies before bailing out.
+        /// </summary>
+        private Tensor BroadcastRouterLogitsForFallback(Tensor normed0, int layer)
+            => LinearForward(normed0, _ffnGateInpKey[layer]);
 
         /// <summary>
         /// Linear forward using a TP-sharded expert weight for a specific rank.
@@ -1526,7 +1582,9 @@ namespace TensorSharp.Models
                 var qw = qShards[rank];
                 int outDim = (int)qw.Ne1;
                 var result = new Tensor(alloc, DType.Float32, seqLen, outDim);
-                AddmmQuantManaged(result, ReplicateTensorToRank(input, rank), qw);
+                var localInput = ReplicateTensorToRank(input, rank);
+                AddmmQuantManaged(result, localInput, qw);
+                if (!ReferenceEquals(localInput, input)) localInput.Dispose();
                 return result;
             }
             else if (_tpWeights.TryGetValue(weightName, out var wShards))
@@ -1672,14 +1730,8 @@ namespace TensorSharp.Models
                 }
             }
 
-            if (_tpReplicaCache != null)
-            {
-                // Every cached entry is a rank >= 1 copy (rank 0 aliases the
-                // original weight and is never stored), so all are ours to free.
-                foreach (var copy in _tpReplicaCache.Values)
-                    copy?.Dispose();
-                _tpReplicaCache.Clear();
-            }
+            DisposeTpWeightReplicaCache();
+            FreeQwenTpMoETables();
         }
     }
 }

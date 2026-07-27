@@ -2863,7 +2863,12 @@ namespace TensorSharp.Models
                     int outDim = (int)qw.Ne1;
                     var alloc = _tpGroup.GetAllocator(r);
                     results[r] = new Tensor(alloc, DType.Float32, seqLen, outDim);
-                    AddmmQuantManaged(results[r], ReplicateTensorToRank(input, r), qw);
+                    var localInput = ReplicateTensorToRank(input, r);
+                    AddmmQuantManaged(results[r], localInput, qw);
+                    // ReplicateTensorToRank allocates a fresh cross-GPU copy for
+                    // every rank > 0; without this it leaked one [seqLen, inDim]
+                    // tensor per rank per call, on every layer of every token.
+                    if (!ReferenceEquals(localInput, input)) localInput.Dispose();
                 }
             }
             else if (_tpWeights.TryGetValue(weightName, out var wShards))
@@ -2944,6 +2949,56 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Row-parallel linear that keeps every rank's copy of the reduced result.
+        /// AllReduce already leaves the sum on all GPUs, so callers that need the
+        /// value replicated (a residual add on each rank, say) should use this
+        /// instead of <see cref="TpRowParallelLinear"/> followed by
+        /// <see cref="BroadcastTensorToAllRanks"/> — that pair throws away the
+        /// reduced copies and then re-sends rank 0's, costing an extra full
+        /// cross-GPU broadcast per call (and on a box without working P2P, an
+        /// extra host round trip).
+        /// </summary>
+        protected Tensor[] TpRowParallelLinearAllRanks(Tensor[] inputs, string weightName)
+        {
+            int tp = TpDegree;
+            var partials = new Tensor[tp];
+            long t0 = Stopwatch.GetTimestamp();
+
+            if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
+            {
+                for (int r = 0; r < tp; r++)
+                {
+                    var qw = qShards[r];
+                    int seqLen = (int)inputs[r].Sizes[0];
+                    var alloc = _tpGroup.GetAllocator(r);
+                    partials[r] = new Tensor(alloc, DType.Float32, seqLen, (int)qw.Ne1);
+                    AddmmQuantManaged(partials[r], inputs[r], qw);
+                }
+            }
+            else if (_tpWeights.TryGetValue(weightName, out var wShards))
+            {
+                for (int r = 0; r < tp; r++)
+                {
+                    var w = wShards[r];
+                    int seqLen = (int)inputs[r].Sizes[0];
+                    var alloc = _tpGroup.GetAllocator(r);
+                    using var wT = w.Transpose();
+                    partials[r] = new Tensor(alloc, DType.Float32, seqLen, (int)w.Sizes[0]);
+                    Ops.Addmm(partials[r], 0, partials[r], 1.0f, inputs[r], wT);
+                }
+            }
+            else
+            {
+                throw new KeyNotFoundException($"TP row-parallel weight '{weightName}' not found in sharded weights.");
+            }
+
+            _linearTicks += Stopwatch.GetTimestamp() - t0;
+
+            _tpGroup.AllReduce(partials);
+            return partials;
+        }
+
+        /// <summary>
         /// Ensure a tensor is available on the given rank's GPU. If the tensor
         /// is already on that GPU (rank 0 typically), returns it as-is.
         /// Otherwise copies it to the target GPU.
@@ -2977,6 +3032,46 @@ namespace TensorSharp.Models
             return result;
         }
 
+        // Per-rank copies of REPLICATED weights (norm alphas, gate vectors) that a
+        // rank-r kernel reads directly. The source lives on rank 0, so a rank-r
+        // kernel reading it would cross GPUs — fault without peer access, wrong
+        // data with it. Cached because these are re-read on every layer of every
+        // token: re-copying per call cost one cross-GPU transfer per norm per
+        // rank per token, which on a host-staged (no working P2P) box dominated
+        // the forward pass.
+        private Dictionary<(Tensor, int), Tensor> _tpWeightReplicaCache;
+
+        /// <summary>
+        /// A replicated weight resident on rank <paramref name="rank"/>'s GPU.
+        /// Rank 0 aliases the original; other ranks get a lazily-cached copy.
+        /// </summary>
+        protected Tensor TpReplicatedWeight(Tensor weight, int rank)
+        {
+            if (rank == 0 || weight == null)
+                return weight;
+
+            _tpWeightReplicaCache ??= new Dictionary<(Tensor, int), Tensor>();
+            var key = (weight, rank);
+            if (!_tpWeightReplicaCache.TryGetValue(key, out var copy))
+            {
+                copy = ReplicateTensorToRank(weight, rank);
+                _tpWeightReplicaCache[key] = copy;
+            }
+            return copy;
+        }
+
+        protected void DisposeTpWeightReplicaCache()
+        {
+            if (_tpWeightReplicaCache == null)
+                return;
+            // Every entry is a rank >= 1 copy (rank 0 aliases the original and is
+            // never stored), so all of them are ours to free.
+            foreach (var copy in _tpWeightReplicaCache.Values)
+                copy?.Dispose();
+            _tpWeightReplicaCache.Clear();
+            _tpWeightReplicaCache = null;
+        }
+
         /// <summary>
         /// TP-aware RMSNorm: runs independently on each GPU (replicated weights).
         /// </summary>
@@ -2993,11 +3088,9 @@ namespace TensorSharp.Models
                 Tensor input2d = inputs[r].Sizes.Length != 2 ? inputs[r].View(rows, dim) : null;
                 Tensor src = input2d ?? inputs[r];
 
-                var alloc = _tpGroup.GetAllocator(r);
-                Tensor alphaLocal = ReplicateTensorToRank(alpha, r);
+                Tensor alphaLocal = TpReplicatedWeight(alpha, r);
                 results[r] = Ops.RMSNorm(null, src, alphaLocal, null, Config.Eps);
 
-                if (!ReferenceEquals(alphaLocal, alpha)) alphaLocal.Dispose();
                 input2d?.Dispose();
             }
 
@@ -3052,23 +3145,31 @@ namespace TensorSharp.Models
             }
             Console.WriteLine($"  TP sharded weights to preload: {tpTotalCount} shards, {tpTotalBytes / 1024 / 1024} MB total");
 
+            int skippedExpertShards = 0;
+            var oomShardsPerRank = new int[TpDegree];
+            var oomBytesPerRank = new long[TpDegree];
             foreach (var kv in _tpQuantWeights)
             {
                 var shards = kv.Value;
                 bool retain = !kernelsAvailable || ShouldRetainCudaHostQuantWeight(kv.Key);
-                // MoE expert weights are very numerous (hundreds of experts × layers)
-                // and only a few are active per token.  Skip device preload for
-                // per-expert weights to keep GPU memory available for KV cache and
-                // attention.  The CPU fallback path in AddmmQuantManaged serves them.
-                bool isExpertWeight = kv.Key.Contains("_exps.");
+                // MoE expert shards are numerous (experts × layers × ranks) but they
+                // are also the overwhelming majority of the model's bytes — on
+                // Qwen3.5-35B-A3B they are ~15.6 GB of a 17 GB checkpoint. Keeping
+                // them on the host (as this path used to) meant TP loaded almost
+                // nothing into VRAM and every routed expert ran the CPU dequant
+                // fallback in AddmmQuantManaged, which is what made TP prefill
+                // ~100x slower than single-GPU. Each rank only holds a 1/tp slice,
+                // so the sharded experts fit comfortably; the OOM catch below still
+                // degrades gracefully to the host path if a GPU really is too small.
                 for (int r = 0; r < shards.Length; r++)
                 {
                     var qw = shards[r];
                     if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
+                    {
+                        if (kv.Key.Contains("_exps."))
+                            skippedExpertShards++;
                         continue;
-
-                    if (isExpertWeight)
-                        continue; // keep on host for CPU fallback
+                    }
 
                     var alloc = _tpGroup.GetAllocator(r);
                     IntPtr cacheKey = qw.EnsureDeviceCacheKey();
@@ -3079,7 +3180,14 @@ namespace TensorSharp.Models
                     }
                     catch (Exception ex) when (ex.Message.Contains("out of memory"))
                     {
-                        Console.WriteLine($"  Skipping TP device preload for {kv.Key} rank={r} ({qw.RawBytes / 1024 / 1024} MB) — GPU {r} out of memory, keeping host copy for CPU fallback.");
+                        // With experts now preloaded this can fire thousands of
+                        // times on an undersized GPU, so report the first per rank
+                        // and tally the rest.
+                        if (oomShardsPerRank[r]++ == 0)
+                        {
+                            Console.WriteLine($"  Skipping TP device preload for {kv.Key} rank={r} ({qw.RawBytes / 1024 / 1024} MB) — GPU {r} out of memory, keeping host copy for CPU fallback.");
+                        }
+                        oomBytesPerRank[r] += qw.RawBytes;
                         continue;
                     }
                     preloadedBytes += qw.RawBytes;
@@ -3163,6 +3271,24 @@ namespace TensorSharp.Models
 
             if (preloadedCount > 0)
                 Console.WriteLine($"  TP CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} shards (host copies released)");
+
+            for (int r = 0; r < oomShardsPerRank.Length; r++)
+            {
+                if (oomShardsPerRank[r] > 0)
+                {
+                    Console.WriteLine($"  TP GPU {r}: {oomShardsPerRank[r]} shards ({oomBytesPerRank[r] / 1024 / 1024} MB) did not fit in VRAM and stay on the host (CPU dequant fallback — expect much slower decode).");
+                }
+            }
+            if (skippedExpertShards > 0)
+            {
+                Console.WriteLine($"  TP: {skippedExpertShards} expert shards have no CUDA quantized kernel for their type and stay on the host.");
+            }
+
+            for (int r = 0; r < TpDegree; r++)
+            {
+                if (_tpGroup.GetAllocator(r) is CudaAllocator rankAlloc)
+                    rankAlloc.LogVram($"after TP quant weight preload (rank {r})");
+            }
         }
 
         #endregion
