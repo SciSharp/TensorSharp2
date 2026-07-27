@@ -20,6 +20,33 @@ namespace TensorSharp.Cuda
             Interop.CudaLibraryResolver.Register();
         }
 
+        /// <summary>
+        /// Bidirectional (unmasked) multi-head attention over flat
+        /// [seq, numHeads, headDim] q/k/v/result tensors — the layout a vision
+        /// encoder's fused-QKV split produces. Runs the flash-shaped
+        /// ts_vision_attention kernel, which streams K/V through shared memory and
+        /// never materializes a [seq, seq] score tensor. Returns false when the
+        /// tensors are not device-resident contiguous float32 or the head dim has no
+        /// specialized kernel, so callers can fall back to
+        /// <see cref="Ops.ScaledDotProductAttention"/>.
+        /// </summary>
+        public static bool TryVisionAttention(Tensor result, Tensor query, Tensor key, Tensor value,
+            int numHeads, int seq, int headDim, float scale)
+        {
+            return CudaKernelOps.TryVisionAttention(result, query, key, value, numHeads, seq, headDim, scale);
+        }
+
+        /// <summary>
+        /// In-place NeoX-style RoPE over a flat [seq, numHeads, headDim] tensor using
+        /// caller-supplied per-position cos/sin tables of [seq, ropeHalf]. Returns
+        /// false when the tensors are not device-resident contiguous float32.
+        /// </summary>
+        public static bool TryNeoxRopeFlat(Tensor data, Tensor cosTable, Tensor sinTable,
+            int numHeads, int seq, int headDim, int ropeHalf)
+        {
+            return CudaKernelOps.TryNeoxRopeFlat(data, cosTable, sinTable, numHeads, seq, headDim, ropeHalf);
+        }
+
         /// <summary>Sync the NULL (default) CUDA stream ÔÇö ensures all pending
         /// GDN kernels launched via GdnDirectBridge have completed.</summary>
         public static void SyncNullStream()

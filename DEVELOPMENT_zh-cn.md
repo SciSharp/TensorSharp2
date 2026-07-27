@@ -89,7 +89,11 @@ Windows（启用 GGML_CUDA）：
 .\build-windows.ps1 --cuda
 ```
 
-在 Windows 和 Linux 上，原生构建脚本会自动检测可见 NVIDIA GPU 的 compute capability，并把一个精简的 `CMAKE_CUDA_ARCHITECTURES` 列表传给 ggml-cuda（例如在 RTX 3080 上为 `86-real`），从而显著降低 CUDA 构建时间。原生构建默认还会以受控的并行任务数运行，避免 `nvcc` 拖慢普通开发机器。
+在 Windows 和 Linux 上，原生构建脚本会自动检测可见 NVIDIA GPU 的 compute capability，并把一个精简的 `CMAKE_CUDA_ARCHITECTURES` 列表传给 ggml-cuda（例如在 RTX 3080 上为 `86-real`），从而显著降低 CUDA 构建时间。原生构建默认还会并行运行，并根据内存容量限制并行任务数（`nvcc` 单个编译单元峰值约 3 GB），避免拖慢普通开发机器。
+
+在 Windows 上，`build-windows.ps1` 优先使用 **Ninja** 生成器，其次是 `Visual Studio NN` 生成器，最后才交由 CMake 自行选择。这对构建时间影响很大：Ninja 会把所有编译单元放进同一个依赖图并行编译，而 Visual Studio 生成器只在 CMake 项目之间并行，导致 ggml-cuda 的约 190 个 `nvcc` 编译任务逐个串行执行。脚本会在 `PATH` 或 Visual Studio 安装目录中查找 `ninja.exe`（"适用于 Windows 的 C++ CMake 工具"组件自带一份），并自行导入 MSVC 的 `vcvars64` 环境，因此不再需要从"x64 Native Tools"命令提示符启动。生成器与实际并行度会打印在 `Configuring TensorSharp.GGML.Native (...)` 一行中；如果脚本警告可能回退到串行的 `NMake Makefiles` 生成器，请安装上述 VS 组件或把 `ninja.exe` 加入 `PATH`。
+
+Visual Studio 的定位由 `eng/vs-locate.ps1` 完成，它能识别被 VS 安装程序标记为"不完整"的安装（对这类安装 `vswhere -latest` 会静默地报告*找不到*任何安装，这正是 CMake 之前回退到串行生成器的原因）。可用 `TENSORSHARP_VS_INSTALL_DIR` 覆盖检测到的安装目录，或通过 `CMAKE_GENERATOR` 环境变量以及向脚本传入 `-G` 来强制指定生成器。
 
 如需覆盖自动检测到的架构列表或默认的并行度，可使用以下任一方式：
 

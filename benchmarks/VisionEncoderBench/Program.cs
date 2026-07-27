@@ -18,6 +18,7 @@
 //   TS_VBENCH_WARMUP  warmup iterations (default 1)
 using System.Diagnostics;
 using TensorSharp;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
 using TensorSharp.Models;
 
@@ -48,15 +49,29 @@ Console.WriteLine($"[vbench] type={type} mmproj={Path.GetFileName(mmproj)} image
 if (!File.Exists(mmproj)) { Console.WriteLine($"[vbench] missing mmproj: {mmproj}"); return; }
 if (!File.Exists(image)) { Console.WriteLine($"[vbench] missing image: {image}"); return; }
 
-// TS_VBENCH_BACKEND=cpu (default) | cuda — exercise the encoder on the GGML CPU
-// or CUDA backend. On CUDA the heavy ops run on the GPU, but GGML tensors are
-// host-resident so each op uploads inputs / downloads outputs (no cross-op
-// device residency); this lets us measure that round-trip cost directly.
-var ggmlBackend = Env("TS_VBENCH_BACKEND", "cpu").ToLowerInvariant() == "cuda"
-    ? GgmlBackendType.Cuda : GgmlBackendType.Cpu;
-Console.WriteLine($"[vbench] ggml backend = {ggmlBackend}");
-var context = new GgmlContext(new[] { 0 }, ggmlBackend);
-var allocator = new GgmlAllocator(context, 0);
+// TS_VBENCH_BACKEND selects the allocator the encoder is built on:
+//   cpu        (default) GGML CPU allocator      — the ggml_cpu backend
+//   ggml_cuda            GGML CUDA allocator     — the ggml_cuda backend
+//   cuda                 direct CudaAllocator    — TensorSharp's own CUDA backend
+// "cuda" is what `--backend cuda` gives the server; "cpu"/"ggml_cuda" give
+// _useNativeAttention = true and go through the fused GGML graph. Comparing the
+// checksums across these three proves the direct-CUDA encoder is equivalent.
+string backendName = Env("TS_VBENCH_BACKEND", "cpu").ToLowerInvariant();
+IAllocator allocator;
+GgmlContext context = null;
+if (backendName == "cuda")
+{
+    Console.WriteLine("[vbench] backend = direct CUDA (CudaAllocator)");
+    allocator = new CudaAllocator(0);
+}
+else
+{
+    var ggmlBackend = backendName is "ggml_cuda" or "ggmlcuda"
+        ? GgmlBackendType.Cuda : GgmlBackendType.Cpu;
+    Console.WriteLine($"[vbench] ggml backend = {ggmlBackend}");
+    context = new GgmlContext(new[] { 0 }, ggmlBackend);
+    allocator = new GgmlAllocator(context, 0);
+}
 
 // Each model's encoder exposes a uniform Encode(pixels, dimA, dimB) -> Tensor.
 // We wrap construction + preprocessing per type and return a closure that runs
@@ -126,15 +141,30 @@ using (var contig = Ops.NewContiguous(last))
     Console.Write("[vbench] first8: ");
     for (int i = 0; i < Math.Min(8, n); i++) Console.Write($"{data[i]:R} ");
     Console.WriteLine();
+
+    // TS_VBENCH_DUMP=<path> writes the raw f32 output so two backends can be
+    // compared element-wise (cosine similarity / max abs delta) offline.
+    string dumpPath = Environment.GetEnvironmentVariable("TS_VBENCH_DUMP");
+    if (!string.IsNullOrEmpty(dumpPath))
+    {
+        using var fs = File.Create(dumpPath);
+        using var bw = new BinaryWriter(fs);
+        bw.Write(n);
+        for (int i = 0; i < n; i++) bw.Write(data[i]);
+        Console.WriteLine($"[vbench] wrote {n} floats to {dumpPath}");
+    }
 }
 last?.Dispose();
 
-// Timed iterations.
+// Timed iterations. Reading one output element forces the backend to drain
+// (CudaStorage syncs its stream on host access); without it a device backend
+// only queues work and the loop measures launch cost, not encode time.
 var times = new List<double>();
 for (int i = 0; i < iters; i++)
 {
     var sw = Stopwatch.StartNew();
     var outp = encodeOnce();
+    _ = outp.Storage.GetElementAsFloat(outp.StorageOffset);
     sw.Stop();
     outp.Dispose();
     times.Add(sw.Elapsed.TotalMilliseconds);

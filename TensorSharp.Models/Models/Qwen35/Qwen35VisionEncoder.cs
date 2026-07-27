@@ -25,8 +25,16 @@ namespace TensorSharp.Models
         private readonly Dictionary<string, Tensor> _transposedWeights = new();
         private readonly Dictionary<long, Tensor> _positionEmbeddingCache = new();
         private readonly Dictionary<long, RopeCache> _ropeCache = new();
+        private readonly Dictionary<long, int[]> _blockOrderCache = new();
+        // Device-resident RoPE tables (direct-CUDA path only), keyed by geometry.
+        private readonly Dictionary<long, (Tensor Cos, Tensor Sin)> _ropeDeviceCache = new();
         private readonly IAllocator _allocator;
         private readonly bool _useNativeAttention;
+        // Direct-CUDA backend. Tensor data lives in device memory and every raw
+        // host pointer checkout (TensorComputePrimitives.GetFloatPointer) forces a
+        // synchronous DtoH copy plus a re-upload on the next kernel, so the encoder
+        // must stay on tensor ops end to end. See CudaSelfAttention.
+        private readonly bool _cudaDirect;
         // Optional ModelBase reference for cooperative GpuComputeLock
         // yielding between encoder blocks. See Gemma4VisionEncoder.
         private ModelBase _hostModel;
@@ -59,6 +67,7 @@ namespace TensorSharp.Models
         {
             _allocator = allocator;
             _useNativeAttention = allocator is GgmlAllocator;
+            _cudaDirect = allocator is TensorSharp.Cuda.CudaAllocator;
             var gguf = new GgufFile(mmProjPath);
 
             _imageSize = (int)gguf.GetUint32("clip.vision.image_size", 768);
@@ -148,22 +157,25 @@ namespace TensorSharp.Models
             int halfDim = headDim / 2;
 
 
-            // 1. Patch embedding (Conv2D, raster order)
+            // 1. Patch embedding (Conv2D). The im2col rows are emitted directly in
+            //    spatial-merge block order, so the separate raster->block reorder
+            //    pass (a full [numPatches, hiddenSize] copy, and on a device
+            //    allocator a full round trip) is not needed. The position
+            //    embedding below is built in the same order, so the sum is exactly
+            //    the raster pipeline's result with its rows permuted.
             long t0 = Stopwatch.GetTimestamp();
-            var hidden = PatchEmbed(pixelValues, resizedH, resizedW, gridH, gridW);
+            var blockOrdered = PatchEmbed(pixelValues, resizedH, resizedW, gridH, gridW);
             long patchEmbedTicks = Stopwatch.GetTimestamp() - t0;
+            Trace("patchEmbed", blockOrdered);
 
-            // 2. Position embedding (bilinear interpolation, raster order)
-            AddPositionEmbedding(hidden, gridH, gridW);
+            // 2. Position embedding (bilinear interpolation, block order)
+            AddPositionEmbedding(blockOrdered, gridH, gridW);
+            Trace("blockOrder", blockOrdered);
 
-            // 3. Reorder from raster to block order
-            var blockOrdered = ReorderToBlockOrder(hidden, gridH, gridW);
-            hidden.Dispose();
-
-            // 4. Build block-order grid coordinate arrays for RoPE
+            // 3. Build block-order grid coordinate arrays for RoPE
             RopeCache ropeCache = GetOrCreateRopeCache(gridH, gridW, numPatches, halfDim);
 
-            // 5. Encoder blocks
+            // 4. Encoder blocks
             long blocksStart = Stopwatch.GetTimestamp();
             // Fast path: run ALL blocks as one device-resident GGML graph (one
             // sync, residual kept on-device) instead of 2 synchronous PCIe
@@ -179,9 +191,11 @@ namespace TensorSharp.Models
             {
                 for (int i = 0; i < _blockCount; i++)
                 {
-                    Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
+                    if (!s_traceEnabled)
+                        Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
                     blockOrdered = EncoderBlock(blockOrdered, i, numPatches, headDim, halfDim,
                         ropeCache.CosTable, ropeCache.SinTable);
+                    Trace($"block{i}", blockOrdered);
                     // Flush MLX's lazy graph at every block boundary. Without this
                     // the [numHeads, numPatches, numPatches] attention-scores
                     // intermediate (~340 MB at 768x768, multiple GB for larger
@@ -198,14 +212,19 @@ namespace TensorSharp.Models
                     _hostModel?.YieldGpuComputeLock();
                 }
             }
+            // Drain before splitting the phase timings; direct-CUDA kernels are
+            // queued, not awaited, so an unsynchronized "blocks" number would just
+            // measure launch overhead.
+            if (_cudaDirect && _allocator is TensorSharp.Cuda.CudaAllocator blocksAllocator)
+                blocksAllocator.Synchronize();
             long blocksTicks = Stopwatch.GetTimestamp() - blocksStart;
             Console.WriteLine(" done");
 
-            // 6. Post-LayerNorm
+            // 5. Post-LayerNorm
             var postNormed = LayerNormOp(blockOrdered, "v.post_ln.weight", "v.post_ln.bias");
             blockOrdered.Dispose();
 
-            // 7. Spatial merge + projection
+            // 6. Spatial merge + projection
             long projStart = Stopwatch.GetTimestamp();
             int mergedPatches = numPatches / (_spatialMergeSize * _spatialMergeSize);
             int mergedDim = _hiddenSize * _spatialMergeSize * _spatialMergeSize;
@@ -219,6 +238,13 @@ namespace TensorSharp.Models
             Ops.GELU(fc1, fc1);
 
             var projected = LinearForwardWithBias(fc1, "mm.2.weight", "mm.2.bias");
+
+            // The direct-CUDA path only *queues* its kernels, so without this the
+            // numbers below would report launch cost (tens of ms) rather than
+            // encode time. The caller consumes the embeddings immediately, so the
+            // work has to complete here regardless.
+            if (_cudaDirect && _allocator is TensorSharp.Cuda.CudaAllocator cudaAllocator)
+                cudaAllocator.Synchronize();
             long projTicks = Stopwatch.GetTimestamp() - projStart;
 
             double msPerTick = 1000.0 / Stopwatch.Frequency;
@@ -234,13 +260,17 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Conv2D patch embedding with combined temporal weights.
-        /// Output in raster (row-major) order: [numPatches, hiddenSize].
+        /// Output in spatial-merge block order: [numPatches, hiddenSize].
         ///
         /// Reformulated as a GEMM (im2col + matmul) so the heavy compute can run on the GPU
         /// when available. The im2col packing itself is parallelised on the CPU using SIMD
         /// per-channel row copies. This is dramatically faster than the original quintuple
         /// nested loop (single-threaded scalar) implementation, especially on Apple Silicon
         /// where matmul saturates the unified-memory bandwidth.
+        ///
+        /// The im2col rows are emitted in block order (see
+        /// <see cref="GetOrCreateBlockOrder"/>) rather than raster order, so the
+        /// encoder never needs a separate reorder pass over the embedded patches.
         /// </summary>
         private unsafe Tensor PatchEmbed(float[] pixelValues, int imgH, int imgW, int gridH, int gridW)
         {
@@ -262,39 +292,51 @@ namespace TensorSharp.Models
             Tensor weightT = GetOrCreatePatchEmbedTransposed(weightView2D, wName);
 
             // Build im2col matrix [numPatches, patchStride] in parallel.
+            int[] blockOrder = GetOrCreateBlockOrder(gridH, gridW);
             var im2col = new Tensor(_allocator, DType.Float32, numPatches, patchStride);
-            float* im2colPtr = GetFloatPtr(im2col);
-
-            // Capture pointer locally since pixelValues is a managed array - we pin once
-            // via fixed at the top so the inner Parallel.For lambda can share the address.
-            fixed (float* pixSrc = pixelValues)
+            using (var staging = new HostStaging(im2col, _cudaDirect))
             {
-                long pixSrcL = (long)pixSrc;
-                Parallel.For(0, gridH, py =>
-                {
-                    float* pixSrcLocal = (float*)pixSrcL;
-                    for (int px = 0; px < gridW; px++)
-                    {
-                        int patchIdx = py * gridW + px;
-                        float* outRow = im2colPtr + (long)patchIdx * patchStride;
-                        int yBase = py * P;
-                        int xBase = px * P;
+                float* im2colPtr = staging.Ptr;
 
-                        for (int c = 0; c < C; c++)
+                // Capture pointer locally since pixelValues is a managed array - we pin once
+                // via fixed at the top so the inner Parallel.For lambda can share the address.
+                fixed (float* pixSrc = pixelValues)
+                fixed (int* orderSrc = blockOrder)
+                {
+                    long pixSrcL = (long)pixSrc;
+                    long orderSrcL = (long)orderSrc;
+                    Parallel.For(0, gridH, brow =>
+                    {
+                        float* pixSrcLocal = (float*)pixSrcL;
+                        int* order = (int*)orderSrcL;
+                        for (int col = 0; col < gridW; col++)
                         {
-                            long imgChannelOffset = (long)c * imgH * imgW;
-                            long outChannelOffset = (long)c * P * P;
-                            for (int ky = 0; ky < P; ky++)
+                            // Destination row is block-ordered; the raster patch it
+                            // pulls from is order[destIdx].
+                            int destIdx = brow * gridW + col;
+                            int rasterIdx = order[destIdx];
+                            int py = rasterIdx / gridW;
+                            int px = rasterIdx - py * gridW;
+                            float* outRow = im2colPtr + (long)destIdx * patchStride;
+                            int yBase = py * P;
+                            int xBase = px * P;
+
+                            for (int c = 0; c < C; c++)
                             {
-                                int imgY = yBase + ky;
-                                long srcOffset = imgChannelOffset + (long)imgY * imgW + xBase;
-                                long dstOffset = outChannelOffset + (long)ky * P;
-                                Buffer.MemoryCopy(pixSrcLocal + srcOffset, outRow + dstOffset,
-                                    P * sizeof(float), P * sizeof(float));
+                                long imgChannelOffset = (long)c * imgH * imgW;
+                                long outChannelOffset = (long)c * P * P;
+                                for (int ky = 0; ky < P; ky++)
+                                {
+                                    int imgY = yBase + ky;
+                                    long srcOffset = imgChannelOffset + (long)imgY * imgW + xBase;
+                                    long dstOffset = outChannelOffset + (long)ky * P;
+                                    Buffer.MemoryCopy(pixSrcLocal + srcOffset, outRow + dstOffset,
+                                        P * sizeof(float), P * sizeof(float));
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
 
             // result = im2col @ weight^T  (+ bias if present)
@@ -307,6 +349,48 @@ namespace TensorSharp.Models
                 Ops.Add(result, result, bias);
 
             return result;
+        }
+
+        /// <summary>
+        /// Host write buffer for a tensor that may live in device memory. On the
+        /// direct-CUDA backend, checking out a raw host pointer (PtrAtElement)
+        /// first synchronously copies the tensor's uninitialized device bytes back
+        /// to the host; for a write-only fill that copy is pure waste. Staging in a
+        /// pinned array and pushing it with a single bulk CopyToStorage skips it.
+        /// On host-resident allocators the tensor's own buffer is used directly.
+        /// </summary>
+        private sealed unsafe class HostStaging : IDisposable
+        {
+            private readonly Tensor _tensor;
+            private readonly float[] _buffer;
+            private System.Runtime.InteropServices.GCHandle _handle;
+
+            public float* Ptr { get; }
+
+            public HostStaging(Tensor tensor, bool stageOnHost)
+            {
+                _tensor = tensor;
+                if (!stageOnHost)
+                {
+                    Ptr = TensorComputePrimitives.GetFloatPointer(tensor);
+                    return;
+                }
+
+                _buffer = new float[tensor.ElementCount()];
+                _handle = System.Runtime.InteropServices.GCHandle.Alloc(
+                    _buffer, System.Runtime.InteropServices.GCHandleType.Pinned);
+                Ptr = (float*)_handle.AddrOfPinnedObject();
+            }
+
+            public void Dispose()
+            {
+                if (_buffer == null)
+                    return;
+
+                _tensor.Storage.CopyToStorage(_tensor.StorageOffset, _handle.AddrOfPinnedObject(),
+                    _tensor.ElementCount() * sizeof(float));
+                _handle.Free();
+            }
         }
 
         private Tensor GetOrCreatePatchEmbedWeight2D(Tensor convWeight, string weightName, int patchStride)
@@ -337,14 +421,24 @@ namespace TensorSharp.Models
             if (_transposedWeights.TryGetValue(key, out var cached))
                 return cached;
 
-            using var t = weight2D.Transpose();
-            var result = Ops.NewContiguous(t);
+            Tensor result;
+            if (_cudaDirect)
+            {
+                result = HostTranspose2D(weight2D);
+            }
+            else
+            {
+                using var t = weight2D.Transpose();
+                result = Ops.NewContiguous(t);
+            }
+
             _transposedWeights[key] = result;
             return result;
         }
 
         /// <summary>
-        /// Add bilinearly-interpolated position embeddings (computed in raster order).
+        /// Add bilinearly-interpolated position embeddings (in block order, matching
+        /// the patch-embed output).
         /// </summary>
         private void AddPositionEmbedding(Tensor hidden, int gridH, int gridW)
         {
@@ -352,59 +446,71 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Reorder patches from raster (h, w) order to spatial-merge block order
-        /// (2x2 groups iterated in raster order, within each group: mh, mw).
-        ///
-        /// Parallelized across block rows (bh). Each block row is independent
-        /// and processes gridW/mergeSize blocks of mergeSize*mergeSize patches each.
+        /// Permutation from spatial-merge block order to raster (h, w) order:
+        /// blockOrder[i] is the raster patch index that lands at block-order row i.
+        /// Blocks are mergeSize x mergeSize groups iterated in raster order; within
+        /// a group the order is (mh, mw). This is the same enumeration the RoPE
+        /// coordinate tables use, so patch-embed rows, position embeddings and RoPE
+        /// positions all agree.
         /// </summary>
-        private unsafe Tensor ReorderToBlockOrder(Tensor input, int gridH, int gridW)
+        private int[] GetOrCreateBlockOrder(int gridH, int gridW)
         {
-            int numPatches = gridH * gridW;
-            var result = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
-            float* srcPtr = GetFloatPtr(input);
-            float* dstPtr = GetFloatPtr(result);
-            int bytes = _hiddenSize * sizeof(float);
+            long key = ((long)gridH << 32) | (uint)gridW;
+            if (_blockOrderCache.TryGetValue(key, out var cached))
+                return cached;
+
             int merge = _spatialMergeSize;
-            int hiddenSize = _hiddenSize;
-            int blocksPerRow = gridW / merge;
-            int patchesPerBlockRow = blocksPerRow * merge * merge;
-
-            long srcPtrL = (long)srcPtr;
-            long dstPtrL = (long)dstPtr;
-
-            int numBlockRows = gridH / merge;
-            Parallel.For(0, numBlockRows, bri =>
+            var order = new int[gridH * gridW];
+            int idx = 0;
+            for (int bh = 0; bh < gridH; bh += merge)
             {
-                float* src = (float*)srcPtrL;
-                float* dst = (float*)dstPtrL;
-                int bh = bri * merge;
-                int baseDstIdx = bri * patchesPerBlockRow;
-                int localIdx = 0;
-
                 for (int bw = 0; bw < gridW; bw += merge)
                 {
                     for (int mh = 0; mh < merge; mh++)
                     {
                         for (int mw = 0; mw < merge; mw++)
-                        {
-                            int srcRow = (bh + mh) * gridW + (bw + mw);
-                            Buffer.MemoryCopy(
-                                src + (long)srcRow * hiddenSize,
-                                dst + (long)(baseDstIdx + localIdx) * hiddenSize,
-                                bytes, bytes);
-                            localIdx++;
-                        }
+                            order[idx++] = (bh + mh) * gridW + (bw + mw);
                     }
                 }
-            });
+            }
 
-            return result;
+            _blockOrderCache[key] = order;
+            return order;
         }
 
         // TS_QWEN35_VENC_FUSED=0 forces the per-block path (A/B + safety kill-switch).
         private static readonly bool s_wholeEncoderFusedEnabled =
             Environment.GetEnvironmentVariable("TS_QWEN35_VENC_FUSED") != "0";
+
+        // TS_QWEN35_VENC_TRACE=1 prints a checksum of the residual stream at every
+        // encoder stage. Used to localize a numeric divergence between backends
+        // (run the same image through two allocators and diff the first stage whose
+        // checksum differs). Forces a host read, so it is debug-only.
+        private static readonly bool s_traceEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_VENC_TRACE") == "1";
+
+        private static void Trace(string label, Tensor t)
+        {
+            if (!s_traceEnabled || t == null)
+                return;
+
+            using var contig = t.IsContiguous() ? null : Ops.NewContiguous(t);
+            Tensor src = contig ?? t;
+            int n = (int)src.ElementCount();
+            float[] data = src.GetElementsAsFloat(n);
+            double sum = 0, sumsq = 0;
+            float min = float.MaxValue, max = float.MinValue;
+            for (int i = 0; i < n; i++)
+            {
+                float v = data[i];
+                sum += v;
+                sumsq += (double)v * v;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+            Console.WriteLine($"[venc-trace] {label,-28} shape={string.Join("x", src.Sizes.ToArray())} " +
+                $"sum={sum:F4} sumsq={sumsq:F4} min={min:F5} max={max:F5} first={data[0]:F6},{data[1]:F6},{data[2]:F6}");
+        }
 
         /// <summary>
         /// Run every encoder block as ONE device-resident GGML graph
@@ -503,12 +609,15 @@ namespace TensorSharp.Models
             if (!fusedAttn)
             {
                 var ln1 = LayerNormOp(hidden, $"{prefix}.ln1.weight", $"{prefix}.ln1.bias");
+                Trace($"{prefix}.ln1", ln1);
                 var attnOut = VisionSelfAttention(ln1, prefix, numPatches, headDim, halfDim,
                     cosTable, sinTable);
                 ln1.Dispose();
+                Trace($"{prefix}.attnOut", attnOut);
                 Ops.Add(hidden, attnOut, hidden);
                 attnOut.Dispose();
             }
+            Trace($"{prefix}.postAttn", hidden);
 
             // Fused MLP path: LayerNorm + up + GELU + down + residual in one GPU dispatch.
             if (_useNativeAttention
@@ -541,6 +650,94 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Direct-CUDA self-attention: QKV split, RoPE, bidirectional attention and
+        /// the output projection all run as device kernels, so nothing in the block
+        /// touches a host pointer.
+        ///
+        /// The generic path below cannot be used here. Its RoPE and Q/K/V split go
+        /// through raw host pointers, which on CudaStorage means a synchronous DtoH
+        /// copy of the whole activation plus a re-upload on the next kernel — twice
+        /// per encoder block — and its fallback attention materializes an
+        /// O(numPatches^2) score tensor per head.
+        /// </summary>
+        private Tensor CudaSelfAttention(Tensor qkv, string prefix, int numPatches,
+            int headDim, int halfDim, float[] cosTable, float[] sinTable)
+        {
+            Tensor q, k, v;
+            using (var qView = qkv.Narrow(1, 0, _hiddenSize))
+            using (var kView = qkv.Narrow(1, _hiddenSize, _hiddenSize))
+            using (var vView = qkv.Narrow(1, 2 * _hiddenSize, _hiddenSize))
+            {
+                q = Ops.NewContiguous(qView);
+                k = Ops.NewContiguous(kView);
+                v = Ops.NewContiguous(vView);
+            }
+
+            try
+            {
+                var rope = GetOrCreateRopeDeviceTables(numPatches, halfDim, cosTable, sinTable);
+                bool roped =
+                    TensorSharp.Cuda.CudaFusedOps.TryNeoxRopeFlat(q, rope.Cos, rope.Sin, _numHeads, numPatches, headDim, halfDim) &&
+                    TensorSharp.Cuda.CudaFusedOps.TryNeoxRopeFlat(k, rope.Cos, rope.Sin, _numHeads, numPatches, headDim, halfDim);
+                if (!roped)
+                {
+                    ApplyVisionRoPE(q, numPatches, headDim, halfDim, cosTable, sinTable);
+                    ApplyVisionRoPE(k, numPatches, headDim, halfDim, cosTable, sinTable);
+                }
+
+                float scale = 1f / MathF.Sqrt(headDim);
+                var attn = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
+                try
+                {
+                    if (!TensorSharp.Cuda.CudaFusedOps.TryVisionAttention(
+                            attn, q, k, v, _numHeads, numPatches, headDim, scale))
+                    {
+                        // No specialized kernel for this head dim: the generic SDPA
+                        // kernel takes the same [1, seq, heads, dim] layout.
+                        using var q4 = q.View(1, numPatches, _numHeads, headDim);
+                        using var k4 = k.View(1, numPatches, _numHeads, headDim);
+                        using var v4 = v.View(1, numPatches, _numHeads, headDim);
+                        using var out4 = attn.View(1, numPatches, _numHeads, headDim);
+                        Ops.ScaledDotProductAttention(out4, q4, k4, v4, null, scale);
+                    }
+
+                    return LinearForwardWithBias(attn, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
+                }
+                finally
+                {
+                    attn.Dispose();
+                }
+            }
+            finally
+            {
+                q.Dispose();
+                k.Dispose();
+                v.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Upload the block-order RoPE cos/sin tables once per image geometry so the
+        /// per-block RoPE runs from device memory.
+        /// </summary>
+        private (Tensor Cos, Tensor Sin) GetOrCreateRopeDeviceTables(int numPatches, int halfDim,
+            float[] cosTable, float[] sinTable)
+        {
+            long key = ((long)numPatches << 32) | (uint)halfDim;
+            if (!_ropeDeviceCache.TryGetValue(key, out var tables))
+            {
+                var cos = new Tensor(_allocator, DType.Float32, numPatches, halfDim);
+                var sin = new Tensor(_allocator, DType.Float32, numPatches, halfDim);
+                cos.SetElementsAsFloat(cosTable);
+                sin.SetElementsAsFloat(sinTable);
+                tables = (cos, sin);
+                _ropeDeviceCache[key] = tables;
+            }
+
+            return tables;
+        }
+
+        /// <summary>
         /// Vision self-attention with fused QKV and RoPE.
         ///
         /// When on GPU (native attention), uses Narrow+NewContiguous to keep data on-device
@@ -554,6 +751,9 @@ namespace TensorSharp.Models
             using var qkv = LinearForwardWithBias(input, $"{prefix}.attn_qkv.weight", $"{prefix}.attn_qkv.bias");
 
             Tensor q, k, v;
+
+            if (_cudaDirect)
+                return CudaSelfAttention(qkv, prefix, numPatches, headDim, halfDim, cosTable, sinTable);
 
             if (_useNativeAttention)
             {
@@ -774,16 +974,19 @@ namespace TensorSharp.Models
 
         private unsafe Tensor LinearForwardWithBias(Tensor input, string weightName, string biasName)
         {
-            var weight = _weights[weightName];
+            // Derived from the transposed copy, not _weights[weightName]: on the
+            // direct-CUDA path the untransposed original is released once the
+            // transpose exists (see GetOrCreateTransposedWeight).
+            Tensor weightT = GetOrCreateTransposedWeight(weightName);
             int seqLen = (int)input.Sizes[0];
-            int outDim = (int)weight.Sizes[0];
+            int outDim = (int)weightT.Sizes[1];
 
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
 
             Tensor contiguousInput = input.IsContiguous() ? null : Ops.NewContiguous(input);
             Tensor src = contiguousInput ?? input;
 
-            Ops.Addmm(result, 0, result, 1.0f, src, GetOrCreateTransposedWeight(weightName));
+            Ops.Addmm(result, 0, result, 1.0f, src, weightT);
 
             contiguousInput?.Dispose();
 
@@ -802,12 +1005,64 @@ namespace TensorSharp.Models
         private static unsafe float* GetFloatPtr(Tensor t) =>
             TensorComputePrimitives.GetFloatPointer(t);
 
-        private Tensor GetOrCreateTransposedWeight(string weightName)
+        /// <summary>
+        /// Transpose a 2D weight through host memory and upload the result.
+        /// NewContiguous over a transposed view has no CUDA kernel (the inner
+        /// stride is not 1), so it lands in the CUDA CPU fallback, whose
+        /// CopyLogical walks every element through the scalar
+        /// Get/SetElementAsFloat accessors. Across the 27 blocks' QKV / out / FFN
+        /// weights that is ~390M scalar round trips — 38 s of first-encode latency.
+        /// </summary>
+        private unsafe Tensor HostTranspose2D(Tensor weight)
+        {
+            int rows = (int)weight.Sizes[0];
+            int cols = (int)weight.Sizes[1];
+            float[] src = weight.GetElementsAsFloat(rows * cols);
+            var transposed = new Tensor(_allocator, DType.Float32, cols, rows);
+            using (var staging = new HostStaging(transposed, true))
+            {
+                float* dst = staging.Ptr;
+                fixed (float* srcPtr = src)
+                {
+                    long srcPtrL = (long)srcPtr;
+                    long dstPtrL = (long)dst;
+                    Parallel.For(0, cols, c =>
+                    {
+                        float* s = (float*)srcPtrL;
+                        float* d = (float*)dstPtrL + (long)c * rows;
+                        for (int r = 0; r < rows; r++)
+                            d[r] = s[(long)r * cols + c];
+                    });
+                }
+            }
+
+            return transposed;
+        }
+
+        private unsafe Tensor GetOrCreateTransposedWeight(string weightName)
         {
             if (_transposedWeights.TryGetValue(weightName, out var transposed))
                 return transposed;
 
-            using var weightViewT = _weights[weightName].Transpose();
+            Tensor weight = _weights[weightName];
+            if (_cudaDirect && weight.DimensionCount == 2)
+            {
+                transposed = HostTranspose2D(weight);
+                _transposedWeights[weightName] = transposed;
+                // Release the untransposed original: nothing on this path reads it
+                // again (LinearForwardWithBias takes its output dim from the
+                // transpose, and the GGML fused block paths are gated off). The
+                // 27 blocks' QKV / out / FFN weights are ~1.6 GB of F32, and
+                // keeping both copies resident next to a multi-GB language model
+                // is what pushes a 16 GB card into WDDM shared-memory spillover —
+                // where the encoder's ~350 MB of per-block activations run 6x
+                // slower and each successive image degrades further.
+                _weights.Remove(weightName);
+                weight.Dispose();
+                return transposed;
+            }
+
+            using var weightViewT = weight.Transpose();
             transposed = Ops.NewContiguous(weightViewT);
             _transposedWeights[weightName] = transposed;
             return transposed;
@@ -822,7 +1077,8 @@ namespace TensorSharp.Models
             int numPatches = gridH * gridW;
             cached = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
             float* posPtr = GetFloatPtr(_weights["v.position_embd.weight"]);
-            float* dstPtr = GetFloatPtr(cached);
+            using var staging = new HostStaging(cached, _cudaDirect);
+            float* dstPtr = staging.Ptr;
 
             float stepH = gridH > 1 ? (float)(_gridPerSide - 1) / (gridH - 1) : 0f;
             float stepW = gridW > 1 ? (float)(_gridPerSide - 1) / (gridW - 1) : 0f;
@@ -830,16 +1086,28 @@ namespace TensorSharp.Models
             int gridPerSide = _gridPerSide;
             int vLen = Vector<float>.Count;
 
+            // Written in block order so the table lines up with the block-ordered
+            // patch-embed rows (see GetOrCreateBlockOrder / PatchEmbed).
+            int[] blockOrder = GetOrCreateBlockOrder(gridH, gridW);
+
             long posPtrL = (long)posPtr;
             long dstPtrL = (long)dstPtr;
 
-            Parallel.For(0, gridH, h =>
+            fixed (int* orderPtr = blockOrder)
+            {
+            long orderPtrL = (long)orderPtr;
+            Parallel.For(0, gridH, brow =>
             {
                 float* pos = (float*)posPtrL;
                 float* dst = (float*)dstPtrL;
+                int* order = (int*)orderPtrL;
 
-                for (int w = 0; w < gridW; w++)
+                for (int bcol = 0; bcol < gridW; bcol++)
                 {
+                    int destIdx = brow * gridW + bcol;
+                    int rasterIdx = order[destIdx];
+                    int h = rasterIdx / gridW;
+                    int w = rasterIdx - h * gridW;
                     float y = h * stepH;
                     float x = w * stepW;
 
@@ -860,8 +1128,7 @@ namespace TensorSharp.Models
                     int idx10 = cy * gridPerSide + fx;
                     int idx11 = cy * gridPerSide + cx;
 
-                    int patchIdx = h * gridW + w;
-                    float* dstRow = dst + (long)patchIdx * hiddenSize;
+                    float* dstRow = dst + (long)destIdx * hiddenSize;
                     float* p00 = pos + (long)idx00 * hiddenSize;
                     float* p01 = pos + (long)idx01 * hiddenSize;
                     float* p10 = pos + (long)idx10 * hiddenSize;
@@ -886,6 +1153,7 @@ namespace TensorSharp.Models
                         dstRow[d] = wt00 * p00[d] + wt01 * p01[d] + wt10 * p10[d] + wt11 * p11[d];
                 }
             });
+            }
 
             _positionEmbeddingCache[key] = cached;
             return cached;
@@ -964,7 +1232,14 @@ namespace TensorSharp.Models
             foreach (var w in _weights.Values)
                 w.Dispose();
             _weights.Clear();
+            foreach (var (cos, sin) in _ropeDeviceCache.Values)
+            {
+                cos.Dispose();
+                sin.Dispose();
+            }
+            _ropeDeviceCache.Clear();
             _ropeCache.Clear();
+            _blockOrderCache.Clear();
         }
     }
 }

@@ -11,5 +11,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\TensorSharp.Models\TensorSharp.Models.csproj" />
     <ProjectReference Include="..\..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
+    <ProjectReference Include="..\..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
   </ItemGroup>
 </Project>

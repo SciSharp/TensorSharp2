@@ -7,6 +7,11 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildDir = Join-Path $ScriptDir "build-windows"
+
+# Get-VisualStudioInstallation / Import-VcVarsEnvironment. See eng/vs-locate.ps1
+# for why a bare `vswhere -latest` cannot be trusted to find the local MSVC.
+. (Join-Path $ScriptDir "..\eng\vs-locate.ps1")
+
 $EnableCuda = $env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA
 $EnableVulkan = $env:TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN
 $BuildTests = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_NATIVE_BUILD_TESTS)) { "OFF" } else { $env:TENSORSHARP_GGML_NATIVE_BUILD_TESTS }
@@ -15,6 +20,7 @@ $BuildParallelLevel = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_NAT
 $ExtraCMakeArgs = New-Object System.Collections.Generic.List[string]
 $UserSetCudaArchitectures = $false
 $UserSetGenerator = $false
+$UserGenerator = ""
 $UserSetPlatform = $false
 
 function Normalize-Bool([string] $Value) {
@@ -85,18 +91,23 @@ function Detect-LocalCudaArchitectures {
     return ($architectures -join ';')
 }
 
-function Detect-DefaultBuildParallelLevel {
+function Detect-DefaultBuildParallelLevel([bool] $CudaEnabled) {
     # Use all CPUs, bounded only by RAM. nvcc is memory-hungry, so allow ~3 GB per
     # parallel job (matches llama.cpp/ggml's own heuristic). The previous hard cap
     # of 4 jobs throttled the CUDA compile to a fraction of available cores even on
     # large machines with plenty of RAM; the memory bound below already prevents
     # OOM. Override with TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL when needed.
+    #
+    # Only a CUDA build needs the 3 GB bound: cl.exe peaks around a few hundred MB
+    # per translation unit, so applying nvcc's budget to a CPU-only build left
+    # cores idle for no reason (a 32 GB / 16-core box was capped at 10 jobs).
     $jobs = [Math]::Max(1, [Environment]::ProcessorCount)
+    $bytesPerJob = if ($CudaEnabled) { 3GB } else { 1GB }
 
     try {
         $computer = Get-CimInstance -ClassName Win32_ComputerSystem
         if ($null -ne $computer.TotalPhysicalMemory) {
-            $memoryLimitedJobs = [Math]::Max(1, [int][Math]::Floor([double]$computer.TotalPhysicalMemory / (3GB)))
+            $memoryLimitedJobs = [Math]::Max(1, [int][Math]::Floor([double]$computer.TotalPhysicalMemory / $bytesPerJob))
             $jobs = [Math]::Min($jobs, $memoryLimitedJobs)
         }
     }
@@ -107,27 +118,38 @@ function Detect-DefaultBuildParallelLevel {
     return $jobs
 }
 
-function Get-DefaultVisualStudioGenerator {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path $vswhere)) {
+function Find-NinjaProgram([object] $VisualStudio) {
+    # A user-installed ninja on PATH wins.
+    $onPath = Get-Command ninja.exe -ErrorAction SilentlyContinue
+    if ($null -ne $onPath) {
+        return $onPath.Source
+    }
+
+    # Every Visual Studio install carrying the "C++ CMake tools for Windows"
+    # component ships a private ninja; CMake's own installer does not. Using it
+    # means no download and no extra prerequisite for the common VS setup.
+    if ($null -ne $VisualStudio) {
+        $bundled = Join-Path $VisualStudio.Path "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+        if (Test-Path $bundled) {
+            return $bundled
+        }
+    }
+
+    return ""
+}
+
+function Read-CachedGenerator {
+    $cacheFile = Join-Path $BuildDir "CMakeCache.txt"
+    if (-not (Test-Path $cacheFile)) {
         return ""
     }
 
-    $installationVersion = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installationVersion)) {
+    $line = Select-String -Path $cacheFile -Pattern "^CMAKE_GENERATOR:INTERNAL=" | Select-Object -First 1
+    if ($null -eq $line) {
         return ""
     }
 
-    # Map the installed VS major version to its CMake generator name; a
-    # hardcoded generator breaks on machines that only carry a different VS
-    # (e.g. GitHub's windows-latest image now ships Visual Studio 2026 only).
-    switch (("$installationVersion".Trim() -split '\.')[0]) {
-        "16" { return "Visual Studio 16 2019" }
-        "17" { return "Visual Studio 17 2022" }
-        "18" { return "Visual Studio 18 2026" }
-        # Unknown/newer VS: return nothing and let CMake pick its own default.
-        default { return "" }
-    }
+    return (($line.Line -split '=', 2)[1]).Trim()
 }
 
 for ($i = 0; $i -lt $RemainingArgs.Length; $i++) {
@@ -178,11 +200,15 @@ for ($i = 0; $i -lt $RemainingArgs.Length; $i++) {
             if ($i -ge $RemainingArgs.Length) {
                 throw "Missing value for -G"
             }
+            # Remember the name too, not just that one was given: the generator
+            # decides whether this script has to import the MSVC environment.
+            $UserGenerator = $RemainingArgs[$i]
             $ExtraCMakeArgs.Add($RemainingArgs[$i])
             continue
         }
         '^-G.+$' {
             $UserSetGenerator = $true
+            $UserGenerator = $arg.Substring(2)
             $ExtraCMakeArgs.Add($arg)
             continue
         }
@@ -296,28 +322,91 @@ if ($EnableCuda -eq "ON") {
 }
 
 if ([string]::IsNullOrWhiteSpace($BuildParallelLevel)) {
-    $BuildParallelLevel = Detect-DefaultBuildParallelLevel
+    $BuildParallelLevel = Detect-DefaultBuildParallelLevel ($EnableCuda -eq "ON")
 }
 if (($BuildParallelLevel -as [int]) -lt 1) {
     throw "Invalid build parallel level: $BuildParallelLevel"
 }
 
+# Generator choice, in order of preference:
+#
+#   1. Ninja - one dependency graph over every translation unit, so all ~190 CUDA
+#      TUs plus the ggml/GgmlOps C++ sources saturate the requested job count
+#      regardless of which CMake target they belong to. It also sidesteps the
+#      MSBuild file-tracker path-length limit that CMakeLists.txt guards against,
+#      and needs no CUDA MSBuild integration for the installed VS version.
+#   2. The "Visual Studio NN" generator - MSBuild parallelises across projects
+#      only, so ggml-cuda's TUs still compile serially, but it works without a
+#      vcvars environment.
+#   3. Nothing, letting CMake decide - warned about below, because CMake's own
+#      fallback when it cannot see a VS instance is the strictly serial
+#      NMake Makefiles generator, where `--parallel` is silently ignored.
+$VisualStudio = Get-VisualStudioInstallation
+$NinjaProgram = Find-NinjaProgram $VisualStudio
+
 $GeneratorArgs = New-Object System.Collections.Generic.List[string]
 if (-not $UserSetGenerator -and [string]::IsNullOrWhiteSpace($env:CMAKE_GENERATOR)) {
-    $generator = Get-DefaultVisualStudioGenerator
-    if (-not [string]::IsNullOrWhiteSpace($generator)) {
+    if (-not [string]::IsNullOrWhiteSpace($NinjaProgram)) {
         $GeneratorArgs.Add("-G")
-        $GeneratorArgs.Add($generator)
+        $GeneratorArgs.Add("Ninja")
+    }
+    elseif ($null -ne $VisualStudio -and -not [string]::IsNullOrWhiteSpace($VisualStudio.Generator)) {
+        $GeneratorArgs.Add("-G")
+        $GeneratorArgs.Add($VisualStudio.Generator)
     }
 }
 
-$effectiveGenerator = if (-not [string]::IsNullOrWhiteSpace($env:CMAKE_GENERATOR)) { $env:CMAKE_GENERATOR } else { ($GeneratorArgs | Select-Object -Last 1) }
+# An explicit -G on the command line beats $env:CMAKE_GENERATOR, which beats the
+# generator chosen above. A caller-supplied -G was appended to $ExtraCMakeArgs by
+# the argument loop, so it is tracked separately in $UserGenerator.
+$effectiveGenerator =
+    if (-not [string]::IsNullOrWhiteSpace($UserGenerator)) { $UserGenerator }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:CMAKE_GENERATOR)) { $env:CMAKE_GENERATOR }
+    else { ($GeneratorArgs | Select-Object -Last 1) }
 if (-not $UserSetPlatform -and [string]::IsNullOrWhiteSpace($env:CMAKE_GENERATOR_PLATFORM) -and $effectiveGenerator -like "Visual Studio*") {
     $GeneratorArgs.Add("-A")
     $GeneratorArgs.Add("x64")
 }
 
-Write-Host "Configuring TensorSharp.GGML.Native (CUDA=$EnableCuda, CUDA_ARCHITECTURES=$CudaArchSummary, VULKAN=$EnableVulkan, TESTS=$BuildTests, PARALLEL=$BuildParallelLevel)"
+$GeneratorCMakeArgs = New-Object System.Collections.Generic.List[string]
+if ($effectiveGenerator -like "*Ninja*") {
+    # Ninja drives cl.exe/link.exe/nvcc itself, so this process needs the MSVC
+    # environment. Importing it here means a plain `dotnet build` works from any
+    # shell, not just from an "x64 Native Tools" prompt.
+    if ($null -ne $VisualStudio) {
+        Import-VcVarsEnvironment $VisualStudio.VcVars64
+    }
+    elseif ([string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
+        Write-Warning ("Generator '$effectiveGenerator' needs the MSVC command-line environment but no Visual Studio " +
+            "installation was found; run from an 'x64 Native Tools' prompt if the configure step cannot find a compiler.")
+    }
+
+    # Pin the ninja we found: when it comes from the Visual Studio install it is
+    # not on PATH, so CMake would not otherwise locate it.
+    if (-not [string]::IsNullOrWhiteSpace($NinjaProgram)) {
+        $GeneratorCMakeArgs.Add("-DCMAKE_MAKE_PROGRAM=$NinjaProgram")
+    }
+}
+elseif ([string]::IsNullOrWhiteSpace($effectiveGenerator) -or $effectiveGenerator -like "*NMake*") {
+    Write-Warning ("No Ninja and no usable Visual Studio generator were found, so this build may fall back to the " +
+        "serial NMake Makefiles generator, which ignores --parallel and compiles one file at a time. Install the " +
+        "'C++ CMake tools for Windows' VS component (it provides ninja), put ninja.exe on PATH, or set " +
+        "TENSORSHARP_VS_INSTALL_DIR to a working Visual Studio installation.")
+}
+
+# The generator is sticky in the CMake cache and CMake refuses to reconfigure an
+# existing build tree with a different one, so switching (e.g. off an older
+# NMake-configured tree onto Ninja) means starting the tree over.
+$CachedGenerator = Read-CachedGenerator
+if (-not [string]::IsNullOrWhiteSpace($CachedGenerator) -and
+    -not [string]::IsNullOrWhiteSpace($effectiveGenerator) -and
+    $CachedGenerator -ne $effectiveGenerator) {
+    Write-Host "Generator changed ('$CachedGenerator' -> '$effectiveGenerator'); removing $BuildDir to reconfigure from scratch."
+    Remove-Item -Recurse -Force $BuildDir
+}
+
+$GeneratorSummary = if ([string]::IsNullOrWhiteSpace($effectiveGenerator)) { "CMake default" } else { $effectiveGenerator }
+Write-Host "Configuring TensorSharp.GGML.Native (CUDA=$EnableCuda, CUDA_ARCHITECTURES=$CudaArchSummary, VULKAN=$EnableVulkan, TESTS=$BuildTests, GENERATOR=$GeneratorSummary, PARALLEL=$BuildParallelLevel)"
 
 $CMakeArgs = @(
     "-DCMAKE_BUILD_TYPE=Release",
@@ -336,7 +425,8 @@ if ($EnableCuda -eq "ON" -and -not [string]::IsNullOrWhiteSpace($CudaArchitectur
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "..\eng\fetch-ggml.ps1")
 if ($LASTEXITCODE -ne 0) { throw "fetch-ggml.ps1 failed with exit code $LASTEXITCODE" }
 
-cmake -S $ScriptDir -B $BuildDir @GeneratorArgs @CMakeArgs @ExtraCMakeArgs
+cmake -S $ScriptDir -B $BuildDir @GeneratorArgs @GeneratorCMakeArgs @CMakeArgs @ExtraCMakeArgs
+if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
 
 $BuildArgs = @("--build", $BuildDir, "--config", "Release", "--parallel", "$BuildParallelLevel")
 if ((Normalize-Bool $BuildTests) -eq "ON") {

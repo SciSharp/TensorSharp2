@@ -171,7 +171,46 @@ namespace TensorSharp.Cuda
         public static Tensor ModValue(Tensor result, Tensor lhs, float rhs) => ScalarFallback("modv", result, lhs, rhs);
 
         [RegisterOpStorageType("addt", typeof(CudaStorage))]
-        public static Tensor AddTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("addt", result, lhs, rhs, CudaBinaryOp.Add);
+        public static Tensor AddTensor(Tensor result, Tensor lhs, Tensor rhs)
+        {
+            // Row-broadcast add (x[rows, cols] + bias[cols]) — the shape the linear
+            // layers use for their bias. The elementwise kernel requires identical
+            // shapes and the CPU fallback's Apply3 stops iterating at the shorter
+            // operand's last block, which silently biases row 0 only. Route it to
+            // the row-bias kernel instead.
+            if (TryAddRowBroadcast(result, lhs, rhs, out Tensor broadcast))
+                return broadcast;
+
+            return Binary("addt", result, lhs, rhs, CudaBinaryOp.Add);
+        }
+
+        private static bool TryAddRowBroadcast(Tensor result, Tensor lhs, Tensor rhs, out Tensor writeTarget)
+        {
+            writeTarget = null;
+            if (lhs == null || rhs == null || lhs.DimensionCount < 2 || rhs.DimensionCount > lhs.DimensionCount)
+                return false;
+
+            long cols = lhs.Sizes[lhs.DimensionCount - 1];
+            if (cols <= 0 || rhs.ElementCount() != cols || lhs.ElementCount() == cols)
+                return false;
+
+            // Only a trailing-dimension broadcast: every leading rhs dim must be 1.
+            for (int i = 0; i < rhs.DimensionCount - 1; i++)
+            {
+                if (rhs.Sizes[i] != 1)
+                    return false;
+            }
+
+            Tensor target = TensorResultBuilder.GetWriteTarget(result, lhs, false, lhs.Sizes);
+            if (!ReferenceEquals(target, lhs))
+                Ops.Copy(target, lhs);
+
+            if (!CudaKernelOps.TryAddBiasRows(target, rhs))
+                return false;
+
+            writeTarget = target;
+            return true;
+        }
 
         [RegisterOpStorageType("subt", typeof(CudaStorage))]
         public static Tensor SubTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("subt", result, lhs, rhs, CudaBinaryOp.Sub);
@@ -448,7 +487,11 @@ namespace TensorSharp.Cuda
         [RegisterOpStorageType("layernorm", typeof(CudaStorage))]
         public static Tensor LayerNorm(Tensor result, Tensor src, Tensor alpha, Tensor beta, float eps)
         {
-            return CudaCpuFallback.InvokeTensor("layernorm", result, result, src, alpha, beta, eps);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, true, src.Sizes);
+            if (CudaKernelOps.TryLayerNorm(writeTarget, src, alpha, beta, eps))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor("layernorm", writeTarget, writeTarget, src, alpha, beta, eps);
         }
 
         [RegisterOpStorageType("rmsnorm", typeof(CudaStorage))]
