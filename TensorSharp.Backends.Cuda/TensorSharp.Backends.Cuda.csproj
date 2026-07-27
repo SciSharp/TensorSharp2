@@ -82,8 +82,15 @@
     <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(VCToolsInstallDir)' != ''">
       <_CompilerBinDir>--compiler-bindir="$(VCToolsInstallDir)bin\Hostx64\x64"</_CompilerBinDir>
     </PropertyGroup>
+    <!-- The query below asks vswhere for "all, including prerelease" rather than
+         "latest": the VS installer flags an instance "incomplete" after an
+         interrupted update, and a latest-only query silently skips such instances
+         (prints nothing, exits 0) even though cl.exe on disk works fine. nvcc
+         would then run with no host compiler directory and fail with
+         "Cannot find compiler 'cl.exe' in PATH". Same reasoning as
+         eng/vs-locate.ps1. -->
     <Exec Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(_CompilerBinDir)' == ''"
-          Command="for /f &quot;delims=&quot; %%i in ('&quot;%25ProgramFiles(x86)%25\Microsoft Visual Studio\Installer\vswhere.exe&quot; -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe') do @echo %%~dpi"
+          Command="for /f &quot;delims=&quot; %%i in ('&quot;%25ProgramFiles(x86)%25\Microsoft Visual Studio\Installer\vswhere.exe&quot; -all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe') do @echo %%~dpi"
           ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_ClExeDir" />
     </Exec>

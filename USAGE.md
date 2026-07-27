@@ -736,7 +736,9 @@ These are read by `build-linux.sh` / `build-windows.ps1` / the auto-build during
 | Enable GGML CUDA in the native build | auto-detected from toolchain | `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` | `--cuda` / `--no-cuda` |
 | Enable GGML Vulkan in the native build | auto-detected from the installed Vulkan runtime; a portable toolchain (headers, glslc, SPIRV-Headers) is downloaded when no Vulkan SDK / dev packages are installed | `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON/OFF` | `--vulkan` / `--no-vulkan` |
 | Narrow `CMAKE_CUDA_ARCHITECTURES` list | auto-detected from visible GPU | `TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES` | `--cuda-arch='86-real;89-real'` |
-| Native build parallelism cap | conservative auto-cap | `TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL` | — |
+| Native build parallelism cap | all CPUs, bounded by RAM (~3 GB per `nvcc` job) | `TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL` | — |
+| Native build CMake generator (Windows) | Ninja when available, else `Visual Studio NN` | `CMAKE_GENERATOR` | `-G <generator>` |
+| Visual Studio installation used by the native build (Windows) | auto-detected, including installs flagged incomplete | `TENSORSHARP_VS_INSTALL_DIR` | — |
 
 ## Server Logging
 

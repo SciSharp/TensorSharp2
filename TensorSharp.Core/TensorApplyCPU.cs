@@ -921,6 +921,57 @@ namespace TensorSharp
 		}
 
 
+		// result[r, c] = lhs[r, c] + rhs[c] for contiguous result/lhs and a
+		// trailing-dimension rhs. Returns false when the operands are not that
+		// shape, leaving the caller on its generic path.
+		unsafe static bool TryAddRowBroadcast(Tensor result, Tensor lhs, Tensor rhs)
+		{
+			if (result == null || lhs == null || rhs == null || lhs.DimensionCount < 2)
+				return false;
+
+			long cols = lhs.Sizes[lhs.DimensionCount - 1];
+			if (cols <= 0 || rhs.ElementCount() != cols || lhs.ElementCount() == cols)
+				return false;
+
+			for (int i = 0; i < rhs.DimensionCount - 1; i++)
+			{
+				if (rhs.Sizes[i] != 1)
+					return false;
+			}
+
+			if (result.DimensionCount != lhs.DimensionCount)
+				return false;
+			for (int i = 0; i < lhs.DimensionCount; i++)
+			{
+				if (result.Sizes[i] != lhs.Sizes[i])
+					return false;
+			}
+
+			if (!TryGetContiguousFloat(result, out float* resultPtr, out int resultLength) ||
+				!TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) ||
+				!TryGetContiguousFloat(rhs, out float* rhsPtr, out int rhsLength) ||
+				resultLength != lhsLength || rhsLength != cols)
+			{
+				return false;
+			}
+
+			int colCount = (int)cols;
+			int rows = lhsLength / colCount;
+			int simdWidth = Vector<float>.Count;
+			System.Threading.Tasks.Parallel.For(0, rows, r =>
+			{
+				float* dst = resultPtr + (long)r * colCount;
+				float* src = lhsPtr + (long)r * colCount;
+				int c = 0;
+				for (; c <= colCount - simdWidth; c += simdWidth)
+					StoreVec(dst + c, LoadVec(src + c) + LoadVec(rhsPtr + c));
+				for (; c < colCount; c++)
+					dst[c] = src[c] + rhsPtr[c];
+			});
+
+			return true;
+		}
+
 		unsafe public static void Add(Tensor result, Tensor lhs, Tensor rhs)
 		{
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
@@ -942,6 +993,13 @@ namespace TensorSharp
 
                 return;
             }
+
+            // Row-broadcast (x[rows, cols] + bias[cols]) — the shape linear layers
+            // use for their bias. Apply3 below cannot express it: it advances all
+            // three iterators together and stops as soon as the shortest one runs
+            // out of blocks, so a [cols] rhs would bias row 0 only.
+            if (TryAddRowBroadcast(result, lhs, rhs))
+                return;
 
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && lhs.Strides[^1] == 1 && rhs.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)

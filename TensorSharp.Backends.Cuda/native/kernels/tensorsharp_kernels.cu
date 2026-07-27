@@ -1467,6 +1467,62 @@ extern "C" __global__ void ts_qwen35_gdn_pack_inputs_f32(
     packed[i] = alpha[(size_t)s * num_v_heads + col];
 }
 
+// Row-wise LayerNorm: y = (x - mean) / sqrt(var + eps) * alpha + beta.
+// Matches TensorApplyCPU.LayerNorm (sigma = sqrt(eps + sumsq/cols)) so the
+// direct-CUDA path is numerically equivalent to the CPU/GGML reference. One
+// block per row; `block_reduce_sum` reuses a static __shared__ scratch buffer,
+// so the two reductions are separated by __syncthreads().
+extern "C" __global__ void ts_layernorm_f32(
+    const float* input,
+    const float* alpha,
+    const float* beta,
+    float* output,
+    int rows,
+    int cols,
+    float eps)
+{
+    int row = blockIdx.x;
+    if (row >= rows)
+        return;
+
+    const float* x = input + (size_t)row * cols;
+    float* y = output + (size_t)row * cols;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        sum += x[i];
+
+    sum = block_reduce_sum(sum);
+    __shared__ float mean;
+    if (threadIdx.x == 0)
+        mean = sum / (float)cols;
+    __syncthreads();
+
+    float mean_local = mean;
+    float sq_sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+    {
+        float d = x[i] - mean_local;
+        sq_sum += d * d;
+    }
+
+    __syncthreads();
+    sq_sum = block_reduce_sum(sq_sum);
+    __shared__ float inv_sigma;
+    if (threadIdx.x == 0)
+        inv_sigma = rsqrtf(sq_sum / (float)cols + eps);
+    __syncthreads();
+
+    float scale = inv_sigma;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+    {
+        float v = (x[i] - mean_local) * scale * alpha[i];
+        if (beta != 0)
+            v += beta[i];
+        y[i] = v;
+    }
+}
+
 extern "C" __global__ void ts_rmsnorm_f32(
     const float* input,
     const float* alpha,
@@ -1635,6 +1691,137 @@ extern "C" __global__ void ts_attention_softmax_sinks_f32(
     for (int k = threadIdx.x; k < kv_len; k += blockDim.x)
         row_ptr[k] *= inv_sum;
 }
+
+// ============================================================================
+// Bidirectional (unmasked) multi-head attention for vision encoders.
+//
+// ts_scaled_dot_product_attention_f32 keeps the whole score row in shared memory
+// and gives one block to every (head, query) pair, so every block streams the
+// full K and V for its head: at 8112 patches x 16 heads that is ~600 GB of
+// global traffic per encoder block. This kernel is the flash-attention shape
+// instead — one block covers TS_VISION_ATTN_THREADS queries, K/V are staged
+// through shared memory in tiles, and the softmax runs online so no
+// [seq, seq] score tensor is ever materialized.
+//
+// Layout matches the QKV split the encoders produce: q/k/v/out are
+// [seq, num_heads, head_dim] with head_dim a compile-time constant so the
+// per-query vector and accumulator stay in registers. head_dim values without
+// an instantiation below fall back to the generic kernel above.
+// ============================================================================
+#define TS_VISION_ATTN_THREADS 128
+#define TS_VISION_ATTN_TILE_K 32
+
+template<int D>
+__device__ __forceinline__ void ts_vision_attention_body(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    float* __restrict__ output,
+    int num_heads,
+    int seq,
+    float scale)
+{
+    __shared__ float k_tile[TS_VISION_ATTN_TILE_K * D];
+    __shared__ float v_tile[TS_VISION_ATTN_TILE_K * D];
+
+    const int head = blockIdx.y;
+    const int q_pos = blockIdx.x * TS_VISION_ATTN_THREADS + threadIdx.x;
+    const bool active = q_pos < seq;
+
+    float qv[D];
+    float acc[D];
+#pragma unroll
+    for (int d = 0; d < D; d++)
+    {
+        qv[d] = 0.0f;
+        acc[d] = 0.0f;
+    }
+
+    if (active)
+    {
+        const float* qp = query + ((size_t)q_pos * num_heads + head) * D;
+#pragma unroll
+        for (int d = 0; d < D; d++)
+            qv[d] = qp[d] * scale;
+    }
+
+    // Online-softmax running max / denominator. -FLT_MAX (not -inf) keeps the
+    // seed a representable float; the first correction factor
+    // expf(-FLT_MAX - s) still underflows to exactly 0.
+    float m = -FLT_MAX;
+    float denom = 0.0f;
+
+    for (int k0 = 0; k0 < seq; k0 += TS_VISION_ATTN_TILE_K)
+    {
+        int tile = min(TS_VISION_ATTN_TILE_K, seq - k0);
+
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < tile * D; idx += TS_VISION_ATTN_THREADS)
+        {
+            int r = idx / D;
+            int c = idx - r * D;
+            size_t src = ((size_t)(k0 + r) * num_heads + head) * D + c;
+            k_tile[idx] = key[src];
+            v_tile[idx] = value[src];
+        }
+        __syncthreads();
+
+        if (!active)
+            continue;
+
+        for (int r = 0; r < tile; r++)
+        {
+            const float* ks = k_tile + r * D;
+            float s = 0.0f;
+#pragma unroll
+            for (int d = 0; d < D; d++)
+                s += qv[d] * ks[d];
+
+            float m_new = fmaxf(m, s);
+            // First key: m is -inf so corr is exp(-inf) == 0 and the zeroed
+            // accumulator stays zero.
+            float corr = __expf(m - m_new);
+            float p = __expf(s - m_new);
+            const float* vs = v_tile + r * D;
+#pragma unroll
+            for (int d = 0; d < D; d++)
+                acc[d] = acc[d] * corr + p * vs[d];
+
+            denom = denom * corr + p;
+            m = m_new;
+        }
+    }
+
+    if (!active)
+        return;
+
+    float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+    float* op = output + ((size_t)q_pos * num_heads + head) * D;
+#pragma unroll
+    for (int d = 0; d < D; d++)
+        op[d] = acc[d] * inv;
+}
+
+#define TS_VISION_ATTENTION_KERNEL(NAME, D)                                     \
+    extern "C" __global__ __launch_bounds__(TS_VISION_ATTN_THREADS) void NAME(   \
+        const float* __restrict__ query,                                         \
+        const float* __restrict__ key,                                           \
+        const float* __restrict__ value,                                         \
+        float* __restrict__ output,                                              \
+        int num_heads,                                                           \
+        int seq,                                                                 \
+        float scale)                                                             \
+    {                                                                            \
+        ts_vision_attention_body<D>(query, key, value, output, num_heads, seq, scale); \
+    }
+
+TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d64_f32, 64)
+TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d72_f32, 72)
+TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d80_f32, 80)
+TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d88_f32, 88)
+TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d96_f32, 96)
+TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d112_f32, 112)
+TS_VISION_ATTENTION_KERNEL(ts_vision_attention_d128_f32, 128)
 
 extern "C" __global__ void ts_scaled_dot_product_attention_f32(
     const float* query,

@@ -89,7 +89,11 @@ Windows (GGML_CUDA enabled):
 .\build-windows.ps1 --cuda
 ```
 
-On Windows and Linux, the native build script auto-detects the visible NVIDIA GPU compute capability and passes a narrow `CMAKE_CUDA_ARCHITECTURES` value to ggml-cuda (for example `86-real` on an RTX 3080), which cuts CUDA build time substantially. The native build also runs in parallel by default with a conservative job cap so `nvcc` does not overwhelm typical developer machines.
+On Windows and Linux, the native build script auto-detects the visible NVIDIA GPU compute capability and passes a narrow `CMAKE_CUDA_ARCHITECTURES` value to ggml-cuda (for example `86-real` on an RTX 3080), which cuts CUDA build time substantially. The native build also runs in parallel by default, with the job count bounded by RAM (`nvcc` peaks around 3 GB per translation unit) so it does not overwhelm typical developer machines.
+
+On Windows, `build-windows.ps1` prefers the **Ninja** generator, falling back to the `Visual Studio NN` generator and finally to whatever CMake picks. This matters for build time: Ninja parallelises across every translation unit at once, while the Visual Studio generator only parallelises across CMake projects, so ggml-cuda's ~190 `nvcc` compilations run one at a time. The script finds `ninja.exe` on `PATH` or in the Visual Studio installation (the "C++ CMake tools for Windows" component ships one) and imports the MSVC `vcvars64` environment itself, so no "x64 Native Tools" prompt is needed. The generator and the effective job count are printed in the `Configuring TensorSharp.GGML.Native (...)` line; if the script warns that it may fall back to the serial `NMake Makefiles` generator, install that VS component or put `ninja.exe` on `PATH`.
+
+Visual Studio is located with `eng/vs-locate.ps1`, which tolerates an installation the VS installer has flagged incomplete (`vswhere -latest` silently reports *no* installation for those, which is what made CMake fall back to the serial generator). Set `TENSORSHARP_VS_INSTALL_DIR` to override the detected installation directory. To force a generator explicitly, set `CMAKE_GENERATOR` or pass `-G` through to the script.
 
 If you want to override the auto-detected architecture list or the default build parallelism, use either environment variables or explicit build flags:
 

@@ -37,11 +37,15 @@ namespace TensorSharp.Cuda
         private readonly IntPtr qwen35GdnPrefillOutF32;
         private readonly IntPtr qwen35GdnUpdateConvStateF32;
         private readonly IntPtr qwen35GdnPackInputsF32;
+        private readonly IntPtr layerNormF32;
         private readonly IntPtr rmsNormF32;
         private readonly IntPtr rmsNormResidualAddF32;
         private readonly IntPtr softmaxF32;
         private readonly IntPtr attentionSoftmaxSinksF32;
         private readonly IntPtr scaledDotProductAttentionF32;
+        // head_dim -> ts_vision_attention_d<D>_f32 (bidirectional flash attention
+        // for vision encoders). Only the instantiated head dims are present.
+        private readonly System.Collections.Generic.Dictionary<int, IntPtr> visionAttentionF32 = new();
         private readonly IntPtr gqaPrefillAttentionF32;
         private readonly IntPtr gqaPrefillAttentionF16;
         private readonly IntPtr gqaPrefillAttentionGroup4D256F32;
@@ -196,11 +200,19 @@ namespace TensorSharp.Cuda
             qwen35GdnPrefillOutF32 = module.GetFunction("ts_qwen35_gdn_prefill_out_f32");
             qwen35GdnUpdateConvStateF32 = module.GetFunction("ts_qwen35_gdn_update_conv_state_f32");
             qwen35GdnPackInputsF32 = module.GetFunction("ts_qwen35_gdn_pack_inputs_f32");
+            layerNormF32 = module.GetFunction("ts_layernorm_f32");
             rmsNormF32 = module.GetFunction("ts_rmsnorm_f32");
             rmsNormResidualAddF32 = module.GetFunction("ts_rmsnorm_residual_add_f32");
             softmaxF32 = module.GetFunction("ts_softmax_f32");
             attentionSoftmaxSinksF32 = module.GetFunction("ts_attention_softmax_sinks_f32");
             scaledDotProductAttentionF32 = module.GetFunction("ts_scaled_dot_product_attention_f32");
+            // Optional: a PTX built before these kernels existed simply leaves the
+            // table empty and vision attention keeps the generic SDPA kernel.
+            foreach (int headDim in new[] { 64, 72, 80, 88, 96, 112, 128 })
+            {
+                try { visionAttentionF32[headDim] = module.GetFunction($"ts_vision_attention_d{headDim}_f32"); }
+                catch { }
+            }
             gqaPrefillAttentionF32 = module.GetFunction("ts_gqa_prefill_attention_f32");
             gqaPrefillAttentionF16 = module.GetFunction("ts_gqa_prefill_attention_f16");
             gqaPrefillAttentionGroup4D256F32 = module.GetFunction("ts_gqa_prefill_attention_group4_d256_f32");
@@ -800,6 +812,43 @@ namespace TensorSharp.Cuda
             // raced the shared-state decay and core[] reduction).
             uint sharedBytes = checked((uint)((2 * headKDim + headVDim) * sizeof(float)));
             Launch(qwen35GdnFusedF32, (uint)numVHeads, 1, 1, GdnBlockSize, 1, 1, sharedBytes, stream, args);
+        }
+
+        public void LaunchLayerNormF32(IntPtr input, IntPtr alpha, IntPtr beta, IntPtr output, int rows, int cols, float eps, IntPtr stream)
+        {
+            IntPtr inputArg = input;
+            IntPtr alphaArg = alpha;
+            IntPtr betaArg = beta;
+            IntPtr outputArg = output;
+            int rowsArg = rows;
+            int colsArg = cols;
+            float epsArg = eps;
+            void** args = stackalloc void*[] { &inputArg, &alphaArg, &betaArg, &outputArg, &rowsArg, &colsArg, &epsArg };
+            Launch(layerNormF32, (uint)rows, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public bool HasVisionAttentionF32(int headDim) => visionAttentionF32.ContainsKey(headDim);
+
+        /// <summary>
+        /// Bidirectional multi-head attention over [seq, num_heads, head_dim] q/k/v.
+        /// Requires <see cref="HasVisionAttentionF32"/> for the head dim.
+        /// </summary>
+        public void LaunchVisionAttentionF32(
+            IntPtr query, IntPtr key, IntPtr value, IntPtr output,
+            int numHeads, int seq, int headDim, float scale, IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr outputArg = output;
+            int numHeadsArg = numHeads;
+            int seqArg = seq;
+            float scaleArg = scale;
+            void** args = stackalloc void*[]
+            { &queryArg, &keyArg, &valueArg, &outputArg, &numHeadsArg, &seqArg, &scaleArg };
+            const int threads = 128; // must match TS_VISION_ATTN_THREADS
+            uint qBlocks = (uint)((seq + threads - 1) / threads);
+            Launch(visionAttentionF32[headDim], qBlocks, (uint)numHeads, 1, threads, 1, 1, 0, stream, args);
         }
 
         public void LaunchRMSNormF32(IntPtr input, IntPtr alpha, IntPtr beta, IntPtr output, int rows, int cols, float eps, IntPtr stream)

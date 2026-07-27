@@ -664,6 +664,105 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        public static bool TryLayerNorm(Tensor result, Tensor src, Tensor alpha, Tensor beta, float eps)
+        {
+            if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||
+                !TryGetContiguousRows(src, out CudaStorage srcStorage, out IntPtr srcPtr, out int srcRows, out int srcCols) ||
+                !TryGetContiguousFloat(alpha, out CudaStorage alphaStorage, out IntPtr alphaPtr, out int alphaCount) ||
+                rows != srcRows ||
+                cols != srcCols ||
+                alphaCount != cols)
+            {
+                return false;
+            }
+
+            IntPtr betaPtr = IntPtr.Zero;
+            CudaStorage betaStorage = null;
+            if (beta != null)
+            {
+                if (!TryGetContiguousFloat(beta, out betaStorage, out betaPtr, out int betaCount) || betaCount != cols)
+                    return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            srcStorage.EnsureDeviceCurrent();
+            alphaStorage.EnsureDeviceCurrent();
+            betaStorage?.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchLayerNormF32(srcPtr, alphaPtr, betaPtr, resultPtr, rows, cols, eps, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        /// <summary>
+        /// Bidirectional multi-head attention on flat [seq, numHeads, headDim]
+        /// tensors (the layout the vision encoders' QKV split produces). Returns
+        /// false when the head dim has no specialized kernel, so callers fall back
+        /// to <see cref="TryScaledDotProductAttention"/>.
+        /// </summary>
+        public static bool TryVisionAttention(Tensor result, Tensor query, Tensor key, Tensor value,
+            int numHeads, int seq, int headDim, float scale)
+        {
+            long expected = (long)seq * numHeads * headDim;
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out int queryCount) ||
+                !TryGetContiguousFloat(key, out CudaStorage keyStorage, out IntPtr keyPtr, out int keyCount) ||
+                !TryGetContiguousFloat(value, out CudaStorage valueStorage, out IntPtr valuePtr, out int valueCount) ||
+                seq <= 0 || numHeads <= 0 || headDim <= 0 ||
+                resultCount != expected || queryCount != expected ||
+                keyCount != expected || valueCount != expected)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels) || !kernels.HasVisionAttentionF32(headDim))
+                return false;
+
+            queryStorage.EnsureDeviceCurrent();
+            keyStorage.EnsureDeviceCurrent();
+            valueStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchVisionAttentionF32(queryPtr, keyPtr, valuePtr, resultPtr,
+                numHeads, seq, headDim, scale, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        /// <summary>
+        /// In-place NeoX-style RoPE over a flat [seq, numHeads, headDim] tensor with
+        /// caller-supplied per-position cos/sin tables of [seq, ropeHalf].
+        /// </summary>
+        public static bool TryNeoxRopeFlat(Tensor data, Tensor cosTable, Tensor sinTable,
+            int numHeads, int seq, int headDim, int ropeHalf)
+        {
+            long expectedData = (long)seq * numHeads * headDim;
+            long expectedTable = (long)seq * ropeHalf;
+            if (!TryGetContiguousFloat(data, out CudaStorage dataStorage, out IntPtr dataPtr, out int dataCount) ||
+                !TryGetContiguousFloat(cosTable, out CudaStorage cosStorage, out IntPtr cosPtr, out int cosCount) ||
+                !TryGetContiguousFloat(sinTable, out CudaStorage sinStorage, out IntPtr sinPtr, out int sinCount) ||
+                ropeHalf <= 0 || 2 * ropeHalf > headDim ||
+                dataCount != expectedData || cosCount != expectedTable || sinCount != expectedTable)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = dataStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            dataStorage.EnsureDeviceCurrent();
+            cosStorage.EnsureDeviceCurrent();
+            sinStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchNeoXRoPEFlatF32(dataPtr, cosPtr, sinPtr, numHeads, seq, headDim, ropeHalf, allocator.Stream.Handle);
+            dataStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryRMSNorm(Tensor result, Tensor src, Tensor alpha, Tensor beta, float eps)
         {
             if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||
