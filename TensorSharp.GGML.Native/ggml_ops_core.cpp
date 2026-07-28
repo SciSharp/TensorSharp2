@@ -2016,6 +2016,14 @@ TSG_EXPORT void TSGgml_AlignedFree(void* ptr)
 // resident weights live in the caches cleared below.
 extern "C" void TSGgml_QwenImageResetForwardCache();
 
+// Tensor-parallel graphs held across calls, defined in their own kernels.
+// TSGgml_Shutdown releases them while the backends are still alive.
+extern "C" void TSGgml_Gemma4ReleaseVerifyTpGraphs();
+extern "C" void TSGgml_Qwen35ReleaseAttentionTpGraphs();
+extern "C" void TSGgml_ReleaseFusedFfnTpGraphs();
+extern "C" void TSGgml_ReleaseFusedMatmulAddTpGraphs();
+extern "C" void TSGgml_Gemma4ResetDecodeCache();
+
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
     // Drop any persistent whole-model graphs first: they bind weights resident by
@@ -2102,6 +2110,15 @@ TSG_EXPORT void TSGgml_Shutdown()
     // they were allocated from is torn down. Both free every rank's slot.
     free_reuse_compute_buffer();
     free_reuse_gallocr();
+    // Tensor-parallel graphs parked between "build" and "execute", plus the
+    // persistent per-rank decode graphs. They own backend buffers, and letting
+    // static destructors free them after the CUDA driver has shut down aborts
+    // the process ("CUDA error: driver shutting down").
+    TSGgml_Gemma4ReleaseVerifyTpGraphs();
+    TSGgml_Qwen35ReleaseAttentionTpGraphs();
+    TSGgml_ReleaseFusedFfnTpGraphs();
+    TSGgml_ReleaseFusedMatmulAddTpGraphs();
+    TSGgml_Gemma4ResetDecodeCache();
     // Release the calling thread's cached prefill-attention sessions while the
     // CUDA driver is still alive; leaving them to thread_local destructors
     // aborts the process on exit ("CUDA error: driver shutting down").

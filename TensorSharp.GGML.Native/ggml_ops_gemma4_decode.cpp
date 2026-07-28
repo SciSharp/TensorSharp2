@@ -64,6 +64,10 @@ namespace
         bool ple_gather = false;                     // in-kernel PLE gather graph vs uploaded ple_data
         bool folded = false;                         // hidden_out holds logits (final norm + lm_head folded in)
         int out_count = 0;                           // floats to download (vocab when folded, else hidden)
+        // Tensor-parallel execution plan for this rank: the same graph, cut at
+        // the two row-parallel projections per layer whose partial sums the
+        // ranks must AllReduce. Empty for a single-device decode.
+        tsg::TpRankPlan tp_plan;
 
         void reset()
         {
@@ -76,6 +80,7 @@ namespace
             num_layers = hidden_size = ple_dim = 0;
             ple_gather = false;
             folded = false; out_count = 0;
+            tp_plan.clear();
         }
     };
 
@@ -137,7 +142,11 @@ namespace
 
         void reset_all() { for (auto& e : entries) e.reset(); }
     };
-    G4DecodeCachePool g_g4dc_pool;
+    // One pool per rank. Under tensor parallelism each GPU builds its own graph
+    // over its own weight shards, and the entries hold that rank's ggml context
+    // and backend buffer — they are not interchangeable between devices.
+    G4DecodeCachePool g_g4dc_pools[tsg::TSG_MAX_DEVICES];
+    inline G4DecodeCachePool& g4dc_pool() { return g_g4dc_pools[tsg::g_active_rank]; }
 }
 
 TSG_EXPORT int TSGgml_Gemma4ModelDecode(
@@ -208,12 +217,26 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
     int ple_token_id,
     const void* ple_model_proj_data, int ple_model_proj_type,
     std::int64_t ple_model_proj_ne0, std::int64_t ple_model_proj_ne1, std::int64_t ple_model_proj_bytes,
-    const float* ple_model_proj_norm_data)
+    const float* ple_model_proj_norm_data,
+    // Tensor parallelism. With tp_degree > 1 the caller drives one rank at a
+    // time: every weight/KV pointer above is THIS rank's shard, num_heads and
+    // kv_heads_arr are this rank's head counts, and the call *builds and binds*
+    // the graph instead of running it — it hands back a plan (via tp_plan_out)
+    // that names the two per-layer AllReduce points. The caller collects one
+    // plan per rank and runs them together through
+    // TSGgml_TensorParallelExecutePlans, so the GPUs overlap and the partial
+    // sums are reduced in VRAM. tp_degree <= 1 is the ordinary single-device
+    // path and ignores both parameters.
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
         if (!ensure_backend())
             return 0;
+
+        const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+        if (tp_mode)
+            *tp_plan_out = nullptr;
 
         const int totalSeqLen = position + 1;
 
@@ -305,6 +328,16 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 if (!li[l].isShared && pvalid[l] > pwindow[l]) { can_persist = false; break; }
             }
         }
+        // The tensor-parallel driver executes the graph *after* this call returns,
+        // so the graph, its context and its backend buffer have to outlive the
+        // call — which is exactly what persist mode provides. Without it there is
+        // nothing to hand back, so the caller falls back to its per-op forward.
+        if (tp_mode && !can_persist)
+        {
+            set_last_error("Gemma4 model decode: tensor-parallel mode requires the persistent decode graph.");
+            return 0;
+        }
+
         const void* g4_sig = attn_norm_arr[0];
         const void* g4_kc0 = k_cache_arr != nullptr ? k_cache_arr[0] : nullptr;
 
@@ -313,7 +346,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         // concurrent requests each replay their own captured graph instead of one
         // shared entry that rebuilds on every switch. find() already matched
         // sig_disc + sig_kcache0, so only the finer shape fields are checked here.
-        G4DecodeCache* dc = (can_persist && g4_persist) ? g_g4dc_pool.find(g4_sig, g4_kc0) : nullptr;
+        G4DecodeCache* dc = (can_persist && g4_persist) ? g4dc_pool().find(g4_sig, g4_kc0) : nullptr;
         if (dc != nullptr && dc->graph != nullptr &&
             dc->num_layers == num_layers && dc->hidden_size == hidden_size &&
             dc->ple_dim == ple_dim && dc->ple_gather == ple_gather &&
@@ -348,6 +381,23 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                     decode_input_set_async(dc->attn_mask[l], md.data(), md.size() * sizeof(ggml_fp16_t));
                 }
             }
+            if (tp_mode)
+            {
+                // Inputs are staged; the driver runs the segments across ranks.
+                if (!dc->tp_plan.valid())
+                {
+                    set_last_error("Gemma4 model decode: cached graph has no tensor-parallel plan.");
+                    dc->reset();
+                    return 0;
+                }
+                dc->tp_plan.out_tensor = dc->hidden_out;
+                dc->tp_plan.out_host = dc->folded ? logits_data : hidden_data;
+                dc->tp_plan.out_bytes = static_cast<std::size_t>(dc->out_count) * sizeof(float);
+                *tp_plan_out = &dc->tp_plan;
+                clear_last_error();
+                return 1;
+            }
+
             ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
             if (st != GGML_STATUS_SUCCESS)
             {
@@ -366,8 +416,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         G4DecodeCache* g4dc = nullptr;
         if (g4_persist)
         {
-            if (can_persist) g4dc = &g_g4dc_pool.claim(g4_sig, g4_kc0);
-            else             g_g4dc_pool.drop(g4_sig, g4_kc0);
+            if (can_persist) g4dc = &g4dc_pool().claim(g4_sig, g4_kc0);
+            else             g4dc_pool().drop(g4_sig, g4_kc0);
         }
 
 
@@ -558,6 +608,19 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         std::vector<ggml_tensor*> layer_attn_mask(num_layers, nullptr);
         std::vector<std::vector<ggml_fp16_t>> layer_attn_mask_data(num_layers);
 
+        // Tensor-parallel cut points. `tp_partial` is the row-parallel matmul
+        // whose output is only this rank's share of the sum — that buffer is what
+        // the collective reduces. `tp_boundary` is the last graph node that may
+        // run before the reduction; it is the reshape view of the same data, so
+        // reducing `tp_partial` and resuming after `tp_boundary` are consistent.
+        std::vector<ggml_tensor*> tp_partial;
+        std::vector<ggml_tensor*> tp_boundary;
+        if (tp_mode)
+        {
+            tp_partial.reserve(static_cast<std::size_t>(num_layers) * 2);
+            tp_boundary.reserve(static_cast<std::size_t>(num_layers) * 2);
+        }
+
         for (int l = 0; l < num_layers; l++)
         {
             auto& lt = layers[l];
@@ -706,10 +769,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
                 q_attn, k_full, v_full, layer_attn_mask[l], 1.0f, 0.0f, 0.0f);
 
-            // 8. O projection
+            // 8. O projection. Row-parallel under TP: lt.o_w holds this rank's
+            // slice of the input dimension, so o_mm is a partial sum and every
+            // rank has to add its neighbours' before the (non-linear) norm below.
             ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, info.qDim, 1);
-            ggml_tensor* o_flat = ggml_reshape_1d(ctx,
-                ggml_mul_mat(ctx, lt.o_w, attn_flat), hidden_size);
+            ggml_tensor* o_mm = ggml_mul_mat(ctx, lt.o_w, attn_flat);
+            ggml_tensor* o_flat = ggml_reshape_1d(ctx, o_mm, hidden_size);
+            if (tp_mode) { tp_partial.push_back(o_mm); tp_boundary.push_back(o_flat); }
 
             // 9. Post-attn norm + residual
             ggml_tensor* post_attn_normed = ggml_mul(ctx,
@@ -730,8 +796,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             ggml_tensor* ffn_hidden = ggml_mul(ctx, ggml_gelu(ctx, gate), up);
 
             ggml_tensor* ffn_2d = ggml_reshape_2d(ctx, ffn_hidden, intermediate_size, 1);
-            ggml_tensor* down_flat = ggml_reshape_1d(ctx,
-                ggml_mul_mat(ctx, lt.down_w, ffn_2d), hidden_size);
+            ggml_tensor* down_mm = ggml_mul_mat(ctx, lt.down_w, ffn_2d);
+            ggml_tensor* down_flat = ggml_reshape_1d(ctx, down_mm, hidden_size);
+            if (tp_mode) { tp_partial.push_back(down_mm); tp_boundary.push_back(down_flat); }
 
             // 11. Post-FFN norm + residual
             ggml_tensor* post_ffn_normed = ggml_mul(ctx,
@@ -943,7 +1010,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 
         // Upload data
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
 
@@ -981,23 +1048,25 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         }
 
 
-        // Execute single graph
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
-        if (status != GGML_STATUS_SUCCESS)
-        {
-            set_last_error("ggml backend graph execution failed for Gemma4 model decode.");
-            if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
-            return 0;
-        }
-
-
-
-        // Download hidden state (async blit on Metal in async mode), or the
-        // folded logits[vocab] when the lm_head was folded into the graph.
         const int g4_out_count = fold ? vocab_size : hidden_size;
         void* g4_out_data = fold ? logits_data : hidden_data;
-        finalize_compute_with_download(hidden_out, g4_out_data, static_cast<std::size_t>(g4_out_count) * sizeof(float));
-        if (can_persist) host_read_barrier();
+
+        if (!tp_mode)
+        {
+            // Execute single graph
+            ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+            if (status != GGML_STATUS_SUCCESS)
+            {
+                set_last_error("ggml backend graph execution failed for Gemma4 model decode.");
+                if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
+                return 0;
+            }
+
+            // Download hidden state (async blit on Metal in async mode), or the
+            // folded logits[vocab] when the lm_head was folded into the graph.
+            finalize_compute_with_download(hidden_out, g4_out_data, static_cast<std::size_t>(g4_out_count) * sizeof(float));
+            if (can_persist) host_read_barrier();
+        }
 
         if (can_persist && g4dc != nullptr)
         {
@@ -1027,6 +1096,27 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             g4dc->valid = true;
         }
 
+        if (tp_mode)
+        {
+            if (g4dc == nullptr)
+            {
+                set_last_error("Gemma4 model decode: tensor-parallel build produced no cache slot.");
+                return 0;
+            }
+            g4dc->tp_plan.clear();
+            g4dc->tp_plan.graph = graph;
+            g4dc->tp_plan.ar_tensor = tp_partial;
+            if (!tp_plan_segments(g4dc->tp_plan, tp_boundary))
+            {
+                g4dc->reset();
+                return 0;
+            }
+            g4dc->tp_plan.out_tensor = hidden_out;
+            g4dc->tp_plan.out_host = g4_out_data;
+            g4dc->tp_plan.out_bytes = static_cast<std::size_t>(g4_out_count) * sizeof(float);
+            *tp_plan_out = &g4dc->tp_plan;
+        }
+
         clear_last_error();
         return 1;
     }
@@ -1050,6 +1140,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 // persist mode is off (the cache is never populated).
 TSG_EXPORT void TSGgml_Gemma4ResetDecodeCache()
 {
-    g_g4dc_pool.reset_all();
+    // Every rank's pool: a KV reset invalidates the cached graphs on all GPUs,
+    // and the caller is not necessarily on the rank that built them.
+    for (auto& pool : g_g4dc_pools)
+        pool.reset_all();
 }
 

@@ -46,6 +46,12 @@ namespace TensorSharp.GGML
         private static extern unsafe int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCount, long count);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_TensorParallelFusedAvailable(int rankCount);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_TensorParallelExecutePlans(IntPtr[] plans, int rankCount);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern unsafe int TSGgml_TensorParallelMatmul(
             GgmlTensorView2D* results,
             GgmlTensorView2D* inputs,
@@ -207,6 +213,33 @@ namespace TensorSharp.GGML
         public static unsafe bool TensorParallelAllReduceDevice(float** buffers, int rankCount, long count)
         {
             return TSGgml_TensorParallelAllReduceDevice(buffers, rankCount, count) != 0;
+        }
+
+        /// <summary>
+        /// True when a fused whole-model tensor-parallel graph can run: more
+        /// than one rank and a device collective to reduce the per-layer
+        /// partials with. False means the caller should keep its per-op forward,
+        /// because every segment boundary would otherwise cost a host round trip.
+        /// </summary>
+        public static bool TensorParallelFusedAvailable(int rankCount)
+        {
+            try { return TSGgml_TensorParallelFusedAvailable(rankCount) != 0; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        /// <summary>
+        /// Run one fused per-rank graph plan per rank: segment k is submitted on
+        /// every GPU asynchronously, its row-parallel partials are AllReduced in
+        /// VRAM, then segment k+1 follows. This is the schedule llama.cpp's meta
+        /// backend uses for <c>--split-mode tensor</c>, and it is what keeps the
+        /// activations off the PCIe bus.
+        /// </summary>
+        public static void TensorParallelExecutePlans(IntPtr[] plans)
+        {
+            if (plans == null || plans.Length == 0)
+                throw new ArgumentException("At least one plan is required.", nameof(plans));
+            if (TSGgml_TensorParallelExecutePlans(plans, plans.Length) == 0)
+                throw new InvalidOperationException(GetLastErrorMessage("GGML tensor-parallel plan execution failed."));
         }
 
         /// <summary>

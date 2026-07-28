@@ -326,14 +326,157 @@ forward, which is ~1000 native calls per token, doubled across two ranks. The
 per-op overhead is fixed, which is why prefill closes the gap as the prompt
 grows (0.62× at 512 tokens, 0.80× at 2048) while decode does not.
 
+---
+
+## Stage 1c — Fused TP execution (Implemented)
+
+**Goal:** stop TP being slower than one GPU.
+
+### The problem
+
+Stage 1b measured TP as a capacity win and a latency loss, and blamed dispatch
+count. That was right, and the magnitude was worse than the Qwen3-4B numbers
+suggested. On Gemma-4-E4B Q8_0, `--tp 2` ran prefill at 37.5 tok/s against
+1000+ on one GPU, and decode at 5.5 against 36.8. Every GGML op submits a graph,
+synchronizes, and copies its result back to host memory; a 42-layer decode is
+~2000 of those per token, doubled across ranks. AllReduce was not the cost.
+
+### The mechanism
+
+`tsg::TpRankPlan` + `tsg::tp_execute_plans` (`ggml_ops_tensor_parallel.cpp`).
+
+A fused kernel already builds its whole-model (or whole-layer) graph in one
+piece. Given `tp_degree > 1` it now builds that same graph over **this rank's
+shards**, records the nodes where a row-parallel projection leaves a *partial*
+sum, and returns a plan instead of executing. The caller collects one plan per
+rank and hands them to the driver, which runs exactly the schedule
+`ggml-backend-meta.cpp` runs for llama.cpp's `--split-mode tensor`:
+
+```
+for each segment k:
+    for each rank r:  ggml_graph_view(graph[r], start[r], end[r])
+                      ggml_backend_graph_compute_async(backend[r], view)
+    if k is not last: ggml_backend_comm_allreduce_tensor(partial[0..N])   # NCCL / P2P, in VRAM
+synchronize every rank; download the result
+```
+
+Activations never leave VRAM, the collective reduces device buffers in place,
+and the host issues `2·L` graph launches per token instead of ~2000 op round
+trips. Because every rank is submitted from one thread, ggml-cuda's graph
+capture also stays valid (opt in with `TS_GGML_TP_CUDA_GRAPHS=1`; measured
+within noise here, so it is off by default).
+
+Everything outside the row-parallel projections is replicated work — each rank
+runs the norms, RoPE, PLE injection and layer scalars on identical values and
+gets identical answers. Only rank 0 folds the final norm and the LM head: it is
+the largest tensor left after sharding, and replicating it would give back a
+large part of what TP just saved.
+
+### Kernels wired onto the executor
+
+| Kernel | Covers | Split points per layer |
+|---|---|---|
+| `TSGgml_Gemma4ModelDecode` | Gemma 4 dense decode (whole model) | attn output proj, FFN down proj |
+| `TSGgml_Gemma4ModelVerify` | Gemma 4 dense prefill (whole model) | attn output proj, FFN down proj |
+| `TSGgml_Qwen35AttentionLayerPrefill` | Qwen 3.5/3.6 full-attention block | attn output proj |
+| `TSGgml_FusedFFNSwiGLUQuantF32` | any dense SwiGLU FFN block | FFN down proj |
+| `TSGgml_FusedMatMulQuantAddF32` | any row-parallel linear + residual | the matmul |
+
+The last two are architecture-agnostic: any TP forward that ends a block with
+`row-parallel linear → AllReduce → residual add` can replace those three host
+round trips with two graph launches. Qwen 3.5 uses it for the GatedDeltaNet
+output projection.
+
+### Measured (2× RTX 2000 Ada, PCIe, no NVLink, `--tp 2`, prefill 512 / decode 64)
+
+| Model | 1 GPU | TP=2 before | TP=2 after |
+|---|---|---|---|
+| Gemma-4-E4B Q8_0 | 2760 / 37.3 | 37.5 / 5.5 | **2488 / 51.7** |
+| Qwen3.5-9B Q8_0 | 1461 / 23.1 | 54.8 / 15.6 | **399 / 24.4** |
+| Qwen3.5-35B-A3B IQ4_XS | does not fit | 98.7 / 14.2 | **184 / 18.1** |
+| Gemma-4-26B-A4B IQ4_XS | 1845 / 48.5 | 43.0 / 4.9 | 43.1 / 5.1 (unchanged) |
+
+(prefill tok/s / decode tok/s.) Decode is where TP should win and now does —
+1.39× single-GPU on E4B, 1.06× on Qwen3.5-9B — while prefill, which is
+compute-bound and pays the collectives, lands at 0.90× / 0.27× instead of 0.01×
+/ 0.04×. Qwen3.5-35B does not fit on one 16 GB card at all, so TP is the only
+way to run it, and it is now 1.9× / 1.3× faster than it was.
+
+**Correctness.** Gemma-4-E4B and Gemma-4-26B produce output **byte-identical** to
+their single-GPU runs over 48–64 greedy tokens. Qwen3.5-9B tracks the single-GPU
+run and diverges at a paraphrase point around token 25 — the TP path composes
+per-block fused graphs where the single-GPU path uses one whole-model graph, so
+the quantized matmuls round differently; both continuations are correct.
+
+### AllReduce precision
+
+ggml-cuda's internal collective converts F32 payloads to BF16 before reducing,
+with a default threshold of 1 byte — i.e. always. For the ~10 KB collectives a
+decode step issues, halving the transfer saves nothing and costs 16 mantissa
+bits on the residual stream. `TSGgml_TensorParallelInit` raises the threshold to
+1 MB, so decode reduces exactly and only megabyte-scale prefill payloads take
+the trade — where it is worth 2.4× (Gemma-4-E4B 512-token prefill: 1038 → 2539
+tok/s, output still byte-identical). `GGML_CUDA_AR_BF16_THRESHOLD` overrides it;
+`0` disables the round-trip entirely.
+
+### Traps, in the order they cost time
+
+1. **Fused kernels upload weights with a raw `ggml_backend_tensor_set`,
+   bypassing `resolve_upload_source`.** Harmless on rank 0, where every
+   quantized weight is preloaded; on rank 1 the *replicated* weights (Gemma 4's
+   PLE gate/proj) miss the cache and the fallback "upload" dereferences a
+   GCHandle — segfault inside `cudaMemcpyAsync`. Every `upload_list` site in the
+   native tree now resolves the key first.
+2. **Do not invalidate the KV cache after a fused TP block.**
+   `InvalidateTensorDeviceCache` drops the device copy on every rank, so the
+   next layer re-uploads the whole cache (16 MB per layer per rank at an 8K
+   context) — and re-uploads the *stale* host copy, because the fused kernel
+   wrote only the device one. Decode 15.6 → 11.4 tok/s. Keep KV device-resident
+   and sync back only when falling back to the per-op path.
+3. **A fresh `ggml_backend_alloc_ctx_tensors` per call is a cudaMalloc/cudaFree
+   pair.** Invisible in a 512-token prefill, dominant in decode, where the
+   per-layer kernel runs once per rank per token. Small batches take the
+   persistent per-rank reuse buffer, large ones `gallocr`'s lifetime packing:
+   11.4 → 18.3 tok/s.
+4. **The replicated activation is one buffer PER RANK, not one buffer.** The
+   per-op blocks accumulate into each rank's copy independently, so a fused
+   block that writes back only rank 0's leaves the others a layer behind and the
+   model drifts from the first token. Each rank's graph reads and writes its own.
+   (For the same reason `BroadcastTensorToAllRanks` must keep copying on GGML
+   even though every rank can read the same host memory — aliasing the ranks
+   would make `TpResidualAdd` apply the same residual `tp` times.)
+5. **Parked graphs freed by static destructors after the CUDA driver shuts
+   down** abort the process with "CUDA error: driver shutting down".
+   `TSGgml_Shutdown` releases them while the backends are still alive.
+
+`PooledContextHandle` is now movable, so a kernel can hand its context to
+something that outlives the call — required for any TP graph that is not already
+persistent.
+
+### Known Limitations / Future Work (Stage 1c)
+
+- [ ] **Gemma 4 MoE (26B) is untouched** and is the one model still far behind
+      its single-GPU numbers. Its whole-model kernels
+      (`TSGgml_Gemma4MoEModelDecode` / `...Verify`) compute the router *inside*
+      the graph and select from the global expert set, so the whole-expert
+      sharding the managed path uses cannot be expressed: foreign expert ids
+      need distinct fillers per rank (duplicates fault `launch_mul_mat_q`).
+      Megatron slicing *inside* each expert avoids it — `sel` stays global — but
+      needs per-rank re-stacked expert tensors built at load time
+      (gate/up sliced on ne1, down on ne0).
+- [ ] **Qwen 3.5's GatedDeltaNet block** still runs its norm + packed projection
+      + conv + scan through `TSGgml_Qwen35GdnLayerTP` and then the rest per op.
+      Folding the ssm output projection into that kernel (it is already the
+      `FusedMatMulQuantAdd` shape) would remove the last per-layer round trip.
+- [ ] **Qwen 3.5 MoE block** under TP still walks the router and experts per op.
+- [ ] The whole-model TP graph is per-rank and single-process; multi-node keeps
+      the per-op forward (`GlobalTpDegree == TpDegree` gates every fused path).
+
+---
+
 ### Known Limitations / Future Work (Stage 1b)
 
-- [ ] **Fused TP decode.** The decisive fix: a per-rank whole-model graph split
-      at the two AllReduce points per layer, submitted asynchronously — the
-      structure ggml's own meta backend (`ggml-backend-meta.cpp`, already
-      vendored) implements for llama.cpp's `--split-mode tensor`. Wiring
-      TensorSharp's fused decode onto the meta device would replace the remaining
-      per-layer dispatches with ~2·L graph launches.
+- [x] **Fused TP decode.** Done — see Stage 1c.
 - [x] **Qwen3.5 on GGML.** Done — see "Qwen 3.5 / 3.6 on GGML" below.
 - [ ] **MoE TP throughput on other architectures.** GptOss/Nemotron still walk
       experts per token per rank. Gemma 4 and Qwen 3.5 now use expert

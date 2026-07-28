@@ -14,6 +14,47 @@
 
 using namespace tsg;
 
+namespace
+{
+    // Resources a tensor-parallel verify graph borrows between "build" and
+    // "execute". This kernel allocates from the context pool and (for prefill-
+    // sized N) the shared gallocr, so unlike the persistent decode graph it has
+    // nothing that naturally outlives the call — and under TP the caller runs the
+    // graph only after every rank has built one. Each rank therefore parks its
+    // context and any per-call buffer here, and the slot is recycled when that
+    // rank builds its next graph. One prefill chunk's worth of scratch is held
+    // between calls; the alternative is a use-after-free.
+    struct G4VerifyTpPending
+    {
+        PooledContextHandle context;
+        BufferHandle buffer{ nullptr };
+        std::vector<BufferHandle> ephemeral;
+        tsg::TpRankPlan plan;
+
+        void reset()
+        {
+            plan.clear();
+            ephemeral.clear();
+            buffer = BufferHandle(nullptr);
+            context = PooledContextHandle();
+        }
+    };
+    G4VerifyTpPending g_g4v_tp[tsg::TSG_MAX_DEVICES];
+}
+
+// Release every rank's parked tensor-parallel verify graph. The C# side calls
+// this when the model is torn down or the KV cache is reset.
+TSG_EXPORT void TSGgml_Gemma4ReleaseVerifyTpGraphs()
+{
+    for (int r = 0; r < tsg::TSG_MAX_DEVICES; ++r)
+    {
+        if (g_g4v_tp[r].plan.graph == nullptr && g_g4v_tp[r].context.value == nullptr)
+            continue;
+        tsg::ScopedRank rank(r);
+        g_g4v_tp[r].reset();
+    }
+}
+
 // ============================================================================
 // Fused MULTI-TOKEN verify (seqLen == num_tokens > 1): runs the whole dense
 // Gemma 4 transformer over a small batch of tokens [start_pos, start_pos+N) as
@@ -87,13 +128,26 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
     // used alone (matches ComputePLE's pleProj==null branch).
     const void* ple_proj_w_data, int ple_proj_w_type,
     std::int64_t ple_proj_w_ne0, std::int64_t ple_proj_w_ne1, std::int64_t ple_proj_w_bytes,
-    const void* ple_proj_norm_data)
+    const void* ple_proj_norm_data,
+    // Tensor parallelism — same contract as TSGgml_Gemma4ModelDecode: with
+    // tp_degree > 1 every pointer above is THIS rank's shard, and the call
+    // builds and binds the graph instead of running it, handing back a plan cut
+    // at the two row-parallel projections per layer.
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
         if (!ensure_backend())
             return 0;
 
+        const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+        if (tp_mode)
+        {
+            *tp_plan_out = nullptr;
+            // Recycle this rank's previous parked graph now that the caller has
+            // finished with it (execution completed before it asked for another).
+            g_g4v_tp[tsg::g_active_rank].reset();
+        }
 
         const int N = num_tokens;
         const int totalSeqLen = start_pos + N;
@@ -159,6 +213,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
 
         ggml_tensor* current = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, NQ);
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, NQ);
+
+        // Tensor-parallel cut points: the attention output projection and the FFN
+        // down projection, whose outputs are this rank's partial sums.
+        std::vector<ggml_tensor*> tp_partial;
+        if (tp_mode)
+            tp_partial.reserve(static_cast<std::size_t>(num_layers) * 2);
 
         ggml_tensor* freq_factors_t = nullptr;
         if (rope_freq_factors != nullptr && rope_freq_factors_len > 0)
@@ -766,6 +826,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
 
             // O projection -> post-attn norm -> residual
             ggml_tensor* o_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);                  // [hidden, N]
+            if (tp_mode) tp_partial.push_back(o_out);
             ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_out, eps), lt.post_attn_norm_w);
             ggml_tensor* residual1 = ggml_add(ctx, hidden, post_attn);
 
@@ -780,6 +841,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // gelu as the old ggml_gelu. Mirrors llama.cpp build_ffn (LLM_FFN_GELU).
             ggml_tensor* ffn_hidden = ggml_geglu(ctx, gu);                              // [ff, N]
             ggml_tensor* down = ggml_mul_mat(ctx, lt.down_w, ffn_hidden);               // [hidden, N]
+            if (tp_mode) tp_partial.push_back(down);
             ggml_tensor* post_ffn = ggml_mul(ctx, ggml_rms_norm(ctx, down, eps), lt.post_ffn_norm_w);
             ggml_tensor* residual2 = ggml_add(ctx, residual1, post_ffn);
 
@@ -954,7 +1016,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
 
 
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * N * sizeof(float));
         if (NQ > N)
@@ -1028,6 +1090,35 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             }
         }
 
+
+        if (tp_mode)
+        {
+            // Park the context and any per-call buffer so the graph stays valid
+            // until the driver has run every rank's segments.
+            auto& pending = g_g4v_tp[tsg::g_active_rank];
+            pending.plan.clear();
+            pending.plan.graph = graph;
+            pending.plan.ar_tensor = tp_partial;
+            if (!tp_plan_segments(pending.plan, tp_partial))
+            {
+                pending.reset();
+                return 0;
+            }
+            // Every rank ends with the same replicated hidden state; only rank 0
+            // copies it back, since they all share one host buffer.
+            if (tsg::g_active_rank == 0)
+            {
+                pending.plan.out_tensor = hidden_out;
+                pending.plan.out_host = hidden_data;
+                pending.plan.out_bytes = static_cast<std::size_t>(hidden_size) * N * sizeof(float);
+            }
+            pending.context = std::move(context);
+            pending.buffer = std::move(buffer);
+            pending.ephemeral = std::move(ephemeral_bufs);
+            *tp_plan_out = &pending.plan;
+            clear_last_error();
+            return 1;
+        }
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
@@ -1288,7 +1379,7 @@ TSG_EXPORT int TSGgml_Gemma4DraftStep(
 
         host_read_barrier();
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         std::int32_t tok = token;
         ggml_backend_tensor_set(tok_idx, &tok, 0, sizeof(std::int32_t));

@@ -491,6 +491,30 @@ namespace tsg
 
         PooledContextHandle(const PooledContextHandle&) = delete;
         PooledContextHandle& operator=(const PooledContextHandle&) = delete;
+
+        // Movable so a caller can hand ownership to something that outlives the
+        // call — the tensor-parallel driver runs a graph after the function that
+        // built it has returned, and the graph's context has to survive that.
+        PooledContextHandle(PooledContextHandle&& other) noexcept
+            : value(other.value), pool_entry(other.pool_entry)
+        {
+            other.value = nullptr;
+            other.pool_entry = {};
+        }
+
+        PooledContextHandle& operator=(PooledContextHandle&& other) noexcept
+        {
+            if (this != &other)
+            {
+                if (value != nullptr) ggml_free(value);
+                if (pool_entry.ptr != nullptr) ggml_pool::release(pool_entry);
+                value = other.value;
+                pool_entry = other.pool_entry;
+                other.value = nullptr;
+                other.pool_entry = {};
+            }
+            return *this;
+        }
     };
 
     struct BufferHandle
@@ -588,6 +612,61 @@ namespace tsg
     // In-place host AllReduce (sum) over one contiguous F32 buffer per rank.
     void tp_host_allreduce(float** buffers, int n, std::int64_t count);
     void tp_host_allreduce_mt(float** buffers, int n, std::int64_t count);
+
+    // --- Fused tensor-parallel graph execution --------------------------------
+    //
+    // A fused single-GPU kernel builds one ggml graph for the whole model (or a
+    // whole layer). Tensor parallelism needs the same graph per rank, cut at the
+    // points where a row-parallel projection produces a *partial* sum that the
+    // ranks must add together before anything non-linear touches it.
+    //
+    // TpRankPlan is that cut: one rank's already-built graph plus the node
+    // indices where it must pause. The driver (tp_execute_plans) then runs the
+    // schedule llama.cpp's meta backend uses — submit segment k on every rank
+    // asynchronously, AllReduce the segment's partials on-device, move to k+1 —
+    // so the activations never leave VRAM and the host issues 2*L graph launches
+    // per token instead of ~L*30 op round trips.
+    struct TpRankPlan
+    {
+        ggml_cgraph* graph = nullptr;
+        // Exclusive end node index of each segment; the last entry is n_nodes.
+        std::vector<int> seg_end;
+        // Partial tensor to reduce after segment k (size == seg_end.size()-1).
+        std::vector<ggml_tensor*> ar_tensor;
+        // Optional result download, performed after the final synchronize.
+        ggml_tensor* out_tensor = nullptr;
+        void* out_host = nullptr;
+        std::size_t out_bytes = 0;
+
+        void clear()
+        {
+            graph = nullptr;
+            seg_end.clear();
+            ar_tensor.clear();
+            out_tensor = nullptr;
+            out_host = nullptr;
+            out_bytes = 0;
+        }
+        bool valid() const { return graph != nullptr && !seg_end.empty(); }
+    };
+
+    // Fill plan.seg_end from the graph positions of plan.ar_tensor's nodes (or
+    // of `boundary`, when the node that ends a segment is a no-op view of the
+    // partial rather than the partial itself). Returns false when a boundary
+    // tensor is absent from the graph, which means the caller recorded a node
+    // the builder did not emit.
+    bool tp_plan_segments(TpRankPlan& plan, const std::vector<ggml_tensor*>& boundary);
+
+    // Run one segmented graph per rank. `plans[r]` must describe rank r and all
+    // ranks must agree on the segment count. Returns false (with the last error
+    // set) when a submission or a collective fails.
+    bool tp_execute_plans(TpRankPlan** plans, int rank_count);
+
+    // True when the fused TP path is usable: more than one rank and a device
+    // collective to reduce with. Without a collective every segment boundary
+    // would cost a host round trip, which is exactly what this path exists to
+    // remove, so the caller should fall back to the generic per-op forward.
+    bool tp_fused_available(int rank_count);
 
     // Memoized static device properties. ggml_backend_dev_get_props also
     // refreshes free/total device memory, which some backends answer with an

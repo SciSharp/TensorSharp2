@@ -38,6 +38,9 @@
 //     submit-all-then-sync structure ggml's meta backend uses.
 // ---------------------------------------------------------------------------
 #include "ggml_ops_internal.h"
+// ggml_graph_view: the segment executor runs [i0, i1) of an already-built graph
+// without copying it, exactly as ggml_backend_sched does for its splits.
+#include "ggml-impl.h"
 
 #if defined(GGML_USE_CUDA)
 #include "ggml-cuda.h"
@@ -310,6 +313,165 @@ namespace tsg
         work(0, chunk < count ? chunk : count);
         for (auto& th : pool)
             th.join();
+    }
+
+    // --- Fused tensor-parallel graph execution ------------------------------
+
+    bool tp_fused_available(int rank_count)
+    {
+        if (rank_count < 2)
+            return false;
+        if (rank_count != g_device_count.load(std::memory_order_acquire))
+            return false;
+        return tp_comm_ensure();
+    }
+
+    bool tp_plan_segments(TpRankPlan& plan, const std::vector<ggml_tensor*>& boundary)
+    {
+        plan.seg_end.clear();
+        if (plan.graph == nullptr)
+            return false;
+
+        const int n_nodes = ggml_graph_n_nodes(plan.graph);
+        // One linear sweep over the node list resolves every boundary at once:
+        // the boundaries appear in graph order (a layer's output projection
+        // cannot precede an earlier layer's), so a single cursor suffices and a
+        // 40-layer model costs one pass instead of 80 searches.
+        std::size_t next = 0;
+        for (int i = 0; i < n_nodes && next < boundary.size(); ++i)
+        {
+            if (plan.graph->nodes[i] == boundary[next])
+            {
+                plan.seg_end.push_back(i + 1);
+                ++next;
+            }
+        }
+        if (next != boundary.size())
+        {
+            set_last_error("Tensor-parallel plan: a segment boundary tensor is not a node of the built graph.");
+            plan.seg_end.clear();
+            return false;
+        }
+        // Trailing segment: everything after the last AllReduce (final norm, LM
+        // head, the output copy).
+        if (plan.seg_end.empty() || plan.seg_end.back() != n_nodes)
+            plan.seg_end.push_back(n_nodes);
+        return true;
+    }
+
+    namespace
+    {
+        // Reduce one segment's partials. Returns false only when the collective
+        // is genuinely unusable — a per-call refusal (an unsupported shape, say)
+        // falls back to summing through the host so the token still completes.
+        bool tp_reduce_segment(ggml_tensor** nodes, int rank_count)
+        {
+            if (tp_device_allreduce(nodes))
+                return true;
+
+            // Host fallback: drain every rank, sum the partials in RAM, push the
+            // total back. Correct but slow (two PCIe crossings per boundary), so
+            // it is a safety net, not a mode anyone should run in.
+            const std::int64_t count = ggml_nelements(nodes[0]);
+            if (count <= 0)
+                return true;
+            if (nodes[0]->type != GGML_TYPE_F32)
+            {
+                set_last_error("Tensor-parallel segment reduction requires F32 partials.");
+                return false;
+            }
+
+            const std::size_t bytes = static_cast<std::size_t>(count) * sizeof(float);
+            std::vector<std::vector<float>> staging(static_cast<std::size_t>(rank_count));
+            std::vector<float*> ptrs(static_cast<std::size_t>(rank_count));
+            for (int r = 0; r < rank_count; ++r)
+            {
+                ScopedRank rank(r);
+                ggml_backend_synchronize(g_backend);
+                staging[static_cast<std::size_t>(r)].resize(static_cast<std::size_t>(count));
+                ggml_backend_tensor_get(nodes[r], staging[static_cast<std::size_t>(r)].data(), 0, bytes);
+                ptrs[static_cast<std::size_t>(r)] = staging[static_cast<std::size_t>(r)].data();
+            }
+            tp_host_allreduce_mt(ptrs.data(), rank_count, count);
+            for (int r = 0; r < rank_count; ++r)
+            {
+                ScopedRank rank(r);
+                ggml_backend_tensor_set(nodes[r], ptrs[static_cast<std::size_t>(r)], 0, bytes);
+            }
+            return true;
+        }
+    } // namespace
+
+    bool tp_execute_plans(TpRankPlan** plans, int rank_count)
+    {
+        if (plans == nullptr || rank_count < 1 || rank_count > TSG_MAX_DEVICES)
+        {
+            set_last_error("Invalid tensor-parallel execution plan set.");
+            return false;
+        }
+
+        const std::size_t n_seg = plans[0]->seg_end.size();
+        for (int r = 0; r < rank_count; ++r)
+        {
+            if (plans[r] == nullptr || !plans[r]->valid() || plans[r]->seg_end.size() != n_seg ||
+                plans[r]->ar_tensor.size() + 1 != n_seg)
+            {
+                set_last_error("Tensor-parallel execution plans disagree on their segment structure.");
+                return false;
+            }
+        }
+
+        std::vector<ggml_tensor*> nodes(static_cast<std::size_t>(rank_count), nullptr);
+        // Per-rank cursors: the segments before the last AllReduce are structurally
+        // identical across ranks, but the trailing one is not — rank 0 may fold the
+        // final norm and LM head that the other ranks do not carry.
+        std::vector<int> start(static_cast<std::size_t>(rank_count), 0);
+
+        for (std::size_t s = 0; s < n_seg; ++s)
+        {
+            // Submit segment s on every rank without waiting: the GPUs overlap,
+            // and (because this all happens on one thread) ggml-cuda's graph
+            // capture stays valid, unlike a worker-per-rank fan-out.
+            for (int r = 0; r < rank_count; ++r)
+            {
+                ScopedRank rank(r);
+                const int end = plans[r]->seg_end[s];
+                const int begin = start[static_cast<std::size_t>(r)];
+                start[static_cast<std::size_t>(r)] = end;
+                if (end <= begin)
+                    continue;
+                ggml_cgraph view = ggml_graph_view(plans[r]->graph, begin, end);
+                if (ggml_backend_graph_compute_async(g_backend, &view) != GGML_STATUS_SUCCESS)
+                {
+                    set_last_error("Tensor-parallel segment execution failed.");
+                    return false;
+                }
+            }
+
+            if (s + 1 < n_seg)
+            {
+                for (int r = 0; r < rank_count; ++r)
+                    nodes[static_cast<std::size_t>(r)] = plans[r]->ar_tensor[s];
+                if (!tp_reduce_segment(nodes.data(), rank_count))
+                    return false;
+            }
+        }
+
+        for (int r = 0; r < rank_count; ++r)
+        {
+            ScopedRank rank(r);
+            ggml_backend_synchronize(g_backend);
+        }
+
+        for (int r = 0; r < rank_count; ++r)
+        {
+            auto* p = plans[r];
+            if (p->out_tensor == nullptr || p->out_host == nullptr || p->out_bytes == 0)
+                continue;
+            ScopedRank rank(r);
+            ggml_backend_tensor_get(p->out_tensor, p->out_host, 0, p->out_bytes);
+        }
+        return true;
     }
 } // namespace tsg
 
@@ -764,13 +926,42 @@ TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndic
         // its first graph_compute — this runs at model load, well ahead of that.
         // Setting it here (rather than from managed code) is deliberate: .NET's
         // Environment.SetEnvironmentVariable does not reach the native getenv.
-        if (count > 1 && concurrentRanks != 0)
+        //
+        // The fused TP path (TSGgml_TensorParallelExecutePlans) submits every
+        // rank from ONE thread, so capture is safe there and worth having — it
+        // is most of the single-GPU decode speed. Set TS_GGML_TP_CUDA_GRAPHS=1
+        // to keep capture on; only do that when the run will not also drive the
+        // ranks from concurrent worker threads.
+        const char* tp_graphs = std::getenv("TS_GGML_TP_CUDA_GRAPHS");
+        const bool keep_graphs = tp_graphs != nullptr && tp_graphs[0] == '1';
+        if (count > 1 && concurrentRanks != 0 && !keep_graphs)
         {
 #if defined(_WIN32)
             if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr)
                 _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
 #else
             setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+#endif
+        }
+
+        // ggml-cuda's internal AllReduce converts F32 payloads to BF16 before
+        // reducing them, to halve on-wire bytes. Its default threshold is 1 byte
+        // — i.e. always, including the ~10 KB collectives a decode step issues,
+        // where halving a PCIe transfer that small saves nothing and an 8-bit
+        // mantissa on the residual stream is pure loss. Raise it so decode
+        // reduces exactly in F32 and only the megabyte-scale prefill payloads
+        // take the bandwidth trade, where it is worth 2.4x (measured on Gemma-4
+        // E4B: 512-token prefill 1038 -> 2539 tok/s, with greedy output still
+        // byte-identical to the single-GPU run). Set GGML_CUDA_AR_BF16_THRESHOLD
+        // to override: 0 disables the round-trip entirely, 1 restores ggml's
+        // always-on default.
+        if (count > 1)
+        {
+#if defined(_WIN32)
+            if (std::getenv("GGML_CUDA_AR_BF16_THRESHOLD") == nullptr)
+                _putenv_s("GGML_CUDA_AR_BF16_THRESHOLD", "1048576");
+#else
+            setenv("GGML_CUDA_AR_BF16_THRESHOLD", "1048576", 0);
 #endif
         }
 
@@ -854,6 +1045,58 @@ TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndic
     catch (const std::exception& ex)
     {
         tsg::set_last_error(ex.what());
+        return 0;
+    }
+}
+
+// 1 when the fused tensor-parallel path can run: several ranks AND a device
+// collective to reduce the per-layer partials with. Without the collective every
+// segment boundary would cost a host round trip, which defeats the purpose, so
+// the managed layer keeps its per-op forward instead.
+TSG_EXPORT int TSGgml_TensorParallelFusedAvailable(int rankCount)
+{
+    try
+    {
+        return tsg::tp_fused_available(rankCount) ? 1 : 0;
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+// Run one fused per-rank graph plan per rank: submit segment k on every rank,
+// AllReduce the segment's partials on-device, advance. Plans come from a fused
+// kernel called once per rank in tensor-parallel build mode (see
+// TSGgml_Gemma4ModelDecode's tp_plan_out).
+TSG_EXPORT int TSGgml_TensorParallelExecutePlans(void** plans, int rankCount)
+{
+    try
+    {
+        tsg::clear_last_error();
+        if (plans == nullptr || rankCount <= 0 || rankCount > tsg::TSG_MAX_DEVICES)
+        {
+            tsg::set_last_error("Invalid tensor-parallel plan array.");
+            return 0;
+        }
+        for (int r = 0; r < rankCount; ++r)
+        {
+            if (plans[r] == nullptr)
+            {
+                tsg::set_last_error("Null tensor-parallel plan for rank " + std::to_string(r) + ".");
+                return 0;
+            }
+        }
+        return tsg::tp_execute_plans(reinterpret_cast<tsg::TpRankPlan**>(plans), rankCount) ? 1 : 0;
+    }
+    catch (const std::exception& ex)
+    {
+        tsg::set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        tsg::set_last_error("Unknown tensor-parallel plan execution failure.");
         return 0;
     }
 }

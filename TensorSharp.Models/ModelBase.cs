@@ -3311,6 +3311,14 @@ namespace TensorSharp.Models
         {
             int tp = TpDegree;
             var result = new Tensor[tp];
+
+            // Note: do NOT collapse the GGML case to one shared buffer, even
+            // though every rank's backend can read the same host memory. Callers
+            // accumulate into these per rank (TpResidualAdd is
+            // `hidden[r] += residual[r]` under RunPerRank), so aliasing them
+            // would apply the same residual tp times — concurrently, on one
+            // buffer. The copy below is what keeps that correct.
+
             // Clone for rank 0 too — the caller may dispose the original
             // tensor after broadcasting, and sharing the storage would leave
             // rank 0 with a dangling reference.

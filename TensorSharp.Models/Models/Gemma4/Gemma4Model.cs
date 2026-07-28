@@ -513,6 +513,9 @@ namespace TensorSharp.Models
                 InitKVCache(initialCacheLength, maxContextLength);
 
             BuildGemma4DecodeArrays();
+            // Needs the per-rank KV caches and the device preload, so it goes
+            // last. No-op outside tensor parallelism.
+            BuildGemma4TpDecodeArrays();
         }
 
         // The E4B cache is compact (about 148 MiB at 8K) and its direct-CUDA

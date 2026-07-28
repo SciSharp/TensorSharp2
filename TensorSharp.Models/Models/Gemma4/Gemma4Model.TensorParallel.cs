@@ -525,6 +525,13 @@ namespace TensorSharp.Models
             }
 
             _tpKvCacheCapacity = newCapacity;
+            // The fused TP decode graphs bake in the KV buffer addresses and the
+            // cache extents, both of which just moved.
+            if (_tpFusedDecodeReady)
+            {
+                GgmlBasicOps.Gemma4ResetDecodeCache();
+                BuildGemma4TpDecodeArrays();
+            }
             Console.WriteLine($"Expanded Gemma4 TP cache to {newCapacity} tokens ({tp} GPUs).");
         }
 
@@ -586,6 +593,40 @@ namespace TensorSharp.Models
             // input-independent output. Replicated input => identical on every
             // node, so it needs no AllReduce.
             Tensor perLayerInputs = _pleDim > 0 ? ComputePLE(tokens, hidden0, seqLen) : null;
+
+            // Single-token step: run the whole trunk as one fused graph per rank,
+            // cut at the two AllReduce points per layer, instead of ~2000 per-op
+            // host round trips. Falls through when the native side declines.
+            if (seqLen == 1 && exceptPositions == null && _tpFusedDecodeReady)
+            {
+                float[] fused = EnsureFoldLogitsBuffer();
+                if (TryGemma4FusedModelDecodeTP(hidden0, startPos, perLayerInputs, fused))
+                {
+                    perLayerInputs?.Dispose();
+                    _cacheSeqLen += seqLen;
+                    _forwardCount++;
+                    _forwardSw.Stop();
+                    return fused;
+                }
+            }
+
+            // Multi-token step (prefill / chunk): same fused-graph treatment, over
+            // N tokens. The trunk output lands back in hidden0 and the final norm
+            // + LM head run here on rank 0, mirroring the single-GPU verify path.
+            if (seqLen > 1 && _tpFusedDecodeReady &&
+                TryGemma4FusedModelVerifyTP(hidden0, startPos, seqLen, perLayerInputs, exceptPositions))
+            {
+                perLayerInputs?.Dispose();
+                float[] result = Gemma4TpFinalNormAndLmHead(hidden0, seqLen);
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                _forwardSw.Stop();
+                return result;
+            }
+
+            // The per-op path below reads the KV caches from host memory; a fused
+            // decode leaves its writes on the devices only.
+            SyncGemma4TpKvCacheToHost();
 
             // Broadcast embedding to all GPUs.
             Tensor[] hidden = BroadcastTensorToAllRanks(hidden0);

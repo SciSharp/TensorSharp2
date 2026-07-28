@@ -611,7 +611,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecodeBatched(
 
         host_read_barrier();
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * n_seqs * sizeof(float));
         ggml_backend_tensor_set(pos_tensor, positions, 0, static_cast<std::size_t>(n_seqs) * sizeof(std::int32_t));
@@ -1061,7 +1061,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
         }
 
         host_read_barrier();
-        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(H) * n_seqs * sizeof(float));
         ggml_backend_tensor_set(pos_tensor, positions, 0, static_cast<std::size_t>(n_seqs) * sizeof(std::int32_t));
         if (can_persist)

@@ -1167,6 +1167,18 @@ namespace TensorSharp.Models
         {
             int tp = TpDegree;
             string prefix = $"blk.{layer}.";
+
+            // Fast path: the whole block (norm through residual add) as one
+            // segmented graph per rank, cut at the row-parallel output
+            // projection. Falls through to the per-op chain below when the fused
+            // kernel declines.
+            if (TryQwen35FusedAttentionBlockTP(hidden, layer, seqLen, startPos))
+                return FFNBlockTP(hidden, layer, seqLen);
+
+            // Per-op attention reads the KV caches from host memory; a fused
+            // block leaves its appends in the device copies only.
+            SyncQwen35TpAttentionKvToHost();
+
             long tAttnBlock = Stopwatch.GetTimestamp();
 
             // 1. Attention norm (replicated).
@@ -1398,19 +1410,30 @@ namespace TensorSharp.Models
                     packedInput[r].Dispose();
             }
 
-            // 4. Row-parallel ssm_out + AllReduce (result already on every rank).
+            // 4-5. Row-parallel ssm_out + AllReduce + residual add. One segmented
+            // graph per rank when the fused path is available, otherwise the
+            // three-dispatch chain.
             long tOut = Stopwatch.GetTimestamp();
-            Tensor[] gdnReduced = TpRowParallelLinearAllRanks(gatedOut, _ssmOutKey[layer]);
-            for (int r = 0; r < tp; r++)
-                gatedOut[r].Dispose();
-            _tpSsmOutTicks += Stopwatch.GetTimestamp() - tOut;
+            _tpQuantWeights.TryGetValue(_ssmOutKey[layer], out var ssmOutShards);
+            if (TryQwen35FusedRowParallelResidualTP(hidden, gatedOut, ssmOutShards))
+            {
+                for (int r = 0; r < tp; r++)
+                    gatedOut[r].Dispose();
+                _tpSsmOutTicks += Stopwatch.GetTimestamp() - tOut;
+            }
+            else
+            {
+                Tensor[] gdnReduced = TpRowParallelLinearAllRanks(gatedOut, _ssmOutKey[layer]);
+                for (int r = 0; r < tp; r++)
+                    gatedOut[r].Dispose();
+                _tpSsmOutTicks += Stopwatch.GetTimestamp() - tOut;
 
-            // 5. Residual add.
-            long tRes = Stopwatch.GetTimestamp();
-            TpResidualAdd(hidden, gdnReduced);
-            for (int r = 0; r < tp; r++)
-                gdnReduced[r].Dispose();
-            _tpResidualTicks += Stopwatch.GetTimestamp() - tRes;
+                long tRes = Stopwatch.GetTimestamp();
+                TpResidualAdd(hidden, gdnReduced);
+                for (int r = 0; r < tp; r++)
+                    gdnReduced[r].Dispose();
+                _tpResidualTicks += Stopwatch.GetTimestamp() - tRes;
+            }
 
             // 6. FFN (dense or MoE).
             hidden = FFNBlockTP(hidden, layer, seqLen);
@@ -1624,6 +1647,10 @@ namespace TensorSharp.Models
 
             if (isMoe)
                 return MoEBlockTP(hidden, layer, seqLen);
+
+            // Fast path: the whole dense FFN as one segmented graph per rank.
+            if (TryQwen35FusedDenseFfnTP(hidden, layer, seqLen))
+                return hidden;
 
             // Dense FFN: column-parallel gate_up → SiLU·mul → row-parallel down + AllReduce.
             int tp = TpDegree;

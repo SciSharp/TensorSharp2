@@ -743,6 +743,21 @@ namespace TensorSharp.GGML
         public static int GetActiveRank() => GgmlNative.GetActiveRank();
 
         /// <summary>
+        /// True when a model's fused whole-model graph can be run tensor-parallel
+        /// (several ranks plus a device collective). See
+        /// <see cref="TensorParallelExecutePlans"/>.
+        /// </summary>
+        public static bool TensorParallelFusedAvailable(int rankCount)
+            => GgmlNative.TensorParallelFusedAvailable(rankCount);
+
+        /// <summary>
+        /// Execute one fused per-rank graph plan per rank, AllReducing the
+        /// row-parallel partials on-device between segments.
+        /// </summary>
+        public static void TensorParallelExecutePlans(IntPtr[] plans)
+            => GgmlNative.TensorParallelExecutePlans(plans);
+
+        /// <summary>
         /// One tensor-parallel linear layer across every rank:
         /// <c>results[r] = inputs[r] · weights[r]</c>, submitted as N concurrent
         /// device graphs and synchronized once. With <paramref name="allReduce"/>
@@ -820,7 +835,8 @@ namespace TensorSharp.GGML
         /// residual += matmul(input, quantWeight)
         /// </summary>
         public static void FusedMatMulQuantAdd(Tensor residual, Tensor input,
-            IntPtr weightData, int ggmlType, long ne0, long ne1, long rawBytes)
+            IntPtr weightData, int ggmlType, long ne0, long ne1, long rawBytes,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             if (residual.DimensionCount != 2 || input.DimensionCount != 2)
                 throw new ArgumentException("FusedMatMulQuantAdd requires 2D tensors.");
@@ -834,8 +850,13 @@ namespace TensorSharp.GGML
                 throw new NotSupportedException("FusedMatMulQuantAdd requires supported layouts.");
 
             GgmlNative.FusedMatMulQuantAdd(residualView, inputView,
-                weightData, ggmlType, ne0, ne1, rawBytes);
+                weightData, ggmlType, ne0, ne1, rawBytes, tpDegree, tpPlanOut);
         }
+
+        /// <summary>
+        /// Release every rank's parked tensor-parallel matmul+add graph.
+        /// </summary>
+        public static void ReleaseFusedMatmulAddTpGraphs() => GgmlNative.ReleaseFusedMatmulAddTpGraphs();
 
         /// <summary>
         /// Fused RMSNorm + residual add in a single GGML graph dispatch:
@@ -902,7 +923,8 @@ namespace TensorSharp.GGML
             Tensor normWeight, float eps,
             IntPtr gateUpData, int gateUpGgmlType, long gateUpNe0, long gateUpNe1, long gateUpRawBytes,
             IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downRawBytes,
-            int halfDim)
+            int halfDim,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             if (residual.DimensionCount != 2 || input.DimensionCount != 2)
                 throw new ArgumentException("FusedFFNSwiGLUQuant requires 2D residual/input tensors.");
@@ -921,8 +943,13 @@ namespace TensorSharp.GGML
             GgmlNative.FusedFFNSwiGLUQuant(residualView, inputView, normPtr, normCount, eps,
                 gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
                 downData, downGgmlType, downNe0, downNe1, downRawBytes,
-                halfDim);
+                halfDim, tpDegree, tpPlanOut);
         }
+
+        /// <summary>
+        /// Release every rank's parked tensor-parallel fused-FFN graph.
+        /// </summary>
+        public static void ReleaseFusedFfnTpGraphs() => GgmlNative.ReleaseFusedFfnTpGraphs();
 
         /// <summary>
         /// Fused dense FFN projection (no residual fold) in a single GGML graph dispatch:
@@ -2214,7 +2241,8 @@ namespace TensorSharp.GGML
             int cacheSize, int startPos,
             float ropeBase, float ropeFreqScale, int ropeDims,
             int ropeMode,
-            int kvCacheType, float eps)
+            int kvCacheType, float eps,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             GgmlNative.Qwen35AttentionLayerPrefill(
                 hiddenData, hiddenSize, seqLen,
@@ -2226,8 +2254,14 @@ namespace TensorSharp.GGML
                 numHeads, kvHeads, headDim,
                 cacheSize, startPos,
                 ropeBase, ropeFreqScale, ropeDims,
-                ropeMode, kvCacheType, eps);
+                ropeMode, kvCacheType, eps,
+                tpDegree, tpPlanOut);
         }
+
+        /// <summary>
+        /// Release every rank's parked tensor-parallel Qwen3.5 attention graph.
+        /// </summary>
+        public static void Qwen35ReleaseAttentionTpGraphs() => GgmlNative.Qwen35ReleaseAttentionTpGraphs();
 
         /// <summary>
         /// Fused GPT-OSS attention layer prefill: full attention block (input
@@ -2603,7 +2637,8 @@ namespace TensorSharp.GGML
             int pleTokenId = -1,
             IntPtr pleModelProjData = default, int pleModelProjType = 0,
             long pleModelProjNe0 = 0, long pleModelProjNe1 = 0, long pleModelProjBytes = 0,
-            IntPtr pleModelProjNormData = default)
+            IntPtr pleModelProjNormData = default,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             GgmlNative.Gemma4ModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -2636,7 +2671,8 @@ namespace TensorSharp.GGML
                 pleTokenId,
                 pleModelProjData, pleModelProjType,
                 pleModelProjNe0, pleModelProjNe1, pleModelProjBytes,
-                pleModelProjNormData);
+                pleModelProjNormData,
+                tpDegree, tpPlanOut);
         }
 
         /// <summary>True token-batched dense decode (N concurrent sequences in one
@@ -2720,7 +2756,8 @@ namespace TensorSharp.GGML
             int[] pleTokenIds = null,
             IntPtr pleProjWData = default, int pleProjWType = 0,
             long pleProjWNe0 = 0, long pleProjWNe1 = 0, long pleProjWBytes = 0,
-            IntPtr pleProjNormData = default)
+            IntPtr pleProjNormData = default,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return GgmlNative.Gemma4ModelVerify(
                 hiddenData, hiddenSize, numLayers, numTokens,
@@ -2750,8 +2787,15 @@ namespace TensorSharp.GGML
                 pleTokenIds,
                 pleProjWData, pleProjWType,
                 pleProjWNe0, pleProjWNe1, pleProjWBytes,
-                pleProjNormData);
+                pleProjNormData,
+                tpDegree, tpPlanOut);
         }
+
+        /// <summary>
+        /// Release every rank's parked tensor-parallel verify graph (its ggml
+        /// context and per-call compute buffer). Call on teardown or KV reset.
+        /// </summary>
+        public static void Gemma4ReleaseVerifyTpGraphs() => GgmlNative.Gemma4ReleaseVerifyTpGraphs();
 
         /// <summary>Fused Gemma 4 MTP draft step. Returns false when the native
         /// kernel declines (fixed_pos past the donor SWA window).</summary>
