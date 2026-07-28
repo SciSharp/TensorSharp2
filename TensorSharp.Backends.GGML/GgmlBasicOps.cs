@@ -1861,10 +1861,12 @@ namespace TensorSharp.GGML
         /// disturbing the captured decode graph).</summary>
         public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
             IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, float logitSoftcap)
+            IntPtr finalNorm, float logitSoftcap,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             GgmlNative.Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position,
-                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap);
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap,
+                tpDegree, tpPlanOut);
         }
 
         /// <summary>True token-batched MoE decode (N concurrent sequences in one
@@ -2070,10 +2072,14 @@ namespace TensorSharp.GGML
         /// into <paramref name="hidden"/>. Returns false when the kernel cannot handle
         /// the shape (caller falls back to the per-op verify).
         /// </summary>
-        public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens)
+        public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
-            return GgmlNative.Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens);
+            return GgmlNative.Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens, tpDegree, tpPlanOut);
         }
+
+        /// <summary>Release every rank's parked tensor-parallel MoE verify graph.</summary>
+        public static void Gemma4MoEReleaseVerifyTpGraphs() => GgmlNative.Gemma4MoEReleaseVerifyTpGraphs();
 
         public static void Gemma4LayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,

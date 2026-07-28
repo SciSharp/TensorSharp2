@@ -68,14 +68,18 @@ namespace TensorSharp.Models
 
             if (!_tpFusedDecodeEnabled || !IsGgmlBackend || !IsTensorParallel)
                 return;
-            // A dense trunk only: the MoE layers have no branch in the fused
-            // whole-model decode graph (they need ggml_mul_mat_id inside it), so
-            // those models keep the expert-parallel per-layer path.
+            // MoE models share these per-rank arrays but run through their own
+            // whole-model trunk kernel; only a dense model can use the dense
+            // decode/verify graphs, so _tpFusedDecodeReady stays clear for MoE.
+            bool anyMoE = false;
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (HasMoE(l))
-                    return;
+                if (HasMoE(l)) { anyMoE = true; break; }
             }
+            // A MoE model only needs the arrays when its sliced-expert layout is
+            // in place; otherwise nothing will consume them.
+            if (anyMoE && !UsesTensorSlicedMoE)
+                return;
             // Needs a device collective; without one every segment boundary would
             // be a host round trip and this would be slower than what it replaces.
             if (!GgmlBasicOps.TensorParallelFusedAvailable(TpDegree))
@@ -153,7 +157,10 @@ namespace TensorSharp.Models
 
             _tpDecodeArrays = perRank;
             _tpDecodePlans = new IntPtr[tp];
-            _tpFusedDecodeReady = true;
+            // The dense whole-model graphs only exist for a dense trunk.
+            _tpFusedDecodeReady = !anyMoE;
+            if (anyMoE)
+                BuildGemma4TpMoeArgs();
         }
 
         private static Gemma4DecodeArrays NewDecodeArrays(int n)

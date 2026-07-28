@@ -2022,6 +2022,8 @@ extern "C" void TSGgml_Gemma4ReleaseVerifyTpGraphs();
 extern "C" void TSGgml_Qwen35ReleaseAttentionTpGraphs();
 extern "C" void TSGgml_ReleaseFusedFfnTpGraphs();
 extern "C" void TSGgml_ReleaseFusedMatmulAddTpGraphs();
+extern "C" void TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
+extern "C" void TSGgml_Gemma4MoEResetDecodeCache();
 extern "C" void TSGgml_Gemma4ResetDecodeCache();
 
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
@@ -2118,6 +2120,8 @@ TSG_EXPORT void TSGgml_Shutdown()
     TSGgml_Qwen35ReleaseAttentionTpGraphs();
     TSGgml_ReleaseFusedFfnTpGraphs();
     TSGgml_ReleaseFusedMatmulAddTpGraphs();
+    TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
+    TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_Gemma4ResetDecodeCache();
     // Release the calling thread's cached prefill-attention sessions while the
     // CUDA driver is still alive; leaving them to thread_local destructors

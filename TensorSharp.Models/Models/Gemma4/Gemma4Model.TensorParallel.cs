@@ -165,6 +165,11 @@ namespace TensorSharp.Models
         /// </summary>
         protected override void PreloadGgmlTpAuxiliaryWeights(long[] bytesPerRank, int[] countPerRank)
         {
+            if (UsesTensorSlicedMoE)
+            {
+                PreloadGemma4TensorSlicedExperts(bytesPerRank, countPerRank);
+                return;
+            }
             if (!UsesExpertParallelMoE)
                 return;
 
@@ -294,9 +299,17 @@ namespace TensorSharp.Models
 
         private void ShardGemma4MoeWeightsForTP()
         {
-            // Prefer whole-expert partitioning: it keeps the batched MoE kernel
-            // usable, which is worth far more than the marginally finer memory
-            // split that per-expert slicing would give.
+            // First choice: slice INSIDE each expert (Megatron), which keeps every
+            // expert on every rank and so keeps the in-graph router's global ids
+            // valid — the one layout the fused whole-model MoE trunk can run under
+            // tensor parallelism. Costs a one-time materialization at load; buys
+            // the whole model as one graph per rank instead of ~90 op dispatches
+            // per layer. See Gemma4Model.TensorParallelMoEFused.cs.
+            if (BuildGemma4TensorSlicedExpertShards())
+                return;
+
+            // Otherwise whole-expert partitioning: zero-copy, and it keeps the
+            // batched per-layer MoE kernel usable.
             if (BuildGemma4ExpertParallelShards())
                 return;
 
@@ -525,11 +538,12 @@ namespace TensorSharp.Models
             }
 
             _tpKvCacheCapacity = newCapacity;
-            // The fused TP decode graphs bake in the KV buffer addresses and the
-            // cache extents, both of which just moved.
-            if (_tpFusedDecodeReady)
+            // The fused TP graphs bake in the KV buffer addresses and the cache
+            // extents, both of which just moved.
+            if (_tpFusedDecodeReady || _tpMoeFusedReady)
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4MoEResetDecodeCache();
                 BuildGemma4TpDecodeArrays();
             }
             Console.WriteLine($"Expanded Gemma4 TP cache to {newCapacity} tokens ({tp} GPUs).");
@@ -607,6 +621,31 @@ namespace TensorSharp.Models
                     _forwardCount++;
                     _forwardSw.Stop();
                     return fused;
+                }
+            }
+
+            // MoE trunk: same treatment through its own whole-model kernel, with a
+            // third AllReduce per layer for the expert down projection.
+            if (exceptPositions == null && perLayerInputs == null && _tpMoeFusedReady)
+            {
+                if (seqLen == 1)
+                {
+                    float[] fused = EnsureFoldLogitsBuffer();
+                    if (TryGemma4FusedMoEModelDecodeTP(hidden0, startPos, fused))
+                    {
+                        _cacheSeqLen += seqLen;
+                        _forwardCount++;
+                        _forwardSw.Stop();
+                        return fused;
+                    }
+                }
+                else if (TryGemma4FusedMoEModelVerifyTP(hidden0, startPos, seqLen))
+                {
+                    float[] result = Gemma4TpFinalNormAndLmHead(hidden0, seqLen);
+                    _cacheSeqLen += seqLen;
+                    _forwardCount++;
+                    _forwardSw.Stop();
+                    return result;
                 }
             }
 

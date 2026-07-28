@@ -453,17 +453,44 @@ tok/s, output still byte-identical). `GGML_CUDA_AR_BF16_THRESHOLD` overrides it;
 something that outlives the call — required for any TP graph that is not already
 persistent.
 
+### MoE trunk (Gemma-4-26B-A4B) — Implemented
+
+The whole-model MoE kernels (`TSGgml_Gemma4MoEModelDecode` / `...Verify`)
+compute the router *inside* the graph, and `ggml_top_k` returns **global**
+expert ids. The whole-expert sharding the per-op TP path used cannot feed
+those kernels: rank r would have to rewrite ids it does not own, and ggml-cuda's
+`mul_mat_id` binds each (expert, token) pair with a `break` after the first
+match and then asserts the binding count — a token that repeats an id (which any
+filler scheme can produce) is a crash, not a wrong answer.
+
+So under TP the MoE layers are sharded the Megatron way instead — *inside* each
+expert. Every rank keeps all 128 experts and holds 1/tp of each expert's FFN
+width: gate/up column-parallel on the intermediate dim (keeping the
+`[gate_r | up_r]` fused layout), down row-parallel on it (whole quant blocks).
+`sel` stays global, the graph is the single-GPU graph with narrower expert
+matrices, and the expert-sum output becomes the third row-parallel partial per
+layer — reduced right after the routing-weighted sum, which is linear, so
+summing partials then weighting equals weighting then summing. Three AllReduce
+points per layer (attention output, dense FFN down, MoE expert sum), 90 per
+token on the 26B.
+
+The slices must be materialized at load (the whole-expert view was zero-copy):
+~10.5 GB, parallelized over (layer, rank, projection), ~36 s — first-touch
+bound, not copy-bound. One-time cost for a 10× decode; `TS_GEMMA4_TP_FUSED_MOE=0`
+falls back to the whole-expert per-op path.
+
+Measured (2× RTX 2000 Ada, `--tp 2`, prefill 512 / decode 64, tok/s):
+
+| | 1 GPU | TP=2 per-op | TP=2 fused |
+|---|---|---|---|
+| Gemma-4-26B-A4B IQ4_XS | 1845 / 48.5 | 43.0 / 4.9 | **2537 / 51.2** |
+
+Output is **byte-identical** to the single-GPU run on every prompt tested
+(three prompts × 48–96 greedy tokens, plus a 3-turn conversation).
+
 ### Known Limitations / Future Work (Stage 1c)
 
-- [ ] **Gemma 4 MoE (26B) is untouched** and is the one model still far behind
-      its single-GPU numbers. Its whole-model kernels
-      (`TSGgml_Gemma4MoEModelDecode` / `...Verify`) compute the router *inside*
-      the graph and select from the global expert set, so the whole-expert
-      sharding the managed path uses cannot be expressed: foreign expert ids
-      need distinct fillers per rank (duplicates fault `launch_mul_mat_q`).
-      Megatron slicing *inside* each expert avoids it — `sel` stays global — but
-      needs per-rank re-stacked expert tensors built at load time
-      (gate/up sliced on ne1, down on ne0).
+- [x] **Gemma 4 MoE (26B)** — done, see above.
 - [ ] **Qwen 3.5's GatedDeltaNet block** still runs its norm + packed projection
       + conv + scan through `TSGgml_Qwen35GdnLayerTP` and then the rest per op.
       Folding the ssm output projection into that kernel (it is already the

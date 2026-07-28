@@ -1782,23 +1782,29 @@ internal enum GgmlIndexReductionOp
             IntPtr hidden, int hiddenSize, int position,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, float logitSoftcap);
+            IntPtr finalNorm, float logitSoftcap,
+            int tpDegree, out IntPtr tpPlanOut);
 
         public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position)
         {
             CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position,
-                IntPtr.Zero, 0, IntPtr.Zero, 0, 0, 0, 0, IntPtr.Zero, 0.0f), nameof(TSGgml_Gemma4MoEModelDecode));
+                IntPtr.Zero, 0, IntPtr.Zero, 0, 0, 0, 0, IntPtr.Zero, 0.0f,
+                1, out _), nameof(TSGgml_Gemma4MoEModelDecode));
         }
 
         // Folded variant: appends final-norm + lm_head + softcap so logits[vocab] are
         // written to <paramref name="logits"/> as part of the captured replay.
         public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
             IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, float logitSoftcap)
+            IntPtr finalNorm, float logitSoftcap,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position,
-                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap),
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap,
+                tpDegree, out IntPtr plan),
                 nameof(TSGgml_Gemma4MoEModelDecode));
+            // Tensor-parallel mode returns a plan instead of running the graph.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
         }
 
         // TRUE token-batched MoE decode: N concurrent sequences, one token each, in
@@ -1836,11 +1842,26 @@ internal enum GgmlIndexReductionOp
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4MoEModelVerify(
             [In] Gemma4MoELayerDecodeArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int startPos, int numTokens);
+            IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            int tpDegree, out IntPtr tpPlanOut);
 
-        public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens)
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
+
+        public static void Gemma4MoEReleaseVerifyTpGraphs()
         {
-            return TSGgml_Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens) != 0;
+            try { TSGgml_Gemma4MoEReleaseVerifyTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
+        }
+
+        public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+        {
+            int rc = TSGgml_Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens,
+                tpDegree, out IntPtr plan);
+            // Tensor-parallel mode returns a plan instead of running the graph.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
+            return rc != 0;
         }
 
         // Qwen3.5/3.6 full-model decode: the whole hybrid transformer (full-attention
