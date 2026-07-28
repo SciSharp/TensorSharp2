@@ -714,6 +714,18 @@ namespace TensorSharp.GGML
                 throw new NotSupportedException("GGML AddmmQuant requires tensors with supported row-contiguous layouts.");
             }
 
+            // Route to the GPU that owns the result. Ops.* get this from
+            // OpRegistry.PreInvokeHook, but this is a direct native entry point
+            // and never passes through the registry — so under tensor parallelism
+            // it would run on whatever rank the calling thread happened to be
+            // left on. That is not just a scheduling detail: the weight caches
+            // are per rank, so a call on the wrong rank misses the preloaded
+            // device copy and re-uploads the whole weight (measured: the Qwen3.5
+            // 35B LM head, ~900 MB, on every decode token). Yields to an active
+            // RunPerRank pin, so it is a no-op inside a per-rank scope.
+            if (result.Storage is GgmlStorage resultStorage)
+                GgmlNative.SetActiveRankIfUnpinned(resultStorage.DeviceId);
+
             GgmlNative.AddmmQuant(resultView, m1View, weightData, ggmlType, ne0, ne1, rawBytes);
         }
 
@@ -1953,6 +1965,45 @@ namespace TensorSharp.GGML
                 convStateIn, deltaStateIn, convStateOut, deltaStateOut,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads, eps);
         }
+
+        /// <summary>
+        /// One tensor-parallel rank's GatedDeltaNet block over N tokens: input
+        /// RMSNorm, the PACKED per-rank in-projection, ssm_conv, the delta-rule
+        /// scan and the gated RMSNorm, as ONE ggml graph on the active rank's
+        /// GPU. Writes this rank's gated output [N, vDim] to
+        /// <paramref name="gatedOut"/>; the caller applies the row-parallel
+        /// ssm_out projection and the AllReduce.
+        ///
+        /// The conv window and delta state stay DEVICE-RESIDENT across calls,
+        /// keyed on their host pointers, so nothing round-trips per layer.
+        /// Call <see cref="Qwen35GdnDropTpGraphs"/> to release the cached graphs
+        /// and <see cref="InvalidateHostBuffer"/> on the state pointers after
+        /// resetting them on the host.
+        /// </summary>
+        public static void Qwen35GdnLayerTP(
+            IntPtr hiddenData, int hiddenSize, int n,
+            IntPtr attnNormW,
+            IntPtr inprojW, int inprojType, long inprojNe0, long inprojNe1, long inprojBytes,
+            IntPtr conv1dW, IntPtr dtBias, IntPtr aLog, IntPtr ssmNormW,
+            IntPtr convState, IntPtr deltaState,
+            IntPtr gatedOut,
+            int packedDim, int qkvDim, int qkDim, int vDim,
+            int numKHeads, int numVHeads, int headKDim, int headVDim,
+            int convKernel, float eps)
+        {
+            GgmlNative.Qwen35GdnLayerTP(
+                hiddenData, hiddenSize, n, attnNormW,
+                inprojW, inprojType, inprojNe0, inprojNe1, inprojBytes,
+                conv1dW, dtBias, aLog, ssmNormW,
+                convState, deltaState, gatedOut,
+                packedDim, qkvDim, qkDim, vDim,
+                numKHeads, numVHeads, headKDim, headVDim,
+                convKernel, eps);
+        }
+
+        /// <summary>Release every cached per-rank TP GatedDeltaNet graph and its
+        /// activation buffer.</summary>
+        public static void Qwen35GdnDropTpGraphs() => GgmlNative.Qwen35GdnDropTpGraphs();
 
         /// <summary>True token-batched fused decode: N sequences' decode tokens
         /// (one per sequence) through the whole hybrid transformer in ONE GGML

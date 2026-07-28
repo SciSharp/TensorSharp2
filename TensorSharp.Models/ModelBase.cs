@@ -2057,9 +2057,12 @@ namespace TensorSharp.Models
             {
                 int outDimF32 = (int)w.Sizes[0];
                 int seqLenF32 = (int)input.Sizes[0];
-                using var wT = w.Transpose();
                 result = new Tensor(_allocator, DType.Float32, seqLenF32, outDimF32);
-                Ops.Addmm(result, 0, result, 1.0f, input, wT);
+                if (!TryGgmlF32LinearResident(result, input, w))
+                {
+                    using var wT = w.Transpose();
+                    Ops.Addmm(result, 0, result, 1.0f, input, wT);
+                }
             }
             else
             {
@@ -2068,6 +2071,59 @@ namespace TensorSharp.Models
 
             _linearTicks += Stopwatch.GetTimestamp() - t0;
             return result;
+        }
+
+        /// <summary>
+        /// GGML linear against an F32 weight, routed through the quantized entry
+        /// point so the weight goes through the per-rank cacheable-buffer cache
+        /// and becomes DEVICE-RESIDENT.
+        ///
+        /// The generic <see cref="Ops.Addmm"/> path has no weight cache: it
+        /// re-binds and re-uploads the whole weight on every call. For a matmul
+        /// that runs once per layer per token — an MoE router, say — that is the
+        /// dominant cost of the layer, not the arithmetic. Measured on
+        /// Qwen3.5-35B-A3B under --tp 2: the 40 F32 routers were 12.8 s of a
+        /// 20.2 s decode, ~4 ms each to push 2 MB over PCIe for a
+        /// [1,2048]x[2048,256] product.
+        ///
+        /// Requires a row-contiguous 2D weight, which is the GGUF layout
+        /// ([outDim][inDim] row-major == ggml ne0=inDim, ne1=outDim). Returns
+        /// false for anything else so the caller keeps the generic path.
+        /// </summary>
+        private static readonly bool GgmlF32ResidentLinearEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_GGML_F32_RESIDENT"), "0", StringComparison.Ordinal);
+
+        protected unsafe bool TryGgmlF32LinearResident(Tensor result, Tensor input, Tensor w)
+        {
+            if (!GgmlF32ResidentLinearEnabled)
+                return false;
+            if (!IsGgmlBackend || w == null || w.DimensionCount != 2 || !w.IsContiguous()
+                || w.ElementType != DType.Float32 || input.ElementType != DType.Float32)
+                return false;
+
+            long inDim = w.Sizes[1];
+            long outDim = w.Sizes[0];
+            if (input.DimensionCount != 2 || input.Sizes[1] != inDim)
+                return false;
+
+            IntPtr data = (IntPtr)GetFloatPtr(w);
+            if (data == IntPtr.Zero)
+                return false;
+
+            try
+            {
+                GgmlBasicOps.AddmmQuant(result, input, data,
+                    0 /* GGML_TYPE_F32 */, inDim, outDim, inDim * outDim * sizeof(float));
+                return true;
+            }
+            catch (NotSupportedException)
+            {
+                return false;
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
         }
 
         private unsafe Tensor EmbeddingManagedQuantized(int[] tokens, QuantizedWeight weight)
@@ -3034,12 +3090,25 @@ namespace TensorSharp.Models
         /// the generic per-rank loop.
         /// </summary>
         /// <summary>
-        /// Diagnostic: TS_GGML_TP_FUSED_MATMUL=0 routes the tensor-parallel
-        /// linears through the generic per-rank path instead of the fused
-        /// multi-rank native entry point.
+        /// The fused multi-rank linear is OFF by default; set
+        /// TS_GGML_TP_FUSED_MATMUL=1 to use it.
+        ///
+        /// It submits both ranks' graphs from one thread without a hand-off,
+        /// which sounds like the faster shape, but it has to allocate a fresh
+        /// backend buffer per rank per call: its graphs run asynchronously, so it
+        /// cannot use the shared per-rank compute buffer the way the ordinary
+        /// per-op path does. On CUDA that is a cudaMalloc/cudaFree pair per rank
+        /// per linear, and on a nearly-full card the cost dwarfs the hand-off it
+        /// saves. Measured on Qwen3.5-35B-A3B, --tp 2, ggml_cuda: decode 8.7 →
+        /// 20.1 tok/s and the LM head 44 → 1.6 ms/token with it disabled.
+        ///
+        /// The generic path is not serial either — <c>RunPerRank</c> fans the
+        /// ranks out across worker threads — so what is given up is the in-call
+        /// device AllReduce, which <c>ITensorParallelGroup.AllReduce</c> does
+        /// anyway.
         /// </summary>
         private static readonly bool TpFusedMatmulEnabled =
-            !string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_FUSED_MATMUL"), "0", StringComparison.Ordinal);
+            string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_FUSED_MATMUL"), "1", StringComparison.Ordinal);
 
         private bool TryTpFusedQuantLinear(Tensor[] inputs, QuantizedWeight[] shards, Tensor[] results, int seqLen, bool allReduce)
         {

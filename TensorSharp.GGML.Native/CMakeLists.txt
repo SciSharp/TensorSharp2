@@ -200,6 +200,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_qwen_image.cpp
     ggml_ops_gated_delta_net.cpp
     ggml_ops_qwen35_recurrent_prefill.cpp
+    ggml_ops_qwen35_gdn_tp.cpp
     ggml_ops_mamba2.cpp
     ggml_ops_moe.cpp
     ggml_ops_paged_attention.cpp

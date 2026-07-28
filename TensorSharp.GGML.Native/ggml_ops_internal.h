@@ -711,6 +711,11 @@ namespace tsg
 
     void upload_binding(const TensorBinding& binding, const void* data, std::size_t size);
 
+    // Map a preloaded weight's opaque cache key back to the host bytes it stands
+    // for. Uploading straight from a cache key would dereference a GCHandle;
+    // every upload path that may be handed one must go through this first.
+    const void* resolve_upload_source(const void* data);
+
     // --- Zero-copy host-pointer bindings ---
 
     bool create_binding_from_host_ptr_2d(

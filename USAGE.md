@@ -594,20 +594,25 @@ TENSORSHARP_TP_DEVICES=0,2 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model <model.gguf> --backend ggml_cuda --tp 2
 ```
 
-**What to expect.** On the GGML backends TP is for *capacity*, not latency: it
-lets a model that does not fit in one GPU's VRAM run entirely on GPUs (a
-26B IQ4_XS model splits 12908 MB into 6835 + 6087 MB across two cards). For a
-model that already fits, a single GPU is currently faster, because the
-single-GPU path runs a whole decode step as one fused native graph while the TP
-path dispatches op by op. Prefill closes most of that gap as the prompt grows;
-decode does not. See `TENSOR_PARALLELISM_PLAN.md` (Stage 1b) for measurements
-and the planned fix. Direct CUDA (`--backend cuda`) is the faster TP path today.
+**What to expect.** On the GGML backends TP is for *capacity* first: it lets a
+model that does not fit in one GPU's VRAM run entirely on GPUs. Qwen 3.5-35B-A3B
+IQ4_XS (16.6 GB, which does not fit a 16 GB card) splits into 9.4 + 8.0 GB across
+two and runs at **20 tok/s decode / 76 tok/s prefill** on 2× RTX 2000 Ada.
+
+For a model that *already* fits on one GPU, that single GPU is still faster: its
+path runs a whole decode step as one fused native graph, while TP dispatches per
+layer. Qwen 3.5-9B Q8_0 measures 23 tok/s on one card against 16 tok/s at
+`--tp 2`. See `TENSOR_PARALLELISM_PLAN.md` (Stage 1b) for the full measurements
+and what is left to fuse.
 
 | Variable | Effect |
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`) |
 | `TS_GGML_TP_PARALLEL=0` | Drive ranks sequentially instead of concurrently (diagnostic) |
+| `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
+| `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
+| `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |
 
 ### Constraints

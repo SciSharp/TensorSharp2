@@ -27,6 +27,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.Cuda;
+using TensorSharp.GGML;
 
 namespace TensorSharp.Models
 {
@@ -106,6 +107,66 @@ namespace TensorSharp.Models
         }
 
         // ====================================================================
+        // TP phase accounting
+        // ====================================================================
+        //
+        // The generic Linear/Attention/Norm buckets lump the whole TP forward
+        // into "Linear", which is useless for deciding what to fuse next. These
+        // split it by block so the dispatch-bound parts are visible.
+        private long _tpGdnTicks, _tpSsmOutTicks, _tpAttnBlockTicks;
+        private long _tpMoeDispatchTicks, _tpSharedExpertTicks, _tpRouterTicks;
+        private long _tpAllReduceTicks, _tpResidualTicks;
+
+        private void PrintTpTimingStats()
+        {
+            if (!IsTensorParallel || _forwardCount == 0)
+                return;
+            double ms = 1000.0 / Stopwatch.Frequency;
+            Console.WriteLine("  Tensor-parallel phases (per rank, wall clock):");
+            Console.WriteLine($"    GDN block:       {_tpGdnTicks * ms:F0} ms");
+            Console.WriteLine($"    ssm_out+AR:      {_tpSsmOutTicks * ms:F0} ms");
+            Console.WriteLine($"    attention block: {_tpAttnBlockTicks * ms:F0} ms");
+            Console.WriteLine($"    MoE router:      {_tpRouterTicks * ms:F0} ms");
+            Console.WriteLine($"    MoE experts:     {_tpMoeDispatchTicks * ms:F0} ms");
+            Console.WriteLine($"    shared expert:   {_tpSharedExpertTicks * ms:F0} ms");
+            Console.WriteLine($"    AllReduce:       {_tpAllReduceTicks * ms:F0} ms");
+            Console.WriteLine($"    residual adds:   {_tpResidualTicks * ms:F0} ms");
+        }
+
+        // ====================================================================
+        // Layer trace (TS_QWEN35_LAYER_TRACE=1)
+        // ====================================================================
+        //
+        // Prints a per-layer summary of the residual stream for the FIRST forward
+        // only, from both the single-GPU and the tensor-parallel loops. Diffing
+        // the two runs is what localizes a TP divergence to a layer — without it
+        // the only observable is the sampled text, which says nothing about where
+        // the two paths parted.
+        private static readonly bool LayerTraceEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_LAYER_TRACE"), "1", StringComparison.Ordinal);
+        private int _layerTraceForwards;
+
+        private unsafe void TraceLayer(Tensor hidden, int layer, string tag)
+        {
+            if (!LayerTraceEnabled || _layerTraceForwards > 0 || hidden == null)
+                return;
+
+            long n = hidden.ElementCount();
+            float* p = GetFloatPtr(hidden);
+            double sum = 0, absSum = 0;
+            float max = float.NegativeInfinity;
+            for (long i = 0; i < n; i++)
+            {
+                double v = p[i];
+                sum += v;
+                absSum += Math.Abs(v);
+                if (p[i] > max) max = p[i];
+            }
+            Console.WriteLine($"[TRACE{tag}] layer={layer} kind={(_isRecurrent[layer] ? "gdn" : "attn")} " +
+                $"n={n} sum={sum:F3} abs={absSum:F3} max={max:F5}");
+        }
+
+        // ====================================================================
         // TP constraint validation
         // ====================================================================
 
@@ -124,26 +185,32 @@ namespace TensorSharp.Models
                 errors.Add($"Attention KV heads ({Config.NumKVHeads}) not divisible by TP degree ({tp})");
             if (Config.IntermediateSize > 0 && Config.IntermediateSize % tp != 0)
                 errors.Add($"Intermediate size ({Config.IntermediateSize}) not divisible by TP degree ({tp})");
-            if (_numExperts > 0 && _expertFfnLength % tp != 0)
+            // Expert parallelism partitions whole experts, so it constrains the
+            // expert COUNT and places none on the per-expert FFN width. Only the
+            // per-expert slicing path needs that.
+            bool expertParallel = CanUseGgmlExpertParallelMoE();
+            if (_numExperts > 0 && !expertParallel && _expertFfnLength % tp != 0)
                 errors.Add($"Expert FFN length ({_expertFfnLength}) not divisible by TP degree ({tp})");
             if (_numExperts > 0 && _sharedExpertFfnLength > 0 && _sharedExpertFfnLength % tp != 0)
                 errors.Add($"Shared expert FFN length ({_sharedExpertFfnLength}) not divisible by TP degree ({tp})");
             if (_numVHeads % _numKHeads != 0)
                 errors.Add($"Model invariant violated: V heads ({_numVHeads}) not divisible by K heads ({_numKHeads})");
 
-            // Verify CUDA-native GDN path is available (the only supported path under TP)
-            // Qwen3.5 is the one architecture still pinned to direct CUDA under
-            // TP: its per-rank GatedDeltaNet runs as a single fused CUDA kernel
-            // (ts_qwen35_gdn_*) that keeps the conv ring buffer and the delta
-            // state on-device, and the GGML bridge exposes no packed-GDN
-            // equivalent — only the unpacked chunked and batched-step forms. The
-            // attention and MoE halves of the TP forward are backend-agnostic, so
-            // this lifts once a packed GDN lands in ggml_ops_gated_delta_net.cpp.
-            if (_backend != BackendType.Cuda)
-                errors.Add($"Qwen3.5/3.6 tensor parallelism requires the direct CUDA backend, got {_backend}. " +
-                           "Its per-rank GatedDeltaNet runs as one fused CUDA kernel and the GGML bridge has no " +
-                           "packed-GDN equivalent yet. Either run multi-GPU on direct CUDA (--backend cuda --tp N), " +
-                           "or run single-GPU on GGML (--backend ggml_cuda, no --tp).");
+            // The per-rank GatedDeltaNet needs a packed-input kernel that keeps the
+            // conv window and the delta state on the device: direct CUDA has
+            // ts_qwen35_gdn_*, GGML has TSGgml_Qwen35GdnLayerTP. No other backend
+            // has one, and the per-token host loop is not a viable substitute
+            // (it round-trips the whole delta state per layer per token).
+            if (_backend != BackendType.Cuda && !IsGgmlBackend)
+                errors.Add($"Qwen3.5/3.6 tensor parallelism requires the direct CUDA or a GGML backend, got {_backend}. " +
+                           "Its per-rank GatedDeltaNet needs a device-resident packed-GDN kernel, which only those " +
+                           "backends provide. Run multi-GPU on --backend cuda / --backend ggml_cuda, or single-GPU here.");
+
+            // The GGML packed GDN builds one ggml_gated_delta_net node, whose
+            // packed state layout requires a square per-head state.
+            if (IsGgmlBackend && _headKDim != _headVDim)
+                errors.Add($"GGML tensor parallelism requires headKDim == headVDim for the GatedDeltaNet " +
+                           $"({_headKDim} vs {_headVDim}); use --backend cuda --tp {tp}.");
 
             if (errors.Count > 0)
                 throw new InvalidOperationException(
@@ -207,7 +274,54 @@ namespace TensorSharp.Models
             if (_numExperts > 0)
                 ShardMoeWeightsForTP();
 
+            // --- LM head: column-parallel over the vocabulary ---
+            ShardLmHeadForTP();
+
             Console.WriteLine($"  Qwen3.5 TP weight sharding complete ({globalTp} GPUs, {tp} local).");
+        }
+
+        /// <summary>
+        /// Name of the column-parallel LM head weight, or null when the head is
+        /// replicated on rank 0 (the direct-CUDA layout, and the tied-embedding
+        /// case where the same tensor is still needed whole for the embedding
+        /// lookup).
+        /// </summary>
+        private string _tpLmHeadKey;
+
+        /// <summary>
+        /// Split the LM head across ranks by vocabulary, so each GPU produces its
+        /// own slice of the logits from its own slice of the weight.
+        ///
+        /// The head is the single largest tensor left after the layers are
+        /// sharded (398 MB Q6_K on Qwen3.5-35B, 1.1 GB Q8_0 on the 9B) and it is
+        /// read in full for every decoded token, so leaving it replicated on rank
+        /// 0 wastes both that GPU's bandwidth and its VRAM while the other card
+        /// sits idle. The vocabulary is the output dimension, so rank r's share is
+        /// a contiguous row range — a zero-copy view — and the "gather" afterwards
+        /// is just two writes into disjoint halves of the logits buffer, with no
+        /// collective at all.
+        /// </summary>
+        private void ShardLmHeadForTP()
+        {
+            // Direct CUDA keeps its replicated head: its TP forward reads the
+            // logits through the CUDA-resident weight path, not by name.
+            if (!IsGgmlBackend)
+                return;
+            // Tied embeddings: token_embd.weight doubles as the embedding table,
+            // which Embedding() gathers rows from on rank 0. Sharding it would
+            // leave half the table missing there.
+            if (!_quantWeights.TryGetValue("output.weight", out var qw) || qw == null)
+                return;
+            if (qw.Ne1 % GlobalTpDegree != 0 || qw.Ne1 != Config.VocabSize)
+                return;
+
+            ShardExpertColumnParallel("output.weight");
+            if (!_tpQuantWeights.ContainsKey("output.weight"))
+                return;
+
+            _tpLmHeadKey = "output.weight";
+            Console.WriteLine($"  Qwen3.5 LM head: column-parallel across {GlobalTpDegree} GPU(s), " +
+                $"{qw.Ne1 / GlobalTpDegree} vocab rows each.");
         }
 
         /// <summary>
@@ -643,6 +757,11 @@ namespace TensorSharp.Models
         {
             int tp = TpDegree;
 
+            // Prefer whole-expert partitioning on GGML: keeping the batched
+            // ggml_mul_mat_id dispatch usable is worth far more than the
+            // marginally finer memory split per-expert slicing would give.
+            bool expertParallel = BuildQwen35ExpertParallelShards();
+
             for (int layer = 0; layer < TotalLayerCount; layer++)
             {
                 if (_isMoeLayer == null || !_isMoeLayer[layer])
@@ -653,7 +772,7 @@ namespace TensorSharp.Models
                 // Router weight: replicated (no sharding needed, stays in _weights)
 
                 // Expert gate/up weights: column-parallel (split expertFfnLength)
-                for (int e = 0; e < _numExperts; e++)
+                for (int e = 0; e < _numExperts && !expertParallel; e++)
                 {
                     string gateKey = prefix + $"ffn_gate_exps.{e}.weight";
                     string upKey = prefix + $"ffn_up_exps.{e}.weight";
@@ -863,7 +982,14 @@ namespace TensorSharp.Models
 
                     if (convDim > 0)
                     {
-                        _tpConvState[l][r] = new Tensor(alloc, DType.Float32, convDim, localQkvDim);
+                        // Direct CUDA drives a ring buffer indexed by
+                        // _tpConvWriteIdx, so time is the slow axis. The GGML
+                        // kernel feeds ggml_ssm_conv, which wants an ordered
+                        // window with time contiguous per channel — the shard is
+                        // transposed and the write index stays 0.
+                        _tpConvState[l][r] = IsGgmlBackend
+                            ? new Tensor(alloc, DType.Float32, localQkvDim, convDim)
+                            : new Tensor(alloc, DType.Float32, convDim, localQkvDim);
                         Ops.Fill(_tpConvState[l][r], 0);
                     }
                 }
@@ -929,7 +1055,7 @@ namespace TensorSharp.Models
         // TP forward pass
         // ====================================================================
 
-        private float[] ForwardTP(int[] tokens)
+        private unsafe float[] ForwardTP(int[] tokens)
         {
             _forwardSw.Start();
             int seqLen = tokens.Length;
@@ -956,7 +1082,9 @@ namespace TensorSharp.Models
                     hidden = RecurrentBlockTP(hidden, layer, seqLen, startPos);
                 else
                     hidden = AttentionBlockTP(hidden, layer, seqLen, startPos);
+                TraceLayer(hidden[0], layer, "-tp");
             }
+            _layerTraceForwards++;
 
             // Final norm + LM head on GPU 0 only (hidden is replicated after AllReduce).
             Tensor normed = RMSNormOp(hidden[0], "output_norm.weight");
@@ -976,18 +1104,51 @@ namespace TensorSharp.Models
             normed.Dispose();
 
             long t2 = Stopwatch.GetTimestamp();
-            Tensor logitsTensor = LinearForward(lastHidden, "output.weight");
-            if (logitsTensor == null)
-                logitsTensor = LinearForward(lastHidden, "token_embd.weight");
-            _lmHeadTicks += Stopwatch.GetTimestamp() - t2;
-            lastHidden.Dispose();
+            if (LayerTraceEnabled && _layerTraceForwards <= 1)
+                Console.WriteLine($"[TRACE-lm] columnParallel={_tpLmHeadKey != null} " +
+                    $"activeRank={(IsGgmlBackend ? GgmlBasicOps.GetActiveRank() : -1)}");
+            if (_tpLmHeadKey != null)
+            {
+                // Column-parallel head: each rank produces its own vocabulary
+                // slice, and the slices are disjoint, so the "gather" is a pair of
+                // copies into halves of the logits buffer rather than a collective.
+                Tensor[] logitParts = TpColumnParallelLinear(lastHidden, _tpLmHeadKey);
+                _lmHeadTicks += Stopwatch.GetTimestamp() - t2;
+                lastHidden.Dispose();
 
-            long t3 = Stopwatch.GetTimestamp();
-            if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
-                _logitsBuffer = new float[Config.VocabSize];
-            _logitsBuffer = TensorToFloatArray(logitsTensor);
-            _logitsCopyTicks += Stopwatch.GetTimestamp() - t3;
-            logitsTensor.Dispose();
+                long tGather = Stopwatch.GetTimestamp();
+                if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                    _logitsBuffer = new float[Config.VocabSize];
+                int offset = 0;
+                for (int r = 0; r < tp; r++)
+                {
+                    int count = (int)logitParts[r].ElementCount();
+                    unsafe
+                    {
+                        float* src = GetFloatPtr(logitParts[r]);
+                        fixed (float* dst = &_logitsBuffer[offset])
+                            Buffer.MemoryCopy(src, dst, (long)count * sizeof(float), (long)count * sizeof(float));
+                    }
+                    offset += count;
+                    logitParts[r].Dispose();
+                }
+                _logitsCopyTicks += Stopwatch.GetTimestamp() - tGather;
+            }
+            else
+            {
+                Tensor logitsTensor = LinearForward(lastHidden, "output.weight");
+                if (logitsTensor == null)
+                    logitsTensor = LinearForward(lastHidden, "token_embd.weight");
+                _lmHeadTicks += Stopwatch.GetTimestamp() - t2;
+                lastHidden.Dispose();
+
+                long t3 = Stopwatch.GetTimestamp();
+                if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                    _logitsBuffer = new float[Config.VocabSize];
+                _logitsBuffer = TensorToFloatArray(logitsTensor);
+                _logitsCopyTicks += Stopwatch.GetTimestamp() - t3;
+                logitsTensor.Dispose();
+            }
 
             _cacheSeqLen += seqLen;
             _forwardCount++;
@@ -1006,6 +1167,7 @@ namespace TensorSharp.Models
         {
             int tp = TpDegree;
             string prefix = $"blk.{layer}.";
+            long tAttnBlock = Stopwatch.GetTimestamp();
 
             // 1. Attention norm (replicated).
             Tensor[] normed = TpRMSNorm(hidden, _attnNormKey[layer]);
@@ -1030,6 +1192,7 @@ namespace TensorSharp.Models
             TpResidualAdd(hidden, attnReduced);
             for (int r = 0; r < tp; r++)
                 attnReduced[r].Dispose();
+            _tpAttnBlockTicks += Stopwatch.GetTimestamp() - tAttnBlock;
 
             // 6. FFN (dense or MoE).
             hidden = FFNBlockTP(hidden, layer, seqLen);
@@ -1212,28 +1375,42 @@ namespace TensorSharp.Models
             int tp = TpDegree;
             string prefix = $"blk.{layer}.";
 
-            // 1. Input norm (replicated).
-            Tensor[] normed = TpRMSNorm(hidden, _attnNormKey[layer]);
+            Tensor[] gatedOut;
+            if (IsGgmlBackend)
+            {
+                // GGML fuses steps 1-3 (norm, packed in-projection, conv, scan,
+                // gated norm) into one graph per rank — see GatedDeltaNetTpGgml.
+                gatedOut = GatedDeltaNetTpGgml(hidden, layer, seqLen);
+            }
+            else
+            {
+                // 1. Input norm (replicated).
+                Tensor[] normed = TpRMSNorm(hidden, _attnNormKey[layer]);
 
-            // 2. Column-parallel packed input projection (segmented).
-            Tensor[] packedInput = TpColumnParallelLinear(normed[0], _ssmInProjKey[layer]);
-            for (int r = 0; r < tp; r++)
-                normed[r].Dispose();
+                // 2. Column-parallel packed input projection (segmented).
+                Tensor[] packedInput = TpColumnParallelLinear(normed[0], _ssmInProjKey[layer]);
+                for (int r = 0; r < tp; r++)
+                    normed[r].Dispose();
 
-            // 3. Per-rank GDN: conv1d → L2norm → delta-rule scan → gated RMSNorm.
-            Tensor[] gatedOut = GatedDeltaNetTP(packedInput, layer, seqLen);
-            for (int r = 0; r < tp; r++)
-                packedInput[r].Dispose();
+                // 3. Per-rank GDN: conv1d → L2norm → delta-rule scan → gated RMSNorm.
+                gatedOut = GatedDeltaNetTP(packedInput, layer, seqLen);
+                for (int r = 0; r < tp; r++)
+                    packedInput[r].Dispose();
+            }
 
             // 4. Row-parallel ssm_out + AllReduce (result already on every rank).
+            long tOut = Stopwatch.GetTimestamp();
             Tensor[] gdnReduced = TpRowParallelLinearAllRanks(gatedOut, _ssmOutKey[layer]);
             for (int r = 0; r < tp; r++)
                 gatedOut[r].Dispose();
+            _tpSsmOutTicks += Stopwatch.GetTimestamp() - tOut;
 
             // 5. Residual add.
+            long tRes = Stopwatch.GetTimestamp();
             TpResidualAdd(hidden, gdnReduced);
             for (int r = 0; r < tp; r++)
                 gdnReduced[r].Dispose();
+            _tpResidualTicks += Stopwatch.GetTimestamp() - tRes;
 
             // 6. FFN (dense or MoE).
             hidden = FFNBlockTP(hidden, layer, seqLen);
@@ -1299,6 +1476,117 @@ namespace TensorSharp.Models
             int convDim = _convKernel - 1;
             if (convDim > 0)
                 _tpConvWriteIdx[layer] = (_tpConvWriteIdx[layer] + seqLen) % convDim;
+
+            return results;
+        }
+
+        /// <summary>
+        /// Per-rank GatedDeltaNet on the GGML backends. Unlike the direct-CUDA
+        /// path — which takes an already-projected packed input — the GGML kernel
+        /// owns the whole front of the block: input RMSNorm, the packed
+        /// column-parallel in-projection, ssm_conv, the delta-rule scan and the
+        /// gated RMSNorm, in ONE graph per rank. Folding the projection in is
+        /// what makes it worth doing: it removes a separate multi-rank matmul
+        /// dispatch and an activation round-trip per recurrent layer, and there
+        /// are 30 of them per token on Qwen3.5-35B.
+        ///
+        /// The conv window and delta state never leave the device; the native
+        /// side keys them on these host pointers (see Qwen35GdnLayerTP).
+        /// </summary>
+        private unsafe Tensor[] GatedDeltaNetTpGgml(Tensor[] hidden, int layer, int seqLen)
+        {
+            int tp = TpDegree;
+            int localKHeads = _numKHeads / GlobalTpDegree;
+            int localVHeads = _numVHeads / GlobalTpDegree;
+            int localQkDim = _headKDim * localKHeads;
+            int localVDim = _headVDim * localVHeads;
+            int localQkvDim = 2 * localQkDim + localVDim;
+            int localPackedDim = localQkvDim + localVDim + 2 * localVHeads;
+
+            // Resolve every pointer on the calling thread: the replicated-weight
+            // cache behind GetTpShardTensor is a plain dictionary and the rank
+            // workers below run concurrently.
+            IntPtr attnNormPtr = (IntPtr)GetFloatPtr(_weights[_attnNormKey[layer]]);
+            IntPtr ssmNormPtr = (IntPtr)GetFloatPtr(_weights[_ssmNormKey[layer]]);
+
+            string inprojKey = _ssmInProjKey[layer];
+            _tpQuantWeights.TryGetValue(inprojKey, out var inprojQuant);
+            if (inprojQuant == null && !_tpWeights.ContainsKey(inprojKey))
+                throw new KeyNotFoundException($"TP in-projection weight '{inprojKey}' not found in sharded weights.");
+            var inprojF32 = inprojQuant == null ? _tpWeights[inprojKey] : null;
+
+            var inprojPtr = new IntPtr[tp];
+            var inprojType = new int[tp];
+            var inprojNe0 = new long[tp];
+            var inprojNe1 = new long[tp];
+            var inprojBytes = new long[tp];
+            var conv1dPtr = new IntPtr[tp];
+            var dtBiasPtr = new IntPtr[tp];
+            var aPtr = new IntPtr[tp];
+            var convStatePtr = new IntPtr[tp];
+            var deltaStatePtr = new IntPtr[tp];
+
+            for (int r = 0; r < tp; r++)
+            {
+                if (inprojQuant != null)
+                {
+                    var qw = inprojQuant[r];
+                    // CacheKey, not Data: it identifies the rank-resident device
+                    // copy made by PrepareGgmlQuantizedWeightsForInferenceTP.
+                    inprojPtr[r] = qw.CacheKey;
+                    inprojType[r] = qw.GgmlType;
+                    inprojNe0[r] = qw.Ne0;
+                    inprojNe1[r] = qw.Ne1;
+                    inprojBytes[r] = qw.RawBytes;
+                }
+                else
+                {
+                    var w = inprojF32[r];
+                    inprojPtr[r] = (IntPtr)GetFloatPtr(w);
+                    inprojType[r] = 0; // GGML_TYPE_F32
+                    inprojNe0[r] = w.Sizes[1];
+                    inprojNe1[r] = w.Sizes[0];
+                    inprojBytes[r] = w.ElementCount() * sizeof(float);
+                }
+
+                conv1dPtr[r] = (IntPtr)GetFloatPtr(GetTpShardTensor(_ssmConv1dKey[layer], r));
+                dtBiasPtr[r] = (IntPtr)GetFloatPtr(GetTpShardTensor(_ssmDtBiasKey[layer], r));
+                aPtr[r] = (IntPtr)GetFloatPtr(GetTpShardTensor(_ssmAKey[layer], r));
+                convStatePtr[r] = (IntPtr)GetFloatPtr(_tpConvState[layer][r]);
+                deltaStatePtr[r] = (IntPtr)GetFloatPtr(_tpDeltaState[layer][r]);
+            }
+
+            var results = new Tensor[tp];
+            long tGdn = Stopwatch.GetTimestamp();
+            _tpGroup.RunPerRank(r =>
+            {
+                var alloc = _tpGroup.GetAllocator(r);
+                var gated = new Tensor(alloc, DType.Float32, seqLen, localVDim);
+                try
+                {
+                    GgmlBasicOps.Qwen35GdnLayerTP(
+                        (IntPtr)GetFloatPtr(hidden[r]), Config.HiddenSize, seqLen,
+                        attnNormPtr,
+                        inprojPtr[r], inprojType[r], inprojNe0[r], inprojNe1[r], inprojBytes[r],
+                        conv1dPtr[r], dtBiasPtr[r], aPtr[r], ssmNormPtr,
+                        convStatePtr[r], deltaStatePtr[r],
+                        (IntPtr)GetFloatPtr(gated),
+                        localPackedDim, localQkvDim, localQkDim, localVDim,
+                        localKHeads, localVHeads, _headKDim, _headVDim,
+                        _convKernel, Config.Eps);
+                }
+                catch
+                {
+                    gated.Dispose();
+                    throw;
+                }
+                InvalidateTensorDeviceCache(gated);
+                results[r] = gated;
+            });
+            long gdnElapsed = Stopwatch.GetTimestamp() - tGdn;
+            _gdnCudaNativeTicks += gdnElapsed;
+            _tpGdnTicks += gdnElapsed;
+            _gdnCudaNativeCalls++;
 
             return results;
         }
@@ -1390,7 +1678,7 @@ namespace TensorSharp.Models
         // MoE block under TP (tensor-parallel experts)
         // ====================================================================
 
-        private Tensor[] MoEBlockTP(Tensor[] hidden, int layer, int seqLen)
+        private unsafe Tensor[] MoEBlockTP(Tensor[] hidden, int layer, int seqLen)
         {
             int tp = TpDegree;
             int hiddenSize = Config.HiddenSize;
@@ -1408,7 +1696,31 @@ namespace TensorSharp.Models
             // routes each token to the same experts.
             var results = new Tensor[tp];
 
+            long tRouter = Stopwatch.GetTimestamp();
             Tensor rank0Logits = LinearForward(normed[0], _ffnGateInpKey[layer]);
+            _tpRouterTicks += Stopwatch.GetTimestamp() - tRouter;
+
+            // Expert-parallel (GGML): each rank runs the batched kernel over the
+            // whole experts it owns, so the layer is three dispatches per rank
+            // instead of a per-(token, expert) loop.
+            if (UsesExpertParallelMoE)
+            {
+                bool routeRowsAreLogits = _normTopKProb;
+                Tensor epRoutes = routeRowsAreLogits ? rank0Logits : Ops.Softmax(null, rank0Logits);
+                bool done = TryQwen35MoEExpertParallel(normed, results, epRoutes, routeRowsAreLogits, layer, seqLen);
+                if (!ReferenceEquals(epRoutes, rank0Logits))
+                    epRoutes.Dispose();
+
+                if (done)
+                {
+                    rank0Logits.Dispose();
+                    for (int r = 0; r < tp; r++)
+                        normed[r].Dispose();
+                    return FinishMoEBlockTP(hidden, results, tp);
+                }
+                // Fall through to the generic paths below with rank0Logits intact.
+            }
+
             Tensor[] routerLogitsPerRank = BroadcastTensorToAllRanks(rank0Logits);
             rank0Logits.Dispose();
 
@@ -1560,7 +1872,9 @@ namespace TensorSharp.Models
         {
             // AllReduce across ranks (sum partial expert results). This leaves the
             // identical sum on every rank.
+            long tAr = Stopwatch.GetTimestamp();
             _tpGroup.AllReduce(results);
+            _tpAllReduceTicks += Stopwatch.GetTimestamp() - tAr;
 
             // Residual add. `hidden` entered replicated and every rank adds the same
             // reduced value, so it stays replicated — the block used to follow this
@@ -1684,6 +1998,7 @@ namespace TensorSharp.Models
         private void ResetTpKVCache()
         {
             int tp = TpDegree;
+            int previousRank = IsGgmlBackend ? GgmlBasicOps.GetActiveRank() : 0;
 
             for (int l = 0; l < TotalLayerCount; l++)
             {
@@ -1702,10 +2017,26 @@ namespace TensorSharp.Models
                         Ops.Fill(_tpDeltaState[l][r], 0);
                         if (_tpConvState[l][r] != null)
                             Ops.Fill(_tpConvState[l][r], 0);
+
+                        // On GGML the recurrent state lives on the device between
+                        // calls, keyed by these host pointers. Zeroing the host
+                        // copy alone would leave the GPU running on the old state,
+                        // so drop the device copy and let the next call re-upload
+                        // the zeros. The cache is per rank, hence the rank switch.
+                        if (IsGgmlBackend)
+                        {
+                            GgmlBasicOps.SetActiveRank(r);
+                            InvalidateTensorDeviceCache(_tpDeltaState[l][r]);
+                            if (_tpConvState[l][r] != null)
+                                InvalidateTensorDeviceCache(_tpConvState[l][r]);
+                        }
                     }
                     _tpConvWriteIdx[l] = 0;
                 }
             }
+
+            if (IsGgmlBackend)
+                GgmlBasicOps.SetActiveRank(previousRank);
         }
 
         // ====================================================================
@@ -1739,6 +2070,11 @@ namespace TensorSharp.Models
                     }
                 }
             }
+
+            // The per-rank GDN graphs are cached natively on (rank, shape), not on
+            // the model, so nothing else would reclaim their activation buffers.
+            if (IsGgmlBackend)
+                GgmlBasicOps.Qwen35GdnDropTpGraphs();
 
             DisposeTpWeightReplicaCache();
             FreeQwenTpMoETables();

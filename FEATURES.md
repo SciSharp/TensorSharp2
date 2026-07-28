@@ -100,8 +100,9 @@ Architecture-specific strategies handle heterogeneous layers:
 | Architecture | Strategy |
 |---|---|
 | Dense transformers (Qwen 3, Mistral 3, Gemma 3) | Standard column/row-parallel QKV + FFN |
-| MoE (Gemma 4, GPT OSS, Qwen 3.5/3.6, Nemotron-H) | Expert slicing — each GPU holds `1/tp` of every expert's weights; router is replicated |
-| GatedDeltaNet SSM (Qwen 3.5/3.6) | Block-cyclic V-head assignment — each rank runs its own GDN kernel on its V-head subset with independent delta/conv state; no cross-rank communication for the recurrent path |
+| MoE (GPT OSS, Nemotron-H) | Expert slicing — each GPU holds `1/tp` of every expert's weights; router is replicated |
+| MoE on GGML (Gemma 4, Qwen 3.5/3.6) | Expert parallelism — whole experts partition across GPUs, so each rank keeps the single batched `ggml_mul_mat_id` dispatch per projection |
+| GatedDeltaNet SSM (Qwen 3.5/3.6) | Block-cyclic V-head assignment — each rank runs its own packed GDN kernel on its V-head subset with independent delta/conv state, resident on its GPU; no cross-rank communication for the recurrent path |
 | Mamba2 SSM (Nemotron-H) | Replicated on rank 0, result broadcast to all ranks |
 
 TP runs on the `cuda` backend and on the GGML CUDA / Vulkan backends
@@ -109,9 +110,10 @@ TP runs on the `cuda` backend and on the GGML CUDA / Vulkan backends
 rank owns a ggml backend on its own GPU with its own weight shards and KV
 cache, and cross-GPU AllReduce goes through ggml-cuda's collective (NCCL when
 available) or a host reduction for small payloads. GGML TP is aimed at capacity
-— running a model too large for one GPU — rather than latency; direct CUDA is
-the faster TP path for models that already fit. Qwen 3.5/3.6 TP is direct-CUDA
-only, because its fused GatedDeltaNet kernel has no GGML equivalent.
+— running a model too large for one GPU — rather than latency; a single GPU is
+still faster for a model that already fits. Qwen 3.5/3.6 runs TP on both paths:
+Qwen 3.5-35B-A3B IQ4_XS (16.6 GB) splits across two 16 GB cards and decodes at
+20 tok/s on `ggml_cuda --tp 2`.
 
 Batched/continuous-batching forward under TP is implemented for Qwen 3
 and Mistral 3; MoE models fall back to per-sequence forward under TP.

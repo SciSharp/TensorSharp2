@@ -100,10 +100,10 @@ CUDA stream 提供。用 `--tp N`（CLI）或 `TENSORSHARP_TP_DEGREE=N`（服务
 |---|---|
 | 稠密 transformer（Qwen 3、Mistral 3、Gemma 3） | 标准列/行并行 QKV + FFN |
 | MoE（Gemma 4、GPT OSS、Qwen 3.5/3.6、Nemotron-H） | 专家切分——每张 GPU 持有每个专家权重的 `1/tp`；router 复制 |
-| GatedDeltaNet SSM（Qwen 3.5/3.6） | 块循环 V-head 分配——各 rank 在自己的 V-head 子集上运行 GDN 内核，delta/conv 状态相互独立；循环路径无需跨 rank 通信 |
+| GatedDeltaNet SSM（Qwen 3.5/3.6） | 块循环 V-head 分配——各 rank 在自己的 V-head 子集上运行常驻本卡的打包 GDN 内核，delta/conv 状态相互独立；循环路径无需跨 rank 通信 |
 | Mamba2 SSM（Nemotron-H） | 在 rank 0 上复制计算，结果广播给所有 rank |
 
-TP 需要 `cuda` 后端（GGML、MLX、Vulkan 在设计上都是单设备）。TP 下的批处理 /
+TP 可运行在 `cuda` 后端以及 GGML CUDA / Vulkan 后端（`ggml_cuda`、`ggml_vulkan`）上；MLX 为单设备。在 GGML 后端上，每个 rank 拥有自己 GPU 上的 ggml 后端、权重分片与 KV 缓存，跨 GPU AllReduce 走 ggml-cuda 的集合通信（可用时用 NCCL），小载荷则在主机内存中归约。GGML 上的 TP 面向**容量**而非延迟：单卡装不下的模型可以整体跑在 GPU 上（Qwen 3.5-35B-A3B IQ4_XS 共 16.6 GB，可拆到两张 16 GB 卡上，`ggml_cuda --tp 2` 解码约 20 tok/s）；本来就能装进单卡的模型，单卡仍然更快。TP 下的批处理 /
 连续批处理前向目前实现于 Qwen 3 与 Mistral 3；MoE 模型在 TP 下回退到按序列前向。
 
 本地集合通信优先使用 CUDA 点对点（P2P）DMA，但启动时会对每一对支持 P2P 的设备

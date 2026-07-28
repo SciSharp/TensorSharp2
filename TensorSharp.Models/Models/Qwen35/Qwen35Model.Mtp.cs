@@ -93,10 +93,21 @@ namespace TensorSharp.Models
                     || _tpQuantWeights.ContainsKey(_attnQKey[_mtpLayerIdx])
                     || _tpWeights.ContainsKey(_attnQKey[_mtpLayerIdx]);
             }
-            HasMtp = _numNextnLayers == 1 && hasProj && _mtpEnormW != null && _mtpHnormW != null
-                && hasAttn && _attnNormW[_mtpLayerIdx] != null && _postAttnNormW[_mtpLayerIdx] != null;
+            // A draft block without its own head borrows the trunk LM head. Under
+            // GGML tensor parallelism that head is split across ranks, so the
+            // cached _lmHeadQW the draft path reads is no longer the head at all
+            // (it falls through to token_embd). Refuse the combination rather than
+            // draft from the wrong weight; the trunk itself is unaffected.
+            bool borrowsSplitHead = _tpLmHeadKey != null && _mtpHeadQW == null && _mtpHeadF32 == null;
 
-            if (_numNextnLayers > 0 && !HasMtp)
+            HasMtp = _numNextnLayers == 1 && hasProj && _mtpEnormW != null && _mtpHnormW != null
+                && hasAttn && _attnNormW[_mtpLayerIdx] != null && _postAttnNormW[_mtpLayerIdx] != null
+                && !borrowsSplitHead;
+
+            if (borrowsSplitHead)
+                Console.WriteLine("  NextN/MTP block has no own head and the LM head is column-parallel under TP; " +
+                    "MTP drafting disabled.");
+            else if (_numNextnLayers > 0 && !HasMtp)
                 Console.WriteLine("  NextN/MTP block present but incomplete; MTP drafting disabled.");
             else if (HasMtp)
                 Console.WriteLine($"  NextN/MTP draft head ready (layer {_mtpLayerIdx}, " +

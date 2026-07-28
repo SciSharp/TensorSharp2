@@ -152,7 +152,7 @@ column/row-parallel pattern:
 | Architecture | Strategy | Details |
 |-------------|----------|---------|
 | **MoE (Gemma4, Qwen3.5, GptOss, Nemotron)** | Expert slicing | Each GPU holds 1/tp slice of every expert's weights (column-parallel gate/up, row-parallel down). Router is replicated. AllReduce after weighted expert sum. |
-| **GatedDeltaNet SSM (Qwen3.5)** | Per-rank V-head ownership | Block-cyclic V-head assignment. Each rank runs its own GDN kernel on its V-head subset with independent delta/conv state — no cross-rank communication needed for the recurrent path. Requires CUDA-native GDN kernels (`ts_qwen35_gdn_*`). |
+| **GatedDeltaNet SSM (Qwen3.5)** | Per-rank V-head ownership | Block-cyclic V-head assignment. Each rank runs its own GDN kernel on its V-head subset with independent delta/conv state — no cross-rank communication needed for the recurrent path. Requires a device-resident packed-GDN kernel: `ts_qwen35_gdn_*` on direct CUDA, `TSGgml_Qwen35GdnLayerTP` on GGML. |
 | **Mamba2 SSM (Nemotron)** | Replicated on rank 0 | Mamba2 layers run on rank 0 only, result broadcast to all ranks. SSM state lives in host arrays with a managed per-token loop; sharding would require a device-resident per-rank kernel. Attention + FFN/MoE layers hold the bulk of weights, so TP still delivers most memory savings. |
 
 ### Known Limitations / Future Work (Stage 1)
@@ -210,6 +210,8 @@ Three things had to change:
 | `TensorSharp.GGML.Native/ggml_ops_internal.h` | `DeviceState` table, `TSG_MAX_DEVICES`, `thread_local g_active_rank`, `ScopedRank`, compatibility macros for the old globals |
 | `TensorSharp.GGML.Native/ggml_ops_core.cpp` | Per-rank backend creation (`create_backend_instance_on_device`, `gpu_device_count`), per-rank reuse buffers/gallocr, rank-wide teardown and budget config |
 | `TensorSharp.GGML.Native/ggml_ops_tensor_parallel.cpp` | **New.** TP init, collective resolution, device + host AllReduce, and the fused multi-rank matmul |
+| `TensorSharp.GGML.Native/ggml_ops_qwen35_gdn_tp.cpp` | **New.** Per-rank packed GatedDeltaNet block (norm + in-projection + ssm_conv + delta-rule scan + gated norm) as one cached graph, with device-resident recurrent state |
+| `TensorSharp.Models/Models/Qwen35/Qwen35Model.TensorParallelGgmlMoE.cs` | **New.** Expert-parallel MoE for Qwen 3.5/3.6 on GGML: whole-expert slices, per-rank route tables, Megatron-split shared expert |
 | `TensorSharp.GGML.Native/CMakeLists.txt` | Auto-detect NCCL instead of forcing `GGML_CUDA_NCCL=OFF` |
 | `TensorSharp.Backends.GGML/GgmlContext.cs` | Accepts N device ids; exposes `Degree`, `DeviceIds`, `HasDeviceAllReduce` |
 | `TensorSharp.Backends.GGML/GgmlTensorParallel.cs` | **New.** P/Invoke surface: device enumeration, rank selection, AllReduce, multi-rank matmul |
@@ -285,8 +287,10 @@ TensorSharp.Cli --model m.gguf --backend ggml_cuda --tp 2 \
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | Explicit GPU ordinals per rank (default `0..tp-1`) |
 | `TS_GGML_TP_PARALLEL=0` | Sequential rank dispatch (diagnostic) |
-| `TS_GGML_TP_FUSED_MATMUL=0` | Use the generic per-rank linear instead of the fused multi-rank one (diagnostic) |
+| `TS_GGML_TP_FUSED_MATMUL=1` | Use the fused multi-rank linear instead of the generic per-rank one (off by default, see below) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective |
+| `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of device-resident (diagnostic) |
+| `TS_QWEN35_LAYER_TRACE=1` | Per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none` — passed through to ggml |
 
 ### Measured results
@@ -328,22 +332,33 @@ grows (0.62× at 512 tokens, 0.80× at 2048) while decode does not.
       at the two AllReduce points per layer, submitted asynchronously — the
       structure ggml's own meta backend (`ggml-backend-meta.cpp`, already
       vendored) implements for llama.cpp's `--split-mode tensor`. Wiring
-      TensorSharp's fused decode onto the meta device would replace ~1000
-      dispatches per token with ~2·L graph launches.
-- [ ] **Qwen3.5 on GGML.** Its per-rank GatedDeltaNet is a single fused CUDA
-      kernel (`ts_qwen35_gdn_*`); the GGML bridge exposes only the unpacked
-      chunked and batched-step forms. Validation rejects the combination with an
-      explicit message. The attention and MoE halves are already backend-agnostic.
+      TensorSharp's fused decode onto the meta device would replace the remaining
+      per-layer dispatches with ~2·L graph launches.
+- [x] **Qwen3.5 on GGML.** Done — see "Qwen 3.5 / 3.6 on GGML" below.
 - [ ] **MoE TP throughput on other architectures.** GptOss/Nemotron still walk
-      experts per token per rank. Gemma 4 now uses expert parallelism (below);
-      the same treatment applies to them.
-- [ ] **Fused multi-rank linear at rank-count 1.** `TSGgml_TensorParallelMatmul`
-      is correct for a genuine multi-GPU group (single-node TP=2 output is
-      byte-identical to single-GPU) but produced wrong results in the multi-node
-      layout, where each node contributes one rank. It is now gated on
-      `TpDegree >= 2`, which costs nothing — with one local rank there is no
-      concurrency to gain — but the underlying discrepancy is unexplained and
-      worth root-causing before the gate is relaxed.
+      experts per token per rank. Gemma 4 and Qwen 3.5 now use expert
+      parallelism; the same treatment applies to them.
+- [ ] **Fused multi-rank linear.** `TSGgml_TensorParallelMatmul` is now OFF by
+      default (`TS_GGML_TP_FUSED_MATMUL=1` re-enables it). Submitting both ranks
+      from one thread avoids a worker hand-off, but its graphs run
+      asynchronously, so it cannot share the per-rank compute buffer and must
+      allocate a backend buffer per rank per call — a cudaMalloc/cudaFree pair
+      per linear. On a nearly-full card that dominates: Qwen3.5-35B decode
+      measured 8.7 tok/s with it on against 20.4 tok/s with it off, and the LM
+      head alone went from 44 ms/token to 1.6 ms/token. The generic path is not
+      serial either — `RunPerRank` fans the ranks across worker threads — so the
+      only thing given up is the in-call device AllReduce, which
+      `ITensorParallelGroup.AllReduce` performs anyway. Its separate multi-node
+      correctness discrepancy (wrong results when each node contributes one rank)
+      is still unexplained and still worth root-causing.
+- [ ] **Fused per-rank attention block.** The Qwen 3.5 TP attention layers still
+      run op-at-a-time (norm, QKV, host deinterleave, QK norm, RoPE, host SDPA,
+      gate, output projection). The single-GPU path has fused kernels for exactly
+      this block (`TSGgml_Qwen35AttentionLayer{Decode,Prefill}`), but they fold
+      the residual add in, which a row-parallel output projection cannot do
+      before the AllReduce; giving them a "write the block output" mode would
+      make them usable per rank. This is now the largest remaining item: 32% of
+      decode and ~75% of prefill time.
 - [ ] Qwen3's QKV fusion requires all three of Q/K/V to share a quant type, so
       mixed-quant GGUFs (`Q4_K_M`) fuse only some layers and then fault. Pre-existing,
       hit while sourcing a test model.
@@ -390,6 +405,87 @@ Measured, Gemma-4-26B-A4B IQ4_XS, `--tp 2` (per-expert loop → expert parallel)
 
 Output is **byte-identical to a single-GPU run** over a 60-token greedy
 generation.
+
+### Qwen 3.5 / 3.6 on GGML (SSM + MoE)
+
+Qwen 3.5 was the one architecture GGML TP rejected outright: its per-rank
+GatedDeltaNet ran as a single fused *CUDA* kernel and the GGML bridge exposed
+only the unpacked chunked and batched-step forms, both of which take Q/K/V/Z/
+beta/alpha already split apart with the conv1d and the gate arithmetic done on
+the host. Under TP that shape is unusable — each rank owns a block-cyclic slice
+of the V heads, so every one of those host steps would run per rank per layer
+with a device round-trip on either side.
+
+Four pieces made it work:
+
+* **A packed per-rank GDN kernel** (`TSGgml_Qwen35GdnLayerTP`,
+  `ggml_ops_qwen35_gdn_tp.cpp`). One ggml graph per rank covering input RMSNorm,
+  the packed column-parallel in-projection, `ggml_ssm_conv`, q/k L2-norm and head
+  tiling, `ggml_gated_delta_net`, the gated RMSNorm and the SiLU(z) gate. Folding
+  the projection in removes a separate multi-rank matmul dispatch and an
+  activation round-trip per recurrent layer, and there are 30 of them per token.
+* **Device-resident recurrent state.** The conv window and the delta state are
+  bound through the per-rank cacheable-buffer cache, keyed on the caller's host
+  pointer, so they upload once and are then updated in place. Downloading the
+  delta state would cost ~1 MB per layer per token per rank — ~60 MB of PCIe
+  traffic per token. `ResetKVCache` drops the device copies so the host reset is
+  picked up.
+* **Expert-parallel MoE.** Same treatment as Gemma 4: whole experts partition
+  cleanly (128 of 256 per rank), so each rank runs one batched
+  `ggml_mul_mat_id` dispatch per projection instead of a per-(token, expert)
+  loop. The shared expert stays Megatron-split, since every token uses it.
+* **Column-parallel LM head.** The head is the largest tensor left after the
+  layers are sharded (398 MB Q6_K here) and is read in full per token. The
+  vocabulary is the output dimension, so each rank owns a contiguous row range
+  and the "gather" is two copies into disjoint halves of the logits buffer — no
+  collective at all.
+
+**The graph-cache hazard that this design has to handle.** The per-rank GDN graph
+is cached per (rank, shape) and reused by all 30 recurrent layers, with the
+weights and state re-pointed per call. A ggml *view* resolves its data pointer
+once, when the graph is allocated — so re-pointing only the base state tensors
+left the 4D state view feeding `ggml_gated_delta_net` and both `ggml_cpy`
+destinations still addressing layer 0's buffers. Every layer then read and wrote
+layer 0's recurrent state. The symptom was subtle: layer 0 correct, layers 1+
+diverging, no NaNs, coherent-looking gibberish. `TS_QWEN35_LAYER_TRACE=1` prints
+a per-layer residual summary from both the single-GPU and TP loops, which is what
+localized it; the fix re-points the views alongside their bases each call.
+
+**Two general GGML fixes fell out of profiling this**, and they help every model
+on the backend, not just this one:
+
+* `LinearForward` bound F32 weights through the generic `Ops.Addmm` path, which
+  has no weight cache and re-uploaded the whole weight per call. For a matmul
+  that runs once per layer per token — an MoE router — that was the dominant
+  cost of the layer: 12.8 s of a 20.2 s decode, ~4 ms each to push 2 MB for a
+  [1,2048]×[2048,256] product. It now routes through the quantized entry point,
+  which is device-resident.
+* `GgmlBasicOps.AddmmQuant` is a direct native call, so it never passed through
+  `OpRegistry.PreInvokeHook` and inherited whatever rank the calling thread was
+  left on. Under TP that silently ran the LM head on the wrong GPU, missing its
+  preloaded weight. It now selects the rank from its result tensor.
+
+**Measured, Qwen3.5-35B-A3B-UD-IQ4_XS, 2× RTX 2000 Ada, `--backend ggml_cuda --tp 2`:**
+
+| | first working version | shipped |
+|---|---|---|
+| decode (short prompt) | 3.9 tok/s | **20.4 tok/s** |
+| prefill (23 tok) | 23.0 tok/s | **26.3 tok/s** |
+| prefill (512 tok) | — | **80.2 tok/s** |
+| prefill (2966 tok) | — | **75.7 tok/s** |
+| decode at 3 K context | — | **12.1 tok/s** |
+| VRAM | 9516 + 7833 MB | 9397 + 8032 MB |
+
+The model is 16.6 GB and does not fit a 16 GB card, so this is the capacity case
+TP exists for. Where decode time goes now (59 ms/token): attention block 32%,
+MoE experts 31%, GDN 15%, ssm_out+AllReduce 6%, router 6%, LM head 2.5%.
+
+**Correctness.** On Qwen3.5-9B Q8_0 (which fits on one card) `--tp 2` produced
+text byte-identical to the single-GPU run over 60 greedy tokens with the device
+AllReduce, and diverges only at a natural branch point (~18 tokens) once the
+partials are summed by the host reduction instead — the expected consequence of a
+different summation order. Per-layer residual traces match the single-GPU loop to
+floating-point noise from layer 0 onward.
 
 ### Multi-node
 
@@ -708,7 +804,7 @@ Stage 3 (RDMA)              ░░░░░░░░░░░░░░░░░�
 | Mistral3 | Dense transformer | ✅ Done | Fused/separate QKV, YaRN RoPE |
 | Gemma3 | Dense transformer | ✅ Done | Separate Q/K/V, GELU, sliding window, extra norms |
 | Gemma4 | Dense + MoE | ✅ Done | Expert slicing, dual dense+MoE FFN, per-layer head dims, shared KV layers |
-| Qwen3.5 | SSM + MoE | ✅ Done | GatedDeltaNet SSM with per-rank V-head ownership + CUDA kernels, MoE expert slicing, shared experts |
+| Qwen3.5 | SSM + MoE | ✅ Done | GatedDeltaNet SSM with per-rank V-head ownership, packed GDN kernels on direct CUDA and GGML; expert-parallel MoE + column-parallel LM head on GGML |
 | GptOss | MoE | ✅ Done | Expert slicing with biased projections, attention sinks, YaRN; expert down-bias skipped in TP |
 | Nemotron | SSM + MoE | ✅ Done | Mamba2 replicated on rank 0, attention (no RoPE), MoE expert slicing |
 | DiffusionGemma | Diffusion | ❌ N/A | Not autoregressive text generation |

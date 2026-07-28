@@ -2018,6 +2018,51 @@ internal enum GgmlIndexReductionOp
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35GdnLayerTP(
+            IntPtr hiddenData, int hiddenSize, int n,
+            IntPtr attnNormW,
+            IntPtr inprojW, int inprojType, long inprojNe0, long inprojNe1, long inprojBytes,
+            IntPtr conv1dW, IntPtr dtBias, IntPtr aLog, IntPtr ssmNormW,
+            IntPtr convState, IntPtr deltaState,
+            IntPtr gatedOut,
+            int packedDim, int qkvDim, int qkDim, int vDim,
+            int numKHeads, int numVHeads, int headKDim, int headVDim,
+            int convKernel, float eps);
+
+        /// <summary>
+        /// One rank's GatedDeltaNet block (norm + packed in-projection + conv +
+        /// delta-rule scan + gated norm) as a single ggml graph. The recurrent
+        /// state stays device-resident between calls, keyed on
+        /// <paramref name="convState"/> / <paramref name="deltaState"/>.
+        /// </summary>
+        public static void Qwen35GdnLayerTP(
+            IntPtr hiddenData, int hiddenSize, int n,
+            IntPtr attnNormW,
+            IntPtr inprojW, int inprojType, long inprojNe0, long inprojNe1, long inprojBytes,
+            IntPtr conv1dW, IntPtr dtBias, IntPtr aLog, IntPtr ssmNormW,
+            IntPtr convState, IntPtr deltaState,
+            IntPtr gatedOut,
+            int packedDim, int qkvDim, int qkDim, int vDim,
+            int numKHeads, int numVHeads, int headKDim, int headVDim,
+            int convKernel, float eps)
+        {
+            CheckResult(TSGgml_Qwen35GdnLayerTP(
+                hiddenData, hiddenSize, n, attnNormW,
+                inprojW, inprojType, inprojNe0, inprojNe1, inprojBytes,
+                conv1dW, dtBias, aLog, ssmNormW,
+                convState, deltaState, gatedOut,
+                packedDim, qkvDim, qkDim, vDim,
+                numKHeads, numVHeads, headKDim, headVDim,
+                convKernel, eps), "qwen35_gdn_layer_tp");
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Qwen35GdnDropTpGraphs();
+
+        /// <summary>Free every cached per-rank TP GatedDeltaNet graph.</summary>
+        public static void Qwen35GdnDropTpGraphs() => TSGgml_Qwen35GdnDropTpGraphs();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GatedDeltaNetChunkedF32(
             GgmlTensorView3D q,
             GgmlTensorView3D k,

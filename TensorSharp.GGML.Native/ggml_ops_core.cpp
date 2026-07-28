@@ -1053,6 +1053,16 @@ namespace tsg
                     out_addr = ggml_backend_buffer_get_base(out_buffer);
                     return true;
                 }
+                // A preloaded weight losing its device copy means every later use
+                // re-uploads it — a silent multi-hundred-MB per-call cost on a big
+                // LM head. Make it visible rather than merely slow.
+                if (vram_log_enabled())
+                {
+                    std::fprintf(stderr,
+                        "[TSVRAM] preloaded weight dropped: cached %zu B / buffer %zu B, requested %zu B, need %zu B\n",
+                        it->second.bytes, it->second.buffer_size, bytes, required_size);
+                    std::fflush(stderr);
+                }
                 ggml_backend_buffer_free(it->second.buffer);
                 g_preloaded_buffer_cache.erase(it);
             }

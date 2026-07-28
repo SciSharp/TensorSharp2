@@ -1515,7 +1515,9 @@ namespace TensorSharp.Models
                 else
                     hidden = AttentionBlock(hidden, layer, seqLen, startPos);
                 TryEvaluateMlxLayerBoundary(hidden, layer, seqLen);
+                TraceLayer(hidden, layer, "");
             }
+            _layerTraceForwards++;
             return hidden;
         }
 
@@ -5625,6 +5627,7 @@ namespace TensorSharp.Models
                 Console.WriteLine($"  (MLX cache eval: {ms:F0} ms, interval={MlxEvalEveryNLayers})");
             }
             PrintGdnTimingStats();
+            PrintTpTimingStats();
         }
 
         public override void Dispose()
