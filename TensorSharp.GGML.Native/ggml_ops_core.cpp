@@ -1530,8 +1530,76 @@ namespace tsg
         return { tensor, tensor, packed.size() * sizeof(float) };
     }
 
+    // --- Quantized-weight cache keys ---
+    //
+    // A preloaded quantized weight is identified to the bridge by its *cache
+    // key*, not by its host pointer: once C# has pinned the weight it hands us
+    // an opaque GCHandle so the device copy survives the host buffer being
+    // released. Every lookup path is keyed on it.
+    //
+    // The hazard is the miss path. If a lookup ever fails — the entry was
+    // evicted, or the buffer was rebuilt at a different size — the caller falls
+    // back to "upload the weight from `data`", and `data` is the GCHandle. That
+    // dereferences an address that is not weight memory and segfaults inside
+    // cudaMemcpyAsync.
+    //
+    // So record what each key actually stands for at preload time and resolve
+    // it back before any upload. Registration is the only thing that makes an
+    // upload from a key safe, and it makes the miss path merely slow (a
+    // re-upload) instead of fatal.
+    std::mutex g_cache_key_mutex;
+    std::unordered_map<const void*, const void*> g_cache_key_host_data;
+
+    void register_cache_key(const void* cache_key, const void* host_data)
+    {
+        if (cache_key == nullptr || host_data == nullptr || cache_key == host_data)
+            return;
+        std::lock_guard<std::mutex> lock(g_cache_key_mutex);
+        g_cache_key_host_data[cache_key] = host_data;
+    }
+
+    void forget_cache_keys()
+    {
+        std::lock_guard<std::mutex> lock(g_cache_key_mutex);
+        g_cache_key_host_data.clear();
+    }
+
+    // Number of uploads that had to be redirected — i.e. preloaded weights whose
+    // device copy was not found. Each one is a silent re-upload of a whole
+    // weight, so a non-zero count is a performance signal as well as the thing
+    // that used to be a crash. Reported under TS_GGML_LOG_VRAM=1.
+    std::atomic<std::int64_t> g_cache_key_redirects{0};
+
+    const void* resolve_upload_source(const void* data)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_cache_key_mutex);
+            // Fast path: nothing registered (no preloads yet, CPU backend, ...).
+            if (g_cache_key_host_data.empty())
+                return data;
+            auto it = g_cache_key_host_data.find(data);
+            if (it == g_cache_key_host_data.end())
+                return data;
+            data = it->second;
+        }
+
+        const std::int64_t n = g_cache_key_redirects.fetch_add(1) + 1;
+        if (vram_log_enabled() && (n == 1 || (n % 1000) == 0))
+        {
+            std::fprintf(stderr,
+                "[TSVRAM] quantized weight upload fell back to host bytes (%lld so far) — "
+                "its preloaded device copy was not found\n", static_cast<long long>(n));
+            std::fflush(stderr);
+        }
+        return data;
+    }
+
     void upload_binding(const TensorBinding& binding, const void* data, std::size_t size)
     {
+        // A quantized weight arrives here as its cache key when its device copy
+        // was expected to be resident; map it back to the real bytes.
+        data = resolve_upload_source(data);
+
         // Async mode safety: ggml_backend_tensor_set on a shared (host-mapped)
         // backend buffer is a CPU memcpy. If the source `data` is host memory that
         // a previously-committed-but-not-yet-completed Metal command buffer is
@@ -1944,6 +2012,7 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // GGUF pointer (shared via these caches), so freeing the caches below would leave
     // their captured graphs pointing at freed device memory.
     TSGgml_QwenImageResetForwardCache();
+    forget_cache_keys();
 
     // Every rank owns its own device copies; clear all of them.
     for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
@@ -1991,6 +2060,7 @@ TSG_EXPORT void TSGgml_Shutdown()
     // Tear the TP communicator down first: it holds NCCL communicators and
     // pinned staging buffers that reference every rank's backend.
     tp_comm_free();
+    forget_cache_keys();
 
     const int ranks = tsg::g_device_count.load(std::memory_order_acquire);
     for (int r = 0; r < ranks; ++r)
@@ -2314,6 +2384,11 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
             return 0;
         }
 
+        // Register before any early return: from here on the managed side may
+        // hand this key to an op, and every path that could upload from it must
+        // be able to resolve it back to the real weight bytes.
+        register_cache_key(cache_key, host_data);
+
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         if (dev == nullptr)
         {
@@ -2418,6 +2493,7 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
                 CachedBufferMode::DeviceCopy
             };
         }
+
 
         if (vram_log_enabled())
         {

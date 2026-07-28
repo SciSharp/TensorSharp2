@@ -234,6 +234,29 @@ single op:
   the rank. This catches ops issued outside a `RunPerRank` scope without every
   model file having to say which GPU it means.
 
+### Two hazards the concurrent-rank design had to solve
+
+**ggml-cuda's memory pool is not shareable between threads.**
+`ggml_cuda_pool_vmm` is a lock-free bump allocator on the backend context that
+asserts every free is the exact reverse of its alloc
+(`GGML_ASSERT(ptr == pool_addr + pool_used)`). Rank fan-out is safe only because
+each thread owns a *different* backend — so the per-op dispatch hook must never
+move a worker onto another rank's backend. `RunPerRank` therefore **pins** the
+thread's rank for the duration of the body, and the hook yields to an active pin
+(`SetActiveRankIfUnpinned`). Without the pin, an op whose result happened to live
+on another rank dragged the worker onto a backend its owner was still using and
+tripped the assert mid-prefill.
+
+**Preloaded weights are addressed by an opaque cache key.** Once C# pins a
+quantized weight it hands the bridge a GCHandle, not a host pointer, so the
+device copy survives the host buffer being released. Every lookup is keyed on it
+— but the *miss* path uploaded from that same pointer, dereferencing a GCHandle
+as if it were weight bytes and segfaulting inside `cudaMemcpyAsync`. The bridge
+now records `cache key -> host data` at preload (`register_cache_key`) and
+resolves it in `upload_binding`, so a miss is merely a re-upload. Set
+`TS_GGML_LOG_VRAM=1` to see when that fires — each occurrence is a whole weight
+re-uploaded, so a steady stream of them is a performance signal.
+
 ### CUDA graph capture
 
 ggml-cuda records graphs with `cudaStreamBeginCapture`. Capture is process-wide:
@@ -313,7 +336,13 @@ grows (0.62× at 512 tokens, 0.80× at 2048) while decode does not.
       explicit message. The attention and MoE halves are already backend-agnostic.
 - [ ] **MoE TP throughput.** Gemma4/GptOss walk experts per token per rank, so a
       512-token prefill issues hundreds of thousands of tiny matmuls. Pre-existing
-      (it affects direct CUDA too); the ranks now at least run concurrently.
+      (it affects direct CUDA too); the ranks now at least run concurrently, and
+      `WarmUpKernels` uses the short warmup for MoE-under-TP so startup no longer
+      looks hung. Measured on Gemma-4-26B-A4B with `--tp 2`: ~2.2 tok/s decode.
+      The fix is to give each rank a *stacked* shard of the expert weights so the
+      existing `ggml_mul_mat_id` batched kernel (`MoEFFNPrefillSwiGLU`, already
+      used on the single-GPU path) can run per rank — one call per layer instead
+      of `tokens x experts_used x 3`.
 - [ ] **Fused multi-rank linear at rank-count 1.** `TSGgml_TensorParallelMatmul`
       is correct for a genuine multi-GPU group (single-node TP=2 output is
       byte-identical to single-GPU) but produced wrong results in the multi-node

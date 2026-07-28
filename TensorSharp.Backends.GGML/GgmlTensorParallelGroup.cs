@@ -116,14 +116,30 @@ namespace TensorSharp.GGML
             if (_workers == null)
             {
                 for (int r = 0; r < Degree; r++)
-                {
-                    using (new RankScope(r))
-                        body(r);
-                }
+                    RunPinned(r, body);
                 return;
             }
 
             _workers.Run(body);
+        }
+
+        /// <summary>
+        /// Run one rank's share of a fan-out with this thread pinned to that
+        /// rank's GPU, so the per-op dispatch hook cannot move it onto a backend
+        /// another rank is concurrently using.
+        /// </summary>
+        private static void RunPinned(int rank, Action<int> body)
+        {
+            int previousRank = GgmlNative.GetActiveRank();
+            bool previousPin = GgmlNative.PinRank(rank);
+            try
+            {
+                body(rank);
+            }
+            finally
+            {
+                GgmlNative.RestorePin(previousPin, previousRank);
+            }
         }
 
         /// <summary>
@@ -218,7 +234,7 @@ namespace TensorSharp.GGML
             OpRegistry.PreInvokeHook = args =>
             {
                 if (args.Length > 0 && args[0] is Tensor t && t.Storage is GgmlStorage s)
-                    GgmlNative.SetActiveRank(s.DeviceId);
+                    GgmlNative.SetActiveRankIfUnpinned(s.DeviceId);
             };
         }
 
@@ -292,8 +308,7 @@ namespace TensorSharp.GGML
                     if (_shutdown) return;
                     try
                     {
-                        GgmlNative.SetActiveRank(rank);
-                        _body(rank);
+                        RunPinned(rank, _body);
                     }
                     catch (Exception ex)
                     {
@@ -317,8 +332,7 @@ namespace TensorSharp.GGML
                 // Rank 0 on the calling thread, overlapping the workers.
                 try
                 {
-                    GgmlNative.SetActiveRank(0);
-                    body(0);
+                    RunPinned(0, body);
                 }
                 catch (Exception ex)
                 {

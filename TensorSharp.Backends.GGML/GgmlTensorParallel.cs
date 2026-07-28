@@ -63,6 +63,24 @@ namespace TensorSharp.GGML
         [ThreadStatic] private static int s_cachedRank;
         [ThreadStatic] private static bool s_cachedRankValid;
 
+        // Set while a thread is executing one rank's share of a RunPerRank body.
+        //
+        // ggml-cuda's VMM pool (ggml_cuda_pool_vmm) is a bump allocator with no
+        // lock that asserts every free is the exact reverse of the matching
+        // alloc. It lives on the backend context, so two threads inside
+        // graph_compute on the SAME backend corrupt it —
+        // "GGML_ASSERT(ptr == pool_addr + pool_used) failed".
+        //
+        // Rank fan-out is the only place this bridge runs concurrently, and it
+        // is safe precisely because each thread owns a different backend. The
+        // per-op dispatch hook would break that: an op whose result happens to
+        // live on another rank would drag the worker onto that rank's backend
+        // while its owner is still using it. So while a rank is pinned the hook
+        // leaves the thread alone — the op then runs on the pinned rank's GPU,
+        // which is correct (GGML tensors are host memory, any GPU computes the
+        // same values) and is the placement the fan-out intended anyway.
+        [ThreadStatic] private static bool s_rankPinned;
+
         /// <summary>Number of GPUs the given GGML backend can address.</summary>
         public static int GetGpuDeviceCount(GgmlBackendType backendType)
         {
@@ -139,6 +157,39 @@ namespace TensorSharp.GGML
             s_cachedRank = TSGgml_GetActiveDevice();
             s_cachedRankValid = true;
             return s_cachedRank;
+        }
+
+        /// <summary>
+        /// Rank selection that yields to an active pin. Used by the per-op
+        /// dispatch hook so it can place ops by result tensor in single-threaded
+        /// code without ever moving a rank worker off its own backend.
+        /// </summary>
+        public static void SetActiveRankIfUnpinned(int rank)
+        {
+            if (s_rankPinned) return;
+            SetActiveRank(rank);
+        }
+
+        /// <summary>
+        /// Pin this thread to <paramref name="rank"/> for the duration of a
+        /// rank fan-out. Returns the previous pin state so the caller can restore
+        /// it (fan-outs can nest — a TP linear inside a TP block).
+        /// </summary>
+        public static bool PinRank(int rank)
+        {
+            bool previous = s_rankPinned;
+            s_rankPinned = false;
+            SetActiveRank(rank);
+            s_rankPinned = true;
+            return previous;
+        }
+
+        /// <summary>Restore the pin state returned by <see cref="PinRank"/>.</summary>
+        public static void RestorePin(bool previous, int previousRank)
+        {
+            s_rankPinned = false;
+            SetActiveRank(previousRank);
+            s_rankPinned = previous;
         }
 
         /// <summary>In-place host AllReduce (sum) over one buffer per rank.</summary>

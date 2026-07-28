@@ -608,6 +608,35 @@ namespace TensorSharp.Models
             return new GgmlTensorParallelGroup(CreateGgmlContext(ggmlType, Math.Max(1, localDegree)));
         }
 
+        /// <summary>
+        /// True when the model carries per-expert MoE weights. Detected from the
+        /// loaded weight names so it works before any model-specific expert
+        /// bookkeeping is built.
+        /// </summary>
+        protected bool HasMoEExpertWeights
+        {
+            get
+            {
+                if (_hasMoEExpertWeights.HasValue)
+                    return _hasMoEExpertWeights.Value;
+                bool found = false;
+                foreach (var name in _quantWeights.Keys)
+                {
+                    if (name.Contains("_exps", StringComparison.Ordinal)) { found = true; break; }
+                }
+                if (!found)
+                {
+                    foreach (var name in _tpQuantWeights.Keys)
+                    {
+                        if (name.Contains("_exps", StringComparison.Ordinal)) { found = true; break; }
+                    }
+                }
+                _hasMoEExpertWeights = found;
+                return found;
+            }
+        }
+        private bool? _hasMoEExpertWeights;
+
         protected bool IsGgmlBackend => ExecutionPlan.UsesGgmlBackend;
 
         protected void EnsureQuantBackendAvailable()
@@ -5018,8 +5047,23 @@ namespace TensorSharp.Models
                 // activation/QMM scratch that is expensive to grow during the first
                 // real request. Hybrid GatedDeltaNet models intentionally retain the
                 // lightweight base default because a 2K warmup can take minutes.
+                // MoE under tensor parallelism walks experts per token per rank
+                // (see the per-model *TensorParallel.cs MoE blocks), so a
+                // 2048-token warmup issues millions of tiny matmuls and takes many
+                // minutes — during which startup looks hung, which is exactly what
+                // it did on Gemma 4 26B A4B with --tp 2. Same treatment as the
+                // other known-slow prefill configurations: warm the path cheaply
+                // and say why.
+                bool moeUnderTp = IsTensorParallel && HasMoEExpertWeights;
+                if (moeUnderTp)
+                {
+                    Console.WriteLine(
+                        "  MoE experts under tensor parallelism are dispatched per token per rank; using a lightweight startup warmup. " +
+                        "Long-prompt prefill will be slow — for a model that fits one GPU, a single-GPU run is faster.");
+                }
+
                 bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu
-                    || integratedGpu || mostlyHostBacked;
+                    || integratedGpu || mostlyHostBacked || moeUnderTp;
                 // 2048 matches ComputePrefillChunkSize, so the warmup runs ONE
                 // fused verify chunk at the largest legacy-chunk shape: the shared
                 // reuse-gallocr is pre-grown (and its device memory first-touched)
