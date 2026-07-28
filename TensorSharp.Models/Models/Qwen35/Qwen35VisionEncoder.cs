@@ -482,6 +482,14 @@ namespace TensorSharp.Models
         private static readonly bool s_wholeEncoderFusedEnabled =
             Environment.GetEnvironmentVariable("TS_QWEN35_VENC_FUSED") != "0";
 
+        // TS_QWEN35_VENC_FUSED_ATTN=0 bypasses the fused native attention
+        // subgraph in the per-block path (keeping the fused MLP), forcing the
+        // managed split + RoPE + Ops.ScaledDotProductAttention chain. A/B
+        // switch for isolating native attention-kernel issues; this is how
+        // the head_dim-72 CUDA flash-attn precision bug was pinned down.
+        private static readonly bool s_fusedAttnEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_VENC_FUSED_ATTN") != "0";
+
         // TS_QWEN35_VENC_TRACE=1 prints a checksum of the residual stream at every
         // encoder stage. Used to localize a numeric divergence between backends
         // (run the same image through two allocators and diff the first stage whose
@@ -585,7 +593,7 @@ namespace TensorSharp.Models
 
             // Fully fused attention path: LN + QKV + RoPE + SDPA + out + residual in one dispatch.
             bool fusedAttn = false;
-            if (_useNativeAttention
+            if (_useNativeAttention && s_fusedAttnEnabled
                 && _weights.TryGetValue($"{prefix}.ln1.weight", out var ln1W)
                 && _weights.TryGetValue($"{prefix}.ln1.bias", out var ln1B)
                 && _weights.TryGetValue($"{prefix}.attn_qkv.weight", out var qkvW)

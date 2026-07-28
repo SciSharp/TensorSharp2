@@ -1189,6 +1189,16 @@ TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCou
                     tsg::set_last_error("Failed to allocate the tensor-parallel AllReduce scratch buffer.");
                     return 0;
                 }
+                // Every rank's scratch holds a real partial that must contribute
+                // to the sum. The backend collective reads
+                // GGML_TENSOR_FLAG_COMPUTE to tell contributing shards from
+                // inactive ones (a meta-backend concept) and ZEROES the data of
+                // any shard without it on the BF16 wire path - without this
+                // flag a large per-op AllReduce (>= the device threshold, i.e.
+                // any prefill longer than ~128 tokens at hidden 2048) silently
+                // returned all-zero sums and the per-op TP forward produced
+                // garbage while every partial was correct.
+                t->flags |= GGML_TENSOR_FLAG_COMPUTE;
                 ggml_backend_tensor_set(t, buffers[r], 0, static_cast<std::size_t>(count) * sizeof(float));
                 tensors[static_cast<std::size_t>(r)] = t;
             }

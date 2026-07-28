@@ -3872,6 +3872,12 @@ namespace TensorSharp.Models
             _mropeInterleavedIds = ids;
         }
 
+        // TS_QWEN35_MROPE_NATIVE=0 forces the managed MRoPE rotation loop on the
+        // GGML backends instead of the native ggml_rope_multi kernel. A/B switch
+        // for isolating rope-kernel issues from the rest of the multimodal path.
+        private static readonly bool _mropeNativeEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_MROPE_NATIVE") != "0";
+
         /// <summary>Per-axis (interleaved MRoPE) variant of ApplyRoPEPrefill.
         /// Q/K go in, get rotated in place by NeoX-style pair rotation where
         /// pair i uses _pendingMRoPEPositions[3*token + _mropeInterleavedIds[i]]
@@ -3899,7 +3905,8 @@ namespace TensorSharp.Models
             // as [T0..T_n, H0..H_n, W0..W_n, 0..0] of length 4*seqLen.
             // Mode 40 = GGML_ROPE_TYPE_IMROPE; sections come straight from the
             // GGUF (Qwen3.5 ships [11,11,10,0]).
-            if (data.Storage is TensorSharp.GGML.GgmlStorage && _mropeSections != null && _mropeSections.Length >= 4)
+            if (data.Storage is TensorSharp.GGML.GgmlStorage && _mropeSections != null && _mropeSections.Length >= 4
+                && _mropeNativeEnabled)
             {
                 int[] flatThw = new int[4 * seqLen];
                 for (int t = 0; t < seqLen; t++)
