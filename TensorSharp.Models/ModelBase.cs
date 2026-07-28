@@ -3407,6 +3407,10 @@ namespace TensorSharp.Models
                 countPerRank[0]++;
             }
 
+            // Architecture-specific per-rank weights that are not plain
+            // QuantizedWeight shards (Gemma 4's stacked expert slices).
+            PreloadGgmlTpAuxiliaryWeights(bytesPerRank, countPerRank);
+
             for (int r = 0; r < tp; r++)
             {
                 Console.WriteLine($"  TP rank {r}: {countPerRank[r]} weight(s), {bytesPerRank[r] / 1024 / 1024} MB resident on GPU {_ggmlContext.DeviceIds[r]}");
@@ -3417,6 +3421,23 @@ namespace TensorSharp.Models
             GgmlBasicOps.SetActiveRank(0);
             _cudaQuantWeightsPrepared = true;
         }
+
+        /// <summary>
+        /// Hook for per-rank weights that do not live in
+        /// <see cref="_tpQuantWeights"/> — Gemma 4's stacked expert slices, for
+        /// instance. Implementations must select the rank with
+        /// <c>GgmlBasicOps.SetActiveRank</c> before each preload, and add what
+        /// they uploaded to the running totals so the load report stays accurate.
+        /// </summary>
+        protected virtual void PreloadGgmlTpAuxiliaryWeights(long[] bytesPerRank, int[] countPerRank) { }
+
+        /// <summary>
+        /// True when the MoE layers under TP fall back to the per-token,
+        /// per-expert dispatch loop, which is slow enough that startup needs the
+        /// lightweight warmup. Architectures with a batched per-rank MoE path
+        /// override this to false.
+        /// </summary>
+        protected virtual bool MoEUnderTpIsSlow => IsTensorParallel && HasMoEExpertWeights;
 
         /// <summary>
         /// Preload TP-sharded quantized weights onto their respective GPUs.
@@ -5047,19 +5068,17 @@ namespace TensorSharp.Models
                 // activation/QMM scratch that is expensive to grow during the first
                 // real request. Hybrid GatedDeltaNet models intentionally retain the
                 // lightweight base default because a 2K warmup can take minutes.
-                // MoE under tensor parallelism walks experts per token per rank
-                // (see the per-model *TensorParallel.cs MoE blocks), so a
-                // 2048-token warmup issues millions of tiny matmuls and takes many
-                // minutes — during which startup looks hung, which is exactly what
-                // it did on Gemma 4 26B A4B with --tp 2. Same treatment as the
-                // other known-slow prefill configurations: warm the path cheaply
-                // and say why.
-                bool moeUnderTp = IsTensorParallel && HasMoEExpertWeights;
+                // Multi-token prefill of an MoE model under tensor parallelism is
+                // slow enough that the full 2048-token warmup dominates startup —
+                // measured at ~61 s on Gemma 4 26B A4B with --tp 2, during which
+                // the process looks hung. Same treatment as the other known-slow
+                // prefill configurations: warm the path cheaply and say why.
+                bool moeUnderTp = MoEUnderTpIsSlow;
                 if (moeUnderTp)
                 {
                     Console.WriteLine(
-                        "  MoE experts under tensor parallelism are dispatched per token per rank; using a lightweight startup warmup. " +
-                        "Long-prompt prefill will be slow — for a model that fits one GPU, a single-GPU run is faster.");
+                        "  MoE under tensor parallelism: using a lightweight startup warmup (the full one costs ~a minute here). " +
+                        "Long-prompt prefill stays slower than a single GPU; TP is for models that do not fit on one.");
                 }
 
                 bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu

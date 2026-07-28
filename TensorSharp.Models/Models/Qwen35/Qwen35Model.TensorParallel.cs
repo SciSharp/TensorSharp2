@@ -140,8 +140,10 @@ namespace TensorSharp.Models
             // attention and MoE halves of the TP forward are backend-agnostic, so
             // this lifts once a packed GDN lands in ggml_ops_gated_delta_net.cpp.
             if (_backend != BackendType.Cuda)
-                errors.Add($"Qwen3.5 TP requires the direct CUDA backend (its per-rank GatedDeltaNet " +
-                           $"kernel has no GGML equivalent), got {_backend}");
+                errors.Add($"Qwen3.5/3.6 tensor parallelism requires the direct CUDA backend, got {_backend}. " +
+                           "Its per-rank GatedDeltaNet runs as one fused CUDA kernel and the GGML bridge has no " +
+                           "packed-GDN equivalent yet. Either run multi-GPU on direct CUDA (--backend cuda --tp N), " +
+                           "or run single-GPU on GGML (--backend ggml_cuda, no --tp).");
 
             if (errors.Count > 0)
                 throw new InvalidOperationException(

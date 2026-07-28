@@ -566,8 +566,8 @@ must be reachable between all nodes.
 | Qwen 3 | ✅ | Reference implementation |
 | Mistral 3 | ✅ | Fused/separate QKV, YaRN RoPE |
 | Gemma 3 | ✅ | Separate Q/K/V, GELU, sliding window |
-| Gemma 4 | ✅ | Dense + MoE expert slicing, per-layer head dims |
-| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership, MoE expert slicing. Direct CUDA only — its fused GDN kernel has no GGML equivalent |
+| Gemma 4 | ✅ | Dense TP + **expert-parallel MoE** on GGML (whole experts per GPU, one batched dispatch per layer); per-expert slicing on direct CUDA |
+| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership, MoE expert slicing. **Direct CUDA only** (`--backend cuda`): its fused per-rank GDN kernel has no GGML equivalent, so `ggml_cuda --tp N` is rejected with an explicit message |
 | GPT OSS | ✅ | MoE expert slicing, attention sinks, YaRN |
 | Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing |
 | DiffusionGemma | — | Not applicable (diffusion model) |

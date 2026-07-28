@@ -334,15 +334,9 @@ grows (0.62× at 512 tokens, 0.80× at 2048) while decode does not.
       kernel (`ts_qwen35_gdn_*`); the GGML bridge exposes only the unpacked
       chunked and batched-step forms. Validation rejects the combination with an
       explicit message. The attention and MoE halves are already backend-agnostic.
-- [ ] **MoE TP throughput.** Gemma4/GptOss walk experts per token per rank, so a
-      512-token prefill issues hundreds of thousands of tiny matmuls. Pre-existing
-      (it affects direct CUDA too); the ranks now at least run concurrently, and
-      `WarmUpKernels` uses the short warmup for MoE-under-TP so startup no longer
-      looks hung. Measured on Gemma-4-26B-A4B with `--tp 2`: ~2.2 tok/s decode.
-      The fix is to give each rank a *stacked* shard of the expert weights so the
-      existing `ggml_mul_mat_id` batched kernel (`MoEFFNPrefillSwiGLU`, already
-      used on the single-GPU path) can run per rank — one call per layer instead
-      of `tokens x experts_used x 3`.
+- [ ] **MoE TP throughput on other architectures.** GptOss/Nemotron still walk
+      experts per token per rank. Gemma 4 now uses expert parallelism (below);
+      the same treatment applies to them.
 - [ ] **Fused multi-rank linear at rank-count 1.** `TSGgml_TensorParallelMatmul`
       is correct for a genuine multi-GPU group (single-node TP=2 output is
       byte-identical to single-GPU) but produced wrong results in the multi-node
@@ -353,6 +347,49 @@ grows (0.62× at 512 tokens, 0.80× at 2048) while decode does not.
 - [ ] Qwen3's QKV fusion requires all three of Q/K/V to share a quant type, so
       mixed-quant GGUFs (`Q4_K_M`) fuse only some layers and then fault. Pre-existing,
       hit while sourcing a test model.
+
+### Expert parallelism for MoE (Gemma 4, GGML)
+
+Slicing *inside* each expert (column-parallel gate/up, row-parallel down) leaves
+every rank holding a piece of every expert, so the layer cannot be expressed as
+one `ggml_mul_mat_id` dispatch and degenerates into a per-token, per-expert loop
+— hundreds of thousands of tiny matmuls per prefill.
+
+Whole experts partition cleanly instead. The stacked expert tensor has the
+expert index as its outer dimension, so rank r's share is a contiguous byte
+range (a zero-copy `StackedExpertWeights` view), and each rank runs the same
+batched kernel the single-GPU path uses. Each rank sums only the experts it
+owns, so the existing AllReduce over the layer output is exactly the right
+recombination.
+
+Two things this needed:
+
+* **Distinct filler expert ids.** The kernel takes a dense `[seqLen][nUsed]`
+  route table, so routes belonging to another rank are neutralised rather than
+  removed. Pointing them all at expert 0 (or at `e % perRank`) produces
+  *duplicate* ids within a token — which real top-k routing never does, and
+  which the batched gather/scatter relies on: two destination slots end up
+  claiming one source row, and the layer faults with
+  `an illegal memory access was encountered` inside `launch_mul_mat_q`. Each
+  filler now takes a distinct unused local id (`perRank >= nUsed` guarantees
+  one exists).
+* **Preloading the per-rank slices.** They are not `QuantizedWeight` shards, so
+  `PrepareGgmlQuantizedWeightsForInferenceTP` gained a
+  `PreloadGgmlTpAuxiliaryWeights` hook. Without it the first forward paid the
+  whole upload — 51 s on Gemma-4-26B.
+
+Measured, Gemma-4-26B-A4B IQ4_XS, `--tp 2` (per-expert loop → expert parallel):
+
+| | before | after |
+|---|---|---|
+| model load | 149 s (cold) / 18.6 s (warm) | 8.3 s |
+| decode warmup | 2.1 s | 0.34 s |
+| time to first interactive turn | ~200 s | ~11 s |
+| interactive decode | 2.2 tok/s | 4.2–5.3 tok/s |
+| prefill 512 | (did not finish in 25 min) | 42.7 tok/s |
+
+Output is **byte-identical to a single-GPU run** over a 60-token greedy
+generation.
 
 ### Multi-node
 
