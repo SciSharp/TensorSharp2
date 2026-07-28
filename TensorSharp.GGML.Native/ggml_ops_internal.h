@@ -194,7 +194,6 @@ namespace tsg
 
     extern thread_local std::string g_last_error;
     extern std::once_flag g_backend_init_once;
-    extern ggml_backend_t g_backend;
     extern int g_backend_type;
 
     enum class CachedBufferMode
@@ -210,10 +209,65 @@ namespace tsg
         CachedBufferMode mode = CachedBufferMode::HostPtr;
     };
 
-    extern std::mutex g_host_buffer_cache_mutex;
-    extern std::unordered_map<void*, CachedHostBuffer> g_host_buffer_cache;
-    extern std::mutex g_preloaded_buffer_cache_mutex;
-    extern std::unordered_map<void*, CachedHostBuffer> g_preloaded_buffer_cache;
+    // --- Multi-device (tensor-parallel) state -------------------------------
+    //
+    // The bridge historically owned a single ggml backend (`g_backend`). Tensor
+    // parallelism needs one backend per GPU, each with its own buffer caches:
+    // a *replicated* weight (an RMSNorm alpha, say) has one host pointer but
+    // must have a distinct device-resident copy per rank, so a single
+    // pointer-keyed cache would hand rank 1 a buffer that lives on rank 0's GPU.
+    //
+    // Every rank's state therefore lives in its own DeviceState slot, and the
+    // active slot is selected per *thread* (`g_active_rank`). Single-device runs
+    // never leave rank 0, so the layout is identical to the old singleton.
+    //
+    // `g_backend` is kept as a macro that resolves to the active slot's backend
+    // (see below) so the ~500 existing use sites keep working unchanged.
+    constexpr int TSG_MAX_DEVICES = 16;
+
+    struct DeviceState
+    {
+        ggml_backend_t backend = nullptr;
+        // Index into the ggml device list this slot was initialized from
+        // (== the CUDA/Vulkan ordinal). -1 until initialized.
+        int device_index = -1;
+
+        std::mutex host_buffer_cache_mutex;
+        std::unordered_map<void*, CachedHostBuffer> host_buffer_cache;
+        std::mutex preloaded_buffer_cache_mutex;
+        std::unordered_map<void*, CachedHostBuffer> preloaded_buffer_cache;
+
+        std::unordered_set<void*> offloadable_keys;
+        std::list<void*> offloadable_lru;
+        std::unordered_map<void*, std::list<void*>::iterator> offloadable_lru_map;
+        std::int64_t offloadable_resident_bytes = 0;
+        std::int64_t offloadable_budget = 0;
+
+        std::int64_t device_copy_resident_bytes = 0;
+        std::int64_t device_copy_budget_bytes = 0;
+    };
+
+    extern DeviceState g_device_states[TSG_MAX_DEVICES];
+    // Number of initialized device slots. 1 for the classic single-device path.
+    extern std::atomic<int> g_device_count;
+    // Active rank for the calling thread. Per-thread so a rank worker pool can
+    // drive several GPUs concurrently without stepping on each other.
+    extern thread_local int g_active_rank;
+
+    inline DeviceState& dev() { return g_device_states[g_active_rank]; }
+    inline DeviceState& dev(int rank) { return g_device_states[rank]; }
+    inline ggml_backend_t& active_backend() { return g_device_states[g_active_rank].backend; }
+
+    // Scoped rank switch — restores the previous rank on destruction so an early
+    // return or a thrown exception cannot leave the thread pointed at the wrong GPU.
+    struct ScopedRank
+    {
+        int previous;
+        explicit ScopedRank(int rank) : previous(g_active_rank) { g_active_rank = rank; }
+        ~ScopedRank() { g_active_rank = previous; }
+        ScopedRank(const ScopedRank&) = delete;
+        ScopedRank& operator=(const ScopedRank&) = delete;
+    };
 
     // --- MoE expert weight offload state ---
     //
@@ -225,11 +279,7 @@ namespace tsg
     // next cache-miss insert, which frees the MTLBuffer wrapper and releases
     // Metal's claim on the underlying mmap pages so the OS may reclaim them.
     // All of these are guarded by g_host_buffer_cache_mutex.
-    extern std::unordered_set<void*> g_offloadable_keys;
-    extern std::list<void*> g_offloadable_lru;
-    extern std::unordered_map<void*, std::list<void*>::iterator> g_offloadable_lru_map;
-    extern std::int64_t g_offloadable_resident_bytes;
-    extern std::int64_t g_offloadable_budget;
+    // (per-rank; see DeviceState)
 
     // --- Device-copy VRAM budget (discrete-GPU backends, e.g. CUDA) ---
     //
@@ -243,10 +293,26 @@ namespace tsg
     // far slower than explicit per-step streaming for diffusion decode.
     // 0 = unlimited (legacy behaviour, correct when everything fits).
     // Both guarded by g_host_buffer_cache_mutex.
-    extern std::int64_t g_device_copy_resident_bytes;
-    extern std::int64_t g_device_copy_budget_bytes;
+    // (per-rank; see DeviceState)
 
     // --- Backend constants ---
+
+    // Compatibility shims: the pre-TP bridge referenced these as plain globals.
+    // Routing them through the active DeviceState keeps every existing use site
+    // (~500 across the op files) correct on both the single-device and the
+    // tensor-parallel paths without touching them.
+#define g_backend                       (::tsg::active_backend())
+#define g_host_buffer_cache_mutex       (::tsg::dev().host_buffer_cache_mutex)
+#define g_host_buffer_cache             (::tsg::dev().host_buffer_cache)
+#define g_preloaded_buffer_cache_mutex  (::tsg::dev().preloaded_buffer_cache_mutex)
+#define g_preloaded_buffer_cache        (::tsg::dev().preloaded_buffer_cache)
+#define g_offloadable_keys              (::tsg::dev().offloadable_keys)
+#define g_offloadable_lru               (::tsg::dev().offloadable_lru)
+#define g_offloadable_lru_map           (::tsg::dev().offloadable_lru_map)
+#define g_offloadable_resident_bytes    (::tsg::dev().offloadable_resident_bytes)
+#define g_offloadable_budget            (::tsg::dev().offloadable_budget)
+#define g_device_copy_resident_bytes    (::tsg::dev().device_copy_resident_bytes)
+#define g_device_copy_budget_bytes      (::tsg::dev().device_copy_budget_bytes)
 
     constexpr int BACKEND_TYPE_METAL = 1;
     constexpr int BACKEND_TYPE_CPU = 2;
@@ -499,11 +565,29 @@ namespace tsg
     // --- Backend management ---
 
     ggml_backend_t create_backend_instance(int backend_type);
+    // Create a backend bound to a specific GPU ordinal (tensor parallelism).
+    // device_index < 0 keeps the legacy "first available device" behaviour.
+    ggml_backend_t create_backend_instance_on_device(int backend_type, int device_index);
+    // Number of GPUs the backend type can address (1 for CPU/Metal).
+    int gpu_device_count(int backend_type);
     void initialize_backend();
     bool ensure_backend(int backend_type);
     bool ensure_backend();
     bool can_initialize_backend(int backend_type);
     bool backend_supports_op(ggml_tensor* op);
+
+    // --- Tensor parallelism (ggml_ops_tensor_parallel.cpp) ---
+
+    // Resolve the backend's collective-communication entry points for the
+    // initialized rank set. False when the backend provides none.
+    bool tp_comm_ensure();
+    // Release the collective context and every rank's AllReduce scratch buffer.
+    void tp_comm_free();
+    // In-place device AllReduce (sum) over one contiguous F32 tensor per rank.
+    bool tp_device_allreduce(ggml_tensor** tensors);
+    // In-place host AllReduce (sum) over one contiguous F32 buffer per rank.
+    void tp_host_allreduce(float** buffers, int n, std::int64_t count);
+    void tp_host_allreduce_mt(float** buffers, int n, std::int64_t count);
 
     // Memoized static device properties. ggml_backend_dev_get_props also
     // refreshes free/total device memory, which some backends answer with an

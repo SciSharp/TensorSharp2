@@ -110,8 +110,11 @@ namespace tsg
 
     thread_local std::string g_last_error;
     std::once_flag g_backend_init_once;
-    ggml_backend_t g_backend = nullptr;
     int g_backend_type = 0;
+
+    DeviceState g_device_states[TSG_MAX_DEVICES];
+    std::atomic<int> g_device_count{1};
+    thread_local int g_active_rank = 0;
     // Vulkan device index requested via TSGgml_SetVulkanDeviceIndex. Must be set
     // before the first backend init (create_backend_instance runs once under
     // g_backend_init_once); later calls with a different index fail. Indices are
@@ -119,21 +122,9 @@ namespace tsg
     // GGML_VK_VISIBLE_DEVICES filtering applied at process launch).
     std::atomic<int> g_vulkan_device_index{0};
 
-    std::mutex g_host_buffer_cache_mutex;
-    std::unordered_map<void*, CachedHostBuffer> g_host_buffer_cache;
-    std::mutex g_preloaded_buffer_cache_mutex;
-    std::unordered_map<void*, CachedHostBuffer> g_preloaded_buffer_cache;
-
-    // MoE expert weight offload state — see ggml_ops_internal.h for the contract.
-    std::unordered_set<void*> g_offloadable_keys;
-    std::list<void*> g_offloadable_lru;
-    std::unordered_map<void*, std::list<void*>::iterator> g_offloadable_lru_map;
-    std::int64_t g_offloadable_resident_bytes = 0;
-    std::int64_t g_offloadable_budget = 0;
-
-    // Device-copy VRAM budget — see ggml_ops_internal.h for the contract.
-    std::int64_t g_device_copy_resident_bytes = 0;
-    std::int64_t g_device_copy_budget_bytes = 0;
+    // The host-buffer / preload / offload / device-copy-budget state now lives
+    // per rank in DeviceState (see ggml_ops_internal.h); the old global names
+    // are macros onto the active slot.
 
     // Async dispatch state. The defaults keep the legacy (eager-sync) behaviour;
     // C# enables async at backend init time via TSGgml_SetAsyncCompute(1).
@@ -208,6 +199,103 @@ namespace tsg
     }
 
     // --- Backend management ---
+
+    // Enumerate the GPU devices a backend type can use, in ggml registration
+    // order. Used both by TSGgml_GetGpuDeviceCount (so C# can size a TP group)
+    // and by create_backend_instance_on_device.
+    static std::vector<ggml_backend_dev_t> enumerate_gpu_devices(int backend_type)
+    {
+        std::vector<ggml_backend_dev_t> out;
+#if defined(GGML_USE_CUDA)
+        if (backend_type == BACKEND_TYPE_CUDA)
+        {
+            const size_t n = ggml_backend_dev_count();
+            for (size_t i = 0; i < n; ++i)
+            {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU)
+                    continue;
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
+                // Only ggml-cuda devices: a mixed CUDA+Vulkan build registers both.
+                if (reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), GGML_CUDA_NAME) != 0)
+                    continue;
+                out.push_back(d);
+            }
+        }
+#endif
+        (void) backend_type;
+        return out;
+    }
+
+    int gpu_device_count(int backend_type)
+    {
+#if defined(GGML_USE_CUDA)
+        if (backend_type == BACKEND_TYPE_CUDA)
+            return static_cast<int>(enumerate_gpu_devices(backend_type).size());
+#endif
+#if defined(GGML_USE_VULKAN)
+        if (backend_type == BACKEND_TYPE_VULKAN)
+            return ggml_backend_vk_get_device_count();
+#endif
+        (void) backend_type;
+        return 1;
+    }
+
+    // Create a backend bound to a specific GPU ordinal. device_index < 0 keeps
+    // the legacy "first available device" behaviour.
+    ggml_backend_t create_backend_instance_on_device(int backend_type, int device_index)
+    {
+        if (device_index < 0)
+            return create_backend_instance(backend_type);
+
+        if (backend_type == BACKEND_TYPE_CUDA)
+        {
+#if defined(GGML_USE_CUDA)
+            const auto devices = enumerate_gpu_devices(backend_type);
+            if (device_index >= static_cast<int>(devices.size()))
+            {
+                set_last_error("CUDA device index " + std::to_string(device_index) +
+                    " is out of range: " + std::to_string(devices.size()) + " device(s) available.");
+                return nullptr;
+            }
+            ggml_backend_t backend = ggml_backend_dev_init(devices[device_index], nullptr);
+            if (backend == nullptr)
+                set_last_error("ggml-cuda backend initialization failed for device " + std::to_string(device_index) + ".");
+            return backend;
+#else
+            set_last_error("The ggml-cuda backend is not available in this build.");
+            return nullptr;
+#endif
+        }
+
+        if (backend_type == BACKEND_TYPE_VULKAN)
+        {
+#if defined(GGML_USE_VULKAN)
+            if (device_index >= ggml_backend_vk_get_device_count())
+            {
+                set_last_error("Vulkan device index " + std::to_string(device_index) + " is out of range.");
+                return nullptr;
+            }
+            ggml_backend_t backend = ggml_backend_vk_init(static_cast<size_t>(device_index));
+            if (backend == nullptr)
+                set_last_error("ggml-vulkan backend initialization failed for device " + std::to_string(device_index) + ".");
+            return backend;
+#else
+            set_last_error("The ggml-vulkan backend is not available in this build.");
+            return nullptr;
+#endif
+        }
+
+        // CPU / Metal have a single logical device; anything past rank 0 would
+        // just be a second view of the same hardware.
+        if (device_index != 0)
+        {
+            set_last_error("The selected GGML backend exposes a single device; rank " +
+                std::to_string(device_index) + " cannot be initialized.");
+            return nullptr;
+        }
+        return create_backend_instance(backend_type);
+    }
 
     ggml_backend_t create_backend_instance(int backend_type)
     {
@@ -1056,10 +1144,22 @@ namespace tsg
     // before it is consumed), and the per-layer host_read_barrier drains the
     // previous layer's GPU work before the next graph runs, so a single buffer
     // can be safely reused (re-packed via ggml_tallocr) across calls.
-    static std::mutex g_reuse_compute_mutex;
-    static ggml_backend_buffer_t g_reuse_compute_buf = nullptr;
-    static std::size_t g_reuse_compute_size = 0;
-    static ggml_backend_t g_reuse_compute_backend = nullptr;
+    //
+    // Under tensor parallelism each rank drives its own backend, so the cached
+    // buffer is per rank: a single shared slot would see the backend change on
+    // every rank switch and free/realloc the buffer twice per layer.
+    struct ReuseComputeSlot
+    {
+        std::mutex mutex;
+        ggml_backend_buffer_t buf = nullptr;
+        std::size_t size = 0;
+        ggml_backend_t backend = nullptr;
+    };
+    static ReuseComputeSlot g_reuse_compute_slots[TSG_MAX_DEVICES];
+#define g_reuse_compute_mutex   (g_reuse_compute_slots[::tsg::g_active_rank].mutex)
+#define g_reuse_compute_buf     (g_reuse_compute_slots[::tsg::g_active_rank].buf)
+#define g_reuse_compute_size    (g_reuse_compute_slots[::tsg::g_active_rank].size)
+#define g_reuse_compute_backend (g_reuse_compute_slots[::tsg::g_active_rank].backend)
 
     // Persistent graph allocator for the large multi-token fused graphs (e.g. the
     // MTP MoE verify). Those used to ggml_gallocr_new()/ggml_gallocr_free() a
@@ -1068,31 +1168,46 @@ namespace tsg
     // verify steps until a contiguous allocation fails (OOM). A single gallocr
     // reused across calls grows its buffer once and keeps it, eliminating the
     // churn (and the per-call ~20 ms Metal allocation). Reset on backend swap.
-    static std::mutex g_reuse_gallocr_mutex;
-    static ggml_gallocr_t g_reuse_gallocr = nullptr;
-    static ggml_backend_t g_reuse_gallocr_backend = nullptr;
+    struct ReuseGallocrSlot
+    {
+        std::mutex mutex;
+        ggml_gallocr_t gallocr = nullptr;
+        ggml_backend_t backend = nullptr;
+    };
+    static ReuseGallocrSlot g_reuse_gallocr_slots[TSG_MAX_DEVICES];
+#define g_reuse_gallocr_mutex   (g_reuse_gallocr_slots[::tsg::g_active_rank].mutex)
+#define g_reuse_gallocr         (g_reuse_gallocr_slots[::tsg::g_active_rank].gallocr)
+#define g_reuse_gallocr_backend (g_reuse_gallocr_slots[::tsg::g_active_rank].backend)
 
     void free_reuse_compute_buffer()
     {
-        std::lock_guard<std::mutex> lock(g_reuse_compute_mutex);
-        if (g_reuse_compute_buf != nullptr)
+        for (int r = 0; r < TSG_MAX_DEVICES; ++r)
         {
-            ggml_backend_buffer_free(g_reuse_compute_buf);
-            g_reuse_compute_buf = nullptr;
+            auto& slot = g_reuse_compute_slots[r];
+            std::lock_guard<std::mutex> lock(slot.mutex);
+            if (slot.buf != nullptr)
+            {
+                ggml_backend_buffer_free(slot.buf);
+                slot.buf = nullptr;
+            }
+            slot.size = 0;
+            slot.backend = nullptr;
         }
-        g_reuse_compute_size = 0;
-        g_reuse_compute_backend = nullptr;
     }
 
     void free_reuse_gallocr()
     {
-        std::lock_guard<std::mutex> lock(g_reuse_gallocr_mutex);
-        if (g_reuse_gallocr != nullptr)
+        for (int r = 0; r < TSG_MAX_DEVICES; ++r)
         {
-            ggml_gallocr_free(g_reuse_gallocr);
-            g_reuse_gallocr = nullptr;
+            auto& slot = g_reuse_gallocr_slots[r];
+            std::lock_guard<std::mutex> lock(slot.mutex);
+            if (slot.gallocr != nullptr)
+            {
+                ggml_gallocr_free(slot.gallocr);
+                slot.gallocr = nullptr;
+            }
+            slot.backend = nullptr;
         }
-        g_reuse_gallocr_backend = nullptr;
     }
 
     // Allocate `graph`'s intermediates into a persistent, reused gallocr (grown on
@@ -1830,25 +1945,30 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // their captured graphs pointing at freed device memory.
     TSGgml_QwenImageResetForwardCache();
 
+    // Every rank owns its own device copies; clear all of them.
+    for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
     {
-        std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
-        for (auto& [ptr, cached] : g_preloaded_buffer_cache)
-            ggml_backend_buffer_free(cached.buffer);
-        g_preloaded_buffer_cache.clear();
-    }
+        tsg::ScopedRank rank(r);
+        {
+            std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+            for (auto& [ptr, cached] : g_preloaded_buffer_cache)
+                ggml_backend_buffer_free(cached.buffer);
+            g_preloaded_buffer_cache.clear();
+        }
 
-    {
-        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-        for (auto& [ptr, cached] : g_host_buffer_cache)
-            ggml_backend_buffer_free(cached.buffer);
-        g_host_buffer_cache.clear();
-        g_offloadable_lru.clear();
-        g_offloadable_lru_map.clear();
-        g_offloadable_resident_bytes = 0;
-        g_device_copy_resident_bytes = 0;
-        // The budget belongs to the model whose load configured it (model
-        // unload clears this cache); don't let it leak onto the next model.
-        g_device_copy_budget_bytes = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            for (auto& [ptr, cached] : g_host_buffer_cache)
+                ggml_backend_buffer_free(cached.buffer);
+            g_host_buffer_cache.clear();
+            g_offloadable_lru.clear();
+            g_offloadable_lru_map.clear();
+            g_offloadable_resident_bytes = 0;
+            g_device_copy_resident_bytes = 0;
+            // The budget belongs to the model whose load configured it (model
+            // unload clears this cache); don't let it leak onto the next model.
+            g_device_copy_budget_bytes = 0;
+        }
     }
 }
 
@@ -1868,29 +1988,38 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
 // releases the resource-set entries before the device deleter runs.
 TSG_EXPORT void TSGgml_Shutdown()
 {
-    {
-        std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
-        for (auto& [ptr, cached] : g_preloaded_buffer_cache)
-            ggml_backend_buffer_free(cached.buffer);
-        g_preloaded_buffer_cache.clear();
-    }
+    // Tear the TP communicator down first: it holds NCCL communicators and
+    // pinned staging buffers that reference every rank's backend.
+    tp_comm_free();
 
+    const int ranks = tsg::g_device_count.load(std::memory_order_acquire);
+    for (int r = 0; r < ranks; ++r)
     {
-        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-        for (auto& [ptr, cached] : g_host_buffer_cache)
-            ggml_backend_buffer_free(cached.buffer);
-        g_host_buffer_cache.clear();
-        g_offloadable_keys.clear();
-        g_offloadable_lru.clear();
-        g_offloadable_lru_map.clear();
-        g_offloadable_resident_bytes = 0;
-        g_offloadable_budget = 0;
-        g_device_copy_resident_bytes = 0;
-        g_device_copy_budget_bytes = 0;
+        tsg::ScopedRank rank(r);
+        {
+            std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+            for (auto& [ptr, cached] : g_preloaded_buffer_cache)
+                ggml_backend_buffer_free(cached.buffer);
+            g_preloaded_buffer_cache.clear();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            for (auto& [ptr, cached] : g_host_buffer_cache)
+                ggml_backend_buffer_free(cached.buffer);
+            g_host_buffer_cache.clear();
+            g_offloadable_keys.clear();
+            g_offloadable_lru.clear();
+            g_offloadable_lru_map.clear();
+            g_offloadable_resident_bytes = 0;
+            g_offloadable_budget = 0;
+            g_device_copy_resident_bytes = 0;
+            g_device_copy_budget_bytes = 0;
+        }
     }
 
     // Release the reusable per-graph compute buffer + gallocr before the backend
-    // they were allocated from is torn down.
+    // they were allocated from is torn down. Both free every rank's slot.
     free_reuse_compute_buffer();
     free_reuse_gallocr();
     // Release the calling thread's cached prefill-attention sessions while the
@@ -1898,12 +2027,18 @@ TSG_EXPORT void TSGgml_Shutdown()
     // aborts the process on exit ("CUDA error: driver shutting down").
     free_prefill_attn_sessions();
 
-    if (g_backend != nullptr)
+    for (int r = 0; r < ranks; ++r)
     {
-        ggml_backend_synchronize(g_backend);
-        ggml_backend_free(g_backend);
-        g_backend = nullptr;
+        tsg::ScopedRank rank(r);
+        if (g_backend != nullptr)
+        {
+            ggml_backend_synchronize(g_backend);
+            ggml_backend_free(g_backend);
+            g_backend = nullptr;
+        }
+        tsg::dev(r).device_index = -1;
     }
+    tsg::g_device_count.store(1, std::memory_order_release);
     g_pending_gpu_work.store(false, std::memory_order_release);
 }
 
@@ -1928,8 +2063,12 @@ TSG_EXPORT void TSGgml_RegisterOffloadable(void* key)
 {
     if (key == nullptr)
         return;
-    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-    g_offloadable_keys.insert(key);
+    for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
+    {
+        tsg::ScopedRank rank(r);
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        g_offloadable_keys.insert(key);
+    }
 }
 
 // Set the byte ceiling for offloadable cache residency. Zero (or negative)
@@ -1937,9 +2076,15 @@ TSG_EXPORT void TSGgml_RegisterOffloadable(void* key)
 // nothing is freed).
 TSG_EXPORT void TSGgml_SetOffloadableBudget(int64_t bytes)
 {
-    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-    g_offloadable_budget = bytes > 0 ? bytes : 0;
-    offloadable_evict_to_budget_locked();
+    // Per-rank budget: each GPU holds its own slice of the expert weights, so
+    // the caller's ceiling applies to every rank independently.
+    for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
+    {
+        tsg::ScopedRank rank(r);
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        g_offloadable_budget = bytes > 0 ? bytes : 0;
+        offloadable_evict_to_budget_locked();
+    }
 }
 
 // Clear the offloadable registry, LRU, and byte accounting. Does NOT touch
@@ -1948,12 +2093,16 @@ TSG_EXPORT void TSGgml_SetOffloadableBudget(int64_t bytes)
 // when the process exits.
 TSG_EXPORT void TSGgml_ClearOffloadableState()
 {
-    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-    g_offloadable_keys.clear();
-    g_offloadable_lru.clear();
-    g_offloadable_lru_map.clear();
-    g_offloadable_resident_bytes = 0;
-    g_offloadable_budget = 0;
+    for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
+    {
+        tsg::ScopedRank rank(r);
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        g_offloadable_keys.clear();
+        g_offloadable_lru.clear();
+        g_offloadable_lru_map.clear();
+        g_offloadable_resident_bytes = 0;
+        g_offloadable_budget = 0;
+    }
 }
 
 // Page-lock (cudaHostRegister) a host memory region so device uploads from it
@@ -2002,8 +2151,12 @@ TSG_EXPORT void TSGgml_UnregisterPinnedHostBuffer(void* ptr)
 // caching). Zero (or negative) disables the cap. See ggml_ops_internal.h.
 TSG_EXPORT void TSGgml_SetDeviceCopyBudget(int64_t bytes)
 {
-    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-    g_device_copy_budget_bytes = bytes > 0 ? bytes : 0;
+    for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
+    {
+        tsg::ScopedRank rank(r);
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        g_device_copy_budget_bytes = bytes > 0 ? bytes : 0;
+    }
 }
 
 // Current free/total memory of the active backend's device, in bytes. For the
@@ -2028,12 +2181,24 @@ TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes
 
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
-    invalidate_cached_buffer(ptr);
+    // The same host pointer can be resident on several ranks (a replicated
+    // weight, or an activation the TP forward round-robins); drop all of them.
+    for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
+    {
+        tsg::ScopedRank rank(r);
+        invalidate_cached_buffer(ptr);
+    }
 }
 
 TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)
 {
-    if (sync_cached_buffer_to_host(ptr, size))
+    bool any = false;
+    for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
+    {
+        tsg::ScopedRank rank(r);
+        any |= sync_cached_buffer_to_host(ptr, size);
+    }
+    if (any)
     {
         clear_last_error();
         return 1;

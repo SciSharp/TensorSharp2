@@ -1,6 +1,6 @@
 using System;
 
-namespace TensorSharp.Cuda
+namespace TensorSharp
 {
     /// <summary>
     /// Abstraction over a tensor-parallel group that may span local GPUs
@@ -32,7 +32,28 @@ namespace TensorSharp.Cuda
         /// <summary>Number of nodes in the distributed group (1 for local-only).</summary>
         int NodeCount { get; }
 
-        CudaAllocator GetAllocator(int rank);
+        /// <summary>
+        /// Allocator that places tensors on <paramref name="rank"/>'s device.
+        /// Typed as <see cref="IAllocator"/> rather than <see cref="CudaAllocator"/>
+        /// so a group can be backed by any multi-device backend — the GGML
+        /// backend hands back a per-rank <c>GgmlAllocator</c>. Call sites that
+        /// need CUDA-specific behaviour pattern-match on the concrete type.
+        /// </summary>
+        IAllocator GetAllocator(int rank);
+
+        /// <summary>
+        /// Run <paramref name="body"/> once per rank. The default is a plain
+        /// sequential loop, which is right for backends whose per-rank work is
+        /// already asynchronous (CUDA streams). Backends that submit
+        /// synchronously override this to dispatch the ranks concurrently,
+        /// otherwise tensor parallelism would serialize the GPUs and be slower
+        /// than a single device.
+        /// </summary>
+        void RunPerRank(Action<int> body)
+        {
+            for (int r = 0; r < Degree; r++)
+                body(r);
+        }
 
         /// <summary>
         /// In-place AllReduce (element-wise sum) across all GPUs.
@@ -66,5 +87,16 @@ namespace TensorSharp.Cuda
         /// the driver broadcasts the next control message, and return it.
         /// </summary>
         (int op, int[] payload) ReceiveControl();
+    }
+
+    /// <summary>
+    /// A tensor-parallel group layered on top of another group — the multi-node
+    /// group wrapping the on-node one, for instance. Lets callers reach the group
+    /// that actually owns this node's devices without taking a dependency on the
+    /// wrapper's assembly.
+    /// </summary>
+    public interface INestedTensorParallelGroup
+    {
+        ITensorParallelGroup LocalGroup { get; }
     }
 }

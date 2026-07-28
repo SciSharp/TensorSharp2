@@ -73,7 +73,10 @@ namespace TensorSharp.Cuda
         /// <summary>Single-node: one node.</summary>
         public int NodeCount => 1;
 
-        public CudaAllocator GetAllocator(int rank)
+        public IAllocator GetAllocator(int rank) => GetCudaAllocator(rank);
+
+        /// <summary>Concretely-typed accessor for CUDA-only call sites.</summary>
+        public CudaAllocator GetCudaAllocator(int rank)
         {
             if ((uint)rank >= (uint)Degree)
                 throw new ArgumentOutOfRangeException(nameof(rank));

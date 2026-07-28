@@ -104,8 +104,16 @@ Architecture-specific strategies handle heterogeneous layers:
 | GatedDeltaNet SSM (Qwen 3.5/3.6) | Block-cyclic V-head assignment — each rank runs its own GDN kernel on its V-head subset with independent delta/conv state; no cross-rank communication for the recurrent path |
 | Mamba2 SSM (Nemotron-H) | Replicated on rank 0, result broadcast to all ranks |
 
-TP requires the `cuda` backend (GGML, MLX, and Vulkan are single-device by
-design). Batched/continuous-batching forward under TP is implemented for Qwen 3
+TP runs on the `cuda` backend and on the GGML CUDA / Vulkan backends
+(`ggml_cuda`, `ggml_vulkan`); MLX is single-device. On the GGML backends each
+rank owns a ggml backend on its own GPU with its own weight shards and KV
+cache, and cross-GPU AllReduce goes through ggml-cuda's collective (NCCL when
+available) or a host reduction for small payloads. GGML TP is aimed at capacity
+— running a model too large for one GPU — rather than latency; direct CUDA is
+the faster TP path for models that already fit. Qwen 3.5/3.6 TP is direct-CUDA
+only, because its fused GatedDeltaNet kernel has no GGML equivalent.
+
+Batched/continuous-batching forward under TP is implemented for Qwen 3
 and Mistral 3; MoE models fall back to per-sequence forward under TP.
 
 Local collectives prefer CUDA peer-to-peer DMA, but the group self-tests every

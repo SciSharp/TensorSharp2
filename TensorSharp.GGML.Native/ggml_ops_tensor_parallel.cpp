@@ -1,0 +1,972 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
+//
+// ---------------------------------------------------------------------------
+// Tensor parallelism for the GGML backend.
+//
+// Design (mirrors llama.cpp's `--split-mode tensor` where it applies, adapted
+// to TensorSharp's host-resident tensor model):
+//
+//   * One ggml backend per GPU, held in tsg::g_device_states[]. Ops select a
+//     rank with TSGgml_SetActiveDevice; every existing single-device op then
+//     runs on that GPU unchanged (`g_backend` resolves to the active slot).
+//
+//   * Column-parallel weights are sliced along ne1 and row-parallel weights
+//     along ne0 by the managed layer, so each rank's matmul is 1/tp of the work
+//     and 1/tp of the VRAM.
+//
+//   * Row-parallel layers end in an AllReduce. Two implementations:
+//       - device AllReduce: the per-rank partial sums stay in VRAM and are
+//         reduced with ggml-cuda's comm backend (NCCL when available, P2P
+//         pipeline otherwise, butterfly as a last resort). Nothing crosses PCIe
+//         to the host. This is the fast path and is what the fused multi-rank
+//         entry points below use.
+//       - host AllReduce: the partials are already back in host RAM (the
+//         generic per-op path downloads every result), so they are summed
+//         in-place with an AVX/NEON-friendly loop. No device round trip.
+//
+//   * The fused multi-rank entry points submit one graph per rank with
+//     ggml_backend_graph_compute_async and only then synchronize, so all GPUs
+//     compute concurrently from a single host thread. This is the same
+//     submit-all-then-sync structure ggml's meta backend uses.
+// ---------------------------------------------------------------------------
+#include "ggml_ops_internal.h"
+
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
+
+#include <cstdio>
+#include <cstring>
+#include <thread>
+#include <vector>
+
+namespace tsg
+{
+    // --- Communicator ------------------------------------------------------
+
+    namespace
+    {
+        // Function pointers resolved from the backend registry. ggml-cuda
+        // exposes them via ggml_backend_reg_get_proc_address; other backends
+        // (CPU / Metal / Vulkan) do not, and fall back to the host reduction.
+        using comm_init_fn = void* (*)(ggml_backend_t*, size_t);
+        using comm_free_fn = void  (*)(void*);
+        using comm_allreduce_fn = bool  (*)(void*, ggml_tensor**);
+
+        struct TpComm
+        {
+            void* ctx = nullptr;
+            comm_free_fn free_fn = nullptr;
+            comm_allreduce_fn allreduce_fn = nullptr;
+            bool attempted = false;
+        };
+
+        TpComm g_tp_comm;
+        std::mutex g_tp_comm_mutex;
+
+        // Scratch device tensors used by the device AllReduce path. One
+        // context+buffer per rank, grown on demand and reused across calls so a
+        // steady-state decode never allocates.
+        struct AllReduceScratch
+        {
+            ggml_context* ctx = nullptr;
+            ggml_backend_buffer_t buffer = nullptr;
+            ggml_tensor* tensor = nullptr;
+            std::size_t capacity = 0;
+        };
+
+        AllReduceScratch g_ar_scratch[TSG_MAX_DEVICES];
+        std::mutex g_ar_scratch_mutex;
+
+        void free_ar_scratch_locked(int rank)
+        {
+            AllReduceScratch& s = g_ar_scratch[rank];
+            if (s.buffer != nullptr)
+            {
+                ggml_backend_buffer_free(s.buffer);
+                s.buffer = nullptr;
+            }
+            if (s.ctx != nullptr)
+            {
+                ggml_free(s.ctx);
+                s.ctx = nullptr;
+            }
+            s.tensor = nullptr;
+            s.capacity = 0;
+        }
+
+        // Ensure rank `rank` has a contiguous F32 device tensor of at least
+        // `count` elements. Must be called with the rank already active.
+        ggml_tensor* ensure_ar_scratch_locked(int rank, std::int64_t count)
+        {
+            AllReduceScratch& s = g_ar_scratch[rank];
+            const std::size_t need = static_cast<std::size_t>(count) * sizeof(float);
+            if (s.tensor != nullptr && s.capacity >= need)
+            {
+                // Reinterpret the cached allocation at the requested length. The
+                // buffer is large enough, so only ne/nb need adjusting.
+                s.tensor->ne[0] = count;
+                s.tensor->ne[1] = 1;
+                s.tensor->ne[2] = 1;
+                s.tensor->ne[3] = 1;
+                s.tensor->nb[0] = sizeof(float);
+                s.tensor->nb[1] = need;
+                s.tensor->nb[2] = need;
+                s.tensor->nb[3] = need;
+                return s.tensor;
+            }
+
+            free_ar_scratch_locked(rank);
+
+            ggml_init_params params = {};
+            params.mem_size = ggml_tensor_overhead() * 2;
+            params.mem_buffer = nullptr;
+            params.no_alloc = true;
+            s.ctx = ggml_init(params);
+            if (s.ctx == nullptr)
+                return nullptr;
+
+            // Round up so a slowly growing prefill does not reallocate per call.
+            const std::size_t slab = 1u << 20;
+            const std::size_t alloc = ((need + slab - 1) / slab) * slab;
+            const std::int64_t alloc_count = static_cast<std::int64_t>(alloc / sizeof(float));
+
+            s.tensor = ggml_new_tensor_1d(s.ctx, GGML_TYPE_F32, alloc_count);
+            if (s.tensor == nullptr)
+            {
+                free_ar_scratch_locked(rank);
+                return nullptr;
+            }
+            s.buffer = ggml_backend_alloc_ctx_tensors(s.ctx, g_backend);
+            if (s.buffer == nullptr)
+            {
+                free_ar_scratch_locked(rank);
+                return nullptr;
+            }
+            s.capacity = alloc;
+            if (vram_log_enabled())
+                vram_log("tp-allreduce-scratch", static_cast<std::int64_t>(alloc));
+
+            s.tensor->ne[0] = count;
+            s.tensor->nb[1] = need;
+            s.tensor->nb[2] = need;
+            s.tensor->nb[3] = need;
+            return s.tensor;
+        }
+    } // namespace
+
+    // Resolve (once) the backend's collective-communication entry points for the
+    // currently initialized rank set. Returns false when the backend has none.
+    bool tp_comm_ensure()
+    {
+        std::lock_guard<std::mutex> lock(g_tp_comm_mutex);
+        if (g_tp_comm.attempted)
+            return g_tp_comm.ctx != nullptr;
+        g_tp_comm.attempted = true;
+
+        const int n = g_device_count.load(std::memory_order_acquire);
+        if (n <= 1)
+            return false;
+
+        ggml_backend_t backend0 = dev(0).backend;
+        if (backend0 == nullptr)
+            return false;
+
+        ggml_backend_dev_t d0 = ggml_backend_get_device(backend0);
+        ggml_backend_reg_t reg = d0 != nullptr ? ggml_backend_dev_backend_reg(d0) : nullptr;
+        if (reg == nullptr)
+            return false;
+
+        auto init_fn = reinterpret_cast<comm_init_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init"));
+        auto free_fn = reinterpret_cast<comm_free_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free"));
+        auto allreduce_fn = reinterpret_cast<comm_allreduce_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor"));
+        if (init_fn == nullptr || allreduce_fn == nullptr)
+            return false;
+
+        std::vector<ggml_backend_t> backends;
+        backends.reserve(static_cast<std::size_t>(n));
+        for (int r = 0; r < n; ++r)
+        {
+            if (dev(r).backend == nullptr)
+                return false;
+            backends.push_back(dev(r).backend);
+        }
+
+        g_tp_comm.ctx = init_fn(backends.data(), backends.size());
+        g_tp_comm.free_fn = free_fn;
+        g_tp_comm.allreduce_fn = allreduce_fn;
+        return g_tp_comm.ctx != nullptr;
+    }
+
+    void tp_comm_free()
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_ar_scratch_mutex);
+            for (int r = 0; r < TSG_MAX_DEVICES; ++r)
+            {
+                if (g_ar_scratch[r].ctx == nullptr && g_ar_scratch[r].buffer == nullptr)
+                    continue;
+                ScopedRank rank(r);
+                free_ar_scratch_locked(r);
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(g_tp_comm_mutex);
+        if (g_tp_comm.ctx != nullptr && g_tp_comm.free_fn != nullptr)
+            g_tp_comm.free_fn(g_tp_comm.ctx);
+        g_tp_comm.ctx = nullptr;
+        g_tp_comm.free_fn = nullptr;
+        g_tp_comm.allreduce_fn = nullptr;
+        g_tp_comm.attempted = false;
+    }
+
+    // In-place AllReduce over device tensors, one per rank. `tensors[r]` must be
+    // contiguous F32 and resident on rank r's backend. Returns false when the
+    // backend has no collective support (caller falls back to the host sum).
+    bool tp_device_allreduce(ggml_tensor** tensors)
+    {
+        if (!tp_comm_ensure())
+            return false;
+        std::lock_guard<std::mutex> lock(g_tp_comm_mutex);
+        if (g_tp_comm.ctx == nullptr)
+            return false;
+        return g_tp_comm.allreduce_fn(g_tp_comm.ctx, tensors);
+    }
+
+    // Host-side AllReduce: sum n contiguous F32 buffers element-wise and write
+    // the total back into every buffer. Compilers vectorize both loops; the
+    // reduction is memory-bandwidth bound and, for TensorSharp's host-resident
+    // tensors, strictly cheaper than staging through VRAM.
+    void tp_host_allreduce(float** buffers, int n, std::int64_t count)
+    {
+        if (n <= 1 || count <= 0)
+            return;
+
+        float* dst = buffers[0];
+        for (int r = 1; r < n; ++r)
+        {
+            const float* src = buffers[r];
+            for (std::int64_t i = 0; i < count; ++i)
+                dst[i] += src[i];
+        }
+        const std::size_t bytes = static_cast<std::size_t>(count) * sizeof(float);
+        for (int r = 1; r < n; ++r)
+            std::memcpy(buffers[r], dst, bytes);
+    }
+
+    // Multi-threaded variant for the large buffers a long prefill produces.
+    // Splitting by element range keeps every thread on its own cache lines.
+    void tp_host_allreduce_mt(float** buffers, int n, std::int64_t count)
+    {
+        // Below this the thread hand-off costs more than the sum itself.
+        constexpr std::int64_t k_parallel_threshold = 1 << 16; // 256 KB of F32
+        if (n <= 1 || count <= 0)
+            return;
+        if (count < k_parallel_threshold)
+        {
+            tp_host_allreduce(buffers, n, count);
+            return;
+        }
+
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 4;
+        int threads = static_cast<int>(hw > 8 ? 8 : hw);
+        const std::int64_t chunk = (count + threads - 1) / threads;
+
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<std::size_t>(threads - 1));
+        auto work = [&](std::int64_t begin, std::int64_t end)
+        {
+            float* dst = buffers[0];
+            for (int r = 1; r < n; ++r)
+            {
+                const float* src = buffers[r];
+                for (std::int64_t i = begin; i < end; ++i)
+                    dst[i] += src[i];
+            }
+            for (int r = 1; r < n; ++r)
+                std::memcpy(buffers[r] + begin, dst + begin,
+                    static_cast<std::size_t>(end - begin) * sizeof(float));
+        };
+
+        for (int t = 1; t < threads; ++t)
+        {
+            const std::int64_t begin = chunk * t;
+            const std::int64_t end = (begin + chunk < count) ? begin + chunk : count;
+            if (begin >= end) break;
+            pool.emplace_back(work, begin, end);
+        }
+        work(0, chunk < count ? chunk : count);
+        for (auto& th : pool)
+            th.join();
+    }
+} // namespace tsg
+
+// ---------------------------------------------------------------------------
+// Fused multi-rank linear layers
+//
+// The whole point of tensor parallelism is that the ranks compute *at the same
+// time*. Driving them through the ordinary one-op-at-a-time bridge would
+// serialize them (every op ends in a synchronize + device->host copy), so the
+// per-rank matmuls of a column-/row-parallel layer are submitted here as N
+// asynchronous graphs and only synchronized once they are all in flight.
+// ---------------------------------------------------------------------------
+namespace tsg
+{
+    namespace
+    {
+        // Everything one rank needs to keep alive from graph build to sync.
+        struct RankGraph
+        {
+            PooledContextHandle context;
+            std::vector<BufferHandle> host_ptr_buffers;
+            BufferHandle owned_buffer{ nullptr };
+            std::vector<float> packed_input;
+            TensorBinding result_binding{};
+            ggml_tensor* result_node = nullptr;
+            bool zero_copy_result = false;
+            void* result_host = nullptr;
+            std::size_t result_bytes = 0;
+        };
+
+        // Build (but do not run) `result = input @ weight` for the active rank.
+        // `weight` is a ggml-quantized matrix with ne0 = inDim, ne1 = outDim.
+        bool build_rank_matmul(
+            RankGraph& rg,
+            const TensorView2DDesc& result_desc,
+            const TensorView2DDesc& input_desc,
+            const QuantizedWeightDesc& weight,
+            ggml_cgraph*& out_graph,
+            bool keep_result_on_device)
+        {
+            if (!validate_desc(result_desc, "result") || !validate_desc(input_desc, "input"))
+                return false;
+            if (weight.data == nullptr || weight.ne0 <= 0 || weight.ne1 <= 0 || weight.raw_bytes <= 0)
+            {
+                set_last_error("Invalid quantized weight descriptor in the multi-rank matmul.");
+                return false;
+            }
+            if (input_desc.dim1 != weight.ne0 || result_desc.dim1 != weight.ne1 ||
+                input_desc.dim0 != result_desc.dim0)
+            {
+                set_last_error("Shape mismatch in the multi-rank matmul.");
+                return false;
+            }
+
+            const std::size_t ctx_size = 1024 * 1024;
+            if (!rg.context.init(ctx_size))
+            {
+                set_last_error("Failed to create a ggml context for the multi-rank matmul.");
+                return false;
+            }
+            ggml_context* ctx = rg.context.value;
+
+            // Try to bind both the input and the result straight onto the
+            // caller's host memory (a device-resident copy cached by pointer on
+            // discrete GPUs, a true zero-copy map on unified memory). When the
+            // result never leaves the GPU — row-parallel with a device AllReduce
+            // — only the input needs a binding.
+            TensorBinding input_binding{};
+            bool zero_copy = false;
+
+            if (can_map_standard_view(input_desc))
+            {
+                ggml_backend_buffer_t input_buf = nullptr;
+                ggml_backend_buffer_t result_buf = nullptr;
+                TensorBinding ib{}, rb{};
+
+                bool ok = create_binding_from_host_ptr_2d(ctx, g_backend, input_desc, ib, input_buf);
+                if (ok && !keep_result_on_device)
+                    ok = create_binding_from_host_ptr_2d(ctx, g_backend, result_desc, rb, result_buf);
+
+                if (ok)
+                {
+                    rg.host_ptr_buffers.emplace_back(input_buf);
+                    input_binding = ib;
+                    if (!keep_result_on_device)
+                    {
+                        rg.host_ptr_buffers.emplace_back(result_buf);
+                        rg.result_binding = rb;
+                    }
+                    zero_copy = true;
+                }
+                else
+                {
+                    if (result_buf != nullptr) ggml_backend_buffer_free(result_buf);
+                    if (input_buf != nullptr) ggml_backend_buffer_free(input_buf);
+                }
+            }
+
+            if (!zero_copy)
+            {
+                input_binding = can_map_standard_view(input_desc)
+                    ? create_standard_binding(ctx, input_desc)
+                    : create_packed_standard_binding(ctx, input_desc, rg.packed_input);
+                if (!keep_result_on_device)
+                    rg.result_binding = create_standard_binding(ctx, result_desc);
+            }
+
+            ggml_type qtype = static_cast<ggml_type>(weight.ggml_type);
+            ggml_tensor* w_tensor = ggml_new_tensor_2d(ctx, qtype, weight.ne0, weight.ne1);
+            if (w_tensor == nullptr || input_binding.tensor == nullptr ||
+                (!keep_result_on_device && rg.result_binding.tensor == nullptr))
+            {
+                set_last_error("Failed to allocate ggml tensors for the multi-rank matmul.");
+                return false;
+            }
+
+            // Bind the weight to its cached device copy when one exists (weights
+            // are stable across calls, so this is a hit after the first token).
+            bool w_bound = false;
+            bool w_needs_upload = false;
+            {
+                ggml_backend_dev_t d = ggml_backend_get_device(g_backend);
+                if (d != nullptr && weight.raw_bytes >= 4096)
+                {
+                    ggml_backend_buffer_t buf = nullptr;
+                    void* addr = nullptr;
+                    if (try_get_cacheable_tensor_buffer(
+                            g_backend, d, w_tensor, weight.data,
+                            static_cast<std::size_t>(weight.raw_bytes), buf, addr, w_needs_upload))
+                    {
+                        w_bound = ggml_backend_tensor_alloc(buf, w_tensor, addr) == GGML_STATUS_SUCCESS;
+                        if (!w_bound)
+                            invalidate_cached_buffer(weight.data);
+                    }
+                }
+            }
+
+            ggml_tensor* mm = ggml_mul_mat(ctx, w_tensor, input_binding.tensor);
+            if (mm == nullptr)
+            {
+                set_last_error("Failed to create the multi-rank matmul node.");
+                return false;
+            }
+
+            ggml_tensor* out = keep_result_on_device ? mm : ggml_cpy(ctx, mm, rg.result_binding.tensor);
+            if (out == nullptr)
+            {
+                set_last_error("Failed to create the multi-rank matmul output node.");
+                return false;
+            }
+            ggml_set_output(out);
+
+            ggml_cgraph* graph = ggml_new_graph(ctx);
+            if (graph == nullptr)
+            {
+                set_last_error("Failed to create the multi-rank matmul graph.");
+                return false;
+            }
+            ggml_build_forward_expand(graph, out);
+
+            rg.owned_buffer = BufferHandle(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+            if (rg.owned_buffer.value == nullptr)
+            {
+                set_last_error("Failed to allocate the multi-rank matmul backend buffer.");
+                return false;
+            }
+
+            if (!zero_copy)
+            {
+                if (rg.packed_input.empty())
+                    upload_binding(input_binding, input_desc.data, input_binding.raw_bytes);
+                else
+                    upload_binding(input_binding, rg.packed_input.data(), input_binding.raw_bytes);
+            }
+            if (!w_bound || w_needs_upload)
+            {
+                TensorBinding wb = { w_tensor, w_tensor, static_cast<std::size_t>(weight.raw_bytes) };
+                upload_binding(wb, weight.data, wb.raw_bytes);
+            }
+
+            rg.result_node = out;
+            rg.zero_copy_result = zero_copy;
+            rg.result_host = result_desc.data;
+            rg.result_bytes = keep_result_on_device
+                ? static_cast<std::size_t>(result_desc.dim0) * result_desc.dim1 * sizeof(float)
+                : rg.result_binding.raw_bytes;
+            out_graph = graph;
+            return true;
+        }
+    } // namespace
+} // namespace tsg
+
+// One column-/row-parallel linear across every rank.
+//
+//   results[r] = inputs[r] @ weights[r]        (r = 0 .. rankCount-1)
+//
+// `allReduce != 0` performs the row-parallel reduction over the per-rank
+// partials before they are copied back, keeping the sum on-device when the
+// backend has a collective (NCCL / P2P) and falling back to a host sum
+// otherwise. With allReduce set, every rank's host buffer receives the same
+// reduced result.
+TSG_EXPORT int TSGgml_TensorParallelMatmul(
+    tsg::TensorView2DDesc* results,
+    tsg::TensorView2DDesc* inputs,
+    void** weightData,
+    int* weightTypes,
+    int64_t* weightNe0,
+    int64_t* weightNe1,
+    int64_t* weightRawBytes,
+    int rankCount,
+    int allReduce)
+{
+    try
+    {
+        tsg::clear_last_error();
+        if (results == nullptr || inputs == nullptr || weightData == nullptr ||
+            rankCount <= 0 || rankCount > tsg::TSG_MAX_DEVICES)
+        {
+            tsg::set_last_error("Invalid arguments to the tensor-parallel matmul.");
+            return 0;
+        }
+        if (rankCount > tsg::g_device_count.load(std::memory_order_acquire))
+        {
+            tsg::set_last_error("Tensor-parallel matmul rank count exceeds the initialized device count.");
+            return 0;
+        }
+
+        // Reduce on-device only when the collective is available and the result
+        // is a genuine row-parallel partial. Otherwise every rank downloads its
+        // own slice and (for allReduce) the host sums them.
+        //
+        // Keeping the partial in VRAM means the download target is the packed
+        // matmul output, so every rank's host buffer must be contiguous.
+        bool device_reduce = allReduce != 0 && rankCount > 1 && tsg::tp_comm_ensure();
+        if (device_reduce)
+        {
+            for (int r = 0; r < rankCount; ++r)
+            {
+                if (results[r].stride1 != 1 || results[r].stride0 != results[r].dim1 ||
+                    results[r].dim0 != results[0].dim0 || results[r].dim1 != results[0].dim1)
+                {
+                    device_reduce = false;
+                    break;
+                }
+            }
+        }
+
+        std::vector<tsg::RankGraph> graphs(static_cast<std::size_t>(rankCount));
+        std::vector<ggml_cgraph*> cgraphs(static_cast<std::size_t>(rankCount), nullptr);
+
+        // Build + submit each rank's graph without waiting: the GPUs overlap.
+        for (int r = 0; r < rankCount; ++r)
+        {
+            tsg::ScopedRank rank(r);
+            if (!tsg::ensure_backend())
+                return 0;
+
+            tsg::QuantizedWeightDesc w;
+            w.data = weightData[r];
+            w.ggml_type = weightTypes[r];
+            w.ne0 = weightNe0[r];
+            w.ne1 = weightNe1[r];
+            w.raw_bytes = weightRawBytes[r];
+
+            if (!tsg::build_rank_matmul(graphs[static_cast<std::size_t>(r)], results[r], inputs[r], w,
+                    cgraphs[static_cast<std::size_t>(r)], device_reduce))
+                return 0;
+
+            if (ggml_backend_graph_compute_async(g_backend, cgraphs[static_cast<std::size_t>(r)]) != GGML_STATUS_SUCCESS)
+            {
+                tsg::set_last_error("Tensor-parallel matmul graph execution failed.");
+                return 0;
+            }
+        }
+
+        if (device_reduce)
+        {
+            // The partials are still in VRAM; reduce them there.
+            std::vector<ggml_tensor*> nodes(static_cast<std::size_t>(rankCount), nullptr);
+            for (int r = 0; r < rankCount; ++r)
+                nodes[static_cast<std::size_t>(r)] = graphs[static_cast<std::size_t>(r)].result_node;
+
+            if (!tsg::tp_device_allreduce(nodes.data()))
+            {
+                // Collective refused this payload (unsupported dtype/shape):
+                // fall back to downloading and summing on the host.
+                for (int r = 0; r < rankCount; ++r)
+                {
+                    tsg::ScopedRank rank(r);
+                    ggml_backend_synchronize(g_backend);
+                    ggml_backend_tensor_get(nodes[static_cast<std::size_t>(r)],
+                        graphs[static_cast<std::size_t>(r)].result_host, 0,
+                        graphs[static_cast<std::size_t>(r)].result_bytes);
+                }
+                std::vector<float*> bufs(static_cast<std::size_t>(rankCount));
+                for (int r = 0; r < rankCount; ++r)
+                    bufs[static_cast<std::size_t>(r)] = static_cast<float*>(graphs[static_cast<std::size_t>(r)].result_host);
+                tsg::tp_host_allreduce_mt(bufs.data(), rankCount,
+                    static_cast<std::int64_t>(graphs[0].result_bytes / sizeof(float)));
+                return 1;
+            }
+
+            for (int r = 0; r < rankCount; ++r)
+            {
+                tsg::ScopedRank rank(r);
+                ggml_backend_synchronize(g_backend);
+                ggml_backend_tensor_get(nodes[static_cast<std::size_t>(r)],
+                    graphs[static_cast<std::size_t>(r)].result_host, 0,
+                    graphs[static_cast<std::size_t>(r)].result_bytes);
+            }
+            return 1;
+        }
+
+        // No device collective: drain each rank and copy its slice back.
+        for (int r = 0; r < rankCount; ++r)
+        {
+            tsg::ScopedRank rank(r);
+            ggml_backend_synchronize(g_backend);
+            auto& rg = graphs[static_cast<std::size_t>(r)];
+            if (!rg.zero_copy_result && rg.result_binding.storage != nullptr &&
+                rg.result_host != nullptr && rg.result_bytes > 0)
+            {
+                ggml_backend_tensor_get(rg.result_binding.storage, rg.result_host, 0, rg.result_bytes);
+            }
+        }
+
+        if (allReduce != 0 && rankCount > 1)
+        {
+            std::vector<float*> bufs(static_cast<std::size_t>(rankCount));
+            for (int r = 0; r < rankCount; ++r)
+                bufs[static_cast<std::size_t>(r)] = static_cast<float*>(graphs[static_cast<std::size_t>(r)].result_host);
+            tsg::tp_host_allreduce_mt(bufs.data(), rankCount,
+                static_cast<std::int64_t>(graphs[0].result_bytes / sizeof(float)));
+        }
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        tsg::set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        tsg::set_last_error("Unknown tensor-parallel matmul failure.");
+        return 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exported entry points
+// ---------------------------------------------------------------------------
+
+// Number of GPUs the given backend type can address. C# uses this to validate
+// a requested TP degree before creating a group.
+TSG_EXPORT int TSGgml_GetGpuDeviceCount(int backendType)
+{
+    try
+    {
+        tsg::clear_last_error();
+        if (!tsg::can_initialize_backend(backendType))
+            return 0;
+        // CUDA needs the registry populated before devices can be enumerated;
+        // ensure_backend brings rank 0 up (and is a no-op afterwards).
+        if (!tsg::ensure_backend(backendType))
+            return 0;
+        return tsg::gpu_device_count(backendType);
+    }
+    catch (const std::exception& ex)
+    {
+        tsg::set_last_error(ex.what());
+        return 0;
+    }
+}
+
+// Human-readable description of a GPU device (adapter name).
+TSG_EXPORT int TSGgml_GetGpuDeviceDescription(int backendType, int deviceIndex, char* description, int descriptionSize)
+{
+    try
+    {
+        tsg::clear_last_error();
+        if (description == nullptr || descriptionSize <= 0)
+            return 0;
+        description[0] = '\0';
+        if (!tsg::ensure_backend(backendType))
+            return 0;
+
+        ggml_backend_t backend = nullptr;
+        bool owned = false;
+        if (deviceIndex == tsg::dev(0).device_index || (deviceIndex == 0 && tsg::dev(0).device_index < 0))
+        {
+            backend = tsg::dev(0).backend;
+        }
+        else
+        {
+            for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
+            {
+                if (tsg::dev(r).device_index == deviceIndex)
+                {
+                    backend = tsg::dev(r).backend;
+                    break;
+                }
+            }
+        }
+        if (backend == nullptr)
+        {
+            backend = tsg::create_backend_instance_on_device(backendType, deviceIndex);
+            owned = backend != nullptr;
+        }
+        if (backend == nullptr)
+            return 0;
+
+        ggml_backend_dev_t d = ggml_backend_get_device(backend);
+        const char* desc = d != nullptr ? ggml_backend_dev_description(d) : nullptr;
+        if (desc != nullptr)
+        {
+            std::snprintf(description, static_cast<std::size_t>(descriptionSize), "%s", desc);
+        }
+        if (owned)
+            ggml_backend_free(backend);
+        return desc != nullptr ? 1 : 0;
+    }
+    catch (const std::exception& ex)
+    {
+        tsg::set_last_error(ex.what());
+        return 0;
+    }
+}
+
+// Bring up `count` backends on the given physical device indices. Rank 0 reuses
+// the already-initialized singleton when its device matches, so a TP run does
+// not pay for a second context on the main GPU. Returns 1 on success.
+TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndices, int count, int concurrentRanks)
+{
+    try
+    {
+        tsg::clear_last_error();
+        if (deviceIndices == nullptr || count <= 0 || count > tsg::TSG_MAX_DEVICES)
+        {
+            tsg::set_last_error("Invalid tensor-parallel device list.");
+            return 0;
+        }
+
+        // ggml-cuda records each graph through cudaStreamBeginCapture. Capture is
+        // a process-wide mode: while one rank's thread is capturing, an "unsafe"
+        // CUDA call from another rank's thread poisons it, and the capture then
+        // fails with "operation failed due to a previous error during capture".
+        // Driving the ranks concurrently is the whole point of TP here, so turn
+        // graph capture off for the run. It only ever helped single-token decode
+        // on one device, and TP already replaces that win by keeping N GPUs busy.
+        //
+        // Must be set before ggml-cuda reads it into a function-local static on
+        // its first graph_compute — this runs at model load, well ahead of that.
+        // Setting it here (rather than from managed code) is deliberate: .NET's
+        // Environment.SetEnvironmentVariable does not reach the native getenv.
+        if (count > 1 && concurrentRanks != 0)
+        {
+#if defined(_WIN32)
+            if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr)
+                _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
+#else
+            setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+#endif
+        }
+
+        // Rank 0 goes through the normal init path so g_backend_type and the
+        // ggml device registry are set up exactly as in a single-device run.
+        if (!tsg::ensure_backend(backendType))
+            return 0;
+
+        const int available = tsg::gpu_device_count(backendType);
+        for (int r = 0; r < count; ++r)
+        {
+            if (deviceIndices[r] < 0 || deviceIndices[r] >= available)
+            {
+                tsg::set_last_error("Tensor-parallel device index " + std::to_string(deviceIndices[r]) +
+                    " is out of range: " + std::to_string(available) + " device(s) available.");
+                return 0;
+            }
+            for (int q = 0; q < r; ++q)
+            {
+                if (deviceIndices[q] == deviceIndices[r])
+                {
+                    tsg::set_last_error("Duplicate device index " + std::to_string(deviceIndices[r]) +
+                        " in the tensor-parallel device list.");
+                    return 0;
+                }
+            }
+        }
+
+        // Rank 0's backend already exists. If it is not the requested device,
+        // replace it — the caller picks the device order.
+        {
+            tsg::ScopedRank rank(0);
+            // ensure_backend picked the first GPU (device 0) unless a previous
+            // TensorParallelInit recorded an explicit index.
+            const int current = tsg::dev(0).device_index >= 0 ? tsg::dev(0).device_index : 0;
+            if (current != deviceIndices[0])
+            {
+                ggml_backend_t replacement = tsg::create_backend_instance_on_device(backendType, deviceIndices[0]);
+                if (replacement == nullptr)
+                    return 0;
+                if (g_backend != nullptr)
+                {
+                    ggml_backend_synchronize(g_backend);
+                    ggml_backend_free(g_backend);
+                }
+                g_backend = replacement;
+            }
+            tsg::dev(0).device_index = deviceIndices[0];
+        }
+
+        for (int r = 1; r < count; ++r)
+        {
+            tsg::ScopedRank rank(r);
+            if (g_backend != nullptr)
+            {
+                // Re-init after a previous group was torn down.
+                ggml_backend_synchronize(g_backend);
+                ggml_backend_free(g_backend);
+                g_backend = nullptr;
+            }
+            ggml_backend_t backend = tsg::create_backend_instance_on_device(backendType, deviceIndices[r]);
+            if (backend == nullptr)
+                return 0;
+            g_backend = backend;
+            tsg::dev(r).device_index = deviceIndices[r];
+        }
+
+        tsg::g_device_count.store(count, std::memory_order_release);
+        // Resolve the collective backend eagerly so an NCCL/P2P init failure is
+        // reported at startup rather than mid-decode.
+        if (count > 1)
+        {
+            const bool device_ar = tsg::tp_comm_ensure();
+            std::fprintf(stderr,
+                "[TP] GGML tensor parallelism: %d device(s), AllReduce=%s\n",
+                count, device_ar ? "device (backend collective)" : "host");
+            std::fflush(stderr);
+        }
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        tsg::set_last_error(ex.what());
+        return 0;
+    }
+}
+
+// Select which rank subsequent ops on this thread execute on.
+TSG_EXPORT int TSGgml_SetActiveDevice(int rank)
+{
+    if (rank < 0 || rank >= tsg::g_device_count.load(std::memory_order_acquire))
+    {
+        tsg::set_last_error("Active device rank out of range.");
+        return 0;
+    }
+    tsg::g_active_rank = rank;
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_GetActiveDevice()
+{
+    return tsg::g_active_rank;
+}
+
+TSG_EXPORT int TSGgml_GetTensorParallelDegree()
+{
+    return tsg::g_device_count.load(std::memory_order_acquire);
+}
+
+// 1 when AllReduce runs entirely on the devices (NCCL / P2P), 0 when it falls
+// back to the host reduction. Surfaced so the CLI can report the transport.
+TSG_EXPORT int TSGgml_TensorParallelHasDeviceAllReduce()
+{
+    return tsg::tp_comm_ensure() ? 1 : 0;
+}
+
+// Host AllReduce over `count` per-rank F32 buffers. Used by the managed TP
+// group: the generic per-op path already leaves every partial in host RAM, so
+// summing there avoids two PCIe crossings per collective.
+TSG_EXPORT int TSGgml_TensorParallelAllReduceHost(float** buffers, int rankCount, int64_t count)
+{
+    try
+    {
+        if (buffers == nullptr || rankCount <= 1 || count <= 0)
+            return 1;
+        for (int r = 0; r < rankCount; ++r)
+        {
+            if (buffers[r] == nullptr)
+            {
+                tsg::set_last_error("Null buffer in tensor-parallel AllReduce.");
+                return 0;
+            }
+        }
+        tsg::tp_host_allreduce_mt(buffers, rankCount, count);
+        tsg::clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        tsg::set_last_error(ex.what());
+        return 0;
+    }
+}
+
+// Device AllReduce over per-rank host buffers: uploads each rank's partial to
+// its own GPU, reduces with the backend collective (NCCL / P2P), then downloads
+// the result once per rank. Only a win when the collective is materially faster
+// than the host sum — that is, on multi-GPU boxes with NVLink or working P2P and
+// large payloads. Returns 0 when unavailable so the caller can use the host path.
+TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCount, int64_t count)
+{
+    try
+    {
+        if (buffers == nullptr || rankCount <= 1 || count <= 0)
+            return 1;
+        if (rankCount != tsg::g_device_count.load(std::memory_order_acquire))
+        {
+            tsg::set_last_error("AllReduce rank count does not match the initialized device count.");
+            return 0;
+        }
+        if (!tsg::tp_comm_ensure())
+            return 0;
+
+        std::vector<ggml_tensor*> tensors(static_cast<std::size_t>(rankCount), nullptr);
+        {
+            std::lock_guard<std::mutex> lock(tsg::g_ar_scratch_mutex);
+            for (int r = 0; r < rankCount; ++r)
+            {
+                tsg::ScopedRank rank(r);
+                ggml_tensor* t = tsg::ensure_ar_scratch_locked(r, count);
+                if (t == nullptr)
+                {
+                    tsg::set_last_error("Failed to allocate the tensor-parallel AllReduce scratch buffer.");
+                    return 0;
+                }
+                ggml_backend_tensor_set(t, buffers[r], 0, static_cast<std::size_t>(count) * sizeof(float));
+                tensors[static_cast<std::size_t>(r)] = t;
+            }
+
+            if (!tsg::tp_device_allreduce(tensors.data()))
+                return 0;
+
+            for (int r = 0; r < rankCount; ++r)
+            {
+                tsg::ScopedRank rank(r);
+                ggml_backend_synchronize(g_backend);
+                ggml_backend_tensor_get(tensors[static_cast<std::size_t>(r)], buffers[r], 0,
+                    static_cast<std::size_t>(count) * sizeof(float));
+            }
+        }
+        tsg::clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        tsg::set_last_error(ex.what());
+        return 0;
+    }
+}

@@ -717,6 +717,67 @@ namespace TensorSharp.GGML
             GgmlNative.AddmmQuant(resultView, m1View, weightData, ggmlType, ne0, ne1, rawBytes);
         }
 
+        /// <summary>Number of GPUs the given GGML backend can address.</summary>
+        public static int GetGpuDeviceCount(GgmlBackendType backendType) => GgmlNative.GetGpuDeviceCount(backendType);
+
+        /// <summary>Adapter name of a GPU visible to the given GGML backend, or null.</summary>
+        public static string GetGpuDeviceDescription(GgmlBackendType backendType, int deviceIndex)
+            => GgmlNative.GetGpuDeviceDescription(backendType, deviceIndex);
+
+        /// <summary>Select the GPU that subsequent GGML ops on this thread run on.</summary>
+        public static void SetActiveRank(int rank) => GgmlNative.SetActiveRank(rank);
+
+        /// <summary>The GPU rank subsequent GGML ops on this thread run on.</summary>
+        public static int GetActiveRank() => GgmlNative.GetActiveRank();
+
+        /// <summary>
+        /// One tensor-parallel linear layer across every rank:
+        /// <c>results[r] = inputs[r] · weights[r]</c>, submitted as N concurrent
+        /// device graphs and synchronized once. With <paramref name="allReduce"/>
+        /// the per-rank partials are summed before they come back — a
+        /// row-parallel layer — using the device collective (NCCL / P2P) when the
+        /// backend has one.
+        ///
+        /// This is the fast path for column-/row-parallel projections: driving
+        /// the ranks through the ordinary one-op-at-a-time bridge would run the
+        /// GPUs strictly one after another, since every GGML op ends in a
+        /// synchronize plus a device-to-host copy.
+        /// </summary>
+        public static void TensorParallelMatmul(
+            Tensor[] results,
+            Tensor[] inputs,
+            IntPtr[] weightData,
+            int[] weightTypes,
+            long[] weightNe0,
+            long[] weightNe1,
+            long[] weightRawBytes,
+            bool allReduce)
+        {
+            int n = results.Length;
+            if (inputs.Length != n || weightData.Length != n)
+                throw new ArgumentException("TensorParallelMatmul requires one entry per rank in every array.");
+
+            var resultViews = new GgmlTensorView2D[n];
+            var inputViews = new GgmlTensorView2D[n];
+            for (int r = 0; r < n; r++)
+            {
+                if (results[r].DimensionCount != 2 || inputs[r].DimensionCount != 2)
+                    throw new ArgumentException("TensorParallelMatmul requires 2D tensors.");
+                if (results[r].ElementType != DType.Float32 || inputs[r].ElementType != DType.Float32)
+                    throw new ArgumentException("TensorParallelMatmul requires Float32 tensors.");
+                if (!HasNativeBufferStorage(results[r]) || !HasNativeBufferStorage(inputs[r]))
+                    throw new ArgumentException("TensorParallelMatmul requires natively-backed tensors.");
+                if (!TryCreateStandardView(results[r], out resultViews[r])
+                    || !TryCreateRawView(inputs[r], out inputViews[r]))
+                {
+                    throw new NotSupportedException("TensorParallelMatmul requires row-contiguous tensor layouts.");
+                }
+            }
+
+            GgmlNative.TensorParallelMatmul(
+                resultViews, inputViews, weightData, weightTypes, weightNe0, weightNe1, weightRawBytes, allReduce);
+        }
+
         /// <summary>
         /// Fused RMSNorm + quantized MatMul in a single GPU dispatch.
         /// result = matmul(rms_norm(input, normWeight, eps), quantWeight)

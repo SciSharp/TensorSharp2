@@ -594,7 +594,7 @@ internal enum GgmlIndexReductionOp
     Argmax = 2,
 }
 
-    internal static class GgmlNative
+    internal static partial class GgmlNative
     {
         private const string DllName = "GgmlOps";
         private const CallingConvention CallingConventionType = CallingConvention.Cdecl;

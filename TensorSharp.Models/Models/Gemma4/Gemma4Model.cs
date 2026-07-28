@@ -392,7 +392,7 @@ namespace TensorSharp.Models
             _pendingAudioEmbeddingsList.Add((embeddings, insertPosition));
         }
 
-        public Gemma4Model(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null) : base(ggufPath, backend, tpDegree, tpGroup)
+        public Gemma4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null) : base(ggufPath, backend, tpDegree, tpGroup)
         {
             Config = new ModelConfig { Architecture = _gguf.GetString("general.architecture") };
             ParseBaseConfig();
@@ -2404,6 +2404,13 @@ namespace TensorSharp.Models
         private unsafe void BuildGemma4DecodeArrays()
         {
             if (!IsGgmlBackend) return;
+
+            // Under tensor parallelism the projection weights have been replaced
+            // by per-rank shards, so the whole-model and per-layer fused decode
+            // graphs — which bind one unsharded weight per layer — have nothing
+            // to point at. The TP forward drives its own per-rank graphs instead;
+            // leaving the fused flags clear keeps it on that path.
+            if (IsTensorParallel) return;
 
             bool anyMoE = false;
             for (int l = 0; l < Config.NumLayers; l++)

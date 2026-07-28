@@ -350,7 +350,7 @@ namespace TensorSharp.Models
         protected readonly Dictionary<string, QuantizedWeight> _quantWeights = new();
 
         // ---- Tensor Parallelism ----
-        protected readonly Cuda.ITensorParallelGroup _tpGroup;
+        protected readonly ITensorParallelGroup _tpGroup;
         protected int TpDegree => _tpGroup?.Degree ?? 1;
         protected bool IsTensorParallel => _tpGroup != null && _tpGroup.IsActive;
 
@@ -480,7 +480,7 @@ namespace TensorSharp.Models
         protected int _forwardCount;
         protected Stopwatch _forwardSw = new Stopwatch();
 
-        protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+        protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
         {
             _backend = backend;
             // The pure-C# CPU backend must never touch native (ggml P/Invoke) dequant — route
@@ -507,13 +507,17 @@ namespace TensorSharp.Models
                     _allocator = new GgmlAllocator(_ggmlContext, 0);
                     break;
                 case BackendType.GgmlCuda:
-                    _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Cuda);
-                    _allocator = new GgmlAllocator(_ggmlContext, 0);
-                    break;
                 case BackendType.GgmlVulkan:
-                    _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Vulkan);
-                    _allocator = new GgmlAllocator(_ggmlContext, 0);
+                {
+                    var ggmlType = backend == BackendType.GgmlCuda ? GgmlBackendType.Cuda : GgmlBackendType.Vulkan;
+                    // A caller-supplied group (multi-node) already owns the
+                    // multi-GPU context; reuse it rather than initializing the
+                    // devices a second time.
+                    _ggmlContext = FindGgmlContext(_tpGroup) ?? CreateGgmlContext(ggmlType, tpDegree);
+                    _tpGroup ??= CreateGgmlTpGroup(_ggmlContext);
+                    _allocator = _tpGroup != null ? _tpGroup.GetAllocator(0) : new GgmlAllocator(_ggmlContext, 0);
                     break;
+                }
                 case BackendType.Cuda:
                     _allocator = _tpGroup != null ? _tpGroup.GetAllocator(0) : new CudaAllocator(0);
                     break;
@@ -530,6 +534,78 @@ namespace TensorSharp.Models
             Console.WriteLine($"Backend: {backend}");
 
             _gguf = new GgufFile(ggufPath);
+        }
+
+        /// <summary>
+        /// Build the GGML context, spanning several GPUs when tensor parallelism
+        /// is requested. Device ordinals are 0..degree-1 by default; set
+        /// TENSORSHARP_TP_DEVICES (e.g. "0,2") to pick specific GPUs, which is how
+        /// you avoid a display-attached or otherwise busy card.
+        /// </summary>
+        private static GgmlContext CreateGgmlContext(GgmlBackendType backendType, int tpDegree)
+        {
+            if (tpDegree <= 1)
+                return new GgmlContext(new[] { 0 }, backendType);
+
+            int[] devices = ParseTpDevices(tpDegree);
+            int available = GgmlBasicOps.GetGpuDeviceCount(backendType);
+            if (available < tpDegree)
+            {
+                throw new InvalidOperationException(
+                    $"Requested tensor-parallel degree {tpDegree} but the GGML {backendType} backend sees only {available} GPU(s).");
+            }
+            return new GgmlContext(devices, backendType);
+        }
+
+        private static int[] ParseTpDevices(int tpDegree)
+        {
+            string raw = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEVICES");
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                var seq = new int[tpDegree];
+                for (int i = 0; i < tpDegree; i++) seq[i] = i;
+                return seq;
+            }
+
+            string[] parts = raw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length != tpDegree)
+            {
+                throw new ArgumentException(
+                    $"TENSORSHARP_TP_DEVICES lists {parts.Length} device(s) but the tensor-parallel degree is {tpDegree}.");
+            }
+            var devices = new int[tpDegree];
+            for (int i = 0; i < tpDegree; i++)
+            {
+                if (!int.TryParse(parts[i].Trim(), out devices[i]) || devices[i] < 0)
+                    throw new ArgumentException($"Invalid device index '{parts[i]}' in TENSORSHARP_TP_DEVICES.");
+            }
+            return devices;
+        }
+
+        private static ITensorParallelGroup CreateGgmlTpGroup(GgmlContext context)
+            => context.Degree > 1 ? new GgmlTensorParallelGroup(context) : null;
+
+        private static GgmlContext FindGgmlContext(ITensorParallelGroup group)
+        {
+            if (group is INestedTensorParallelGroup nested)
+                group = nested.LocalGroup;
+            return (group as GgmlTensorParallelGroup)?.Context;
+        }
+
+        /// <summary>
+        /// Build the GGML multi-GPU group that a distributed (multi-node) run
+        /// wraps. The cross-node layer needs the on-node group up front, before a
+        /// model exists, so this is exposed for the CLI and the server to call.
+        /// </summary>
+        public static GgmlTensorParallelGroup CreateGgmlLocalTpGroup(BackendType backend, int localDegree)
+        {
+            GgmlBackendType ggmlType = backend switch
+            {
+                BackendType.GgmlCuda => GgmlBackendType.Cuda,
+                BackendType.GgmlVulkan => GgmlBackendType.Vulkan,
+                _ => throw new ArgumentException($"{backend} is not a multi-device GGML backend.", nameof(backend)),
+            };
+            return new GgmlTensorParallelGroup(CreateGgmlContext(ggmlType, Math.Max(1, localDegree)));
         }
 
         protected bool IsGgmlBackend => ExecutionPlan.UsesGgmlBackend;
@@ -2068,6 +2144,20 @@ namespace TensorSharp.Models
                 return;
             }
 
+            // GGML backends: dispatch to the device. Without this the tensor-
+            // parallel path — which reaches this helper for every sharded
+            // projection — would drop to the managed dequant loop below and run
+            // the whole model on the CPU.
+            if (IsGgmlBackend && weight.HasHostData)
+            {
+                // CacheKey, not Data: the GGML device cache is keyed by it, and
+                // after a preload it is an opaque handle rather than the host
+                // pointer. Passing Data would miss the resident copy and re-upload
+                // the weight on every call.
+                GgmlBasicOps.AddmmQuant(result, input, weight.CacheKey, weight.GgmlType, weight.Ne0, weight.Ne1, weight.RawBytes);
+                return;
+            }
+
             if (!weight.HasHostData)
                 throw new InvalidOperationException($"Quantized linear weight type {(GgmlTensorType)weight.GgmlType} is not available on the selected device and its host copy has been released.");
 
@@ -2857,7 +2947,18 @@ namespace TensorSharp.Models
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
                 int seqLen = (int)input.Sizes[0];
-                for (int r = 0; r < tp; r++)
+                // Column-parallel: every rank reads the same replicated
+                // activation straight out of host memory, so one shared input
+                // tensor covers all of them.
+                var sharedInputs = new Tensor[tp];
+                for (int r = 0; r < tp; r++) sharedInputs[r] = input;
+                if (TryTpFusedQuantLinear(sharedInputs, qShards, results, seqLen, allReduce: false))
+                {
+                    _linearTicks += Stopwatch.GetTimestamp() - t0;
+                    return results;
+                }
+
+                _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
                     int outDim = (int)qw.Ne1;
@@ -2869,12 +2970,12 @@ namespace TensorSharp.Models
                     // every rank > 0; without this it leaked one [seqLen, inDim]
                     // tensor per rank per call, on every layer of every token.
                     if (!ReferenceEquals(localInput, input)) localInput.Dispose();
-                }
+                });
             }
             else if (_tpWeights.TryGetValue(weightName, out var wShards))
             {
                 int seqLen = (int)input.Sizes[0];
-                for (int r = 0; r < tp; r++)
+                _tpGroup.RunPerRank(r =>
                 {
                     var w = wShards[r];
                     int outDim = (int)w.Sizes[0];
@@ -2884,7 +2985,7 @@ namespace TensorSharp.Models
                     var localInput = ReplicateTensorToRank(input, r);
                     Ops.Addmm(results[r], 0, results[r], 1.0f, localInput, wT);
                     if (!ReferenceEquals(localInput, input)) localInput.Dispose();
-                }
+                });
             }
             else
             {
@@ -2893,6 +2994,75 @@ namespace TensorSharp.Models
 
             _linearTicks += Stopwatch.GetTimestamp() - t0;
             return results;
+        }
+
+        /// <summary>
+        /// GGML fast path for a tensor-parallel quantized linear: hand all ranks
+        /// to the native bridge in one call so the per-rank matmuls are submitted
+        /// as concurrent device graphs (and, for a row-parallel layer, reduced
+        /// on-device before they come back). Returns false on other backends, or
+        /// when the shapes don't fit the fused entry point, so the caller can use
+        /// the generic per-rank loop.
+        /// </summary>
+        /// <summary>
+        /// Diagnostic: TS_GGML_TP_FUSED_MATMUL=0 routes the tensor-parallel
+        /// linears through the generic per-rank path instead of the fused
+        /// multi-rank native entry point.
+        /// </summary>
+        private static readonly bool TpFusedMatmulEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_FUSED_MATMUL"), "0", StringComparison.Ordinal);
+
+        private bool TryTpFusedQuantLinear(Tensor[] inputs, QuantizedWeight[] shards, Tensor[] results, int seqLen, bool allReduce)
+        {
+            // The fused entry point exists to overlap several local GPUs. With a
+            // single local rank — the multi-node layout, one GPU per node — there
+            // is nothing to overlap, and it is not the validated configuration:
+            // it was measured to produce wrong results there, while the generic
+            // per-rank path is correct. Require a genuine multi-GPU group.
+            if (!TpFusedMatmulEnabled || !IsGgmlBackend || _ggmlContext == null ||
+                TpDegree < 2 || _ggmlContext.Degree != TpDegree)
+                return false;
+
+            int tp = TpDegree;
+            for (int r = 0; r < tp; r++)
+            {
+                if (!shards[r].HasHostData)
+                    return false;
+            }
+
+            var data = new IntPtr[tp];
+            var types = new int[tp];
+            var ne0 = new long[tp];
+            var ne1 = new long[tp];
+            var raw = new long[tp];
+
+            for (int r = 0; r < tp; r++)
+            {
+                var qw = shards[r];
+                results[r] = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, seqLen, (int)qw.Ne1);
+                // CacheKey identifies the rank-resident device copy created by
+                // PrepareGgmlQuantizedWeightsForInferenceTP; Data would miss it.
+                data[r] = qw.CacheKey;
+                types[r] = qw.GgmlType;
+                ne0[r] = qw.Ne0;
+                ne1[r] = qw.Ne1;
+                raw[r] = qw.RawBytes;
+            }
+
+            try
+            {
+                GgmlBasicOps.TensorParallelMatmul(results, inputs, data, types, ne0, ne1, raw, allReduce);
+                return true;
+            }
+            catch (NotSupportedException)
+            {
+                for (int r = 0; r < tp; r++)
+                {
+                    results[r]?.Dispose();
+                    results[r] = null;
+                }
+                return false;
+            }
         }
 
         /// <summary>
@@ -2909,19 +3079,28 @@ namespace TensorSharp.Models
 
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
-                for (int r = 0; r < tp; r++)
+                int seqLen = (int)inputs[0].Sizes[0];
+                if (TryTpFusedQuantLinear(inputs, qShards, partials, seqLen, allReduce: true))
+                {
+                    _linearTicks += Stopwatch.GetTimestamp() - t0;
+                    for (int r = 1; r < tp; r++)
+                        partials[r].Dispose();
+                    return partials[0];
+                }
+
+                _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
-                    int seqLen = (int)inputs[r].Sizes[0];
+                    int rows = (int)inputs[r].Sizes[0];
                     int outDim = (int)qw.Ne1;
                     var alloc = _tpGroup.GetAllocator(r);
-                    partials[r] = new Tensor(alloc, DType.Float32, seqLen, outDim);
+                    partials[r] = new Tensor(alloc, DType.Float32, rows, outDim);
                     AddmmQuantManaged(partials[r], inputs[r], qw);
-                }
+                });
             }
             else if (_tpWeights.TryGetValue(weightName, out var wShards))
             {
-                for (int r = 0; r < tp; r++)
+                _tpGroup.RunPerRank(r =>
                 {
                     var w = wShards[r];
                     int seqLen = (int)inputs[r].Sizes[0];
@@ -2930,7 +3109,7 @@ namespace TensorSharp.Models
                     using var wT = w.Transpose();
                     partials[r] = new Tensor(alloc, DType.Float32, seqLen, outDim);
                     Ops.Addmm(partials[r], 0, partials[r], 1.0f, inputs[r], wT);
-                }
+                });
             }
             else
             {
@@ -2966,18 +3145,25 @@ namespace TensorSharp.Models
 
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
-                for (int r = 0; r < tp; r++)
+                int seqLen = (int)inputs[0].Sizes[0];
+                if (TryTpFusedQuantLinear(inputs, qShards, partials, seqLen, allReduce: true))
+                {
+                    _linearTicks += Stopwatch.GetTimestamp() - t0;
+                    return partials;
+                }
+
+                _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
-                    int seqLen = (int)inputs[r].Sizes[0];
+                    int rows = (int)inputs[r].Sizes[0];
                     var alloc = _tpGroup.GetAllocator(r);
-                    partials[r] = new Tensor(alloc, DType.Float32, seqLen, (int)qw.Ne1);
+                    partials[r] = new Tensor(alloc, DType.Float32, rows, (int)qw.Ne1);
                     AddmmQuantManaged(partials[r], inputs[r], qw);
-                }
+                });
             }
             else if (_tpWeights.TryGetValue(weightName, out var wShards))
             {
-                for (int r = 0; r < tp; r++)
+                _tpGroup.RunPerRank(r =>
                 {
                     var w = wShards[r];
                     int seqLen = (int)inputs[r].Sizes[0];
@@ -2985,7 +3171,7 @@ namespace TensorSharp.Models
                     using var wT = w.Transpose();
                     partials[r] = new Tensor(alloc, DType.Float32, seqLen, (int)w.Sizes[0]);
                     Ops.Addmm(partials[r], 0, partials[r], 1.0f, inputs[r], wT);
-                }
+                });
             }
             else
             {
@@ -3006,6 +3192,12 @@ namespace TensorSharp.Models
         protected Tensor ReplicateTensorToRank(Tensor tensor, int rank)
         {
             if (rank == 0) return tensor;
+
+            // GGML tensors live in host memory that every rank's backend can read
+            // directly, so "replicating" is just handing over the same buffer.
+            // Copying would add a full activation-sized memcpy per rank per
+            // linear for no benefit.
+            if (IsGgmlBackend) return tensor;
 
             var alloc = _tpGroup.GetAllocator(rank);
             var copy = new Tensor(alloc, tensor.ElementType, tensor.Sizes);
@@ -3081,18 +3273,24 @@ namespace TensorSharp.Models
             var results = new Tensor[tp];
             var alpha = _weights[weightName];
 
+            // Materialize every rank's replica up front: TpReplicatedWeight
+            // populates a shared dictionary, which is not safe to fill from the
+            // concurrent rank workers below.
+            var alphaLocal = new Tensor[tp];
             for (int r = 0; r < tp; r++)
+                alphaLocal[r] = TpReplicatedWeight(alpha, r);
+
+            _tpGroup.RunPerRank(r =>
             {
                 int rows = (int)inputs[r].Sizes[0];
                 int dim = (int)(inputs[r].ElementCount() / rows);
                 Tensor input2d = inputs[r].Sizes.Length != 2 ? inputs[r].View(rows, dim) : null;
                 Tensor src = input2d ?? inputs[r];
 
-                Tensor alphaLocal = TpReplicatedWeight(alpha, r);
-                results[r] = Ops.RMSNorm(null, src, alphaLocal, null, Config.Eps);
+                results[r] = Ops.RMSNorm(null, src, alphaLocal[r], null, Config.Eps);
 
                 input2d?.Dispose();
-            }
+            });
 
             return results;
         }
@@ -3102,8 +3300,93 @@ namespace TensorSharp.Models
         /// </summary>
         protected void TpResidualAdd(Tensor[] hidden, Tensor[] residual)
         {
-            for (int r = 0; r < TpDegree; r++)
-                Ops.Add(hidden[r], hidden[r], residual[r]);
+            _tpGroup.RunPerRank(r => Ops.Add(hidden[r], hidden[r], residual[r]));
+        }
+
+        /// <summary>
+        /// GGML counterpart of <see cref="PrepareCudaQuantizedWeightsForInferenceTP"/>:
+        /// upload rank r's shard of every sharded weight to rank r's GPU, and the
+        /// replicated (unsharded) weights to all of them.
+        ///
+        /// This is what actually splits the model across the GPUs. The shards are
+        /// keyed in the native cache by host pointer *per rank*, so rank r's
+        /// matmul finds its slice already resident on its own device and no GPU
+        /// holds more than its share.
+        ///
+        /// Host copies are kept: unlike direct CUDA, the GGML path reads
+        /// activations and any non-resident weight straight out of host memory,
+        /// and the mmap'd GGUF pages cost no extra RAM.
+        /// </summary>
+        private void PrepareGgmlQuantizedWeightsForInferenceTP()
+        {
+            if (_cudaQuantWeightsPrepared || _tpGroup == null)
+                return;
+
+            EnsureQuantBackendAvailable();
+
+            int tp = TpDegree;
+            long[] bytesPerRank = new long[tp];
+            int[] countPerRank = new int[tp];
+            int tooLarge = 0;
+
+            // Sharded weights: rank r gets its own slice.
+            foreach (var kv in _tpQuantWeights)
+            {
+                var shards = kv.Value;
+                for (int r = 0; r < tp; r++)
+                {
+                    var qw = shards[r];
+                    if (!qw.HasHostData)
+                        continue;
+
+                    GgmlBasicOps.SetActiveRank(r);
+                    IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                    if (!GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))
+                    {
+                        qw.MarkDevicePreloadTooLarge();
+                        tooLarge++;
+                        continue;
+                    }
+                    bytesPerRank[r] += qw.RawBytes;
+                    countPerRank[r]++;
+                }
+            }
+
+            // Replicated weights (embeddings, the LM head, anything the model did
+            // not shard) stay on rank 0: they are read by the pre/post-transformer
+            // stages, which run there. Duplicating them on every GPU would undo a
+            // chunk of the memory saving TP just bought.
+            GgmlBasicOps.SetActiveRank(0);
+            foreach (var kv in _quantWeights)
+            {
+                QuantizedWeight qw = kv.Value;
+                if (!qw.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key))
+                    continue;
+                if (string.Equals(kv.Key, "token_embd.weight", StringComparison.Ordinal)
+                    && !CanUseGgmlQuantizedGetRows(qw.GgmlType)
+                    && (_quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")))
+                    continue;
+
+                IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                if (!GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))
+                {
+                    qw.MarkDevicePreloadTooLarge();
+                    tooLarge++;
+                    continue;
+                }
+                bytesPerRank[0] += qw.RawBytes;
+                countPerRank[0]++;
+            }
+
+            for (int r = 0; r < tp; r++)
+            {
+                Console.WriteLine($"  TP rank {r}: {countPerRank[r]} weight(s), {bytesPerRank[r] / 1024 / 1024} MB resident on GPU {_ggmlContext.DeviceIds[r]}");
+            }
+            if (tooLarge > 0)
+                Console.WriteLine($"  {tooLarge} weight(s) exceeded the device single-buffer limit and stream from host memory.");
+
+            GgmlBasicOps.SetActiveRank(0);
+            _cudaQuantWeightsPrepared = true;
         }
 
         /// <summary>
@@ -3113,6 +3396,12 @@ namespace TensorSharp.Models
         /// </summary>
         protected void PrepareCudaQuantizedWeightsForInferenceTP()
         {
+            if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan)
+            {
+                PrepareGgmlQuantizedWeightsForInferenceTP();
+                return;
+            }
+
             if (_backend != BackendType.Cuda || _tpQuantWeights.Count == 0)
                 return;
 
@@ -3171,7 +3460,7 @@ namespace TensorSharp.Models
                         continue;
                     }
 
-                    var alloc = _tpGroup.GetAllocator(r);
+                    var alloc = (CudaAllocator)_tpGroup.GetAllocator(r);
                     IntPtr cacheKey = qw.EnsureDeviceCacheKey();
                     try
                     {
@@ -5209,7 +5498,7 @@ namespace TensorSharp.Models
                 allocatorDisposable.Dispose();
         }
 
-        public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+        public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
         {
             if (tpGroup == null && tpDegree <= 1)
             {

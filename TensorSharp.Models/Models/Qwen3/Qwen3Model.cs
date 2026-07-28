@@ -41,7 +41,7 @@ namespace TensorSharp.Models
         private bool _canUseNativeLayerDecode;
         private bool _kvCacheHostDirty;
 
-        public Qwen3Model(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+        public Qwen3Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
             : base(ggufPath, backend, tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "qwen3";

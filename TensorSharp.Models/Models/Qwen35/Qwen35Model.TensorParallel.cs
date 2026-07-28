@@ -132,8 +132,16 @@ namespace TensorSharp.Models
                 errors.Add($"Model invariant violated: V heads ({_numVHeads}) not divisible by K heads ({_numKHeads})");
 
             // Verify CUDA-native GDN path is available (the only supported path under TP)
+            // Qwen3.5 is the one architecture still pinned to direct CUDA under
+            // TP: its per-rank GatedDeltaNet runs as a single fused CUDA kernel
+            // (ts_qwen35_gdn_*) that keeps the conv ring buffer and the delta
+            // state on-device, and the GGML bridge exposes no packed-GDN
+            // equivalent — only the unpacked chunked and batched-step forms. The
+            // attention and MoE halves of the TP forward are backend-agnostic, so
+            // this lifts once a packed GDN lands in ggml_ops_gated_delta_net.cpp.
             if (_backend != BackendType.Cuda)
-                errors.Add($"TP requires CUDA backend, got {_backend}");
+                errors.Add($"Qwen3.5 TP requires the direct CUDA backend (its per-rank GatedDeltaNet " +
+                           $"kernel has no GGML equivalent), got {_backend}");
 
             if (errors.Count > 0)
                 throw new InvalidOperationException(
@@ -1164,7 +1172,7 @@ namespace TensorSharp.Models
         /// Output: separate Q [seqLen, numHeads*headDim] and gate [seqLen, numHeads*headDim].
         /// </summary>
         private void DeinterleaveQGate(Tensor qFull, out Tensor q, out Tensor gate,
-            int numHeads, int headDim, int seqLen, CudaAllocator alloc)
+            int numHeads, int headDim, int seqLen, IAllocator alloc)
         {
             int totalDim = numHeads * headDim;
             q = new Tensor(alloc, DType.Float32, seqLen, totalDim);

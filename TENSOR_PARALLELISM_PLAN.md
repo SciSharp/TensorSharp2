@@ -137,7 +137,7 @@ TENSORSHARP_TP_DEGREE=2 dotnet run --project TensorSharp.Server
 
 ### Constraints
 
-- CUDA backend only (GGML, MLX backends are single-device by design)
+- Direct CUDA and the GGML CUDA/Vulkan backends (see Stage 1b); MLX is single-device
 - `numHeads` and `numKVHeads` must be divisible by TP degree
 - `intermediateSize` must be divisible by TP degree
 - Quantized row-parallel splits require `ne0` divisible by `tp × blockSize`
@@ -166,6 +166,177 @@ column/row-parallel pattern:
 - [ ] Column-parallel LM head with AllGather (currently replicated on GPU 0)
 - [ ] GptOss: expert down-projection bias is skipped in TP mode (small correction, documented as follow-up)
 - [ ] Nemotron: Mamba2 layers are replicated on rank 0 rather than sharded (requires device-resident SSM kernel)
+
+---
+
+## Stage 1b — Tensor Parallelism on the GGML Backends (Implemented)
+
+**Goal:** Let the GGML CUDA / Vulkan backends span several GPUs (and, via
+Stage 2's TCP layer, several nodes) so a model larger than one GPU's VRAM can
+run without falling back to CPU offload.
+
+### Why this needed its own stage
+
+The GGML backend has a different execution model from direct CUDA. Tensors live
+in **host** memory (`GgmlStorage` allocates from an mmap/VirtualAlloc pool); ops
+upload to the device, run a ggml graph, and copy the result back. There was also
+exactly one ggml backend per process (`g_backend`), so "which GPU" was not a
+concept the bridge had.
+
+Three things had to change:
+
+1. **One ggml backend per GPU.** `tsg::g_device_states[]` holds a backend plus
+   its own buffer caches per rank; the active rank is a `thread_local`, so a
+   worker pool can drive several GPUs at once. `g_backend` and the cache globals
+   became macros onto the active slot, which kept ~500 existing use sites
+   working unchanged.
+2. **Per-rank device residency.** The host-pointer-keyed buffer caches are now
+   per rank. This matters for *replicated* weights: one host pointer, but a
+   distinct device copy per GPU. Without it rank 1 would be handed a buffer
+   living on rank 0's card.
+3. **A collective.** `ggml_backend_reg_get_proc_address("ggml_backend_comm_*")`
+   exposes ggml-cuda's AllReduce — NCCL when available, its P2P pipeline
+   otherwise, butterfly as a last resort. This is the same collective
+   llama.cpp's `--split-mode tensor` uses. A multi-threaded host reduction is
+   the fallback for backends without one, and is the *faster* choice for small
+   payloads: TensorSharp's activations are already in host RAM, so summing them
+   there costs nothing extra, while the device path pays two PCIe crossings.
+   `TS_GGML_TP_DEVICE_AR_THRESHOLD` (default 256 Ki elements) picks between them.
+
+### Files Created / Modified
+
+| File | Change |
+|------|--------|
+| `TensorSharp.GGML.Native/ggml_ops_internal.h` | `DeviceState` table, `TSG_MAX_DEVICES`, `thread_local g_active_rank`, `ScopedRank`, compatibility macros for the old globals |
+| `TensorSharp.GGML.Native/ggml_ops_core.cpp` | Per-rank backend creation (`create_backend_instance_on_device`, `gpu_device_count`), per-rank reuse buffers/gallocr, rank-wide teardown and budget config |
+| `TensorSharp.GGML.Native/ggml_ops_tensor_parallel.cpp` | **New.** TP init, collective resolution, device + host AllReduce, and the fused multi-rank matmul |
+| `TensorSharp.GGML.Native/CMakeLists.txt` | Auto-detect NCCL instead of forcing `GGML_CUDA_NCCL=OFF` |
+| `TensorSharp.Backends.GGML/GgmlContext.cs` | Accepts N device ids; exposes `Degree`, `DeviceIds`, `HasDeviceAllReduce` |
+| `TensorSharp.Backends.GGML/GgmlTensorParallel.cs` | **New.** P/Invoke surface: device enumeration, rank selection, AllReduce, multi-rank matmul |
+| `TensorSharp.Backends.GGML/GgmlTensorParallelGroup.cs` | **New.** `ITensorParallelGroup` over N ggml backends: per-rank allocators, rank worker pool, op dispatch hook |
+| `TensorSharp.Core/ITensorParallelGroup.cs` | Moved out of the CUDA project; `GetAllocator` returns `IAllocator`; added `RunPerRank`; added `INestedTensorParallelGroup` |
+| `TensorSharp.Core/OpRegistry.cs` | `PreInvokeHook` so a multi-device backend can route an op to its result's device |
+| `TensorSharp.Distributed/DistributedTensorParallelGroup.cs` | Takes any local group, so multi-node works over GGML too |
+| `TensorSharp.Models/ModelBase.cs` | GGML TP context/group construction, `TENSORSHARP_TP_DEVICES`, per-rank weight preload, GGML branch in `AddmmQuantManaged`, fused TP linear path |
+
+### How an op finds its GPU
+
+Two mechanisms, because rank is a property of a *block of work*, not of a
+single op:
+
+* `ITensorParallelGroup.RunPerRank(body)` pins each rank's worker thread to its
+  GPU for the duration of `body`. This is the reliable base, and it is what
+  makes the ranks actually run concurrently — GGML ops submit *and* synchronize
+  in one call, so a sequential rank loop runs the GPUs strictly one after
+  another and TP ends up slower than a single device.
+* `OpRegistry.PreInvokeHook` selects the device from an op's result tensor.
+  TensorSharp ops take the destination first, so the result's allocator names
+  the rank. This catches ops issued outside a `RunPerRank` scope without every
+  model file having to say which GPU it means.
+
+### CUDA graph capture
+
+ggml-cuda records graphs with `cudaStreamBeginCapture`. Capture is process-wide:
+while one rank's thread is capturing, an unsafe CUDA call from another rank's
+thread poisons it (`operation failed due to a previous error during capture`).
+Concurrent ranks are the point of TP here, so `TSGgml_TensorParallelInit` sets
+`GGML_CUDA_DISABLE_GRAPHS=1` for multi-GPU runs with concurrent dispatch. It is
+set natively rather than from C# because .NET's `Environment.SetEnvironmentVariable`
+does not reach the native `getenv`.
+
+### Usage
+
+```bash
+# 2 GPUs on the GGML CUDA backend
+TensorSharp.Cli --model qwen3-8b.gguf --backend ggml_cuda --tp 2
+
+# Pick specific GPUs
+TENSORSHARP_TP_DEVICES=0,2 TensorSharp.Cli --model m.gguf --backend ggml_cuda --tp 2
+
+# Multi-node (2 nodes x 2 local GPUs)
+TensorSharp.Cli --model m.gguf --backend ggml_cuda --tp 2 \
+  --tp-node-id 0 --tp-peers "10.0.0.1:9500,10.0.0.2:9500"
+```
+
+| Variable | Effect |
+|---|---|
+| `TENSORSHARP_TP_DEVICES` | Explicit GPU ordinals per rank (default `0..tp-1`) |
+| `TS_GGML_TP_PARALLEL=0` | Sequential rank dispatch (diagnostic) |
+| `TS_GGML_TP_FUSED_MATMUL=0` | Use the generic per-rank linear instead of the fused multi-rank one (diagnostic) |
+| `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective |
+| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none` — passed through to ggml |
+
+### Measured results
+
+2× RTX 2000 Ada (16 GB each, PCIe, no NVLink), CUDA 12.8, NCCL 2.25.
+
+**Memory — the capacity win, verified:**
+
+| Model | 1 GPU | TP=2 rank 0 | TP=2 rank 1 |
+|---|---|---|---|
+| Qwen3-4B Q8_0 | 4075 MB | 2234 MB | 1840 MB |
+| Gemma-4-26B-A4B IQ4_XS | 12908 MB | 6835 MB | 6087 MB |
+
+**Correctness:** on a fixed prompt with greedy decode, TP=2 and single-GPU
+produce byte-identical text for short generations and diverge only after ~30
+tokens, at a natural branch point, with both continuations coherent — the
+expected consequence of summing the row-parallel partials in a different order.
+Parallel and sequential rank dispatch are bit-identical to each other, which is
+what rules out a race in the worker pool.
+
+**Throughput (Qwen3-4B Q8_0, tokens/s):**
+
+| | prefill 512 | prefill 2048 | decode |
+|---|---|---|---|
+| 1 GPU | 67.8 | 42.1 | 25.8 |
+| TP=2 | 42.3 | 33.8 | 11.6 |
+
+TP is currently **slower than a single GPU for models that fit on one**. This is
+not an AllReduce cost — it is dispatch count. The single-GPU GGML path runs a
+whole 36-layer decode as *one* fused native graph
+(`TSGgml_TransformerModelDecode`); the TP path runs the generic op-at-a-time
+forward, which is ~1000 native calls per token, doubled across two ranks. The
+per-op overhead is fixed, which is why prefill closes the gap as the prompt
+grows (0.62× at 512 tokens, 0.80× at 2048) while decode does not.
+
+### Known Limitations / Future Work (Stage 1b)
+
+- [ ] **Fused TP decode.** The decisive fix: a per-rank whole-model graph split
+      at the two AllReduce points per layer, submitted asynchronously — the
+      structure ggml's own meta backend (`ggml-backend-meta.cpp`, already
+      vendored) implements for llama.cpp's `--split-mode tensor`. Wiring
+      TensorSharp's fused decode onto the meta device would replace ~1000
+      dispatches per token with ~2·L graph launches.
+- [ ] **Qwen3.5 on GGML.** Its per-rank GatedDeltaNet is a single fused CUDA
+      kernel (`ts_qwen35_gdn_*`); the GGML bridge exposes only the unpacked
+      chunked and batched-step forms. Validation rejects the combination with an
+      explicit message. The attention and MoE halves are already backend-agnostic.
+- [ ] **MoE TP throughput.** Gemma4/GptOss walk experts per token per rank, so a
+      512-token prefill issues hundreds of thousands of tiny matmuls. Pre-existing
+      (it affects direct CUDA too); the ranks now at least run concurrently.
+- [ ] **Fused multi-rank linear at rank-count 1.** `TSGgml_TensorParallelMatmul`
+      is correct for a genuine multi-GPU group (single-node TP=2 output is
+      byte-identical to single-GPU) but produced wrong results in the multi-node
+      layout, where each node contributes one rank. It is now gated on
+      `TpDegree >= 2`, which costs nothing — with one local rank there is no
+      concurrency to gain — but the underlying discrepancy is unexplained and
+      worth root-causing before the gate is relaxed.
+- [ ] Qwen3's QKV fusion requires all three of Q/K/V to share a quant type, so
+      mixed-quant GGUFs (`Q4_K_M`) fuse only some layers and then fault. Pre-existing,
+      hit while sourcing a test model.
+
+### Multi-node
+
+Verified on the GGML CUDA backend with two processes (one GPU each) over TCP
+loopback: the driver/worker lockstep, hierarchical AllReduce, and shutdown all
+work, and the generated text matches both the single-GPU and the direct-CUDA
+multi-node runs.
+
+```bash
+# node 0                                         # node 1
+TENSORSHARP_TP_DEVICES=0 ... --tp 1 \            TENSORSHARP_TP_DEVICES=1 ... --tp 1 \
+  --tp-node-id 0 --tp-peers "h0:9500,h1:9500"      --tp-node-id 1 --tp-peers "h0:9500,h1:9500"
+```
 
 ---
 
