@@ -222,7 +222,7 @@ namespace
 
         // Upload non-host-ptr tensors.
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(q_in, q_data, 0, static_cast<std::size_t>(q_dim) * sizeof(float));
         ggml_backend_tensor_set(k_in, k_data, 0, static_cast<std::size_t>(kv_dim) * sizeof(float));
@@ -848,7 +848,7 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
 
         // Upload non-bound tensors
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
 

@@ -162,7 +162,7 @@ namespace TensorSharp.Models
         private float[][] _layerDownBiasStacked;    // shape [hidden_dim * num_experts] per layer
         private int _layerStackedReady;             // 1 once InitMoeStackedWeights has run
 
-        public GptOssModel(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+        public GptOssModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
             : base(ggufPath, backend, tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "gpt-oss";

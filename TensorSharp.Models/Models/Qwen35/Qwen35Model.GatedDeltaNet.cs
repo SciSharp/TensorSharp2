@@ -1038,6 +1038,11 @@ namespace TensorSharp.Models
         {
             if (logitsOut == null || logitsOut.Length < Config.VocabSize)
                 return false;
+            // Whole-model single-graph paths read the single-device caches
+            // (_kvCacheK, _deltaStateTensor) and the unsharded LM head, none of
+            // which exist under tensor parallelism — ForwardTP owns that state.
+            if (IsTensorParallel)
+                return false;
             // Fold final-norm + lm_head into the graph requires both present.
             if ((_lmHeadQW == null && _lmHeadF32 == null) || _finalNormW == null)
                 return false;
@@ -1345,6 +1350,9 @@ namespace TensorSharp.Models
                 || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan))
                 return false;
             if (seqLen < 1 || hidden == null)
+                return false;
+            // Single-device state only — see the note in TryFullModelDecode.
+            if (IsTensorParallel)
                 return false;
             // Prefill requests logits for only the last nLogitRows tokens; MTP verify
             // (nLogitRows<=0) needs all seqLen rows. The kernel writes vocab*effLogitRows.

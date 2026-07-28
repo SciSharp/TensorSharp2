@@ -85,13 +85,20 @@ namespace TensorSharp.Server
             try
             {
                 // Check for distributed TP configuration via environment variables.
-                Cuda.ITensorParallelGroup tpGroup = null;
+                ITensorParallelGroup tpGroup = null;
                 var distConfig = TensorSharp.Distributed.DistributedTpConfig.TryFromEnvironment(
                     localDegree: GetLocalTpDegree());
                 if (distConfig != null)
                 {
-                    tpGroup = new TensorSharp.Distributed.DistributedTensorParallelGroup(
-                        distConfig.LocalDegree, distConfig.NodeId, distConfig.PeerEndpoints);
+                    // The on-node group has to match the backend: direct CUDA
+                    // drives CudaAllocators, the ggml backends drive per-rank
+                    // ggml backends.
+                    tpGroup = _backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
+                        ? new TensorSharp.Distributed.DistributedTensorParallelGroup(
+                            ModelBase.CreateGgmlLocalTpGroup(_backend, distConfig.LocalDegree),
+                            distConfig.NodeId, distConfig.PeerEndpoints)
+                        : new TensorSharp.Distributed.DistributedTensorParallelGroup(
+                            distConfig.LocalDegree, distConfig.NodeId, distConfig.PeerEndpoints);
                 }
 
                 _model = ModelBase.Create(modelPath, _backend, tpGroup: tpGroup);

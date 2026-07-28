@@ -23,16 +23,30 @@ namespace TensorSharp.GGML
                 throw new ArgumentException("At least one device id is required for the GGML backend.", nameof(deviceIds));
             }
 
-            if (deviceIds.Length != 1)
-            {
-                throw new NotSupportedException("GGML backends currently support a single device only.");
-            }
-
+            DeviceIds = (int[])deviceIds.Clone();
             DeviceId = deviceIds[0];
             BackendType = backendType;
             MemoryPool = new GgmlMemoryPool(backendType);
             MemoryPool.EnsureInitialBlocks();
             GgmlNative.EnsureAvailable(backendType);
+
+            if (deviceIds.Length > 1)
+            {
+                // Tensor parallelism: bring up one ggml backend per GPU. Ops then
+                // select a rank with GgmlNative.SetActiveDevice; tensors carry
+                // their rank through GgmlAllocator.DeviceId.
+                if (backendType != GgmlBackendType.Cuda && backendType != GgmlBackendType.Vulkan)
+                {
+                    throw new NotSupportedException(
+                        $"The GGML {backendType} backend exposes a single device; tensor parallelism requires the CUDA or Vulkan backend.");
+                }
+                // The native side needs to know whether the ranks will be driven
+                // concurrently: that decides whether ggml-cuda's graph capture
+                // (which is process-wide and breaks under concurrent CUDA calls)
+                // has to be turned off for the run.
+                GgmlNative.TensorParallelInit(backendType, DeviceIds, GgmlTensorParallelGroup.ParallelRanks);
+                HasDeviceAllReduce = GgmlNative.TensorParallelHasDeviceAllReduce();
+            }
             OpRegistry.RegisterAssembly(Assembly.GetExecutingAssembly());
 
             // On Metal, default to async (lazy) GPU dispatch. This is the same model
@@ -53,7 +67,20 @@ namespace TensorSharp.GGML
             GgmlNative.SetAsyncCompute(enableAsync);
         }
 
+        /// <summary>Physical device index backing rank 0.</summary>
         public int DeviceId { get; }
+
+        /// <summary>Physical device index per rank; length == the TP degree.</summary>
+        public int[] DeviceIds { get; }
+
+        /// <summary>Number of GPUs this context spans (1 = no tensor parallelism).</summary>
+        public int Degree => DeviceIds.Length;
+
+        /// <summary>
+        /// True when cross-GPU AllReduce runs entirely on the devices (NCCL or
+        /// P2P via ggml's CUDA comm backend) rather than through host memory.
+        /// </summary>
+        public bool HasDeviceAllReduce { get; }
 
         public GgmlBackendType BackendType { get; }
     }

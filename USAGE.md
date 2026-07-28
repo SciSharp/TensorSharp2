@@ -1,4 +1,4 @@
-# Usage
+﻿# Usage
 [English](USAGE.md) | [中文](USAGE_zh-cn.md)
 
 > Part of the [TensorSharp](README.md) documentation. Quick-start commands are in the [README](README.md#quick-start); configuration files are in [config/README.md](config/README.md).
@@ -222,7 +222,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--qwen-image-vl <path>` | Override the resolved Qwen2.5-VL-7B text-encoder GGUF. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen2.5-VL mmproj (vision grounding) GGUF. |
 | `--qwen-image-lora <path>` | Qwen-Image-Edit Lightning distillation LoRA (`.safetensors`), merged into the DiT at load time. Auto-derives the step count (e.g. 4 or 8) and switches CFG to 1.0. Env: `TS_QWEN_IMAGE_LORA`. |
-| `--tp <N>` | Tensor parallelism degree — split the model across N CUDA GPUs in a single process (default: `1`). Requires `--backend cuda`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
+| `--tp <N>` | Tensor parallelism degree — split the model across N GPUs in a single process (default: `1`). Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. Requires `--tp-peers`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. |
 | `--test` | Run built-in tokenizer + Qwen3 chat-template + ollama-comparison tests |
@@ -503,7 +503,7 @@ machines connected over a TCP peer-to-peer network.
 
 ### Local tensor parallelism (single process, multiple GPUs)
 
-Split the model across N CUDA GPUs within one process. Each GPU holds `1/N` of
+Split the model across N GPUs within one process (direct CUDA, or the GGML CUDA / Vulkan backends). Each GPU holds `1/N` of
 the sharded weights (column-parallel QKV/gate/up, row-parallel output/down) plus
 a full copy of replicated weights (norms, embeddings, LM head). Per-GPU KV
 caches are independent; AllReduce (via CUDA P2P copies + elementwise-add kernel)
@@ -566,16 +566,57 @@ must be reachable between all nodes.
 | Qwen 3 | ✅ | Reference implementation |
 | Mistral 3 | ✅ | Fused/separate QKV, YaRN RoPE |
 | Gemma 3 | ✅ | Separate Q/K/V, GELU, sliding window |
-| Gemma 4 | ✅ | Dense + MoE expert slicing, per-layer head dims |
-| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership, MoE expert slicing |
+| Gemma 4 | ✅ | Dense TP + **expert-parallel MoE** on GGML (whole experts per GPU, one batched dispatch per layer); per-expert slicing on direct CUDA |
+| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership, MoE expert slicing. **Direct CUDA only** (`--backend cuda`): its fused per-rank GDN kernel has no GGML equivalent, so `ggml_cuda --tp N` is rejected with an explicit message |
 | GPT OSS | ✅ | MoE expert slicing, attention sinks, YaRN |
 | Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing |
 | DiffusionGemma | — | Not applicable (diffusion model) |
 | Qwen-Image-Edit | — | Not applicable (image generation) |
 
+### Backend support
+
+TP runs on the **direct CUDA** backend (`--backend cuda`) and on the **GGML
+CUDA / Vulkan** backends (`--backend ggml_cuda`, `ggml_vulkan`). MLX is
+single-device.
+
+On the GGML backends each rank gets its own ggml backend on its own GPU, with
+its own device-resident weight shards and KV cache. Cross-GPU AllReduce uses
+ggml-cuda's collective (NCCL when the build finds it, its P2P pipeline
+otherwise); small payloads are reduced in host memory instead, which is cheaper
+because GGML activations already live there.
+
+```bash
+# 2 GPUs on the GGML CUDA backend
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend ggml_cuda --tp 2
+
+# Choose which physical GPUs the ranks map to
+TENSORSHARP_TP_DEVICES=0,2 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model <model.gguf> --backend ggml_cuda --tp 2
+```
+
+**What to expect.** On the GGML backends TP is for *capacity* first: it lets a
+model that does not fit in one GPU's VRAM run entirely on GPUs. Qwen 3.5-35B-A3B
+IQ4_XS (16.6 GB, which does not fit a 16 GB card) splits into 9.4 + 8.0 GB across
+two and runs at **20 tok/s decode / 76 tok/s prefill** on 2× RTX 2000 Ada.
+
+For a model that *already* fits on one GPU, that single GPU is still faster: its
+path runs a whole decode step as one fused native graph, while TP dispatches per
+layer. Qwen 3.5-9B Q8_0 measures 23 tok/s on one card against 16 tok/s at
+`--tp 2`. See `TENSOR_PARALLELISM_PLAN.md` (Stage 1b) for the full measurements
+and what is left to fuse.
+
+| Variable | Effect |
+|---|---|
+| `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`) |
+| `TS_GGML_TP_PARALLEL=0` | Drive ranks sequentially instead of concurrently (diagnostic) |
+| `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
+| `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
+| `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
+| `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
+| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |
+
 ### Constraints
 
-- **CUDA backend only** (`--backend cuda`). GGML, MLX, and Vulkan backends are single-device by design.
 - `numHeads`, `numKVHeads`, and `intermediateSize` must be divisible by the TP degree.
 - Quantized row-parallel splits require `ne0` divisible by `tp × blockSize`.
 - Batched/continuous-batching forward under TP is implemented for Qwen 3 and Mistral 3; MoE models (Gemma 4, Qwen 3.5/3.6, GPT OSS, Nemotron-H) fall back to per-sequence forward under TP.

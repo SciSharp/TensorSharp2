@@ -479,11 +479,21 @@ namespace {
 
         ggml_build_forward_expand(graph, output_tensor);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
-        if (buffer.value == nullptr)
+        // Reuse the per-rank compute buffer instead of allocating (and freeing) a
+        // fresh backend buffer per call. On CUDA that pair is a cudaMalloc +
+        // cudaFree; a few hundred of them per token on a nearly-full card make an
+        // unrelated large matmul that follows pay tens of milliseconds for its own
+        // allocation (measured on the Qwen3.5-35B LM head under --tp 2). Falls
+        // back to a per-call buffer when the reuse path is unavailable.
+        BufferHandle buffer(nullptr);
+        if (!alloc_ctx_tensors_reuse(context.value))
         {
-            set_last_error("Failed to allocate ggml backend buffer for addmm_quant.");
-            return 0;
+            buffer.value = ggml_backend_alloc_ctx_tensors(context.value, g_backend);
+            if (buffer.value == nullptr)
+            {
+                set_last_error("Failed to allocate ggml backend buffer for addmm_quant.");
+                return 0;
+            }
         }
 
         // Upload data
@@ -496,7 +506,20 @@ namespace {
         }
 
         if (!m2_bound || m2_needs_upload)
+        {
+            // A weight that reaches this line is NOT device-resident: its bytes
+            // cross the bus on every call. Harmless for a small weight, ruinous
+            // for a big one (a 400 MB LM head at PCIe speed is ~45 ms per token),
+            // so surface it instead of leaving it as unexplained latency.
+            if (vram_log_enabled() && m2_binding.raw_bytes > (64u << 20))
+            {
+                std::fprintf(stderr,
+                    "[TSVRAM] addmm_quant uploading a non-resident %.1f MB weight (bound=%d needs_upload=%d)\n",
+                    m2_binding.raw_bytes / (1024.0 * 1024.0), m2_bound ? 1 : 0, m2_needs_upload ? 1 : 0);
+                std::fflush(stderr);
+            }
             upload_binding(m2_binding, m2_quant.data, m2_binding.raw_bytes);
+        }
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)

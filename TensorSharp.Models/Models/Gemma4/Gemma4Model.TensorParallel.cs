@@ -25,6 +25,7 @@ using System.Diagnostics;
 using System.Linq;
 using TensorSharp;
 using TensorSharp.Cuda;
+using TensorSharp.GGML;
 
 namespace TensorSharp.Models
 {
@@ -62,7 +63,13 @@ namespace TensorSharp.Models
                 }
             }
 
-            if (_numExperts > 0)
+            // Expert-parallel MoE (GGML) partitions whole experts, so it needs the
+            // expert *count* to divide evenly and places no constraint on the
+            // expert FFN width. Only the per-expert slicing path needs that.
+            bool expertParallel = IsGgmlBackend && _numExperts > 0 && (_numExperts % tp) == 0
+                && _layerStackedGate != null && _layerStackedDown != null;
+
+            if (_numExperts > 0 && !expertParallel)
             {
                 // Check expert FFN dims from weight shapes
                 for (int l = 0; l < Config.NumLayers; l++)
@@ -82,8 +89,10 @@ namespace TensorSharp.Models
                 }
             }
 
-            if (_backend != BackendType.Cuda)
-                errors.Add($"TP requires CUDA backend, got {_backend}");
+            // Tensor parallelism runs on the multi-GPU backends: direct CUDA and
+            // the GGML CUDA/Vulkan backends (one ggml backend per GPU).
+            if (_backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+                errors.Add($"TP requires a multi-GPU backend (cuda, ggml-cuda, ggml-vulkan), got {_backend}");
 
             if (errors.Count > 0)
                 throw new InvalidOperationException(
@@ -135,8 +144,175 @@ namespace TensorSharp.Models
             Console.WriteLine($"  Gemma4 TP weight sharding complete ({TpDegree} GPUs).");
         }
 
+        // Per-rank slices of the stacked expert weights, [layer][rank]. Populated
+        // when the expert-parallel path is in use (see BuildGemma4ExpertParallelShards).
+        private StackedExpertWeights[][] _tpStackedGate;
+        private StackedExpertWeights[][] _tpStackedUp;
+        private StackedExpertWeights[][] _tpStackedDown;
+        private int _tpExpertsPerRank;
+        private bool _loggedExpertParallelShapes;
+
+        /// <summary>
+        /// True when the MoE layers are split by whole expert rather than by
+        /// slicing inside each expert.
+        /// </summary>
+        private bool UsesExpertParallelMoE => _tpStackedGate != null;
+
+        /// <summary>
+        /// Make each rank's stacked expert slice device-resident at load time.
+        /// Without this the first forward pays the whole upload — measured at
+        /// ~51 s on Gemma-4-26B — and it looks like a hang.
+        /// </summary>
+        protected override void PreloadGgmlTpAuxiliaryWeights(long[] bytesPerRank, int[] countPerRank)
+        {
+            if (UsesTensorSlicedMoE)
+            {
+                PreloadGemma4TensorSlicedExperts(bytesPerRank, countPerRank);
+                return;
+            }
+            if (!UsesExpertParallelMoE)
+                return;
+
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                if (!HasMoE(layer)) continue;
+                for (int r = 0; r < TpDegree; r++)
+                {
+                    GgmlBasicOps.SetActiveRank(r);
+                    PreloadStackedShard(_tpStackedGate[layer]?[r], bytesPerRank, countPerRank, r);
+                    PreloadStackedShard(_tpStackedUp?[layer]?[r], bytesPerRank, countPerRank, r);
+                    PreloadStackedShard(_tpStackedDown[layer]?[r], bytesPerRank, countPerRank, r);
+                }
+            }
+            GgmlBasicOps.SetActiveRank(0);
+        }
+
+        private static void PreloadStackedShard(StackedExpertWeights w, long[] bytesPerRank, int[] countPerRank, int rank)
+        {
+            if (w == null) return;
+            // The MoE kernel looks the buffer up by the data pointer, so the
+            // cache key must be that same pointer.
+            if (GgmlBasicOps.PreloadQuantizedWeight(
+                    w.Data, w.Data, w.GgmlType, w.PerExpertNe0, w.PerExpertNe1 * w.NumExperts, w.TotalRawBytes))
+            {
+                bytesPerRank[rank] += w.TotalRawBytes;
+                countPerRank[rank]++;
+            }
+        }
+
+        /// <summary>
+        /// Split the MoE layers by *expert* instead of by tensor.
+        ///
+        /// Slicing inside each expert (column-parallel gate/up, row-parallel
+        /// down) forces the per-token expert loop: every rank holds a piece of
+        /// every expert, so the layer cannot be expressed as one
+        /// <c>ggml_mul_mat_id</c> dispatch. On a 2048-token prefill of
+        /// Gemma-4-26B that is ~3 million tiny matmuls.
+        ///
+        /// Whole experts partition cleanly instead. The stacked expert tensor
+        /// has the expert index as its outer dimension, so rank r's share is a
+        /// contiguous byte range — a zero-copy view — and each rank can run the
+        /// same batched kernel the single-GPU path uses, one dispatch per layer.
+        /// Each rank sums only the experts it owns, so the existing AllReduce
+        /// over the layer output is exactly the right recombination.
+        ///
+        /// Returns false when the model did not expose stacked expert weights,
+        /// leaving the caller on the per-expert sharding path.
+        /// </summary>
+        private bool BuildGemma4ExpertParallelShards()
+        {
+            // The batched dispatch is GgmlBasicOps.MoEFFNPrefill, so this path is
+            // for the GGML backends only; direct CUDA keeps its per-expert
+            // sharding and its own on-device MoE kernels.
+            if (!IsGgmlBackend)
+                return false;
+
+            int tp = GlobalTpDegree;
+            if (_numExperts <= 0 || tp <= 1 || (_numExperts % tp) != 0)
+                return false;
+            if (_layerStackedGate == null || _layerStackedDown == null)
+                return false;
+
+            int localTp = TpDegree;
+            int rankOffset = TpRankOffset;
+            int perRank = _numExperts / tp;
+            int n = Config.NumLayers;
+
+            var gate = new StackedExpertWeights[n][];
+            var up = new StackedExpertWeights[n][];
+            var down = new StackedExpertWeights[n][];
+
+            for (int layer = 0; layer < n; layer++)
+            {
+                if (!HasMoE(layer))
+                    continue;
+                var g = _layerStackedGate[layer];
+                var d = _layerStackedDown[layer];
+                if (g == null || d == null)
+                    return false;
+                var u = _layerStackedUp?[layer];
+
+                gate[layer] = new StackedExpertWeights[localTp];
+                down[layer] = new StackedExpertWeights[localTp];
+                if (u != null) up[layer] = new StackedExpertWeights[localTp];
+
+                for (int lr = 0; lr < localTp; lr++)
+                {
+                    int firstExpert = (rankOffset + lr) * perRank;
+                    gate[layer][lr] = SliceExperts(g, firstExpert, perRank);
+                    down[layer][lr] = SliceExperts(d, firstExpert, perRank);
+                    if (u != null) up[layer][lr] = SliceExperts(u, firstExpert, perRank);
+                }
+            }
+
+            _tpStackedGate = gate;
+            _tpStackedUp = _layerStackedUp != null ? up : null;
+            _tpStackedDown = down;
+            _tpExpertsPerRank = perRank;
+
+            Console.WriteLine(
+                $"  Gemma4 MoE: expert-parallel across {tp} GPU(s), {perRank} of {_numExperts} experts per GPU " +
+                "(batched ggml_mul_mat_id dispatch per layer).");
+            return true;
+        }
+
+        /// <summary>
+        /// Zero-copy view of <paramref name="count"/> consecutive experts. The
+        /// expert index is the stacked tensor's outer dimension, so this is a
+        /// byte offset — no copy, and each rank's device cache holds only its
+        /// own slice.
+        /// </summary>
+        private static StackedExpertWeights SliceExperts(StackedExpertWeights src, int firstExpert, int count)
+        {
+            long perExpertBytes = src.PerExpertRawBytes;
+            return new StackedExpertWeights(
+                new IntPtr(src.Data.ToInt64() + firstExpert * perExpertBytes),
+                src.GgmlType,
+                src.PerExpertNe0,
+                src.PerExpertNe1,
+                count,
+                perExpertBytes * count,
+                isExternalView: true,
+                ownerToken: src,
+                ownedBuffer: IntPtr.Zero);
+        }
+
         private void ShardGemma4MoeWeightsForTP()
         {
+            // First choice: slice INSIDE each expert (Megatron), which keeps every
+            // expert on every rank and so keeps the in-graph router's global ids
+            // valid — the one layout the fused whole-model MoE trunk can run under
+            // tensor parallelism. Costs a one-time materialization at load; buys
+            // the whole model as one graph per rank instead of ~90 op dispatches
+            // per layer. See Gemma4Model.TensorParallelMoEFused.cs.
+            if (BuildGemma4TensorSlicedExpertShards())
+                return;
+
+            // Otherwise whole-expert partitioning: zero-copy, and it keeps the
+            // batched per-layer MoE kernel usable.
+            if (BuildGemma4ExpertParallelShards())
+                return;
+
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 if (!HasMoE(layer))
@@ -362,6 +538,14 @@ namespace TensorSharp.Models
             }
 
             _tpKvCacheCapacity = newCapacity;
+            // The fused TP graphs bake in the KV buffer addresses and the cache
+            // extents, both of which just moved.
+            if (_tpFusedDecodeReady || _tpMoeFusedReady)
+            {
+                GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4MoEResetDecodeCache();
+                BuildGemma4TpDecodeArrays();
+            }
             Console.WriteLine($"Expanded Gemma4 TP cache to {newCapacity} tokens ({tp} GPUs).");
         }
 
@@ -423,6 +607,65 @@ namespace TensorSharp.Models
             // input-independent output. Replicated input => identical on every
             // node, so it needs no AllReduce.
             Tensor perLayerInputs = _pleDim > 0 ? ComputePLE(tokens, hidden0, seqLen) : null;
+
+            // Single-token step: run the whole trunk as one fused graph per rank,
+            // cut at the two AllReduce points per layer, instead of ~2000 per-op
+            // host round trips. Falls through when the native side declines.
+            if (seqLen == 1 && exceptPositions == null && _tpFusedDecodeReady)
+            {
+                float[] fused = EnsureFoldLogitsBuffer();
+                if (TryGemma4FusedModelDecodeTP(hidden0, startPos, perLayerInputs, fused))
+                {
+                    perLayerInputs?.Dispose();
+                    _cacheSeqLen += seqLen;
+                    _forwardCount++;
+                    _forwardSw.Stop();
+                    return fused;
+                }
+            }
+
+            // MoE trunk: same treatment through its own whole-model kernel, with a
+            // third AllReduce per layer for the expert down projection.
+            if (exceptPositions == null && perLayerInputs == null && _tpMoeFusedReady)
+            {
+                if (seqLen == 1)
+                {
+                    float[] fused = EnsureFoldLogitsBuffer();
+                    if (TryGemma4FusedMoEModelDecodeTP(hidden0, startPos, fused))
+                    {
+                        _cacheSeqLen += seqLen;
+                        _forwardCount++;
+                        _forwardSw.Stop();
+                        return fused;
+                    }
+                }
+                else if (TryGemma4FusedMoEModelVerifyTP(hidden0, startPos, seqLen))
+                {
+                    float[] result = Gemma4TpFinalNormAndLmHead(hidden0, seqLen);
+                    _cacheSeqLen += seqLen;
+                    _forwardCount++;
+                    _forwardSw.Stop();
+                    return result;
+                }
+            }
+
+            // Multi-token step (prefill / chunk): same fused-graph treatment, over
+            // N tokens. The trunk output lands back in hidden0 and the final norm
+            // + LM head run here on rank 0, mirroring the single-GPU verify path.
+            if (seqLen > 1 && _tpFusedDecodeReady &&
+                TryGemma4FusedModelVerifyTP(hidden0, startPos, seqLen, perLayerInputs, exceptPositions))
+            {
+                perLayerInputs?.Dispose();
+                float[] result = Gemma4TpFinalNormAndLmHead(hidden0, seqLen);
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                _forwardSw.Stop();
+                return result;
+            }
+
+            // The per-op path below reads the KV caches from host memory; a fused
+            // decode leaves its writes on the devices only.
+            SyncGemma4TpKvCacheToHost();
 
             // Broadcast embedding to all GPUs.
             Tensor[] hidden = BroadcastTensorToAllRanks(hidden0);
@@ -1043,7 +1286,22 @@ namespace TensorSharp.Models
             Tensor[] moeInput = TpRMSNorm(hidden, moeNormKey);
 
             var moeResults = new Tensor[tp];
-            for (int r = 0; r < tp; r++)
+
+            // Expert-parallel fast path: one batched dispatch per rank per layer.
+            if (UsesExpertParallelMoE &&
+                TryGemma4MoEExpertParallel(moeInput, moeResults, selectedExpertsFlat, routingWeightsFlat,
+                    layer, seqLen, hiddenSize))
+            {
+                for (int r = 0; r < tp; r++)
+                    moeInput[r].Dispose();
+                _tpGroup.AllReduce(moeResults);
+                return Gemma4MoEBlockTPFinish(hidden, denseNormed, moeResults, prefix);
+            }
+
+            // Every rank walks the same token/expert schedule over its own slice
+            // of the expert weights, so the ranks are independent right up to the
+            // AllReduce below — run them concurrently.
+            _tpGroup.RunPerRank(r =>
             {
                 var alloc = _tpGroup.GetAllocator(r);
 
@@ -1126,13 +1384,25 @@ namespace TensorSharp.Models
                 }
 
                 moeResults[r] = output;
-            }
+            });
 
             for (int r = 0; r < tp; r++)
                 moeInput[r].Dispose();
 
             // AllReduce MoE results.
             _tpGroup.AllReduce(moeResults);
+
+            return Gemma4MoEBlockTPFinish(hidden, denseNormed, moeResults, prefix);
+        }
+
+        /// <summary>
+        /// Tail of the MoE block, shared by the expert-parallel and per-expert
+        /// paths: post-norm the reduced MoE output, add it to the dense FFN
+        /// branch, then final-norm and add back into the residual stream.
+        /// </summary>
+        private Tensor[] Gemma4MoEBlockTPFinish(Tensor[] hidden, Tensor[] denseNormed, Tensor[] moeResults, string prefix)
+        {
+            int tp = TpDegree;
 
             // Apply post_ffw_norm_2 to MoE output
             string postNorm2Key = $"{prefix}.post_ffw_norm_2.weight";
@@ -1162,6 +1432,165 @@ namespace TensorSharp.Models
             }
 
             return hidden;
+        }
+
+        /// <summary>
+        /// Run one MoE layer expert-parallel: each rank dispatches the batched
+        /// <c>ggml_mul_mat_id</c> kernel over the experts it owns.
+        ///
+        /// The kernel wants a dense [seqLen][nUsed] route table, so routes that
+        /// belong to another rank are neutralised rather than removed — expert 0
+        /// with weight 0, which contributes nothing. That costs each rank a full
+        /// nUsed-wide pass instead of its ~nUsed/tp share, but it is still three
+        /// dispatches per layer against the hundreds of thousands the per-token
+        /// loop issued, and it keeps the route table shape the kernel expects.
+        ///
+        /// Returns false if any rank's shapes don't suit the kernel, leaving the
+        /// caller on the per-expert path.
+        /// </summary>
+        private bool TryGemma4MoEExpertParallel(
+            Tensor[] moeInput,
+            Tensor[] moeResults,
+            int[] selectedExpertsFlat,
+            float[] routingWeightsFlat,
+            int layer,
+            int seqLen,
+            int hiddenSize)
+        {
+            var gateShards = _tpStackedGate?[layer];
+            var downShards = _tpStackedDown?[layer];
+            if (gateShards == null || downShards == null)
+                return false;
+            var upShards = _tpStackedUp?[layer];
+
+            int tp = TpDegree;
+            int rankOffset = TpRankOffset;
+            int nUsed = _numExpertsUsed;
+            int perRank = _tpExpertsPerRank;
+            bool fusedGateUp = upShards == null;
+            int nFf = fusedGateUp
+                ? (int)(gateShards[0].PerExpertNe1 / 2)
+                : (int)gateShards[0].PerExpertNe1;
+
+            float[] perExpertScale = _layerPerExpertScale?[layer];
+            int totalRoutes = seqLen * nUsed;
+
+            // Per-rank route tables, built once on the calling thread: the rank
+            // workers must not race on shared scratch.
+            var localExperts = new int[tp][];
+            var localWeights = new float[tp][];
+            for (int r = 0; r < tp; r++)
+            {
+                int first = (rankOffset + r) * perRank;
+                int last = first + perRank;
+                var ids = new int[totalRoutes];
+                var wts = new float[totalRoutes];
+                var taken = new bool[perRank];
+                for (int s = 0; s < seqLen; s++)
+                {
+                    int baseIdx = s * nUsed;
+                    Array.Clear(taken, 0, perRank);
+
+                    // Own routes first, so the filler pass below can see which
+                    // local experts this token already uses.
+                    for (int k = 0; k < nUsed; k++)
+                    {
+                        int i = baseIdx + k;
+                        int e = selectedExpertsFlat[i];
+                        if (e >= first && e < last)
+                        {
+                            int local = e - first;
+                            ids[i] = local;
+                            taken[local] = true;
+                            float w = routingWeightsFlat[i];
+                            if (perExpertScale != null) w *= perExpertScale[e];
+                            wts[i] = w;
+                        }
+                        else
+                        {
+                            ids[i] = -1;
+                            wts[i] = 0f;
+                        }
+                    }
+
+                    // Foreign routes contribute nothing, but they still occupy a
+                    // slot in the dense route table. Give each a *distinct*
+                    // local expert: real top-k routing never repeats an expert
+                    // within a token, and the batched kernel's per-expert
+                    // gather/scatter relies on that — duplicates make two
+                    // destination slots claim one source row. perRank (>= nUsed)
+                    // guarantees a free id exists.
+                    int probe = 0;
+                    for (int k = 0; k < nUsed; k++)
+                    {
+                        int i = baseIdx + k;
+                        if (ids[i] >= 0) continue;
+                        while (probe < perRank && taken[probe]) probe++;
+                        int filler = probe < perRank ? probe : 0;
+                        if (probe < perRank) taken[probe] = true;
+                        ids[i] = filler;
+                    }
+                }
+                localExperts[r] = ids;
+                localWeights[r] = wts;
+            }
+
+            if (!_loggedExpertParallelShapes &&
+                string.Equals(Environment.GetEnvironmentVariable("TS_GGML_LOG_VRAM"), "1", StringComparison.Ordinal))
+            {
+                _loggedExpertParallelShapes = true;
+                var g0 = gateShards[0];
+                var d0 = downShards[0];
+                Console.WriteLine($"  [MoE-EP] seqLen={seqLen} hidden={hiddenSize} nFf={nFf} perRank={perRank} nUsed={nUsed} " +
+                    $"fusedGateUp={fusedGateUp} gate=[{g0.PerExpertNe0}x{g0.PerExpertNe1}x{g0.NumExperts}] type={g0.GgmlType} bytes={g0.TotalRawBytes} " +
+                    $"down=[{d0.PerExpertNe0}x{d0.PerExpertNe1}x{d0.NumExperts}] type={d0.GgmlType} bytes={d0.TotalRawBytes}");
+            }
+
+            bool ok = true;
+            _tpGroup.RunPerRank(r =>
+            {
+                var alloc = _tpGroup.GetAllocator(r);
+                var output = new Tensor(alloc, DType.Float32, seqLen, hiddenSize);
+                var g = gateShards[r];
+                var d = downShards[r];
+                var u = upShards?[r];
+
+                IntPtr upData = u == null ? IntPtr.Zero : u.Data;
+                int upType = u == null ? 0 : u.GgmlType;
+                long upNe0 = u == null ? 0L : u.PerExpertNe0;
+                long upNe1 = u == null ? 0L : u.PerExpertNe1;
+                long upBytes = u == null ? 0L : u.TotalRawBytes;
+
+                try
+                {
+                    GgmlBasicOps.MoEFFNPrefill(
+                        moeInput[r], output,
+                        seqLen, hiddenSize, nFf, perRank, nUsed,
+                        localExperts[r], localWeights[r],
+                        g.Data, g.GgmlType, g.PerExpertNe0, g.PerExpertNe1, g.TotalRawBytes,
+                        upData, upType, upNe0, upNe1, upBytes,
+                        d.Data, d.GgmlType, d.PerExpertNe0, d.PerExpertNe1, d.TotalRawBytes,
+                        gateBias: null, upBias: null, downBias: null,
+                        activation: GgmlBasicOps.MoEActivation.GEGLUSplit);
+                    InvalidateTensorDeviceCache(output);
+                    moeResults[r] = output;
+                }
+                catch (NotSupportedException)
+                {
+                    output.Dispose();
+                    ok = false;
+                }
+            });
+
+            if (!ok)
+            {
+                for (int r = 0; r < tp; r++)
+                {
+                    moeResults[r]?.Dispose();
+                    moeResults[r] = null;
+                }
+            }
+            return ok;
         }
 
         private Tensor TpExpertLinear(Tensor input, string weightName, int rank, int seqLen)

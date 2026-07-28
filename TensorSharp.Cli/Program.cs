@@ -434,12 +434,17 @@ namespace TensorSharp.Cli
             var modelLoadSw = Stopwatch.StartNew();
 
             // Build a distributed TP group when --tp-node-id and --tp-peers are provided.
-            Cuda.ITensorParallelGroup tpGroup = null;
+            ITensorParallelGroup tpGroup = null;
             if (tpNodeId >= 0 && !string.IsNullOrEmpty(tpPeers))
             {
                 var peerEndpoints = TensorSharp.Distributed.DistributedTpConfig.ParsePeers(tpPeers);
                 int localDegree = tpDegree > 1 ? tpDegree : 1;
-                tpGroup = new TensorSharp.Distributed.DistributedTensorParallelGroup(localDegree, tpNodeId, peerEndpoints);
+                // The on-node group has to match the backend: direct CUDA drives
+                // CudaAllocators, the ggml backends drive per-rank ggml backends.
+                tpGroup = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
+                    ? new TensorSharp.Distributed.DistributedTensorParallelGroup(
+                        ModelBase.CreateGgmlLocalTpGroup(backend, localDegree), tpNodeId, peerEndpoints)
+                    : new TensorSharp.Distributed.DistributedTensorParallelGroup(localDegree, tpNodeId, peerEndpoints);
                 tpDegree = localDegree;
             }
 

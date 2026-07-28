@@ -17,9 +17,12 @@ namespace TensorSharp.Distributed
     /// This minimises network traffic: only one buffer per AllReduce
     /// crosses the network, regardless of how many local GPUs participate.
     /// </summary>
-    public sealed class DistributedTensorParallelGroup : ITensorParallelGroup
+    public sealed class DistributedTensorParallelGroup : ITensorParallelGroup, INestedTensorParallelGroup
     {
-        private readonly TensorParallelGroup _localGroup;
+        /// <summary>The group that owns this node's GPUs.</summary>
+        public ITensorParallelGroup LocalGroup => _localGroup;
+
+        private readonly ITensorParallelGroup _localGroup;
         private readonly TcpCommunicator _tcp;
         private readonly int _nodeId;
         private readonly int _nodeCount;
@@ -38,16 +41,33 @@ namespace TensorSharp.Distributed
         /// TCP endpoints for every node in the group, indexed by node ID.
         /// </param>
         public DistributedTensorParallelGroup(int localDegree, int nodeId, IPEndPoint[] peerEndpoints)
+            : this(new TensorParallelGroup(localDegree), nodeId, peerEndpoints)
+        {
+        }
+
+        /// <summary>
+        /// Wrap an already-constructed local group. Lets the caller choose which
+        /// backend owns the on-node GPUs — <see cref="TensorParallelGroup"/> for
+        /// direct CUDA, a GGML group for the ggml backends — while this class
+        /// supplies the cross-node layer unchanged.
+        /// </summary>
+        /// <param name="localGroup">Group covering this node's GPUs.</param>
+        /// <param name="nodeId">This node's ID (0..nodeCount-1).</param>
+        /// <param name="peerEndpoints">
+        /// TCP endpoints for every node in the group, indexed by node ID.
+        /// </param>
+        public DistributedTensorParallelGroup(ITensorParallelGroup localGroup, int nodeId, IPEndPoint[] peerEndpoints)
         {
             _nodeId = nodeId;
             _nodeCount = peerEndpoints.Length;
 
-            if (localDegree < 1)
-                throw new ArgumentOutOfRangeException(nameof(localDegree));
+            if (localGroup == null)
+                throw new ArgumentNullException(nameof(localGroup));
             if (_nodeCount < 2)
                 throw new ArgumentException("Distributed TP requires at least 2 nodes.", nameof(peerEndpoints));
 
-            _localGroup = new TensorParallelGroup(localDegree);
+            _localGroup = localGroup;
+            int localDegree = localGroup.Degree;
             _tcp = new TcpCommunicator(nodeId, peerEndpoints);
 
             Console.WriteLine($"Distributed tensor parallelism: node {nodeId}/{_nodeCount}, " +
@@ -69,7 +89,10 @@ namespace TensorSharp.Distributed
         /// <summary>Number of nodes in the cluster.</summary>
         public int NodeCount => _nodeCount;
 
-        public CudaAllocator GetAllocator(int rank) => _localGroup.GetAllocator(rank);
+        public IAllocator GetAllocator(int rank) => _localGroup.GetAllocator(rank);
+
+        /// <summary>Delegate rank fan-out to the local group's dispatch policy.</summary>
+        public void RunPerRank(Action<int> body) => _localGroup.RunPerRank(body);
 
         /// <summary>
         /// Hierarchical AllReduce: local P2P reduce → TCP reduce → local broadcast.

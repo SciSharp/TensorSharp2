@@ -536,7 +536,7 @@ TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
 | Mistral 3 | ✅ | 融合 / 分离 QKV，YaRN RoPE |
 | Gemma 3 | ✅ | 分离 Q/K/V，GELU，滑动窗口 |
 | Gemma 4 | ✅ | 稠密 + MoE 专家切分，逐层 head 维度 |
-| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属，MoE 专家切分 |
+| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属；直连 CUDA 与 GGML 均有打包 GDN 内核，GGML 上另有专家并行 MoE 与列并行 LM head |
 | GPT OSS | ✅ | MoE 专家切分，attention sink，YaRN |
 | Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算，MoE 专家切分 |
 | DiffusionGemma | — | 不适用（扩散模型） |

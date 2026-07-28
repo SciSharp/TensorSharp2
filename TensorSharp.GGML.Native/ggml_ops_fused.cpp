@@ -208,6 +208,33 @@ int fused_rms_norm_matmul_quant_f32_impl(
     return 1;
 }
 
+// Per-rank parking for a tensor-parallel FFN graph: the driver runs it after
+// this function returns, so the pooled context and the backend buffer have to
+// outlive the call. Recycled when that rank builds its next one.
+namespace
+{
+    struct FfnTpPending
+    {
+        PooledContextHandle context;
+        BufferHandle buffer{ nullptr };
+        std::vector<BufferHandle> host_ptr_buffers;
+        std::vector<float> packed_input;
+        tsg::TpRankPlan plan;
+
+        void reset()
+        {
+            plan.clear();
+            host_ptr_buffers.clear();
+            packed_input.clear();
+            buffer = BufferHandle(nullptr);
+            context = PooledContextHandle();
+        }
+    };
+    FfnTpPending g_ffn_tp[tsg::TSG_MAX_DEVICES];
+    // Same parking for the generic row-parallel matmul + residual add.
+    FfnTpPending g_mmadd_tp[tsg::TSG_MAX_DEVICES];
+}
+
 // ============================================================================
 // Fused Quantized MatMul + Add: single GPU dispatch.
 // residual += matmul(input, quant_weight)
@@ -216,10 +243,24 @@ int fused_rms_norm_matmul_quant_f32_impl(
 int fused_matmul_quant_add_f32_impl(
     const TensorView2DDesc& residual_desc,
     const TensorView2DDesc& input_desc,
-    const QuantizedWeightDesc& m2_quant)
+    const QuantizedWeightDesc& m2_quant,
+    int tp_degree,
+    void** tp_plan_out)
 {
     if (!ensure_backend())
         return 0;
+
+    // Tensor-parallel build mode. This is the generic row-parallel layer: the
+    // matmul is a partial sum, the ranks add theirs together, then the residual
+    // add closes the block. Cutting at the matmul is what lets an attention or
+    // SSM output projection run as one graph per rank instead of a linear, a
+    // collective and an add, each a separate host round trip.
+    const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+    if (tp_mode)
+    {
+        *tp_plan_out = nullptr;
+        g_mmadd_tp[tsg::g_active_rank].reset();
+    }
 
     if (!validate_desc(residual_desc, "residual") || !validate_desc(input_desc, "input"))
         return 0;
@@ -355,6 +396,32 @@ int fused_matmul_quant_add_f32_impl(
     if (!m2_bound || m2_needs_upload)
         upload_binding(m2_binding, m2_quant.data, m2_binding.raw_bytes);
 
+    if (tp_mode)
+    {
+        auto& pending = g_mmadd_tp[tsg::g_active_rank];
+        pending.plan.clear();
+        pending.plan.graph = graph;
+        pending.plan.ar_tensor.push_back(mm);
+        if (!tp_plan_segments(pending.plan, pending.plan.ar_tensor))
+        {
+            pending.reset();
+            return 0;
+        }
+        if (!use_zero_copy)
+        {
+            pending.plan.out_tensor = residual_binding.storage;
+            pending.plan.out_host = residual_desc.data;
+            pending.plan.out_bytes = residual_binding.raw_bytes;
+        }
+        pending.context = std::move(context);
+        pending.buffer = std::move(buffer);
+        pending.host_ptr_buffers = std::move(host_ptr_buffers);
+        pending.packed_input = std::move(packed_input);
+        *tp_plan_out = &pending.plan;
+        clear_last_error();
+        return 1;
+    }
+
     ggml_status status = ggml_backend_graph_compute(g_backend, graph);
     if (status != GGML_STATUS_SUCCESS)
     {
@@ -365,6 +432,18 @@ int fused_matmul_quant_add_f32_impl(
 
     clear_last_error();
     return 1;
+}
+
+// Release every rank's parked tensor-parallel matmul+add graph.
+TSG_EXPORT void TSGgml_ReleaseFusedMatmulAddTpGraphs()
+{
+    for (int r = 0; r < tsg::TSG_MAX_DEVICES; ++r)
+    {
+        if (g_mmadd_tp[r].plan.graph == nullptr && g_mmadd_tp[r].context.value == nullptr)
+            continue;
+        tsg::ScopedRank rank(r);
+        g_mmadd_tp[r].reset();
+    }
 }
 
 // ============================================================================
@@ -389,10 +468,22 @@ int fused_ffn_swiglu_quant_f32_impl(
     float eps,
     const QuantizedWeightDesc& gate_up_quant,
     const QuantizedWeightDesc& down_quant,
-    int half_dim)
+    int half_dim,
+    int tp_degree,
+    void** tp_plan_out)
 {
     if (!ensure_backend())
         return 0;
+
+    // Tensor-parallel build mode: the down projection is row-parallel, so its
+    // output is this rank's partial sum and the residual add has to wait for the
+    // ranks to agree. Build the graph, mark that cut, hand it back.
+    const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+    if (tp_mode)
+    {
+        *tp_plan_out = nullptr;
+        g_ffn_tp[tsg::g_active_rank].reset();
+    }
 
     if (!validate_desc(residual_desc, "residual") || !validate_desc(input_desc, "input"))
         return 0;
@@ -634,6 +725,34 @@ int fused_ffn_swiglu_quant_f32_impl(
         upload_binding(tmp, norm_weight_data, norm_bytes);
     }
 
+    if (tp_mode)
+    {
+        auto& pending = g_ffn_tp[tsg::g_active_rank];
+        pending.plan.clear();
+        pending.plan.graph = graph;
+        pending.plan.ar_tensor.push_back(down_mm);
+        if (!tp_plan_segments(pending.plan, pending.plan.ar_tensor))
+        {
+            pending.reset();
+            return 0;
+        }
+        // Zero-copy bindings write the result straight into the caller's host
+        // memory; otherwise the driver copies it back after the last segment.
+        if (!use_zero_copy)
+        {
+            pending.plan.out_tensor = residual_binding.storage;
+            pending.plan.out_host = residual_desc.data;
+            pending.plan.out_bytes = residual_binding.raw_bytes;
+        }
+        pending.context = std::move(context);
+        pending.buffer = std::move(buffer);
+        pending.host_ptr_buffers = std::move(host_ptr_buffers);
+        pending.packed_input = std::move(packed_input);
+        *tp_plan_out = &pending.plan;
+        clear_last_error();
+        return 1;
+    }
+
     ggml_status status = ggml_backend_graph_compute(g_backend, graph);
     if (status != GGML_STATUS_SUCCESS)
     {
@@ -644,6 +763,18 @@ int fused_ffn_swiglu_quant_f32_impl(
 
     clear_last_error();
     return 1;
+}
+
+// Release every rank's parked tensor-parallel FFN graph.
+TSG_EXPORT void TSGgml_ReleaseFusedFfnTpGraphs()
+{
+    for (int r = 0; r < tsg::TSG_MAX_DEVICES; ++r)
+    {
+        if (g_ffn_tp[r].plan.graph == nullptr && g_ffn_tp[r].context.value == nullptr)
+            continue;
+        tsg::ScopedRank rank(r);
+        g_ffn_tp[r].reset();
+    }
 }
 
 // ============================================================================
@@ -1917,7 +2048,10 @@ TSG_EXPORT int TSGgml_FusedMatMulQuantAddF32(
     int m2_ggml_type,
     std::int64_t m2_ne0,
     std::int64_t m2_ne1,
-    std::int64_t m2_raw_bytes)
+    std::int64_t m2_raw_bytes,
+    // Tensor parallelism: with tp_degree > 1 `m2` is this rank's row-parallel
+    // shard and the call returns a plan cut at the matmul instead of running it.
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
@@ -1927,7 +2061,7 @@ TSG_EXPORT int TSGgml_FusedMatMulQuantAddF32(
         m2_quant.ne0 = m2_ne0;
         m2_quant.ne1 = m2_ne1;
         m2_quant.raw_bytes = m2_raw_bytes;
-        return fused_matmul_quant_add_f32_impl(residual, input, m2_quant);
+        return fused_matmul_quant_add_f32_impl(residual, input, m2_quant, tp_degree, tp_plan_out);
     }
     catch (const std::exception& ex)
     {
@@ -1957,7 +2091,11 @@ TSG_EXPORT int TSGgml_FusedFFNSwiGLUQuantF32(
     std::int64_t down_ne0,
     std::int64_t down_ne1,
     std::int64_t down_raw_bytes,
-    int half_dim)
+    int half_dim,
+    // Tensor parallelism: with tp_degree > 1 the weights are this rank's shards
+    // (gate_up column-parallel, down row-parallel) and the call returns a plan
+    // cut at the down projection instead of running the graph.
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
@@ -1977,7 +2115,7 @@ TSG_EXPORT int TSGgml_FusedFFNSwiGLUQuantF32(
 
         return fused_ffn_swiglu_quant_f32_impl(
             residual, input, norm_weight_data, norm_weight_count, eps,
-            gate_up_quant, down_quant, half_dim);
+            gate_up_quant, down_quant, half_dim, tp_degree, tp_plan_out);
     }
     catch (const std::exception& ex)
     {
@@ -2687,7 +2825,7 @@ static int fused_qwen35_vision_encoder_f32_impl(
     if (!use_zero_copy)
         upload_binding(hidden_binding, hidden_desc.data, hidden_binding.raw_bytes);
     for (auto& u : upload_list)
-        ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+        ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
     ggml_backend_tensor_set(cos_t, cos_table, 0, cos_sin_elems * sizeof(float));
     ggml_backend_tensor_set(sin_t, sin_table, 0, cos_sin_elems * sizeof(float));
 

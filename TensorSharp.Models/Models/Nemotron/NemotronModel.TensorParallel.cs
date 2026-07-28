@@ -81,8 +81,10 @@ namespace TensorSharp.Models
                 }
             }
 
-            if (_backend != BackendType.Cuda)
-                errors.Add($"TP requires CUDA backend, got {_backend}");
+            // Tensor parallelism runs on the multi-GPU backends: direct CUDA and
+            // the GGML CUDA/Vulkan backends (one ggml backend per GPU).
+            if (_backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+                errors.Add($"TP requires a multi-GPU backend (cuda, ggml-cuda, ggml-vulkan), got {_backend}");
 
             if (errors.Count > 0)
                 throw new InvalidOperationException(

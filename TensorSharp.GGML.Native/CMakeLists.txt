@@ -103,11 +103,26 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     set(GGML_CUDA_NO_VMM OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_NO_PEER_COPY OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_DEBUG OFF CACHE BOOL "" FORCE)
-    # NCCL is only used for multi-GPU collective communication and defaults to ON
-    # upstream, which makes the build emit "Warning: NCCL not found ..." on the
-    # common single-GPU / no-NCCL setup. TensorSharp does not depend on NCCL, so
-    # disable the probe to keep the build quiet (multi-GPU still works without it).
-    set(GGML_CUDA_NCCL OFF CACHE BOOL "" FORCE)
+    # NCCL powers the cross-GPU AllReduce on the tensor-parallel path
+    # (ggml-cuda's comm backend prefers it over the P2P pipeline and the
+    # butterfly fallback). Upstream defaults it ON and warns loudly when the
+    # library is missing, which is noise on the common single-GPU box — so probe
+    # for it here and only enable it when it is actually installed.
+    # TENSORSHARP_GGML_NATIVE_ENABLE_NCCL=ON/OFF forces the decision.
+    if (DEFINED TENSORSHARP_GGML_NATIVE_ENABLE_NCCL)
+        set(TSG_USE_NCCL ${TENSORSHARP_GGML_NATIVE_ENABLE_NCCL})
+    else()
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/cmake")
+        find_package(NCCL QUIET)
+        if (NCCL_FOUND)
+            set(TSG_USE_NCCL ON)
+            message(STATUS "NCCL found: enabling multi-GPU collective AllReduce for tensor parallelism")
+        else()
+            set(TSG_USE_NCCL OFF)
+            message(STATUS "NCCL not found: tensor-parallel AllReduce will use the P2P/butterfly fallback")
+        endif()
+    endif()
+    set(GGML_CUDA_NCCL ${TSG_USE_NCCL} CACHE BOOL "" FORCE)
     set(GGML_CUDA_PEER_MAX_BATCH_SIZE 128 CACHE STRING "" FORCE)
     set(GGML_CUDA_COMPRESSION_MODE "speed" CACHE STRING "" FORCE)
 endif()
@@ -185,9 +200,11 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_qwen_image.cpp
     ggml_ops_gated_delta_net.cpp
     ggml_ops_qwen35_recurrent_prefill.cpp
+    ggml_ops_qwen35_gdn_tp.cpp
     ggml_ops_mamba2.cpp
     ggml_ops_moe.cpp
     ggml_ops_paged_attention.cpp
+    ggml_ops_tensor_parallel.cpp
 )
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)

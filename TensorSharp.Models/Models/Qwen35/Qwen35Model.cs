@@ -341,7 +341,7 @@ namespace TensorSharp.Models
         private long _mlxEvalBoundaryTicks;
         private long _mlxCacheEvalTicks;
 
-        public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, Cuda.ITensorParallelGroup tpGroup = null)
+        public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
             : base(ggufPath, backend, tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "qwen35";
@@ -1515,7 +1515,9 @@ namespace TensorSharp.Models
                 else
                     hidden = AttentionBlock(hidden, layer, seqLen, startPos);
                 TryEvaluateMlxLayerBoundary(hidden, layer, seqLen);
+                TraceLayer(hidden, layer, "");
             }
+            _layerTraceForwards++;
             return hidden;
         }
 
@@ -5625,6 +5627,7 @@ namespace TensorSharp.Models
                 Console.WriteLine($"  (MLX cache eval: {ms:F0} ms, interval={MlxEvalEveryNLayers})");
             }
             PrintGdnTimingStats();
+            PrintTpTimingStats();
         }
 
         public override void Dispose()

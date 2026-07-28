@@ -1329,6 +1329,42 @@ TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
 //   - Single contiguous KV cache per layer (no rolling window). Mask is plain
 //     causal (no SWA).
 // ============================================================================
+namespace
+{
+    // Per-rank parking for a tensor-parallel attention-layer graph. This kernel
+    // builds from the context pool and a per-call backend buffer, neither of
+    // which survives the call — and under TP the driver runs the graph only
+    // after every rank has built one.
+    struct Q35AttnTpPending
+    {
+        PooledContextHandle context;
+        BufferHandle buffer{ nullptr };
+        std::vector<BufferHandle> ephemeral;
+        tsg::TpRankPlan plan;
+
+        void reset()
+        {
+            plan.clear();
+            ephemeral.clear();
+            buffer = BufferHandle(nullptr);
+            context = PooledContextHandle();
+        }
+    };
+    Q35AttnTpPending g_q35attn_tp[tsg::TSG_MAX_DEVICES];
+}
+
+// Release every rank's parked tensor-parallel attention graph.
+TSG_EXPORT void TSGgml_Qwen35ReleaseAttentionTpGraphs()
+{
+    for (int r = 0; r < tsg::TSG_MAX_DEVICES; ++r)
+    {
+        if (g_q35attn_tp[r].plan.graph == nullptr && g_q35attn_tp[r].context.value == nullptr)
+            continue;
+        tsg::ScopedRank rank(r);
+        g_q35attn_tp[r].reset();
+    }
+}
+
 TSG_EXPORT int TSGgml_Qwen35AttentionLayerPrefill(
     float* hidden_data,        // [seqLen * hiddenSize] in/out
     int hiddenSize, int seqLen,
@@ -1342,11 +1378,27 @@ TSG_EXPORT int TSGgml_Qwen35AttentionLayerPrefill(
     float ropeBase, float ropeFreqScale, int ropeDims,
     int ropeMode,
     int kvCacheType,
-    float eps)
+    float eps,
+    // Tensor parallelism. With tp_degree > 1 the weights, head counts and KV
+    // cache above are THIS rank's shard, and the call builds the graph instead
+    // of running it: the output projection is row-parallel, so its result is a
+    // partial sum that the ranks must add together before the residual add. The
+    // returned plan names that cut point; the caller collects one plan per rank
+    // and runs them through TSGgml_TensorParallelExecutePlans.
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
         if (!ensure_backend()) return 0;
+
+        const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+        if (tp_mode)
+        {
+            *tp_plan_out = nullptr;
+            // Recycle this rank's previous parked graph: the driver has already
+            // run it, or the caller abandoned it.
+            g_q35attn_tp[tsg::g_active_rank].reset();
+        }
 
         const int qDim = numHeads * headDim;          // post-deinterleave Q dim
         const int qFullDim = qDim * 2;                // pre-deinterleave Q+gate dim
@@ -1585,10 +1637,33 @@ TSG_EXPORT int TSGgml_Qwen35AttentionLayerPrefill(
         bind(k_cache_t, kCacheData, kvCacheBytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         bind(v_cache_t, vCacheData, kvCacheBytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
-        if (buffer.value == nullptr) {
-            set_last_error("Failed to allocate buffer for Qwen3.5 attention layer prefill.");
-            return 0;
+        // Allocation strategy, mirroring the Gemma 4 verify kernel. A fresh
+        // ggml_backend_alloc_ctx_tensors is a cudaMalloc/cudaFree pair per call,
+        // which is invisible next to a 512-token prefill but dominates a
+        // single-token step — and under tensor parallelism this kernel IS the
+        // decode path, once per attention layer per rank per token. Small
+        // batches therefore take the persistent per-rank reuse buffer; large
+        // ones keep gallocr's lifetime packing, whose peak is one layer's
+        // working set rather than the sum of every intermediate.
+        BufferHandle buffer(nullptr);
+        if (seqLen > 16)
+        {
+            if (!alloc_graph_reuse_gallocr(graph))
+            {
+                buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+                if (buffer.value == nullptr) {
+                    set_last_error("Failed to allocate buffer for Qwen3.5 attention layer prefill.");
+                    return 0;
+                }
+            }
+        }
+        else if (!alloc_ctx_tensors_reuse(ctx))
+        {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr) {
+                set_last_error("Failed to allocate buffer for Qwen3.5 attention layer prefill.");
+                return 0;
+            }
         }
 
         host_read_barrier();
@@ -1600,6 +1675,36 @@ TSG_EXPORT int TSGgml_Qwen35AttentionLayerPrefill(
             static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float));
         ggml_backend_tensor_set(pos_tensor, pos_data.data(), 0, seqLen * sizeof(int32_t));
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+
+        if (tp_mode)
+        {
+            auto& pending = g_q35attn_tp[tsg::g_active_rank];
+            pending.plan.clear();
+            pending.plan.graph = graph;
+            pending.plan.ar_tensor.push_back(o_out);
+            if (!tp_plan_segments(pending.plan, pending.plan.ar_tensor))
+            {
+                pending.reset();
+                return 0;
+            }
+            // The residual add and the output copy sit after the reduction, so
+            // every rank ends with the same replicated block output. Each rank
+            // writes back into the `hidden_data` it was given: the caller keeps
+            // one activation buffer PER RANK (they are accumulated into
+            // independently by the per-op blocks around this one), so writing
+            // only rank 0's would leave the others a layer behind. When the
+            // caller passes one shared buffer the extra copies are identical
+            // bytes and harmless.
+            pending.plan.out_tensor = hidden_out_t;
+            pending.plan.out_host = hidden_data;
+            pending.plan.out_bytes = static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float);
+            pending.context = std::move(context);
+            pending.buffer = std::move(buffer);
+            pending.ephemeral = std::move(ephem);
+            *tp_plan_out = &pending.plan;
+            clear_last_error();
+            return 1;
+        }
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS) {

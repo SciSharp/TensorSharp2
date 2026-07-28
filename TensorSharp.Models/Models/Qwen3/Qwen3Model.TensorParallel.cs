@@ -9,6 +9,7 @@
 using System;
 using System.Diagnostics;
 using TensorSharp;
+using TensorSharp.GGML;
 
 namespace TensorSharp.Models
 {
@@ -174,18 +175,18 @@ namespace TensorSharp.Models
             // 3. Per-GPU attention (each GPU handles numHeads/tp Q heads).
             Tensor[] attnOut = AttentionTP(qkvFused, layer, wn, seqLen, startPos);
 
-            // 4. Row-parallel output projection + AllReduce.
-            Tensor reducedAttn = TpRowParallelLinear(attnOut, wn[4]);
+            // 4. Row-parallel output projection + AllReduce. AllReduce already
+            //    leaves the sum on every rank, so take all of them rather than
+            //    keeping rank 0 and re-broadcasting it — that pair cost an extra
+            //    allocate + copy per rank per layer for a value each rank held.
+            Tensor[] reducedAttn = TpRowParallelLinearAllRanks(attnOut, wn[4]);
             for (int r = 0; r < tp; r++)
                 attnOut[r].Dispose();
 
             // 5. Residual add (replicated after AllReduce).
-            // Broadcast reducedAttn (rank 0) to all GPUs, then add.
-            Tensor[] attnReplicated = BroadcastTensorToAllRanks(reducedAttn);
-            TpResidualAdd(hidden, attnReplicated);
-            for (int r = 1; r < tp; r++)
-                attnReplicated[r].Dispose();
-            reducedAttn.Dispose();
+            TpResidualAdd(hidden, reducedAttn);
+            for (int r = 0; r < tp; r++)
+                reducedAttn[r].Dispose();
 
             // 6. FFN norm (replicated).
             Tensor[] normed2 = TpRMSNorm(hidden, wn[5]);
@@ -203,7 +204,7 @@ namespace TensorSharp.Models
             int halfDim = (int)(gateUp[0].Sizes[1] / 2);
 
             Tensor[] gateResults = new Tensor[tp];
-            for (int r = 0; r < tp; r++)
+            _tpGroup.RunPerRank(r =>
             {
                 Tensor gate, up;
                 if (seqLen == 1)
@@ -223,19 +224,17 @@ namespace TensorSharp.Models
                 Ops.SiLUMul(gate, gate, up);
                 up.Dispose();
                 gateResults[r] = gate;
-            }
+            });
 
-            // 9. Row-parallel down projection + AllReduce.
-            Tensor ffnOut = TpRowParallelLinear(gateResults, wn[7]);
+            // 9. Row-parallel down projection + AllReduce (kept on every rank).
+            Tensor[] ffnOut = TpRowParallelLinearAllRanks(gateResults, wn[7]);
             for (int r = 0; r < tp; r++)
                 gateResults[r].Dispose();
 
             // 10. Residual add.
-            Tensor[] ffnReplicated = BroadcastTensorToAllRanks(ffnOut);
-            TpResidualAdd(hidden, ffnReplicated);
-            for (int r = 1; r < tp; r++)
-                ffnReplicated[r].Dispose();
-            ffnOut.Dispose();
+            TpResidualAdd(hidden, ffnOut);
+            for (int r = 0; r < tp; r++)
+                ffnOut[r].Dispose();
 
             return hidden;
         }
@@ -253,7 +252,9 @@ namespace TensorSharp.Models
 
             var results = new Tensor[tp];
 
-            for (int r = 0; r < tp; r++)
+            // Each rank owns a disjoint head subset with its own KV cache
+            // slice, so the whole attention block is rank-independent.
+            _tpGroup.RunPerRank(r =>
             {
                 var alloc = _tpGroup.GetAllocator(r);
 
@@ -296,6 +297,12 @@ namespace TensorSharp.Models
                 if (seqLen == 1)
                 {
                     // Decode path: copy K/V to per-GPU cache, run attention.
+                    //
+                    // This stays on the managed host loop deliberately. Routing it
+                    // through GgmlBasicOps.FlashAttnDecode was measured slower
+                    // (12.0 -> 10.1 tok/s on Qwen3-4B at 512+32): a decode step
+                    // touches only a few hundred KB of KV cache, and the device
+                    // round trip for that costs more than reading it on the CPU.
                     CopyToCacheDecode(_tpKvCacheK[layer][r], kTensor, _tpKvCacheV[layer][r], vTensor,
                         numKVHeadsPerGpu, headDim, startPos);
                     kTensor.Dispose();
@@ -346,7 +353,7 @@ namespace TensorSharp.Models
 
                     results[r] = flatOutput;
                 }
-            }
+            });
 
             return results;
         }

@@ -52,8 +52,21 @@ namespace TensorSharp
             }
         }
 
+        /// <summary>
+        /// Optional pre-dispatch hook, invoked with the raw argument array before
+        /// a handler runs. Installed by multi-device backends so an op lands on
+        /// the device that owns its result tensor: under tensor parallelism the
+        /// result's allocator identifies the rank, and the backend needs that
+        /// selection made before the handler touches the device.
+        ///
+        /// Null (and therefore free) unless a backend opts in.
+        /// </summary>
+        public static Action<object[]> PreInvokeHook;
+
         public static object Invoke(string opName, params object[] args)
         {
+            PreInvokeHook?.Invoke(args);
+
             if (opInstances.TryGetValue(opName, out List<OpInstance> instanceList))
             {
                 foreach (OpInstance instance in instanceList)

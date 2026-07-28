@@ -594,7 +594,7 @@ internal enum GgmlIndexReductionOp
     Argmax = 2,
 }
 
-    internal static class GgmlNative
+    internal static partial class GgmlNative
     {
         private const string DllName = "GgmlOps";
         private const CallingConvention CallingConventionType = CallingConvention.Cdecl;
@@ -673,7 +673,11 @@ internal enum GgmlIndexReductionOp
             int m2GgmlType,
             long m2Ne0,
             long m2Ne1,
-            long m2RawBytes);
+            long m2RawBytes,
+            int tpDegree, out IntPtr tpPlanOut);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_ReleaseFusedMatmulAddTpGraphs();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_FusedFFNSwiGLUQuantF32(
@@ -692,7 +696,17 @@ internal enum GgmlIndexReductionOp
             long downNe0,
             long downNe1,
             long downRawBytes,
-            int halfDim);
+            int halfDim,
+            int tpDegree, out IntPtr tpPlanOut);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_ReleaseFusedFfnTpGraphs();
+
+        public static void ReleaseFusedFfnTpGraphs()
+        {
+            try { TSGgml_ReleaseFusedFfnTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
+        }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_FusedFFNActProjectQuantF32(
@@ -1332,7 +1346,17 @@ internal enum GgmlIndexReductionOp
             float ropeBase, float ropeFreqScale, int ropeDims,
             int ropeMode,
             int kvCacheType,
-            float eps);
+            float eps,
+            int tpDegree, out IntPtr tpPlanOut);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Qwen35ReleaseAttentionTpGraphs();
+
+        public static void Qwen35ReleaseAttentionTpGraphs()
+        {
+            try { TSGgml_Qwen35ReleaseAttentionTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
+        }
 
         public static void Qwen35AttentionLayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,
@@ -1346,7 +1370,8 @@ internal enum GgmlIndexReductionOp
             float ropeBase, float ropeFreqScale, int ropeDims,
             int ropeMode,
             int kvCacheType,
-            float eps)
+            float eps,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             CheckResult(TSGgml_Qwen35AttentionLayerPrefill(
                 hiddenData, hiddenSize, seqLen,
@@ -1358,7 +1383,10 @@ internal enum GgmlIndexReductionOp
                 numHeads, kvHeads, headDim,
                 cacheSize, startPos,
                 ropeBase, ropeFreqScale, ropeDims,
-                ropeMode, kvCacheType, eps), "qwen35_attention_layer_prefill");
+                ropeMode, kvCacheType, eps,
+                tpDegree, out IntPtr plan), "qwen35_attention_layer_prefill");
+            // Tensor-parallel mode returns a plan instead of running the graph.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
         }
 
         public static void GptOssAttentionLayerPrefill(
@@ -1455,7 +1483,8 @@ internal enum GgmlIndexReductionOp
             int pleTokenId,
             IntPtr pleModelProjData, int pleModelProjType,
             long pleModelProjNe0, long pleModelProjNe1, long pleModelProjBytes,
-            IntPtr pleModelProjNormData);
+            IntPtr pleModelProjNormData,
+            int tpDegree, out IntPtr tpPlanOut);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4ModelDecodeBatched(
@@ -1512,7 +1541,8 @@ internal enum GgmlIndexReductionOp
             int[] pleTokenIds,
             IntPtr pleProjWData, int pleProjWType,
             long pleProjWNe0, long pleProjWNe1, long pleProjWBytes,
-            IntPtr pleProjNormData);
+            IntPtr pleProjNormData,
+            int tpDegree, out IntPtr tpPlanOut);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4DraftStep(
@@ -1752,23 +1782,29 @@ internal enum GgmlIndexReductionOp
             IntPtr hidden, int hiddenSize, int position,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, float logitSoftcap);
+            IntPtr finalNorm, float logitSoftcap,
+            int tpDegree, out IntPtr tpPlanOut);
 
         public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position)
         {
             CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position,
-                IntPtr.Zero, 0, IntPtr.Zero, 0, 0, 0, 0, IntPtr.Zero, 0.0f), nameof(TSGgml_Gemma4MoEModelDecode));
+                IntPtr.Zero, 0, IntPtr.Zero, 0, 0, 0, 0, IntPtr.Zero, 0.0f,
+                1, out _), nameof(TSGgml_Gemma4MoEModelDecode));
         }
 
         // Folded variant: appends final-norm + lm_head + softcap so logits[vocab] are
         // written to <paramref name="logits"/> as part of the captured replay.
         public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
             IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, float logitSoftcap)
+            IntPtr finalNorm, float logitSoftcap,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position,
-                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap),
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap,
+                tpDegree, out IntPtr plan),
                 nameof(TSGgml_Gemma4MoEModelDecode));
+            // Tensor-parallel mode returns a plan instead of running the graph.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
         }
 
         // TRUE token-batched MoE decode: N concurrent sequences, one token each, in
@@ -1806,11 +1842,26 @@ internal enum GgmlIndexReductionOp
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4MoEModelVerify(
             [In] Gemma4MoELayerDecodeArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int startPos, int numTokens);
+            IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            int tpDegree, out IntPtr tpPlanOut);
 
-        public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens)
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
+
+        public static void Gemma4MoEReleaseVerifyTpGraphs()
         {
-            return TSGgml_Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens) != 0;
+            try { TSGgml_Gemma4MoEReleaseVerifyTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
+        }
+
+        public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+        {
+            int rc = TSGgml_Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens,
+                tpDegree, out IntPtr plan);
+            // Tensor-parallel mode returns a plan instead of running the graph.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
+            return rc != 0;
         }
 
         // Qwen3.5/3.6 full-model decode: the whole hybrid transformer (full-attention
@@ -1837,6 +1888,15 @@ internal enum GgmlIndexReductionOp
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_Gemma4ResetDecodeCache();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Gemma4ReleaseVerifyTpGraphs();
+
+        public static void Gemma4ReleaseVerifyTpGraphs()
+        {
+            try { TSGgml_Gemma4ReleaseVerifyTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
+        }
 
         public static void Gemma4ResetDecodeCache() => TSGgml_Gemma4ResetDecodeCache();
 
@@ -2016,6 +2076,51 @@ internal enum GgmlIndexReductionOp
                 convStateIn, deltaStateIn, convStateOut, deltaStateOut,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads, eps) != 0;
         }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35GdnLayerTP(
+            IntPtr hiddenData, int hiddenSize, int n,
+            IntPtr attnNormW,
+            IntPtr inprojW, int inprojType, long inprojNe0, long inprojNe1, long inprojBytes,
+            IntPtr conv1dW, IntPtr dtBias, IntPtr aLog, IntPtr ssmNormW,
+            IntPtr convState, IntPtr deltaState,
+            IntPtr gatedOut,
+            int packedDim, int qkvDim, int qkDim, int vDim,
+            int numKHeads, int numVHeads, int headKDim, int headVDim,
+            int convKernel, float eps);
+
+        /// <summary>
+        /// One rank's GatedDeltaNet block (norm + packed in-projection + conv +
+        /// delta-rule scan + gated norm) as a single ggml graph. The recurrent
+        /// state stays device-resident between calls, keyed on
+        /// <paramref name="convState"/> / <paramref name="deltaState"/>.
+        /// </summary>
+        public static void Qwen35GdnLayerTP(
+            IntPtr hiddenData, int hiddenSize, int n,
+            IntPtr attnNormW,
+            IntPtr inprojW, int inprojType, long inprojNe0, long inprojNe1, long inprojBytes,
+            IntPtr conv1dW, IntPtr dtBias, IntPtr aLog, IntPtr ssmNormW,
+            IntPtr convState, IntPtr deltaState,
+            IntPtr gatedOut,
+            int packedDim, int qkvDim, int qkDim, int vDim,
+            int numKHeads, int numVHeads, int headKDim, int headVDim,
+            int convKernel, float eps)
+        {
+            CheckResult(TSGgml_Qwen35GdnLayerTP(
+                hiddenData, hiddenSize, n, attnNormW,
+                inprojW, inprojType, inprojNe0, inprojNe1, inprojBytes,
+                conv1dW, dtBias, aLog, ssmNormW,
+                convState, deltaState, gatedOut,
+                packedDim, qkvDim, qkDim, vDim,
+                numKHeads, numVHeads, headKDim, headVDim,
+                convKernel, eps), "qwen35_gdn_layer_tp");
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Qwen35GdnDropTpGraphs();
+
+        /// <summary>Free every cached per-rank TP GatedDeltaNet graph.</summary>
+        public static void Qwen35GdnDropTpGraphs() => TSGgml_Qwen35GdnDropTpGraphs();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GatedDeltaNetChunkedF32(
@@ -2558,10 +2663,20 @@ internal enum GgmlIndexReductionOp
 
         public static void FusedMatMulQuantAdd(
             GgmlTensorView2D residual, GgmlTensorView2D input,
-            IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes)
+            IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             CheckResult(TSGgml_FusedMatMulQuantAddF32(
-                residual, input, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "fused_matmul_quant_add");
+                residual, input, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes,
+                tpDegree, out IntPtr plan), "fused_matmul_quant_add");
+            // Tensor-parallel mode returns a plan instead of running the graph.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
+        }
+
+        public static void ReleaseFusedMatmulAddTpGraphs()
+        {
+            try { TSGgml_ReleaseFusedMatmulAddTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
         }
 
         public static void FusedFFNSwiGLUQuant(
@@ -2572,13 +2687,16 @@ internal enum GgmlIndexReductionOp
             float eps,
             IntPtr gateUpData, int gateUpGgmlType, long gateUpNe0, long gateUpNe1, long gateUpRawBytes,
             IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downRawBytes,
-            int halfDim)
+            int halfDim,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             CheckResult(TSGgml_FusedFFNSwiGLUQuantF32(
                 residual, input, normWeightData, normWeightCount, eps,
                 gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
                 downData, downGgmlType, downNe0, downNe1, downRawBytes,
-                halfDim), "fused_ffn_swiglu_quant");
+                halfDim, tpDegree, out IntPtr plan), "fused_ffn_swiglu_quant");
+            // Tensor-parallel mode returns a plan instead of running the graph.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
         }
 
         public static void FusedFFNActProjectQuant(
@@ -3502,7 +3620,8 @@ internal enum GgmlIndexReductionOp
             int pleTokenId = -1,
             IntPtr pleModelProjData = default, int pleModelProjType = 0,
             long pleModelProjNe0 = 0, long pleModelProjNe1 = 0, long pleModelProjBytes = 0,
-            IntPtr pleModelProjNormData = default)
+            IntPtr pleModelProjNormData = default,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             CheckResult(TSGgml_Gemma4ModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -3535,7 +3654,11 @@ internal enum GgmlIndexReductionOp
                 pleTokenId,
                 pleModelProjData, pleModelProjType,
                 pleModelProjNe0, pleModelProjNe1, pleModelProjBytes,
-                pleModelProjNormData), "gemma4_model_decode");
+                pleModelProjNormData,
+                tpDegree, out IntPtr plan), "gemma4_model_decode");
+            // Tensor-parallel mode returns a plan instead of running the graph;
+            // the caller collects one per rank for TensorParallelExecutePlans.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
         }
 
         /// <summary>True token-batched dense decode: N concurrent sequences, one
@@ -3622,7 +3745,8 @@ internal enum GgmlIndexReductionOp
             int[] pleTokenIds = null,
             IntPtr pleProjWData = default, int pleProjWType = 0,
             long pleProjWNe0 = 0, long pleProjWNe1 = 0, long pleProjWBytes = 0,
-            IntPtr pleProjNormData = default)
+            IntPtr pleProjNormData = default,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             int r = TSGgml_Gemma4ModelVerify(
                 hiddenData, hiddenSize, numLayers, numTokens,
@@ -3652,7 +3776,10 @@ internal enum GgmlIndexReductionOp
                 pleTokenIds,
                 pleProjWData, pleProjWType,
                 pleProjWNe0, pleProjWNe1, pleProjWBytes,
-                pleProjNormData);
+                pleProjNormData,
+                tpDegree, out IntPtr plan);
+            // Tensor-parallel mode returns a plan instead of running the graph.
+            if (tpPlanOut != null) tpPlanOut[0] = plan;
             return r != 0;
         }
 

@@ -1016,7 +1016,7 @@ namespace
 
         host_read_barrier();
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * N * sizeof(float));
         if (use_mrope)
         {

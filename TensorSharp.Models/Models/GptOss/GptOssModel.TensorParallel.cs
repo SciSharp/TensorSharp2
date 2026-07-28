@@ -57,8 +57,10 @@ namespace TensorSharp.Models
                 errors.Add($"KV heads ({Config.NumKVHeads}) not divisible by global TP degree ({tp})");
             if (_expertFfnLength > 0 && _expertFfnLength % tp != 0)
                 errors.Add($"Expert FFN length ({_expertFfnLength}) not divisible by global TP degree ({tp})");
-            if (_backend != BackendType.Cuda)
-                errors.Add($"TP requires CUDA backend, got {_backend}");
+            // Tensor parallelism runs on the multi-GPU backends: direct CUDA and
+            // the GGML CUDA/Vulkan backends (one ggml backend per GPU).
+            if (_backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+                errors.Add($"TP requires a multi-GPU backend (cuda, ggml-cuda, ggml-vulkan), got {_backend}");
 
             if (errors.Count > 0)
                 throw new InvalidOperationException(

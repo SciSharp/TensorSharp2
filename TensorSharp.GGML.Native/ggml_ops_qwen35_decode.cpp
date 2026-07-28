@@ -307,7 +307,7 @@ namespace
         host_read_barrier();
 
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         if (!residual_zero_copy)
             ggml_backend_tensor_set(residual_in, residual_data,
@@ -1188,7 +1188,7 @@ namespace
         host_read_barrier();
 
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         // Zero the padded KV rows [totalSeqLen, attnKvLen) once per graph build for the
         // Vulkan non-flash persist path. That path reads the FULL padded window and
@@ -1950,7 +1950,7 @@ namespace
         }
 
         host_read_barrier();
-        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * T * sizeof(float));
         ggml_backend_tensor_set(pos_t, positions, 0, static_cast<std::size_t>(T) * sizeof(std::int32_t));
         ggml_backend_tensor_set(slot_t, slot_mapping, 0, static_cast<std::size_t>(T) * sizeof(std::int64_t));

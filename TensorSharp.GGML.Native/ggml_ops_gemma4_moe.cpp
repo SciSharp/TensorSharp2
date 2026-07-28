@@ -364,7 +364,7 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
         host_read_barrier();
 
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(hidden_t, d->hidden, 0, static_cast<std::size_t>(H) * sizeof(float));
         std::int32_t pos_val = position;
@@ -457,6 +457,9 @@ namespace
         int hidden_size = 0;
         bool folded = false;                         // hidden_out holds logits (final norm + lm_head folded in)
         int out_count = 0;                           // floats to download (vocab when folded, else hidden)
+        // Tensor-parallel plan: this rank's graph cut at the three row-parallel
+        // projections per layer (attention output, dense FFN down, MoE down).
+        tsg::TpRankPlan tp_plan;
 
         void reset()
         {
@@ -468,6 +471,7 @@ namespace
             sig_disc = sig_kcache0 = nullptr;
             num_layers = hidden_size = 0;
             folded = false; out_count = 0;
+            tp_plan.clear();
         }
     };
 
@@ -505,7 +509,14 @@ namespace
 
         void reset_all() { for (auto& e : entries) e.reset(); }
     };
-    G4MoEDecodeCachePool g_g4moe_pool;
+    // One pool per rank: under tensor parallelism each GPU builds its own
+    // graph over its own shards, and the entries own that rank's ggml
+    // context and backend buffer.
+    G4MoEDecodeCachePool g_g4moe_pools[tsg::TSG_MAX_DEVICES];
+}
+static G4MoEDecodeCachePool& g_moe_pool() { return g_g4moe_pools[tsg::g_active_rank]; }
+namespace
+{
 }
 
 TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
@@ -520,7 +531,13 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
     // caller then skips its own final-norm/lm_head/softcap dispatches.
     void* logits_data, int vocab_size,
     const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-    const void* final_norm_data, float logit_softcap)
+    const void* final_norm_data, float logit_softcap,
+    // Tensor parallelism. With tp_degree > 1 every weight and KV pointer in
+    // `layers` is THIS rank's shard (attention/dense FFN Megatron-split, experts
+    // sliced on the intermediate dimension so `sel` stays global), and the call
+    // builds and binds the graph instead of running it — returning a plan cut at
+    // the three row-parallel projections per layer.
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
@@ -531,6 +548,10 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             set_last_error("Gemma4 MoE model decode: invalid arguments.");
             return 0;
         }
+
+        const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+        if (tp_mode)
+            *tp_plan_out = nullptr;
         if (layers[0].struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlGemma4MoELayerDesc)))
         {
             set_last_error("Gemma4 MoE model decode: descriptor size mismatch (C#/native struct layout drift).");
@@ -590,13 +611,21 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                 }
             }
         }
+        // The driver runs the graph after this call returns, so it must outlive
+        // the call — which is what persist mode provides.
+        if (tp_mode && !can_persist)
+        {
+            set_last_error("Gemma4 MoE model decode: tensor-parallel mode requires the persistent decode graph.");
+            return 0;
+        }
+
         const void* g4moe_sig = layers[0].attn_norm_w;
         const void* g4moe_kc0 = layers[0].k_cache;
 
         // ---- reuse fast-path: replay THIS request's captured graph ----
         // Per-request lookup (model instance + KV holder); find() already matched
         // sig_disc + sig_kcache0, so only the finer shape fields are checked here.
-        G4MoEDecodeCache* dc = can_persist ? g_g4moe_pool.find(g4moe_sig, g4moe_kc0) : nullptr;
+        G4MoEDecodeCache* dc = can_persist ? g_moe_pool().find(g4moe_sig, g4moe_kc0) : nullptr;
         if (dc != nullptr && dc->graph != nullptr &&
             dc->num_layers == num_layers && dc->hidden_size == H &&
             dc->layer_window == pwindow &&
@@ -620,6 +649,21 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                     decode_input_set_async(dc->attn_mask[l], md.data(), md.size() * sizeof(ggml_fp16_t));
                 }
             }
+            if (tp_mode)
+            {
+                if (!dc->tp_plan.valid())
+                {
+                    set_last_error("Gemma4 MoE model decode: cached graph has no tensor-parallel plan.");
+                    dc->reset();
+                    return 0;
+                }
+                dc->tp_plan.out_tensor = dc->hidden_out;
+                dc->tp_plan.out_host = dc->folded ? logits_data : hidden_data;
+                dc->tp_plan.out_bytes = static_cast<std::size_t>(dc->out_count) * sizeof(float);
+                *tp_plan_out = &dc->tp_plan;
+                return 1;
+            }
+
             ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
             if (st != GGML_STATUS_SUCCESS)
             {
@@ -633,7 +677,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             return 1;
         }
         // Miss -> claim this request's slot to (re)build into (when persistable).
-        G4MoEDecodeCache* g4moe = can_persist ? &g_g4moe_pool.claim(g4moe_sig, g4moe_kc0) : nullptr;
+        G4MoEDecodeCache* g4moe = can_persist ? &g_moe_pool().claim(g4moe_sig, g4moe_kc0) : nullptr;
 
         // ctx holds only tensor metadata (no_alloc: data is bound externally). Non-
         // persist uses a pooled 32 MB block; persist uses a raw ctx kept alive in
@@ -663,6 +707,19 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
 
         // Per-layer persist inputs (created in the build loop; null in legacy mode).
         std::vector<ggml_tensor*> layer_kv_index(num_layers, nullptr);
+
+        // Tensor-parallel cut points: three per layer, one for each row-parallel
+        // projection whose output is only this rank's share of the sum — the
+        // attention output, the dense FFN down, and the MoE down (reduced after
+        // the routing-weighted expert sum, which is linear, so summing partials
+        // then weighting is the same as weighting then summing).
+        std::vector<ggml_tensor*> tp_partial;
+        std::vector<ggml_tensor*> tp_boundary;
+        if (tp_mode)
+        {
+            tp_partial.reserve(static_cast<std::size_t>(num_layers) * 3);
+            tp_boundary.reserve(static_cast<std::size_t>(num_layers) * 3);
+        }
 
         ggml_tensor* hidden_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
@@ -870,7 +927,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, t.attn_mask, 1.0f, 0.0f, 0.0f);
             ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
             ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, 1);
-            ggml_tensor* o_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, t.o_w, attn_flat), H);
+            ggml_tensor* o_mm = ggml_mul_mat(ctx, t.o_w, attn_flat);
+            ggml_tensor* o_flat = ggml_reshape_1d(ctx, o_mm, H);
+            if (tp_mode) { tp_partial.push_back(o_mm); tp_boundary.push_back(o_flat); }
             ggml_tensor* post_attn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, o_flat, eps), t.post_attn_norm_w);
             ggml_tensor* residual1 = ggml_add(ctx, hidden, post_attn_normed);
 
@@ -882,7 +941,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             ggml_tensor* dense_up = ggml_view_1d(ctx, gu_flat, ffDense, static_cast<std::size_t>(ffDense) * sizeof(float));
             ggml_tensor* dense_h = ggml_mul(ctx, ggml_gelu(ctx, dense_gate), dense_up);
             ggml_tensor* dense_h_2d = ggml_reshape_2d(ctx, dense_h, ffDense, 1);
-            ggml_tensor* dense_down = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, t.down_w, dense_h_2d), H);
+            ggml_tensor* dense_down_mm = ggml_mul_mat(ctx, t.down_w, dense_h_2d);
+            ggml_tensor* dense_down = ggml_reshape_1d(ctx, dense_down_mm, H);
+            if (tp_mode) { tp_partial.push_back(dense_down_mm); tp_boundary.push_back(dense_down); }
             ggml_tensor* mlp = ggml_mul(ctx, ggml_rms_norm(ctx, dense_down, eps), t.post_ffw_norm_1_w);
 
             // ===== MoE router (in-graph) =====
@@ -923,6 +984,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                 moe_out = ggml_add(ctx, moe_out, view_u);
             }
             ggml_tensor* moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
+            if (tp_mode) { tp_partial.push_back(moe_out); tp_boundary.push_back(moe_out_1d); }
             ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out_1d, eps), t.post_ffw_norm_2_w);
             mlp = ggml_add(ctx, mlp, moe_normed);
 
@@ -1098,7 +1160,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         host_read_barrier();
 
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
         std::int32_t pos_val = position;
@@ -1121,20 +1183,24 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             }
         }
 
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
-        if (status != GGML_STATUS_SUCCESS)
-        {
-            set_last_error("Gemma4 MoE model decode: graph execution failed.");
-            if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
-            return 0;
-        }
-
         void* out_data = fold ? logits_data : hidden_data;
-        finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
-        // If we used the per-call fallback buffer (not the persistent gallocr),
-        // drain the queued async download before BufferHandle frees it. No-op on
-        // the common gallocr path (buffer.value == nullptr).
-        if (buffer.value != nullptr || can_persist) host_read_barrier();
+
+        if (!tp_mode)
+        {
+            ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+            if (status != GGML_STATUS_SUCCESS)
+            {
+                set_last_error("Gemma4 MoE model decode: graph execution failed.");
+                if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
+                return 0;
+            }
+
+            finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
+            // If we used the per-call fallback buffer (not the persistent gallocr),
+            // drain the queued async download before BufferHandle frees it. No-op on
+            // the common gallocr path (buffer.value == nullptr).
+            if (buffer.value != nullptr || can_persist) host_read_barrier();
+        }
 
         if (can_persist && g4moe != nullptr)
         {
@@ -1158,6 +1224,28 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             g4moe->out_count = out_count;
             g4moe->valid = true;
         }
+
+        if (tp_mode)
+        {
+            if (g4moe == nullptr)
+            {
+                set_last_error("Gemma4 MoE model decode: tensor-parallel build produced no cache slot.");
+                return 0;
+            }
+            g4moe->tp_plan.clear();
+            g4moe->tp_plan.graph = graph;
+            g4moe->tp_plan.ar_tensor = tp_partial;
+            if (!tp_plan_segments(g4moe->tp_plan, tp_boundary))
+            {
+                g4moe->reset();
+                return 0;
+            }
+            g4moe->tp_plan.out_tensor = hidden_out;
+            g4moe->tp_plan.out_host = out_data;
+            g4moe->tp_plan.out_bytes = static_cast<std::size_t>(out_count) * sizeof(float);
+            *tp_plan_out = &g4moe->tp_plan;
+        }
+
         clear_last_error();
         return 1;
     }
@@ -1181,7 +1269,46 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
 // mode is off (the cache is never populated).
 TSG_EXPORT void TSGgml_Gemma4MoEResetDecodeCache()
 {
-    g_g4moe_pool.reset_all();
+    // Every rank's pool: a KV reset invalidates the cached graphs on all GPUs and
+    // the caller is not necessarily on the rank that built them.
+    for (auto& pool : g_g4moe_pools)
+        pool.reset_all();
+}
+
+namespace
+{
+    // Resources a tensor-parallel MoE verify graph borrows between "build" and
+    // "execute". Unlike the decode graph this one is not persistent, so the
+    // pooled context and any per-call buffer have to be parked until the driver
+    // has run every rank's segments. Recycled on that rank's next build.
+    struct G4MoEVerifyTpPending
+    {
+        PooledContextHandle context;
+        BufferHandle buffer{ nullptr };
+        std::vector<BufferHandle> ephemeral;
+        tsg::TpRankPlan plan;
+
+        void reset()
+        {
+            plan.clear();
+            ephemeral.clear();
+            buffer = BufferHandle(nullptr);
+            context = PooledContextHandle();
+        }
+    };
+    G4MoEVerifyTpPending g_g4moev_tp[tsg::TSG_MAX_DEVICES];
+}
+
+// Release every rank's parked tensor-parallel MoE verify graph.
+TSG_EXPORT void TSGgml_Gemma4MoEReleaseVerifyTpGraphs()
+{
+    for (int r = 0; r < tsg::TSG_MAX_DEVICES; ++r)
+    {
+        if (g_g4moev_tp[r].plan.graph == nullptr && g_g4moev_tp[r].context.value == nullptr)
+            continue;
+        tsg::ScopedRank rank(r);
+        g_g4moev_tp[r].reset();
+    }
 }
 
 // ============================================================================
@@ -1209,7 +1336,9 @@ TSG_EXPORT void TSGgml_Gemma4MoEResetDecodeCache()
 // ============================================================================
 TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
     const TSGgmlGemma4MoELayerDesc* layers, int num_layers,
-    void* hidden_data, int hidden_size, int start_pos, int num_tokens)
+    void* hidden_data, int hidden_size, int start_pos, int num_tokens,
+    // Tensor parallelism — same contract as TSGgml_Gemma4MoEModelDecode.
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
@@ -1220,6 +1349,17 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             set_last_error("Gemma4 MoE model verify: invalid arguments.");
             return 0;
         }
+
+        const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+        if (tp_mode)
+        {
+            *tp_plan_out = nullptr;
+            g_g4moev_tp[tsg::g_active_rank].reset();
+        }
+        // Cut points: the three row-parallel projections per layer (and per query
+        // tile, when the tiled path runs — both ranks tile identically, so the
+        // segment structure still matches).
+        std::vector<ggml_tensor*> tp_partial;
         if (layers[0].struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlGemma4MoELayerDesc)))
         {
             set_last_error("Gemma4 MoE model verify: descriptor size mismatch (C#/native struct layout drift).");
@@ -1660,6 +1800,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                 ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed);                 // [2*ffDense, M]
                 ggml_tensor* dense_h = ggml_geglu(ctx, gu);                             // [ffDense, M]
                 ggml_tensor* dense_down = ggml_mul_mat(ctx, t.down_w, dense_h);         // [H, M]
+                if (tp_mode) tp_partial.push_back(dense_down);
                 ggml_tensor* mlp = ggml_mul(ctx, ggml_rms_norm(ctx, dense_down, eps), t.post_ffw_norm_1_w);
                 // MoE router (in-graph)
                 ggml_tensor* route_n = ggml_rms_norm(ctx, residual1, eps);              // [H, M]
@@ -1696,6 +1837,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                     ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, M, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
                     moe_out = ggml_add(ctx, moe_out, view_u);
                 }
+                if (tp_mode) tp_partial.push_back(moe_out);
                 ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out, eps), t.post_ffw_norm_2_w);
                 mlp = ggml_add(ctx, mlp, moe_normed);
                 // final residual + layer scale
@@ -1784,6 +1926,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                     // O projection (per tile) → post-attn norm → residual → layer tail.
                     ggml_tensor* fa_flat = ggml_reshape_2d(ctx, fa, qDim, qLen);
                     ggml_tensor* o_tile = ggml_mul_mat(ctx, t.o_w, fa_flat);               // [H, qLen]
+                    if (tp_mode) tp_partial.push_back(o_tile);
                     ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_tile, eps), t.post_attn_norm_w);
                     ggml_tensor* hidden_tile = ggml_view_2d(ctx, hidden, H, qLen,
                         hidden->nb[1], static_cast<std::size_t>(qs) * hidden->nb[1]);
@@ -1816,6 +1959,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                 // contiguously, exactly what the O projection wants.
                 ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, N);
                 ggml_tensor* o_out = ggml_mul_mat(ctx, t.o_w, attn_flat);                  // [H, N]
+                if (tp_mode) tp_partial.push_back(o_out);
                 ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_out, eps), t.post_attn_norm_w);
                 ggml_tensor* residual1 = ggml_add(ctx, hidden, post_attn);                // [H, N]
                 result = layer_tail(residual1, N);                                         // [H, N]
@@ -1950,7 +2094,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         host_read_barrier();
 
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(H) * N * sizeof(float));
 
@@ -1967,6 +2111,32 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         for (auto& m : tile_mask_cache)
             ggml_backend_tensor_set(m.tensor, mask_data_store[m.dataIdx].data(), 0,
                 mask_data_store[m.dataIdx].size() * sizeof(ggml_fp16_t));
+
+        if (tp_mode)
+        {
+            auto& pending = g_g4moev_tp[tsg::g_active_rank];
+            pending.plan.clear();
+            pending.plan.graph = graph;
+            pending.plan.ar_tensor = tp_partial;
+            if (!tp_plan_segments(pending.plan, tp_partial))
+            {
+                pending.reset();
+                return 0;
+            }
+            // Every rank ends with the same replicated hidden state; they share one
+            // host buffer, so only rank 0 copies it back.
+            if (tsg::g_active_rank == 0)
+            {
+                pending.plan.out_tensor = hidden_out;
+                pending.plan.out_host = hidden_data;
+                pending.plan.out_bytes = static_cast<std::size_t>(H) * N * sizeof(float);
+            }
+            pending.context = std::move(context);
+            pending.ephemeral = std::move(ephemeral_bufs);
+            *tp_plan_out = &pending.plan;
+            clear_last_error();
+            return 1;
+        }
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)

@@ -476,7 +476,7 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
         host_read_barrier();
 
         for (auto& u : upload_list)
-            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
         ggml_backend_tensor_set(hidden_t, d->hidden, 0, static_cast<std::size_t>(H) * C * sizeof(float));
         std::vector<std::int32_t> pos_data(C);
@@ -808,7 +808,7 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
         }
 
         host_read_barrier();
-        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, (std::size_t)H * C * sizeof(float));
         std::vector<std::int32_t> pos_data(C);
         for (int i = 0; i < C; i++) pos_data[i] = P + i;
@@ -915,7 +915,7 @@ TSG_EXPORT int TSGgml_DiffusionLmHead(
         }
 
         host_read_barrier();
-        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, (std::size_t)H * C * sizeof(float));
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
@@ -1036,7 +1036,7 @@ TSG_EXPORT int TSGgml_DiffusionLmHeadSample(
         }
 
         host_read_barrier();
-        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, (std::size_t)H * C * sizeof(float));
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
