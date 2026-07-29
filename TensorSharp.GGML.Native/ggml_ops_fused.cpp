@@ -1108,7 +1108,11 @@ ggml_tensor* build_vision_attention(
     ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v_3d, 1, 2, 0, 3));
 
     // Bound the [rows, chunk, heads] F32 score tensor to ~256 MB per chunk.
-    const int64_t score_budget_bytes = 256ll * 1024 * 1024;
+    // TS_VISION_ATTN_BUDGET_MB overrides for A/B debugging (e.g. huge = single chunk).
+    static const int64_t score_budget_mb = []{
+        const char* e = std::getenv("TS_VISION_ATTN_BUDGET_MB");
+        return e != nullptr ? std::atoll(e) : 256ll; }();
+    const int64_t score_budget_bytes = score_budget_mb * 1024 * 1024;
     int64_t chunk = score_budget_bytes /
         (static_cast<int64_t>(rows) * num_heads * static_cast<int64_t>(sizeof(float)));
     if (chunk < 256) chunk = 256;
@@ -1122,6 +1126,15 @@ ggml_tensor* build_vision_attention(
             ? q_cont
             : ggml_view_3d(ctx, q_cont, head_dim, len, num_heads,
                 q_cont->nb[1], q_cont->nb[2], static_cast<std::size_t>(start) * q_cont->nb[1]);
+        // Materialize the chunk view before the matmul. ggml-vulkan feeds a
+        // non-contiguous F32 src1 through its internal F16 conversion path,
+        // which mangles this offset view (ne1 < nb2/nb1) — the encoder output
+        // turns into scrambled patches ("glitchy pixels" descriptions) on any
+        // image large enough to need more than one chunk. An explicit cont
+        // goes through the (correct) CPY op instead, is numerically identical
+        // on every backend, and costs a few MB of scratch per chunk.
+        if (len != rows)
+            q_c = ggml_cont(ctx, q_c);
 
         ggml_tensor* scores = ggml_mul_mat(ctx, k_cont, q_c); // [rows(kv), len, heads]
         ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
