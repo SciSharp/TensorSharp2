@@ -691,40 +691,115 @@ namespace TensorSharp.Models
             // size via ffn_latent_out after the AllReduce.
             Tensor latentIn = hasLatent ? LinearForward(normed[0], prefix + "ffn_latent_in.weight") : null;
 
-            // 2. Per-rank expert accumulation (column-parallel up + row-parallel down).
+            // 2. Router (replicated — identical routing on every rank): computed
+            //    ONCE on rank 0 where the unsharded router weight lives, then each
+            //    token routes independently. SelectNemotronTopKExperts treats its
+            //    whole input as ONE token's logits, so it must be fed exactly one
+            //    numExperts-length row — the previous code passed the flattened
+            //    [seqLen, numExperts] batch, which indexed the router bias out of
+            //    bounds for seqLen > 1 (TP prefill crashed) and applied a single
+            //    expert set to the whole chunk.
+            Tensor routerLogitsT = LinearForward(normed[0], prefix + "ffn_gate_inp.weight");
+            float[] routePtr = TensorToFloatArray(routerLogitsT);
+            routerLogitsT.Dispose();
+
+            int nUsed = _numExpertsUsed;
+            int totalAssignments = seqLen * nUsed;
+            var selectedExperts = new int[totalAssignments];
+            var routeWeightsAll = new float[totalAssignments];
+            var tokenLogits = new float[_numExperts];
+            for (int s = 0; s < seqLen; s++)
+            {
+                Array.Copy(routePtr, s * _numExperts, tokenLogits, 0, _numExperts);
+                var (te, tw) = SelectNemotronTopKExperts(tokenLogits, routerBias);
+                for (int k = 0; k < nUsed; k++)
+                {
+                    selectedExperts[s * nUsed + k] = te[k];
+                    routeWeightsAll[s * nUsed + k] = tw[k];
+                }
+            }
+
+            // Bucket the assignments by expert so each expert runs ONE batched
+            // matmul over its tokens instead of a per-token dispatch (the gpt-oss
+            // TP MoE shape; mirrors the non-TP batched path).
+            var expertCounts = new int[_numExperts];
+            for (int a = 0; a < totalAssignments; a++)
+                expertCounts[selectedExperts[a]]++;
+            var expertOffsets = new int[_numExperts];
+            for (int e = 1; e < _numExperts; e++)
+                expertOffsets[e] = expertOffsets[e - 1] + expertCounts[e - 1];
+            var tokenMap = new int[totalAssignments];
+            var weightMap = new float[totalAssignments];
+            var fillPos = (int[])expertOffsets.Clone();
+            for (int s = 0; s < seqLen; s++)
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int e = selectedExperts[s * nUsed + k];
+                    int pos = fillPos[e]++;
+                    tokenMap[pos] = s;
+                    weightMap[pos] = routeWeightsAll[s * nUsed + k];
+                }
+
+            // 3. Per-rank expert accumulation (column-parallel up + row-parallel down).
             var results = new Tensor[tp];
             for (int r = 0; r < tp; r++)
             {
                 var alloc = _tpGroup.GetAllocator(r);
-
-                Tensor routerLogits = LinearForward(normed[r], prefix + "ffn_gate_inp.weight");
-                float[] routePtr = TensorToFloatArray(routerLogits);
-                routerLogits.Dispose();
-
-                var (topExperts, routeWeights) = SelectNemotronTopKExperts(routePtr, routerBias);
-
                 Tensor expertInput = hasLatent ? latentIn : normed[r];
+                int expertInDim = (int)expertInput.Sizes[1];
+                long inRowBytes = (long)expertInDim * sizeof(float);
 
                 var output = new Tensor(alloc, DType.Float32, seqLen, expertOutDim);
-                Ops.Fill(output, 0f);
 
-                for (int k = 0; k < _numExpertsUsed; k++)
+                unsafe
                 {
-                    int expertIdx = topExperts[k];
-                    float weight = routeWeights[k];
-                    string upKey = prefix + $"ffn_up_exps.{expertIdx}.weight";
-                    string downKey = prefix + $"ffn_down_exps.{expertIdx}.weight";
+                    float* inPtr = GetFloatPtr(expertInput);
+                    float* outPtr = GetFloatPtr(output);
+                    for (long z = 0; z < (long)seqLen * expertOutDim; z++)
+                        outPtr[z] = 0f;
 
-                    Tensor upOut = TpNemotronExpertLinear(expertInput, upKey, r, seqLen);
-                    ReluSquaredInPlace(upOut);   // Nemotron MoE uses ReLU^2, not SiLU.
-                    Tensor downOut = TpNemotronExpertLinear(upOut, downKey, r, seqLen);
-                    upOut.Dispose();
+                    for (int e = 0; e < _numExperts; e++)
+                    {
+                        int count = expertCounts[e];
+                        if (count == 0) continue;
+                        int offset = expertOffsets[e];
 
-                    Ops.Mul(downOut, downOut, weight);
-                    Ops.Add(output, output, downOut);
-                    downOut.Dispose();
+                        string upKey = prefix + $"ffn_up_exps.{e}.weight";
+                        string downKey = prefix + $"ffn_down_exps.{e}.weight";
+
+                        // Gather this expert's tokens into a [count, dim] batch.
+                        var batchInput = new Tensor(alloc, DType.Float32, count, expertInDim);
+                        float* bPtr = GetFloatPtr(batchInput);
+                        for (int i = 0; i < count; i++)
+                        {
+                            int tokenIdx = tokenMap[offset + i];
+                            Buffer.MemoryCopy(inPtr + (long)tokenIdx * expertInDim,
+                                bPtr + (long)i * expertInDim, inRowBytes, inRowBytes);
+                        }
+
+                        Tensor upOut = TpNemotronExpertLinear(batchInput, upKey, r, count);
+                        batchInput.Dispose();
+                        ReluSquaredInPlace(upOut);   // Nemotron MoE uses ReLU^2, not SiLU.
+                        Tensor downOut = TpNemotronExpertLinear(upOut, downKey, r, count);
+                        upOut.Dispose();
+
+                        // Weighted scatter-add back into each token's output row.
+                        float* dPtr = GetFloatPtr(downOut);
+                        for (int i = 0; i < count; i++)
+                        {
+                            int tokenIdx = tokenMap[offset + i];
+                            float w = weightMap[offset + i];
+                            float* src = dPtr + (long)i * expertOutDim;
+                            float* dst = outPtr + (long)tokenIdx * expertOutDim;
+                            for (int d = 0; d < expertOutDim; d++)
+                                dst[d] += w * src[d];
+                        }
+                        downOut.Dispose();
+                    }
                 }
 
+                // Host buffer is authoritative — push to device for the AllReduce.
+                output.EnsureDeviceCurrent();
                 results[r] = output;
             }
 
