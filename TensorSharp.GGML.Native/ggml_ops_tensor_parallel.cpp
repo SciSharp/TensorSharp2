@@ -592,10 +592,15 @@ namespace tsg
         for (int r = 0; r < rank_count; ++r)
         {
             auto* p = plans[r];
-            if (p->out_tensor == nullptr || p->out_host == nullptr || p->out_bytes == 0)
+            const bool has_out = p->out_tensor != nullptr && p->out_host != nullptr && p->out_bytes != 0;
+            if (!has_out && p->extra_out.empty())
                 continue;
             ScopedRank rank(r);
-            ggml_backend_tensor_get(p->out_tensor, p->out_host, 0, p->out_bytes);
+            if (has_out)
+                ggml_backend_tensor_get(p->out_tensor, p->out_host, 0, p->out_bytes);
+            for (const auto& d : p->extra_out)
+                if (d.tensor != nullptr && d.host != nullptr && d.bytes != 0)
+                    ggml_backend_tensor_get(d.tensor, d.host, 0, d.bytes);
         }
         return true;
     }

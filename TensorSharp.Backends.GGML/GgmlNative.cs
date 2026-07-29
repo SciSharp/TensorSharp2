@@ -2010,7 +2010,8 @@ internal enum GgmlIndexReductionOp
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNorm, IntPtr normedOut, int nLogitRows,
-            int[] mropePos, int[] mropeSections);
+            int[] mropePos, int[] mropeSections,
+            int tpDegree, IntPtr[] tpPlanOut);
 
         public static bool Qwen35ModelVerify(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
@@ -2024,7 +2025,8 @@ internal enum GgmlIndexReductionOp
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNorm, IntPtr normedOut, int nLogitRows,
-            int[] mropePos = null, int[] mropeSections = null)
+            int[] mropePos = null, int[] mropeSections = null,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return TSGgml_Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -2036,7 +2038,17 @@ internal enum GgmlIndexReductionOp
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, normedOut, nLogitRows, mropePos, mropeSections) != 0;
+                finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
+                tpDegree, tpPlanOut) != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Qwen35ReleaseVerifyTpGraphs();
+
+        public static void Qwen35ReleaseVerifyTpGraphs()
+        {
+            try { TSGgml_Qwen35ReleaseVerifyTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]

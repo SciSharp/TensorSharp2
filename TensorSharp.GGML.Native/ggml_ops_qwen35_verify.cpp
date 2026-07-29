@@ -151,9 +151,37 @@ namespace
     // cacheable buffer out from under the cached (possibly CUDA-captured) graphs that
     // pin it. Freed only on backend swap; contents are re-uploaded every call, so
     // staleness is impossible.
-    ggml_backend_buffer_t g_q35v_state_buf = nullptr;
-    std::size_t g_q35v_state_buf_size = 0;
-    ggml_backend_t g_q35v_state_backend = nullptr;
+    // Per-rank: under tensor parallelism every rank builds its own prefill
+    // graph on its own backend, and a single shared buffer keyed to one
+    // backend would be freed out from under rank 0 the moment rank 1 builds
+    // (the backend-swap check below). Non-TP runs always use slot 0.
+    ggml_backend_buffer_t g_q35v_state_bufs[TSG_MAX_DEVICES] = {};
+    std::size_t g_q35v_state_buf_sizes[TSG_MAX_DEVICES] = {};
+    ggml_backend_t g_q35v_state_backends[TSG_MAX_DEVICES] = {};
+#define g_q35v_state_buf      (g_q35v_state_bufs[::tsg::g_active_rank])
+#define g_q35v_state_buf_size (g_q35v_state_buf_sizes[::tsg::g_active_rank])
+#define g_q35v_state_backend  (g_q35v_state_backends[::tsg::g_active_rank])
+
+    // Resources a tensor-parallel verify graph borrows between "build" and
+    // "execute" (the same shape as gemma4's G4VerifyTpPending): the TP prefill
+    // allocates from the context pool + the per-rank reuse gallocr, so nothing
+    // naturally outlives the call — and the caller only runs the graph after
+    // every rank has built one. Each rank parks its context here; the slot is
+    // recycled when that rank builds its next graph.
+    struct Q35VerifyTpPending
+    {
+        PooledContextHandle context;
+        std::vector<BufferHandle> ephemeral;
+        tsg::TpRankPlan plan;
+
+        void reset()
+        {
+            plan.clear();
+            ephemeral.clear();
+            context = PooledContextHandle();
+        }
+    };
+    Q35VerifyTpPending g_q35v_tp[TSG_MAX_DEVICES];
 
     // Ensure the shared GDN state buffer covers `needed` bytes. Any resize would
     // move slices pinned by cached graphs, so the caller must reset the verify
@@ -217,7 +245,8 @@ namespace
         void* logits_data, int vocab_size,
         const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
         const void* final_norm_data, void* normed_out, int n_logit_rows,
-        const std::int32_t* mrope_pos, const std::int32_t* mrope_sections)
+        const std::int32_t* mrope_pos, const std::int32_t* mrope_sections,
+        int tp_degree, void** tp_plan_out)
     {
         if (!ensure_backend())
             return 0;
@@ -235,6 +264,31 @@ namespace
         if (head_k_dim != head_v_dim)
         {
             set_last_error("Qwen3.5 model verify: head_k_dim != head_v_dim unsupported.");
+            return 0;
+        }
+
+        // Tensor parallelism — the prefill sibling of qwen35_model_decode_impl's
+        // tp_mode: the caller drives one rank at a time (SetActiveRank); this
+        // builds the active rank's whole-model N-token graph over its shards,
+        // uploads the inputs, and hands back a segmented plan (via tp_plan_out)
+        // instead of running it. Per-layer dims (attention heads, GDN heads,
+        // stacked experts, shared-expert width) arrive already sharded; the MoE
+        // router stays global and the ep_lut/ep_mask pair below confines each
+        // rank's mul_mat_id to the whole experts it owns.
+        const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+        if (tp_mode)
+        {
+            *tp_plan_out = nullptr;
+            // Recycle this rank's previous parked graph — the caller finished
+            // executing it before asking for another.
+            g_q35v_tp[g_active_rank].reset();
+        }
+        const int tp_rank = tp_mode ? g_active_rank : 0;
+        const int stacked_experts = tp_mode && num_experts > 0 ? num_experts / tp_degree : num_experts;
+        if (tp_mode && num_experts > 0 &&
+            (num_experts % tp_degree != 0 || stacked_experts < num_experts_used))
+        {
+            set_last_error("Qwen3.5 model verify: expert count is not shardable across the tensor-parallel ranks.");
             return 0;
         }
 
@@ -296,7 +350,10 @@ namespace
         // still ONE fused graph per draft (vs the op-by-op block), just rebuilt each
         // call — for a 1-layer graph the build is cheap. The trunk verify
         // (num_layers > 1) keeps its persist+capture fast replay.
-        const bool fv_persist = fv_persist_cfg && (n_logits >= N) && !use_mrope && num_layers > 1;
+        // TP always takes the non-persist path: the plan executes after this
+        // call returns, so the context is parked in g_q35v_tp instead, and a
+        // prefill-sized graph never repeats its exact shape anyway.
+        const bool fv_persist = fv_persist_cfg && (n_logits >= N) && !use_mrope && num_layers > 1 && !tp_mode;
 
         const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
         const std::size_t deltaStateBytes = static_cast<std::size_t>(head_k_dim) * head_v_dim * num_v_heads * sizeof(float);
@@ -517,9 +574,15 @@ namespace
             else
             {
                 t.gdn_qkv_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gdn_qkv_type), d.gdn_qkv_ne0, d.gdn_qkv_ne1);
-                t.gdn_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gdn_gate_type), d.gdn_gate_ne0, d.gdn_gate_ne1);
-                t.ssm_beta_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_beta_type), d.ssm_beta_ne0, d.ssm_beta_ne1);
-                t.ssm_alpha_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_alpha_type), d.ssm_alpha_ne0, d.ssm_alpha_ne1);
+                // Packed in-projection (the TP shards): one [hidden, Q|K|V|Z|beta|alpha]
+                // weight instead of four separate ones; gdn_gate_w == null marks it,
+                // and the z/beta/alpha weights are neither created nor bound.
+                if (d.gdn_gate_w != nullptr)
+                {
+                    t.gdn_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gdn_gate_type), d.gdn_gate_ne0, d.gdn_gate_ne1);
+                    t.ssm_beta_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_beta_type), d.ssm_beta_ne0, d.ssm_beta_ne1);
+                    t.ssm_alpha_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_alpha_type), d.ssm_alpha_ne0, d.ssm_alpha_ne1);
+                }
                 t.conv1d_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_kernel, conv_dim);
                 t.ssm_dt_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_v_heads);
                 t.ssm_a_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_v_heads);
@@ -572,14 +635,64 @@ namespace
             else
             {
                 t.gate_inp_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gate_inp_type), d.gate_inp_ne0, d.gate_inp_ne1);
-                t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gate_exps_type), hidden_size, expert_ff, num_experts);
-                t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.up_exps_type), hidden_size, expert_ff, num_experts);
-                t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.down_exps_type), expert_ff, hidden_size, num_experts);
+                // Under TP the stacked expert tensors hold only this rank's
+                // whole-expert slice; the router dims stay global.
+                t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gate_exps_type), hidden_size, expert_ff, stacked_experts);
+                t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.up_exps_type), hidden_size, expert_ff, stacked_experts);
+                t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.down_exps_type), expert_ff, hidden_size, stacked_experts);
                 t.shexp_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_gate_type), d.shexp_gate_ne0, d.shexp_gate_ne1);
                 t.shexp_up_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_up_type), d.shexp_up_ne0, d.shexp_up_ne1);
                 t.shexp_down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_down_type), d.shexp_down_ne0, d.shexp_down_ne1);
                 t.shexp_gate_inp_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
             }
+        }
+
+        // Expert-parallel routing constants (TP MoE only) — the verify sibling of
+        // qwen35_model_decode_impl's ep_lut/ep_mask. Whole experts partition
+        // across ranks, but the top-k runs on the GLOBAL router probabilities
+        // (identical on every rank), so the selected ids must be confined to
+        // this rank's slice before feeding mul_mat_id:
+        //   ep_lut  I32 [1, num_experts]: global id -> local id (foreign -> 0)
+        //   ep_mask F32 [1, num_experts]: 1 for owned experts, else 0
+        // The lookups run over the flattened [num_used*N] selection so a plain
+        // 2D get_rows serves every token (ggml_get_rows has no ne2 broadcast).
+        ggml_tensor* ep_lut = nullptr;
+        ggml_tensor* ep_mask = nullptr;
+        std::vector<std::int32_t> ep_lut_data;
+        std::vector<float> ep_mask_data;
+        if (tp_mode && num_experts > 0)
+        {
+            bool any_moe = false;
+            for (int l = 0; l < num_layers; l++)
+                if (layers[l].is_moe != 0) { any_moe = true; break; }
+            if (any_moe)
+            {
+                ep_lut = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, num_experts);
+                ep_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, num_experts);
+                ggml_set_input(ep_lut);
+                ggml_set_input(ep_mask);
+                const int ep_first = tp_rank * stacked_experts;
+                const int ep_last = ep_first + stacked_experts;
+                ep_lut_data.resize(static_cast<std::size_t>(num_experts));
+                ep_mask_data.resize(static_cast<std::size_t>(num_experts));
+                for (int e = 0; e < num_experts; e++)
+                {
+                    const bool own = e >= ep_first && e < ep_last;
+                    ep_lut_data[static_cast<std::size_t>(e)] = own ? e - ep_first : 0;
+                    ep_mask_data[static_cast<std::size_t>(e)] = own ? 1.0f : 0.0f;
+                }
+            }
+        }
+
+        // Tensor-parallel cut points: the row-parallel projections (attention
+        // o-proj, GDN ssm_out, dense FFN down) and the MoE routed+shared sum,
+        // whose per-rank outputs the collective reduces between segments.
+        std::vector<ggml_tensor*> tp_partial;
+        std::vector<ggml_tensor*> tp_boundary;
+        if (tp_mode)
+        {
+            tp_partial.reserve(static_cast<std::size_t>(num_layers) * 2);
+            tp_boundary.reserve(static_cast<std::size_t>(num_layers) * 2);
         }
 
         // --- build the chained graph over N tokens ---
@@ -713,14 +826,37 @@ namespace
                 ggml_tensor* gate_flat = ggml_reshape_2d(ctx, gate_cont, qDim, N);
                 ggml_tensor* attn_gated = ggml_mul(ctx, attn_flat, ggml_sigmoid(ctx, gate_flat));
                 block_out = ggml_mul_mat(ctx, t.o_w, attn_gated); // [H, N]
+                if (tp_mode) { tp_partial.push_back(block_out); tp_boundary.push_back(block_out); }
             }
             else
             {
                 // ===== Gated Delta Net over N tokens (one ggml_gated_delta_net, K=N) =====
-                ggml_tensor* qkv_mixed = ggml_mul_mat(ctx, t.gdn_qkv_w, normed);  // [conv_dim, N]
-                ggml_tensor* z_all = ggml_mul_mat(ctx, t.gdn_gate_w, normed);     // [value_dim, N]
-                ggml_tensor* beta_all = ggml_sigmoid(ctx, ggml_mul_mat(ctx, t.ssm_beta_w, normed)); // [num_v_heads, N]
-                ggml_tensor* alpha_all = ggml_mul_mat(ctx, t.ssm_alpha_w, normed); // [num_v_heads, N]
+                ggml_tensor* qkv_mixed;
+                ggml_tensor* z_all;
+                ggml_tensor* beta_all;
+                ggml_tensor* alpha_all;
+                if (t.gdn_gate_w == nullptr)
+                {
+                    // Packed in-projection: one matmul, row-sliced per token into
+                    // [Q|K|V | Z | beta | alpha]. The slices are strided views, so
+                    // materialize each — the unary/reshape consumers below need
+                    // contiguous inputs on CUDA/Vulkan.
+                    ggml_tensor* packed = ggml_mul_mat(ctx, t.gdn_qkv_w, normed); // [packed_dim, N]
+                    qkv_mixed = ggml_cont(ctx, ggml_view_2d(ctx, packed, conv_dim, N, packed->nb[1], 0));
+                    z_all = ggml_cont(ctx, ggml_view_2d(ctx, packed, value_dim, N, packed->nb[1],
+                        static_cast<std::size_t>(conv_dim) * sizeof(float)));
+                    beta_all = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_2d(ctx, packed, num_v_heads, N, packed->nb[1],
+                        static_cast<std::size_t>(conv_dim + value_dim) * sizeof(float))));
+                    alpha_all = ggml_cont(ctx, ggml_view_2d(ctx, packed, num_v_heads, N, packed->nb[1],
+                        static_cast<std::size_t>(conv_dim + value_dim + num_v_heads) * sizeof(float)));
+                }
+                else
+                {
+                    qkv_mixed = ggml_mul_mat(ctx, t.gdn_qkv_w, normed);  // [conv_dim, N]
+                    z_all = ggml_mul_mat(ctx, t.gdn_gate_w, normed);     // [value_dim, N]
+                    beta_all = ggml_sigmoid(ctx, ggml_mul_mat(ctx, t.ssm_beta_w, normed)); // [num_v_heads, N]
+                    alpha_all = ggml_mul_mat(ctx, t.ssm_alpha_w, normed); // [num_v_heads, N]
+                }
                 ggml_tensor* g_all = ggml_softplus(ctx, ggml_add(ctx, alpha_all, t.ssm_dt_w));
                 g_all = ggml_mul(ctx, g_all, t.ssm_a_w); // [num_v_heads, N]
 
@@ -783,6 +919,7 @@ namespace
                 ggml_tensor* gated = ggml_mul(ctx, out_n_3d, ggml_silu(ctx, z_3d));
                 ggml_tensor* gated_flat = ggml_reshape_2d(ctx, gated, value_dim, N);
                 block_out = ggml_mul_mat(ctx, t.ssm_out_w, gated_flat); // [H, N]
+                if (tp_mode) { tp_partial.push_back(block_out); tp_boundary.push_back(block_out); }
 
                 ggml_set_output(t.conv_state_out);
                 ggml_set_output(t.delta_state_out);
@@ -805,29 +942,99 @@ namespace
                 // FFN layer. gu is laid out gate-first, matching ggml_swiglu (swapped=false).
                 ggml_tensor* act = ggml_swiglu(ctx, gu); // [ffDense, N]
                 ffn_out = ggml_mul_mat(ctx, t.down_w, act); // [H, N]
+                if (tp_mode) { tp_partial.push_back(ffn_out); tp_boundary.push_back(ffn_out); }
             }
             else
             {
                 ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, ffn_normed); // [num_experts, N]
                 ggml_tensor* probs = ggml_soft_max(ctx, router_logits);
-                ggml_tensor* sel = ggml_top_k(ctx, probs, num_experts_used);              // [num_used, N]
                 ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, num_experts, N);
-                ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                         // [1, num_used, N]
-                ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, num_experts_used, N);
-                if (norm_topk != 0)
+                ggml_tensor* sel_ids;
+                ggml_tensor* w_final;
+                if (ep_lut == nullptr)
                 {
-                    ggml_tensor* w_sum = ggml_sum_rows(ctx, w_2d);
-                    w_2d = ggml_div(ctx, w_2d, w_sum);
+                    ggml_tensor* sel = ggml_top_k(ctx, probs, num_experts_used);          // [num_used, N]
+                    ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                     // [1, num_used, N]
+                    ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, num_experts_used, N);
+                    if (norm_topk != 0)
+                    {
+                        ggml_tensor* w_sum = ggml_sum_rows(ctx, w_2d);
+                        w_2d = ggml_div(ctx, w_2d, w_sum);
+                    }
+                    if (expert_weights_scale != 1.0f)
+                        w_2d = ggml_scale(ctx, w_2d, expert_weights_scale);
+                    w_final = ggml_reshape_3d(ctx, w_2d, 1, num_experts_used, N);
+                    sel_ids = sel;
                 }
-                if (expert_weights_scale != 1.0f)
-                    w_2d = ggml_scale(ctx, w_2d, expert_weights_scale);
-                ggml_tensor* w_final = ggml_reshape_3d(ctx, w_2d, 1, num_experts_used, N);
+                else
+                {
+                    // Expert-parallel TP. ggml's batched mul_mat_id paths (the
+                    // CUDA mm_ids_helper and the generic fallback) require the
+                    // ids WITHIN one token to be DISTINCT — their (expert, token)
+                    // compaction collapses duplicates and the row bookkeeping
+                    // shifts, silently scrambling expert outputs. Mapping every
+                    // foreign route to a filler id therefore cannot work at N > 1.
+                    // Instead each rank runs its own top-k over MASK-ZEROED probs,
+                    // which selects num_used DISTINCT experts it owns; any expert
+                    // in the global top-k that this rank owns has a prob >= every
+                    // non-selected prob, so it is guaranteed to be in that set.
+                    // The gating weight keeps only global top-k members — an
+                    // expert is one iff its prob >= the k-th largest global prob
+                    // (w_min, read through the DESC argsort, since CUDA's TOP_K
+                    // output is unsorted) — and zero for the rest, so the ranks'
+                    // partial sums add up to exactly the single-GPU MoE.
+                    // get_rows only ever sees whole (buffer-aligned) tensors as its
+                    // id input: ggml-vulkan asserts zero buffer-offset remainders
+                    // for GET_ROWS, so an element-offset view of the argsort output
+                    // cannot be gathered directly. Gather ALL sorted probs once and
+                    // slice the k-th column as a view — the elementwise consumers
+                    // below carry offsets in their push constants.
+                    ggml_tensor* sorted_g = ggml_argsort(ctx, probs, GGML_SORT_ORDER_DESC); // I32 [num_experts, N]
+                    ggml_tensor* sorted_p = ggml_reshape_2d(ctx,
+                        ggml_get_rows(ctx, probs_r, sorted_g), num_experts, N);            // probs, descending per token
+                    ggml_tensor* w_min = ggml_view_2d(ctx, sorted_p, 1, N,
+                        sorted_p->nb[1], static_cast<std::size_t>(num_experts_used - 1) * sizeof(float));
+
+                    // Zero foreign experts, then float every owned entry above
+                    // zero: a softmax prob can underflow to exactly 0.0f, and a
+                    // zero-for-zero tie in top_k could pick a FOREIGN index —
+                    // whose LUT filler id would reintroduce the duplicate-ids
+                    // hazard this scheme exists to avoid.
+                    ggml_tensor* mask_col = ggml_reshape_2d(ctx, ep_mask, num_experts, 1);
+                    ggml_tensor* probs_m = ggml_add(ctx, ggml_mul(ctx, probs, mask_col),
+                        ggml_scale(ctx, mask_col, 1e-30f));
+                    ggml_tensor* sel_r = ggml_top_k(ctx, probs_m, num_experts_used);       // owned, distinct, [num_used, N]
+                    ggml_tensor* p_r = ggml_reshape_2d(ctx,
+                        ggml_get_rows(ctx, probs_r, sel_r), num_experts_used, N);          // unmasked probs of the picks
+
+                    // keep = [p >= w_min] = 1 - step(w_min - p); w = p * keep.
+                    ggml_tensor* wmp = ggml_add(ctx, ggml_scale(ctx, p_r, -1.0f), w_min);
+                    ggml_tensor* st = ggml_step(ctx, wmp);
+                    ggml_tensor* w_r = ggml_sub(ctx, p_r, ggml_mul(ctx, p_r, st));
+                    if (norm_topk != 0)
+                    {
+                        // Normalizer over the GLOBAL top-k (identical on every rank):
+                        // the first num_used rows of the sorted probs.
+                        ggml_tensor* w_g = ggml_cont(ctx, ggml_view_2d(ctx, sorted_p,
+                            num_experts_used, N, sorted_p->nb[1], 0));
+                        ggml_tensor* z_sum = ggml_sum_rows(ctx, w_g);
+                        w_r = ggml_div(ctx, w_r, z_sum);
+                    }
+                    if (expert_weights_scale != 1.0f)
+                        w_r = ggml_scale(ctx, w_r, expert_weights_scale);
+                    w_final = ggml_reshape_3d(ctx, w_r, 1, num_experts_used, N);
+
+                    // Local ids for this rank's stacked expert slice.
+                    ggml_tensor* sel_flat = ggml_reshape_1d(ctx, sel_r, num_experts_used * N);
+                    ggml_tensor* local_ids = ggml_get_rows(ctx, ep_lut, sel_flat);         // I32 [1, num_used*N]
+                    sel_ids = ggml_reshape_2d(ctx, local_ids, num_experts_used, N);
+                }
 
                 ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, ffn_normed, H, 1, N);
-                ggml_tensor* g_exp = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel);     // [expert_ff, num_used, N]
-                ggml_tensor* u_exp = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel);
+                ggml_tensor* g_exp = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel_ids); // [expert_ff, num_used, N]
+                ggml_tensor* u_exp = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel_ids);
                 ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, g_exp), u_exp);
-                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps, act, sel);        // [H, num_used, N]
+                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps, act, sel_ids);    // [H, num_used, N]
                 ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
                 ggml_tensor* moe_out = ggml_cont(ctx, ggml_view_3d(ctx, weighted, H, 1, N, weighted->nb[1], weighted->nb[2], 0));
                 for (int u = 1; u < num_experts_used; ++u)
@@ -843,7 +1050,11 @@ namespace
                 ggml_tensor* sh_down = ggml_mul_mat(ctx, t.shexp_down_w, sh_act); // [H, N]
                 ggml_tensor* sh_gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, ggml_reshape_2d(ctx, t.shexp_gate_inp_w, H, 1), ffn_normed)); // [1, N]
                 ggml_tensor* sh_out = ggml_mul(ctx, sh_down, sh_gate);
+                // Both the routed sum (this rank's experts only) and the
+                // Megatron-split shared expert are partials, so their sum is
+                // the layer's single reduction point.
                 ffn_out = ggml_add(ctx, moe_out_2d, sh_out);
+                if (tp_mode) { tp_partial.push_back(ffn_out); tp_boundary.push_back(ffn_out); }
             }
 
             hidden = ggml_add(ctx, residual1, ffn_out); // [H, N]
@@ -1041,6 +1252,49 @@ namespace
                 ggml_backend_tensor_set(lt[l].delta_state_in, layers[l].delta_state_in, 0, deltaStateBytes);
             }
         }
+        if (ep_lut != nullptr)
+        {
+            ggml_backend_tensor_set(ep_lut, ep_lut_data.data(), 0, ep_lut_data.size() * sizeof(std::int32_t));
+            ggml_backend_tensor_set(ep_mask, ep_mask_data.data(), 0, ep_mask_data.size() * sizeof(float));
+        }
+
+        // Tensor-parallel mode: every input is staged; hand the caller a
+        // segmented plan instead of computing. The graph, its pooled context
+        // and the gallocr buffers stay alive parked in this rank's pending
+        // slot until the next TP build recycles them; the driver downloads the
+        // logits slice and the post-window GDN states after the final sync.
+        if (tp_mode)
+        {
+            auto& pending = g_q35v_tp[g_active_rank];
+            pending.plan.clear();
+            pending.plan.graph = graph;
+            pending.plan.ar_tensor = tp_partial;
+            if (!tp_plan_segments(pending.plan, tp_boundary))
+            {
+                pending.reset();
+                return 0;
+            }
+            pending.plan.out_tensor = logits_out_t;
+            pending.plan.out_host = logits_data;
+            pending.plan.out_bytes = static_cast<std::size_t>(vocab_size) * n_logits * sizeof(float);
+            if (normed_out != nullptr && normed_out_t != nullptr)
+                pending.plan.extra_out.push_back({ normed_cpy, normed_out,
+                    static_cast<std::size_t>(H) * N * sizeof(float) });
+            for (int l = 0; l < num_layers; l++)
+            {
+                const TSGgmlQwen35LayerDesc& d = layers[l];
+                if (d.is_recurrent == 0) continue;
+                if (d.conv_state_out != nullptr)
+                    pending.plan.extra_out.push_back({ lt[l].conv_state_out, d.conv_state_out, convStateBytes });
+                if (d.delta_state_out != nullptr)
+                    pending.plan.extra_out.push_back({ lt[l].delta_state_out, d.delta_state_out, deltaStateBytes });
+            }
+            pending.context = std::move(context);
+            pending.ephemeral = std::move(ephemeral_bufs);
+            *tp_plan_out = &pending.plan;
+            clear_last_error();
+            return 1;
+        }
 
         if (vram_log_enabled())
         {
@@ -1142,7 +1396,8 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
     void* logits_data, int vocab_size,
     const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
     const void* final_norm_data, void* normed_out, int n_logit_rows,
-    const std::int32_t* mrope_pos, const std::int32_t* mrope_sections)
+    const std::int32_t* mrope_pos, const std::int32_t* mrope_sections,
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
@@ -1156,11 +1411,26 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
             norm_topk, expert_weights_scale,
             logits_data, vocab_size,
             lm_head_data, lm_head_type, lm_head_ne0, lm_head_ne1, lm_head_bytes,
-            final_norm_data, normed_out, n_logit_rows, mrope_pos, mrope_sections);
+            final_norm_data, normed_out, n_logit_rows, mrope_pos, mrope_sections,
+            tp_degree, tp_plan_out);
         return r;
     }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown error in Qwen3.5 model verify."); return 0; }
+}
+
+// Release every rank's parked tensor-parallel prefill graph. The C# side calls
+// this when the model is torn down (the parked contexts hold pooled memory and
+// the plans reference per-rank gallocr buffers).
+TSG_EXPORT void TSGgml_Qwen35ReleaseVerifyTpGraphs()
+{
+    for (int r = 0; r < TSG_MAX_DEVICES; ++r)
+    {
+        if (g_q35v_tp[r].plan.graph == nullptr && g_q35v_tp[r].context.value == nullptr)
+            continue;
+        tsg::ScopedRank rank(r);
+        g_q35v_tp[r].reset();
+    }
 }
 
 // Drop the persistent verify-graph cache. Called from C# whenever the attention KV

@@ -1949,7 +1949,8 @@ namespace TensorSharp.GGML
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNorm, IntPtr normedOut, int nLogitRows = -1,
-            int[] mropePos = null, int[] mropeSections = null)
+            int[] mropePos = null, int[] mropeSections = null,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return GgmlNative.Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -1961,8 +1962,13 @@ namespace TensorSharp.GGML
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, normedOut, nLogitRows, mropePos, mropeSections);
+                finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
+                tpDegree, tpPlanOut);
         }
+
+        /// <summary>Release every rank's parked tensor-parallel prefill graph
+        /// (see TSGgml_Qwen35ReleaseVerifyTpGraphs).</summary>
+        public static void Qwen35ReleaseVerifyTpGraphs() => GgmlNative.Qwen35ReleaseVerifyTpGraphs();
 
         /// <summary>Device-resident single-graph fused prefill for ONE Qwen3.5/
         /// Qwen3-Next gated-delta-net layer over N tokens (input norm + in-proj +
