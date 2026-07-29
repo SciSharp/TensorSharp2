@@ -42,6 +42,16 @@ namespace TensorSharp.GGML
 
         private readonly object _lock = new object();
         private readonly List<PoolBlock> _available = new List<PoolBlock>();
+        // True size and allocation provenance of every block currently handed
+        // out. The best-fit search below can serve a request from a LARGER
+        // pooled block, so the byteLength the caller passes back to Free() is a
+        // lower bound, not the block's real size. Freeing (or re-pooling) with
+        // the caller's size would munmap only part of the mapping and leak the
+        // tail as an unreclaimable VMA — enough churn eventually exhausts
+        // vm.max_map_count, munmap starts failing, and the old fallback then
+        // handed an mmap pointer to free(), aborting the process with
+        // "free(): invalid pointer" / "munmap_chunk(): invalid pointer".
+        private readonly Dictionary<IntPtr, PoolBlock> _outstanding = new Dictionary<IntPtr, PoolBlock>();
         private readonly bool _useVirtualAlloc;
         private readonly int _pageSize;
         private readonly int _initialBlockCount;
@@ -101,36 +111,44 @@ namespace TensorSharp.GGML
                 {
                     PoolBlock block = _available[bestIdx];
                     _available.RemoveAt(bestIdx);
+                    _outstanding[block.Ptr] = block;
                     return block.Ptr;
                 }
             }
 
-            return AllocateNew(alignedSize);
+            PoolBlock fresh = AllocateNew(alignedSize);
+            lock (_lock)
+            {
+                _outstanding[fresh.Ptr] = fresh;
+            }
+            return fresh.Ptr;
         }
 
         public void Free(IntPtr ptr, long byteLength)
         {
             if (ptr == IntPtr.Zero) return;
 
-            nuint size = (nuint)byteLength;
-            nuint alignedSize = AlignSize(size);
-
-            if (_maxPooledBlocks <= 0 || alignedSize > _maxRetainedBlockSize)
-            {
-                FreeToSystem(ptr, alignedSize);
-                return;
-            }
-
+            PoolBlock block;
             lock (_lock)
             {
-                if (_available.Count < _maxPooledBlocks)
+                if (!_outstanding.Remove(ptr, out block))
                 {
-                    _available.Add(new PoolBlock(ptr, alignedSize));
+                    // Unknown pointer: not handed out by this pool. Freeing it
+                    // with a guessed size/allocator can only corrupt the heap,
+                    // so treat it as a virtual mapping of the caller-claimed
+                    // size and let FreeToSystem leak it if munmap declines.
+                    block = new PoolBlock(ptr, AlignSize((nuint)byteLength), _useVirtualAlloc);
+                }
+
+                if (_maxPooledBlocks > 0 && block.Size <= _maxRetainedBlockSize &&
+                    _available.Count < _maxPooledBlocks)
+                {
+                    _available.Add(block);
                     return;
                 }
             }
 
-            FreeToSystem(ptr, alignedSize);
+            FreeToSystem(block);
         }
 
         private nuint AlignSize(nuint size)
@@ -139,26 +157,30 @@ namespace TensorSharp.GGML
             return ((size + (nuint)(_pageSize - 1)) / (nuint)_pageSize) * (nuint)_pageSize;
         }
 
-        private IntPtr AllocateNew(nuint alignedSize)
+        private PoolBlock AllocateNew(nuint alignedSize)
         {
             if (_useVirtualAlloc)
             {
                 IntPtr ptr = AllocateVirtual(alignedSize);
                 if (ptr != IntPtr.Zero)
-                    return ptr;
+                    return new PoolBlock(ptr, alignedSize, isVirtual: true);
             }
 
-            return Marshal.AllocHGlobal((nint)alignedSize);
+            return new PoolBlock(Marshal.AllocHGlobal((nint)alignedSize), alignedSize, isVirtual: false);
         }
 
-        private void FreeToSystem(IntPtr ptr, nuint size)
+        private static void FreeToSystem(in PoolBlock block)
         {
-            if (_useVirtualAlloc && FreeVirtual(ptr, size))
+            if (block.IsVirtual)
             {
+                // If munmap/VirtualFree fails (e.g. vm.max_map_count exhausted),
+                // leaking the mapping is the only safe outcome — this pointer
+                // did not come from the C heap, so it must NEVER reach free().
+                FreeVirtual(block.Ptr, block.Size);
                 return;
             }
 
-            Marshal.FreeHGlobal(ptr);
+            Marshal.FreeHGlobal(block.Ptr);
         }
 
         internal void EnsureInitialBlocks()
@@ -166,10 +188,7 @@ namespace TensorSharp.GGML
             lock (_lock)
             {
                 while (_available.Count < _initialBlockCount)
-                {
-                    IntPtr ptr = AllocateNew((nuint)BlockSize);
-                    _available.Add(new PoolBlock(ptr, (nuint)BlockSize));
-                }
+                    _available.Add(AllocateNew((nuint)BlockSize));
             }
         }
 
@@ -177,11 +196,13 @@ namespace TensorSharp.GGML
         {
             public readonly IntPtr Ptr;
             public readonly nuint Size;
+            public readonly bool IsVirtual;
 
-            public PoolBlock(IntPtr ptr, nuint size)
+            public PoolBlock(IntPtr ptr, nuint size, bool isVirtual)
             {
                 Ptr = ptr;
                 Size = size;
+                IsVirtual = isVirtual;
             }
         }
 
