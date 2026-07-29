@@ -79,6 +79,17 @@ namespace TensorSharp.Runtime
                 // tokenizer.ggml.pre == "qwen35" pre-tokenizer exactly.
                 "qwen35" =>
                     @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+                // DeepSeek V3/V4 family pre-tokenizer (llama.cpp DEEPSEEK3_LLM /
+                // JOYAI_LLM). llama.cpp applies three regexes as sequential split
+                // passes; a single ordered alternation produces the same splits for
+                // these patterns (verified against the llama-tokenize oracle).
+                "joyai-llm" or "deepseek-v3" or "hunyuan-dense" =>
+                    @"\p{N}{1,3}|" +
+                    @"[一-龥぀-ゟ゠-ヿ]+|" +
+                    @"[!""#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|" +
+                    @"[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+|" +
+                    @" ?[\p{P}\p{S}]+[\r\n]*|" +
+                    @"\s*[\r\n]+|\s+(?!\S)|\s+",
                 _ =>
                     @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             };

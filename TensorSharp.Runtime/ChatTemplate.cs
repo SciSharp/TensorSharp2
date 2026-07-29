@@ -527,6 +527,13 @@ namespace TensorSharp.Runtime
             if (architecture == "nemotron_h" || architecture == "nemotron_h_moe" || architecture == "nemotron_h_omni")
                 return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
 
+            // DeepSeek V4: the GGUF-embedded (Unsloth) template leans on Jinja
+            // features the lightweight engine handles inconsistently (nested
+            // namespaces, from_json, dict.items()); the format itself is simple,
+            // so always use the purpose-built renderer.
+            if (architecture == "deepseek4")
+                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+
             // gpt-oss / Harmony: the embedded template relies on advanced Jinja
             // features (recursive macros, namespace(), strftime_now, list slicing)
             // that the lightweight engine does not fully support — especially on the
@@ -645,7 +652,70 @@ namespace TensorSharp.Runtime
             if (architecture == "mistral3")
                 return RenderMistral3(messages, addGenerationPrompt);
 
+            if (architecture == "deepseek4")
+                return RenderDeepSeek4(messages, addGenerationPrompt, enableThinking);
+
             return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
+        }
+
+        /// <summary>
+        /// DeepSeek V4 chat format (mirrors models/templates/deepseek-ai-DeepSeek-V4.jinja):
+        /// leading system prompt(s) concatenated after BOS, then
+        /// &lt;｜User｜&gt;...&lt;｜Assistant｜&gt;&lt;/think&gt;...&lt;｜end▁of▁sentence｜&gt; turns.
+        /// Consecutive user/tool messages merge into one &lt;｜User｜&gt; block. The BOS
+        /// token itself is prepended by the tokenizer (add_bos), not emitted here.
+        /// </summary>
+        public static string RenderDeepSeek4(List<ChatMessage> messages, bool addGenerationPrompt = true,
+            bool enableThinking = false)
+        {
+            var sb = new StringBuilder();
+
+            bool firstSystem = true;
+            foreach (var m in messages)
+            {
+                if (m.Role != "system")
+                    continue;
+                if (!firstSystem)
+                    sb.Append("\n\n");
+                sb.Append(m.Content ?? "");
+                firstSystem = false;
+            }
+
+            bool inUser = false;
+            foreach (var m in messages)
+            {
+                switch (m.Role)
+                {
+                    case "user":
+                    case "developer":
+                        sb.Append(inUser ? "\n\n" : "<｜User｜>");
+                        inUser = true;
+                        sb.Append(m.Content ?? "");
+                        break;
+                    case "tool":
+                        sb.Append(inUser ? "\n\n" : "<｜User｜>");
+                        inUser = true;
+                        sb.Append("<tool_result>").Append(m.Content ?? "").Append("</tool_result>");
+                        break;
+                    case "assistant":
+                        inUser = false;
+                        sb.Append("<｜Assistant｜>");
+                        // Past-turn reasoning is dropped (drop_thinking behavior);
+                        // non-thinking turns start with a closed think block.
+                        sb.Append(enableThinking ? "<think></think>" : "</think>");
+                        sb.Append(m.Content ?? "");
+                        sb.Append("<｜end▁of▁sentence｜>");
+                        break;
+                }
+            }
+
+            if (addGenerationPrompt)
+            {
+                sb.Append("<｜Assistant｜>");
+                sb.Append(enableThinking ? "<think>" : "</think>");
+            }
+
+            return sb.ToString();
         }
 
         private static bool IsQwen35Family(string? architecture)
