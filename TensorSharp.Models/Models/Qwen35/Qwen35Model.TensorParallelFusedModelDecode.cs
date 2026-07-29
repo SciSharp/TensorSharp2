@@ -359,5 +359,257 @@ namespace TensorSharp.Models
             }
             return true;
         }
+
+        // ====================================================================
+        // Whole-model fused PREFILL under tensor parallelism
+        // ====================================================================
+        //
+        // The N-token sibling of TryQwen35FusedModelDecodeTP, backed by the
+        // verify kernel's tp_mode. The per-layer fused-block prefill this
+        // replaces round-trips the [N, hidden] activation through host memory
+        // several times per layer (measured 612 vs 1459 tok/s single-GPU on the
+        // 9B at N=512); one segmented whole-model graph per rank keeps the
+        // activations in VRAM and reduces the row-parallel partials at ~2 cut
+        // points per layer, exactly like the decode.
+
+        private bool _tpPfFailed;            // latched: the native side declined once
+        private bool _tpPfLogged;
+
+        /// <summary>Disable with TS_QWEN35_TP_FUSED_PREFILL=0.</summary>
+        private static readonly bool _tpPfEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_TP_FUSED_PREFILL") != "0";
+
+        /// <summary>
+        /// Pull the per-rank GDN states back to host memory. The fused decode
+        /// (and the per-op GDN kernel) advance the device-resident copies keyed
+        /// by these host pointers, so before a host-mode prefill reads the state
+        /// the host copy must be refreshed. No-op for state that never went
+        /// device-resident (first turn).
+        /// </summary>
+        private unsafe void SyncQwen35TpGdnStateToHost()
+        {
+            if (_tpDeltaState == null)
+                return;
+            int previousRank = GgmlBasicOps.GetActiveRank();
+            try
+            {
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    if (!_isRecurrent[l] || _tpDeltaState[l] == null)
+                        continue;
+                    for (int r = 0; r < TpDegree; r++)
+                    {
+                        GgmlBasicOps.SetActiveRank(r);
+                        SyncTpHostTensor(_tpDeltaState[l][r]);
+                        SyncTpHostTensor(_tpConvState[l]?[r]);
+                    }
+                }
+            }
+            finally
+            {
+                GgmlBasicOps.SetActiveRank(previousRank);
+            }
+        }
+
+        private unsafe void SyncTpHostTensor(Tensor t)
+        {
+            if (t == null) return;
+            IntPtr ptr = (IntPtr)GetFloatPtr(t);
+            if (ptr == IntPtr.Zero) return;
+            long bytes = t.ElementCount() * sizeof(float);
+            try { GgmlBasicOps.SyncHostBuffer(ptr, bytes); }
+            catch (InvalidOperationException) { /* never went device-resident */ }
+        }
+
+        /// <summary>
+        /// The prefill advanced the GDN states in HOST memory; any device-resident
+        /// copy keyed by those pointers is now stale. Drop the decode graphs that
+        /// pin them first, then invalidate so the next decode (fused or per-op)
+        /// re-uploads the post-prefill state.
+        /// </summary>
+        private void InvalidateQwen35TpGdnDeviceState()
+        {
+            DropTpFusedDecodeGraphs();
+            if (_tpDeltaState == null)
+                return;
+            int previousRank = GgmlBasicOps.GetActiveRank();
+            try
+            {
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    if (!_isRecurrent[l] || _tpDeltaState[l] == null)
+                        continue;
+                    for (int r = 0; r < TpDegree; r++)
+                    {
+                        GgmlBasicOps.SetActiveRank(r);
+                        InvalidateTensorDeviceCache(_tpDeltaState[l][r]);
+                        if (_tpConvState[l]?[r] != null)
+                            InvalidateTensorDeviceCache(_tpConvState[l][r]);
+                    }
+                }
+            }
+            finally
+            {
+                GgmlBasicOps.SetActiveRank(previousRank);
+            }
+        }
+
+        /// <summary>
+        /// One fused tensor-parallel prefill: the whole model over
+        /// <paramref name="seqLen"/> tokens as one segmented graph per rank,
+        /// the last token's logits written into <paramref name="logitsOut"/>
+        /// (column-parallel LM head — each rank downloads its own vocabulary
+        /// slice). Returns false when unavailable, leaving the caller on the
+        /// per-layer TP prefill.
+        /// </summary>
+        private unsafe bool TryQwen35FusedModelPrefillTP(Tensor hidden, int seqLen, int startPos, float[] logitsOut)
+        {
+            if (!_tpPfEnabled || _tpPfFailed || seqLen < 2)
+                return false;
+            if (!TpFusedModelDecodeAvailable() || logitsOut == null || logitsOut.Length < Config.VocabSize)
+                return false;
+            if (hidden == null || hidden.DimensionCount != 2 || hidden.Sizes[0] != seqLen
+                || hidden.ElementType != DType.Float32)
+                return false;
+            // gated_delta_net over N tokens needs the square per-head state.
+            if (_headKDim != _headVDim)
+                return false;
+
+            int tp = TpDegree;
+            int n = Config.NumLayers;
+
+            int cacheSize = 0;
+            int kvCacheType = 0;
+            for (int l = 0; l < n; l++)
+            {
+                if (_isRecurrent[l] || _tpKvCacheK?[l] == null)
+                    continue;
+                var k0 = _tpKvCacheK[l][0];
+                if (k0.ElementType != DType.Float32 && k0.ElementType != DType.Float16)
+                    return false;
+                cacheSize = (int)k0.Sizes[1];
+                kvCacheType = k0.ElementType == DType.Float16 ? 1 : 0;
+                break;
+            }
+            if (cacheSize <= 0 || startPos + seqLen > cacheSize)
+                return false;
+
+            if (_tpFdLayers == null || _tpFdBuiltCapacity != _tpKvCacheCapacity)
+            {
+                DropTpFusedDecodeGraphs();
+                bool built;
+                try { built = TryBuildTpFdLayerDescs(); }
+                catch (KeyNotFoundException) { built = false; }
+                if (!built)
+                {
+                    _tpPfFailed = true;
+                    return false;
+                }
+            }
+
+            // The graph reads the GDN state from the HOST pointers; refresh them
+            // from the device-resident copies a preceding decode advanced.
+            SyncQwen35TpGdnStateToHost();
+
+            // Multimodal MRoPE positions, [3 * seqLen] T/H/W per token staged by
+            // SetMRoPEPositions, re-laid out axis-concatenated [4 * seqLen] for
+            // ggml_rope_multi (mirrors TryFullModelVerify).
+            int[] mropePos = null;
+            int[] mropeSecs = null;
+            if (_pendingMRoPEPositions != null)
+            {
+                if (_mropeSections == null || _mropeSections.Length < 4
+                    || _pendingMRoPEPositions.Length < 3 * seqLen)
+                    return false;
+                mropePos = new int[4 * seqLen];
+                for (int i = 0; i < seqLen; i++)
+                {
+                    mropePos[i]              = _pendingMRoPEPositions[3 * i + 0]; // T
+                    mropePos[seqLen + i]     = _pendingMRoPEPositions[3 * i + 1]; // H
+                    mropePos[2 * seqLen + i] = _pendingMRoPEPositions[3 * i + 2]; // W
+                }
+                mropeSecs = new int[4] { _mropeSections[0], _mropeSections[1], _mropeSections[2], _mropeSections[3] };
+            }
+
+            var lmShards = _tpQuantWeights[_tpLmHeadKey];
+            IntPtr finalNormPtr = (IntPtr)GetFloatPtr(_weights["output_norm.weight"]);
+            int gTp = GlobalTpDegree;
+            int headsPerRank = Config.NumHeads / gTp;
+            int kvHeadsPerRank = Config.NumKVHeads / gTp;
+            int kHeadsPerRank = _numKHeads / gTp;
+            int vHeadsPerRank = _numVHeads / gTp;
+            int sharedFfPerRank = _sharedExpertFfnLength > 0 ? _sharedExpertFfnLength / gTp : 0;
+            int headDim = Config.HeadDim;
+
+            int previousRank = GgmlBasicOps.GetActiveRank();
+            var planSlot = new IntPtr[1];
+            long t0 = Stopwatch.GetTimestamp();
+            try
+            {
+                fixed (float* lp = logitsOut)
+                {
+                    long offset = 0;
+                    for (int r = 0; r < tp; r++)
+                    {
+                        var lm = lmShards[r];
+                        GgmlBasicOps.SetActiveRank(r);
+                        planSlot[0] = IntPtr.Zero;
+                        bool ok = GgmlBasicOps.Qwen35ModelVerify(
+                            _tpFdLayers[r], n,
+                            (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, startPos, seqLen,
+                            headsPerRank, kvHeadsPerRank, headDim, cacheSize,
+                            _ropeDimCount > 0 ? _ropeDimCount : headDim, 2, kvCacheType,
+                            _convKernel, _headKDim, _headVDim, kHeadsPerRank, vHeadsPerRank,
+                            Config.Eps, Config.RopeBase, 1.0f / Config.RopeScale,
+                            _numExperts, _numExpertsUsed, _expertFfnLength, sharedFfPerRank,
+                            _normTopKProb ? 1 : 0, 1.0f,
+                            (IntPtr)(lp + offset), (int)lm.Ne1,
+                            lm.CacheKey, lm.GgmlType, lm.Ne0, lm.Ne1, lm.RawBytes,
+                            finalNormPtr, IntPtr.Zero, nLogitRows: 1,
+                            mropePos, mropeSecs,
+                            tpDegree: tp, tpPlanOut: planSlot);
+                        if (!ok || planSlot[0] == IntPtr.Zero)
+                        {
+                            _tpPfFailed = true;
+                            if (!_tpPfLogged)
+                            {
+                                _tpPfLogged = true;
+                                Console.Error.WriteLine(
+                                    "[tp-full-prefill] native declined; staying on the per-layer TP prefill.");
+                            }
+                            return false;
+                        }
+                        _tpFdPlans[r] = planSlot[0];
+                        offset += lm.Ne1;
+                    }
+
+                    GgmlBasicOps.TensorParallelExecutePlans(_tpFdPlans);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                _tpPfFailed = true;
+                return false;
+            }
+            finally
+            {
+                GgmlBasicOps.SetActiveRank(previousRank);
+            }
+            _tpAttnBlockTicks += Stopwatch.GetTimestamp() - t0;
+
+            // KV rows advanced in the device-resident copies only; the GDN state
+            // advanced on the HOST (downloaded by the plan) — flip both caches'
+            // coherence accordingly.
+            _tpAttnKvDeviceOnly = true;
+            InvalidateQwen35TpGdnDeviceState();
+
+            if (!_tpPfLogged)
+            {
+                _tpPfLogged = true;
+                Console.WriteLine($"  Qwen3.5 fused tensor-parallel prefill active ({tp} GPUs, " +
+                    $"{2 * n} AllReduce points/pass).");
+            }
+            return true;
+        }
     }
 }

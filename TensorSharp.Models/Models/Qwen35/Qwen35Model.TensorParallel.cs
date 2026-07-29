@@ -1097,6 +1097,25 @@ namespace TensorSharp.Models
                 }
             }
 
+            // Whole-model fused prefill: the N-token sibling of the fused decode
+            // (verify-kernel tp_mode). One segmented graph per rank keeps the
+            // [N, hidden] activations in VRAM instead of round-tripping them
+            // through the host between every per-layer fused block.
+            if (seqLen > 1)
+            {
+                if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                    _logitsBuffer = new float[Config.VocabSize];
+                if (TryQwen35FusedModelPrefillTP(hidden0, seqLen, startPos, _logitsBuffer))
+                {
+                    hidden0.Dispose();
+                    _cacheSeqLen += seqLen;
+                    _forwardCount++;
+                    _pendingMRoPEPositions = null;
+                    _forwardSw.Stop();
+                    return _logitsBuffer;
+                }
+            }
+
             // Broadcast embedding to all GPUs.
             Tensor[] hidden = BroadcastTensorToAllRanks(hidden0);
 
@@ -2129,7 +2148,10 @@ namespace TensorSharp.Models
             // The per-rank GDN graphs are cached natively on (rank, shape), not on
             // the model, so nothing else would reclaim their activation buffers.
             if (IsGgmlBackend)
+            {
                 GgmlBasicOps.Qwen35GdnDropTpGraphs();
+                GgmlBasicOps.Qwen35ReleaseVerifyTpGraphs();
+            }
 
             DisposeTpWeightReplicaCache();
             FreeQwenTpMoETables();

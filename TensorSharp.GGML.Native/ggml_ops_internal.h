@@ -637,6 +637,10 @@ namespace tsg
         ggml_tensor* out_tensor = nullptr;
         void* out_host = nullptr;
         std::size_t out_bytes = 0;
+        // Additional post-execution downloads (e.g. the per-layer GDN states a
+        // whole-model prefill graph leaves behind), performed with out_tensor.
+        struct ExtraDownload { ggml_tensor* tensor; void* host; std::size_t bytes; };
+        std::vector<ExtraDownload> extra_out;
 
         void clear()
         {
@@ -646,6 +650,7 @@ namespace tsg
             out_tensor = nullptr;
             out_host = nullptr;
             out_bytes = 0;
+            extra_out.clear();
         }
         bool valid() const { return graph != nullptr && !seg_end.empty(); }
     };
