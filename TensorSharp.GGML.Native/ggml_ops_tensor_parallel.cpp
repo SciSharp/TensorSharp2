@@ -46,8 +46,11 @@
 #include "ggml-cuda.h"
 #endif
 
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -323,7 +326,13 @@ namespace tsg
             return false;
         if (rank_count != g_device_count.load(std::memory_order_acquire))
             return false;
-        return tp_comm_ensure();
+        // Resolve the device collective (NCCL / P2P) when the backend has one;
+        // without it the segment boundaries reduce through host staging in
+        // tp_reduce_segment instead. That is still far cheaper than the per-op
+        // fallback (two host crossings per layer instead of ~30), and it is
+        // the only transport on backends with no comm support (Vulkan).
+        tp_comm_ensure();
+        return true;
     }
 
     bool tp_plan_segments(TpRankPlan& plan, const std::vector<ggml_tensor*>& boundary)
@@ -361,6 +370,96 @@ namespace tsg
 
     namespace
     {
+        // Persistent per-rank staging for the host segment reduction. Reused
+        // across boundaries so a prefill-sized partial (tens of MB) is not
+        // re-allocated and zero-filled ~100 times per forward. Only the
+        // single driving thread of tp_execute_plans grows these; the workers
+        // below touch disjoint ranks.
+        std::vector<float> g_reduce_staging[TSG_MAX_DEVICES];
+
+        // Long-lived workers that fan one per-rank staging job out across the
+        // ranks above 0 (rank 0 runs on the caller). A segment boundary fires
+        // twice per layer per token, so the ~50 µs of a thread spawn matters;
+        // a condvar wake is an order of magnitude cheaper and lets the ranks'
+        // fence waits overlap. Worker r is permanently bound to rank r+1.
+        // The pool is leaked deliberately: workers park on the condvar and die
+        // with the process, avoiding static-destruction races with the ggml
+        // backends they never touch while idle.
+        class TpStagePool
+        {
+        public:
+            using Job = std::function<void(int)>;
+
+            void run(int rank_count, const Job& job)
+            {
+                const int extra = rank_count - 1;
+                if (extra <= 0)
+                {
+                    job(0);
+                    return;
+                }
+                ensure(extra);
+                {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    _job = &job;
+                    _active = extra;
+                    _pending = extra;
+                    ++_generation;
+                }
+                _wake.notify_all();
+                job(0);
+                std::unique_lock<std::mutex> lock(_mutex);
+                _done.wait(lock, [&] { return _pending == 0; });
+                _job = nullptr;
+            }
+
+        private:
+            void ensure(int extra)
+            {
+                while (static_cast<int>(_workers.size()) < extra)
+                {
+                    const int rank = static_cast<int>(_workers.size()) + 1;
+                    _workers.emplace_back([this, rank] { worker(rank); });
+                }
+            }
+
+            void worker(int rank)
+            {
+                std::uint64_t seen = 0;
+                for (;;)
+                {
+                    const Job* job = nullptr;
+                    {
+                        std::unique_lock<std::mutex> lock(_mutex);
+                        _wake.wait(lock, [&] { return _generation != seen && _job != nullptr && rank <= _active; });
+                        seen = _generation;
+                        job = _job;
+                    }
+                    (*job)(rank);
+                    {
+                        std::lock_guard<std::mutex> lock(_mutex);
+                        if (--_pending == 0)
+                            _done.notify_all();
+                    }
+                }
+            }
+
+            std::mutex _mutex;
+            std::condition_variable _wake;
+            std::condition_variable _done;
+            std::vector<std::thread> _workers;
+            const Job* _job = nullptr;
+            int _active = 0;
+            int _pending = 0;
+            std::uint64_t _generation = 0;
+        };
+
+        TpStagePool& tp_stage_pool()
+        {
+            static TpStagePool* pool = new TpStagePool();
+            return *pool;
+        }
+
         // Reduce one segment's partials. Returns false only when the collective
         // is genuinely unusable — a per-call refusal (an unsupported shape, say)
         // falls back to summing through the host so the token still completes.
@@ -369,9 +468,12 @@ namespace tsg
             if (tp_device_allreduce(nodes))
                 return true;
 
-            // Host fallback: drain every rank, sum the partials in RAM, push the
-            // total back. Correct but slow (two PCIe crossings per boundary), so
-            // it is a safety net, not a mode anyone should run in.
+            // Host reduction: drain every rank, sum the partials in RAM, push
+            // the total back. On backends with no device collective (Vulkan)
+            // this is the routine transport for every segment boundary, so the
+            // per-rank staging runs concurrently — each rank owns its own
+            // backend queue and g_active_rank is thread-local, and the fence
+            // waits overlap instead of chaining.
             const std::int64_t count = ggml_nelements(nodes[0]);
             if (count <= 0)
                 return true;
@@ -382,21 +484,45 @@ namespace tsg
             }
 
             const std::size_t bytes = static_cast<std::size_t>(count) * sizeof(float);
-            std::vector<std::vector<float>> staging(static_cast<std::size_t>(rank_count));
-            std::vector<float*> ptrs(static_cast<std::size_t>(rank_count));
+            float* ptrs[TSG_MAX_DEVICES] = {};
             for (int r = 0; r < rank_count; ++r)
+            {
+                auto& stage = g_reduce_staging[r];
+                if (stage.size() < static_cast<std::size_t>(count))
+                    stage.resize(static_cast<std::size_t>(count));
+                ptrs[r] = stage.data();
+            }
+
+            auto stage_down = [&](int r)
             {
                 ScopedRank rank(r);
                 ggml_backend_synchronize(g_backend);
-                staging[static_cast<std::size_t>(r)].resize(static_cast<std::size_t>(count));
-                ggml_backend_tensor_get(nodes[r], staging[static_cast<std::size_t>(r)].data(), 0, bytes);
-                ptrs[static_cast<std::size_t>(r)] = staging[static_cast<std::size_t>(r)].data();
-            }
-            tp_host_allreduce_mt(ptrs.data(), rank_count, count);
-            for (int r = 0; r < rank_count; ++r)
+                ggml_backend_tensor_get(nodes[r], ptrs[r], 0, bytes);
+            };
+            auto stage_up = [&](int r)
             {
                 ScopedRank rank(r);
-                ggml_backend_tensor_set(nodes[r], ptrs[static_cast<std::size_t>(r)], 0, bytes);
+                ggml_backend_tensor_set(nodes[r], ptrs[r], 0, bytes);
+            };
+
+            // Concurrent staging pays off once the copies outweigh the wake:
+            // ggml-vulkan serializes submissions behind one queue mutex, so for
+            // decode-sized partials two threads only add contention (measured
+            // slower than the serial loop), while prefill-sized ones overlap
+            // their PCIe time.
+            if (rank_count > 1 && bytes >= (256u << 10))
+            {
+                tp_stage_pool().run(rank_count, stage_down);
+                tp_host_allreduce_mt(ptrs, rank_count, count);
+                tp_stage_pool().run(rank_count, stage_up);
+            }
+            else
+            {
+                for (int r = 0; r < rank_count; ++r)
+                    stage_down(r);
+                tp_host_allreduce_mt(ptrs, rank_count, count);
+                for (int r = 0; r < rank_count; ++r)
+                    stage_up(r);
             }
             return true;
         }
@@ -1049,10 +1175,10 @@ TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndic
     }
 }
 
-// 1 when the fused tensor-parallel path can run: several ranks AND a device
-// collective to reduce the per-layer partials with. Without the collective every
-// segment boundary would cost a host round trip, which defeats the purpose, so
-// the managed layer keeps its per-op forward instead.
+// 1 when the fused tensor-parallel path can run (several ranks spanning every
+// initialized device). The per-layer partials reduce with the backend's device
+// collective when it has one (ggml-cuda: NCCL / P2P) and through host staging
+// otherwise (ggml-vulkan), so the collective is no longer a requirement.
 TSG_EXPORT int TSGgml_TensorParallelFusedAvailable(int rankCount)
 {
     try

@@ -1916,7 +1916,8 @@ namespace TensorSharp.GGML
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm)
+            IntPtr finalNorm,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return GgmlNative.Qwen35ModelDecode(
                 layers, numLayers, hidden, hiddenSize, position,
@@ -1928,7 +1929,7 @@ namespace TensorSharp.GGML
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm);
+                finalNorm, tpDegree, tpPlanOut);
         }
 
         /// <summary>Fused multi-token VERIFY: the whole hybrid transformer over N

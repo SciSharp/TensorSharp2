@@ -583,11 +583,17 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         std::vector<int> pwindow(num_layers, 0);          // padded window length per layer
         std::vector<int> pvalid(num_layers, 0);           // unmasked (valid) length per layer
         std::vector<std::int64_t> pwrite(num_layers, 0);  // set_rows write row per layer
-        // CUDA-gate persist: ggml_set_rows segfaults on Metal (null-context buffer
-        // in ggml_metal_op_set_rows). Metal falls through to the ggml_cpy path,
-        // which still folds the LM head and keeps the KV cache device-resident.
-        // See the dense TSGgml_Gemma4ModelDecode for the full rationale.
-        bool can_persist = g4moe_persist && g_backend_type == BACKEND_TYPE_CUDA;
+        // Persist on CUDA and Vulkan; Metal falls through to the ggml_cpy path
+        // (ggml_set_rows segfaults there — null-context buffer in
+        // ggml_metal_op_set_rows), which still folds the LM head and keeps the
+        // KV cache device-resident. On CUDA persist enables CUDA-graph capture;
+        // on Vulkan reusing the built graph removes the per-token rebuild +
+        // gallocr work, and it is what makes the tensor-parallel plan possible
+        // (the driver executes the graph after this call returns). Vulkan's
+        // set_rows / mul_mat_id / argsort cover everything this graph emits —
+        // see the dense TSGgml_Gemma4ModelDecode for the full rationale.
+        bool can_persist = g4moe_persist &&
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
         {
             auto roundup_stride = [](int v){ return ((v + kG4MoePersistKvStride - 1) / kG4MoePersistKvStride) * kG4MoePersistKvStride; };
             for (int l = 0; l < num_layers; l++)

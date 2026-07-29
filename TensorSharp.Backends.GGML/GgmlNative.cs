@@ -1880,7 +1880,8 @@ internal enum GgmlIndexReductionOp
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm);
+            IntPtr finalNorm,
+            int tpDegree, [In, Out] IntPtr[] tpPlanOut);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_Qwen35ResetDecodeCache();
@@ -1973,7 +1974,8 @@ internal enum GgmlIndexReductionOp
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm)
+            IntPtr finalNorm,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return TSGgml_Qwen35ModelDecode(
                 layers, numLayers, hidden, hiddenSize, position,
@@ -1985,7 +1987,7 @@ internal enum GgmlIndexReductionOp
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm) != 0;
+                finalNorm, tpDegree, tpPlanOut) != 0;
         }
 
         // Qwen3.5/3.6 fused multi-token VERIFY: the whole hybrid transformer over
