@@ -983,13 +983,17 @@ namespace
                     // (w_min, read through the DESC argsort, since CUDA's TOP_K
                     // output is unsorted) — and zero for the rest, so the ranks'
                     // partial sums add up to exactly the single-GPU MoE.
+                    // get_rows only ever sees whole (buffer-aligned) tensors as its
+                    // id input: ggml-vulkan asserts zero buffer-offset remainders
+                    // for GET_ROWS, so an element-offset view of the argsort output
+                    // cannot be gathered directly. Gather ALL sorted probs once and
+                    // slice the k-th column as a view — the elementwise consumers
+                    // below carry offsets in their push constants.
                     ggml_tensor* sorted_g = ggml_argsort(ctx, probs, GGML_SORT_ORDER_DESC); // I32 [num_experts, N]
-                    ggml_tensor* selg = ggml_view_2d(ctx, sorted_g, num_experts_used, N,
-                        sorted_g->nb[1], 0);                                               // global top-k ids
-                    ggml_tensor* kth = ggml_view_2d(ctx, sorted_g, 1, N,
-                        sorted_g->nb[1], static_cast<std::size_t>(num_experts_used - 1) * sizeof(std::int32_t));
-                    ggml_tensor* w_min = ggml_reshape_2d(ctx,
-                        ggml_get_rows(ctx, probs_r, kth), 1, N);                           // k-th largest prob per token
+                    ggml_tensor* sorted_p = ggml_reshape_2d(ctx,
+                        ggml_get_rows(ctx, probs_r, sorted_g), num_experts, N);            // probs, descending per token
+                    ggml_tensor* w_min = ggml_view_2d(ctx, sorted_p, 1, N,
+                        sorted_p->nb[1], static_cast<std::size_t>(num_experts_used - 1) * sizeof(float));
 
                     // Zero foreign experts, then float every owned entry above
                     // zero: a softmax prob can underflow to exactly 0.0f, and a
@@ -1009,9 +1013,10 @@ namespace
                     ggml_tensor* w_r = ggml_sub(ctx, p_r, ggml_mul(ctx, p_r, st));
                     if (norm_topk != 0)
                     {
-                        // Normalizer over the GLOBAL top-k (identical on every rank).
-                        ggml_tensor* w_g = ggml_reshape_2d(ctx,
-                            ggml_get_rows(ctx, probs_r, selg), num_experts_used, N);
+                        // Normalizer over the GLOBAL top-k (identical on every rank):
+                        // the first num_used rows of the sorted probs.
+                        ggml_tensor* w_g = ggml_cont(ctx, ggml_view_2d(ctx, sorted_p,
+                            num_experts_used, N, sorted_p->nb[1], 0));
                         ggml_tensor* z_sum = ggml_sum_rows(ctx, w_g);
                         w_r = ggml_div(ctx, w_r, z_sum);
                     }
