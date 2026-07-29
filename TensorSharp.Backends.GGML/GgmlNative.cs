@@ -1843,6 +1843,7 @@ internal enum GgmlIndexReductionOp
         private static extern int TSGgml_Gemma4MoEModelVerify(
             [In] Gemma4MoELayerDecodeArgs[] layers, int numLayers,
             IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            byte[] mmIsExcept,
             int tpDegree, out IntPtr tpPlanOut);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -1855,10 +1856,10 @@ internal enum GgmlIndexReductionOp
         }
 
         public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+            byte[] mmIsExcept = null, int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             int rc = TSGgml_Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens,
-                tpDegree, out IntPtr plan);
+                mmIsExcept, tpDegree, out IntPtr plan);
             // Tensor-parallel mode returns a plan instead of running the graph.
             if (tpPlanOut != null) tpPlanOut[0] = plan;
             return rc != 0;

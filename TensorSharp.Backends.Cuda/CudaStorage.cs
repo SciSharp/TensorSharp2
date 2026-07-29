@@ -275,6 +275,17 @@ namespace TensorSharp.Cuda
                         source, src.AllocatorImpl.Context.Handle,
                         new UIntPtr((ulong)byteCount),
                         AllocatorImpl.Stream.Handle).ThrowOnError();
+                    // The copy runs on OUR stream but reads the SOURCE device's
+                    // buffer, and nothing orders the source stream against it:
+                    // the caller may dispose the source tensor immediately, its
+                    // buffer goes back to the pool, and the source rank's next
+                    // kernel writes it WHILE the peer DMA is still reading — at
+                    // tensor-parallel prefill sizes (MBs in flight) that
+                    // corrupted most of the transfer (measured ~96% of bytes on
+                    // 2x RTX 2000 Ada; the repeated-token TP garbage). Block
+                    // until the copy completes, matching the synchronous
+                    // host-staged fallback below.
+                    AllocatorImpl.Stream.Synchronize();
                 }
                 else
                 {

@@ -2,6 +2,7 @@ using TensorSharp;
 using TensorSharp.Cuda;
 using TensorSharp.Models;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace InferenceWeb.Tests;
 
@@ -2080,6 +2081,123 @@ public class CudaBackendTests
             AssertClose(expected, actual, 0.04f * maxAbs);
 
             CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+        }
+        finally
+        {
+            CudaQuantizedOps.Q80MmqEnabled = savedMmq;
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    /// <summary>
+    /// Two tensor-parallel ranks running the prefill-sized dequant+cuBLAS F16
+    /// GEMM (rows >= F16GemmMinRows) concurrently on column-shard VIEWS of one
+    /// quantized weight must each produce the same result that a single
+    /// allocator produces for that shard. This is the exact projection shape
+    /// the Gemma4 --tp 2 direct-CUDA prefill runs; a divergence here is the
+    /// repeated-token garbage seen at prompt lengths >= 32 tokens.
+    /// </summary>
+    [Fact]
+    public void CudaF16GemmColumnShards_TwoRanksConcurrent_MatchSingleAllocator()
+    {
+        if (!CudaBackend.IsAvailable() || CudaDevice.GetDeviceCount() < 2)
+            return;
+
+        const int inDim = 2048;
+        const int outDim = 512;      // full weight; each shard is 256 columns
+        const int rows = 64;         // >= F16GemmMinRows -> RunF16Gemm
+        const int tp = 2;
+        byte[] weights = CreateQ8_0Rows(
+            outDim, inDim,
+            (r, c) => (sbyte)(((r * 7) + (c * 13)) % 127 - 63),
+            r => 0.01f + (r % 5) * 0.002f);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 3) * (c + 5) * 0.0191f) * 0.625f;
+
+        long rowBytes = weights.Length / outDim;
+        long shardBytes = (outDim / tp) * rowBytes;
+        int shardOut = outDim / tp;
+
+        bool savedMmq = CudaQuantizedOps.Q80MmqEnabled;
+        // Force the F16 GEMM route for Q8_0 (MMQ would otherwise take priority).
+        CudaQuantizedOps.Q80MmqEnabled = false;
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            var shardPtrs = new IntPtr[tp];
+            for (int r = 0; r < tp; r++)
+                shardPtrs[r] = IntPtr.Add(host, (int)(r * shardBytes));
+
+            // Reference: both shards computed on one allocator, sequentially.
+            var expected = new float[tp][];
+            using (var alloc0 = new CudaAllocator(0))
+            {
+                using var inputTensor = Tensor.FromArray(alloc0, input);
+                for (int r = 0; r < tp; r++)
+                {
+                    using var output = new Tensor(alloc0, DType.Float32, rows, shardOut);
+                    Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                        output, inputTensor, shardPtrs[r], shardPtrs[r], 8, inDim, shardOut, shardBytes));
+                    expected[r] = output.GetElementsAsFloat(rows * shardOut);
+                    CudaQuantizedOps.ReleaseQuantizedWeight(alloc0, shardPtrs[r]);
+                }
+            }
+
+            // TP: rank r's shard on allocator r, both ranks concurrently, several
+            // iterations to catch cross-rank scratch/handle races.
+            var allocators = new CudaAllocator[tp];
+            for (int r = 0; r < tp; r++)
+                allocators[r] = new CudaAllocator(r);
+            try
+            {
+                for (int iter = 0; iter < 4; iter++)
+                {
+                    var actual = new float[tp][];
+                    var errors = new Exception[tp];
+                    var threads = new Thread[tp];
+                    for (int r = 0; r < tp; r++)
+                    {
+                        int rank = r;
+                        threads[r] = new Thread(() =>
+                        {
+                            try
+                            {
+                                using var inputTensor = Tensor.FromArray(allocators[rank], input);
+                                using var output = new Tensor(allocators[rank], DType.Float32, rows, shardOut);
+                                if (!CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                                        output, inputTensor, shardPtrs[rank], shardPtrs[rank], 8,
+                                        inDim, shardOut, shardBytes))
+                                {
+                                    throw new InvalidOperationException("quantized matmul declined");
+                                }
+                                actual[rank] = output.GetElementsAsFloat(rows * shardOut);
+                            }
+                            catch (Exception ex) { errors[rank] = ex; }
+                        });
+                        threads[r].Start();
+                    }
+                    foreach (var t in threads) t.Join();
+                    foreach (var e in errors) Assert.Null(e);
+
+                    for (int r = 0; r < tp; r++)
+                    {
+                        float maxAbs = 1e-6f;
+                        foreach (float e in expected[r]) maxAbs = MathF.Max(maxAbs, MathF.Abs(e));
+                        AssertClose(expected[r], actual[r], 0.02f * maxAbs);
+                    }
+                }
+            }
+            finally
+            {
+                for (int r = 0; r < tp; r++)
+                {
+                    CudaQuantizedOps.ReleaseQuantizedWeight(allocators[r], shardPtrs[r]);
+                    allocators[r].Dispose();
+                }
+            }
         }
         finally
         {

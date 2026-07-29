@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp.GGML;
@@ -463,10 +464,23 @@ namespace TensorSharp.Models
         /// output back into <paramref name="hidden"/>; the caller owns the final
         /// norm and the LM head.
         /// </summary>
-        private unsafe bool TryGemma4FusedMoEModelVerifyTP(Tensor hidden, int startPos, int n)
+        private unsafe bool TryGemma4FusedMoEModelVerifyTP(Tensor hidden, int startPos, int n,
+            HashSet<int> exceptPositions = null)
         {
             if (!_tpMoeFusedReady || n <= 1)
                 return false;
+            // Multimodal spans are only expressible at startPos == 0 (mask
+            // view-index == logical position); later chunks fall to per-op.
+            if (exceptPositions != null && exceptPositions.Count > 0 && startPos != 0)
+                return false;
+
+            byte[] isExcept = null;
+            if (exceptPositions != null && exceptPositions.Count > 0)
+            {
+                isExcept = new byte[n];
+                foreach (int p in exceptPositions)
+                    if (p >= 0 && p < n) isExcept[p] = 1;
+            }
 
             int tp = TpDegree;
             int layers = Config.NumLayers;
@@ -488,7 +502,7 @@ namespace TensorSharp.Models
                     planSlot[0] = IntPtr.Zero;
                     if (!GgmlBasicOps.Gemma4MoEModelVerify(
                             _tpMoeArgs[r], layers, hiddenPtr, Config.HiddenSize, startPos, n,
-                            tpDegree: tp, tpPlanOut: planSlot)
+                            mmIsExcept: isExcept, tpDegree: tp, tpPlanOut: planSlot)
                         || planSlot[0] == IntPtr.Zero)
                     {
                         return false;

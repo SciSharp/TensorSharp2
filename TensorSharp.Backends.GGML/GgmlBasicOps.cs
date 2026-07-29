@@ -2073,9 +2073,9 @@ namespace TensorSharp.GGML
         /// the shape (caller falls back to the per-op verify).
         /// </summary>
         public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+            byte[] mmIsExcept = null, int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
-            return GgmlNative.Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens, tpDegree, tpPlanOut);
+            return GgmlNative.Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens, mmIsExcept, tpDegree, tpPlanOut);
         }
 
         /// <summary>Release every rank's parked tensor-parallel MoE verify graph.</summary>
