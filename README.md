@@ -153,6 +153,7 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 
 | Family | Example model (GGUF) | Image / Video / Audio | Thinking | Tools | Card |
 |---|---|---|---|---|---|
+| DeepSeek V4 Flash | [DeepSeek-V4-Flash](https://huggingface.co/unsloth/DeepSeek-V4-Flash-GGUF) (284B MoE, split GGUF) | — / — / — | ✅ | — | [deepseek4.md](docs/models/deepseek4.md) |
 | Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) (also 31B, 26B-A4B MoE) | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4.md](docs/models/gemma4.md) |
 | Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) (also 35B-A3B MoE) | ✅ / — / — | ✅ | ✅ | [qwen35.md](docs/models/qwen35.md) |
 | Qwen 3 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B-GGUF) | — / — / — | ✅ | ✅ | [qwen3.md](docs/models/qwen3.md) |
@@ -167,6 +168,7 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 
 | Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tools | MTP spec | Card |
 |---|---|---|---|---|---|---|---|
+| DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash (284B MoE, 256 experts, compressed sparse attention, 1M context) | Text only | Yes | No | — | [deepseek4.md](docs/models/deepseek4.md) |
 | Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes | Yes (separate draft GGUF) | [gemma4.md](docs/models/gemma4.md) |
 | Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No | — | [gemma3.md](docs/models/gemma3.md) |
 | Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes | — | [qwen3.md](docs/models/qwen3.md) |
