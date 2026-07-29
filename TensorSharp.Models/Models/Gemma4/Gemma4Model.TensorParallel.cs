@@ -625,10 +625,12 @@ namespace TensorSharp.Models
             }
 
             // MoE trunk: same treatment through its own whole-model kernel, with a
-            // third AllReduce per layer for the expert down projection.
-            if (exceptPositions == null && perLayerInputs == null && _tpMoeFusedReady)
+            // third AllReduce per layer for the expert down projection. The verify
+            // kernel takes the multimodal bidirectional-span mask directly (at
+            // startPos == 0), so image chunks stay on the fused path too.
+            if (perLayerInputs == null && _tpMoeFusedReady)
             {
-                if (seqLen == 1)
+                if (seqLen == 1 && exceptPositions == null)
                 {
                     float[] fused = EnsureFoldLogitsBuffer();
                     if (TryGemma4FusedMoEModelDecodeTP(hidden0, startPos, fused))
@@ -639,7 +641,7 @@ namespace TensorSharp.Models
                         return fused;
                     }
                 }
-                else if (TryGemma4FusedMoEModelVerifyTP(hidden0, startPos, seqLen))
+                else if (seqLen > 1 && TryGemma4FusedMoEModelVerifyTP(hidden0, startPos, seqLen, exceptPositions))
                 {
                     float[] result = Gemma4TpFinalNormAndLmHead(hidden0, seqLen);
                     _cacheSeqLen += seqLen;
@@ -670,6 +672,10 @@ namespace TensorSharp.Models
             // Broadcast embedding to all GPUs.
             Tensor[] hidden = BroadcastTensorToAllRanks(hidden0);
 
+            bool tpDebug = Environment.GetEnvironmentVariable("TS_TP_DEBUG") == "1";
+            if (tpDebug)
+                DumpTpTensorStats(hidden[0], $"embed seqLen={seqLen} startPos={startPos}");
+
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 Tensor perLayerInput = perLayerInputs != null
@@ -677,6 +683,12 @@ namespace TensorSharp.Models
                     : null;
                 hidden = Gemma4TransformerBlockTP(hidden, layer, seqLen, startPos, perLayerInput, exceptPositions);
                 perLayerInput?.Dispose();
+                if (tpDebug)
+                {
+                    DumpTpTensorStats(hidden[0], $"layer {layer} rank0");
+                    if (TpDegree > 1)
+                        DumpTpTensorStats(hidden[1], $"layer {layer} rank1");
+                }
             }
 
             perLayerInputs?.Dispose();
@@ -781,6 +793,9 @@ namespace TensorSharp.Models
             Tensor reducedAttn = TpRowParallelLinear(attnOut, $"{prefix}.attn_output.weight");
             for (int r = 0; r < tp; r++)
                 attnOut[r].Dispose();
+
+            if (Environment.GetEnvironmentVariable("TS_TP_DEBUG") == "1")
+                DumpTpTensorStats(reducedAttn, $"layer {layer} attn-reduced");
 
             // 5. Broadcast + post-attention norm + residual.
             Tensor[] attnReplicated = BroadcastTensorToAllRanks(reducedAttn);
@@ -974,9 +989,28 @@ namespace TensorSharp.Models
                             int cacheLen = (int)_tpKvCacheK[layer][r].Sizes[1];
                             CopyToCacheCircular(_tpKvCacheK[layer][r], kHeads, startPos, seqLen, cacheLen);
                             CopyToCacheCircular(_tpKvCacheV[layer][r], vHeads, startPos, seqLen, cacheLen);
-                            // Keep fresh K/V for direct attention below.
-                            freshKHeads = kHeads;
-                            freshVHeads = vHeads;
+                            if (startPos > 0 && seqLen < cacheLen)
+                            {
+                                // Chunk 2+: queries near the chunk start attend the
+                                // previous window, which fresh-only K/V can't serve.
+                                // The circular cache (just written) holds the last
+                                // min(totalSeqLen, cacheLen) positions — fall through
+                                // to the gather path below (same as the donor case).
+                                // Attending only the fresh chunk here dropped that
+                                // history and, with an image, fed the bidi mask
+                                // chunk-relative query positions against absolute
+                                // exceptPositions.
+                                kHeads.Dispose();
+                                vHeads.Dispose();
+                            }
+                            else
+                            {
+                                // Chunk 1 (or a chunk that overflows the window, where
+                                // the cache has already overwritten itself): attend the
+                                // fresh K/V directly with the sliding-window mask.
+                                freshKHeads = kHeads;
+                                freshVHeads = vHeads;
+                            }
                         }
                         else
                         {
@@ -1033,7 +1067,21 @@ namespace TensorSharp.Models
                     kExpanded.Dispose();
 
                     int windowSize = isLocal ? _slidingWindow : 0;
-                    ApplyCausalMask(scores, seqLen, kvAttendLen, windowSize, exceptPositions);
+                    // ApplyCausalMask works in key-index coordinates: key 0 is
+                    // absolute position (totalSeqLen - kvAttendLen), and it derives
+                    // query positions from that same origin. exceptPositions holds
+                    // ABSOLUTE positions, so shift them into the mask's frame (the
+                    // global branch has shift 0; the fresh-chunk and gathered-window
+                    // branches start later in the sequence).
+                    HashSet<int> exceptForMask = exceptPositions;
+                    int maskShift = totalSeqLen - kvAttendLen;
+                    if (exceptPositions != null && maskShift != 0)
+                    {
+                        exceptForMask = new HashSet<int>();
+                        foreach (int p in exceptPositions)
+                            exceptForMask.Add(p - maskShift);
+                    }
+                    ApplyCausalMask(scores, seqLen, kvAttendLen, windowSize, exceptForMask);
                     Ops.Softmax(scores, scores);
 
                     var attnOutTensor = new Tensor(alloc, DType.Float32, numHeadsPerGpu, seqLen, headDim);
@@ -1287,8 +1335,11 @@ namespace TensorSharp.Models
 
             var moeResults = new Tensor[tp];
 
-            // Expert-parallel fast path: one batched dispatch per rank per layer.
-            if (UsesExpertParallelMoE &&
+            // Batched fast path: one dispatch per rank per layer. Runs from the
+            // whole-expert stacks (expert-parallel) or, when the fused trunk's
+            // Megatron-sliced stacks are the only shards (multimodal prompts
+            // fall off the fused trunk onto this per-op path), from those.
+            if ((UsesExpertParallelMoE || UsesTensorSlicedMoE) &&
                 TryGemma4MoEExpertParallel(moeInput, moeResults, selectedExpertsFlat, routingWeightsFlat,
                     layer, seqLen, hiddenSize))
             {
@@ -1404,6 +1455,12 @@ namespace TensorSharp.Models
         {
             int tp = TpDegree;
 
+            if (Environment.GetEnvironmentVariable("TS_TP_DEBUG") == "1")
+            {
+                DumpTpTensorStats(denseNormed[0], $"{prefix} dense-ffn");
+                DumpTpTensorStats(moeResults[0], $"{prefix} moe-reduced");
+            }
+
             // Apply post_ffw_norm_2 to MoE output
             string postNorm2Key = $"{prefix}.post_ffw_norm_2.weight";
             if (!_weights.ContainsKey(postNorm2Key))
@@ -1459,14 +1516,29 @@ namespace TensorSharp.Models
         {
             var gateShards = _tpStackedGate?[layer];
             var downShards = _tpStackedDown?[layer];
-            if (gateShards == null || downShards == null)
-                return false;
-            var upShards = _tpStackedUp?[layer];
+            StackedExpertWeights[] upShards = null;
+            // Megatron-sliced mode: every rank holds ALL experts at 1/tp of the
+            // FFN width (fused [gate|up] layout), so the dispatch runs with
+            // global expert ids and the row-parallel down projection's partial
+            // sums meet in the caller's AllReduce — the same reduction the
+            // whole-expert split needs.
+            bool sliced = gateShards == null || downShards == null;
+            if (sliced)
+            {
+                gateShards = _tpSlicedGateUp?[layer];
+                downShards = _tpSlicedDown?[layer];
+                if (gateShards == null || downShards == null)
+                    return false;
+            }
+            else
+            {
+                upShards = _tpStackedUp?[layer];
+            }
 
             int tp = TpDegree;
             int rankOffset = TpRankOffset;
             int nUsed = _numExpertsUsed;
-            int perRank = _tpExpertsPerRank;
+            int perRank = sliced ? _numExperts : _tpExpertsPerRank;
             bool fusedGateUp = upShards == null;
             int nFf = fusedGateUp
                 ? (int)(gateShards[0].PerExpertNe1 / 2)
@@ -1481,7 +1553,9 @@ namespace TensorSharp.Models
             var localWeights = new float[tp][];
             for (int r = 0; r < tp; r++)
             {
-                int first = (rankOffset + r) * perRank;
+                // Sliced mode: all experts are rank-local, ids pass through
+                // globally and the foreign-route filler below never runs.
+                int first = sliced ? 0 : (rankOffset + r) * perRank;
                 int last = first + perRank;
                 var ids = new int[totalRoutes];
                 var wts = new float[totalRoutes];
@@ -1591,6 +1665,25 @@ namespace TensorSharp.Models
                 }
             }
             return ok;
+        }
+
+        /// <summary>TS_TP_DEBUG=1: layer-by-layer activation stats for hunting
+        /// the first divergent op in the tensor-parallel per-op path.</summary>
+        private static unsafe void DumpTpTensorStats(Tensor t, string label)
+        {
+            long n = t.ElementCount();
+            float* p = GetFloatPtr(t);
+            double sumSq = 0; float mn = float.MaxValue, mx = float.MinValue;
+            long nanCount = 0;
+            for (long i = 0; i < n; i++)
+            {
+                float v = p[i];
+                if (float.IsNaN(v) || float.IsInfinity(v)) { nanCount++; continue; }
+                sumSq += (double)v * v;
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            Console.WriteLine($"  [tp-debug] {label}: rms={Math.Sqrt(sumSq / Math.Max(1, n - nanCount)):G6} min={mn:G6} max={mx:G6} nan/inf={nanCount}/{n}");
         }
 
         private Tensor TpExpertLinear(Tensor input, string weightName, int rank, int seqLen)

@@ -163,6 +163,13 @@ namespace TensorSharp.Models
                 return;
             _tpAttnKvDeviceOnly = false;
 
+            // Entering the per-op attention path: it reads and rewrites the
+            // caches through host memory, after which the device copies the
+            // persistent whole-model decode graphs bake would go stale (or be
+            // invalidated outright). Drop those graphs; the next fused decode
+            // rebuilds against the refreshed state.
+            DropTpFusedDecodeGraphs();
+
             for (int l = 0; l < _tpKvCacheK.Length; l++)
             {
                 if (_tpKvCacheK[l] == null) continue;

@@ -1011,6 +1011,10 @@ namespace TensorSharp.Models
             while (newCapacity < requiredSeqLen)
                 newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
 
+            // The persistent TP decode graphs bake the old cache tensors'
+            // device buffers; drop them before those tensors are disposed.
+            DropTpFusedDecodeGraphs();
+
             int tp = TpDegree;
             int numKVHeadsPerGpu = Config.NumKVHeads / GlobalTpDegree;
             int headDim = Config.HeadDim;
@@ -1072,6 +1076,26 @@ namespace TensorSharp.Models
             // staged via SetMRoPEPositions and consumed by the attention block.
             if (_visionEmbeddingsList.Count > 0)
                 InjectVisionEmbeddings(hidden0, seqLen);
+
+            // Whole-model fused decode: one persistent segmented graph per rank
+            // (KV append, GDN recurrence, MoE routing and the column-parallel LM
+            // head all in-graph). Falls through to the per-op layer loop below
+            // when unavailable. MRoPE positions only ever accompany a multimodal
+            // prefill, so the scalar-position decode graph applies whenever none
+            // are staged — the same condition the per-op attention path uses.
+            if (seqLen == 1 && _pendingMRoPEPositions == null)
+            {
+                if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                    _logitsBuffer = new float[Config.VocabSize];
+                if (TryQwen35FusedModelDecodeTP(hidden0, startPos, _logitsBuffer))
+                {
+                    hidden0.Dispose();
+                    _cacheSeqLen += seqLen;
+                    _forwardCount++;
+                    _forwardSw.Stop();
+                    return _logitsBuffer;
+                }
+            }
 
             // Broadcast embedding to all GPUs.
             Tensor[] hidden = BroadcastTensorToAllRanks(hidden0);
@@ -2026,6 +2050,10 @@ namespace TensorSharp.Models
         {
             int tp = TpDegree;
             int previousRank = IsGgmlBackend ? GgmlBasicOps.GetActiveRank() : 0;
+
+            // The reset below invalidates (frees) the per-rank state device
+            // buffers the persistent TP decode graphs reference; drop them first.
+            DropTpFusedDecodeGraphs();
 
             for (int l = 0; l < TotalLayerCount; l++)
             {

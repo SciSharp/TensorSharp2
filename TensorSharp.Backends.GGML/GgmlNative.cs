@@ -1843,6 +1843,7 @@ internal enum GgmlIndexReductionOp
         private static extern int TSGgml_Gemma4MoEModelVerify(
             [In] Gemma4MoELayerDecodeArgs[] layers, int numLayers,
             IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            byte[] mmIsExcept,
             int tpDegree, out IntPtr tpPlanOut);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -1855,10 +1856,10 @@ internal enum GgmlIndexReductionOp
         }
 
         public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+            byte[] mmIsExcept = null, int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             int rc = TSGgml_Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens,
-                tpDegree, out IntPtr plan);
+                mmIsExcept, tpDegree, out IntPtr plan);
             // Tensor-parallel mode returns a plan instead of running the graph.
             if (tpPlanOut != null) tpPlanOut[0] = plan;
             return rc != 0;
@@ -1879,7 +1880,8 @@ internal enum GgmlIndexReductionOp
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm);
+            IntPtr finalNorm,
+            int tpDegree, [In, Out] IntPtr[] tpPlanOut);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_Qwen35ResetDecodeCache();
@@ -1972,7 +1974,8 @@ internal enum GgmlIndexReductionOp
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm)
+            IntPtr finalNorm,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return TSGgml_Qwen35ModelDecode(
                 layers, numLayers, hidden, hiddenSize, position,
@@ -1984,7 +1987,7 @@ internal enum GgmlIndexReductionOp
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm) != 0;
+                finalNorm, tpDegree, tpPlanOut) != 0;
         }
 
         // Qwen3.5/3.6 fused multi-token VERIFY: the whole hybrid transformer over

@@ -1916,7 +1916,8 @@ namespace TensorSharp.GGML
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm)
+            IntPtr finalNorm,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return GgmlNative.Qwen35ModelDecode(
                 layers, numLayers, hidden, hiddenSize, position,
@@ -1928,7 +1929,7 @@ namespace TensorSharp.GGML
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm);
+                finalNorm, tpDegree, tpPlanOut);
         }
 
         /// <summary>Fused multi-token VERIFY: the whole hybrid transformer over N
@@ -2073,9 +2074,9 @@ namespace TensorSharp.GGML
         /// the shape (caller falls back to the per-op verify).
         /// </summary>
         public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+            byte[] mmIsExcept = null, int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
-            return GgmlNative.Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens, tpDegree, tpPlanOut);
+            return GgmlNative.Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens, mmIsExcept, tpDegree, tpPlanOut);
         }
 
         /// <summary>Release every rank's parked tensor-parallel MoE verify graph.</summary>

@@ -583,11 +583,17 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         std::vector<int> pwindow(num_layers, 0);          // padded window length per layer
         std::vector<int> pvalid(num_layers, 0);           // unmasked (valid) length per layer
         std::vector<std::int64_t> pwrite(num_layers, 0);  // set_rows write row per layer
-        // CUDA-gate persist: ggml_set_rows segfaults on Metal (null-context buffer
-        // in ggml_metal_op_set_rows). Metal falls through to the ggml_cpy path,
-        // which still folds the LM head and keeps the KV cache device-resident.
-        // See the dense TSGgml_Gemma4ModelDecode for the full rationale.
-        bool can_persist = g4moe_persist && g_backend_type == BACKEND_TYPE_CUDA;
+        // Persist on CUDA and Vulkan; Metal falls through to the ggml_cpy path
+        // (ggml_set_rows segfaults there — null-context buffer in
+        // ggml_metal_op_set_rows), which still folds the LM head and keeps the
+        // KV cache device-resident. On CUDA persist enables CUDA-graph capture;
+        // on Vulkan reusing the built graph removes the per-token rebuild +
+        // gallocr work, and it is what makes the tensor-parallel plan possible
+        // (the driver executes the graph after this call returns). Vulkan's
+        // set_rows / mul_mat_id / argsort cover everything this graph emits —
+        // see the dense TSGgml_Gemma4ModelDecode for the full rationale.
+        bool can_persist = g4moe_persist &&
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
         {
             auto roundup_stride = [](int v){ return ((v + kG4MoePersistKvStride - 1) / kG4MoePersistKvStride) * kG4MoePersistKvStride; };
             for (int l = 0; l < num_layers; l++)
@@ -1337,6 +1343,11 @@ TSG_EXPORT void TSGgml_Gemma4MoEReleaseVerifyTpGraphs()
 TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
     const TSGgmlGemma4MoELayerDesc* layers, int num_layers,
     void* hidden_data, int hidden_size, int start_pos, int num_tokens,
+    // Multimodal bidirectional-span mask, nullable, length N (one byte per
+    // token, 1 = "soft" image/audio token). Only honoured at start_pos == 0
+    // (view index == logical position); mirrors the dense verify's
+    // is_except_arr and the C# per-op ApplyCausalMask exceptPositions path.
+    const unsigned char* mm_is_except,
     // Tensor parallelism — same contract as TSGgml_Gemma4MoEModelDecode.
     int tp_degree, void** tp_plan_out)
 {
@@ -1371,6 +1382,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             return 0;
         const int H = hidden_size;
         const int totalSeqLen = start_pos + N;
+        // The bidirectional-span mask maps view-index == logical position only
+        // at start_pos == 0; the C# gate guarantees that for multimodal.
+        const unsigned char* is_except = (start_pos == 0) ? mm_is_except : nullptr;
         const int num_heads = layers[0].num_heads;
         const float eps = layers[0].eps;
         const int kvType = layers[0].kv_cache_type;
@@ -1534,6 +1548,21 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                 const int threshold = nPast + qi;
                 const int low = (window > 0) ? (threshold - window + 1) : 0;
                 ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kvLen];
+                // Bidirectional within soft-token (image/audio) spans: a soft
+                // query also keeps soft keys ahead of it (window low bound not
+                // applied to the bidi branch — mirrors the C# per-op path). At
+                // start_pos == 0 (the only case with is_except set) key index
+                // == logical position.
+                if (is_except != nullptr && qi < N && is_except[qi] != 0)
+                {
+                    for (int ki = 0; ki < kvLen; ki++)
+                    {
+                        bool causal = (ki < validLen) && (ki <= threshold) && !(window > 0 && ki < low);
+                        bool bidi = ki < N && is_except[ki] != 0;
+                        row[ki] = (causal || bidi) ? zero_val : neg_inf;
+                    }
+                    continue;
+                }
                 // Unmasked keys form a single contiguous band [lo, hi]; fill it
                 // analytically rather than a per-element branch over [0, kvLen)
                 // (the host loop blocks the GPU at long prefill — see dense verify).
@@ -1578,9 +1607,24 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             for (int qi = 0; qi < qLen; qi++)
             {
                 const int gQ = qStartAbs + qi;
+                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kLen];
+                // Bidirectional soft-token spans (multimodal, start_pos == 0
+                // only): a soft query also keeps soft keys ahead of it, with no
+                // window low bound on the bidi branch. Key ki sits at logical
+                // position kStart + ki.
+                if (is_except != nullptr && gQ < N && is_except[gQ] != 0)
+                {
+                    for (int ki = 0; ki < kLen; ki++)
+                    {
+                        const int kAbs = kStart + ki;
+                        bool causal = (kAbs <= gQ) && !(window > 0 && kAbs < gQ - window + 1);
+                        bool bidi = kAbs < N && is_except[kAbs] != 0;
+                        row[ki] = (causal || bidi) ? zero_val : neg_inf;
+                    }
+                    continue;
+                }
                 const int lo = (window > 0) ? std::max(0, gQ - window + 1 - kStart) : 0;
                 int hi = gQ - kStart; if (hi > kLen - 1) hi = kLen - 1;
-                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kLen];
                 std::fill(row, row + kLen, neg_inf);
                 if (hi >= lo && lo < kLen) std::fill(row + lo, row + hi + 1, zero_val);
             }
@@ -1627,7 +1671,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             // Tile whenever it bounds the working set: swaPrev ALWAYS (its extended K/V
             // + the M-token layer tail otherwise peak higher than the start-of-prompt
             // chunk), otherwise once there are >= 3 query tiles.
-            const bool moe_use_tiled = moe_attn_tiled
+            // Bidi multimodal spans need forward attention past a query tile's
+            // key slice — keep the full-N attention there (mirrors the dense
+            // verify's swa_tiled fallback). is_except implies start_pos == 0,
+            // so swaPrev (start_pos != 0) never overlaps with it.
+            const bool moe_use_tiled = moe_attn_tiled && is_except == nullptr
                 && (swaPrev || (N > 2 * moe_attn_tile && (swaFresh || !isLocal)));
             const bool tileQ = moe_use_tiled && separate_qkv;
 

@@ -79,6 +79,21 @@ namespace TensorSharp.Cli
                 _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed");
                 try { TensorSharp.GGML.GgmlBasicOps.Shutdown(); }
                 catch { /* native lib may be absent for non-GGML backends */ }
+
+                // ggml-vulkan on Linux: the NVIDIA driver's worker threads
+                // ("[vkrt] Analysis") race the C++ static destructors that tear
+                // the Vulkan instance down and intermittently segfault the
+                // process AFTER all work — and the ordered Shutdown above —
+                // has completed. Nothing is left to clean up (backends, caches
+                // and graphs were freed by Shutdown), so skip the destructors:
+                // flush what buffers output and leave through _exit.
+                if (OperatingSystem.IsLinux() && SelectedBackend(args) == "ggml_vulkan")
+                {
+                    loggerFactory.Dispose();
+                    Console.Out.Flush();
+                    Console.Error.Flush();
+                    LibcExit(Environment.ExitCode);
+                }
             }
             catch (Exception ex)
             {
@@ -87,6 +102,21 @@ namespace TensorSharp.Cli
                 throw;
             }
         }
+
+        /// <summary>The effective --backend value (last one wins, as in MainCore).</summary>
+        private static string SelectedBackend(string[] args)
+        {
+            string backend = null;
+            for (int i = 0; i + 1 < args.Length; i++)
+            {
+                if (args[i] == "--backend")
+                    backend = args[i + 1].ToLowerInvariant();
+            }
+            return backend;
+        }
+
+        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "_exit")]
+        private static extern void LibcExit(int status);
 
         static void MainCore(string[] args)
         {

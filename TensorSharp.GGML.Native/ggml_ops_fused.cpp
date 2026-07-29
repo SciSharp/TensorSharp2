@@ -1061,6 +1061,91 @@ int fused_ffn_act_project_quant_f32_impl(
 // the whole-encoder path.
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// Vision-encoder attention: flash on CPU/Metal, explicit F32 SDPA on CUDA and
+// Vulkan.
+//
+// The vision head_dim (72; hidden 1152 / 16 heads for both the Qwen3-VL and
+// SigLIP towers) is excluded from every ggml-cuda tensor-core and vec
+// flash-attention kernel, so ggml_flash_attn_ext lands on the generic tile
+// kernel, which on fast-fp16 NVIDIA GPUs accumulates in F16 and ignores
+// GGML_PREC_F32. Over a 4000+ patch bidirectional attention row that loses
+// enough precision to visibly corrupt a subset of tokens (measured on the
+// Qwen3.5 27-block encoder: per-token cosine vs the CPU backend down to 0.81
+// on the worst rows, and the corrupted embeddings derail the language model
+// entirely). Padding the KV length to FATTN_KQ_STRIDE and masking, i.e. the
+// exact llama.cpp calling convention, reproduces the same bits, so this is
+// kernel numerics, not a tail/oob bug.
+//
+// On CUDA/Vulkan the attention is therefore built as explicit
+// mul_mat(F32-prec) + soft_max + mul_mat, with the query axis chunked so the
+// [kv, chunk, heads] score tensor stays bounded (~256 MB) instead of the full
+// O(patches^2) blow-up that motivated flash here in the first place. The CPU
+// and Metal flash kernels compute in F32 and match the reference, so they
+// keep the (faster, memory-free) flash path.
+//
+// Layouts: q_perm/k_perm are [head_dim, rows, heads] permuted views, v_3d is
+// [head_dim, heads, rows]. Returns a [head_dim, heads, rows] node, the same
+// logical shape ggml_flash_attn_ext produces, so callers cont+reshape
+// identically on either path.
+// ----------------------------------------------------------------------------
+ggml_tensor* build_vision_attention(
+    ggml_context* ctx,
+    ggml_tensor* q_perm, ggml_tensor* k_perm, ggml_tensor* v_3d,
+    int rows, int num_heads, int head_dim, float attn_scale)
+{
+    if (g_backend_type != BACKEND_TYPE_CUDA && g_backend_type != BACKEND_TYPE_VULKAN)
+    {
+        ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3); // [hd, rows, heads]
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx, q_perm, k_perm, v_perm, nullptr, attn_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        return attn;
+    }
+
+    ggml_tensor* q_cont = ggml_cont(ctx, q_perm); // [hd, rows, heads]
+    ggml_tensor* k_cont = ggml_cont(ctx, k_perm); // [hd, rows, heads]
+    // V transposed for the probs matmul: [rows, hd, heads].
+    ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v_3d, 1, 2, 0, 3));
+
+    // Bound the [rows, chunk, heads] F32 score tensor to ~256 MB per chunk.
+    // TS_VISION_ATTN_BUDGET_MB overrides for A/B debugging (e.g. huge = single chunk).
+    static const int64_t score_budget_mb = []{
+        const char* e = std::getenv("TS_VISION_ATTN_BUDGET_MB");
+        return e != nullptr ? std::atoll(e) : 256ll; }();
+    const int64_t score_budget_bytes = score_budget_mb * 1024 * 1024;
+    int64_t chunk = score_budget_bytes /
+        (static_cast<int64_t>(rows) * num_heads * static_cast<int64_t>(sizeof(float)));
+    if (chunk < 256) chunk = 256;
+    if (chunk > rows) chunk = rows;
+
+    ggml_tensor* out = nullptr; // [hd, rows-so-far, heads]
+    for (int64_t start = 0; start < rows; start += chunk)
+    {
+        const int64_t len = std::min<int64_t>(chunk, rows - start);
+        ggml_tensor* q_c = (len == rows)
+            ? q_cont
+            : ggml_view_3d(ctx, q_cont, head_dim, len, num_heads,
+                q_cont->nb[1], q_cont->nb[2], static_cast<std::size_t>(start) * q_cont->nb[1]);
+        // Materialize the chunk view before the matmul. ggml-vulkan feeds a
+        // non-contiguous F32 src1 through its internal F16 conversion path,
+        // which mangles this offset view (ne1 < nb2/nb1) — the encoder output
+        // turns into scrambled patches ("glitchy pixels" descriptions) on any
+        // image large enough to need more than one chunk. An explicit cont
+        // goes through the (correct) CPY op instead, is numerically identical
+        // on every backend, and costs a few MB of scratch per chunk.
+        if (len != rows)
+            q_c = ggml_cont(ctx, q_c);
+
+        ggml_tensor* scores = ggml_mul_mat(ctx, k_cont, q_c); // [rows(kv), len, heads]
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, nullptr, attn_scale, 0.0f);
+        ggml_tensor* out_c = ggml_mul_mat(ctx, vt, probs);    // [hd, len, heads]
+        out = out == nullptr ? out_c : ggml_concat(ctx, out, out_c, 1);
+    }
+
+    return ggml_permute(ctx, out, 0, 2, 1, 3); // [hd, heads, rows]
+}
+
 // LN + QKV(+bias) + split + NeoX RoPE(cos/sin tables) + flash-attn + out(+bias) + residual.
 static ggml_tensor* build_vision_attn_subgraph(
     ggml_context* ctx, ggml_tensor* cur,
@@ -1120,9 +1205,9 @@ static ggml_tensor* build_vision_attn_subgraph(
 
     ggml_tensor* q_perm = ggml_permute(ctx, q_roped, 0, 2, 1, 3);
     ggml_tensor* k_perm = ggml_permute(ctx, k_roped, 0, 2, 1, 3);
-    ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
 
-    ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_perm, k_perm, v_perm, nullptr, attn_scale, 0.0f, 0.0f);
+    ggml_tensor* attn_out = build_vision_attention(ctx, q_perm, k_perm, v_3d,
+        rows, num_heads, head_dim, attn_scale);
     ggml_tensor* attn_flat = ggml_reshape_2d(ctx, ggml_cont(ctx, attn_out), hidden, rows);
 
     ggml_tensor* out_proj = ggml_mul_mat(ctx, out_w_t, attn_flat);
@@ -1611,9 +1696,7 @@ int fused_gemma4_vision_block_f32_impl(
 
     ggml_tensor* qp = ggml_permute(ctx, qr, 0, 2, 1, 3);  // [hd, N, nH]
     ggml_tensor* kp = ggml_permute(ctx, kr, 0, 2, 1, 3);
-    ggml_tensor* vp = ggml_permute(ctx, v3, 0, 2, 1, 3);
-    ggml_tensor* flash = ggml_flash_attn_ext(ctx, qp, kp, vp, nullptr, 1.0f, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(flash, GGML_PREC_F32);
+    ggml_tensor* flash = build_vision_attention(ctx, qp, kp, v3, N, nH, hd, 1.0f);
     if (!backend_supports_op(flash))
     {
         set_last_error("fused_gemma4_vision_block: flash_attn unsupported for this head_dim/backend.");

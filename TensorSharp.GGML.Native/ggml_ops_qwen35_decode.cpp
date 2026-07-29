@@ -426,6 +426,9 @@ namespace
         int window = 0;
         bool folded = false;               // hidden_out holds logits (final norm + lm_head folded in)
         int out_count = 0;                 // element count of hidden_out (vocab when folded, else hidden)
+        // Tensor-parallel plan over this cache's graph: one entry per rank-local
+        // build (each rank keeps its own pool slot, keyed by its KV pointer).
+        tsg::TpRankPlan tp_plan;
 
         void reset()
         {
@@ -435,6 +438,7 @@ namespace
             hidden_t = hidden_out = pos_tensor = kv_index = attn_mask = nullptr;
             sig_disc = sig_kcache0 = nullptr; num_layers = hidden_size = window = 0;
             folded = false; out_count = 0;
+            tp_plan.clear();
         }
     };
 
@@ -498,13 +502,34 @@ namespace
         int norm_topk, float expert_weights_scale,
         void* logits_data, int vocab_size,
         const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-        const void* final_norm_data)
+        const void* final_norm_data,
+        int tp_degree = 1, void** tp_plan_out = nullptr)
     {
         if (!ensure_backend())
             return 0;
         if (layers == nullptr || num_layers <= 0 || hidden_data == nullptr)
         {
             set_last_error("Qwen3.5 model decode: invalid arguments.");
+            return 0;
+        }
+        // Tensor parallelism. With tp_degree > 1 the caller drives one rank at a
+        // time (SetActiveDevice): this builds the active rank's graph and hands
+        // back a plan (via tp_plan_out) instead of running it; the driver then
+        // executes every rank's plan segment-by-segment, reducing the partials
+        // at the row-parallel cut points. Per-layer dims (heads, GDN heads,
+        // stacked experts) arrive already sharded for this rank; the MoE router
+        // stays global — every rank computes the same top-k from the replicated
+        // hidden state, and a per-rank id LUT + weight mask (see below) confine
+        // its rank's mul_mat_id to the experts it owns.
+        const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+        if (tp_mode)
+            *tp_plan_out = nullptr;
+        const int tp_rank = tp_mode ? g_active_rank : 0;
+        const int stacked_experts = tp_mode && num_experts > 0 ? num_experts / tp_degree : num_experts;
+        if (tp_mode && num_experts > 0 &&
+            (num_experts % tp_degree != 0 || stacked_experts < num_experts_used))
+        {
+            set_last_error("Qwen3.5 model decode: expert count is not shardable across the tensor-parallel ranks.");
             return 0;
         }
         if (layers[0].struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlQwen35LayerDesc)))
@@ -580,6 +605,14 @@ namespace
         const bool fold = logits_data != nullptr && lm_head_data != nullptr &&
                           final_norm_data != nullptr && vocab_size > 0;
 
+        // The tensor-parallel driver executes the graph *after* this call
+        // returns, so the graph, its context and its backend buffer must
+        // outlive the call — which is exactly what persist mode provides.
+        if (tp_mode && !persist)
+        {
+            set_last_error("Qwen3.5 model decode: tensor-parallel mode requires the persistent decode graph.");
+            return 0;
+        }
 
         // ===== Persist reuse fast-path: replay THIS request's captured graph =====
         // find() already matched (sig_disc, sig_kcache0); check the finer shape here.
@@ -597,6 +630,22 @@ namespace
             std::vector<ggml_fp16_t> mask_data;
             fill_flash_attn_mask(mask_data, attnKvLen, totalSeqLen);
             ggml_backend_tensor_set(dc->attn_mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+            if (tp_mode)
+            {
+                // Inputs are staged; the driver runs the segments across ranks.
+                if (!dc->tp_plan.valid())
+                {
+                    set_last_error("Qwen3.5 model decode: cached graph has no tensor-parallel plan.");
+                    dc->reset();
+                    return 0;
+                }
+                dc->tp_plan.out_tensor = dc->hidden_out;
+                dc->tp_plan.out_host = dc->folded ? logits_data : hidden_data;
+                dc->tp_plan.out_bytes = static_cast<std::size_t>(dc->out_count) * sizeof(float);
+                *tp_plan_out = &dc->tp_plan;
+                clear_last_error();
+                return 1;
+            }
             ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
             if (st != GGML_STATUS_SUCCESS)
             {
@@ -721,9 +770,15 @@ namespace
             else
             {
                 t.gdn_qkv_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gdn_qkv_type), d.gdn_qkv_ne0, d.gdn_qkv_ne1);
-                t.gdn_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gdn_gate_type), d.gdn_gate_ne0, d.gdn_gate_ne1);
-                t.ssm_beta_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_beta_type), d.ssm_beta_ne0, d.ssm_beta_ne1);
-                t.ssm_alpha_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_alpha_type), d.ssm_alpha_ne0, d.ssm_alpha_ne1);
+                // Packed in-projection (the TP shards): one [hidden, Q|K|V|Z|beta|alpha]
+                // weight instead of four separate ones; gdn_gate_w == null marks
+                // it, and the z/beta/alpha weights are neither created nor bound.
+                if (d.gdn_gate_w != nullptr)
+                {
+                    t.gdn_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gdn_gate_type), d.gdn_gate_ne0, d.gdn_gate_ne1);
+                    t.ssm_beta_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_beta_type), d.ssm_beta_ne0, d.ssm_beta_ne1);
+                    t.ssm_alpha_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_alpha_type), d.ssm_alpha_ne0, d.ssm_alpha_ne1);
+                }
                 t.conv1d_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_kernel, conv_dim);
                 t.ssm_dt_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_v_heads);
                 t.ssm_a_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_v_heads);
@@ -741,14 +796,65 @@ namespace
             else
             {
                 t.gate_inp_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gate_inp_type), d.gate_inp_ne0, d.gate_inp_ne1);
-                t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gate_exps_type), hidden_size, expert_ff, num_experts);
-                t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.up_exps_type), hidden_size, expert_ff, num_experts);
-                t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.down_exps_type), expert_ff, hidden_size, num_experts);
+                // Under TP the stacked expert tensors hold only this rank's
+                // whole-expert slice; the router dims stay global.
+                t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gate_exps_type), hidden_size, expert_ff, stacked_experts);
+                t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.up_exps_type), hidden_size, expert_ff, stacked_experts);
+                t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.down_exps_type), expert_ff, hidden_size, stacked_experts);
                 t.shexp_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_gate_type), d.shexp_gate_ne0, d.shexp_gate_ne1);
                 t.shexp_up_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_up_type), d.shexp_up_ne0, d.shexp_up_ne1);
                 t.shexp_down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_down_type), d.shexp_down_ne0, d.shexp_down_ne1);
                 t.shexp_gate_inp_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
             }
+        }
+
+        // Expert-parallel routing constants (TP MoE only). Whole experts
+        // partition across ranks, but the top-k runs on the GLOBAL router
+        // probabilities (identical on every rank, since the hidden stream is
+        // replicated bit-for-bit after each reduction), so the selected ids
+        // must be confined to this rank's slice without integer arithmetic —
+        // which ggml lacks on I32 — before feeding mul_mat_id:
+        //   ep_lut  I32 [1, num_experts]: global id -> local id (foreign -> 0)
+        //   ep_mask F32 [1, num_experts]: 1 for owned experts, else 0
+        // get_rows over the selected ids yields the local ids and a weight
+        // mask; a zero weight nullifies the (locally computed, wrong-expert)
+        // contribution of every foreign route. Both are uploaded once at graph
+        // build and live in the persist buffer.
+        ggml_tensor* ep_lut = nullptr;
+        ggml_tensor* ep_mask = nullptr;
+        std::vector<std::int32_t> ep_lut_data;
+        std::vector<float> ep_mask_data;
+        if (tp_mode && num_experts > 0)
+        {
+            bool any_moe = false;
+            for (int l = 0; l < num_layers; l++)
+                if (layers[l].is_moe != 0) { any_moe = true; break; }
+            if (any_moe)
+            {
+                ep_lut = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, num_experts);
+                ep_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, num_experts);
+                const int first = tp_rank * stacked_experts;
+                const int last = first + stacked_experts;
+                ep_lut_data.resize(static_cast<std::size_t>(num_experts));
+                ep_mask_data.resize(static_cast<std::size_t>(num_experts));
+                for (int e = 0; e < num_experts; e++)
+                {
+                    const bool own = e >= first && e < last;
+                    ep_lut_data[static_cast<std::size_t>(e)] = own ? e - first : 0;
+                    ep_mask_data[static_cast<std::size_t>(e)] = own ? 1.0f : 0.0f;
+                }
+            }
+        }
+
+        // Tensor-parallel cut points. `tp_partial` is the row-parallel matmul
+        // whose per-rank outputs the collective reduces; `tp_boundary` is the
+        // last graph node that may run before that reduction.
+        std::vector<ggml_tensor*> tp_partial;
+        std::vector<ggml_tensor*> tp_boundary;
+        if (tp_mode)
+        {
+            tp_partial.reserve(static_cast<std::size_t>(num_layers) * 2);
+            tp_boundary.reserve(static_cast<std::size_t>(num_layers) * 2);
         }
 
         // --- build the chained graph ---
@@ -870,15 +976,42 @@ namespace
                 ggml_tensor* gate_2d = ggml_cont(ctx, gate_view);
                 ggml_tensor* attn_gated = ggml_mul(ctx, attn_out_2d, ggml_sigmoid(ctx, gate_2d));
                 ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_gated, qDim, 1);
-                block_out = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, t.o_w, attn_flat), H);
+                ggml_tensor* o_mm = ggml_mul_mat(ctx, t.o_w, attn_flat);
+                block_out = ggml_reshape_1d(ctx, o_mm, H);
+                if (tp_mode) { tp_partial.push_back(o_mm); tp_boundary.push_back(block_out); }
             }
             else
             {
                 // ===== Gated Delta Net (linear attention) =====
-                ggml_tensor* qkv_mixed = ggml_mul_mat(ctx, t.gdn_qkv_w, normed_2d);          // [conv_dim, 1]
-                ggml_tensor* z = ggml_mul_mat(ctx, t.gdn_gate_w, normed_2d);                 // [value_dim, 1]
-                ggml_tensor* beta_raw = ggml_mul_mat(ctx, t.ssm_beta_w, normed_2d);          // [num_v_heads, 1]
-                ggml_tensor* alpha_raw = ggml_mul_mat(ctx, t.ssm_alpha_w, normed_2d);        // [num_v_heads, 1]
+                ggml_tensor* qkv_mixed;
+                ggml_tensor* z;
+                ggml_tensor* beta_raw;
+                ggml_tensor* alpha_raw;
+                if (t.gdn_gate_w == nullptr)
+                {
+                    // Packed in-projection: one matmul, sliced [Q|K|V | Z | beta | alpha].
+                    const std::int64_t packed_dim = d.gdn_qkv_ne1;
+                    ggml_tensor* packed = ggml_mul_mat(ctx, t.gdn_qkv_w, normed_2d);          // [packed_dim, 1]
+                    ggml_tensor* packed_flat = ggml_reshape_1d(ctx, packed, packed_dim);
+                    qkv_mixed = ggml_reshape_2d(ctx,
+                        ggml_view_1d(ctx, packed_flat, conv_dim, 0), conv_dim, 1);
+                    z = ggml_reshape_2d(ctx,
+                        ggml_view_1d(ctx, packed_flat, value_dim,
+                            static_cast<std::size_t>(conv_dim) * sizeof(float)), value_dim, 1);
+                    beta_raw = ggml_reshape_2d(ctx,
+                        ggml_view_1d(ctx, packed_flat, num_v_heads,
+                            static_cast<std::size_t>(conv_dim + value_dim) * sizeof(float)), num_v_heads, 1);
+                    alpha_raw = ggml_reshape_2d(ctx,
+                        ggml_view_1d(ctx, packed_flat, num_v_heads,
+                            static_cast<std::size_t>(conv_dim + value_dim + num_v_heads) * sizeof(float)), num_v_heads, 1);
+                }
+                else
+                {
+                    qkv_mixed = ggml_mul_mat(ctx, t.gdn_qkv_w, normed_2d);          // [conv_dim, 1]
+                    z = ggml_mul_mat(ctx, t.gdn_gate_w, normed_2d);                 // [value_dim, 1]
+                    beta_raw = ggml_mul_mat(ctx, t.ssm_beta_w, normed_2d);          // [num_v_heads, 1]
+                    alpha_raw = ggml_mul_mat(ctx, t.ssm_alpha_w, normed_2d);        // [num_v_heads, 1]
+                }
 
                 ggml_tensor* beta = ggml_sigmoid(ctx, beta_raw);
                 beta = ggml_reshape_4d(ctx, beta, 1, num_v_heads, 1, 1);
@@ -942,7 +1075,9 @@ namespace
                 ggml_tensor* z_2d = ggml_reshape_2d(ctx, z, head_v_dim, num_v_heads);
                 ggml_tensor* gated = ggml_mul(ctx, out_n, ggml_silu(ctx, z_2d));
                 ggml_tensor* gated_flat = ggml_reshape_2d(ctx, gated, value_dim, 1);
-                block_out = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, t.ssm_out_w, gated_flat), H);
+                ggml_tensor* ssm_mm = ggml_mul_mat(ctx, t.ssm_out_w, gated_flat);
+                block_out = ggml_reshape_1d(ctx, ssm_mm, H);
+                if (tp_mode) { tp_partial.push_back(ssm_mm); tp_boundary.push_back(block_out); }
             }
 
             ggml_tensor* residual1 = ggml_add(ctx, hidden, block_out);
@@ -959,7 +1094,9 @@ namespace
                 // dispatches, which matters most on backends without graph capture (Vulkan).
                 ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed_2d); // [2*ffDense, 1]
                 ggml_tensor* act_2d = ggml_swiglu(ctx, gu);                 // [ffDense, 1]
-                ffn_down = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, t.down_w, act_2d), H);
+                ggml_tensor* down_mm = ggml_mul_mat(ctx, t.down_w, act_2d);
+                ffn_down = ggml_reshape_1d(ctx, down_mm, H);
+                if (tp_mode) { tp_partial.push_back(down_mm); tp_boundary.push_back(ffn_down); }
             }
             else
             {
@@ -979,11 +1116,27 @@ namespace
                     w_2d = ggml_scale(ctx, w_2d, expert_weights_scale);
                 ggml_tensor* w_final = ggml_reshape_3d(ctx, w_2d, 1, num_experts_used, 1);
 
+                // Expert-parallel TP: confine the (global) top-k to this rank's
+                // expert slice — local ids via the I32 LUT, foreign contributions
+                // nullified through the weight mask. The renormalization above
+                // ran on the global weights first, so every rank's masked
+                // weights sum to the single-GPU values across the group.
+                ggml_tensor* sel_ids = sel;
+                if (ep_lut != nullptr)
+                {
+                    ggml_tensor* lut_r = ggml_reshape_3d(ctx, ep_lut, 1, num_experts, 1);
+                    ggml_tensor* local_ids = ggml_get_rows(ctx, lut_r, sel);                  // [1, num_used, 1] I32
+                    sel_ids = ggml_reshape_2d(ctx, local_ids, num_experts_used, 1);
+                    ggml_tensor* mask_r = ggml_reshape_3d(ctx, ep_mask, 1, num_experts, 1);
+                    ggml_tensor* own_mask = ggml_get_rows(ctx, mask_r, sel);                  // [1, num_used, 1] F32
+                    w_final = ggml_mul(ctx, w_final, own_mask);
+                }
+
                 ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, ffn_normed, H, 1, 1);
-                ggml_tensor* g_exp = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel);       // [expert_ff, num_used, 1]
-                ggml_tensor* u_exp = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel);
+                ggml_tensor* g_exp = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel_ids);   // [expert_ff, num_used, 1]
+                ggml_tensor* u_exp = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel_ids);
                 ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, g_exp), u_exp);               // [expert_ff, num_used, 1]
-                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps, act, sel);          // [hidden, num_used, 1]
+                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps, act, sel_ids);      // [hidden, num_used, 1]
                 ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
 
                 ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
@@ -1002,7 +1155,11 @@ namespace
                 ggml_tensor* sh_gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, ggml_reshape_2d(ctx, t.shexp_gate_inp_w, H, 1), ffn_normed_2d)); // [1,1]
                 ggml_tensor* sh_out = ggml_mul(ctx, sh_down, sh_gate);
 
+                // Both the routed sum (this rank's experts only) and the
+                // Megatron-split shared expert are partials, so their sum is
+                // the layer's single reduction point.
                 ffn_down = ggml_add(ctx, moe_out_1d, sh_out);
+                if (tp_mode) { tp_partial.push_back(ffn_down); tp_boundary.push_back(ffn_down); }
             }
 
             hidden = ggml_add(ctx, residual1, ffn_down);
@@ -1234,7 +1391,55 @@ namespace
             fill_flash_attn_mask(mask_data, attnKvLen, totalSeqLen);
             ggml_backend_tensor_set(shared_attn_mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
         }
+        if (ep_lut != nullptr)
+        {
+            ggml_backend_tensor_set(ep_lut, ep_lut_data.data(), 0, ep_lut_data.size() * sizeof(std::int32_t));
+            ggml_backend_tensor_set(ep_mask, ep_mask_data.data(), 0, ep_mask_data.size() * sizeof(float));
+        }
 
+        if (tp_mode)
+        {
+            // Hand the built graph back as a rank plan instead of running it:
+            // the driver executes every rank's plan segment-by-segment with the
+            // partials reduced at the recorded cut points. The persist cache
+            // keeps the ctx/graph/buffer alive across tokens; the replay path
+            // above refreshes the per-token inputs and re-returns this plan.
+            Q35DecodeCache* slot = dcb;
+            slot->tp_plan.clear();
+            slot->tp_plan.graph = graph;
+            slot->tp_plan.ar_tensor = tp_partial;
+            if (!tp_plan_segments(slot->tp_plan, tp_boundary))
+            {
+                slot->tp_plan.clear();
+                ggml_backend_buffer_free(persist_buf);
+                ggml_free(ctx);
+                slot->ctx = nullptr; slot->buffer = nullptr; slot->graph = nullptr; slot->valid = false;
+                return 0;
+            }
+            const int out_count_tp = fold ? vocab_size : H;
+            slot->tp_plan.out_tensor = hidden_out;
+            slot->tp_plan.out_host = fold ? logits_data : hidden_data;
+            slot->tp_plan.out_bytes = static_cast<std::size_t>(out_count_tp) * sizeof(float);
+            slot->ctx = ctx;
+            slot->buffer = persist_buf;
+            slot->graph = graph;
+            slot->hidden_t = hidden_t;
+            slot->hidden_out = hidden_out;
+            slot->pos_tensor = pos_tensor;
+            slot->kv_index = shared_kv_index;
+            slot->attn_mask = shared_attn_mask;
+            slot->sig_disc = sig_disc;
+            slot->sig_kcache0 = sig_kcache0;
+            slot->num_layers = num_layers;
+            slot->hidden_size = H;
+            slot->window = attnKvLen;
+            slot->folded = fold;
+            slot->out_count = out_count_tp;
+            slot->valid = true;
+            *tp_plan_out = &slot->tp_plan;
+            clear_last_error();
+            return 1;
+        }
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
@@ -1287,7 +1492,8 @@ TSG_EXPORT int TSGgml_Qwen35ModelDecode(
     int norm_topk, float expert_weights_scale,
     void* logits_data, int vocab_size,
     const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-    const void* final_norm_data)
+    const void* final_norm_data,
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
@@ -1301,7 +1507,8 @@ TSG_EXPORT int TSGgml_Qwen35ModelDecode(
             norm_topk, expert_weights_scale,
             logits_data, vocab_size,
             lm_head_data, lm_head_type, lm_head_ne0, lm_head_ne1, lm_head_bytes,
-            final_norm_data);
+            final_norm_data,
+            tp_degree, tp_plan_out);
         return r;
     }
     catch (const std::exception& ex)

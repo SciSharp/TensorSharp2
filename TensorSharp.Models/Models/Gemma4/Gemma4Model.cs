@@ -1272,7 +1272,7 @@ namespace TensorSharp.Models
                 // the kernel wrote the KV cache for all seqLen tokens on-device.
                 _kvCacheHostDirty = true;
             }
-            else if (useWholeModelMoEPrefill && TryFusedMoEModelVerify(hidden, startPos, seqLen))
+            else if (useWholeModelMoEPrefill && TryFusedMoEModelVerify(hidden, startPos, seqLen, exceptPositions))
             {
                 // All-MoE prefill ran as ONE fused GGML graph over all seqLen tokens
                 // (one dispatch instead of ~20/layer). hidden now holds the
@@ -1913,7 +1913,7 @@ namespace TensorSharp.Models
                 // KV cache for all seqLen tokens on-device. No logits needed here.
                 _kvCacheHostDirty = true;
             }
-            else if (useWholeModelMoEPrefill && TryFusedMoEModelVerify(hidden, startPos, seqLen))
+            else if (useWholeModelMoEPrefill && TryFusedMoEModelVerify(hidden, startPos, seqLen, exceptPositions))
             {
                 // All-MoE prefill chunk ran as ONE fused GGML graph over all seqLen
                 // tokens. The kernel wrote the KV cache on-device and set
@@ -2001,6 +2001,8 @@ namespace TensorSharp.Models
         private void InjectVisionEmbeddings(Tensor hidden, Tensor visionEmbeddings, int insertPos, int startPos)
         {
             int numVisionTokens = (int)visionEmbeddings.Sizes[0];
+            if (Environment.GetEnvironmentVariable("TS_VISION_DEBUG") == "1")
+                DumpVisionEmbeddingStats(visionEmbeddings, numVisionTokens);
             using var target = hidden.Narrow(0, insertPos, numVisionTokens);
             if (ReferenceEquals(target.Allocator, visionEmbeddings.Allocator))
             {
@@ -2017,6 +2019,31 @@ namespace TensorSharp.Models
             // (the cached sequence length) makes the absolute position explicit so
             // the log reads monotonically across chunked multimodal prefill.
             Console.WriteLine($"Injected {numVisionTokens} vision tokens at chunk-offset {insertPos} (absolute position {startPos + insertPos})");
+        }
+
+        /// <summary>TS_VISION_DEBUG=1: per-quarter stats of the projected vision
+        /// embedding, for cross-backend divergence hunting (encoder vs LM path).</summary>
+        private static unsafe void DumpVisionEmbeddingStats(Tensor emb, int numTokens)
+        {
+            int dim = (int)emb.Sizes[1];
+            float* p = GetFloatPtr(emb);
+            for (int q = 0; q < 4; q++)
+            {
+                int r0 = q * numTokens / 4, r1 = (q + 1) * numTokens / 4;
+                double sum = 0, sumSq = 0; float mn = float.MaxValue, mx = float.MinValue;
+                for (int r = r0; r < r1; r++)
+                {
+                    float* row = p + (long)r * dim;
+                    for (int d = 0; d < dim; d++)
+                    {
+                        float v = row[d];
+                        sum += v; sumSq += (double)v * v;
+                        if (v < mn) mn = v; if (v > mx) mx = v;
+                    }
+                }
+                long cnt = (long)(r1 - r0) * dim;
+                Console.WriteLine($"  [vision-debug] rows {r0}..{r1 - 1}: mean={sum / cnt:G6} rms={Math.Sqrt(sumSq / cnt):G6} min={mn:G6} max={mx:G6}");
+            }
         }
 
         private bool CanUseFusedLayerGraph(int seqLen, HashSet<int> exceptPositions, bool enabled)
@@ -3338,12 +3365,18 @@ namespace TensorSharp.Models
         ///     each query's window covers its whole causal prefix ÔåÆ causal == windowed
         ///     (the kernel's plain-causal mask is exact).
         /// Longer prompts / later chunks (totalSeqLen &gt; window) fall back to the
-        /// per-op chunked path. Multimodal spans (exceptPositions) and PLE excluded.
+        /// per-op chunked path. Multimodal spans (exceptPositions) run through the
+        /// kernel's bidirectional-span mask at startPos == 0 (mirrors the dense
+        /// verify); later multimodal chunks and PLE excluded.
         /// </summary>
         private bool CanUseWholeModelMoEPrefillVerify(int startPos, int seqLen, HashSet<int> exceptPositions)
         {
             if (!s_wholeModelPrefillEnabled) return false;
-            if (!IsGgmlBackend || seqLen <= 1 || exceptPositions != null) return false;
+            if (!IsGgmlBackend || seqLen <= 1) return false;
+            // Multimodal bidirectional spans are only expressible at startPos == 0,
+            // where the kernel's mask view-index == logical position (mirrors the
+            // dense gate).
+            if (exceptPositions != null && (!s_wholeModelMMPrefillEnabled || startPos != 0)) return false;
             if (_moeModelVerifyDisabled || !s_MoeModelDecodeEnabled) return false;
             if (_kvCacheDtype.IsBlockQuantized()) return false;
 
@@ -3659,7 +3692,7 @@ namespace TensorSharp.Models
         /// output_norm). Returns false (caller falls back to the per-op verify) when
         /// the model shape is unsupported, a layer can't build, the global cache is
         /// too small for the sequence, or the kernel throws.</summary>
-        private unsafe bool TryFusedMoEModelVerify(Tensor hidden, int startPos, int n)
+        private unsafe bool TryFusedMoEModelVerify(Tensor hidden, int startPos, int n, HashSet<int> exceptPositions = null)
         {
             if (_moeModelVerifyDisabled || !s_MoeModelDecodeEnabled) return false;
             if (!_moeModelDecodeChecked)
@@ -3701,10 +3734,21 @@ namespace TensorSharp.Models
                 }
             }
 
+            // Multimodal bidirectional-span mask (image/audio soft tokens attend
+            // bidirectionally within their span). Only valid at startPos == 0;
+            // the CanUseWholeModelMoEPrefillVerify gate guarantees that.
+            byte[] isExcept = null;
+            if (exceptPositions != null && exceptPositions.Count > 0 && startPos == 0)
+            {
+                isExcept = new byte[n];
+                foreach (int p in exceptPositions)
+                    if (p >= 0 && p < n) isExcept[p] = 1;
+            }
+
             bool ok;
             try
             {
-                ok = GgmlBasicOps.Gemma4MoEModelVerify(_moeVerifyArgs, layerCount, hiddenPtr, Config.HiddenSize, startPos, n);
+                ok = GgmlBasicOps.Gemma4MoEModelVerify(_moeVerifyArgs, layerCount, hiddenPtr, Config.HiddenSize, startPos, n, isExcept);
             }
             catch (Exception ex)
             {
