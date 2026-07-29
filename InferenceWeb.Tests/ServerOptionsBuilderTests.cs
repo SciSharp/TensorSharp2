@@ -419,6 +419,7 @@ public class ServerOptionsBuilderTests : IDisposable
         string[] flags =
         {
             "--model", "--mmproj", "--backend", "--gpu-device", "--list-gpus",
+            "--tp", "--tp-node-id", "--tp-peers",
             "--max-tokens", "--temperature", "--top-k", "--top-p", "--min-p",
             "--repeat-penalty", "--presence-penalty", "--frequency-penalty",
             "--seed", "--stop", "--kv-cache-dtype",
@@ -467,6 +468,129 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.Equal("1", Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_OFFLOAD_CPU"));
         // The boolean flag has no value; the main parser must skip it, not abort.
         Assert.NotNull(ServerOptionsBuilder.Build(new[] { "--offload-cpu" }, _baseDir));
+    }
+
+    // ----- Tensor-parallelism CLI flags -----
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_TpFlag_SetsDegreeEnvVar()
+    {
+        _env.Set("TENSORSHARP_TP_DEGREE", null);
+        bool applied = ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--tp", "2" });
+        Assert.True(applied);
+        Assert.Equal("2", Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"));
+    }
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_InlineEqualsForm_IsAccepted()
+    {
+        _env.Set("TENSORSHARP_TP_DEGREE", null);
+        bool applied = ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--tp=4" });
+        Assert.True(applied);
+        Assert.Equal("4", Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"));
+    }
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_NoFlags_LeavesEnvUnchanged()
+    {
+        _env.Set("TENSORSHARP_TP_DEGREE", "2");
+        bool applied = ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--unrelated", "value" });
+        Assert.False(applied);
+        Assert.Equal("2", Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"));
+    }
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_RejectsZeroNegativeAndNonInteger()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--tp", "0" }));
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--tp", "-2" }));
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--tp", "two" }));
+    }
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_DistributedPair_SetsBothEnvVars()
+    {
+        _env.Set("TENSORSHARP_TP_DEGREE", null);
+        _env.Set("TENSORSHARP_TP_NODE_ID", null);
+        _env.Set("TENSORSHARP_TP_PEERS", null);
+        bool applied = ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[]
+        {
+            "--tp", "2",
+            "--tp-node-id", "0",
+            "--tp-peers", "192.168.1.10:9500,192.168.1.11:9500",
+        });
+        Assert.True(applied);
+        Assert.Equal("2", Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"));
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID"));
+        Assert.Equal("192.168.1.10:9500,192.168.1.11:9500", Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS"));
+        // The model loader's config factory must see the distributed pair.
+        var cfg = TensorSharp.Distributed.DistributedTpConfig.TryFromEnvironment(localDegree: 2);
+        Assert.NotNull(cfg);
+        Assert.Equal(0, cfg.NodeId);
+        Assert.Equal(2, cfg.PeerEndpoints.Length);
+    }
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_NodeIdWithoutPeers_ThrowsFailFast()
+    {
+        _env.Set("TENSORSHARP_TP_NODE_ID", null);
+        _env.Set("TENSORSHARP_TP_PEERS", null);
+        var ex = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--tp-node-id", "0" }));
+        Assert.Contains("--tp-peers", ex.Message);
+    }
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_PeersWithoutNodeId_ThrowsFailFast()
+    {
+        _env.Set("TENSORSHARP_TP_NODE_ID", null);
+        _env.Set("TENSORSHARP_TP_PEERS", null);
+        var ex = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--tp-peers", "10.0.0.1:9500,10.0.0.2:9500" }));
+        Assert.Contains("--tp-node-id", ex.Message);
+    }
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_NodeIdFlagWithPeersFromEnv_IsAccepted()
+    {
+        // One half of the distributed pair may legitimately come from the
+        // environment; only a half-configured RESULT should fail.
+        _env.Set("TENSORSHARP_TP_NODE_ID", null);
+        _env.Set("TENSORSHARP_TP_PEERS", "10.0.0.1:9500,10.0.0.2:9500");
+        bool applied = ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[] { "--tp-node-id", "1" });
+        Assert.True(applied);
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID"));
+    }
+
+    [Fact]
+    public void ApplyTensorParallelCliFlags_MalformedPeers_ThrowsWithFlagName()
+    {
+        _env.Set("TENSORSHARP_TP_NODE_ID", null);
+        _env.Set("TENSORSHARP_TP_PEERS", null);
+        var ex = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyTensorParallelCliFlags(new[]
+            {
+                "--tp-node-id", "0",
+                "--tp-peers", "not-an-endpoint",
+            }));
+        Assert.Contains("--tp-peers", ex.Message);
+    }
+
+    [Fact]
+    public void Build_TensorParallelFlags_DoNotTripUnknownArgTrap()
+    {
+        // The TP flags are consumed by ApplyTensorParallelCliFlags before
+        // ParseArgs; ParseArgs's unknown-arg guard must recognise and skip them.
+        var options = ServerOptionsBuilder.Build(new[]
+        {
+            "--tp", "2",
+            "--tp-node-id", "0",
+            "--tp-peers", "10.0.0.1:9500,10.0.0.2:9500",
+        }, _baseDir);
+        Assert.NotNull(options);
     }
 
     // ----- MTP speculative-decoding CLI flags -----

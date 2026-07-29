@@ -108,6 +108,26 @@ namespace TensorSharp.Server.Hosting
                     "List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit.",
                     "--list-gpus"),
             }),
+            ("Tensor parallelism (multi-GPU serving)", new[]
+            {
+                new OptionHelp("--tp <N>",
+                    "Split the model across N GPUs on this machine (tensor parallelism): each GPU holds 1/N of every " +
+                    "weight and the shards cooperate on every token. Use it when a model does not fit on one GPU. " +
+                    "Range: 1 to the number of local GPUs. Applies to the cuda, ggml_cuda, and ggml_vulkan backends. " +
+                    "Default: 1 — no splitting (TENSORSHARP_TP_DEGREE env var overrides).",
+                    "--model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2"),
+                new OptionHelp("--tp-node-id <N>",
+                    "This node's 0-based ID for multi-node (distributed) tensor parallelism over TCP. The server can " +
+                    "only be node 0 — the driver that owns sampling and serves HTTP; start every other node as a " +
+                    "worker with TensorSharp.Cli using the same model, backend, and --tp-peers list. Requires " +
+                    "--tp-peers. Default: none — single-node (TENSORSHARP_TP_NODE_ID env var overrides).",
+                    "--tp 2 --tp-node-id 0 --tp-peers 192.168.1.10:9500,192.168.1.11:9500"),
+                new OptionHelp("--tp-peers <list>",
+                    "Comma-separated host:port list of ALL nodes in the distributed TP cluster, ordered by node ID; " +
+                    "every node passes the identical list. Requires --tp-node-id. Default: none " +
+                    "(TENSORSHARP_TP_PEERS env var overrides).",
+                    "--tp-peers 192.168.1.10:9500,192.168.1.11:9500"),
+            }),
             ("Generation defaults (used when a request omits the field)", new[]
             {
                 new OptionHelp("--max-tokens <N>",
@@ -274,6 +294,7 @@ namespace TensorSharp.Server.Hosting
             writer.WriteLine("Examples:");
             writer.WriteLine("  TensorSharp.Server --model C:\\models\\gemma-4-E4B-it-Q8_0.gguf --backend ggml_cpu");
             writer.WriteLine("  TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda");
+            writer.WriteLine("  TensorSharp.Server --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2    (split across 2 GPUs)");
             writer.WriteLine("  TensorSharp.Server --backend ggml_cpu    (model-less status process; inference unavailable)");
             writer.WriteLine("  TensorSharp.Server --config server.json    (read options from a file)");
             writer.WriteLine("  TensorSharp.Server --config server.json --backend ggml_cuda    (file, but override the backend)");

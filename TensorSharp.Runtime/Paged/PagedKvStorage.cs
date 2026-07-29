@@ -29,7 +29,14 @@ namespace TensorSharp.Runtime.Paged
         public PagedKvStorage(int numBlocks, long blockByteSize)
         {
             if (numBlocks <= 0) throw new ArgumentOutOfRangeException(nameof(numBlocks));
-            if (blockByteSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockByteSize));
+            // blockByteSize == 0 is a metadata-only pool: the model cannot
+            // snapshot its KV state into host bytes (e.g. a tensor-parallel
+            // model whose KV cache lives sharded across per-rank device
+            // backends), but the scheduler still needs the block ids for its
+            // block tables. Every byte-level caller (capture/inject in
+            // BatchExecutor) is gated on SupportsKVStateSnapshot, so the
+            // zero-length slabs are never read or written.
+            if (blockByteSize < 0) throw new ArgumentOutOfRangeException(nameof(blockByteSize));
 
             _numBlocks = numBlocks;
             _blockByteSize = blockByteSize;

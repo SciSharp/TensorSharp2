@@ -54,6 +54,15 @@ namespace TensorSharp.Cli
             bool showSarah = Array.Exists(args, a => a == "--xzf");
             ConsoleBanner.Print(showSarah);
 
+            // A bare `TensorSharp.Cli` or `--help` shows the full usage page —
+            // every option with its description, default, range, and an example —
+            // and exits before any logging/model machinery spins up.
+            if (args.Length == 0 || CliUsage.IsHelpRequested(args))
+            {
+                CliUsage.PrintUsage(Console.Out);
+                return;
+            }
+
             var loggingOptions = CliLoggingSetup.ParseFromArgs(args);
             using var loggerFactory = CliLoggingSetup.Build(loggingOptions);
             _log = loggerFactory.CreateLogger("TensorSharp.Cli");
@@ -381,26 +390,9 @@ namespace TensorSharp.Cli
             {
                 _log.LogError(LogEventIds.CliFailed,
                 "Model file not found: {ModelPath}", modelPath ?? "(none)");
-                Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [--input <input.txt>] " +
-                    "[--pdf <document.pdf>] " +
-                    "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
-                    "[--prompt <text>] [--cfg F] [--diffusion-steps N] [--diffusion-seed N] " +
-                    "[--qwen-image-vae <vae.gguf>] [--qwen-image-vl <qwen2.5-vl.gguf>] [--qwen-image-mmproj <mmproj.gguf>] [--qwen-image-lora <lora.safetensors>] [--offload-cpu] " +
-                    "[--max-tokens N] [--test] [--backend cpu|cuda|mlx|ggml_cpu|ggml_metal|ggml_cuda|ggml_vulkan] " +
-                    "[--tp N] [--tp-node-id N --tp-peers host1:port1,host2:port2,...] " +
-                    "[--gpu-device N] [--list-gpus] " +
-                    "[--interactive] [--system <text>] [--system-file <path>] " +
-                    "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
-                    "[--repeat-penalty F] [--presence-penalty F] [--frequency-penalty F] " +
-                    "[--seed N] [--stop <text>] [--think] [--warmup-runs N] " +
-                    "[--paged-kv | --no-paged-kv] [--paged-kv-block-size N] [--paged-kv-ram-mb N] " +
-                    "[--paged-kv-ssd-dir <path>] [--paged-kv-ssd-mb N] [--paged-kv-quant-bits 0|2|4|8] " +
-                    "[--config <config.json>] " +
-                    "[--log-level info|debug|trace] [--log-dir <path>] [--log-file off] [--log-console off]");
+                Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [options]");
                 Console.Error.WriteLine(
-                    "  --config reads options from a JSON file (command-line options override it). The file supports " +
-                    "${variables} and auto-downloading models via { \"path\": ..., \"urls\": [...] }. " +
-                    "See the config/ folder and config/README.md for examples.");
+                    "Run 'TensorSharp.Cli --help' for the full option list with descriptions, defaults, ranges, and examples.");
                 return;
             }
 
