@@ -38,7 +38,7 @@ namespace TensorSharp.Server.Hosting
             if (string.IsNullOrWhiteSpace(options.StartupModelPath))
             {
                 logger.LogInformation(LogEventIds.HostConfiguration,
-                    "No startup model configured. Launch with --model <path.gguf> --backend <type> [--mmproj <path>] [--max-tokens 20000]" +
+                    "No startup model configured. Launch with --model <path.gguf> --backend <type> [--mmproj <path>] [--tp N] [--max-tokens 20000]" +
                     " [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--repeat-penalty F]" +
                     " [--presence-penalty F] [--frequency-penalty F] [--seed N] [--stop <text>]" +
                     " [--prefill-chunk-size N]" +
@@ -83,6 +83,13 @@ namespace TensorSharp.Server.Hosting
                 logger.LogInformation(LogEventIds.HostConfiguration,
                     "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
                 modelService.Model.LogVramSnapshot("after kernel warmup");
+
+                // Multi-node tensor parallelism: from here on this server is the
+                // driver (node 0) — every forward pass broadcasts to the worker
+                // nodes so their weight shards join each AllReduce. Must run
+                // AFTER WarmUpKernels (warmup executes symmetrically on every
+                // node and must not broadcast). No-op on single-node groups.
+                modelService.Model.BeginDistributedDriver();
             }
         }
     }

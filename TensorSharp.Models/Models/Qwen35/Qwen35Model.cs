@@ -1028,6 +1028,11 @@ namespace TensorSharp.Models
         {
             if (requiredContextTokens <= 0)
                 return;
+            // Tensor-parallel runs keep no host-side attention cache — each rank
+            // owns a device-resident shard that the TP forward path grows itself —
+            // so there is nothing to pre-reserve here.
+            if (_kvCacheK == null || _kvCacheV == null)
+                return;
             EnsureCacheCapacity(requiredContextTokens, geometricGrowth: false);
         }
 

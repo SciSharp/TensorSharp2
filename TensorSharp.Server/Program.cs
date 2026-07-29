@@ -100,6 +100,11 @@ bool kvCacheDtypeFlagApplied = ServerOptionsBuilder.ApplyKvCacheDtypeCliFlag(arg
 // which Vulkan device the ggml_vulkan backend initializes on. Must run before
 // the startup model is loaded (the device is fixed at first backend init).
 bool gpuDeviceFlagApplied = ServerOptionsBuilder.ApplyGpuDeviceCliFlag(args);
+// Translate --tp / --tp-node-id / --tp-peers into the TENSORSHARP_TP_* env vars
+// the model loader reads (ModelBase.Create for the local degree,
+// DistributedTpConfig for the multi-node pair). Must run before the startup
+// model is loaded so the very first load is sharded across the GPUs.
+bool tensorParallelFlagsApplied = ServerOptionsBuilder.ApplyTensorParallelCliFlags(args);
 
 var builder = WebApplication.CreateBuilder(args);
 LoggingSetup.Configure(builder.Logging, hostingOptions, resolvedLogLevel);
@@ -196,6 +201,15 @@ if (gpuDeviceFlagApplied)
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
         "Vulkan GPU device configured via CLI: --gpu-device {DeviceIndex} (applies when the ggml_vulkan backend initializes)",
         Environment.GetEnvironmentVariable(GgmlBasicOps.VulkanDeviceEnvVar));
+}
+
+if (tensorParallelFlagsApplied)
+{
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Tensor parallelism configured via CLI: degree={TpDegree} nodeId={TpNodeId} peers={TpPeers}",
+        Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE") ?? "1",
+        Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID") ?? "(single-node)",
+        Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS") ?? "(none)");
 }
 
 if (qwenImageFlagsApplied)

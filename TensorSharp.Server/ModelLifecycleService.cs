@@ -102,6 +102,20 @@ namespace TensorSharp.Server
                 }
 
                 _model = ModelBase.Create(modelPath, _backend, tpGroup: tpGroup);
+
+                // A worker node (--tp-node-id > 0) spends its life blocked in a
+                // mirror loop and cannot also serve HTTP requests, so the server
+                // only takes the driver role (node 0). Fail fast with the
+                // supported topology instead of hanging on the first inference.
+                if (_model.IsDistributedWorker)
+                {
+                    throw new InvalidOperationException(
+                        "TensorSharp.Server cannot run as a distributed tensor-parallel WORKER node " +
+                        "(--tp-node-id > 0 / TENSORSHARP_TP_NODE_ID > 0). Run this server as node 0 (the driver) " +
+                        "and start each worker node with TensorSharp.Cli, e.g.: " +
+                        "TensorSharp.Cli --model <same.gguf> --backend <same> --tp <localGpus> --tp-node-id <N> --tp-peers <same list>.");
+                }
+
                 _loadedModelPath = modelPath;
 
                 if (!string.IsNullOrEmpty(mmProjPath) && File.Exists(mmProjPath))

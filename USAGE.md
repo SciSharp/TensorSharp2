@@ -354,6 +354,9 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--model <path>` | GGUF file to host (required for inference; when other options are passed without it, the server starts but `/api/models/load` will report no hosted model) |
 | `--mmproj <path>` | Multimodal projector GGUF (resolved relative to the model directory when only a filename is given; pass `none` to disable). Requires `--model`. |
 | `--backend <type>` | Default compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
+| `--tp <N>` | Tensor parallelism degree — split the hosted model across N local GPUs (default: `1`). Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. Env: `TENSORSHARP_TP_DEGREE`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
+| `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. The server can only be node `0` (the driver that serves HTTP); start worker nodes with `TensorSharp.Cli`. Requires `--tp-peers`. Env: `TENSORSHARP_TP_NODE_ID`. |
+| `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster, ordered by node ID (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. Env: `TENSORSHARP_TP_PEERS`. |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--help` | Print the parameter reference (also shown when the server is started with no arguments) and exit |
@@ -409,7 +412,7 @@ server-wide defaults; the defaults only fill in fields the client omits.
 | `TENSORSHARP_LOG_LEVEL` | Minimum log level for both console and file loggers: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` (default: `Information`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
-| `TENSORSHARP_TP_DEGREE` | Tensor parallelism degree — number of local CUDA GPUs to split the model across (default: `1`). Used by `TensorSharp.Server` (which has no `--tp` CLI flag) and as a fallback in `ModelBase.Create`. Requires `--backend cuda`. |
+| `TENSORSHARP_TP_DEGREE` | Tensor parallelism degree — number of local GPUs to split the model across (default: `1`). Fallback in `ModelBase.Create` when no `--tp` flag is passed; both `TensorSharp.Cli` and `TensorSharp.Server` expose it as `--tp <N>`. Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. |
 | `TENSORSHARP_TP_NODE_ID` | This node's 0-based ID for multi-node distributed tensor parallelism. Must be set together with `TENSORSHARP_TP_PEERS`. |
 | `TENSORSHARP_TP_PEERS` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Must be set together with `TENSORSHARP_TP_NODE_ID`. |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | How long each node keeps retrying outbound connections to its peers before giving up (default: `120`). Raise it when nodes are started far apart by hand or by a slow orchestrator. |
@@ -513,9 +516,9 @@ reconverges the hidden state after each row-parallel projection.
 # CLI: 2-GPU tensor parallelism
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2
 
-# Server: via environment variable (the server has no --tp CLI flag)
-TENSORSHARP_TP_DEGREE=2 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
-    --model <model.gguf> --backend cuda
+# Server: same flag (TENSORSHARP_TP_DEGREE=2 env var also works)
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model <model.gguf> --backend cuda --tp 2
 
 # Config JSON
 { "tp": 2, "backend": "cuda", "model": "<model.gguf>" }
@@ -539,16 +542,17 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
     --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 
-# Server: via environment variables
-# Node 0:
-TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=0 \
-TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
-    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda
+# Server as the cluster front-end: the server must be node 0 (the driver that
+# owns sampling and serves HTTP); every other node runs a TensorSharp.Cli worker
+# with the same model, backend, and peer list. The TENSORSHARP_TP_* env vars
+# work as well.
+# Node 0 (server / driver):
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda \
+    --tp 2 --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 
-# Node 1:
-TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=1 \
-TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
-    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda
+# Node 1 (CLI worker):
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda \
+    --tp 2 --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 
 # Config JSON (per node)
 { "tp": 2, "tp-node-id": 0, "tp-peers": "192.168.1.10:9500,192.168.1.11:9500", "backend": "cuda" }
