@@ -69,7 +69,7 @@
       <tr><td><code>--bench-kvcache / --bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准。</td></tr>
       <tr><td><code>--warmup-runs &lt;N&gt;</code></td><td>计时前丢弃的前向次数（默认 0）。</td></tr>
       <tr><td><code>--test / --test-templates &lt;dir&gt;</code></td><td>内置分词器/模板测试；对照 GGUF Jinja2 校验模板。</td></tr>
-      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 在单个进程内把模型切分到 N 张 CUDA GPU 上（默认 1；需要 <code>--backend cuda</code>）。</td></tr>
+      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 在单个进程内把模型切分到 N 张 GPU 上（默认 1；需要 <code>--backend cuda</code>、<code>ggml_cuda</code> 或 <code>ggml_vulkan</code>）。<code>TensorSharp.Server</code> 同样支持该参数。</td></tr>
       <tr><td><code>--tp-node-id &lt;N&gt;</code> / <code>--tp-peers &lt;list&gt;</code></td><td>多节点分布式 TP：本节点的 0 起始编号，以及所有节点共用的逗号分隔 <code>host:port</code> 列表。</td></tr>
       <tr><td><code>--log-level / --log-dir / --log-file / --log-console</code></td><td>日志级别、目录，以及文件/控制台开关。</td></tr>
     </tbody>
@@ -132,7 +132,8 @@
       <tr><td><code>TS_QWEN_IMAGE_VAE / TS_QWEN_IMAGE_TE / TS_QWEN_IMAGE_MMPROJ</code></td><td>Qwen-Image-Edit 伴随文件路径（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
       <tr><td><code>TS_QWEN_IMAGE_LORA / TS_QWEN_IMAGE_LORA_SCALE</code></td><td>合并进 DiT 的 Lightning LoRA <code>.safetensors</code> / 缩放覆盖。</td></tr>
       <tr><td><code>TS_QWEN_DIT_CACHE / TS_QWEN_DIT_CACHE_MODE</code></td><td>整步 DiT 缓存：<code>0</code> 禁用 / 模式 <code>easycache</code>、<code>fbc</code>、<code>both</code>、<code>off</code>。</td></tr>
-      <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td>本地张量并行度 —— 模型切分到多少张 CUDA GPU（= CLI 的 <code>--tp</code>；也是服务端设置该项的唯一方式）。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td>本地张量并行度 —— 模型切分到多少张 GPU（= CLI 与服务端的 <code>--tp</code>）。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DEVICES</code></td><td>各 TP rank 使用的 GPU 序号，例如 <code>0,2</code>（默认 <code>0..tp-1</code>）。用于 GGML 后端。</td></tr>
       <tr><td><code>TENSORSHARP_TP_NODE_ID / TENSORSHARP_TP_PEERS</code></td><td>多节点分布式 TP：0 起始的节点编号与所有节点共用的 <code>host:port</code> 列表（= <code>--tp-node-id</code> / <code>--tp-peers</code>）。</td></tr>
       <tr><td><code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS / _RECV_TIMEOUT_SECONDS</code></td><td>分布式 TP 网格的 peer 连接重试窗口（120 秒）与单次接收超时（300 秒）。</td></tr>
       <tr><td><code>TENSORSHARP_TP_DISABLE_P2P / TENSORSHARP_TP_HOST_ALLREDUCE</code></td><td><code>1</code> 强制跨 GPU 拷贝 / 本地 AllReduce 走主机内存，而非 CUDA P2P（诊断用）。</td></tr>

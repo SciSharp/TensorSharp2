@@ -159,7 +159,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
   <p>开箱即用的示例见仓库 <code>config/</code> 目录（<code>cli-basic.json</code>、<code>server-basic.json</code>、<code>variables.json</code>、<code>auto-download.json</code>、<code>qwen-image-edit.json</code>）——每个都使用真实、公开、无需授权的 URL，因此在全新机器上也能直接运行。完整说明见 <code>config/README.md</code>。</p>
 
   <h2 id="options">命令行选项</h2>
-  <p>CLI 目前没有完整的 <code>--help</code> 页面；找不到有效模型路径时才会打印用法概要。未知参数会被忽略，因此请准确复制选项名，否则拼写错误也可能看起来执行成功。</p>
+  <p>不带任何参数运行 CLI —— 或使用 <code>--help</code>（也支持 <code>-h</code>、<code>-?</code>、<code>/?</code>）—— 会打印完整的参数参考：逐项列出说明、默认值、取值范围与示例，并在日志与模型机制启动之前退出。未知参数会被忽略，因此请准确复制选项名，否则拼写错误也可能看起来执行成功。</p>
   <h4>输入 / 输出</h4>
   <div class="table-scroll">
   <table>
@@ -185,13 +185,14 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--backend &lt;type&gt;</code></td><td>计算后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code>（默认：<code>ggml_cpu</code>）。</td></tr>
       <tr><td><code>--gpu-device &lt;N&gt;</code></td><td><code>ggml_vulkan</code> 后端在多 GPU 主机上使用的 Vulkan 设备索引（默认：0；环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）。</td></tr>
       <tr><td><code>--list-gpus</code></td><td>列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
+      <tr><td><code>--help</code></td><td>打印完整参数参考（逐项列出说明、默认值、取值范围与示例）后退出；不带任何参数启动 CLI 时也会显示。</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>（默认：自动，由后端/模型选择；覆盖 <code>KV_CACHE_DTYPE</code> 环境变量）。块量化档位需要原生 GGML flash-attention 路径；<code>q4_0</code>（约为 f32 占用的 1/7）面向 128K–256K 的超长上下文。</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>启动交互式 REPL（见下文）。</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>从文本或文件设定会话的系统提示。仅交互式 REPL 与 DiffusionGemma 扩散模式使用它；普通单次文本模式会忽略系统提示。</td></tr>
       <tr><td><code>--think</code></td><td>启用思考 / 推理模式（思维链）。</td></tr>
       <tr><td><code>--tools &lt;path&gt;</code></td><td>含工具 / 函数定义的 JSON 文件。</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>渲染提示词 + 分词后退出（不生成）。</td></tr>
-      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 在单个进程内把模型切分到 N 张 CUDA GPU 上（默认：1）。需要 <code>--backend cuda</code>。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
+      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 在单个进程内把模型切分到 N 张 GPU 上（默认：1）。需要 <code>--backend cuda</code>、<code>ggml_cuda</code> 或 <code>ggml_vulkan</code>；用 <code>TENSORSHARP_TP_DEVICES</code> 指定使用哪几张卡。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
       <tr><td><code>--tp-node-id &lt;N&gt;</code></td><td>多节点分布式张量并行中本节点的 0 起始编号。需与 <code>--tp-peers</code> 一起使用。</td></tr>
       <tr><td><code>--tp-peers &lt;list&gt;</code></td><td>集群中所有节点的 <code>host:port</code> 列表，逗号分隔（例如 <code>192.168.1.10:9500,192.168.1.11:9500</code>）。所有节点必须完全一致；端口没有默认值，且需在节点之间可达。</td></tr>
       <tr><td><code>--config &lt;path&gt;</code></td><td>从 JSON <a href="#config">配置文件</a>读取参数（命令行参数会覆盖它）。支持 <code>${变量}</code> 与模型自动下载。可重复。</td></tr>

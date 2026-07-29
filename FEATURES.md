@@ -14,7 +14,7 @@
 - **Continuous batching & paged KV cache** -- vLLM-style block-paged KV pool with block-hash prefix sharing across requests, iteration-level scheduler that admits / preempts sequences mid-batch, optional SSD-backed tier for very large KV working sets, and a native fused paged-attention kernel (`TSGgml_PagedAttentionForward`) that drives `ggml_flash_attn_ext` on Metal/CUDA/Vulkan. Enabled by default in `TensorSharp.Server`; opt-out with `--no-continuous-batching`. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 - **MTP / NextN speculative decoding** -- multi-token-prediction draft heads accelerate solo (non-concurrent) decode. Qwen 3.6 ships its NextN block fused into the trunk GGUF; Gemma 4 loads a separate EAGLE-style `gemma4-assistant` draft GGUF via `--mtp-draft-model` whose draft layers attend the target's own KV cache. The draft proposes up to `--mtp-draft` tokens per step (kept while draft confidence ≥ `--mtp-pmin`) and the trunk verifies them in a single batched forward; the request's own sampler — penalties included — drives both drafting and verification, so output is identical to standard decode. Opt in with the server's `--mtp-spec` flag (off by default; `TensorSharp.Cli` has no MTP flags — set the `TS_MTP_*` env vars there). On ggml backends fused multi-token-verify / draft-step kernels make it a clear win; the pure-C# `cuda` backend runs a fully GPU-resident per-op verify/draft and is also a win. CPU / MLX stay on standard decode. Env: `TS_MTP_*` (shared) and `TS_GMTP_*` (Gemma 4 tuning).
 - **Batched / parallel inference** -- `IBatchedPagedModel.ForwardBatch` implementations for Mistral 3, Gemma 4, GPT OSS, Qwen 3, Qwen 3.5/3.6-family, and Nemotron-H all run by default and pack N sequences into a single forward pass with paged K/V scatter and per-sequence attention via the native kernel. Gemma 4, Qwen 3.5/3.6, GPT OSS, and Nemotron-H expose a per-family `TS_<FAMILY>_BATCHED=0` escape hatch (`TS_GEMMA4_BATCHED=0`, `TS_QWEN35_BATCHED=0`, `TS_GPTOSS_BATCHED=0`, `TS_NEMOTRON_BATCHED=0`) to fall back to the per-sequence KV-swap path for A/B comparison or regression isolation; Qwen 3 and Mistral 3 have no per-family switch — use the global `TS_SCHED_DISABLE_BATCHED=1`.
-- **Tensor parallelism & distributed inference** -- split a model across multiple CUDA GPUs (Megatron-LM column/row-parallel pattern) with `--tp N` (CLI) or `TENSORSHARP_TP_DEGREE` (server), and extend across machines with peer-to-peer TCP clustering (`--tp-node-id` / `--tp-peers`). Hierarchical AllReduce minimizes inter-node traffic. Supports all autoregressive architectures (Qwen 3, Mistral 3, Gemma 3/4, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H) with architecture-specific strategies for MoE expert slicing, GatedDeltaNet per-rank V-head ownership, and Mamba2 replication. Optional Redis-backed KV cache and Responses API store for shared state. → [Tensor Parallelism](USAGE.md#tensor-parallelism--distributed-inference)
+- **Tensor parallelism & distributed inference** -- split a model across multiple GPUs (Megatron-LM column/row-parallel pattern) with `--tp N` on both `TensorSharp.Cli` and `TensorSharp.Server` (or `TENSORSHARP_TP_DEGREE`), and extend across machines with peer-to-peer TCP clustering (`--tp-node-id` / `--tp-peers`). Hierarchical AllReduce minimizes inter-node traffic. Runs on the direct `cuda` backend and on the GGML CUDA / Vulkan backends, where each rank owns a ggml backend, weight shards, and KV cache on its own GPU. Supports all autoregressive architectures (Qwen 3, Mistral 3, Gemma 3/4, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H) with architecture-specific strategies for MoE expert parallelism / expert slicing, GatedDeltaNet per-rank V-head ownership, and Mamba2 replication. Fused per-rank graphs make `--tp 2` decode faster than a single GPU (Gemma 4 E4B 51.7 vs 37.3 tok/s) and run models that do not fit one card. Optional Redis-backed KV cache and Responses API store for shared state. → [Tensor Parallelism](USAGE.md#tensor-parallelism--distributed-inference)
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
 - **Chat templates** -- auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture
@@ -76,7 +76,7 @@ Tuning: `--mtp-draft` (default `8`) bounds tokens drafted per step; `--mtp-pmin`
 
 ## Tensor Parallelism & Distributed Inference
 
-Tensor parallelism (TP) splits a single model across multiple CUDA GPUs using the
+Tensor parallelism (TP) splits a single model across multiple GPUs using the
 Megatron-LM column/row-parallel pattern. Each transformer block runs
 column-parallel projections (QKV, gate/up) that split output heads or
 intermediate dimensions across GPUs, independent per-GPU attention or activation
@@ -84,16 +84,20 @@ computation, and row-parallel projections (output, down) followed by an AllReduc
 that reconverges the hidden state. Norms, embeddings, and the LM head are
 replicated.
 
-**Local TP** runs within a single process: one thread issues commands to all GPUs
-sequentially, and CUDA streams provide the actual parallelism. Enable with
-`--tp N` (CLI) or `TENSORSHARP_TP_DEGREE=N` (server).
+**Local TP** runs within a single process. On the direct `cuda` backend one
+thread issues commands to all GPUs and CUDA streams provide the parallelism; on
+the GGML backends a rank worker pool drives the GPUs concurrently, because a
+GGML op submits *and* synchronizes in one call. Enable with `--tp N` on either
+`TensorSharp.Cli` or `TensorSharp.Server` (or `TENSORSHARP_TP_DEGREE=N`);
+`TENSORSHARP_TP_DEVICES=0,2` picks which physical GPUs the ranks map to.
 
 **Distributed TP** extends across machines via a peer-to-peer TCP mesh. Each node
 runs its own process with its own local GPUs; AllReduce is hierarchical — local
 P2P within each node, TCP across node representatives, then broadcast back — so
 only `1/tp_local` of the data crosses the network. Enable with `--tp-node-id` and
-`--tp-peers` (CLI) or `TENSORSHARP_TP_NODE_ID` and `TENSORSHARP_TP_PEERS`
-(server).
+`--tp-peers` (or `TENSORSHARP_TP_NODE_ID` / `TENSORSHARP_TP_PEERS`). The server
+can join such a cluster as node `0` — the driver that owns sampling and serves
+HTTP — with every other node running a `TensorSharp.Cli` worker.
 
 Architecture-specific strategies handle heterogeneous layers:
 
@@ -101,7 +105,8 @@ Architecture-specific strategies handle heterogeneous layers:
 |---|---|
 | Dense transformers (Qwen 3, Mistral 3, Gemma 3) | Standard column/row-parallel QKV + FFN |
 | MoE (GPT OSS, Nemotron-H) | Expert slicing — each GPU holds `1/tp` of every expert's weights; router is replicated |
-| MoE on GGML (Gemma 4, Qwen 3.5/3.6) | Expert parallelism — whole experts partition across GPUs, so each rank keeps the single batched `ggml_mul_mat_id` dispatch per projection |
+| MoE on GGML (Qwen 3.5/3.6) | Expert parallelism — whole experts partition across GPUs (128 of 256 per rank), so each rank keeps the single batched `ggml_mul_mat_id` dispatch per projection; the shared expert stays Megatron-split |
+| MoE on GGML (Gemma 4) | Megatron split *inside* each expert (gate/up column-parallel, down row-parallel) so the fused whole-model MoE trunk kernel keeps working with global expert ids; the expert sum becomes a third row-parallel AllReduce per layer. `TS_GEMMA4_TP_FUSED_MOE=0` falls back to the whole-expert per-op path |
 | GatedDeltaNet SSM (Qwen 3.5/3.6) | Block-cyclic V-head assignment — each rank runs its own packed GDN kernel on its V-head subset with independent delta/conv state, resident on its GPU; no cross-rank communication for the recurrent path |
 | Mamba2 SSM (Nemotron-H) | Replicated on rank 0, result broadcast to all ranks |
 
@@ -109,11 +114,15 @@ TP runs on the `cuda` backend and on the GGML CUDA / Vulkan backends
 (`ggml_cuda`, `ggml_vulkan`); MLX is single-device. On the GGML backends each
 rank owns a ggml backend on its own GPU with its own weight shards and KV
 cache, and cross-GPU AllReduce goes through ggml-cuda's collective (NCCL when
-available) or a host reduction for small payloads. GGML TP is aimed at capacity
-— running a model too large for one GPU — rather than latency; a single GPU is
-still faster for a model that already fits. Qwen 3.5/3.6 runs TP on both paths:
-Qwen 3.5-35B-A3B IQ4_XS (16.6 GB) splits across two 16 GB cards and decodes at
-20 tok/s on `ggml_cuda --tp 2`.
+available) or a host reduction for small payloads. GGML TP delivers both
+capacity and latency: fused per-rank block graphs (attention, dense FFN, MoE
+trunk, GatedDeltaNet) replaced the op-at-a-time forward, so on 2× RTX 2000 Ada
+`--tp 2` decodes **1.39×** a single GPU on Gemma 4 E4B Q8_0 (51.7 vs 37.3 tok/s)
+and **1.06×** on Qwen 3.5-9B Q8_0, with Gemma 4 output byte-identical to the
+single-GPU run. Models that do not fit one card run only under TP:
+Qwen 3.5-35B-A3B IQ4_XS (16.6 GB) splits across two 16 GB cards at 184 tok/s
+prefill / 18 tok/s decode. Full measurements: `TENSOR_PARALLELISM_PLAN.md`
+(Stages 1b and 1c).
 
 Batched/continuous-batching forward under TP is implemented for Qwen 3
 and Mistral 3; MoE models fall back to per-sequence forward under TP.

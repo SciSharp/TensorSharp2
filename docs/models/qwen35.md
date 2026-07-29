@@ -792,6 +792,38 @@ flag list.
   tokens for the corresponding image, and the multimodal injector then writes
   the encoded embeddings into those positions before `Forward()`.
 
+## 13a. Tensor parallelism
+
+Qwen 3.5/3.6 runs under `--tp N` on the direct `cuda` backend and on the GGML
+CUDA / Vulkan backends. Four pieces make the GGML path work:
+
+- **Per-rank packed GatedDeltaNet kernel** (`TSGgml_Qwen35GdnLayerTP`) — one
+  ggml graph per rank covering input RMSNorm, the packed column-parallel
+  in-projection, `ggml_ssm_conv`, q/k L2-norm and head tiling,
+  `ggml_gated_delta_net`, the gated RMSNorm, and the SiLU(z) gate. Each rank
+  owns a block-cyclic slice of the V heads, so the recurrent path needs no
+  cross-rank communication.
+- **Device-resident recurrent state** — the conv window and delta state upload
+  once and are updated in place; downloading them would cost ~1 MB per layer
+  per token per rank. `ResetKVCache` drops the device copies.
+- **Expert-parallel MoE** (`Qwen35Model.TensorParallelGgmlMoE.cs`) — whole
+  experts partition across ranks (128 of 256 each), so a rank still issues one
+  batched `ggml_mul_mat_id` dispatch per projection instead of a per-(token,
+  expert) loop. The shared expert stays Megatron-split, since every token uses
+  it.
+- **Column-parallel LM head** — the vocabulary is the output dimension, so each
+  rank owns a contiguous row range and the gather is two copies into disjoint
+  halves of the logits buffer, with no collective at all.
+
+Measured on 2× RTX 2000 Ada (`--backend ggml_cuda --tp 2`): Qwen3.5-35B-A3B
+UD-IQ4_XS — which does not fit a 16 GB card — decodes at 20.4 tok/s short-prompt
+(12.1 at 3 K context) with prefill 26.3 / 80.2 / 75.7 tok/s at 23 / 512 / 2966
+tokens, using 9.4 + 8.0 GB. Decode time splits: attention block 32%, MoE experts
+31%, GDN 15%, ssm_out + AllReduce 6%, router 6%, LM head 2.5%. On Qwen3.5-9B
+Q8_0 (which fits one card) `--tp 2` is byte-identical to the single-GPU run over
+60 greedy tokens with the device AllReduce. Full detail:
+[`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md).
+
 ## 14. Optimization opportunities
 
 - **Native GDN decode (legacy path)** — the legacy per-seq GDN decode

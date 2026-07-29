@@ -600,6 +600,33 @@ prefill 内核也会加速投机验证：在 Qwen3.6-27B IQ2_XXS 上实测把 MT
 - 聊天模板使用标准 Qwen `<|im_start|>` / `<|im_end|>` 格式，外加视觉占位符 `<|image_pad|>`。
 - `ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts)` 把每个 `<|image_pad|>` 占位符展开为对应图像所需 token 数；多模态注入器随后在这些位置写入编码后的 embedding，再调用 `Forward()`。
 
+## 13a. 张量并行
+
+Qwen 3.5/3.6 在 Direct `cuda` 后端以及 GGML CUDA / Vulkan 后端上都支持 `--tp N`。
+GGML 路径由四个部分构成：
+
+- **按 rank 的打包 GatedDeltaNet 内核**（`TSGgml_Qwen35GdnLayerTP`）—— 每个 rank
+  一张 ggml 计算图，覆盖输入 RMSNorm、打包的列并行 in-projection、
+  `ggml_ssm_conv`、q/k L2 归一化与 head 平铺、`ggml_gated_delta_net`、门控
+  RMSNorm 以及 SiLU(z) 门。每个 rank 持有 V head 的块循环切片，因此循环路径无需
+  跨 rank 通信。
+- **常驻设备的循环状态** —— conv 窗口与 delta 状态只上传一次并原地更新；若要回
+  读，每层每 token 每 rank 就要付出约 1 MB 的代价。`ResetKVCache` 会丢弃设备副本。
+- **专家并行 MoE**（`Qwen35Model.TensorParallelGgmlMoE.cs`）—— 整个专家在各 rank
+  之间划分（每个 rank 256 选 128），因此每个 rank 每个投影仍只需一次批量
+  `ggml_mul_mat_id` 调度，而不是按 (token, 专家) 循环。shared expert 仍按
+  Megatron 方式切分，因为每个 token 都会用到它。
+- **列并行 LM head** —— 词表就是输出维度，因此每个 rank 拥有一段连续的行区间，
+  "gather" 只是两次写入 logits 缓冲的不相交半区，完全不需要集合通信。
+
+在 2× RTX 2000 Ada 上实测（`--backend ggml_cuda --tp 2`）：单张 16 GB 卡装不下的
+Qwen3.5-35B-A3B UD-IQ4_XS 短提示 decode 为 20.4 tok/s（3 K 上下文时 12.1），
+23 / 512 / 2966 token 的 prefill 分别为 26.3 / 80.2 / 75.7 tok/s，显存占用
+9.4 + 8.0 GB。decode 时间分布：注意力 block 32%、MoE 专家 31%、GDN 15%、
+ssm_out + AllReduce 6%、router 6%、LM head 2.5%。在能装进单卡的 Qwen3.5-9B Q8_0
+上，使用设备 AllReduce 时 `--tp 2` 与单卡运行在 60 个贪心 token 内逐字节一致。
+完整细节见 [`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md)。
+
 ## 14. 优化机会
 
 - **原生 GDN decode（旧路径）** —— 旧的单序列 GDN decode 当前仍在托管 C#

@@ -789,6 +789,32 @@ Opt-in / opt-out and tuning use the shared `--mtp-spec` / `--mtp-draft` /
 Chat template falls back to the hardcoded Gemma 4 template when the GGUF does
 not ship a Jinja2 one.
 
+## 13a. Tensor parallelism
+
+Gemma 4 runs under `--tp N` on the direct `cuda` backend and on the GGML CUDA /
+Vulkan backends, with multimodal embeddings injected into the TP path so
+vision/audio prompts survive sharding.
+
+The MoE variants need special handling on GGML. The whole-model MoE kernels
+(`TSGgml_Gemma4MoEModelDecode` / `...Verify`) compute the router inside the
+graph and `ggml_top_k` returns *global* expert ids, which whole-expert sharding
+cannot feed. Under TP the MoE layers are therefore sharded the Megatron way
+*inside* each expert: every rank keeps all 128 experts and holds `1/tp` of each
+expert's FFN width (gate/up column-parallel on the intermediate dim keeping the
+fused `[gate_r | up_r]` layout, down row-parallel on it over whole quant
+blocks). `sel` stays global, the graph is the single-GPU graph with narrower
+expert matrices, and the expert-sum output becomes a third row-parallel partial
+per layer — reduced right after the routing-weighted sum, which is linear, so
+summing then weighting equals weighting then summing. The slices are
+materialized at load (~10.5 GB on the 26B, ~36 s); `TS_GEMMA4_TP_FUSED_MOE=0`
+falls back to the whole-expert per-op path.
+
+Measured on 2× RTX 2000 Ada (prefill 512 / decode 64, tok/s): E4B Q8_0 goes from
+2760 / 37.3 on one GPU to 2488 / **51.7** at `--tp 2`; 26B-A4B IQ4_XS from
+1845 / 48.5 to 2537 / **51.2**. Both produce output **byte-identical** to their
+single-GPU runs. Full detail:
+[`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md).
+
 ## 14. Optimization opportunities
 
 - **Fused MoE kernels for mixed dense+MoE layouts** — all-MoE variants

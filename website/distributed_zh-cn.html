@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>多 GPU 与多节点 — TensorSharp 维基</title>
-  <meta name="description" content="TensorSharp 的张量并行：用 --tp 把一个模型切分到多张 CUDA GPU 上，并通过点对点 TCP 集群扩展到多台机器。">
+  <meta name="description" content="TensorSharp 的张量并行：用 --tp 把一个模型切分到多张 GPU 上（Direct CUDA 与 GGML CUDA/Vulkan 后端），并通过点对点 TCP 集群扩展到多台机器。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -18,7 +18,7 @@
   <h1>多 GPU 与多节点</h1>
   <p class="lede">一个模型，多张 GPU——当一台机器不够用时，还可以是多台机器。TensorSharp 按 Megatron-LM 列/行并行范式实现了<strong>张量并行</strong>，并通过点对点 TCP 网格把它扩展到多台主机。</p>
 
-  <div class="callout note"><div class="ic">🧭</div><p><strong>一句话上手：</strong>加上 <code>--tp N</code> 即可在本机 N 张 GPU 上运行；在此基础上再加 <code>--tp-node-id</code> 与 <code>--tp-peers</code> 就能跨机器扩展。张量并行需要 Direct <a href="backends_zh-cn.html#cuda"><code>cuda</code></a> 后端。</p></div>
+  <div class="callout note"><div class="ic">🧭</div><p><strong>一句话上手：</strong>加上 <code>--tp N</code> 即可在本机 N 张 GPU 上运行；在此基础上再加 <code>--tp-node-id</code> 与 <code>--tp-peers</code> 就能跨机器扩展。<code>TensorSharp.Cli</code> 与 <code>TensorSharp.Server</code> 都支持这些参数，可运行在 Direct <a href="backends_zh-cn.html#cuda"><code>cuda</code></a> 后端以及 <a href="backends_zh-cn.html#ggml">GGML CUDA / Vulkan</a> 后端上。</p></div>
 
   <h2 id="why">什么时候需要它？</h2>
   <ul>
@@ -26,7 +26,7 @@
     <li><strong>模型装不进一台机器。</strong>分布式 TP 把多台主机的 GPU 汇聚成一个逻辑并行组——2 节点 × 4 GPU 即全局并行度 8。</li>
     <li><strong>希望每个 token 获得更多显存带宽。</strong>每张 GPU 处理每个投影的自有切片，逐层矩阵乘是被切分的，而不是排队串行执行。</li>
   </ul>
-  <p>如果模型本来就装得下单卡，你需要的只是更高的<em>吞吐</em>，那么请先看 <a href="advanced_zh-cn.html#continuous-batching">连续批处理</a>——它默认开启，零成本即可尝试。</p>
+  <p>在 GGML 后端上，融合的按 rank block 计算图让 <code>--tp 2</code> 在本来就装得下单卡的模型上也能<strong>快于</strong>单 GPU —— Gemma 4 E4B Q8_0 上 51.7 对 37.3 tok/s（2× RTX 2000 Ada）。如果你要的是更高的<em>并发吞吐</em>而非更低的单流延迟，请先看 <a href="advanced_zh-cn.html#continuous-batching">连续批处理</a>——它默认开启，零成本即可尝试。</p>
 
   <h2 id="how">张量并行的工作原理</h2>
   <p>每个 transformer block 被改写为一对互补的切分方式，因此每半个 block 只需要一次集合通信：</p>
@@ -47,13 +47,20 @@
   <p>归一化层、词嵌入与 LM head 在各 rank 上<strong>复制</strong>而非切分——它们体积很小，复制可以从关键路径上省掉一次集合通信。</p>
 
   <h3 id="local">本地 TP —— 单进程，多张 GPU</h3>
-  <p>本地 TP 运行在单个进程内：由一个线程顺序向所有 GPU 下发命令，真正的并行由 CUDA stream 提供。AllReduce 通过点对点设备拷贝加逐元素加法内核完成。</p>
-  <pre data-lang="bash"><code># CLI —— 把模型切分到 2 张 CUDA GPU
+  <p>本地 TP 运行在单个进程内。在 Direct <code>cuda</code> 后端上，由一个线程顺序向所有 GPU 下发命令，真正的并行由 CUDA stream 提供，AllReduce 通过点对点设备拷贝加逐元素加法内核完成。在 GGML 后端上，则由一个 rank 工作线程池<em>并发</em>驱动各张 GPU —— GGML 的一次算子调用同时完成提交与同步，顺序循环各 rank 会让显卡严格串行执行。</p>
+  <pre data-lang="bash"><code># CLI —— 把模型切分到 2 张 GPU
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda --tp 2
 
-# 服务端 —— 服务端没有 --tp 参数，请使用环境变量
-TENSORSHARP_TP_DEGREE=2 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
-    --model model.gguf --backend cuda</code></pre>
+# GGML CUDA 后端上同理
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend ggml_cuda --tp 2
+
+# 指定各 rank 对应的物理 GPU
+TENSORSHARP_TP_DEVICES=0,2 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model model.gguf --backend ggml_cuda --tp 2
+
+# 服务端 —— 同样的参数（TENSORSHARP_TP_DEGREE=2 环境变量也可用）
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model model.gguf --backend ggml_cuda --tp 2</code></pre>
   <p>也可以写进<a href="cli_zh-cn.html#config">配置文件</a>：</p>
   <pre data-lang="json"><code>{ "model": "model.gguf", "backend": "cuda", "tp": 2 }</code></pre>
 
@@ -67,11 +74,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
 # 节点 1 —— peer 列表相同，节点 ID 不同：
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda --tp 2 \
     --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"</code></pre>
-  <p>服务端从环境变量读取同样的三项配置：</p>
-  <pre data-lang="bash"><code># 节点 0（节点 1 上把 TENSORSHARP_TP_NODE_ID 改为 1）
-TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=0 \
-TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
-    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model model.gguf --backend cuda</code></pre>
+  <p>服务端可以作为这样一个集群的前端，但只能是<strong>节点 0</strong> —— 即负责采样并对外提供 HTTP 的 driver。其余每个节点都运行一个 <code>TensorSharp.Cli</code> worker，使用相同的模型、后端与 peer 列表。<code>TENSORSHARP_TP_*</code> 环境变量可以替代这些参数。</p>
+  <pre data-lang="bash"><code># 节点 0 —— 服务端 / driver：
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model model.gguf --backend cuda \
+    --tp 2 --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+
+# 节点 1 —— CLI worker：
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda --tp 2 \
+    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"</code></pre>
   <div class="callout warn"><div class="ic">⚠️</div><p>所有节点必须传入<strong>完全相同</strong>的 <code>--tp-peers</code> 列表（顺序也要一致），并各自使用<strong>唯一</strong>的 <code>--tp-node-id</code>（0 起始，对应该列表中的下标）。示例中的端口 <code>9500</code> 不是默认值：请自行选定，并确保所有节点之间可达。节点间流量没有鉴权也没有加密，请把集群放在可信的内网中。</p></div>
   <p>节点通常由人工间隔数秒到数分钟启动，因此先起来的节点会持续重试对外连接（最长 120 秒），而不是在第一次连接被拒绝时就失败。网格建立完成后，每个节点会打印 <code>[TcpCommunicator] Rank r/N connected to all peers.</code>。</p>
 
@@ -84,24 +94,40 @@ TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
       <tr><td>Qwen 3</td><td class="yes">✅</td><td>参考实现 —— 标准列/行并行 QKV + FFN。</td></tr>
       <tr><td>Mistral 3</td><td class="yes">✅</td><td>融合与分离两种 QKV 布局，YaRN RoPE。</td></tr>
       <tr><td>Gemma 3</td><td class="yes">✅</td><td>分离 Q/K/V、GELU、滑动窗口注意力。</td></tr>
-      <tr><td>Gemma 4</td><td class="yes">✅</td><td>稠密与 MoE（专家切分）、逐层 head 维度；多模态嵌入会注入 TP 路径，因此视觉 / 音频提示不会丢失。</td></tr>
-      <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>MoE 专家切分，外加 GatedDeltaNet 循环层的块循环 V-head 归属 —— 每个 rank 维护自己的 delta/conv 状态，循环路径无需跨 rank 通信。</td></tr>
-      <tr><td>GPT OSS</td><td class="yes">✅</td><td>MoE 专家切分、attention sink、YaRN。</td></tr>
-      <tr><td>Nemotron-H</td><td class="yes">✅</td><td>MoE 专家切分；Mamba2 SSM 层在 rank 0 上计算后广播。</td></tr>
+      <tr><td>Gemma 4</td><td class="yes">✅</td><td>稠密与 MoE、逐层 head 维度；多模态嵌入会注入 TP 路径，因此视觉 / 音频提示不会丢失。GGML 上融合的整模 MoE 主干在<em>每个专家内部</em>切分（gate/up 列并行、down 行并行），从而保留全局专家 id —— <code>TS_GEMMA4_TP_FUSED_MOE=0</code> 可回退到逐算子的整专家路径。Direct CUDA 使用逐专家切分。</td></tr>
+      <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>GatedDeltaNet 循环层采用块循环 V-head 归属 —— 每个 rank 维护自己的、常驻设备的 delta/conv 状态，循环路径无需跨 rank 通信。GGML 上整个 GDN block 作为一个打包的按 rank 内核运行，MoE 采用专家并行（每个 rank 持有整个专家，shared expert 按 Megatron 切分），LM head 为列并行且完全不需要集合通信。Direct CUDA 使用专家切分。</td></tr>
+      <tr><td>GPT OSS</td><td class="yes">✅</td><td>MoE 专家切分、attention sink、YaRN。GGML 后端同样可运行，但 GGML 上的 MoE 路径目前仍按 token 逐个遍历专家，尚未使用专家并行。</td></tr>
+      <tr><td>Nemotron-H</td><td class="yes">✅</td><td>MoE 专家切分；Mamba2 SSM 层在 rank 0 上计算后广播。GGML 上的 MoE 限制与 GPT OSS 相同。</td></tr>
       <tr><td>DiffusionGemma</td><td class="no">—</td><td>不适用（文本扩散采样器，非自回归 decode）。</td></tr>
       <tr><td>Qwen-Image-Edit</td><td class="no">—</td><td>不适用（MMDiT 图像生成）。</td></tr>
     </tbody>
   </table>
   </div>
-  <p>对 MoE 模型来说，每张 GPU 持有<em>每一个</em>专家权重的 <code>1/tp</code>，router 则复制——因此无论 token 选中哪些专家，专家负载都保持均衡。</p>
+  <p>MoE 有两种切分方式。<strong>专家切分</strong>（Direct CUDA，以及各后端上的 GPT OSS / Nemotron-H）让每张 GPU 持有<em>每一个</em>专家权重的 <code>1/tp</code>，router 复制——因此无论 token 选中哪些专家，负载都保持均衡。<strong>专家并行</strong>（GGML 上的 Qwen 3.5/3.6）则划分整个专家，使每个 rank 每个投影仍然只需一次批量 <code>ggml_mul_mat_id</code> 调度，而不是按 (token, 专家) 循环。</p>
 
   <h2 id="constraints">要求与约束</h2>
   <ul>
-    <li><strong>仅限 Direct <code>cuda</code> 后端。</strong>GGML、MLX、Vulkan 在设计上都是单设备——<code>--backend ggml_cuda</code> 不会切分模型。</li>
+    <li><strong>仅限 GPU 后端。</strong>TP 可运行在 <code>cuda</code>、<code>ggml_cuda</code> 与 <code>ggml_vulkan</code> 上；MLX 与 CPU 后端为单设备。</li>
     <li><strong>整除性。</strong><code>numHeads</code>、<code>numKVHeads</code> 与 <code>intermediateSize</code> 都必须能被 TP 度整除；量化权重的行并行切分还要求 <code>ne0</code> 能被 <code>tp × blockSize</code> 整除。</li>
     <li><strong>TP 下的批处理前向</strong>目前实现于 Qwen 3 与 Mistral 3。MoE 模型（Gemma 4、Qwen 3.5/3.6、GPT OSS、Nemotron-H）在 TP 激活时回退到按序列前向，因此连续批处理在这些模型上的增益较小。</li>
-    <li><strong>本地并行度 ≤ 可见 GPU 数。</strong>请求的 rank 数超过主机 CUDA 设备数时，启动阶段就会直接失败。</li>
+    <li><strong>本地并行度 ≤ 可见 GPU 数。</strong>请求的 rank 数超过主机设备数时，启动阶段就会直接失败。</li>
+    <li><strong>多节点仍走逐算子前向。</strong>融合的整模 TP 计算图是按 rank、单进程的；分布式运行会回退到逐算子执行。</li>
   </ul>
+
+  <h2 id="performance">实测结果</h2>
+  <p>2× RTX 2000 Ada（各 16 GB，PCIe，无 NVLink），<code>--backend ggml_cuda --tp 2</code>，prefill 512 / decode 64，单位 tok/s：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>模型</th><th>单 GPU</th><th><code>--tp 2</code></th></tr></thead>
+    <tbody>
+      <tr><td>Gemma 4 E4B Q8_0</td><td>2760 / 37.3</td><td>2488 / <strong>51.7</strong></td></tr>
+      <tr><td>Gemma 4 26B-A4B IQ4_XS</td><td>1845 / 48.5</td><td>2537 / <strong>51.2</strong></td></tr>
+      <tr><td>Qwen 3.5-9B Q8_0</td><td>1461 / 23.1</td><td>399 / <strong>24.4</strong></td></tr>
+      <tr><td>Qwen 3.5-35B-A3B IQ4_XS</td><td>装不下</td><td><strong>184 / 18.1</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Decode —— TP 本该受益的访存瓶颈部分 —— 在 Gemma 4 E4B 上达到单卡的 1.39×，在 Qwen 3.5-9B 上为 1.06×，且两个 Gemma 4 模型的输出与单卡运行<strong>逐字节一致</strong>。Prefill 受计算约束且要承担集合通信开销，因此在单卡装得下的模型上持平或略低于单卡。Qwen 3.5-35B-A3B 在 16 GB 卡上根本装不下 —— 只有 TP 能跑，两张卡上的显存占用为 9.4 + 8.0 GB。</p>
 
   <h2 id="tuning">调优与诊断</h2>
   <p>本地 AllReduce 优先使用 CUDA 点对点（P2P）DMA。启动时，并行组会为每一对报告支持 P2P 的设备启用 peer access，随后做一次往返自检——部分拓扑（挂在某些 PCIe 交换机后的 L4、开启 IOMMU 的主机、BAR1 窗口过小）虽然声称支持 P2P，却会静默传输损坏数据，未通过自检的设备对会被永久降级为主机中转。完全不支持 peer access 的硬件（A16 vGPU 配置、大多数消费级显卡）则从一开始就走主机内存中转。这些回退都是自动的；下面的开关用于人为强制走某条路径以便定位问题。</p>
@@ -109,13 +135,19 @@ TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
   <table>
     <thead><tr><th>变量</th><th>默认值</th><th>作用</th></tr></thead>
     <tbody>
-      <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td><code>1</code></td><td>本机切分使用的 GPU 数（等价于 CLI 的 <code>--tp</code>；也是服务端设置该项的唯一方式）。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td><code>1</code></td><td>本机切分使用的 GPU 数（等价于 CLI 与服务端的 <code>--tp</code>）。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DEVICES</code></td><td><code>0..tp-1</code></td><td>各 rank 使用的 GPU 序号，例如 <code>0,2</code>。用于 GGML 后端。</td></tr>
       <tr><td><code>TENSORSHARP_TP_NODE_ID</code></td><td>未设置</td><td>本节点的 0 起始编号（等价于 <code>--tp-node-id</code>），需与 peer 列表一起设置。</td></tr>
       <tr><td><code>TENSORSHARP_TP_PEERS</code></td><td>未设置</td><td>所有节点的 <code>host:port</code> 列表，逗号分隔（等价于 <code>--tp-peers</code>）。</td></tr>
       <tr><td><code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS</code></td><td><code>120</code></td><td>节点向 peer 重试连接的时长。编排系统启动节点间隔较大时可调大。</td></tr>
       <tr><td><code>TENSORSHARP_TP_RECV_TIMEOUT_SECONDS</code></td><td><code>300</code></td><td>peer 套接字的单次接收超时，让卡住的 peer 直接让集合通信失败，而不是挂在操作系统 TCP keepalive（往往 2 小时以上）上。</td></tr>
       <tr><td><code>TENSORSHARP_TP_DISABLE_P2P</code></td><td>关闭</td><td><code>1</code> 表示所有跨 GPU 传输一律经主机内存中转——与无 P2P 硬件的路径完全一致。用于判断某个多 GPU 缺陷是否出在 P2P DMA 路径上。</td></tr>
       <tr><td><code>TENSORSHARP_TP_HOST_ALLREDUCE</code></td><td>关闭</td><td><code>1</code> 表示本地 AllReduce 改为设备→主机、CPU 求和、主机→设备。更慢，但与已知可靠的多节点归约路径完全一致。</td></tr>
+      <tr><td><code>TS_GGML_TP_DEVICE_AR_THRESHOLD</code></td><td><code>262144</code></td><td>超过该元素数量时 AllReduce 走 ggml 的设备集合通信，否则在主机内存中归约。GGML 的激活本来就在主机内存里，小载荷在那里求和更划算。</td></tr>
+      <tr><td><code>TS_GGML_TP_PARALLEL</code></td><td>开启</td><td><code>0</code> 表示顺序而非并发地驱动各 rank —— 诊断用，会显著变慢。</td></tr>
+      <tr><td><code>TS_GEMMA4_TP_FUSED_MOE</code></td><td>开启</td><td><code>0</code> 表示 Gemma 4 从融合的 MoE 主干回退到逐算子的整专家路径。</td></tr>
+      <tr><td><code>GGML_CUDA_ALLREDUCE</code></td><td>自动</td><td><code>nccl</code> / <code>internal</code> / <code>none</code>，直接透传给 ggml 的集合通信选择。</td></tr>
+      <tr><td><code>GGML_CUDA_AR_BF16_THRESHOLD</code></td><td><code>1 MB</code></td><td>ggml 在多大载荷以上把 F32 集合通信转成 BF16。TensorSharp 提高了 ggml 自身的默认值（总是转换），使 decode 规模的归约保持精确；设为 <code>0</code> 则完全禁用转换。</td></tr>
     </tbody>
   </table>
   </div>
@@ -141,11 +173,11 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model model.gguf --backen
     <thead><tr><th>现象</th><th>可能原因与处理</th></tr></thead>
     <tbody>
       <tr><td>启动失败：请求的 TP 度超过设备数</td><td>进程看到的 CUDA 设备少于 <code>--tp</code> 所要求的数量。检查 <code>CUDA_VISIBLE_DEVICES</code> 与驱动。</td></tr>
-      <tr><td>指定了 <code>--tp 2</code>，模型却只加载到一张 GPU</td><td>后端不是 <code>cuda</code>。TP 不适用于 <code>ggml_cuda</code>、<code>ggml_vulkan</code>、<code>mlx</code> 与 CPU 后端。</td></tr>
+      <tr><td>指定了 <code>--tp 2</code>，模型却只加载到一张 GPU</td><td>后端是 <code>mlx</code>、<code>cpu</code> 或 <code>ggml_cpu</code>/<code>ggml_metal</code>。TP 适用于 <code>cuda</code>、<code>ggml_cuda</code> 与 <code>ggml_vulkan</code>。</td></tr>
       <tr><td>某个维度无法被 TP 度整除</td><td>选择能整除 <code>numHeads</code>、<code>numKVHeads</code> 与 <code>intermediateSize</code> 的并行度，通常取 2 的幂。</td></tr>
       <tr><td>节点一直等待 peer</td><td>各节点的 peer 列表、顺序或端口不一致，或者防火墙拦截了该端口。若只是节点启动间隔较久，调大 <code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS</code>。</td></tr>
       <tr><td>只有多 GPU 时输出乱码</td><td>怀疑 P2P DMA 路径。先用 <code>TENSORSHARP_TP_HOST_ALLREDUCE=1</code> 重跑，再试 <code>TENSORSHARP_TP_DISABLE_P2P=1</code>；如果输出恢复正常，问题出在该拓扑的 peer DMA 上。</td></tr>
-      <tr><td>多 GPU 比单 GPU 更慢</td><td>对本来就能装进单卡的模型，这是预期结果：TP 会为每个 block 增加一次集合通信。TP 用于扩容，吞吐请交给<a href="advanced_zh-cn.html#continuous-batching">连续批处理</a>。</td></tr>
+      <tr><td>多 GPU 比单 GPU 更慢</td><td>Prefill 受计算约束且要承担集合通信开销，在本来就装得下单卡的模型上可能落后于单卡。GGML 后端上的 decode 应当更快 —— 如果不是，请确认融合路径处于开启状态（未设置 <code>TS_GEMMA4_TP_FUSED_MOE</code> 与 <code>TS_GGML_TP_FUSED_MATMUL</code>），并确认是单进程运行，因为多节点会回退到逐算子前向。</td></tr>
     </tbody>
   </table>
   </div>
