@@ -73,6 +73,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll       --config config/cli-basic.j
 
 ## 控制台应用
 
+不带任何参数运行 `TensorSharp.Cli` 会打印完整的参数参考——逐项列出说明、默认值、
+取值范围与示例——并在日志与模型机制启动之前退出；`--help`（以及 `-h`、`-?`、`/?`）
+效果相同。
+
+```bash
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --help
+```
+
 ```bash
 # 文本推理
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --output result.txt \
@@ -162,7 +170,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
 | `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16`、`q8_0` 或 `q4_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径。 |
-| `--tp <N>` | 张量并行度 —— 在单个进程内把模型切分到 N 张 CUDA GPU 上（默认：`1`）。需要 `--backend cuda`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
+| `--tp <N>` | 张量并行度 —— 在单个进程内把模型切分到 N 张 GPU 上（默认：`1`）。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
 | `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |
 | `--tp-peers <list>` | 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。所有节点必须使用完全相同的列表。必须与 `--tp-node-id` 一起使用。 |
 | `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
@@ -330,6 +338,9 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `--model <path>` | 需要托管的 GGUF 文件（推理时必填；如传入了其他参数但未指定该项，服务仍可启动，但 `/api/models/load` 会报告未加载模型） |
 | `--mmproj <path>` | 多模态投影器 GGUF（仅给文件名时按模型目录解析；传 `none` 可显式禁用）。需要先指定 `--model`。 |
 | `--backend <type>` | 默认计算后端：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan` |
+| `--tp <N>` | 张量并行度 —— 把托管的模型切分到本机 N 张 GPU 上（默认：`1`）。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。环境变量：`TENSORSHARP_TP_DEGREE`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
+| `--tp-node-id <N>` | 多节点（分布式）张量并行中本节点的 0 起始编号。服务端只能是节点 `0`（对外提供 HTTP 的 driver）；其余节点请用 `TensorSharp.Cli` 启动。必须与 `--tp-peers` 一起使用。环境变量：`TENSORSHARP_TP_NODE_ID`。 |
+| `--tp-peers <list>` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，按节点 ID 排序，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `--tp-node-id` 一起使用。环境变量：`TENSORSHARP_TP_PEERS`。 |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
 | `--help` | 打印参数说明后退出（不带任何参数启动服务时也会显示） |
@@ -382,7 +393,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
-| `TENSORSHARP_TP_DEGREE` | 张量并行度 —— 把模型切分到本机多少张 CUDA GPU 上（默认：`1`）。`TensorSharp.Server` 使用该变量（服务端没有 `--tp` 命令行参数），同时也是 `ModelBase.Create` 的兜底来源。需要 `--backend cuda`。 |
+| `TENSORSHARP_TP_DEGREE` | 张量并行度 —— 把模型切分到本机多少张 GPU 上（默认：`1`）。当未传 `--tp` 参数时作为 `ModelBase.Create` 的兜底来源；`TensorSharp.Cli` 与 `TensorSharp.Server` 都提供了 `--tp <N>` 参数。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。 |
+| `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`；默认 `0..tp-1`）。用于 GGML 后端上的 TP。 |
 | `TENSORSHARP_TP_NODE_ID` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `TENSORSHARP_TP_PEERS` 一起设置。 |
 | `TENSORSHARP_TP_PEERS` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `TENSORSHARP_TP_NODE_ID` 一起设置。 |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 各节点向 peer 发起连接的重试窗口（默认：`120` 秒）。若节点由人工或较慢的编排系统间隔较久启动，可调大该值。 |
@@ -475,18 +487,19 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 
 ### 本地张量并行（单进程，多 GPU）
 
-在一个进程内把模型切分到 N 张 CUDA GPU 上。每张 GPU 持有 `1/N` 的切分权重（列
-并行的 QKV / gate / up，行并行的 output / down），外加一份完整的复制权重（归一
-化层、词嵌入、LM head）。各 GPU 的 KV 缓存彼此独立；每次行并行投影之后由
-AllReduce（CUDA P2P 拷贝 + 逐元素加法内核）把隐藏状态重新汇聚。
+在一个进程内把模型切分到 N 张 GPU 上（Direct CUDA，或 GGML CUDA / Vulkan 后端）。
+每张 GPU 持有 `1/N` 的切分权重（列并行的 QKV / gate / up，行并行的 output /
+down），外加一份完整的复制权重（归一化层、词嵌入、LM head）。各 GPU 的 KV 缓存
+彼此独立；每次行并行投影之后由 AllReduce（CUDA P2P 拷贝 + 逐元素加法内核）把隐
+藏状态重新汇聚。
 
 ```bash
 # CLI：2 GPU 张量并行
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2
 
-# 服务端：通过环境变量（服务端没有 --tp 命令行参数）
-TENSORSHARP_TP_DEGREE=2 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
-    --model <model.gguf> --backend cuda
+# 服务端：同样的参数（也可用 TENSORSHARP_TP_DEGREE=2 环境变量）
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model <model.gguf> --backend cuda --tp 2
 
 # 配置文件 JSON
 { "tp": 2, "backend": "cuda", "model": "<model.gguf>" }
@@ -509,16 +522,16 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
     --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 
-# 服务端：通过环境变量
-# 节点 0：
-TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=0 \
-TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
-    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda
+# 以服务端作为集群前端：服务端必须是节点 0（负责采样并对外提供 HTTP 的 driver），
+# 其余每个节点都运行一个 TensorSharp.Cli worker，使用相同的模型、后端与 peer 列表。
+# TENSORSHARP_TP_* 环境变量同样可用。
+# 节点 0（服务端 / driver）：
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda \
+    --tp 2 --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 
-# 节点 1：
-TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=1 \
-TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
-    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend cuda
+# 节点 1（CLI worker）：
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda \
+    --tp 2 --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 
 # 配置文件 JSON（每个节点一份）
 { "tp": 2, "tp-node-id": 0, "tp-peers": "192.168.1.10:9500,192.168.1.11:9500", "backend": "cuda" }
@@ -535,16 +548,67 @@ TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
 | Qwen 3 | ✅ | 参考实现 |
 | Mistral 3 | ✅ | 融合 / 分离 QKV，YaRN RoPE |
 | Gemma 3 | ✅ | 分离 Q/K/V，GELU，滑动窗口 |
-| Gemma 4 | ✅ | 稠密 + MoE 专家切分，逐层 head 维度 |
-| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属；直连 CUDA 与 GGML 均有打包 GDN 内核，GGML 上另有专家并行 MoE 与列并行 LM head |
-| GPT OSS | ✅ | MoE 专家切分，attention sink，YaRN |
-| Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算，MoE 专家切分 |
+| Gemma 4 | ✅ | 稠密 TP + MoE。GGML 上融合的整模 MoE 主干在**每个专家内部**切分（gate/up 列并行、down 行并行），从而保留全局专家 id；`TS_GEMMA4_TP_FUSED_MOE=0` 可回退到逐算子的整专家路径。Direct CUDA 上为逐专家切分 |
+| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属；GGML 上为专家并行 MoE（每个 rank 持有整个专家，shared expert 仍按 Megatron 切分）与列并行 LM head，Direct CUDA 上为专家切分。`cuda` 与 `ggml_cuda` / `ggml_vulkan` 均可运行——GGML 路径使用打包的按 rank GDN 内核（`TSGgml_Qwen35GdnLayerTP`）并把循环状态常驻设备 |
+| GPT OSS | ✅ | MoE 专家切分，attention sink，YaRN。`cuda` 与 GGML 后端均可运行；GGML 路径目前仍按 token 逐个遍历专家（尚未使用专家并行） |
+| Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算，MoE 专家切分。GGML 上的限制与 GPT OSS 相同 |
 | DiffusionGemma | — | 不适用（扩散模型） |
 | Qwen-Image-Edit | — | 不适用（图像生成） |
 
+### 后端支持
+
+TP 可运行在 **Direct CUDA** 后端（`--backend cuda`）以及 **GGML CUDA / Vulkan**
+后端（`--backend ggml_cuda`、`ggml_vulkan`）上；MLX 为单设备。
+
+在 GGML 后端上，每个 rank 在自己的 GPU 上拥有独立的 ggml 后端、常驻设备的权重分
+片与 KV 缓存。跨 GPU AllReduce 使用 ggml-cuda 的集合通信（构建时能找到 NCCL 就用
+NCCL，否则用其 P2P 流水线）；小载荷则改在主机内存中归约——因为 GGML 的激活本来就
+在主机内存里，这样反而更省。
+
+```bash
+# GGML CUDA 后端上的 2 GPU
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend ggml_cuda --tp 2
+
+# 指定各 rank 对应的物理 GPU
+TENSORSHARP_TP_DEVICES=0,2 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model <model.gguf> --backend ggml_cuda --tp 2
+```
+
+**预期效果。** GGML 上的 TP 最初是**容量**特性——让单卡显存装不下的模型完整跑在
+GPU 上——而融合的按 rank 执行（Stage 1c）让它同时成为延迟收益。现在每个 TP block
+都以按 rank 融合的原生计算图运行（注意力、稠密 FFN、MoE 主干、GatedDeltaNet），
+而不再逐算子下发，因此每层每个 rank 只需几次图调度，而不是数百次原生调用。
+
+在 2× RTX 2000 Ada（各 16 GB，PCIe，无 NVLink）上测得，prefill 512 / decode 64，
+单位 tok/s：
+
+| 模型 | 单 GPU | `--tp 2` |
+|---|---|---|
+| Gemma 4 E4B Q8_0 | 2760 / 37.3 | 2488 / **51.7** |
+| Gemma 4 26B-A4B IQ4_XS | 1845 / 48.5 | 2537 / **51.2** |
+| Qwen 3.5-9B Q8_0 | 1461 / 23.1 | 399 / **24.4** |
+| Qwen 3.5-35B-A3B IQ4_XS | 装不下 | **184 / 18.1** |
+
+Decode——TP 本该受益的访存瓶颈部分——在 Gemma 4 E4B 上达到单卡的 1.39×，在
+Qwen 3.5-9B 上为 1.06×；两个 Gemma 4 模型的输出与单卡逐字节一致。Prefill 受计算
+约束且要承担集合通信开销，因此在单卡装得下的模型上持平或略低于单卡。
+Qwen 3.5-35B 在 16 GB 卡上根本装不下，只能靠 TP 运行。完整测量数据与尚待融合的
+部分见 `TENSOR_PARALLELISM_PLAN.md`（Stage 1b 与 1c）。
+
+| 变量 | 作用 |
+|---|---|
+| `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号，例如 `0,2`（默认 `0..tp-1`） |
+| `TS_GGML_TP_PARALLEL=0` | 顺序而非并发地驱动各 rank（诊断用） |
+| `TS_GGML_TP_FUSED_MATMUL=1` | 由单个线程提交两个 rank 的线性层（默认关闭；它每次调用都要为每个 rank 分配设备缓冲，在 Qwen 3.5 35B 上实测慢 2.3×） |
+| `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 超过该元素数量时 AllReduce 走设备集合通信（默认 262144） |
+| `TS_GGML_F32_RESIDENT=0` | 每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） |
+| `TS_GEMMA4_TP_FUSED_MOE=0` | 仅 Gemma 4：从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径。融合路径在 26B 上加载时会物化约 10.5 GB 的专家分片（约 36 秒），换来约 10× 的 decode |
+| `GGML_CUDA_AR_BF16_THRESHOLD` | ggml-cuda 集合通信在多大载荷以上把 F32 转成 BF16 再归约。TensorSharp 把 ggml 的默认值（1 字节，即总是转换）提高到 1 MB，使 decode 规模的集合通信精确归约；设为 `0` 则完全禁用转换 |
+| `TS_QWEN35_LAYER_TRACE=1` | 打印首次前向的逐层残差流摘要，单卡与 TP 两条路径都会输出（诊断用） |
+| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`，直接透传给 ggml |
+
 ### 约束
 
-- **仅支持 CUDA 后端**（`--backend cuda`）。GGML、MLX、Vulkan 在设计上都是单设备。
 - `numHeads`、`numKVHeads` 与 `intermediateSize` 必须能被 TP 度整除。
 - 量化权重的行并行切分要求 `ne0` 能被 `tp × blockSize` 整除。
 - TP 下的批处理 / 连续批处理前向目前实现于 Qwen 3 与 Mistral 3；MoE 模型（Gemma 4、Qwen 3.5/3.6、GPT OSS、Nemotron-H）在 TP 下回退到按序列前向。
@@ -628,9 +692,10 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
-| 本地张量并行（单进程，多 GPU） | 关闭（`1` 张 GPU） | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N`（仅 CLI） |
-| 分布式 TP 节点编号（多节点） | 未设置（关闭） | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N`（仅 CLI） |
-| 分布式 TP peer 端点 | 未设置（关闭） | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2`（仅 CLI） |
+| 本地张量并行（单进程，多 GPU） | 关闭（`1` 张 GPU） | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N`（CLI 与服务端） |
+| TP 各 rank 使用的 GPU 序号（GGML 后端） | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
+| 分布式 TP 节点编号（多节点） | 未设置（关闭） | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N`（CLI 与服务端；服务端必须是节点 `0`） |
+| 分布式 TP peer 端点 | 未设置（关闭） | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2`（CLI 与服务端） |
 | peer 连接重试窗口（多节点） | `120` 秒 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |
 | 单次接收超时（多节点） | `300` 秒 | `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS=N` | — |
 | 强制跨 GPU 拷贝走主机中转 | 关闭（可用时使用 P2P） | `TENSORSHARP_TP_DISABLE_P2P=1` | — |

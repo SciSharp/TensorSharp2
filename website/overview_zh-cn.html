@@ -93,7 +93,7 @@
       <tr><td>多模态</td><td>Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3 与 Nemotron-H Omni 图像输入。PDF 文档可经 Web UI 上传或 CLI <code>--pdf</code> 传入（提取文本并内联；扫描页渲染为图像交给视觉模型）。</td></tr>
       <tr><td>连续批处理</td><td>vLLM 式分页 KV 缓存、块哈希前缀共享、迭代级调度器（默认开启；可用 <code>--no-continuous-batching</code> 关闭）。</td></tr>
       <tr><td>推测解码</td><td>Qwen 3.6（内嵌）与 Gemma 4（独立草稿 GGUF）的 MTP / NextN 草稿头；默认关闭，通过服务器的 <code>--mtp-spec</code> 参数（环境变量 <code>TS_MTP_SPEC</code>）启用。</td></tr>
-      <tr><td>张量并行</td><td>跨 CUDA GPU 的 Megatron-LM 列/行并行 TP（<code>--tp N</code> / <code>TENSORSHARP_TP_DEGREE</code>），以及基于点对点 TCP 网格的多节点分布式 TP（<code>--tp-node-id</code> / <code>--tp-peers</code>），覆盖全部自回归架构。可选 Redis 支撑的共享 KV 缓存与 Responses API 存储。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
+      <tr><td>张量并行</td><td>Direct <code>cuda</code> 后端与 GGML CUDA / Vulkan 后端上的 Megatron-LM 列/行并行 TP（<code>--tp N</code> / <code>TENSORSHARP_TP_DEGREE</code>，CLI 与服务端均支持），以及基于点对点 TCP 网格的多节点分布式 TP（<code>--tp-node-id</code> / <code>--tp-peers</code>），覆盖全部自回归架构。融合的按 rank 计算图与 MoE 专家并行让 Gemma 4 上 <code>--tp 2</code> 的 decode 快于单卡。可选 Redis 支撑的共享 KV 缓存与 Responses API 存储。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
       <tr><td>可观测性</td><td>结构化的逐轮日志、队列状态，以及跨 Web UI、Ollama 与 OpenAI 响应形态的 KV 缓存复用指标。</td></tr>
     </tbody>
   </table>

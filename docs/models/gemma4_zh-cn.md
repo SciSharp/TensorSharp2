@@ -621,6 +621,26 @@ KV 缓存，并对每个起草 token 复用相同位置（递归只通过 `h` �
 
 聊天模板在 GGUF 没带 Jinja2 模板时回退到内置 Gemma 4 模板。
 
+## 13a. 张量并行
+
+Gemma 4 在 Direct `cuda` 后端以及 GGML CUDA / Vulkan 后端上都支持 `--tp N`，并且
+多模态嵌入会被注入 TP 路径，因此切分后视觉 / 音频提示不会丢失。
+
+MoE 变体在 GGML 上需要特殊处理。整模 MoE 内核（`TSGgml_Gemma4MoEModelDecode` /
+`...Verify`）在计算图内部完成路由，`ggml_top_k` 返回的是*全局*专家 id，整专家切分
+无法喂给它们。因此 TP 下的 MoE 层改为在**每个专家内部**按 Megatron 方式切分：每个
+rank 保留全部 128 个专家，但只持有每个专家 FFN 宽度的 `1/tp`（gate/up 沿中间维度
+列并行，保持融合的 `[gate_r | up_r]` 布局；down 沿该维度按整量化块行并行）。
+`sel` 保持全局，计算图与单卡一致、只是专家矩阵更窄，而专家求和的输出成为该层的第
+三个行并行部分和 —— 在路由加权求和之后立即归约；由于该运算是线性的，"先求和再加
+权"与"先加权再求和"等价。这些切片在加载时物化（26B 上约 10.5 GB，约 36 秒）；
+`TS_GEMMA4_TP_FUSED_MOE=0` 可回退到逐算子的整专家路径。
+
+在 2× RTX 2000 Ada 上实测（prefill 512 / decode 64，tok/s）：E4B Q8_0 由单卡的
+2760 / 37.3 变为 `--tp 2` 的 2488 / **51.7**；26B-A4B IQ4_XS 由 1845 / 48.5 变为
+2537 / **51.2**。两者的输出都与单卡运行**逐字节一致**。完整细节见
+[`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md)。
+
 ## 14. 优化机会
 
 - **混合 dense+MoE 布局的融合 MoE kernel** —— 全 MoE 变体（例如 26B-A4B）现在已经运行融合整模型 MoE decode（`TryFusedMoEModelDecode` / `TSGgml_Gemma4MoEModelDecode`）与 prefill/verify（`TryFusedMoEModelVerify`），但假想中混合密集层与 MoE 层的模型仍会回退到 per-layer 图。（下文的 expert-batched FFN 已经把未融合路径里的顺序 per-expert 派发去掉了。）

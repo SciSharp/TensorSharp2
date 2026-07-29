@@ -78,6 +78,15 @@ Ready-to-use examples live in [`config/`](config/) (`cli-basic.json`,
 
 ## Console Application
 
+Running `TensorSharp.Cli` with no arguments prints the full parameter reference —
+every option with its description, default, range, and an example — and exits
+before any logging or model machinery starts; `--help` (also `-h`, `-?`, `/?`)
+does the same.
+
+```bash
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --help
+```
+
 ```bash
 # Text inference
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --output result.txt \
@@ -154,7 +163,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prom
 # *.gguf file in a directory (useful when adding new architectures)
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 
-# Tensor parallelism: split a model across 2 CUDA GPUs in one process
+# Tensor parallelism: split a model across 2 GPUs in one process
+# (--backend cuda, ggml_cuda, or ggml_vulkan)
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --backend cuda --tp 2
 
 # Distributed tensor parallelism: 2 nodes × 2 GPUs each (4 GPUs total)
@@ -413,6 +423,7 @@ server-wide defaults; the defaults only fill in fields the client omits.
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_TP_DEGREE` | Tensor parallelism degree — number of local GPUs to split the model across (default: `1`). Fallback in `ModelBase.Create` when no `--tp` flag is passed; both `TensorSharp.Cli` and `TensorSharp.Server` expose it as `--tp <N>`. Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. |
+| `TENSORSHARP_TP_DEVICES` | GPU ordinals the TP ranks map to, comma-separated (e.g. `0,2`; default `0..tp-1`). Used by TP on the GGML backends. |
 | `TENSORSHARP_TP_NODE_ID` | This node's 0-based ID for multi-node distributed tensor parallelism. Must be set together with `TENSORSHARP_TP_PEERS`. |
 | `TENSORSHARP_TP_PEERS` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Must be set together with `TENSORSHARP_TP_NODE_ID`. |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | How long each node keeps retrying outbound connections to its peers before giving up (default: `120`). Raise it when nodes are started far apart by hand or by a slow orchestrator. |
@@ -570,10 +581,10 @@ must be reachable between all nodes.
 | Qwen 3 | ✅ | Reference implementation |
 | Mistral 3 | ✅ | Fused/separate QKV, YaRN RoPE |
 | Gemma 3 | ✅ | Separate Q/K/V, GELU, sliding window |
-| Gemma 4 | ✅ | Dense TP + **expert-parallel MoE** on GGML (whole experts per GPU, one batched dispatch per layer); per-expert slicing on direct CUDA |
-| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership, MoE expert slicing. **Direct CUDA only** (`--backend cuda`): its fused per-rank GDN kernel has no GGML equivalent, so `ggml_cuda --tp N` is rejected with an explicit message |
-| GPT OSS | ✅ | MoE expert slicing, attention sinks, YaRN |
-| Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing |
+| Gemma 4 | ✅ | Dense TP + MoE. On GGML the fused whole-model MoE trunk splits *inside* each expert (gate/up column-parallel, down row-parallel) so global expert ids keep working; `TS_GEMMA4_TP_FUSED_MOE=0` falls back to the whole-expert per-op path. Per-expert slicing on direct CUDA |
+| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership; expert-parallel MoE on GGML (whole experts per rank, Megatron-split shared expert), expert slicing on direct CUDA. Runs on both `cuda` and `ggml_cuda` / `ggml_vulkan` — the GGML path uses the packed per-rank GDN kernel (`TSGgml_Qwen35GdnLayerTP`) with device-resident recurrent state |
+| GPT OSS | ✅ | MoE expert slicing, attention sinks, YaRN. Runs on `cuda` and the GGML backends; the GGML path still walks experts per token per rank (no expert parallelism yet) |
+| Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing. Same GGML caveat as GPT OSS |
 | DiffusionGemma | — | Not applicable (diffusion model) |
 | Qwen-Image-Edit | — | Not applicable (image generation) |
 
@@ -598,16 +609,30 @@ TENSORSHARP_TP_DEVICES=0,2 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model <model.gguf> --backend ggml_cuda --tp 2
 ```
 
-**What to expect.** On the GGML backends TP is for *capacity* first: it lets a
-model that does not fit in one GPU's VRAM run entirely on GPUs. Qwen 3.5-35B-A3B
-IQ4_XS (16.6 GB, which does not fit a 16 GB card) splits into 9.4 + 8.0 GB across
-two and runs at **20 tok/s decode / 76 tok/s prefill** on 2× RTX 2000 Ada.
+**What to expect.** GGML TP started as a *capacity* feature — it lets a model
+that does not fit in one GPU's VRAM run entirely on GPUs — and fused per-rank
+execution (Stage 1c) made it a latency win as well. Each TP block now runs as a
+per-rank fused native graph (attention, dense FFN, MoE trunk, GatedDeltaNet)
+instead of op-at-a-time, so a rank issues a handful of graph launches per layer
+rather than hundreds of native calls.
 
-For a model that *already* fits on one GPU, that single GPU is still faster: its
-path runs a whole decode step as one fused native graph, while TP dispatches per
-layer. Qwen 3.5-9B Q8_0 measures 23 tok/s on one card against 16 tok/s at
-`--tp 2`. See `TENSOR_PARALLELISM_PLAN.md` (Stage 1b) for the full measurements
-and what is left to fuse.
+Measured on 2× RTX 2000 Ada (16 GB each, PCIe, no NVLink), prefill 512 /
+decode 64, tok/s:
+
+| Model | 1 GPU | `--tp 2` |
+|---|---|---|
+| Gemma 4 E4B Q8_0 | 2760 / 37.3 | 2488 / **51.7** |
+| Gemma 4 26B-A4B IQ4_XS | 1845 / 48.5 | 2537 / **51.2** |
+| Qwen 3.5-9B Q8_0 | 1461 / 23.1 | 399 / **24.4** |
+| Qwen 3.5-35B-A3B IQ4_XS | does not fit | **184 / 18.1** |
+
+Decode — the memory-bound half TP should help — is 1.39× a single GPU on
+Gemma 4 E4B and 1.06× on Qwen 3.5-9B; both Gemma 4 models produce output
+byte-identical to their single-GPU runs. Prefill is compute-bound and pays the
+collectives, so it lands at or below the single-GPU figure on models that fit on
+one card. Qwen 3.5-35B does not fit a 16 GB card at all, so TP is the only way
+to run it. See `TENSOR_PARALLELISM_PLAN.md` (Stages 1b and 1c) for the full
+measurements and what is left to fuse.
 
 | Variable | Effect |
 |---|---|
@@ -616,6 +641,8 @@ and what is left to fuse.
 | `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
+| `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode |
+| `GGML_CUDA_AR_BF16_THRESHOLD` | Payload size above which ggml-cuda's collective converts F32 to BF16 before reducing. TensorSharp raises ggml's default (1 byte — i.e. always) to 1 MB so decode-sized collectives reduce exactly; `0` disables the conversion entirely |
 | `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |
 
@@ -706,9 +733,10 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Local tensor parallelism (multi-GPU, single process) | OFF (`1` GPU) | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N` (CLI only) |
-| Distributed TP node ID (multi-node) | unset (disabled) | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N` (CLI only) |
-| Distributed TP peer endpoints | unset (disabled) | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2` (CLI only) |
+| Local tensor parallelism (multi-GPU, single process) | OFF (`1` GPU) | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N` (CLI and server) |
+| GPU ordinals used by the TP ranks (GGML backends) | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
+| Distributed TP node ID (multi-node) | unset (disabled) | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N` (CLI and server; the server must be node `0`) |
+| Distributed TP peer endpoints | unset (disabled) | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2` (CLI and server) |
 | Peer connect retry window (multi-node) | `120` s | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |
 | Per-receive timeout (multi-node) | `300` s | `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS=N` | — |
 | Force host-staged cross-GPU copies | OFF (P2P when available) | `TENSORSHARP_TP_DISABLE_P2P=1` | — |

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Multi-GPU &amp; Multi-Node — TensorSharp Wiki</title>
-  <meta name="description" content="Tensor parallelism in TensorSharp: split one model across multiple CUDA GPUs with --tp, and scale across machines with peer-to-peer TCP clustering.">
+  <meta name="description" content="Tensor parallelism in TensorSharp: split one model across multiple GPUs with --tp on the CUDA and GGML CUDA/Vulkan backends, and scale across machines with peer-to-peer TCP clustering.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -18,7 +18,7 @@
   <h1>Multi-GPU &amp; Multi-Node</h1>
   <p class="lede">One model, many GPUs — and, when one machine is not enough, many machines. TensorSharp implements <strong>tensor parallelism</strong> in the Megatron-LM column/row-parallel pattern, and extends it across hosts with a peer-to-peer TCP mesh.</p>
 
-  <div class="callout note"><div class="ic">🧭</div><p><strong>In one line:</strong> add <code>--tp N</code> to run on N local GPUs; add <code>--tp-node-id</code> and <code>--tp-peers</code> on top of that to span machines. Tensor parallelism requires the direct <a href="backends.html#cuda"><code>cuda</code></a> backend.</p></div>
+  <div class="callout note"><div class="ic">🧭</div><p><strong>In one line:</strong> add <code>--tp N</code> to run on N local GPUs; add <code>--tp-node-id</code> and <code>--tp-peers</code> on top of that to span machines. Both <code>TensorSharp.Cli</code> and <code>TensorSharp.Server</code> take the flags, on the direct <a href="backends.html#cuda"><code>cuda</code></a> backend and on the <a href="backends.html#ggml">GGML CUDA / Vulkan</a> backends.</p></div>
 
   <h2 id="why">When do you need it?</h2>
   <ul>
@@ -26,7 +26,7 @@
     <li><strong>The model does not fit on one machine.</strong> Distributed TP pools the GPUs of several hosts into one logical group — 2 nodes × 4 GPUs is a global degree of 8.</li>
     <li><strong>You want more memory bandwidth per token.</strong> Every GPU works on its own slice of every projection, so the per-layer matmuls are split rather than queued.</li>
   </ul>
-  <p>If your model already fits on one GPU and you only need more <em>throughput</em>, reach for <a href="advanced.html#continuous-batching">continuous batching</a> first — it is on by default and costs nothing to try.</p>
+  <p>On the GGML backends, fused per-rank block graphs make <code>--tp 2</code> decode <strong>faster</strong> than a single GPU on models that fit on one card too — 51.7 vs 37.3 tok/s on Gemma 4 E4B Q8_0 (2× RTX 2000 Ada). If you need more <em>concurrent throughput</em> rather than lower single-stream latency, reach for <a href="advanced.html#continuous-batching">continuous batching</a> first — it is on by default and costs nothing to try.</p>
 
   <h2 id="how">How tensor parallelism works</h2>
   <p>Each transformer block is rewritten into a pair of complementary shardings, so exactly one collective is needed per block half:</p>
@@ -47,13 +47,20 @@
   <p>Norms, token embeddings, and the LM head are <strong>replicated</strong> on every rank rather than sharded — they are small, and replicating them removes a collective from the critical path.</p>
 
   <h3 id="local">Local TP — one process, several GPUs</h3>
-  <p>Local TP lives in a single process: one thread issues commands to all GPUs in sequence, and CUDA streams provide the real parallelism. AllReduce runs as peer-to-peer device copies plus an element-wise add kernel.</p>
-  <pre data-lang="bash"><code># CLI — split the model across 2 CUDA GPUs
+  <p>Local TP lives in a single process. On the direct <code>cuda</code> backend one thread issues commands to all GPUs in sequence and CUDA streams provide the real parallelism; AllReduce runs as peer-to-peer device copies plus an element-wise add kernel. On the GGML backends a rank worker pool drives the GPUs <em>concurrently</em> — a GGML op submits and synchronizes in one call, so a sequential rank loop would run the cards strictly one after another.</p>
+  <pre data-lang="bash"><code># CLI — split the model across 2 GPUs
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda --tp 2
 
-# Server — the server has no --tp flag; use the environment variable
-TENSORSHARP_TP_DEGREE=2 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
-    --model model.gguf --backend cuda</code></pre>
+# Same on the GGML CUDA backend
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend ggml_cuda --tp 2
+
+# Pick which physical GPUs the ranks map to
+TENSORSHARP_TP_DEVICES=0,2 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model model.gguf --backend ggml_cuda --tp 2
+
+# Server — same flag (TENSORSHARP_TP_DEGREE=2 also works)
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model model.gguf --backend ggml_cuda --tp 2</code></pre>
   <p>Or put it in a <a href="cli.html#config">config file</a>:</p>
   <pre data-lang="json"><code>{ "model": "model.gguf", "backend": "cuda", "tp": 2 }</code></pre>
 
@@ -67,11 +74,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
 # Node 1 — same peer list, different node ID:
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda --tp 2 \
     --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"</code></pre>
-  <p>The server takes the same three settings from the environment:</p>
-  <pre data-lang="bash"><code># Node 0 (repeat on node 1 with TENSORSHARP_TP_NODE_ID=1)
-TENSORSHARP_TP_DEGREE=2 TENSORSHARP_TP_NODE_ID=0 \
-TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
-    dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model model.gguf --backend cuda</code></pre>
+  <p>The server can front such a cluster, but only as <strong>node 0</strong> — the driver that owns sampling and serves HTTP. Every other node runs a <code>TensorSharp.Cli</code> worker with the same model, backend, and peer list. The <code>TENSORSHARP_TP_*</code> environment variables work in place of the flags.</p>
+  <pre data-lang="bash"><code># Node 0 — server / driver:
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model model.gguf --backend cuda \
+    --tp 2 --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+
+# Node 1 — CLI worker:
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda --tp 2 \
+    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"</code></pre>
   <div class="callout warn"><div class="ic">⚠️</div><p>Every node must pass the <strong>same</strong> <code>--tp-peers</code> list, in the same order, and a <strong>unique</strong> <code>--tp-node-id</code> (0-based, indexing into that list). The port — <code>9500</code> in the examples — is not a default: choose one and make sure it is reachable between all nodes. Peer traffic is unauthenticated and unencrypted, so keep the cluster on a trusted private network.</p></div>
   <p>Nodes are usually started by hand a few seconds or minutes apart, so a node that comes up first keeps retrying its outbound connections for up to 120 seconds instead of failing on the first refused connection. Once the mesh is complete each node prints <code>[TcpCommunicator] Rank r/N connected to all peers.</code></p>
 
@@ -84,24 +94,40 @@ TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
       <tr><td>Qwen 3</td><td class="yes">✅</td><td>Reference implementation — standard column/row-parallel QKV + FFN.</td></tr>
       <tr><td>Mistral 3</td><td class="yes">✅</td><td>Fused and separate QKV layouts, YaRN RoPE.</td></tr>
       <tr><td>Gemma 3</td><td class="yes">✅</td><td>Separate Q/K/V, GELU, sliding-window attention.</td></tr>
-      <tr><td>Gemma 4</td><td class="yes">✅</td><td>Dense and MoE (expert slicing), per-layer head dims; multimodal embeddings are injected into the TP path so vision/audio prompts survive.</td></tr>
-      <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>MoE expert slicing plus block-cyclic V-head ownership for the GatedDeltaNet recurrent layers — each rank keeps its own delta/conv state and needs no cross-rank traffic for the recurrent path.</td></tr>
-      <tr><td>GPT OSS</td><td class="yes">✅</td><td>MoE expert slicing, attention sinks, YaRN.</td></tr>
-      <tr><td>Nemotron-H</td><td class="yes">✅</td><td>MoE expert slicing; Mamba2 SSM layers are computed on rank 0 and broadcast.</td></tr>
+      <tr><td>Gemma 4</td><td class="yes">✅</td><td>Dense and MoE, per-layer head dims; multimodal embeddings are injected into the TP path so vision/audio prompts survive. On GGML the fused whole-model MoE trunk splits <em>inside</em> each expert (gate/up column-parallel, down row-parallel) so global expert ids keep working — <code>TS_GEMMA4_TP_FUSED_MOE=0</code> falls back to the whole-expert per-op path. Direct CUDA uses per-expert slicing.</td></tr>
+      <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>Block-cyclic V-head ownership for the GatedDeltaNet recurrent layers — each rank keeps its own delta/conv state, device-resident, and needs no cross-rank traffic for the recurrent path. On GGML the whole GDN block runs as one packed per-rank kernel, MoE uses expert parallelism (whole experts per rank, Megatron-split shared expert), and the LM head is column-parallel with no collective at all. Direct CUDA uses expert slicing.</td></tr>
+      <tr><td>GPT OSS</td><td class="yes">✅</td><td>MoE expert slicing, attention sinks, YaRN. Runs on the GGML backends too, though the GGML MoE path still walks experts per token per rank rather than using expert parallelism.</td></tr>
+      <tr><td>Nemotron-H</td><td class="yes">✅</td><td>MoE expert slicing; Mamba2 SSM layers are computed on rank 0 and broadcast. Same GGML MoE caveat as GPT OSS.</td></tr>
       <tr><td>DiffusionGemma</td><td class="no">—</td><td>Not applicable (text-diffusion sampler, not autoregressive decode).</td></tr>
       <tr><td>Qwen-Image-Edit</td><td class="no">—</td><td>Not applicable (MMDiT image generation).</td></tr>
     </tbody>
   </table>
   </div>
-  <p>For MoE models, each GPU holds <code>1/tp</code> of <em>every</em> expert's weights and the router is replicated — so expert load stays balanced no matter which experts a token selects.</p>
+  <p>Two MoE shardings are in play. <strong>Expert slicing</strong> (direct CUDA, and GPT OSS / Nemotron-H everywhere) gives each GPU <code>1/tp</code> of <em>every</em> expert's weights with a replicated router, so load stays balanced whichever experts a token selects. <strong>Expert parallelism</strong> (Qwen 3.5/3.6 on GGML) partitions whole experts instead, which keeps each rank down to a single batched <code>ggml_mul_mat_id</code> dispatch per projection rather than a per-(token, expert) loop.</p>
 
   <h2 id="constraints">Requirements &amp; constraints</h2>
   <ul>
-    <li><strong>The direct <code>cuda</code> backend only.</strong> GGML, MLX, and Vulkan are single-device by design — <code>--backend ggml_cuda</code> will not shard.</li>
+    <li><strong>GPU backends only.</strong> TP runs on <code>cuda</code>, <code>ggml_cuda</code>, and <code>ggml_vulkan</code>. MLX and the CPU backends are single-device.</li>
     <li><strong>Divisibility.</strong> <code>numHeads</code>, <code>numKVHeads</code>, and <code>intermediateSize</code> must all divide evenly by the TP degree. Quantized row-parallel splits additionally need <code>ne0</code> divisible by <code>tp × blockSize</code>.</li>
     <li><strong>Batched forward under TP</strong> is implemented for Qwen 3 and Mistral 3. MoE models (Gemma 4, Qwen 3.5/3.6, GPT OSS, Nemotron-H) fall back to per-sequence forward when TP is active, so continuous batching gives less of a lift there.</li>
-    <li><strong>Local degree ≤ visible GPUs.</strong> Requesting more ranks than the host has CUDA devices fails fast at startup.</li>
+    <li><strong>Local degree ≤ visible GPUs.</strong> Requesting more ranks than the host has devices fails fast at startup.</li>
+    <li><strong>Multi-node keeps the per-op forward.</strong> The fused whole-model TP graphs are per-rank and single-process; a distributed run falls back to op-at-a-time execution.</li>
   </ul>
+
+  <h2 id="performance">Measured results</h2>
+  <p>2× RTX 2000 Ada (16 GB each, PCIe, no NVLink), <code>--backend ggml_cuda --tp 2</code>, prefill 512 / decode 64, tokens per second:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Model</th><th>1 GPU</th><th><code>--tp 2</code></th></tr></thead>
+    <tbody>
+      <tr><td>Gemma 4 E4B Q8_0</td><td>2760 / 37.3</td><td>2488 / <strong>51.7</strong></td></tr>
+      <tr><td>Gemma 4 26B-A4B IQ4_XS</td><td>1845 / 48.5</td><td>2537 / <strong>51.2</strong></td></tr>
+      <tr><td>Qwen 3.5-9B Q8_0</td><td>1461 / 23.1</td><td>399 / <strong>24.4</strong></td></tr>
+      <tr><td>Qwen 3.5-35B-A3B IQ4_XS</td><td>does not fit</td><td><strong>184 / 18.1</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Decode — the memory-bound half TP is meant to help — reaches 1.39× a single GPU on Gemma 4 E4B and 1.06× on Qwen 3.5-9B, with both Gemma 4 models producing output <strong>byte-identical</strong> to their single-GPU runs. Prefill is compute-bound and pays the collectives, so it lands at or below the single-GPU figure for models that fit on one card. Qwen 3.5-35B-A3B does not fit a 16 GB card at all — TP is the only way to run it, and memory splits 9.4 + 8.0 GB across the pair.</p>
 
   <h2 id="tuning">Tuning &amp; diagnostics</h2>
   <p>Local AllReduce prefers CUDA peer-to-peer DMA. At startup the group enables peer access for every pair that reports it, then runs a round-trip self-test — some topologies (L4 cards behind certain PCIe switches, IOMMU-enabled hosts, small BAR1 windows) claim peer access but silently transfer corrupt data, and any pair that fails is demoted to host staging permanently. Hardware with no peer access at all (A16 vGPU profiles, most consumer cards) stages through host memory from the start. The fallbacks are automatic; the switches below exist to force them for diagnosis.</p>
@@ -109,13 +135,19 @@ TENSORSHARP_TP_PEERS=192.168.1.10:9500,192.168.1.11:9500 \
   <table>
     <thead><tr><th>Variable</th><th>Default</th><th>What it does</th></tr></thead>
     <tbody>
-      <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td><code>1</code></td><td>Local GPU count to split across (= the CLI's <code>--tp</code>; the only way to set it on the server).</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td><code>1</code></td><td>Local GPU count to split across (= <code>--tp</code> on both the CLI and the server).</td></tr>
+      <tr><td><code>TENSORSHARP_TP_DEVICES</code></td><td><code>0..tp-1</code></td><td>GPU ordinals the ranks map to, e.g. <code>0,2</code>. GGML backends.</td></tr>
       <tr><td><code>TENSORSHARP_TP_NODE_ID</code></td><td>unset</td><td>This node's 0-based ID (= <code>--tp-node-id</code>). Set together with the peer list.</td></tr>
       <tr><td><code>TENSORSHARP_TP_PEERS</code></td><td>unset</td><td>Comma-separated <code>host:port</code> list of every node (= <code>--tp-peers</code>).</td></tr>
       <tr><td><code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS</code></td><td><code>120</code></td><td>How long a node retries outbound connections to its peers. Raise it when a slow orchestrator staggers node startup.</td></tr>
       <tr><td><code>TENSORSHARP_TP_RECV_TIMEOUT_SECONDS</code></td><td><code>300</code></td><td>Per-receive timeout on a peer socket, so a stalled peer fails the collective instead of hanging on the OS TCP keepalive (often 2+ hours).</td></tr>
       <tr><td><code>TENSORSHARP_TP_DISABLE_P2P</code></td><td>off</td><td><code>1</code> forces every cross-GPU transfer through host memory — exactly the path no-peer hardware takes. Use it to test whether a multi-GPU defect lives in the P2P DMA path.</td></tr>
       <tr><td><code>TENSORSHARP_TP_HOST_ALLREDUCE</code></td><td>off</td><td><code>1</code> runs the local AllReduce as device→host, sum on the CPU, host→device. Slower, but mirrors the known-good multi-node reduce exactly.</td></tr>
+      <tr><td><code>TS_GGML_TP_DEVICE_AR_THRESHOLD</code></td><td><code>262144</code></td><td>Element count above which AllReduce uses ggml's device collective instead of a host reduction. GGML activations already live in host RAM, so small payloads are cheaper to sum there.</td></tr>
+      <tr><td><code>TS_GGML_TP_PARALLEL</code></td><td>on</td><td><code>0</code> drives the ranks sequentially instead of concurrently — a diagnostic, and a large slowdown.</td></tr>
+      <tr><td><code>TS_GEMMA4_TP_FUSED_MOE</code></td><td>on</td><td><code>0</code> falls back from Gemma 4's fused MoE trunk to the whole-expert per-op path.</td></tr>
+      <tr><td><code>GGML_CUDA_ALLREDUCE</code></td><td>auto</td><td><code>nccl</code> / <code>internal</code> / <code>none</code>, passed through to ggml's collective selection.</td></tr>
+      <tr><td><code>GGML_CUDA_AR_BF16_THRESHOLD</code></td><td><code>1 MB</code></td><td>Payload size above which ggml converts F32 collectives to BF16. TensorSharp raises ggml's own default (always convert) so decode-sized reductions stay exact; <code>0</code> disables the conversion.</td></tr>
     </tbody>
   </table>
   </div>
@@ -141,11 +173,11 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model model.gguf --backen
     <thead><tr><th>Symptom</th><th>Likely cause &amp; fix</th></tr></thead>
     <tbody>
       <tr><td>Startup fails: requested TP degree exceeds device count</td><td>The process sees fewer CUDA devices than <code>--tp</code> asks for. Check <code>CUDA_VISIBLE_DEVICES</code> and the driver.</td></tr>
-      <tr><td>Model loads on one GPU despite <code>--tp 2</code></td><td>The backend is not <code>cuda</code>. TP does not apply to <code>ggml_cuda</code>, <code>ggml_vulkan</code>, <code>mlx</code>, or the CPU backends.</td></tr>
+      <tr><td>Model loads on one GPU despite <code>--tp 2</code></td><td>The backend is <code>mlx</code>, <code>cpu</code>, or <code>ggml_cpu</code>/<code>ggml_metal</code>. TP applies to <code>cuda</code>, <code>ggml_cuda</code>, and <code>ggml_vulkan</code>.</td></tr>
       <tr><td>A dimension is not divisible by the TP degree</td><td>Pick a degree that divides <code>numHeads</code>, <code>numKVHeads</code>, and <code>intermediateSize</code> — usually a power of two.</td></tr>
       <tr><td>A node hangs waiting for peers</td><td>The peer list, order, or port does not match on all nodes, or a firewall blocks the port. Raise <code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS</code> if the nodes simply start far apart.</td></tr>
       <tr><td>Garbled output only with multiple GPUs</td><td>Suspect the P2P DMA path. Re-run with <code>TENSORSHARP_TP_HOST_ALLREDUCE=1</code>, then <code>TENSORSHARP_TP_DISABLE_P2P=1</code>; if the output becomes correct, the topology's peer DMA is at fault.</td></tr>
-      <tr><td>Multi-GPU is slower than a single GPU</td><td>Expected for a model that already fits comfortably on one card: TP adds a collective per block. Use it for capacity, and use <a href="advanced.html#continuous-batching">continuous batching</a> for throughput.</td></tr>
+      <tr><td>Multi-GPU is slower than a single GPU</td><td>Prefill is compute-bound and pays the collectives, so it can trail a single card on a model that already fits. Decode should be faster on the GGML backends — if it is not, check that the fused paths are on (<code>TS_GEMMA4_TP_FUSED_MOE</code> unset, <code>TS_GGML_TP_FUSED_MATMUL</code> unset) and that the run is single-process, since multi-node falls back to the per-op forward.</td></tr>
     </tbody>
   </table>
   </div>

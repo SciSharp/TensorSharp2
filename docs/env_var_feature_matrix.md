@@ -136,22 +136,33 @@ server CLI flags.
 ## Out-of-Matrix Tensor Parallelism & Distributed Inference Knobs
 
 These variables configure tensor parallelism (splitting a model across multiple
-CUDA GPUs) and distributed multi-node TP over a peer-to-peer TCP mesh. They are
+GPUs) and distributed multi-node TP over a peer-to-peer TCP mesh. They are
 not registered in `EnvVarMatrix.All` and are not swept by the default TestMatrix
-config — TP requires the direct `cuda` backend and multiple GPUs, which the
-standard single-GPU test harness does not exercise. `TENSORSHARP_TP_DEGREE` is
-also settable via the CLI's `--tp` flag; `TENSORSHARP_TP_NODE_ID` and
-`TENSORSHARP_TP_PEERS` via `--tp-node-id` and `--tp-peers`.
+config — TP requires multiple GPUs, which the standard single-GPU test harness
+does not exercise. TP runs on the direct `cuda` backend and on the GGML CUDA /
+Vulkan backends (`ggml_cuda`, `ggml_vulkan`). `TENSORSHARP_TP_DEGREE`,
+`TENSORSHARP_TP_NODE_ID`, and `TENSORSHARP_TP_PEERS` are also settable via the
+`--tp`, `--tp-node-id`, and `--tp-peers` flags on both `TensorSharp.Cli` and
+`TensorSharp.Server`.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TENSORSHARP_TP_DEGREE` | all autoregressive models, `cuda` backend | Number of local CUDA GPUs to split the model across (Megatron-LM column/row-parallel) | `1` (single GPU) | not registered | no |
-| `TENSORSHARP_TP_NODE_ID` | all autoregressive models, `cuda` backend | This node's 0-based ID for multi-node distributed TP; must be set with `TENSORSHARP_TP_PEERS` | unset (disabled) | not registered | no |
-| `TENSORSHARP_TP_PEERS` | all autoregressive models, `cuda` backend | Comma-separated `host:port` list of all nodes in the distributed TP cluster; must be set with `TENSORSHARP_TP_NODE_ID` | unset (disabled) | not registered | no |
+| `TENSORSHARP_TP_DEGREE` | all autoregressive models; `cuda`, `ggml_cuda`, `ggml_vulkan` backends | Number of local GPUs to split the model across (Megatron-LM column/row-parallel) | `1` (single GPU) | not registered | no |
+| `TENSORSHARP_TP_DEVICES` | local TP on the GGML backends | Comma-separated GPU ordinals the ranks map to (e.g. `0,2`) | `0..tp-1` | not registered | no |
+| `TENSORSHARP_TP_NODE_ID` | all autoregressive models; `cuda`, `ggml_cuda`, `ggml_vulkan` backends | This node's 0-based ID for multi-node distributed TP; must be set with `TENSORSHARP_TP_PEERS` | unset (disabled) | not registered | no |
+| `TENSORSHARP_TP_PEERS` | all autoregressive models; `cuda`, `ggml_cuda`, `ggml_vulkan` backends | Comma-separated `host:port` list of all nodes in the distributed TP cluster; must be set with `TENSORSHARP_TP_NODE_ID` | unset (disabled) | not registered | no |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | distributed TP only | How long each node retries outbound connections to its peers before failing | `120` seconds | not registered | no |
 | `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` | distributed TP only | Per-receive timeout on a peer socket; a stalled peer fails the collective instead of hanging | `300` seconds | not registered | no |
 | `TENSORSHARP_TP_DISABLE_P2P` | local TP, `cuda` backend | `1` forces every cross-GPU transfer through host staging instead of CUDA peer-to-peer DMA (matches no-peer hardware such as A16 vGPU profiles) | off (P2P used when the pair passes the DMA self-test) | not registered | no |
 | `TENSORSHARP_TP_HOST_ALLREDUCE` | local TP, `cuda` backend | `1` runs the local AllReduce through host memory (device→host, sum, host→device) instead of the device-to-device path — diagnostic fallback | off (device-to-device) | not registered | no |
+| `TS_GGML_TP_PARALLEL` | local TP, GGML backends | `0` drives the ranks sequentially instead of concurrently (diagnostic) | on (concurrent rank workers) | not registered | no |
+| `TS_GGML_TP_FUSED_MATMUL` | local TP, GGML backends | `1` submits both ranks' linears from one thread; allocates a device buffer per rank per call and measured 2.3× slower on Qwen 3.5 35B | off (generic per-rank path) | not registered | no |
+| `TS_GGML_TP_DEVICE_AR_THRESHOLD` | local TP, GGML backends | Element count above which AllReduce uses the device collective instead of the host reduction | `262144` | not registered | no |
+| `TS_GGML_F32_RESIDENT` | GGML backends | `0` binds F32 linear weights per call instead of keeping them device-resident (diagnostic) | on (device-resident) | not registered | no |
+| `TS_GEMMA4_TP_FUSED_MOE` | Gemma 4 MoE under TP on GGML | `0` falls back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path | on (fused trunk) | not registered | no |
+| `GGML_CUDA_ALLREDUCE` | local TP, `ggml_cuda` | `nccl` / `internal` / `none` — passed through to ggml's collective selection | auto (NCCL when the build finds it) | not registered | no |
+| `GGML_CUDA_AR_BF16_THRESHOLD` | local TP, `ggml_cuda` | Payload size above which ggml converts F32 collectives to BF16; TensorSharp raises ggml's default to 1 MB so decode-sized reductions stay exact | `1 MB` (set by `TSGgml_TensorParallelInit`) | not registered | no |
+| `TS_QWEN35_LAYER_TRACE` | Qwen 3.5/3.6 | `1` prints a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) | off | not registered | no |
 
 ## Out-of-Matrix Redis Shared-State Knobs
 
