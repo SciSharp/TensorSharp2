@@ -328,7 +328,13 @@ namespace TensorSharp.Models
                     bool useParallel = outDim >= 128 && (long)rowCount * outDim >= 512 && Environment.ProcessorCount > 1;
                     if (useParallel)
                     {
-                        Parallel.For(0, outDim, col => ComputeColumnRange(col, col + 1));
+                        // Blocked ranges: per-column tasks make the scheduler
+                        // overhead comparable to the ~0.5-2us dot itself and cap
+                        // scaling at a handful of cores.
+                        int colBlock = Math.Max(8, outDim / (Environment.ProcessorCount * 8));
+                        int nBlocks = (outDim + colBlock - 1) / colBlock;
+                        Parallel.For(0, nBlocks, b =>
+                            ComputeColumnRange(b * colBlock, Math.Min(outDim, b * colBlock + colBlock)));
                     }
                     else
                     {
@@ -389,6 +395,31 @@ namespace TensorSharp.Models
             Q8_K,
         }
 
+        /// <summary>
+        /// Exposes the direct quantized-dot plan so callers that drive their own
+        /// parallel loops (e.g. the DeepSeek4 CPU executor) can quantize the
+        /// activations once and then dot weight rows in whatever blocking works
+        /// best for their shapes. Returns false when <paramref name="type"/> has
+        /// no integer fast path (callers fall back to dequant + float dot).
+        /// </summary>
+        internal static bool TryGetActivationPlan(GgmlTensorType type, int elementCount, out int activationRowBytes)
+        {
+            bool ok = TryGetDirectMatMulPlan(type, elementCount, out _, out activationRowBytes);
+            return ok;
+        }
+
+        internal static unsafe void QuantizeActivationRow(GgmlTensorType weightType, float* src, byte* dst, int elementCount)
+        {
+            if (!TryGetDirectMatMulPlan(weightType, elementCount, out ActivationQuantKind kind, out _))
+                throw new NotSupportedException($"No direct activation plan for {weightType}.");
+            QuantizeActivation(src, dst, elementCount, kind);
+        }
+
+        internal static unsafe float DotQuantizedRow(GgmlTensorType type, byte* weightRow, byte* activationRow, int elementCount)
+        {
+            return DotQuantized(type, weightRow, activationRow, elementCount);
+        }
+
         private static bool TryGetDirectMatMulPlan(
             GgmlTensorType type,
             int elementCount,
@@ -421,10 +452,18 @@ namespace TensorSharp.Models
                 case GgmlTensorType.Q4_K:
                 case GgmlTensorType.Q5_K:
                 case GgmlTensorType.Q6_K:
+                case GgmlTensorType.IQ3_S:
                     if (elementCount % QK_K != 0)
                         return false;
                     activationKind = ActivationQuantKind.Q8_K;
                     activationRowBytes = elementCount / QK_K * Q8_KBlockBytes;
+                    return true;
+
+                case GgmlTensorType.MXFP4:
+                    if (elementCount % QK_MXFP4 != 0)
+                        return false;
+                    activationKind = ActivationQuantKind.Q8_0;
+                    activationRowBytes = elementCount / QK8_0 * Q8_0BlockBytes;
                     return true;
 
                 default:
@@ -463,6 +502,8 @@ namespace TensorSharp.Models
                 GgmlTensorType.Q4_K => VecDotQ4_KQ8_K(weightRow, activationRow, elementCount / QK_K),
                 GgmlTensorType.Q5_K => VecDotQ5_KQ8_K(weightRow, activationRow, elementCount / QK_K),
                 GgmlTensorType.Q6_K => VecDotQ6_KQ8_K(weightRow, activationRow, elementCount / QK_K),
+                GgmlTensorType.IQ3_S => VecDotIq3SQ8K(weightRow, activationRow, elementCount / QK_K),
+                GgmlTensorType.MXFP4 => VecDotMxfp4Q8_0(weightRow, activationRow, elementCount / QK_MXFP4),
                 _ => throw new NotSupportedException($"Direct managed quantized matmul does not support {type}."),
             };
         }
@@ -1996,6 +2037,213 @@ namespace TensorSharp.Models
         {
             for (int i = 0; i < 8; i++)
                 GetScaleMinK4(i, packed, out scales[i], out mins[i]);
+        }
+
+        // ------------------------------------------------------------------
+        // IQ3_S x Q8_K (mirrors ggml_vec_dot_iq3_s_q8_K_generic)
+        // ------------------------------------------------------------------
+
+        // Per-byte sign expansion: bit j of the signs byte selects -1 (0xFF) or
+        // +1 (0x01) for element j of an 8-element group.
+        private static readonly ulong[] Iq3SignTab = BuildIq3SignTab();
+
+        private static ulong[] BuildIq3SignTab()
+        {
+            var tab = new ulong[256];
+            for (int b = 0; b < 256; b++)
+            {
+                ulong v = 0;
+                for (int j = 0; j < 8; j++)
+                {
+                    byte lane = ((b >> j) & 1) != 0 ? (byte)0xFF : (byte)0x01;
+                    v |= (ulong)lane << (8 * j);
+                }
+                tab[b] = v;
+            }
+            return tab;
+        }
+
+        private const int Iq3SBlockBytes = 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64; // 110
+
+        private static unsafe float VecDotIq3SQ8K(byte* iq3, byte* q8k, int superBlockCount)
+        {
+            if (Avx2.IsSupported)
+                return VecDotIq3SQ8KAvx2(iq3, q8k, superBlockCount);
+            return VecDotIq3SQ8KScalar(iq3, q8k, superBlockCount);
+        }
+
+        private static unsafe float VecDotIq3SQ8KAvx2(byte* iq3, byte* q8k, int superBlockCount)
+        {
+            float sum = 0.0f;
+            fixed (uint* grid = IQuantGrids.iq3s_grid)
+            fixed (ulong* signTab = Iq3SignTab)
+            {
+                for (int block = 0; block < superBlockCount; block++)
+                {
+                    byte* x = iq3 + block * Iq3SBlockBytes;
+                    float d3 = HalfToSingle(ReadUInt16(x));
+                    byte* qs = x + 2;                       // [64]
+                    byte* qh = qs + QK_K / 4;               // [8]
+                    byte* signs = qh + QK_K / 32;           // [32]
+                    byte* scales = signs + QK_K / 8;        // [4]
+
+                    byte* y = q8k + block * Q8_KBlockBytes;
+                    float d8 = ReadSingle(y);
+                    sbyte* q8 = (sbyte*)(y + 4);
+
+                    Vector256<int> bsumVec = Vector256<int>.Zero;
+                    for (int ib32 = 0; ib32 < QK_K / 32; ib32++)
+                    {
+                        int ls = 2 * ((ib32 & 1) == 0 ? scales[ib32 / 2] & 0xF : scales[ib32 / 2] >> 4) + 1;
+                        int qhv = qh[ib32];
+
+                        Vector256<int> acc = Vector256<int>.Zero;
+                        for (int l = 0; l < 4; l += 2)
+                        {
+                            // 16 elements: groups l and l+1 (8 grid magnitudes each)
+                            Vector128<byte> gridV = Vector128.Create(
+                                grid[qs[2 * l + 0] | ((qhv << (8 - 2 * l)) & 256)],
+                                grid[qs[2 * l + 1] | ((qhv << (7 - 2 * l)) & 256)],
+                                grid[qs[2 * l + 2] | ((qhv << (8 - 2 * (l + 1))) & 256)],
+                                grid[qs[2 * l + 3] | ((qhv << (7 - 2 * (l + 1))) & 256)]).AsByte();
+                            Vector128<sbyte> signV = Vector128.Create(
+                                signTab[signs[l]], signTab[signs[l + 1]]).AsSByte();
+
+                            Vector256<short> g16 = Avx2.ConvertToVector256Int16(gridV);
+                            Vector256<short> s16 = Avx2.ConvertToVector256Int16(signV);
+                            Vector256<short> gs = Avx2.MultiplyLow(g16, s16);
+                            Vector256<short> q16 = Avx2.ConvertToVector256Int16(
+                                Unsafe.ReadUnaligned<Vector128<sbyte>>(q8 + 8 * l));
+                            acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(gs, q16));
+                        }
+                        bsumVec = Avx2.Add(bsumVec, Avx2.MultiplyLow(acc, Vector256.Create(ls)));
+
+                        qs += 8;
+                        signs += 4;
+                        q8 += 32;
+                    }
+
+                    int bsum = HorizontalSum128(Sse2.Add(bsumVec.GetLower(), bsumVec.GetUpper()));
+                    sum += d3 * d8 * bsum;
+                }
+            }
+            return sum;
+        }
+
+        private static unsafe float VecDotIq3SQ8KScalar(byte* iq3, byte* q8k, int superBlockCount)
+        {
+            float sum = 0.0f;
+            fixed (uint* grid = IQuantGrids.iq3s_grid)
+            fixed (byte* kmask = IQuantGrids.kmask_iq2xs)
+            {
+                for (int block = 0; block < superBlockCount; block++)
+                {
+                    byte* x = iq3 + block * Iq3SBlockBytes;
+                    float d3 = HalfToSingle(ReadUInt16(x));
+                    byte* qs = x + 2;
+                    byte* qh = qs + QK_K / 4;
+                    byte* signs = qh + QK_K / 32;
+                    byte* scales = signs + QK_K / 8;
+
+                    byte* y = q8k + block * Q8_KBlockBytes;
+                    float d8 = ReadSingle(y);
+                    sbyte* q8 = (sbyte*)(y + 4);
+
+                    int bsum = 0;
+                    for (int ib32 = 0; ib32 < QK_K / 32; ib32++)
+                    {
+                        int ls = 2 * ((ib32 & 1) == 0 ? scales[ib32 / 2] & 0xF : scales[ib32 / 2] >> 4) + 1;
+                        int qhv = qh[ib32];
+                        int sumi = 0;
+                        for (int l = 0; l < 4; ++l)
+                        {
+                            byte* grid1 = (byte*)(grid + (qs[2 * l + 0] | ((qhv << (8 - 2 * l)) & 256)));
+                            byte* grid2 = (byte*)(grid + (qs[2 * l + 1] | ((qhv << (7 - 2 * l)) & 256)));
+                            byte sgn = signs[l];
+                            for (int j = 0; j < 4; ++j)
+                            {
+                                sumi += grid1[j] * q8[j + 0] * ((sgn & kmask[j + 0]) != 0 ? -1 : 1);
+                                sumi += grid2[j] * q8[j + 4] * ((sgn & kmask[j + 4]) != 0 ? -1 : 1);
+                            }
+                            q8 += 8;
+                        }
+                        bsum += sumi * ls;
+                        qs += 8;
+                        signs += 4;
+                    }
+                    sum += d3 * d8 * bsum;
+                }
+            }
+            return sum;
+        }
+
+        // ------------------------------------------------------------------
+        // MXFP4 x Q8_0 (mirrors ggml_vec_dot_mxfp4_q8_0_generic)
+        // ------------------------------------------------------------------
+
+        private const int Mxfp4BlockBytes = 1 + QK_MXFP4 / 2; // 17
+
+        private static unsafe float VecDotMxfp4Q8_0(byte* mx, byte* q8, int blockCount)
+        {
+            if (Avx2.IsSupported)
+                return VecDotMxfp4Q8_0Avx2(mx, q8, blockCount);
+
+            float sum = 0.0f;
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* xb = mx + block * Mxfp4BlockBytes;
+                byte* yb = q8 + block * Q8_0BlockBytes;
+                float d = HalfToSingle(ReadUInt16(yb)) * E8M0ToFp32Half(xb[0]);
+                byte* qs = xb + 1;
+                sbyte* q8v = (sbyte*)(yb + 2);
+
+                int sumi1 = 0, sumi2 = 0;
+                for (int j = 0; j < QK_MXFP4 / 2; ++j)
+                {
+                    sumi1 += q8v[j] * Mxfp4Values[qs[j] & 0xF];
+                    sumi2 += q8v[j + QK_MXFP4 / 2] * Mxfp4Values[qs[j] >> 4];
+                }
+                sum += d * (sumi1 + sumi2);
+            }
+            return sum;
+        }
+
+        private static unsafe float VecDotMxfp4Q8_0Avx2(byte* mx, byte* q8, int blockCount)
+        {
+            Vector128<byte> loMask = Vector128.Create((byte)0x0F);
+            Vector128<byte> table;
+            fixed (sbyte* tbl = Mxfp4Values)
+            {
+                table = Unsafe.ReadUnaligned<Vector128<byte>>(tbl);
+            }
+
+            float sum = 0.0f;
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* xb = mx + block * Mxfp4BlockBytes;
+                byte* yb = q8 + block * Q8_0BlockBytes;
+                float d = HalfToSingle(ReadUInt16(yb)) * E8M0ToFp32Half(xb[0]);
+
+                Vector128<byte> qsBytes = Unsafe.ReadUnaligned<Vector128<byte>>(xb + 1);
+                Vector128<byte> lo = Sse2.And(qsBytes, loMask);
+                Vector128<byte> hi = Sse2.And(Sse2.ShiftRightLogical(qsBytes.AsUInt16(), 4).AsByte(), loMask);
+
+                Vector128<sbyte> vlo = Ssse3.Shuffle(table, lo).AsSByte();
+                Vector128<sbyte> vhi = Ssse3.Shuffle(table, hi).AsSByte();
+
+                // lo nibbles are elements 0..15, hi nibbles elements 16..31
+                Vector256<short> w16lo = Avx2.ConvertToVector256Int16(vlo);
+                Vector256<short> w16hi = Avx2.ConvertToVector256Int16(vhi);
+                Vector256<short> q16lo = Avx2.ConvertToVector256Int16(Unsafe.ReadUnaligned<Vector128<sbyte>>(yb + 2));
+                Vector256<short> q16hi = Avx2.ConvertToVector256Int16(Unsafe.ReadUnaligned<Vector128<sbyte>>(yb + 2 + 16));
+
+                Vector256<int> prod = Avx2.Add(
+                    Avx2.MultiplyAddAdjacent(w16lo, q16lo),
+                    Avx2.MultiplyAddAdjacent(w16hi, q16hi));
+                int sumi = HorizontalSum128(Sse2.Add(prod.GetLower(), prod.GetUpper()));
+                sum += d * sumi;
+            }
+            return sum;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -341,6 +341,71 @@ public class ManagedQuantizedOpsTests
         AssertClose(expected, actual, tol);
     }
 
+    [Theory]
+    [InlineData(GgmlTensorType.IQ3_S, 256, 5, 1)]
+    [InlineData(GgmlTensorType.IQ3_S, 512, 5, 3)]
+    [InlineData(GgmlTensorType.IQ3_S, 1024, 33, 4)]
+    [InlineData(GgmlTensorType.MXFP4, 256, 5, 1)]
+    [InlineData(GgmlTensorType.MXFP4, 512, 5, 3)]
+    [InlineData(GgmlTensorType.MXFP4, 1024, 33, 4)]
+    public void TryAddmmQuantizedToFloat32_MoeQuantDots_MatchDequantReference(
+        GgmlTensorType type, int inDim, int outDim, int rows)
+    {
+        // Validates the IQ3_S x Q8_K and MXFP4 x Q8_0 integer dots (used by the
+        // DeepSeek4 CPU executor's MoE experts) against the dequantize-then-dot
+        // reference over the SAME random weight bytes.
+        var rng = new Random(20260729 + (int)type * 11 + inDim);
+        byte[] weights = BuildRandomMoeQuant(rng, type, outDim, inDim);
+        float[] input = Enumerable.Range(0, rows * inDim)
+            .Select(i => 0.06f * MathF.Sin(i * 0.017f + (int)type))
+            .ToArray();
+        float[] actual = new float[rows * outDim];
+
+        Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+            (int)type, weights, 0, inDim, outDim,
+            input, 0, inDim, rows, actual, 0, outDim));
+
+        float[] expected = DequantizedMatmul(weights, type, outDim, inDim, input, rows);
+
+        float maxRef = 0f;
+        for (int i = 0; i < expected.Length; i++) maxRef = MathF.Max(maxRef, MathF.Abs(expected[i]));
+        float tol = 0.02f * maxRef + 1e-3f;   // activation quant noise
+        AssertClose(expected, actual, tol);
+    }
+
+    private static byte[] BuildRandomMoeQuant(Random rng, GgmlTensorType type, int outDim, int inDim)
+    {
+        int blockBytes = (int)GgufFile.GetTypeSize(type);
+        int blockSize = (int)GgufFile.GetBlockSize(type);
+        Assert.Equal(0, inDim % blockSize);
+        int blocksPerRow = inDim / blockSize;
+        byte[] raw = new byte[(long)outDim * blocksPerRow * blockBytes];
+        int o = 0;
+        for (int r = 0; r < outDim; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                switch (type)
+                {
+                    case GgmlTensorType.IQ3_S:
+                        // half d + qs/qh/signs/scales, any bit pattern decodes
+                        WriteHalf(raw, o, 0.01f + 0.02f * (float)rng.NextDouble());
+                        for (int i = 2; i < blockBytes; i++) raw[o + i] = (byte)rng.Next(0, 256);
+                        break;
+                    case GgmlTensorType.MXFP4:
+                        // E8M0 exponent constrained so scales stay finite/sane
+                        raw[o] = (byte)(118 + rng.Next(0, 10));
+                        for (int i = 1; i < blockBytes; i++) raw[o + i] = (byte)rng.Next(0, 256);
+                        break;
+                    default:
+                        throw new NotSupportedException(type.ToString());
+                }
+                o += blockBytes;
+            }
+        }
+        return raw;
+    }
+
     private static byte[] BuildRandomKQuant(Random rng, GgmlTensorType type, int outDim, int inDim)
     {
         Assert.Equal(0, inDim % 256);
