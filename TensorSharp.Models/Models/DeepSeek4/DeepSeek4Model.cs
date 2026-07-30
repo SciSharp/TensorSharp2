@@ -27,6 +27,7 @@ namespace TensorSharp.Models
     public class DeepSeek4Model : ModelBase
     {
         private IntPtr _handle;
+        private DeepSeek4CpuExecutor _cpuExec;
         private readonly object _sync = new object();
 
         public DeepSeek4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
@@ -46,24 +47,39 @@ namespace TensorSharp.Models
             _maxContextLength = maxContext;
 
             int nUbatch = ParseEnvInt("TS_DSV4_UBATCH", 512);
-            int nThreads = ParseEnvInt("TS_DSV4_THREADS", Math.Min(Environment.ProcessorCount, 32));
-            int nGpu = ParseEnvInt("TS_DSV4_NGPU", tpDegree > 1 ? tpDegree : 0); // 0 = all visible GPUs
 
-            Console.WriteLine($"Model: {arch} (native whole-model executor), Layers={Config.NumLayers}, " +
-                $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}");
+            if (_backend == BackendType.Cpu)
+            {
+                // Pure C# whole-model executor: quantized weights served straight
+                // from the memory-mapped GGUF shards, managed SIMD kernels only.
+                int nThreads = ParseEnvInt("TS_DSV4_THREADS", Environment.ProcessorCount);
+                Console.WriteLine($"Model: {arch} (pure C# CPU executor), Layers={Config.NumLayers}, " +
+                    $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}");
+                _cpuExec = new DeepSeek4CpuExecutor(ggufPath, maxContext, nUbatch, nThreads);
+            }
+            else
+            {
+                int nThreads = ParseEnvInt("TS_DSV4_THREADS", Math.Min(Environment.ProcessorCount, 32));
+                int nGpu = ParseEnvInt("TS_DSV4_NGPU", tpDegree > 1 ? tpDegree : 0); // 0 = all visible GPUs
 
-            _handle = GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads);
-            if (_handle == IntPtr.Zero)
-                throw new InvalidOperationException($"Failed to load DeepSeek V4 model from {ggufPath} (see stderr for details).");
+                Console.WriteLine($"Model: {arch} (native whole-model executor), Layers={Config.NumLayers}, " +
+                    $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}");
+
+                _handle = GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads);
+                if (_handle == IntPtr.Zero)
+                    throw new InvalidOperationException($"Failed to load DeepSeek V4 model from {ggufPath} (see stderr for details).");
+            }
         }
 
         private static BackendType NormalizeBackend(BackendType backend)
         {
-            // The native executor drives ggml directly; the managed side only needs
-            // the GGML library loaded. Accept the ggml backends as-is and coerce
-            // everything else to GgmlCpu so no second GPU context is created.
+            // BackendType.Cpu runs the pure C# executor. The other backends drive
+            // the native ggml executor; the managed side only needs the GGML
+            // library loaded, so coerce everything else to GgmlCpu so no second
+            // GPU context is created.
             return backend switch
             {
+                BackendType.Cpu => BackendType.Cpu,
                 BackendType.GgmlCuda => BackendType.GgmlCuda,
                 BackendType.GgmlVulkan => BackendType.GgmlVulkan,
                 _ => BackendType.GgmlCpu,
@@ -83,8 +99,14 @@ namespace TensorSharp.Models
             lock (_sync)
             {
                 var logits = new float[Config.VocabSize];
-                if (!GgmlDeepSeek4Native.Forward(_handle, tokens, logits))
+                if (_cpuExec != null)
+                {
+                    _cpuExec.Forward(tokens, logits);
+                }
+                else if (!GgmlDeepSeek4Native.Forward(_handle, tokens, logits))
+                {
                     throw new InvalidOperationException("DeepSeek V4 native forward failed (see stderr).");
+                }
                 return logits;
             }
         }
@@ -93,7 +115,9 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
-                if (_handle != IntPtr.Zero)
+                if (_cpuExec != null)
+                    _cpuExec.Reset();
+                else if (_handle != IntPtr.Zero)
                     GgmlDeepSeek4Native.Reset(_handle);
             }
         }
@@ -121,6 +145,11 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
+                if (_cpuExec != null)
+                {
+                    _cpuExec.Dispose();
+                    _cpuExec = null;
+                }
                 if (_handle != IntPtr.Zero)
                 {
                     GgmlDeepSeek4Native.Free(_handle);
