@@ -204,12 +204,14 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_mamba2.cpp
     ggml_ops_moe.cpp
     ggml_ops_deepseek4.cpp
+    ggml_ops_dsv4_fused_cpu.cpp
     ggml_ops_paged_attention.cpp
     ggml_ops_tensor_parallel.cpp
 )
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_mask.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_dsv4_fused.cu)
 endif()
 
 add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})
