@@ -1523,6 +1523,20 @@ namespace TensorSharp.GGML
                 intermediateSize, ropeMode, kvCacheType);
         }
 
+        /// <summary>KV-cache dtypes the native kernels accept (kv_cache_type is a raw
+        /// ggml_type id: F32=0, F16=1, Q4_0=2, Q8_0=8 — must match ggml.h).</summary>
+        private static bool IsSupportedKvCacheDType(DType dt) =>
+            dt == DType.Float32 || dt == DType.Float16 || dt == DType.Q8_0 || dt == DType.Q4_0;
+
+        private static int KvCacheGgmlTypeId(DType dt) => dt switch
+        {
+            DType.Float32 => 0,
+            DType.Float16 => 1,
+            DType.Q4_0 => 2,
+            DType.Q8_0 => 8,
+            _ => throw new ArgumentException($"Unsupported KV cache dtype: {dt}"),
+        };
+
         /// <summary>
         /// Single-token flash attention decode kernel. Reads Q/K/V (post-norm, post-RoPE) for
         /// the new query position, appends K/V to the persistent KV cache at <paramref name="position"/>,
@@ -1542,8 +1556,8 @@ namespace TensorSharp.GGML
             if (q.ElementType != DType.Float32 || k.ElementType != DType.Float32 || v.ElementType != DType.Float32 ||
                 output.ElementType != DType.Float32)
                 throw new ArgumentException("Flash attention decode requires F32 Q/K/V/output tensors.");
-            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
-                throw new ArgumentException("Flash attention decode requires F32 or F16 K cache tensor.");
+            if (!IsSupportedKvCacheDType(kCache.ElementType))
+                throw new ArgumentException("Flash attention decode requires an F32, F16, Q8_0 or Q4_0 K cache tensor.");
             if (vCache.ElementType != kCache.ElementType)
                 throw new ArgumentException("Flash attention decode requires K and V caches to share an element type.");
 
@@ -1554,7 +1568,7 @@ namespace TensorSharp.GGML
             IntPtr vcPtr = GetBufferStart(vCache);
             IntPtr outPtr = GetBufferStart(output);
 
-            int kvGgmlType = kCache.ElementType == DType.Float16 ? 1 : 0;
+            int kvGgmlType = KvCacheGgmlTypeId(kCache.ElementType);
 
             GgmlNative.FlashAttnDecode(
                 qPtr, kPtr, vPtr,
@@ -2342,8 +2356,8 @@ namespace TensorSharp.GGML
             if (residual.ElementType != DType.Float32 || attnNorm.ElementType != DType.Float32 ||
                 qNorm.ElementType != DType.Float32 || kNorm.ElementType != DType.Float32)
                 throw new ArgumentException("Qwen3.5 attention layer decode requires F32 hidden/norm tensors.");
-            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
-                throw new ArgumentException("Qwen3.5 attention layer decode requires F32 or F16 K cache tensor.");
+            if (!IsSupportedKvCacheDType(kCache.ElementType))
+                throw new ArgumentException("Qwen3.5 attention layer decode requires an F32, F16, Q8_0 or Q4_0 K cache tensor.");
             if (vCache.ElementType != kCache.ElementType)
                 throw new ArgumentException("Qwen3.5 attention layer decode requires K and V caches to share an element type.");
             if (qkvData == IntPtr.Zero || oData == IntPtr.Zero)
@@ -2356,7 +2370,7 @@ namespace TensorSharp.GGML
             IntPtr kCachePtr = GetBufferStart(kCache);
             IntPtr vCachePtr = GetBufferStart(vCache);
             int hiddenSize = (int)residual.Sizes[residual.Sizes.Length - 1];
-            int kvGgmlType = kCache.ElementType == DType.Float16 ? 1 : 0;
+            int kvGgmlType = KvCacheGgmlTypeId(kCache.ElementType);
 
             GgmlNative.Qwen35AttentionLayerDecode(
                 residualPtr, hiddenSize,

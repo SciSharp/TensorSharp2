@@ -3420,7 +3420,7 @@ namespace TensorSharp.Models
             if (q.ElementType != DType.Float32 || k.ElementType != DType.Float32 || v.ElementType != DType.Float32 ||
                 output.ElementType != DType.Float32)
                 return false;
-            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
+            if (!IsFusedGraphKvCacheDType(kCache.ElementType))
                 return false;
             if (vCache.ElementType != kCache.ElementType)
                 return false;
@@ -3493,7 +3493,7 @@ namespace TensorSharp.Models
             if (qkv == null || oOut == null || attnNorm == null || qNorm == null || kNorm == null
                 || kCache == null || vCache == null)
                 return false;
-            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
+            if (!IsFusedGraphKvCacheDType(kCache.ElementType))
                 return false;
             if (vCache.ElementType != kCache.ElementType)
                 return false;
@@ -3506,7 +3506,7 @@ namespace TensorSharp.Models
             const int ropeMode = 2; // NeoX, matches the legacy ApplyRoPEPrefill
             float ropeFreqScale = 1.0f / Config.RopeScale;
 
-            int kvCacheTypeId = (kCache.ElementType == DType.Float16) ? 1 : 0;
+            int kvCacheTypeId = FusedGraphKvCacheTypeId(kCache.ElementType);
 
             try
             {
@@ -3556,7 +3556,7 @@ namespace TensorSharp.Models
             if (qkv == null || oOut == null || attnNorm == null || qNorm == null || kNorm == null
                 || kCache == null || vCache == null)
                 return false;
-            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
+            if (!IsFusedGraphKvCacheDType(kCache.ElementType))
                 return false;
             if (vCache.ElementType != kCache.ElementType)
                 return false;

@@ -474,9 +474,15 @@ namespace TensorSharp.Models
 
                     // Fused QKV projection. The fused weight emits
                     // [numTokens, qFullDim + 2*kvDim] where the first qFullDim cols
-                    // are Q+gate interleaved per head.
+                    // are Q+gate interleaved per head. UD-style GGUFs mix quant
+                    // types across Q/K/V, so the loader fuses them into an F32
+                    // tensor (_attnQkvF32) and DISPOSES the separate projections —
+                    // gating on the quantized handle alone would route those models
+                    // into the separate-projection branch below, whose weights no
+                    // longer exist (LinearForwardCached returns null and the
+                    // batched MTP trunk crashes in DeinterleaveQGate).
                     Tensor qFull, kTensor, vTensor;
-                    if (_attnQkvQW[layer] != null)
+                    if (_attnQkvQW[layer] != null || _attnQkvF32[layer] != null)
                     {
                         using Tensor fusedQkv = LinearForwardCached(normed, _attnQkvQW[layer], _attnQkvF32[layer]);
                         normed.Dispose();

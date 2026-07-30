@@ -1034,6 +1034,31 @@ namespace TensorSharp.Models
             return ((IntPtr)GetFloatPtr(f32), 0, ne0, ne1, f32.ElementCount() * 4L);
         }
 
+        /// <summary>
+        /// KV-cache dtypes the fused whole-model / per-layer native graphs accept.
+        /// F32/F16 everywhere; block-quantized (Q8_0 / Q4_0) only on ggml_cuda,
+        /// where every op the graphs touch the cache with has a quantized-KV
+        /// kernel at this model's head size (ggml_set_rows and ggml_cpy write
+        /// F32-&gt;Q8_0/Q4_0 rows, ggml_flash_attn_ext reads quantized K/V incl.
+        /// head_dim 256). Metal's set_rows faults and Vulkan's quantized-KV
+        /// flash attention is unvalidated here, so those backends decline and
+        /// take the per-op path, whose host helpers handle block-quant caches.
+        /// </summary>
+        private bool IsFusedGraphKvCacheDType(DType dt) =>
+            dt == DType.Float32 || dt == DType.Float16
+            || (IsBlockQuantCacheDType(dt) && _backend == BackendType.GgmlCuda);
+
+        /// <summary>ggml_type id passed as the native kernels' kv_cache_type
+        /// argument (must match ggml.h: F32=0, F16=1, Q4_0=2, Q8_0=8).</summary>
+        private static int FusedGraphKvCacheTypeId(DType dt) => dt switch
+        {
+            DType.Float32 => 0,
+            DType.Float16 => 1,
+            DType.Q4_0 => 2,
+            DType.Q8_0 => 8,
+            _ => throw new NotSupportedException($"Unsupported KV cache dtype for fused graphs: {dt}"),
+        };
+
         internal unsafe bool TryFullModelDecode(Tensor hidden, int position, float[] logitsOut)
         {
             if (logitsOut == null || logitsOut.Length < Config.VocabSize)
@@ -1091,7 +1116,8 @@ namespace TensorSharp.Models
                             && HasW(_attnOutputQW[l], _attnOutputF32[l])
                             && _attnQNormW[l] != null && _attnKNormW[l] != null
                             && _kvCacheK[l] != null && _kvCacheV[l] != null
-                            && (_kvCacheK[l].ElementType == DType.Float32 || _kvCacheK[l].ElementType == DType.Float16);
+                            && IsFusedGraphKvCacheDType(_kvCacheK[l].ElementType)
+                            && _kvCacheV[l].ElementType == _kvCacheK[l].ElementType;
                     if (ok && _isRecurrent[l])
                         ok = HasW(_attnQkvRecQW[l], _attnQkvRecF32[l]) && HasW(_attnGateRecQW[l], _attnGateRecF32[l])
                             && HasW(_ssmBetaQW[l], _ssmBetaF32[l]) && HasW(_ssmAlphaQW[l], _ssmAlphaF32[l])
@@ -1122,7 +1148,7 @@ namespace TensorSharp.Models
                 if (!_isRecurrent[l])
                 {
                     cacheSize = (int)_kvCacheK[l].Sizes[1];
-                    kvCacheType = _kvCacheK[l].ElementType == DType.Float16 ? 1 : 0;
+                    kvCacheType = FusedGraphKvCacheTypeId(_kvCacheK[l].ElementType);
                     break;
                 }
             }
@@ -1385,7 +1411,7 @@ namespace TensorSharp.Models
                 if (!_isRecurrent[l])
                 {
                     cacheSize = (int)_kvCacheK[l].Sizes[1];
-                    kvCacheType = _kvCacheK[l].ElementType == DType.Float16 ? 1 : 0;
+                    kvCacheType = FusedGraphKvCacheTypeId(_kvCacheK[l].ElementType);
                     break;
                 }
             }
@@ -1417,7 +1443,8 @@ namespace TensorSharp.Models
                             && HasW(_attnOutputQW[l], _attnOutputF32[l])
                             && _attnQNormW[l] != null && _attnKNormW[l] != null
                             && _kvCacheK[l] != null && _kvCacheV[l] != null
-                            && (_kvCacheK[l].ElementType == DType.Float32 || _kvCacheK[l].ElementType == DType.Float16);
+                            && IsFusedGraphKvCacheDType(_kvCacheK[l].ElementType)
+                            && _kvCacheV[l].ElementType == _kvCacheK[l].ElementType;
                     if (ok && _isRecurrent[l])
                         ok = HasW(_attnQkvRecQW[l], _attnQkvRecF32[l]) && HasW(_attnGateRecQW[l], _attnGateRecF32[l])
                             && HasW(_ssmBetaQW[l], _ssmBetaF32[l]) && HasW(_ssmAlphaQW[l], _ssmAlphaF32[l])
@@ -1684,8 +1711,11 @@ namespace TensorSharp.Models
                 return false;
             if (_kvCacheK[mtp] == null || _kvCacheV[mtp] == null)
                 return false;
+            if (!IsFusedGraphKvCacheDType(_kvCacheK[mtp].ElementType)
+                || _kvCacheV[mtp].ElementType != _kvCacheK[mtp].ElementType)
+                return false;
             int cacheSize = (int)_kvCacheK[mtp].Sizes[1];
-            int kvCacheType = _kvCacheK[mtp].ElementType == DType.Float16 ? 1 : 0;
+            int kvCacheType = FusedGraphKvCacheTypeId(_kvCacheK[mtp].ElementType);
             if (cacheSize <= 0 || startPos + seqLen > cacheSize)
                 return false;
 

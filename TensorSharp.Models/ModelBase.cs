@@ -3958,7 +3958,7 @@ namespace TensorSharp.Models
         // along the head axis when group_size > 1) — the block-quant analogue of
         // ExpandKVHeadsF16. mul_mat then accumulates in F32, identical to having
         // dequantized in the native kernel.
-        private static bool IsBlockQuantCacheDType(DType dt) =>
+        protected static bool IsBlockQuantCacheDType(DType dt) =>
             dt == DType.Q4_0 || dt == DType.Q8_0;
 
         // ggml type id for a block-quantized KV-cache dtype (must match ggml.h /
@@ -4049,6 +4049,12 @@ namespace TensorSharp.Models
             if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
             {
                 CopyToCacheDecodeF16(kCache, kTensor, vCache, vTensor, numKVHeads, headDim, startPos);
+                return;
+            }
+
+            if (IsBlockQuantCacheDType(kCache.ElementType) && vCache.ElementType == kCache.ElementType)
+            {
+                CopyToCacheDecodeBlockQuant(kCache, kTensor, vCache, vTensor, numKVHeads, headDim, startPos);
                 return;
             }
 
@@ -4188,6 +4194,41 @@ namespace TensorSharp.Models
             return true;
         }
 
+        /// <summary>
+        /// Single-position decode append into a block-quantized (Q4_0 / Q8_0) linear
+        /// cache: each head's new K/V row (headDim elements, a whole number of
+        /// 32-element blocks) is quantized in place at its row offset. Decode analogue
+        /// of <see cref="CopyToCacheBlockQuant"/>; bytes match ggml's block layout so
+        /// the fused native kernels dequantize them identically on later reads.
+        /// </summary>
+        private unsafe void CopyToCacheDecodeBlockQuant(Tensor kCache, Tensor kTensor,
+            Tensor vCache, Tensor vTensor, int numKVHeads, int headDim, int startPos)
+        {
+            int ggmlType = GgmlTypeForCacheDType(kCache.ElementType);
+            long rowBytes = ManagedQuantizedOps.RowSize(ggmlType, headDim);
+            int maxSeqLen = (int)kCache.Sizes[1];
+
+            kCache.Storage.EnsureHostReadable();
+            vCache.Storage.EnsureHostReadable();
+            float* kSrc = GetFloatPtr(kTensor);
+            float* vSrc = GetFloatPtr(vTensor);
+            byte* kBase = (byte*)TensorComputePrimitives.GetStoragePointer(kCache);
+            byte* vBase = (byte*)TensorComputePrimitives.GetStoragePointer(vCache);
+
+            for (int h = 0; h < numKVHeads; h++)
+            {
+                long cacheOffset = (long)h * maxSeqLen * rowBytes + (long)startPos * rowBytes;
+                int srcOffset = h * headDim;
+                ManagedQuantizedOps.QuantizeRowFromFloat32(ggmlType, kSrc + srcOffset,
+                    (IntPtr)(kBase + cacheOffset), headDim);
+                ManagedQuantizedOps.QuantizeRowFromFloat32(ggmlType, vSrc + srcOffset,
+                    (IntPtr)(vBase + cacheOffset), headDim);
+            }
+
+            InvalidateTensorDeviceCache(kCache);
+            InvalidateTensorDeviceCache(vCache);
+        }
+
         private unsafe void CopyToCacheDecodeF16(Tensor kCache, Tensor kTensor,
             Tensor vCache, Tensor vTensor, int numKVHeads, int headDim, int startPos)
         {
@@ -4216,6 +4257,24 @@ namespace TensorSharp.Models
             {
                 AttentionDecodePureCSF16(q, kCache, vCache, result,
                     numHeads, numKVHeads, headDim, totalSeqLen, scale);
+                return;
+            }
+
+            if (IsBlockQuantCacheDType(kCache.ElementType) && vCache.ElementType == kCache.ElementType)
+            {
+                // Block-quantized (Q4_0 / Q8_0) caches cannot be walked as flat float
+                // buffers. Dequantize the active [0, totalSeqLen) window into compact
+                // F32 tensors (no GQA broadcast; the grouped kernel below reads per
+                // KV head) and re-enter on the F32 path — the compact copy's
+                // Sizes[1] == totalSeqLen doubles as its row stride. This is the
+                // deep-fallback path (fused native attention handles quantized
+                // caches on-device), so correctness beats the extra dequant cost.
+                using (Tensor kF32 = ExpandKVHeadsBlockQuant(kCache, 1, totalSeqLen))
+                using (Tensor vF32 = ExpandKVHeadsBlockQuant(vCache, 1, totalSeqLen))
+                {
+                    AttentionDecodePureCS(q, kF32, vF32, result,
+                        numHeads, numKVHeads, headDim, totalSeqLen, scale);
+                }
                 return;
             }
 
