@@ -154,7 +154,9 @@ NextN 块；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）。投机仅对单�
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 本地 TP，GGML 后端 | 超过该元素数量时 AllReduce 走设备集合通信，否则在主机内存中归约 | `262144` | 未注册 | 否 |
 | `TS_GGML_F32_RESIDENT` | GGML 后端 | `0` 表示每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） | 开启（常驻设备） | 未注册 | 否 |
 | `TS_GEMMA4_TP_FUSED_MOE` | GGML 上 TP 下的 Gemma 4 MoE | `0` 表示从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径 | 开启（融合主干） | 未注册 | 否 |
-| `GGML_CUDA_ALLREDUCE` | 本地 TP，`ggml_cuda` | `nccl` / `internal` / `none` —— 直接透传给 ggml 的集合通信选择 | 自动（构建时能找到 NCCL 就用 NCCL） | 未注册 | 否 |
+| `GGML_CUDA_ALLREDUCE` | 本地 TP，`ggml_cuda` | `nccl` / `internal` / `none` —— 直接透传给 ggml 的集合通信选择；显式设置同时会跳过启动前探测 | 自动（构建时能找到 NCCL 且通过探测就用 NCCL） | 未注册 | 否 |
+| `TS_GGML_TP_AR_PROBE` | 本地 TP，`ggml_cuda` | `0` 跳过 NCCL 启动前探测；`force` 忽略缓存的判定（`~/.cache/tensorsharp/tp-collective-probe`）重新探测。探测在模型加载前端到端跑一次小型 AllReduce —— 一些云主机声称支持 P2P 但数据永远送不到，NCCL 的第一次集合通信会让两块 GPU 永远空转 | 探测开启，判定按 驱动/NCCL/GPU 组合缓存 | 未注册 | 否 |
+| `TS_GGML_TP_AR_PROBE_MS` | 本地 TP，`ggml_cuda` | 探测 AllReduce 的完成期限；超时即判定集合通信不可用并改走钉页主机内存的 `internal` 管线；`0` 关闭探测 | `10000` 毫秒 | 未注册 | 否 |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | 本地 TP，`ggml_cuda` | ggml 在多大载荷以上把 F32 集合通信转成 BF16；TensorSharp 把 ggml 的默认值提高到 1 MB，使 decode 规模的归约保持精确 | `1 MB`（由 `TSGgml_TensorParallelInit` 设置） | 未注册 | 否 |
 | `TS_QWEN35_LAYER_TRACE` | Qwen 3.5/3.6 | `1` 打印首次前向的逐层残差流摘要，单卡与 TP 两条路径都会输出（诊断用） | 关闭 | 未注册 | 否 |
 

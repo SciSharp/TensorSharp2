@@ -1253,6 +1253,11 @@ namespace TensorSharp.Models
 
         protected void LoadWeights()
         {
+            // Parallel page-cache warm-up first: everything below (serial
+            // F32/dequant reads, mmap faults from the sharding/upload threads)
+            // otherwise reads the file at one-or-two-stream speed, which is the
+            // whole cold-load time on network-backed model storage.
+            _gguf.PrefaultFileCache();
             Console.Write("Loading model weights...");
             int countF32 = 0;
             int countQuant = 0;

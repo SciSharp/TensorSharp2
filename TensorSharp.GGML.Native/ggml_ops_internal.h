@@ -605,6 +605,15 @@ namespace tsg
     // Resolve the backend's collective-communication entry points for the
     // initialized rank set. False when the backend provides none.
     bool tp_comm_ensure();
+    // Behavioural pre-flight of the NCCL device collective on the given CUDA
+    // devices (ggml_ops_tp_probe.cu, CUDA builds only): runs one small
+    // AllReduce end to end on private streams with a bounded wait and checks
+    // the sums that come back. Some hosts (virtualized cloud instances)
+    // advertise P2P that never delivers, and NCCL's first collective then
+    // spins forever. Returns 1 when the collective works, 0 when it hangs or
+    // corrupts (the caller reroutes to the pinned-host "internal" AllReduce),
+    // -1 when the probe does not apply (Windows, NCCL absent, disabled).
+    int tp_probe_cuda_collective(const int* device_indices, int count);
     // Release the collective context and every rank's AllReduce scratch buffer.
     void tp_comm_free();
     // In-place device AllReduce (sum) over one contiguous F32 tensor per rank.

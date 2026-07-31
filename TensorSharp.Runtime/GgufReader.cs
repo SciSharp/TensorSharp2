@@ -14,6 +14,7 @@ using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace TensorSharp.Runtime
 {
@@ -143,6 +144,95 @@ namespace TensorSharp.Runtime
         }
 
         public int LastLockError { get; private set; }
+
+        private bool _prefaulted;
+
+        /// <summary>
+        /// Warm the OS page cache for the whole GGUF with parallel positional
+        /// reads before the loaders touch it. The load path reads the file
+        /// through at most a couple of streams (the serial F32/dequant reads,
+        /// plus one mmap-faulting upload thread per TP rank), which caps a
+        /// cold load at single-stream throughput. Network-backed model storage
+        /// is far faster in parallel (measured on a MooseFS volume: ~440 MB/s
+        /// on one stream, ~1.8 GB/s at 8-16 streams), so a 16-stream warm-up
+        /// pass first makes every subsequent read a RAM hit. On an
+        /// already-cached file the pass is a quick no-op (reads hit the page
+        /// cache), so it is safe to call unconditionally; it skips itself when
+        /// the file cannot reasonably fit in memory (> half of available RAM —
+        /// huge models stream through their own chunked loaders instead).
+        /// Controlled by TS_GGUF_PREFAULT=0 (disable) and
+        /// TS_GGUF_PREFAULT_THREADS (default: min(16, cores)).
+        /// </summary>
+        public void PrefaultFileCache()
+        {
+            if (_prefaulted)
+                return;
+            _prefaulted = true;
+
+            if (Environment.GetEnvironmentVariable("TS_GGUF_PREFAULT") == "0")
+                return;
+
+            long length;
+            try { length = _stream.Length; }
+            catch { return; }
+            if (length <= 0)
+                return;
+
+            var memInfo = GC.GetGCMemoryInfo();
+            if (memInfo.TotalAvailableMemoryBytes > 0 && length > memInfo.TotalAvailableMemoryBytes / 2)
+                return;
+
+            int threads = Math.Min(16, Environment.ProcessorCount);
+            {
+                string? env = Environment.GetEnvironmentVariable("TS_GGUF_PREFAULT_THREADS");
+                if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int t) && t > 0)
+                    threads = t;
+            }
+
+            // One contiguous region per thread: every stream reads strictly
+            // sequentially, which is what network filesystems' readahead
+            // optimizes for (dynamic chunk claiming interleaves the workers
+            // across the file and was measured ~3x slower on MooseFS).
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                long regionBytes = (length + threads - 1) / threads;
+                Parallel.For(0, threads,
+                    new ParallelOptions { MaxDegreeOfParallelism = threads },
+                    () => new byte[8 << 20],
+                    (region, _, buffer) =>
+                    {
+                        // A private handle per stream: FUSE-backed filesystems
+                        // (MooseFS et al.) keep per-open readahead state, and
+                        // sixteen streams sharing one handle serialize on it.
+                        using var handle = File.OpenHandle(_path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        long offset = region * regionBytes;
+                        long end = Math.Min(offset + regionBytes, length);
+                        while (offset < end)
+                        {
+                            int want = (int)Math.Min(buffer.Length, end - offset);
+                            int read = RandomAccess.Read(handle, buffer.AsSpan(0, want), offset);
+                            if (read <= 0)
+                                break;
+                            offset += read;
+                        }
+                        return buffer;
+                    },
+                    _ => { });
+            }
+            catch
+            {
+                return; // Best-effort: a failed warm-up just means cold-speed reads.
+            }
+            sw.Stop();
+
+            // Only worth mentioning when it actually pulled data off storage.
+            if (sw.Elapsed.TotalSeconds >= 1.0)
+            {
+                double gb = length / (1024.0 * 1024.0 * 1024.0);
+                Console.WriteLine($"  Prefaulted GGUF page cache: {gb:F1} GiB with {threads} read streams in {sw.Elapsed.TotalSeconds:F1}s ({gb / sw.Elapsed.TotalSeconds:F2} GiB/s)");
+            }
+        }
 
         [DllImport("libc", SetLastError = true, EntryPoint = "mlock")]
         private static extern unsafe int mlock(void* addr, nuint len);

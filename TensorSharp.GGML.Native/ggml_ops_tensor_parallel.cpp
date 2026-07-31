@@ -191,6 +191,41 @@ namespace tsg
         if (reg == nullptr)
             return false;
 
+#ifdef TSG_GGML_USE_CUDA
+        // The CUDA comm chain defaults to NCCL on Linux, and NCCL trusts the
+        // driver's P2P capability report. On hosts where that report is a lie
+        // (virtualized cloud boxes), NCCL's init succeeds and its FIRST
+        // collective wedges both GPUs in peer-waiting spin kernels — a model
+        // load that should take seconds appears hung for tens of minutes.
+        // Behaviourally verify the collective up front and, when it proves
+        // unusable, steer ggml's selection to the pinned-host-memory pipeline
+        // before the backend ever creates a communicator. An explicit
+        // GGML_CUDA_ALLREDUCE from the operator wins unconditionally.
+        {
+            const char* reg_name = ggml_backend_reg_name(reg);
+            if (reg_name != nullptr && std::strcmp(reg_name, "CUDA") == 0
+                && std::getenv("GGML_CUDA_ALLREDUCE") == nullptr)
+            {
+                int probe_devices[TSG_MAX_DEVICES];
+                for (int r = 0; r < n; ++r)
+                    probe_devices[r] = dev(r).device_index >= 0 ? dev(r).device_index : r;
+                if (tp_probe_cuda_collective(probe_devices, n) == 0)
+                {
+#if defined(_WIN32)
+                    _putenv_s("GGML_CUDA_ALLREDUCE", "internal");
+#else
+                    setenv("GGML_CUDA_ALLREDUCE", "internal", 1);
+#endif
+                    std::fprintf(stderr,
+                        "[TP] device collective (NCCL) is non-functional on this host; "
+                        "using the pinned-host-memory AllReduce instead. Set "
+                        "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n");
+                    std::fflush(stderr);
+                }
+            }
+        }
+#endif
+
         auto init_fn = reinterpret_cast<comm_init_fn>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init"));
         auto free_fn = reinterpret_cast<comm_free_fn>(

@@ -146,7 +146,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td><code>TS_GGML_TP_DEVICE_AR_THRESHOLD</code></td><td><code>262144</code></td><td>超过该元素数量时 AllReduce 走 ggml 的设备集合通信，否则在主机内存中归约。GGML 的激活本来就在主机内存里，小载荷在那里求和更划算。</td></tr>
       <tr><td><code>TS_GGML_TP_PARALLEL</code></td><td>开启</td><td><code>0</code> 表示顺序而非并发地驱动各 rank —— 诊断用，会显著变慢。</td></tr>
       <tr><td><code>TS_GEMMA4_TP_FUSED_MOE</code></td><td>开启</td><td><code>0</code> 表示 Gemma 4 从融合的 MoE 主干回退到逐算子的整专家路径。</td></tr>
-      <tr><td><code>GGML_CUDA_ALLREDUCE</code></td><td>自动</td><td><code>nccl</code> / <code>internal</code> / <code>none</code>，直接透传给 ggml 的集合通信选择。</td></tr>
+      <tr><td><code>GGML_CUDA_ALLREDUCE</code></td><td>自动</td><td><code>nccl</code> / <code>internal</code> / <code>none</code>，直接透传给 ggml 的集合通信选择。显式设置会同时跳过 NCCL 启动前探测。</td></tr>
+      <tr><td><code>TS_GGML_TP_AR_PROBE</code></td><td>开</td><td>模型加载前对 NCCL 集合通信做行为探测：一些云主机声称支持 GPU P2P 但数据永远送不到，NCCL 的第一次 AllReduce 会让两块 GPU 永远空转——典型症状是 TP 模型加载卡死在 kernel warmup。探测失败时 TensorSharp 自动改走 ggml 的钉页主机内存 <code>internal</code> 管线。<code>0</code> 跳过探测；<code>force</code> 忽略缓存的按主机判定（<code>~/.cache/tensorsharp/tp-collective-probe</code>）。</td></tr>
+      <tr><td><code>TS_GGML_TP_AR_PROBE_MS</code></td><td><code>10000</code></td><td>探测 AllReduce 的完成期限，超时即判定集合通信不可用；<code>0</code> 关闭探测。</td></tr>
       <tr><td><code>GGML_CUDA_AR_BF16_THRESHOLD</code></td><td><code>1 MB</code></td><td>ggml 在多大载荷以上把 F32 集合通信转成 BF16。TensorSharp 提高了 ggml 自身的默认值（总是转换），使 decode 规模的归约保持精确；设为 <code>0</code> 则完全禁用转换。</td></tr>
     </tbody>
   </table>
