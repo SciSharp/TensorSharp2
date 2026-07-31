@@ -37,6 +37,7 @@ enum tsg_dsv4_fused_kind : int32_t
     TSG_DSV4_FUSED_HC_GATES      = 8,
     TSG_DSV4_FUSED_TOPK_MASK     = 9,
     TSG_DSV4_FUSED_TOPK_SELECT   = 10,
+    TSG_DSV4_FUSED_KGATHER       = 11,
 };
 
 #define TSG_DSV4_FUSED_MAGIC 0x5453445356344655ull  // "TSDSV4FU"

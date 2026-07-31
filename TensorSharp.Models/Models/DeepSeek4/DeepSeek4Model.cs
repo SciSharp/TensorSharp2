@@ -46,7 +46,13 @@ namespace TensorSharp.Models
                 maxContext = Math.Min(maxContext, 65536);
             _maxContextLength = maxContext;
 
-            int nUbatch = ParseEnvInt("TS_DSV4_UBATCH", 512);
+            // GPU prefill chunks amortize the MoE expert-GEMM tile padding (256
+            // experts x top-6 leaves ~nt/42 rows per expert, so per-chunk MoE
+            // cost is nearly flat in nt): 1024 measured ~11-21% faster overall
+            // prefill than 512 and also halves what a non-multiple tail chunk
+            // costs relative to the whole prompt. The CPU executor stays at 512
+            // (activation memory bound, no tile padding to amortize).
+            int nUbatch = ParseEnvInt("TS_DSV4_UBATCH", _backend == BackendType.Cpu ? 512 : 1024);
 
             if (_backend == BackendType.Cpu)
             {
