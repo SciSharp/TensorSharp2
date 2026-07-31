@@ -81,8 +81,11 @@ namespace TensorSharp.Models
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
 
             // q = wq_b(rms(wq_a(cur))) -> per-head RMS (no weight) -> RoPE on rope slice
+            bool dbg = StageDebug && il == 0;
             MatMul(L.WqA, 0, _qLoraRank, _cur, E, nt, _qr, _qLoraRank);
             RmsNormRows(_qr, L.QANorm, nt, _qLoraRank);
+            if (dbg)
+                DumpDbg("L0.qr", _qr);
             MatMul(L.WqB, 0, NH * HD, _qr, _qLoraRank, nt, _q, NH * HD);
             RmsNormRows(_q, null, nt * NH, HD);
 
@@ -93,9 +96,13 @@ namespace TensorSharp.Models
                 for (int h = 0; h < NH; h++)
                     RotatePairs(qt + (long)h * HD + NOPE, cache, ROT, 1f);
             });
+            if (dbg)
+                DumpDbg("L0.q_prep", _q);
 
             // kv: single shared 512-dim K(=V) head; commit to the SWA ring (F16-rounded)
             MatMul(L.Wkv, 0, HD, _cur, E, nt, _kvRow, HD);
+            if (dbg)
+                DumpDbg("L0.kv_raw_preNorm", _kvRow);
             RmsNormRows(_kvRow, L.KvNorm, nt, HD);
             PFor(nt, t =>
             {
@@ -106,6 +113,8 @@ namespace TensorSharp.Models
                 for (int d = 0; d < HD; d++)
                     dst[d] = F16(kv[d]);
             });
+            if (dbg && p0 == 0)
+                DumpDbg("L0.ring0", L.RawK);
 
             Tick(2, t0);
             t0 = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -148,6 +157,8 @@ namespace TensorSharp.Models
 
             t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             AttentionCore(L, nt, p0);
+            if (dbg)
+                DumpDbg("L0.attn_core", _attnO);
             Tick(5, t0);
             t0 = System.Diagnostics.Stopwatch.GetTimestamp();
 

@@ -3148,7 +3148,9 @@ namespace TensorSharp.Cuda
             return (uint)Math.Max(1, (count + BlockSize - 1) / BlockSize);
         }
 
-        private static string LocatePtxPath()
+        private static string LocatePtxPath() => LocatePtxPath("tensorsharp_kernels.ptx");
+
+        internal static string LocatePtxPath(string fileName)
         {
             // Probe the application base directory first, then the directory the
             // CUDA backend assembly itself was loaded from. When TensorSharp is
@@ -3160,9 +3162,9 @@ namespace TensorSharp.Cuda
             {
                 string[] candidates =
                 {
-                    Path.Combine(baseDirectory, "cuda_kernels", "tensorsharp_kernels.ptx"),
-                    Path.Combine(baseDirectory, "tensorsharp_kernels.ptx"),
-                    Path.Combine(baseDirectory, "..", "..", "..", "native", "ptx", "tensorsharp_kernels.ptx"),
+                    Path.Combine(baseDirectory, "cuda_kernels", fileName),
+                    Path.Combine(baseDirectory, fileName),
+                    Path.Combine(baseDirectory, "..", "..", "..", "native", "ptx", fileName),
                 };
 
                 foreach (string candidate in candidates)
@@ -3176,11 +3178,11 @@ namespace TensorSharp.Cuda
             DirectoryInfo dir = new DirectoryInfo(AppContext.BaseDirectory);
             while (dir != null)
             {
-                string sourceTreePath = Path.Combine(dir.FullName, "TensorSharp.Backends.Cuda", "native", "ptx", "tensorsharp_kernels.ptx");
+                string sourceTreePath = Path.Combine(dir.FullName, "TensorSharp.Backends.Cuda", "native", "ptx", fileName);
                 if (File.Exists(sourceTreePath))
                     return sourceTreePath;
 
-                string localProjectPath = Path.Combine(dir.FullName, "native", "ptx", "tensorsharp_kernels.ptx");
+                string localProjectPath = Path.Combine(dir.FullName, "native", "ptx", fileName);
                 if (File.Exists(localProjectPath))
                     return localProjectPath;
 

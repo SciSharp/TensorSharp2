@@ -2854,11 +2854,17 @@ namespace TensorSharp.Models
                 // QK^T / mask / softmax / *V as separate dispatches -- the
                 // dominant attention cost during MTP verify. The fused kernel
                 // reads the head-first KV cache in place (F16 or F32). Gated to
-                // text continuations (no per-axis MRoPE staged) and the kernel's
-                // kvLen<=8192 limit; on any miss it returns false and we fall
-                // through to the legacy path unchanged.
-                if (!usedFusedAttn && _backend == BackendType.Cuda && !useMRoPE
-                    && totalSeqLen <= 8192)
+                // text continuations (no per-axis MRoPE staged); on any miss it
+                // returns false and we fall through to the legacy path.
+                //
+                // There is deliberately no kvLen cap here: the flash-tiled
+                // kernel handles arbitrary kvLen, and the legacy fallback CANNOT
+                // handle long contexts at all -- its [heads, seqLen, kvLen]
+                // score tensor overflows the int element count past ~2G entries
+                // (a 15K-token prompt is ~7G), which silently drops to the CPU
+                // path and faults. TryGqaPrefillAttentionWithSinks declines the
+                // shapes its flash path cannot serve.
+                if (!usedFusedAttn && _backend == BackendType.Cuda && !useMRoPE)
                 {
                     int cacheSize = (int)_kvCacheK[layer].Sizes[1];
                     var cudaPrefill = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
@@ -2903,30 +2909,80 @@ namespace TensorSharp.Models
                     Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
 
                     using var kT = kExpanded.Transpose(1, 2);
-                    var scores = new Tensor(_allocator, DType.Float32, numHeads, seqLen, totalSeqLen);
-                    Ops.AddmmBatch(scores, 0, scores, attentionScale, qHeads, kT);
-                    qHeads?.Dispose();
-                    kExpanded.Dispose();
 
-                    // Fused causal-mask + softmax on GPU. Replaces AddCausalMask + Softmax
-                    // (two separate ops) with one Metal kernel. No sinks for Qwen3.5
-                    // dense attention.
-                    if (IsGgmlBackend)
+                    // The score matrix is [numHeads, seqLen, totalSeqLen]. For a
+                    // long prompt that overflows what the elementwise ops can
+                    // address (they cap at int.MaxValue ELEMENTS and otherwise
+                    // silently fall back to a CPU path that then faults), so
+                    // split the QUERY rows into chunks small enough to stay
+                    // inside the cap. Each chunk attends over the same full KV,
+                    // with its causal mask shifted by the chunk offset, so the
+                    // result is identical to the unchunked form; short prompts
+                    // take a single chunk and behave exactly as before.
+                    const long MaxScoreElements = 256L * 1024 * 1024;
+                    long scoreElems = (long)numHeads * seqLen * totalSeqLen;
+                    int qChunk = seqLen;
+                    if (scoreElems > MaxScoreElements)
                     {
-                        GgmlBasicOps.AttentionSoftmaxWithSinks(
-                            scores, sinks: null,
-                            numHeads: numHeads, seqLen: seqLen, kvLen: totalSeqLen,
-                            maskStartPos: startPos, slidingWindow: 0, scale: 1.0f);
-                    }
-                    else
-                    {
-                        Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-                        Ops.Softmax(scores, scores);
+                        long perRow = (long)numHeads * totalSeqLen;
+                        qChunk = (int)Math.Max(1, Math.Min(seqLen, MaxScoreElements / Math.Max(1, perRow)));
                     }
 
                     var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
-                    Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
-                    scores.Dispose();
+                    bool chunked = qChunk < seqLen;
+                    for (int q0 = 0; q0 < seqLen; q0 += qChunk)
+                    {
+                        int qc = Math.Min(qChunk, seqLen - q0);
+                        // AddmmBatch needs contiguous operands, and a narrowed
+                        // view of the [heads, seq, dim] tensors is strided, so
+                        // chunks are staged through compact buffers. The
+                        // unchunked case (every prompt short enough to fit the
+                        // element cap) uses the original tensors directly.
+                        Tensor qChunkT = qHeads;
+                        if (chunked)
+                        {
+                            qChunkT = new Tensor(_allocator, DType.Float32, numHeads, qc, headDim);
+                            using Tensor qView = qHeads.Narrow(1, q0, qc);
+                            Ops.Copy(qChunkT, qView);
+                        }
+                        var scores = new Tensor(_allocator, DType.Float32, numHeads, qc, totalSeqLen);
+                        Ops.AddmmBatch(scores, 0, scores, attentionScale, qChunkT, kT);
+                        if (chunked)
+                            qChunkT.Dispose();
+
+                        // Fused causal-mask + softmax on GPU. Replaces AddCausalMask + Softmax
+                        // (two separate ops) with one Metal kernel. No sinks for Qwen3.5
+                        // dense attention.
+                        if (IsGgmlBackend)
+                        {
+                            GgmlBasicOps.AttentionSoftmaxWithSinks(
+                                scores, sinks: null,
+                                numHeads: numHeads, seqLen: qc, kvLen: totalSeqLen,
+                                maskStartPos: startPos + q0, slidingWindow: 0, scale: 1.0f);
+                        }
+                        else
+                        {
+                            Ops.AddCausalMask(scores, qc, startPos + q0, float.NegativeInfinity);
+                            Ops.Softmax(scores, scores);
+                        }
+
+                        if (chunked)
+                        {
+                            var outChunk = new Tensor(_allocator, DType.Float32, numHeads, qc, headDim);
+                            Ops.AddmmBatch(outChunk, 0, outChunk, 1.0f, scores, vExpanded);
+                            using (Tensor outView = attnOut.Narrow(1, q0, qc))
+                                Ops.Copy(outView, outChunk);
+                            outChunk.Dispose();
+                        }
+                        else
+                        {
+                            Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
+                        }
+                        scores.Dispose();
+                    }
+
+                    qHeads?.Dispose();
+                    kExpanded.Dispose();
                     vExpanded.Dispose();
 
                     attnOutput = ReshapeFromHeads(attnOut, numHeads, seqLen, headDim);

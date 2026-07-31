@@ -1404,7 +1404,6 @@ namespace TensorSharp.Cuda
                 headDim <= 0 ||
                 seqLen <= 0 ||
                 kvLen <= 0 ||
-                kvLen > 8192 ||
                 cacheSize <= 0 ||
                 maskStart < 0 ||
                 maskStart >= kvLen ||
@@ -1495,6 +1494,15 @@ namespace TensorSharp.Cuda
                 resultStorage.MarkDeviceModified();
                 return true;
             }
+
+            // The flash paths above tile over K, so their cost and shared-memory
+            // use are independent of kvLen. The one-CTA-per-(head, position)
+            // kernels below walk the whole visible K/V serially per query, which
+            // is why they are capped -- past this the caller is better off on its
+            // own path.
+            if (kvLen > 8192)
+                return false;
+
             if (keyIsHalf)
             {
                 kernels.LaunchGqaPrefillAttentionSinksF16(

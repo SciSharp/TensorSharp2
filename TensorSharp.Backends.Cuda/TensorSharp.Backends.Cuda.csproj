@@ -114,10 +114,13 @@
   </Target>
 
   <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx">
-    <MakeDir Directories="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))" Condition="Exists('$(PtxOutputDir)/tensorsharp_kernels.ptx')" />
-    <Copy SourceFiles="$(PtxOutputDir)/tensorsharp_kernels.ptx"
+    <ItemGroup>
+      <_CompiledPtx Include="$(PtxOutputDir)/*.ptx" />
+    </ItemGroup>
+    <MakeDir Directories="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))" Condition="'@(_CompiledPtx)' != ''" />
+    <Copy SourceFiles="@(_CompiledPtx)"
           DestinationFolder="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))"
           SkipUnchangedFiles="true"
-          Condition="Exists('$(PtxOutputDir)/tensorsharp_kernels.ptx')" />
+          Condition="'@(_CompiledPtx)' != ''" />
   </Target>
 </Project>
