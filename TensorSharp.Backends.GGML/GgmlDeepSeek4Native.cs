@@ -54,6 +54,10 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_Dsv4SlotFree(IntPtr handle, int slotId);
 
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_Dsv4ForwardBatchedDecode(
+            IntPtr handle, int n, int* slotIds, int* tokens, int* positions, float* logitsOut);
+
         public static IntPtr LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads)
             => TSGgml_Dsv4LoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads);
 
@@ -85,5 +89,21 @@ namespace TensorSharp.GGML
         /// slot cannot be freed.</summary>
         public static bool SlotFree(IntPtr handle, int slotId)
             => TSGgml_Dsv4SlotFree(handle, slotId) == 0;
+
+        /// <summary>True token-batched decode: one token per slot in a single
+        /// fused graph. logitsOut receives n rows of vocab-size floats; every
+        /// slot advances one position on success. Returns false when the step
+        /// can't be batched (caller falls back to per-slot forwards).</summary>
+        public static unsafe bool ForwardBatchedDecode(
+            IntPtr handle, int[] slotIds, int[] tokens, int[] positions, float[] logitsOut)
+        {
+            fixed (int* s = slotIds)
+            fixed (int* t = tokens)
+            fixed (int* p = positions)
+            fixed (float* l = logitsOut)
+            {
+                return TSGgml_Dsv4ForwardBatchedDecode(handle, slotIds.Length, s, t, p, l) == 0;
+            }
+        }
     }
 }

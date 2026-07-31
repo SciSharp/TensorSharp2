@@ -139,6 +139,46 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>TRUE token-batched decode: one token for each of N
+        /// concurrent requests in a single fused graph, so the dense weights
+        /// (and each step's routed experts) are read once per step instead of
+        /// once per sequence. Engine opt-in via TS_BATCHED_FUSED_DECODE=1.
+        /// Declines (returns false) whenever a request has no slot yet or a
+        /// position disagrees with its slot — the engine then falls back to
+        /// the per-sequence round-robin loop.</summary>
+        public bool TryForwardBatchedFusedDecode(
+            IReadOnlyList<string> requestIds, int[] tokens, int[] positions, float[][] outLogits)
+        {
+            lock (_sync)
+            {
+                if (_handle == IntPtr.Zero || _slotByRequest == null) return false;
+                int n = requestIds.Count;
+                if (n < 2 || n > 8) return false;
+
+                var slots = new int[n];
+                for (int i = 0; i < n; i++)
+                {
+                    if (requestIds[i] == null || !_slotByRequest.TryGetValue(requestIds[i], out slots[i]))
+                        return false;
+                }
+
+                int vocab = Config.VocabSize;
+                var flat = new float[(long) n * vocab <= int.MaxValue ? n * vocab : 0];
+                if (flat.Length == 0) return false;
+
+                if (!GgmlDeepSeek4Native.ForwardBatchedDecode(_handle, slots, tokens, positions, flat))
+                    return false;
+
+                for (int i = 0; i < n; i++)
+                {
+                    var row = new float[vocab];
+                    Array.Copy(flat, (long) i * vocab, row, 0, vocab);
+                    outLogits[i] = row;
+                }
+                return true;
+            }
+        }
+
         /// <summary>Free a finished/aborted request's slot (its caches and any
         /// graphs captured against them).</summary>
         public void OnSequenceReleased(string requestId)
