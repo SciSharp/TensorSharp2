@@ -708,6 +708,9 @@ namespace tsg
     // MTP MoE verify) whose per-call gallocr alloc/free would fragment Metal VRAM.
     // Returns false if unavailable (caller falls back to its own gallocr).
     bool alloc_graph_reuse_gallocr(ggml_cgraph* graph);
+    // Run Metal's backend graph optimizer before any graph allocation. Direct
+    // backend graph_compute calls do not invoke this hook themselves.
+    void optimize_graph_for_metal(ggml_cgraph* graph);
     // Free the cached reuse gallocr (called from TSGgml_Shutdown / backend reset).
     void free_reuse_gallocr();
     // Free the calling thread's cached prefill-attention sessions (defined in

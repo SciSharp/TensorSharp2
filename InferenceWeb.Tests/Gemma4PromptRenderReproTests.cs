@@ -100,6 +100,74 @@ public class Gemma4PromptRenderReproTests
         Assert.Contains("<|turn>user", rendered);
     }
 
+    [Fact]
+    public void RenderFromGguf_RestoresGemma4ThinkingPromptNewline()
+    {
+        const string template =
+            "<|turn>user\n{{ messages[0]['content'] }}<turn|>\n" +
+            "{% if add_generation_prompt %}<|turn>model\n{% endif %}";
+        var history = new List<ChatMessage> { new() { Role = "user", Content = "hello" } };
+
+        string rendered = ChatTemplate.RenderFromGgufTemplate(
+            template,
+            history,
+            addGenerationPrompt: true,
+            architecture: "gemma4",
+            enableThinking: true);
+
+        Assert.EndsWith("<|turn>model\n", rendered);
+
+        var tokenizer = CreateCharacterGemma4Tokenizer(rendered);
+        var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
+        List<int> tokens = renderer.RenderToTokens(
+            tokenizer,
+            template,
+            history,
+            architecture: "gemma4",
+            addGenerationPrompt: true,
+            enableThinking: true);
+        int newlineId = tokenizer.LookupToken("\n");
+        Assert.Equal(newlineId, tokens[^1]);
+        Assert.NotEqual(newlineId, tokens[^2]);
+    }
+
+    [Fact]
+    public void RenderFromGguf_DoesNotAddGemma4ModelTurnWithoutGenerationPrompt()
+    {
+        const string template =
+            "<|turn>user\n{{ messages[0]['content'] }}<turn|>\n" +
+            "{% if add_generation_prompt %}<|turn>model\n{% endif %}";
+        var history = new List<ChatMessage> { new() { Role = "user", Content = "hello" } };
+
+        string rendered = ChatTemplate.RenderFromGgufTemplate(
+            template,
+            history,
+            addGenerationPrompt: false,
+            architecture: "gemma4",
+            enableThinking: true);
+
+        Assert.DoesNotContain("<|turn>model", rendered);
+        Assert.EndsWith("<turn|>", rendered);
+    }
+
+    private static BpeTokenizer CreateCharacterGemma4Tokenizer(string text)
+    {
+        string[] vocab = text
+            .Select(c => c.ToString())
+            .Append("\u2581")
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        return new BpeTokenizer(
+            vocab,
+            Enumerable.Repeat(1, vocab.Length).ToArray(),
+            Array.Empty<string>(),
+            bosTokenId: -1,
+            eosTokenIds: Array.Empty<int>(),
+            addBos: false,
+            addEos: false,
+            preTokenizerType: "gemma4");
+    }
+
     // ---------- end-to-end tests (need the real 12B GGUF) ----------
 
     private static string? FindModel()
@@ -113,6 +181,69 @@ public class Gemma4PromptRenderReproTests
         return candidates.FirstOrDefault(p => !string.IsNullOrEmpty(p) && File.Exists(p));
     }
 
+    private static string? FindBpeModel()
+    {
+        string[] candidates =
+        {
+            Environment.GetEnvironmentVariable("TS_GEMMA4_BPE_MODEL") ?? "",
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "work", "model", "mtp_gemma4", "gemma-4-26B-A4B-it-Q4_K_M.gguf"),
+        };
+        return candidates.FirstOrDefault(p => !string.IsNullOrEmpty(p) && File.Exists(p));
+    }
+
+    [Fact]
+    public void RealGemma4BpeTokenizer_MatchesLlamaCppOracle()
+    {
+        string? modelPath = FindBpeModel();
+        if (modelPath == null) { _output.WriteLine("Gemma 4 BPE GGUF not found; skipping"); return; }
+
+        using var gguf = new GgufFile(modelPath);
+        Assert.Equal("gemma4", gguf.GetString("tokenizer.ggml.model"));
+
+        ITokenizer tokenizer = ModelBase.CreateTokenizerFromGguf(gguf);
+        Assert.IsType<BpeTokenizer>(tokenizer);
+
+        Assert.Equal(new[] { 2, 23391 }, tokenizer.Encode("hello", addSpecial: true));
+        Assert.Equal(
+            new[] { 54593, 786, 1003, 614, 763, 76215, 236761 },
+            tokenizer.Encode("Tell me about an abacus.", addSpecial: false));
+        Assert.Equal(
+            new[] { 1364, 237001, 74235 },
+            tokenizer.Encode("coöperate", addSpecial: false));
+        Assert.Equal(
+            new[] { 12324, 236787, 3714, 596, 91577, 1083, 1847, 236783 },
+            tokenizer.Encode("JSON: {\"abbreviation\": true}", addSpecial: false));
+
+        const string noThinkingPrompt =
+            "<|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+        Assert.Equal(
+            new[] { 2, 105, 2364, 107, 23391, 106, 107, 105, 4368, 107, 100, 45518, 107, 101 },
+            tokenizer.Encode(noThinkingPrompt, addSpecial: true));
+
+        const string thinkingPrompt =
+            "<|turn>system\n<|think|><turn|>\n<|turn>user\nhello<turn|>\n<|turn>model\n";
+        Assert.Equal(
+            new[] { 2, 105, 9731, 107, 98, 106, 107, 105, 2364, 107, 23391, 106, 107, 105, 4368, 107 },
+            tokenizer.Encode(thinkingPrompt, addSpecial: true));
+
+        var history = new List<ChatMessage> { new() { Role = "user", Content = "hello" } };
+        string renderedThinkingPrompt = ChatTemplate.RenderFromGgufTemplate(
+            gguf.GetString("tokenizer.chat_template"),
+            history,
+            addGenerationPrompt: true,
+            architecture: "gemma4",
+            enableThinking: true);
+        Assert.Equal(thinkingPrompt, renderedThinkingPrompt);
+        Assert.Equal(
+            new[] { 2, 105, 9731, 107, 98, 106, 107, 105, 2364, 107, 23391, 106, 107, 105, 4368, 107 },
+            tokenizer.Encode(renderedThinkingPrompt, addSpecial: true));
+
+        Assert.Equal(
+            "Hello! How can I help you today?",
+            tokenizer.Decode(new List<int> { 9259, 236888, 2088, 740, 564, 1601, 611, 3124, 236881 }));
+    }
+
     [Fact]
     public void RealTemplate_RendersUserText_AndSingleBos()
     {
@@ -120,19 +251,9 @@ public class Gemma4PromptRenderReproTests
         if (modelPath == null) { _output.WriteLine("gemma-4-12b GGUF not found; skipping"); return; }
 
         using var gguf = new GgufFile(modelPath);
-        var vocab = gguf.GetStringArray("tokenizer.ggml.tokens")!;
-        var tokenTypes = gguf.GetInt32Array("tokenizer.ggml.token_type")!;
-        var scores = gguf.GetFloatArray("tokenizer.ggml.scores")!;
-        int bosId = (int)gguf.GetUint32("tokenizer.ggml.bos_token_id");
-        int eosId = (int)gguf.GetUint32("tokenizer.ggml.eos_token_id");
-        bool addBosMeta = gguf.GetBool("tokenizer.ggml.add_bos_token", false);
         string chatTemplate = gguf.GetString("tokenizer.chat_template") ?? "";
-        // Mirror production BOS resolution: a template with a leading {{ bos_token }}
-        // requires a BOS even when add_bos_token=false (TensorSharp renders bos_token
-        // empty, so the tokenizer must own it). See ModelBase.ResolveAddBosToken.
-        bool addBos = ModelBase.ResolveAddBosToken(addBosMeta, bosId, chatTemplate);
-        var tokenizer = new SentencePieceTokenizer(vocab, tokenTypes, scores, bosId,
-            new[] { eosId }, addBos, false);
+        ITokenizer tokenizer = ModelBase.CreateTokenizerFromGguf(gguf);
+        int bosId = tokenizer.BosTokenId;
 
         var history = new List<ChatMessage> { new() { Role = "user", Content = "请介绍最终幻想7" } };
         var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());

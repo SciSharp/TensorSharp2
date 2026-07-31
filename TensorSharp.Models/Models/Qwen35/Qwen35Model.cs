@@ -344,6 +344,11 @@ namespace TensorSharp.Models
         public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
             : base(ggufPath, backend, tpDegree, tpGroup)
         {
+            _useMetalGdnInplaceState = ShouldUseMetalGdnInplaceState(
+                backend,
+                IsTensorParallel,
+                Environment.GetEnvironmentVariable("TS_QWEN35_METAL_GDN_INPLACE_STATE"));
+
             string arch = _gguf.GetString("general.architecture") ?? "qwen35";
             Config = new ModelConfig { Architecture = arch };
             ParseBaseConfig();
@@ -466,7 +471,7 @@ namespace TensorSharp.Models
         private unsafe void FuseAttentionProjectionWeights()
         {
             int fused = 0;
-            int fusedF32 = 0;
+            int keptSeparate = 0;
             for (int layer = 0; layer < TotalLayerCount; layer++)
             {
                 if (_isRecurrent[layer])
@@ -483,29 +488,23 @@ namespace TensorSharp.Models
                 {
                     fused++;
                 }
-                else if (!IsTensorParallel &&
-                         TryFuseWeightsToFloat32(prefix + "attn_qkv.weight", sources))
+                else
                 {
-                    // Mixed quant types (e.g. UD-Q4_K_XL) prevent in-place quant
-                    // fusion; dequantize to F32 so the fused key exists for the
-                    // non-TP layer-key cache. Under TP the shard path reads the
-                    // separate Q/K/V weights directly (ShardSeparateColumnParallel),
-                    // avoiding a full-model F32 intermediate that can OOM.
-                    for (int i = 0; i < sources.Length; i++)
-                    {
-                        if (_quantWeights.Remove(sources[i], out var qw))
-                            qw.Dispose();
-                        else if (_weights.Remove(sources[i], out var w))
-                            w.Dispose();
-                    }
-                    fusedF32++;
+                    // Importance-matrix UD quants commonly choose different
+                    // types for Q, K and V. Repacking those mixed sources as F32
+                    // expanded Qwen3.6-27B's 409 MiB of source weights to 4.65 GiB
+                    // and streamed that expansion on every layer pass. llama.cpp
+                    // keeps the original tensors and issues three quantized
+                    // matmuls; our managed and native full-model paths already
+                    // support the same SeparateQkv contract, so retain them too.
+                    keptSeparate++;
                 }
             }
 
             if (fused > 0)
                 Console.WriteLine($"  Fused projections: {fused} Q+K+V");
-            if (fusedF32 > 0)
-                Console.WriteLine($"  Fused projections: {fusedF32} Q+K+V (dequantized to F32; mixed source quant types)");
+            if (keptSeparate > 0)
+                Console.WriteLine($"  Separate projections: {keptSeparate} mixed-quant Q/K/V sets preserved");
         }
 
         private unsafe void FuseRecurrentInputWeights()
@@ -1048,6 +1047,11 @@ namespace TensorSharp.Models
             // drain both before replacing the buffers / invalidating their graphs.
             EnsureKvCacheHostSynchronized();
             EnsureFusedDecodeStateHostSynchronized();
+            // Native graphs retain bindings to the current cache/state buffers.
+            // Drop them while those pointers are still alive, before any tensor is
+            // replaced or its device-copy cache entry is evicted.
+            InvalidateFullDecodeState(hardBindings: true);
+            InvalidateVerifyCache();
 
             int newCapacity;
             if (geometricGrowth)
@@ -1101,11 +1105,6 @@ namespace TensorSharp.Models
 
             _kvCacheCapacity = newCapacity;
             _kvCacheHostDirty = false;
-            // The KV tensors were reallocated, so any cached fused-decode / fused-verify
-            // graph pins the freed device buffers -> drop them (they rebuild on the next
-            // call against the new buffers).
-            InvalidateFullDecodeState();
-            InvalidateVerifyCache();
             Console.WriteLine($"Expanded Qwen3.5 attention cache to {newCapacity} tokens.");
         }
 
@@ -1145,6 +1144,14 @@ namespace TensorSharp.Models
                 return;
             }
 
+            // Reset intentionally discards the current device-resident state. Clear
+            // the dirty latches first so dropping the graphs does not copy it back,
+            // and release all native bindings before touching their host tensors.
+            _kvCacheHostDirty = false;
+            _gdnStateHostDirty = false;
+            InvalidateFullDecodeState();
+            InvalidateVerifyCache();
+
             for (int l = 0; l < TotalLayerCount; l++)
             {
                 if (!_isRecurrent[l])
@@ -1159,10 +1166,6 @@ namespace TensorSharp.Models
                 }
             }
             _cacheSeqLen = 0;
-            _kvCacheHostDirty = false;
-            _gdnStateHostDirty = false;
-            InvalidateFullDecodeState();
-            InvalidateVerifyCache();
             _fdSpecSessionActive = false;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _mlxEvalBoundaryTicks = 0;
@@ -1289,7 +1292,10 @@ namespace TensorSharp.Models
             _cacheSeqLen = destToken + tokenCount;
 
             // Invalidate any device-cached views so the next forward refills them
-            // from the freshly-written host buffers.
+            // from the freshly-written host buffers. Drop native graphs first:
+            // their bindings still point at those device-cache entries.
+            InvalidateFullDecodeState(hardBindings: true);
+            InvalidateVerifyCache();
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_isRecurrent[l]) continue;
@@ -1334,7 +1340,7 @@ namespace TensorSharp.Models
         {
             // convState bytes + writeIdx (4 bytes) + deltaState tensor bytes.
             long convBytes = (long)_convState[layer].Length * sizeof(float);
-            long deltaBytes = _deltaStateTensor[layer].Storage.ByteLength;
+            long deltaBytes = GdnDeltaStateBytes(_deltaStateTensor[layer]);
             return convBytes + sizeof(int) + deltaBytes;
         }
 
@@ -1400,7 +1406,7 @@ namespace TensorSharp.Models
             float[] conv = _convState[layer];
             int convBytes = conv.Length * sizeof(float);
             Tensor delta = _deltaStateTensor[layer];
-            long deltaBytes = delta.Storage.ByteLength;
+            long deltaBytes = GdnDeltaStateBytes(delta);
             long total = (long)convBytes + sizeof(int) + deltaBytes;
             if (destination.Length < total) return false;
 
@@ -1410,7 +1416,7 @@ namespace TensorSharp.Models
             BitConverter.TryWriteBytes(destination.Slice(convBytes, sizeof(int)), _convStateWriteIdx[layer]);
             // deltaState bytes via storage pointer (host-resident on every backend).
             delta.Storage.EnsureHostReadable();
-            IntPtr deltaBase = delta.Storage.PtrAtElement(0);
+            IntPtr deltaBase = GdnDeltaStatePointer(delta);
             unsafe
             {
                 fixed (byte* dst = destination[(convBytes + sizeof(int))..])
@@ -1428,7 +1434,7 @@ namespace TensorSharp.Models
             float[] conv = _convState[layer];
             int convBytes = conv.Length * sizeof(float);
             Tensor delta = _deltaStateTensor[layer];
-            long deltaBytes = delta.Storage.ByteLength;
+            long deltaBytes = GdnDeltaStateBytes(delta);
             long total = (long)convBytes + sizeof(int) + deltaBytes;
             if (source.Length < total) return false;
 
@@ -1437,7 +1443,7 @@ namespace TensorSharp.Models
             SyncCudaGdnConvStateFromHost(layer);
 
             delta.Storage.EnsureHostReadable();
-            IntPtr deltaBase = delta.Storage.PtrAtElement(0);
+            IntPtr deltaBase = GdnDeltaStatePointer(delta);
             unsafe
             {
                 fixed (byte* src = source[(convBytes + sizeof(int))..])
@@ -1491,13 +1497,13 @@ namespace TensorSharp.Models
         private bool CanUsePrefillVerify(int startPos, int seqLen)
         {
             if (!_prefillVerifyEnabled || _fvUnsupported) return false;
-            // Fused whole-model verify prefill runs on ggml_cuda AND ggml_vulkan (both
-            // implement the ops the graph needs — set_rows, mul_mat_id, gated_delta_net,
-            // ssm_scan/conv). Vulkan was previously gated out here, so Vulkan silently
-            // fell back to the per-op layer loop (pp512 ~20 tok/s vs ~300+ fused); the
-            // low-level TryFullModelVerify already permits Vulkan. Metal stays out
-            // (ggml_metal_op_set_rows SEGFAULTs — same reason it is non-persist decode).
-            if ((_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan) || seqLen <= 1)
+            // All GGML GPU backends run the whole-model prefill graph. CUDA and
+            // Vulkan use dynamic set_rows writes; Metal uses contiguous cpy views
+            // whose offset is baked into this one-shot prefill graph. The latter
+            // mirrors llama.cpp's linear KV-store path without relying on Metal's
+            // problematic multi-dimensional set_rows shape.
+            if ((_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan
+                    && _backend != BackendType.GgmlMetal) || seqLen <= 1)
                 return false;
             if (_visionEmbeddingsList.Count > 0 || _pendingMRoPEPositions != null) return false;
             if (_headKDim != _headVDim) return false;
@@ -1912,11 +1918,34 @@ namespace TensorSharp.Models
 
             EnsureKvCacheHostSynchronized();
             EnsureFusedDecodeStateHostSynchronized();
+            // The per-op recurrent kernels below invalidate and replace their
+            // host-keyed delta-state device buffers. A retained Metal decode
+            // graph still binds those buffers, so drop that graph before the
+            // fallback mutates the cache entries.
+            InvalidateFullDecodeState(hardBindings: true);
             hidden = RunCudaPrefillLayerLoop(hidden, seqLen, startPos);
 
             hidden.Dispose();
             _cacheSeqLen += seqLen;
             _forwardSw.Stop();
+        }
+
+        internal static bool CanTryDirectTokenDecode(
+            BackendType backend,
+            bool isTensorParallel,
+            int sequenceLength,
+            bool hasVisionEmbeddings,
+            bool hasMRoPEPositions,
+            int tokenId,
+            int vocabSize)
+        {
+            return backend == BackendType.GgmlMetal
+                && !isTensorParallel
+                && sequenceLength == 1
+                && !hasVisionEmbeddings
+                && !hasMRoPEPositions
+                && tokenId >= 0
+                && tokenId < vocabSize;
         }
 
         protected override float[] ForwardCore(int[] tokens)
@@ -1928,6 +1957,30 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
             EnsureCacheCapacity(startPos + seqLen);
+
+            if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                _logitsBuffer = new float[Config.VocabSize];
+
+            // llama.cpp feeds a token id into its decode graph and performs the
+            // quantized embedding lookup on-device. Do the same for ordinary
+            // text-only Metal decode, avoiding a per-token CPU dequantization,
+            // Tensor allocation, and hidden-vector upload.
+            int directTokenId = seqLen == 1 ? tokens[0] : -1;
+            if (CanTryDirectTokenDecode(
+                    _backend,
+                    IsTensorParallel,
+                    seqLen,
+                    _visionEmbeddingsList.Count != 0,
+                    _pendingMRoPEPositions != null,
+                    directTokenId,
+                    Config.VocabSize) &&
+                TryFullModelDecodeToken(directTokenId, startPos, _logitsBuffer))
+            {
+                _cacheSeqLen++;
+                _forwardCount++;
+                _forwardSw.Stop();
+                return _logitsBuffer;
+            }
 
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
@@ -1951,8 +2004,6 @@ namespace TensorSharp.Models
             // as one fused, CUDA-graph-captured GGML graph that outputs LOGITS
             // directly. Collapses ~120-400 per-op dispatches/token + the separate
             // lm_head graph_compute into a single captured replay.
-            if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
-                _logitsBuffer = new float[Config.VocabSize];
             if (seqLen == 1 && TryFullModelDecode(hidden, startPos, _logitsBuffer))
             {
                 // _logitsBuffer holds the final logits; skip the per-op loop + lm head.
@@ -1990,7 +2041,10 @@ namespace TensorSharp.Models
             // decode's device-resident GDN state must be re-seeded next time.
             EnsureKvCacheHostSynchronized();
             EnsureFusedDecodeStateHostSynchronized();
-            InvalidateFullDecodeState();
+            // RecurrentBlock may invalidate the host-keyed delta-state device
+            // buffers. Retaining a Metal graph across that transition would
+            // leave it holding freed buffer bindings.
+            InvalidateFullDecodeState(hardBindings: true);
             hidden = RunCudaPrefillLayerLoop(hidden, seqLen, startPos);
             }
 
@@ -5642,8 +5696,37 @@ namespace TensorSharp.Models
             PrintTpTimingStats();
         }
 
+        protected override void OnBeforeReleaseGgmlDeviceResidency()
+        {
+            // Whole-model Qwen graphs pin weight buffers. Preserve mutable
+            // device-authoritative state, then drop every graph family before
+            // ModelBase evicts the corresponding weight bindings.
+            EnsureKvCacheHostSynchronized();
+            EnsureFusedDecodeStateHostSynchronized();
+            InvalidateFullDecodeState(hardBindings: true);
+            InvalidateVerifyCache();
+            GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+            GgmlBasicOps.Qwen35ReleaseVerifyTpGraphs();
+            GgmlBasicOps.Qwen35ReleaseAttentionTpGraphs();
+            GgmlBasicOps.Qwen35GdnDropTpGraphs();
+        }
+
         public override void Dispose()
         {
+            // Native whole-model graphs retain backend buffers and weight/cache
+            // bindings. Release them while the model tensors and Metal backend are
+            // still alive; otherwise Metal residency sets retain allocations until
+            // process teardown.
+            if (IsGgmlBackend)
+            {
+                GgmlBasicOps.Qwen35ResetDecodeCache();
+                GgmlBasicOps.Qwen35ResetVerifyCache();
+                GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+                GgmlBasicOps.Qwen35ReleaseVerifyTpGraphs();
+                GgmlBasicOps.Qwen35ReleaseAttentionTpGraphs();
+                GgmlBasicOps.Qwen35GdnDropTpGraphs();
+            }
+
             // Cached CUDA prefill graphs own pool blocks + pinned tensors; free
             // them before the tensors/caches they reference are torn down.
             _cudaPrefillGraphs?.Dispose();

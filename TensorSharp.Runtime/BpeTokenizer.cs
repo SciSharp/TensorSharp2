@@ -31,14 +31,15 @@ namespace TensorSharp.Runtime
     public class BpeTokenizer : ITokenizer
     {
         private readonly string[] _vocab;
-        private readonly int[] _tokenTypes;
         private readonly Dictionary<string, int> _vocabLookup;
         private readonly Dictionary<string, int> _mergeLookup;
+        private readonly List<string> _specialTokens;
         private readonly Regex _pretokenizerRegex;
         private readonly int _bosTokenId;
         private readonly int[] _eosTokenIds;
         private readonly bool _addBos;
         private readonly bool _addEos;
+        private readonly bool _spmStyleBpe;
 
         public string[] Vocab => _vocab;
         public int BosTokenId => _bosTokenId;
@@ -50,11 +51,12 @@ namespace TensorSharp.Runtime
             string? preTokenizerType = null)
         {
             _vocab = vocab;
-            _tokenTypes = tokenTypes;
             _bosTokenId = bosTokenId;
             _eosTokenIds = eosTokenIds;
             _addBos = addBos;
             _addEos = addEos;
+            _spmStyleBpe = string.Equals(
+                preTokenizerType, "gemma4", StringComparison.OrdinalIgnoreCase);
 
             _vocabLookup = new Dictionary<string, int>(vocab.Length);
             for (int i = 0; i < vocab.Length; i++)
@@ -62,7 +64,22 @@ namespace TensorSharp.Runtime
 
             _mergeLookup = new Dictionary<string, int>(merges.Length);
             for (int i = 0; i < merges.Length; i++)
-                _mergeLookup[merges[i]] = i;
+                _mergeLookup.TryAdd(merges[i], i);
+
+            const int TOKEN_TYPE_CONTROL = 3;
+            const int TOKEN_TYPE_USER_DEFINED = 4;
+            var eogIds = new HashSet<int>(eosTokenIds);
+            _specialTokens = new List<string>();
+            for (int i = 0; i < vocab.Length; i++)
+            {
+                if ((tokenTypes != null && i < tokenTypes.Length &&
+                     (tokenTypes[i] == TOKEN_TYPE_CONTROL ||
+                      tokenTypes[i] == TOKEN_TYPE_USER_DEFINED)) ||
+                    eogIds.Contains(i))
+                {
+                    _specialTokens.Add(vocab[i]);
+                }
+            }
 
             string pattern = preTokenizerType switch
             {
@@ -90,6 +107,12 @@ namespace TensorSharp.Runtime
                     @"[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+|" +
                     @" ?[\p{P}\p{S}]+[\r\n]*|" +
                     @"\s*[\r\n]+|\s+(?!\S)|\s+",
+                // Gemma 4 uses BPE merge ranks, but with SentencePiece-style
+                // whitespace escaping and raw UTF-8 code points rather than
+                // GPT-2's byte-to-Unicode alphabet.  Merges run across the
+                // complete text, splitting only at newline runs.
+                "gemma4" =>
+                    @"[^\n]+|[\n]+",
                 _ =>
                     @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             };
@@ -97,29 +120,12 @@ namespace TensorSharp.Runtime
             _pretokenizerRegex = new Regex(pattern, RegexOptions.Compiled);
         }
 
-        private List<string> GetSpecialTokens()
-        {
-            const int TOKEN_TYPE_CONTROL = 3;
-            const int TOKEN_TYPE_USER_DEFINED = 4;
-            var specials = new List<string>();
-            for (int i = 0; i < _vocab.Length; i++)
-            {
-                if (_tokenTypes != null && i < _tokenTypes.Length &&
-                    (_tokenTypes[i] == TOKEN_TYPE_CONTROL || _tokenTypes[i] == TOKEN_TYPE_USER_DEFINED))
-                {
-                    specials.Add(_vocab[i]);
-                }
-            }
-            return specials;
-        }
-
         public List<int> Encode(string text, bool addSpecial = true)
         {
-            var specials = GetSpecialTokens();
             var fragments = new List<(string text, List<int>? ids)>();
             fragments.Add((text, null));
 
-            foreach (var special in specials)
+            foreach (var special in _specialTokens)
             {
                 int id = _vocabLookup.TryGetValue(special, out var sid) ? sid : -1;
                 if (id < 0) continue;
@@ -166,6 +172,28 @@ namespace TensorSharp.Runtime
                 foreach (Match match in matches)
                 {
                     string split = match.Value;
+
+                    if (_spmStyleBpe)
+                    {
+                        string spmNormalized = split.Replace(" ", "\u2581", StringComparison.Ordinal);
+
+                        // llama.cpp preserves a complete newline run when the
+                        // vocabulary contains it.  Otherwise normal BPE merging
+                        // starts from Unicode code points.
+                        if (spmNormalized.All(c => c == '\n') &&
+                            _vocabLookup.TryGetValue(spmNormalized, out int newlineId))
+                        {
+                            ids.Add(newlineId);
+                            continue;
+                        }
+
+                        ids.AddRange(BpeMerge(
+                            spmNormalized,
+                            rawUnicodeCodePoints: true,
+                            byteFallback: true));
+                        continue;
+                    }
+
                     string normalized = NormalizeSplit(split);
 
                     if (_vocabLookup.TryGetValue(normalized, out int directId))
@@ -206,15 +234,20 @@ namespace TensorSharp.Runtime
             return sb.ToString();
         }
 
-        private List<int> BpeMerge(string normalized)
+        private List<int> BpeMerge(
+            string normalized,
+            bool rawUnicodeCodePoints = false,
+            bool byteFallback = false)
         {
-            var runes = normalized.ToCharArray().Select(c => c.ToString()).ToList();
+            var runes = rawUnicodeCodePoints
+                ? normalized.EnumerateRunes().Select(r => r.ToString()).ToList()
+                : normalized.ToCharArray().Select(c => c.ToString()).ToList();
             if (runes.Count == 0) return new List<int>();
             if (runes.Count == 1)
             {
                 if (_vocabLookup.TryGetValue(runes[0], out int id))
                     return new List<int> { id };
-                return new List<int>();
+                return byteFallback ? ByteFallback(runes[0]) : new List<int>();
             }
 
             var mergeNodes = new List<MergeNode>();
@@ -297,7 +330,24 @@ namespace TensorSharp.Runtime
             var result = new List<int>();
             foreach (var node in mergeNodes)
             {
-                if (node.Active && _vocabLookup.TryGetValue(node.Runes, out int id))
+                if (!node.Active)
+                    continue;
+
+                if (_vocabLookup.TryGetValue(node.Runes, out int id))
+                    result.Add(id);
+                else if (byteFallback)
+                    result.AddRange(ByteFallback(node.Runes));
+            }
+            return result;
+        }
+
+        private List<int> ByteFallback(string text)
+        {
+            var result = new List<int>();
+            foreach (byte b in Encoding.UTF8.GetBytes(text))
+            {
+                string byteToken = $"<0x{b:X2}>";
+                if (_vocabLookup.TryGetValue(byteToken, out int id))
                     result.Add(id);
             }
             return result;
@@ -312,6 +362,27 @@ namespace TensorSharp.Runtime
         public void AppendTokenBytes(int tokenId, List<byte> buffer)
         {
             string token = _vocab[tokenId];
+
+            if (_spmStyleBpe)
+            {
+                if (token.Length == 6 &&
+                    token.StartsWith("<0x", StringComparison.Ordinal) &&
+                    token.EndsWith(">", StringComparison.Ordinal) &&
+                    byte.TryParse(
+                        token.Substring(3, 2),
+                        System.Globalization.NumberStyles.HexNumber,
+                        null,
+                        out byte byteValue))
+                {
+                    buffer.Add(byteValue);
+                    return;
+                }
+
+                token = token.Replace("\u2581", " ", StringComparison.Ordinal);
+                buffer.AddRange(Encoding.UTF8.GetBytes(token));
+                return;
+            }
+
             foreach (char r in token)
             {
                 if (r == 0x0100) continue;
@@ -351,4 +422,3 @@ namespace TensorSharp.Runtime
         }
     }
 }
-

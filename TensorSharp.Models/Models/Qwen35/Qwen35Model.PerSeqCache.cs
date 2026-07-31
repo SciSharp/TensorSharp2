@@ -82,22 +82,12 @@ namespace TensorSharp.Models
         /// also requires that decode to be available (full-decode on, not
         /// latched unsupported).
         ///
-        /// ggml_metal: the whole-model fused decode is CUDA-only
-        /// (<see cref="TryFullModelDecode"/> returns false on Metal), so each
-        /// request decodes through the op-by-op <see cref="Forward"/> — the SAME
-        /// path the single-stream (N==1) case already uses correctly on Metal —
-        /// against its own KV + GDN holder. Routing concurrent requests here is
-        /// what keeps them running together (each scheduled sequence gets a
-        /// Forward per step) AND keeps each request's recurrent/attention state
-        /// isolated in its own holder. Without it, Metal had no per-seq fused
-        /// path: concurrent requests fell back to <c>ExecuteStepPerSequence</c>,
-        /// which serializes them (at most one Forward per step) and corrupts
-        /// output via the byte-level cross-sequence KV/GDN swap in
-        /// EnsureOwnership. The op-by-op Forward touches only the model fields
-        /// the holder swaps (<c>_kvCacheK/V</c>, <c>_convState</c>,
-        /// <c>_convStateWriteIdx</c>, <c>_deltaStateTensor</c>), with no
-        /// CUDA-graph-captured device addresses to go stale across the swap, so
-        /// it is correct per-request on Metal.</summary>
+        /// ggml_metal: each holder gets its own persistent whole-model graph,
+        /// keyed by the first attention KV pointer. Swapping holders refreshes
+        /// the managed descriptors once and selects the matching native graph;
+        /// unsupported shapes still fall back to the isolated per-holder
+        /// operation path. This preserves both concurrency and per-request
+        /// recurrent/attention state.</summary>
         public bool SupportsPerSequenceFusedForward =>
             !_fdSpecSessionActive
             && ((_backend == BackendType.GgmlCuda && _fullDecodeEnabled && !_fdUnsupported)
@@ -123,6 +113,13 @@ namespace TensorSharp.Models
 
         private void LoadCacheHolder(Qwen35KvCacheHolder h)
         {
+            // The persistent verify cache is keyed by graph shape, not by the
+            // per-request K/V holder whose device addresses it captures. Drop it
+            // before switching holders so an all-logits/spec verify cannot replay
+            // a graph against the previous request's cache.
+            if (IsGgmlBackend && !ReferenceEquals(_kvCacheK, h.K))
+                InvalidateVerifyCache();
+
             _kvCacheK = h.K;
             _kvCacheV = h.V;
             _kvCacheCapacity = h.KvCapacity;
@@ -134,10 +131,10 @@ namespace TensorSharp.Models
             _fdConvScratch = h.ConvScratch;
             _fdStateResident = h.FdStateResident;
             _gdnStateHostDirty = h.GdnHostDirty;
-            // The fused-decode descriptors are rebuilt from these fields on every
-            // TryFullModelDecode call, so no cached pointer array needs refreshing
-            // (unlike Gemma4's _decodeArrays). The native g_q35dc_pool selects this
-            // holder's captured graph by its first attention KV pointer.
+            // TryFullModelDecode keys its descriptor cache on these storage and
+            // conv-scratch pointers, so switching holders refreshes bindings once.
+            // The native g_q35dc_pool selects the captured graph by the same first
+            // attention-KV pointer.
         }
 
         private Qwen35KvCacheHolder CreateFreshHolder()
@@ -167,7 +164,12 @@ namespace TensorSharp.Models
                 {
                     convState[l] = new float[Math.Max(0, convDim) * qkvDim];
                     convWriteIdx[l] = 0;
-                    deltaState[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
+                    deltaState[l] = AllocateGdnDeltaStateTensor(
+                        _allocator,
+                        _useMetalGdnInplaceState,
+                        _numVHeads,
+                        _headVDim,
+                        _headKDim);
                     Ops.Fill(deltaState[l], 0);
                     gdnCount++;
                 }
@@ -309,7 +311,13 @@ namespace TensorSharp.Models
             // concurrent request), so rebuilding the surviving holders' graphs on
             // their next token is a small price for deterministic lifetime safety.
             if (IsGgmlBackend)
+            {
                 GgmlBasicOps.Qwen35ResetDecodeCache();
+                // Persistent fused prefill/spec verify graphs bind the same
+                // holder K/V and recurrent-state buffers. Release them before
+                // invalidating those host keys as well.
+                InvalidateVerifyCache();
+            }
 
             if (holder.K != null)
                 foreach (var t in holder.K)
@@ -326,7 +334,8 @@ namespace TensorSharp.Models
             if (holder.DeltaState != null)
                 foreach (var t in holder.DeltaState)
                 {
-                    InvalidateTensorDeviceCache(t);
+                    if (IsGgmlBackend)
+                        InvalidateGdnDeltaStateDeviceCaches(t);
                     t?.Dispose();
                 }
             if (holder.ConvScratch != IntPtr.Zero)

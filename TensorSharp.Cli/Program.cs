@@ -156,6 +156,7 @@ namespace TensorSharp.Cli
             int benchmarkDecode = 64;
             int benchmarkRuns = 1;
             bool benchmarkChunked = false;
+            bool benchmarkFixedTokens = false;
             bool runChunkedPrefillCorrectness = false;
             int correctnessPrefill = 1500;
             int correctnessDecode = 8;
@@ -251,6 +252,7 @@ namespace TensorSharp.Cli
                     case "--bench-decode": benchmarkDecode = int.Parse(args[++i]); break;
                     case "--bench-runs": benchmarkRuns = int.Parse(args[++i]); break;
                     case "--bench-chunked": benchmarkChunked = true; break;
+                    case "--bench-fixed-tokens": benchmarkFixedTokens = true; break;
                     case "--test-chunked-prefill": runChunkedPrefillCorrectness = true; break;
                     case "--correct-prefill": correctnessPrefill = int.Parse(args[++i]); break;
                     case "--correct-decode": correctnessDecode = int.Parse(args[++i]); break;
@@ -603,7 +605,9 @@ namespace TensorSharp.Cli
 
             if (runBenchmark)
             {
-                RunBenchmark(model, benchmarkPrefill, benchmarkDecode, benchmarkRuns, benchmarkChunked);
+                RunBenchmark(
+                    model, benchmarkPrefill, benchmarkDecode, benchmarkRuns,
+                    benchmarkChunked, benchmarkFixedTokens);
                 return;
             }
 
@@ -2314,34 +2318,69 @@ namespace TensorSharp.Cli
         }
 
         /// <summary>
-        /// Standalone inference benchmark: measures pure prefill and decode throughput
-        /// without prompt rendering, sampling, or output formatting overhead. Reports the
-        /// best (minimum-time) of `runs` independent runs to filter out warm-up artifacts.
+        /// Standalone inference benchmark: measures prefill and decode throughput without
+        /// prompt rendering or output formatting overhead. The default greedy mode reports
+        /// model-forward and host argmax time separately while retaining the end-to-end
+        /// decode measurement. Fixed-token mode feeds a predetermined token stream so its
+        /// timed decode is directly comparable to inference-only tools such as llama-bench;
+        /// an untimed greedy chain still verifies deterministic model output.
         ///
         /// Optionally captures the first decode tokens after each prefill so the same
         /// benchmark can be run twice (e.g. with and without GDN_DISABLE_CHUNKED_PREFILL=1)
         /// and the outputs compared.
         /// </summary>
-        static void RunBenchmark(ModelBase model, int prefillTokens, int decodeTokens, int runs, bool chunked = false)
+        static void RunBenchmark(
+            ModelBase model,
+            int prefillTokens,
+            int decodeTokens,
+            int runs,
+            bool chunked = false,
+            bool fixedTokens = false)
         {
+            if (prefillTokens < 1)
+                throw new ArgumentOutOfRangeException(nameof(prefillTokens), "Benchmark prefill tokens must be at least 1.");
+            if (decodeTokens < 1)
+                throw new ArgumentOutOfRangeException(nameof(decodeTokens), "Benchmark decode tokens must be at least 1.");
+            if (runs < 1)
+                throw new ArgumentOutOfRangeException(nameof(runs), "Benchmark runs must be at least 1.");
+
+            string decodeMode = fixedTokens ? "fixed-inference" : "greedy-e2e";
             _log.LogInformation(LogEventIds.CliBenchmark,
-                "inference benchmark starting: prefillTokens={PrefillTokens} decodeTokens={DecodeTokens} runs={Runs} chunked={Chunked}",
-                prefillTokens, decodeTokens, runs, chunked);
+                "inference benchmark starting: prefillTokens={PrefillTokens} decodeTokens={DecodeTokens} runs={Runs} chunked={Chunked} decodeMode={DecodeMode}",
+                prefillTokens, decodeTokens, runs, chunked, decodeMode);
 
             // Build a synthetic prompt of `prefillTokens` tokens by repeating a stable token.
             // We pick a token id that's safely inside the vocab (not BOS/EOS/special).
             int vocab = model.Config.VocabSize;
-            int basisToken = Math.Min(100, vocab - 1);
+            int syntheticSpan = Math.Max(1, Math.Min(17, vocab));
+            int basisToken = Math.Max(0, Math.Min(100, vocab - syntheticSpan));
             int[] prefillIds = new int[prefillTokens];
             for (int i = 0; i < prefillTokens; i++)
-                prefillIds[i] = basisToken + (i % 17);
+                prefillIds[i] = basisToken + (i % syntheticSpan);
+
+            // llama-bench advances decode with generated random token IDs rather
+            // than scanning the vocabulary after every step. This deterministic
+            // equivalent keeps token preparation out of the timed model call and
+            // makes repeated TensorSharp runs directly comparable.
+            int[] fixedDecodeIds = null;
+            if (fixedTokens)
+            {
+                fixedDecodeIds = new int[decodeTokens];
+                for (int i = 0; i < decodeTokens; i++)
+                    fixedDecodeIds[i] = basisToken + ((prefillTokens + i) % syntheticSpan);
+            }
 
             double bestPrefillMs = double.PositiveInfinity;
             double bestDecodeMs = double.PositiveInfinity;
             double bestPrefillTps = 0;
             double bestDecodeTps = 0;
+            double bestDecodeModelMs = double.NaN;
+            double bestDecodeModelTps = double.NaN;
+            double bestDecodeSamplingMs = double.NaN;
             double avgPrefillTps = 0;
             double avgDecodeTps = 0;
+            double avgDecodeModelTps = 0;
+            int decodeModelTimingRuns = 0;
 
             int[] firstRunDecodeTokens = null;
             int firstRunPrefillTopToken = -1;
@@ -2375,15 +2414,38 @@ namespace TensorSharp.Cli
                 double prefillMs = prefillSw.Elapsed.TotalMilliseconds;
                 double prefillTps = prefillTokens / (prefillMs / 1000.0);
 
-                // Decode timing - greedy sampling on a stable token chain
-                int next = SampleGreedyFromLogits(logits, vocab);
-                if (run == 0)
+                int next = -1;
+                if (!fixedTokens)
                 {
-                    firstRunPrefillTopToken = next;
-                    firstRunDecodeTokens = new int[decodeTokens];
+                    // Seed sampling occurs after prefill and before the decode
+                    // stopwatch, matching the benchmark's historic behavior.
+                    next = SampleGreedyFromLogits(logits, vocab);
+                    if (run == 0)
+                    {
+                        firstRunPrefillTopToken = next;
+                        firstRunDecodeTokens = new int[decodeTokens];
+                    }
                 }
+
+                // The outer stopwatch retains the benchmark's end-to-end metric.
+                // Per-operation timestamps expose how much of it is actual model
+                // execution versus the managed O(vocab) greedy scan.
+                long decodeModelTicks = 0;
+                long decodeSamplingTicks = 0;
+                bool decodeBreakdownAvailable = fixedTokens || !usePipelinedGreedy;
+                int[] decodeInput = new int[1];
                 var decodeSw = Stopwatch.StartNew();
-                if (usePipelinedGreedy && decodeTokens > 0)
+                if (fixedTokens)
+                {
+                    for (int i = 0; i < decodeTokens; i++)
+                    {
+                        decodeInput[0] = fixedDecodeIds[i];
+                        long modelStart = Stopwatch.GetTimestamp();
+                        logits = model.Forward(decodeInput);
+                        decodeModelTicks += Stopwatch.GetTimestamp() - modelStart;
+                    }
+                }
+                else if (usePipelinedGreedy)
                 {
                     // Submit decode step N+1 BEFORE host-syncing token N — overlaps
                     // the MLX LM-head sync wait with the next forward's first
@@ -2410,8 +2472,14 @@ namespace TensorSharp.Cli
                 {
                     for (int i = 0; i < decodeTokens; i++)
                     {
-                        logits = model.Forward(new[] { next });
+                        decodeInput[0] = next;
+                        long modelStart = Stopwatch.GetTimestamp();
+                        logits = model.Forward(decodeInput);
+                        decodeModelTicks += Stopwatch.GetTimestamp() - modelStart;
+
+                        long samplingStart = Stopwatch.GetTimestamp();
                         next = SampleGreedyFromLogits(logits, vocab);
+                        decodeSamplingTicks += Stopwatch.GetTimestamp() - samplingStart;
                         if (run == 0)
                             firstRunDecodeTokens[i] = next;
                     }
@@ -2419,10 +2487,27 @@ namespace TensorSharp.Cli
                 decodeSw.Stop();
                 double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
                 double decodeTps = decodeTokens / (decodeMs / 1000.0);
+                double decodeModelMs = decodeModelTicks * 1000.0 / Stopwatch.Frequency;
+                double decodeSamplingMs = decodeSamplingTicks * 1000.0 / Stopwatch.Frequency;
+                double decodeModelTps = decodeBreakdownAvailable
+                    ? decodeTokens / (decodeModelMs / 1000.0)
+                    : double.NaN;
 
-                _log.LogInformation(LogEventIds.CliBenchmark,
-                    "benchmark run {Run}/{Runs}: prefillMs={PrefillMs:F0} prefillTps={PrefillTps:F1} decodeMs={DecodeMs:F0} decodeTps={DecodeTps:F1} msPerTok={MsPerTok:F1}",
-                    run + 1, runs, prefillMs, prefillTps, decodeMs, decodeTps, decodeMs / decodeTokens);
+                if (decodeBreakdownAvailable)
+                {
+                    _log.LogInformation(LogEventIds.CliBenchmark,
+                        "benchmark run {Run}/{Runs}: prefillMs={PrefillMs:F0} prefillTps={PrefillTps:F1} decodeMs={DecodeMs:F0} decodeTps={DecodeTps:F1} msPerTok={MsPerTok:F1} decodeModelMs={DecodeModelMs:F0} decodeModelTps={DecodeModelTps:F1} greedySampleMs={GreedySampleMs:F1} decodeMode={DecodeMode}",
+                        run + 1, runs, prefillMs, prefillTps, decodeMs, decodeTps,
+                        decodeMs / decodeTokens, decodeModelMs, decodeModelTps,
+                        decodeSamplingMs, decodeMode);
+                }
+                else
+                {
+                    _log.LogInformation(LogEventIds.CliBenchmark,
+                        "benchmark run {Run}/{Runs}: prefillMs={PrefillMs:F0} prefillTps={PrefillTps:F1} decodeMs={DecodeMs:F0} decodeTps={DecodeTps:F1} msPerTok={MsPerTok:F1} decodeBreakdown=pipelined-overlap decodeMode={DecodeMode}",
+                        run + 1, runs, prefillMs, prefillTps, decodeMs, decodeTps,
+                        decodeMs / decodeTokens, decodeMode);
+                }
 
                 if (prefillMs < bestPrefillMs)
                 {
@@ -2433,26 +2518,104 @@ namespace TensorSharp.Cli
                 {
                     bestDecodeMs = decodeMs;
                     bestDecodeTps = decodeTps;
+                    bestDecodeModelMs = decodeBreakdownAvailable ? decodeModelMs : double.NaN;
+                    bestDecodeModelTps = decodeBreakdownAvailable ? decodeModelTps : double.NaN;
+                    bestDecodeSamplingMs = decodeBreakdownAvailable ? decodeSamplingMs : double.NaN;
                 }
                 avgPrefillTps += prefillTps;
                 avgDecodeTps += decodeTps;
+                if (decodeBreakdownAvailable)
+                {
+                    avgDecodeModelTps += decodeModelTps;
+                    decodeModelTimingRuns++;
+                }
             }
 
             avgPrefillTps /= runs;
             avgDecodeTps /= runs;
+            if (decodeModelTimingRuns > 0)
+                avgDecodeModelTps /= decodeModelTimingRuns;
 
-            _log.LogInformation(LogEventIds.CliBenchmark,
-                "benchmark summary: bestPrefillMs={BestPrefillMs:F0} bestPrefillTps={BestPrefillTps:F1} bestDecodeMs={BestDecodeMs:F0} bestDecodeTps={BestDecodeTps:F1} bestDecodeMsPerTok={BestDecodeMsPerTok:F2} avgPrefillTps={AvgPrefillTps:F1} avgDecodeTps={AvgDecodeTps:F1}",
-                bestPrefillMs, bestPrefillTps, bestDecodeMs, bestDecodeTps,
-                bestDecodeMs / decodeTokens, avgPrefillTps, avgDecodeTps);
+            if (decodeModelTimingRuns > 0)
+            {
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "benchmark summary: bestPrefillMs={BestPrefillMs:F0} bestPrefillTps={BestPrefillTps:F1} bestDecodeMs={BestDecodeMs:F0} bestDecodeTps={BestDecodeTps:F1} bestDecodeMsPerTok={BestDecodeMsPerTok:F2} bestDecodeModelMs={BestDecodeModelMs:F0} bestDecodeModelTps={BestDecodeModelTps:F1} bestGreedySampleMs={BestGreedySampleMs:F1} avgPrefillTps={AvgPrefillTps:F1} avgDecodeTps={AvgDecodeTps:F1} avgDecodeModelTps={AvgDecodeModelTps:F1} decodeMode={DecodeMode}",
+                    bestPrefillMs, bestPrefillTps, bestDecodeMs, bestDecodeTps,
+                    bestDecodeMs / decodeTokens, bestDecodeModelMs, bestDecodeModelTps,
+                    bestDecodeSamplingMs, avgPrefillTps, avgDecodeTps,
+                    avgDecodeModelTps, decodeMode);
+            }
+            else
+            {
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "benchmark summary: bestPrefillMs={BestPrefillMs:F0} bestPrefillTps={BestPrefillTps:F1} bestDecodeMs={BestDecodeMs:F0} bestDecodeTps={BestDecodeTps:F1} bestDecodeMsPerTok={BestDecodeMsPerTok:F2} avgPrefillTps={AvgPrefillTps:F1} avgDecodeTps={AvgDecodeTps:F1} decodeBreakdown=pipelined-overlap decodeMode={DecodeMode}",
+                    bestPrefillMs, bestPrefillTps, bestDecodeMs, bestDecodeTps,
+                    bestDecodeMs / decodeTokens, avgPrefillTps, avgDecodeTps, decodeMode);
+            }
 
-            if (firstRunDecodeTokens != null)
+            if (!fixedTokens && firstRunDecodeTokens != null)
             {
                 _log.LogInformation(LogEventIds.CliBenchmark,
                     "benchmark sampled tokens (run1): prefillTopToken={Prefill} decode={Decode}",
                     firstRunPrefillTopToken, string.Join(",", firstRunDecodeTokens));
             }
             model.PrintTimingStats();
+
+            if (fixedTokens)
+            {
+                // Fixed-token timing intentionally does not inspect logits. Run
+                // the historic greedy chain once, outside all benchmark
+                // stopwatches, so regressions remain visible and comparable.
+                model.ResetKVCache();
+                float[] correctnessLogits = chunked
+                    ? model.ForwardRefill(prefillIds)
+                    : model.Forward(prefillIds);
+                firstRunPrefillTopToken = SampleGreedyFromLogits(correctnessLogits, vocab);
+                firstRunDecodeTokens = RunUntimedGreedyDecode(
+                    model, firstRunPrefillTopToken, decodeTokens, vocab, usePipelinedGreedy);
+
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "benchmark sampled tokens (untimed correctness): prefillTopToken={Prefill} decode={Decode}",
+                    firstRunPrefillTopToken, string.Join(",", firstRunDecodeTokens));
+            }
+        }
+
+        static int[] RunUntimedGreedyDecode(
+            ModelBase model,
+            int firstToken,
+            int decodeTokens,
+            int vocab,
+            bool usePipelinedGreedy)
+        {
+            int[] sampledTokens = new int[decodeTokens];
+            if (usePipelinedGreedy)
+            {
+                Tensor pending = model.SubmitGreedyDecodeStep(firstToken);
+                int step = 1;
+                for (; step < decodeTokens; step++)
+                {
+                    Tensor nextDevice = model.SubmitGreedyDecodeStep(null);
+                    sampledTokens[step - 1] = pending.GetElementsAsInt(1)[0];
+                    pending.Dispose();
+                    pending = nextDevice;
+                }
+
+                sampledTokens[decodeTokens - 1] = pending.GetElementsAsInt(1)[0];
+                pending.Dispose();
+                model.ResetPipelinedGreedyState();
+                return sampledTokens;
+            }
+
+            int next = firstToken;
+            int[] decodeInput = new int[1];
+            for (int i = 0; i < decodeTokens; i++)
+            {
+                decodeInput[0] = next;
+                float[] logits = model.Forward(decodeInput);
+                next = SampleGreedyFromLogits(logits, vocab);
+                sampledTokens[i] = next;
+            }
+            return sampledTokens;
         }
 
         static int SampleGreedyFromLogits(float[] logits, int vocab)

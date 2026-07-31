@@ -102,6 +102,96 @@ public class BpeTokenizerTests
     }
 
     [Fact]
+    public void Encode_Gemma4UsesRankedBpeOverRawUnicodeAndEscapedSpaces()
+    {
+        string[] vocab =
+        {
+            "<bos>", "h", "e", "l", "o", "\u2581", "w", "r", "d", "你",
+            "he", "hel", "hell", "hello",
+            "\u2581w", "\u2581wo", "\u2581wor", "\u2581worl", "\u2581world",
+        };
+        string[] merges =
+        {
+            "h e", "he l", "hel l", "hell o",
+            "\u2581 w", "\u2581w o", "\u2581wo r", "\u2581wor l", "\u2581worl d",
+        };
+        var tokenizer = new BpeTokenizer(
+            vocab,
+            new[] { 3 }.Concat(Enumerable.Repeat(1, vocab.Length - 1)).ToArray(),
+            merges,
+            bosTokenId: 0,
+            eosTokenIds: Array.Empty<int>(),
+            addBos: true,
+            addEos: false,
+            preTokenizerType: "gemma4");
+
+        List<int> ids = tokenizer.Encode("hello world你", addSpecial: false);
+
+        Assert.Equal(new[] { 13, 18, 9 }, ids);
+        Assert.Equal("hello world你", tokenizer.Decode(ids));
+        Assert.Equal(0, tokenizer.Encode("hello", addSpecial: true)[0]);
+    }
+
+    [Fact]
+    public void Encode_Gemma4PreservesKnownNewlineRuns()
+    {
+        string[] vocab = { "\n", "\n\n" };
+        var tokenizer = new BpeTokenizer(
+            vocab,
+            new[] { 1, 1 },
+            Array.Empty<string>(),
+            bosTokenId: -1,
+            eosTokenIds: Array.Empty<int>(),
+            addBos: false,
+            addEos: false,
+            preTokenizerType: "gemma4");
+
+        Assert.Equal(new[] { 1 }, tokenizer.Encode("\n\n", addSpecial: false));
+    }
+
+    [Fact]
+    public void Encode_Gemma4FallsBackToRawUtf8ByteTokens()
+    {
+        string[] vocab = { "<0xF0>", "<0x9F>", "<0x99>", "<0x82>" };
+        var tokenizer = new BpeTokenizer(
+            vocab,
+            new[] { 6, 6, 6, 6 },
+            Array.Empty<string>(),
+            bosTokenId: -1,
+            eosTokenIds: Array.Empty<int>(),
+            addBos: false,
+            addEos: false,
+            preTokenizerType: "gemma4");
+
+        List<int> ids = tokenizer.Encode("🙂", addSpecial: false);
+
+        Assert.Equal(new[] { 0, 1, 2, 3 }, ids);
+        Assert.Equal("🙂", tokenizer.Decode(ids));
+    }
+
+    [Fact]
+    public void ResolveAddBosToken_ForcesGemma4BosWithoutTemplateMarker()
+    {
+        Assert.True(ModelBase.ResolveAddBosToken(
+            addBosFromMetadata: false,
+            bosTokenId: 2,
+            chatTemplate: "",
+            tokenizerModel: "gemma4"));
+    }
+
+    [Theory]
+    [InlineData("llama", true)]
+    [InlineData("t5", true)]
+    [InlineData("gemma4", false)]
+    [InlineData("gpt2", false)]
+    public void UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(
+        string tokenizerModel,
+        bool expected)
+    {
+        Assert.Equal(expected, ModelBase.UsesSentencePieceTokenizer(tokenizerModel));
+    }
+
+    [Fact]
     public void ResolveEogTokenIds_IncludesBothQwenControlEndings()
     {
         string[] vocab = { "ordinary", "<|endoftext|>", "<|im_end|>", "extra" };
@@ -120,6 +210,45 @@ public class BpeTokenizerTests
         Assert.True(tokenizer.IsEos(1));
         Assert.True(tokenizer.IsEos(2));
         Assert.False(tokenizer.IsEos(0));
+    }
+
+    [Fact]
+    public void Encode_ParsesNormalTypedEogMarkerAsSpecialToken()
+    {
+        string[] vocab = { "a", "b", "<|tool_response>" };
+        var tokenizer = new BpeTokenizer(
+            vocab,
+            new[] { 1, 1, 1 },
+            Array.Empty<string>(),
+            bosTokenId: -1,
+            eosTokenIds: new[] { 2 },
+            addBos: false,
+            addEos: false,
+            preTokenizerType: "gemma4");
+
+        Assert.Equal(
+            new[] { 0, 2, 1 },
+            tokenizer.Encode("a<|tool_response>b", addSpecial: false));
+    }
+
+    [Fact]
+    public void Encode_ParsesNormalTypedEogMarkerForDefaultBpeTokenizer()
+    {
+        // EOG-token promotion is a llama.cpp vocabulary rule, not specific to
+        // Gemma 4's SPM-style pre-tokenizer.
+        string[] vocab = { "a", "b", "<|im_end|>" };
+        var tokenizer = new BpeTokenizer(
+            vocab,
+            new[] { 1, 1, 1 },
+            Array.Empty<string>(),
+            bosTokenId: -1,
+            eosTokenIds: new[] { 2 },
+            addBos: false,
+            addEos: false);
+
+        Assert.Equal(
+            new[] { 0, 2, 1 },
+            tokenizer.Encode("a<|im_end|>b", addSpecial: false));
     }
 
     [Fact]

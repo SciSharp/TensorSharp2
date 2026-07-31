@@ -569,8 +569,12 @@ namespace TensorSharp.Runtime
                         }
                         else
                         {
-                            if (architecture == "gemma4" && addGenerationPrompt && !enableThinking)
-                                result = EnsureGemma4ThinkingBlock(result);
+                            if (architecture == "gemma4" && addGenerationPrompt)
+                            {
+                                result = enableThinking
+                                    ? EnsureGemma4ThinkingPromptNewline(result)
+                                    : EnsureGemma4ThinkingBlock(result);
+                            }
                             else if (IsQwen35Family(architecture) && addGenerationPrompt && enableThinking)
                                 result = EnsureQwen35ThinkOpen(result);
                             Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering succeeded for '{architecture}', prompt length={result.Length}");
@@ -1347,6 +1351,22 @@ namespace TensorSharp.Runtime
         }
 
         /// <summary>
+        /// Restore the newline after Gemma 4's open model turn when thinking is
+        /// enabled. The embedded template ends in <c>&lt;|turn&gt;model\n</c>,
+        /// but the generic Jinja result cleanup trims that newline. Gemma 4
+        /// treats the newline as part of the generation prompt; omitting it can
+        /// drive the model into repetitive garbage instead of its reasoning
+        /// channel.
+        /// </summary>
+        private static string EnsureGemma4ThinkingPromptNewline(string result)
+        {
+            const string openModelTurn = "<|turn>model";
+            if (result.EndsWith(openModelTurn, StringComparison.Ordinal))
+                result += "\n";
+            return result;
+        }
+
+        /// <summary>
         /// Ensure a thinking-enabled Qwen 3.5/3.6 generation prompt ends with an OPEN
         /// thinking block "&lt;think&gt;\n" (note the trailing newline).
         ///
@@ -1440,4 +1460,3 @@ namespace TensorSharp.Runtime
         }
     }
 }
-

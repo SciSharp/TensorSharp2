@@ -356,9 +356,10 @@ output_norm.weight
 output.weight
 ```
 
-`FuseAttentionProjectionWeights()` fuses the per-layer Q+K+V into
-`attn_qkv.weight` for FullAttention layers when the GGUF stores them
-separately. `FuseRecurrentInputWeights()` packs five recurrent projections
+`FuseAttentionProjectionWeights()` fuses per-layer Q+K+V into
+`attn_qkv.weight` when all three GGUF tensors share a quantization type.
+Mixed-type importance-matrix/UD quant projections remain separate, avoiding
+multi-gigabyte FP32 expansion. `FuseRecurrentInputWeights()` packs five recurrent projections
 (`attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha`, plus an empty slot) into
 one fused `ssm_in_proj.weight` for GatedDeltaNet layers. `FuseGateUpWeights()`
 fuses dense FFN gate and up.
@@ -393,6 +394,9 @@ Constructor:
 `Forward(int[] tokens)` distinguishes prefill (`seqLen > 1`) from decode
 (`seqLen == 1`) and routes each layer through one of:
 
+- A fused whole-model GGML graph for supported dense single-device GPU
+  prefill and decode. On Metal, this is the default path for the 27B dense
+  Qwen 3.6 model.
 - The fused per-layer attention decode kernel
   (`TryFusedAttnLayerDecode`) when the cached sequence length is past the
   `FUSED_ATTN_LAYER_MIN_SEQ_LEN` threshold (default 4096).
@@ -406,6 +410,15 @@ Constructor:
 - A standard managed C# path otherwise.
 
 ## 8. Prefill optimization
+
+### Whole-model fused prefill
+
+On supported dense GGML GPU models, prefill is dispatched through
+`TSGgml_Qwen35ModelVerify`: one graph evaluates every FullAttention and
+GatedDeltaNet layer, final RMSNorm, and the LM head. Intermediate activations
+remain device-resident, mixed-quant Q/K/V projections keep their native
+quantized representations, and logits are copied directly into the managed
+output buffer. Unsupported layouts continue through the per-layer path below.
 
 ### Fused prefill attention (`FusedPrefillAttention`)
 
@@ -549,6 +562,25 @@ CPU). Top sampled tokens match exactly between the two paths at all three
 lengths.
 
 ## 9. Decode optimization
+
+### Persistent whole-model Metal decode
+
+`TSGgml_Qwen35ModelDecode` retains a complete per-sequence decode graph across
+tokens. It includes all 64 transformer layers, final RMSNorm, and the LM head;
+the Metal path can also perform `GET_ROWS` directly from the quantized token
+embedding table. A 64-token padded attention bucket keeps graph topology
+stable, movable `CPY` destinations append K/V without a scatter kernel, and
+asynchronous submission combines graph execution and logits readback behind
+one synchronization.
+
+GatedDeltaNet K=1 output is laid out as
+`[attention output | recurrent state]`. On single-device Metal, the managed
+state view and native result share that backing buffer, so the 48 recurrent
+layers update state in place instead of issuing a 3 MiB copy apiece. The
+native side validates backend, pointer offset, alignment, and exact tensor
+geometry before omitting any copy. Set
+`TS_QWEN35_METAL_GDN_INPLACE_STATE=0` for an A/B run with separate state
+buffers, or `TS_QWEN35_FD_PERSIST=0` to rebuild the decode graph per token.
 
 ### Fused per-layer attention decode (`Qwen35AttentionLayerDecode`)
 
@@ -826,10 +858,11 @@ Q8_0 (which fits one card) `--tp 2` is byte-identical to the single-GPU run over
 
 ## 14. Optimization opportunities
 
-- **Native GDN decode (legacy path)** — the legacy per-seq GDN decode
-  still runs in managed C# (with pre-allocated buffers and
-  `Ops.AddmmBatch`). Moving the per-token recurrent update into native
-  C / CUDA on that path would remove the remaining managed overhead.
+- **Native GDN decode (fallback path)** — the fused whole-model path is
+  native, but the legacy per-operation fallback still runs GDN decode in
+  managed C# (with pre-allocated buffers and `Ops.AddmmBatch`). Moving that
+  fallback update into native C / CUDA would remove its remaining managed
+  overhead.
 - **Vectorized conv1d** — `Conv1dStep` is a scalar loop. A SIMD or native
   vectorized version would shave a few percent off the decode hot path.
 - **MoE prefill batching** — MoE prefill currently iterates per token. A

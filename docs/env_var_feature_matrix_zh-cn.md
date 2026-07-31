@@ -68,6 +68,11 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_PREFILL_CHUNK` | 在 GPT OSS、Qwen 3.5 / 3.6 family 长上下文功能上 sweep；运行时 Gemma 4、Nemotron-H、Mistral 3、Qwen 3 也会读取 | 分块 prefill 大小 | 架构默认值 | `256`, `512`, `1024` | 是 |
 | `GDN_DISABLE_CHUNKED_PREFILL` | `qwen3next` | 关闭 GDN 分块 prefill | 关闭 | `0`, `1` | 否 |
 | `TS_GGML_ASYNC_COMPUTE` | GGML 后端 | 异步 compute 提交 | `ggml_metal` 上启用（`0` 关闭），其他 GGML 后端关闭 | `0`, `1` | 是 |
+| `TS_QWEN35_FD_PERSIST` | GGML GPU 后端上的 Qwen 3.5 / 3.6 family | 保留并重放整模型单 token decode 图 | 启用 | `0`, `1` | 否 |
+| `TS_QWEN35_METAL_GDN_INPLACE_STATE` | 单设备 `ggml_metal` 上的 Qwen 3.5 / 3.6 family | 让 K=1 GatedDeltaNet 输出与递归状态共享存储，消除逐层状态复制 | 启用 | `0`, `1` | 否 |
+| `TS_QWEN35_METAL_TOKEN_INPUT` | `ggml_metal` 上的 Qwen 3.5 / 3.6 family | 在 decode 图内直接从量化表读取 token embedding | 启用 | `0`, `1` | 否 |
+| `TS_QWEN35_METAL_KV_CPY` | `ggml_metal` 上的 Qwen 3.5 / 3.6 family | 通过可移动 `CPY` view 追加 K/V，而不是索引 scatter | 启用 | `0`, `1` | 否 |
+| `TS_QWEN35_METAL_ASYNC_SUBMIT` | `ggml_metal` 上的 Qwen 3.5 / 3.6 family | decode 和 logits 回读提交后只同步一次 | 启用 | `0`, `1` | 否 |
 
 ## 多模态
 

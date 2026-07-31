@@ -314,7 +314,7 @@ namespace TensorSharp.Models
             // Fast path: run the whole trunk over the N tokens as ONE fused GGML
             // graph (TSGgml_Qwen35ModelVerify) instead of the op-by-op layer loop.
             // Writes hAllOut (post-norm hidden) + logitsOut directly; advances KV +
-            // GDN state by N. Env-gated TS_QWEN35_FUSED_VERIFY (default off).
+            // GDN state by N. Env-gated TS_QWEN35_FUSED_VERIFY (default on).
             if (TryFusedVerifyTrunk(hidden, startPos, seqLen, hAllOut, logitsOut, allLogitsRows))
             {
                 hidden.Dispose();
