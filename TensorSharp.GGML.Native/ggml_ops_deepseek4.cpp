@@ -49,6 +49,7 @@
 #include <deque>
 #include <list>
 #include <map>
+#include <memory>
 #include <thread>
 
 namespace tsg_dsv4
@@ -157,7 +158,13 @@ struct dsv4_layer
     ggml_tensor * ffn_down_shexp = nullptr;
     ggml_tensor * ffn_up_shexp = nullptr;
 
-    // KV caches / state (device-resident, persist across ubatches)
+    int device = 0;
+};
+
+// Per-layer KV caches / compressor state for ONE sequence slot
+// (device-resident, persist across ubatches).
+struct dsv4_slot_layer
+{
     ggml_tensor * raw_k = nullptr;        // F16 [n_embd_head, ring_raw]
     ggml_tensor * csa_k = nullptr;        // F16 [n_embd_head, n_csa_rows]   (ratio 4)
     ggml_tensor * lid_k = nullptr;        // F16 [idx_head_size, n_csa_rows] (ratio 4)
@@ -166,8 +173,27 @@ struct dsv4_layer
     ggml_tensor * comp_state_score = nullptr; // F32 [coff*head, state_size]
     ggml_tensor * lid_state_kv = nullptr;     // F32 [2*idx_head, 8]
     ggml_tensor * lid_state_score = nullptr;  // F32 [2*idx_head, 8]
+};
 
-    int device = 0;
+// One independent sequence context: its own caches + position, sharing the
+// model weights. The server's continuous-batching engine binds one slot per
+// in-flight request; the CLI / single-stream path only ever uses slot 0.
+struct dsv4_slot
+{
+    int id = 0;
+    int32_t n_past = 0;
+    std::vector<dsv4_slot_layer> layers;
+    ggml_context * ctx[MAX_GPUS + 1] = {};
+    ggml_backend_buffer_t buf[MAX_GPUS + 1] = {};
+
+    ~dsv4_slot()
+    {
+        for (int i = 0; i <= MAX_GPUS; i++)
+        {
+            if (buf[i]) ggml_backend_buffer_free(buf[i]);
+            if (ctx[i]) ggml_free(ctx[i]);
+        }
+    }
 };
 
 // gguf tensor location within the (possibly split) model
@@ -226,6 +252,28 @@ struct graph_inputs
     plan_inputs lid[MAX_GPUS + 1];
 };
 
+// Per-slot piece of a batched multi-slot decode graph: one decode token per
+// slot, each against its own caches at its own position.
+struct bd_slot_state
+{
+    int slot_id = 0;
+    int64_t p0 = 0;          // this slot's decode position
+    bool skip_topk = false;  // per-slot indexer-skip decision
+    comp_plan plan_csa;
+    comp_plan plan_hca;
+    comp_plan plan_lid;
+    // per-device inputs (created only on devices hosting matching layers)
+    ggml_tensor * raw_idxs[MAX_GPUS + 1] = {};    // I64 [1]
+    ggml_tensor * raw_mask[MAX_GPUS + 1] = {};    // F16 [ring, 1]
+    ggml_tensor * gather_mask[MAX_GPUS + 1] = {}; // F16 [ring+top_k, 1] (!skip)
+    ggml_tensor * csa_mask[MAX_GPUS + 1] = {};    // F16 [n_kv_csa, 1] (skip)
+    ggml_tensor * lid_mask[MAX_GPUS + 1] = {};    // F16 [n_kv_lid, 1] (!skip)
+    ggml_tensor * hca_mask[MAX_GPUS + 1] = {};    // F16 [n_kv_hca, 1]
+    ggml_tensor * csa_meta[MAX_GPUS + 1] = {};    // I32 comp meta
+    ggml_tensor * lid_meta[MAX_GPUS + 1] = {};
+    ggml_tensor * hca_meta[MAX_GPUS + 1] = {};
+};
+
 struct graph_build_result
 {
     ggml_context * ctx = nullptr;
@@ -238,6 +286,12 @@ struct graph_build_result
     comp_plan plan_lid;
     int64_t nt = 0;
     int64_t p0 = 0;
+    // sequence slot whose cache tensors this graph was built against; entries
+    // are purged when their slot is freed (the baked addresses die with it)
+    int slot_id = 0;
+    // batched multi-slot decode: per-slot plans/inputs (empty for normal
+    // single-slot graphs). Purge-on-free checks these slot ids too.
+    std::vector<bd_slot_state> bd;
     // shape signature this graph was built for (plan array sizes + n_kv pads)
     uint64_t sig = 0;
     // descriptors referenced (by pointer) from the fused GGML_OP_CUSTOM nodes
@@ -295,7 +349,11 @@ struct dsv4_model
     int64_t n_csa_rows = 0;
     int64_t n_hca_rows = 0;
 
-    int32_t n_past = 0;
+    // sequence slots (per-request caches); slot 0 is the primary/single-stream
+    // slot created at load. All Forward/Reset/NPast calls act on active_slot.
+    std::map<int, std::unique_ptr<dsv4_slot>> slots;
+    dsv4_slot * active_slot = nullptr;
+    int next_slot_id = 0;
 
     // final position of the current TSGgml_Dsv4Forward call; keeps every
     // chunk of one prefill on one graph shape (bucketing + indexer skip)
@@ -327,6 +385,7 @@ struct dsv4_model
     ~dsv4_model()
     {
         graph_cache.clear();
+        slots.clear();   // slot buffers must go before the backends below
         for (int i = 0; i <= MAX_GPUS; i++)
         {
             if (c_buf[i]) ggml_backend_buffer_free(c_buf[i]);
@@ -552,9 +611,9 @@ static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_jo
 // The overlap compressors read a synthetic "before the first block" source
 // from the state rings' extra row: kv stays zero (buffer clear), the score
 // row must be -inf so the per-element softmax gives those slots zero weight.
-static void dsv4_init_state_rows(dsv4_model & m)
+static void dsv4_init_slot_state_rows(dsv4_slot & slot)
 {
-    for (auto & L : m.layers)
+    for (auto & C : slot.layers)
     {
         auto fill_neg_inf_row = [&](ggml_tensor * t)
         {
@@ -562,9 +621,94 @@ static void dsv4_init_state_rows(dsv4_model & m)
             std::vector<float> row((size_t) t->ne[0], -INFINITY);
             ggml_backend_tensor_set(t, row.data(), (size_t) (t->ne[1] - 1) * t->nb[1], row.size() * sizeof(float));
         };
-        fill_neg_inf_row(L.comp_state_score);
-        fill_neg_inf_row(L.lid_state_score);
+        fill_neg_inf_row(C.comp_state_score);
+        fill_neg_inf_row(C.lid_state_score);
     }
+}
+
+// Clear a slot's caches back to the fresh state (position 0).
+static void dsv4_reset_slot(dsv4_slot & slot)
+{
+    slot.n_past = 0;
+    for (int d = 0; d <= MAX_GPUS; d++)
+        if (slot.buf[d]) ggml_backend_buffer_clear(slot.buf[d], 0);
+    dsv4_init_slot_state_rows(slot);
+}
+
+// Allocate a new sequence slot: per-layer caches + compressor state rings on
+// each layer's device. Weights and rope tables are shared across slots.
+// Returns nullptr on allocation failure (e.g. VRAM exhausted).
+static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
+{
+    const dsv4_hparams & hp = m.hp;
+    auto slot = std::make_unique<dsv4_slot>();
+    slot->id = m.next_slot_id++;
+    slot->layers.resize(hp.n_layer);
+
+    for (int d = 0; d <= m.n_gpu; d++)
+    {
+        ggml_init_params cp = { (size_t) (hp.n_layer * 10 + 16) * ggml_tensor_overhead(), nullptr, true };
+        slot->ctx[d] = ggml_init(cp);
+        if (!slot->ctx[d]) return nullptr;
+    }
+
+    for (int il = 0; il < hp.n_layer; il++)
+    {
+        const int d = m.layers[il].device;
+        const int ratio = hp.compress_ratios[il];
+        dsv4_slot_layer & C = slot->layers[il];
+        ggml_context * ctx = slot->ctx[d];
+
+        const int64_t head = hp.n_embd_head;
+        C.raw_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, m.ring_raw);
+        ggml_format_name(C.raw_k, "cache_raw_k.%d.%d", slot->id, il);
+        // State rings carry one extra row (index state_size) that stays
+        // zero (kv) / -inf (score): the overlap compressor's synthetic
+        // "before the first block" source. It is never written by persists
+        // (dst = pos % state_size < state_size), so no per-eval zero-row
+        // append is needed in the graph.
+        if (ratio == CSA_RATIO)
+        {
+            C.csa_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, m.n_csa_rows);
+            ggml_format_name(C.csa_k, "cache_csa_k.%d.%d", slot->id, il);
+            C.lid_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.indexer_head_size, m.n_csa_rows);
+            ggml_format_name(C.lid_k, "cache_lid_k.%d.%d", slot->id, il);
+            C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
+            C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
+            C.lid_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
+            C.lid_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
+            ggml_format_name(C.comp_state_kv, "state_csa_kv.%d.%d", slot->id, il);
+            ggml_format_name(C.comp_state_score, "state_csa_score.%d.%d", slot->id, il);
+            ggml_format_name(C.lid_state_kv, "state_lid_kv.%d.%d", slot->id, il);
+            ggml_format_name(C.lid_state_score, "state_lid_score.%d.%d", slot->id, il);
+        }
+        else if (ratio == HCA_RATIO)
+        {
+            C.hca_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, m.n_hca_rows);
+            ggml_format_name(C.hca_k, "cache_hca_k.%d.%d", slot->id, il);
+            C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, HCA_RATIO + 1);
+            C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, HCA_RATIO + 1);
+            ggml_format_name(C.comp_state_kv, "state_hca_kv.%d.%d", slot->id, il);
+            ggml_format_name(C.comp_state_score, "state_hca_score.%d.%d", slot->id, il);
+        }
+    }
+
+    for (int d = 0; d <= m.n_gpu; d++)
+    {
+        if (ggml_get_first_tensor(slot->ctx[d]) == nullptr) continue;
+        slot->buf[d] = ggml_backend_alloc_ctx_tensors(slot->ctx[d], m.backends[d]);
+        if (!slot->buf[d])
+        {
+            fprintf(stderr, "[dsv4] slot %d cache alloc failed on device %d\n", slot->id, d);
+            return nullptr;
+        }
+        ggml_backend_buffer_clear(slot->buf[d], 0);
+    }
+    dsv4_init_slot_state_rows(*slot);
+
+    dsv4_slot * raw = slot.get();
+    m.slots[slot->id] = std::move(slot);
+    return raw;
 }
 
 // Build the [n_rot, n_ctx] cos/sin table by running ggml's own rope over
@@ -918,40 +1062,6 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             fprintf(stderr, "[dsv4] layer %d incomplete\n", il);
             return nullptr;
         }
-
-        // caches
-        const int64_t head = hp.n_embd_head;
-        L.raw_k = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F16, head, m->ring_raw);
-        ggml_format_name(L.raw_k, "cache_raw_k.%d", il);
-        // State rings carry one extra row (index state_size) that stays
-        // zero (kv) / -inf (score): the overlap compressor's synthetic
-        // "before the first block" source. It is never written by persists
-        // (dst = pos % state_size < state_size), so no per-eval zero-row
-        // append is needed in the graph.
-        if (ratio == CSA_RATIO)
-        {
-            L.csa_k = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F16, head, m->n_csa_rows);
-            ggml_format_name(L.csa_k, "cache_csa_k.%d", il);
-            L.lid_k = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F16, hp.indexer_head_size, m->n_csa_rows);
-            ggml_format_name(L.lid_k, "cache_lid_k.%d", il);
-            L.comp_state_kv = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
-            L.comp_state_score = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
-            L.lid_state_kv = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
-            L.lid_state_score = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
-            ggml_format_name(L.comp_state_kv, "state_csa_kv.%d", il);
-            ggml_format_name(L.comp_state_score, "state_csa_score.%d", il);
-            ggml_format_name(L.lid_state_kv, "state_lid_kv.%d", il);
-            ggml_format_name(L.lid_state_score, "state_lid_score.%d", il);
-        }
-        else if (ratio == HCA_RATIO)
-        {
-            L.hca_k = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F16, head, m->n_hca_rows);
-            ggml_format_name(L.hca_k, "cache_hca_k.%d", il);
-            L.comp_state_kv = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, head, HCA_RATIO + 1);
-            L.comp_state_score = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, head, HCA_RATIO + 1);
-            ggml_format_name(L.comp_state_kv, "state_hca_kv.%d", il);
-            ggml_format_name(L.comp_state_score, "state_hca_score.%d", il);
-        }
     }
 
     // rope cos/sin tables for the fused table-driven kernels (per device)
@@ -1028,7 +1138,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 load_threads, m->n_ctx, m->ring_raw, m->n_csa_rows, m->n_hca_rows);
     }
 
-    dsv4_init_state_rows(*m);
+    // primary sequence slot (slot 0) — the CLI / single-stream cache
+    m->active_slot = dsv4_slot_alloc(*m);
+    if (!m->active_slot)
+    {
+        fprintf(stderr, "[dsv4] primary slot allocation failed\n");
+        return nullptr;
+    }
 
     if (m->fused)
     {
@@ -1555,6 +1671,7 @@ struct graph_builder
     ggml_tensor * build_lid_top_k(int il, ggml_tensor * qr, ggml_tensor * cur, ggml_tensor * inp_pos, int dev)
     {
         const dsv4_layer & L = m.layers[il];
+        const dsv4_slot_layer & C = m.active_slot->layers[il];
         const int64_t idx_head = hp.indexer_head_size;
         const int64_t n_idx_head = hp.indexer_n_head;
         const int64_t n_rope = hp.n_rot;
@@ -1575,7 +1692,7 @@ struct graph_builder
         iw = ggml_scale(ctx, iw, 1.0f / sqrtf((float) (idx_head * n_idx_head)));
 
         const int64_t n_lid = res.plan_lid.n_kv;
-        ggml_tensor * ik = ggml_view_2d(ctx, L.lid_k, idx_head, n_lid, L.lid_k->nb[1], 0);
+        ggml_tensor * ik = ggml_view_2d(ctx, C.lid_k, idx_head, n_lid, C.lid_k->nb[1], 0);
         ik = ggml_reshape_3d(ctx, ik, idx_head, 1, n_lid);
 
         // fused lightning indexer: q [idx_head, n_idx_head, nt], k [idx_head, 1, n_lid],
@@ -1610,6 +1727,7 @@ struct graph_builder
     ggml_tensor * build_attention(int il, ggml_tensor * cur, ggml_tensor * inp_pos)
     {
         const dsv4_layer & L = m.layers[il];
+        const dsv4_slot_layer & C = m.active_slot->layers[il];
         const int dev = L.device;
         const int64_t head = hp.n_embd_head;
         const int64_t n_head = hp.n_head;
@@ -1683,21 +1801,21 @@ struct graph_builder
 
             // per-head q RMS + RoPE, kv RMS(w) + RoPE + F16 SWA-ring commit
             q = fused_node(TSG_DSV4_FUSED_ATTN_PREP, GGML_TYPE_F32, head, n_head, nt, 1,
-                    { q_raw, kv_raw, L.attn_kv_norm, rope_tab, inp_pos, L.raw_k, res.inp.raw_idxs[dev] },
+                    { q_raw, kv_raw, L.attn_kv_norm, rope_tab, inp_pos, C.raw_k, res.inp.raw_idxs[dev] },
                     dev, (int) n_rope, 0, 0, 0, hp.rms_eps);
             ggml_build_forward_expand(gf, q);
 
             if (ratio == CSA_RATIO)
             {
-                emit_compress(cs_kv, cs_score, L.comp_state_kv, L.comp_state_score, L.attn_comp_norm,
-                              L.csa_k, CSA_RATIO, true, res.inp.csa[dev], res.plan_csa);
-                emit_compress(ls_kv, ls_score, L.lid_state_kv, L.lid_state_score, L.indexer_comp_norm,
-                              L.lid_k, CSA_RATIO, true, res.inp.lid[dev], res.plan_lid);
+                emit_compress(cs_kv, cs_score, C.comp_state_kv, C.comp_state_score, L.attn_comp_norm,
+                              C.csa_k, CSA_RATIO, true, res.inp.csa[dev], res.plan_csa);
+                emit_compress(ls_kv, ls_score, C.lid_state_kv, C.lid_state_score, L.indexer_comp_norm,
+                              C.lid_k, CSA_RATIO, true, res.inp.lid[dev], res.plan_lid);
             }
             else if (ratio == HCA_RATIO)
             {
-                emit_compress(cs_kv, cs_score, L.comp_state_kv, L.comp_state_score, L.attn_comp_norm,
-                              L.hca_k, HCA_RATIO, false, res.inp.hca[dev], res.plan_hca);
+                emit_compress(cs_kv, cs_score, C.comp_state_kv, C.comp_state_score, L.attn_comp_norm,
+                              C.hca_k, HCA_RATIO, false, res.inp.hca[dev], res.plan_hca);
             }
         }
         else
@@ -1728,29 +1846,29 @@ struct graph_builder
 
             // write raw K into the SWA ring
             ggml_tensor * kv2d = ggml_reshape_2d(ctx, kv, head, nt);
-            ggml_build_forward_expand(gf, ggml_set_rows(ctx, L.raw_k, kv2d, res.inp.raw_idxs[dev]));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.raw_k, kv2d, res.inp.raw_idxs[dev]));
             ggml_build_forward_expand(gf, q);
 
             // compressor state updates + compressed row commits
             if (ratio == CSA_RATIO)
             {
                 run_compressor(il, cur, L.attn_comp_wkv, L.attn_comp_wgate, L.attn_comp_ape, L.attn_comp_norm,
-                               L.comp_state_kv, L.comp_state_score, L.csa_k, head, CSA_RATIO, true,
+                               C.comp_state_kv, C.comp_state_score, C.csa_k, head, CSA_RATIO, true,
                                res.inp.csa[dev], res.plan_csa, dev);
                 run_compressor(il, cur, L.indexer_comp_wkv, L.indexer_comp_wgate, L.indexer_comp_ape, L.indexer_comp_norm,
-                               L.lid_state_kv, L.lid_state_score, L.lid_k, hp.indexer_head_size, CSA_RATIO, true,
+                               C.lid_state_kv, C.lid_state_score, C.lid_k, hp.indexer_head_size, CSA_RATIO, true,
                                res.inp.lid[dev], res.plan_lid, dev);
             }
             else if (ratio == HCA_RATIO)
             {
                 run_compressor(il, cur, L.attn_comp_wkv, L.attn_comp_wgate, L.attn_comp_ape, L.attn_comp_norm,
-                               L.comp_state_kv, L.comp_state_score, L.hca_k, head, HCA_RATIO, false,
+                               C.comp_state_kv, C.comp_state_score, C.hca_k, head, HCA_RATIO, false,
                                res.inp.hca[dev], res.plan_hca, dev);
             }
         }
 
         // attention source: raw ring (+ compressed rows)
-        ggml_tensor * raw_k = ggml_view_2d(ctx, L.raw_k, head, m.ring_raw, L.raw_k->nb[1], 0);
+        ggml_tensor * raw_k = ggml_view_2d(ctx, C.raw_k, head, m.ring_raw, C.raw_k->nb[1], 0);
         raw_k = ggml_reshape_3d(ctx, raw_k, head, 1, m.ring_raw);
 
         ggml_tensor * out = nullptr;
@@ -1768,12 +1886,12 @@ struct graph_builder
             ggml_tensor * top_k = build_lid_top_k(il, qr, cur, inp_pos, dev);
             ggml_tensor * k_sel = fused_node(TSG_DSV4_FUSED_KGATHER, GGML_TYPE_F16,
                     head, 1, m.ring_raw + top_k->ne[0], 1,
-                    { L.raw_k, L.csa_k, top_k }, dev, (int) m.ring_raw);
+                    { C.raw_k, C.csa_k, top_k }, dev, (int) m.ring_raw);
             out = attn_mha(q, k_sel, res.inp.gather_mask[dev], L.attn_sinks, kq_scale);
         }
         else if (ratio == CSA_RATIO)
         {
-            ggml_tensor * csa_k = ggml_view_2d(ctx, L.csa_k, head, res.plan_csa.n_kv, L.csa_k->nb[1], 0);
+            ggml_tensor * csa_k = ggml_view_2d(ctx, C.csa_k, head, res.plan_csa.n_kv, C.csa_k->nb[1], 0);
             csa_k = ggml_reshape_3d(ctx, csa_k, head, 1, res.plan_csa.n_kv);
 
             ggml_tensor * k_all = ggml_concat(ctx, raw_k, csa_k, 2);
@@ -1812,7 +1930,7 @@ struct graph_builder
         }
         else if (ratio == HCA_RATIO)
         {
-            ggml_tensor * hca_k = ggml_view_2d(ctx, L.hca_k, head, res.plan_hca.n_kv, L.hca_k->nb[1], 0);
+            ggml_tensor * hca_k = ggml_view_2d(ctx, C.hca_k, head, res.plan_hca.n_kv, C.hca_k->nb[1], 0);
             hca_k = ggml_reshape_3d(ctx, hca_k, head, 1, res.plan_hca.n_kv);
 
             ggml_tensor * k_all = ggml_concat(ctx, raw_k, hca_k, 2);
@@ -1975,6 +2093,309 @@ struct graph_builder
         ggml_tensor * gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
         ggml_tensor * h = swiglu_clamped(gate, up, clamp_limit, L.device);
         return ggml_mul_mat(ctx, L.ffn_down_shexp, h);
+    }
+
+    // ---- batched multi-slot decode ----
+    //
+    // One decode token for each of N sequence slots in a single graph: the
+    // weight-heavy dense parts (hyper-connections, q/kv/compressor
+    // projections, MoE + shared expert, attention epilogue, lm head) run
+    // batched over the N tokens so every weight matrix is read once per
+    // step, while the cache-touching parts (ring commit, compressors,
+    // indexer, top-k gather, attention) fork out per slot on column views —
+    // each token reads/writes only its own slot's caches at its own
+    // position.
+
+    // [ne0, 1] view of column i of a contiguous 2-D activation
+    ggml_tensor * col_view(ggml_tensor * t, int64_t i)
+    {
+        return ggml_view_2d(ctx, t, t->ne[0], 1, t->nb[1], i * t->nb[1]);
+    }
+
+    ggml_tensor * new_input_mask1(int64_t n_kv, const char * name, int dev)
+    {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
+        ggml_set_input(t);
+        ggml_set_name(t, name);
+        pin(t, dev);
+        return t;
+    }
+
+    // per-slot lightning-indexer top-k (single token at pos_i against
+    // lid_cache; the parametrized twin of build_lid_top_k)
+    ggml_tensor * bd_lid_top_k(int il, ggml_tensor * lid_cache, ggml_tensor * qr_i,
+                               ggml_tensor * cur_i, ggml_tensor * pos_i,
+                               ggml_tensor * lid_mask, int64_t n_lid)
+    {
+        const dsv4_layer & L = m.layers[il];
+        const int64_t idx_head = hp.indexer_head_size;
+        const int64_t n_idx_head = hp.indexer_n_head;
+        const int64_t n_rope = hp.n_rot;
+        const int64_t n_nope = idx_head - n_rope;
+
+        ggml_tensor * iq = ggml_mul_mat(ctx, L.indexer_attn_q_b, qr_i);
+        iq = ggml_reshape_3d(ctx, iq, idx_head, n_idx_head, 1);
+
+        ggml_tensor * iq_nope = ggml_view_3d(ctx, iq, n_nope, n_idx_head, 1,
+                ggml_row_size(iq->type, idx_head), ggml_row_size(iq->type, idx_head) * n_idx_head, 0);
+        ggml_tensor * iq_pe = ggml_view_3d(ctx, iq, n_rope, n_idx_head, 1,
+                ggml_row_size(iq->type, idx_head), ggml_row_size(iq->type, idx_head) * n_idx_head,
+                ggml_row_size(iq->type, n_nope));
+        iq_pe = rope_compress(iq_pe, pos_i);
+        iq = ggml_concat(ctx, iq_nope, iq_pe, 0);
+
+        ggml_tensor * iw = ggml_mul_mat(ctx, L.indexer_proj, cur_i);
+        iw = ggml_scale(ctx, iw, 1.0f / sqrtf((float) (idx_head * n_idx_head)));
+
+        ggml_tensor * ik = ggml_view_2d(ctx, lid_cache, idx_head, n_lid, lid_cache->nb[1], 0);
+        ik = ggml_reshape_3d(ctx, ik, idx_head, 1, n_lid);
+
+        ggml_tensor * score = ggml_lightning_indexer(ctx, iq, ik, iw, lid_mask);
+        const int64_t k = std::min<int64_t>(hp.indexer_top_k, score->ne[0]);
+        return ggml_cont(ctx, ggml_top_k(ctx, score, (int) k));
+    }
+
+    ggml_tensor * build_attention_batched(int il, ggml_tensor * cur, ggml_tensor * inp_pos)
+    {
+        const dsv4_layer & L = m.layers[il];
+        const int dev = L.device;
+        const int64_t head = hp.n_embd_head;
+        const int64_t n_head = hp.n_head;
+        const int64_t n_rope = hp.n_rot;
+        const int64_t n_groups = hp.o_groups;
+        const int64_t o_lora = hp.o_lora_rank;
+        const int64_t o_group_dim = (n_head / n_groups) * head;
+        const int32_t ratio = hp.compress_ratios[il];
+        ggml_tensor * rope_tab = m.rope_tab_dev[ratio != 0 ? 1 : 0][dev];
+        const int64_t N = nt;
+        const float kq_scale = 1.0f / sqrtf((float) head);
+
+        // ---- dense prologue, batched over the N tokens ----
+        ggml_tensor * qr = ggml_mul_mat(ctx, L.wq_a, cur);
+        qr = rms(qr, L.attn_q_a_norm);
+        ggml_tensor * q_raw = ggml_mul_mat(ctx, L.wq_b, qr);    // [head*n_head, N]
+        ggml_tensor * kv_raw = ggml_mul_mat(ctx, L.wkv, cur);   // [head, N]
+
+        ggml_tensor * cs_kv = nullptr, * cs_score = nullptr;
+        ggml_tensor * ls_kv = nullptr, * ls_score = nullptr;
+        if (ratio == CSA_RATIO)
+        {
+            cs_kv = ggml_mul_mat(ctx, L.attn_comp_wkv, cur);
+            cs_score = ggml_add(ctx, ggml_mul_mat(ctx, L.attn_comp_wgate, cur),
+                    ggml_get_rows(ctx, L.attn_comp_ape, res.inp.csa[dev].state_pos));
+            ls_kv = ggml_mul_mat(ctx, L.indexer_comp_wkv, cur);
+            ls_score = ggml_add(ctx, ggml_mul_mat(ctx, L.indexer_comp_wgate, cur),
+                    ggml_get_rows(ctx, L.indexer_comp_ape, res.inp.csa[dev].state_pos));
+        }
+        else if (ratio == HCA_RATIO)
+        {
+            cs_kv = ggml_mul_mat(ctx, L.attn_comp_wkv, cur);
+            cs_score = ggml_add(ctx, ggml_mul_mat(ctx, L.attn_comp_wgate, cur),
+                    ggml_get_rows(ctx, L.attn_comp_ape, res.inp.hca[dev].state_pos));
+        }
+
+        // ---- per-slot cache ops + attention ----
+        ggml_tensor * attn_cat = nullptr;
+        for (int64_t i = 0; i < N; i++)
+        {
+            bd_slot_state & B = res.bd[i];
+            const dsv4_slot_layer & C = m.slots.at(B.slot_id)->layers[il];
+            ggml_tensor * pos_i = ggml_view_1d(ctx, inp_pos, 1, i * sizeof(int32_t));
+
+            ggml_tensor * q = fused_node(TSG_DSV4_FUSED_ATTN_PREP, GGML_TYPE_F32, head, n_head, 1, 1,
+                    { col_view(q_raw, i), col_view(kv_raw, i), L.attn_kv_norm, rope_tab, pos_i,
+                      C.raw_k, B.raw_idxs[dev] },
+                    dev, (int) n_rope, 0, 0, 0, hp.rms_eps);
+            ggml_build_forward_expand(gf, q);
+
+            auto emit_compress = [&](ggml_tensor * st_kv, ggml_tensor * st_score,
+                                     ggml_tensor * state_kv, ggml_tensor * state_score,
+                                     ggml_tensor * norm_w, ggml_tensor * cache,
+                                     int64_t cratio, bool overlap,
+                                     ggml_tensor * meta, const comp_plan & plan)
+            {
+                const int n_blocks = (int) plan.state_write_idxs.size();
+                const int np = (int) plan.state_persist_src_idxs.size();
+                ggml_tensor * marker = fused_node(TSG_DSV4_FUSED_COMPRESS, GGML_TYPE_F32, 1, 1, 1, 1,
+                        { st_kv, st_score, state_kv, state_score, norm_w, m.rope_tab_dev[1][dev],
+                          meta, cache },
+                        dev, n_blocks, (int) cratio, overlap ? 2 : 1, hp.n_rot,
+                        hp.rms_eps, (float) np);
+                ggml_build_forward_expand(gf, marker);
+            };
+            if (ratio == CSA_RATIO)
+            {
+                emit_compress(col_view(cs_kv, i), col_view(cs_score, i),
+                              C.comp_state_kv, C.comp_state_score, L.attn_comp_norm, C.csa_k,
+                              CSA_RATIO, true, B.csa_meta[dev], B.plan_csa);
+                emit_compress(col_view(ls_kv, i), col_view(ls_score, i),
+                              C.lid_state_kv, C.lid_state_score, L.indexer_comp_norm, C.lid_k,
+                              CSA_RATIO, true, B.lid_meta[dev], B.plan_lid);
+            }
+            else if (ratio == HCA_RATIO)
+            {
+                emit_compress(col_view(cs_kv, i), col_view(cs_score, i),
+                              C.comp_state_kv, C.comp_state_score, L.attn_comp_norm, C.hca_k,
+                              HCA_RATIO, false, B.hca_meta[dev], B.plan_hca);
+            }
+
+            ggml_tensor * raw_k = ggml_view_2d(ctx, C.raw_k, head, m.ring_raw, C.raw_k->nb[1], 0);
+            raw_k = ggml_reshape_3d(ctx, raw_k, head, 1, m.ring_raw);
+
+            ggml_tensor * out;
+            if (ratio == CSA_RATIO && !B.skip_topk)
+            {
+                ggml_tensor * top_k = bd_lid_top_k(il, C.lid_k, col_view(qr, i), col_view(cur, i),
+                                                   pos_i, B.lid_mask[dev], B.plan_lid.n_kv);
+                ggml_tensor * k_sel = fused_node(TSG_DSV4_FUSED_KGATHER, GGML_TYPE_F16,
+                        head, 1, m.ring_raw + top_k->ne[0], 1,
+                        { C.raw_k, C.csa_k, top_k }, dev, (int) m.ring_raw);
+                out = attn_mha(q, k_sel, B.gather_mask[dev], L.attn_sinks, kq_scale);
+            }
+            else if (ratio == CSA_RATIO)
+            {
+                ggml_tensor * csa_k = ggml_view_2d(ctx, C.csa_k, head, B.plan_csa.n_kv, C.csa_k->nb[1], 0);
+                csa_k = ggml_reshape_3d(ctx, csa_k, head, 1, B.plan_csa.n_kv);
+                ggml_tensor * k_all = ggml_concat(ctx, raw_k, csa_k, 2);
+                ggml_tensor * kq_mask = ggml_concat(ctx, B.raw_mask[dev], B.csa_mask[dev], 0);
+                out = attn_mha(q, k_all, kq_mask, L.attn_sinks, kq_scale);
+            }
+            else if (ratio == HCA_RATIO)
+            {
+                ggml_tensor * hca_k = ggml_view_2d(ctx, C.hca_k, head, B.plan_hca.n_kv, C.hca_k->nb[1], 0);
+                hca_k = ggml_reshape_3d(ctx, hca_k, head, 1, B.plan_hca.n_kv);
+                ggml_tensor * k_all = ggml_concat(ctx, raw_k, hca_k, 2);
+                ggml_tensor * kq_mask = ggml_concat(ctx, B.raw_mask[dev], B.hca_mask[dev], 0);
+                out = attn_mha(q, k_all, kq_mask, L.attn_sinks, kq_scale);
+            }
+            else
+            {
+                out = attn_mha(q, raw_k, B.raw_mask[dev], L.attn_sinks, kq_scale);
+            }
+            attn_cat = attn_cat ? ggml_concat(ctx, attn_cat, out, 1) : out;   // [head*n_head, N]
+        }
+
+        // ---- batched epilogue: inverse rope + grouped LoRA out (weights once) ----
+        ggml_tensor * grouped = fused_node(TSG_DSV4_FUSED_ATTN_FINISH, GGML_TYPE_F32, o_group_dim, N, n_groups, 1,
+                { attn_cat, rope_tab, inp_pos }, dev, (int) n_rope, (int) n_groups, (int) head);
+        ggml_tensor * oa = ggml_mul_mat(ctx,
+                ggml_reshape_3d(ctx, L.wo_a, L.wo_a->ne[0], o_lora, n_groups), grouped);
+        oa = ggml_permute(ctx, oa, 0, 2, 1, 3);
+        oa = ggml_cont_2d(ctx, oa, o_lora * n_groups, N);
+        return ggml_mul_mat(ctx, L.wo_b, oa);
+    }
+
+    static size_t bd_meta_size(const comp_plan & plan)
+    {
+        return plan.state_read_idxs.size()
+            + 2 * plan.state_write_idxs.size()
+            + 2 * plan.state_persist_src_idxs.size();
+    }
+
+    void build_batched()
+    {
+        graph_inputs & inp = res.inp;
+        const int64_t N = nt;
+
+        bool dev_used[MAX_GPUS + 1] = {};
+        for (int il = 0; il < hp.n_layer; il++) dev_used[m.layers[il].device] = true;
+        const int dev_last = m.layers[hp.n_layer - 1].device;
+
+        for (int d = 0; d <= m.n_gpu; d++)
+        {
+            if (!dev_used[d]) continue;
+            char nb[96];
+            snprintf(nb, sizeof(nb), "inp_tokens.%d", d);
+            inp.tokens[d] = new_input_i32(N, nb, d);
+            snprintf(nb, sizeof(nb), "inp_pos.%d", d);
+            inp.pos[d] = new_input_i32(N, nb, d);
+            // batched APE row selectors (pos % ratio), shared across slots;
+            // csa's doubles for the lid compressor (same ratio)
+            snprintf(nb, sizeof(nb), "inp_csa_state_pos.%d", d);
+            inp.csa[d].state_pos = new_input_i32(N, nb, d);
+            snprintf(nb, sizeof(nb), "inp_hca_state_pos.%d", d);
+            inp.hca[d].state_pos = new_input_i32(N, nb, d);
+
+            for (size_t i = 0; i < res.bd.size(); i++)
+            {
+                bd_slot_state & B = res.bd[i];
+                snprintf(nb, sizeof(nb), "bd%zu_raw_idxs.%d", i, d);
+                B.raw_idxs[d] = new_input_i64(1, nb, d);
+                snprintf(nb, sizeof(nb), "bd%zu_raw_mask.%d", i, d);
+                B.raw_mask[d] = new_input_mask1(m.ring_raw, nb, d);
+                snprintf(nb, sizeof(nb), "bd%zu_csa_meta.%d", i, d);
+                B.csa_meta[d] = new_input_i32(std::max<size_t>(bd_meta_size(B.plan_csa), 1), nb, d);
+                snprintf(nb, sizeof(nb), "bd%zu_lid_meta.%d", i, d);
+                B.lid_meta[d] = new_input_i32(std::max<size_t>(bd_meta_size(B.plan_lid), 1), nb, d);
+                snprintf(nb, sizeof(nb), "bd%zu_hca_meta.%d", i, d);
+                B.hca_meta[d] = new_input_i32(std::max<size_t>(bd_meta_size(B.plan_hca), 1), nb, d);
+                snprintf(nb, sizeof(nb), "bd%zu_hca_mask.%d", i, d);
+                B.hca_mask[d] = new_input_mask1(B.plan_hca.n_kv, nb, d);
+                if (B.skip_topk)
+                {
+                    snprintf(nb, sizeof(nb), "bd%zu_csa_mask.%d", i, d);
+                    B.csa_mask[d] = new_input_mask1(B.plan_csa.n_kv, nb, d);
+                }
+                else
+                {
+                    snprintf(nb, sizeof(nb), "bd%zu_lid_mask.%d", i, d);
+                    B.lid_mask[d] = new_input_mask1(B.plan_lid.n_kv, nb, d);
+                    snprintf(nb, sizeof(nb), "bd%zu_gather_mask.%d", i, d);
+                    B.gather_mask[d] = new_input_mask1(m.ring_raw + hp.indexer_top_k, nb, d);
+                }
+            }
+        }
+        inp.out_ids = new_input_i32(N, "inp_out_ids", dev_last);
+
+        const int64_t hc = hp.hc_mult;
+        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.layers[0].device]);
+        ggml_tensor * inpL = ggml_reshape_3d(ctx, emb, hp.n_embd, 1, N);
+        inpL = ggml_repeat_4d(ctx, inpL, hp.n_embd, hc, N, 1);
+
+        for (int il = 0; il < hp.n_layer; il++)
+        {
+            const dsv4_layer & L = m.layers[il];
+            const int dev = L.device;
+
+            if (il > 0 && L.device != m.layers[il - 1].device)
+                ggml_backend_sched_set_tensor_backend(res.sched, inpL, m.backends[L.device]);
+
+            ggml_tensor * residual = inpL;
+            ggml_tensor * post = nullptr;
+            ggml_tensor * comb = nullptr;
+
+            ggml_tensor * cur = build_hc_pre(inpL, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, &post, &comb, dev);
+            cur = rms(cur, L.attn_norm);
+            cur = build_attention_batched(il, cur, inp.pos[dev]);
+            inpL = build_hc_post(cur, residual, post, comb);
+
+            residual = inpL;
+            cur = build_hc_pre(inpL, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, &post, &comb, dev);
+            ggml_build_forward_expand(gf, residual);
+            ggml_build_forward_expand(gf, post);
+            ggml_build_forward_expand(gf, comb);
+
+            cur = rms(cur, L.ffn_norm);
+
+            ggml_tensor * shexp = build_shexp(il, cur);
+            cur = build_moe(il, cur, inp.tokens[dev], shexp);
+
+            inpL = build_hc_post(cur, residual, post, comb);
+        }
+
+        // logits for every slot's token
+        ggml_tensor * flat = ggml_reshape_2d(ctx, inpL, hp.n_embd * hc, N);
+        flat = ggml_get_rows(ctx, flat, inp.out_ids);
+        inpL = ggml_reshape_3d(ctx, flat, hp.n_embd, hc, N);
+
+        ggml_tensor * cur = build_hc_head(inpL);
+        cur = rms(cur, m.output_norm);
+        cur = ggml_mul_mat(ctx, m.output, cur);
+        ggml_set_output(cur);
+        ggml_set_name(cur, "logits");
+        res.logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
     }
 
     // ---- whole graph ----
@@ -2158,6 +2579,8 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
     sig = sig * 1099511628211ull ^ dsv4_plan_sig(plan_csa);
     sig = sig * 1099511628211ull ^ dsv4_plan_sig(plan_hca);
     sig = sig * 1099511628211ull ^ dsv4_plan_sig(plan_lid);
+    // graphs bake the active slot's cache tensor addresses
+    sig = sig * 1099511628211ull ^ (uint64_t) (m.active_slot->id + 1);
     // the short-context indexer skip changes the graph shape
     if (m.fused && pos_end <= (int64_t) hp.indexer_top_k * CSA_RATIO)
         sig ^= 0x9e3779b97f4a7c15ull;
@@ -2189,6 +2612,7 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
         r.gf = ggml_new_graph_custom(r.ctx, 32768, false);
         r.nt = nt;
         r.sig = sig;
+        r.slot_id = m.active_slot->id;
         r.plan_csa = plan_csa;
         r.plan_hca = plan_hca;
         r.plan_lid = plan_lid;
@@ -2419,6 +2843,229 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
     return true;
 }
 
+// Build (or fetch) the batched multi-slot decode graph for the given slot/
+// position vector. Cached alongside the normal graphs; the sig covers N, the
+// slot ids, every slot's plan shapes and its indexer-skip bit, so steady
+// concurrent decode reuses one entry (and its captured CUDA graphs) until a
+// slot crosses a bucket or block boundary.
+static graph_build_result * dsv4_acquire_batched_graph(
+    dsv4_model & m, int n, const int32_t * slot_ids, const int32_t * positions, bool * out_reuse)
+{
+    const dsv4_hparams & hp = m.hp;
+
+    std::vector<bd_slot_state> bd((size_t) n);
+    uint64_t sig = 0xBD5EEDB47C8ED0DEull ^ (uint64_t) n;
+    for (int i = 0; i < n; i++)
+    {
+        bd_slot_state & B = bd[i];
+        B.slot_id = slot_ids[i];
+        B.p0 = positions[i];
+        const int64_t pos_end = B.p0 + 1;
+        const int64_t hint = std::min<int64_t>(pos_end, 8192);
+        B.plan_csa = build_comp_plan(B.p0, 1, CSA_RATIO, true, 2 * CSA_RATIO, m.n_csa_rows, hint / CSA_RATIO);
+        B.plan_hca = build_comp_plan(B.p0, 1, HCA_RATIO, false, HCA_RATIO, m.n_hca_rows, hint / HCA_RATIO);
+        B.plan_lid = build_comp_plan(B.p0, 1, CSA_RATIO, true, 2 * CSA_RATIO, m.n_csa_rows, hint / CSA_RATIO);
+        B.skip_topk = pos_end <= (int64_t) hp.indexer_top_k * CSA_RATIO;
+        sig = sig * 1099511628211ull ^ (uint64_t) (B.slot_id + 1);
+        sig = sig * 1099511628211ull ^ dsv4_plan_sig(B.plan_csa);
+        sig = sig * 1099511628211ull ^ dsv4_plan_sig(B.plan_hca);
+        sig = sig * 1099511628211ull ^ dsv4_plan_sig(B.plan_lid);
+        if (B.skip_topk) sig ^= 0x9e3779b97f4a7c15ull;
+    }
+
+    graph_build_result * res_p = nullptr;
+    bool reuse = false;
+    for (auto it = m.graph_cache.begin(); it != m.graph_cache.end(); ++it)
+    {
+        if ((*it)->sig == sig && (*it)->bd.size() == (size_t) n)
+        {
+            if (it != m.graph_cache.begin())
+                m.graph_cache.splice(m.graph_cache.begin(), m.graph_cache, it);
+            res_p = m.graph_cache.front().get();
+            reuse = true;
+            break;
+        }
+    }
+
+    if (!reuse)
+    {
+        m.graph_cache.emplace_front(new graph_build_result());
+        graph_build_result & r = *m.graph_cache.front();
+        const size_t meta_size = (size_t) 96 * 1024 * 1024;
+        ggml_init_params gp = { meta_size, nullptr, true };
+        r.ctx = ggml_init(gp);
+        r.gf = ggml_new_graph_custom(r.ctx, 32768, false);
+        r.nt = n;
+        r.sig = sig;
+        r.slot_id = -1;   // multi-slot; purge-on-free checks r.bd
+        r.bd = std::move(bd);
+        r.sched = ggml_backend_sched_new(m.sched_backends, m.sched_bufts, m.n_sched_backends, 32768, false, true);
+        if (!r.sched)
+        {
+            fprintf(stderr, "[dsv4] batched sched creation failed\n");
+            m.graph_cache.pop_front();
+            return nullptr;
+        }
+
+        graph_builder gb(m, r, n, 0);
+        gb.build_batched();
+
+        if (!ggml_backend_sched_alloc_graph(r.sched, r.gf))
+        {
+            fprintf(stderr, "[dsv4] batched sched_alloc_graph failed (n=%d)\n", n);
+            m.graph_cache.pop_front();
+            return nullptr;
+        }
+        res_p = &r;
+
+        while ((int) m.graph_cache.size() > m.graph_cache_cap)
+            m.graph_cache.pop_back();
+    }
+    else
+    {
+        // refresh per-slot plans/positions; input tensor pointers stay
+        for (int i = 0; i < n; i++)
+        {
+            bd_slot_state & dst = res_p->bd[i];
+            dst.p0 = bd[i].p0;
+            dst.plan_csa = std::move(bd[i].plan_csa);
+            dst.plan_hca = std::move(bd[i].plan_hca);
+            dst.plan_lid = std::move(bd[i].plan_lid);
+        }
+    }
+
+    if (out_reuse) *out_reuse = reuse;
+    return res_p;
+}
+
+static bool dsv4_forward_batched_decode(
+    dsv4_model & m, int n, const int32_t * slot_ids, const int32_t * tokens,
+    const int32_t * positions, float * logits_out)
+{
+    const dsv4_hparams & hp = m.hp;
+
+    static const int perf = []() { const char * e = getenv("TS_DSV4_PERF"); return e ? atoi(e) : 0; }();
+    auto t0 = std::chrono::steady_clock::now();
+
+    bool reuse = false;
+    graph_build_result * res_p = dsv4_acquire_batched_graph(m, n, slot_ids, positions, &reuse);
+    if (!res_p) return false;
+    graph_build_result & res = *res_p;
+
+    const ggml_fp16_t NEG_INF16 = ggml_fp32_to_fp16(-INFINITY);
+    const ggml_fp16_t ZERO16 = ggml_fp32_to_fp16(0.0f);
+
+    // ---- shared batched inputs ----
+    {
+        std::vector<int32_t> v32(n);
+        for (int d = 0; d <= m.n_gpu; d++)
+        {
+            if (!res.inp.pos[d]) continue;
+            for (int i = 0; i < n; i++) v32[i] = tokens[i];
+            set_i32(res.inp.tokens[d], v32);
+            for (int i = 0; i < n; i++) v32[i] = positions[i];
+            set_i32(res.inp.pos[d], v32);
+            for (int i = 0; i < n; i++) v32[i] = (int32_t) (positions[i] % CSA_RATIO);
+            set_i32(res.inp.csa[d].state_pos, v32);
+            for (int i = 0; i < n; i++) v32[i] = (int32_t) (positions[i] % HCA_RATIO);
+            set_i32(res.inp.hca[d].state_pos, v32);
+        }
+        for (int i = 0; i < n; i++) v32[i] = i;
+        set_i32(res.inp.out_ids, v32);
+    }
+
+    // ---- per-slot inputs ----
+    {
+        std::vector<ggml_fp16_t> mask;
+        std::vector<int32_t> meta;
+        std::vector<int64_t> ridx(1);
+
+        auto set_f16 = [](ggml_tensor * t, const std::vector<ggml_fp16_t> & v)
+        {
+            if (!t || !t->buffer || v.empty()) return;
+            ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(ggml_fp16_t));
+        };
+        auto fill_meta = [&](const comp_plan & plan)
+        {
+            meta.clear();
+            meta.insert(meta.end(), plan.state_read_idxs.begin(), plan.state_read_idxs.end());
+            for (size_t k = 0; k < plan.state_write_idxs.size(); k++)
+            {
+                meta.push_back((int32_t) plan.state_write_idxs[k]);
+                meta.push_back(plan.state_write_pos[k]);
+            }
+            for (size_t k = 0; k < plan.state_persist_src_idxs.size(); k++)
+            {
+                meta.push_back(plan.state_persist_src_idxs[k]);
+                meta.push_back((int32_t) plan.state_persist_dst_idxs[k]);
+            }
+        };
+        auto plan_mask1 = [&](const comp_plan & plan)
+        {
+            mask.assign((size_t) plan.n_kv, NEG_INF16);
+            for (int64_t r = 0; r < std::min<int64_t>(plan.n_visible[0], plan.n_kv); r++)
+                mask[(size_t) r] = ZERO16;
+        };
+
+        for (int i = 0; i < n; i++)
+        {
+            bd_slot_state & B = res.bd[i];
+            const int64_t p = B.p0;
+
+            // raw SWA ring mask for this slot's single token
+            std::vector<ggml_fp16_t> rmask((size_t) m.ring_raw, NEG_INF16);
+            for (int64_t s = 0; s < m.ring_raw; s++)
+            {
+                int64_t t = p - ((p - s) % m.ring_raw + m.ring_raw) % m.ring_raw;
+                if (t < 0) continue;
+                if (t <= p && t > p - hp.n_swa)
+                    rmask[(size_t) s] = ZERO16;
+            }
+            std::vector<ggml_fp16_t> gmask;
+            if (!B.skip_topk)
+            {
+                gmask.assign(rmask.begin(), rmask.end());
+                gmask.resize((size_t) (m.ring_raw + hp.indexer_top_k), ZERO16);
+            }
+
+            ridx[0] = p % m.ring_raw;
+            for (int d = 0; d <= m.n_gpu; d++)
+            {
+                set_i64(B.raw_idxs[d], ridx);
+                set_f16(B.raw_mask[d], rmask);
+                set_f16(B.gather_mask[d], gmask);
+                fill_meta(B.plan_csa);
+                if (!meta.empty()) set_i32(B.csa_meta[d], meta);
+                fill_meta(B.plan_lid);
+                if (!meta.empty()) set_i32(B.lid_meta[d], meta);
+                fill_meta(B.plan_hca);
+                if (!meta.empty()) set_i32(B.hca_meta[d], meta);
+                if (B.csa_mask[d]) { plan_mask1(B.plan_csa); set_f16(B.csa_mask[d], mask); }
+                if (B.lid_mask[d]) { plan_mask1(B.plan_lid); set_f16(B.lid_mask[d], mask); }
+                if (B.hca_mask[d]) { plan_mask1(B.plan_hca); set_f16(B.hca_mask[d], mask); }
+            }
+        }
+    }
+
+    if (ggml_backend_sched_graph_compute(res.sched, res.gf) != GGML_STATUS_SUCCESS)
+    {
+        fprintf(stderr, "[dsv4] batched graph compute failed\n");
+        return false;
+    }
+
+    ggml_backend_tensor_get(res.logits, logits_out, 0, (size_t) n * hp.n_vocab * sizeof(float));
+
+    if (perf >= 2)
+    {
+        auto t1 = std::chrono::steady_clock::now();
+        fprintf(stderr, "[dsv4] batched decode n=%d: %.2fms (nodes %d, splits %d%s)\n",
+                n, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                ggml_graph_n_nodes(res.gf), ggml_backend_sched_get_n_splits(res.sched),
+                reuse ? ", reused" : "");
+    }
+    return true;
+}
+
 } // namespace tsg_dsv4
 
 // ---------------------------------------------------------------------------
@@ -2453,41 +3100,42 @@ TSG_EXPORT int TSGgml_Dsv4CtxSize(void * handle)
 TSG_EXPORT int TSGgml_Dsv4NPast(void * handle)
 {
     if (!handle) return 0;
-    return ((tsg_dsv4::dsv4_model *) handle)->n_past;
+    return ((tsg_dsv4::dsv4_model *) handle)->active_slot->n_past;
 }
 
-// Feeds `n_tokens` tokens at positions [n_past, n_past + n_tokens) and writes
-// the last token's logits into logits_out (size n_vocab). Returns 0 on
-// success, negative on failure.
+// Feeds `n_tokens` tokens at positions [n_past, n_past + n_tokens) of the
+// ACTIVE slot and writes the last token's logits into logits_out (size
+// n_vocab). Returns 0 on success, negative on failure.
 TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_tokens, float * logits_out)
 {
     if (!handle || !tokens || n_tokens <= 0) return -1;
     auto * m = (tsg_dsv4::dsv4_model *) handle;
+    tsg_dsv4::dsv4_slot * slot = m->active_slot;
 
-    if (m->n_past + n_tokens > m->n_ctx)
+    if (slot->n_past + n_tokens > m->n_ctx)
     {
-        fprintf(stderr, "[dsv4] context overflow: n_past=%d + %d > n_ctx=%d\n", m->n_past, n_tokens, m->n_ctx);
+        fprintf(stderr, "[dsv4] context overflow: n_past=%d + %d > n_ctx=%d\n", slot->n_past, n_tokens, m->n_ctx);
         return -2;
     }
 
     const bool perf = []() { const char * e = getenv("TS_DSV4_PERF"); return e && atoi(e) > 0; }();
     auto t0 = std::chrono::steady_clock::now();
 
-    m->pos_end_hint = (int64_t) m->n_past + n_tokens;
+    m->pos_end_hint = (int64_t) slot->n_past + n_tokens;
 
     // Pre-acquire the first two chunk graphs (the pipelined pair) and the
     // final chunk's graph so the pipelined prefill never stalls on a
     // device-synchronizing arena allocation mid-flight.
     if (n_tokens > m->n_ubatch)
     {
-        tsg_dsv4::dsv4_acquire_graph(*m, m->n_ubatch, m->n_past, m->n_gpu > 1, nullptr);
+        tsg_dsv4::dsv4_acquire_graph(*m, m->n_ubatch, slot->n_past, m->n_gpu > 1, nullptr);
         const int nt2 = std::min(m->n_ubatch, n_tokens - m->n_ubatch);
         const bool last2 = (2 * m->n_ubatch >= n_tokens);
-        tsg_dsv4::dsv4_acquire_graph(*m, nt2, m->n_past + m->n_ubatch, !last2 && m->n_gpu > 1, nullptr);
+        tsg_dsv4::dsv4_acquire_graph(*m, nt2, slot->n_past + m->n_ubatch, !last2 && m->n_gpu > 1, nullptr);
         if (!last2)
         {
             const int last_nt = n_tokens - m->n_ubatch * ((n_tokens - 1) / m->n_ubatch);
-            tsg_dsv4::dsv4_acquire_graph(*m, last_nt, (int64_t) m->n_past + (n_tokens - last_nt), false, nullptr);
+            tsg_dsv4::dsv4_acquire_graph(*m, last_nt, (int64_t) slot->n_past + (n_tokens - last_nt), false, nullptr);
         }
     }
 
@@ -2496,9 +3144,9 @@ TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_t
     {
         const int nt = std::min(m->n_ubatch, n_tokens - done);
         const bool last = (done + nt == n_tokens);
-        if (!tsg_dsv4::dsv4_forward_ubatch(*m, tokens + done, nt, m->n_past, last, last ? logits_out : nullptr))
+        if (!tsg_dsv4::dsv4_forward_ubatch(*m, tokens + done, nt, slot->n_past, last, last ? logits_out : nullptr))
             return -3;
-        m->n_past += nt;
+        slot->n_past += nt;
         done += nt;
     }
 
@@ -2511,16 +3159,112 @@ TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_t
     return 0;
 }
 
+// Resets the ACTIVE slot's caches to position 0. Weights, rope tables and
+// other slots are untouched.
 TSG_EXPORT void TSGgml_Dsv4Reset(void * handle)
 {
     if (!handle) return;
     auto * m = (tsg_dsv4::dsv4_model *) handle;
-    m->n_past = 0;
-    for (int d = 0; d <= m->n_gpu; d++)
-        if (m->c_buf[d]) ggml_backend_buffer_clear(m->c_buf[d], 0);
-    tsg_dsv4::dsv4_init_state_rows(*m);
-    // the rope tables live in the cache buffers the clear above just wiped
-    tsg_dsv4::dsv4_upload_rope_tables(*m);
+    tsg_dsv4::dsv4_reset_slot(*m->active_slot);
+}
+
+// Allocate a new sequence slot (own caches, shared weights). Returns the slot
+// id, or -1 on allocation failure. The new slot is NOT made active.
+TSG_EXPORT int TSGgml_Dsv4SlotAlloc(void * handle)
+{
+    if (!handle) return -1;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    try
+    {
+        tsg_dsv4::dsv4_slot * slot = tsg_dsv4::dsv4_slot_alloc(*m);
+        return slot ? slot->id : -1;
+    }
+    catch (const std::exception & e)
+    {
+        fprintf(stderr, "[dsv4] slot alloc failed: %s\n", e.what());
+        return -1;
+    }
+}
+
+// Select which slot Forward/Reset/NPast operate on. Returns 0 on success,
+// -1 for an unknown slot id.
+TSG_EXPORT int TSGgml_Dsv4SetActiveSlot(void * handle, int slot_id)
+{
+    if (!handle) return -1;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    auto it = m->slots.find(slot_id);
+    if (it == m->slots.end()) return -1;
+    m->active_slot = it->second.get();
+    return 0;
+}
+
+// Free a slot's caches and every cached graph built against them (captured
+// graphs bake the slot's device addresses). The active slot cannot be freed;
+// callers switch to another slot first.
+TSG_EXPORT int TSGgml_Dsv4SlotFree(void * handle, int slot_id)
+{
+    if (!handle) return -1;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    auto it = m->slots.find(slot_id);
+    if (it == m->slots.end()) return -1;
+    if (it->second.get() == m->active_slot)
+    {
+        fprintf(stderr, "[dsv4] refusing to free the active slot %d\n", slot_id);
+        return -1;
+    }
+    for (auto gi = m->graph_cache.begin(); gi != m->graph_cache.end(); )
+    {
+        bool hit = (*gi)->slot_id == slot_id;
+        for (const auto & b : (*gi)->bd)
+            if (b.slot_id == slot_id) { hit = true; break; }
+        if (hit) gi = m->graph_cache.erase(gi);
+        else ++gi;
+    }
+    m->slots.erase(it);
+    return 0;
+}
+
+// TRUE token-batched decode: one token for each of `n` distinct slots in a
+// single fused graph (dense weights and MoE experts loaded once per step).
+// slot_ids/tokens/positions are parallel arrays; positions[i] must equal slot
+// i's current n_past. On success writes logits_out as n rows of n_vocab
+// floats and advances every slot by one position. Returns 0 on success,
+// negative when this step can't be batched (caller falls back to per-slot
+// forwards).
+TSG_EXPORT int TSGgml_Dsv4ForwardBatchedDecode(
+    void * handle, int n, const int32_t * slot_ids, const int32_t * tokens,
+    const int32_t * positions, float * logits_out)
+{
+    if (!handle || n < 2 || n > 8 || !slot_ids || !tokens || !positions || !logits_out) return -1;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    if (!m->fused) return -2;
+
+    tsg_dsv4::dsv4_slot * slots[8];
+    for (int i = 0; i < n; i++)
+    {
+        auto it = m->slots.find(slot_ids[i]);
+        if (it == m->slots.end()) return -2;
+        slots[i] = it->second.get();
+        if (slots[i]->n_past != positions[i]) return -2;
+        if (positions[i] + 1 > m->n_ctx) return -2;
+        for (int j = 0; j < i; j++)
+            if (slot_ids[j] == slot_ids[i]) return -2;
+    }
+
+    try
+    {
+        if (!tsg_dsv4::dsv4_forward_batched_decode(*m, n, slot_ids, tokens, positions, logits_out))
+            return -3;
+    }
+    catch (const std::exception & e)
+    {
+        fprintf(stderr, "[dsv4] batched decode failed: %s\n", e.what());
+        return -3;
+    }
+
+    for (int i = 0; i < n; i++)
+        slots[i]->n_past += 1;
+    return 0;
 }
 
 TSG_EXPORT void TSGgml_Dsv4Free(void * handle)
