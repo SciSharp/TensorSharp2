@@ -45,18 +45,24 @@ namespace TensorSharp.Cuda
         private const int Q81BlockBytes = 36;
 
         // ggml type ids this engine dispatches on
-        private const int TF32 = 0, TF16 = 1, TQ8_0 = 8, TQ6_K = 14, TIQ3_S = 21, TMXFP4 = 39;
+        private const int TF32 = 0, TF16 = 1, TQ8_0 = 8, TQ6_K = 14, TIQ3_S = 21, TBF16 = 30, TMXFP4 = 39;
 
         public struct QuantWeightDesc
         {
+            /// <summary>Host staging pointer. Zero when the weight streams
+            /// straight from <see cref="Source"/> into VRAM.</summary>
             public IntPtr HostPtr;
+            /// <summary>Byte source the upload reads from when
+            /// <see cref="HostPtr"/> is zero (the GGUF shard, normally).</summary>
+            public IDsv4WeightSource Source;
+            public long SourceOffset;
             public int GgmlType;
             public int Ne0;
             public int Ne1;
             public int Ne2;
             public long RowBytes;
             public string Name;
-            public bool IsValid => HostPtr != IntPtr.Zero;
+            public bool IsValid => HostPtr != IntPtr.Zero || Source != null;
             public long TotalBytes => (long)Ne1 * Math.Max(1, Ne2) * RowBytes;
         }
 
@@ -87,6 +93,14 @@ namespace TensorSharp.Cuda
             public float[] OutputNorm, HcHeadFn, HcHeadScale, HcHeadBase;
             public float[] RopeRawTable, RopeCompTable; // [nCtx * nRot] interleaved cos/sin
             public LayerDesc[] Layers;
+        }
+
+        internal sealed class UploadJob
+        {
+            public IntPtr Dst;
+            public IDsv4WeightSource Src;
+            public long SrcOffset;
+            public long Bytes;
         }
 
         private struct DevQW
@@ -151,6 +165,11 @@ namespace TensorSharp.Cuda
             public IntPtr WF16, AF16;
             public long WF16Elems;
             public List<IntPtr> OwnedAllocs = new List<IntPtr>();
+            // Weights that stream from disk: planned during the (I/O-free)
+            // arena-layout pass, then transferred by the loader thread pool.
+            public List<UploadJob> UploadPlan = new List<UploadJob>();
+            public UploadJob[] UploadJobs;
+            public int UploadCursor;
 
             public IntPtr Stream => Alloc.Stream.Handle;
             public void MakeCurrent() => Alloc.Context.MakeCurrent();
@@ -323,6 +342,10 @@ namespace TensorSharp.Cuda
                 dev.RopeComp = UploadF32(dev, m.RopeCompTable);
             });
 
+            // Weights sourced from disk were only *placed* above; move the bytes
+            // now, with the reader concurrency the filesystem actually likes.
+            RunStreamedUploads();
+
             // ---- scratch + tokens + logits ----
             for (int d = 0; d < useDevs; d++)
                 AllocateScratch(_devs[d]);
@@ -446,8 +469,170 @@ namespace TensorSharp.Cuda
                 return default;
             long bytes = qw.TotalBytes;
             IntPtr p = ArenaTake(dev, bytes);
-            CudaDriverApi.cuMemcpyHtoD(p, qw.HostPtr, new UIntPtr((ulong)bytes)).ThrowOnError();
+            if (qw.HostPtr != IntPtr.Zero)
+            {
+                CudaDriverApi.cuMemcpyHtoD(p, qw.HostPtr, new UIntPtr((ulong)bytes)).ThrowOnError();
+            }
+            else
+            {
+                // Planned now, transferred later by RunStreamedUploads so that
+                // the (slow) reads run wide instead of one tensor at a time.
+                // Split into segments so several loader threads can share one
+                // multi-hundred-MB expert stack.
+                for (long off = 0; off < bytes; off += UploadSegmentBytes)
+                {
+                    dev.UploadPlan.Add(new UploadJob
+                    {
+                        Dst = (IntPtr)((long)p + off),
+                        Src = qw.Source,
+                        SrcOffset = qw.SourceOffset + off,
+                        Bytes = Math.Min(UploadSegmentBytes, bytes - off),
+                    });
+                }
+            }
             return new DevQW { Ptr = p, Type = qw.GgmlType, Ne0 = qw.Ne0, Ne1 = qw.Ne1, RowBytes = qw.RowBytes };
+        }
+
+        // Loader tuning. The read side is the bottleneck on network filesystems
+        // and its throughput is *not* monotonic in thread count -- MooseFS/FUSE
+        // peaks around 8-32 concurrent readers and falls off a cliff above that
+        // (2.4 GB/s at 16 threads vs 1.0 GB/s at 96), so the pool is explicitly
+        // bounded rather than left to the thread pool's discretion.
+        private static readonly int LoaderThreads = Math.Max(1, EnvInt("TS_DSV4_LOAD_THREADS", 16));
+        private static readonly int LoaderChunkBytes = Math.Max(1 << 20, EnvInt("TS_DSV4_LOAD_CHUNK_MB", 16) << 20);
+        private const long UploadSegmentBytes = 128L << 20;
+        private static readonly bool LoaderStats = EnvInt("TS_DSV4_LOAD_STATS", 0) != 0;
+        private static long _loaderReadTicks;
+        private static long _loaderCopyTicks;
+
+        /// <summary>
+        /// Streams every planned weight from its GGUF shard into VRAM: bounded
+        /// pool of reader threads, each double-buffering through pinned host
+        /// chunks so the file read of chunk N+1 overlaps the HtoD of chunk N.
+        /// </summary>
+        private void RunStreamedUploads()
+        {
+            long total = 0;
+            int jobCount = 0;
+            foreach (var dev in _devs)
+            {
+                dev.UploadJobs = dev.UploadPlan.ToArray();
+                dev.UploadPlan = null;
+                dev.UploadCursor = 0;
+                jobCount += dev.UploadJobs.Length;
+                foreach (var j in dev.UploadJobs)
+                    total += j.Bytes;
+            }
+            if (jobCount == 0)
+                return;
+
+            var sw = Stopwatch.StartNew();
+            int perDev = Math.Max(1, LoaderThreads / _devs.Length);
+            var errors = new List<Exception>();
+            var threads = new List<System.Threading.Thread>(perDev * _devs.Length);
+
+            foreach (var devLocal in _devs)
+            {
+                var dev = devLocal;
+                if (dev.UploadJobs.Length == 0)
+                    continue;
+                for (int w = 0; w < perDev; w++)
+                {
+                    var t = new System.Threading.Thread(() =>
+                    {
+                        try
+                        {
+                            StreamUploadWorker(dev);
+                        }
+                        catch (Exception ex)
+                        {
+                            lock (errors)
+                                errors.Add(ex);
+                        }
+                    });
+                    t.IsBackground = true;
+                    threads.Add(t);
+                    t.Start();
+                }
+            }
+            foreach (var t in threads)
+                t.Join();
+            if (errors.Count > 0)
+                throw new AggregateException("[dsv4-cuda] weight streaming failed", errors);
+
+            double gib = total / (1024.0 * 1024 * 1024);
+            Console.Error.WriteLine($"[dsv4-cuda] streamed {gib:F1} GiB of weights into VRAM in " +
+                $"{sw.Elapsed.TotalSeconds:F1}s ({gib / Math.Max(0.001, sw.Elapsed.TotalSeconds):F2} GiB/s, " +
+                $"{threads.Count} readers)");
+            if (LoaderStats)
+            {
+                double readS = System.Threading.Interlocked.Read(ref _loaderReadTicks) / (double)Stopwatch.Frequency;
+                double copyS = System.Threading.Interlocked.Read(ref _loaderCopyTicks) / (double)Stopwatch.Frequency;
+                Console.Error.WriteLine($"[dsv4-cuda]   thread-seconds: read {readS:F1}s " +
+                    $"({gib / Math.Max(0.001, readS) * threads.Count:F2} GiB/s aggregate), copy-wait {copyS:F1}s");
+            }
+        }
+
+        private static void StreamUploadWorker(Dev dev)
+        {
+            dev.MakeCurrent();
+            int chunk = LoaderChunkBytes;
+            IntPtr stream = IntPtr.Zero;
+            var bufs = new IntPtr[2];
+            var evs = new IntPtr[2];
+            var pending = new bool[2];
+            try
+            {
+                CudaDriverApi.cuStreamCreate(out stream, 0x1 /*NON_BLOCKING*/).ThrowOnError();
+                for (int i = 0; i < 2; i++)
+                {
+                    CudaDriverApi.cuMemHostAlloc(out bufs[i], new UIntPtr((ulong)chunk), 0x1 /*PORTABLE*/).ThrowOnError();
+                    CudaDriverApi.cuEventCreate(out evs[i], 0x02 /*DISABLE_TIMING*/).ThrowOnError();
+                }
+
+                var jobs = dev.UploadJobs;
+                int slot = 0;
+                while (true)
+                {
+                    int idx = System.Threading.Interlocked.Increment(ref dev.UploadCursor) - 1;
+                    if (idx >= jobs.Length)
+                        break;
+                    var job = jobs[idx];
+                    for (long done = 0; done < job.Bytes; )
+                    {
+                        long n = Math.Min(chunk, job.Bytes - done);
+                        // Reclaim the staging buffer only once its copy retired.
+                        if (pending[slot])
+                        {
+                            long tc = LoaderStats ? Stopwatch.GetTimestamp() : 0;
+                            CudaDriverApi.cuEventSynchronize(evs[slot]).ThrowOnError();
+                            if (LoaderStats)
+                                System.Threading.Interlocked.Add(ref _loaderCopyTicks, Stopwatch.GetTimestamp() - tc);
+                            pending[slot] = false;
+                        }
+                        long t0 = LoaderStats ? Stopwatch.GetTimestamp() : 0;
+                        job.Src.Read(job.SrcOffset + done, bufs[slot], n);
+                        if (LoaderStats)
+                            System.Threading.Interlocked.Add(ref _loaderReadTicks, Stopwatch.GetTimestamp() - t0);
+                        CudaDriverApi.cuMemcpyHtoDAsync((IntPtr)((long)job.Dst + done), bufs[slot],
+                            new UIntPtr((ulong)n), stream).ThrowOnError();
+                        CudaDriverApi.cuEventRecord(evs[slot], stream).ThrowOnError();
+                        pending[slot] = true;
+                        done += n;
+                        slot ^= 1;
+                    }
+                }
+                CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
+            }
+            finally
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    if (evs[i] != IntPtr.Zero) CudaDriverApi.cuEventDestroy(evs[i]);
+                    if (bufs[i] != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(bufs[i]);
+                }
+                if (stream != IntPtr.Zero) CudaDriverApi.cuStreamDestroy(stream);
+            }
         }
 
         private static IntPtr UploadF32(Dev dev, float[] data)
@@ -623,6 +808,10 @@ namespace TensorSharp.Cuda
                 foreach (var qw in new[] { L.WqA, L.WqB, L.Wkv, L.WoA, L.WoB, L.CompWkv, L.CompWgate, L.IdxProj, L.IdxQB, L.IdxCompWkv, L.IdxCompWgate, L.GateShexp, L.UpShexp, L.DownShexp })
                 {
                     if (qw.Ptr == IntPtr.Zero)
+                        continue;
+                    // Only quantized weights are staged through WF16; F16/BF16/F32
+                    // feed cuBLAS straight from the arena.
+                    if (qw.Type == TF16 || qw.Type == TBF16 || qw.Type == TF32)
                         continue;
                     long elems = (long)qw.Ne0 * qw.Ne1;
                     if (elems > maxWElems)
@@ -1046,14 +1235,24 @@ namespace TensorSharp.Cuda
             // quantize the whole grouped layout once ([G*nt, groupDim] rows), then
             // run one matmul per group against the matching WoA row block.
             var woA = l.WoA;
-            for (int g = 0; g < m.OGroups; g++)
+            if (nt == 1 && woA.Type == TBF16 && Bf16MatvecEnabled && (groupDim & 7) == 0)
             {
-                var slice = woA;
-                slice.Ptr = (IntPtr)((long)woA.Ptr + (long)g * m.OLoraRank * woA.RowBytes);
-                slice.Ne1 = m.OLoraRank;
-                IntPtr input = (IntPtr)((long)dev.OGrouped + (long)g * nt * groupDim * 4);
-                IntPtr output = (IntPtr)((long)dev.OGroupedOut + (long)g * nt * m.OLoraRank * 4);
-                MatMul(dev, slice, input, output, nt);
+                // Decode: the 8 group matvecs are ~11us each, so folding them
+                // into one grid saves more in launch gaps than it costs.
+                dev.Alloc.Kernels.LaunchMatvecBf16(woA.Ptr, dev.OGrouped, dev.OGroupedOut,
+                    groupDim, m.OLoraRank, dev.Stream, m.OGroups);
+            }
+            else
+            {
+                for (int g = 0; g < m.OGroups; g++)
+                {
+                    var slice = woA;
+                    slice.Ptr = (IntPtr)((long)woA.Ptr + (long)g * m.OLoraRank * woA.RowBytes);
+                    slice.Ne1 = m.OLoraRank;
+                    IntPtr input = (IntPtr)((long)dev.OGrouped + (long)g * nt * groupDim * 4);
+                    IntPtr output = (IntPtr)((long)dev.OGroupedOut + (long)g * nt * m.OLoraRank * 4);
+                    MatMul(dev, slice, input, output, nt);
+                }
             }
             dev.DK.Regroup(dev.OGroupedOut, dev.OG, m.OGroups, nt, m.OLoraRank, dev.Stream);
             MatMul(dev, l.WoB, dev.OG, dev.AttnOut, nt);
@@ -1178,6 +1377,10 @@ namespace TensorSharp.Cuda
 
         // Register-staged expert kernels for prefill (TS_DSV4_STAGED_EXPERTS=0
         // reverts to the per-token kernels for A/B).
+        // TS_DSV4_BF16_MATVEC=0 reverts decode's dense BF16 projections to cuBLAS.
+        private static readonly bool Bf16MatvecEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_DSV4_BF16_MATVEC"), "0", StringComparison.Ordinal);
+
         private static readonly bool StagedExpertsEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_DSV4_STAGED_EXPERTS"), "0", StringComparison.Ordinal);
 
@@ -1257,6 +1460,21 @@ namespace TensorSharp.Cuda
                     GemmF16(dev, w.Ptr, dev.AF16, output, inDim, outDim, rows);
                     break;
 
+                case TBF16:
+                    // Weights stay bit-exact BF16 in VRAM. Decode is one row, so
+                    // it is bandwidth-bound and the dedicated matvec beats a
+                    // cuBLAS GEMM with n = 1; prefill wants the tensor cores.
+                    if (rows == 1 && Bf16MatvecEnabled && (inDim & 7) == 0)
+                    {
+                        k.LaunchMatvecBf16(w.Ptr, input, output, inDim, outDim, dev.Stream);
+                    }
+                    else
+                    {
+                        k.LaunchConvertF32Bf16(input, dev.AF16, (long)rows * inDim, dev.Stream);
+                        GemmBf16(dev, w.Ptr, dev.AF16, output, inDim, outDim, rows);
+                    }
+                    break;
+
                 case TF32:
                     GemmF32(dev, w.Ptr, input, output, inDim, outDim, rows);
                     break;
@@ -1291,6 +1509,22 @@ namespace TensorSharp.Cuda
                 ref alpha,
                 wF16, CublasApi.CUDA_R_16F, inDim,
                 aF16, CublasApi.CUDA_R_16F, inDim,
+                ref beta,
+                outF32, CublasApi.CUDA_R_32F, outDim,
+                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+        }
+
+        private static void GemmBf16(Dev dev, IntPtr wBf16, IntPtr aBf16, IntPtr outF32, int inDim, int outDim, int rows)
+        {
+            dev.Alloc.Blas.SetStream(dev.Stream);
+            float alpha = 1.0f, beta = 0.0f;
+            CublasApi.cublasGemmEx(
+                dev.Alloc.Blas.Handle,
+                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                outDim, rows, inDim,
+                ref alpha,
+                wBf16, CublasApi.CUDA_R_16BF, inDim,
+                aBf16, CublasApi.CUDA_R_16BF, inDim,
                 ref beta,
                 outF32, CublasApi.CUDA_R_32F, outDim,
                 CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();

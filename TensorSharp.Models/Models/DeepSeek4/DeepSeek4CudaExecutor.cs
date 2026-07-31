@@ -9,19 +9,24 @@
 // DeepSeek V4 (Flash) executor for the direct-CUDA backend.
 //
 // The model-side half of the DSV4 direct-CUDA path: opens the split-GGUF
-// shards (memory-mapped), parses the deepseek4 hyper-parameters, dequantizes
-// the small tensors (norms, gates, sinks, APE tables, the BF16 router) to
-// F32 host arrays, precomputes the raw/compress RoPE cos-sin tables (same
-// YaRN math as DeepSeek4CpuExecutor.RopeCacheInit), and hands everything to
-// TensorSharp.Cuda.Dsv4CudaEngine, which uploads the quantized weights to
-// device memory (layer-split across all visible GPUs) and runs the forward
-// pass with driver-API kernels — fully independent of ggml.
+// shards, parses the deepseek4 hyper-parameters, dequantizes the small
+// tensors (norms, gates, sinks, APE tables, the router) to F32 host arrays,
+// precomputes the raw/compress RoPE cos-sin tables (same YaRN math as
+// DeepSeek4CpuExecutor.RopeCacheInit), and hands everything to
+// TensorSharp.Cuda.Dsv4CudaEngine, which runs the forward pass with
+// driver-API kernels — fully independent of ggml.
+//
+// The bulk weights are never staged in host RAM: each one is described to the
+// engine as (shard, file offset, length) and the engine's loader pool streams
+// it through pinned chunks straight into VRAM (layer-split across the visible
+// GPUs). A 150 GiB model therefore loads with a ~2 GB host footprint.
 // ---------------------------------------------------------------------------
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp.Cuda;
 
@@ -37,7 +42,57 @@ namespace TensorSharp.Models
         private readonly Dictionary<string, (GgufFile File, GgufTensorInfo Info)> _tensorMap
             = new Dictionary<string, (GgufFile, GgufTensorInfo)>(StringComparer.Ordinal);
         private readonly List<IntPtr> _ownedBuffers = new List<IntPtr>();
-        private Dictionary<string, IntPtr> _bufferedTensors;
+        private ShardSource[] _shardSources;
+        private Dictionary<string, IntPtr> _prefetched;
+        private readonly Dictionary<GgufFile, int> _shardIndexOf = new Dictionary<GgufFile, int>();
+
+        /// <summary>
+        /// Positional-read view over one GGUF shard, handed to the CUDA engine
+        /// so big weights go file -> pinned chunk -> VRAM without a host-RAM
+        /// copy of the whole model.
+        /// </summary>
+        /// <remarks>
+        /// One descriptor per reader thread, deliberately. pread(2) on a shared
+        /// handle is correct but on FUSE filesystems it is also *serialized*:
+        /// on MooseFS, 16 threads sharing one descriptor read at 0.69 GB/s
+        /// while the same 16 threads on their own descriptors read at 2.4 GB/s,
+        /// independent of the access pattern.
+        /// </remarks>
+        private sealed class ShardSource : IDsv4WeightSource, IDisposable
+        {
+            private readonly string _path;
+            private readonly ThreadLocal<Microsoft.Win32.SafeHandles.SafeFileHandle> _handles;
+
+            public ShardSource(string path)
+            {
+                _path = path;
+                _handles = new ThreadLocal<Microsoft.Win32.SafeHandles.SafeFileHandle>(
+                    () => File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read),
+                    trackAllValues: true);
+            }
+
+            public void Read(long offset, IntPtr dst, long bytes)
+            {
+                var handle = _handles.Value;
+                byte* p = (byte*)dst;
+                long done = 0;
+                while (done < bytes)
+                {
+                    int want = (int)Math.Min(1 << 30, bytes - done);
+                    int got = RandomAccess.Read(handle, new Span<byte>(p + done, want), offset + done);
+                    if (got <= 0)
+                        throw new IOException($"[dsv4-cuda] short read at offset {offset + done} in {_path}");
+                    done += got;
+                }
+            }
+
+            public void Dispose()
+            {
+                foreach (var h in _handles.Values)
+                    h?.Dispose();
+                _handles.Dispose();
+            }
+        }
 
         // hparams
         private int _nLayer, _nEmbd, _nHead, _nVocab, _headDim, _nRot, _qLoraRank, _oGroups, _oLoraRank, _nSwa;
@@ -65,32 +120,45 @@ namespace TensorSharp.Models
         public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu)
         {
             var sw = Stopwatch.StartNew();
+            bool stats = ParseEnvInt("TS_DSV4_LOAD_STATS", 0) != 0;
+            void Mark(string phase)
+            {
+                if (stats)
+                    Console.Error.WriteLine($"[dsv4-cuda]   +{sw.Elapsed.TotalSeconds,6:F1}s {phase}");
+            }
+
             OpenShards(ggufPath);
             ParseHparams();
+            Mark("shards opened / hparams parsed");
 
-            // Weights are read from the host exactly once (the upload to VRAM),
-            // so materializing with wide parallel positional reads beats paying
-            // serial mmap page faults inside cuMemcpyHtoD — on a network
-            // filesystem by 2-3x. TS_DSV4_MMAP=1 opts back into mmap.
-            bool materialize = ParseEnvInt("TS_DSV4_MMAP", 0) == 0;
-            if (materialize)
-                MaterializeTensors();
+            // Large weights are read exactly once, on their way to VRAM, so the
+            // engine streams them straight from the shards through pinned
+            // chunks instead of staging the whole (hundreds of GB) model in
+            // host RAM first. TS_DSV4_MMAP=1 opts back into the mmap path.
+            bool stream = ParseEnvInt("TS_DSV4_MMAP", 0) == 0;
+            if (stream)
+            {
+                _shardSources = new ShardSource[_shardPaths.Count];
+                for (int s = 0; s < _shardPaths.Count; s++)
+                    _shardSources[s] = new ShardSource(_shardPaths[s]);
+                PrefetchSmallTensors();
+                Mark("small tensors prefetched");
+            }
 
             int nCtx = maxContext > 0 ? maxContext : 16384;
             int ubatch = nUbatch > 0 ? nUbatch : 1024;
 
             var desc = BuildModelDesc(nCtx, ubatch);
+            Mark("model desc built");
             _engine = new Dsv4CudaEngine(desc, nGpu);
+            Mark("engine ready");
 
-            if (materialize)
-            {
-                // Everything lives in VRAM now; the staged host copies (~the
-                // whole model) are dead weight.
-                _bufferedTensors = null;
-                foreach (var p in _ownedBuffers)
-                    Marshal.FreeHGlobal(p);
-                _ownedBuffers.Clear();
-            }
+            // Everything lives in VRAM now; drop the host-side scraps.
+            _prefetched = null;
+            foreach (var p in _ownedBuffers)
+                Marshal.FreeHGlobal(p);
+            _ownedBuffers.Clear();
+            DisposeShardSources();
 
             Console.Error.WriteLine($"[dsv4-cuda] model ready in {sw.Elapsed.TotalSeconds:F1}s");
         }
@@ -131,9 +199,59 @@ namespace TensorSharp.Models
                 }
             }
 
-            foreach (var shard in _shards)
-                foreach (var kv in shard.Tensors)
-                    _tensorMap[kv.Key] = (shard, kv.Value);
+            for (int s = 0; s < _shards.Count; s++)
+            {
+                _shardIndexOf[_shards[s]] = s;
+                foreach (var kv in _shards[s].Tensors)
+                    _tensorMap[kv.Key] = (_shards[s], kv.Value);
+            }
+        }
+
+        /// <summary>
+        /// Reads the tensors the host itself has to look at (norms, gates,
+        /// sinks, APE tables, the router, tid2eid) up front and in parallel.
+        /// Individually they are tiny, but there are hundreds of them and a
+        /// serial read of each costs a full round-trip on a network filesystem.
+        /// Anything not prefetched still resolves through GetRaw's direct read.
+        /// </summary>
+        private void PrefetchSmallTensors()
+        {
+            var names = new List<string>();
+            foreach (var kv in _tensorMap)
+            {
+                var type = kv.Value.Info.Type;
+                if (type == GgmlTensorType.F32 || type == GgmlTensorType.I32)
+                    names.Add(kv.Key);
+            }
+            if (names.Count == 0)
+                return;
+
+            var slots = new IntPtr[names.Count];
+            Parallel.For(0, names.Count, new ParallelOptions { MaxDegreeOfParallelism = 16 }, i =>
+            {
+                var entry = _tensorMap[names[i]];
+                long bytes = entry.File.GetTensorByteCount(entry.Info);
+                IntPtr buf = Marshal.AllocHGlobal((nint)bytes);
+                _shardSources[_shardIndexOf[entry.File]]
+                    .Read(entry.File.DataOffset + (long)entry.Info.Offset, buf, bytes);
+                slots[i] = buf;
+            });
+
+            _prefetched = new Dictionary<string, IntPtr>(names.Count, StringComparer.Ordinal);
+            for (int i = 0; i < names.Count; i++)
+            {
+                _prefetched[names[i]] = slots[i];
+                _ownedBuffers.Add(slots[i]);
+            }
+        }
+
+        private void DisposeShardSources()
+        {
+            if (_shardSources == null)
+                return;
+            foreach (var s in _shardSources)
+                s?.Dispose();
+            _shardSources = null;
         }
 
         private void ParseHparams()
@@ -193,59 +311,11 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// TS_DSV4_MMAP=0: copy every tensor into anonymous RAM with parallel
-        /// positional reads (for network filesystems whose mmap page faults are
-        /// slow). The upload to VRAM reads each page exactly once, so the
-        /// default mmap path is usually fine.
+        /// Materializes a tensor in host memory. Only used for the small
+        /// tensors the host actually has to look at (norms, gates, sinks, APE
+        /// tables, the router, tid2eid); the bulk weights never come here —
+        /// they stream from the shard directly into VRAM.
         /// </summary>
-        private void MaterializeTensors()
-        {
-            var sw = Stopwatch.StartNew();
-            _bufferedTensors = new Dictionary<string, IntPtr>(StringComparer.Ordinal);
-
-            var handles = new Microsoft.Win32.SafeHandles.SafeFileHandle[_shardPaths.Count];
-            var shardIndexOf = new Dictionary<GgufFile, int>();
-            for (int s = 0; s < _shards.Count; s++)
-            {
-                shardIndexOf[_shards[s]] = s;
-                handles[s] = File.OpenHandle(_shardPaths[s], FileMode.Open, FileAccess.Read, FileShare.Read);
-            }
-
-            var names = new List<string>(_tensorMap.Keys);
-            var slots = new IntPtr[names.Count];
-            long totalBytes = 0;
-            Parallel.For(0, names.Count, i =>
-            {
-                var entry = _tensorMap[names[i]];
-                int s = shardIndexOf[entry.File];
-                long bytes = entry.File.GetTensorByteCount(entry.Info);
-                long fileOff = entry.File.DataOffset + (long)entry.Info.Offset;
-                IntPtr buf = Marshal.AllocHGlobal((nint)bytes);
-                byte* dst = (byte*)buf;
-                long done = 0;
-                while (done < bytes)
-                {
-                    int want = (int)Math.Min(32 << 20, bytes - done);
-                    int got = RandomAccess.Read(handles[s], new Span<byte>(dst + done, want), fileOff + done);
-                    if (got <= 0)
-                        throw new IOException($"[dsv4-cuda] short read materializing {names[i]}");
-                    done += got;
-                }
-                slots[i] = buf;
-                System.Threading.Interlocked.Add(ref totalBytes, bytes);
-            });
-
-            foreach (var h in handles)
-                h?.Dispose();
-
-            for (int i = 0; i < names.Count; i++)
-            {
-                _bufferedTensors[names[i]] = slots[i];
-                _ownedBuffers.Add(slots[i]);
-            }
-            Console.Error.WriteLine($"[dsv4-cuda] buffered {totalBytes / (1024.0 * 1024 * 1024):F1} GiB of weights into RAM in {sw.Elapsed.TotalSeconds:F1}s");
-        }
-
         private (IntPtr Ptr, GgufTensorInfo Info) GetRaw(string name, bool required = true)
         {
             if (!_tensorMap.TryGetValue(name, out var entry))
@@ -256,26 +326,45 @@ namespace TensorSharp.Models
             }
 
             GgufTensorInfo info = entry.Info;
-            if (_bufferedTensors != null && _bufferedTensors.TryGetValue(name, out IntPtr buffered))
-                return (buffered, info);
+            if (_prefetched != null && _prefetched.TryGetValue(name, out IntPtr cached))
+                return (cached, info);
+
+            long bytes = entry.File.GetTensorByteCount(info);
+            if (_shardSources != null)
+            {
+                IntPtr staged = Marshal.AllocHGlobal((nint)bytes);
+                _ownedBuffers.Add(staged);
+                _shardSources[_shardIndexOf[entry.File]]
+                    .Read(entry.File.DataOffset + (long)info.Offset, staged, bytes);
+                return (staged, info);
+            }
+
             if (entry.File.TryGetTensorDataPointer(info, out IntPtr mapped))
                 return (mapped, info);
 
-            long bytes = entry.File.GetTensorByteCount(info);
             IntPtr buf = Marshal.AllocHGlobal((nint)bytes);
             _ownedBuffers.Add(buf);
             entry.File.ReadTensorDataToNative(info, buf, bytes);
             return (buf, info);
         }
 
+        /// <summary>
+        /// Describes a bulk weight to the engine. In the default (streaming)
+        /// mode this touches no tensor data at all: it hands over the shard and
+        /// the file offset, and the engine's loader pool moves the bytes.
+        /// </summary>
         private Dsv4CudaEngine.QuantWeightDesc GetQW(string name, bool required = true)
         {
-            var (ptr, info) = GetRaw(name, required);
-            if (ptr == IntPtr.Zero)
+            if (!_tensorMap.TryGetValue(name, out var entry))
+            {
+                if (required)
+                    throw new InvalidOperationException($"[dsv4-cuda] missing tensor: {name}");
                 return default;
+            }
+
+            GgufTensorInfo info = entry.Info;
             var desc = new Dsv4CudaEngine.QuantWeightDesc
             {
-                HostPtr = ptr,
                 GgmlType = (int)info.Type,
                 Ne0 = (int)info.Shape[0],
                 Ne1 = info.Shape.Length > 1 ? (int)info.Shape[1] : 1,
@@ -283,6 +372,19 @@ namespace TensorSharp.Models
                 RowBytes = ManagedQuantizedOps.RowSize((int)info.Type, (int)info.Shape[0]),
                 Name = name,
             };
+
+            if (_shardSources != null)
+            {
+                desc.Source = _shardSources[_shardIndexOf[entry.File]];
+                desc.SourceOffset = entry.File.DataOffset + (long)info.Offset;
+            }
+            else
+            {
+                var (ptr, _) = GetRaw(name, required);
+                if (ptr == IntPtr.Zero)
+                    return default;
+                desc.HostPtr = ptr;
+            }
             return desc;
         }
 
@@ -317,8 +419,9 @@ namespace TensorSharp.Models
             var tokEmbd = GetQW("token_embd.weight");
             _nVocab = tokEmbd.Ne1;
             int tokType = tokEmbd.GgmlType;
-            if (tokType != 8 && tokType != 1 && tokType != 0)
-                throw new NotSupportedException($"[dsv4-cuda] token_embd type {tokType} unsupported (Q8_0/F16/F32).");
+            // ts_dsv4_embed_f32 decodes these row layouts directly.
+            if (tokType != 8 && tokType != 1 && tokType != 0 && tokType != 30)
+                throw new NotSupportedException($"[dsv4-cuda] token_embd type {tokType} unsupported (Q8_0/F16/BF16/F32).");
 
             var m = new Dsv4CudaEngine.ModelDesc
             {
@@ -460,6 +563,7 @@ namespace TensorSharp.Models
         {
             _engine?.Dispose();
             _engine = null;
+            DisposeShardSources();
             foreach (var p in _ownedBuffers)
                 Marshal.FreeHGlobal(p);
             _ownedBuffers.Clear();

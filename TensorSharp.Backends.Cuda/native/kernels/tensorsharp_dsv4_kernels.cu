@@ -403,6 +403,10 @@ extern "C" __global__ void ts_dsv4_embed_f32(
     {
         v = __half2float(((const half*)row)[e]);
     }
+    else if (wtype == 30) // BF16
+    {
+        v = __uint_as_float((unsigned int)((const unsigned short*)row)[e] << 16);
+    }
     else // F32
     {
         v = ((const float*)row)[e];
