@@ -481,6 +481,27 @@ static __global__ void tsg_dsv4_topk_mask_f16(
     }
 }
 
+// Compact sparse-attention K for decode: dst row r < ring_rows copies the raw
+// SWA ring row r, row ring_rows+j gathers compressed cache row topk[j]. K
+// doubles as V, so one gather serves the whole attention read. Rows are
+// contiguous F16; copy as int (half2 pairs).
+static __global__ void tsg_dsv4_kgather_f16(
+        const half * __restrict__ ring,    // [head, ring_rows]
+        const half * __restrict__ comp,    // [head, n_comp_rows]
+        const int32_t * __restrict__ topk, // [n_rows - ring_rows]
+        half * __restrict__ dst,           // [head, n_rows]
+        const int head,
+        const int ring_rows) {
+    const int r = blockIdx.x;
+    const half * src = r < ring_rows ? ring + (int64_t) r * head
+                                     : comp + (int64_t) topk[r - ring_rows] * head;
+    const int * s = (const int *) src;
+    int * o = (int *) (dst + (int64_t) r * head);
+    for (int i = threadIdx.x; i < head/2; i += blockDim.x) {
+        o[i] = s[i];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Launcher
 // ---------------------------------------------------------------------------
@@ -667,6 +688,21 @@ static void tsg_dsv4_fused_launch(const tsg_dsv4_fused_desc * d, ggml_tensor * d
             tsg_dsv4_topk_mask_f16<<<nt, 256, 0, stream>>>(
                 (const half *) base->data, (const int32_t *) topk->data,
                 (half *) dst->data, W, k, d->i0 /*offset*/);
+        } break;
+
+        case TSG_DSV4_FUSED_KGATHER:
+        {
+            const ggml_tensor * ring = dst->src[0];
+            const ggml_tensor * comp = dst->src[1];
+            const ggml_tensor * topk = dst->src[2];
+
+            const int head      = (int) dst->ne[0];
+            const int n_rows    = (int) dst->ne[2];
+            const int ring_rows = d->i0;
+
+            tsg_dsv4_kgather_f16<<<n_rows, 256, 0, stream>>>(
+                (const half *) ring->data, (const half *) comp->data,
+                (const int32_t *) topk->data, (half *) dst->data, head, ring_rows);
         } break;
 
         default:

@@ -218,6 +218,8 @@ struct graph_inputs
     ggml_tensor * pos[MAX_GPUS + 1] = {};       // I32 [nt]
     ggml_tensor * raw_idxs[MAX_GPUS + 1] = {};  // I64 [nt]
     ggml_tensor * raw_mask[MAX_GPUS + 1] = {};  // F16 [ring, nt]
+    // decode index-gather mode: F16 [ring + top_k, 1] (top-k tail all zeros)
+    ggml_tensor * gather_mask[MAX_GPUS + 1] = {};
     ggml_tensor * out_ids = nullptr;            // I32 [1] (last device)
     plan_inputs csa[MAX_GPUS + 1];
     plan_inputs hca[MAX_GPUS + 1];
@@ -319,6 +321,8 @@ struct dsv4_model
 
     // scratch for logits
     std::vector<float> logits;
+
+    bool gather_env = true; // TS_DSV4_GATHER=0 disables decode index-gather
 
     ~dsv4_model()
     {
@@ -687,6 +691,9 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
 
         const char * gc = getenv("TS_DSV4_GRAPH_CACHE");
         if (gc && atoi(gc) > 0) m->graph_cache_cap = atoi(gc);
+
+        const char * ge = getenv("TS_DSV4_GATHER");
+        m->gather_env = !(ge && atoi(ge) == 0);
     }
 
     // --- read gguf metadata (all shards) ---
@@ -1059,6 +1066,18 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
 
     m->logits.resize(hp.n_vocab);
     return m.release();
+}
+
+// Decode-time index-gather sparse attention: past the indexer-skip horizon
+// (pos_end > top_k * ratio) the decode token sees n_visible >= top_k
+// compressed rows, so every top-k index is a valid row and CSA attention can
+// read a compact [raw ring | gathered top-k] K with an all-visible tail mask
+// instead of masked-dense over every compressed row. Attention cost then
+// stops growing with context; only the indexer scores/top-k stay O(n).
+static bool dsv4_use_gather(const dsv4_model & m, int64_t nt, int64_t pos_end)
+{
+    return m.fused && m.gather_env && nt == 1 &&
+           pos_end > (int64_t) m.hp.indexer_top_k * CSA_RATIO;
 }
 
 static comp_plan build_comp_plan(
@@ -1737,7 +1756,22 @@ struct graph_builder
         ggml_tensor * out = nullptr;
         const float kq_scale = 1.0f / sqrtf((float) head);
 
-        if (ratio == CSA_RATIO)
+        if (ratio == CSA_RATIO && res.inp.gather_mask[dev])
+        {
+            // Decode index-gather: compact [raw ring | top-k rows] K. Every
+            // top-k index is a valid compressed row here (see
+            // dsv4_use_gather), so the gathered tail needs no masking and the
+            // softmax over the gathered subset equals the masked-dense
+            // result. The gather runs after this layer's compressor commit
+            // (same stream, graph order), so a just-completed block is
+            // selectable exactly like in the masked-dense path.
+            ggml_tensor * top_k = build_lid_top_k(il, qr, cur, inp_pos, dev);
+            ggml_tensor * k_sel = fused_node(TSG_DSV4_FUSED_KGATHER, GGML_TYPE_F16,
+                    head, 1, m.ring_raw + top_k->ne[0], 1,
+                    { L.raw_k, L.csa_k, top_k }, dev, (int) m.ring_raw);
+            out = attn_mha(q, k_sel, res.inp.gather_mask[dev], L.attn_sinks, kq_scale);
+        }
+        else if (ratio == CSA_RATIO)
         {
             ggml_tensor * csa_k = ggml_view_2d(ctx, L.csa_k, head, res.plan_csa.n_kv, L.csa_k->nb[1], 0);
             csa_k = ggml_reshape_3d(ctx, csa_k, head, 1, res.plan_csa.n_kv);
@@ -1999,6 +2033,11 @@ struct graph_builder
             inp.raw_idxs[d] = new_input_i64(nt, nb, d);
             snprintf(nb, sizeof(nb), "inp_raw_mask.%d", d);
             inp.raw_mask[d] = new_input_mask(m.ring_raw, GGML_TYPE_F16, nb, d);
+            if (dsv4_use_gather(m, nt, std::max(m.pos_end_hint, p0 + nt)))
+            {
+                snprintf(nb, sizeof(nb), "inp_gather_mask.%d", d);
+                inp.gather_mask[d] = new_input_mask(m.ring_raw + hp.indexer_top_k, GGML_TYPE_F16, nb, d);
+            }
             make_plan_inputs(inp.csa[d], res.plan_csa, GGML_TYPE_F16, "csa", d);
             make_plan_inputs(inp.hca[d], res.plan_hca, GGML_TYPE_F16, "hca", d);
             make_plan_inputs(inp.lid[d], res.plan_lid, GGML_TYPE_F16, "lid", d);
@@ -2258,6 +2297,16 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
         plan_mask(res.plan_hca, mk_hca);
         plan_mask(res.plan_lid, mk_lid);
 
+        // gather-mode attention mask: [raw ring mask | top-k rows, all visible]
+        std::vector<ggml_fp16_t> gmask;
+        bool any_gather = false;
+        for (int d = 0; d <= m.n_gpu && !any_gather; d++) any_gather = res.inp.gather_mask[d] != nullptr;
+        if (any_gather)
+        {
+            gmask.assign(mask.begin(), mask.end());
+            gmask.resize((size_t) (m.ring_raw + hp.indexer_top_k) * nt, ZERO16);
+        }
+
         auto set_f16 = [](ggml_tensor * t, const std::vector<ggml_fp16_t> & v)
         {
             if (!t || !t->buffer || v.empty()) return;
@@ -2307,6 +2356,7 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
             for (int64_t i = 0; i < nt; i++) ridx[i] = (p0 + i) % m.ring_raw;
             set_i64(res.inp.raw_idxs[d], ridx);
             set_f16(res.inp.raw_mask[d], mask);
+            set_f16(res.inp.gather_mask[d], gmask);
             fill_plan(res.inp.csa[d], res.plan_csa, mk_csa);
             fill_plan(res.inp.hca[d], res.plan_hca, mk_hca);
             fill_plan(res.inp.lid[d], res.plan_lid, mk_lid);

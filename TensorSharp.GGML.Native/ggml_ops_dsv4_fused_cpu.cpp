@@ -398,6 +398,27 @@ static void tsg_dsv4_cpu_topk_mask(ggml_tensor * dst, const tsg_dsv4_fused_desc 
     }
 }
 
+static void tsg_dsv4_cpu_kgather(ggml_tensor * dst, const tsg_dsv4_fused_desc * d)
+{
+    const ggml_tensor * ring = dst->src[0];
+    const ggml_tensor * comp = dst->src[1];
+    const ggml_tensor * topk = dst->src[2];
+
+    const int64_t head      = dst->ne[0];
+    const int64_t n_rows    = dst->ne[2];
+    const int64_t ring_rows = d->i0;
+
+    const int32_t * tk = (const int32_t *) topk->data;
+
+    for (int64_t r = 0; r < n_rows; ++r)
+    {
+        const ggml_fp16_t * src = r < ring_rows
+            ? (const ggml_fp16_t *) ring->data + r * head
+            : (const ggml_fp16_t *) comp->data + (int64_t) tk[r - ring_rows] * head;
+        memcpy((ggml_fp16_t *) dst->data + r * head, src, head * sizeof(ggml_fp16_t));
+    }
+}
+
 void tsg_dsv4_fused_cpu(ggml_tensor * dst, int ith, int nth, void * userdata)
 {
     GGML_UNUSED(nth);
@@ -417,6 +438,7 @@ void tsg_dsv4_fused_cpu(ggml_tensor * dst, int ith, int nth, void * userdata)
         case TSG_DSV4_FUSED_SWIGLU_CLAMP:  tsg_dsv4_cpu_swiglu_clamp(dst, d); break;
         case TSG_DSV4_FUSED_HC_GATES:      tsg_dsv4_cpu_hc_gates(dst, d); break;
         case TSG_DSV4_FUSED_TOPK_MASK:     tsg_dsv4_cpu_topk_mask(dst, d); break;
+        case TSG_DSV4_FUSED_KGATHER:       tsg_dsv4_cpu_kgather(dst, d); break;
         default: GGML_ABORT("tsg_dsv4_fused_cpu: unknown kind %d", d->kind);
     }
 }
