@@ -135,6 +135,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr dequantWeightF16;
         private readonly IntPtr dequantWeightQ80F16;
         private readonly IntPtr convertF32F16;
+        private readonly IntPtr convertF32Bf16;
+        private readonly IntPtr matvecBf16F32;
         private readonly IntPtr qkNormRopeNeoxF32;
         private readonly IntPtr qwen35GdnFusedF32;
 
@@ -311,6 +313,8 @@ namespace TensorSharp.Cuda
             dequantWeightF16 = module.GetFunction("ts_dequant_weight_f16");
             dequantWeightQ80F16 = module.GetFunction("ts_dequant_weight_q8_0_f16");
             convertF32F16 = module.GetFunction("ts_convert_f32_f16");
+            convertF32Bf16 = module.GetFunction("ts_convert_f32_bf16");
+            matvecBf16F32 = module.GetFunction("ts_matvec_bf16_f32");
             quantGetRowsF32 = module.GetFunction("ts_quant_get_rows_f32");
             qkNormRopeNeoxF32 = module.GetFunction("ts_qk_norm_rope_neox_f32");
             qwen35GdnFusedF32 = module.GetFunction("ts_qwen35_gdn_fused_f32");
@@ -2986,6 +2990,34 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &srcArg, &dstArg, &countArg };
             uint grid = (uint)((count + BlockSize - 1) / BlockSize);
             Launch(convertF32F16, grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>
+        /// Single-row BF16 matvec: output[outDim] = weights[outDim, inDim] x input[inDim].
+        /// With <paramref name="groups"/> &gt; 1 this runs that many independent
+        /// block-diagonal matvecs in one launch, group g taking
+        /// weights[g*outDim..], input[g*inDim..] and output[g*outDim..].
+        /// Caller must ensure inDim % 8 == 0 (16-byte vector loads).
+        /// </summary>
+        public void LaunchMatvecBf16(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, IntPtr stream, int groups = 1)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr inputArg = input;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &inDimArg, &outDimArg };
+            Launch(matvecBf16F32, (uint)outDim, (uint)groups, 1, 128, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchConvertF32Bf16(IntPtr src, IntPtr dstBf16, long count, IntPtr stream)
+        {
+            IntPtr srcArg = src;
+            IntPtr dstArg = dstBf16;
+            long countArg = count;
+            void** args = stackalloc void*[] { &srcArg, &dstArg, &countArg };
+            uint grid = (uint)((count + BlockSize - 1) / BlockSize);
+            Launch(convertF32Bf16, grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         // Single-row Q8_0 dp4a matvec: four warps cooperate on each output

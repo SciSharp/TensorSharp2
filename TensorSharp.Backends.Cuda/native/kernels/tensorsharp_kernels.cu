@@ -872,6 +872,91 @@ extern "C" __global__ void ts_convert_f32_f16(const float* src, half* dst, long 
         dst[i] = __float2half(src[i]);
 }
 
+// out[j] = dot(row j of the BF16 weight, the F32 activation), one block per
+// output column. Decode-time (rows == 1) replacement for a cuBLAS GEMM with
+// n = 1: purely memory bound, so the block issues 16-byte loads (8 BF16 each)
+// to saturate the row read, and accumulates in F32 like CUBLAS_COMPUTE_32F.
+// Requires inDim % 8 == 0 and a 16-byte-aligned weight base.
+//
+// gridDim.y is the block-diagonal group count: group g multiplies weight rows
+// [g*outDim, (g+1)*outDim) by x + g*inDim into out + g*outDim. DSV4's grouped
+// LoRA out-projection uses it to run all 8 groups in one launch -- the
+// per-group kernels are only ~11us each, so the launch gaps were costing more
+// than a quarter of the stage. gridDim.y == 1 is the ordinary matvec.
+extern "C" __global__ void ts_matvec_bf16_f32(
+    const uint4* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    const int inDim,
+    const int outDim)
+{
+    const int j = blockIdx.x;
+    if (j >= outDim)
+        return;
+
+    const int g = blockIdx.y;
+    const int nvec = inDim >> 3;
+    const uint4* row = w + ((size_t)g * outDim + j) * nvec;
+    x += (size_t)g * inDim;
+    out += (size_t)g * outDim;
+
+    float acc = 0.0f;
+    for (int v = threadIdx.x; v < nvec; v += blockDim.x)
+    {
+        const uint4 packed = row[v];
+        const float* xs = x + (v << 3);
+        const unsigned int* u = (const unsigned int*)&packed;
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+        {
+            // Little-endian: element 2k is the low half of the word, 2k+1 the
+            // high half. BF16 -> F32 is just a 16-bit left shift.
+            acc = fmaf(__uint_as_float(u[k] << 16), xs[2 * k], acc);
+            acc = fmaf(__uint_as_float(u[k] & 0xFFFF0000u), xs[2 * k + 1], acc);
+        }
+    }
+
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+
+    __shared__ float warpSums[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0)
+        warpSums[warp] = acc;
+    __syncthreads();
+
+    if (warp == 0)
+    {
+        const int nwarps = blockDim.x >> 5;
+        float v = (lane < nwarps) ? warpSums[lane] : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xFFFFFFFFu, v, off);
+        if (lane == 0)
+            out[j] = v;
+    }
+}
+
+// F32 -> BF16 with round-to-nearest-even, matching __float2bfloat16. Written
+// through a uint16 view so the kernel builds on architectures whose headers
+// predate the __nv_bfloat16 intrinsics.
+extern "C" __global__ void ts_convert_f32_bf16(const float* src, unsigned short* dst, long long count)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+    unsigned int u = __float_as_uint(src[i]);
+    // NaN stays NaN (quiet); everything else rounds half-to-even on bit 16.
+    unsigned int rounded = ((u & 0xFFFFu) != 0x8000u || (u & 0x10000u) != 0u)
+        ? u + 0x7FFFu + ((u >> 16) & 1u)
+        : u;
+    dst[i] = (unsigned short)((((u & 0x7F800000u) == 0x7F800000u) && (u & 0x007FFFFFu))
+        ? ((u >> 16) | 0x0040u)
+        : (rounded >> 16));
+}
+
 // Deinterleave a fused Q+gate projection: src rows hold num_heads blocks of
 // [q(head_dim) | gate(head_dim)]; q/gate receive the de-interleaved halves as
 // dense [rows, num_heads*head_dim]. src_row_stride supports reading a Narrow'd

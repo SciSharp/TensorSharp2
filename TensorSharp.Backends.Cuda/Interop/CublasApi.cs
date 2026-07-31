@@ -84,6 +84,7 @@ namespace TensorSharp.Cuda.Interop
         public const int CUBLAS_TENSOR_OP_MATH = 1;
         public const int CUDA_R_16F = 2;
         public const int CUDA_R_32F = 0;
+        public const int CUDA_R_16BF = 14;
         public const int CUBLAS_COMPUTE_32F = 68;
         public const int CUBLAS_GEMM_DEFAULT = -1;
     }
