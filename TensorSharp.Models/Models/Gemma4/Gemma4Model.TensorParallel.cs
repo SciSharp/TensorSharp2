@@ -163,28 +163,25 @@ namespace TensorSharp.Models
         /// Without this the first forward pays the whole upload — measured at
         /// ~51 s on Gemma-4-26B — and it looks like a hang.
         /// </summary>
-        protected override void PreloadGgmlTpAuxiliaryWeights(long[] bytesPerRank, int[] countPerRank)
+        protected override void PreloadGgmlTpAuxiliaryWeightsForRank(int rank, long[] bytesPerRank, int[] countPerRank)
         {
             if (UsesTensorSlicedMoE)
             {
-                PreloadGemma4TensorSlicedExperts(bytesPerRank, countPerRank);
+                PreloadGemma4TensorSlicedExpertsForRank(rank, bytesPerRank, countPerRank);
                 return;
             }
             if (!UsesExpertParallelMoE)
                 return;
 
+            // The calling thread is pinned to this rank's GPU by the RunPerRank
+            // fan-out, so each rank streams its own expert slices concurrently.
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 if (!HasMoE(layer)) continue;
-                for (int r = 0; r < TpDegree; r++)
-                {
-                    GgmlBasicOps.SetActiveRank(r);
-                    PreloadStackedShard(_tpStackedGate[layer]?[r], bytesPerRank, countPerRank, r);
-                    PreloadStackedShard(_tpStackedUp?[layer]?[r], bytesPerRank, countPerRank, r);
-                    PreloadStackedShard(_tpStackedDown[layer]?[r], bytesPerRank, countPerRank, r);
-                }
+                PreloadStackedShard(_tpStackedGate[layer]?[rank], bytesPerRank, countPerRank, rank);
+                PreloadStackedShard(_tpStackedUp?[layer]?[rank], bytesPerRank, countPerRank, rank);
+                PreloadStackedShard(_tpStackedDown[layer]?[rank], bytesPerRank, countPerRank, rank);
             }
-            GgmlBasicOps.SetActiveRank(0);
         }
 
         private static void PreloadStackedShard(StackedExpertWeights w, long[] bytesPerRank, int[] countPerRank, int rank)

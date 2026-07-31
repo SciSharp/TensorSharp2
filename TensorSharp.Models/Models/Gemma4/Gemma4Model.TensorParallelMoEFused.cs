@@ -243,21 +243,18 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Make every rank's sliced expert stack device-resident. Without this the
-        /// first forward pays the whole ~6 GB upload per rank.
+        /// Make one rank's sliced expert stack device-resident. Without this the
+        /// first forward pays the whole ~6 GB upload per rank. Runs inside the
+        /// per-rank preload fan-out: the calling thread is pinned to the rank's
+        /// GPU, and every rank uploads its slices concurrently.
         /// </summary>
-        private void PreloadGemma4TensorSlicedExperts(long[] bytesPerRank, int[] countPerRank)
+        private void PreloadGemma4TensorSlicedExpertsForRank(int rank, long[] bytesPerRank, int[] countPerRank)
         {
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
-                for (int r = 0; r < TpDegree; r++)
-                {
-                    GgmlBasicOps.SetActiveRank(r);
-                    PreloadStackedShard(_tpSlicedGateUp[layer]?[r], bytesPerRank, countPerRank, r);
-                    PreloadStackedShard(_tpSlicedDown[layer]?[r], bytesPerRank, countPerRank, r);
-                }
+                PreloadStackedShard(_tpSlicedGateUp[layer]?[rank], bytesPerRank, countPerRank, rank);
+                PreloadStackedShard(_tpSlicedDown[layer]?[rank], bytesPerRank, countPerRank, rank);
             }
-            GgmlBasicOps.SetActiveRank(0);
         }
 
         // ====================================================================

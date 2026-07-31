@@ -2709,7 +2709,12 @@ namespace TensorSharp.Models
                         Console.WriteLine($"    Row-parallel quant debug: {name} origNe0={qw.Ne0} origNe1={qw.Ne1} globalTp={globalTp} blockSize={blockSize} blocksPerRow={blocksPerRow} blocksPerShard={blocksPerShard} ne0PerShard={ne0PerShard} totalBytesPerShard={totalBytesPerShard}");
 
 
-                    for (int lr = 0; lr < tp; lr++)
+                    // Extract every rank's slice concurrently: each rank writes
+                    // its own buffer, and when the source is the memory-mapped
+                    // GGUF the parallel ranks fault in disjoint file regions at
+                    // once — on slow or network-backed storage the page-fault
+                    // reads, not the memcpy, are what this loop actually costs.
+                    Parallel.For(0, tp, lr =>
                     {
                         int globalRank = rankOffset + lr;
                         IntPtr shardPtr = QuantizedWeight.AllocateBuffer(totalBytesPerShard);
@@ -2729,7 +2734,7 @@ namespace TensorSharp.Models
                         }
                         shards[lr] = new QuantizedWeight(shardPtr, totalBytesPerShard,
                             qw.GgmlType, ne0PerShard, qw.Ne1);
-                    }
+                    });
                 }
 
                 _tpQuantWeights[name] = shards;
@@ -3507,58 +3512,66 @@ namespace TensorSharp.Models
             int[] countPerRank = new int[tp];
             int tooLarge = 0;
 
-            // Sharded weights: rank r gets its own slice.
-            foreach (var kv in _tpQuantWeights)
+            // Upload every rank concurrently: each rank's worker pushes only its
+            // own shards (rank 0 also takes the replicated weights), so the
+            // host reads — page faults against the memory-mapped GGUF included —
+            // and the PCIe transfers to different GPUs overlap instead of
+            // running one after another. RunPerRank pins each worker to its
+            // rank, and the native per-rank buffer caches are mutex-protected,
+            // so the concurrency here matches what inference already does.
+            _tpGroup.RunPerRank(r =>
             {
-                var shards = kv.Value;
-                for (int r = 0; r < tp; r++)
+                foreach (var kv in _tpQuantWeights)
                 {
-                    var qw = shards[r];
+                    var qw = kv.Value[r];
                     if (!qw.HasHostData)
                         continue;
 
-                    GgmlBasicOps.SetActiveRank(r);
                     IntPtr cacheKey = qw.EnsureDeviceCacheKey();
                     if (!GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))
                     {
                         qw.MarkDevicePreloadTooLarge();
-                        tooLarge++;
+                        Interlocked.Increment(ref tooLarge);
                         continue;
                     }
                     bytesPerRank[r] += qw.RawBytes;
                     countPerRank[r]++;
                 }
-            }
 
-            // Replicated weights (embeddings, the LM head, anything the model did
-            // not shard) stay on rank 0: they are read by the pre/post-transformer
-            // stages, which run there. Duplicating them on every GPU would undo a
-            // chunk of the memory saving TP just bought.
-            GgmlBasicOps.SetActiveRank(0);
-            foreach (var kv in _quantWeights)
-            {
-                QuantizedWeight qw = kv.Value;
-                if (!qw.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key))
-                    continue;
-                if (string.Equals(kv.Key, "token_embd.weight", StringComparison.Ordinal)
-                    && !CanUseGgmlQuantizedGetRows(qw.GgmlType)
-                    && (_quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")))
-                    continue;
-
-                IntPtr cacheKey = qw.EnsureDeviceCacheKey();
-                if (!GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))
+                // Replicated weights (embeddings, the LM head, anything the
+                // model did not shard) stay on rank 0: they are read by the
+                // pre/post-transformer stages, which run there. Duplicating
+                // them on every GPU would undo a chunk of the memory saving TP
+                // just bought.
+                if (r != 0)
+                    return;
+                foreach (var kv in _quantWeights)
                 {
-                    qw.MarkDevicePreloadTooLarge();
-                    tooLarge++;
-                    continue;
+                    QuantizedWeight qw = kv.Value;
+                    if (!qw.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key))
+                        continue;
+                    if (string.Equals(kv.Key, "token_embd.weight", StringComparison.Ordinal)
+                        && !CanUseGgmlQuantizedGetRows(qw.GgmlType)
+                        && (_quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")))
+                        continue;
+
+                    IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                    if (!GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))
+                    {
+                        qw.MarkDevicePreloadTooLarge();
+                        Interlocked.Increment(ref tooLarge);
+                        continue;
+                    }
+                    bytesPerRank[0] += qw.RawBytes;
+                    countPerRank[0]++;
                 }
-                bytesPerRank[0] += qw.RawBytes;
-                countPerRank[0]++;
-            }
+            });
 
             // Architecture-specific per-rank weights that are not plain
-            // QuantizedWeight shards (Gemma 4's stacked expert slices).
-            PreloadGgmlTpAuxiliaryWeights(bytesPerRank, countPerRank);
+            // QuantizedWeight shards (Gemma 4's stacked expert slices). A second
+            // fan-out (rather than a tail call in the first) keeps the hook free
+            // to assume every generic shard is already resident.
+            _tpGroup.RunPerRank(r => PreloadGgmlTpAuxiliaryWeightsForRank(r, bytesPerRank, countPerRank));
 
             for (int r = 0; r < tp; r++)
             {
@@ -3574,11 +3587,14 @@ namespace TensorSharp.Models
         /// <summary>
         /// Hook for per-rank weights that do not live in
         /// <see cref="_tpQuantWeights"/> — Gemma 4's stacked expert slices, for
-        /// instance. Implementations must select the rank with
-        /// <c>GgmlBasicOps.SetActiveRank</c> before each preload, and add what
-        /// they uploaded to the running totals so the load report stays accurate.
+        /// instance. Called once per rank from a <c>RunPerRank</c> fan-out, so
+        /// every rank uploads concurrently: the calling thread is already pinned
+        /// to <paramref name="rank"/>'s GPU (do NOT call
+        /// <c>GgmlBasicOps.SetActiveRank</c>), the implementation must touch only
+        /// that rank's shards, and it must add what it uploaded to that rank's
+        /// slot in the running totals so the load report stays accurate.
         /// </summary>
-        protected virtual void PreloadGgmlTpAuxiliaryWeights(long[] bytesPerRank, int[] countPerRank) { }
+        protected virtual void PreloadGgmlTpAuxiliaryWeightsForRank(int rank, long[] bytesPerRank, int[] countPerRank) { }
 
         /// <summary>
         /// True when the MoE layers under TP fall back to the per-token,

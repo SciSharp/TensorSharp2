@@ -157,52 +157,48 @@ namespace TensorSharp.Models
         /// this the first forward pays the whole upload — on a 35B that is
         /// ~8 GB per rank and looks like a hang.
         /// </summary>
-        protected override unsafe void PreloadGgmlTpAuxiliaryWeights(long[] bytesPerRank, int[] countPerRank)
+        protected override unsafe void PreloadGgmlTpAuxiliaryWeightsForRank(int rank, long[] bytesPerRank, int[] countPerRank)
         {
-            // The MoE routers are F32 and replicated, so they are not in
-            // _tpQuantWeights and the generic loop skips them. Preloading them
-            // here (rather than letting the first forward create the device copy)
-            // keeps every weight's residency decided at load time — a weight that
-            // first becomes resident mid-forward competes with the activation
-            // allocations for whatever VRAM is left, and on this model that cost
-            // the LM head its own residency.
-            GgmlBasicOps.SetActiveRank(0);
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            // Runs inside the per-rank preload fan-out: the calling thread is
+            // pinned to this rank's GPU, and every rank uploads concurrently.
+            if (rank == 0)
             {
-                if (_isMoeLayer == null || layer >= _isMoeLayer.Length || !_isMoeLayer[layer])
-                    continue;
-                if (!_weights.TryGetValue(_ffnGateInpKey[layer], out var router) || router == null
-                    || router.DimensionCount != 2 || !router.IsContiguous())
-                    continue;
-
-                IntPtr data = (IntPtr)GetFloatPtr(router);
-                long bytes = router.ElementCount() * sizeof(float);
-                if (GgmlBasicOps.PreloadQuantizedWeight(data, data, 0, router.Sizes[1], router.Sizes[0], bytes))
+                // The MoE routers are F32 and replicated, so they are not in
+                // _tpQuantWeights and the generic loop skips them. Preloading them
+                // here (rather than letting the first forward create the device copy)
+                // keeps every weight's residency decided at load time — a weight that
+                // first becomes resident mid-forward competes with the activation
+                // allocations for whatever VRAM is left, and on this model that cost
+                // the LM head its own residency.
+                for (int layer = 0; layer < Config.NumLayers; layer++)
                 {
-                    bytesPerRank[0] += bytes;
-                    countPerRank[0]++;
+                    if (_isMoeLayer == null || layer >= _isMoeLayer.Length || !_isMoeLayer[layer])
+                        continue;
+                    if (!_weights.TryGetValue(_ffnGateInpKey[layer], out var router) || router == null
+                        || router.DimensionCount != 2 || !router.IsContiguous())
+                        continue;
+
+                    IntPtr data = (IntPtr)GetFloatPtr(router);
+                    long bytes = router.ElementCount() * sizeof(float);
+                    if (GgmlBasicOps.PreloadQuantizedWeight(data, data, 0, router.Sizes[1], router.Sizes[0], bytes))
+                    {
+                        bytesPerRank[0] += bytes;
+                        countPerRank[0]++;
+                    }
                 }
             }
 
             if (!UsesExpertParallelMoE)
-            {
-                GgmlBasicOps.SetActiveRank(0);
                 return;
-            }
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 if (_isMoeLayer == null || !_isMoeLayer[layer] || _tpStackedGate[layer] == null)
                     continue;
-                for (int r = 0; r < TpDegree; r++)
-                {
-                    GgmlBasicOps.SetActiveRank(r);
-                    PreloadStackedShard(_tpStackedGate[layer][r], bytesPerRank, countPerRank, r);
-                    PreloadStackedShard(_tpStackedUp[layer][r], bytesPerRank, countPerRank, r);
-                    PreloadStackedShard(_tpStackedDown[layer][r], bytesPerRank, countPerRank, r);
-                }
+                PreloadStackedShard(_tpStackedGate[layer][rank], bytesPerRank, countPerRank, rank);
+                PreloadStackedShard(_tpStackedUp[layer][rank], bytesPerRank, countPerRank, rank);
+                PreloadStackedShard(_tpStackedDown[layer][rank], bytesPerRank, countPerRank, rank);
             }
-            GgmlBasicOps.SetActiveRank(0);
         }
 
         private static void PreloadStackedShard(StackedExpertWeights w, long[] bytesPerRank, int[] countPerRank, int rank)

@@ -44,9 +44,12 @@
 #include <cstdarg>
 #include <cstdio>
 #include <chrono>
+#include <algorithm>
+#include <atomic>
 #include <deque>
 #include <list>
 #include <map>
+#include <thread>
 
 namespace tsg_dsv4
 {
@@ -464,35 +467,82 @@ static ggml_tensor * dsv4_create_weight(
     return t;
 }
 
-static bool dsv4_upload_tensor(ggml_tensor * t, const tensor_source & src, FILE * f, std::vector<uint8_t> & staging)
+// One chunk of one weight tensor: read [file_off, file_off+len) from its
+// shard and land it at tensor_off inside the (already allocated) tensor.
+struct load_job
 {
-    const size_t total = ggml_nbytes(t);
-    if (total != src.size)
+    ggml_tensor * t;
+    int shard;
+    size_t file_off;
+    size_t tensor_off;
+    size_t len;
+};
+
+// Stream every job through a pool of reader threads. Model files commonly sit
+// on slow or network-backed storage where one reader stream is the whole load
+// time (a single thread also serializes disk reads against H2D copies).
+// Each worker owns its FILE* per shard and its staging buffer, and
+// ggml_backend_tensor_set copies on cudaStreamPerThread, so reads and uploads
+// to all GPUs proceed concurrently. Jobs are handed out in file order per
+// shard to keep the concurrent streams roughly sequential for readahead.
+static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_job> & jobs, int n_threads)
+{
+    std::sort(jobs.begin(), jobs.end(), [](const load_job & a, const load_job & b)
     {
-        fprintf(stderr, "[dsv4] size mismatch for %s: tensor %zu vs file %zu\n", t->name, total, src.size);
-        return false;
-    }
+        if (a.shard != b.shard) return a.shard < b.shard;
+        return a.file_off < b.file_off;
+    });
+
+    if (n_threads > (int) jobs.size()) n_threads = (int) jobs.size();
+    if (n_threads < 1) n_threads = 1;
+
+    std::atomic<size_t> cursor(0);
+    std::atomic<bool> failed(false);
+
+    auto worker = [&]()
+    {
+        std::vector<FILE *> files(shards.paths.size(), nullptr);
+        std::vector<uint8_t> staging;
+        while (!failed.load(std::memory_order_relaxed))
+        {
+            size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (i >= jobs.size()) break;
+            const load_job & j = jobs[i];
+
+            FILE *& f = files[j.shard];
+            if (!f)
+            {
+                f = fopen(shards.paths[j.shard].c_str(), "rb");
+                if (!f)
+                {
+                    fprintf(stderr, "[dsv4] cannot open %s\n", shards.paths[j.shard].c_str());
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+            }
+            if (staging.size() < j.len) staging.resize(j.len);
 
 #if defined(_WIN32)
-    _fseeki64(f, (long long) src.offset, SEEK_SET);
+            _fseeki64(f, (long long) j.file_off, SEEK_SET);
 #else
-    fseeko(f, (off_t) src.offset, SEEK_SET);
+            fseeko(f, (off_t) j.file_off, SEEK_SET);
 #endif
-
-    const size_t chunk = staging.size();
-    size_t done = 0;
-    while (done < total)
-    {
-        size_t n = std::min(chunk, total - done);
-        if (fread(staging.data(), 1, n, f) != n)
-        {
-            fprintf(stderr, "[dsv4] short read for %s\n", t->name);
-            return false;
+            if (fread(staging.data(), 1, j.len, f) != j.len)
+            {
+                fprintf(stderr, "[dsv4] short read for %s\n", j.t->name);
+                failed.store(true, std::memory_order_relaxed);
+                break;
+            }
+            ggml_backend_tensor_set(j.t, staging.data(), j.tensor_off, j.len);
         }
-        ggml_backend_tensor_set(t, staging.data(), done, n);
-        done += n;
-    }
-    return true;
+        for (FILE * f : files) if (f) fclose(f);
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(n_threads);
+    for (int i = 0; i < n_threads; i++) pool.emplace_back(worker);
+    for (auto & th : pool) th.join();
+    return !failed.load();
 }
 
 // The overlap compressors read a synthetic "before the first block" source
@@ -927,36 +977,48 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     }
 
     {
-        std::vector<FILE *> files(shards.paths.size(), nullptr);
-        for (size_t i = 0; i < shards.paths.size(); i++)
-        {
-            files[i] = fopen(shards.paths[i].c_str(), "rb");
-            if (!files[i]) { fprintf(stderr, "[dsv4] cannot open %s\n", shards.paths[i].c_str()); return nullptr; }
-        }
-        std::vector<uint8_t> staging((size_t) 256 * 1024 * 1024);
+        // Chunk size balances two pressures: big reads amortize network-FS
+        // round trips, small chunks keep all reader threads busy at the tail.
+        size_t chunk = (size_t) 64 * 1024 * 1024;
+        if (const char * e = getenv("TS_DSV4_LOAD_CHUNK_MB")) { long v = atol(e); if (v > 0) chunk = (size_t) v * 1024 * 1024; }
 
+        int load_threads = 16;
+        if (const char * e = getenv("TS_DSV4_LOAD_THREADS")) { int v = atoi(e); if (v > 0) load_threads = v; }
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw > 0 && load_threads > (int) hw) load_threads = (int) hw;
+
+        std::vector<load_job> jobs;
         size_t uploaded = 0;
-        auto upload_ctx = [&](ggml_context * ctx) -> bool
+        bool sizes_ok = true;
+        for (int d = 0; d <= n_gpu; d++)
         {
+            ggml_context * ctx = m->w_ctx[d];
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t))
             {
                 auto it = sources.find(t->name);
                 if (it == sources.end()) continue; // cache tensors etc.
-                if (!dsv4_upload_tensor(t, it->second, files[it->second.shard], staging)) return false;
-                uploaded += it->second.size;
+                const tensor_source & src = it->second;
+                const size_t total = ggml_nbytes(t);
+                if (total != src.size)
+                {
+                    fprintf(stderr, "[dsv4] size mismatch for %s: tensor %zu vs file %zu\n", t->name, total, src.size);
+                    sizes_ok = false;
+                    continue;
+                }
+                for (size_t off = 0; off < total; off += chunk)
+                    jobs.push_back({ t, src.shard, src.offset + off, off, std::min(chunk, total - off) });
+                uploaded += total;
             }
-            return true;
-        };
-        bool up_ok = true;
-        for (int d = 0; d <= n_gpu && up_ok; d++)
-            up_ok = upload_ctx(m->w_ctx[d]);
-        for (auto f : files) fclose(f);
-        if (!up_ok) return nullptr;
+        }
+        if (!sizes_ok) return nullptr;
+        if (!dsv4_upload_parallel(shards, jobs, load_threads)) return nullptr;
 
         auto t_end = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(t_end - t_start).count();
-        fprintf(stderr, "[dsv4] loaded %.1f GiB across %d GPU(s) in %.1fs (n_ctx=%d, ring=%" PRId64 ", csa_rows=%" PRId64 ", hca_rows=%" PRId64 ")\n",
-                uploaded / (1024.0 * 1024.0 * 1024.0), n_gpu, secs, m->n_ctx, m->ring_raw, m->n_csa_rows, m->n_hca_rows);
+        fprintf(stderr, "[dsv4] loaded %.1f GiB across %d GPU(s) in %.1fs (%.2f GiB/s, %d load threads; n_ctx=%d, ring=%" PRId64 ", csa_rows=%" PRId64 ", hca_rows=%" PRId64 ")\n",
+                uploaded / (1024.0 * 1024.0 * 1024.0), n_gpu, secs,
+                secs > 0 ? uploaded / (1024.0 * 1024.0 * 1024.0) / secs : 0.0,
+                load_threads, m->n_ctx, m->ring_raw, m->n_csa_rows, m->n_hca_rows);
     }
 
     dsv4_init_state_rows(*m);
