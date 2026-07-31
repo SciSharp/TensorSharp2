@@ -41,6 +41,8 @@ namespace TensorSharp.Models
         private object _ownerToken;
         public bool HasHostData => _data != IntPtr.Zero;
         public bool HasExternalHostView => _data != IntPtr.Zero && !_ownsBuffer && _ownerToken != null;
+        internal bool IsExternalHostViewOwnedBy(object owner)
+            => HasExternalHostView && ReferenceEquals(_ownerToken, owner);
 
         /// <summary>
         /// True when the active device could not hold this weight in a single
@@ -810,19 +812,55 @@ namespace TensorSharp.Models
             return length;
         }
 
-        // GgmlVulkan follows GgmlCuda here: the fused prefill/decode paths mask or
-        // overwrite every cache position they read, so zero-filling 100s of MB of
-        // host KV arrays on every request reset is pure waste.
+        internal static bool UsesLightweightPrefillWarmupByDefault(BackendType backend)
+        {
+            // Metal is always unified-memory on supported Apple hardware. Unlike
+            // CUDA/Vulkan, several Metal model paths cannot use the persistent
+            // whole-model prefill graph, so a 2048-token startup pass only creates
+            // a large transient working set. On near-capacity models that can pin
+            // ggml-metal's residency-set worker in requestResidency while per-op
+            // buffer destruction waits on the same lock, making startup appear
+            // permanently hung. A 32-token pass still compiles the multi-token
+            // kernels without manufacturing long-prompt memory pressure.
+            return backend == BackendType.Mlx ||
+                   backend == BackendType.Cpu ||
+                   backend == BackendType.GgmlMetal;
+        }
+
+        internal static int ResolvePrefillWarmupTargetLength(
+            BackendType backend,
+            bool integratedGpu,
+            bool mostlyHostBacked,
+            bool moeUnderTp,
+            int nativeCudaLength,
+            int? explicitLength)
+        {
+            if (explicitLength is >= 2)
+                return explicitLength.Value;
+
+            bool conservative = UsesLightweightPrefillWarmupByDefault(backend)
+                || integratedGpu || mostlyHostBacked || moeUnderTp;
+            if (conservative)
+                return 32;
+            return backend == BackendType.Cuda
+                ? Math.Max(2, nativeCudaLength)
+                : 2048;
+        }
+
+        // GgmlVulkan and GgmlMetal follow GgmlCuda here: the fused prefill/decode
+        // paths mask or overwrite every cache position they read, so zero-filling
+        // 100s of MB of host KV arrays on every request reset is pure waste.
         protected bool ShouldZeroFillCacheTensors =>
             _backend != BackendType.GgmlCuda && _backend != BackendType.Mlx &&
-            _backend != BackendType.GgmlVulkan;
+            _backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal;
 
         protected void InitializeCacheTensor(Tensor tensor)
         {
             // First allocation still zero-fills on every backend that keeps a host
-            // copy (including Vulkan): the fused kernels' flash-padding may read
-            // never-written cache rows, which must be finite.
-            if (tensor != null && (ShouldZeroFillCacheTensors || _backend == BackendType.GgmlVulkan))
+            // copy (including Vulkan/Metal): the fused kernels' flash-padding may
+            // read never-written cache rows, which must be finite.
+            if (tensor != null && (ShouldZeroFillCacheTensors ||
+                _backend == BackendType.GgmlVulkan || _backend == BackendType.GgmlMetal))
                 Ops.Fill(tensor, 0f);
         }
 
@@ -834,15 +872,13 @@ namespace TensorSharp.Models
             if (ShouldZeroFillCacheTensors)
                 Ops.Fill(tensor, 0f);
 
-            // On GgmlVulkan keep the resident device copy VALID across resets: the
-            // host copy was not touched above, so host and device stay consistent
-            // (both hold the previous request's bytes — semantically "empty"
-            // because _cacheSeqLen gates every read, exactly like GgmlCuda which
-            // has never zero-filled). Invalidation here caused every new request's
-            // first prefill to free + reallocate + re-upload the ENTIRE KV cache
-            // (~470 MB / ~170 ms per request on gemma4-12B over PCIe), which was
-            // the dominant server-TTFT overhead on the Vulkan backend.
-            if (_backend != BackendType.GgmlVulkan)
+            // On GgmlVulkan/Metal keep the resident device copy VALID across
+            // logical resets. The host copy was not touched above, so both retain
+            // the previous request's bytes; _cacheSeqLen plus the attention mask
+            // makes those rows semantically empty until overwritten. Besides
+            // avoiding a full KV re-upload, stable Metal bindings let a warmed
+            // persistent decode graph survive from startup into the first request.
+            if (_backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal)
                 InvalidateTensorDeviceCache(tensor);
         }
 
@@ -957,12 +993,21 @@ namespace TensorSharp.Models
         /// one, let the tokenizer own it so the prompt still begins with exactly one BOS
         /// (the empty-rendered <c>bos_token</c> guarantees we never double it).
         /// </summary>
-        public static bool ResolveAddBosToken(bool addBosFromMetadata, int bosTokenId, string? chatTemplate)
+        public static bool ResolveAddBosToken(
+            bool addBosFromMetadata,
+            int bosTokenId,
+            string? chatTemplate,
+            string? tokenizerModel = null)
         {
             if (addBosFromMetadata)
                 return true;
             if (bosTokenId < 0)
                 return false;
+            // Gemma 4's tokenizer contract requires BOS even when older GGUF
+            // conversions recorded add_bos_token=false.  This is independent
+            // of whether a particular chat template mentions bos_token.
+            if (string.Equals(tokenizerModel, "gemma4", StringComparison.Ordinal))
+                return true;
             return !string.IsNullOrEmpty(chatTemplate)
                 && chatTemplate.Contains("bos_token", StringComparison.Ordinal);
         }
@@ -1057,46 +1102,72 @@ namespace TensorSharp.Models
 
         protected void ParseTokenizer()
         {
-            var vocabTokens = _gguf.GetStringArray("tokenizer.ggml.tokens");
-            Config.VocabSize = vocabTokens.Length;
+            Tokenizer = CreateTokenizerFromGguf(_gguf);
+            Config.VocabSize = Tokenizer.VocabSize;
+        }
 
-            var tokenTypes = _gguf.GetInt32Array("tokenizer.ggml.token_type");
-            int bosId = (int)_gguf.GetUint32("tokenizer.ggml.bos_token_id");
-            int eosId = (int)_gguf.GetUint32("tokenizer.ggml.eos_token_id");
-            bool addBosMetadata = _gguf.GetBool("tokenizer.ggml.add_bos_token", false);
-            bool addEos = _gguf.GetBool("tokenizer.ggml.add_eos_token", false);
+        internal static bool UsesSentencePieceTokenizer(string tokenizerModel)
+        {
+            return string.Equals(tokenizerModel, "llama", StringComparison.Ordinal)
+                || string.Equals(tokenizerModel, "t5", StringComparison.Ordinal);
+        }
 
-            bool addBos = ResolveAddBosToken(addBosMetadata, bosId, _gguf.GetString("tokenizer.chat_template"));
+        /// <summary>
+        /// Build the tokenizer declared by a GGUF without loading model weights.
+        /// Kept internal so tokenizer-oracle tests exercise the exact production
+        /// dispatch instead of duplicating the metadata branching.
+        /// </summary>
+        internal static ITokenizer CreateTokenizerFromGguf(GgufFile gguf)
+        {
+            if (gguf == null)
+                throw new ArgumentNullException(nameof(gguf));
+
+            var vocabTokens = gguf.GetStringArray("tokenizer.ggml.tokens");
+
+            var tokenTypes = gguf.GetInt32Array("tokenizer.ggml.token_type");
+            int bosId = (int)gguf.GetUint32("tokenizer.ggml.bos_token_id");
+            int eosId = (int)gguf.GetUint32("tokenizer.ggml.eos_token_id");
+            bool addBosMetadata = gguf.GetBool("tokenizer.ggml.add_bos_token", false);
+            bool addEos = gguf.GetBool("tokenizer.ggml.add_eos_token", false);
+            string tokenizerModel = gguf.GetString("tokenizer.ggml.model", "gpt2");
+
+            bool addBos = ResolveAddBosToken(
+                addBosMetadata,
+                bosId,
+                gguf.GetString("tokenizer.chat_template"),
+                tokenizerModel);
             if (addBos && !addBosMetadata)
             {
                 Console.WriteLine(
-                    "  Tokenizer: add_bos_token=false but chat template emits bos_token; " +
+                    "  Tokenizer: add_bos_token=false but the model requires BOS; " +
                     "enabling BOS so the prompt starts with exactly one BOS.");
             }
 
-            var extraEos = _gguf.GetInt32Array("tokenizer.ggml.eos_token_ids");
+            var extraEos = gguf.GetInt32Array("tokenizer.ggml.eos_token_ids");
             var eosIds = new List<int>(ResolveEogTokenIds(vocabTokens, eosId, extraEos));
 
-            string tokenizerModel = _gguf.GetString("tokenizer.ggml.model", "gpt2");
-
-            if (tokenizerModel == "llama" || tokenizerModel == "t5" || tokenizerModel == "gemma4")
+            if (UsesSentencePieceTokenizer(tokenizerModel))
             {
-                var scores = _gguf.GetFloatArray("tokenizer.ggml.scores");
+                var scores = gguf.GetFloatArray("tokenizer.ggml.scores");
 
-                int eotId = (int)_gguf.GetUint32("tokenizer.ggml.eot_token_id", 106);
+                int eotId = (int)gguf.GetUint32("tokenizer.ggml.eot_token_id", 106);
                 if (!eosIds.Contains(eotId))
                     eosIds.Add(eotId);
 
-                Tokenizer = new SentencePieceTokenizer(vocabTokens, tokenTypes, scores,
+                return new SentencePieceTokenizer(vocabTokens, tokenTypes, scores,
                     bosId, eosIds.ToArray(), addBos, addEos);
             }
-            else
-            {
-                var merges = _gguf.GetStringArray("tokenizer.ggml.merges");
-                string preType = _gguf.GetString("tokenizer.ggml.pre", null);
-                Tokenizer = new BpeTokenizer(vocabTokens, tokenTypes, merges,
-                    bosId, eosIds.ToArray(), addBos, addEos, preType);
-            }
+
+            var merges = gguf.GetStringArray("tokenizer.ggml.merges");
+            // tokenizer.ggml.model=gemma4 is an SPM-style BPE vocabulary,
+            // not a unigram SentencePiece vocabulary.  It does not need a
+            // tokenizer.ggml.pre entry: the model name selects its raw
+            // UTF-8/newline-only pre-tokenizer in llama.cpp.
+            string preType = tokenizerModel == "gemma4"
+                ? "gemma4"
+                : gguf.GetString("tokenizer.ggml.pre", null);
+            return new BpeTokenizer(vocabTokens, tokenTypes, merges,
+                bosId, eosIds.ToArray(), addBos, addEos, preType);
         }
 
         protected virtual bool IsQuantizedLinearWeight(GgufTensorInfo info)
@@ -1659,10 +1730,11 @@ namespace TensorSharp.Models
         {
             if (_quantWeights.Count == 0)
                 return;
-            if (!MoeExpertOffload.IsEnabled)
-                return;
 
             EnsureQuantBackendAvailable();
+
+            if (!MoeExpertOffload.IsEnabled)
+                return;
 
             long offloadedBytes = 0;
             int offloadedCount = 0;
@@ -4958,6 +5030,8 @@ namespace TensorSharp.Models
             if (!IsGgmlBackend)
                 return;
 
+            OnBeforeReleaseGgmlDeviceResidency();
+
             foreach (Tensor t in _weights.Values)
             {
                 if (t != null)
@@ -4973,6 +5047,16 @@ namespace TensorSharp.Models
                 if (stacked != null && stacked.Data != IntPtr.Zero)
                     GgmlBasicOps.InvalidateHostBuffer(stacked.Data);
             }
+        }
+
+        /// <summary>
+        /// Architecture hook for releasing persistent native graphs before their
+        /// weight bindings are evicted by <see cref="ReleaseGgmlDeviceResidency"/>.
+        /// Implementations must preserve any device-authoritative mutable state
+        /// needed to continue inference after the release.
+        /// </summary>
+        protected virtual void OnBeforeReleaseGgmlDeviceResidency()
+        {
         }
 
         // ====================================================================
@@ -5156,10 +5240,11 @@ namespace TensorSharp.Models
             // block startup; disable entirely via TS_PREFILL_WARMUP=0.
             if (!string.Equals(Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP"), "0", StringComparison.Ordinal))
             {
-                // MLX and the managed CPU backend stay conservative (short prompt);
-                // CUDA/GGML use a longer one to reach the fused-verify prefill path
-                // that short prompts bypass. The long warmup only pays off where a
-                // first real prompt builds/captures a fused whole-model prefill graph
+                // MLX, Metal, and the managed CPU backend stay conservative (short
+                // prompt); discrete CUDA/Vulkan GGML paths use a longer one to reach
+                // the fused-verify prefill path that short prompts bypass. The long
+                // warmup only pays off where a first real prompt builds/captures a
+                // fused whole-model prefill graph
                 // and reserves a gallocr (CUDA/GGML) -- the managed CPU backend has
                 // none of that, so a 1024-token prefill there is pure cost: tens of
                 // seconds of GEMM plus large O(N^2) activation/KV first-touch paging
@@ -5197,13 +5282,13 @@ namespace TensorSharp.Models
                     Console.WriteLine(
                         $"  {hostBackedFrac * 100:F0}% of quantized weights use a CUDA-unsupported quant type and stay host-backed (CPU matmul); using a lightweight startup warmup. Inference will be slow — prefer a quant the direct CUDA backend supports (Q4_0/Q4_K/Q5_K/Q6_K/Q8_0/IQ2/IQ3/IQ4_XS) or run with --backend ggml_cuda.");
                 }
-                // GGML builds/captures a fused whole-model prefill graph and pre-grows
-                // its gallocr. Native CUDA has no captured verify-prefill graph, so its
-                // architecture default remains a lightweight 32-token shape. A model
-                // may opt into a larger direct-CUDA warmup when it has persistent
-                // activation/QMM scratch that is expensive to grow during the first
-                // real request. Hybrid GatedDeltaNet models intentionally retain the
-                // lightweight base default because a 2K warmup can take minutes.
+                // GGML CUDA/Vulkan build/capture a fused whole-model prefill graph and
+                // pre-grow its gallocr. Native CUDA has no captured verify-prefill
+                // graph, so its architecture default remains a lightweight 32-token
+                // shape. A model may opt into a larger direct-CUDA warmup when it has
+                // persistent activation/QMM scratch that is expensive to grow during
+                // the first real request. Hybrid GatedDeltaNet models intentionally
+                // retain the lightweight base default because a 2K warmup can take minutes.
                 // Multi-token prefill of an MoE model under tensor parallelism is
                 // slow enough that the full 2048-token warmup dominates startup —
                 // measured at ~61 s on Gemma 4 26B A4B with --tp 2, during which
@@ -5217,7 +5302,7 @@ namespace TensorSharp.Models
                         "Long-prompt prefill stays slower than a single GPU; TP is for models that do not fit on one.");
                 }
 
-                bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu
+                bool conservativeWarmup = UsesLightweightPrefillWarmupByDefault(_backend)
                     || integratedGpu || mostlyHostBacked || moeUnderTp;
                 // 2048 matches ComputePrefillChunkSize, so the warmup runs ONE
                 // fused verify chunk at the largest legacy-chunk shape: the shared
@@ -5226,20 +5311,20 @@ namespace TensorSharp.Models
                 // prompts. Measured on gemma4-12B/Vulkan: first ~2k-token request
                 // was ~300-500 ms slower than warm (gallocr growth + residency)
                 // with the old 1024 warmup; with 2048 it starts warm.
-                int warmupLength = conservativeWarmup
-                    ? 32
-                    : _backend == BackendType.Cuda
-                        ? Math.Max(2, NativeCudaPrefillWarmupLength)
-                        : 2048;
-                bool explicitWarmupLength = false;
+                int? explicitWarmupLengthValue = null;
                 {
                     string wl = Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP_LEN");
                     if (!string.IsNullOrEmpty(wl) && int.TryParse(wl, out int wlv) && wlv >= 2)
-                    {
-                        warmupLength = wlv;
-                        explicitWarmupLength = true;
-                    }
+                        explicitWarmupLengthValue = wlv;
                 }
+                int warmupLength = ResolvePrefillWarmupTargetLength(
+                    _backend,
+                    integratedGpu,
+                    mostlyHostBacked,
+                    moeUnderTp,
+                    NativeCudaPrefillWarmupLength,
+                    explicitWarmupLengthValue);
+                bool explicitWarmupLength = explicitWarmupLengthValue.HasValue;
                 int warmupTokenOverhead =
                     _backend == BackendType.Cuda && !conservativeWarmup
                         ? NativeCudaPrefillWarmupTokenOverhead
@@ -5255,11 +5340,12 @@ namespace TensorSharp.Models
 
                 try
                 {
+                    Console.WriteLine($"    Prefill warmup ({warmupLength} tokens): starting...");
                     long prefillStart = Stopwatch.GetTimestamp();
                     ForwardRefill(warmupPrompt);
                     Forward(new[] { safeToken });
                     double prefillMs = (Stopwatch.GetTimestamp() - prefillStart) * 1000.0 / Stopwatch.Frequency;
-                    Console.WriteLine($"    Prefill warmup ({warmupLength} tokens): {prefillMs:F1} ms");
+                    Console.WriteLine($"    Prefill warmup ({warmupLength} tokens): completed in {prefillMs:F1} ms");
                 }
                 catch (Exception ex)
                 {

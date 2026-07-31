@@ -105,6 +105,71 @@ namespace TensorSharp.Models
         private float[] _recPrefillConvIn;  // reusable [convDim * qkvDim] ring->time-major conv state
         private float[] _recPrefillConvOut; // reusable [convDim * qkvDim] post-window conv state download
 
+        // Metal decode layout. The fused ggml_gated_delta_net(K=1)
+        // result is [attention output | recurrent state]. Giving the managed
+        // recurrent-state view a prefix of exactly one attention-output row lets
+        // the native graph bind that result and its state input to one backing
+        // buffer and update the state in place, removing one 3 MiB CPY per
+        // recurrent layer. TS_QWEN35_METAL_GDN_INPLACE_STATE=0 retains the
+        // separate state-copy path for diagnostics and A/B comparisons.
+        private readonly bool _useMetalGdnInplaceState;
+
+        internal static bool ShouldUseMetalGdnInplaceState(
+            BackendType backend,
+            bool isTensorParallel,
+            string environmentValue)
+        {
+            return backend == BackendType.GgmlMetal &&
+                !isTensorParallel &&
+                !string.Equals(environmentValue, "0", StringComparison.Ordinal);
+        }
+
+        internal static Tensor AllocateGdnDeltaStateTensor(
+            IAllocator allocator,
+            bool useMetalInplaceLayout,
+            int numVHeads,
+            int headVDim,
+            int headKDim)
+        {
+            if (!useMetalInplaceLayout)
+                return new Tensor(allocator, DType.Float32, numVHeads, headVDim, headKDim);
+
+            long attentionElements = checked((long)numVHeads * headVDim);
+            long stateElements = checked(attentionElements * headKDim);
+            using var backing = new Tensor(
+                allocator,
+                DType.Float32,
+                checked(attentionElements + stateElements));
+            using Tensor stateSlice = backing.Narrow(0, attentionElements, stateElements);
+            return stateSlice.View(numVHeads, headVDim, headKDim);
+        }
+
+        internal static long GdnDeltaStateBytes(Tensor state)
+        {
+            if (state == null)
+                throw new ArgumentNullException(nameof(state));
+            if (state.ElementType != DType.Float32)
+                throw new ArgumentException("GDN delta state must be Float32.", nameof(state));
+            return checked(state.ElementCount() * sizeof(float));
+        }
+
+        private static IntPtr GdnDeltaStatePointer(Tensor state) =>
+            TensorComputePrimitives.GetStoragePointer(state);
+
+        private static IntPtr GdnDeltaStateBackingPointer(Tensor state) =>
+            TensorComputePrimitives.GetStorageBasePointer(state);
+
+        private static void InvalidateGdnDeltaStateDeviceCaches(Tensor state)
+        {
+            if (state == null)
+                return;
+
+            IntPtr statePointer = GdnDeltaStatePointer(state);
+            GgmlBasicOps.InvalidateHostBuffer(statePointer);
+            if (state.StorageOffset != 0)
+                GgmlBasicOps.InvalidateHostBuffer(GdnDeltaStateBackingPointer(state));
+        }
+
         // Direct CUDA runs the packed Qwen3.5/Qwen3.6 GDN recurrence on device
         // instead of downloading the packed projection, conv state, and SSM state
         // for the managed per-token loop. Set TS_CUDA_QWEN35_GDN_NATIVE=0 to
@@ -411,7 +476,12 @@ namespace TensorSharp.Models
                 _cudaGdnConvStateTensor[l] = new Tensor(_allocator, DType.Float32, convDim, qkvDim);
                 Ops.Fill(_cudaGdnConvStateTensor[l], 0);
             }
-            _deltaStateTensor[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
+            _deltaStateTensor[l] = AllocateGdnDeltaStateTensor(
+                _allocator,
+                _useMetalGdnInplaceState,
+                _numVHeads,
+                _headVDim,
+                _headKDim);
             Ops.Fill(_deltaStateTensor[l], 0);
             if (_mlxGdnCache != null)
                 _mlxGdnCache[l] = new MlxFusedOps.GatedDeltaNetCache();
@@ -516,7 +586,16 @@ namespace TensorSharp.Models
             if (_cudaGdnConvStateTensor != null)
                 foreach (var t in _cudaGdnConvStateTensor) t?.Dispose();
             if (_deltaStateTensor != null)
-                foreach (var t in _deltaStateTensor) t?.Dispose();
+                foreach (var t in _deltaStateTensor)
+                {
+                    // Qwen35Model.Dispose drops decode, verify, and batched
+                    // graphs before reaching this point. Evict both the normal
+                    // state-view key and the opt-in alias backing-base key while
+                    // their host pointers are still valid.
+                    if (IsGgmlBackend)
+                        InvalidateGdnDeltaStateDeviceCaches(t);
+                    t?.Dispose();
+                }
             if (_mlxGdnCache != null)
                 foreach (var cache in _mlxGdnCache) cache?.Dispose();
             if (_q35GdnSlotMlxCache != null)
@@ -549,6 +628,39 @@ namespace TensorSharp.Models
             _gdnChunkedAlphaBuf?.Dispose();
             _gdnChunkedBetaBuf?.Dispose();
             _gdnDecodePackedBuf?.Dispose();
+
+            // Native full-decode/verify graphs use per-recurrent-layer offsets
+            // within these unmanaged blocks as host-buffer cache keys. Dispose()
+            // drops the graphs before reaching here; evict those exact keys before
+            // releasing the backing allocations so no stale pointer survives a
+            // later model load.
+            int convDim = Math.Max(0, _convKernel - 1);
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            long layerBytes = (long)convDim * qkvDim * sizeof(float);
+            void ReleaseStateScratch(ref IntPtr scratch)
+            {
+                if (scratch == IntPtr.Zero)
+                    return;
+                if (IsGgmlBackend && layerBytes > 0)
+                {
+                    int slot = 0;
+                    for (int l = 0; l < Config.NumLayers; l++)
+                    {
+                        if (!_isRecurrent[l])
+                            continue;
+                        GgmlBasicOps.InvalidateHostBuffer(
+                            new IntPtr(scratch.ToInt64() + slot * layerBytes));
+                        slot++;
+                    }
+                }
+                Marshal.FreeHGlobal(scratch);
+                scratch = IntPtr.Zero;
+            }
+
+            ReleaseStateScratch(ref _fdConvScratch);
+            ReleaseStateScratch(ref _fvConvIn);
+            ReleaseStateScratch(ref _fvConvOut);
+            _fdBindingConvScratch = IntPtr.Zero;
         }
 
         /// <summary>
@@ -908,18 +1020,25 @@ namespace TensorSharp.Models
         }
 
         // ====================================================================
-        // Full-model fused decode (ggml_cuda). Runs the whole hybrid transformer
-        // (full-attention + GatedDeltaNet recurrent layers + per-layer dense FFN)
-        // as ONE GGML graph per token via TSGgml_Qwen35ModelDecode, collapsing the
-        // ~120-400 per-op kernel dispatches/token (the WDDM per-submit tax that
-        // dominates decode) into a single graph_compute. Falls back to the per-op
-        // layer loop on any unsupported shape. Default ON; TS_QWEN35_FULL_DECODE=0
-        // disables. Dense models only for now (MoE FFN routes to per-op).
+        // Full-model fused decode for GGML CUDA, Vulkan, and Metal. Runs the whole
+        // hybrid transformer (full-attention + GatedDeltaNet + dense or MoE FFN)
+        // as one persistent graph per token, collapsing hundreds of per-operation
+        // submissions. CUDA additionally captures the graph; Metal/Vulkan replay
+        // its fixed topology. Falls back on unsupported shapes. Default ON;
+        // TS_QWEN35_FULL_DECODE=0 disables it.
         // ====================================================================
         private static readonly bool _fullDecodeEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_FULL_DECODE"), "0", StringComparison.Ordinal);
+        // Default-on Metal token-id input. Set to 0 for an exact A/B against the
+        // legacy host-dequantized embedding path while retaining fused decode.
+        private static readonly bool _metalTokenInputEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_METAL_TOKEN_INPUT"), "0", StringComparison.Ordinal);
 
         private Qwen35LayerDecodeArgs[] _fdLayers;
+        private IntPtr _fdBindingKCache;
+        private IntPtr _fdBindingDeltaState;
+        private IntPtr _fdBindingConvScratch;
+        private int _fdBindingCacheSize;
         private IntPtr _fdConvScratch;    // unmanaged [numGdnLayers * convDim * qkvDim], STABLE addr
                                           // (cache key for the device-resident conv state) ggml [time,channel]
         private int[] _fdGdnSlot;         // layer -> index into _fdConvScratch blocks (-1 for attn layers)
@@ -961,8 +1080,23 @@ namespace TensorSharp.Models
                         ring[t * qkvDim + ch] = conv[ch * convDim + t];
                 _convStateWriteIdx[l] = 0;
 
-                IntPtr deltaPtr = (IntPtr)GetFloatPtr(_deltaStateTensor[l]);
-                GgmlBasicOps.SyncHostBuffer(deltaPtr, _deltaStateTensor[l].Storage.ByteLength);
+                Tensor deltaState = _deltaStateTensor[l];
+                IntPtr deltaPtr = GdnDeltaStatePointer(deltaState);
+                if (_useMetalGdnInplaceState)
+                {
+                    // The device cache is keyed by the backing-base pointer and
+                    // spans [attention output | state]. Download that exact key;
+                    // syncing the offset state pointer would miss the authoritative
+                    // buffer. Do not invalidate the offset-keyed mirror here:
+                    // opt-in resident verify graphs can retain that binding.
+                    GgmlBasicOps.SyncHostBuffer(
+                        GdnDeltaStateBackingPointer(deltaState),
+                        deltaState.Storage.ByteLength);
+                }
+                else
+                {
+                    GgmlBasicOps.SyncHostBuffer(deltaPtr, GdnDeltaStateBytes(deltaState));
+                }
             }
 
             _gdnStateHostDirty = false;
@@ -972,7 +1106,7 @@ namespace TensorSharp.Models
         // Called whenever host-side GDN state becomes the source of truth again
         // (reset / prefill / per-op recurrent execution), forcing the next fused
         // decode to re-seed the device-resident state from the host buffers.
-        internal void InvalidateFullDecodeState()
+        internal void InvalidateFullDecodeState(bool hardBindings = false)
         {
             // A graph reset drops the only current copy of recurrent state when
             // fused decode has kept it device-resident.  Preserve it first (reset
@@ -984,12 +1118,12 @@ namespace TensorSharp.Models
             _bfdPoolSeeded = false;
             if (_backend == BackendType.GgmlCuda)
                 GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
-            // The persistent decode graph (CUDA-graph-captured on CUDA, replayed on
-            // Vulkan) pins the GDN conv/delta device-buffer addresses AND holds the
-            // last-seeded GDN state device-resident; the persist replay fast-path does
-            // NOT re-run the bind loop, so once the host state changes (prefill / per-op
-            // recurrence advanced it) the cached graph must be dropped or it replays
-            // stale state. Drop it on both persist backends. No-op when persist is off.
+            // CUDA/Vulkan persistent graphs still use their established hard-drop
+            // lifecycle. Metal can retain its graph across a logical state change:
+            // the next replay receives an explicit reseed flag and uploads the
+            // current host conv/delta state into the graph's stable bindings.
+            // A structural change (KV capacity/pointer replacement or disposal)
+            // must still hard-drop the Metal graph before those bindings move.
             //
             // NOTE: the fused VERIFY cache is NOT reset here. InvalidateFullDecodeState
             // runs on every EnterSpecSession (i.e. every spec step), but the verify
@@ -997,7 +1131,8 @@ namespace TensorSharp.Models
             // (ResetKVCache / EnsureCacheCapacity grow) — it uploads fresh GDN state
             // each call, so a per-step reset would defeat the whole cache. Those two
             // call sites reset it explicitly via InvalidateVerifyCache().
-            if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan)
+            if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan
+                || (_backend == BackendType.GgmlMetal && hardBindings))
                 GgmlBasicOps.Qwen35ResetDecodeCache();
         }
 
@@ -1009,7 +1144,8 @@ namespace TensorSharp.Models
             // The device-resident verify state lives in the same buffers; a KV reset/grow
             // invalidates it, so re-seed on the next verify.
             _fvStateResident = false;
-            if (_backend == BackendType.GgmlCuda)
+            if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan
+                || _backend == BackendType.GgmlMetal)
                 GgmlBasicOps.Qwen35ResetVerifyCache();
         }
 
@@ -1018,7 +1154,15 @@ namespace TensorSharp.Models
         // device-resident, so once any spec op runs this session the fused decode
         // must stay off (host state is the single source of truth). Latched until
         // the next ResetKVCache. Spec is net-negative for this model anyway.
-        internal void EnterSpecSession() { _fdSpecSessionActive = true; InvalidateFullDecodeState(); }
+        internal void EnterSpecSession()
+        {
+            _fdSpecSessionActive = true;
+            // Speculative paths may fall back to host/per-op recurrent kernels,
+            // which invalidate the state buffers captured by the decode graph.
+            // Speculation already latches fused decode off for the session, so
+            // retaining that graph has no benefit and risks dangling bindings.
+            InvalidateFullDecodeState(hardBindings: true);
+        }
 
         // Resolve a linear-projection weight to (ptr, ggml-type, ne0, ne1, bytes)
         // from EITHER its quantized form or its F32 form (small projections such as
@@ -1031,7 +1175,7 @@ namespace TensorSharp.Models
                 return (qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
             long ne0 = f32.Sizes[f32.DimensionCount - 1];
             long ne1 = f32.Sizes[0];
-            return ((IntPtr)GetFloatPtr(f32), 0, ne0, ne1, f32.ElementCount() * 4L);
+            return (TensorComputePrimitives.GetStoragePointer(f32), 0, ne0, ne1, f32.ElementCount() * 4L);
         }
 
         /// <summary>
@@ -1059,10 +1203,23 @@ namespace TensorSharp.Models
             _ => throw new NotSupportedException($"Unsupported KV cache dtype for fused graphs: {dt}"),
         };
 
-        internal unsafe bool TryFullModelDecode(Tensor hidden, int position, float[] logitsOut)
+        internal bool TryFullModelDecode(Tensor hidden, int position, float[] logitsOut)
+            => TryFullModelDecodeCore(hidden, -1, position, logitsOut);
+
+        /// <summary>
+        /// Metal decode can gather the quantized token embedding as the first node
+        /// of the persistent graph. Passing only the token id avoids the managed
+        /// row dequantization, tensor allocation, and hidden-vector upload.
+        /// </summary>
+        internal bool TryFullModelDecodeToken(int tokenId, int position, float[] logitsOut)
+            => TryFullModelDecodeCore(null, tokenId, position, logitsOut);
+
+        private unsafe bool TryFullModelDecodeCore(
+            Tensor hidden, int tokenId, int position, float[] logitsOut)
         {
             if (logitsOut == null || logitsOut.Length < Config.VocabSize)
                 return false;
+            bool tokenInput = tokenId >= 0;
             // Whole-model single-graph paths read the single-device caches
             // (_kvCacheK, _deltaStateTensor) and the unsharded LM head, none of
             // which exist under tensor parallelism — ForwardTP owns that state.
@@ -1071,26 +1228,56 @@ namespace TensorSharp.Models
             // Fold final-norm + lm_head into the graph requires both present.
             if ((_lmHeadQW == null && _lmHeadF32 == null) || _finalNormW == null)
                 return false;
-            // The whole-model single-graph decode now runs on ggml_cuda + ggml_vulkan
-            // (persistent replay: build the fixed-topology graph once, replay it each
-            // token via set_rows KV write — CUDA also captures a CUDA graph) AND
-            // ggml_metal (non-persist: cpy KV write + per-call scratch buffer, since
-            // ggml_metal_op_set_rows SEGFAULTs). All three collapse the ~145 op-by-op
-            // graph_compute submits/token — the dispatch ceiling that leaves the GPU
-            // ~10% utilized — into ONE graph, with the GDN recurrence + MoE top-K
-            // routing fully in-graph (no host drain). ggml-vulkan v0.15.3 implements
-            // every op the graph needs (gated_delta_net / ssm_conv / ssm_scan /
-            // argsort-top_k / mul_mat_id + set_rows), matching llama.cpp Vulkan decode.
+            // All three GGML GPU backends persist and replay the fixed-topology
+            // graph. CUDA/Vulkan use dynamic SET_ROWS KV writes; Metal moves CPY
+            // destination views before replay, avoiding its problematic SET_ROWS
+            // shape. GDN recurrence and MoE top-K routing remain device-resident.
             if (!_fullDecodeEnabled || _fdUnsupported || _fdSpecSessionActive
                 || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal
                     && _backend != BackendType.GgmlVulkan))
                 return false;
-            if (hidden == null || hidden.DimensionCount != 2 || hidden.Sizes[0] != 1
-                || hidden.ElementType != DType.Float32)
+            if (!tokenInput &&
+                (hidden == null || hidden.DimensionCount != 2 || hidden.Sizes[0] != 1
+                    || hidden.ElementType != DType.Float32))
                 return false;
+
+            // Keep the new token-input contract scoped to Metal for now. CUDA
+            // supports only a subset of quantized GET_ROWS types and TP needs the
+            // existing shared-hidden input; the hidden path remains their fallback.
+            (IntPtr ptr, int type, long ne0, long ne1, long bytes) tokenEmbedding = default;
+            if (tokenInput)
+            {
+                if (!_metalTokenInputEnabled ||
+                    _backend != BackendType.GgmlMetal ||
+                    tokenId >= Config.VocabSize)
+                    return false;
+                if (_quantWeights.TryGetValue("token_embd.weight", out QuantizedWeight tokenQw))
+                {
+                    if (!CanUseGgmlQuantizedGetRows(tokenQw.GgmlType))
+                        return false;
+                    tokenEmbedding = ResolveW(tokenQw, null);
+                }
+                else if (_weights.TryGetValue("token_embd.weight", out Tensor tokenF32))
+                {
+                    tokenEmbedding = ResolveW(null, tokenF32);
+                }
+                else
+                {
+                    return false;
+                }
+                if (tokenEmbedding.ptr == IntPtr.Zero ||
+                    tokenEmbedding.ne0 != Config.HiddenSize ||
+                    tokenEmbedding.ne1 <= tokenId)
+                    return false;
+            }
 
             int n = Config.NumLayers;
             int headDim = Config.HeadDim;
+            // ggml_gated_delta_net represents recurrent state as
+            // [S_v, S_v, heads], so asymmetric key/value state widths cannot
+            // enter the fused graph (the per-operation path remains available).
+            if (_headKDim != _headVDim)
+                return false;
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             int convDim = _convKernel - 1;
             if (convDim <= 0)
@@ -1143,12 +1330,14 @@ namespace TensorSharp.Models
 
             int cacheSize = 0;
             int kvCacheType = 0;
+            IntPtr bindingKCache = IntPtr.Zero;
             for (int l = 0; l < n; l++)
             {
                 if (!_isRecurrent[l])
                 {
                     cacheSize = (int)_kvCacheK[l].Sizes[1];
                     kvCacheType = FusedGraphKvCacheTypeId(_kvCacheK[l].ElementType);
+                    bindingKCache = TensorComputePrimitives.GetStoragePointer(_kvCacheK[l]);
                     break;
                 }
             }
@@ -1158,14 +1347,65 @@ namespace TensorSharp.Models
             int structBytes = Marshal.SizeOf<Qwen35LayerDecodeArgs>();
             int convBlock = convDim * qkvDim;
 
+            IntPtr bindingDeltaState = IntPtr.Zero;
+            for (int l = 0; l < n; l++)
             {
-                float* convBase = (float*)_fdConvScratch;
+                if (_isRecurrent[l])
+                {
+                    bindingDeltaState = TensorComputePrimitives.GetStoragePointer(_deltaStateTensor[l]);
+                    break;
+                }
+            }
+
+            // Re-seeding is dynamic state work, but all descriptor pointers are
+            // otherwise stable for the lifetime of the active cache holder. Keep
+            // it separate so the hot replay path does not rebuild hundreds of
+            // weight/state fields or invoke host-read barriers every token.
+            float* convBase = (float*)_fdConvScratch;
+            bool reseedState = !_fdStateResident;
+            if (reseedState)
+            {
+                for (int l = 0; l < n; l++)
+                {
+                    if (!_isRecurrent[l]) continue;
+                    float* conv = convBase + (long)_fdGdnSlot[l] * convBlock;
+                    float[] ring = _convState[l];
+                    int w = _convStateWriteIdx[l];
+                    for (int t = 0; t < convDim; t++)
+                    {
+                        int slot = (w + t) % convDim;
+                        int srcBase = slot * qkvDim;
+                        for (int ch = 0; ch < qkvDim; ch++)
+                            conv[ch * convDim + t] = ring[srcBase + ch];
+                    }
+                    IntPtr deltaPtr = TensorComputePrimitives.GetStoragePointer(_deltaStateTensor[l]);
+                    // Metal keeps the persistent graph and its device-copy
+                    // bindings alive across logical reset/prefill transitions.
+                    // The native reseed path refreshes those exact tensors
+                    // in-place; invalidating either host key here would free a
+                    // buffer still referenced by the cached graph.
+                    if (_backend != BackendType.GgmlMetal)
+                    {
+                        GgmlBasicOps.InvalidateHostBuffer((IntPtr)conv);
+                        GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
+                    }
+                }
+            }
+
+            bool rebuildBindings =
+                _fdBindingKCache != bindingKCache ||
+                _fdBindingDeltaState != bindingDeltaState ||
+                _fdBindingConvScratch != _fdConvScratch ||
+                _fdBindingCacheSize != cacheSize;
+
+            if (rebuildBindings)
+            {
                 for (int l = 0; l < n; l++)
                 {
                     var a = default(Qwen35LayerDecodeArgs);
                     a.StructBytes = structBytes;
-                    a.AttnNormW = (IntPtr)GetFloatPtr(_attnNormW[l]);
-                    a.PostAttnNormW = (IntPtr)GetFloatPtr(_postAttnNormW[l]);
+                    a.AttnNormW = TensorComputePrimitives.GetStoragePointer(_attnNormW[l]);
+                    a.PostAttnNormW = TensorComputePrimitives.GetStoragePointer(_postAttnNormW[l]);
                     // FFN: dense SwiGLU or MoE
                     bool isMoe = _isMoeLayer != null && _isMoeLayer[l];
                     a.IsMoe = isMoe ? 1 : 0;
@@ -1191,7 +1431,7 @@ namespace TensorSharp.Models
                         a.ShexpGateW = shg.ptr; a.ShexpGateType = shg.type; a.ShexpGateNe0 = shg.ne0; a.ShexpGateNe1 = shg.ne1; a.ShexpGateBytes = shg.bytes;
                         a.ShexpUpW = shu.ptr; a.ShexpUpType = shu.type; a.ShexpUpNe0 = shu.ne0; a.ShexpUpNe1 = shu.ne1; a.ShexpUpBytes = shu.bytes;
                         a.ShexpDownW = shd.ptr; a.ShexpDownType = shd.type; a.ShexpDownNe0 = shd.ne0; a.ShexpDownNe1 = shd.ne1; a.ShexpDownBytes = shd.bytes;
-                        a.ShexpGateInpW = (IntPtr)GetFloatPtr(_ffnGateInpShexpVec[l]);
+                        a.ShexpGateInpW = TensorComputePrimitives.GetStoragePointer(_ffnGateInpShexpVec[l]);
                     }
 
                     if (!_isRecurrent[l])
@@ -1215,8 +1455,8 @@ namespace TensorSharp.Models
                             a.VW = v.ptr; a.VType = v.type; a.VNe0 = v.ne0; a.VNe1 = v.ne1; a.VBytes = v.bytes;
                             a.SeparateQkv = 1;
                         }
-                        a.QNormW = (IntPtr)GetFloatPtr(_attnQNormW[l]);
-                        a.KNormW = (IntPtr)GetFloatPtr(_attnKNormW[l]);
+                        a.QNormW = TensorComputePrimitives.GetStoragePointer(_attnQNormW[l]);
+                        a.KNormW = TensorComputePrimitives.GetStoragePointer(_attnKNormW[l]);
                         a.KCache = TensorComputePrimitives.GetStoragePointer(_kvCacheK[l]);
                         a.VCache = TensorComputePrimitives.GetStoragePointer(_kvCacheV[l]);
                     }
@@ -1233,10 +1473,10 @@ namespace TensorSharp.Models
                         a.SsmBetaW = sb.ptr; a.SsmBetaType = sb.type; a.SsmBetaNe0 = sb.ne0; a.SsmBetaNe1 = sb.ne1; a.SsmBetaBytes = sb.bytes;
                         a.SsmAlphaW = sa.ptr; a.SsmAlphaType = sa.type; a.SsmAlphaNe0 = sa.ne0; a.SsmAlphaNe1 = sa.ne1; a.SsmAlphaBytes = sa.bytes;
                         a.SsmOutW = so.ptr; a.SsmOutType = so.type; a.SsmOutNe0 = so.ne0; a.SsmOutNe1 = so.ne1; a.SsmOutBytes = so.bytes;
-                        a.Conv1dW = (IntPtr)GetFloatPtr(_ssmConv1dW[l]);
-                        a.SsmDtW = (IntPtr)GetFloatPtr(_ssmDtBiasW[l]);
-                        a.SsmAW = (IntPtr)GetFloatPtr(_ssmAW[l]);
-                        a.SsmNormW = (IntPtr)GetFloatPtr(_ssmNormW[l]);
+                        a.Conv1dW = TensorComputePrimitives.GetStoragePointer(_ssmConv1dW[l]);
+                        a.SsmDtW = TensorComputePrimitives.GetStoragePointer(_ssmDtBiasW[l]);
+                        a.SsmAW = TensorComputePrimitives.GetStoragePointer(_ssmAW[l]);
+                        a.SsmNormW = TensorComputePrimitives.GetStoragePointer(_ssmNormW[l]);
 
                         // GDN recurrent state is device-resident across decode tokens.
                         // On (re)seed, convert the host conv ring -> ggml [time, channel]
@@ -1244,38 +1484,56 @@ namespace TensorSharp.Models
                         // on resident tokens the device buffer is authoritative (no host
                         // touch, no per-token transfer).
                         float* conv = convBase + (long)_fdGdnSlot[l] * convBlock;
-                        IntPtr deltaPtr = (IntPtr)GetFloatPtr(_deltaStateTensor[l]);
-                        if (!_fdStateResident)
-                        {
-                            float[] ring = _convState[l];
-                            int w = _convStateWriteIdx[l];
-                            for (int t = 0; t < convDim; t++)
-                            {
-                                int slot = (w + t) % convDim;
-                                int srcBase = slot * qkvDim;
-                                for (int ch = 0; ch < qkvDim; ch++)
-                                    conv[ch * convDim + t] = ring[srcBase + ch];
-                            }
-                            GgmlBasicOps.InvalidateHostBuffer((IntPtr)conv);
-                            GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
-                        }
+                        IntPtr deltaPtr = TensorComputePrimitives.GetStoragePointer(_deltaStateTensor[l]);
                         a.ConvStateIn = (IntPtr)conv;
                         a.ConvStateOut = (IntPtr)conv;
                         a.DeltaStateIn = deltaPtr;
-                        a.DeltaStateOut = deltaPtr;
+                        // Opt-in Metal contract: DeltaStateOut is the backing
+                        // base, while DeltaStateIn is base + one attention row.
+                        // Native verifies this exact relationship before aliasing.
+                        a.DeltaStateOut = _useMetalGdnInplaceState
+                            ? GdnDeltaStateBackingPointer(_deltaStateTensor[l])
+                            : deltaPtr;
                     }
                     _fdLayers[l] = a;
                 }
+                _fdBindingKCache = bindingKCache;
+                _fdBindingDeltaState = bindingDeltaState;
+                _fdBindingConvScratch = _fdConvScratch;
+                _fdBindingCacheSize = cacheSize;
+            }
 
-                // Fold final-norm + lm_head into the graph: output logits directly.
-                var lmh = ResolveW(_lmHeadQW, _lmHeadF32);
-                IntPtr finalNormPtr = (IntPtr)GetFloatPtr(_finalNormW);
-                bool ok2;
-                fixed (float* lp = logitsOut)
+            // Fold final-norm + lm_head into the graph: output logits directly.
+            var lmh = ResolveW(_lmHeadQW, _lmHeadF32);
+            IntPtr finalNormPtr = TensorComputePrimitives.GetStoragePointer(_finalNormW);
+            bool ok2;
+            fixed (float* lp = logitsOut)
+            {
+                if (tokenInput)
+                {
+                    ok2 = GgmlBasicOps.Qwen35ModelDecodeToken(
+                        _fdLayers, n,
+                        reseedState,
+                        tokenId,
+                        tokenEmbedding.ptr, tokenEmbedding.type,
+                        tokenEmbedding.ne0, tokenEmbedding.ne1, tokenEmbedding.bytes,
+                        Config.HiddenSize, position,
+                        Config.NumHeads, Config.NumKVHeads, headDim, cacheSize,
+                        _ropeDimCount > 0 ? _ropeDimCount : headDim, 2, kvCacheType,
+                        _convKernel, _headKDim, _headVDim, _numKHeads, _numVHeads,
+                        Config.Eps, Config.RopeBase, 1.0f / Config.RopeScale,
+                        _numExperts, _numExpertsUsed, _expertFfnLength, _sharedExpertFfnLength,
+                        _normTopKProb ? 1 : 0, 1.0f,
+                        (IntPtr)lp, Config.VocabSize,
+                        lmh.ptr, lmh.type, lmh.ne0, lmh.ne1, lmh.bytes,
+                        finalNormPtr);
+                }
+                else
                 {
                     ok2 = GgmlBasicOps.Qwen35ModelDecode(
                         _fdLayers, n,
-                        (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, position,
+                        reseedState,
+                        TensorComputePrimitives.GetStoragePointer(hidden), Config.HiddenSize, position,
                         Config.NumHeads, Config.NumKVHeads, headDim, cacheSize,
                         // rope_n_dims: this model uses partial rotary (rope.dimension_count,
                         // e.g. 64 of the 256-dim head). Passing headDim here rotated ALL 256
@@ -1292,23 +1550,23 @@ namespace TensorSharp.Models
                         lmh.ptr, lmh.type, lmh.ne0, lmh.ne1, lmh.bytes,
                         finalNormPtr);
                 }
-                if (!ok2)
-                {
-                    if (!_fdDiagPrinted)
-                    {
-                        _fdDiagPrinted = true;
-                        Console.Error.WriteLine($"[full-decode] disabled (native returned 0); falling back to per-op decode.");
-                    }
-                    _fdUnsupported = true;   // don't retry a failing kernel every token
-                    return false;
-                }
-
-                // GDN state is now device-resident and was updated in-place; no
-                // host write-back. Mark resident so subsequent tokens skip seeding.
-                _fdStateResident = true;
-                _gdnStateHostDirty = true;
-                _kvCacheHostDirty = true;
             }
+            if (!ok2)
+            {
+                if (!_fdDiagPrinted)
+                {
+                    _fdDiagPrinted = true;
+                    Console.Error.WriteLine($"[full-decode] disabled (native returned 0); falling back to per-op decode.");
+                }
+                _fdUnsupported = true;   // don't retry a failing kernel every token
+                return false;
+            }
+
+            // GDN state is now device-resident and was updated in-place; no
+            // host write-back. Mark resident so subsequent tokens skip seeding.
+            _fdStateResident = true;
+            _gdnStateHostDirty = true;
+            _kvCacheHostDirty = true;
 
             // logitsOut now holds the final logits (final-norm + lm_head folded
             // into the graph); the caller skips the separate LM head.
@@ -1323,14 +1581,10 @@ namespace TensorSharp.Models
         // input), appends the N rows to the attention KV cache, and advances every
         // recurrent layer's GDN state (conv ring + delta) by N tokens. Returns
         // false (caller falls back to the op-by-op trunk) on any unsupported shape.
-        // Gated TS_QWEN35_FUSED_VERIFY (default ON on ggml_cuda). The non-persist
-        // fused verify is ~8.6x faster per verify step than the op-by-op trunk
-        // (~121 ms vs ~1041 ms) and crash-free, so --mtp-spec routes through it; set
-        // TS_QWEN35_FUSED_VERIFY=0 to fall back to the op-by-op batched trunk. The
-        // persistent-cache + capture path (TS_Q35_VERIFY_PERSIST=1) would amortize the
-        // remaining graph build to ~8 ms warm but currently access-violates on reuse
-        // (interleaved op-by-op draft/catch-up disturbs shared cacheable buffers).
-        // See native TSGgml_Qwen35ModelVerify.
+        // Gated by TS_QWEN35_FUSED_VERIFY (default ON on every GGML GPU backend).
+        // Prefill uses the lifetime-packed one-shot graph; all-logits MTP verify
+        // uses the default-on per-(N,window) persistent cache. Set either this flag
+        // or TS_Q35_VERIFY_PERSIST=0 for isolated fallback/A-B testing.
         private static readonly bool _fusedVerifyEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_FUSED_VERIFY"), "0", StringComparison.Ordinal);
         private Qwen35LayerDecodeArgs[] _fvLayers;
@@ -1360,20 +1614,33 @@ namespace TensorSharp.Models
             string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_VERIFY_RESIDENT"), "1", StringComparison.Ordinal);
         private bool _fvStateResident;
 
+        internal static bool ShouldUseVerifyResidentState(
+            BackendType backend,
+            bool residentEnabled,
+            int nLogitRows,
+            int seqLen)
+        {
+            // Metal decode may bind the GDN result by its backing-base pointer
+            // while an experimental resident verify graph would retain the
+            // offset state-view pointer. Invalidating that view after the verify
+            // download can otherwise leave a cached verify graph holding a freed
+            // buffer. Metal's default host-mode verify remains correct and the
+            // experimental resident mode was never enabled there by default.
+            return residentEnabled &&
+                backend != BackendType.GgmlMetal &&
+                !(nLogitRows > 0 && nLogitRows < seqLen);
+        }
+
         internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1, int rowOffset = 0)
         {
-            // CUDA + Vulkan: the whole-model verify graph writes KV via ggml_set_rows
-            // (per-head 2D shape, a Vulkan-supported op in ggml v0.15.3) and, for
-            // PREFILL (n_logits < N), allocates activations through the reuse gallocr
-            // (lifetime-packing, backend-agnostic). This collapses the per-GDN-layer +
-            // op-by-op attention prefill (≈22 tok/s / 23 s for a 512-tok prompt on
-            // Vulkan) into ONE graph for the whole prompt. Metal stays OFF: an older
-            // cpy-based variant hit a VRAM wall + a gallocr "tensor buffer not set"
-            // assert on Metal (and ggml_metal_op_set_rows SEGFAULTs), so Metal prefill
-            // keeps the per-GDN-layer device-resident fused prefill (TryFusedRecLayerPrefill)
-            // plus op-by-op attention.
+            // Run one whole-model prefill/verify graph on every GGML GPU backend.
+            // CUDA and Vulkan use per-head set_rows KV writes. Metal uses contiguous
+            // cpy views at a graph-baked offset, matching llama.cpp's linear KV-store
+            // strategy and avoiding Metal's problematic multi-dimensional set_rows
+            // path. Prefill activations use the lifetime-packed reuse gallocr.
             if (!_fusedVerifyEnabled || _fvUnsupported
-                || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan))
+                || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan
+                    && _backend != BackendType.GgmlMetal))
                 return false;
             if (seqLen < 1 || hidden == null)
                 return false;
@@ -1466,7 +1733,11 @@ namespace TensorSharp.Models
             // whose in-place GDN cpy faults, so they stay in host mode here too. This
             // predicate must match the native fv_persist gate exactly (see
             // TSGgml_Qwen35ModelVerify) so both sides agree per call.
-            bool residentThisCall = _fvResidentEnabled && !(nLogitRows > 0 && nLogitRows < seqLen);
+            bool residentThisCall = ShouldUseVerifyResidentState(
+                _backend,
+                _fvResidentEnabled,
+                nLogitRows,
+                seqLen);
 
             float* convInBase = (float*)_fvConvIn;
             float* convOutBase = (float*)_fvConvOut;
@@ -1565,7 +1836,12 @@ namespace TensorSharp.Models
                                 convIn[ch * convDim + t] = ring[srcBase + ch];
                         }
                         GgmlBasicOps.InvalidateHostBuffer((IntPtr)convIn);
-                        GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
+                        // A retained Metal decode graph binds the same
+                        // delta-state host key. Verify stages its host-mode
+                        // state explicitly, so freeing that shared device-copy
+                        // entry is both unnecessary and unsafe for the graph.
+                        if (_backend != BackendType.GgmlMetal)
+                            GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
                     }
                     a.ConvStateIn = (IntPtr)convIn;
                     // Resident: conv_in == conv_out signals the native to keep the state
@@ -1644,7 +1920,9 @@ namespace TensorSharp.Models
                 if (residentThisCall)
                 {
                     GgmlBasicOps.SyncHostBuffer((IntPtr)convSrc, (long)convBlock * sizeof(float));
-                    GgmlBasicOps.SyncHostBuffer(deltaPtr, _deltaStateTensor[l].Storage.ByteLength);
+                    GgmlBasicOps.SyncHostBuffer(
+                        deltaPtr,
+                        GdnDeltaStateBytes(_deltaStateTensor[l]));
                     InvalidateTensorDeviceCache(_deltaStateTensor[l]);
                 }
                 float[] ring = _convState[l];
@@ -1655,7 +1933,7 @@ namespace TensorSharp.Models
                         ring[dstBase + ch] = convSrc[ch * convDim + t];
                 }
                 _convStateWriteIdx[l] = 0;
-                if (!residentThisCall)
+                if (!residentThisCall && _backend != BackendType.GgmlMetal)
                     GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
             }
             // Latch resident-seeded state only for resident calls. A host-mode call

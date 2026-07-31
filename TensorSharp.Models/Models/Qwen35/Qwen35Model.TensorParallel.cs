@@ -2119,6 +2119,8 @@ namespace TensorSharp.Models
 
         private void DisposeTpState()
         {
+            // Native TP and verify graphs are released by Qwen35Model.Dispose
+            // before reaching this method, while every bound tensor is alive.
             if (_tpKvCacheK != null)
             {
                 for (int l = 0; l < _tpKvCacheK.Length; l++)
@@ -2143,14 +2145,6 @@ namespace TensorSharp.Models
                         _tpConvState[l]?[r]?.Dispose();
                     }
                 }
-            }
-
-            // The per-rank GDN graphs are cached natively on (rank, shape), not on
-            // the model, so nothing else would reclaim their activation buffers.
-            if (IsGgmlBackend)
-            {
-                GgmlBasicOps.Qwen35GdnDropTpGraphs();
-                GgmlBasicOps.Qwen35ReleaseVerifyTpGraphs();
             }
 
             DisposeTpWeightReplicaCache();

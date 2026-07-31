@@ -96,4 +96,43 @@ public class ModelContextLengthTests
             Environment.SetEnvironmentVariable("MAX_CONTEXT", previousMaxContext);
         }
     }
+
+    [Fact]
+    public void UsesLightweightPrefillWarmupByDefault_IncludesMetalWithoutChangingDiscreteGgmlBackends()
+    {
+        Assert.True(ModelBase.UsesLightweightPrefillWarmupByDefault(BackendType.GgmlMetal));
+        Assert.True(ModelBase.UsesLightweightPrefillWarmupByDefault(BackendType.Mlx));
+        Assert.True(ModelBase.UsesLightweightPrefillWarmupByDefault(BackendType.Cpu));
+
+        Assert.False(ModelBase.UsesLightweightPrefillWarmupByDefault(BackendType.GgmlCuda));
+        Assert.False(ModelBase.UsesLightweightPrefillWarmupByDefault(BackendType.GgmlVulkan));
+        Assert.False(ModelBase.UsesLightweightPrefillWarmupByDefault(BackendType.Cuda));
+        Assert.False(ModelBase.UsesLightweightPrefillWarmupByDefault(BackendType.GgmlCpu));
+    }
+
+    [Fact]
+    public void ResolvePrefillWarmupTargetLength_UsesSafeMetalDefaultAndPreservesExplicitOverride()
+    {
+        Assert.Equal(
+            32,
+            ModelBase.ResolvePrefillWarmupTargetLength(
+                BackendType.GgmlMetal, false, false, false, 32, null));
+        Assert.Equal(
+            2048,
+            ModelBase.ResolvePrefillWarmupTargetLength(
+                BackendType.GgmlCuda, false, false, false, 32, null));
+        Assert.Equal(
+            2048,
+            ModelBase.ResolvePrefillWarmupTargetLength(
+                BackendType.GgmlVulkan, false, false, false, 32, null));
+        Assert.Equal(
+            96,
+            ModelBase.ResolvePrefillWarmupTargetLength(
+                BackendType.Cuda, false, false, false, 96, null));
+
+        Assert.Equal(
+            2048,
+            ModelBase.ResolvePrefillWarmupTargetLength(
+                BackendType.GgmlMetal, false, false, false, 32, 2048));
+    }
 }

@@ -306,6 +306,7 @@ namespace TensorSharp.Models
                         planSlot[0] = IntPtr.Zero;
                         bool ok = GgmlBasicOps.Qwen35ModelDecode(
                             _tpFdLayers[r], n,
+                            false,
                             (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, position,
                             headsPerRank, kvHeadsPerRank, headDim, cacheSize,
                             _ropeDimCount > 0 ? _ropeDimCount : headDim, 2, kvCacheType,

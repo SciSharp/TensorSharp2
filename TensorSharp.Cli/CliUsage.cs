@@ -238,8 +238,9 @@ namespace TensorSharp.Cli
             ("Benchmarks and diagnostics", new[]
             {
                 new OptionHelp("--benchmark",
-                    "Measure pure prefill and decode throughput (tok/s) without rendering/sampling overhead, " +
-                    "using synthetic tokens. Tune with --bench-prefill / --bench-decode / --bench-runs. Default: off.",
+                    "Measure prefill and decode throughput (tok/s) with synthetic tokens. Decode output reports " +
+                    "model-forward and greedy-sampling time separately. Tune with --bench-prefill / " +
+                    "--bench-decode / --bench-runs. Default: off.",
                     "--benchmark --bench-prefill 512 --bench-decode 128"),
                 new OptionHelp("--bench-prefill <N>",
                     "Prompt length (tokens) for --benchmark. Range: >= 1. Default: 32.",
@@ -252,9 +253,12 @@ namespace TensorSharp.Cli
                     "noise. Range: >= 1. Default: 1.",
                     "--bench-runs 3"),
                 new OptionHelp("--bench-chunked",
-                    "During --benchmark, capture the first decode tokens after each prefill so two runs (e.g. " +
-                    "chunked vs non-chunked prefill) can be diffed. Default: off.",
+                    "Use the server-style chunked ForwardRefill path for benchmark prefill. Default: off.",
                     "--benchmark --bench-chunked"),
+                new OptionHelp("--bench-fixed-tokens",
+                    "Feed a predetermined decode-token stream and time inference without host greedy sampling, " +
+                    "for llama-bench-style comparison. An untimed greedy correctness chain is still reported. Default: off.",
+                    "--benchmark --bench-fixed-tokens"),
                 new OptionHelp("--test",
                     "Run the built-in generation smoke-test prompts against the loaded model. Default: off.",
                     "--test"),

@@ -74,6 +74,11 @@ per-model `TS_*_BATCHED` opt-outs surface as the model's declared
 | `TS_PREFILL_CHUNK` | swept on GPT OSS, Qwen 3.5 / 3.6 family long-context features; honored at runtime by Gemma 4, Nemotron-H, Mistral 3, and Qwen 3 as well | Chunked prefill block size | architecture default | `256`, `512`, `1024` | yes |
 | `GDN_DISABLE_CHUNKED_PREFILL` | `qwen3next` | Disable GDN chunked prefill | OFF | `0`, `1` | no |
 | `TS_GGML_ASYNC_COMPUTE` | GGML backends | Async compute submission | ON on `ggml_metal` (`0` disables), OFF on other GGML backends | `0`, `1` | yes |
+| `TS_QWEN35_FD_PERSIST` | Qwen 3.5 / 3.6 family on GGML GPU backends | Retain and replay the whole-model single-token decode graph | ON | `0`, `1` | no |
+| `TS_QWEN35_METAL_GDN_INPLACE_STATE` | Qwen 3.5 / 3.6 family on single-device `ggml_metal` | Alias K=1 GatedDeltaNet output and recurrent state, eliminating the per-layer state copy | ON | `0`, `1` | no |
+| `TS_QWEN35_METAL_TOKEN_INPUT` | Qwen 3.5 / 3.6 family on `ggml_metal` | Read token embeddings directly from the quantized table inside the decode graph | ON | `0`, `1` | no |
+| `TS_QWEN35_METAL_KV_CPY` | Qwen 3.5 / 3.6 family on `ggml_metal` | Append K/V through movable `CPY` views instead of indexed scatter | ON | `0`, `1` | no |
+| `TS_QWEN35_METAL_ASYNC_SUBMIT` | Qwen 3.5 / 3.6 family on `ggml_metal` | Submit decode and logits readback before a single synchronization | ON | `0`, `1` | no |
 
 ## Multimodal
 

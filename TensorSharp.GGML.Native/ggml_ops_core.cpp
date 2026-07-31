@@ -9,6 +9,10 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 
+#if defined(TSG_GGML_USE_METAL)
+#include "ggml-backend-impl.h"
+#endif
+
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -1265,6 +1269,26 @@ namespace tsg
         return ok;
     }
 
+    void optimize_graph_for_metal(ggml_cgraph* graph)
+    {
+#if defined(TSG_GGML_USE_METAL)
+        // Direct ggml_backend_graph_compute() calls do not run the backend
+        // optimizer. Match ggml's scheduler path for Metal, where this hook
+        // reorders alias-aware nodes and applies supported graph fusions.
+        // This must run before gallocr/context allocation because reordering
+        // after lifetime planning can invalidate the allocator's alias plan.
+        if (g_backend_type == BACKEND_TYPE_METAL &&
+            g_backend != nullptr &&
+            graph != nullptr &&
+            g_backend->iface.graph_optimize != nullptr)
+        {
+            g_backend->iface.graph_optimize(g_backend, graph);
+        }
+#else
+        (void) graph;
+#endif
+    }
+
     bool alloc_ctx_tensors_reuse(ggml_context* ctx)
     {
         // Escape hatch for A/B testing / regression isolation.
@@ -2020,11 +2044,15 @@ extern "C" void TSGgml_QwenImageResetForwardCache();
 // TSGgml_Shutdown releases them while the backends are still alive.
 extern "C" void TSGgml_Gemma4ReleaseVerifyTpGraphs();
 extern "C" void TSGgml_Qwen35ReleaseAttentionTpGraphs();
+extern "C" void TSGgml_Qwen35GdnDropTpGraphs();
 extern "C" void TSGgml_ReleaseFusedFfnTpGraphs();
 extern "C" void TSGgml_ReleaseFusedMatmulAddTpGraphs();
 extern "C" void TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
 extern "C" void TSGgml_Gemma4MoEResetDecodeCache();
 extern "C" void TSGgml_Gemma4ResetDecodeCache();
+extern "C" void TSGgml_Qwen35ReleaseVerifyTpGraphs();
+extern "C" void TSGgml_Qwen35ResetDecodeCache();
+extern "C" void TSGgml_Qwen35ResetBatchedDecodeCache();
 
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
@@ -2032,6 +2060,11 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // GGUF pointer (shared via these caches), so freeing the caches below would leave
     // their captured graphs pointing at freed device memory.
     TSGgml_QwenImageResetForwardCache();
+    TSGgml_Qwen35ResetDecodeCache();
+    TSGgml_Qwen35ResetBatchedDecodeCache();
+    TSGgml_Qwen35ReleaseVerifyTpGraphs();
+    TSGgml_Qwen35ReleaseAttentionTpGraphs();
+    TSGgml_Qwen35GdnDropTpGraphs();
     forget_cache_keys();
 
     // Every rank owns its own device copies; clear all of them.
@@ -2080,6 +2113,9 @@ TSG_EXPORT void TSGgml_Shutdown()
     // Tear the TP communicator down first: it holds NCCL communicators and
     // pinned staging buffers that reference every rank's backend.
     tp_comm_free();
+    TSGgml_Qwen35ResetDecodeCache();
+    TSGgml_Qwen35ResetBatchedDecodeCache();
+    TSGgml_Qwen35ReleaseVerifyTpGraphs();
     forget_cache_keys();
 
     const int ranks = tsg::g_device_count.load(std::memory_order_acquire);
@@ -2118,6 +2154,7 @@ TSG_EXPORT void TSGgml_Shutdown()
     // the process ("CUDA error: driver shutting down").
     TSGgml_Gemma4ReleaseVerifyTpGraphs();
     TSGgml_Qwen35ReleaseAttentionTpGraphs();
+    TSGgml_Qwen35GdnDropTpGraphs();
     TSGgml_ReleaseFusedFfnTpGraphs();
     TSGgml_ReleaseFusedMatmulAddTpGraphs();
     TSGgml_Gemma4MoEReleaseVerifyTpGraphs();

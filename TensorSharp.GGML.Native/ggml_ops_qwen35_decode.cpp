@@ -382,32 +382,25 @@ TSG_EXPORT int TSGgml_Qwen35AttentionLayerDecode(
 // QKV with interleaved Q+gate, per-head q/k RMSNorm, NeoX RoPE, device-resident
 // circular KV cache append, flash attention, sigmoid-gated output, o-proj).
 // Recurrent (GDN) layers: built like llama.cpp's build_layer_attn_linear +
-// build_delta_net_fused — qkv/z/beta/alpha projections, ssm_conv over a host
-// conv-state ring, SiLU, q/k L2-norm + head tiling, the fused ggml_gated_delta_net
+// build_delta_net_fused — qkv/z/beta/alpha projections, ssm_conv over persistent
+// device state, SiLU, q/k L2-norm + head tiling, the fused ggml_gated_delta_net
 // op (K=1), gated RMSNorm with z, and the ssm output projection.
 //
-// GDN recurrent state (conv ring + delta state) is passed per-token via host
-// in/out pointers (no device residency / latch), which keeps this path trivially
-// correct alongside the per-op fallback and MTP (the host buffers are always the
-// single source of truth). Attention KV cache stays device-resident (cacheable
-// bind, in-place append) exactly like the per-op attention kernel.
+// GDN recurrent state and attention KV remain device-resident across replay.
+// The managed caller synchronizes them before switching to a host-side fallback
+// and explicitly resets the graph when state buffers move or need reseeding.
 //
-// Output is the final pre-output-norm hidden state [hidden_size]; the C# caller
-// owns output_norm + the LM head. Returns 0 on anything it cannot handle so the
-// caller falls back to the per-op decode.
+// Final RMSNorm and the LM head are folded into the graph, whose output is the
+// complete vocabulary logits. Returns 0 on unsupported inputs so the caller can
+// use the per-operation path.
 // ============================================================================
 namespace
 {
-    // Persistent decode-graph cache (single entry). When TS_QWEN35_FD_PERSIST is
-    // set, the whole-model decode graph is built ONCE with stable tensor addresses
-    // (raw ggml ctx + ggml_backend_alloc_ctx_tensors) and reused across tokens, so
-    // ggml-cuda's CUDA-graph capture engages (key = cgraph->nodes[0]; replays one
-    // captured graph instead of re-launching ~2000 kernels/token, which on WDDM the
-    // GPU is starved waiting for — measured ~35% util / 21 W without it). The KV
-    // write uses ggml_set_rows (position is an I64 input, not a baked view offset)
-    // and attention uses a padded window + F16 mask input, so the graph topology is
-    // identical token-to-token within a 256-token stride. Dropped + rebuilt when the
-    // window grows a stride or the GDN state re-seeds (TSGgml_Qwen35ResetDecodeCache).
+    // Small LRU pool of persistent decode graphs, keyed by model and per-request
+    // KV storage. CUDA captures replay; Vulkan and Metal reuse the graph/context.
+    // CUDA/Vulkan update KV with SET_ROWS. Metal re-encodes movable CPY destination
+    // views and uses a measured 64-token attention bucket; other backends use 256.
+    // A graph is rebuilt when its bucket/input mode changes or state needs reseeding.
     struct Q35DecodeCache
     {
         bool valid = false;
@@ -415,12 +408,31 @@ namespace
         ggml_backend_buffer_t buffer = nullptr;
         ggml_cgraph* graph = nullptr;
         ggml_tensor* hidden_t = nullptr;
+        ggml_tensor* token_t = nullptr;
         ggml_tensor* hidden_out = nullptr;
         ggml_tensor* pos_tensor = nullptr;
         ggml_tensor* kv_index = nullptr;   // I64 [1] = write position (shared, all attn layers)
         ggml_tensor* attn_mask = nullptr;  // F16 [window] causal padding mask (shared)
+        // Persistent recurrent-state tensors. On Metal a logical cache reset or
+        // fused prefill can make the descriptor host state authoritative again
+        // without moving these device buffers. Retaining the handles lets a cache
+        // hit explicitly re-seed them instead of destroying and rebuilding the
+        // complete decode graph.
+        std::vector<int> gdn_layers;
+        std::vector<ggml_tensor*> gdn_conv_state;
+        std::vector<ggml_tensor*> gdn_delta_state;
+        // Metal re-encodes the graph on every replay, so its KV writes can use
+        // ordinary CPY nodes whose destination-view pointers move each token.
+        // Each entry is the CPY result; src[1] is its destination view.
+        std::vector<ggml_tensor*> movable_kv_copies;
         const void* sig_disc = nullptr;    // model-instance discriminator
         const void* sig_kcache0 = nullptr; // first attention layer's KV ptr (per-holder identity)
+        const void* sig_token_embd = nullptr;
+        int token_embd_type = -1;
+        std::int64_t token_embd_ne0 = 0;
+        std::int64_t token_embd_ne1 = 0;
+        std::int64_t token_embd_bytes = 0;
+        bool token_input = false;
         int num_layers = 0;
         int hidden_size = 0;
         int window = 0;
@@ -435,8 +447,16 @@ namespace
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
-            hidden_t = hidden_out = pos_tensor = kv_index = attn_mask = nullptr;
+            hidden_t = token_t = hidden_out = pos_tensor = kv_index = attn_mask = nullptr;
+            gdn_layers.clear();
+            gdn_conv_state.clear();
+            gdn_delta_state.clear();
+            movable_kv_copies.clear();
             sig_disc = sig_kcache0 = nullptr; num_layers = hidden_size = window = 0;
+            sig_token_embd = nullptr;
+            token_embd_type = -1;
+            token_embd_ne0 = token_embd_ne1 = token_embd_bytes = 0;
+            token_input = false;
             folded = false; out_count = 0;
             tp_plan.clear();
         }
@@ -492,7 +512,7 @@ namespace
     Q35DecodeCachePool g_q35dc_pool;
 
     int qwen35_model_decode_impl(
-        const TSGgmlQwen35LayerDesc* layers, int num_layers,
+        const TSGgmlQwen35LayerDesc* layers, int num_layers, int reseed_state,
         void* hidden_data, int hidden_size, int position,
         int num_heads, int num_kv_heads, int head_dim, int cache_size,
         int rope_n_dims, int rope_mode, int kv_cache_type,
@@ -503,11 +523,17 @@ namespace
         void* logits_data, int vocab_size,
         const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
         const void* final_norm_data,
-        int tp_degree = 1, void** tp_plan_out = nullptr)
+        int tp_degree = 1, void** tp_plan_out = nullptr,
+        int token_id = -1,
+        const void* token_embd_data = nullptr, int token_embd_type = -1,
+        std::int64_t token_embd_ne0 = 0, std::int64_t token_embd_ne1 = 0,
+        std::int64_t token_embd_bytes = 0)
     {
         if (!ensure_backend())
             return 0;
-        if (layers == nullptr || num_layers <= 0 || hidden_data == nullptr)
+        const bool token_input = token_embd_data != nullptr;
+        if (layers == nullptr || num_layers <= 0 ||
+            (!token_input && hidden_data == nullptr))
         {
             set_last_error("Qwen3.5 model decode: invalid arguments.");
             return 0;
@@ -539,6 +565,13 @@ namespace
                 std::to_string(sizeof(TSGgmlQwen35LayerDesc)) + ").");
             return 0;
         }
+        // gated_delta_net requires S_k == S_v (state is [S_v, S_v, H]).
+        // Reject unsupported geometry before ggml graph construction can assert.
+        if (head_k_dim != head_v_dim)
+        {
+            set_last_error("Qwen3.5 model decode: head_k_dim != head_v_dim unsupported.");
+            return 0;
+        }
 
         const int H = hidden_size;
         const int totalSeqLen = position + 1;
@@ -550,6 +583,41 @@ namespace
         const int key_dim = head_k_dim * num_k_heads;
         const int value_dim = head_v_dim * num_v_heads;
         const int conv_dim = 2 * key_dim + value_dim;
+        const std::size_t convStateBytes =
+            static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
+        const std::size_t deltaStateBytes =
+            static_cast<std::size_t>(head_k_dim) * head_v_dim * num_v_heads * sizeof(float);
+        constexpr int gdnStateSnapshots = 1;
+        const std::size_t gdnAttentionBytes =
+            static_cast<std::size_t>(value_dim) * sizeof(float);
+        const std::size_t gdnResultBytes = gdnAttentionBytes + deltaStateBytes;
+        // CUDA/Vulkan keep their existing reset-and-rebind lifecycle. Metal can
+        // preserve a persistent graph across a logical state transition and
+        // explicitly upload the descriptor's new host-side recurrent state.
+        const bool reseed_metal_state =
+            reseed_state != 0 && g_backend_type == BACKEND_TYPE_METAL;
+        // Metal-only K=1 state alias. The managed descriptor uses
+        // delta_state_out as the backing-base pointer and delta_state_in as the
+        // state view one attention row later. Every layer re-validates that
+        // relationship before the CPY is removed. Keep an opt-out for
+        // diagnostics and A/B comparisons.
+        static const bool metal_gdn_inplace_state_cfg = [] {
+            const char* e = std::getenv("TS_QWEN35_METAL_GDN_INPLACE_STATE");
+            return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+        }();
+        ggml_backend_buffer_type_t default_buft =
+            ggml_backend_get_default_buffer_type(g_backend);
+        const std::size_t default_alignment =
+            default_buft != nullptr
+                ? ggml_backend_buft_get_alignment(default_buft)
+                : 0;
+        const bool try_metal_gdn_inplace_state =
+            metal_gdn_inplace_state_cfg &&
+            g_backend_type == BACKEND_TYPE_METAL &&
+            !tp_mode &&
+            gdnStateSnapshots == 1 &&
+            default_alignment != 0 &&
+            gdnAttentionBytes % default_alignment == 0;
 
         // Persistent decode graph: default ON; TS_QWEN35_FD_PERSIST=0 disables.
         // Persist mode uses ggml_set_rows (KV write) + a fixed-topology graph that is
@@ -557,22 +625,51 @@ namespace
         // no per-token graph rebuild / backend-buffer alloc+free / weight re-upload).
         //   - CUDA: the static graph additionally lets ggml-cuda capture+replay a CUDA
         //     graph (cuts per-node launch latency).
-        //   - Vulkan: no graph capture, but the replay still skips the ~120ms/token
+        //   - Metal/Vulkan: no graph capture, but replay still skips the per-token
         //     non-persist rebuild churn (fresh vkAllocateMemory + re-record of 4200+
-        //     nodes + 176 norm-weight re-uploads every token). set_rows has a Vulkan
-        //     kernel in ggml v0.15.3 (unlike Metal, where ggml_metal_op_set_rows
-        //     SEGFAULTs — Metal stays on the non-persist cpy path).
+        //     nodes + 176 norm-weight re-uploads every token). Current ggml Metal
+        //     supports an F32->F16 row scatter broadcast over all KV heads, while
+        //     CUDA/Vulkan retain their established per-head capture graph.
         // Persist mode pads the attention window to a fixed stride so the graph is
         // identical token-to-token (CUDA-graph capture); the F16 mask zeroes valid
         // positions and -inf's the padding. Non-persist keeps the exact window.
         static const bool persist_cfg = []{ const char* e = std::getenv("TS_QWEN35_FD_PERSIST"); return e == nullptr || e[0] != '0'; }();
         const bool persist = persist_cfg &&
-            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
-        constexpr int kPersistKvStride = 256;
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN
+                || g_backend_type == BACKEND_TYPE_METAL);
+        // Match llama.cpp's Metal scheduler ordering: enqueue the graph and the
+        // logits download back-to-back, then synchronize once. The synchronous
+        // wrapper waits after graph execution, forcing a second command-buffer
+        // round trip for the download on every generated token.
+        static const bool metal_async_submit_cfg = [] {
+            const char* e = std::getenv("TS_QWEN35_METAL_ASYNC_SUBMIT");
+            return e == nullptr || e[0] != '0';
+        }();
+        const bool use_metal_async_submit =
+            metal_async_submit_cfg &&
+            g_backend_type == BACKEND_TYPE_METAL &&
+            g_async_compute_enabled.load(std::memory_order_acquire);
+        // Metal can replay a graph across a much smaller attention-window bucket
+        // without CUDA/Vulkan pipeline-capture costs. Keeping its padded tail to
+        // at most 63 rows is faster in measured decode than using the 128-row
+        // flash-attention group size: the latter removes an internal pad kernel
+        // but its larger direct KV window costs more overall.
+        const int persistKvStride =
+            g_backend_type == BACKEND_TYPE_METAL ? 64 : 256;
         const int attnKvLen = persist
-            ? std::min(cache_size, ((totalSeqLen + kPersistKvStride - 1) / kPersistKvStride) * kPersistKvStride)
+            ? std::min(cache_size, ((totalSeqLen + persistKvStride - 1) / persistKvStride) * persistKvStride)
             : flash_attn_kv_length(totalSeqLen, cache_size, head_dim);
         const bool use_persist_mask = persist;
+        // Unlike CUDA graph capture, Metal re-encodes buffer bindings for every
+        // compute. Move a normal CPY destination view to the current KV row and
+        // avoid the index/scatter work of SET_ROWS, matching llama.cpp's KV store.
+        static const bool metal_kv_cpy_cfg = [] {
+            const char* e = std::getenv("TS_QWEN35_METAL_KV_CPY");
+            return e == nullptr || e[0] != '0';
+        }();
+        const bool use_movable_metal_kv_cpy =
+            metal_kv_cpy_cfg && persist &&
+            g_backend_type == BACKEND_TYPE_METAL && !tp_mode;
         // VULKAN CORRECTNESS: the persist path pads the flash-attn KV window to the
         // 256-stride so the graph topology stays constant for replay. On ggml-vulkan a
         // padded window (KV a multiple of the flash block width) selects the "aligned"
@@ -604,7 +701,42 @@ namespace
         // 248K-vocab logits) is one captured replay -> no separate lm_head submit.
         const bool fold = logits_data != nullptr && lm_head_data != nullptr &&
                           final_norm_data != nullptr && vocab_size > 0;
-
+        if (token_input)
+        {
+            if (tp_mode)
+            {
+                set_last_error("Qwen3.5 model decode: token input is not supported with tensor parallelism.");
+                return 0;
+            }
+            if (!fold)
+            {
+                set_last_error("Qwen3.5 model decode: token input requires folded logits output.");
+                return 0;
+            }
+            if (token_id < 0 || token_embd_type < 0 || token_embd_type >= GGML_TYPE_COUNT ||
+                token_embd_ne0 != H || token_embd_ne1 <= token_id || token_embd_ne1 <= 0 ||
+                token_embd_bytes <= 0)
+            {
+                set_last_error("Qwen3.5 model decode: invalid token embedding arguments.");
+                return 0;
+            }
+            const ggml_type emb_type = static_cast<ggml_type>(token_embd_type);
+            const std::int64_t block_size = ggml_blck_size(emb_type);
+            if (block_size <= 0 || token_embd_ne0 % block_size != 0)
+            {
+                set_last_error("Qwen3.5 model decode: token embedding row is incompatible with its ggml type.");
+                return 0;
+            }
+            const std::size_t row_bytes = ggml_row_size(emb_type, token_embd_ne0);
+            if (static_cast<std::uint64_t>(token_embd_ne1) >
+                    static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / row_bytes) ||
+                static_cast<std::uint64_t>(token_embd_bytes) <
+                    static_cast<std::uint64_t>(row_bytes) * static_cast<std::uint64_t>(token_embd_ne1))
+            {
+                set_last_error("Qwen3.5 model decode: token embedding storage is too small.");
+                return 0;
+            }
+        }
         // The tensor-parallel driver executes the graph *after* this call
         // returns, so the graph, its context and its backend buffer must
         // outlive the call — which is exactly what persist mode provides.
@@ -619,14 +751,78 @@ namespace
         Q35DecodeCache* dc = persist ? g_q35dc_pool.find(sig_disc, sig_kcache0) : nullptr;
         if (dc != nullptr && dc->graph != nullptr &&
             dc->num_layers == num_layers && dc->hidden_size == H &&
-            dc->window == attnKvLen)
+            dc->window == attnKvLen &&
+            dc->token_input == token_input &&
+            (!token_input ||
+                (dc->sig_token_embd == token_embd_data &&
+                 dc->token_embd_type == token_embd_type &&
+                 dc->token_embd_ne0 == token_embd_ne0 &&
+                 dc->token_embd_ne1 == token_embd_ne1 &&
+                 dc->token_embd_bytes == token_embd_bytes)))
         {
             host_read_barrier();
-            ggml_backend_tensor_set(dc->hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
+            if (reseed_metal_state)
+            {
+                if (dc->gdn_layers.size() != dc->gdn_conv_state.size() ||
+                    dc->gdn_layers.size() != dc->gdn_delta_state.size())
+                {
+                    set_last_error("Qwen3.5 model decode: cached recurrent-state handles are inconsistent.");
+                    dc->reset();
+                    return 0;
+                }
+                for (std::size_t gi = 0; gi < dc->gdn_layers.size(); ++gi)
+                {
+                    const int l = dc->gdn_layers[gi];
+                    if (l < 0 || l >= num_layers ||
+                        layers[l].conv_state_in == nullptr ||
+                        layers[l].delta_state_in == nullptr ||
+                        dc->gdn_conv_state[gi] == nullptr ||
+                        dc->gdn_delta_state[gi] == nullptr)
+                    {
+                        set_last_error("Qwen3.5 model decode: invalid recurrent-state reseed binding.");
+                        dc->reset();
+                        return 0;
+                    }
+                    ggml_backend_tensor_set(
+                        dc->gdn_conv_state[gi], layers[l].conv_state_in,
+                        0, convStateBytes);
+                    ggml_backend_tensor_set(
+                        dc->gdn_delta_state[gi], layers[l].delta_state_in,
+                        0, deltaStateBytes);
+                }
+            }
+            if (token_input)
+            {
+                std::int32_t token_val = token_id;
+                ggml_backend_tensor_set(dc->token_t, &token_val, 0, sizeof(token_val));
+            }
+            else
+            {
+                ggml_backend_tensor_set(dc->hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
+            }
             std::int32_t pos_val = position;
             ggml_backend_tensor_set(dc->pos_tensor, &pos_val, 0, sizeof(std::int32_t));
-            std::int64_t kv_idx = position;
-            ggml_backend_tensor_set(dc->kv_index, &kv_idx, 0, sizeof(std::int64_t));
+            if (dc->kv_index != nullptr)
+            {
+                std::int64_t kv_idx = position;
+                ggml_backend_tensor_set(dc->kv_index, &kv_idx, 0, sizeof(std::int64_t));
+            }
+            for (ggml_tensor* copy : dc->movable_kv_copies)
+            {
+                ggml_tensor* dst = copy != nullptr ? copy->src[1] : nullptr;
+                ggml_tensor* base = dst != nullptr ? dst->view_src : nullptr;
+                if (base == nullptr || base->data == nullptr)
+                {
+                    set_last_error("Qwen3.5 model decode: invalid movable Metal KV view.");
+                    dc->reset();
+                    return 0;
+                }
+                const std::size_t offset =
+                    static_cast<std::size_t>(position) * base->nb[1];
+                dst->view_offs = offset;
+                dst->data = static_cast<char*>(base->data) + offset;
+                copy->data = dst->data;
+            }
             std::vector<ggml_fp16_t> mask_data;
             fill_flash_attn_mask(mask_data, attnKvLen, totalSeqLen);
             ggml_backend_tensor_set(dc->attn_mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
@@ -646,7 +842,9 @@ namespace
                 clear_last_error();
                 return 1;
             }
-            ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
+            ggml_status st = use_metal_async_submit
+                ? ggml_backend_graph_compute_async(g_backend, dc->graph)
+                : ggml_backend_graph_compute(g_backend, dc->graph);
             if (st != GGML_STATUS_SUCCESS)
             {
                 set_last_error("Qwen3.5 model decode: cached graph execution failed.");
@@ -654,7 +852,8 @@ namespace
                 return 0;
             }
             void* out_data = dc->folded ? logits_data : hidden_data;
-            finalize_compute_with_download(dc->hidden_out, out_data, static_cast<std::size_t>(dc->out_count) * sizeof(float));
+            finalize_compute_with_download(dc->hidden_out, out_data,
+                static_cast<std::size_t>(dc->out_count) * sizeof(float));
             host_read_barrier();
             return 1;
         }
@@ -686,18 +885,30 @@ namespace
             ctx = context.value;
         }
 
-        ggml_tensor* hidden_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* hidden_t =
+            token_input ? nullptr : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* token_t =
+            token_input ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1) : nullptr;
+        ggml_tensor* token_embd_t =
+            token_input
+                ? ggml_new_tensor_2d(ctx, static_cast<ggml_type>(token_embd_type),
+                    token_embd_ne0, token_embd_ne1)
+                : nullptr;
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_tensor* lm_head_t = fold ? ggml_new_tensor_2d(ctx, static_cast<ggml_type>(lm_head_type), lm_head_ne0, lm_head_ne1) : nullptr;
         ggml_tensor* final_norm_t = fold ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
         // Shared per-token inputs for the static (capturable) graph.
-        ggml_tensor* shared_kv_index = use_persist_mask ? ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1) : nullptr;
+        ggml_tensor* shared_kv_index =
+            use_persist_mask && !use_movable_metal_kv_cpy
+                ? ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1)
+                : nullptr;
         ggml_tensor* shared_attn_mask = use_persist_mask ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1) : nullptr;
         if (use_persist_mask)
         {
-            ggml_set_input(hidden_t);
+            ggml_set_input(token_input ? token_t : hidden_t);
             ggml_set_input(pos_tensor);
-            ggml_set_input(shared_kv_index);
+            if (shared_kv_index != nullptr)
+                ggml_set_input(shared_kv_index);
             ggml_set_input(shared_attn_mask);
         }
 
@@ -715,6 +926,8 @@ namespace
             ggml_tensor* attn_mask;
             ggml_tensor* k_cpy;
             ggml_tensor* v_cpy;
+            std::vector<ggml_tensor*> k_set_rows;
+            std::vector<ggml_tensor*> v_set_rows;
             std::vector<ggml_fp16_t> attn_mask_data;
             // gdn
             ggml_tensor* gdn_qkv_w;
@@ -728,8 +941,10 @@ namespace
             ggml_tensor* ssm_out_w;
             ggml_tensor* conv_state_in;
             ggml_tensor* delta_state_in;
+            ggml_tensor* gdn_result;
             ggml_tensor* conv_state_out;
             ggml_tensor* delta_state_out;
+            bool delta_state_inplace;
             // ffn (dense)
             ggml_tensor* post_attn_norm_w;
             ggml_tensor* gu_w;
@@ -858,7 +1073,9 @@ namespace
         }
 
         // --- build the chained graph ---
-        ggml_tensor* hidden = hidden_t;
+        ggml_tensor* hidden = token_input
+            ? ggml_reshape_1d(ctx, ggml_get_rows(ctx, token_embd_t, token_t), H)
+            : hidden_t;
         for (int l = 0; l < num_layers; l++)
         {
             const TSGgmlQwen35LayerDesc& d = layers[l];
@@ -892,7 +1109,10 @@ namespace
                 ggml_tensor* q_view = ggml_view_2d(ctx, qg_3d, head_dim, num_heads, qg_3d->nb[2], 0);
                 ggml_tensor* gate_view = ggml_view_2d(ctx, qg_3d, head_dim, num_heads, qg_3d->nb[2], qg_3d->nb[1]);
 
-                ggml_tensor* q_2d_raw = ggml_cont(ctx, q_view);
+                // Metal RMSNorm accepts row-contiguous strided views, so it can
+                // consume the interleaved Q slice directly.
+                ggml_tensor* q_2d_raw =
+                    g_backend_type == BACKEND_TYPE_METAL ? q_view : ggml_cont(ctx, q_view);
                 ggml_tensor* k_2d_raw = ggml_reshape_2d(ctx, k_raw, head_dim, num_kv_heads);
                 ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_2d_raw, eps), t.q_norm_w);
                 ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_2d_raw, eps), t.k_norm_w);
@@ -903,19 +1123,72 @@ namespace
                 ggml_tensor* k_rope = ggml_rope_ext(ctx, k_3d, pos_tensor, nullptr, rope_n_dims, rope_mode, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
 
                 ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
-                ggml_tensor* k_rope_perm = ggml_permute(ctx, k_rope, 0, 2, 1, 3);
                 ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_raw, head_dim, num_kv_heads, 1);
-                ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
-                ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
-                ggml_tensor* v_write = ggml_cont(ctx, v_perm);
+                ggml_tensor* k_write;
+                ggml_tensor* v_write;
+                if (g_backend_type == BACKEND_TYPE_METAL)
+                {
+                    // [D,H,1] is already physically laid out exactly like the
+                    // old permute+CONT result [D,1,H]. Reshape the metadata only.
+                    k_write = ggml_reshape_3d(ctx, k_rope, head_dim, 1, num_kv_heads);
+                    v_write = ggml_reshape_3d(ctx, v_3d, head_dim, 1, num_kv_heads);
+                }
+                else
+                {
+                    k_write = ggml_cont(ctx, ggml_permute(ctx, k_rope, 0, 2, 1, 3));
+                    v_write = ggml_cont(ctx, ggml_permute(ctx, v_3d, 0, 2, 1, 3));
+                }
                 ggml_tensor* mask_for_attn;
                 if (persist)
                 {
-                    // KV write via set_rows: the write position is an I64 INPUT
-                    // (shared_kv_index), not a baked view offset, so the graph
-                    // topology is identical token-to-token (CUDA-graph capturable).
-                    t.k_cpy = ggml_set_rows(ctx, t.k_cache_base, k_write, shared_kv_index);
-                    t.v_cpy = ggml_set_rows(ctx, t.v_cache_base, v_write, shared_kv_index);
+                    if (use_movable_metal_kv_cpy)
+                    {
+                        const std::size_t kv_byte_offset =
+                            static_cast<std::size_t>(position) * t.k_cache_base->nb[1];
+                        ggml_tensor* k_dst = ggml_view_3d(ctx, t.k_cache_base,
+                            head_dim, 1, num_kv_heads,
+                            t.k_cache_base->nb[1], t.k_cache_base->nb[2],
+                            kv_byte_offset);
+                        ggml_tensor* v_dst = ggml_view_3d(ctx, t.v_cache_base,
+                            head_dim, 1, num_kv_heads,
+                            t.v_cache_base->nb[1], t.v_cache_base->nb[2],
+                            kv_byte_offset);
+                        t.k_cpy = ggml_cpy(ctx, k_write, k_dst);
+                        t.v_cpy = ggml_cpy(ctx, v_write, v_dst);
+                    }
+                    else if (g_backend_type == BACKEND_TYPE_METAL)
+                    {
+                        // Current ggml-metal broadcasts the row index over ne[2],
+                        // so update all KV heads in one dispatch. The per-head form
+                        // below costs eight tiny Metal dispatches per attention
+                        // layer (128 per token for this model).
+                        t.k_cpy = ggml_set_rows(ctx, t.k_cache_base, k_write, shared_kv_index);
+                        t.v_cpy = ggml_set_rows(ctx, t.v_cache_base, v_write, shared_kv_index);
+                    }
+                    else
+                    {
+                        // CUDA/Vulkan keep the established one-2D-slice-per-head
+                        // graph shape used by their capture/replay paths.
+                        t.k_set_rows.reserve(num_kv_heads);
+                        t.v_set_rows.reserve(num_kv_heads);
+                        for (int h = 0; h < num_kv_heads; h++)
+                        {
+                            ggml_tensor* k_dst_h = ggml_view_2d(ctx, t.k_cache_base,
+                                head_dim, cache_size, t.k_cache_base->nb[1],
+                                static_cast<std::size_t>(h) * t.k_cache_base->nb[2]);
+                            ggml_tensor* v_dst_h = ggml_view_2d(ctx, t.v_cache_base,
+                                head_dim, cache_size, t.v_cache_base->nb[1],
+                                static_cast<std::size_t>(h) * t.v_cache_base->nb[2]);
+                            ggml_tensor* k_src_h = ggml_view_2d(ctx, k_write,
+                                head_dim, 1, k_write->nb[1],
+                                static_cast<std::size_t>(h) * k_write->nb[2]);
+                            ggml_tensor* v_src_h = ggml_view_2d(ctx, v_write,
+                                head_dim, 1, v_write->nb[1],
+                                static_cast<std::size_t>(h) * v_write->nb[2]);
+                            t.k_set_rows.push_back(ggml_set_rows(ctx, k_dst_h, k_src_h, shared_kv_index));
+                            t.v_set_rows.push_back(ggml_set_rows(ctx, v_dst_h, v_src_h, shared_kv_index));
+                        }
+                    }
                     mask_for_attn = shared_attn_mask;
                 }
                 else
@@ -973,8 +1246,11 @@ namespace
                     ggml_flash_attn_ext_set_prec(attn_out_4d, GGML_PREC_F32);
                     attn_out_2d = ggml_reshape_2d(ctx, attn_out_4d, head_dim, num_heads);
                 }
-                ggml_tensor* gate_2d = ggml_cont(ctx, gate_view);
-                ggml_tensor* attn_gated = ggml_mul(ctx, attn_out_2d, ggml_sigmoid(ctx, gate_2d));
+                // Metal unary kernels also accept this row-contiguous strided
+                // gate view and write a dense result.
+                ggml_tensor* gate_input =
+                    g_backend_type == BACKEND_TYPE_METAL ? gate_view : ggml_cont(ctx, gate_view);
+                ggml_tensor* attn_gated = ggml_mul(ctx, attn_out_2d, ggml_sigmoid(ctx, gate_input));
                 ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_gated, qDim, 1);
                 ggml_tensor* o_mm = ggml_mul_mat(ctx, t.o_w, attn_flat);
                 block_out = ggml_reshape_1d(ctx, o_mm, H);
@@ -1031,17 +1307,23 @@ namespace
 
                 // new conv state = the most recent convDim time-steps of conv_input,
                 // written in-place back to the device-resident conv-state buffer.
-                ggml_tensor* new_conv = ggml_cont(ctx, ggml_view_2d(ctx, conv_input, convDim, conv_dim,
-                    conv_input->nb[1], static_cast<std::size_t>(1) * conv_input->nb[0]));
+                // CPY handles the source strides directly; materializing this
+                // shifted [convDim, channels] view first was another dispatch in
+                // every recurrent layer.
+                ggml_tensor* new_conv = ggml_view_2d(ctx, conv_input, convDim, conv_dim,
+                    conv_input->nb[1], static_cast<std::size_t>(1) * conv_input->nb[0]);
                 t.conv_state_out = ggml_cpy(ctx, new_conv, t.conv_state_in);
 
                 // split q/k/v
-                ggml_tensor* q_c = ggml_cont(ctx, ggml_view_2d(ctx, conv_out_1d, head_k_dim, num_k_heads,
-                    static_cast<std::size_t>(head_k_dim) * sizeof(float), 0));
-                ggml_tensor* k_c = ggml_cont(ctx, ggml_view_2d(ctx, conv_out_1d, head_k_dim, num_k_heads,
-                    static_cast<std::size_t>(head_k_dim) * sizeof(float), static_cast<std::size_t>(key_dim) * sizeof(float)));
-                ggml_tensor* v_c = ggml_cont(ctx, ggml_view_2d(ctx, conv_out_1d, head_v_dim, num_v_heads,
-                    static_cast<std::size_t>(head_v_dim) * sizeof(float), static_cast<std::size_t>(2 * key_dim) * sizeof(float)));
+                // These head views already have dense rows and are accepted directly
+                // by l2_norm / gated_delta_net, as in llama.cpp. Materializing each
+                // one added three Metal copy dispatches per recurrent layer.
+                ggml_tensor* q_c = ggml_view_2d(ctx, conv_out_1d, head_k_dim, num_k_heads,
+                    static_cast<std::size_t>(head_k_dim) * sizeof(float), 0);
+                ggml_tensor* k_c = ggml_view_2d(ctx, conv_out_1d, head_k_dim, num_k_heads,
+                    static_cast<std::size_t>(head_k_dim) * sizeof(float), static_cast<std::size_t>(key_dim) * sizeof(float));
+                ggml_tensor* v_c = ggml_view_2d(ctx, conv_out_1d, head_v_dim, num_v_heads,
+                    static_cast<std::size_t>(head_v_dim) * sizeof(float), static_cast<std::size_t>(2 * key_dim) * sizeof(float));
 
                 q_c = ggml_l2_norm(ctx, q_c, eps);
                 k_c = ggml_l2_norm(ctx, k_c, eps);
@@ -1055,22 +1337,53 @@ namespace
                 ggml_tensor* v4 = ggml_reshape_4d(ctx, v_c, head_v_dim, num_v_heads, 1, 1);
                 ggml_tensor* state4 = ggml_reshape_4d(ctx, t.delta_state_in, head_k_dim, head_v_dim, num_v_heads, 1);
 
-                ggml_tensor* gdn = ggml_gated_delta_net(ctx, q4, k4, v4, g, beta, state4, 1);
+                ggml_tensor* gdn = ggml_gated_delta_net(
+                    ctx, q4, k4, v4, g, beta, state4, gdnStateSnapshots);
+                t.gdn_result = gdn;
                 ggml_tensor* gdn_out = ggml_view_4d(ctx, gdn, head_v_dim, num_v_heads, 1, 1,
                     ggml_row_size(gdn->type, head_v_dim),
                     ggml_row_size(gdn->type, head_v_dim * num_v_heads),
                     ggml_row_size(gdn->type, head_v_dim * num_v_heads), 0);
-                ggml_tensor* new_state = ggml_view_4d(ctx, gdn, head_k_dim, head_v_dim, num_v_heads, 1,
-                    ggml_row_size(gdn->type, head_k_dim),
-                    ggml_row_size(gdn->type, head_k_dim * head_v_dim),
-                    ggml_row_size(gdn->type, head_k_dim * head_v_dim * num_v_heads),
-                    ggml_row_size(gdn->type, head_v_dim * num_v_heads));
-                // write the new recurrent state in-place back to the device-resident
-                // delta-state buffer (state4 aliases delta_state_in).
-                t.delta_state_out = ggml_cpy(ctx, new_state, state4);
+                const std::uintptr_t state_in_addr =
+                    reinterpret_cast<std::uintptr_t>(d.delta_state_in);
+                const std::uintptr_t backing_addr =
+                    reinterpret_cast<std::uintptr_t>(d.delta_state_out);
+                const bool descriptor_alias_contract =
+                    d.delta_state_in != nullptr &&
+                    d.delta_state_out != nullptr &&
+                    backing_addr <=
+                        std::numeric_limits<std::uintptr_t>::max() - gdnAttentionBytes &&
+                    backing_addr + gdnAttentionBytes == state_in_addr;
+                if (descriptor_alias_contract &&
+                    (!try_metal_gdn_inplace_state ||
+                     ggml_nbytes(gdn) != gdnResultBytes))
+                {
+                    set_last_error(
+                        "Qwen3.5 model decode: Metal GDN state alias contract "
+                        "was supplied but the K=1 result geometry is unsupported.");
+                    if (persist)
+                        ggml_free(ctx);
+                    return 0;
+                }
+                t.delta_state_inplace =
+                    descriptor_alias_contract && try_metal_gdn_inplace_state;
+                if (!t.delta_state_inplace)
+                {
+                    ggml_tensor* new_state = ggml_view_4d(ctx, gdn,
+                        head_k_dim, head_v_dim, num_v_heads, 1,
+                        ggml_row_size(gdn->type, head_k_dim),
+                        ggml_row_size(gdn->type, head_k_dim * head_v_dim),
+                        ggml_row_size(gdn->type, head_k_dim * head_v_dim * num_v_heads),
+                        ggml_row_size(gdn->type, head_v_dim * num_v_heads));
+                    // Default/non-Metal path: copy the result tail back into
+                    // the separately-bound persistent state tensor.
+                    t.delta_state_out = ggml_cpy(ctx, new_state, state4);
+                }
 
                 // gated RMSNorm: rms_norm(core, ssm_norm) * silu(z)
-                ggml_tensor* out_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, gdn_out), head_v_dim, num_v_heads);
+                // gdn_out is the dense leading slice of the fused op's result;
+                // reshape its view directly instead of copying it once per layer.
+                ggml_tensor* out_2d = ggml_reshape_2d(ctx, gdn_out, head_v_dim, num_v_heads);
                 ggml_tensor* out_n = ggml_mul(ctx, ggml_rms_norm(ctx, out_2d, eps), t.ssm_norm_w);
                 ggml_tensor* z_2d = ggml_reshape_2d(ctx, z, head_v_dim, num_v_heads);
                 ggml_tensor* gated = ggml_mul(ctx, out_n, ggml_silu(ctx, z_2d));
@@ -1088,12 +1401,10 @@ namespace
             ggml_tensor* ffn_down;
             if (d.is_moe == 0)
             {
-                // dense SwiGLU: fused silu(gate)*up over the packed [gate|up] matmul
-                // output (gate-first, matching ggml_swiglu swapped=false). One gated
-                // kernel instead of a cont + standalone silu + separate mul — fewer op
-                // dispatches, which matters most on backends without graph capture (Vulkan).
-                ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed_2d); // [2*ffDense, 1]
-                ggml_tensor* act_2d = ggml_swiglu(ctx, gu);                 // [ffDense, 1]
+                // Dense SwiGLU over the packed gate/up projection is faster than
+                // splitting it into two Metal matmuls for this quantized model.
+                ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed_2d);
+                ggml_tensor* act_2d = ggml_swiglu(ctx, gu);
                 ggml_tensor* down_mm = ggml_mul_mat(ctx, t.down_w, act_2d);
                 ffn_down = ggml_reshape_1d(ctx, down_mm, H);
                 if (tp_mode) { tp_partial.push_back(down_mm); tp_boundary.push_back(ffn_down); }
@@ -1166,24 +1477,25 @@ namespace
         }
 
         ggml_tensor* hidden_out;
-        ggml_tensor* out_cpy;
+        ggml_tensor* graph_out;
         if (fold)
         {
             // Final RMSNorm * weight, then lm_head -> logits, folded into the graph
             // so the lm_head matmul + the 248K-vocab output are part of the captured
-            // replay (no separate per-token lm_head graph_compute / submit).
+            // replay (no separate per-token lm_head graph_compute / submit). Use the
+            // matmul result itself as the downloadable graph output, matching
+            // llama.cpp and avoiding an extra full-vocabulary device copy.
             ggml_tensor* fn = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), final_norm_t);
             ggml_tensor* fn_2d = ggml_reshape_2d(ctx, fn, H, 1);
-            ggml_tensor* logits = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lm_head_t, fn_2d), vocab_size);
-            hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab_size);
-            out_cpy = ggml_cpy(ctx, logits, hidden_out);
+            hidden_out = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lm_head_t, fn_2d), vocab_size);
+            graph_out = hidden_out;
         }
         else
         {
             hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-            out_cpy = ggml_cpy(ctx, hidden, hidden_out);
+            graph_out = ggml_cpy(ctx, hidden, hidden_out);
         }
-        ggml_set_output(out_cpy);
+        ggml_set_output(graph_out);
 
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 160 + 512;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
@@ -1191,18 +1503,31 @@ namespace
         {
             if (layers[l].is_recurrent == 0)
             {
-                ggml_build_forward_expand(graph, lt[l].k_cpy);
-                ggml_build_forward_expand(graph, lt[l].v_cpy);
+                if (!lt[l].k_set_rows.empty())
+                {
+                    for (ggml_tensor* write : lt[l].k_set_rows)
+                        ggml_build_forward_expand(graph, write);
+                    for (ggml_tensor* write : lt[l].v_set_rows)
+                        ggml_build_forward_expand(graph, write);
+                }
+                else
+                {
+                    ggml_build_forward_expand(graph, lt[l].k_cpy);
+                    ggml_build_forward_expand(graph, lt[l].v_cpy);
+                }
             }
             else
             {
                 ggml_set_output(lt[l].conv_state_out);
-                ggml_set_output(lt[l].delta_state_out);
                 ggml_build_forward_expand(graph, lt[l].conv_state_out);
-                ggml_build_forward_expand(graph, lt[l].delta_state_out);
+                if (lt[l].delta_state_out != nullptr)
+                {
+                    ggml_set_output(lt[l].delta_state_out);
+                    ggml_build_forward_expand(graph, lt[l].delta_state_out);
+                }
             }
         }
-        ggml_build_forward_expand(graph, out_cpy);
+        ggml_build_forward_expand(graph, graph_out);
 
         // --- bind tensors ---
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -1211,7 +1536,8 @@ namespace
         std::vector<BufferHandle> ephemeral_bufs;
 
         auto bind_or_mark = [&](ggml_tensor* tgt, void* data, std::size_t bytes, bool cacheable,
-                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+                                bool force_upload = false) {
             if (tgt == nullptr || data == nullptr) return;
             if (cacheable && bytes >= 4096)
             {
@@ -1222,7 +1548,8 @@ namespace
                 {
                     if (ggml_backend_tensor_alloc(buf, tgt, addr) == GGML_STATUS_SUCCESS)
                     {
-                        if (needs_upload) upload_list.push_back({tgt, data, bytes});
+                        if (needs_upload || force_upload)
+                            upload_list.push_back({tgt, data, bytes});
                         return;
                     }
                     invalidate_cached_buffer(data);
@@ -1235,14 +1562,65 @@ namespace
                 {
                     if (!cacheable) ephemeral_bufs.emplace_back(buf);
                     if (ggml_backend_tensor_alloc(buf, tgt, data) == GGML_STATUS_SUCCESS)
+                    {
+                        if (force_upload)
+                            upload_list.push_back({tgt, data, bytes});
                         return;
+                    }
                 }
             }
             upload_list.push_back({tgt, data, bytes});
         };
 
-        const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
-        const std::size_t deltaStateBytes = static_cast<std::size_t>(head_k_dim) * head_v_dim * num_v_heads * sizeof(float);
+        auto bind_metal_gdn_state_alias = [&](LayerTensors& t,
+                                              const TSGgmlQwen35LayerDesc& d) {
+            ggml_backend_buffer_t result_buf = nullptr;
+            void* result_addr = nullptr;
+            bool needs_upload = false;
+            if (!try_get_cacheable_tensor_buffer(
+                    g_backend,
+                    dev,
+                    t.gdn_result,
+                    d.delta_state_out,
+                    gdnResultBytes,
+                    result_buf,
+                    result_addr,
+                    needs_upload,
+                    GGML_BACKEND_BUFFER_USAGE_COMPUTE))
+            {
+                return false;
+            }
+
+            const std::size_t alignment =
+                ggml_backend_buffer_get_alignment(result_buf);
+            if (alignment == 0 || gdnAttentionBytes % alignment != 0 ||
+                ggml_backend_tensor_alloc(result_buf, t.gdn_result, result_addr) !=
+                    GGML_STATUS_SUCCESS)
+            {
+                invalidate_cached_buffer(d.delta_state_out);
+                return false;
+            }
+
+            void* state_addr =
+                static_cast<void*>(static_cast<char*>(result_addr) + gdnAttentionBytes);
+            if (ggml_backend_tensor_alloc(
+                    result_buf,
+                    t.delta_state_in,
+                    state_addr) != GGML_STATUS_SUCCESS)
+            {
+                invalidate_cached_buffer(d.delta_state_out);
+                return false;
+            }
+
+            // The attention prefix is produced before it is read. Seed only the
+            // state tail, either when this cached buffer is new or after a
+            // managed reset/prefill made the host state authoritative.
+            if (needs_upload || reseed_metal_state)
+                upload_list.push_back(
+                    {t.delta_state_in, d.delta_state_in, deltaStateBytes});
+            return true;
+        };
+
         for (int l = 0; l < num_layers; l++)
         {
             const TSGgmlQwen35LayerDesc& d = layers[l];
@@ -1292,12 +1670,32 @@ namespace
                 bind_or_mark(t.ssm_a_w, d.ssm_a_w, static_cast<std::size_t>(num_v_heads) * sizeof(float), true);
                 bind_or_mark(t.ssm_norm_w, d.ssm_norm_w, static_cast<std::size_t>(head_v_dim) * sizeof(float), true);
                 bind_or_mark(t.ssm_out_w, d.ssm_out_w, static_cast<std::size_t>(d.ssm_out_bytes), true);
-                // GDN recurrent state is device-resident across decode tokens
-                // (cacheable COMPUTE buffer, updated in-place each token); the C#
-                // seed path invalidates these on (re)seed so the host state is
-                // re-uploaded. Mirrors the KV-cache binding.
-                bind_or_mark(t.conv_state_in, d.conv_state_in, convStateBytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-                bind_or_mark(t.delta_state_in, d.delta_state_in, deltaStateBytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                // GDN recurrent state is device-resident across decode tokens.
+                // A Metal graph miss can still find an existing host-keyed device
+                // buffer, so a requested logical re-seed must force the current
+                // descriptor bytes into that binding even when the cache lookup
+                // reports that no initial upload is needed.
+                bind_or_mark(
+                    t.conv_state_in, d.conv_state_in, convStateBytes, true,
+                    GGML_BACKEND_BUFFER_USAGE_COMPUTE, reseed_metal_state);
+                if (t.delta_state_inplace)
+                {
+                    if (!bind_metal_gdn_state_alias(t, d))
+                    {
+                        set_last_error(
+                            "Qwen3.5 model decode: failed to bind the Metal GDN "
+                            "result/state alias buffer.");
+                        if (persist)
+                            ggml_free(ctx);
+                        return 0;
+                    }
+                }
+                else
+                {
+                    bind_or_mark(
+                        t.delta_state_in, d.delta_state_in, deltaStateBytes, true,
+                        GGML_BACKEND_BUFFER_USAGE_COMPUTE, reseed_metal_state);
+                }
             }
         }
         if (fold)
@@ -1305,13 +1703,21 @@ namespace
             bind_or_mark(lm_head_t, const_cast<void*>(lm_head_data), static_cast<std::size_t>(lm_head_bytes), true);
             bind_or_mark(final_norm_t, const_cast<void*>(final_norm_data), static_cast<std::size_t>(H) * sizeof(float), true);
         }
+        if (token_input)
+        {
+            bind_or_mark(token_embd_t, const_cast<void*>(token_embd_data),
+                static_cast<std::size_t>(token_embd_bytes), true);
+        }
+
+        optimize_graph_for_metal(graph);
 
         BufferHandle buffer(nullptr);
         ggml_backend_buffer_t persist_buf = nullptr;
         if (persist)
         {
-            // STABLE addresses for CUDA-graph capture: give every tensor its own
-            // slot (no gallocr lifetime packing, whose plan can move addresses).
+            // Stable unique slots are faster than lifetime-packed scratch for
+            // this replayed Metal graph and retain capture-safe addresses on
+            // CUDA/Vulkan.
             persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (persist_buf == nullptr)
             {
@@ -1320,11 +1726,13 @@ namespace
                 return 0;
             }
             if (vram_log_enabled())
-                vram_log("q35-decode-persist", static_cast<std::int64_t>(ggml_backend_buffer_get_size(persist_buf)));
+                vram_log("q35-decode-persist",
+                    static_cast<std::int64_t>(
+                        ggml_backend_buffer_get_size(persist_buf)));
         }
         else
         {
-            // Non-persist (Metal): the whole-model GDN decode graph must NOT use the
+            // Non-persist fallback: the whole-model GDN decode graph must NOT use the
             // shared reuse gallocr. Its lifetime-packing mis-aliases this graph's
             // intermediates across the gated_delta_net + in-place recurrent-state
             // ggml_cpy chain, so the packed scratch retains the PREVIOUS token's
@@ -1380,13 +1788,24 @@ namespace
             }
         }
 
-        ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
+        if (token_input)
+        {
+            std::int32_t token_val = token_id;
+            ggml_backend_tensor_set(token_t, &token_val, 0, sizeof(token_val));
+        }
+        else
+        {
+            ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
+        }
         std::int32_t pos_val = position;
         ggml_backend_tensor_set(pos_tensor, &pos_val, 0, sizeof(std::int32_t));
         if (persist)
         {
-            std::int64_t kv_idx = position;
-            ggml_backend_tensor_set(shared_kv_index, &kv_idx, 0, sizeof(std::int64_t));
+            if (shared_kv_index != nullptr)
+            {
+                std::int64_t kv_idx = position;
+                ggml_backend_tensor_set(shared_kv_index, &kv_idx, 0, sizeof(std::int64_t));
+            }
             std::vector<ggml_fp16_t> mask_data;
             fill_flash_attn_mask(mask_data, attnKvLen, totalSeqLen);
             ggml_backend_tensor_set(shared_attn_mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
@@ -1396,6 +1815,20 @@ namespace
             ggml_backend_tensor_set(ep_lut, ep_lut_data.data(), 0, ep_lut_data.size() * sizeof(std::int32_t));
             ggml_backend_tensor_set(ep_mask, ep_mask_data.data(), 0, ep_mask_data.size() * sizeof(float));
         }
+
+        auto retain_gdn_state_handles = [&](Q35DecodeCache* cache) {
+            cache->gdn_layers.clear();
+            cache->gdn_conv_state.clear();
+            cache->gdn_delta_state.clear();
+            for (int l = 0; l < num_layers; ++l)
+            {
+                if (layers[l].is_recurrent == 0)
+                    continue;
+                cache->gdn_layers.push_back(l);
+                cache->gdn_conv_state.push_back(lt[l].conv_state_in);
+                cache->gdn_delta_state.push_back(lt[l].delta_state_in);
+            }
+        };
 
         if (tp_mode)
         {
@@ -1424,12 +1857,31 @@ namespace
             slot->buffer = persist_buf;
             slot->graph = graph;
             slot->hidden_t = hidden_t;
+            slot->token_t = token_t;
             slot->hidden_out = hidden_out;
             slot->pos_tensor = pos_tensor;
             slot->kv_index = shared_kv_index;
             slot->attn_mask = shared_attn_mask;
+            retain_gdn_state_handles(slot);
+            if (use_movable_metal_kv_cpy)
+            {
+                slot->movable_kv_copies.reserve(static_cast<std::size_t>(num_layers) * 2);
+                for (int l = 0; l < num_layers; ++l)
+                {
+                    if (layers[l].is_recurrent != 0)
+                        continue;
+                    slot->movable_kv_copies.push_back(lt[l].k_cpy);
+                    slot->movable_kv_copies.push_back(lt[l].v_cpy);
+                }
+            }
             slot->sig_disc = sig_disc;
             slot->sig_kcache0 = sig_kcache0;
+            slot->sig_token_embd = token_embd_data;
+            slot->token_embd_type = token_embd_type;
+            slot->token_embd_ne0 = token_embd_ne0;
+            slot->token_embd_ne1 = token_embd_ne1;
+            slot->token_embd_bytes = token_embd_bytes;
+            slot->token_input = token_input;
             slot->num_layers = num_layers;
             slot->hidden_size = H;
             slot->window = attnKvLen;
@@ -1441,11 +1893,17 @@ namespace
             return 1;
         }
 
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        ggml_status status = use_metal_async_submit
+            ? ggml_backend_graph_compute_async(g_backend, graph)
+            : ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("Qwen3.5 model decode: graph execution failed.");
-            if (persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
+            if (persist)
+            {
+                ggml_backend_buffer_free(persist_buf);
+                ggml_free(ctx);
+            }
             return 0;
         }
 
@@ -1453,7 +1911,8 @@ namespace
         // folded logits or the bare hidden state.
         const int out_count = fold ? vocab_size : H;
         void* out_data = fold ? logits_data : hidden_data;
-        finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
+        finalize_compute_with_download(hidden_out, out_data,
+            static_cast<std::size_t>(out_count) * sizeof(float));
         if (persist || buffer.value != nullptr) host_read_barrier();
 
         if (persist && dcb != nullptr)
@@ -1463,12 +1922,31 @@ namespace
             dcb->buffer = persist_buf;
             dcb->graph = graph;
             dcb->hidden_t = hidden_t;
+            dcb->token_t = token_t;
             dcb->hidden_out = hidden_out;
             dcb->pos_tensor = pos_tensor;
             dcb->kv_index = shared_kv_index;
             dcb->attn_mask = shared_attn_mask;
+            retain_gdn_state_handles(dcb);
+            if (use_movable_metal_kv_cpy)
+            {
+                dcb->movable_kv_copies.reserve(static_cast<std::size_t>(num_layers) * 2);
+                for (int l = 0; l < num_layers; ++l)
+                {
+                    if (layers[l].is_recurrent != 0)
+                        continue;
+                    dcb->movable_kv_copies.push_back(lt[l].k_cpy);
+                    dcb->movable_kv_copies.push_back(lt[l].v_cpy);
+                }
+            }
             dcb->sig_disc = sig_disc;
             dcb->sig_kcache0 = sig_kcache0;
+            dcb->sig_token_embd = token_embd_data;
+            dcb->token_embd_type = token_embd_type;
+            dcb->token_embd_ne0 = token_embd_ne0;
+            dcb->token_embd_ne1 = token_embd_ne1;
+            dcb->token_embd_bytes = token_embd_bytes;
+            dcb->token_input = token_input;
             dcb->num_layers = num_layers;
             dcb->hidden_size = H;
             dcb->window = attnKvLen;
@@ -1482,7 +1960,7 @@ namespace
 }
 
 TSG_EXPORT int TSGgml_Qwen35ModelDecode(
-    const TSGgmlQwen35LayerDesc* layers, int num_layers,
+    const TSGgmlQwen35LayerDesc* layers, int num_layers, int reseed_state,
     void* hidden_data, int hidden_size, int position,
     int num_heads, int num_kv_heads, int head_dim, int cache_size,
     int rope_n_dims, int rope_mode, int kv_cache_type,
@@ -1498,7 +1976,8 @@ TSG_EXPORT int TSGgml_Qwen35ModelDecode(
     try
     {
         int r = qwen35_model_decode_impl(
-            layers, num_layers, hidden_data, hidden_size, position,
+            layers, num_layers, reseed_state,
+            hidden_data, hidden_size, position,
             num_heads, num_kv_heads, head_dim, cache_size,
             rope_n_dims, rope_mode, kv_cache_type,
             conv_kernel, head_k_dim, head_v_dim, num_k_heads, num_v_heads,
@@ -1519,6 +1998,64 @@ TSG_EXPORT int TSGgml_Qwen35ModelDecode(
     catch (...)
     {
         set_last_error("Unknown error in Qwen3.5 model decode.");
+        return 0;
+    }
+}
+
+// Single-token sibling of TSGgml_Qwen35ModelDecode. Instead of accepting a
+// host-materialized F32 hidden vector, this entry point accepts the token id and
+// the model's (possibly quantized) embedding matrix. The persistent graph keeps
+// the embedding matrix device binding and executes GET_ROWS as its first node,
+// avoiding CPU dequantization plus an H-float upload on every decode token.
+//
+// Tensor parallel callers retain the hidden-input API above because their
+// driver is responsible for distributing the shared hidden state. This path is
+// therefore degree-1 and always folds final norm + lm_head to return logits.
+TSG_EXPORT int TSGgml_Qwen35ModelDecodeToken(
+    const TSGgmlQwen35LayerDesc* layers, int num_layers, int reseed_state,
+    int token_id,
+    const void* token_embd_data, int token_embd_type,
+    std::int64_t token_embd_ne0, std::int64_t token_embd_ne1,
+    std::int64_t token_embd_bytes,
+    int hidden_size, int position,
+    int num_heads, int num_kv_heads, int head_dim, int cache_size,
+    int rope_n_dims, int rope_mode, int kv_cache_type,
+    int conv_kernel, int head_k_dim, int head_v_dim, int num_k_heads, int num_v_heads,
+    float eps, float rope_base, float rope_freq_scale,
+    int num_experts, int num_experts_used, int expert_ff, int shared_ff,
+    int norm_topk, float expert_weights_scale,
+    void* logits_data, int vocab_size,
+    const void* lm_head_data, int lm_head_type,
+    std::int64_t lm_head_ne0, std::int64_t lm_head_ne1,
+    std::int64_t lm_head_bytes,
+    const void* final_norm_data)
+{
+    try
+    {
+        return qwen35_model_decode_impl(
+            layers, num_layers, reseed_state,
+            nullptr, hidden_size, position,
+            num_heads, num_kv_heads, head_dim, cache_size,
+            rope_n_dims, rope_mode, kv_cache_type,
+            conv_kernel, head_k_dim, head_v_dim, num_k_heads, num_v_heads,
+            eps, rope_base, rope_freq_scale,
+            num_experts, num_experts_used, expert_ff, shared_ff,
+            norm_topk, expert_weights_scale,
+            logits_data, vocab_size,
+            lm_head_data, lm_head_type, lm_head_ne0, lm_head_ne1, lm_head_bytes,
+            final_norm_data,
+            1, nullptr,
+            token_id, token_embd_data, token_embd_type,
+            token_embd_ne0, token_embd_ne1, token_embd_bytes);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in Qwen3.5 token-input model decode.");
         return 0;
     }
 }
@@ -2256,4 +2793,3 @@ TSG_EXPORT void TSGgml_Qwen35ResetBatchedDecodeCache()
 {
     g_q35bdc.reset();
 }
-

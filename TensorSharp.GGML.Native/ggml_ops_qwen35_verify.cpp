@@ -480,9 +480,12 @@ namespace
 
         ggml_tensor* kv_index = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, N);
         ggml_tensor* attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, window, N, 1, 1);
+        const bool uses_dynamic_kv_index =
+            !(g_backend_type == BACKEND_TYPE_METAL && !fv_persist);
         ggml_set_input(hidden_t);
         ggml_set_input(pos_tensor);
-        ggml_set_input(kv_index);
+        if (uses_dynamic_kv_index)
+            ggml_set_input(kv_index);
         ggml_set_input(attn_mask);
         std::vector<std::int64_t> kv_index_data(N);
         for (int i = 0; i < N; i++) kv_index_data[i] = start_pos + i;
@@ -709,6 +712,10 @@ namespace
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * (260 + 2 * num_kv_heads) + 1024;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
         ggml_tensor* hidden = hidden_t;
+        // llama.cpp feeds strided head/token views directly to Metal's norm, CPY,
+        // and gated-delta-net kernels. Keep the established materialized layout on
+        // CUDA/Vulkan, whose capture/replay paths were validated with those CONTs.
+        const bool metal_strided_views = g_backend_type == BACKEND_TYPE_METAL;
         for (int l = 0; l < num_layers; l++)
         {
             const TSGgmlQwen35LayerDesc& d = layers[l];
@@ -735,18 +742,39 @@ namespace
                     v_raw = ggml_view_2d(ctx, qkv_out, kDim, N, qkv_out->nb[1], static_cast<std::size_t>(qFullDim + kDim) * sizeof(float));
                 }
 
-                ggml_tensor* qg_4d = ggml_reshape_4d(ctx, ggml_cont(ctx, qg_part), head_dim, 2, num_heads, N);
+                // Separate Q/K/V projections are already contiguous matmul outputs.
+                // A fused-QKV row slice remains strided and still needs materializing.
+                ggml_tensor* qg_dense =
+                    metal_strided_views && d.separate_qkv != 0 ? qg_part : ggml_cont(ctx, qg_part);
+                ggml_tensor* k_dense =
+                    metal_strided_views && d.separate_qkv != 0 ? k_raw : ggml_cont(ctx, k_raw);
+                ggml_tensor* v_dense =
+                    metal_strided_views && d.separate_qkv != 0 ? v_raw : ggml_cont(ctx, v_raw);
+                ggml_tensor* qg_4d = ggml_reshape_4d(ctx, qg_dense, head_dim, 2, num_heads, N);
                 ggml_tensor* q_view = ggml_view_3d(ctx, qg_4d, head_dim, num_heads, N, qg_4d->nb[2], qg_4d->nb[3], 0);
                 ggml_tensor* gate_view = ggml_view_3d(ctx, qg_4d, head_dim, num_heads, N, qg_4d->nb[2], qg_4d->nb[3], qg_4d->nb[1]);
-                ggml_tensor* q_cont = ggml_cont(ctx, q_view);       // [head_dim, num_heads, N]
                 ggml_tensor* gate_cont = ggml_cont(ctx, gate_view); // [head_dim, num_heads, N]
-                ggml_tensor* k_3d_raw = ggml_reshape_3d(ctx, ggml_cont(ctx, k_raw), head_dim, num_kv_heads, N);
-                ggml_tensor* v_3d_raw = ggml_reshape_3d(ctx, ggml_cont(ctx, v_raw), head_dim, num_kv_heads, N);
+                ggml_tensor* k_3d_raw = ggml_reshape_3d(ctx, k_dense, head_dim, num_kv_heads, N);
+                ggml_tensor* v_3d_raw = ggml_reshape_3d(ctx, v_dense, head_dim, num_kv_heads, N);
 
-                ggml_tensor* q_norm_in = ggml_reshape_2d(ctx, q_cont, head_dim, num_heads * N);
-                ggml_tensor* k_norm_in = ggml_reshape_2d(ctx, k_3d_raw, head_dim, num_kv_heads * N);
-                ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_norm_in, eps), t.q_norm_w);
-                ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_norm_in, eps), t.k_norm_w);
+                ggml_tensor* q_normed;
+                ggml_tensor* k_normed;
+                if (metal_strided_views)
+                {
+                    // Q is interleaved with its gate, but every head row is dense.
+                    // Metal consumes the explicit strides, as llama.cpp's Qwen35
+                    // graph does, and the norm outputs themselves are contiguous.
+                    q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_view, eps), t.q_norm_w);
+                    k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_3d_raw, eps), t.k_norm_w);
+                }
+                else
+                {
+                    ggml_tensor* q_cont = ggml_cont(ctx, q_view); // [head_dim, num_heads, N]
+                    ggml_tensor* q_norm_in = ggml_reshape_2d(ctx, q_cont, head_dim, num_heads * N);
+                    ggml_tensor* k_norm_in = ggml_reshape_2d(ctx, k_3d_raw, head_dim, num_kv_heads * N);
+                    q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_norm_in, eps), t.q_norm_w);
+                    k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_norm_in, eps), t.k_norm_w);
+                }
 
                 ggml_tensor* q_4d = ggml_reshape_4d(ctx, q_normed, head_dim, num_heads, N, 1);
                 ggml_tensor* k_4d = ggml_reshape_4d(ctx, k_normed, head_dim, num_kv_heads, N, 1);
@@ -772,26 +800,42 @@ namespace
                 ggml_tensor* v_3d_pre = ggml_reshape_4d(ctx, v_3d_raw, head_dim, num_kv_heads, N, 1);
                 ggml_tensor* v_fresh = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, v_3d_pre, 0, 2, 1, 3)), head_dim, N, num_kv_heads);
 
-                // KV write: a 2D ggml_set_rows PER HEAD — dst [head_dim, cache_size]
-                // (a contiguous ne2 slice of the head-major cache), src [head_dim, N],
-                // idx [N]. This is EXACTLY llama.cpp's proven 2D set_rows shape
-                // (n_embd_gqa == head_dim for one head). The single 3D N-row set_rows
-                // (heads broadcast via ne2) is the untested combo that faults on
-                // cgraph reuse (the decode is fine only because it writes N=1). The
-                // write position is an I64 INPUT (kv_index), keeping the graph constant
-                // within a window stride for reuse/capture.
-                for (int h = 0; h < num_kv_heads; h++)
+                if (g_backend_type == BACKEND_TYPE_METAL && !fv_persist)
                 {
-                    ggml_tensor* k_dst_h = ggml_view_2d(ctx, t.k_cache_base, head_dim, cache_size,
-                        t.k_cache_base->nb[1], static_cast<std::size_t>(h) * t.k_cache_base->nb[2]);
-                    ggml_tensor* v_dst_h = ggml_view_2d(ctx, t.v_cache_base, head_dim, cache_size,
-                        t.v_cache_base->nb[1], static_cast<std::size_t>(h) * t.v_cache_base->nb[2]);
-                    ggml_tensor* k_src_h = ggml_view_2d(ctx, k_fresh, head_dim, N,
-                        k_fresh->nb[1], static_cast<std::size_t>(h) * k_fresh->nb[2]);
-                    ggml_tensor* v_src_h = ggml_view_2d(ctx, v_fresh, head_dim, N,
-                        v_fresh->nb[1], static_cast<std::size_t>(h) * v_fresh->nb[2]);
-                    ggml_build_forward_expand(graph, ggml_set_rows(ctx, k_dst_h, k_src_h, kv_index));
-                    ggml_build_forward_expand(graph, ggml_set_rows(ctx, v_dst_h, v_src_h, kv_index));
+                    // A prefill graph is one-shot and already keyed by start_pos,
+                    // so bake the contiguous destination offset into a cache view.
+                    // This is the same cpy-based linear KV write used by llama.cpp
+                    // and avoids Metal's fragile multi-dimensional set_rows path.
+                    const std::size_t kv_offset =
+                        static_cast<std::size_t>(start_pos) * t.k_cache_base->nb[1];
+                    ggml_tensor* k_dst = ggml_view_3d(ctx, t.k_cache_base,
+                        head_dim, N, num_kv_heads,
+                        t.k_cache_base->nb[1], t.k_cache_base->nb[2], kv_offset);
+                    ggml_tensor* v_dst = ggml_view_3d(ctx, t.v_cache_base,
+                        head_dim, N, num_kv_heads,
+                        t.v_cache_base->nb[1], t.v_cache_base->nb[2], kv_offset);
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx, k_fresh, k_dst));
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx, v_fresh, v_dst));
+                }
+                else
+                {
+                    // Dynamic KV write: a 2D ggml_set_rows PER HEAD — dst
+                    // [head_dim, cache_size], src [head_dim, N], idx [N].
+                    // The position input keeps persistent CUDA/Vulkan graph
+                    // topology constant within an attention-window stride.
+                    for (int h = 0; h < num_kv_heads; h++)
+                    {
+                        ggml_tensor* k_dst_h = ggml_view_2d(ctx, t.k_cache_base, head_dim, cache_size,
+                            t.k_cache_base->nb[1], static_cast<std::size_t>(h) * t.k_cache_base->nb[2]);
+                        ggml_tensor* v_dst_h = ggml_view_2d(ctx, t.v_cache_base, head_dim, cache_size,
+                            t.v_cache_base->nb[1], static_cast<std::size_t>(h) * t.v_cache_base->nb[2]);
+                        ggml_tensor* k_src_h = ggml_view_2d(ctx, k_fresh, head_dim, N,
+                            k_fresh->nb[1], static_cast<std::size_t>(h) * k_fresh->nb[2]);
+                        ggml_tensor* v_src_h = ggml_view_2d(ctx, v_fresh, head_dim, N,
+                            v_fresh->nb[1], static_cast<std::size_t>(h) * v_fresh->nb[2]);
+                        ggml_build_forward_expand(graph, ggml_set_rows(ctx, k_dst_h, k_src_h, kv_index));
+                        ggml_build_forward_expand(graph, ggml_set_rows(ctx, v_dst_h, v_src_h, kv_index));
+                    }
                 }
 
                 // Attend over the fixed window [0, window) (now holds the N fresh rows);
@@ -868,28 +912,69 @@ namespace
                 ggml_tensor* conv_input = ggml_concat(ctx, t.conv_state_in, ggml_transpose(ctx, qkv_mixed), 0); // [convDim+N, conv_dim]
                 ggml_tensor* conv_out = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, t.conv1d_w)); // [conv_dim, N]
                 // new conv state = the last convDim timesteps (rows [N, N+convDim)).
-                ggml_tensor* new_conv = ggml_cont(ctx, ggml_view_2d(ctx, conv_input, convDim, conv_dim, conv_input->nb[1], static_cast<std::size_t>(N) * conv_input->nb[0]));
+                ggml_tensor* new_conv_view = ggml_view_2d(ctx, conv_input, convDim, conv_dim,
+                    conv_input->nb[1], static_cast<std::size_t>(N) * conv_input->nb[0]);
+                ggml_tensor* new_conv =
+                    metal_strided_views ? new_conv_view : ggml_cont(ctx, new_conv_view);
                 // Resident: write the post-window conv state IN-PLACE to conv_state_in
                 // (the device-resident buffer); host mode: to the shared-state-buffer
                 // out slice.
                 t.conv_state_out = ggml_cpy(ctx, new_conv, resident_state ? t.conv_state_in : t.conv_state_out);
-
-                ggml_tensor* q_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out, key_dim, N, conv_out->nb[1], 0));
-                ggml_tensor* k_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out, key_dim, N, conv_out->nb[1], static_cast<std::size_t>(key_dim) * sizeof(float)));
-                ggml_tensor* v_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out, value_dim, N, conv_out->nb[1], static_cast<std::size_t>(2 * key_dim) * sizeof(float)));
 
                 // l2-norm over head_k_dim. q/k keep num_k_heads heads: the fused
                 // gated_delta_net kernel broadcasts each v-head h to k-head (h % num_k_heads)
                 // internally (kernel iq1 = h_idx % neqk1, neqk1 = q->ne[1]), so pre-tiling
                 // q/k up to num_v_heads via concat+cont (~2% of prefill, 4 concats/layer)
                 // is redundant — llama.cpp's fused GDN path passes the un-tiled q/k too.
-                ggml_tensor* q_hn = ggml_l2_norm(ctx, ggml_reshape_2d(ctx, q_part, head_k_dim, num_k_heads * N), eps);
-                ggml_tensor* k_hn = ggml_l2_norm(ctx, ggml_reshape_2d(ctx, k_part, head_k_dim, num_k_heads * N), eps);
-                ggml_tensor* q4 = ggml_reshape_4d(ctx, q_hn, head_k_dim, num_k_heads, N, 1);
-                ggml_tensor* k4 = ggml_reshape_4d(ctx, k_hn, head_k_dim, num_k_heads, N, 1);
-                ggml_tensor* v4 = ggml_reshape_4d(ctx, v_part, head_v_dim, num_v_heads, N, 1);
-                ggml_tensor* g4 = ggml_reshape_4d(ctx, ggml_cont(ctx, g_all), 1, num_v_heads, N, 1);
-                ggml_tensor* beta4 = ggml_reshape_4d(ctx, ggml_cont(ctx, beta_all), 1, num_v_heads, N, 1);
+                ggml_tensor* q4;
+                ggml_tensor* k4;
+                ggml_tensor* v4;
+                if (metal_strided_views)
+                {
+                    // conv_out is [Q|K|V, token]. Preserve that token stride in
+                    // 4D views instead of copying all three slices. Metal's GDN
+                    // kernel advances tokens with nb[2], matching llama.cpp.
+                    const std::size_t token_stride = conv_out->nb[1];
+                    const std::size_t sequence_stride = token_stride * static_cast<std::size_t>(N);
+                    ggml_tensor* q_view = ggml_view_4d(ctx, conv_out,
+                        head_k_dim, num_k_heads, N, 1,
+                        ggml_row_size(conv_out->type, head_k_dim),
+                        token_stride, sequence_stride, 0);
+                    ggml_tensor* k_view = ggml_view_4d(ctx, conv_out,
+                        head_k_dim, num_k_heads, N, 1,
+                        ggml_row_size(conv_out->type, head_k_dim),
+                        token_stride, sequence_stride,
+                        ggml_row_size(conv_out->type, key_dim));
+                    v4 = ggml_view_4d(ctx, conv_out,
+                        head_v_dim, num_v_heads, N, 1,
+                        ggml_row_size(conv_out->type, head_v_dim),
+                        token_stride, sequence_stride,
+                        ggml_row_size(conv_out->type, 2 * key_dim));
+                    q4 = ggml_l2_norm(ctx, q_view, eps);
+                    k4 = ggml_l2_norm(ctx, k_view, eps);
+                }
+                else
+                {
+                    ggml_tensor* q_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out,
+                        key_dim, N, conv_out->nb[1], 0));
+                    ggml_tensor* k_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out,
+                        key_dim, N, conv_out->nb[1], static_cast<std::size_t>(key_dim) * sizeof(float)));
+                    ggml_tensor* v_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out,
+                        value_dim, N, conv_out->nb[1], static_cast<std::size_t>(2 * key_dim) * sizeof(float)));
+                    ggml_tensor* q_hn = ggml_l2_norm(ctx,
+                        ggml_reshape_2d(ctx, q_part, head_k_dim, num_k_heads * N), eps);
+                    ggml_tensor* k_hn = ggml_l2_norm(ctx,
+                        ggml_reshape_2d(ctx, k_part, head_k_dim, num_k_heads * N), eps);
+                    q4 = ggml_reshape_4d(ctx, q_hn, head_k_dim, num_k_heads, N, 1);
+                    k4 = ggml_reshape_4d(ctx, k_hn, head_k_dim, num_k_heads, N, 1);
+                    v4 = ggml_reshape_4d(ctx, v_part, head_v_dim, num_v_heads, N, 1);
+                }
+                ggml_tensor* g4 = ggml_reshape_4d(ctx,
+                    metal_strided_views ? g_all : ggml_cont(ctx, g_all),
+                    1, num_v_heads, N, 1);
+                ggml_tensor* beta4 = ggml_reshape_4d(ctx,
+                    metal_strided_views ? beta_all : ggml_cont(ctx, beta_all),
+                    1, num_v_heads, N, 1);
                 ggml_tensor* state4 = ggml_reshape_4d(ctx, t.delta_state_in, head_k_dim, head_v_dim, num_v_heads, 1);
 
                 // K=1: the op recurs over all N tokens internally and emits the per-
@@ -912,7 +997,9 @@ namespace
                 t.delta_state_out = ggml_cpy(ctx, new_state, resident_state ? state4 : t.delta_state_out);
 
                 // gated RMSNorm with z, per token: rms_norm(out) * ssm_norm * silu(z).
-                ggml_tensor* out_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, gdn_out), head_v_dim, num_v_heads * N);
+                ggml_tensor* out_2d = ggml_reshape_2d(ctx,
+                    metal_strided_views ? gdn_out : ggml_cont(ctx, gdn_out),
+                    head_v_dim, num_v_heads * N);
                 ggml_tensor* out_n = ggml_mul(ctx, ggml_rms_norm(ctx, out_2d, eps), t.ssm_norm_w);
                 ggml_tensor* out_n_3d = ggml_reshape_3d(ctx, out_n, head_v_dim, num_v_heads, N);
                 ggml_tensor* z_3d = ggml_reshape_3d(ctx, z_all, head_v_dim, num_v_heads, N);
@@ -934,13 +1021,8 @@ namespace
             ggml_tensor* ffn_out;
             if (d.is_moe == 0)
             {
-                ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed); // [2*ffDense, N]
-                // Fused SwiGLU over the packed [gate|up] matmul output: silu(gate)*up
-                // in one gated kernel. Avoids materializing the two halves via cont
-                // (strided view -> contiguous, 2x ~ffDense*N) plus a standalone silu and
-                // a separate mul — the split path was ~1GB extra VRAM traffic per dense
-                // FFN layer. gu is laid out gate-first, matching ggml_swiglu (swapped=false).
-                ggml_tensor* act = ggml_swiglu(ctx, gu); // [ffDense, N]
+                ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed);
+                ggml_tensor* act = ggml_swiglu(ctx, gu);
                 ffn_out = ggml_mul_mat(ctx, t.down_w, act); // [H, N]
                 if (tp_mode) { tp_partial.push_back(ffn_out); tp_boundary.push_back(ffn_out); }
             }
@@ -1182,6 +1264,8 @@ namespace
         bind_or_mark(lm_head_t, const_cast<void*>(lm_head_data), static_cast<std::size_t>(lm_head_bytes), true);
         bind_or_mark(final_norm_t, const_cast<void*>(final_norm_data), static_cast<std::size_t>(H) * sizeof(float), true);
 
+        optimize_graph_for_metal(graph);
+
         // Persist: give every still-unbound tensor (intermediates, inputs, outputs,
         // small weights) its OWN stable slot via alloc_ctx_tensors. Own slots (no
         // lifetime packing / buffer aliasing) are REQUIRED for ggml-cuda's CUDA-graph
@@ -1239,7 +1323,8 @@ namespace
             for (int i = 0; i < N; i++) pos_vals[i] = start_pos + i;
             ggml_backend_tensor_set(pos_tensor, pos_vals.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int32_t));
         }
-        ggml_backend_tensor_set(kv_index, kv_index_data.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int64_t));
+        if (uses_dynamic_kv_index)
+            ggml_backend_tensor_set(kv_index, kv_index_data.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int64_t));
         ggml_backend_tensor_set(attn_mask, attn_mask_data.data(), 0, attn_mask_data.size() * sizeof(ggml_fp16_t));
         if (!resident_state)
         {
@@ -1302,7 +1387,15 @@ namespace
             std::snprintf(tag, sizeof(tag), "q35-verify-compute-begin(N=%d)", N);
             vram_log(tag, 0);
         }
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        // On Metal, submit without waiting so the CPU can enqueue the 48 conv-state
+        // and 48 delta-state downloads while the long prefill graph is running.
+        // The final host_read_barrier below remains the single synchronization
+        // point. Other backends retain their established synchronous path.
+        ggml_status status =
+            g_backend_type == BACKEND_TYPE_METAL &&
+            g_async_compute_enabled.load(std::memory_order_acquire)
+                ? ggml_backend_graph_compute_async(g_backend, graph)
+                : ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             if (persist_buf != nullptr) ggml_backend_buffer_free(persist_buf);
@@ -1424,12 +1517,22 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
 // the plans reference per-rank gallocr buffers).
 TSG_EXPORT void TSGgml_Qwen35ReleaseVerifyTpGraphs()
 {
+    // This is the model-teardown hook for both TP and single-device Qwen35.
+    // Drop graphs before their shared recurrent-state buffer so Metal residency
+    // sets do not retain a live allocation past backend destruction.
+    reset_qwen35_verify_cache();
     for (int r = 0; r < TSG_MAX_DEVICES; ++r)
     {
-        if (g_q35v_tp[r].plan.graph == nullptr && g_q35v_tp[r].context.value == nullptr)
-            continue;
         tsg::ScopedRank rank(r);
-        g_q35v_tp[r].reset();
+        if (g_q35v_tp[r].plan.graph != nullptr || g_q35v_tp[r].context.value != nullptr)
+            g_q35v_tp[r].reset();
+        if (g_q35v_state_bufs[r] != nullptr)
+        {
+            ggml_backend_buffer_free(g_q35v_state_bufs[r]);
+            g_q35v_state_bufs[r] = nullptr;
+            g_q35v_state_buf_sizes[r] = 0;
+            g_q35v_state_backends[r] = nullptr;
+        }
     }
 }
 
@@ -1440,4 +1543,3 @@ TSG_EXPORT void TSGgml_Qwen35ResetVerifyCache()
 {
     reset_qwen35_verify_cache();
 }
-

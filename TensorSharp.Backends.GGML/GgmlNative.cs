@@ -1871,6 +1871,7 @@ internal enum GgmlIndexReductionOp
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Qwen35ModelDecode(
             [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
+            [MarshalAs(UnmanagedType.Bool)] bool reseedState,
             IntPtr hidden, int hiddenSize, int position,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
@@ -1882,6 +1883,24 @@ internal enum GgmlIndexReductionOp
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNorm,
             int tpDegree, [In, Out] IntPtr[] tpPlanOut);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35ModelDecodeToken(
+            [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
+            [MarshalAs(UnmanagedType.Bool)] bool reseedState,
+            int tokenId,
+            IntPtr tokenEmbedding, int tokenEmbeddingType,
+            long tokenEmbeddingNe0, long tokenEmbeddingNe1, long tokenEmbeddingBytes,
+            int hiddenSize, int position,
+            int numHeads, int numKvHeads, int headDim, int cacheSize,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_Qwen35ResetDecodeCache();
@@ -1965,6 +1984,7 @@ internal enum GgmlIndexReductionOp
 
         public static bool Qwen35ModelDecode(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
+            bool reseedState,
             IntPtr hidden, int hiddenSize, int position,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
@@ -1978,7 +1998,8 @@ internal enum GgmlIndexReductionOp
             int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return TSGgml_Qwen35ModelDecode(
-                layers, numLayers, hidden, hiddenSize, position,
+                layers, numLayers, reseedState,
+                hidden, hiddenSize, position,
                 numHeads, numKvHeads, headDim, cacheSize,
                 ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,
@@ -1988,6 +2009,40 @@ internal enum GgmlIndexReductionOp
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm, tpDegree, tpPlanOut) != 0;
+        }
+
+        public static bool Qwen35ModelDecodeToken(
+            Qwen35LayerDecodeArgs[] layers, int numLayers,
+            bool reseedState,
+            int tokenId,
+            IntPtr tokenEmbedding, int tokenEmbeddingType,
+            long tokenEmbeddingNe0, long tokenEmbeddingNe1, long tokenEmbeddingBytes,
+            int hiddenSize, int position,
+            int numHeads, int numKvHeads, int headDim, int cacheSize,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm)
+        {
+            return TSGgml_Qwen35ModelDecodeToken(
+                layers, numLayers, reseedState,
+                tokenId,
+                tokenEmbedding, tokenEmbeddingType,
+                tokenEmbeddingNe0, tokenEmbeddingNe1, tokenEmbeddingBytes,
+                hiddenSize, position,
+                numHeads, numKvHeads, headDim, cacheSize,
+                ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads,
+                eps, ropeBase, ropeFreqScale,
+                numExperts, numExpertsUsed, expertFf, sharedFf,
+                normTopk, expertWeightsScale,
+                logits, vocabSize,
+                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNorm) != 0;
         }
 
         // Qwen3.5/3.6 fused multi-token VERIFY: the whole hybrid transformer over
