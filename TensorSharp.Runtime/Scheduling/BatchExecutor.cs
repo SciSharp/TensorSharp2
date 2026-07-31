@@ -742,6 +742,24 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     bool freshCache = fused.BindSequenceCache(seq.RequestId);
 
+                    // A planned live-cache continuation is only materialized on
+                    // this path when the prior owner's primary cache was adopted
+                    // into this request's own holder above (owner still running
+                    // under the same RequestId). A FRESH holder that still
+                    // carries a continuation claim means the claimed live state
+                    // is gone — its reserved blocks are accounting placeholders
+                    // that were never written, and for snapshot-less models the
+                    // inject below is skipped entirely — so decoding would
+                    // silently run against an empty cache at a non-zero
+                    // position. Drop the claim and re-prefill from position 0.
+                    if (freshCache && seq.UsesLiveCacheContinuation)
+                    {
+                        _logger.LogDebug(
+                            "Live-cache continuation for {RequestId} not materializable on the fused path; re-prefilling.",
+                            seq.RequestId);
+                        seq.ClearLiveCacheContinuation();
+                    }
+
                     // Prefix-cache reuse: a freshly-created cache whose sequence
                     // was admitted with already-computed (reused) tokens needs
                     // that prefix injected from the shared paged blocks before

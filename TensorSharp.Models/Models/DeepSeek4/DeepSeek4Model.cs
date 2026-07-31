@@ -21,10 +21,11 @@
 // multi-turn prompts re-prefill; the engine handles that automatically.
 using System;
 using TensorSharp.GGML;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
-    public class DeepSeek4Model : ModelBase
+    public partial class DeepSeek4Model : ModelBase, IBatchedPagedModel
     {
         private IntPtr _handle;
         private DeepSeek4CpuExecutor _cpuExec;

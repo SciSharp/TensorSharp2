@@ -49,6 +49,7 @@
 #include <deque>
 #include <list>
 #include <map>
+#include <memory>
 #include <thread>
 
 namespace tsg_dsv4
@@ -157,7 +158,13 @@ struct dsv4_layer
     ggml_tensor * ffn_down_shexp = nullptr;
     ggml_tensor * ffn_up_shexp = nullptr;
 
-    // KV caches / state (device-resident, persist across ubatches)
+    int device = 0;
+};
+
+// Per-layer KV caches / compressor state for ONE sequence slot
+// (device-resident, persist across ubatches).
+struct dsv4_slot_layer
+{
     ggml_tensor * raw_k = nullptr;        // F16 [n_embd_head, ring_raw]
     ggml_tensor * csa_k = nullptr;        // F16 [n_embd_head, n_csa_rows]   (ratio 4)
     ggml_tensor * lid_k = nullptr;        // F16 [idx_head_size, n_csa_rows] (ratio 4)
@@ -166,8 +173,27 @@ struct dsv4_layer
     ggml_tensor * comp_state_score = nullptr; // F32 [coff*head, state_size]
     ggml_tensor * lid_state_kv = nullptr;     // F32 [2*idx_head, 8]
     ggml_tensor * lid_state_score = nullptr;  // F32 [2*idx_head, 8]
+};
 
-    int device = 0;
+// One independent sequence context: its own caches + position, sharing the
+// model weights. The server's continuous-batching engine binds one slot per
+// in-flight request; the CLI / single-stream path only ever uses slot 0.
+struct dsv4_slot
+{
+    int id = 0;
+    int32_t n_past = 0;
+    std::vector<dsv4_slot_layer> layers;
+    ggml_context * ctx[MAX_GPUS + 1] = {};
+    ggml_backend_buffer_t buf[MAX_GPUS + 1] = {};
+
+    ~dsv4_slot()
+    {
+        for (int i = 0; i <= MAX_GPUS; i++)
+        {
+            if (buf[i]) ggml_backend_buffer_free(buf[i]);
+            if (ctx[i]) ggml_free(ctx[i]);
+        }
+    }
 };
 
 // gguf tensor location within the (possibly split) model
@@ -238,6 +264,9 @@ struct graph_build_result
     comp_plan plan_lid;
     int64_t nt = 0;
     int64_t p0 = 0;
+    // sequence slot whose cache tensors this graph was built against; entries
+    // are purged when their slot is freed (the baked addresses die with it)
+    int slot_id = 0;
     // shape signature this graph was built for (plan array sizes + n_kv pads)
     uint64_t sig = 0;
     // descriptors referenced (by pointer) from the fused GGML_OP_CUSTOM nodes
@@ -295,7 +324,11 @@ struct dsv4_model
     int64_t n_csa_rows = 0;
     int64_t n_hca_rows = 0;
 
-    int32_t n_past = 0;
+    // sequence slots (per-request caches); slot 0 is the primary/single-stream
+    // slot created at load. All Forward/Reset/NPast calls act on active_slot.
+    std::map<int, std::unique_ptr<dsv4_slot>> slots;
+    dsv4_slot * active_slot = nullptr;
+    int next_slot_id = 0;
 
     // final position of the current TSGgml_Dsv4Forward call; keeps every
     // chunk of one prefill on one graph shape (bucketing + indexer skip)
@@ -327,6 +360,7 @@ struct dsv4_model
     ~dsv4_model()
     {
         graph_cache.clear();
+        slots.clear();   // slot buffers must go before the backends below
         for (int i = 0; i <= MAX_GPUS; i++)
         {
             if (c_buf[i]) ggml_backend_buffer_free(c_buf[i]);
@@ -552,9 +586,9 @@ static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_jo
 // The overlap compressors read a synthetic "before the first block" source
 // from the state rings' extra row: kv stays zero (buffer clear), the score
 // row must be -inf so the per-element softmax gives those slots zero weight.
-static void dsv4_init_state_rows(dsv4_model & m)
+static void dsv4_init_slot_state_rows(dsv4_slot & slot)
 {
-    for (auto & L : m.layers)
+    for (auto & C : slot.layers)
     {
         auto fill_neg_inf_row = [&](ggml_tensor * t)
         {
@@ -562,9 +596,94 @@ static void dsv4_init_state_rows(dsv4_model & m)
             std::vector<float> row((size_t) t->ne[0], -INFINITY);
             ggml_backend_tensor_set(t, row.data(), (size_t) (t->ne[1] - 1) * t->nb[1], row.size() * sizeof(float));
         };
-        fill_neg_inf_row(L.comp_state_score);
-        fill_neg_inf_row(L.lid_state_score);
+        fill_neg_inf_row(C.comp_state_score);
+        fill_neg_inf_row(C.lid_state_score);
     }
+}
+
+// Clear a slot's caches back to the fresh state (position 0).
+static void dsv4_reset_slot(dsv4_slot & slot)
+{
+    slot.n_past = 0;
+    for (int d = 0; d <= MAX_GPUS; d++)
+        if (slot.buf[d]) ggml_backend_buffer_clear(slot.buf[d], 0);
+    dsv4_init_slot_state_rows(slot);
+}
+
+// Allocate a new sequence slot: per-layer caches + compressor state rings on
+// each layer's device. Weights and rope tables are shared across slots.
+// Returns nullptr on allocation failure (e.g. VRAM exhausted).
+static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
+{
+    const dsv4_hparams & hp = m.hp;
+    auto slot = std::make_unique<dsv4_slot>();
+    slot->id = m.next_slot_id++;
+    slot->layers.resize(hp.n_layer);
+
+    for (int d = 0; d <= m.n_gpu; d++)
+    {
+        ggml_init_params cp = { (size_t) (hp.n_layer * 10 + 16) * ggml_tensor_overhead(), nullptr, true };
+        slot->ctx[d] = ggml_init(cp);
+        if (!slot->ctx[d]) return nullptr;
+    }
+
+    for (int il = 0; il < hp.n_layer; il++)
+    {
+        const int d = m.layers[il].device;
+        const int ratio = hp.compress_ratios[il];
+        dsv4_slot_layer & C = slot->layers[il];
+        ggml_context * ctx = slot->ctx[d];
+
+        const int64_t head = hp.n_embd_head;
+        C.raw_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, m.ring_raw);
+        ggml_format_name(C.raw_k, "cache_raw_k.%d.%d", slot->id, il);
+        // State rings carry one extra row (index state_size) that stays
+        // zero (kv) / -inf (score): the overlap compressor's synthetic
+        // "before the first block" source. It is never written by persists
+        // (dst = pos % state_size < state_size), so no per-eval zero-row
+        // append is needed in the graph.
+        if (ratio == CSA_RATIO)
+        {
+            C.csa_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, m.n_csa_rows);
+            ggml_format_name(C.csa_k, "cache_csa_k.%d.%d", slot->id, il);
+            C.lid_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.indexer_head_size, m.n_csa_rows);
+            ggml_format_name(C.lid_k, "cache_lid_k.%d.%d", slot->id, il);
+            C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
+            C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
+            C.lid_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
+            C.lid_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
+            ggml_format_name(C.comp_state_kv, "state_csa_kv.%d.%d", slot->id, il);
+            ggml_format_name(C.comp_state_score, "state_csa_score.%d.%d", slot->id, il);
+            ggml_format_name(C.lid_state_kv, "state_lid_kv.%d.%d", slot->id, il);
+            ggml_format_name(C.lid_state_score, "state_lid_score.%d.%d", slot->id, il);
+        }
+        else if (ratio == HCA_RATIO)
+        {
+            C.hca_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, m.n_hca_rows);
+            ggml_format_name(C.hca_k, "cache_hca_k.%d.%d", slot->id, il);
+            C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, HCA_RATIO + 1);
+            C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, HCA_RATIO + 1);
+            ggml_format_name(C.comp_state_kv, "state_hca_kv.%d.%d", slot->id, il);
+            ggml_format_name(C.comp_state_score, "state_hca_score.%d.%d", slot->id, il);
+        }
+    }
+
+    for (int d = 0; d <= m.n_gpu; d++)
+    {
+        if (ggml_get_first_tensor(slot->ctx[d]) == nullptr) continue;
+        slot->buf[d] = ggml_backend_alloc_ctx_tensors(slot->ctx[d], m.backends[d]);
+        if (!slot->buf[d])
+        {
+            fprintf(stderr, "[dsv4] slot %d cache alloc failed on device %d\n", slot->id, d);
+            return nullptr;
+        }
+        ggml_backend_buffer_clear(slot->buf[d], 0);
+    }
+    dsv4_init_slot_state_rows(*slot);
+
+    dsv4_slot * raw = slot.get();
+    m.slots[slot->id] = std::move(slot);
+    return raw;
 }
 
 // Build the [n_rot, n_ctx] cos/sin table by running ggml's own rope over
@@ -918,40 +1037,6 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             fprintf(stderr, "[dsv4] layer %d incomplete\n", il);
             return nullptr;
         }
-
-        // caches
-        const int64_t head = hp.n_embd_head;
-        L.raw_k = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F16, head, m->ring_raw);
-        ggml_format_name(L.raw_k, "cache_raw_k.%d", il);
-        // State rings carry one extra row (index state_size) that stays
-        // zero (kv) / -inf (score): the overlap compressor's synthetic
-        // "before the first block" source. It is never written by persists
-        // (dst = pos % state_size < state_size), so no per-eval zero-row
-        // append is needed in the graph.
-        if (ratio == CSA_RATIO)
-        {
-            L.csa_k = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F16, head, m->n_csa_rows);
-            ggml_format_name(L.csa_k, "cache_csa_k.%d", il);
-            L.lid_k = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F16, hp.indexer_head_size, m->n_csa_rows);
-            ggml_format_name(L.lid_k, "cache_lid_k.%d", il);
-            L.comp_state_kv = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
-            L.comp_state_score = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
-            L.lid_state_kv = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
-            L.lid_state_score = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
-            ggml_format_name(L.comp_state_kv, "state_csa_kv.%d", il);
-            ggml_format_name(L.comp_state_score, "state_csa_score.%d", il);
-            ggml_format_name(L.lid_state_kv, "state_lid_kv.%d", il);
-            ggml_format_name(L.lid_state_score, "state_lid_score.%d", il);
-        }
-        else if (ratio == HCA_RATIO)
-        {
-            L.hca_k = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F16, head, m->n_hca_rows);
-            ggml_format_name(L.hca_k, "cache_hca_k.%d", il);
-            L.comp_state_kv = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, head, HCA_RATIO + 1);
-            L.comp_state_score = ggml_new_tensor_2d(m->c_ctx[d], GGML_TYPE_F32, head, HCA_RATIO + 1);
-            ggml_format_name(L.comp_state_kv, "state_hca_kv.%d", il);
-            ggml_format_name(L.comp_state_score, "state_hca_score.%d", il);
-        }
     }
 
     // rope cos/sin tables for the fused table-driven kernels (per device)
@@ -1028,7 +1113,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 load_threads, m->n_ctx, m->ring_raw, m->n_csa_rows, m->n_hca_rows);
     }
 
-    dsv4_init_state_rows(*m);
+    // primary sequence slot (slot 0) — the CLI / single-stream cache
+    m->active_slot = dsv4_slot_alloc(*m);
+    if (!m->active_slot)
+    {
+        fprintf(stderr, "[dsv4] primary slot allocation failed\n");
+        return nullptr;
+    }
 
     if (m->fused)
     {
@@ -1555,6 +1646,7 @@ struct graph_builder
     ggml_tensor * build_lid_top_k(int il, ggml_tensor * qr, ggml_tensor * cur, ggml_tensor * inp_pos, int dev)
     {
         const dsv4_layer & L = m.layers[il];
+        const dsv4_slot_layer & C = m.active_slot->layers[il];
         const int64_t idx_head = hp.indexer_head_size;
         const int64_t n_idx_head = hp.indexer_n_head;
         const int64_t n_rope = hp.n_rot;
@@ -1575,7 +1667,7 @@ struct graph_builder
         iw = ggml_scale(ctx, iw, 1.0f / sqrtf((float) (idx_head * n_idx_head)));
 
         const int64_t n_lid = res.plan_lid.n_kv;
-        ggml_tensor * ik = ggml_view_2d(ctx, L.lid_k, idx_head, n_lid, L.lid_k->nb[1], 0);
+        ggml_tensor * ik = ggml_view_2d(ctx, C.lid_k, idx_head, n_lid, C.lid_k->nb[1], 0);
         ik = ggml_reshape_3d(ctx, ik, idx_head, 1, n_lid);
 
         // fused lightning indexer: q [idx_head, n_idx_head, nt], k [idx_head, 1, n_lid],
@@ -1610,6 +1702,7 @@ struct graph_builder
     ggml_tensor * build_attention(int il, ggml_tensor * cur, ggml_tensor * inp_pos)
     {
         const dsv4_layer & L = m.layers[il];
+        const dsv4_slot_layer & C = m.active_slot->layers[il];
         const int dev = L.device;
         const int64_t head = hp.n_embd_head;
         const int64_t n_head = hp.n_head;
@@ -1683,21 +1776,21 @@ struct graph_builder
 
             // per-head q RMS + RoPE, kv RMS(w) + RoPE + F16 SWA-ring commit
             q = fused_node(TSG_DSV4_FUSED_ATTN_PREP, GGML_TYPE_F32, head, n_head, nt, 1,
-                    { q_raw, kv_raw, L.attn_kv_norm, rope_tab, inp_pos, L.raw_k, res.inp.raw_idxs[dev] },
+                    { q_raw, kv_raw, L.attn_kv_norm, rope_tab, inp_pos, C.raw_k, res.inp.raw_idxs[dev] },
                     dev, (int) n_rope, 0, 0, 0, hp.rms_eps);
             ggml_build_forward_expand(gf, q);
 
             if (ratio == CSA_RATIO)
             {
-                emit_compress(cs_kv, cs_score, L.comp_state_kv, L.comp_state_score, L.attn_comp_norm,
-                              L.csa_k, CSA_RATIO, true, res.inp.csa[dev], res.plan_csa);
-                emit_compress(ls_kv, ls_score, L.lid_state_kv, L.lid_state_score, L.indexer_comp_norm,
-                              L.lid_k, CSA_RATIO, true, res.inp.lid[dev], res.plan_lid);
+                emit_compress(cs_kv, cs_score, C.comp_state_kv, C.comp_state_score, L.attn_comp_norm,
+                              C.csa_k, CSA_RATIO, true, res.inp.csa[dev], res.plan_csa);
+                emit_compress(ls_kv, ls_score, C.lid_state_kv, C.lid_state_score, L.indexer_comp_norm,
+                              C.lid_k, CSA_RATIO, true, res.inp.lid[dev], res.plan_lid);
             }
             else if (ratio == HCA_RATIO)
             {
-                emit_compress(cs_kv, cs_score, L.comp_state_kv, L.comp_state_score, L.attn_comp_norm,
-                              L.hca_k, HCA_RATIO, false, res.inp.hca[dev], res.plan_hca);
+                emit_compress(cs_kv, cs_score, C.comp_state_kv, C.comp_state_score, L.attn_comp_norm,
+                              C.hca_k, HCA_RATIO, false, res.inp.hca[dev], res.plan_hca);
             }
         }
         else
@@ -1728,29 +1821,29 @@ struct graph_builder
 
             // write raw K into the SWA ring
             ggml_tensor * kv2d = ggml_reshape_2d(ctx, kv, head, nt);
-            ggml_build_forward_expand(gf, ggml_set_rows(ctx, L.raw_k, kv2d, res.inp.raw_idxs[dev]));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, C.raw_k, kv2d, res.inp.raw_idxs[dev]));
             ggml_build_forward_expand(gf, q);
 
             // compressor state updates + compressed row commits
             if (ratio == CSA_RATIO)
             {
                 run_compressor(il, cur, L.attn_comp_wkv, L.attn_comp_wgate, L.attn_comp_ape, L.attn_comp_norm,
-                               L.comp_state_kv, L.comp_state_score, L.csa_k, head, CSA_RATIO, true,
+                               C.comp_state_kv, C.comp_state_score, C.csa_k, head, CSA_RATIO, true,
                                res.inp.csa[dev], res.plan_csa, dev);
                 run_compressor(il, cur, L.indexer_comp_wkv, L.indexer_comp_wgate, L.indexer_comp_ape, L.indexer_comp_norm,
-                               L.lid_state_kv, L.lid_state_score, L.lid_k, hp.indexer_head_size, CSA_RATIO, true,
+                               C.lid_state_kv, C.lid_state_score, C.lid_k, hp.indexer_head_size, CSA_RATIO, true,
                                res.inp.lid[dev], res.plan_lid, dev);
             }
             else if (ratio == HCA_RATIO)
             {
                 run_compressor(il, cur, L.attn_comp_wkv, L.attn_comp_wgate, L.attn_comp_ape, L.attn_comp_norm,
-                               L.comp_state_kv, L.comp_state_score, L.hca_k, head, HCA_RATIO, false,
+                               C.comp_state_kv, C.comp_state_score, C.hca_k, head, HCA_RATIO, false,
                                res.inp.hca[dev], res.plan_hca, dev);
             }
         }
 
         // attention source: raw ring (+ compressed rows)
-        ggml_tensor * raw_k = ggml_view_2d(ctx, L.raw_k, head, m.ring_raw, L.raw_k->nb[1], 0);
+        ggml_tensor * raw_k = ggml_view_2d(ctx, C.raw_k, head, m.ring_raw, C.raw_k->nb[1], 0);
         raw_k = ggml_reshape_3d(ctx, raw_k, head, 1, m.ring_raw);
 
         ggml_tensor * out = nullptr;
@@ -1768,12 +1861,12 @@ struct graph_builder
             ggml_tensor * top_k = build_lid_top_k(il, qr, cur, inp_pos, dev);
             ggml_tensor * k_sel = fused_node(TSG_DSV4_FUSED_KGATHER, GGML_TYPE_F16,
                     head, 1, m.ring_raw + top_k->ne[0], 1,
-                    { L.raw_k, L.csa_k, top_k }, dev, (int) m.ring_raw);
+                    { C.raw_k, C.csa_k, top_k }, dev, (int) m.ring_raw);
             out = attn_mha(q, k_sel, res.inp.gather_mask[dev], L.attn_sinks, kq_scale);
         }
         else if (ratio == CSA_RATIO)
         {
-            ggml_tensor * csa_k = ggml_view_2d(ctx, L.csa_k, head, res.plan_csa.n_kv, L.csa_k->nb[1], 0);
+            ggml_tensor * csa_k = ggml_view_2d(ctx, C.csa_k, head, res.plan_csa.n_kv, C.csa_k->nb[1], 0);
             csa_k = ggml_reshape_3d(ctx, csa_k, head, 1, res.plan_csa.n_kv);
 
             ggml_tensor * k_all = ggml_concat(ctx, raw_k, csa_k, 2);
@@ -1812,7 +1905,7 @@ struct graph_builder
         }
         else if (ratio == HCA_RATIO)
         {
-            ggml_tensor * hca_k = ggml_view_2d(ctx, L.hca_k, head, res.plan_hca.n_kv, L.hca_k->nb[1], 0);
+            ggml_tensor * hca_k = ggml_view_2d(ctx, C.hca_k, head, res.plan_hca.n_kv, C.hca_k->nb[1], 0);
             hca_k = ggml_reshape_3d(ctx, hca_k, head, 1, res.plan_hca.n_kv);
 
             ggml_tensor * k_all = ggml_concat(ctx, raw_k, hca_k, 2);
@@ -2158,6 +2251,8 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
     sig = sig * 1099511628211ull ^ dsv4_plan_sig(plan_csa);
     sig = sig * 1099511628211ull ^ dsv4_plan_sig(plan_hca);
     sig = sig * 1099511628211ull ^ dsv4_plan_sig(plan_lid);
+    // graphs bake the active slot's cache tensor addresses
+    sig = sig * 1099511628211ull ^ (uint64_t) (m.active_slot->id + 1);
     // the short-context indexer skip changes the graph shape
     if (m.fused && pos_end <= (int64_t) hp.indexer_top_k * CSA_RATIO)
         sig ^= 0x9e3779b97f4a7c15ull;
@@ -2189,6 +2284,7 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
         r.gf = ggml_new_graph_custom(r.ctx, 32768, false);
         r.nt = nt;
         r.sig = sig;
+        r.slot_id = m.active_slot->id;
         r.plan_csa = plan_csa;
         r.plan_hca = plan_hca;
         r.plan_lid = plan_lid;
@@ -2453,41 +2549,42 @@ TSG_EXPORT int TSGgml_Dsv4CtxSize(void * handle)
 TSG_EXPORT int TSGgml_Dsv4NPast(void * handle)
 {
     if (!handle) return 0;
-    return ((tsg_dsv4::dsv4_model *) handle)->n_past;
+    return ((tsg_dsv4::dsv4_model *) handle)->active_slot->n_past;
 }
 
-// Feeds `n_tokens` tokens at positions [n_past, n_past + n_tokens) and writes
-// the last token's logits into logits_out (size n_vocab). Returns 0 on
-// success, negative on failure.
+// Feeds `n_tokens` tokens at positions [n_past, n_past + n_tokens) of the
+// ACTIVE slot and writes the last token's logits into logits_out (size
+// n_vocab). Returns 0 on success, negative on failure.
 TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_tokens, float * logits_out)
 {
     if (!handle || !tokens || n_tokens <= 0) return -1;
     auto * m = (tsg_dsv4::dsv4_model *) handle;
+    tsg_dsv4::dsv4_slot * slot = m->active_slot;
 
-    if (m->n_past + n_tokens > m->n_ctx)
+    if (slot->n_past + n_tokens > m->n_ctx)
     {
-        fprintf(stderr, "[dsv4] context overflow: n_past=%d + %d > n_ctx=%d\n", m->n_past, n_tokens, m->n_ctx);
+        fprintf(stderr, "[dsv4] context overflow: n_past=%d + %d > n_ctx=%d\n", slot->n_past, n_tokens, m->n_ctx);
         return -2;
     }
 
     const bool perf = []() { const char * e = getenv("TS_DSV4_PERF"); return e && atoi(e) > 0; }();
     auto t0 = std::chrono::steady_clock::now();
 
-    m->pos_end_hint = (int64_t) m->n_past + n_tokens;
+    m->pos_end_hint = (int64_t) slot->n_past + n_tokens;
 
     // Pre-acquire the first two chunk graphs (the pipelined pair) and the
     // final chunk's graph so the pipelined prefill never stalls on a
     // device-synchronizing arena allocation mid-flight.
     if (n_tokens > m->n_ubatch)
     {
-        tsg_dsv4::dsv4_acquire_graph(*m, m->n_ubatch, m->n_past, m->n_gpu > 1, nullptr);
+        tsg_dsv4::dsv4_acquire_graph(*m, m->n_ubatch, slot->n_past, m->n_gpu > 1, nullptr);
         const int nt2 = std::min(m->n_ubatch, n_tokens - m->n_ubatch);
         const bool last2 = (2 * m->n_ubatch >= n_tokens);
-        tsg_dsv4::dsv4_acquire_graph(*m, nt2, m->n_past + m->n_ubatch, !last2 && m->n_gpu > 1, nullptr);
+        tsg_dsv4::dsv4_acquire_graph(*m, nt2, slot->n_past + m->n_ubatch, !last2 && m->n_gpu > 1, nullptr);
         if (!last2)
         {
             const int last_nt = n_tokens - m->n_ubatch * ((n_tokens - 1) / m->n_ubatch);
-            tsg_dsv4::dsv4_acquire_graph(*m, last_nt, (int64_t) m->n_past + (n_tokens - last_nt), false, nullptr);
+            tsg_dsv4::dsv4_acquire_graph(*m, last_nt, (int64_t) slot->n_past + (n_tokens - last_nt), false, nullptr);
         }
     }
 
@@ -2496,9 +2593,9 @@ TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_t
     {
         const int nt = std::min(m->n_ubatch, n_tokens - done);
         const bool last = (done + nt == n_tokens);
-        if (!tsg_dsv4::dsv4_forward_ubatch(*m, tokens + done, nt, m->n_past, last, last ? logits_out : nullptr))
+        if (!tsg_dsv4::dsv4_forward_ubatch(*m, tokens + done, nt, slot->n_past, last, last ? logits_out : nullptr))
             return -3;
-        m->n_past += nt;
+        slot->n_past += nt;
         done += nt;
     }
 
@@ -2511,16 +2608,66 @@ TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_t
     return 0;
 }
 
+// Resets the ACTIVE slot's caches to position 0. Weights, rope tables and
+// other slots are untouched.
 TSG_EXPORT void TSGgml_Dsv4Reset(void * handle)
 {
     if (!handle) return;
     auto * m = (tsg_dsv4::dsv4_model *) handle;
-    m->n_past = 0;
-    for (int d = 0; d <= m->n_gpu; d++)
-        if (m->c_buf[d]) ggml_backend_buffer_clear(m->c_buf[d], 0);
-    tsg_dsv4::dsv4_init_state_rows(*m);
-    // the rope tables live in the cache buffers the clear above just wiped
-    tsg_dsv4::dsv4_upload_rope_tables(*m);
+    tsg_dsv4::dsv4_reset_slot(*m->active_slot);
+}
+
+// Allocate a new sequence slot (own caches, shared weights). Returns the slot
+// id, or -1 on allocation failure. The new slot is NOT made active.
+TSG_EXPORT int TSGgml_Dsv4SlotAlloc(void * handle)
+{
+    if (!handle) return -1;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    try
+    {
+        tsg_dsv4::dsv4_slot * slot = tsg_dsv4::dsv4_slot_alloc(*m);
+        return slot ? slot->id : -1;
+    }
+    catch (const std::exception & e)
+    {
+        fprintf(stderr, "[dsv4] slot alloc failed: %s\n", e.what());
+        return -1;
+    }
+}
+
+// Select which slot Forward/Reset/NPast operate on. Returns 0 on success,
+// -1 for an unknown slot id.
+TSG_EXPORT int TSGgml_Dsv4SetActiveSlot(void * handle, int slot_id)
+{
+    if (!handle) return -1;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    auto it = m->slots.find(slot_id);
+    if (it == m->slots.end()) return -1;
+    m->active_slot = it->second.get();
+    return 0;
+}
+
+// Free a slot's caches and every cached graph built against them (captured
+// graphs bake the slot's device addresses). The active slot cannot be freed;
+// callers switch to another slot first.
+TSG_EXPORT int TSGgml_Dsv4SlotFree(void * handle, int slot_id)
+{
+    if (!handle) return -1;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    auto it = m->slots.find(slot_id);
+    if (it == m->slots.end()) return -1;
+    if (it->second.get() == m->active_slot)
+    {
+        fprintf(stderr, "[dsv4] refusing to free the active slot %d\n", slot_id);
+        return -1;
+    }
+    for (auto gi = m->graph_cache.begin(); gi != m->graph_cache.end(); )
+    {
+        if ((*gi)->slot_id == slot_id) gi = m->graph_cache.erase(gi);
+        else ++gi;
+    }
+    m->slots.erase(it);
+    return 0;
 }
 
 TSG_EXPORT void TSGgml_Dsv4Free(void * handle)

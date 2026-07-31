@@ -45,6 +45,15 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern void TSGgml_Dsv4Free(IntPtr handle);
 
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_Dsv4SlotAlloc(IntPtr handle);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_Dsv4SetActiveSlot(IntPtr handle, int slotId);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_Dsv4SlotFree(IntPtr handle, int slotId);
+
         public static IntPtr LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads)
             => TSGgml_Dsv4LoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads);
 
@@ -63,5 +72,18 @@ namespace TensorSharp.GGML
 
         public static void Reset(IntPtr handle) => TSGgml_Dsv4Reset(handle);
         public static void Free(IntPtr handle) => TSGgml_Dsv4Free(handle);
+
+        /// <summary>Allocate a new sequence slot (own KV caches, shared
+        /// weights). Returns the slot id, or -1 on failure (e.g. VRAM).</summary>
+        public static int SlotAlloc(IntPtr handle) => TSGgml_Dsv4SlotAlloc(handle);
+
+        /// <summary>Select the slot Forward/Reset/NPast act on.</summary>
+        public static bool SetActiveSlot(IntPtr handle, int slotId)
+            => TSGgml_Dsv4SetActiveSlot(handle, slotId) == 0;
+
+        /// <summary>Free a slot's caches (and its cached graphs). The active
+        /// slot cannot be freed.</summary>
+        public static bool SlotFree(IntPtr handle, int slotId)
+            => TSGgml_Dsv4SlotFree(handle, slotId) == 0;
     }
 }
