@@ -29,6 +29,7 @@ namespace TensorSharp.Models
     {
         private IntPtr _handle;
         private DeepSeek4CpuExecutor _cpuExec;
+        private DeepSeek4CudaExecutor _cudaExec;
         private readonly object _sync = new object();
 
         public DeepSeek4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
@@ -53,9 +54,19 @@ namespace TensorSharp.Models
             // prefill than 512 and also halves what a non-multiple tail chunk
             // costs relative to the whole prompt. The CPU executor stays at 512
             // (activation memory bound, no tile padding to amortize).
-            int nUbatch = ParseEnvInt("TS_DSV4_UBATCH", _backend == BackendType.Cpu ? 512 : 1024);
+            int nUbatch = ParseEnvInt("TS_DSV4_UBATCH", backend == BackendType.Cpu ? 512 : 1024);
 
-            if (_backend == BackendType.Cpu)
+            if (backend == BackendType.Cuda)
+            {
+                // Direct-CUDA whole-model executor: quantized weights resident in
+                // device memory, layer-split across the visible GPUs, driver-API
+                // kernels only (no ggml).
+                int nGpu = ParseEnvInt("TS_DSV4_NGPU", tpDegree > 1 ? tpDegree : 0); // 0 = all visible GPUs
+                Console.WriteLine($"Model: {arch} (direct-CUDA whole-model executor), Layers={Config.NumLayers}, " +
+                    $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}");
+                _cudaExec = new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, nGpu);
+            }
+            else if (_backend == BackendType.Cpu)
             {
                 // Pure C# whole-model executor: quantized weights served straight
                 // from the memory-mapped GGUF shards, managed SIMD kernels only.
@@ -80,13 +91,17 @@ namespace TensorSharp.Models
 
         private static BackendType NormalizeBackend(BackendType backend)
         {
-            // BackendType.Cpu runs the pure C# executor. The other backends drive
-            // the native ggml executor; the managed side only needs the GGML
-            // library loaded, so coerce everything else to GgmlCpu so no second
-            // GPU context is created.
+            // BackendType.Cpu runs the pure C# executor. BackendType.Cuda runs
+            // the direct-CUDA executor, which owns its own per-device contexts —
+            // the base class only needs a lightweight CPU allocator, so it is
+            // coerced to Cpu (the ctor dispatches on the ORIGINAL backend). The
+            // other backends drive the native ggml executor; the managed side
+            // only needs the GGML library loaded, so everything else is coerced
+            // to GgmlCpu so no second GPU context is created.
             return backend switch
             {
                 BackendType.Cpu => BackendType.Cpu,
+                BackendType.Cuda => BackendType.Cpu,
                 BackendType.GgmlCuda => BackendType.GgmlCuda,
                 BackendType.GgmlVulkan => BackendType.GgmlVulkan,
                 _ => BackendType.GgmlCpu,
@@ -106,7 +121,11 @@ namespace TensorSharp.Models
             lock (_sync)
             {
                 var logits = new float[Config.VocabSize];
-                if (_cpuExec != null)
+                if (_cudaExec != null)
+                {
+                    _cudaExec.Forward(tokens, logits);
+                }
+                else if (_cpuExec != null)
                 {
                     _cpuExec.Forward(tokens, logits);
                 }
@@ -122,7 +141,9 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
-                if (_cpuExec != null)
+                if (_cudaExec != null)
+                    _cudaExec.Reset();
+                else if (_cpuExec != null)
                     _cpuExec.Reset();
                 else if (_handle != IntPtr.Zero)
                     GgmlDeepSeek4Native.Reset(_handle);
@@ -152,6 +173,11 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
+                if (_cudaExec != null)
+                {
+                    _cudaExec.Dispose();
+                    _cudaExec = null;
+                }
                 if (_cpuExec != null)
                 {
                     _cpuExec.Dispose();

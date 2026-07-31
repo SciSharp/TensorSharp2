@@ -749,6 +749,20 @@ namespace TensorSharp.Models
             }
         }
 
+        // TS_DSV4_CPU_DEBUG=1: layer-0 stage prints paired with the
+        // TS_DSV4_CUDA_DEBUG=1 prints in Dsv4CudaEngine for A/B debugging.
+        private static readonly bool StageDebug = ParseEnvInt("TS_DSV4_CPU_DEBUG", 0) != 0;
+
+        private static void DumpDbg(string label, float* p, int n = 6)
+        {
+            if (!StageDebug)
+                return;
+            var vals = new string[n];
+            for (int i = 0; i < n; i++)
+                vals[i] = p[i].ToString("G6");
+            Console.Error.WriteLine($"[dbg-cpu] {label}: {string.Join(" ", vals)}");
+        }
+
         private void ForwardUbatch(int[] tokens, int tokOff, int nt, int p0, float[] logitsOut)
         {
             int E = _nEmbd;
@@ -764,6 +778,7 @@ namespace TensorSharp.Models
                     Buffer.MemoryCopy(dst, dst + (long)s * E, E * sizeof(float), E * sizeof(float));
             });
             Tick(0, t0);
+            DumpDbg("embed.xs", _xs);
 
             // per-token rope caches for this ubatch (raw + compress parameter sets)
             t0 = Stopwatch.GetTimestamp();
@@ -779,21 +794,39 @@ namespace TensorSharp.Models
                 Layer L = _layers[il];
 
                 // ---- attention super-block ----
+                bool dbg = StageDebug && il == 0;
                 t0 = Stopwatch.GetTimestamp();
                 HcPre(L.HcAttnFn, L.HcAttnScale, L.HcAttnBase, nt, computeComb: true);
+                if (dbg)
+                {
+                    DumpDbg("L0.attn.mixes", _mixes);
+                    DumpDbg("L0.attn.pre", _pre, 4);
+                    DumpDbg("L0.attn.comb", _comb, 8);
+                    DumpDbg("L0.attn.cur", _cur);
+                }
                 RmsNormRows(_cur, L.AttnNorm, nt, E);
+                if (dbg)
+                    DumpDbg("L0.attn.cur_norm", _cur);
                 Tick(1, t0);
                 Attention(il, nt, p0);
+                if (dbg)
+                    DumpDbg("L0.attn.out", _attnOut);
                 t0 = Stopwatch.GetTimestamp();
                 HcPost(_attnOut, nt);
+                if (dbg)
+                    DumpDbg("L0.attn.xs_post", _xs);
 
                 // ---- FFN super-block ----
                 HcPre(L.HcFfnFn, L.HcFfnScale, L.HcFfnBase, nt, computeComb: true);
                 RmsNormRows(_cur, L.FfnNorm, nt, E);
                 Tick(1, t0);
                 MoeFfn(il, nt, tokens, tokOff);
+                if (dbg)
+                    DumpDbg("L0.ffn.out", _ffnOut);
                 t0 = Stopwatch.GetTimestamp();
                 HcPost(_ffnOut, nt);
+                if (dbg)
+                    DumpDbg("L0.ffn.xs_post", _xs);
                 Tick(1, t0);
             }
 
@@ -1008,6 +1041,11 @@ namespace TensorSharp.Models
                     for (int j = 0; j < nUsed; j++) w[j] *= _expertWeightsScale;
             });
 
+            if (StageDebug && il == 0)
+            {
+                DumpDbg("L0.router", _routerLogits);
+                DumpDbg("L0.selw", _selWeights, nUsed);
+            }
             Tick(7, t0);
             t0 = Stopwatch.GetTimestamp();
 
@@ -1398,11 +1436,13 @@ namespace TensorSharp.Models
             for (int s = 1; s < HC; s++)
                 TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(x + (long)s * E, E), headBuf[s], curSpan, curSpan);
 
+            DumpDbg("head.cur", cur);
             RmsNormRows(cur, _outputNorm, 1, E);
 
             fixed (float* lo = logitsOut)
             {
                 MatMul(_output, 0, _nVocab, cur, E, 1, lo, _nVocab);
+                DumpDbg("head.logits", lo, 8);
             }
         }
 
