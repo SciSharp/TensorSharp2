@@ -113,10 +113,10 @@ the C# speculative core is backend-specific.
 
 The drafter is NOT in the target GGUF: every GGUF conversion of DeepSeek V4 drops
 the `mtp.*` tensors (`DeepSeek-V4-Flash-0731-UD-Q8_K_XL` has `blk.0`-`blk.42` and
-nothing else). Either download a pre-built drafter GGUF, e.g.
-[`sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF`](https://huggingface.co/sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF)
-(5.6 GB, 2-bit experts — the fastest of the drafters measured here), or build one
-from the upstream **safetensors** checkpoint.
+nothing else). Either download a pre-built drafter GGUF (three are listed in
+[Model Downloads](../../MODEL_DOWNLOADS.md#dspark-drafters); publishers spell the
+tensors and metadata differently and the loader accepts each spelling), or build
+one from the upstream **safetensors** checkpoint.
 
 Any DeepSeek V4 release whose `config.json` has `dspark_block_size` carries the
 module: `deepseek-ai/DeepSeek-V4-Flash-0731`, `deepseek-ai/DeepSeek-V4-Flash-DSpark`,
@@ -149,12 +149,13 @@ The routed experts are stored as FP4 with per-32 E8M0 scales in the checkpoint,
 which is GGUF's MXFP4 layout up to nibble order, so `mxfp4` repacks them
 losslessly (~11 GB); `--expert-type q2_k` roughly halves that.
 
-**Prefer the smaller drafter.** Measured on 4xA40 with the 0731 target, a
-lossless MXFP4 drafter and a 2-bit one accept about equally often (65% vs 69%),
-but the drafter's own weights are read on every speculative step, so the ~5.6 GB
-2-bit build decoded faster (34.0 vs 30.9 tok/s) *and* left the trunk a whole
-layer more room per GPU. Accuracy in the drafter buys much less than its
-bandwidth costs.
+**Drafter size is a real trade-off.** Its weights are re-read on every
+speculative step, so a bigger drafter has to earn its bandwidth back in
+acceptance. On 4xA40 the effect was clear on the direct-CUDA engine (5.6 GB
+2-bit: 34.0 tok/s / 69% accepted, vs 10.9 GB MXFP4: 30.9 / 65%) and inside
+run-to-run noise on ggml (31.1 / 31.5 / 31.8 tok/s for the 5.6 GB, 7 GB and
+10.9 GB builds on a 120-token sample, acceptance rising 63% -> 66% -> 68% with
+size). Start with a small one; move up only if acceptance is your bottleneck.
 
 | Flag | Default | Meaning |
 |---|---|---|

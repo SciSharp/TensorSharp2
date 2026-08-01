@@ -566,17 +566,40 @@ namespace TensorSharp.Models
             if (_dsparkGguf == null)
                 return null;
 
+            // Published DSpark drafters carry the same weights under three
+            // naming schemes (the ds4 builder's `mtp.*`, and two `dspark.*`
+            // variants that differ in the metadata prefix), so resolve both the
+            // keys and the tensor names by trying each spelling.
             string arch = _dsparkGguf.GetString("general.architecture") ?? string.Empty;
-            if (arch != "deepseek4-dspark")
-                throw new InvalidOperationException($"[dsv4-cuda] draft model architecture '{arch}' is not deepseek4-dspark");
+            if (arch != "deepseek4-dspark" && arch != "deepseek_v4_flash_dspark_draft")
+            {
+                throw new InvalidOperationException(
+                    $"[dsv4-cuda] draft model architecture '{arch}' is not a DeepSeek V4 DSpark drafter " +
+                    "(expected deepseek4-dspark or deepseek_v4_flash_dspark_draft). DSpark drafters for other " +
+                    "architectures (Qwen 3, Gemma 4) use a different drafter design and are not supported.");
+            }
 
-            int nStages = (int)_dsparkGguf.GetUint32("dspark.n_layers", 0);
-            if (nStages <= 0)
-                nStages = (int)_dsparkGguf.GetUint32("dspark.stage_count", 0);
-            int blockSize = (int)_dsparkGguf.GetUint32("dspark.block_size", 0);
-            int markovRank = (int)_dsparkGguf.GetUint32("dspark.markov_rank", 0);
-            int noiseToken = (int)_dsparkGguf.GetUint32("dspark.noise_token_id", 0);
-            int[] targetLayers = _dsparkGguf.GetInt32Array("dspark.target_layer_ids") ?? Array.Empty<int>();
+            int DsUint(params string[] keys)
+            {
+                foreach (string k in keys)
+                {
+                    uint v = _dsparkGguf.GetUint32(k, 0);
+                    if (v != 0)
+                        return (int)v;
+                }
+                return 0;
+            }
+
+            int nStages = DsUint("dspark.n_layers", "dspark.stage_count", "dspark.layer_count",
+                                 "deepseek4.dspark.n_layers", "deepseek4.dspark.layer_count");
+            int blockSize = DsUint("dspark.block_size", "deepseek4.dspark.block_size");
+            int markovRank = DsUint("dspark.markov_rank", "deepseek4.dspark.markov_rank");
+            int noiseToken = DsUint("dspark.noise_token_id", "deepseek4.dspark.noise_token_id");
+            int[] targetLayers = _dsparkGguf.GetInt32Array("dspark.target_layer_ids")
+                ?? _dsparkGguf.GetInt32Array("dspark.target_layers")
+                ?? _dsparkGguf.GetInt32Array("deepseek4.dspark.target_layer_ids")
+                ?? _dsparkGguf.GetInt32Array("deepseek4.dspark.target_layers")
+                ?? Array.Empty<int>();
             if (nStages <= 0 || blockSize <= 0 || markovRank <= 0 || targetLayers.Length == 0)
                 throw new InvalidOperationException("[dsv4-cuda] draft model is missing dspark.* metadata");
 
@@ -585,10 +608,19 @@ namespace TensorSharp.Models
             float clamp = _swigluClampExp.Length > 0 ? _swigluClampExp[_swigluClampExp.Length - 1] : 0f;
             float clampSh = _swigluClampShexp.Length > 0 ? _swigluClampShexp[_swigluClampShexp.Length - 1] : clamp;
 
+            // First spelling that exists in the drafter file wins.
+            string Pick(params string[] names)
+            {
+                foreach (string n in names)
+                    if (_tensorMap.ContainsKey(n))
+                        return n;
+                return names[0];
+            }
+
             var stages = new Dsv4CudaEngine.LayerDesc[nStages];
             for (int s = 0; s < nStages; s++)
             {
-                string p = $"mtp.{s}.";
+                string p = _tensorMap.ContainsKey($"mtp.{s}.attn_norm.weight") ? $"mtp.{s}." : $"dspark.{s}.";
                 stages[s] = new Dsv4CudaEngine.LayerDesc
                 {
                     Ratio = 0,
@@ -630,15 +662,16 @@ namespace TensorSharp.Models
                 MarkovRank = markovRank,
                 TargetLayerIds = targetLayers,
                 Stages = stages,
-                MainProj = GetQW(first + "main_proj.weight"),
-                MainNorm = GetF32(first + "main_norm.weight"),
-                Norm = GetF32(lastS + "norm.weight"),
-                HcHeadFn = GetF32(lastS + "hc_head_fn.weight"),
-                HcHeadScale = GetF32(lastS + "hc_head_scale.weight"),
-                HcHeadBase = GetF32(lastS + "hc_head_base.weight"),
-                MarkovW1 = GetF32(lastS + "markov_head.markov_w1.weight"),
-                MarkovW2 = GetQW(lastS + "markov_head.markov_w2.weight"),
-                ConfProj = GetF32(lastS + "confidence_head.proj.weight"),
+                MainProj = GetQW(Pick(first + "main_proj.weight", "dspark.main_proj.weight")),
+                MainNorm = GetF32(Pick(first + "main_norm.weight", "dspark.main_norm.weight")),
+                Norm = GetF32(Pick(lastS + "norm.weight", "dspark.norm.weight")),
+                HcHeadFn = GetF32(Pick(lastS + "hc_head_fn.weight", "dspark.hc_head_fn.weight")),
+                HcHeadScale = GetF32(Pick(lastS + "hc_head_scale.weight", "dspark.hc_head_scale.weight")),
+                HcHeadBase = GetF32(Pick(lastS + "hc_head_base.weight", "dspark.hc_head_base.weight")),
+                MarkovW1 = GetF32(Pick(lastS + "markov_head.markov_w1.weight", "dspark.markov_w1.weight")),
+                MarkovW2 = GetQW(Pick(lastS + "markov_head.markov_w2.weight", "dspark.markov_w2.weight")),
+                ConfProj = GetF32(Pick(lastS + "confidence_head.proj.weight",
+                                       "dspark.conf_proj.weight", "dspark.confidence_head.weight")),
             };
         }
 

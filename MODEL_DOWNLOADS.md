@@ -24,12 +24,56 @@ TensorSharp loads models in GGUF format. Below are verified Hugging Face repos f
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron 3 Nano Omni 30B-A3B (image-capable) | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) — mmproj `mmproj-BF16.gguf` (same repo) is required for image input. Audio is preprocessed only: real audio inference needs a Parakeet audio mmproj these GGUFs do not ship |
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct-2503 | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) — Pixtral mmproj `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` in the same repo |
+| DeepSeek V4 | DeepSeek-V4-Flash-0731 (284B MoE) | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) — one subdirectory per quant (`UD-Q8_K_XL/`, `UD-IQ4_XS/`, `UD-IQ1_S/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. Text only |
+| DeepSeek V4 | DSpark speculative drafters | see [DSpark drafters](#dspark-drafters) below — a separate GGUF loaded with `--draft-model` for ~1.3-1.4x decode |
 | DiffusionGemma | diffusiongemma-26B-A4B-it | [unsloth/diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) (`general.architecture` = `diffusion-gemma`) |
 | Qwen-Image-Edit | MMDiT DiT (the `--model` GGUF) | [unsloth/Qwen-Image-Edit-2511-GGUF](https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF) (e.g. `qwen-image-edit-2511-Q4_K_M.gguf`; `general.architecture` = `qwen_image`) |
 | Qwen-Image-Edit | Qwen-Image VAE (required) | `VAE/Qwen_Image-VAE.safetensors` from [QuantStack/Qwen-Image-Edit-GGUF](https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF) — place next to the DiT or point `--qwen-image-vae` / `TS_QWEN_IMAGE_VAE` at it (the `.safetensors` VAE loads directly) |
 | Qwen-Image-Edit | Qwen2.5-VL-7B text encoder (required) | [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) — place next to the DiT or set `--qwen-image-vl` / `TS_QWEN_IMAGE_TE` |
 | Qwen-Image-Edit | Vision mmproj (optional) | `mmproj-BF16.gguf` from [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) — image-grounded conditioning via `--qwen-image-mmproj` / `TS_QWEN_IMAGE_MMPROJ` |
 | Qwen-Image-Edit | Lightning LoRA (optional, 4/8-step) | [lightx2v/Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) (`Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`) — `--qwen-image-lora` / `TS_QWEN_IMAGE_LORA`; auto-switches to the LoRA's step count and CFG 1.0 |
+
+### DSpark drafters
+
+[DSpark](docs/models/deepseek4.md#dspark-speculative-decoding) is DeepSeek's block
+speculative-decoding drafter. TensorSharp runs it for **DeepSeek V4** on both GPU engines
+(`--backend cuda` and `--backend ggml_cuda`); the drafter is a separate GGUF passed with
+`--draft-model`, and greedy output is unchanged because the trunk verifies every block.
+
+Pick ONE of these — all three load as-is (the loader accepts each publisher's tensor/metadata
+spelling). Drafters read the trunk's hidden states, so a drafter built from the **same
+checkpoint revision** as your model accepts more often:
+
+| Drafter | Size | For | Notes |
+|---|---|---|---|
+| [bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) | 7.0 GB | `DSpark-drafter-Q2K-Q8-0731.gguf` for the **0731** release (a non-0731 build is in the same repo) | Q2_K experts + Q8_0 dense; measured 71% acceptance |
+| [sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF](https://huggingface.co/sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF) | 5.6 GB | the pre-0731 `DeepSeek-V4-Flash` release | Smallest, and still ~69% acceptance against the 0731 trunk; fastest of the three on the direct-CUDA engine because its weights are re-read every speculative step |
+| [alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF](https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF) | 10.9 GB | the **0731** release | MXFP4 experts (lossless repack of the checkpoint's FP4); highest acceptance measured (68%), most VRAM — it displaces about a whole trunk layer per GPU |
+
+Or build one from any DeepSeek V4 checkpoint that ships the module (only its three `mtp.*`
+shards are downloaded, ~11 GB): see
+[Getting a drafter](docs/models/deepseek4.md#getting-a-drafter) and
+`eng/dsv4-dspark-to-gguf.py`.
+
+**DSpark drafters for other architectures are NOT supported yet.** DeepSeek also released
+DSpark drafters for Qwen 3 and Gemma 4, and community GGUF conversions exist, but they are a
+different drafter design — a 5-layer transformer stack with an `fc` fusion over five target
+layers (`general.architecture` = `dspark` or `dflash`, `block_size` 7), not DeepSeek V4's
+three hyper-connection blocks (`mtp.*`). TensorSharp rejects them with a clear message rather
+than mis-loading them. Listed here so you know what exists upstream:
+
+| Backbone | Official checkpoint (safetensors) | Community GGUF |
+|---|---|---|
+| Qwen3-4B | [deepseek-ai/dspark_qwen3_4b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7) | — |
+| Qwen3-8B | [deepseek-ai/dspark_qwen3_8b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_8b_block7) | [ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF](https://huggingface.co/ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF) (1.5 GB) |
+| Qwen3-14B | [deepseek-ai/dspark_qwen3_14b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_14b_block7) | — |
+| Gemma-4-12B | [deepseek-ai/dspark_gemma4_12b_block7](https://huggingface.co/deepseek-ai/dspark_gemma4_12b_block7) | [ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF](https://huggingface.co/ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF) (1.9 GB), [williamliao/dspark_gemma4_12b-GGUF](https://huggingface.co/williamliao/dspark_gemma4_12b-GGUF) (IQ4_XS…F16) |
+| Gemma-4-26B-A4B | — | [williamliao/dspark_gemma4_26b-a4b-it-GGUF](https://huggingface.co/williamliao/dspark_gemma4_26b-a4b-it-GGUF) (1.2-3.8 GB) |
+| Gemma-4-31B | — | [williamliao/dspark_gemma4_31b-it-GGUF](https://huggingface.co/williamliao/dspark_gemma4_31b-it-GGUF) (3.3-11 GB) |
+
+Gemma 4 does have a supported speculative path today — the `gemma4-assistant` MTP drafts in
+the table above, via `--mtp-spec --mtp-draft-model` — and Qwen 3.6 has its embedded NextN
+block. Those are different drafters from DSpark.
 
 ### Download & Run — per-model quick reference
 
@@ -40,6 +84,22 @@ The `hf download` commands need the Hugging Face CLI (`pip install -U huggingfac
 ```bash
 echo "Give me three facts about the Moon." > prompt.txt
 ```
+
+**DeepSeek V4 Flash** — 284B MoE, text only, DSpark speculative decoding ([unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF))
+
+```bash
+# ~160 GB of weights: needs several GPUs (layer-split automatically) plus ~7 GB for the drafter
+hf download unsloth/DeepSeek-V4-Flash-0731-GGUF --include "UD-Q8_K_XL/*" --local-dir models
+hf download bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF DSpark-drafter-Q2K-Q8-0731.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    --backend ggml_cuda --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf \
+    --input prompt.txt --max-tokens 200 --temperature 0
+```
+
+Drop `--draft-model` for plain decode. Speculation needs greedy sampling (`--temperature 0`);
+`--spec-draft-conf-min` tunes how far each block is drafted.
 
 **Gemma 4** — text + image/video/audio, thinking, tools, MTP ([ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF))
 

@@ -840,8 +840,10 @@ static void dsv4_upload_rope_tables(dsv4_model & m)
 // shard, so the normal create+upload path moves them. Returns false only on a
 // malformed/mismatched file; a null path just leaves DSpark disabled.
 static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
-                             shard_files & shards, std::map<std::string, tensor_source> & sources)
+                             shard_files & shards, std::map<std::string, tensor_source> & sources,
+                             size_t * out_bytes)
 {
+    if (out_bytes) *out_bytes = 0;
     if (!dspark_path || !*dspark_path) return true;
 
     ggml_context * meta = nullptr;
@@ -853,14 +855,31 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
         return false;
     }
 
+    // Published drafters carry the same weights under three naming schemes
+    // (the ds4 builder's mtp.* plus two dspark.* variants that differ in the
+    // metadata prefix), so try every spelling for both keys and tensors.
+    auto kv_u32 = [&](std::initializer_list<const char *> keys, int32_t * out) -> bool
+    {
+        for (const char * k : keys)
+            if (gguf_get_u32_key(g, k, out)) return true;
+        return false;
+    };
+    auto kv_arr = [&](std::initializer_list<const char *> keys, std::vector<int32_t> & out) -> bool
+    {
+        for (const char * k : keys)
+            if (gguf_get_arr_i32(g, k, out)) return true;
+        return false;
+    };
+
     dsv4_dspark & ds = m.ds;
     bool ok = true;
-    ok &= gguf_get_u32_key(g, "dspark.block_size", &ds.block_size);
-    ok &= gguf_get_u32_key(g, "dspark.markov_rank", &ds.markov_rank);
-    ok &= gguf_get_u32_key(g, "dspark.noise_token_id", &ds.noise_token);
-    if (!gguf_get_u32_key(g, "dspark.n_layers", &ds.n_stages))
-        ok &= gguf_get_u32_key(g, "dspark.stage_count", &ds.n_stages);
-    ok &= gguf_get_arr_i32(g, "dspark.target_layer_ids", ds.target_layers);
+    ok &= kv_u32({ "dspark.block_size", "deepseek4.dspark.block_size" }, &ds.block_size);
+    ok &= kv_u32({ "dspark.markov_rank", "deepseek4.dspark.markov_rank" }, &ds.markov_rank);
+    ok &= kv_u32({ "dspark.noise_token_id", "deepseek4.dspark.noise_token_id" }, &ds.noise_token);
+    ok &= kv_u32({ "dspark.n_layers", "dspark.stage_count", "dspark.layer_count",
+                   "deepseek4.dspark.n_layers", "deepseek4.dspark.layer_count" }, &ds.n_stages);
+    ok &= kv_arr({ "dspark.target_layer_ids", "dspark.target_layers",
+                   "deepseek4.dspark.target_layer_ids", "deepseek4.dspark.target_layers" }, ds.target_layers);
     if (!ok || ds.block_size <= 0 || ds.n_stages <= 0 || ds.markov_rank <= 0 || ds.target_layers.empty())
     {
         fprintf(stderr, "[dsv4] %s is missing dspark.* metadata\n", dspark_path);
@@ -875,6 +894,20 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
             gguf_free(g); if (meta) ggml_free(meta);
             return false;
         }
+    }
+
+    const char * arch = nullptr;
+    {
+        const int64_t ai = gguf_find_key(g, "general.architecture");
+        if (ai >= 0 && gguf_get_kv_type(g, ai) == GGUF_TYPE_STRING)
+            arch = gguf_get_val_str(g, ai);
+    }
+    if (arch && strcmp(arch, "deepseek4-dspark") != 0 && strcmp(arch, "deepseek_v4_flash_dspark_draft") != 0)
+    {
+        fprintf(stderr, "[dsv4] %s is a '%s' drafter, not a DeepSeek V4 DSpark one; DSpark drafters for other "
+                        "architectures use a different design and are not supported\n", dspark_path, arch);
+        gguf_free(g); if (meta) ggml_free(meta);
+        return false;
     }
 
     const int si = (int) shards.paths.size();
@@ -894,6 +927,7 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
         src.type = mt->type;
         for (int d = 0; d < 4; d++) src.ne[d] = mt->ne[d];
         sources[name] = src;
+        if (out_bytes) *out_bytes += src.size;
     }
 
     gguf_free(g);
@@ -1072,8 +1106,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         ggml_free(meta);
     }
 
-    if (!dsv4_scan_dspark(*m, dspark_path, shards, sources))
+    size_t dspark_bytes = 0;
+    if (!dsv4_scan_dspark(*m, dspark_path, shards, sources, &dspark_bytes))
         return nullptr;
+    // The drafter lands entirely on the output-head device, so it has to weigh
+    // on the split: counted as root bytes it pushes whole layers onto the
+    // earlier devices instead of overflowing the last one.
+    root_bytes += dspark_bytes;
 
     // --- vocab size from tok_embd ---
     {
@@ -1224,34 +1263,48 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     if (m->ds.loaded)
     {
         dsv4_dspark & ds = m->ds;
+        // First spelling present in the drafter file wins (see dsv4_scan_dspark).
+        auto pick = [&](const std::string & a, const std::string & b) -> std::string
+        {
+            return sources.count(a) ? a : b;
+        };
+        auto DSW = [&](int d, const std::string & a, const std::string & b) -> ggml_tensor *
+        {
+            return dsv4_create_weight(*m, sources, d, "%s", pick(a, b).c_str());
+        };
+        auto SW = [&](int d, int st, const char * suffix) -> ggml_tensor *
+        {
+            const std::string n = std::to_string(st);
+            return DSW(d, "mtp." + n + "." + suffix, "dspark." + n + "." + suffix);
+        };
         for (int st = 0; st < ds.n_stages; st++)
         {
             dsv4_layer & L = m->layers[hp.n_layer + st];
             const int d = ds.dev;
-            L.attn_norm      = W(d, "mtp.%d.attn_norm.weight", st);
-            L.attn_q_a_norm  = W(d, "mtp.%d.attn_q_a_norm.weight", st);
-            L.attn_kv_norm   = W(d, "mtp.%d.attn_kv_a_norm.weight", st);
-            L.attn_sinks     = W(d, "mtp.%d.attn_sinks.weight", st);
-            L.wq_a           = W(d, "mtp.%d.attn_q_a.weight", st);
-            L.wq_b           = W(d, "mtp.%d.attn_q_b.weight", st);
-            L.wkv            = W(d, "mtp.%d.attn_kv.weight", st);
-            L.wo_a           = W(d, "mtp.%d.attn_output_a.weight", st);
-            L.wo_b           = W(d, "mtp.%d.attn_output_b.weight", st);
-            L.hc_attn_fn     = W(d, "mtp.%d.hc_attn_fn.weight", st);
-            L.hc_attn_scale  = W(d, "mtp.%d.hc_attn_scale.weight", st);
-            L.hc_attn_base   = W(d, "mtp.%d.hc_attn_base.weight", st);
-            L.hc_ffn_fn      = W(d, "mtp.%d.hc_ffn_fn.weight", st);
-            L.hc_ffn_scale   = W(d, "mtp.%d.hc_ffn_scale.weight", st);
-            L.hc_ffn_base    = W(d, "mtp.%d.hc_ffn_base.weight", st);
-            L.ffn_norm       = W(d, "mtp.%d.ffn_norm.weight", st);
-            L.ffn_gate_inp   = W(d, "mtp.%d.ffn_gate_inp.weight", st);
-            L.ffn_exp_probs_b = W(d, "mtp.%d.exp_probs_b.bias", st);
-            L.ffn_gate_exps  = W(d, "mtp.%d.ffn_gate_exps.weight", st);
-            L.ffn_down_exps  = W(d, "mtp.%d.ffn_down_exps.weight", st);
-            L.ffn_up_exps    = W(d, "mtp.%d.ffn_up_exps.weight", st);
-            L.ffn_gate_shexp = W(d, "mtp.%d.ffn_gate_shexp.weight", st);
-            L.ffn_down_shexp = W(d, "mtp.%d.ffn_down_shexp.weight", st);
-            L.ffn_up_shexp   = W(d, "mtp.%d.ffn_up_shexp.weight", st);
+            L.attn_norm      = SW(d, st, "attn_norm.weight");
+            L.attn_q_a_norm  = SW(d, st, "attn_q_a_norm.weight");
+            L.attn_kv_norm   = SW(d, st, "attn_kv_a_norm.weight");
+            L.attn_sinks     = SW(d, st, "attn_sinks.weight");
+            L.wq_a           = SW(d, st, "attn_q_a.weight");
+            L.wq_b           = SW(d, st, "attn_q_b.weight");
+            L.wkv            = SW(d, st, "attn_kv.weight");
+            L.wo_a           = SW(d, st, "attn_output_a.weight");
+            L.wo_b           = SW(d, st, "attn_output_b.weight");
+            L.hc_attn_fn     = SW(d, st, "hc_attn_fn.weight");
+            L.hc_attn_scale  = SW(d, st, "hc_attn_scale.weight");
+            L.hc_attn_base   = SW(d, st, "hc_attn_base.weight");
+            L.hc_ffn_fn      = SW(d, st, "hc_ffn_fn.weight");
+            L.hc_ffn_scale   = SW(d, st, "hc_ffn_scale.weight");
+            L.hc_ffn_base    = SW(d, st, "hc_ffn_base.weight");
+            L.ffn_norm       = SW(d, st, "ffn_norm.weight");
+            L.ffn_gate_inp   = SW(d, st, "ffn_gate_inp.weight");
+            L.ffn_exp_probs_b = SW(d, st, "exp_probs_b.bias");
+            L.ffn_gate_exps  = SW(d, st, "ffn_gate_exps.weight");
+            L.ffn_down_exps  = SW(d, st, "ffn_down_exps.weight");
+            L.ffn_up_exps    = SW(d, st, "ffn_up_exps.weight");
+            L.ffn_gate_shexp = SW(d, st, "ffn_gate_shexp.weight");
+            L.ffn_down_shexp = SW(d, st, "ffn_down_shexp.weight");
+            L.ffn_up_shexp   = SW(d, st, "ffn_up_shexp.weight");
             if (!L.attn_norm || !L.wq_a || !L.wq_b || !L.wkv || !L.wo_a || !L.wo_b ||
                 !L.ffn_gate_exps || !L.ffn_down_exps || !L.ffn_up_exps || !L.ffn_gate_inp)
             {
@@ -1259,16 +1312,18 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 return nullptr;
             }
         }
-        const int last = ds.n_stages - 1;
-        ds.main_norm     = W(ds.dev, "mtp.0.main_norm.weight");
-        ds.main_proj     = W(ds.dev, "mtp.0.main_proj.weight");
-        ds.norm          = W(ds.dev, "mtp.%d.norm.weight", last);
-        ds.hc_head_fn    = W(ds.dev, "mtp.%d.hc_head_fn.weight", last);
-        ds.hc_head_scale = W(ds.dev, "mtp.%d.hc_head_scale.weight", last);
-        ds.hc_head_base  = W(ds.dev, "mtp.%d.hc_head_base.weight", last);
-        ds.markov_w1     = W(ds.dev, "mtp.%d.markov_head.markov_w1.weight", last);
-        ds.markov_w2     = W(ds.dev, "mtp.%d.markov_head.markov_w2.weight", last);
-        ds.conf_proj     = W(ds.dev, "mtp.%d.confidence_head.proj.weight", last);
+        const std::string last = std::to_string(ds.n_stages - 1);
+        ds.main_norm     = DSW(ds.dev, "mtp.0.main_norm.weight", "dspark.main_norm.weight");
+        ds.main_proj     = DSW(ds.dev, "mtp.0.main_proj.weight", "dspark.main_proj.weight");
+        ds.norm          = DSW(ds.dev, "mtp." + last + ".norm.weight", "dspark.norm.weight");
+        ds.hc_head_fn    = DSW(ds.dev, "mtp." + last + ".hc_head_fn.weight", "dspark.hc_head_fn.weight");
+        ds.hc_head_scale = DSW(ds.dev, "mtp." + last + ".hc_head_scale.weight", "dspark.hc_head_scale.weight");
+        ds.hc_head_base  = DSW(ds.dev, "mtp." + last + ".hc_head_base.weight", "dspark.hc_head_base.weight");
+        ds.markov_w1     = DSW(ds.dev, "mtp." + last + ".markov_head.markov_w1.weight", "dspark.markov_w1.weight");
+        ds.markov_w2     = DSW(ds.dev, "mtp." + last + ".markov_head.markov_w2.weight", "dspark.markov_w2.weight");
+        ds.conf_proj     = DSW(ds.dev, "mtp." + last + ".confidence_head.proj.weight",
+                               sources.count("dspark.conf_proj.weight") ? "dspark.conf_proj.weight"
+                                                                       : "dspark.confidence_head.weight");
         if (!ds.main_norm || !ds.main_proj || !ds.norm || !ds.hc_head_fn || !ds.markov_w1 ||
             !ds.markov_w2 || !ds.conf_proj)
         {
