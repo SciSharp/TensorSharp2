@@ -386,8 +386,37 @@ namespace TensorSharp.Runtime
                     case State.CollectingContent:
                         int chIdx = buf.IndexOf("<|channel>", StringComparison.Ordinal);
                         int tcIdx = buf.IndexOf("<|tool_call>", StringComparison.Ordinal);
+                        // A CLOSING <channel|> with no opener in the generated text:
+                        // the block was opened by the prompt's channel primer, so the
+                        // model is closing a thinking block we never saw start. Gemma 4
+                        // does this even with thinking disabled (the primer is a
+                        // complete empty block, but smaller checkpoints still reason
+                        // first), and treating it as content is what surfaced the whole
+                        // chain of thought — plus the raw marker — as the answer.
+                        int strayCloseIdx = buf.IndexOf("<channel|>", StringComparison.Ordinal);
 
-                        if (chIdx >= 0 && (tcIdx < 0 || chIdx < tcIdx))
+                        if (strayCloseIdx >= 0
+                            && (chIdx < 0 || strayCloseIdx < chIdx)
+                            && (tcIdx < 0 || strayCloseIdx < tcIdx))
+                        {
+                            string thought = buf.Substring(0, strayCloseIdx);
+                            // The model may re-emit the channel name it is closing.
+                            if (thought.StartsWith("thought\n", StringComparison.Ordinal))
+                                thought = thought.Substring(8);
+                            string after = buf.Substring(strayCloseIdx + 10).TrimStart();
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            // Only text still buffered can be reclassified: a streaming
+                            // consumer already received whatever was flushed before the
+                            // marker arrived, and there is no bounded lookahead that
+                            // would let us hold an arbitrarily long thought block back.
+                            // Batch callers (Add(full, done: true)) buffer the whole
+                            // output, so they get the split exactly right.
+                            thought = thought.Trim();
+                            if (thought.Length > 0 && _thinkingEnabled) thinkingSb.Append(thought);
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (chIdx >= 0 && (tcIdx < 0 || chIdx < tcIdx))
                         {
                             string before = buf.Substring(0, chIdx).TrimEnd();
                             string after = buf.Substring(chIdx + 10);
@@ -410,7 +439,7 @@ namespace TensorSharp.Runtime
                         }
                         else if (!done)
                         {
-                            int hold = HoldBack(buf, "<|channel>", "<|tool_call>");
+                            int hold = HoldBack(buf, "<|channel>", "<|tool_call>", "<channel|>");
                             if (hold > 0)
                             {
                                 string emit = buf.Substring(0, buf.Length - hold);

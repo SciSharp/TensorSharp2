@@ -2708,7 +2708,17 @@ int qi_fwd_run(QiForwardPersist* e, const TSGgmlQwenImageForwardDesc* d)
     // reuses the same buffer (not regrown, so addresses stay stable and the CUDA-graph capture
     // holds) and re-derives the buffer-reuse tensor data pointers.
     if (e->galloc != nullptr && !ggml_gallocr_alloc_graph(e->galloc, g.graph))
-    { set_last_error("QwenImageForward: gallocr realloc failed."); return 0; }
+    {
+        // A failed reserve frees the buffer but leaves the plan claiming every
+        // tensor is placed (see alloc_graph_reuse_gallocr), so the NEXT forward —
+        // same graph, so needs_realloc() says no — would allocate tensors out of a
+        // NULL buffer and segfault. Tear the whole persistent entry down (the
+        // graph's tensors point into the buffer that reserve just freed, so the
+        // gallocr alone cannot be replaced) and let the next call rebuild it.
+        e->reset();
+        set_last_error("QwenImageForward: gallocr realloc failed.");
+        return 0;
+    }
 
     // The graph reads an intermediate buffer slot before it is fully written (benign with a
     // fresh allocation, which reads as zero, but on a reused gallocr buffer that slot holds the

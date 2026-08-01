@@ -437,7 +437,12 @@ public sealed class CliRunner
         int markerIdx = stdout.IndexOf(GeneratedOutputMarker, StringComparison.Ordinal);
         if (markerIdx < 0)
         {
-            return string.Empty;
+            // Multi-turn runs never print the marker: --multi-turn-jsonl streams
+            // nothing and reports each turn's answer through the structured log
+            // instead. Without this the assistant text is always empty, so every
+            // multi_turn cell fails its correctness check on every model no
+            // matter how well the model answered.
+            return ExtractMultiTurnText(stdout);
         }
         int textStart = stdout.IndexOf('\n', markerIdx);
         if (textStart < 0)
@@ -469,6 +474,29 @@ public sealed class CliRunner
         }
         return string.Join('\n', keep);
     }
+
+    /// <summary>
+    /// Collect the per-turn answers of a <c>--multi-turn-jsonl</c> run from the
+    /// CLI's structured log, which reports each turn as
+    /// <c>multi-turn content chars=… tokens=… … preview=&lt;answer&gt;</c>.
+    /// The previews are joined newest-last so a correctness check sees the whole
+    /// conversation (turn 2 answers the name, turn 3 the colour).
+    /// </summary>
+    private static string ExtractMultiTurnText(string stdout)
+    {
+        var turns = new List<string>();
+        foreach (System.Text.RegularExpressions.Match match in MultiTurnPreviewRegex.Matches(stdout))
+        {
+            string preview = match.Groups["preview"].Value.TrimEnd('\r');
+            if (preview.Length > 0) turns.Add(preview);
+        }
+        return string.Join('\n', turns);
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex MultiTurnPreviewRegex =
+        new(@"multi-turn content chars=\d+.*?preview=(?<preview>.*)$",
+            System.Text.RegularExpressions.RegexOptions.Compiled
+            | System.Text.RegularExpressions.RegexOptions.Multiline);
 
     private static readonly System.Text.RegularExpressions.Regex LogLinePrefixRegex =
         new(@"^(?:\d{2}:\d{2}:\d{2}\s+)?(info|warn|warning|error|critical|trace|debug|fail|crit):\s",
