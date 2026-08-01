@@ -1115,11 +1115,17 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     root_bytes += dspark_bytes;
 
     // --- vocab size from tok_embd ---
+    // Its size is also where the split learns how the root bytes really land:
+    // the embedding table on the first device, the output head and the whole
+    // drafter on the last one (see the W(dev_first/dev_last) placements below).
+    size_t embd_bytes = 0;
     {
         auto it = sources.find("token_embd.weight");
         if (it == sources.end()) { fprintf(stderr, "[dsv4] token_embd missing\n"); return nullptr; }
         hp.n_vocab = (int32_t) it->second.ne[1];
+        embd_bytes = it->second.size;
     }
+    const size_t head_bytes = root_bytes - embd_bytes;
 
     // --- geometry ---
     m->n_ctx = n_ctx > 0 ? n_ctx : 16384;
@@ -1130,18 +1136,71 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     m->n_csa_rows = pad64(m->n_ctx / CSA_RATIO + 1, 256);
     m->n_hca_rows = pad64(m->n_ctx / HCA_RATIO + 1, 256);
 
-    // --- layer -> device split by cumulative weight bytes ---
+    // --- layer -> device split ------------------------------------------
+    // Minimize the LARGEST per-device load, counting each device's fixed
+    // residents (embedding table on the first, output head + drafter on the
+    // last). Spreading those fixed bytes evenly instead -- what a plain
+    // byte-proportional split does -- hands the first device a share of layers
+    // it should never have had: with a drafter loaded that was ~1.7 GB of
+    // surplus weights on device 0, enough that a long prompt's prefill compute
+    // buffer no longer fit and ggml's allocator faulted.
     size_t total_bytes = root_bytes;
     for (auto b : layer_bytes) total_bytes += b;
     m->layers.resize(hp.n_layer);
     {
-        size_t acc = 0;
-        for (int il = 0; il < hp.n_layer; il++)
+        std::vector<size_t> fixed_bytes((size_t) n_gpu, 0);
+        fixed_bytes[0] += embd_bytes;
+        fixed_bytes[(size_t) n_gpu - 1] += head_bytes;
+
+        // Layers stay in pipeline order, so every device takes one contiguous
+        // run: fill each device up to `cap`, and report how many devices that
+        // needed (n_gpu + 1 = "does not fit").
+        auto assign = [&](size_t cap, std::vector<int> * out) -> int
         {
-            int dev = (int) ((acc * n_gpu) / (total_bytes + 1));
-            if (dev >= n_gpu) dev = n_gpu - 1;
-            m->layers[il].device = dev;
-            acc += layer_bytes[il];
+            int dev = 0;
+            size_t used = fixed_bytes[0];
+            for (int il = 0; il < hp.n_layer; il++)
+            {
+                while (used + layer_bytes[il] > cap)
+                {
+                    if (dev + 1 >= n_gpu) return n_gpu + 1;
+                    used = fixed_bytes[++dev];
+                }
+                used += layer_bytes[il];
+                if (out) (*out)[il] = dev;
+            }
+            return dev + 1;
+        };
+
+        size_t lo = 1, hi = total_bytes;
+        while (lo < hi)
+        {
+            size_t mid = lo + (hi - lo) / 2;
+            if (assign(mid, nullptr) <= n_gpu) hi = mid;
+            else lo = mid + 1;
+        }
+
+        std::vector<int> devs((size_t) hp.n_layer, 0);
+        int used_devs = assign(lo, &devs);
+        if (used_devs == n_gpu)
+        {
+            for (int il = 0; il < hp.n_layer; il++)
+                m->layers[il].device = devs[il];
+        }
+        else
+        {
+            // Fewer layers than devices, or a fixed resident so large that a
+            // device cannot take any layer: the balanced split would leave the
+            // output head stranded on a device the pipeline never reaches, so
+            // fall back to spreading by cumulative bytes.
+            size_t acc = 0;
+            for (int il = 0; il < hp.n_layer; il++)
+            {
+                int dev = (int) ((acc * n_gpu) / (total_bytes + 1));
+                if (dev >= n_gpu) dev = n_gpu - 1;
+                m->layers[il].device = dev;
+                acc += layer_bytes[il];
+            }
         }
     }
 

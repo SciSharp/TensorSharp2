@@ -118,9 +118,12 @@ namespace TensorSharp.Models
         /// Greedy generation with MTP speculative decoding. Resets the model KV
         /// cache, prefills <paramref name="promptTokens"/>, then emits up to
         /// <paramref name="maxNewTokens"/> tokens (the stop token, when hit, is
-        /// included as the final element).
+        /// included as the final element). <paramref name="onToken"/>, when
+        /// given, receives every emitted token as it is produced and returns
+        /// false to stop generating.
         /// </summary>
-        public List<int> GenerateGreedy(int[] promptTokens, int maxNewTokens, Func<int, bool> isStopToken = null)
+        public List<int> GenerateGreedy(int[] promptTokens, int maxNewTokens, Func<int, bool> isStopToken = null,
+            Func<int, bool> onToken = null)
         {
             _model.ResetKVCache();
             _exec.Reset();
@@ -132,15 +135,78 @@ namespace TensorSharp.Models
             var sw = System.Diagnostics.Stopwatch.StartNew();
             float[] logits = Prefill(promptTokens);
             LastPrefillSeconds = sw.Elapsed.TotalSeconds;
-            sw.Restart();
+            GenerateFrom(logits, promptTokens.Length, maxNewTokens, isStopToken, onToken, output);
+            return output;
+        }
+
+        /// <summary>
+        /// Greedy speculative generation continuing from <paramref name="promptLogits"/>,
+        /// the next-token logits at trunk position <paramref name="position"/>. Unlike
+        /// <see cref="GenerateGreedy"/> this touches neither the KV cache nor the
+        /// speculative state, so a caller that owns prompt prefill (a chat turn reusing
+        /// the prefix its predecessor left in the cache) can drive the same draft/verify
+        /// loop. <paramref name="onToken"/> receives each token as it is emitted and
+        /// returns false to stop; the stop token is appended to the result but is not
+        /// streamed.
+        ///
+        /// On return the trunk holds exactly the first
+        /// <c>CacheSeqLen - position</c> tokens of the result, so a caller tracking the
+        /// cache can mirror it without guessing where a stopped step left off.
+        /// </summary>
+        public List<int> GenerateGreedyFrom(float[] promptLogits, int position, int maxNewTokens,
+            Func<int, bool> isStopToken = null, Func<int, bool> onToken = null)
+        {
+            if (promptLogits == null)
+                throw new ArgumentNullException(nameof(promptLogits));
+
+            var output = new List<int>();
+            if (maxNewTokens > 0)
+                GenerateFrom(promptLogits, position, maxNewTokens, isStopToken, onToken, output);
+            return output;
+        }
+
+        private void GenerateFrom(float[] promptLogits, int position, int maxNewTokens,
+            Func<int, bool> isStopToken, Func<int, bool> onToken, List<int> output)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                int tLast = Argmax(logits, _vocab);
-                output.Add(tLast);
-                if (isStopToken != null && isStopToken(tLast))
-                    return output;
+                Decode();
 
-                int n = promptTokens.Length;
+                // A verify batch commits the whole accepted prefix at once, so a run
+                // that ends part-way through emitting one (a stop token, a consumer
+                // that asked to stop) leaves the trunk holding tokens that never
+                // reached the result. Drop them, so the trunk always holds exactly a
+                // prefix of what was returned and a caller mirroring the cache does
+                // not have to reason about where the last step stopped.
+                int emitted = position + output.Count;
+                if (_model.CacheSeqLen > emitted)
+                    _model.MtpRewindCache(emitted);
+            }
+            finally
+            {
+                LastDecodeSeconds = sw.Elapsed.TotalSeconds;
+            }
+
+            void Decode()
+            {
+                // Appends a token to the result and reports whether generation
+                // should continue: a stop token ends the run without being
+                // streamed, and the consumer can end it too (cancellation, a
+                // stop sequence).
+                bool Emit(int t)
+                {
+                    output.Add(t);
+                    if (isStopToken != null && isStopToken(t))
+                        return false;
+                    return onToken == null || onToken(t);
+                }
+
+                int tLast = Argmax(promptLogits, _vocab);
+                if (!Emit(tLast))
+                    return;
+
+                int n = position;
 
                 while (output.Count < maxNewTokens)
                 {
@@ -159,42 +225,38 @@ namespace TensorSharp.Models
                     {
                         // Plain decode step.
                         int next = Argmax(outcome.NextLogits, _vocab);
-                        output.Add(next);
                         n += 1;
                         tLast = next;
-                        if (isStopToken != null && isStopToken(next))
-                            return output;
+                        if (!Emit(next))
+                            return;
                         continue;
                     }
+
+                    // The trunk has already committed the accepted prefix plus the
+                    // corrected/bonus token, so advance the position before emitting:
+                    // a consumer that stops mid-step must still see a position that
+                    // matches the cache.
+                    n += outcome.AcceptedCount + 1;
+                    tLast = outcome.NextToken;
 
                     // Emit accepted drafts then the corrected/bonus token.
                     int emittedThisStep = 0;
                     for (int i = 0; i < _acceptedScratch.Count && output.Count < maxNewTokens; i++)
                     {
-                        output.Add(_acceptedScratch[i]);
                         emittedThisStep++;
-                        if (isStopToken != null && isStopToken(_acceptedScratch[i]))
-                            return output;
+                        if (!Emit(_acceptedScratch[i]))
+                            return;
                     }
                     if (output.Count < maxNewTokens)
                     {
-                        output.Add(outcome.NextToken);
                         emittedThisStep++;
-                        if (isStopToken != null && isStopToken(outcome.NextToken))
-                            return output;
+                        if (!Emit(outcome.NextToken))
+                            return;
                     }
 
-                    n += outcome.AcceptedCount + 1;
-                    tLast = outcome.NextToken;
                     if (emittedThisStep == 0)
                         break; // budget exhausted mid-step
                 }
-
-                return output;
-            }
-            finally
-            {
-                LastDecodeSeconds = sw.Elapsed.TotalSeconds;
             }
         }
 

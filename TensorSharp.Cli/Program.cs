@@ -669,7 +669,9 @@ namespace TensorSharp.Cli
                     tools,
                     enableThinking,
                     maxTokens > 0 ? maxTokens : 512,
-                    _log);
+                    _log,
+                    specDraftMax,
+                    specDraftConfMin);
                 if (!string.IsNullOrEmpty(systemPrompt))
                     session.SetInitialSystemPrompt(systemPrompt);
                 session.Run();
@@ -2067,7 +2069,8 @@ namespace TensorSharp.Cli
             // plain greedy decoding, so it is only a speed path.
             {
                 var specCfg = samplingConfig ?? SamplingConfig.Greedy;
-                if (specCfg.IsGreedy && model is TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel blockSpec
+                if (InteractiveSession.IsArgmaxSampling(specCfg)
+                    && model is TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel blockSpec
                     && blockSpec.HasMtp && blockSpec.MtpDraftBlockSize > 0)
                 {
                     return RunBlockSpeculativeInference(model, blockSpec, inputTokens, maxTokens,

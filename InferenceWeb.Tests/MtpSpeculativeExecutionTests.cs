@@ -14,6 +14,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp.Models;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
@@ -467,6 +468,85 @@ public class MtpSpeculativeExecutionTests
         Assert.Empty(model.ProtocolViolations);
     }
 
+    // ----- streaming / resumable generation (the interactive chat path) -----
+
+    [Fact]
+    public void GenerateGreedy_StreamsEveryEmittedTokenAndWithholdsTheStopToken()
+    {
+        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+
+        var prompt = new[] { 1, 2, 3, 4, 5 };
+        // Generated token j is the trunk's prediction at position prompt.Length-1+j,
+        // so this ends the run on the 8th one.
+        int eos = model.ExpectedNext(prompt.Length + 6);
+
+        var streamed = new List<int>();
+        var output = decoder.GenerateGreedy(prompt, maxNewTokens: 64,
+            isStopToken: t => t == eos,
+            onToken: t => { streamed.Add(t); return true; });
+
+        Assert.Equal(eos, output[^1]);
+        // Everything except the stop token reaches the consumer, in order.
+        Assert.Equal(output.Take(output.Count - 1), streamed);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void GenerateGreedy_ConsumerStopsMidBlock_TrunkStaysAPrefixOfTheOutput()
+    {
+        // The invariant the chat session's KV bookkeeping rests on: on return the
+        // trunk holds exactly a PREFIX OF THE RETURNED OUTPUT. A block step commits
+        // its whole accepted window in one forward, so stopping part-way through
+        // emitting it runs the trunk past the result — the decoder has to drop that
+        // tail rather than leave the caller's cache mirror guessing.
+        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+
+        var prompt = new[] { 1, 2, 3, 4, 5 };
+        var streamed = new List<int>();
+        var output = decoder.GenerateGreedy(prompt, maxNewTokens: 64,
+            isStopToken: null,
+            onToken: t => { streamed.Add(t); return streamed.Count < 3; });
+
+        Assert.Equal(3, streamed.Count);
+        Assert.Equal(streamed, output);
+        int committed = model.CacheSeqLen - prompt.Length;
+        Assert.True(committed <= output.Count);
+        Assert.Equal(output.Take(committed), model.Trunk.Skip(prompt.Length));
+    }
+
+    [Fact]
+    public void GenerateGreedyFrom_ResumesOnTheCachedPrefixWithoutResettingTheTrunk()
+    {
+        // The multi-turn chat path: turn 2 prefills only its new tokens on top of
+        // the cache turn 1 left behind, then decodes from there.
+        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+
+        var prompt = new[] { 1, 2, 3, 4, 5 };
+        var turn1 = decoder.GenerateGreedy(prompt, maxNewTokens: 6);
+        int afterTurn1 = model.CacheSeqLen;
+        // The trunk holds a prefix of what was generated (the final token is only
+        // forwarded when the next step consumes it).
+        Assert.InRange(afterTurn1, prompt.Length + turn1.Count - 1, prompt.Length + turn1.Count);
+
+        // Extend the cache with the next turn's tokens only — no ResetKVCache.
+        var suffix = new[] { 11, 12, 13 };
+        float[] logits = decoder.Prefill(suffix);
+        Assert.Equal(afterTurn1 + suffix.Length, model.CacheSeqLen);
+
+        int resumePos = model.CacheSeqLen;
+        var turn2 = decoder.GenerateGreedyFrom(logits, resumePos, maxNewTokens: 6);
+
+        Assert.Equal(6, turn2.Count);
+        Assert.Equal(model.ExpectedNext(resumePos - 1), turn2[0]);
+        Assert.InRange(model.CacheSeqLen, resumePos + turn2.Count - 1, resumePos + turn2.Count);
+        // The drafter was fed the right hidden state across the turn boundary.
+        Assert.Empty(model.ProtocolViolations);
+        Assert.True(decoder.TokensDrafted > 0);
+    }
+
     private sealed class FakeMtpModel : IMtpBatchedSpeculativeModel
     {
         private readonly List<int> _trunk = new();
@@ -516,6 +596,9 @@ public class MtpSpeculativeExecutionTests
         }
 
         public int ExpectedNext(int position) => ((position * 13) + 7) % VocabSize;
+
+        /// <summary>Tokens the trunk has actually committed to its KV cache.</summary>
+        public IReadOnlyList<int> Trunk => _trunk;
 
         // ---- IModelArchitecture ----
         public ModelConfig Config { get; } = new ModelConfig

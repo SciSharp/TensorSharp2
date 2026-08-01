@@ -94,11 +94,28 @@ greedy (`--temperature 0`) single-sequence generation on **both GPU engines** �
 executor). `ggml_vulkan` and `cpu` have no speculative path for this
 architecture and log a warning if a drafter is configured.
 
+Every single-sequence CLI generation path uses it: one-shot `--input`,
+`--multi-turn-jsonl`, and the `--interactive` chat REPL (which streams the
+accepted block token by token and reuses the cached prefix across turns). The
+per-turn line reports what speculation did, e.g.
+`spec=window5/accepted330of502(66 %)`.
+
 ```bash
 TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --backend ggml_cuda --draft-model DeepSeek-V4-Flash-0731-DSpark.gguf \
     --input prompt.txt --max-tokens 200 --temperature 0
+
+# Interactive chat, 4 GPUs
+TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    --backend ggml_cuda --draft-model DSpark-drafter-Q2K-Q8-0731.gguf \
+    --interactive --think --tp 4 --max-tokens 20000
 ```
+
+Speculation needs a pure argmax sampler, so it stays off for anything that
+rewrites the logits it verifies against — a non-zero temperature, top-k/top-p,
+or a repetition/presence/frequency penalty (`/temp`, `/top-k`, … in the REPL
+turn it off from the next turn onward). It also stays off for a turn that
+carries an image or audio attachment.
 
 The two engines implement the same algorithm differently. The **ggml** engine
 builds the drafter as three extra layers of the model graph: the trunk graph
@@ -172,7 +189,13 @@ fall back to plain decode more often.
 The drafter needs its three target feature layers on the device that owns the
 output head; the layer split reserves room for it automatically, and loading
 fails with a clear message if the split cannot satisfy that (reduce the GPU
-count or drop `--draft-model`).
+count or drop `--draft-model`). The split balances the LARGEST per-device load,
+counting each device's fixed residents — the embedding table on the first
+device, the output head and the whole drafter on the last — where they actually
+land. Spreading those over every device instead (what a plain byte-proportional
+split does) left the first device ~1.7 GB of surplus weights with a drafter
+loaded, which was enough for a long prompt's prefill compute buffer to no
+longer fit in VRAM.
 
 Measured on 4xA40 46 GB (DeepSeek-V4-Flash-0731 UD-Q8_K_XL, greedy, 200-token
 generation, 5.6 GB drafter):
@@ -186,6 +209,22 @@ generation, 5.6 GB drafter):
 Multi-turn decode benefits most (2.2x on the third turn of the sample
 conversation, 93% acceptance): a turn that continues an established context is
 exactly where the drafter is confident.
+
+Same box, `--interactive --think --tp 4` with the 7 GB Q2K-Q8 0731 drafter, a
+5-turn chat: short answer, long explanation, follow-up summary, then a 10K-token
+document with two questions about it.
+
+| Turn | Baseline | + DSpark | Acceptance |
+|---|---|---|---|
+| 1 short (53 tokens) | 25.6 tok/s | **44.4 tok/s (1.73x)** | 87% |
+| 2 long generation (512) | 26.4 tok/s | **39.6 tok/s (1.50x)** | 66% |
+| 3 follow-up (470) | 26.4 tok/s | **45.3 tok/s (1.72x)** | 76% |
+| 4 10K-token document (214) | 25.3 tok/s | **51.0 tok/s (2.02x)** | 85% |
+| 5 second question on it (156) | 25.4 tok/s | **49.3 tok/s (1.94x)** | 82% |
+
+Prefill stays at parity (831 vs 835 tok/s on the 10K prompt). Acceptance — and
+so the speedup — is highest where the next tokens are most predictable: a
+question answered out of a document in context beats free-form prose.
 
 Greedy output was byte-identical to the non-speculative baseline on both the
 200-token generation and the 15K-context run. Speculation only re-orders the
