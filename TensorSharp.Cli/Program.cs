@@ -204,6 +204,9 @@ namespace TensorSharp.Cli
             string qwenImageMmprojPath = null;
             string qwenImageLoraPath = null;
             bool offloadCpu = false;
+            string draftModelPath = null;
+            int specDraftMax = 0;
+            float specDraftConfMin = -1f;
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -227,6 +230,9 @@ namespace TensorSharp.Cli
                     case "--audio": audioPath = args[++i]; break;
                     case "--video": videoPath = args[++i]; break;
                     case "--mmproj": mmProjPath = args[++i]; break;
+                    case "--draft-model": draftModelPath = args[++i]; break;
+                    case "--spec-draft-n-max": specDraftMax = int.Parse(args[++i]); break;
+                    case "--spec-draft-conf-min": specDraftConfMin = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
                     case "--max-tokens": maxTokens = int.Parse(args[++i]); break;
                     case "--test": runTest = true; break;
                     case "--backend": backendStr = args[++i].ToLowerInvariant(); break;
@@ -472,7 +478,7 @@ namespace TensorSharp.Cli
                 tpDegree = localDegree;
             }
 
-            using var model = ModelBase.Create(modelPath, backend, tpDegree, tpGroup);
+            using var model = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath);
             modelLoadSw.Stop();
             _log.LogInformation(LogEventIds.ModelLoadCompleted,
                 "Loaded model {ModelFile} architecture={Architecture} contextLength={ContextLength} kvCacheDtype={KvCacheDtype} elapsedMs={ElapsedMs:F1}",
@@ -925,7 +931,8 @@ namespace TensorSharp.Cli
             string result = RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
                 isVideo: videoPath != null, samplingConfig: samplingConfig,
                 enableThinking: enableThinking, tools: tools,
-                preserveAllInput: pdfPath != null);
+                preserveAllInput: pdfPath != null,
+                specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin);
 
             _log.LogInformation(LogEventIds.ChatCompleted,
                 "cli.inference.complete chars={Chars} preview=\"{Preview}\"",
@@ -1023,33 +1030,75 @@ namespace TensorSharp.Cli
                 _log.LogInformation(LogEventIds.ChatStarted,
                     "multi-turn prompt tokens={PromptTokens}", inputTokens.Count);
 
-                var sw = Stopwatch.StartNew();
-                ReusePlan plan = kvCache.PlanReuse(inputTokens, model.SupportsKVCacheTruncation);
-                float[] logits = ApplyReusePlan(model, kvCache, plan, inputTokens);
-                double prefillMs = sw.Elapsed.TotalMilliseconds;
-
-                _log.LogInformation(LogEventIds.KvCacheReusePlan,
-                    "kv plan={Plan} prefillMs={PrefillMs:F1} description={Description}",
-                    plan.Kind, prefillMs, DescribePlan(plan, inputTokens.Count));
-
                 var cfg = sampling ?? SamplingConfig.Greedy;
                 var sampler = new TokenSampler(cfg);
                 var generatedTokens = new List<int>();
                 var sb = new StringBuilder();
+                double prefillMs;
+                double decodeMs;
 
-                var decodeSw = Stopwatch.StartNew();
-                for (int step = 0; step < turnMaxTokens; step++)
+                bool turnSpeculative = cfg.IsGreedy
+                    && model is TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel turnSpec
+                    && turnSpec.HasMtp && turnSpec.MtpDraftBlockSize > 0;
+
+                if (turnSpeculative)
                 {
-                    int nextToken = sampler.Sample(logits, generatedTokens);
-                    if (model.Tokenizer.IsEos(nextToken)) break;
-                    generatedTokens.Add(nextToken);
-                    string decoded = model.Tokenizer.Decode(generatedTokens);
-                    sb.Clear();
-                    sb.Append(decoded);
-                    logits = model.Forward(new[] { nextToken });
-                    kvCache.RecordAppend(nextToken, logits);
+                    // Models with a block drafter (DeepSeek V4 + DSpark) cannot
+                    // truncate their compressed caches, so every turn re-prefills
+                    // anyway: hand the whole turn to the speculative decoder,
+                    // which owns the reset, the chunked prefill (replaying the
+                    // drafter's key ring) and the draft/verify loop.
+                    var turnSpecModel = (TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel)model;
+                    kvCache.Reset();
+                    var turnDecoder = new MtpSpeculativeDecoder(turnSpecModel, turnSpecModel.MtpDraftBlockSize)
+                    {
+                        MinDraftProb = 0.35f,
+                        PrefillChunkSize = turnSpecModel.MtpPrefillChunkSize > 0
+                            ? turnSpecModel.MtpPrefillChunkSize : 512,
+                    };
+                    var turnTokens = turnDecoder.GenerateGreedy(inputTokens.ToArray(), turnMaxTokens,
+                        t => model.Tokenizer.IsEos(t));
+                    if (turnTokens.Count > 0 && model.Tokenizer.IsEos(turnTokens[turnTokens.Count - 1]))
+                        turnTokens.RemoveAt(turnTokens.Count - 1);
+                    generatedTokens.AddRange(turnTokens);
+                    sb.Append(model.Tokenizer.Decode(generatedTokens));
+                    prefillMs = turnDecoder.LastPrefillSeconds * 1000.0;
+                    decodeMs = turnDecoder.LastDecodeSeconds * 1000.0;
+
+                    _log.LogInformation(LogEventIds.KvCacheReusePlan,
+                        "kv plan=Reset prefillMs={PrefillMs:F1} description={Description}",
+                        prefillMs, $"Full reset: forwarding {inputTokens.Count} tokens (block speculative)");
+                    _log.LogInformation(LogEventIds.CliBenchmark,
+                        "multi-turn speculative: drafted={Drafted} accepted={Accepted} acceptanceRate={Rate:F3} " +
+                        "verifySteps={Verify} plainSteps={Plain} rollbacks={Rollbacks}",
+                        turnDecoder.TokensDrafted, turnDecoder.TokensAccepted, turnDecoder.AcceptanceRate,
+                        turnDecoder.VerifySteps, turnDecoder.PlainSteps, turnDecoder.RollbackSteps);
                 }
-                double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
+                else
+                {
+                    var sw = Stopwatch.StartNew();
+                    ReusePlan plan = kvCache.PlanReuse(inputTokens, model.SupportsKVCacheTruncation);
+                    float[] logits = ApplyReusePlan(model, kvCache, plan, inputTokens);
+                    prefillMs = sw.Elapsed.TotalMilliseconds;
+
+                    _log.LogInformation(LogEventIds.KvCacheReusePlan,
+                        "kv plan={Plan} prefillMs={PrefillMs:F1} description={Description}",
+                        plan.Kind, prefillMs, DescribePlan(plan, inputTokens.Count));
+
+                    var decodeSw = Stopwatch.StartNew();
+                    for (int step = 0; step < turnMaxTokens; step++)
+                    {
+                        int nextToken = sampler.Sample(logits, generatedTokens);
+                        if (model.Tokenizer.IsEos(nextToken)) break;
+                        generatedTokens.Add(nextToken);
+                        string decoded = model.Tokenizer.Decode(generatedTokens);
+                        sb.Clear();
+                        sb.Append(decoded);
+                        logits = model.Forward(new[] { nextToken });
+                        kvCache.RecordAppend(nextToken, logits);
+                    }
+                    decodeMs = decodeSw.Elapsed.TotalMilliseconds;
+                }
 
                 string rawOutput = sb.ToString();
 
@@ -1486,7 +1535,7 @@ namespace TensorSharp.Cli
         static string RunInference(ModelBase model, string rawText, List<string> imagePaths, int maxTokens,
             List<string> audioPaths = null, bool isVideo = false, SamplingConfig samplingConfig = null,
             bool enableThinking = false, List<ToolFunction> tools = null, bool silent = false,
-            bool preserveAllInput = false)
+            bool preserveAllInput = false, int specDraftMax = 0, float specDraftConfMin = -1f)
         {
             var messages = new List<ChatMessage>
             {
@@ -2012,6 +2061,20 @@ namespace TensorSharp.Cli
                     "Reduce --max-tokens, use a shorter PDF, or choose a model with a larger context window.");
             }
 
+            // Block speculative decoding (DeepSeek V4 + DSpark): the drafter
+            // proposes a block per step and the trunk verifies it in one batched
+            // forward. Greedy verification keeps the emitted stream identical to
+            // plain greedy decoding, so it is only a speed path.
+            {
+                var specCfg = samplingConfig ?? SamplingConfig.Greedy;
+                if (specCfg.IsGreedy && model is TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel blockSpec
+                    && blockSpec.HasMtp && blockSpec.MtpDraftBlockSize > 0)
+                {
+                    return RunBlockSpeculativeInference(model, blockSpec, inputTokens, maxTokens,
+                        enableThinking, tools, silent, specDraftMax, specDraftConfMin);
+                }
+            }
+
             model.ResetKVCache();
 
             var prefillSw = Stopwatch.StartNew();
@@ -2210,6 +2273,69 @@ namespace TensorSharp.Cli
                 var parsed = parser.Add(decoded, true);
                 return FormatParsedResult(parsed, showThinking);
             }
+            return decoded;
+        }
+
+        /// <summary>
+        /// Greedy generation through the shared block-speculative core (DSpark):
+        /// prompt prefill replays the drafter's key ring, then every step drafts
+        /// one block and verifies it with a single batched trunk forward.
+        /// </summary>
+        static string RunBlockSpeculativeInference(ModelBase model, TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel spec,
+            List<int> inputTokens, int maxTokens, bool enableThinking, List<ToolFunction> tools,
+            bool silent, int specDraftMax, float specDraftConfMin)
+        {
+            int window = spec.MtpDraftBlockSize;
+            if (specDraftMax > 0)
+                window = Math.Min(window, specDraftMax);
+
+            var decoder = new MtpSpeculativeDecoder(spec, window)
+            {
+                // Cumulative acceptance gate (see MtpSpeculativeExecution):
+                // an extra verify row costs ~a quarter of a decode step on a
+                // sparse-MoE trunk, so drafting past a ~0.35 prefix-acceptance
+                // estimate is expected-negative.
+                MinDraftProb = specDraftConfMin >= 0f ? specDraftConfMin : 0.35f,
+                PrefillChunkSize = spec.MtpPrefillChunkSize > 0 ? spec.MtpPrefillChunkSize : 512,
+            };
+
+            var parser = OutputParserFactory.Create(model.Config.Architecture);
+            parser.Init(enableThinking, tools);
+            bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
+            bool showThinking = enableThinking || parser.AlwaysRequired;
+
+            var generated = decoder.GenerateGreedy(inputTokens.ToArray(), maxTokens,
+                t => model.Tokenizer.IsEos(t));
+
+            bool hitEos = generated.Count > 0 && model.Tokenizer.IsEos(generated[generated.Count - 1]);
+            if (hitEos)
+                generated.RemoveAt(generated.Count - 1);
+
+            if (!silent)
+            {
+                double prefillMs = decoder.LastPrefillSeconds * 1000.0;
+                double decodeMs = decoder.LastDecodeSeconds * 1000.0;
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "cli.inference prefill complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
+                    inputTokens.Count, prefillMs,
+                    prefillMs > 0 ? inputTokens.Count / (prefillMs / 1000.0) : 0.0);
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
+                    generated.Count, decodeMs,
+                    decodeMs > 0 ? generated.Count / (decodeMs / 1000.0) : 0.0);
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "cli.inference speculative: window={Window} confMin={ConfMin:F2} drafted={Drafted} accepted={Accepted} " +
+                    "acceptanceRate={Rate:F3} verifySteps={Verify} plainSteps={Plain} rollbacks={Rollbacks}",
+                    window, decoder.MinDraftProb, decoder.TokensDrafted, decoder.TokensAccepted,
+                    decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps);
+                _log.LogInformation(LogEventIds.ChatCompleted,
+                    "cli.inference finishReason={FinishReason} tokens={Tokens}",
+                    hitEos ? "eos" : "max_tokens", generated.Count);
+            }
+
+            string decoded = model.Tokenizer.Decode(generated);
+            if (useParser)
+                return FormatParsedResult(parser.Add(decoded, true), showThinking);
             return decoded;
         }
 

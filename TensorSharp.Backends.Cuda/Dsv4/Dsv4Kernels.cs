@@ -17,6 +17,7 @@ namespace TensorSharp.Cuda
     internal sealed unsafe class Dsv4Kernels : IDisposable
     {
         private const int BlockSize = 256;
+        private const int HC = 4; // hyper-connection streams (Dsv4CudaEngine.HC)
 
         private readonly CudaModule module;
 
@@ -47,6 +48,11 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
         private readonly IntPtr moeScatterAdd;
+        private readonly IntPtr hcMean;
+        private readonly IntPtr dsparkPrep;
+        private readonly IntPtr dsparkGather;
+        private readonly IntPtr dsparkArgmax;
+        private readonly IntPtr dsparkConf;
 
         private Dsv4Kernels(CudaModule module)
         {
@@ -78,6 +84,11 @@ namespace TensorSharp.Cuda
             moeGateUpDecode = module.GetFunction("ts_dsv4_moe_gateup_decode_f32");
             moeDownDecode = module.GetFunction("ts_dsv4_moe_down_decode_f32");
             moeScatterAdd = module.GetFunction("ts_dsv4_moe_scatter_add_f32");
+            hcMean = module.GetFunction("ts_dsv4_hc_mean_f32");
+            dsparkPrep = module.GetFunction("ts_dsv4_dspark_prep_f32");
+            dsparkGather = module.GetFunction("ts_dsv4_dspark_gather_f32");
+            dsparkArgmax = module.GetFunction("ts_dsv4_dspark_argmax_f32");
+            dsparkConf = module.GetFunction("ts_dsv4_dspark_conf_f32");
         }
 
         public static Dsv4Kernels Create()
@@ -144,12 +155,12 @@ namespace TensorSharp.Cuda
             Launch(hcPost, CeilDiv(4L * e, BlockSize), (uint)nt, 1, BlockSize, 0, stream, args);
         }
 
-        public void HcHead(Tensor x, IntPtr fn, IntPtr scale, IntPtr baseW, Tensor cur, int e, int scaleCount, int baseCount, float eps, IntPtr stream)
+        public void HcHead(Tensor x, IntPtr fn, IntPtr scale, IntPtr baseW, Tensor cur, int e, int scaleCount, int baseCount, float eps, IntPtr stream, int rows = 1)
         {
             IntPtr a0 = P(x), a1 = fn, a2 = scale, a3 = baseW, a4 = P(cur);
             int a5 = e, a6 = scaleCount, a7 = baseCount; float a8 = eps;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
-            Launch(hcHead, 1, 1, 1, BlockSize, 0, stream, args);
+            Launch(hcHead, (uint)Math.Max(rows, 1), 1, 1, BlockSize, 0, stream, args);
         }
 
         public void AttnPrep(Tensor q, Tensor kvRaw, IntPtr kvNormW, IntPtr ropeTab, IntPtr ring,
@@ -240,6 +251,65 @@ namespace TensorSharp.Cuda
             int a2 = g, a3 = nt, a4 = r;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
             Launch(regroup, CeilDiv((long)g * nt * r, BlockSize), 1, 1, BlockSize, 0, stream, args);
+        }
+
+        // ---- DSpark drafter ----
+
+        /// <summary>Mean over the hyper-connection streams of every row, written
+        /// into column block <paramref name="dstOff"/> of a [nt, dstStride] buffer
+        /// (the drafter's concatenated target-layer features).</summary>
+        public void HcMean(Tensor xs, Tensor dst, int nt, int e, int dstStride, int dstOff, IntPtr stream)
+        {
+            IntPtr a0 = P(xs), a1 = P(dst);
+            int a2 = nt, a3 = e, a4 = HC, a5 = dstStride, a6 = dstOff;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6 };
+            Launch(hcMean, CeilDiv((long)nt * e, BlockSize), 1, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Drafter RMS-norm + RoPE with the rope position
+        /// (<paramref name="pos0"/>) and the destination slot
+        /// (<paramref name="slot0"/> mod <paramref name="slotMod"/>) decoupled.
+        /// <paramref name="kvOnly"/> skips the query heads (catch-up pass).</summary>
+        public void DsparkPrep(Tensor q, Tensor kvRaw, IntPtr kvNormW, IntPtr ropeTab, IntPtr kvOut,
+            int pos0, int slot0, int slotMod, int nh, int hd, int nRot, float eps, int nt, bool kvOnly, IntPtr stream)
+        {
+            IntPtr a0 = P(q), a1 = P(kvRaw), a2 = kvNormW, a3 = ropeTab, a4 = kvOut;
+            int a5 = pos0, a6 = slot0, a7 = slotMod, a8 = nh, a9 = hd, a10 = nRot;
+            float a11 = eps;
+            int a12 = kvOnly ? 1 : 0;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
+            Launch(dsparkPrep, kvOnly ? 1u : (uint)(nh + 1), (uint)nt, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Copy the Markov embedding row of the previous token
+        /// (<paramref name="tokSlot"/> &lt; 0 selects <paramref name="anchorTok"/>).</summary>
+        public void DsparkGather(IntPtr w1, Tensor toks, int tokSlot, int anchorTok, Tensor dst, int rank, IntPtr stream)
+        {
+            IntPtr a0 = w1, a1 = P(toks);
+            int a2 = tokSlot, a3 = anchorTok;
+            IntPtr a4 = P(dst);
+            int a5 = rank;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            Launch(dsparkGather, 1, 1, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>toks[slot] = argmax(logits + bias) over the vocabulary.</summary>
+        public void DsparkArgmax(Tensor logits, Tensor bias, Tensor toks, int slot, int vocab, IntPtr stream)
+        {
+            IntPtr a0 = P(logits), a1 = P(bias), a2 = P(toks);
+            int a3 = slot, a4 = vocab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
+            Launch(dsparkArgmax, 1, 1, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Per-block-position acceptance probability from the
+        /// confidence head.</summary>
+        public void DsparkConf(Tensor x, Tensor w1Rows, IntPtr proj, Tensor conf, int e, int rank, int nt, IntPtr stream)
+        {
+            IntPtr a0 = P(x), a1 = P(w1Rows), a2 = proj, a3 = P(conf);
+            int a4 = e, a5 = rank;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            Launch(dsparkConf, (uint)nt, 1, 1, BlockSize, 0, stream, args);
         }
 
         public void MoeSelect(Tensor logits, IntPtr bias, IntPtr tid2eid, Tensor tokens, Tensor sel, Tensor wOut,

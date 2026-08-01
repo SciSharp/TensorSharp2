@@ -32,6 +32,7 @@
 #include <stdint.h>
 
 #include "tensorsharp_dsv4_tables.cuh"
+#include "tensorsharp_iq2xxs_tables.cuh"
 
 #define TS_DSV4_QK8_1 32
 
@@ -42,6 +43,14 @@ struct ts_dsv4_block_q8_1
     half d;
     half s;
     int8_t qs[TS_DSV4_QK8_1];
+};
+
+// block_iq2_xxs: 66 bytes / 256 values (half d + 32 uint16 of packed grid
+// indices, signs and scales).
+struct ts_dsv4_block_iq2_xxs
+{
+    half d;
+    uint16_t qs[32];
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +87,12 @@ __device__ __forceinline__ float ts_dsv4_softplus(float x)
 }
 
 // int load from a 2-byte-aligned byte pointer (block interiors of K-quants).
+// int read from an aligned 4-byte lane (q8_1 activation quants).
+__device__ __forceinline__ int ts_dsv4_get_int_b4(const void* x, int i)
+{
+    return ((const int*)x)[i];
+}
+
 __device__ __forceinline__ int ts_dsv4_get_int_b2(const void* x, int i)
 {
     const uint16_t* x16 = (const uint16_t*)x;
@@ -329,11 +344,94 @@ __device__ __forceinline__ float ts_dsv4_dot_q6k_superblock(
 #define TS_DSV4_WTYPE_Q6_K 14
 #define TS_DSV4_WTYPE_IQ3S 21
 #define TS_DSV4_WTYPE_MXFP4 39
+#define TS_DSV4_WTYPE_Q2_K 10
+#define TS_DSV4_WTYPE_IQ2XXS 16
+#define TS_DSV4_Q2_K_BLOCK_BYTES 84
+#define TS_DSV4_IQ2XXS_BLOCK_BYTES 66
 #define TS_DSV4_Q6_K_BLOCK_BYTES 210
 
 // Full-row dot: one warp computes dot(weight row, activation row).
 // inDim % 256 == 0 for every DSV4 projection, so each lane handles whole
 // superblocks/blocks with no tail handling.
+// One IQ2_XXS 32-value group dotted against one q8_1 activation block. Ported
+// from the generic backend's dot_iq2_xxs_q8_1 (tensorsharp_kernels.cu), which
+// follows ggml-cuda's vec_dot_iq2_xxs_q8_1: eight 8-value grid lookups with the
+// sign permutation applied via __vsub4, accumulated with dp4a.
+__device__ __forceinline__ float ts_dsv4_dot_iq2xxs_group(
+    const uint8_t* iq_block, const ts_dsv4_block_q8_1* q8, int group)
+{
+    const ts_dsv4_block_iq2_xxs* bq2 = (const ts_dsv4_block_iq2_xxs*)iq_block;
+    const int iqs = group * 2;
+    const int q2 = ts_dsv4_get_int_b2(bq2->qs, iqs);
+    const uint8_t* aux8 = (const uint8_t*)&q2;
+    const uint32_t aux32 = (uint32_t)ts_dsv4_get_int_b2(bq2->qs, iqs + 1);
+
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2)
+    {
+        const int* gridPos = (const int*)(iq2xxs_grid + aux8[k0 / 2]);
+        const int signsPacked = ksigns_iq2xs[(aux32 >> (7 * k0 / 2)) & 0x7F];
+
+        const int signs0 = __vcmpne4(((signsPacked & 0x03) << 7) | ((signsPacked & 0x0C) << 21), 0x00000000);
+        const int grid0 = __vsub4(gridPos[0] ^ signs0, signs0);
+        sumi = ts_dsv4_dp4a(grid0, ts_dsv4_get_int_b4(q8[group].qs, k0 + 0), sumi);
+
+        const int signs1 = __vcmpne4(((signsPacked & 0x30) << 3) | ((signsPacked & 0xC0) << 17), 0x00000000);
+        const int grid1 = __vsub4(gridPos[1] ^ signs1, signs1);
+        sumi = ts_dsv4_dp4a(grid1, ts_dsv4_get_int_b4(q8[group].qs, k0 + 1), sumi);
+    }
+
+    const int ls = aux32 >> 28;
+    sumi = (ls * sumi + sumi / 2) / 4;
+    return __half2float(bq2->d) * __half2float(q8[group].d) * (float)sumi;
+}
+
+// One Q2_K 32-value group dotted against one q8_1 activation block.
+//
+// block_q2_K (84 bytes / 256 values): scales[16] (low nibble = value scale,
+// high nibble = min scale), qs[64] (2 bits per value), d, dmin. Group g takes
+// its 2-bit field from byte lane (g & 3) of the 32-byte half (g >> 2), and its
+// two 16-value halves use consecutive scale bytes. The min term needs the
+// activation sums per 16-value half, so it is accumulated with dp4a against
+// 0x01010101 rather than read from the block's `s` field (which covers all 32).
+__device__ __forceinline__ float ts_dsv4_dot_q2k_group(
+    const uint8_t* block, const ts_dsv4_block_q8_1* q8, int group)
+{
+    const uint8_t* scales = block;
+    const int gh = group >> 2;               // which 128-value half
+    const int j = group & 3;                 // 2-bit field within the byte
+    const uint8_t* qs = block + 16 + gh * 32;
+    const int shift = 2 * j;
+    const float d = __half2float(*(const half*)(block + 80));
+    const float dmin = __half2float(*(const half*)(block + 82));
+    const uint8_t sc0 = scales[gh * 8 + j * 2 + 0];
+    const uint8_t sc1 = scales[gh * 8 + j * 2 + 1];
+
+    int sumi0 = 0, sumi1 = 0, sa0 = 0, sa1 = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        const int w = (ts_dsv4_get_int_b1(qs, k) >> shift) & 0x03030303;
+        const int u = ts_dsv4_get_int_b4(q8[group].qs, k);
+        sumi0 = ts_dsv4_dp4a(w, u, sumi0);
+        sa0 = ts_dsv4_dp4a(0x01010101, u, sa0);
+    }
+#pragma unroll
+    for (int k = 4; k < 8; ++k)
+    {
+        const int w = (ts_dsv4_get_int_b1(qs, k) >> shift) & 0x03030303;
+        const int u = ts_dsv4_get_int_b4(q8[group].qs, k);
+        sumi1 = ts_dsv4_dp4a(w, u, sumi1);
+        sa1 = ts_dsv4_dp4a(0x01010101, u, sa1);
+    }
+
+    const float da = __half2float(q8[group].d);
+    const float val = d * ((float)(sc0 & 0xF) * (float)sumi0 + (float)(sc1 & 0xF) * (float)sumi1)
+                    - dmin * ((float)(sc0 >> 4) * (float)sa0 + (float)(sc1 >> 4) * (float)sa1);
+    return da * val;
+}
+
 __device__ __forceinline__ float ts_dsv4_dot_row_warp(
     const uint8_t* wRow, int wtype, const ts_dsv4_block_q8_1* act, int inDim, int lane)
 {
@@ -362,6 +460,22 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
         const int nSuper = inDim / 256;
         for (int sb = lane; sb < nSuper; sb += 32)
             sum += ts_dsv4_dot_q6k_superblock(wRow + (size_t)sb * TS_DSV4_Q6_K_BLOCK_BYTES, act + sb * 8);
+    }
+    else if (wtype == TS_DSV4_WTYPE_IQ2XXS)
+    {
+        // 8 groups of 32 values per super-block: stride whole groups so a
+        // 4096-wide row (16 super-blocks) still fills the warp.
+        const int nGroups = inDim / 32;
+        for (int g = lane; g < nGroups; g += 32)
+            sum += ts_dsv4_dot_iq2xxs_group(wRow + (size_t)(g >> 3) * TS_DSV4_IQ2XXS_BLOCK_BYTES,
+                                            act + (size_t)(g >> 3) * 8, g & 7);
+    }
+    else if (wtype == TS_DSV4_WTYPE_Q2_K)
+    {
+        const int nGroups = inDim / 32;
+        for (int g = lane; g < nGroups; g += 32)
+            sum += ts_dsv4_dot_q2k_group(wRow + (size_t)(g >> 3) * TS_DSV4_Q2_K_BLOCK_BYTES,
+                                         act + (size_t)(g >> 3) * 8, g & 7);
     }
     else // TS_DSV4_WTYPE_Q8_0
     {
@@ -594,18 +708,22 @@ extern "C" __global__ void ts_dsv4_hc_post_f32(
 
 // hc_head for the final token: collapse streams with sigmoid gates from
 // output_hc_fn (F32 [4, flatDim]), written into cur [E].
+// One block per row (grid.x == 1 for the target's single-token head, == the
+// block size for the DSpark drafter's whole block).
 extern "C" __global__ void ts_dsv4_hc_head_f32(
-    const float* __restrict__ x,      // [4*E] (the selected token's streams)
+    const float* __restrict__ xAll,   // [rows, 4*E] (the selected tokens' streams)
     const float* __restrict__ fn,     // [4, 4*E] F32
     const float* __restrict__ scale,  // [>=1]
     const float* __restrict__ baseW,  // [>=1]
-    float* __restrict__ cur,          // [E]
+    float* __restrict__ curAll,       // [rows, E]
     const int E,
     const int scaleCount,
     const int baseCount,
     const float eps)
 {
     const int flatDim = 4 * E;
+    const float* __restrict__ x = xAll + (size_t)blockIdx.x * flatDim;
+    float* __restrict__ cur = curAll + (size_t)blockIdx.x * E;
     __shared__ float red[256];
     __shared__ float gates[4];
 
@@ -1163,8 +1281,12 @@ extern "C" __global__ void ts_dsv4_attention_f32(
     const int t = blockIdx.y;
     const long long p = (long long)p0 + t;
 
-    const long long rawStart = p - nSwa + 1 > 0 ? p - nSwa + 1 : 0;
-    const int rawCnt = (int)(p - rawStart + 1);
+    // mode 3 (DSpark drafter): every block row sees the SAME committed history
+    // -- the window ending at p0, the drafter's last committed position -- plus
+    // all K rows of the block itself (passed in `comp`), non-causally.
+    const long long pHist = mode == 3 ? (long long)p0 : p;
+    const long long rawStart = pHist - nSwa + 1 > 0 ? pHist - nSwa + 1 : 0;
+    const int rawCnt = (int)(pHist - rawStart + 1);
     int compCnt = 0;
     const int32_t* sel = nullptr;
     if (mode == 1)
@@ -1175,6 +1297,10 @@ extern "C" __global__ void ts_dsv4_attention_f32(
     else if (mode == 2)
     {
         compCnt = (int)((p + 1) / ratio);
+    }
+    else if (mode == 3)
+    {
+        compCnt = K;
     }
     const int n = rawCnt + compCnt;
 
@@ -2147,4 +2273,235 @@ extern "C" __global__ void ts_dsv4_moe_scatter_add_f32(
         acc += downOut[(size_t)row * E + e] * wSel[slot];
     }
     ffnOut[(size_t)t * E + e] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// DSpark speculative-decoding drafter
+//
+// The DSpark support module (DeepSeek's `mtp.*` stages) is three ordinary DSV4
+// blocks with compress_ratio 0, driven off the target's hidden states instead
+// of a token history of its own:
+//
+//   main_x       = main_norm(main_proj([h40; h41; h42]))     (per committed pos)
+//   ring[pos]    = rope(kv_norm(wkv(main_x)))                (one row per pos)
+//   block input  = embed([anchor, noise, noise, ...])        (block_size rows)
+//   block attn   = softmax(q . [ring window | block kv]) with sinks, NON-causal
+//                  inside the block (every block row sees the whole block)
+//   logits(i)    = lm_head(norm(hc_head(x)))(i) + W2 . W1[prev(i)]
+//   conf(i)      = sigmoid(proj . [x(i); W1[prev(i)]])
+//
+// Only the parts that differ from the target model live here: the block KV
+// prep (rope position and ring slot are decoupled), and the Markov/confidence
+// heads. The block-visible attention is mode 3 of ts_dsv4_attention_f32;
+// everything else reuses the target's kernels.
+// ---------------------------------------------------------------------------
+
+// Per-row hyper-connection stream mean: dst[t, dstOff + d] = mean_c xs[t, c, d].
+// Concatenating the three target layers into one [nt, 3*E] row is what the
+// drafter's main_proj consumes.
+extern "C" __global__ void ts_dsv4_hc_mean_f32(
+    const float* __restrict__ xs,   // [nt, HC, E]
+    float* __restrict__ dst,        // [nt, dstStride]
+    const int nt,
+    const int E,
+    const int HC,
+    const int dstStride,
+    const int dstOff)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)nt * E;
+    if (i >= total)
+        return;
+    const int t = (int)(i / E);
+    const int d = (int)(i % E);
+
+    const float* src = xs + (size_t)t * HC * E + d;
+    float acc = 0.0f;
+    for (int c = 0; c < HC; ++c)
+        acc += src[(size_t)c * E];
+    dst[(size_t)t * dstStride + dstOff + d] = acc / (float)HC;
+}
+
+// RMS-norm + RoPE for the drafter, with the rope position and the destination
+// slot decoupled: the block's own KV goes to a dense [block, HD] buffer while
+// the committed rows go to the SWA ring at (slot0 + t) % slotMod.
+//
+// grid.x == NH + 1 runs the q heads (h < NH, in place) and the single KV head
+// (h == NH); grid.x == 1 with kvOnly runs the KV head alone (the catch-up pass
+// has no queries).
+extern "C" __global__ void ts_dsv4_dspark_prep_f32(
+    float* __restrict__ q,               // [nt, NH, HD] in-place (unused when kvOnly)
+    const float* __restrict__ kvRaw,     // [nt, HD]
+    const float* __restrict__ kvNormW,   // [HD]
+    const float* __restrict__ ropeTab,   // [nCtx, nRot]
+    half* __restrict__ kvOut,            // [slotMod, HD]
+    const int pos0,                      // rope position of row 0
+    const int slot0,                     // kvOut slot of row 0
+    const int slotMod,
+    const int NH,
+    const int HD,
+    const int nRot,
+    const float eps,
+    const int kvOnly)
+{
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    const bool isKv = kvOnly != 0 || h == NH;
+
+    __shared__ float sh[512];
+    __shared__ float red[256];
+
+    float* qDst = q + ((size_t)t * NH + h) * HD;
+    const float* src = isKv ? kvRaw + (size_t)t * HD : qDst;
+
+    float acc = 0.0f;
+    for (int d = threadIdx.x; d < HD; d += blockDim.x)
+    {
+        const float v = src[d];
+        sh[d] = v;
+        acc += v * v;
+    }
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s)
+            red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(red[0] / HD + eps);
+
+    for (int d = threadIdx.x; d < HD; d += blockDim.x)
+        sh[d] *= isKv ? inv * kvNormW[d] : inv;
+    __syncthreads();
+
+    const float* tab = ropeTab + (long long)(pos0 + t) * nRot;
+    const int rbase = HD - nRot;
+
+    if (isKv)
+    {
+        half* out = kvOut + (size_t)((slot0 + t) % slotMod) * HD;
+        for (int d = threadIdx.x; d < HD; d += blockDim.x)
+        {
+            float v = sh[d];
+            if (d >= rbase)
+            {
+                const int i = (d - rbase) >> 1;
+                const float c = tab[2 * i + 0];
+                const float s = tab[2 * i + 1];
+                const float x0 = sh[rbase + 2 * i + 0];
+                const float x1 = sh[rbase + 2 * i + 1];
+                v = ((d - rbase) & 1) == 0 ? x0 * c - x1 * s : x0 * s + x1 * c;
+            }
+            out[d] = __float2half(v);
+        }
+    }
+    else
+    {
+        for (int d = threadIdx.x; d < HD; d += blockDim.x)
+        {
+            float v = sh[d];
+            if (d >= rbase)
+            {
+                const int i = (d - rbase) >> 1;
+                const float c = tab[2 * i + 0];
+                const float s = tab[2 * i + 1];
+                const float x0 = sh[rbase + 2 * i + 0];
+                const float x1 = sh[rbase + 2 * i + 1];
+                v = ((d - rbase) & 1) == 0 ? x0 * c - x1 * s : x0 * s + x1 * c;
+            }
+            qDst[d] = v;
+        }
+    }
+}
+
+// dst[0..R) = w1[tok * R ..], where tok is toks[tokSlot] (tokSlot < 0 selects
+// the anchor token, which the host passes in directly).
+extern "C" __global__ void ts_dsv4_dspark_gather_f32(
+    const float* __restrict__ w1,   // [vocab, R]
+    const int32_t* __restrict__ toks,
+    const int tokSlot,
+    const int anchorTok,
+    float* __restrict__ dst,        // [R]
+    const int R)
+{
+    const int tok = tokSlot < 0 ? anchorTok : toks[tokSlot];
+    for (int i = threadIdx.x; i < R; i += blockDim.x)
+        dst[i] = w1[(size_t)tok * R + i];
+}
+
+// toks[slot] = argmax_i (logits[i] + bias[i]). One block; ties resolve to the
+// lowest index, matching the host-side argmax the verifier uses.
+extern "C" __global__ void ts_dsv4_dspark_argmax_f32(
+    const float* __restrict__ logits, // [V]
+    const float* __restrict__ bias,   // [V] (may be null)
+    int32_t* __restrict__ toks,
+    const int slot,
+    const int V)
+{
+    __shared__ float shV[256];
+    __shared__ int shI[256];
+
+    float best = -INFINITY;
+    int bestIdx = 0;
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
+    {
+        const float v = bias != nullptr ? logits[i] + bias[i] : logits[i];
+        if (v > best)
+        {
+            best = v;
+            bestIdx = i;
+        }
+    }
+    shV[threadIdx.x] = best;
+    shI[threadIdx.x] = bestIdx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s)
+        {
+            const float o = shV[threadIdx.x + s];
+            const int oi = shI[threadIdx.x + s];
+            if (o > shV[threadIdx.x] || (o == shV[threadIdx.x] && oi < shI[threadIdx.x]))
+            {
+                shV[threadIdx.x] = o;
+                shI[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        toks[slot] = shI[0];
+}
+
+// conf[t] = sigmoid(proj . [x[t]; w1Rows[t]]) -- the drafter's predicted
+// acceptance probability for block position t.
+extern "C" __global__ void ts_dsv4_dspark_conf_f32(
+    const float* __restrict__ x,       // [B, E]
+    const float* __restrict__ w1Rows,  // [B, R]
+    const float* __restrict__ proj,    // [E + R]
+    float* __restrict__ conf,          // [B]
+    const int E,
+    const int R)
+{
+    const int t = blockIdx.x;
+    __shared__ float red[256];
+
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x)
+        acc += x[(size_t)t * E + i] * proj[i];
+    for (int i = threadIdx.x; i < R; i += blockDim.x)
+        acc += w1Rows[(size_t)t * R + i] * proj[E + i];
+
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s)
+            red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        conf[t] = 1.0f / (1.0f + expf(-red[0]));
 }

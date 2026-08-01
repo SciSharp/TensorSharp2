@@ -93,7 +93,12 @@ namespace TensorSharp.Models
             if (promptTokens == null || promptTokens.Length == 0)
                 throw new ArgumentException("Prompt must not be empty.", nameof(promptTokens));
 
-            int chunkSize = Math.Max(1, PrefillChunkSize);
+            // A trunk that keeps its draft head in sync internally wants the whole
+            // prompt in one call: chunking it only adds a host round trip per
+            // chunk, which stalls the trunk's own micro-batch pipelining.
+            int chunkSize = _model.MtpPrefillSelfCatchUp
+                ? Math.Max(1, promptTokens.Length)
+                : Math.Max(1, PrefillChunkSize);
             float[] logits = null;
             int offset = 0;
             while (offset < promptTokens.Length)

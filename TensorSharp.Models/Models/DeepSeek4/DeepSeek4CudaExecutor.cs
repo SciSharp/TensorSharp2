@@ -117,7 +117,9 @@ namespace TensorSharp.Models
         public int VocabSize => _nVocab;
         public int NPast => _engine.NPast;
 
-        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu)
+        private GgufFile _dsparkGguf;
+
+        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu, string dsparkPath = null)
         {
             var sw = Stopwatch.StartNew();
             bool stats = ParseEnvInt("TS_DSV4_LOAD_STATS", 0) != 0;
@@ -127,7 +129,7 @@ namespace TensorSharp.Models
                     Console.Error.WriteLine($"[dsv4-cuda]   +{sw.Elapsed.TotalSeconds,6:F1}s {phase}");
             }
 
-            OpenShards(ggufPath);
+            OpenShards(ggufPath, dsparkPath);
             ParseHparams();
             Mark("shards opened / hparams parsed");
 
@@ -173,11 +175,33 @@ namespace TensorSharp.Models
 
         public void Reset() => _engine.Reset();
 
+        // ---- DSpark speculative decoding (no-ops without a drafter) ----
+
+        public bool HasDspark => _engine.DsparkBlockSize > 0;
+
+        public int DsparkBlockSize => _engine.DsparkBlockSize;
+
+        /// <summary>Row width of the target features the drafter consumes.</summary>
+        public int DsparkFeatureSize => _engine.DsparkFeatureSize;
+
+        public int UBatch => _engine.UBatch;
+
+        public void ForwardSpec(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+            => _engine.ForwardSpec(tokens, hAllOut, logitsOut, allLogitsRows);
+
+        public void DsparkCatchUp(float[] hRows, int rows, int firstPos)
+            => _engine.DsparkCatchUp(hRows, rows, firstPos);
+
+        public int DsparkDraft(int anchorToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
+            => _engine.DsparkDraft(anchorToken, hPrev, position, draftOut, confOut);
+
+        public void Rewind(int nPast) => _engine.Rewind(nPast);
+
         // -------------------------------------------------------------------
         // Loading (mirrors DeepSeek4CpuExecutor's split-shard resolver)
         // -------------------------------------------------------------------
 
-        private void OpenShards(string firstPath)
+        private void OpenShards(string firstPath, string dsparkPath = null)
         {
             var first = new GgufFile(firstPath);
             _shards.Add(first);
@@ -197,6 +221,16 @@ namespace TensorSharp.Models
                         _shardPaths.Add(path);
                     }
                 }
+            }
+
+            // The DSpark drafter is a separate GGUF whose tensors are all
+            // mtp.*-prefixed, so it can share the shard table (and therefore the
+            // streaming loader) with the target model's shards.
+            if (!string.IsNullOrEmpty(dsparkPath))
+            {
+                _dsparkGguf = new GgufFile(dsparkPath);
+                _shards.Add(_dsparkGguf);
+                _shardPaths.Add(dsparkPath);
             }
 
             for (int s = 0; s < _shards.Count; s++)
@@ -458,6 +492,7 @@ namespace TensorSharp.Models
                 RopeRawTable = BuildRopeTable(nCtx, comp: false),
                 RopeCompTable = BuildRopeTable(nCtx, comp: true),
                 Layers = new Dsv4CudaEngine.LayerDesc[_nLayer],
+                Dspark = BuildDsparkDesc(),
             };
 
             for (int il = 0; il < _nLayer; il++)
@@ -519,6 +554,92 @@ namespace TensorSharp.Models
             }
 
             return m;
+        }
+
+        /// <summary>
+        /// Describes the DSpark drafter (a separate GGUF: three DSV4 blocks with
+        /// compress_ratio 0, plus the Markov and confidence heads) for the
+        /// engine. Returns null when no drafter was supplied.
+        /// </summary>
+        private Dsv4CudaEngine.DsparkDesc BuildDsparkDesc()
+        {
+            if (_dsparkGguf == null)
+                return null;
+
+            string arch = _dsparkGguf.GetString("general.architecture") ?? string.Empty;
+            if (arch != "deepseek4-dspark")
+                throw new InvalidOperationException($"[dsv4-cuda] draft model architecture '{arch}' is not deepseek4-dspark");
+
+            int nStages = (int)_dsparkGguf.GetUint32("dspark.n_layers", 0);
+            if (nStages <= 0)
+                nStages = (int)_dsparkGguf.GetUint32("dspark.stage_count", 0);
+            int blockSize = (int)_dsparkGguf.GetUint32("dspark.block_size", 0);
+            int markovRank = (int)_dsparkGguf.GetUint32("dspark.markov_rank", 0);
+            int noiseToken = (int)_dsparkGguf.GetUint32("dspark.noise_token_id", 0);
+            int[] targetLayers = _dsparkGguf.GetInt32Array("dspark.target_layer_ids") ?? Array.Empty<int>();
+            if (nStages <= 0 || blockSize <= 0 || markovRank <= 0 || targetLayers.Length == 0)
+                throw new InvalidOperationException("[dsv4-cuda] draft model is missing dspark.* metadata");
+
+            // The drafter has no per-layer swiglu clamp of its own; the module is
+            // trained with the target's single swiglu_limit.
+            float clamp = _swigluClampExp.Length > 0 ? _swigluClampExp[_swigluClampExp.Length - 1] : 0f;
+            float clampSh = _swigluClampShexp.Length > 0 ? _swigluClampShexp[_swigluClampShexp.Length - 1] : clamp;
+
+            var stages = new Dsv4CudaEngine.LayerDesc[nStages];
+            for (int s = 0; s < nStages; s++)
+            {
+                string p = $"mtp.{s}.";
+                stages[s] = new Dsv4CudaEngine.LayerDesc
+                {
+                    Ratio = 0,
+                    ClampExp = clamp,
+                    ClampShexp = clampSh,
+                    AttnNorm = GetF32(p + "attn_norm.weight"),
+                    Sinks = GetF32(p + "attn_sinks.weight"),
+                    WqA = GetQW(p + "attn_q_a.weight"),
+                    QANorm = GetF32(p + "attn_q_a_norm.weight"),
+                    WqB = GetQW(p + "attn_q_b.weight"),
+                    Wkv = GetQW(p + "attn_kv.weight"),
+                    KvNorm = GetF32(p + "attn_kv_a_norm.weight"),
+                    WoA = GetQW(p + "attn_output_a.weight"),
+                    WoB = GetQW(p + "attn_output_b.weight"),
+                    HcAttnFn = GetF32(p + "hc_attn_fn.weight"),
+                    HcAttnScale = GetF32(p + "hc_attn_scale.weight"),
+                    HcAttnBase = GetF32(p + "hc_attn_base.weight"),
+                    HcFfnFn = GetF32(p + "hc_ffn_fn.weight"),
+                    HcFfnScale = GetF32(p + "hc_ffn_scale.weight"),
+                    HcFfnBase = GetF32(p + "hc_ffn_base.weight"),
+                    GateInp = GetF32(p + "ffn_gate_inp.weight"),
+                    ExpProbsBias = GetF32(p + "exp_probs_b.bias", required: false),
+                    FfnNorm = GetF32(p + "ffn_norm.weight"),
+                    GateExps = GetQW(p + "ffn_gate_exps.weight"),
+                    DownExps = GetQW(p + "ffn_down_exps.weight"),
+                    UpExps = GetQW(p + "ffn_up_exps.weight"),
+                    GateShexp = GetQW(p + "ffn_gate_shexp.weight"),
+                    DownShexp = GetQW(p + "ffn_down_shexp.weight"),
+                    UpShexp = GetQW(p + "ffn_up_shexp.weight"),
+                };
+            }
+
+            string first = "mtp.0.";
+            string lastS = $"mtp.{nStages - 1}.";
+            return new Dsv4CudaEngine.DsparkDesc
+            {
+                BlockSize = blockSize,
+                NoiseTokenId = noiseToken,
+                MarkovRank = markovRank,
+                TargetLayerIds = targetLayers,
+                Stages = stages,
+                MainProj = GetQW(first + "main_proj.weight"),
+                MainNorm = GetF32(first + "main_norm.weight"),
+                Norm = GetF32(lastS + "norm.weight"),
+                HcHeadFn = GetF32(lastS + "hc_head_fn.weight"),
+                HcHeadScale = GetF32(lastS + "hc_head_scale.weight"),
+                HcHeadBase = GetF32(lastS + "hc_head_base.weight"),
+                MarkovW1 = GetF32(lastS + "markov_head.markov_w1.weight"),
+                MarkovW2 = GetQW(lastS + "markov_head.markov_w2.weight"),
+                ConfProj = GetF32(lastS + "confidence_head.proj.weight"),
+            };
         }
 
         /// <summary>

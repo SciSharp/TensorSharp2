@@ -43,6 +43,10 @@ Models that support thinking mode (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS
 
 Enable via `--think` (console), `"think": true` (Ollama API), or the thinking toggle in the web UI.
 
+## DSpark Block Speculative Decoding (DeepSeek V4)
+
+DeepSeek V4 ships **DSpark** ("Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation") as a support module in the checkpoint: three DSV4 blocks that read the trunk's hidden states and propose a whole BLOCK of tokens per step instead of one, a Markov head that conditions each block position on the token before it, and a confidence head that predicts each position's acceptance probability. TensorSharp loads it as a separate drafter GGUF (`--draft-model`, built with `eng/dsv4-dspark-to-gguf.py`) and runs it on both GPU engines (`--backend cuda` and `--backend ggml_cuda`) for greedy single-sequence generation — on ggml the drafter is three extra graph layers whose key ring the trunk graph commits itself, so speculation costs no host round trips; the trunk verifies each block in one batched forward and keeps only the prefix it would have produced anyway. Measured **1.3-1.4x decode** on 4xA40 with the drafter's cumulative-confidence gate at its default; the gate matters because each extra verify row pulls a fresh set of MoE experts through VRAM. See the [DeepSeek V4 card](docs/models/deepseek4.md#dspark-speculative-decoding).
+
 ## MTP / NextN Speculative Decoding
 
 Some architectures ship a **multi-token-prediction (MTP / NextN) draft head** that lets `TensorSharp.Server` run lossless speculative decoding for solo (non-concurrent) sequences. The draft proposes several future tokens cheaply, the trunk verifies all of them in one batched forward, and accepted tokens are committed in a single step. Because the request's own sampler — temperature, top-k/p, and repetition/presence/frequency penalties — drives both the draft and the verify, the output is identical to standard decode; speculation only changes how many forward passes it takes to produce it.

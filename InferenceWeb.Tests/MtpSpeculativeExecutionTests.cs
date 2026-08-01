@@ -382,12 +382,104 @@ public class MtpSpeculativeExecutionTests
     /// <see cref="ProtocolViolations"/> rather than thrown so a buggy caller
     /// fails the test with a readable message instead of a hung engine.
     /// </summary>
+    // ----- block drafting (DSpark) -----
+
+    [Fact]
+    public void BlockDraft_PerfectBlock_AcceptsWholeBlockInOneDraftCall()
+    {
+        var model = new FakeMtpModel { BlockDraftSize = 5 };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 8);
+
+        // The window is clamped to the drafter's trained block size.
+        Assert.Equal(5, exec.MaxDraftTokens);
+
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        var accepted = new List<int>();
+        var outcome = exec.DecodeStep(lastToken, pos, kMax: 8,
+            drawNext: Argmax, onDraftAccepted: accepted.Add);
+
+        Assert.True(outcome.UsedSpeculation);
+        Assert.Equal(5, outcome.AcceptedCount);
+        Assert.Equal(1, model.BlockDraftCalls); // ONE pass for the whole block
+        Assert.Equal(model.ExpectedNext(pos + 5), outcome.NextToken);
+        Assert.Equal(pos + 6, model.CacheSeqLen);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void BlockDraft_CumulativeConfidenceGate_TruncatesOnPrefixProbability()
+    {
+        // Every position is individually above the gate, but the prefix product
+        // falls below it at position 3 (0.8^3 = 0.512 >= 0.5 > 0.8^4 = 0.41).
+        var model = new FakeMtpModel
+        {
+            BlockDraftSize = 5,
+            BlockConfidences = new[] { 0.8f, 0.8f, 0.8f, 0.8f, 0.8f },
+        };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5) { MinDraftProb = 0.5f };
+
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        var accepted = new List<int>();
+        var outcome = exec.DecodeStep(lastToken, pos, kMax: 5,
+            drawNext: Argmax, onDraftAccepted: accepted.Add);
+
+        Assert.Equal(3, exec.Stats.TokensDrafted);
+        Assert.Equal(3, outcome.AcceptedCount);
+        Assert.Equal(pos + 4, model.CacheSeqLen);
+    }
+
+    [Fact]
+    public void BlockDraft_WrongDraftMidBlock_KeepsPrefixAndCorrects()
+    {
+        var model = new FakeMtpModel { BlockDraftSize = 5 };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        model.DraftWrongPositions.Add(pos + 2); // third drafted token is wrong
+
+        var accepted = new List<int>();
+        var outcome = exec.DecodeStep(lastToken, pos, kMax: 5,
+            drawNext: Argmax, onDraftAccepted: accepted.Add);
+
+        Assert.Equal(2, outcome.AcceptedCount);
+        Assert.Equal(model.ExpectedNext(pos + 2), outcome.NextToken);
+        Assert.Equal(pos + 3, model.CacheSeqLen);
+        Assert.Equal(1, exec.Stats.RollbackSteps);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void PrefillSelfCatchUp_SkipsPerRowCaptureAndCatchUp()
+    {
+        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+
+        var prompt = new int[6];
+        for (int i = 0; i < prompt.Length; i++)
+            prompt[i] = i + 1;
+        exec.PrefillStep(prompt, 0);
+
+        // The drafter still gets the last prompt row's hidden state, and the
+        // block draft's protocol check would flag it if it did not.
+        var outcome = exec.DecodeStep(model.ExpectedNext(prompt.Length - 1), prompt.Length, kMax: 5,
+            drawNext: Argmax);
+        Assert.True(outcome.UsedSpeculation);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
     private sealed class FakeMtpModel : IMtpBatchedSpeculativeModel
     {
         private readonly List<int> _trunk = new();
         private int _recurrentState;       // advances with the trunk
         private int _recurrentSnapshot = -1;
 
+        // Block drafting (DSpark): a positive size routes the executor through
+        // MtpDraftBlock, and BlockConfidences is what the confidence head
+        // reports for each block position.
+        public int BlockDraftSize { get; set; }
+        public float[] BlockConfidences { get; set; }
+        public int BlockDraftCalls { get; private set; }
+        public bool PrefillSelfCatchUp { get; set; }
         public HashSet<int> DraftWrongPositions { get; } = new();
         public HashSet<int> LowConfidencePositions { get; } = new();
         public List<string> ProtocolViolations { get; } = new();
@@ -420,6 +512,7 @@ public class MtpSpeculativeExecutionTests
             SnapshotCalls = RestoreCalls = 0;
             LinearSpecForwardCalls = BatchedSpecForwardCalls = 0;
             SlotSnapshotCalls = SlotRestoreCalls = 0;
+            BlockDraftCalls = 0;
         }
 
         public int ExpectedNext(int position) => ((position * 13) + 7) % VocabSize;
@@ -484,12 +577,17 @@ public class MtpSpeculativeExecutionTests
             _trunk.AddRange(tokens);
             _recurrentState = _trunk.Count;
 
+            // A hidden buffer too small for every row means the caller only
+            // wants the LAST row (the self-catch-up prefill contract).
+            bool lastRowOnly = hAllOut != null && hAllOut.Length < tokens.Length * HiddenSize;
+
             for (int i = 0; i < tokens.Length; i++)
             {
-                if (hAllOut != null)
+                if (hAllOut != null && (!lastRowOnly || i == tokens.Length - 1))
                 {
+                    int row = lastRowOnly ? 0 : i;
                     for (int hh = 0; hh < HiddenSize; hh++)
-                        hAllOut[i * HiddenSize + hh] = startPos + i + 1;
+                        hAllOut[row * HiddenSize + hh] = startPos + i + 1;
                 }
                 if (allLogitsRows)
                 {
@@ -524,6 +622,32 @@ public class MtpSpeculativeExecutionTests
             }
             for (int hh = 0; hh < HiddenSize; hh++)
                 hOut[hh] = pos + 1;
+        }
+
+        public int MtpDraftBlockSize => BlockDraftSize;
+
+        public bool MtpPrefillSelfCatchUp => PrefillSelfCatchUp;
+
+        /// <summary>One-pass block draft: position i predicts the token after
+        /// position pos+i, mirroring what a DSpark block does.</summary>
+        public int MtpDraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
+        {
+            BlockDraftCalls++;
+            float expectH = position == 0 ? 0f : position;
+            if (Math.Abs(hPrev[0] - expectH) > 0.001f)
+                ProtocolViolations.Add($"block draft at pos {position} got hPrev {hPrev[0]} (expected {expectH})");
+
+            int n = Math.Min(BlockDraftSize, draftOut.Length);
+            for (int i = 0; i < n; i++)
+            {
+                int pos = position + i;
+                int predicted = ExpectedNext(pos);
+                if (DraftWrongPositions.Contains(pos))
+                    predicted = (predicted + 1) % VocabSize;
+                draftOut[i] = predicted;
+                confOut[i] = BlockConfidences != null && i < BlockConfidences.Length ? BlockConfidences[i] : 1.0f;
+            }
+            return n;
         }
 
         public void MtpCatchUp(int[] tokens, float[] hRows, int startPos)
