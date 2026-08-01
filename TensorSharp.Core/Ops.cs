@@ -73,6 +73,19 @@ namespace TensorSharp
         public static Tensor GELU(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("GELU", result, src); }
 
         public static Tensor SiLUMul(Tensor result, Tensor gate, Tensor up) { return (Tensor)OpRegistry.Invoke("SiLUMul", result, gate, up); }
+
+        /// <summary>
+        /// Clamped SwiGLU: result = clamp(up, -limit, +limit) * SiLU(min(gate, limit)).
+        /// A non-positive <paramref name="limit"/> disables the clamp, making this
+        /// exactly <see cref="SiLUMul"/>.
+        ///
+        /// The asymmetry is deliberate and matches the DeepSeek V4 reference (and
+        /// llama.cpp's ggml_swiglu_clamped): the gate is only clamped from above,
+        /// because SiLU already saturates on the negative side, while the up
+        /// projection is clamped on both.
+        /// </summary>
+        public static Tensor SiLUMulClamp(Tensor result, Tensor gate, Tensor up, float limit) { return (Tensor)OpRegistry.Invoke("SiLUMulClamp", result, gate, up, limit); }
+
         public static Tensor SiLUMulSplit(Tensor result, Tensor gateUp, int halfDim) { return (Tensor)OpRegistry.Invoke("SiLUMulSplit", result, gateUp, halfDim); }
         public static Tensor GELUMul(Tensor result, Tensor gate, Tensor up) { return (Tensor)OpRegistry.Invoke("GELUMul", result, gate, up); }
         public static Tensor SigmoidMul(Tensor result, Tensor x, Tensor gate) { return (Tensor)OpRegistry.Invoke("SigmoidMul", result, x, gate); }

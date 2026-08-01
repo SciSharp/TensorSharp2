@@ -274,6 +274,16 @@ namespace TensorSharp.Cuda
             return CudaCpuFallback.InvokeTensor("SiLUMul", writeTarget, writeTarget, gate, up);
         }
 
+        [RegisterOpStorageType("SiLUMulClamp", typeof(CudaStorage))]
+        public static Tensor SiLUMulClamp(Tensor result, Tensor gate, Tensor up, float limit)
+        {
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, gate, false, gate.Sizes);
+            if (CudaKernelOps.TrySiLUMulClamp(writeTarget, gate, up, limit))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor("SiLUMulClamp", writeTarget, writeTarget, gate, up, limit);
+        }
+
         [RegisterOpStorageType("SiLUMulSplit", typeof(CudaStorage))]
         public static Tensor SiLUMulSplit(Tensor result, Tensor gateUp, int halfDim)
         {

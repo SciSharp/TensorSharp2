@@ -2323,103 +2323,20 @@ namespace TensorSharp.Models
             if (!weight.HasHostData)
                 throw new InvalidOperationException($"Quantized linear weight type {(GgmlTensorType)weight.GgmlType} is not available on the selected device and its host copy has been released.");
 
-            long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
-            float* inputPtr = GetFloatPtr(input);
-            float* resultPtr = GetFloatPtr(result);
-            byte* weightBase = (byte*)weight.Data.ToPointer();
-
-            if (ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+            // One managed implementation, in ManagedQuantizedOps: integer dot
+            // kernels where the weight type has them, dequant-once + register-
+            // blocked float dots otherwise.
+            ManagedQuantizedOps.AddmmQuantizedToFloat32(
                 weight.GgmlType,
                 weight.Data,
                 weight.Ne0,
                 weight.Ne1,
-                inputPtr,
+                GetFloatPtr(input),
                 inDim,
                 seqLen,
-                resultPtr,
-                outDim))
-            {
-                InvalidateTensorDeviceCache(result);
-                return;
-            }
-
-            // Dequantize each weight row (one output column) to F32 ONCE into a thread-local
-            // scratch that stays hot in L1, then dot it with every activation row. VecDot4
-            // computes four activation rows per pass, keeping the weight-row vector loads in
-            // registers (~4x fewer loads of the weight than four sequential VecDots) — the same
-            // register-blocking the GQA-decode attention uses. This replaces the previous
-            // per-256-element chunked path (~seqLen*inDim/256 tiny TensorPrimitives.Dot calls per
-            // column) with seqLen/4 full-length dots, which is markedly faster for the DiT's large
-            // (3072/12288-wide) quantized projections. Dequant uses the managed path on the pure-C#
-            // CPU backend (NativeDequant.PreferManaged); native only for a non-CPU device fallback.
-            void RunRange(int start, int end, float* w)
-                => DequantMatMulColumns(weight.GgmlType, weightBase, rowBytes, inDim, outDim,
-                    inputPtr, inDim, seqLen, resultPtr, outDim, start, end, w);
-
-            bool useParallel = outDim >= 128 && seqLen * outDim >= 512 && Environment.ProcessorCount > 1;
-            if (!useParallel)
-            {
-                float[] wArr = ArrayPool<float>.Shared.Rent(inDim);
-                try
-                {
-                    fixed (float* w = wArr)
-                    {
-                        RunRange(0, outDim, w);
-                    }
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(wArr);
-                }
-
-                return;
-            }
-
-            Parallel.For(0, outDim,
-                () => ArrayPool<float>.Shared.Rent(inDim),
-                (col, _, wArr) =>
-                {
-                    fixed (float* w = wArr)
-                    {
-                        RunRange(col, col + 1, w);
-                    }
-                    return wArr;
-                },
-                wArr => ArrayPool<float>.Shared.Return(wArr));
-        }
-
-        // Core of the pure-C# quantized linear (shared by AddmmQuantManaged and the
-        // quant-matmul benchmark/self-test): for each output column in [startCol,endCol),
-        // dequantize its weight row into <paramref name="wScratch"/> (inDim floats, hot in L1)
-        // and dot it with every activation row using register-blocked VecDot4. Dequant honours
-        // NativeDequant.PreferManaged (managed on the pure-C# CPU backend).
-        internal static unsafe void DequantMatMulColumns(
-            int ggmlType, byte* weightBase, long rowBytes, int inDim, int outDim,
-            float* inputPtr, int inputRowStride, int seqLen, float* resultPtr, int outputRowStride,
-            int startCol, int endCol, float* wScratch)
-        {
-            for (int col = startCol; col < endCol; col++)
-            {
-                byte* rowPtr = weightBase + (long)col * rowBytes;
-                NativeDequant.DequantizeToFloat32Native(ggmlType, (IntPtr)rowPtr, (IntPtr)wScratch, inDim);
-
-                int row = 0;
-                for (; row + 4 <= seqLen; row += 4)
-                {
-                    VecDot4(
-                        inputPtr + (long)row * inputRowStride,
-                        inputPtr + (long)(row + 1) * inputRowStride,
-                        inputPtr + (long)(row + 2) * inputRowStride,
-                        inputPtr + (long)(row + 3) * inputRowStride,
-                        wScratch, inDim, out float r0, out float r1, out float r2, out float r3);
-                    resultPtr[(long)row * outputRowStride + col] = r0;
-                    resultPtr[(long)(row + 1) * outputRowStride + col] = r1;
-                    resultPtr[(long)(row + 2) * outputRowStride + col] = r2;
-                    resultPtr[(long)(row + 3) * outputRowStride + col] = r3;
-                }
-                for (; row < seqLen; row++)
-                    resultPtr[(long)row * outputRowStride + col] = VecDot(inputPtr + (long)row * inputRowStride, wScratch, inDim);
-            }
+                GetFloatPtr(result),
+                outDim);
+            InvalidateTensorDeviceCache(result);
         }
 
         #region SIMD Helpers

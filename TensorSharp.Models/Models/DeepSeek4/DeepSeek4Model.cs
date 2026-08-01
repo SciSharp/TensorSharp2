@@ -73,7 +73,7 @@ namespace TensorSharp.Models
                 int nThreads = ParseEnvInt("TS_DSV4_THREADS", Environment.ProcessorCount);
                 Console.WriteLine($"Model: {arch} (pure C# CPU executor), Layers={Config.NumLayers}, " +
                     $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}");
-                _cpuExec = new DeepSeek4CpuExecutor(ggufPath, maxContext, nUbatch, nThreads);
+                _cpuExec = new DeepSeek4CpuExecutor(ggufPath, maxContext, nUbatch, nThreads, _allocator);
             }
             else
             {

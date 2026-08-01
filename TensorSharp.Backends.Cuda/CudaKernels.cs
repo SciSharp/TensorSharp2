@@ -106,6 +106,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeExpertGateUpDp4aF32;
         private readonly IntPtr moeExpertDownDp4aF32;
         private readonly IntPtr siluMulF32;
+        private readonly IntPtr siluMulClampF32;
         private readonly IntPtr moeSharedGatedAddF32;
         private readonly IntPtr moeRouterBatchedF32;
         private readonly IntPtr moeExpertGateUpBatchedDp4aF32;
@@ -284,6 +285,7 @@ namespace TensorSharp.Cuda
             moeExpertGateUpDp4aF32 = module.GetFunction("ts_moe_expert_gate_up_dp4a_f32");
             moeExpertDownDp4aF32 = module.GetFunction("ts_moe_expert_down_dp4a_f32");
             siluMulF32 = module.GetFunction("ts_silu_mul_f32");
+            siluMulClampF32 = module.GetFunction("ts_silu_mul_clamp_f32");
             moeSharedGatedAddF32 = module.GetFunction("ts_moe_shared_gated_add");
             moeRouterBatchedF32 = module.GetFunction("ts_moe_router_batched_f32");
             moeExpertGateUpBatchedDp4aF32 = module.GetFunction("ts_moe_expert_gate_up_batched_dp4a_f32");
@@ -2673,6 +2675,24 @@ namespace TensorSharp.Cuda
             uint blocks = (uint)((n + BlockSize - 1) / BlockSize);
             if (blocks == 0) blocks = 1;
             Launch(siluMulF32, blocks, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>
+        /// dst[i] = clamp(b[i], ±limit) * silu(min(a[i], limit)); limit &lt;= 0
+        /// disables the clamp. In-place safe when dst == a.
+        /// </summary>
+        public void LaunchSiluMulClampF32(IntPtr dst, IntPtr a, IntPtr b, long n, float limit, IntPtr stream)
+        {
+            IntPtr dstArg = dst;
+            IntPtr aArg = a;
+            IntPtr bArg = b;
+            long nArg = n;
+            float limArg = limit;
+            int clampArg = limit > 0.0f ? 1 : 0;
+            void** args = stackalloc void*[] { &dstArg, &aArg, &bArg, &nArg, &limArg, &clampArg };
+            uint blocks = (uint)((n + BlockSize - 1) / BlockSize);
+            if (blocks == 0) blocks = 1;
+            Launch(siluMulClampF32, blocks, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         // output[j] += sigmoid(input . gate_vec) * shared_down[j], gate computed

@@ -120,12 +120,15 @@ namespace TensorSharp.Cuda
             public DevQW WqA, WqB, Wkv, WoA, WoB;
             public DevQW CompWkv, CompWgate, IdxProj, IdxQB, IdxCompWkv, IdxCompWgate;
             public DevQW GateExps, UpExps, DownExps, GateShexp, UpShexp, DownShexp;
-            public IntPtr AttnNorm, QANorm, KvNorm, Sinks;
-            public IntPtr HcAttnFn, HcAttnScale, HcAttnBase, HcFfnFn, HcFfnScale, HcFfnBase;
-            public IntPtr CompApe, CompNorm, IdxCompApe, IdxCompNorm;
-            public IntPtr GateInp, ExpProbsBias, FfnNorm, Tid2Eid;
-            public IntPtr RingK, CompK, LidK;
-            public IntPtr HistKv, HistScore, LidHistKv, LidHistScore;
+            // Small dense tensors and the KV/compressor caches are allocator-owned
+            // Tensors (the arena now holds only the packed quantized weights), so
+            // the shared Ops can consume them directly.
+            public Tensor AttnNorm, QANorm, KvNorm, Sinks;
+            public Tensor HcAttnFn, HcAttnScale, HcAttnBase, HcFfnFn, HcFfnScale, HcFfnBase;
+            public Tensor CompApe, CompNorm, IdxCompApe, IdxCompNorm;
+            public Tensor GateInp, ExpProbsBias, FfnNorm, Tid2Eid;
+            public Tensor RingK, CompK, LidK;
+            public Tensor HistKv, HistScore, LidHistKv, LidHistScore;
             public int ShFf;
         }
 
@@ -135,12 +138,17 @@ namespace TensorSharp.Cuda
             public CudaAllocator Alloc;
             public Dsv4Kernels DK;
             public IntPtr Event;
-            public IntPtr Arena;
+            // One allocator-owned byte tensor per device holding every packed
+            // quantized weight assigned to it; ArenaTake bump-allocates inside it.
+            // A single block keeps the ~7k weight tensors from each paying an
+            // allocation-granularity tax (and keeps upload segments contiguous).
+            public Tensor Arena;
+            public IntPtr ArenaBase;
             public long ArenaBytes;
             public long ArenaUsed;
-            public IntPtr RopeRaw, RopeComp;
+            public Tensor RopeRaw, RopeComp;
             public bool NeedsTokens;
-            public IntPtr TokensDev0, TokensDev1;
+            public Tensor TokensDev0, TokensDev1;
             public IntPtr TokEv0, TokEv1; // guards pinned-buffer reuse per parity
             // Layer-boundary handoff staging: this device's outgoing hidden
             // streams go DtoH into BoundaryPinned on this device's stream, then
@@ -152,19 +160,21 @@ namespace TensorSharp.Cuda
             public IntPtr XsReadyEv;   // recorded on this stream after the DtoH
             public IntPtr CopyDoneEv;  // recorded on the DST stream after the HtoD
 
-            // scratch
-            public IntPtr Xs, XsOut, Cur, Inv, Mixes, Pre, Post, Comb;
-            public IntPtr Qr, Q, KvRaw, StKv, StScore, LidStKv, LidStScore;
-            public IntPtr Iq, Iw, IdxScores, TopkIdx, TopkCnt;
-            public IntPtr AttnO, OGrouped, OGroupedOut, OG, AttnOut, FfnOut;
-            public IntPtr RouterLogits, Sel, SelW, Counts, Offsets, Cursors, RowOfSlot, SlotToken;
-            public IntPtr ActQ8A, ActQ8B, ExpGate, ExpUp, ExpDown, ShGate, ShUp, ShDown;
+            // Scratch. Every buffer is an allocator-owned Tensor so it comes out
+            // of the shared CudaAllocator pool and is visible to its VRAM
+            // accounting; the DSV4-specific kernels take the raw device pointer
+            // via Ptr(), the shared Ops take the Tensor (or a per-ubatch row view).
+            public Tensor Xs, XsOut, Cur, Inv, Mixes, Pre, Post, Comb;
+            public Tensor Qr, Q, KvRaw, StKv, StScore, LidStKv, LidStScore;
+            public Tensor Iq, Iw, IdxScores, TopkIdx, TopkCnt;
+            public Tensor AttnO, OGrouped, OGroupedOut, OG, AttnOut, FfnOut;
+            public Tensor RouterLogits, Sel, SelW, Counts, Offsets, Cursors, RowOfSlot, SlotToken;
+            public Tensor ActQ8A, ActQ8B, ExpGate, ExpUp, ExpDown, ShGate, ShUp, ShDown;
             // dense split-q8_1 activation scratch for the register-staged expert
             // kernels (A = per-token rows into gate/up, B = packed rows into down)
-            public IntPtr SplitQsA, SplitDA, SplitQsB, SplitDB;
-            public IntPtr WF16, AF16;
-            public long WF16Elems;
-            public List<IntPtr> OwnedAllocs = new List<IntPtr>();
+            public Tensor SplitQsA, SplitDA, SplitQsB, SplitDB;
+            public Tensor Logits;
+            public List<Tensor> OwnedTensors = new List<Tensor>();
             // Weights that stream from disk: planned during the (I/O-free)
             // arena-layout pass, then transferred by the loader thread pool.
             public List<UploadJob> UploadPlan = new List<UploadJob>();
@@ -182,11 +192,9 @@ namespace TensorSharp.Cuda
         private readonly int _compRowsCsa;
         private readonly int _compRowsHca;
         private readonly int _lastDev;
-        private IntPtr _outputW;          // lm head (device ptr on last dev)
         private DevQW _outputQW;
         private DevQW _tokEmbdQW;
-        private IntPtr _outputNorm, _hcHeadFn, _hcHeadScale, _hcHeadBase;
-        private IntPtr _logitsDev;
+        private Tensor _outputNorm, _hcHeadFn, _hcHeadScale, _hcHeadBase;
         private IntPtr _pinnedTokens0, _pinnedTokens1;
         private int _chunkParity;
         private readonly int _perf;
@@ -209,6 +217,12 @@ namespace TensorSharp.Cuda
             _perf = EnvInt("TS_DSV4_PERF", 0);
             _syncDebug = EnvInt("TS_DSV4_CUDA_SYNCDBG", 0) != 0;
             _logitsHost = new float[m.NVocab];
+
+            // The model layer coerces DSV4's backend to Cpu (it only needs a cheap
+            // host allocator), so the CUDA op handlers are not registered for us:
+            // do it here, since this engine drives Ops.RMSNorm / Ops.SiLUMulClamp
+            // on CUDA storage. Idempotent.
+            CudaBackend.Register();
 
             CudaDriverApi.cuInit(0);
             CudaDriverApi.cuDeviceGetCount(out int devCount).ThrowOnError();
@@ -278,34 +292,25 @@ namespace TensorSharp.Cuda
                 dev.CopyDoneEv = cd;
             }
 
-            // ---- arena sizing per device (weights + small tensors + caches + rope) ----
+            // ---- arena sizing per device (packed quantized weights only) ----
+            // Norms, gates, APE/RoPE tables and the caches are separate allocator
+            // tensors, so they are not counted here.
             var arenaNeed = new long[useDevs];
             for (int il = 0; il < m.NLayer; il++)
             {
                 int d = assignment[il];
-                var L = m.Layers[il];
-                foreach (var qw in EnumerateQuantWeights(L))
+                foreach (var qw in EnumerateQuantWeights(m.Layers[il]))
                     arenaNeed[d] += Align(qw.TotalBytes);
-                foreach (var arr in EnumerateF32Arrays(L))
-                    arenaNeed[d] += Align((long)(arr?.Length ?? 0) * 4);
-                if (L.Tid2Eid != null)
-                    arenaNeed[d] += Align((long)L.Tid2Eid.Length * 4);
-                arenaNeed[d] += CacheBytes(L.Ratio);
             }
             arenaNeed[0] += Align(m.TokEmbd.TotalBytes);
-            arenaNeed[_lastDev] += Align(m.Output.TotalBytes)
-                + Align((long)m.OutputNorm.Length * 4) + Align((long)m.HcHeadFn.Length * 4)
-                + Align((long)m.HcHeadScale.Length * 4) + Align((long)m.HcHeadBase.Length * 4);
-            for (int d = 0; d < useDevs; d++)
-                arenaNeed[d] += Align((long)m.RopeRawTable.Length * 4) + Align((long)m.RopeCompTable.Length * 4);
+            arenaNeed[_lastDev] += Align(m.Output.TotalBytes);
 
             for (int d = 0; d < useDevs; d++)
             {
                 var dev = _devs[d];
-                dev.MakeCurrent();
-                dev.ArenaBytes = arenaNeed[d];
-                CudaDriverApi.cuMemAlloc(out IntPtr arena, new UIntPtr((ulong)Math.Max(arenaNeed[d], 256))).ThrowOnError();
-                dev.Arena = arena;
+                dev.ArenaBytes = Math.Max(arenaNeed[d], 256);
+                dev.Arena = AllocT(_devs[d], DType.UInt8, dev.ArenaBytes);
+                dev.ArenaBase = Ptr(dev.Arena);
                 dev.ArenaUsed = 0;
             }
 
@@ -332,7 +337,6 @@ namespace TensorSharp.Cuda
                 if (d == _lastDev)
                 {
                     _outputQW = UploadQuant(dev, m.Output);
-                    _outputW = _outputQW.Ptr;
                     _outputNorm = UploadF32(dev, m.OutputNorm);
                     _hcHeadFn = UploadF32(dev, m.HcHeadFn);
                     _hcHeadScale = UploadF32(dev, m.HcHeadScale);
@@ -358,8 +362,8 @@ namespace TensorSharp.Cuda
                 if (!dev.NeedsTokens)
                     continue;
                 dev.MakeCurrent();
-                dev.TokensDev0 = AllocDev(dev, (long)m.NUbatch * 4);
-                dev.TokensDev1 = AllocDev(dev, (long)m.NUbatch * 4);
+                dev.TokensDev0 = AllocI32(dev, m.NUbatch);
+                dev.TokensDev1 = AllocI32(dev, m.NUbatch);
                 CudaDriverApi.cuEventCreate(out IntPtr te0, 0x02).ThrowOnError();
                 CudaDriverApi.cuEventCreate(out IntPtr te1, 0x02).ThrowOnError();
                 dev.TokEv0 = te0;
@@ -367,8 +371,7 @@ namespace TensorSharp.Cuda
             }
 
             var last = _devs[_lastDev];
-            last.MakeCurrent();
-            _logitsDev = AllocDev(last, (long)m.NVocab * 4);
+            last.Logits = AllocF32(last, 1, m.NVocab);
 
             _devs[0].MakeCurrent();
             // CU_MEMHOSTALLOC_PORTABLE (0x1): the pinned token buffers are copied
@@ -423,34 +426,6 @@ namespace TensorSharp.Cuda
             yield return l.DownShexp;
         }
 
-        private static IEnumerable<float[]> EnumerateF32Arrays(LayerDesc l)
-        {
-            yield return l.AttnNorm; yield return l.QANorm; yield return l.KvNorm; yield return l.Sinks;
-            yield return l.HcAttnFn; yield return l.HcAttnScale; yield return l.HcAttnBase;
-            yield return l.HcFfnFn; yield return l.HcFfnScale; yield return l.HcFfnBase;
-            yield return l.CompApe; yield return l.CompNorm; yield return l.IdxCompApe; yield return l.IdxCompNorm;
-            yield return l.GateInp; yield return l.ExpProbsBias; yield return l.FfnNorm;
-        }
-
-        private long CacheBytes(int ratio)
-        {
-            int hd = _m.HeadDim;
-            long b = Align((long)_ringRaw * hd * 2);
-            if (ratio == CsaRatio)
-            {
-                b += Align((long)_compRowsCsa * hd * 2);
-                b += Align((long)_compRowsCsa * _m.IdxHeadSize * 2);
-                b += 2 * Align(2L * CsaRatio * 2 * hd * 4);
-                b += 2 * Align(2L * CsaRatio * 2 * _m.IdxHeadSize * 4);
-            }
-            else if (ratio == HcaRatio)
-            {
-                b += Align((long)_compRowsHca * hd * 2);
-                b += 2 * Align((long)HcaRatio * hd * 4);
-            }
-            return b;
-        }
-
         // ---- arena sub-allocation + upload helpers (device context must be current) ----
 
         private static IntPtr ArenaTake(Dev dev, long bytes)
@@ -458,7 +433,7 @@ namespace TensorSharp.Cuda
             long aligned = Align(bytes);
             if (dev.ArenaUsed + aligned > dev.ArenaBytes)
                 throw new InvalidOperationException($"[dsv4-cuda] arena overflow on device {dev.Ordinal}");
-            IntPtr p = (IntPtr)((long)dev.Arena + dev.ArenaUsed);
+            IntPtr p = (IntPtr)((long)dev.ArenaBase + dev.ArenaUsed);
             dev.ArenaUsed += aligned;
             return p;
         }
@@ -635,24 +610,27 @@ namespace TensorSharp.Cuda
             }
         }
 
-        private static IntPtr UploadF32(Dev dev, float[] data)
+        /// <summary>Small dense tensor (norm/gate/table) as an allocator-owned
+        /// F32 tensor. Null/empty input yields null, which every consumer treats
+        /// as "absent".</summary>
+        private static Tensor UploadF32(Dev dev, float[] data)
         {
             if (data == null || data.Length == 0)
-                return IntPtr.Zero;
-            IntPtr p = ArenaTake(dev, (long)data.Length * 4);
+                return null;
+            Tensor t = AllocF32(dev, data.Length);
             fixed (float* src = data)
-                CudaDriverApi.cuMemcpyHtoD(p, (IntPtr)src, new UIntPtr((ulong)data.Length * 4)).ThrowOnError();
-            return p;
+                CudaDriverApi.cuMemcpyHtoD(Ptr(t), (IntPtr)src, new UIntPtr((ulong)data.Length * 4)).ThrowOnError();
+            return t;
         }
 
-        private static IntPtr UploadI32(Dev dev, int[] data)
+        private static Tensor UploadI32(Dev dev, int[] data)
         {
             if (data == null || data.Length == 0)
-                return IntPtr.Zero;
-            IntPtr p = ArenaTake(dev, (long)data.Length * 4);
+                return null;
+            Tensor t = AllocI32(dev, data.Length);
             fixed (int* src = data)
-                CudaDriverApi.cuMemcpyHtoD(p, (IntPtr)src, new UIntPtr((ulong)data.Length * 4)).ThrowOnError();
-            return p;
+                CudaDriverApi.cuMemcpyHtoD(Ptr(t), (IntPtr)src, new UIntPtr((ulong)data.Length * 4)).ThrowOnError();
+            return t;
         }
 
         private void UploadLayer(Dev dev, int il)
@@ -700,30 +678,68 @@ namespace TensorSharp.Cuda
             dst.FfnNorm = UploadF32(dev, src.FfnNorm);
             dst.Tid2Eid = UploadI32(dev, src.Tid2Eid);
 
+            // Caches: F16 key rows (parity with the native executor / llama.cpp),
+            // F32 compressor state rings. Allocator-owned, one tensor each.
             int hd = _m.HeadDim;
-            dst.RingK = ArenaTake(dev, (long)_ringRaw * hd * 2);
+            dst.RingK = AllocT(dev, DType.Float16, _ringRaw, hd);
             if (dst.Ratio == CsaRatio)
             {
-                dst.CompK = ArenaTake(dev, (long)_compRowsCsa * hd * 2);
-                dst.LidK = ArenaTake(dev, (long)_compRowsCsa * _m.IdxHeadSize * 2);
-                dst.HistKv = ArenaTake(dev, 2L * CsaRatio * 2 * hd * 4);
-                dst.HistScore = ArenaTake(dev, 2L * CsaRatio * 2 * hd * 4);
-                dst.LidHistKv = ArenaTake(dev, 2L * CsaRatio * 2 * _m.IdxHeadSize * 4);
-                dst.LidHistScore = ArenaTake(dev, 2L * CsaRatio * 2 * _m.IdxHeadSize * 4);
+                dst.CompK = AllocT(dev, DType.Float16, _compRowsCsa, hd);
+                dst.LidK = AllocT(dev, DType.Float16, _compRowsCsa, _m.IdxHeadSize);
+                dst.HistKv = AllocF32(dev, 2L * CsaRatio, 2L * hd);
+                dst.HistScore = AllocF32(dev, 2L * CsaRatio, 2L * hd);
+                dst.LidHistKv = AllocF32(dev, 2L * CsaRatio, 2L * _m.IdxHeadSize);
+                dst.LidHistScore = AllocF32(dev, 2L * CsaRatio, 2L * _m.IdxHeadSize);
             }
             else if (dst.Ratio == HcaRatio)
             {
-                dst.CompK = ArenaTake(dev, (long)_compRowsHca * hd * 2);
-                dst.HistKv = ArenaTake(dev, (long)HcaRatio * hd * 4);
-                dst.HistScore = ArenaTake(dev, (long)HcaRatio * hd * 4);
+                dst.CompK = AllocT(dev, DType.Float16, _compRowsHca, hd);
+                dst.HistKv = AllocF32(dev, HcaRatio, hd);
+                dst.HistScore = AllocF32(dev, HcaRatio, hd);
             }
         }
 
-        private static IntPtr AllocDev(Dev dev, long bytes)
+        /// <summary>Device pointer of a contiguous allocator-owned tensor (or of
+        /// its first element when the tensor is a row view of a larger buffer).</summary>
+        internal static IntPtr Ptr(Tensor t)
+            => t == null ? IntPtr.Zero : ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
+
+        /// <summary>
+        /// Scratch tensor from the device's <see cref="CudaAllocator"/>. Replaces
+        /// the engine's former private cuMemAlloc list: pooled, counted by the
+        /// allocator's VRAM stats, and usable directly by the shared Ops.
+        /// </summary>
+        private static Tensor AllocT(Dev dev, DType type, params long[] sizes)
         {
-            CudaDriverApi.cuMemAlloc(out IntPtr p, new UIntPtr((ulong)Math.Max(bytes, 256))).ThrowOnError();
-            dev.OwnedAllocs.Add(p);
-            return p;
+            dev.MakeCurrent();
+            var t = new Tensor(dev.Alloc, type, sizes);
+            dev.OwnedTensors.Add(t);
+            return t;
+        }
+
+        private static Tensor AllocF32(Dev dev, params long[] sizes) => AllocT(dev, DType.Float32, sizes);
+
+        private static Tensor AllocI32(Dev dev, params long[] sizes) => AllocT(dev, DType.Int32, sizes);
+
+        /// <summary>Raw byte scratch (quantized activation blocks). Rounded up to
+        /// whole rows so the tensor stays 2-D and contiguous.</summary>
+        private static Tensor AllocU8(Dev dev, long rows, long rowBytes) => AllocT(dev, DType.UInt8, Math.Max(rows, 1), Math.Max(rowBytes, 1));
+
+        /// <summary>
+        /// Row view [rows, cols] over a scratch tensor allocated for the largest
+        /// ubatch. Cheap (no device work) and disposed by the caller; used to hand
+        /// the shared Ops the exact shape of the current chunk.
+        /// </summary>
+        private static Tensor Rows(Tensor t, int rows)
+            => t.Sizes[0] == rows ? t.CopyRef() : t.Narrow(0, 0, rows);
+
+        /// <summary>Row view of <paramref name="rows"/> rows starting at
+        /// <paramref name="first"/>, reshaped to [rows, cols].</summary>
+        private static Tensor Block(Tensor t, long first, long rows, long cols)
+        {
+            using Tensor flat = t.View(t.ElementCount());
+            using Tensor slice = flat.Narrow(0, first * cols, rows * cols);
+            return slice.View(rows, cols);
         }
 
         private void AllocateScratch(Dev dev)
@@ -735,40 +751,43 @@ namespace TensorSharp.Cuda
             int hd = m.HeadDim;
             int s = nt * m.NExpertUsed;
 
-            dev.Xs = AllocDev(dev, (long)nt * HC * e * 4);
-            dev.XsOut = AllocDev(dev, (long)nt * HC * e * 4);
-            dev.Cur = AllocDev(dev, (long)nt * e * 4);
-            dev.Inv = AllocDev(dev, (long)nt * 4);
-            dev.Mixes = AllocDev(dev, (long)nt * HcMixDim * 4);
-            dev.Pre = AllocDev(dev, (long)nt * HC * 4);
-            dev.Post = AllocDev(dev, (long)nt * HC * 4);
-            dev.Comb = AllocDev(dev, (long)nt * HC * HC * 4);
-            dev.Qr = AllocDev(dev, (long)nt * m.QLoraRank * 4);
-            dev.Q = AllocDev(dev, (long)nt * m.NHead * hd * 4);
-            dev.KvRaw = AllocDev(dev, (long)nt * hd * 4);
-            dev.StKv = AllocDev(dev, (long)nt * 2 * hd * 4);
-            dev.StScore = AllocDev(dev, (long)nt * 2 * hd * 4);
-            dev.LidStKv = AllocDev(dev, (long)nt * 2 * m.IdxHeadSize * 4);
-            dev.LidStScore = AllocDev(dev, (long)nt * 2 * m.IdxHeadSize * 4);
-            dev.Iq = AllocDev(dev, (long)nt * m.IdxNHead * m.IdxHeadSize * 4);
-            dev.Iw = AllocDev(dev, (long)nt * m.IdxNHead * 4);
-            dev.IdxScores = AllocDev(dev, (long)nt * _compRowsCsa * 4);
-            dev.TopkIdx = AllocDev(dev, (long)nt * m.IdxTopK * 4);
-            dev.TopkCnt = AllocDev(dev, (long)nt * 4);
-            dev.AttnO = AllocDev(dev, (long)nt * m.NHead * hd * 4);
-            dev.OGrouped = AllocDev(dev, (long)nt * m.NHead * hd * 4);
-            dev.OGroupedOut = AllocDev(dev, (long)m.OGroups * nt * m.OLoraRank * 4);
-            dev.OG = AllocDev(dev, (long)nt * m.OGroups * m.OLoraRank * 4);
-            dev.AttnOut = AllocDev(dev, (long)nt * e * 4);
-            dev.FfnOut = AllocDev(dev, (long)nt * e * 4);
-            dev.RouterLogits = AllocDev(dev, (long)nt * m.NExpert * 4);
-            dev.Sel = AllocDev(dev, (long)s * 4);
-            dev.SelW = AllocDev(dev, (long)s * 4);
-            dev.Counts = AllocDev(dev, (long)m.NExpert * 4);
-            dev.Offsets = AllocDev(dev, (long)m.NExpert * 4);
-            dev.Cursors = AllocDev(dev, (long)m.NExpert * 4);
-            dev.RowOfSlot = AllocDev(dev, (long)s * 4);
-            dev.SlotToken = AllocDev(dev, (long)s * 4);
+            dev.Xs = AllocF32(dev, nt, HC * e);
+            dev.XsOut = AllocF32(dev, nt, HC * e);
+            dev.Cur = AllocF32(dev, nt, e);
+            dev.Inv = AllocF32(dev, nt);
+            dev.Mixes = AllocF32(dev, nt, HcMixDim);
+            dev.Pre = AllocF32(dev, nt, HC);
+            dev.Post = AllocF32(dev, nt, HC);
+            dev.Comb = AllocF32(dev, nt, HC * HC);
+            dev.Qr = AllocF32(dev, nt, m.QLoraRank);
+            dev.Q = AllocF32(dev, nt, (long)m.NHead * hd);
+            dev.KvRaw = AllocF32(dev, nt, hd);
+            dev.StKv = AllocF32(dev, nt, 2 * hd);
+            dev.StScore = AllocF32(dev, nt, 2 * hd);
+            dev.LidStKv = AllocF32(dev, nt, 2 * m.IdxHeadSize);
+            dev.LidStScore = AllocF32(dev, nt, 2 * m.IdxHeadSize);
+            dev.Iq = AllocF32(dev, nt, (long)m.IdxNHead * m.IdxHeadSize);
+            dev.Iw = AllocF32(dev, nt, Math.Max(m.IdxNHead, 1));
+            dev.IdxScores = AllocF32(dev, nt, _compRowsCsa);
+            dev.TopkIdx = AllocI32(dev, nt, Math.Max(m.IdxTopK, 1));
+            dev.TopkCnt = AllocI32(dev, nt);
+            dev.AttnO = AllocF32(dev, nt, (long)m.NHead * hd);
+            dev.OGrouped = AllocF32(dev, nt, (long)m.NHead * hd);
+            dev.OGroupedOut = AllocF32(dev, (long)m.OGroups * nt, m.OLoraRank);
+            dev.OG = AllocF32(dev, nt, (long)m.OGroups * m.OLoraRank);
+            dev.AttnOut = AllocF32(dev, nt, e);
+            dev.FfnOut = AllocF32(dev, nt, e);
+            dev.RouterLogits = AllocF32(dev, nt, m.NExpert);
+            dev.Sel = AllocI32(dev, nt, m.NExpertUsed);
+            dev.SelW = AllocF32(dev, nt, m.NExpertUsed);
+            // Counts/Offsets/Cursors are int32 histograms; Counts is cleared with
+            // the F32 fill kernel because 0.0f and 0 share the same bit pattern
+            // and that keeps the clear stream-ordered with the grouping kernels.
+            dev.Counts = AllocI32(dev, m.NExpert);
+            dev.Offsets = AllocI32(dev, m.NExpert);
+            dev.Cursors = AllocI32(dev, m.NExpert);
+            dev.RowOfSlot = AllocI32(dev, s);
+            dev.SlotToken = AllocI32(dev, s);
 
             // q8_1 activation scratch: A covers [max(nt, S)] rows of the widest
             // quantized input (oGroups*oLoraRank for wo_b); B covers the packed
@@ -776,53 +795,31 @@ namespace TensorSharp.Cuda
             int maxIn = Math.Max(Math.Max(e, m.OGroups * m.OLoraRank), Math.Max(m.QLoraRank, m.NFfExp));
             long q8RowBytesA = (long)(maxIn / 32) * Q81BlockBytes;
             long rowsA = Math.Max(Math.Max(nt, s), (long)m.OGroups * nt);
-            dev.ActQ8A = AllocDev(dev, rowsA * q8RowBytesA);
-            dev.ActQ8B = AllocDev(dev, (long)s * (m.NFfExp / 32) * Q81BlockBytes);
+            dev.ActQ8A = AllocU8(dev, rowsA, q8RowBytesA);
+            dev.ActQ8B = AllocU8(dev, s, (long)(m.NFfExp / 32) * Q81BlockBytes);
 
             // split-layout twins for the staged expert kernels
-            dev.SplitQsA = AllocDev(dev, (long)nt * e);
-            dev.SplitDA = AllocDev(dev, (long)nt * (e / 32) * 4);
-            dev.SplitQsB = AllocDev(dev, (long)s * m.NFfExp);
-            dev.SplitDB = AllocDev(dev, (long)s * (m.NFfExp / 32) * 4);
+            dev.SplitQsA = AllocU8(dev, nt, e);
+            dev.SplitDA = AllocF32(dev, nt, e / 32);
+            dev.SplitQsB = AllocU8(dev, s, m.NFfExp);
+            dev.SplitDB = AllocF32(dev, s, m.NFfExp / 32);
 
-            dev.ExpGate = AllocDev(dev, (long)s * m.NFfExp * 4);
-            dev.ExpUp = AllocDev(dev, (long)s * m.NFfExp * 4);
-            dev.ExpDown = AllocDev(dev, (long)s * e * 4);
+            dev.ExpGate = AllocF32(dev, s, m.NFfExp);
+            dev.ExpUp = AllocF32(dev, s, m.NFfExp);
+            dev.ExpDown = AllocF32(dev, s, e);
             int shFf = 0;
             foreach (var dl in _layers)
                 if (dl.Device == dev.Ordinal && dl.ShFf > shFf)
                     shFf = dl.ShFf;
             shFf = Math.Max(shFf, 1);
-            dev.ShGate = AllocDev(dev, (long)nt * shFf * 4);
-            dev.ShUp = AllocDev(dev, (long)nt * shFf * 4);
-            dev.ShDown = AllocDev(dev, (long)nt * e * 4);
+            dev.ShGate = AllocF32(dev, nt, shFf);
+            dev.ShUp = AllocF32(dev, nt, shFf);
+            dev.ShDown = AllocF32(dev, nt, e);
 
-            // F16 dequant scratch for prefill GEMMs: sized to the largest dense
-            // quantized weight on this device (+ activation panel).
-            long maxWElems = 0;
-            for (int il = 0; il < _m.NLayer; il++)
-            {
-                if (_layers[il].Device != dev.Ordinal)
-                    continue;
-                var L = _layers[il];
-                foreach (var qw in new[] { L.WqA, L.WqB, L.Wkv, L.WoA, L.WoB, L.CompWkv, L.CompWgate, L.IdxProj, L.IdxQB, L.IdxCompWkv, L.IdxCompWgate, L.GateShexp, L.UpShexp, L.DownShexp })
-                {
-                    if (qw.Ptr == IntPtr.Zero)
-                        continue;
-                    // Only quantized weights are staged through WF16; F16/BF16/F32
-                    // feed cuBLAS straight from the arena.
-                    if (qw.Type == TF16 || qw.Type == TBF16 || qw.Type == TF32)
-                        continue;
-                    long elems = (long)qw.Ne0 * qw.Ne1;
-                    if (elems > maxWElems)
-                        maxWElems = elems;
-                }
-            }
-            dev.WF16Elems = maxWElems;
-            if (maxWElems > 0)
-                dev.WF16 = AllocDev(dev, maxWElems * 2);
-            long maxAElems = (long)Math.Max(nt, s) * maxIn;
-            dev.AF16 = AllocDev(dev, maxAElems * 2);
+            // The F16 weight-dequant and F16/BF16 activation panels the prefill
+            // GEMMs need are NOT allocated here any more: CudaQuantizedOps owns
+            // one grow-on-demand scratch per allocator and every matmul on this
+            // device shares it (see RunResidentMatmul / RunF16Gemm).
         }
 
         // -------------------------------------------------------------------
@@ -836,36 +833,28 @@ namespace TensorSharp.Cuda
                 dev.MakeCurrent();
                 CudaDriverApi.cuStreamSynchronize(dev.Stream);
             }
-            int hd = _m.HeadDim;
             for (int il = 0; il < _m.NLayer; il++)
             {
                 var L = _layers[il];
-                var dev = _devs[L.Device];
-                dev.MakeCurrent();
-                Memset0(L.RingK, (long)_ringRaw * hd * 2);
-                if (L.Ratio == CsaRatio)
-                {
-                    Memset0(L.CompK, (long)_compRowsCsa * hd * 2);
-                    Memset0(L.LidK, (long)_compRowsCsa * _m.IdxHeadSize * 2);
-                    Memset0(L.HistKv, 2L * CsaRatio * 2 * hd * 4);
-                    Memset0(L.HistScore, 2L * CsaRatio * 2 * hd * 4);
-                    Memset0(L.LidHistKv, 2L * CsaRatio * 2 * _m.IdxHeadSize * 4);
-                    Memset0(L.LidHistScore, 2L * CsaRatio * 2 * _m.IdxHeadSize * 4);
-                }
-                else if (L.Ratio == HcaRatio)
-                {
-                    Memset0(L.CompK, (long)_compRowsHca * hd * 2);
-                    Memset0(L.HistKv, (long)HcaRatio * hd * 4);
-                    Memset0(L.HistScore, (long)HcaRatio * hd * 4);
-                }
+                _devs[L.Device].MakeCurrent();
+                Memset0(L.RingK);
+                Memset0(L.CompK);
+                Memset0(L.LidK);
+                Memset0(L.HistKv);
+                Memset0(L.HistScore);
+                Memset0(L.LidHistKv);
+                Memset0(L.LidHistScore);
             }
             NPast = 0;
         }
 
-        private static void Memset0(IntPtr p, long bytes)
+        private static void Memset0(Tensor t)
         {
-            if (p != IntPtr.Zero && bytes > 0)
-                CudaDriverApi.cuMemsetD8(p, 0, new UIntPtr((ulong)bytes)).ThrowOnError();
+            if (t == null)
+                return;
+            long bytes = t.ElementCount() * t.ElementType.Size();
+            if (bytes > 0)
+                CudaDriverApi.cuMemsetD8(Ptr(t), 0, new UIntPtr((ulong)bytes)).ThrowOnError();
         }
 
         // -------------------------------------------------------------------
@@ -953,10 +942,11 @@ namespace TensorSharp.Cuda
         // stage-by-stage A/B against the exact managed reference).
         private static readonly bool StageDebug = EnvInt("TS_DSV4_CUDA_DEBUG", 0) != 0;
 
-        private void Dump(Dev dev, string label, IntPtr ptr, int n = 6)
+        private void Dump(Dev dev, string label, Tensor t, int n = 6)
         {
-            if (!StageDebug || ptr == IntPtr.Zero)
+            if (!StageDebug || t == null)
                 return;
+            IntPtr ptr = Ptr(t);
             dev.MakeCurrent();
             CudaDriverApi.cuStreamSynchronize(dev.Stream);
             var tmp = new float[n];
@@ -965,10 +955,11 @@ namespace TensorSharp.Cuda
             Console.Error.WriteLine($"[dbg-cuda] {label}: {string.Join(" ", Array.ConvertAll(tmp, v => v.ToString("G6")))}");
         }
 
-        private void DumpF16(Dev dev, string label, IntPtr ptr, int n = 6)
+        private void DumpF16(Dev dev, string label, Tensor t, int n = 6)
         {
-            if (!StageDebug || ptr == IntPtr.Zero)
+            if (!StageDebug || t == null)
                 return;
+            IntPtr ptr = Ptr(t);
             dev.MakeCurrent();
             CudaDriverApi.cuStreamSynchronize(dev.Stream);
             var tmp = new ushort[n];
@@ -1003,11 +994,11 @@ namespace TensorSharp.Cuda
                 if (!dev.NeedsTokens)
                     continue;
                 dev.MakeCurrent();
-                IntPtr dst = parity == 0 ? dev.TokensDev0 : dev.TokensDev1;
-                CudaDriverApi.cuMemcpyHtoDAsync(dst, pinned, new UIntPtr((ulong)nt * 4), dev.Stream).ThrowOnError();
+                Tensor dst = parity == 0 ? dev.TokensDev0 : dev.TokensDev1;
+                CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dst), pinned, new UIntPtr((ulong)nt * 4), dev.Stream).ThrowOnError();
                 CudaDriverApi.cuEventRecord(parity == 0 ? dev.TokEv0 : dev.TokEv1, dev.Stream).ThrowOnError();
             }
-            IntPtr TokensOf(Dev dev) => parity == 0 ? dev.TokensDev0 : dev.TokensDev1;
+            Tensor TokensOf(Dev dev) => parity == 0 ? dev.TokensDev0 : dev.TokensDev1;
 
             // embedding on device 0
             var dev0 = _devs[0];
@@ -1038,11 +1029,11 @@ namespace TensorSharp.Cuda
                     // resource handle"); only the WAITS cross contexts, which
                     // is the supported multi-GPU pattern.
                     src.MakeCurrent();
-                    CudaDriverApi.cuMemcpyDtoHAsync(src.BoundaryPinned, src.Xs, copyBytes, src.Stream).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoHAsync(src.BoundaryPinned, Ptr(src.Xs), copyBytes, src.Stream).ThrowOnError();
                     CudaDriverApi.cuEventRecord(src.XsReadyEv, src.Stream).ThrowOnError();
                     dst.MakeCurrent();
                     CudaDriverApi.cuStreamWaitEvent(dst.Stream, src.XsReadyEv, 0).ThrowOnError();
-                    CudaDriverApi.cuMemcpyHtoDAsync(dst.Xs, src.BoundaryPinned, copyBytes, dst.Stream).ThrowOnError();
+                    CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dst.Xs), src.BoundaryPinned, copyBytes, dst.Stream).ThrowOnError();
                     CudaDriverApi.cuEventRecord(dst.CopyDoneEv, dst.Stream).ThrowOnError();
                     src.MakeCurrent();
                     CudaDriverApi.cuStreamWaitEvent(src.Stream, dst.CopyDoneEv, 0).ThrowOnError();
@@ -1063,7 +1054,7 @@ namespace TensorSharp.Cuda
                     Dump(dev, "L0.attn.comb", dev.Comb, 8);
                     Dump(dev, "L0.attn.cur", dev.Cur);
                 }
-                dev.DK.RmsNorm(dev.Cur, L.AttnNorm, nt, e, m.RmsEps, dev.Stream);
+                RmsNorm(dev, dev.Cur, L.AttnNorm, nt);
                 StageEnd(dev, 1);
                 if (dbg)
                     Dump(dev, "L0.attn.cur_norm", dev.Cur);
@@ -1080,7 +1071,7 @@ namespace TensorSharp.Cuda
 
                 // ---- FFN super-block ----
                 HcPre(dev, L, nt, attn: false);
-                dev.DK.RmsNorm(dev.Cur, L.FfnNorm, nt, e, m.RmsEps, dev.Stream);
+                RmsNorm(dev, dev.Cur, L.FfnNorm, nt);
                 StageEnd(dev, 1);
                 MoeFfn(dev, L, il, nt, TokensOf(dev));
                 if (dbg)
@@ -1099,17 +1090,19 @@ namespace TensorSharp.Cuda
                 if (curDev != _lastDev)
                     throw new InvalidOperationException("[dsv4-cuda] output head is not on the final layer device");
                 dev.MakeCurrent();
-                IntPtr lastX = (IntPtr)((long)dev.Xs + (long)(nt - 1) * HC * e * 4);
-                dev.DK.HcHead(lastX, _hcHeadFn, _hcHeadScale, _hcHeadBase, dev.Cur, e,
-                    m.HcHeadScale.Length, m.HcHeadBase.Length, m.RmsEps, dev.Stream);
+                using (Tensor lastX = dev.Xs.Narrow(0, nt - 1, 1))
+                {
+                    dev.DK.HcHead(lastX, Ptr(_hcHeadFn), Ptr(_hcHeadScale), Ptr(_hcHeadBase), dev.Cur, e,
+                        m.HcHeadScale.Length, m.HcHeadBase.Length, m.RmsEps, dev.Stream);
+                }
                 Dump(dev, "head.cur", dev.Cur);
-                dev.DK.RmsNorm(dev.Cur, _outputNorm, 1, e, m.RmsEps, dev.Stream);
-                MatMul(dev, _outputQW, dev.Cur, _logitsDev, 1);
+                RmsNorm(dev, dev.Cur, _outputNorm, 1);
+                MatMul(dev, _outputQW, dev.Cur, dev.Logits, 1);
                 StageEnd(dev, 10);
-                Dump(dev, "head.logits", _logitsDev, 8);
+                Dump(dev, "head.logits", dev.Logits, 8);
                 fixed (float* dst = _logitsHost)
                 {
-                    CudaDriverApi.cuMemcpyDtoHAsync((IntPtr)dst, _logitsDev, new UIntPtr((ulong)m.NVocab * 4UL), dev.Stream).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoHAsync((IntPtr)dst, Ptr(dev.Logits), new UIntPtr((ulong)m.NVocab * 4UL), dev.Stream).ThrowOnError();
                     CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
                 }
                 Array.Copy(_logitsHost, logitsOut, m.NVocab);
@@ -1121,18 +1114,26 @@ namespace TensorSharp.Cuda
             (dev.Xs, dev.XsOut) = (dev.XsOut, dev.Xs);
         }
 
+        /// <summary>In-place RMS norm of the first <paramref name="rows"/> rows,
+        /// through the shared Ops (the engine no longer carries its own kernel).</summary>
+        private void RmsNorm(Dev dev, Tensor data, Tensor weight, int rows)
+        {
+            using Tensor view = Rows(data, rows);
+            Ops.RMSNorm(view, view, weight, null, _m.RmsEps);
+        }
+
         private void HcPre(Dev dev, DevLayer l, int nt, bool attn)
         {
             var m = _m;
             int flatDim = HC * m.NEmbd;
-            IntPtr fn = attn ? l.HcAttnFn : l.HcFfnFn;
-            IntPtr scale = attn ? l.HcAttnScale : l.HcFfnScale;
-            IntPtr baseW = attn ? l.HcAttnBase : l.HcFfnBase;
+            Tensor fn = attn ? l.HcAttnFn : l.HcFfnFn;
+            Tensor scale = attn ? l.HcAttnScale : l.HcFfnScale;
+            Tensor baseW = attn ? l.HcAttnBase : l.HcFfnBase;
 
             dev.DK.HcRms(dev.Xs, dev.Inv, nt, flatDim, m.RmsEps, dev.Stream);
             // mixes = hc_fn (F32 [24, flatDim]) x flat streams
-            GemmF32(dev, fn, dev.Xs, dev.Mixes, flatDim, HcMixDim, nt);
-            dev.DK.HcGatesComb(dev.Mixes, dev.Inv, scale, baseW, dev.Pre, dev.Post, dev.Comb,
+            MatMulF32(dev, Ptr(fn), dev.Xs, dev.Mixes, flatDim, HcMixDim, nt);
+            dev.DK.HcGatesComb(dev.Mixes, dev.Inv, Ptr(scale), Ptr(baseW), dev.Pre, dev.Post, dev.Comb,
                 nt, m.HcSinkhornIters, m.HcEps, dev.Stream);
             dev.DK.HcCollapse(dev.Xs, dev.Pre, dev.Cur, nt, m.NEmbd, dev.Stream);
         }
@@ -1141,24 +1142,24 @@ namespace TensorSharp.Cuda
         // Attention
         // -------------------------------------------------------------------
 
-        private void Attention(Dev dev, DevLayer l, int il, int nt, int p0, IntPtr tokensDev)
+        private void Attention(Dev dev, DevLayer l, int il, int nt, int p0, Tensor tokensDev)
         {
             var m = _m;
             int e = m.NEmbd, nh = m.NHead, hd = m.HeadDim, rot = m.NRot;
             bool comp = l.Ratio != 0;
-            IntPtr ropeTab = comp ? dev.RopeComp : dev.RopeRaw;
+            IntPtr ropeTab = Ptr(comp ? dev.RopeComp : dev.RopeRaw);
 
             // q = wq_b(rms(wq_a(cur))), kv = wkv(cur)
             bool dbg = StageDebug && il == 0;
             MatMul(dev, l.WqA, dev.Cur, dev.Qr, nt);
-            dev.DK.RmsNorm(dev.Qr, l.QANorm, nt, m.QLoraRank, m.RmsEps, dev.Stream);
+            RmsNorm(dev, dev.Qr, l.QANorm, nt);
             if (dbg)
                 Dump(dev, "L0.qr", dev.Qr);
             MatMul(dev, l.WqB, dev.Qr, dev.Q, nt);
             MatMul(dev, l.Wkv, dev.Cur, dev.KvRaw, nt);
             if (dbg)
                 Dump(dev, "L0.kv_raw", dev.KvRaw);
-            dev.DK.AttnPrep(dev.Q, dev.KvRaw, l.KvNorm, ropeTab, l.RingK, p0, _ringRaw, nh, hd, rot, m.RmsEps, nt, dev.Stream);
+            dev.DK.AttnPrep(dev.Q, dev.KvRaw, Ptr(l.KvNorm), ropeTab, Ptr(l.RingK), p0, _ringRaw, nh, hd, rot, m.RmsEps, nt, dev.Stream);
             StageEnd(dev, 2);
             if (dbg)
             {
@@ -1173,14 +1174,14 @@ namespace TensorSharp.Cuda
                 int cw = 2 * hd;
                 MatMul(dev, l.CompWkv, dev.Cur, dev.StKv, nt);
                 MatMul(dev, l.CompWgate, dev.Cur, dev.StScore, nt);
-                dev.DK.ApeAdd(dev.StScore, l.CompApe, p0, CsaRatio, nt, cw, dev.Stream);
+                dev.DK.ApeAdd(dev.StScore, Ptr(l.CompApe), p0, CsaRatio, nt, cw, dev.Stream);
                 RunCompressor(dev, nt, p0, CsaRatio, 2, hd, 2 * CsaRatio, cw,
                     dev.StKv, dev.StScore, l.HistKv, l.HistScore, l.CompNorm, l.CompK, dev.RopeComp);
 
                 int lcw = 2 * m.IdxHeadSize;
                 MatMul(dev, l.IdxCompWkv, dev.Cur, dev.LidStKv, nt);
                 MatMul(dev, l.IdxCompWgate, dev.Cur, dev.LidStScore, nt);
-                dev.DK.ApeAdd(dev.LidStScore, l.IdxCompApe, p0, CsaRatio, nt, lcw, dev.Stream);
+                dev.DK.ApeAdd(dev.LidStScore, Ptr(l.IdxCompApe), p0, CsaRatio, nt, lcw, dev.Stream);
                 RunCompressor(dev, nt, p0, CsaRatio, 2, m.IdxHeadSize, 2 * CsaRatio, lcw,
                     dev.LidStKv, dev.LidStScore, l.LidHistKv, l.LidHistScore, l.IdxCompNorm, l.LidK, dev.RopeComp);
                 StageEnd(dev, 3);
@@ -1193,8 +1194,8 @@ namespace TensorSharp.Cuda
                     MatMul(dev, l.IdxQB, dev.Qr, dev.Iq, nt);
                     MatMul(dev, l.IdxProj, dev.Cur, dev.Iw, nt);
                     float iwScale = 1.0f / MathF.Sqrt((float)m.IdxHeadSize * m.IdxNHead);
-                    dev.DK.IdxPrep(dev.Iq, dev.Iw, dev.RopeComp, p0, m.IdxNHead, m.IdxHeadSize, rot, iwScale, nt, dev.Stream);
-                    dev.DK.IdxScores(dev.Iq, dev.Iw, l.LidK, dev.IdxScores, p0, CsaRatio, m.IdxNHead, m.IdxHeadSize,
+                    dev.DK.IdxPrep(dev.Iq, dev.Iw, Ptr(dev.RopeComp), p0, m.IdxNHead, m.IdxHeadSize, rot, iwScale, nt, dev.Stream);
+                    dev.DK.IdxScores(dev.Iq, dev.Iw, Ptr(l.LidK), dev.IdxScores, p0, CsaRatio, m.IdxNHead, m.IdxHeadSize,
                         nt, _compRowsCsa, maxVis, dev.Stream);
                     dev.DK.TopK(dev.IdxScores, dev.TopkIdx, dev.TopkCnt, p0, CsaRatio, m.IdxTopK, _compRowsCsa, nt, dev.Stream);
                     StageEnd(dev, 4);
@@ -1210,7 +1211,7 @@ namespace TensorSharp.Cuda
             {
                 MatMul(dev, l.CompWkv, dev.Cur, dev.StKv, nt);
                 MatMul(dev, l.CompWgate, dev.Cur, dev.StScore, nt);
-                dev.DK.ApeAdd(dev.StScore, l.CompApe, p0, HcaRatio, nt, hd, dev.Stream);
+                dev.DK.ApeAdd(dev.StScore, Ptr(l.CompApe), p0, HcaRatio, nt, hd, dev.Stream);
                 RunCompressor(dev, nt, p0, HcaRatio, 1, hd, HcaRatio, hd,
                     dev.StKv, dev.StScore, l.HistKv, l.HistScore, l.CompNorm, l.CompK, dev.RopeComp);
                 StageEnd(dev, 3);
@@ -1219,7 +1220,7 @@ namespace TensorSharp.Cuda
             }
 
             float kqScale = 1.0f / MathF.Sqrt(hd);
-            dev.DK.Attention(dev.Q, l.RingK, l.CompK, dev.TopkIdx, dev.TopkCnt, l.Sinks, dev.AttnO,
+            dev.DK.Attention(dev.Q, Ptr(l.RingK), Ptr(l.CompK), dev.TopkIdx, dev.TopkCnt, Ptr(l.Sinks), dev.AttnO,
                 p0, m.NSwa, _ringRaw, nh, hd, mode, l.Ratio == 0 ? 1 : l.Ratio, m.IdxTopK, kqScale, nt, dev.Stream);
             StageEnd(dev, 5);
             if (dbg)
@@ -1235,11 +1236,11 @@ namespace TensorSharp.Cuda
             // quantize the whole grouped layout once ([G*nt, groupDim] rows), then
             // run one matmul per group against the matching WoA row block.
             var woA = l.WoA;
-            if (nt == 1 && woA.Type == TBF16 && Bf16MatvecEnabled && (groupDim & 7) == 0)
+            if (nt == 1 && woA.Type == TBF16 && CudaQuantizedOps.Bf16MatvecEnabled && (groupDim & 7) == 0)
             {
                 // Decode: the 8 group matvecs are ~11us each, so folding them
                 // into one grid saves more in launch gaps than it costs.
-                dev.Alloc.Kernels.LaunchMatvecBf16(woA.Ptr, dev.OGrouped, dev.OGroupedOut,
+                dev.Alloc.Kernels.LaunchMatvecBf16(woA.Ptr, Ptr(dev.OGrouped), Ptr(dev.OGroupedOut),
                     groupDim, m.OLoraRank, dev.Stream, m.OGroups);
             }
             else
@@ -1249,8 +1250,8 @@ namespace TensorSharp.Cuda
                     var slice = woA;
                     slice.Ptr = (IntPtr)((long)woA.Ptr + (long)g * m.OLoraRank * woA.RowBytes);
                     slice.Ne1 = m.OLoraRank;
-                    IntPtr input = (IntPtr)((long)dev.OGrouped + (long)g * nt * groupDim * 4);
-                    IntPtr output = (IntPtr)((long)dev.OGroupedOut + (long)g * nt * m.OLoraRank * 4);
+                    using Tensor input = Block(dev.OGrouped, (long)g * nt, nt, groupDim);
+                    using Tensor output = Block(dev.OGroupedOut, (long)g * nt, nt, m.OLoraRank);
                     MatMul(dev, slice, input, output, nt);
                 }
             }
@@ -1261,7 +1262,7 @@ namespace TensorSharp.Cuda
         }
 
         private void RunCompressor(Dev dev, int nt, int p0, int ratio, int coff, int head, int stateSize, int cw,
-            IntPtr stKv, IntPtr stScore, IntPtr histKv, IntPtr histScore, IntPtr normW, IntPtr cache, IntPtr ropeTab)
+            Tensor stKv, Tensor stScore, Tensor histKv, Tensor histScore, Tensor normW, Tensor cache, Tensor ropeTab)
         {
             long firstBoundary = -1;
             for (long p = p0; p < (long)p0 + nt; p++)
@@ -1275,17 +1276,17 @@ namespace TensorSharp.Cuda
             if (firstBoundary >= 0)
             {
                 int nBlocks = (int)(((long)p0 + nt - 1 - firstBoundary) / ratio) + 1;
-                dev.DK.Compress(stKv, stScore, histKv, histScore, normW, ropeTab, cache,
+                dev.DK.Compress(stKv, stScore, Ptr(histKv), Ptr(histScore), Ptr(normW), Ptr(ropeTab), Ptr(cache),
                     firstBoundary, nBlocks, p0, ratio, coff, head, stateSize, _m.NRot, _m.RmsEps, dev.Stream);
             }
-            dev.DK.Persist(stKv, stScore, histKv, histScore, p0, nt, stateSize, cw, dev.Stream);
+            dev.DK.Persist(stKv, stScore, Ptr(histKv), Ptr(histScore), p0, nt, stateSize, cw, dev.Stream);
         }
 
         // -------------------------------------------------------------------
         // MoE FFN
         // -------------------------------------------------------------------
 
-        private void MoeFfn(Dev dev, DevLayer l, int il, int nt, IntPtr tokensDev)
+        private void MoeFfn(Dev dev, DevLayer l, int il, int nt, Tensor tokensDev)
         {
             var m = _m;
             int e = m.NEmbd, ff = m.NFfExp, nUsed = m.NExpertUsed, nEx = m.NExpert;
@@ -1293,8 +1294,8 @@ namespace TensorSharp.Cuda
 
             // router logits (gate_inp is F32) + selection/weights
             bool dbg = StageDebug && il == 0;
-            GemmF32(dev, l.GateInp, dev.Cur, dev.RouterLogits, e, nEx, nt);
-            dev.DK.MoeSelect(dev.RouterLogits, l.ExpProbsBias, l.Tid2Eid, tokensDev, dev.Sel, dev.SelW,
+            MatMulF32(dev, Ptr(l.GateInp), dev.Cur, dev.RouterLogits, e, nEx, nt);
+            dev.DK.MoeSelect(dev.RouterLogits, Ptr(l.ExpProbsBias), Ptr(l.Tid2Eid), tokensDev, dev.Sel, dev.SelW,
                 nEx, nUsed, m.ExpertWeightsNorm ? 1 : 0, m.ExpertWeightsScale, nt, dev.Stream);
             StageEnd(dev, 7);
             if (dbg)
@@ -1308,7 +1309,7 @@ namespace TensorSharp.Cuda
             int shFf = l.ShFf;
             MatMul(dev, l.UpShexp, dev.Cur, dev.ShUp, nt);
             MatMul(dev, l.GateShexp, dev.Cur, dev.ShGate, nt);
-            dev.DK.SwigluClamp(dev.ShGate, dev.ShUp, (long)nt * shFf, l.ClampShexp, dev.Stream);
+            SwigluClamp(dev.ShGate, dev.ShUp, (long)nt * shFf, l.ClampShexp);
             MatMul(dev, l.DownShexp, dev.ShGate, dev.ShDown, nt);
             StageEnd(dev, 9);
             CheckSync(dev, $"shexp L{il}");
@@ -1331,17 +1332,17 @@ namespace TensorSharp.Cuda
             {
                 dev.DK.MoeGateUpDecode(l.GateExps.Ptr, l.UpExps.Ptr, dev.ActQ8A, dev.Sel,
                     dev.ExpGate, dev.ExpUp, guType, ff, e, l.GateExps.RowBytes, nUsed, dev.Stream);
-                dev.DK.SwigluClamp(dev.ExpGate, dev.ExpUp, (long)nUsed * ff, l.ClampExp, dev.Stream);
+                SwigluClamp(dev.ExpGate, dev.ExpUp, (long)nUsed * ff, l.ClampExp);
                 QuantizeQ81(dev, dev.ExpGate, dev.ActQ8B, ff, nUsed);
                 dev.DK.MoeDownDecode(l.DownExps.Ptr, dev.ActQ8B, dev.Sel, dev.ExpDown,
                     downType, e, ff, l.DownExps.RowBytes, nUsed, dev.Stream);
-                dev.DK.MoeScatterAdd(dev.ExpDown, IntPtr.Zero, dev.SelW, dev.ShDown, dev.FfnOut, 1, nUsed, e, dev.Stream);
+                dev.DK.MoeScatterAdd(dev.ExpDown, null, dev.SelW, dev.ShDown, dev.FfnOut, 1, nUsed, e, dev.Stream);
             }
             else
             {
                 // grouping plan (all on device; Counts zeroed via the fill kernel
                 // so everything stays stream-ordered)
-                dev.Alloc.Kernels.LaunchFillF32(dev.Counts, nEx, 0f, dev.Stream);
+                dev.Alloc.Kernels.LaunchFillF32(Ptr(dev.Counts), nEx, 0f, dev.Stream);
                 dev.DK.MoeCount(dev.Sel, dev.Counts, s, dev.Stream);
                 dev.DK.MoeScan(dev.Counts, dev.Offsets, dev.Cursors, nEx, dev.Stream);
                 dev.DK.MoeScatter(dev.Sel, dev.Cursors, dev.RowOfSlot, dev.SlotToken, s, nUsed, dev.Stream);
@@ -1355,7 +1356,7 @@ namespace TensorSharp.Cuda
                     dev.DK.MoeGateUpStaged(l.GateExps.Ptr, l.UpExps.Ptr, dev.SplitQsA, dev.SplitDA,
                         dev.Counts, dev.Offsets, dev.SlotToken,
                         dev.ExpGate, dev.ExpUp, guType, ff, e, l.GateExps.RowBytes, nEx, dev.Stream);
-                    dev.DK.SwigluClamp(dev.ExpGate, dev.ExpUp, (long)s * ff, l.ClampExp, dev.Stream);
+                    SwigluClamp(dev.ExpGate, dev.ExpUp, (long)s * ff, l.ClampExp);
                     QuantizeQ81Split(dev, dev.ExpGate, dev.SplitQsB, dev.SplitDB, ff, s);
                     dev.DK.MoeDownStaged(l.DownExps.Ptr, dev.SplitQsB, dev.SplitDB, dev.Counts, dev.Offsets, dev.ExpDown,
                         downType, e, ff, l.DownExps.RowBytes, nEx, dev.Stream);
@@ -1364,7 +1365,7 @@ namespace TensorSharp.Cuda
                 {
                     dev.DK.MoeGateUp(l.GateExps.Ptr, l.UpExps.Ptr, dev.ActQ8A, dev.Counts, dev.Offsets, dev.SlotToken,
                         dev.ExpGate, dev.ExpUp, guType, ff, e, l.GateExps.RowBytes, nEx, dev.Stream);
-                    dev.DK.SwigluClamp(dev.ExpGate, dev.ExpUp, (long)s * ff, l.ClampExp, dev.Stream);
+                    SwigluClamp(dev.ExpGate, dev.ExpUp, (long)s * ff, l.ClampExp);
                     QuantizeQ81(dev, dev.ExpGate, dev.ActQ8B, ff, s);
                     dev.DK.MoeDown(l.DownExps.Ptr, dev.ActQ8B, dev.Counts, dev.Offsets, dev.ExpDown,
                         downType, e, ff, l.DownExps.RowBytes, nEx, dev.Stream);
@@ -1375,12 +1376,25 @@ namespace TensorSharp.Cuda
             CheckSync(dev, $"experts L{il}");
         }
 
+        /// <summary>
+        /// Clamped SwiGLU over the leading <paramref name="n"/> elements, through
+        /// the shared Ops.SiLUMulClamp (gate is overwritten in place).
+        /// </summary>
+        private static void SwigluClamp(Tensor gate, Tensor up, long n, float limit)
+        {
+            using Tensor g = Flat(gate, n);
+            using Tensor u = Flat(up, n);
+            Ops.SiLUMulClamp(g, g, u, limit);
+        }
+
+        private static Tensor Flat(Tensor t, long n)
+        {
+            using Tensor flat = t.View(t.ElementCount());
+            return flat.Narrow(0, 0, n);
+        }
+
         // Register-staged expert kernels for prefill (TS_DSV4_STAGED_EXPERTS=0
         // reverts to the per-token kernels for A/B).
-        // TS_DSV4_BF16_MATVEC=0 reverts decode's dense BF16 projections to cuBLAS.
-        private static readonly bool Bf16MatvecEnabled =
-            !string.Equals(Environment.GetEnvironmentVariable("TS_DSV4_BF16_MATVEC"), "0", StringComparison.Ordinal);
-
         private static readonly bool StagedExpertsEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_DSV4_STAGED_EXPERTS"), "0", StringComparison.Ordinal);
 
@@ -1394,156 +1408,47 @@ namespace TensorSharp.Cuda
         // dense matmul dispatch
         // -------------------------------------------------------------------
 
-        private void QuantizeQ81(Dev dev, IntPtr input, IntPtr scratch, int inDim, int rows)
+        private void QuantizeQ81(Dev dev, Tensor input, Tensor scratch, int inDim, int rows)
         {
-            dev.Alloc.Kernels.LaunchQuantizeQ81Rows(input, scratch, inDim, rows, dev.Stream, warpCooperative: true);
+            dev.Alloc.Kernels.LaunchQuantizeQ81Rows(Ptr(input), Ptr(scratch), inDim, rows, dev.Stream, warpCooperative: true);
         }
 
         /// <summary>Dense split q8_1 (contiguous int8 row + separate per-block
         /// scale). Values are bit-identical to the interleaved layout; the dense
         /// form is what makes the staged expert kernels' activation reads
         /// vectorizable.</summary>
-        private void QuantizeQ81Split(Dev dev, IntPtr input, IntPtr qs, IntPtr d, int inDim, int rows)
+        private void QuantizeQ81Split(Dev dev, Tensor input, Tensor qs, Tensor d, int inDim, int rows)
         {
-            dev.Alloc.Kernels.LaunchQuantizeQ81SplitRows(input, qs, d, inDim, rows, dev.Stream);
+            dev.Alloc.Kernels.LaunchQuantizeQ81SplitRows(Ptr(input), Ptr(qs), Ptr(d), inDim, rows, dev.Stream);
         }
 
         /// <summary>
-        /// output[rows, w.Ne1] = input[rows, w.Ne0] x w^T for the resident
-        /// quantized/dense weight. Decode uses the dp4a matvec kernels, mid-size
-        /// row counts the Q8_0 MMQ GEMM, prefill-sized row counts a
-        /// dequant-to-F16 + cuBLAS GEMM (mirroring CudaQuantizedOps' routing).
+        /// result[rows, w.Ne1] = input[rows, w.Ne0] x w^T for a weight this engine
+        /// already holds resident in its per-device arena.
+        ///
+        /// The kernel choice (dp4a matvec, MMQ int8 GEMM, dequant-to-F16 + cuBLAS,
+        /// BF16 tensor cores, ...) is NOT decided here: it is the shared routing in
+        /// CudaQuantizedOps, so DSV4 gets exactly the same tuning as every other
+        /// direct-CUDA model and there is one implementation to maintain.
         /// </summary>
-        private void MatMul(Dev dev, in DevQW w, IntPtr input, IntPtr output, int rows)
+        private void MatMul(Dev dev, in DevQW w, Tensor input, Tensor output, int rows)
         {
-            int inDim = w.Ne0;
-            int outDim = w.Ne1;
-            var k = dev.Alloc.Kernels;
-
-            switch (w.Type)
-            {
-                case TQ8_0:
-                    if (rows == 1)
-                    {
-                        QuantizeQ81(dev, input, dev.ActQ8A, inDim, 1);
-                        k.LaunchQuantMatmulQ80Vec(w.Ptr, dev.ActQ8A, output, inDim, outDim, dev.Stream);
-                    }
-                    else if (rows <= 512 && inDim % 32 == 0)
-                    {
-                        QuantizeQ81(dev, input, dev.ActQ8A, inDim, rows);
-                        k.LaunchQuantMatmulQ80Mmq(w.Ptr, dev.ActQ8A, output, inDim, outDim, rows, dev.Stream);
-                    }
-                    else
-                    {
-                        k.LaunchDequantWeightQ80F16(w.Ptr, dev.WF16, (long)inDim * outDim, dev.Stream);
-                        k.LaunchConvertF32F16(input, dev.AF16, (long)rows * inDim, dev.Stream);
-                        GemmF16(dev, dev.WF16, dev.AF16, output, inDim, outDim, rows);
-                    }
-                    break;
-
-                case TQ6_K:
-                    if (rows == 1)
-                    {
-                        QuantizeQ81(dev, input, dev.ActQ8A, inDim, 1);
-                        k.LaunchQuantMatmulQ6KDp4a(w.Ptr, dev.ActQ8A, output, inDim, outDim, dev.Stream);
-                    }
-                    else
-                    {
-                        k.LaunchDequantWeightF16(w.Ptr, dev.WF16, w.Type, inDim, (long)inDim * outDim, dev.Stream);
-                        k.LaunchConvertF32F16(input, dev.AF16, (long)rows * inDim, dev.Stream);
-                        GemmF16(dev, dev.WF16, dev.AF16, output, inDim, outDim, rows);
-                    }
-                    break;
-
-                case TF16:
-                    k.LaunchConvertF32F16(input, dev.AF16, (long)rows * inDim, dev.Stream);
-                    GemmF16(dev, w.Ptr, dev.AF16, output, inDim, outDim, rows);
-                    break;
-
-                case TBF16:
-                    // Weights stay bit-exact BF16 in VRAM. Decode is one row, so
-                    // it is bandwidth-bound and the dedicated matvec beats a
-                    // cuBLAS GEMM with n = 1; prefill wants the tensor cores.
-                    if (rows == 1 && Bf16MatvecEnabled && (inDim & 7) == 0)
-                    {
-                        k.LaunchMatvecBf16(w.Ptr, input, output, inDim, outDim, dev.Stream);
-                    }
-                    else
-                    {
-                        k.LaunchConvertF32Bf16(input, dev.AF16, (long)rows * inDim, dev.Stream);
-                        GemmBf16(dev, w.Ptr, dev.AF16, output, inDim, outDim, rows);
-                    }
-                    break;
-
-                case TF32:
-                    GemmF32(dev, w.Ptr, input, output, inDim, outDim, rows);
-                    break;
-
-                default:
-                    if (rows == 1 && CudaQuantizedOps.SupportsQuantizedType(w.Type))
-                    {
-                        k.LaunchQuantMatmulVecF32(w.Ptr, input, output, w.Type, inDim, outDim, dev.Stream);
-                    }
-                    else if (CudaQuantizedOps.SupportsQuantizedType(w.Type))
-                    {
-                        k.LaunchDequantWeightF16(w.Ptr, dev.WF16, w.Type, inDim, (long)inDim * outDim, dev.Stream);
-                        k.LaunchConvertF32F16(input, dev.AF16, (long)rows * inDim, dev.Stream);
-                        GemmF16(dev, dev.WF16, dev.AF16, output, inDim, outDim, rows);
-                    }
-                    else
-                    {
-                        throw new NotSupportedException($"[dsv4-cuda] unsupported dense weight type {w.Type}");
-                    }
-                    break;
-            }
+            // Scratch buffers are sized for the WIDEST user on this device (the
+            // shared expert's ff differs per layer, compressor widths differ
+            // between CSA and HCA), so the operands are compact [rows, dim]
+            // blocks at the front of the buffer, not full-width row views.
+            using Tensor a = Block(input, 0, rows, w.Ne0);
+            using Tensor r = Block(output, 0, rows, w.Ne1);
+            CudaQuantizedOps.AddmmResidentToFloat32(r, a, w.Ptr, w.Type, w.Ne0, w.Ne1);
         }
 
-        private static void GemmF16(Dev dev, IntPtr wF16, IntPtr aF16, IntPtr outF32, int inDim, int outDim, int rows)
+        /// <summary>Dense F32 weight (MoE router, hyper-connection mixer) held in
+        /// the arena rather than as a tensor: same shared routing, type F32.</summary>
+        private void MatMulF32(Dev dev, IntPtr wF32, Tensor input, Tensor output, int inDim, int outDim, int rows)
         {
-            dev.Alloc.Blas.SetStream(dev.Stream);
-            float alpha = 1.0f, beta = 0.0f;
-            CublasApi.cublasGemmEx(
-                dev.Alloc.Blas.Handle,
-                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
-                outDim, rows, inDim,
-                ref alpha,
-                wF16, CublasApi.CUDA_R_16F, inDim,
-                aF16, CublasApi.CUDA_R_16F, inDim,
-                ref beta,
-                outF32, CublasApi.CUDA_R_32F, outDim,
-                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
-        }
-
-        private static void GemmBf16(Dev dev, IntPtr wBf16, IntPtr aBf16, IntPtr outF32, int inDim, int outDim, int rows)
-        {
-            dev.Alloc.Blas.SetStream(dev.Stream);
-            float alpha = 1.0f, beta = 0.0f;
-            CublasApi.cublasGemmEx(
-                dev.Alloc.Blas.Handle,
-                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
-                outDim, rows, inDim,
-                ref alpha,
-                wBf16, CublasApi.CUDA_R_16BF, inDim,
-                aBf16, CublasApi.CUDA_R_16BF, inDim,
-                ref beta,
-                outF32, CublasApi.CUDA_R_32F, outDim,
-                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
-        }
-
-        private static void GemmF32(Dev dev, IntPtr wF32, IntPtr aF32, IntPtr outF32, int inDim, int outDim, int rows)
-        {
-            dev.Alloc.Blas.SetStream(dev.Stream);
-            float alpha = 1.0f, beta = 0.0f;
-            CublasApi.cublasGemmEx(
-                dev.Alloc.Blas.Handle,
-                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
-                outDim, rows, inDim,
-                ref alpha,
-                wF32, CublasApi.CUDA_R_32F, inDim,
-                aF32, CublasApi.CUDA_R_32F, inDim,
-                ref beta,
-                outF32, CublasApi.CUDA_R_32F, outDim,
-                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            using Tensor a = Block(input, 0, rows, inDim);
+            using Tensor r = Block(output, 0, rows, outDim);
+            CudaQuantizedOps.AddmmResidentToFloat32(r, a, wF32, TF32, inDim, outDim);
         }
 
         public void Dispose()
@@ -1556,11 +1461,12 @@ namespace TensorSharp.Cuda
                 {
                     dev.MakeCurrent();
                     CudaDriverApi.cuStreamSynchronize(dev.Stream);
-                    foreach (var p in dev.OwnedAllocs)
-                        CudaDriverApi.cuMemFree(p);
-                    dev.OwnedAllocs.Clear();
-                    if (dev.Arena != IntPtr.Zero)
-                        CudaDriverApi.cuMemFree(dev.Arena);
+                    // Scratch, caches, small tensors and the weight arena are all
+                    // allocator-owned: returning them to the pool is the only
+                    // teardown needed (the allocator frees the pool on Dispose).
+                    foreach (var t in dev.OwnedTensors)
+                        t.Dispose();
+                    dev.OwnedTensors.Clear();
                     if (dev.Event != IntPtr.Zero)
                         CudaDriverApi.cuEventDestroy(dev.Event);
                     if (dev.TokEv0 != IntPtr.Zero)

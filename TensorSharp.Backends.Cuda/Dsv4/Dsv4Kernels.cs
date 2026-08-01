@@ -26,7 +26,6 @@ namespace TensorSharp.Cuda
         private readonly IntPtr hcCollapse;
         private readonly IntPtr hcPost;
         private readonly IntPtr hcHead;
-        private readonly IntPtr rmsNorm;
         private readonly IntPtr attnPrep;
         private readonly IntPtr apeAdd;
         private readonly IntPtr compress;
@@ -47,7 +46,6 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeDownStaged;
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
-        private readonly IntPtr swigluClamp;
         private readonly IntPtr moeScatterAdd;
 
         private Dsv4Kernels(CudaModule module)
@@ -59,7 +57,6 @@ namespace TensorSharp.Cuda
             hcCollapse = module.GetFunction("ts_dsv4_hc_collapse_f32");
             hcPost = module.GetFunction("ts_dsv4_hc_post_f32");
             hcHead = module.GetFunction("ts_dsv4_hc_head_f32");
-            rmsNorm = module.GetFunction("ts_dsv4_rmsnorm_f32");
             attnPrep = module.GetFunction("ts_dsv4_attn_prep_f32");
             apeAdd = module.GetFunction("ts_dsv4_ape_add_f32");
             compress = module.GetFunction("ts_dsv4_compress_f32");
@@ -80,7 +77,6 @@ namespace TensorSharp.Cuda
             moeDownStaged = module.GetFunction("ts_dsv4_moe_down_staged_f32");
             moeGateUpDecode = module.GetFunction("ts_dsv4_moe_gateup_decode_f32");
             moeDownDecode = module.GetFunction("ts_dsv4_moe_down_decode_f32");
-            swigluClamp = module.GetFunction("ts_dsv4_swiglu_clamp_f32");
             moeScatterAdd = module.GetFunction("ts_dsv4_moe_scatter_add_f32");
         }
 
@@ -103,84 +99,80 @@ namespace TensorSharp.Cuda
 
         private static uint CeilDiv(long n, int d) => (uint)Math.Max(1, (n + d - 1) / d);
 
-        public void Embed(IntPtr w, IntPtr tokens, IntPtr xs, int wtype, long rowBytes, int nt, int e, IntPtr stream)
+        /// <summary>Device pointer behind an engine scratch tensor (null =>
+        /// nullptr, which several kernels accept as "argument absent").</summary>
+        private static IntPtr P(Tensor t) => Dsv4CudaEngine.Ptr(t);
+
+        public void Embed(IntPtr w, Tensor tokens, Tensor xs, int wtype, long rowBytes, int nt, int e, IntPtr stream)
         {
-            IntPtr a0 = w, a1 = tokens, a2 = xs;
+            IntPtr a0 = w, a1 = P(tokens), a2 = P(xs);
             int a3 = wtype; long a4 = rowBytes; int a5 = nt, a6 = e;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6 };
             Launch(embed, CeilDiv(e, BlockSize), (uint)nt, 1, BlockSize, 0, stream, args);
         }
 
-        public void HcRms(IntPtr xs, IntPtr inv, int nt, int flatDim, float eps, IntPtr stream)
+        public void HcRms(Tensor xs, Tensor inv, int nt, int flatDim, float eps, IntPtr stream)
         {
-            IntPtr a0 = xs, a1 = inv;
+            IntPtr a0 = P(xs), a1 = P(inv);
             int a2 = flatDim; float a3 = eps;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3 };
             Launch(hcRms, (uint)nt, 1, 1, BlockSize, 0, stream, args);
         }
 
-        public void HcGatesComb(IntPtr mixes, IntPtr inv, IntPtr scale, IntPtr baseW, IntPtr pre, IntPtr post, IntPtr comb,
+        public void HcGatesComb(Tensor mixes, Tensor inv, IntPtr scale, IntPtr baseW, Tensor pre, Tensor post, Tensor comb,
             int nt, int iters, float eps, IntPtr stream)
         {
-            IntPtr a0 = mixes, a1 = inv, a2 = scale, a3 = baseW, a4 = pre, a5 = post, a6 = comb;
+            IntPtr a0 = P(mixes), a1 = P(inv), a2 = scale, a3 = baseW, a4 = P(pre), a5 = P(post), a6 = P(comb);
             int a7 = nt, a8 = iters; float a9 = eps;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
             Launch(hcGatesComb, CeilDiv(nt, 128), 1, 1, 128, 0, stream, args);
         }
 
-        public void HcCollapse(IntPtr xs, IntPtr pre, IntPtr cur, int nt, int e, IntPtr stream)
+        public void HcCollapse(Tensor xs, Tensor pre, Tensor cur, int nt, int e, IntPtr stream)
         {
-            IntPtr a0 = xs, a1 = pre, a2 = cur;
+            IntPtr a0 = P(xs), a1 = P(pre), a2 = P(cur);
             int a3 = nt, a4 = e;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
             Launch(hcCollapse, CeilDiv(e, BlockSize), (uint)nt, 1, BlockSize, 0, stream, args);
         }
 
-        public void HcPost(IntPtr xs, IntPtr blockOut, IntPtr post, IntPtr comb, IntPtr xsOut, int nt, int e, IntPtr stream)
+        public void HcPost(Tensor xs, Tensor blockOut, Tensor post, Tensor comb, Tensor xsOut, int nt, int e, IntPtr stream)
         {
-            IntPtr a0 = xs, a1 = blockOut, a2 = post, a3 = comb, a4 = xsOut;
+            IntPtr a0 = P(xs), a1 = P(blockOut), a2 = P(post), a3 = P(comb), a4 = P(xsOut);
             int a5 = nt, a6 = e;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6 };
             Launch(hcPost, CeilDiv(4L * e, BlockSize), (uint)nt, 1, BlockSize, 0, stream, args);
         }
 
-        public void HcHead(IntPtr x, IntPtr fn, IntPtr scale, IntPtr baseW, IntPtr cur, int e, int scaleCount, int baseCount, float eps, IntPtr stream)
+        public void HcHead(Tensor x, IntPtr fn, IntPtr scale, IntPtr baseW, Tensor cur, int e, int scaleCount, int baseCount, float eps, IntPtr stream)
         {
-            IntPtr a0 = x, a1 = fn, a2 = scale, a3 = baseW, a4 = cur;
+            IntPtr a0 = P(x), a1 = fn, a2 = scale, a3 = baseW, a4 = P(cur);
             int a5 = e, a6 = scaleCount, a7 = baseCount; float a8 = eps;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
             Launch(hcHead, 1, 1, 1, BlockSize, 0, stream, args);
         }
 
-        public void RmsNorm(IntPtr data, IntPtr weight, int rows, int n, float eps, IntPtr stream)
-        {
-            IntPtr a0 = data, a1 = weight;
-            int a2 = rows, a3 = n; float a4 = eps;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
-            Launch(rmsNorm, (uint)rows, 1, 1, BlockSize, 0, stream, args);
-        }
-
-        public void AttnPrep(IntPtr q, IntPtr kvRaw, IntPtr kvNormW, IntPtr ropeTab, IntPtr ring,
+        public void AttnPrep(Tensor q, Tensor kvRaw, IntPtr kvNormW, IntPtr ropeTab, IntPtr ring,
             int p0, int ringRows, int nh, int hd, int nRot, float eps, int nt, IntPtr stream)
         {
-            IntPtr a0 = q, a1 = kvRaw, a2 = kvNormW, a3 = ropeTab, a4 = ring;
+            IntPtr a0 = P(q), a1 = P(kvRaw), a2 = kvNormW, a3 = ropeTab, a4 = ring;
             int a5 = p0, a6 = ringRows, a7 = nh, a8 = hd, a9 = nRot; float a10 = eps;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10 };
             Launch(attnPrep, (uint)(nh + 1), (uint)nt, 1, BlockSize, 0, stream, args);
         }
 
-        public void ApeAdd(IntPtr stScore, IntPtr ape, int p0, int ratio, int nt, int cw, IntPtr stream)
+        public void ApeAdd(Tensor stScore, IntPtr ape, int p0, int ratio, int nt, int cw, IntPtr stream)
         {
-            IntPtr a0 = stScore, a1 = ape;
+            IntPtr a0 = P(stScore), a1 = ape;
             int a2 = p0, a3 = ratio, a4 = nt, a5 = cw;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
             Launch(apeAdd, CeilDiv(cw, BlockSize), (uint)nt, 1, BlockSize, 0, stream, args);
         }
 
-        public void Compress(IntPtr stKv, IntPtr stScore, IntPtr histKv, IntPtr histScore, IntPtr normW, IntPtr ropeTab, IntPtr cache,
+        public void Compress(Tensor stKv, Tensor stScore, IntPtr histKv, IntPtr histScore, IntPtr normW, IntPtr ropeTab, IntPtr cache,
             long firstBoundary, int nBlocks, int p0, int ratio, int coff, int head, int stateSize, int nRot, float eps, IntPtr stream)
         {
-            IntPtr a0 = stKv, a1 = stScore, a2 = histKv, a3 = histScore, a4 = normW, a5 = ropeTab, a6 = cache;
+            IntPtr a0 = P(stKv), a1 = P(stScore), a2 = histKv, a3 = histScore, a4 = normW, a5 = ropeTab, a6 = cache;
             long a7 = firstBoundary;
             int a8 = nBlocks, a9 = p0, a10 = ratio, a11 = coff, a12 = head, a13 = stateSize, a14 = nRot;
             float a15 = eps;
@@ -188,114 +180,114 @@ namespace TensorSharp.Cuda
             Launch(compress, (uint)nBlocks, 1, 1, BlockSize, 0, stream, args);
         }
 
-        public void Persist(IntPtr stKv, IntPtr stScore, IntPtr histKv, IntPtr histScore,
+        public void Persist(Tensor stKv, Tensor stScore, IntPtr histKv, IntPtr histScore,
             int p0, int nt, int stateSize, int cw, IntPtr stream)
         {
-            IntPtr a0 = stKv, a1 = stScore, a2 = histKv, a3 = histScore;
+            IntPtr a0 = P(stKv), a1 = P(stScore), a2 = histKv, a3 = histScore;
             int a4 = p0, a5 = nt, a6 = stateSize, a7 = cw;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
             long np = Math.Min(nt, stateSize);
             Launch(persist, CeilDiv(np * cw, BlockSize), 1, 1, BlockSize, 0, stream, args);
         }
 
-        public void IdxPrep(IntPtr iq, IntPtr iw, IntPtr ropeTab, int p0, int ih, int id, int nRot, float iwScale, int nt, IntPtr stream)
+        public void IdxPrep(Tensor iq, Tensor iw, IntPtr ropeTab, int p0, int ih, int id, int nRot, float iwScale, int nt, IntPtr stream)
         {
-            IntPtr a0 = iq, a1 = iw, a2 = ropeTab;
+            IntPtr a0 = P(iq), a1 = P(iw), a2 = ropeTab;
             int a3 = p0, a4 = ih, a5 = id, a6 = nRot; float a7 = iwScale;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
             Launch(idxPrep, (uint)ih, (uint)nt, 1, 128, 0, stream, args);
         }
 
-        public void IdxScores(IntPtr iq, IntPtr iw, IntPtr lidK, IntPtr scores,
+        public void IdxScores(Tensor iq, Tensor iw, IntPtr lidK, Tensor scores,
             int p0, int ratio, int ih, int id, int nt, int scoreStride, int rowsMax, IntPtr stream)
         {
-            IntPtr a0 = iq, a1 = iw, a2 = lidK, a3 = scores;
+            IntPtr a0 = P(iq), a1 = P(iw), a2 = lidK, a3 = P(scores);
             int a4 = p0, a5 = ratio, a6 = ih, a7 = id, a8 = nt, a9 = scoreStride;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
             uint shared = (uint)((ih * id + ih) * sizeof(float));
             Launch(idxScores, CeilDiv(rowsMax, 8), (uint)nt, 1, BlockSize, shared, stream, args);
         }
 
-        public void TopK(IntPtr scores, IntPtr topkIdx, IntPtr topkCnt, int p0, int ratio, int k, int scoreStride, int nt, IntPtr stream)
+        public void TopK(Tensor scores, Tensor topkIdx, Tensor topkCnt, int p0, int ratio, int k, int scoreStride, int nt, IntPtr stream)
         {
-            IntPtr a0 = scores, a1 = topkIdx, a2 = topkCnt;
+            IntPtr a0 = P(scores), a1 = P(topkIdx), a2 = P(topkCnt);
             int a3 = p0, a4 = ratio, a5 = k, a6 = scoreStride;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6 };
             Launch(topk, (uint)nt, 1, 1, BlockSize, 0, stream, args);
         }
 
-        public void Attention(IntPtr q, IntPtr ring, IntPtr comp, IntPtr topkIdx, IntPtr topkCnt, IntPtr sinks, IntPtr attnO,
+        public void Attention(Tensor q, IntPtr ring, IntPtr comp, Tensor topkIdx, Tensor topkCnt, IntPtr sinks, Tensor attnO,
             int p0, int nSwa, int ringRows, int nh, int hd, int mode, int ratio, int k, float kqScale, int nt, IntPtr stream)
         {
-            IntPtr a0 = q, a1 = ring, a2 = comp, a3 = topkIdx, a4 = topkCnt, a5 = sinks, a6 = attnO;
+            IntPtr a0 = P(q), a1 = ring, a2 = comp, a3 = P(topkIdx), a4 = P(topkCnt), a5 = sinks, a6 = P(attnO);
             int a7 = p0, a8 = nSwa, a9 = ringRows, a10 = nh, a11 = hd, a12 = mode, a13 = ratio, a14 = k;
             float a15 = kqScale;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15 };
             Launch(attention, (uint)nh, (uint)nt, 1, BlockSize, 0, stream, args);
         }
 
-        public void AttnFinish(IntPtr attnO, IntPtr ropeTab, IntPtr dst, int p0, int nh, int hd, int nRot, int headsPerGroup, int nt, IntPtr stream)
+        public void AttnFinish(Tensor attnO, IntPtr ropeTab, Tensor dst, int p0, int nh, int hd, int nRot, int headsPerGroup, int nt, IntPtr stream)
         {
-            IntPtr a0 = attnO, a1 = ropeTab, a2 = dst;
+            IntPtr a0 = P(attnO), a1 = ropeTab, a2 = P(dst);
             int a3 = p0, a4 = nh, a5 = hd, a6 = nRot, a7 = headsPerGroup, a8 = nt;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
             Launch(attnFinish, (uint)nh, (uint)nt, 1, BlockSize, 0, stream, args);
         }
 
-        public void Regroup(IntPtr oGtmp, IntPtr oG, int g, int nt, int r, IntPtr stream)
+        public void Regroup(Tensor oGtmp, Tensor oG, int g, int nt, int r, IntPtr stream)
         {
-            IntPtr a0 = oGtmp, a1 = oG;
+            IntPtr a0 = P(oGtmp), a1 = P(oG);
             int a2 = g, a3 = nt, a4 = r;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
             Launch(regroup, CeilDiv((long)g * nt * r, BlockSize), 1, 1, BlockSize, 0, stream, args);
         }
 
-        public void MoeSelect(IntPtr logits, IntPtr bias, IntPtr tid2eid, IntPtr tokens, IntPtr sel, IntPtr wOut,
+        public void MoeSelect(Tensor logits, IntPtr bias, IntPtr tid2eid, Tensor tokens, Tensor sel, Tensor wOut,
             int nExpert, int nUsed, int norm, float wScale, int nt, IntPtr stream)
         {
-            IntPtr a0 = logits, a1 = bias, a2 = tid2eid, a3 = tokens, a4 = sel, a5 = wOut;
+            IntPtr a0 = P(logits), a1 = bias, a2 = tid2eid, a3 = P(tokens), a4 = P(sel), a5 = P(wOut);
             int a6 = nExpert, a7 = nUsed, a8 = norm; float a9 = wScale;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
             Launch(moeSelect, (uint)nt, 1, 1, BlockSize, (uint)(nExpert * sizeof(float)), stream, args);
         }
 
-        public void MoeCount(IntPtr sel, IntPtr counts, int s, IntPtr stream)
+        public void MoeCount(Tensor sel, Tensor counts, int s, IntPtr stream)
         {
-            IntPtr a0 = sel, a1 = counts;
+            IntPtr a0 = P(sel), a1 = P(counts);
             int a2 = s;
             void** args = stackalloc void*[] { &a0, &a1, &a2 };
             Launch(moeCount, CeilDiv(s, BlockSize), 1, 1, BlockSize, 0, stream, args);
         }
 
-        public void MoeScan(IntPtr counts, IntPtr offsets, IntPtr cursors, int nExpert, IntPtr stream)
+        public void MoeScan(Tensor counts, Tensor offsets, Tensor cursors, int nExpert, IntPtr stream)
         {
-            IntPtr a0 = counts, a1 = offsets, a2 = cursors;
+            IntPtr a0 = P(counts), a1 = P(offsets), a2 = P(cursors);
             int a3 = nExpert;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3 };
             Launch(moeScan, 1, 1, 1, 32, 0, stream, args);
         }
 
-        public void MoeScatter(IntPtr sel, IntPtr cursors, IntPtr rowOfSlot, IntPtr slotToken, int s, int nUsed, IntPtr stream)
+        public void MoeScatter(Tensor sel, Tensor cursors, Tensor rowOfSlot, Tensor slotToken, int s, int nUsed, IntPtr stream)
         {
-            IntPtr a0 = sel, a1 = cursors, a2 = rowOfSlot, a3 = slotToken;
+            IntPtr a0 = P(sel), a1 = P(cursors), a2 = P(rowOfSlot), a3 = P(slotToken);
             int a4 = s, a5 = nUsed;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
             Launch(moeScatter, CeilDiv(s, BlockSize), 1, 1, BlockSize, 0, stream, args);
         }
 
-        public void MoeGateUp(IntPtr gateW, IntPtr upW, IntPtr act, IntPtr counts, IntPtr offsets, IntPtr slotToken,
-            IntPtr gateOut, IntPtr upOut, int wtype, int ff, int inDim, long rowBytes, int nExpert, IntPtr stream)
+        public void MoeGateUp(IntPtr gateW, IntPtr upW, Tensor act, Tensor counts, Tensor offsets, Tensor slotToken,
+            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nExpert, IntPtr stream)
         {
-            IntPtr a0 = gateW, a1 = upW, a2 = act, a3 = counts, a4 = offsets, a5 = slotToken, a6 = gateOut, a7 = upOut;
+            IntPtr a0 = gateW, a1 = upW, a2 = P(act), a3 = P(counts), a4 = P(offsets), a5 = P(slotToken), a6 = P(gateOut), a7 = P(upOut);
             int a8 = wtype, a9 = ff, a10 = inDim; long a11 = rowBytes;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
             Launch(moeGateUp, (uint)nExpert, CeilDiv(ff, 32), 2, BlockSize, 0, stream, args);
         }
 
-        public void MoeDown(IntPtr downW, IntPtr act, IntPtr counts, IntPtr offsets, IntPtr downOut,
+        public void MoeDown(IntPtr downW, Tensor act, Tensor counts, Tensor offsets, Tensor downOut,
             int wtype, int e, int ff, long rowBytes, int nExpert, IntPtr stream)
         {
-            IntPtr a0 = downW, a1 = act, a2 = counts, a3 = offsets, a4 = downOut;
+            IntPtr a0 = downW, a1 = P(act), a2 = P(counts), a3 = P(offsets), a4 = P(downOut);
             int a5 = wtype, a6 = e, a7 = ff; long a8 = rowBytes;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
             Launch(moeDown, (uint)nExpert, CeilDiv(e, 32), 1, BlockSize, 0, stream, args);
@@ -312,12 +304,12 @@ namespace TensorSharp.Cuda
         /// lane, so they cover input widths up to 32 * 32 * MAX_SUBS.</summary>
         public static bool StagedSupports(int inDim) => inDim % 1024 == 0 && inDim / 1024 <= 4;
 
-        public void MoeGateUpStaged(IntPtr gateW, IntPtr upW, IntPtr actQs, IntPtr actD,
-            IntPtr counts, IntPtr offsets, IntPtr slotToken,
-            IntPtr gateOut, IntPtr upOut, int wtype, int ff, int inDim, long rowBytes, int nExpert, IntPtr stream)
+        public void MoeGateUpStaged(IntPtr gateW, IntPtr upW, Tensor actQs, Tensor actD,
+            Tensor counts, Tensor offsets, Tensor slotToken,
+            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nExpert, IntPtr stream)
         {
-            IntPtr a0 = gateW, a1 = upW, a2 = actQs, a3 = actD, a4 = counts, a5 = offsets, a6 = slotToken,
-                a7 = gateOut, a8 = upOut;
+            IntPtr a0 = gateW, a1 = upW, a2 = P(actQs), a3 = P(actD), a4 = P(counts), a5 = P(offsets), a6 = P(slotToken),
+                a7 = P(gateOut), a8 = P(upOut);
             int a9 = wtype, a10 = ff, a11 = inDim; long a12 = rowBytes;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
             // grid.x = row tiles, grid.y = experts (blockIdx.x varies fastest,
@@ -326,46 +318,38 @@ namespace TensorSharp.Cuda
             Launch(moeGateUpStaged, rowTiles, (uint)nExpert, 2, BlockSize, 0, stream, args);
         }
 
-        public void MoeDownStaged(IntPtr downW, IntPtr actQs, IntPtr actD, IntPtr counts, IntPtr offsets, IntPtr downOut,
+        public void MoeDownStaged(IntPtr downW, Tensor actQs, Tensor actD, Tensor counts, Tensor offsets, Tensor downOut,
             int wtype, int e, int ff, long rowBytes, int nExpert, IntPtr stream)
         {
-            IntPtr a0 = downW, a1 = actQs, a2 = actD, a3 = counts, a4 = offsets, a5 = downOut;
+            IntPtr a0 = downW, a1 = P(actQs), a2 = P(actD), a3 = P(counts), a4 = P(offsets), a5 = P(downOut);
             int a6 = wtype, a7 = e, a8 = ff; long a9 = rowBytes;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
             uint rowTiles = CeilDiv(e, StageWarps * StageRows);
             Launch(moeDownStaged, rowTiles, (uint)nExpert, 1, BlockSize, 0, stream, args);
         }
 
-        public void MoeGateUpDecode(IntPtr gateW, IntPtr upW, IntPtr act, IntPtr sel,
-            IntPtr gateOut, IntPtr upOut, int wtype, int ff, int inDim, long rowBytes, int nUsed, IntPtr stream)
+        public void MoeGateUpDecode(IntPtr gateW, IntPtr upW, Tensor act, Tensor sel,
+            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nUsed, IntPtr stream)
         {
-            IntPtr a0 = gateW, a1 = upW, a2 = act, a3 = sel, a4 = gateOut, a5 = upOut;
+            IntPtr a0 = gateW, a1 = upW, a2 = P(act), a3 = P(sel), a4 = P(gateOut), a5 = P(upOut);
             int a6 = wtype, a7 = ff, a8 = inDim; long a9 = rowBytes;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
             Launch(moeGateUpDecode, (uint)nUsed, CeilDiv(ff, 32), 2, BlockSize, 0, stream, args);
         }
 
-        public void MoeDownDecode(IntPtr downW, IntPtr act, IntPtr sel, IntPtr downOut,
+        public void MoeDownDecode(IntPtr downW, Tensor act, Tensor sel, Tensor downOut,
             int wtype, int e, int ff, long rowBytes, int nUsed, IntPtr stream)
         {
-            IntPtr a0 = downW, a1 = act, a2 = sel, a3 = downOut;
+            IntPtr a0 = downW, a1 = P(act), a2 = P(sel), a3 = P(downOut);
             int a4 = wtype, a5 = e, a6 = ff; long a7 = rowBytes;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
             Launch(moeDownDecode, (uint)nUsed, CeilDiv(e, 32), 1, BlockSize, 0, stream, args);
         }
 
-        public void SwigluClamp(IntPtr gate, IntPtr up, long n, float limit, IntPtr stream)
-        {
-            IntPtr a0 = gate, a1 = up;
-            long a2 = n; float a3 = limit; int a4 = limit > 1e-6f ? 1 : 0;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
-            Launch(swigluClamp, CeilDiv(n, BlockSize), 1, 1, BlockSize, 0, stream, args);
-        }
-
-        public void MoeScatterAdd(IntPtr downOut, IntPtr rowOfSlot, IntPtr wSel, IntPtr shexp, IntPtr ffnOut,
+        public void MoeScatterAdd(Tensor downOut, Tensor rowOfSlot, Tensor wSel, Tensor shexp, Tensor ffnOut,
             int nt, int nUsed, int e, IntPtr stream)
         {
-            IntPtr a0 = downOut, a1 = rowOfSlot, a2 = wSel, a3 = shexp, a4 = ffnOut;
+            IntPtr a0 = P(downOut), a1 = P(rowOfSlot), a2 = P(wSel), a3 = P(shexp), a4 = P(ffnOut);
             int a5 = nt, a6 = nUsed, a7 = e;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
             Launch(moeScatterAdd, CeilDiv(e, BlockSize), (uint)nt, 1, BlockSize, 0, stream, args);

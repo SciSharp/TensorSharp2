@@ -45,6 +45,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using TensorSharp.Cpu;
 
 namespace TensorSharp.Models
 {
@@ -170,8 +171,9 @@ namespace TensorSharp.Models
         public int ContextSize => _nCtx;
         public int NPast => _nPast;
 
-        public DeepSeek4CpuExecutor(string ggufPath, int maxContext, int nUbatch, int nThreads)
+        public DeepSeek4CpuExecutor(string ggufPath, int maxContext, int nUbatch, int nThreads, IAllocator allocator)
         {
+            _alloc = allocator ?? throw new ArgumentNullException(nameof(allocator));
             var sw = Stopwatch.StartNew();
             int dop = nThreads > 0 ? nThreads : Environment.ProcessorCount;
             _po = new ParallelOptions { MaxDegreeOfParallelism = dop };
@@ -541,15 +543,40 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// Every buffer this executor owns is an <see cref="IAllocator"/>-backed
+        /// <see cref="Tensor"/>, so the shared Ops (RMSNorm, SiLUMulClamp, ...)
+        /// can be handed the same memory the imperative kernels write through a
+        /// raw pointer. <see cref="AllocF32"/> returns the pointer for the hot
+        /// loops; <see cref="Buf"/> looks the tensor back up when an Op needs it.
+        /// </summary>
+        private readonly IAllocator _alloc;
+
+        private readonly List<Tensor> _tensors = new List<Tensor>();
+        private readonly Dictionary<IntPtr, Tensor> _byPtr = new Dictionary<IntPtr, Tensor>();
+
         private float* AllocF32(long count)
         {
-            float* p = (float*)NativeMemory.AlignedAlloc((nuint)(count * sizeof(float)), 64);
-            _nativeAllocs.Add((IntPtr)p);
+            var tensor = new Tensor(_alloc, DType.Float32, count);
+            _tensors.Add(tensor);
+            float* p = (float*)CpuNativeHelpers.GetBufferStart(tensor);
             NativeMemory.Clear(p, (nuint)(count * sizeof(float)));
+            _byPtr[(IntPtr)p] = tensor;
             return p;
         }
 
-        private readonly List<IntPtr> _nativeAllocs = new List<IntPtr>();
+        /// <summary>The tensor that owns <paramref name="p"/> (which must be a
+        /// buffer start handed out by <see cref="AllocF32(long)"/>).</summary>
+        private Tensor Buf(float* p) => _byPtr[(IntPtr)p];
+
+        /// <summary>Contiguous [rows, cols] view over the front of a buffer.</summary>
+        private Tensor View(float* p, long rows, long cols)
+        {
+            Tensor owner = Buf(p);
+            using Tensor flat = owner.View(owner.ElementCount());
+            using Tensor slice = flat.Narrow(0, 0, rows * cols);
+            return slice.View(rows, cols);
+        }
 
         private void AllocateCaches()
         {
@@ -678,8 +705,9 @@ namespace TensorSharp.Models
             // fused decode MoE can hold per-group / per-expert activations.
             int maxNe0 = Math.Max(Math.Max(_nEmbd, _oGroups * _oLoraRank), Math.Max(_qLoraRank, _nFfExp));
             _maxActRowBytes = (maxNe0 / 256 + 1) * 300;
-            _actQuant = (byte*)NativeMemory.AlignedAlloc((nuint)((long)nt * Math.Max(8, _oGroups) * _maxActRowBytes), 64);
-            _nativeAllocs.Add((IntPtr)_actQuant);
+            var actTensor = new Tensor(_alloc, DType.UInt8, (long)nt * Math.Max(8, _oGroups), _maxActRowBytes);
+            _tensors.Add(actTensor);
+            _actQuant = (byte*)CpuNativeHelpers.GetBufferStart(actTensor);
         }
 
         public void Reset()
@@ -1359,28 +1387,13 @@ namespace TensorSharp.Models
             MatMulExpert(L.DownExps, e, _expertGate, ff, m, downOut, E);
         }
 
-        /// <summary>up = clamp(up, ±limit); gate = min(gate, limit); gate = silu(gate) * up (written into gate).</summary>
+        /// <summary>up = clamp(up, ±limit); gate = min(gate, limit); gate = silu(gate) * up
+        /// (written into gate), through the shared Ops.SiLUMulClamp.</summary>
         private void SwigluClamp(float* gate, float* up, long n, float clamp)
         {
-            bool doClamp = clamp > 1e-6f;
-            int chunk = 1 << 16;
-            long nChunks = (n + chunk - 1) / chunk;
-            PFor((int)nChunks, ci =>
-            {
-                long start = (long)ci * chunk;
-                long end = Math.Min(start + chunk, n);
-                for (long i = start; i < end; i++)
-                {
-                    float g = gate[i];
-                    float u = up[i];
-                    if (doClamp)
-                    {
-                        if (u > clamp) u = clamp; else if (u < -clamp) u = -clamp;
-                        if (g > clamp) g = clamp;
-                    }
-                    gate[i] = g / (1.0f + MathF.Exp(-g)) * u;
-                }
-            });
+            using Tensor g = View(gate, 1, n);
+            using Tensor u = View(up, 1, n);
+            Ops.SiLUMulClamp(g, g, u, clamp > 1e-6f ? clamp : 0.0f);
         }
 
         private static void SelectTopK(float* probs, float[] bias, int n, int k, int* outIdx)
@@ -1453,24 +1466,32 @@ namespace TensorSharp.Models
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float Sigmoid(float x) => 1.0f / (1.0f + MathF.Exp(-x));
 
-        /// <summary>RMS-norm each of nt rows of len n in place, optional weight.</summary>
+        /// <summary>
+        /// Small dense weights (norms) as Tensors, built once and cached by array
+        /// identity so the shared Ops can take them without a per-call copy.
+        /// </summary>
+        // float[] has no value equality, so the default comparer is reference identity.
+        private readonly Dictionary<float[], Tensor> _weightTensors = new Dictionary<float[], Tensor>();
+
+        private Tensor WeightTensor(float[] w)
+        {
+            if (w == null)
+                return null;
+            if (_weightTensors.TryGetValue(w, out Tensor t))
+                return t;
+            t = new Tensor(_alloc, DType.Float32, w.Length);
+            float* dst = (float*)CpuNativeHelpers.GetBufferStart(t);
+            new ReadOnlySpan<float>(w).CopyTo(new Span<float>(dst, w.Length));
+            _weightTensors[w] = t;
+            return t;
+        }
+
+        /// <summary>RMS-norm each of nt rows of len n in place, through the shared
+        /// Ops.RMSNorm (the executor no longer carries its own kernel).</summary>
         private void RmsNormRows(float* data, float[] weight, int nt, int n)
         {
-            PFor(nt, t =>
-            {
-                float* row = data + (long)t * n;
-                double ss = 0;
-                for (int i = 0; i < n; i++) ss += (double)row[i] * row[i];
-                float inv = 1.0f / MathF.Sqrt((float)(ss / n) + _rmsEps);
-                if (weight != null)
-                {
-                    for (int i = 0; i < n; i++) row[i] = row[i] * inv * weight[i];
-                }
-                else
-                {
-                    for (int i = 0; i < n; i++) row[i] *= inv;
-                }
-            });
+            using Tensor rows = View(data, nt, n);
+            Ops.RMSNorm(rows, rows, WeightTensor(weight), null, _rmsEps);
         }
 
         /// <summary>Dot input (len = w.Ne0) against the first nRows rows of an F32/any-typed small weight, serially.</summary>
@@ -1497,79 +1518,23 @@ namespace TensorSharp.Models
         /// </summary>
         private void MatMul(in WeightRef w, long rowBase, int nRows, float* input, int inStride, int nt, float* output, int outStride)
         {
-            GgmlTensorType type = w.Type;
-            int ne0 = w.Ne0;
-            byte* basePtr = w.Row(rowBase);
-            long rowBytes = w.RowBytes;
-
-            if (ManagedQuantizedOps.TryGetActivationPlan(type, ne0, out int actRowBytes) && actRowBytes <= _maxActRowBytes)
-            {
-                byte* act = _actQuant;
-                if (nt == 1)
-                {
-                    ManagedQuantizedOps.QuantizeActivationRow(type, input, act, ne0);
-                }
-                else
-                {
-                    var localType = type;
-                    var localIn = input;
-                    var localAct = act;
-                    int localNe0 = ne0, localStride = inStride, localActBytes = actRowBytes;
-                    PFor(nt, t =>
-                        ManagedQuantizedOps.QuantizeActivationRow(localType, localIn + (long)t * localStride, localAct + (long)t * localActBytes, localNe0));
-                }
-
-                int blockRows = Math.Max(8, nRows / (_po.MaxDegreeOfParallelism * 8));
-                int nBlocks = (nRows + blockRows - 1) / blockRows;
-                var bType = type;
-                var bBase = basePtr;
-                var bAct = act;
-                var bOut = output;
-                int bNe0 = ne0, bNt = nt, bOutStride = outStride, bActBytes = actRowBytes;
-                long bRowBytes = rowBytes;
-                PFor(nBlocks, bi =>
-                {
-                    int r0 = bi * blockRows;
-                    int r1 = Math.Min(r0 + blockRows, nRows);
-                    for (int r = r0; r < r1; r++)
-                    {
-                        byte* wr = bBase + (long)r * bRowBytes;
-                        for (int t = 0; t < bNt; t++)
-                            bOut[(long)t * bOutStride + r] = ManagedQuantizedOps.DotQuantizedRow(bType, wr, bAct + (long)t * bActBytes, bNe0);
-                    }
-                });
-            }
-            else
-            {
-                // dequant + float dot fallback (F32/F16/BF16/IQ3_S/MXFP4/...)
-                int blockRows = Math.Max(4, nRows / (_po.MaxDegreeOfParallelism * 8));
-                int nBlocks = (nRows + blockRows - 1) / blockRows;
-                var bType = type;
-                var bBase = basePtr;
-                var bIn = input;
-                var bOut = output;
-                int bNe0 = ne0, bNt = nt, bInStride = inStride, bOutStride = outStride;
-                long bRowBytes = rowBytes;
-                PFor(nBlocks, bi =>
-                {
-                    int r0 = bi * blockRows;
-                    int r1 = Math.Min(r0 + blockRows, nRows);
-                    float* rowOut = stackalloc float[512];
-                    for (int r = r0; r < r1; r++)
-                    {
-                        byte* wr = bBase + (long)r * bRowBytes;
-                        int tDone = 0;
-                        while (tDone < bNt)
-                        {
-                            int tn = Math.Min(512, bNt - tDone);
-                            ManagedQuantizedOps.DotRowBatchToFloat32((int)bType, (IntPtr)wr, bIn + (long)tDone * bInStride, bInStride, tn, bNe0, rowOut);
-                            for (int t = 0; t < tn; t++)
-                                bOut[(long)(tDone + t) * bOutStride + r] = rowOut[t];
-                            tDone += tn;
-                        }
-                    }
-                });
-            }
+            // One managed quantized-linear implementation for the whole library
+            // (see ManagedQuantizedOps.AddmmQuantizedToFloat32): integer dot
+            // kernels for the types that have them, dequant-once + register-
+            // blocked float dots for the rest. rowBase/nRows select the weight
+            // row block (grouped LoRA out-projection, expert slices), and the
+            // strides let the operands sit inside wider scratch buffers.
+            ManagedQuantizedOps.AddmmQuantizedToFloat32(
+                (int)w.Type,
+                (IntPtr)w.Row(rowBase),
+                w.Ne0,
+                nRows,
+                input,
+                inStride,
+                nt,
+                output,
+                outStride,
+                _po);
         }
 
         /// <summary>MatMul against expert e of a stacked 3D expert tensor.</summary>
@@ -1582,9 +1547,13 @@ namespace TensorSharp.Models
 
         public void Dispose()
         {
-            foreach (var p in _nativeAllocs)
-                NativeMemory.AlignedFree((void*)p);
-            _nativeAllocs.Clear();
+            foreach (var t in _tensors)
+                t.Dispose();
+            _tensors.Clear();
+            _byPtr.Clear();
+            foreach (var t in _weightTensors.Values)
+                t.Dispose();
+            _weightTensors.Clear();
             foreach (var p in _ownedBuffers)
                 Marshal.FreeHGlobal(p);
             _ownedBuffers.Clear();

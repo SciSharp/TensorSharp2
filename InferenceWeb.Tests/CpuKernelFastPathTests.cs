@@ -92,6 +92,89 @@ public class CpuKernelFastPathTests
         AssertClose(expected, upAliased);
     }
 
+    private static float[] SwigluClampReference(float[] gate, float[] up, float limit)
+        => gate.Zip(up, (g, u) =>
+        {
+            if (limit > 0f)
+            {
+                g = MathF.Min(g, limit);
+                u = MathF.Min(MathF.Max(u, -limit), limit);
+            }
+            return (g / (1.0f + MathF.Exp(-g))) * u;
+        }).ToArray();
+
+    [Fact]
+    public void SiLUMulClamp_ClampsGateAboveAndUpBothWays()
+    {
+        // Values deliberately straddle the limit on both sides so the asymmetric
+        // clamp (gate from above only, up on both sides) is actually exercised.
+        float[] gate = [-9f, -3f, 0f, 0.5f, 6f, 7.5f, 12f, 40f];
+        float[] up = [11f, -2f, 3f, -14f, -1.5f, 0.75f, 2f, -30f];
+        const float limit = 7.0f;
+        float[] expected = SwigluClampReference(gate, up, limit);
+
+        using var gateTensor = TensorFrom(gate, gate.Length);
+        using var upTensor = TensorFrom(up, up.Length);
+        using var outOfPlace = new Tensor(_alloc, DType.Float32, gate.Length);
+        Ops.SiLUMulClamp(outOfPlace, gateTensor, upTensor, limit);
+        AssertClose(expected, outOfPlace, 1e-5f);
+
+        // The MoE FFN writes the activation back over the gate buffer.
+        using var gateAliased = TensorFrom(gate, gate.Length);
+        using var upForAlias = TensorFrom(up, up.Length);
+        Ops.SiLUMulClamp(gateAliased, gateAliased, upForAlias, limit);
+        AssertClose(expected, gateAliased, 1e-5f);
+
+        // The inputs must not have been mutated by the clamp.
+        AssertClose(up, upForAlias);
+    }
+
+    [Fact]
+    public void SiLUMulClamp_WithoutLimit_MatchesSiLUMul()
+    {
+        float[] gate = [-3f, -1f, 0f, 0.5f, 1f, 2f, 4f, 6f];
+        float[] up = [0.25f, -2f, 3f, 4f, -1.5f, 0.75f, 2f, -0.5f];
+        float[] expected = SwigluClampReference(gate, up, 0f);
+
+        using var gateTensor = TensorFrom(gate, gate.Length);
+        using var upTensor = TensorFrom(up, up.Length);
+        using var result = new Tensor(_alloc, DType.Float32, gate.Length);
+        Ops.SiLUMulClamp(result, gateTensor, upTensor, 0f);
+        AssertClose(expected, result);
+    }
+
+    [Fact]
+    public void RMSNorm_WithNullGamma_IsUnweighted()
+    {
+        // Per-head query/key norms have no learned scale; the shared op must
+        // accept a null alpha rather than forcing callers to materialize ones.
+        const int rows = 3, cols = 8;
+        float[] values = new float[rows * cols];
+        for (int i = 0; i < values.Length; i++)
+            values[i] = (i % 7) - 3.5f + 0.25f * i;
+
+        const float eps = 1e-5f;
+        float[] expected = new float[values.Length];
+        for (int r = 0; r < rows; r++)
+        {
+            float sumSq = 0f;
+            for (int c = 0; c < cols; c++)
+                sumSq += values[r * cols + c] * values[r * cols + c];
+            float inv = 1.0f / MathF.Sqrt(sumSq / cols + eps);
+            for (int c = 0; c < cols; c++)
+                expected[r * cols + c] = values[r * cols + c] * inv;
+        }
+
+        using var src = TensorFrom(values, rows, cols);
+        using var dst = new Tensor(_alloc, DType.Float32, rows, cols);
+        Ops.RMSNorm(dst, src, null, null, eps);
+        AssertClose(expected, dst, 1e-5f);
+
+        using var inPlace = TensorFrom(values, rows, cols);
+        Ops.RMSNorm(inPlace, inPlace, null, null, eps);
+        AssertClose(expected, inPlace, 1e-5f);
+    }
+
     [Fact]
     public void SigmoidAndExp_FastPaths_SupportInPlace()
     {
