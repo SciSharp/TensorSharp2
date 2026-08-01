@@ -85,10 +85,15 @@ namespace TensorSharp.Runtime.Scheduling
         /// n_max). CLI: <c>--mtp-draft</c>; env: <c>TS_MTP_DRAFT</c>.</summary>
         public int MtpMaxDraftTokens { get; init; } = 8;
 
-        /// <summary>Minimum draft confidence for a drafted token to be kept
-        /// (top-1 probability over the draft head's top-10 logits). CLI:
-        /// <c>--mtp-pmin</c>; env: <c>TS_MTP_PMIN</c>.</summary>
-        public float MtpMinDraftProb { get; init; } = 0.75f;
+        /// <summary>
+        /// Minimum draft confidence for a drafted token to be kept, or null to
+        /// let the drafter pick (<see cref="MtpSpeculativeExecution.MinDraftProb"/>:
+        /// 0.75 per-token, 0.35 cumulative for a block drafter). The two gates
+        /// threshold different quantities, so one shared default cannot serve
+        /// both — leave this unset unless the operator asked for a specific
+        /// value. CLI: <c>--mtp-pmin</c>; env: <c>TS_MTP_PMIN</c>.
+        /// </summary>
+        public float? MtpMinDraftProb { get; init; }
 
         public static SchedulerConfig Default => new();
 
@@ -106,7 +111,7 @@ namespace TensorSharp.Runtime.Scheduling
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
                 MtpSpeculativeEnabled = ReadBool("TS_MTP_SPEC", false),
                 MtpMaxDraftTokens = ReadInt("TS_MTP_DRAFT", 8),
-                MtpMinDraftProb = ReadFloat("TS_MTP_PMIN", 0.75f),
+                MtpMinDraftProb = ReadFloatOrNull("TS_MTP_PMIN"),
             };
             return cfg;
         }
@@ -117,6 +122,21 @@ namespace TensorSharp.Runtime.Scheduling
             if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out int v) && v > 0)
                 return v;
             return fallback;
+        }
+
+        /// <summary>Reads an optional probability: null when unset or unusable,
+        /// so the consumer can apply its own kind-specific default.</summary>
+        private static float? ReadFloatOrNull(string name)
+        {
+            string raw = System.Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrEmpty(raw)
+                && float.TryParse(raw, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out float v)
+                && v > 0f)
+            {
+                return v;
+            }
+            return null;
         }
 
         private static float ReadFloat(string name, float fallback)

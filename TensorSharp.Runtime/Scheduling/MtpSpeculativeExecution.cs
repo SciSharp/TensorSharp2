@@ -38,6 +38,51 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         bool MtpSpeculationProfitable => true;
 
+        /// <summary>
+        /// Width of one row of the hidden state passed between the trunk and the
+        /// draft head (<see cref="SpecForward"/>'s hAllOut, <see cref="MtpDraftStep"/>'s
+        /// hPrev). Defaults to the model's hidden size; block drafters that consume
+        /// several concatenated layers (DeepSeek V4's DSpark) report a wider row.
+        /// </summary>
+        int MtpHiddenSize => Config.HiddenSize;
+
+        /// <summary>
+        /// Tokens drafted per BLOCK by a semi-autoregressive draft head (DSpark),
+        /// or 0 for classic one-token-at-a-time MTP drafting. When positive the
+        /// executor calls <see cref="MtpDraftBlock"/> once per step instead of
+        /// looping <see cref="MtpDraftStep"/>.
+        /// </summary>
+        int MtpDraftBlockSize => 0;
+
+        /// <summary>Prompt-prefill chunk the model prefers for speculative
+        /// prefill (0 = let the caller choose). Models whose trunk re-reads
+        /// per-expert weights once per micro-batch want whole micro-batches.</summary>
+        int MtpPrefillChunkSize => 0;
+
+        /// <summary>
+        /// True when <see cref="SpecForward"/> replays the draft head's own state
+        /// for every row it processes, so prompt prefill needs neither per-row
+        /// hidden states nor a <see cref="MtpCatchUp"/> call. Prefill then runs
+        /// as ONE call and keeps the trunk's micro-batch pipelining instead of
+        /// stalling on a readback per chunk.
+        ///
+        /// Implementations must honour the buffer-size contract this implies:
+        /// when <c>hAllOut</c> is too small to hold one row per token,
+        /// <see cref="SpecForward"/> fills only its first row, with the hidden
+        /// state of the LAST token it processed.
+        /// </summary>
+        bool MtpPrefillSelfCatchUp => false;
+
+        /// <summary>
+        /// Drafts one block at <paramref name="position"/> (the position of
+        /// <paramref name="lastToken"/>, which is not yet in the trunk cache),
+        /// given the trunk hidden state of the position before it. Writes the
+        /// drafted tokens to <paramref name="draftOut"/> and their predicted
+        /// acceptance probabilities to <paramref name="confOut"/>, and returns
+        /// how many it produced.
+        /// </summary>
+        int MtpDraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut) => 0;
+
         /// <summary>Trunk tokens currently committed to the model's live KV cache.</summary>
         int CacheSeqLen { get; }
 
@@ -324,12 +369,36 @@ namespace TensorSharp.Runtime.Scheduling
         public int MaxDraftTokens { get; }
 
         /// <summary>
-        /// Minimum draft confidence (top-1 probability over the draft head's
-        /// top-10 logits, matching llama.cpp's top-k(10) draft sampler) for a
-        /// drafted token to be kept. Drafting stops at the first low-confidence
-        /// token.
+        /// Default gate for a per-token MTP head: the top-1 probability over the
+        /// head's top-10 logits, thresholded per drafted token (llama.cpp's
+        /// top-k(10) draft sampler with p_min).
         /// </summary>
-        public float MinDraftProb { get; set; } = 0.75f;
+        public const float DefaultTokenMinDraftProb = 0.75f;
+
+        /// <summary>
+        /// Default gate for a BLOCK drafter (DSpark). Much lower than
+        /// <see cref="DefaultTokenMinDraftProb"/> because it thresholds a
+        /// different quantity: the CUMULATIVE prefix probability (the product of
+        /// the confidence head's per-position estimates), which decays with every
+        /// position. 0.35 is the break-even point where an extra verify row stops
+        /// paying for itself on a sparse-MoE trunk; a per-token-sized 0.75 here
+        /// truncates almost every block to nothing.
+        /// </summary>
+        public const float DefaultBlockMinDraftProb = 0.35f;
+
+        /// <summary>
+        /// Minimum draft confidence for a drafted token to be kept; drafting
+        /// stops at the first token below it. For MTP heads this is the top-1
+        /// probability over the head's top-10 logits (llama.cpp's top-k(10)
+        /// draft sampler); for a DSpark block it is the CUMULATIVE product of the
+        /// confidence head's predicted acceptance probabilities. Defaults to the
+        /// constant matching the loaded drafter's kind.
+        /// </summary>
+        public float MinDraftProb { get; set; } = DefaultTokenMinDraftProb;
+
+        private readonly int _blockDraft;
+        private readonly int[] _blockTokens;
+        private readonly float[] _blockConf;
 
         public MtpSpecStats Stats { get; } = new();
 
@@ -342,9 +411,20 @@ namespace TensorSharp.Runtime.Scheduling
                 throw new ArgumentOutOfRangeException(nameof(maxDraftTokens));
             _trunk = trunk ?? new LinearMtpTrunk(model);
 
-            MaxDraftTokens = maxDraftTokens;
-            _hidden = model.Config.HiddenSize;
+            _blockDraft = model.MtpDraftBlockSize;
+            if (_blockDraft > 0)
+            {
+                MaxDraftTokens = maxDraftTokens = Math.Min(maxDraftTokens, _blockDraft);
+                MinDraftProb = DefaultBlockMinDraftProb;
+            }
+            else
+            {
+                MaxDraftTokens = maxDraftTokens;
+            }
+            _hidden = model.MtpHiddenSize;
             _vocab = model.Config.VocabSize;
+            _blockTokens = new int[Math.Max(_blockDraft, 1)];
+            _blockConf = new float[Math.Max(_blockDraft, 1)];
 
             _pendingH = new float[_hidden];
             _draftLogits = new float[_vocab];
@@ -378,17 +458,27 @@ namespace TensorSharp.Runtime.Scheduling
                 throw new ArgumentException("Chunk must not be empty.", nameof(chunk));
 
             int n = chunk.Length;
-            EnsureChunkBuffers(n);
 
-            _trunk.Forward(chunk, _chunkH, _stepLogits, allLogitsRows: false);
+            if (_model.MtpPrefillSelfCatchUp)
+            {
+                // The trunk keeps the draft head in sync itself and only hands
+                // back the last row's hidden state.
+                _trunk.Forward(chunk, _pendingH, _stepLogits, allLogitsRows: false);
+            }
+            else
+            {
+                EnsureChunkBuffers(n);
 
-            // Pair token k with the hidden state of the token before it.
-            Array.Copy(_pendingH, 0, _chunkHPairs, 0, _hidden);
-            if (n > 1)
-                Array.Copy(_chunkH, 0, _chunkHPairs, _hidden, (long)(n - 1) * _hidden);
-            _model.MtpCatchUp(chunk, _chunkHPairs, startPos);
+                _trunk.Forward(chunk, _chunkH, _stepLogits, allLogitsRows: false);
 
-            Array.Copy(_chunkH, (long)(n - 1) * _hidden, _pendingH, 0, _hidden);
+                // Pair token k with the hidden state of the token before it.
+                Array.Copy(_pendingH, 0, _chunkHPairs, 0, _hidden);
+                if (n > 1)
+                    Array.Copy(_chunkH, 0, _chunkHPairs, _hidden, (long)(n - 1) * _hidden);
+                _model.MtpCatchUp(chunk, _chunkHPairs, startPos);
+
+                Array.Copy(_chunkH, (long)(n - 1) * _hidden, _pendingH, 0, _hidden);
+            }
 
             float[] logits = new float[_vocab];
             Array.Copy(_stepLogits, logits, _vocab);
@@ -431,22 +521,47 @@ namespace TensorSharp.Runtime.Scheduling
                 long tDraft0 = Stopwatch.GetTimestamp();
                 _model.MtpEnsureCapacity(position + kMax + 1);
 
-                float[] hIn = _pendingH;
-                float[] hOut = _draftHA;
-                int tokIn = lastToken;
-                for (int i = 0; i < kMax; i++)
+                if (_blockDraft > 0)
                 {
-                    _model.MtpDraftStep(tokIn, hIn, position + i, _draftLogits, hOut);
-                    adjustDraftLogits?.Invoke(_draftLogits, _draftTokens);
-                    int d = ArgmaxWithTopKConfidence(_draftLogits, _vocab, out float p);
-                    if (p < MinDraftProb)
-                        break;
-                    _draftTokens.Add(d);
-                    tokIn = d;
-                    // Chain the MTP hidden output into the next draft step.
-                    float[] next = ReferenceEquals(hOut, _draftHA) ? _draftHB : _draftHA;
-                    hIn = hOut;
-                    hOut = next;
+                    // Semi-autoregressive block draft (DSpark): one pass proposes
+                    // the whole block, and the confidence head truncates it.
+                    //
+                    // The gate is CUMULATIVE: draft position i only pays off when
+                    // the whole prefix before it is also accepted, so the product
+                    // of the per-position acceptance probabilities is the expected
+                    // value of adding it, and MinDraftProb is the point where that
+                    // value stops covering the extra verify row. (Per-position
+                    // gating -- what the reference runtime does -- keeps positions
+                    // whose prefix has already gone unlikely.)
+                    int n = _model.MtpDraftBlock(lastToken, _pendingH, position, _blockTokens, _blockConf);
+                    double cum = 1.0;
+                    for (int i = 0; i < Math.Min(n, kMax); i++)
+                    {
+                        cum *= _blockConf[i];
+                        if (cum < MinDraftProb)
+                            break;
+                        _draftTokens.Add(_blockTokens[i]);
+                    }
+                }
+                else
+                {
+                    float[] hIn = _pendingH;
+                    float[] hOut = _draftHA;
+                    int tokIn = lastToken;
+                    for (int i = 0; i < kMax; i++)
+                    {
+                        _model.MtpDraftStep(tokIn, hIn, position + i, _draftLogits, hOut);
+                        adjustDraftLogits?.Invoke(_draftLogits, _draftTokens);
+                        int d = ArgmaxWithTopKConfidence(_draftLogits, _vocab, out float p);
+                        if (p < MinDraftProb)
+                            break;
+                        _draftTokens.Add(d);
+                        tokIn = d;
+                        // Chain the MTP hidden output into the next draft step.
+                        float[] next = ReferenceEquals(hOut, _draftHA) ? _draftHB : _draftHA;
+                        hIn = hOut;
+                        hOut = next;
+                    }
                 }
                 Stats.DraftTicks += Stopwatch.GetTimestamp() - tDraft0;
             }

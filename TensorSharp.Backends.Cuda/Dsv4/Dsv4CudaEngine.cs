@@ -36,7 +36,7 @@ using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
 {
-    public sealed unsafe class Dsv4CudaEngine : IDisposable
+    public sealed unsafe partial class Dsv4CudaEngine : IDisposable
     {
         private const int HC = 4;
         private const int HcMixDim = (2 + HC) * HC; // 24
@@ -45,7 +45,7 @@ namespace TensorSharp.Cuda
         private const int Q81BlockBytes = 36;
 
         // ggml type ids this engine dispatches on
-        private const int TF32 = 0, TF16 = 1, TQ8_0 = 8, TQ6_K = 14, TIQ3_S = 21, TBF16 = 30, TMXFP4 = 39;
+        private const int TF32 = 0, TF16 = 1, TQ8_0 = 8, TQ2_K = 10, TQ6_K = 14, TIQ2_XXS = 16, TIQ3_S = 21, TBF16 = 30, TMXFP4 = 39;
 
         public struct QuantWeightDesc
         {
@@ -93,6 +93,9 @@ namespace TensorSharp.Cuda
             public float[] OutputNorm, HcHeadFn, HcHeadScale, HcHeadBase;
             public float[] RopeRawTable, RopeCompTable; // [nCtx * nRot] interleaved cos/sin
             public LayerDesc[] Layers;
+            /// <summary>Optional DSpark speculative-decoding module (see
+            /// Dsv4CudaEngine.Dspark.cs); null when no drafter was loaded.</summary>
+            public DsparkDesc Dspark;
         }
 
         internal sealed class UploadJob
@@ -196,13 +199,22 @@ namespace TensorSharp.Cuda
         private DevQW _tokEmbdQW;
         private Tensor _outputNorm, _hcHeadFn, _hcHeadScale, _hcHeadBase;
         private IntPtr _pinnedTokens0, _pinnedTokens1;
+        // Logits leave the device through PINNED staging: a device-to-host copy
+        // into a pageable managed array is not just un-overlappable, the driver
+        // stages it in small synchronous chunks (~0.1 GB/s here), which costs
+        // more than the decode step that produced the logits.
+        private IntPtr _pinnedLogits;
         private int _chunkParity;
         private readonly int _perf;
         private readonly bool _syncDebug;
-        private readonly float[] _logitsHost;
 
         public int NPast { get; private set; }
         public int ContextSize => _m.NCtx;
+
+        /// <summary>Prefill micro-batch the engine chunks by. Speculative prefill
+        /// should hand it whole ubatches: a half-sized chunk re-reads every
+        /// touched expert's weights for half as many tokens.</summary>
+        public int UBatch => _m.NUbatch;
 
         public Dsv4CudaEngine(ModelDesc m, int nGpu)
         {
@@ -216,7 +228,6 @@ namespace TensorSharp.Cuda
 
             _perf = EnvInt("TS_DSV4_PERF", 0);
             _syncDebug = EnvInt("TS_DSV4_CUDA_SYNCDBG", 0) != 0;
-            _logitsHost = new float[m.NVocab];
 
             // The model layer coerces DSV4's backend to Cpu (it only needs a cheap
             // host allocator), so the CUDA op handlers are not registered for us:
@@ -230,6 +241,12 @@ namespace TensorSharp.Cuda
             if (useDevs < 1)
                 throw new InvalidOperationException("No CUDA devices available for the DSV4 engine.");
 
+            // A speculative verify writes KV for tokens that may be rejected. The
+            // rejected tail is never restored -- instead every ring the next pass
+            // still reads from is widened by the draft window, so a stale write
+            // can no longer alias a live position (the raw ring already has
+            // NUbatch of headroom; the compressor state rings do not).
+            _maxDraft = m.Dspark != null ? m.Dspark.BlockSize : 0;
             _ringRaw = Pad(m.NSwa + m.NUbatch, 256);
             _compRowsCsa = m.NCtx / CsaRatio + 1;
             _compRowsHca = m.NCtx / HcaRatio + 1;
@@ -247,21 +264,34 @@ namespace TensorSharp.Cuda
                 totalBytes += b;
             }
 
+            long dsparkBytes = DsparkBytes(m.Dspark);
             var assignment = new int[m.NLayer];
             {
-                long target = totalBytes / useDevs;
-                int dev = 0;
-                long acc = 0;
-                for (int il = 0; il < m.NLayer; il++)
+                // Contiguous ranges chosen to MINIMIZE THE LARGEST per-device
+                // load, counting the drafter as a fixed load on its hosting
+                // (last) device. Filling each device to the average instead
+                // overflows the first device as soon as something else takes
+                // space on the last one: the average rises, device 0 accepts
+                // one more layer than fits, and the model OOMs on a split the
+                // devices could have held.
+                long lo = 0;
+                long hi = dsparkBytes;
+                foreach (long b in layerBytes)
                 {
-                    assignment[il] = dev;
-                    acc += layerBytes[il];
-                    if (acc >= target && dev < useDevs - 1 && il < m.NLayer - 1)
-                    {
-                        dev++;
-                        acc = 0;
-                    }
+                    lo = Math.Max(lo, b);
+                    hi += b;
                 }
+                lo += dsparkBytes;
+                while (lo < hi)
+                {
+                    long mid = lo + (hi - lo) / 2;
+                    if (TrySplit(layerBytes, dsparkBytes, useDevs, mid, null))
+                        hi = mid;
+                    else
+                        lo = mid + 1;
+                }
+                if (!TrySplit(layerBytes, dsparkBytes, useDevs, lo, assignment))
+                    throw new InvalidOperationException("[dsv4-cuda] cannot split the model across the visible GPUs");
             }
             _lastDev = useDevs - 1;
 
@@ -303,7 +333,7 @@ namespace TensorSharp.Cuda
                     arenaNeed[d] += Align(qw.TotalBytes);
             }
             arenaNeed[0] += Align(m.TokEmbd.TotalBytes);
-            arenaNeed[_lastDev] += Align(m.Output.TotalBytes);
+            arenaNeed[_lastDev] += Align(m.Output.TotalBytes) + dsparkBytes;
 
             for (int d = 0; d < useDevs; d++)
             {
@@ -346,6 +376,11 @@ namespace TensorSharp.Cuda
                 dev.RopeComp = UploadF32(dev, m.RopeCompTable);
             });
 
+            // The drafter shares the loader pass: it plans its uploads here so
+            // its (few GiB of) weights stream in with everything else.
+            if (m.Dspark != null)
+                SetupDspark(m.Dspark);
+
             // Weights sourced from disk were only *placed* above; move the bytes
             // now, with the reader concurrency the filesystem actually likes.
             RunStreamedUploads();
@@ -372,12 +407,19 @@ namespace TensorSharp.Cuda
 
             var last = _devs[_lastDev];
             last.Logits = AllocF32(last, 1, m.NVocab);
+            if (m.Dspark != null)
+            {
+                int specRows = m.Dspark.BlockSize + 1;
+                _specLogits = AllocF32(last, specRows, m.NVocab);
+            }
 
             _devs[0].MakeCurrent();
             // CU_MEMHOSTALLOC_PORTABLE (0x1): the pinned token buffers are copied
             // from by every device that needs token ids, not just device 0.
             CudaDriverApi.cuMemHostAlloc(out _pinnedTokens0, new UIntPtr((ulong)m.NUbatch * 4), 0x1).ThrowOnError();
             CudaDriverApi.cuMemHostAlloc(out _pinnedTokens1, new UIntPtr((ulong)m.NUbatch * 4), 0x1).ThrowOnError();
+            long logitRows = m.Dspark != null ? m.Dspark.BlockSize + 1 : 1;
+            CudaDriverApi.cuMemHostAlloc(out _pinnedLogits, new UIntPtr((ulong)(logitRows * m.NVocab * 4L)), 0x1).ThrowOnError();
 
             Reset();
 
@@ -386,6 +428,44 @@ namespace TensorSharp.Cuda
                 $"[dsv4-cuda] {gib:F1} GiB of weights resident across {useDevs} GPU(s) " +
                 $"(layer split {string.Join("/", CountPerDev(assignment, useDevs))}), uploaded in {uploadSw.Elapsed.TotalSeconds:F1}s " +
                 $"(n_ctx={m.NCtx}, ubatch={m.NUbatch})");
+        }
+
+        /// <summary>
+        /// Places contiguous layer ranges so no device exceeds
+        /// <paramref name="limit"/> bytes (the last device additionally carries
+        /// <paramref name="extraLast"/>, the drafter). Every device gets at
+        /// least one layer and the last device owns the tail, which is what the
+        /// output head and the boundary hand-offs assume.
+        /// </summary>
+        private static bool TrySplit(long[] layerBytes, long extraLast, int nDev, long limit, int[] assignment)
+        {
+            int n = layerBytes.Length;
+            if (n < nDev)
+                return false;
+
+            int dev = 0, onDev = 0;
+            long acc = 0;
+            for (int il = 0; il < n; il++)
+            {
+                long budget = limit - (dev == nDev - 1 ? extraLast : 0);
+                bool mustMove = onDev > 0 && (acc + layerBytes[il] > budget || n - il <= nDev - 1 - dev);
+                if (mustMove)
+                {
+                    if (dev == nDev - 1)
+                        return false;
+                    dev++;
+                    onDev = 0;
+                    acc = 0;
+                    budget = limit - (dev == nDev - 1 ? extraLast : 0);
+                }
+                acc += layerBytes[il];
+                onDev++;
+                if (assignment != null)
+                    assignment[il] = dev;
+                if (acc > budget)
+                    return false;
+            }
+            return dev == nDev - 1;
         }
 
         private static int[] CountPerDev(int[] assignment, int nDev)
@@ -686,16 +766,16 @@ namespace TensorSharp.Cuda
             {
                 dst.CompK = AllocT(dev, DType.Float16, _compRowsCsa, hd);
                 dst.LidK = AllocT(dev, DType.Float16, _compRowsCsa, _m.IdxHeadSize);
-                dst.HistKv = AllocF32(dev, 2L * CsaRatio, 2L * hd);
-                dst.HistScore = AllocF32(dev, 2L * CsaRatio, 2L * hd);
-                dst.LidHistKv = AllocF32(dev, 2L * CsaRatio, 2L * _m.IdxHeadSize);
-                dst.LidHistScore = AllocF32(dev, 2L * CsaRatio, 2L * _m.IdxHeadSize);
+                dst.HistKv = AllocF32(dev, 2L * CsaRatio + _maxDraft, 2L * hd);
+                dst.HistScore = AllocF32(dev, 2L * CsaRatio + _maxDraft, 2L * hd);
+                dst.LidHistKv = AllocF32(dev, 2L * CsaRatio + _maxDraft, 2L * _m.IdxHeadSize);
+                dst.LidHistScore = AllocF32(dev, 2L * CsaRatio + _maxDraft, 2L * _m.IdxHeadSize);
             }
             else if (dst.Ratio == HcaRatio)
             {
                 dst.CompK = AllocT(dev, DType.Float16, _compRowsHca, hd);
-                dst.HistKv = AllocF32(dev, HcaRatio, hd);
-                dst.HistScore = AllocF32(dev, HcaRatio, hd);
+                dst.HistKv = AllocF32(dev, HcaRatio + _maxDraft, hd);
+                dst.HistScore = AllocF32(dev, HcaRatio + _maxDraft, hd);
             }
         }
 
@@ -811,6 +891,10 @@ namespace TensorSharp.Cuda
             foreach (var dl in _layers)
                 if (dl.Device == dev.Ordinal && dl.ShFf > shFf)
                     shFf = dl.ShFf;
+            if (_ds != null && _ds.Dev.Ordinal == dev.Ordinal)
+                foreach (var st in _ds.Stages)
+                    if (st.ShFf > shFf)
+                        shFf = st.ShFf;
             shFf = Math.Max(shFf, 1);
             dev.ShGate = AllocF32(dev, nt, shFf);
             dev.ShUp = AllocF32(dev, nt, shFf);
@@ -845,6 +929,7 @@ namespace TensorSharp.Cuda
                 Memset0(L.LidHistKv);
                 Memset0(L.LidHistScore);
             }
+            ResetDspark();
             NPast = 0;
         }
 
@@ -874,7 +959,7 @@ namespace TensorSharp.Cuda
             {
                 int nt = Math.Min(_m.NUbatch, tokens.Length - done);
                 bool last = done + nt == tokens.Length;
-                ForwardUbatch(tokens, done, nt, NPast, last ? logitsOut : null);
+                ForwardUbatch(tokens, done, nt, NPast, last ? logitsOut : null, false, null, 0);
                 NPast += nt;
                 done += nt;
             }
@@ -971,7 +1056,12 @@ namespace TensorSharp.Cuda
             Console.Error.WriteLine($"[dbg-cuda] {label}: {string.Join(" ", Array.ConvertAll(vals, v => v.ToString("G6")))}");
         }
 
-        private void ForwardUbatch(int[] tokens, int tokOff, int nt, int p0, float[] logitsOut)
+        /// <param name="allLogitsRows">Emit LM-head logits for every row (the
+        /// speculative verify) instead of only the last.</param>
+        /// <param name="hAllOut">When set, receives the DSpark target features of
+        /// every row, starting at row <paramref name="hRowOff"/>.</param>
+        private void ForwardUbatch(int[] tokens, int tokOff, int nt, int p0, float[] logitsOut,
+            bool allLogitsRows, float[] hAllOut, int hRowOff)
         {
             var m = _m;
             int e = m.NEmbd;
@@ -1082,6 +1172,22 @@ namespace TensorSharp.Cuda
                 if (StageDebug)
                     Dump(dev, $"L{il}.ffn.xs_post", dev.Xs);
                 CheckSync(dev, $"ffn L{il}");
+
+                // DSpark reads the mean over this block's output streams for a
+                // few late layers; capture them into the drafter's feature row.
+                if (_ds != null && (hAllOut != null || _dsSelfCatchUp) && DsparkCaptureEnabled && _ds.CaptureSlot[il] >= 0)
+                {
+                    dev.DK.HcMean(dev.Xs, _ds.CapH, nt, e, DsparkFeatureSize, _ds.CaptureSlot[il] * e, dev.Stream);
+                    CheckSync(dev, $"dspark capture L{il}");
+                }
+            }
+
+            if (DsparkCaptureEnabled)
+            {
+                if (_dsSelfCatchUp)
+                    DsparkWriteRingFromCapture(nt, p0);
+                else if (hAllOut != null)
+                    DsparkCaptureOut(nt, hAllOut, hRowOff);
             }
 
             if (logitsOut != null)
@@ -1090,22 +1196,23 @@ namespace TensorSharp.Cuda
                 if (curDev != _lastDev)
                     throw new InvalidOperationException("[dsv4-cuda] output head is not on the final layer device");
                 dev.MakeCurrent();
-                using (Tensor lastX = dev.Xs.Narrow(0, nt - 1, 1))
+                int headRows = allLogitsRows ? nt : 1;
+                Tensor logitsDst = allLogitsRows ? _specLogits : dev.Logits;
+                using (Tensor headX = allLogitsRows ? dev.Xs.CopyRef() : dev.Xs.Narrow(0, nt - 1, 1))
                 {
-                    dev.DK.HcHead(lastX, Ptr(_hcHeadFn), Ptr(_hcHeadScale), Ptr(_hcHeadBase), dev.Cur, e,
-                        m.HcHeadScale.Length, m.HcHeadBase.Length, m.RmsEps, dev.Stream);
+                    dev.DK.HcHead(headX, Ptr(_hcHeadFn), Ptr(_hcHeadScale), Ptr(_hcHeadBase), dev.Cur, e,
+                        m.HcHeadScale.Length, m.HcHeadBase.Length, m.RmsEps, dev.Stream, headRows);
                 }
                 Dump(dev, "head.cur", dev.Cur);
-                RmsNorm(dev, dev.Cur, _outputNorm, 1);
-                MatMul(dev, _outputQW, dev.Cur, dev.Logits, 1);
+                RmsNorm(dev, dev.Cur, _outputNorm, headRows);
+                MatMul(dev, _outputQW, dev.Cur, logitsDst, headRows);
                 StageEnd(dev, 10);
-                Dump(dev, "head.logits", dev.Logits, 8);
-                fixed (float* dst = _logitsHost)
-                {
-                    CudaDriverApi.cuMemcpyDtoHAsync((IntPtr)dst, Ptr(dev.Logits), new UIntPtr((ulong)m.NVocab * 4UL), dev.Stream).ThrowOnError();
-                    CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
-                }
-                Array.Copy(_logitsHost, logitsOut, m.NVocab);
+                Dump(dev, "head.logits", logitsDst, 8);
+                long logitCount = (long)headRows * m.NVocab;
+                CudaDriverApi.cuMemcpyDtoHAsync(_pinnedLogits, Ptr(logitsDst), new UIntPtr((ulong)logitCount * 4UL), dev.Stream).ThrowOnError();
+                CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+                fixed (float* dst = logitsOut)
+                    Buffer.MemoryCopy((void*)_pinnedLogits, dst, logitsOut.LongLength * 4L, logitCount * 4L);
             }
         }
 
@@ -1175,14 +1282,14 @@ namespace TensorSharp.Cuda
                 MatMul(dev, l.CompWkv, dev.Cur, dev.StKv, nt);
                 MatMul(dev, l.CompWgate, dev.Cur, dev.StScore, nt);
                 dev.DK.ApeAdd(dev.StScore, Ptr(l.CompApe), p0, CsaRatio, nt, cw, dev.Stream);
-                RunCompressor(dev, nt, p0, CsaRatio, 2, hd, 2 * CsaRatio, cw,
+                RunCompressor(dev, nt, p0, CsaRatio, 2, hd, 2 * CsaRatio + _maxDraft, cw,
                     dev.StKv, dev.StScore, l.HistKv, l.HistScore, l.CompNorm, l.CompK, dev.RopeComp);
 
                 int lcw = 2 * m.IdxHeadSize;
                 MatMul(dev, l.IdxCompWkv, dev.Cur, dev.LidStKv, nt);
                 MatMul(dev, l.IdxCompWgate, dev.Cur, dev.LidStScore, nt);
                 dev.DK.ApeAdd(dev.LidStScore, Ptr(l.IdxCompApe), p0, CsaRatio, nt, lcw, dev.Stream);
-                RunCompressor(dev, nt, p0, CsaRatio, 2, m.IdxHeadSize, 2 * CsaRatio, lcw,
+                RunCompressor(dev, nt, p0, CsaRatio, 2, m.IdxHeadSize, 2 * CsaRatio + _maxDraft, lcw,
                     dev.LidStKv, dev.LidStScore, l.LidHistKv, l.LidHistScore, l.IdxCompNorm, l.LidK, dev.RopeComp);
                 StageEnd(dev, 3);
                 CheckSync(dev, $"compress L{il}");
@@ -1212,7 +1319,7 @@ namespace TensorSharp.Cuda
                 MatMul(dev, l.CompWkv, dev.Cur, dev.StKv, nt);
                 MatMul(dev, l.CompWgate, dev.Cur, dev.StScore, nt);
                 dev.DK.ApeAdd(dev.StScore, Ptr(l.CompApe), p0, HcaRatio, nt, hd, dev.Stream);
-                RunCompressor(dev, nt, p0, HcaRatio, 1, hd, HcaRatio, hd,
+                RunCompressor(dev, nt, p0, HcaRatio, 1, hd, HcaRatio + _maxDraft, hd,
                     dev.StKv, dev.StScore, l.HistKv, l.HistScore, l.CompNorm, l.CompK, dev.RopeComp);
                 StageEnd(dev, 3);
                 CheckSync(dev, $"compress L{il}");
@@ -1323,6 +1430,7 @@ namespace TensorSharp.Cuda
             RequireExpertType(downType);
 
             bool staged = StagedExpertsEnabled && nt > 1
+                && StagedSupportsType(guType) && StagedSupportsType(downType)
                 && Dsv4Kernels.StagedSupports(e) && Dsv4Kernels.StagedSupports(ff);
             if (staged)
                 QuantizeQ81Split(dev, dev.Cur, dev.SplitQsA, dev.SplitDA, e, nt);
@@ -1400,9 +1508,19 @@ namespace TensorSharp.Cuda
 
         private static void RequireExpertType(int type)
         {
-            if (type != TIQ3_S && type != TMXFP4 && type != TQ8_0 && type != TQ6_K)
-                throw new NotSupportedException($"[dsv4-cuda] unsupported expert quant type {type} (supported: Q8_0, Q6_K, IQ3_S, MXFP4)");
+            if (type != TIQ3_S && type != TMXFP4 && type != TQ8_0 && type != TQ6_K
+                && type != TIQ2_XXS && type != TQ2_K)
+            {
+                throw new NotSupportedException(
+                    $"[dsv4-cuda] unsupported expert quant type {type} (supported: Q8_0, Q6_K, Q2_K, IQ3_S, IQ2_XXS, MXFP4)");
+            }
         }
+
+        /// <summary>The register-staged expert kernels decode a fixed set of
+        /// weight layouts; the low-bit types (used by the DSpark drafter) only
+        /// have the per-token path.</summary>
+        private static bool StagedSupportsType(int type)
+            => type == TIQ3_S || type == TMXFP4 || type == TQ8_0 || type == TQ6_K;
 
         // -------------------------------------------------------------------
         // dense matmul dispatch

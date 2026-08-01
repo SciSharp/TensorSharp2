@@ -178,11 +178,42 @@ struct dsv4_slot_layer
 // One independent sequence context: its own caches + position, sharing the
 // model weights. The server's continuous-batching engine binds one slot per
 // in-flight request; the CLI / single-stream path only ever uses slot 0.
+// DSpark speculative decoding: the checkpoint's `mtp.*` support module, loaded
+// from a separate drafter GGUF. Three DSV4 blocks (compress_ratio 0) that read
+// the trunk's hidden states, a Markov head that conditions each block position
+// on the token before it, and a confidence head predicting per-position
+// acceptance. The stage weights are appended to dsv4_model::layers so the
+// existing MoE / hyper-connection builders work on them unchanged.
+struct dsv4_dspark
+{
+    bool loaded = false;
+    int32_t block_size = 0;
+    int32_t markov_rank = 0;
+    int32_t noise_token = 0;
+    int32_t n_stages = 0;
+    std::vector<int32_t> target_layers;   // trunk blocks whose output feeds main_proj
+    int layer_base = 0;                   // index of stage 0 in dsv4_model::layers
+    int dev = 0;                          // hosting device (the output head's)
+
+    ggml_tensor * main_norm = nullptr;
+    ggml_tensor * main_proj = nullptr;
+    ggml_tensor * norm = nullptr;
+    ggml_tensor * hc_head_fn = nullptr;
+    ggml_tensor * hc_head_scale = nullptr;
+    ggml_tensor * hc_head_base = nullptr;
+    ggml_tensor * markov_w1 = nullptr;
+    ggml_tensor * markov_w2 = nullptr;
+    ggml_tensor * conf_proj = nullptr;
+};
+
 struct dsv4_slot
 {
     int id = 0;
     int32_t n_past = 0;
     std::vector<dsv4_slot_layer> layers;
+    // DSpark: one SWA ring per drafter stage, keyed by trunk position and fed
+    // from the trunk's own hidden states (see build_dspark_ring_update).
+    std::vector<ggml_tensor *> ds_k;
     ggml_context * ctx[MAX_GPUS + 1] = {};
     ggml_backend_buffer_t buf[MAX_GPUS + 1] = {};
 
@@ -246,7 +277,12 @@ struct graph_inputs
     ggml_tensor * raw_mask[MAX_GPUS + 1] = {};  // F16 [ring, nt]
     // decode index-gather mode: F16 [ring + top_k, 1] (top-k tail all zeros)
     ggml_tensor * gather_mask[MAX_GPUS + 1] = {};
-    ggml_tensor * out_ids = nullptr;            // I32 [1] (last device)
+    ggml_tensor * out_ids = nullptr;            // I32 [1] or [nt] (last device)
+    // DSpark draft graph inputs (drafter device)
+    ggml_tensor * ds_tokens = nullptr;          // I32 [block]  [anchor, noise...]
+    ggml_tensor * ds_pos = nullptr;             // I32 [block]
+    ggml_tensor * ds_idxs = nullptr;            // I64 [block]  ring slots of the block
+    ggml_tensor * ds_mask = nullptr;            // F16 [ring + block, block]
     plan_inputs csa[MAX_GPUS + 1];
     plan_inputs hca[MAX_GPUS + 1];
     plan_inputs lid[MAX_GPUS + 1];
@@ -281,6 +317,10 @@ struct graph_build_result
     ggml_backend_sched_t sched = nullptr;   // owned; keeps this graph's allocation alive
     graph_inputs inp;
     ggml_tensor * logits = nullptr;
+    ggml_tensor * ds_toks = nullptr;    // I32 [block] drafted ids
+    ggml_tensor * ds_conf = nullptr;    // F32 [block] acceptance probabilities
+    bool all_logits = false;            // logits for every row (speculative verify)
+    bool draft = false;                 // this entry is the drafter's graph
     comp_plan plan_csa;
     comp_plan plan_hca;
     comp_plan plan_lid;
@@ -341,6 +381,14 @@ struct dsv4_model
     ggml_tensor * hc_head_scale = nullptr;
 
     std::vector<dsv4_layer> layers;
+    dsv4_dspark ds;
+
+    // Extra rows in every compressor state ring, so a speculative verify's
+    // REJECTED tail cannot alias a row the next pass still reads (a rejected
+    // write at position q and a live read at position p are less than
+    // window+max_draft apart, so widening the modulus by max_draft decouples
+    // them and rollback needs no restore at all).
+    int64_t state_extra = 0;
 
     // geometry
     int32_t n_ctx = 0;
@@ -647,9 +695,20 @@ static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
 
     for (int d = 0; d <= m.n_gpu; d++)
     {
-        ggml_init_params cp = { (size_t) (hp.n_layer * 10 + 16) * ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params cp = { (size_t) (hp.n_layer * 10 + 32) * ggml_tensor_overhead(), nullptr, true };
         slot->ctx[d] = ggml_init(cp);
         if (!slot->ctx[d]) return nullptr;
+    }
+
+    if (m.ds.loaded)
+    {
+        slot->ds_k.assign(m.ds.n_stages, nullptr);
+        for (int s = 0; s < m.ds.n_stages; s++)
+        {
+            slot->ds_k[s] = ggml_new_tensor_2d(slot->ctx[m.ds.dev], GGML_TYPE_F16,
+                                               hp.n_embd_head, m.ring_raw);
+            ggml_format_name(slot->ds_k[s], "cache_ds_k.%d.%d", slot->id, s);
+        }
     }
 
     for (int il = 0; il < hp.n_layer; il++)
@@ -673,10 +732,10 @@ static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
             ggml_format_name(C.csa_k, "cache_csa_k.%d.%d", slot->id, il);
             C.lid_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.indexer_head_size, m.n_csa_rows);
             ggml_format_name(C.lid_k, "cache_lid_k.%d.%d", slot->id, il);
-            C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
-            C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + 1);
-            C.lid_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
-            C.lid_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + 1);
+            C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + m.state_extra + 1);
+            C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head, 2 * CSA_RATIO + m.state_extra + 1);
+            C.lid_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + m.state_extra + 1);
+            C.lid_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * hp.indexer_head_size, 2 * CSA_RATIO + m.state_extra + 1);
             ggml_format_name(C.comp_state_kv, "state_csa_kv.%d.%d", slot->id, il);
             ggml_format_name(C.comp_state_score, "state_csa_score.%d.%d", slot->id, il);
             ggml_format_name(C.lid_state_kv, "state_lid_kv.%d.%d", slot->id, il);
@@ -686,8 +745,8 @@ static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
         {
             C.hca_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, head, m.n_hca_rows);
             ggml_format_name(C.hca_k, "cache_hca_k.%d.%d", slot->id, il);
-            C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, HCA_RATIO + 1);
-            C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, HCA_RATIO + 1);
+            C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, HCA_RATIO + m.state_extra + 1);
+            C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, HCA_RATIO + m.state_extra + 1);
             ggml_format_name(C.comp_state_kv, "state_hca_kv.%d.%d", slot->id, il);
             ggml_format_name(C.comp_state_score, "state_hca_score.%d.%d", slot->id, il);
         }
@@ -777,7 +836,108 @@ static void dsv4_upload_rope_tables(dsv4_model & m)
     }
 }
 
-static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch, int n_threads)
+// Reads the drafter GGUF's metadata and registers its tensors as an extra
+// shard, so the normal create+upload path moves them. Returns false only on a
+// malformed/mismatched file; a null path just leaves DSpark disabled.
+static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
+                             shard_files & shards, std::map<std::string, tensor_source> & sources,
+                             size_t * out_bytes)
+{
+    if (out_bytes) *out_bytes = 0;
+    if (!dspark_path || !*dspark_path) return true;
+
+    ggml_context * meta = nullptr;
+    gguf_init_params sp = { true, &meta };
+    gguf_context * g = gguf_init_from_file(dspark_path, sp);
+    if (!g)
+    {
+        fprintf(stderr, "[dsv4] failed to open DSpark drafter %s\n", dspark_path);
+        return false;
+    }
+
+    // Published drafters carry the same weights under three naming schemes
+    // (the ds4 builder's mtp.* plus two dspark.* variants that differ in the
+    // metadata prefix), so try every spelling for both keys and tensors.
+    auto kv_u32 = [&](std::initializer_list<const char *> keys, int32_t * out) -> bool
+    {
+        for (const char * k : keys)
+            if (gguf_get_u32_key(g, k, out)) return true;
+        return false;
+    };
+    auto kv_arr = [&](std::initializer_list<const char *> keys, std::vector<int32_t> & out) -> bool
+    {
+        for (const char * k : keys)
+            if (gguf_get_arr_i32(g, k, out)) return true;
+        return false;
+    };
+
+    dsv4_dspark & ds = m.ds;
+    bool ok = true;
+    ok &= kv_u32({ "dspark.block_size", "deepseek4.dspark.block_size" }, &ds.block_size);
+    ok &= kv_u32({ "dspark.markov_rank", "deepseek4.dspark.markov_rank" }, &ds.markov_rank);
+    ok &= kv_u32({ "dspark.noise_token_id", "deepseek4.dspark.noise_token_id" }, &ds.noise_token);
+    ok &= kv_u32({ "dspark.n_layers", "dspark.stage_count", "dspark.layer_count",
+                   "deepseek4.dspark.n_layers", "deepseek4.dspark.layer_count" }, &ds.n_stages);
+    ok &= kv_arr({ "dspark.target_layer_ids", "dspark.target_layers",
+                   "deepseek4.dspark.target_layer_ids", "deepseek4.dspark.target_layers" }, ds.target_layers);
+    if (!ok || ds.block_size <= 0 || ds.n_stages <= 0 || ds.markov_rank <= 0 || ds.target_layers.empty())
+    {
+        fprintf(stderr, "[dsv4] %s is missing dspark.* metadata\n", dspark_path);
+        gguf_free(g); if (meta) ggml_free(meta);
+        return false;
+    }
+    for (int32_t tl : ds.target_layers)
+    {
+        if (tl < 0 || tl >= m.hp.n_layer)
+        {
+            fprintf(stderr, "[dsv4] DSpark target layer %d out of range\n", (int) tl);
+            gguf_free(g); if (meta) ggml_free(meta);
+            return false;
+        }
+    }
+
+    const char * arch = nullptr;
+    {
+        const int64_t ai = gguf_find_key(g, "general.architecture");
+        if (ai >= 0 && gguf_get_kv_type(g, ai) == GGUF_TYPE_STRING)
+            arch = gguf_get_val_str(g, ai);
+    }
+    if (arch && strcmp(arch, "deepseek4-dspark") != 0 && strcmp(arch, "deepseek_v4_flash_dspark_draft") != 0)
+    {
+        fprintf(stderr, "[dsv4] %s is a '%s' drafter, not a DeepSeek V4 DSpark one; DSpark drafters for other "
+                        "architectures use a different design and are not supported\n", dspark_path, arch);
+        gguf_free(g); if (meta) ggml_free(meta);
+        return false;
+    }
+
+    const int si = (int) shards.paths.size();
+    shards.paths.push_back(dspark_path);
+
+    const size_t data_off = gguf_get_data_offset(g);
+    const int64_t n_tensors = gguf_get_n_tensors(g);
+    for (int64_t ti = 0; ti < n_tensors; ti++)
+    {
+        const char * name = gguf_get_tensor_name(g, ti);
+        ggml_tensor * mt = ggml_get_tensor(meta, name);
+        if (!mt) continue;
+        tensor_source src;
+        src.shard = si;
+        src.offset = data_off + gguf_get_tensor_offset(g, ti);
+        src.size = ggml_nbytes(mt);
+        src.type = mt->type;
+        for (int d = 0; d < 4; d++) src.ne[d] = mt->ne[d];
+        sources[name] = src;
+        if (out_bytes) *out_bytes += src.size;
+    }
+
+    gguf_free(g);
+    if (meta) ggml_free(meta);
+    ds.loaded = true;
+    return true;
+}
+
+static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch, int n_threads,
+                              const char * dspark_path)
 {
     auto t_start = std::chrono::steady_clock::now();
 
@@ -946,12 +1106,26 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         ggml_free(meta);
     }
 
+    size_t dspark_bytes = 0;
+    if (!dsv4_scan_dspark(*m, dspark_path, shards, sources, &dspark_bytes))
+        return nullptr;
+    // The drafter lands entirely on the output-head device, so it has to weigh
+    // on the split: counted as root bytes it pushes whole layers onto the
+    // earlier devices instead of overflowing the last one.
+    root_bytes += dspark_bytes;
+
     // --- vocab size from tok_embd ---
+    // Its size is also where the split learns how the root bytes really land:
+    // the embedding table on the first device, the output head and the whole
+    // drafter on the last one (see the W(dev_first/dev_last) placements below).
+    size_t embd_bytes = 0;
     {
         auto it = sources.find("token_embd.weight");
         if (it == sources.end()) { fprintf(stderr, "[dsv4] token_embd missing\n"); return nullptr; }
         hp.n_vocab = (int32_t) it->second.ne[1];
+        embd_bytes = it->second.size;
     }
+    const size_t head_bytes = root_bytes - embd_bytes;
 
     // --- geometry ---
     m->n_ctx = n_ctx > 0 ? n_ctx : 16384;
@@ -962,18 +1136,71 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     m->n_csa_rows = pad64(m->n_ctx / CSA_RATIO + 1, 256);
     m->n_hca_rows = pad64(m->n_ctx / HCA_RATIO + 1, 256);
 
-    // --- layer -> device split by cumulative weight bytes ---
+    // --- layer -> device split ------------------------------------------
+    // Minimize the LARGEST per-device load, counting each device's fixed
+    // residents (embedding table on the first, output head + drafter on the
+    // last). Spreading those fixed bytes evenly instead -- what a plain
+    // byte-proportional split does -- hands the first device a share of layers
+    // it should never have had: with a drafter loaded that was ~1.7 GB of
+    // surplus weights on device 0, enough that a long prompt's prefill compute
+    // buffer no longer fit and ggml's allocator faulted.
     size_t total_bytes = root_bytes;
     for (auto b : layer_bytes) total_bytes += b;
     m->layers.resize(hp.n_layer);
     {
-        size_t acc = 0;
-        for (int il = 0; il < hp.n_layer; il++)
+        std::vector<size_t> fixed_bytes((size_t) n_gpu, 0);
+        fixed_bytes[0] += embd_bytes;
+        fixed_bytes[(size_t) n_gpu - 1] += head_bytes;
+
+        // Layers stay in pipeline order, so every device takes one contiguous
+        // run: fill each device up to `cap`, and report how many devices that
+        // needed (n_gpu + 1 = "does not fit").
+        auto assign = [&](size_t cap, std::vector<int> * out) -> int
         {
-            int dev = (int) ((acc * n_gpu) / (total_bytes + 1));
-            if (dev >= n_gpu) dev = n_gpu - 1;
-            m->layers[il].device = dev;
-            acc += layer_bytes[il];
+            int dev = 0;
+            size_t used = fixed_bytes[0];
+            for (int il = 0; il < hp.n_layer; il++)
+            {
+                while (used + layer_bytes[il] > cap)
+                {
+                    if (dev + 1 >= n_gpu) return n_gpu + 1;
+                    used = fixed_bytes[++dev];
+                }
+                used += layer_bytes[il];
+                if (out) (*out)[il] = dev;
+            }
+            return dev + 1;
+        };
+
+        size_t lo = 1, hi = total_bytes;
+        while (lo < hi)
+        {
+            size_t mid = lo + (hi - lo) / 2;
+            if (assign(mid, nullptr) <= n_gpu) hi = mid;
+            else lo = mid + 1;
+        }
+
+        std::vector<int> devs((size_t) hp.n_layer, 0);
+        int used_devs = assign(lo, &devs);
+        if (used_devs == n_gpu)
+        {
+            for (int il = 0; il < hp.n_layer; il++)
+                m->layers[il].device = devs[il];
+        }
+        else
+        {
+            // Fewer layers than devices, or a fixed resident so large that a
+            // device cannot take any layer: the balanced split would leave the
+            // output head stranded on a device the pipeline never reaches, so
+            // fall back to spreading by cumulative bytes.
+            size_t acc = 0;
+            for (int il = 0; il < hp.n_layer; il++)
+            {
+                int dev = (int) ((acc * n_gpu) / (total_bytes + 1));
+                if (dev >= n_gpu) dev = n_gpu - 1;
+                m->layers[il].device = dev;
+                acc += layer_bytes[il];
+            }
         }
     }
 
@@ -993,6 +1220,34 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     {
         return dsv4_create_weight(*m, sources, device, fmt, args...);
     };
+
+    if (m->ds.loaded)
+    {
+        // The drafter runs where the output head lives: it consumes the last
+        // trunk blocks' hidden states and reuses the trunk's LM head.
+        m->ds.dev = dev_last;
+        m->ds.layer_base = hp.n_layer;
+        for (int32_t tl : m->ds.target_layers)
+        {
+            if (m->layers[tl].device != dev_last)
+            {
+                fprintf(stderr, "[dsv4] DSpark needs target layer %d on the output-head device %d (it is on %d)\n",
+                        (int) tl, dev_last, m->layers[tl].device);
+                return nullptr;
+            }
+        }
+        m->layers.resize(hp.n_layer + m->ds.n_stages);
+        for (int s = 0; s < m->ds.n_stages; s++)
+        {
+            m->layers[hp.n_layer + s].device = dev_last;
+            hp.compress_ratios.push_back(0);
+            if (!hp.swiglu_clamp_exp.empty())
+                hp.swiglu_clamp_exp.push_back(hp.swiglu_clamp_exp.back());
+            if (!hp.swiglu_clamp_shexp.empty())
+                hp.swiglu_clamp_shexp.push_back(hp.swiglu_clamp_shexp.back());
+        }
+        m->state_extra = m->ds.block_size;
+    }
 
     m->tok_embd = W(dev_first, "token_embd.weight");
     m->output_norm = W(dev_last, "output_norm.weight");
@@ -1062,6 +1317,82 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             fprintf(stderr, "[dsv4] layer %d incomplete\n", il);
             return nullptr;
         }
+    }
+
+    if (m->ds.loaded)
+    {
+        dsv4_dspark & ds = m->ds;
+        // First spelling present in the drafter file wins (see dsv4_scan_dspark).
+        auto pick = [&](const std::string & a, const std::string & b) -> std::string
+        {
+            return sources.count(a) ? a : b;
+        };
+        auto DSW = [&](int d, const std::string & a, const std::string & b) -> ggml_tensor *
+        {
+            return dsv4_create_weight(*m, sources, d, "%s", pick(a, b).c_str());
+        };
+        auto SW = [&](int d, int st, const char * suffix) -> ggml_tensor *
+        {
+            const std::string n = std::to_string(st);
+            return DSW(d, "mtp." + n + "." + suffix, "dspark." + n + "." + suffix);
+        };
+        for (int st = 0; st < ds.n_stages; st++)
+        {
+            dsv4_layer & L = m->layers[hp.n_layer + st];
+            const int d = ds.dev;
+            L.attn_norm      = SW(d, st, "attn_norm.weight");
+            L.attn_q_a_norm  = SW(d, st, "attn_q_a_norm.weight");
+            L.attn_kv_norm   = SW(d, st, "attn_kv_a_norm.weight");
+            L.attn_sinks     = SW(d, st, "attn_sinks.weight");
+            L.wq_a           = SW(d, st, "attn_q_a.weight");
+            L.wq_b           = SW(d, st, "attn_q_b.weight");
+            L.wkv            = SW(d, st, "attn_kv.weight");
+            L.wo_a           = SW(d, st, "attn_output_a.weight");
+            L.wo_b           = SW(d, st, "attn_output_b.weight");
+            L.hc_attn_fn     = SW(d, st, "hc_attn_fn.weight");
+            L.hc_attn_scale  = SW(d, st, "hc_attn_scale.weight");
+            L.hc_attn_base   = SW(d, st, "hc_attn_base.weight");
+            L.hc_ffn_fn      = SW(d, st, "hc_ffn_fn.weight");
+            L.hc_ffn_scale   = SW(d, st, "hc_ffn_scale.weight");
+            L.hc_ffn_base    = SW(d, st, "hc_ffn_base.weight");
+            L.ffn_norm       = SW(d, st, "ffn_norm.weight");
+            L.ffn_gate_inp   = SW(d, st, "ffn_gate_inp.weight");
+            L.ffn_exp_probs_b = SW(d, st, "exp_probs_b.bias");
+            L.ffn_gate_exps  = SW(d, st, "ffn_gate_exps.weight");
+            L.ffn_down_exps  = SW(d, st, "ffn_down_exps.weight");
+            L.ffn_up_exps    = SW(d, st, "ffn_up_exps.weight");
+            L.ffn_gate_shexp = SW(d, st, "ffn_gate_shexp.weight");
+            L.ffn_down_shexp = SW(d, st, "ffn_down_shexp.weight");
+            L.ffn_up_shexp   = SW(d, st, "ffn_up_shexp.weight");
+            if (!L.attn_norm || !L.wq_a || !L.wq_b || !L.wkv || !L.wo_a || !L.wo_b ||
+                !L.ffn_gate_exps || !L.ffn_down_exps || !L.ffn_up_exps || !L.ffn_gate_inp)
+            {
+                fprintf(stderr, "[dsv4] DSpark stage %d is incomplete\n", st);
+                return nullptr;
+            }
+        }
+        const std::string last = std::to_string(ds.n_stages - 1);
+        ds.main_norm     = DSW(ds.dev, "mtp.0.main_norm.weight", "dspark.main_norm.weight");
+        ds.main_proj     = DSW(ds.dev, "mtp.0.main_proj.weight", "dspark.main_proj.weight");
+        ds.norm          = DSW(ds.dev, "mtp." + last + ".norm.weight", "dspark.norm.weight");
+        ds.hc_head_fn    = DSW(ds.dev, "mtp." + last + ".hc_head_fn.weight", "dspark.hc_head_fn.weight");
+        ds.hc_head_scale = DSW(ds.dev, "mtp." + last + ".hc_head_scale.weight", "dspark.hc_head_scale.weight");
+        ds.hc_head_base  = DSW(ds.dev, "mtp." + last + ".hc_head_base.weight", "dspark.hc_head_base.weight");
+        ds.markov_w1     = DSW(ds.dev, "mtp." + last + ".markov_head.markov_w1.weight", "dspark.markov_w1.weight");
+        ds.markov_w2     = DSW(ds.dev, "mtp." + last + ".markov_head.markov_w2.weight", "dspark.markov_w2.weight");
+        ds.conf_proj     = DSW(ds.dev, "mtp." + last + ".confidence_head.proj.weight",
+                               sources.count("dspark.conf_proj.weight") ? "dspark.conf_proj.weight"
+                                                                       : "dspark.confidence_head.weight");
+        if (!ds.main_norm || !ds.main_proj || !ds.norm || !ds.hc_head_fn || !ds.markov_w1 ||
+            !ds.markov_w2 || !ds.conf_proj)
+        {
+            fprintf(stderr, "[dsv4] DSpark heads are incomplete\n");
+            return nullptr;
+        }
+        fprintf(stderr, "[dsv4] DSpark drafter on device %d: %d stage(s), block_size=%d, markov_rank=%d, "
+                "target_layers=[%d..%d], noise_token=%d\n",
+                ds.dev, ds.n_stages, ds.block_size, ds.markov_rank,
+                (int) ds.target_layers.front(), (int) ds.target_layers.back(), ds.noise_token);
     }
 
     // rope cos/sin tables for the fused table-driven kernels (per device)
@@ -1466,19 +1797,255 @@ struct graph_builder
 
     ggml_tensor * build_hc_head(ggml_tensor * x)
     {
+        return build_hc_head_w(x, m.hc_head_fn, m.hc_head_scale, m.hc_head_base);
+    }
+
+    ggml_tensor * build_hc_head_w(ggml_tensor * x, ggml_tensor * fn, ggml_tensor * scale, ggml_tensor * base)
+    {
         const int64_t hc = hp.hc_mult;
         const int64_t hc_dim = hc * hp.n_embd;
         const int64_t n = x->ne[2];
 
         ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc_dim, n);
         ggml_tensor * flat_norm = ggml_rms_norm(ctx, flat, hp.rms_eps);
-        ggml_tensor * mixes = ggml_mul_mat(ctx, m.hc_head_fn, flat_norm);
+        ggml_tensor * mixes = ggml_mul_mat(ctx, fn, flat_norm);
 
-        ggml_tensor * pre = hc_affine(mixes, m.hc_head_scale, m.hc_head_base);
+        ggml_tensor * pre = hc_affine(mixes, scale, base);
         pre = ggml_sigmoid(ctx, pre);
         pre = ggml_scale_bias(ctx, pre, 1.0f, hp.hc_eps);
 
         return ggml_dsv4_hc_pre(ctx, x, pre);
+    }
+
+    // ---- DSpark drafter ----
+
+    // Mean over the hyper-connection streams: [n_embd, hc, n] -> [n_embd, n].
+    // This is what the drafter's main_proj consumes from each target layer.
+    ggml_tensor * hc_mean(ggml_tensor * x)
+    {
+        const int64_t hc = hp.hc_mult;
+        const int64_t n = x->ne[2];
+        ggml_tensor * acc = nullptr;
+        for (int64_t c = 0; c < hc; c++)
+        {
+            ggml_tensor * v = ggml_cont(ctx, ggml_view_2d(ctx, x, hp.n_embd, n, x->nb[2], c * x->nb[1]));
+            acc = acc ? ggml_add(ctx, acc, v) : v;
+        }
+        return ggml_scale(ctx, acc, 1.0f / (float) hc);
+    }
+
+    // Commit one key row per COMMITTED position into every drafter stage's SWA
+    // ring, straight from the trunk's own hidden states. Doing it inside the
+    // trunk graph is what keeps prefill free of host round trips: the drafter
+    // never needs a catch-up pass of its own.
+    void build_dspark_ring_update(const std::vector<ggml_tensor *> & feats,
+                                  ggml_tensor * inp_pos, ggml_tensor * raw_idxs)
+    {
+        const dsv4_dspark & ds = m.ds;
+        const int64_t head = hp.n_embd_head;
+        const int64_t n_rope = hp.n_rot;
+        const int64_t n_nope = head - n_rope;
+
+        ggml_tensor * feat = feats[0];
+        for (size_t i = 1; i < feats.size(); i++)
+            feat = ggml_concat(ctx, feat, feats[i], 0);          // [n_target*n_embd, nt]
+
+        ggml_tensor * mx = ggml_mul_mat(ctx, ds.main_proj, feat); // [n_embd, nt]
+        mx = rms(mx, ds.main_norm);
+
+        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+        int n_ctx_orig;
+        rope_params(ds.layer_base, freq_base, freq_scale, ext_factor, attn_factor,
+                    beta_fast, beta_slow, n_ctx_orig);
+
+        for (int st = 0; st < ds.n_stages; st++)
+        {
+            const dsv4_layer & L = m.layers[ds.layer_base + st];
+            ggml_tensor * kv = ggml_mul_mat(ctx, L.wkv, mx);
+            kv = rms(kv, L.attn_kv_norm);
+            kv = ggml_reshape_3d(ctx, kv, head, 1, nt);
+
+            ggml_tensor * kv_nope = ggml_view_3d(ctx, kv, n_nope, 1, nt,
+                    ggml_row_size(kv->type, head), ggml_row_size(kv->type, head), 0);
+            ggml_tensor * kv_pe = ggml_view_3d(ctx, kv, n_rope, 1, nt,
+                    ggml_row_size(kv->type, head), ggml_row_size(kv->type, head),
+                    ggml_row_size(kv->type, n_nope));
+            kv_pe = ggml_rope_ext(ctx, kv_pe, inp_pos, nullptr, (int) n_rope, GGML_ROPE_TYPE_NORMAL,
+                                  n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+                                  beta_fast, beta_slow);
+            kv = ggml_concat(ctx, kv_nope, kv_pe, 0);
+
+            ggml_tensor * kv2d = ggml_reshape_2d(ctx, kv, head, nt);
+            ggml_build_forward_expand(gf,
+                ggml_set_rows(ctx, m.active_slot->ds_k[st], kv2d, raw_idxs));
+        }
+    }
+
+    // Block attention for one drafter stage: queries at the block's positions
+    // over [committed ring | the block itself], the block part NON-causal (the
+    // mask input carries both halves).
+    ggml_tensor * build_dspark_attention(int st, ggml_tensor * cur, ggml_tensor * inp_pos)
+    {
+        const dsv4_layer & L = m.layers[m.ds.layer_base + st];
+        const int64_t head = hp.n_embd_head;
+        const int64_t n_head = hp.n_head;
+        const int64_t n_rope = hp.n_rot;
+        const int64_t n_nope = head - n_rope;
+        const int64_t n_groups = hp.o_groups;
+        const int64_t o_lora = hp.o_lora_rank;
+        const int64_t o_group_dim = (n_head / n_groups) * head;
+
+        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+        int n_ctx_orig;
+        rope_params(m.ds.layer_base + st, freq_base, freq_scale, ext_factor, attn_factor,
+                    beta_fast, beta_slow, n_ctx_orig);
+        auto rope_l = [&](ggml_tensor * x, ggml_tensor * pos)
+        {
+            return ggml_rope_ext(ctx, x, pos, nullptr, (int) n_rope, GGML_ROPE_TYPE_NORMAL, n_ctx_orig,
+                                 freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        };
+
+        ggml_tensor * qr = ggml_mul_mat(ctx, L.wq_a, cur);
+        qr = rms(qr, L.attn_q_a_norm);
+        ggml_tensor * q = ggml_mul_mat(ctx, L.wq_b, qr);
+        q = ggml_reshape_3d(ctx, q, head, n_head, nt);
+        q = ggml_rms_norm(ctx, q, hp.rms_eps);
+        {
+            ggml_tensor * q_nope = ggml_view_3d(ctx, q, n_nope, n_head, nt,
+                    ggml_row_size(q->type, head), ggml_row_size(q->type, head) * n_head, 0);
+            ggml_tensor * q_pe = ggml_view_3d(ctx, q, n_rope, n_head, nt,
+                    ggml_row_size(q->type, head), ggml_row_size(q->type, head) * n_head,
+                    ggml_row_size(q->type, n_nope));
+            q_pe = rope_l(q_pe, inp_pos);
+            q = ggml_concat(ctx, q_nope, q_pe, 0);
+        }
+
+        ggml_tensor * kv = ggml_mul_mat(ctx, L.wkv, cur);
+        kv = rms(kv, L.attn_kv_norm);
+        kv = ggml_reshape_3d(ctx, kv, head, 1, nt);
+        {
+            ggml_tensor * kv_nope = ggml_view_3d(ctx, kv, n_nope, 1, nt,
+                    ggml_row_size(kv->type, head), ggml_row_size(kv->type, head), 0);
+            ggml_tensor * kv_pe = ggml_view_3d(ctx, kv, n_rope, 1, nt,
+                    ggml_row_size(kv->type, head), ggml_row_size(kv->type, head),
+                    ggml_row_size(kv->type, n_nope));
+            kv_pe = rope_l(kv_pe, inp_pos);
+            kv = ggml_concat(ctx, kv_nope, kv_pe, 0);
+        }
+
+        // [ring | block] keys. The block's own keys stay in the graph (they are
+        // speculative, not committed), so they are concatenated rather than
+        // written to the ring.
+        ggml_tensor * ring = ggml_view_2d(ctx, m.active_slot->ds_k[st], head, m.ring_raw,
+                                          m.active_slot->ds_k[st]->nb[1], 0);
+        ring = ggml_reshape_3d(ctx, ring, head, 1, m.ring_raw);
+        ggml_tensor * blk = ggml_cast(ctx, ggml_reshape_2d(ctx, kv, head, nt), GGML_TYPE_F16);
+        blk = ggml_reshape_3d(ctx, blk, head, 1, nt);
+        ggml_tensor * k_all = ggml_concat(ctx, ring, blk, 2);
+
+        const float kq_scale = 1.0f / sqrtf((float) head);
+        ggml_tensor * out = attn_mha(q, k_all, res.inp.ds_mask, L.attn_sinks, kq_scale);
+
+        out = ggml_reshape_3d(ctx, out, head, n_head, nt);
+        ggml_tensor * out_nope = ggml_view_3d(ctx, out, n_nope, n_head, nt,
+                ggml_row_size(out->type, head), ggml_row_size(out->type, head) * n_head, 0);
+        ggml_tensor * out_pe = ggml_view_3d(ctx, out, n_rope, n_head, nt,
+                ggml_row_size(out->type, head), ggml_row_size(out->type, head) * n_head,
+                ggml_row_size(out->type, n_nope));
+        out_pe = ggml_rope_ext_back(ctx, out_pe, inp_pos, nullptr, (int) n_rope, GGML_ROPE_TYPE_NORMAL,
+                                    n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+                                    beta_fast, beta_slow);
+        out = ggml_concat(ctx, out_nope, out_pe, 0);
+
+        out = ggml_reshape_3d(ctx, out, o_group_dim, n_groups, nt);
+        ggml_tensor * grouped = ggml_permute(ctx, out, 0, 2, 1, 3);
+
+        ggml_tensor * oa = ggml_mul_mat(ctx,
+                ggml_reshape_3d(ctx, L.wo_a, L.wo_a->ne[0], o_lora, n_groups), grouped);
+        oa = ggml_permute(ctx, oa, 0, 2, 1, 3);
+        oa = ggml_cont_2d(ctx, oa, o_lora * n_groups, nt);
+        return ggml_mul_mat(ctx, L.wo_b, oa);
+    }
+
+    // The whole drafter: [anchor, noise x (block-1)] -> block_size proposals,
+    // each conditioned on the one before it through the Markov head, plus the
+    // confidence head's per-position acceptance estimate.
+    void build_dspark_draft()
+    {
+        const dsv4_dspark & ds = m.ds;
+        const int64_t hc = hp.hc_mult;
+        const int64_t rank = ds.markov_rank;
+        const int dev = ds.dev;
+
+        res.inp.ds_tokens = new_input_i32(nt, "inp_ds_tokens", dev);
+        res.inp.ds_pos = new_input_i32(nt, "inp_ds_pos", dev);
+        res.inp.ds_mask = new_input_mask(m.ring_raw + nt, GGML_TYPE_F16, "inp_ds_mask", dev);
+
+        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, res.inp.ds_tokens);
+        ggml_tensor * x = ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt);
+        x = ggml_repeat_4d(ctx, x, hp.n_embd, hc, nt, 1);
+
+        for (int st = 0; st < ds.n_stages; st++)
+        {
+            const dsv4_layer & L = m.layers[ds.layer_base + st];
+            ggml_tensor * post = nullptr;
+            ggml_tensor * comb = nullptr;
+
+            ggml_tensor * residual = x;
+            ggml_tensor * cur = build_hc_pre(x, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, &post, &comb, dev);
+            cur = rms(cur, L.attn_norm);
+            cur = build_dspark_attention(st, cur, res.inp.ds_pos);
+            x = build_hc_post(cur, residual, post, comb);
+
+            residual = x;
+            cur = build_hc_pre(x, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, &post, &comb, dev);
+            ggml_build_forward_expand(gf, residual);
+            ggml_build_forward_expand(gf, post);
+            ggml_build_forward_expand(gf, comb);
+            cur = rms(cur, L.ffn_norm);
+            ggml_tensor * shexp = build_shexp(ds.layer_base + st, cur);
+            cur = build_moe(ds.layer_base + st, cur, nullptr, shexp);
+            x = build_hc_post(cur, residual, post, comb);
+        }
+
+        // head: hc_head -> the drafter's norm -> the TRUNK's LM head
+        ggml_tensor * h = build_hc_head_w(x, ds.hc_head_fn, ds.hc_head_scale, ds.hc_head_base); // [n_embd, 1, nt]
+        h = ggml_reshape_2d(ctx, h, hp.n_embd, nt);
+        ggml_tensor * base = ggml_mul_mat(ctx, m.output, rms(h, ds.norm));   // [n_vocab, nt]
+        ggml_mul_mat_set_prec(base, GGML_PREC_F32);
+
+        // Markov chain: position i is biased by W2 . W1[prev(i)], and its argmax
+        // is prev(i+1). prev(0) is the anchor, i.e. block token 0.
+        ggml_tensor * prev = ggml_view_1d(ctx, res.inp.ds_tokens, 1, 0);
+        ggml_tensor * toks = nullptr;
+        ggml_tensor * conf = nullptr;
+        for (int64_t i = 0; i < nt; i++)
+        {
+            ggml_tensor * w1 = ggml_get_rows(ctx, ds.markov_w1, prev);        // [rank, 1]
+            ggml_tensor * bias = ggml_mul_mat(ctx, ds.markov_w2, w1);         // [n_vocab, 1]
+            ggml_mul_mat_set_prec(bias, GGML_PREC_F32);
+            ggml_tensor * col = ggml_view_2d(ctx, base, hp.n_vocab, 1, base->nb[1], i * base->nb[1]);
+            col = ggml_add(ctx, col, bias);
+            ggml_tensor * tok = ggml_argmax(ctx, col);                        // I32 [1]
+            toks = toks ? ggml_concat(ctx, toks, tok, 0) : tok;
+
+            // conf(i) = sigmoid(proj . [h(i); W1[prev(i)]])
+            ggml_tensor * hi = ggml_view_2d(ctx, h, hp.n_embd, 1, h->nb[1], i * h->nb[1]);
+            ggml_tensor * feat = ggml_concat(ctx, ggml_cont(ctx, hi), ggml_reshape_2d(ctx, w1, rank, 1), 0);
+            ggml_tensor * c = ggml_sigmoid(ctx, ggml_mul_mat(ctx, ds.conf_proj, feat));   // [1, 1]
+            conf = conf ? ggml_concat(ctx, conf, c, 0) : c;
+
+            prev = tok;
+        }
+
+        ggml_set_output(toks);
+        ggml_set_name(toks, "ds_toks");
+        ggml_set_output(conf);
+        ggml_set_name(conf, "ds_conf");
+        res.ds_toks = toks;
+        res.ds_conf = conf;
+        ggml_build_forward_expand(gf, toks);
+        ggml_build_forward_expand(gf, conf);
     }
 
     // ---- compression ----
@@ -2463,13 +3030,15 @@ struct graph_builder
             make_plan_inputs(inp.hca[d], res.plan_hca, GGML_TYPE_F16, "hca", d);
             make_plan_inputs(inp.lid[d], res.plan_lid, GGML_TYPE_F16, "lid", d);
         }
-        inp.out_ids = new_input_i32(1, "inp_out_ids", dev_last);
+        inp.out_ids = new_input_i32(res.all_logits ? nt : 1, "inp_out_ids", dev_last);
 
         const int64_t hc = hp.hc_mult;
 
         ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.layers[0].device]);   // [n_embd, nt]
         ggml_tensor * inpL = ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt);
         inpL = ggml_repeat_4d(ctx, inpL, hp.n_embd, hc, nt, 1);
+
+        std::vector<ggml_tensor *> ds_feats;
 
         for (int il = 0; il < hp.n_layer; il++)
         {
@@ -2505,12 +3074,22 @@ struct graph_builder
             cur = build_moe(il, cur, inp.tokens[dev], shexp);
 
             inpL = build_hc_post(cur, residual, post, comb);
+
+            if (m.ds.loaded &&
+                std::find(m.ds.target_layers.begin(), m.ds.target_layers.end(), il) != m.ds.target_layers.end())
+            {
+                ds_feats.push_back(hc_mean(inpL));
+            }
         }
+
+        if (m.ds.loaded && ds_feats.size() == m.ds.target_layers.size())
+            build_dspark_ring_update(ds_feats, inp.pos[m.ds.dev], inp.raw_idxs[m.ds.dev]);
 
         // gather output row(s)
         ggml_tensor * flat = ggml_reshape_2d(ctx, inpL, hp.n_embd * hc, nt);
         flat = ggml_get_rows(ctx, flat, inp.out_ids);
-        inpL = ggml_reshape_3d(ctx, flat, hp.n_embd, hc, 1);
+        const int64_t n_out = res.all_logits ? nt : 1;
+        inpL = ggml_reshape_3d(ctx, flat, hp.n_embd, hc, n_out);
 
         ggml_tensor * cur = build_hc_head(inpL);
         cur = rms(cur, m.output_norm);
@@ -2559,7 +3138,8 @@ static uint64_t dsv4_plan_sig(const comp_plan & p)
 // graphs captured by ggml-cuda. Fresh entries device-synchronize on their
 // arena allocation — TSGgml_Dsv4Forward pre-acquires the first two prefill
 // chunks so this happens while the devices are idle.
-static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64_t p0, bool pipeline, bool * out_reuse)
+static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64_t p0, bool pipeline, bool * out_reuse,
+                                              bool all_logits = false)
 {
     const dsv4_hparams & hp = m.hp;
 
@@ -2571,9 +3151,9 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
     const int64_t pos_end = std::max(m.pos_end_hint, p0 + nt);
     const int64_t hint = std::min<int64_t>(pos_end, 8192);
 
-    comp_plan plan_csa = build_comp_plan(p0, nt, CSA_RATIO, true, 2 * CSA_RATIO, m.n_csa_rows, hint / CSA_RATIO);
-    comp_plan plan_hca = build_comp_plan(p0, nt, HCA_RATIO, false, HCA_RATIO, m.n_hca_rows, hint / HCA_RATIO);
-    comp_plan plan_lid = build_comp_plan(p0, nt, CSA_RATIO, true, 2 * CSA_RATIO, m.n_csa_rows, hint / CSA_RATIO);
+    comp_plan plan_csa = build_comp_plan(p0, nt, CSA_RATIO, true, 2 * CSA_RATIO + m.state_extra, m.n_csa_rows, hint / CSA_RATIO);
+    comp_plan plan_hca = build_comp_plan(p0, nt, HCA_RATIO, false, HCA_RATIO + m.state_extra, m.n_hca_rows, hint / HCA_RATIO);
+    comp_plan plan_lid = build_comp_plan(p0, nt, CSA_RATIO, true, 2 * CSA_RATIO + m.state_extra, m.n_csa_rows, hint / CSA_RATIO);
 
     uint64_t sig = 14695981039346656037ull ^ (uint64_t) nt;
     sig = sig * 1099511628211ull ^ dsv4_plan_sig(plan_csa);
@@ -2587,6 +3167,9 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
     // pipelined chunks alternate between two entries so in-flight inputs stay private
     if (pipeline && ((p0 / std::max<int64_t>(nt, 1)) & 1))
         sig ^= 0x517cc1b727220a95ull;
+    // per-row logits change the head's shape
+    if (all_logits)
+        sig ^= 0xd6e8feb86659fd93ull;
 
     graph_build_result * res_p = nullptr;
     bool reuse = false;
@@ -2616,6 +3199,7 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
         r.plan_csa = plan_csa;
         r.plan_hca = plan_hca;
         r.plan_lid = plan_lid;
+        r.all_logits = all_logits;
         r.sched = ggml_backend_sched_new(m.sched_backends, m.sched_bufts, m.n_sched_backends, 32768, false, true);
         if (!r.sched)
         {
@@ -2647,7 +3231,8 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
     return res_p;
 }
 
-static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t nt, int64_t p0, bool want_logits, float * logits_out)
+static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t nt, int64_t p0, bool want_logits, float * logits_out,
+                                bool all_logits = false)
 {
     const dsv4_hparams & hp = m.hp;
 
@@ -2665,7 +3250,7 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
     const bool pipeline = !want_logits && m.n_gpu > 1;
 
     bool reuse = false;
-    graph_build_result * res_p = dsv4_acquire_graph(m, nt, p0, pipeline, &reuse);
+    graph_build_result * res_p = dsv4_acquire_graph(m, nt, p0, pipeline, &reuse, all_logits);
     if (!res_p) return false;
     graph_build_result & res = *res_p;
 
@@ -2686,7 +3271,16 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
     {
         std::vector<int32_t> v32(nt);
         std::vector<int64_t> ridx(nt);
-        std::vector<int32_t> out_ids(1, (int32_t) (nt - 1));
+        std::vector<int32_t> out_ids;
+        if (all_logits)
+        {
+            out_ids.resize(nt);
+            for (int64_t i = 0; i < nt; i++) out_ids[i] = (int32_t) i;
+        }
+        else
+        {
+            out_ids.assign(1, (int32_t) (nt - 1));
+        }
         std::vector<int32_t> meta;
 
         const ggml_fp16_t NEG_INF16 = ggml_fp32_to_fp16(-INFINITY);
@@ -2814,7 +3408,8 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
     auto t_compute = now();
 
     if (want_logits && logits_out)
-        ggml_backend_tensor_get(res.logits, logits_out, 0, (size_t) hp.n_vocab * sizeof(float));
+        ggml_backend_tensor_get(res.logits, logits_out, 0,
+                                (size_t) (all_logits ? nt : 1) * hp.n_vocab * sizeof(float));
 
     if (perf >= 2)
     {
@@ -2862,9 +3457,9 @@ static graph_build_result * dsv4_acquire_batched_graph(
         B.p0 = positions[i];
         const int64_t pos_end = B.p0 + 1;
         const int64_t hint = std::min<int64_t>(pos_end, 8192);
-        B.plan_csa = build_comp_plan(B.p0, 1, CSA_RATIO, true, 2 * CSA_RATIO, m.n_csa_rows, hint / CSA_RATIO);
-        B.plan_hca = build_comp_plan(B.p0, 1, HCA_RATIO, false, HCA_RATIO, m.n_hca_rows, hint / HCA_RATIO);
-        B.plan_lid = build_comp_plan(B.p0, 1, CSA_RATIO, true, 2 * CSA_RATIO, m.n_csa_rows, hint / CSA_RATIO);
+        B.plan_csa = build_comp_plan(B.p0, 1, CSA_RATIO, true, 2 * CSA_RATIO + m.state_extra, m.n_csa_rows, hint / CSA_RATIO);
+        B.plan_hca = build_comp_plan(B.p0, 1, HCA_RATIO, false, HCA_RATIO + m.state_extra, m.n_hca_rows, hint / HCA_RATIO);
+        B.plan_lid = build_comp_plan(B.p0, 1, CSA_RATIO, true, 2 * CSA_RATIO + m.state_extra, m.n_csa_rows, hint / CSA_RATIO);
         B.skip_topk = pos_end <= (int64_t) hp.indexer_top_k * CSA_RATIO;
         sig = sig * 1099511628211ull ^ (uint64_t) (B.slot_id + 1);
         sig = sig * 1099511628211ull ^ dsv4_plan_sig(B.plan_csa);
@@ -3066,17 +3661,130 @@ static bool dsv4_forward_batched_decode(
     return true;
 }
 
+// One DSpark draft at `position` (the position of `anchor_token`, which is not
+// yet in the trunk cache). The drafter's key ring was committed by the trunk's
+// own forward passes, so this needs no state from the host beyond the anchor.
+static int dsv4_dspark_draft(dsv4_model & m, int32_t anchor_token, int64_t position,
+                             int32_t * toks_out, float * conf_out)
+{
+    const dsv4_dspark & ds = m.ds;
+    if (!ds.loaded || position <= 0) return 0;
+
+    const int64_t B = ds.block_size;
+
+    // The drafter's graph shape never changes, so it gets one cache entry of
+    // its own (keyed like the trunk's, plus a draft bit).
+    uint64_t sig = 14695981039346656037ull ^ 0x44535041524bull;
+    sig = sig * 1099511628211ull ^ (uint64_t) (m.active_slot->id + 1);
+
+    graph_build_result * res_p = nullptr;
+    for (auto it = m.graph_cache.begin(); it != m.graph_cache.end(); ++it)
+    {
+        if ((*it)->sig == sig)
+        {
+            if (it != m.graph_cache.begin())
+                m.graph_cache.splice(m.graph_cache.begin(), m.graph_cache, it);
+            res_p = m.graph_cache.front().get();
+            break;
+        }
+    }
+
+    if (!res_p)
+    {
+        m.graph_cache.emplace_front(new graph_build_result());
+        graph_build_result & r = *m.graph_cache.front();
+        ggml_init_params gp = { (size_t) 32 * 1024 * 1024, nullptr, true };
+        r.ctx = ggml_init(gp);
+        r.gf = ggml_new_graph_custom(r.ctx, 8192, false);
+        r.nt = B;
+        r.sig = sig;
+        r.draft = true;
+        r.slot_id = m.active_slot->id;
+        r.sched = ggml_backend_sched_new(m.sched_backends, m.sched_bufts, m.n_sched_backends, 8192, false, true);
+        if (!r.sched)
+        {
+            m.graph_cache.pop_front();
+            return 0;
+        }
+        graph_builder gb(m, r, B, position);
+        gb.build_dspark_draft();
+        if (!ggml_backend_sched_alloc_graph(r.sched, r.gf))
+        {
+            fprintf(stderr, "[dsv4] DSpark draft graph alloc failed\n");
+            m.graph_cache.pop_front();
+            return 0;
+        }
+        res_p = &r;
+    }
+    graph_build_result & res = *res_p;
+
+    // inputs: [anchor, noise...] at positions [position .. position+B-1], and a
+    // mask exposing the committed window (ending at position-1) plus the whole
+    // block (non-causal inside the block).
+    {
+        std::vector<int32_t> ids((size_t) B, ds.noise_token);
+        ids[0] = anchor_token;
+        std::vector<int32_t> pos((size_t) B);
+        for (int64_t i = 0; i < B; i++) pos[i] = (int32_t) (position + i);
+        set_i32(res.inp.ds_tokens, ids);
+        set_i32(res.inp.ds_pos, pos);
+
+        const ggml_fp16_t NEG_INF16 = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_fp16_t ZERO16 = ggml_fp32_to_fp16(0.0f);
+        const int64_t n_kv = m.ring_raw + B;
+        std::vector<ggml_fp16_t> mask((size_t) n_kv * B, NEG_INF16);
+        const int64_t p_last = position - 1;                   // last committed position
+        for (int64_t i = 0; i < B; i++)
+        {
+            for (int64_t sIdx = 0; sIdx < m.ring_raw; sIdx++)
+            {
+                int64_t t = p_last - ((p_last - sIdx) % m.ring_raw + m.ring_raw) % m.ring_raw;
+                if (t < 0) continue;
+                if (t <= p_last && t > p_last - m.hp.n_swa)
+                    mask[(size_t) i * n_kv + sIdx] = ZERO16;
+            }
+            for (int64_t b = 0; b < B; b++)
+                mask[(size_t) i * n_kv + m.ring_raw + b] = ZERO16;
+        }
+        ggml_backend_tensor_set(res.inp.ds_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    }
+
+    if (ggml_backend_sched_graph_compute(res.sched, res.gf) != GGML_STATUS_SUCCESS)
+    {
+        fprintf(stderr, "[dsv4] DSpark draft compute failed\n");
+        return 0;
+    }
+
+    ggml_backend_tensor_get(res.ds_toks, toks_out, 0, (size_t) B * sizeof(int32_t));
+    ggml_backend_tensor_get(res.ds_conf, conf_out, 0, (size_t) B * sizeof(float));
+    return (int) B;
+}
+
 } // namespace tsg_dsv4
 
 // ---------------------------------------------------------------------------
 // C API
 // ---------------------------------------------------------------------------
 
+TSG_EXPORT void * TSGgml_Dsv4LoadModelDspark(const char * gguf_path, int n_gpu, int n_ctx, int n_ubatch, int n_threads,
+                                             const char * dspark_path)
+{
+    try
+    {
+        return tsg_dsv4::dsv4_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, dspark_path);
+    }
+    catch (const std::exception & e)
+    {
+        fprintf(stderr, "[dsv4] DSpark load failed: %s\n", e.what());
+        return nullptr;
+    }
+}
+
 TSG_EXPORT void * TSGgml_Dsv4LoadModel(const char * gguf_path, int n_gpu, int n_ctx, int n_ubatch, int n_threads)
 {
     try
     {
-        return tsg_dsv4::dsv4_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads);
+        return tsg_dsv4::dsv4_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, nullptr);
     }
     catch (const std::exception & e)
     {
@@ -3265,6 +3973,51 @@ TSG_EXPORT int TSGgml_Dsv4ForwardBatchedDecode(
     for (int i = 0; i < n; i++)
         slots[i]->n_past += 1;
     return 0;
+}
+
+TSG_EXPORT int TSGgml_Dsv4DsparkBlockSize(void * handle)
+{
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    return (m && m->ds.loaded) ? m->ds.block_size : 0;
+}
+
+// Trunk forward with per-row logits (the speculative verify). Behaves exactly
+// like TSGgml_Dsv4Forward otherwise, including the drafter ring commit.
+TSG_EXPORT int TSGgml_Dsv4ForwardSpec(void * handle, const int32_t * tokens, int n_tokens, float * logits_out)
+{
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    if (!m || !tokens || n_tokens <= 0) return 0;
+    if (n_tokens > m->n_ubatch)
+    {
+        fprintf(stderr, "[dsv4] spec forward needs a single micro-batch (%d > %d)\n", n_tokens, m->n_ubatch);
+        return 0;
+    }
+    tsg_dsv4::dsv4_slot & slot = *m->active_slot;
+    if (slot.n_past + n_tokens > m->n_ctx) return 0;
+
+    m->pos_end_hint = slot.n_past + n_tokens;
+    if (!tsg_dsv4::dsv4_forward_ubatch(*m, tokens, n_tokens, slot.n_past, true, logits_out, /*all_logits*/ true))
+        return 0;
+    slot.n_past += n_tokens;
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_Dsv4DsparkDraft(void * handle, int anchor_token, int32_t * toks_out, float * conf_out)
+{
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    if (!m || !m->ds.loaded || !toks_out || !conf_out) return 0;
+    return tsg_dsv4::dsv4_dspark_draft(*m, anchor_token, m->active_slot->n_past, toks_out, conf_out);
+}
+
+// Drop the KV of rejected speculative tokens. Nothing is restored: the rings
+// are sized so a rejected tail cannot alias a row a later pass reads, and the
+// compressed rows it wrote are recomputed before they become visible.
+TSG_EXPORT int TSGgml_Dsv4Rewind(void * handle, int n_past)
+{
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    if (!m || n_past < 0 || n_past > m->active_slot->n_past) return 0;
+    m->active_slot->n_past = n_past;
+    return 1;
 }
 
 TSG_EXPORT void TSGgml_Dsv4Free(void * handle)

@@ -117,7 +117,9 @@ namespace TensorSharp.Models
         public int VocabSize => _nVocab;
         public int NPast => _engine.NPast;
 
-        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu)
+        private GgufFile _dsparkGguf;
+
+        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu, string dsparkPath = null)
         {
             var sw = Stopwatch.StartNew();
             bool stats = ParseEnvInt("TS_DSV4_LOAD_STATS", 0) != 0;
@@ -127,7 +129,7 @@ namespace TensorSharp.Models
                     Console.Error.WriteLine($"[dsv4-cuda]   +{sw.Elapsed.TotalSeconds,6:F1}s {phase}");
             }
 
-            OpenShards(ggufPath);
+            OpenShards(ggufPath, dsparkPath);
             ParseHparams();
             Mark("shards opened / hparams parsed");
 
@@ -173,11 +175,33 @@ namespace TensorSharp.Models
 
         public void Reset() => _engine.Reset();
 
+        // ---- DSpark speculative decoding (no-ops without a drafter) ----
+
+        public bool HasDspark => _engine.DsparkBlockSize > 0;
+
+        public int DsparkBlockSize => _engine.DsparkBlockSize;
+
+        /// <summary>Row width of the target features the drafter consumes.</summary>
+        public int DsparkFeatureSize => _engine.DsparkFeatureSize;
+
+        public int UBatch => _engine.UBatch;
+
+        public void ForwardSpec(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+            => _engine.ForwardSpec(tokens, hAllOut, logitsOut, allLogitsRows);
+
+        public void DsparkCatchUp(float[] hRows, int rows, int firstPos)
+            => _engine.DsparkCatchUp(hRows, rows, firstPos);
+
+        public int DsparkDraft(int anchorToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
+            => _engine.DsparkDraft(anchorToken, hPrev, position, draftOut, confOut);
+
+        public void Rewind(int nPast) => _engine.Rewind(nPast);
+
         // -------------------------------------------------------------------
         // Loading (mirrors DeepSeek4CpuExecutor's split-shard resolver)
         // -------------------------------------------------------------------
 
-        private void OpenShards(string firstPath)
+        private void OpenShards(string firstPath, string dsparkPath = null)
         {
             var first = new GgufFile(firstPath);
             _shards.Add(first);
@@ -197,6 +221,16 @@ namespace TensorSharp.Models
                         _shardPaths.Add(path);
                     }
                 }
+            }
+
+            // The DSpark drafter is a separate GGUF whose tensors are all
+            // mtp.*-prefixed, so it can share the shard table (and therefore the
+            // streaming loader) with the target model's shards.
+            if (!string.IsNullOrEmpty(dsparkPath))
+            {
+                _dsparkGguf = new GgufFile(dsparkPath);
+                _shards.Add(_dsparkGguf);
+                _shardPaths.Add(dsparkPath);
             }
 
             for (int s = 0; s < _shards.Count; s++)
@@ -458,6 +492,7 @@ namespace TensorSharp.Models
                 RopeRawTable = BuildRopeTable(nCtx, comp: false),
                 RopeCompTable = BuildRopeTable(nCtx, comp: true),
                 Layers = new Dsv4CudaEngine.LayerDesc[_nLayer],
+                Dspark = BuildDsparkDesc(),
             };
 
             for (int il = 0; il < _nLayer; il++)
@@ -519,6 +554,125 @@ namespace TensorSharp.Models
             }
 
             return m;
+        }
+
+        /// <summary>
+        /// Describes the DSpark drafter (a separate GGUF: three DSV4 blocks with
+        /// compress_ratio 0, plus the Markov and confidence heads) for the
+        /// engine. Returns null when no drafter was supplied.
+        /// </summary>
+        private Dsv4CudaEngine.DsparkDesc BuildDsparkDesc()
+        {
+            if (_dsparkGguf == null)
+                return null;
+
+            // Published DSpark drafters carry the same weights under three
+            // naming schemes (the ds4 builder's `mtp.*`, and two `dspark.*`
+            // variants that differ in the metadata prefix), so resolve both the
+            // keys and the tensor names by trying each spelling.
+            string arch = _dsparkGguf.GetString("general.architecture") ?? string.Empty;
+            if (arch != "deepseek4-dspark" && arch != "deepseek_v4_flash_dspark_draft")
+            {
+                throw new InvalidOperationException(
+                    $"[dsv4-cuda] draft model architecture '{arch}' is not a DeepSeek V4 DSpark drafter " +
+                    "(expected deepseek4-dspark or deepseek_v4_flash_dspark_draft). DSpark drafters for other " +
+                    "architectures (Qwen 3, Gemma 4) use a different drafter design and are not supported.");
+            }
+
+            int DsUint(params string[] keys)
+            {
+                foreach (string k in keys)
+                {
+                    uint v = _dsparkGguf.GetUint32(k, 0);
+                    if (v != 0)
+                        return (int)v;
+                }
+                return 0;
+            }
+
+            int nStages = DsUint("dspark.n_layers", "dspark.stage_count", "dspark.layer_count",
+                                 "deepseek4.dspark.n_layers", "deepseek4.dspark.layer_count");
+            int blockSize = DsUint("dspark.block_size", "deepseek4.dspark.block_size");
+            int markovRank = DsUint("dspark.markov_rank", "deepseek4.dspark.markov_rank");
+            int noiseToken = DsUint("dspark.noise_token_id", "deepseek4.dspark.noise_token_id");
+            int[] targetLayers = _dsparkGguf.GetInt32Array("dspark.target_layer_ids")
+                ?? _dsparkGguf.GetInt32Array("dspark.target_layers")
+                ?? _dsparkGguf.GetInt32Array("deepseek4.dspark.target_layer_ids")
+                ?? _dsparkGguf.GetInt32Array("deepseek4.dspark.target_layers")
+                ?? Array.Empty<int>();
+            if (nStages <= 0 || blockSize <= 0 || markovRank <= 0 || targetLayers.Length == 0)
+                throw new InvalidOperationException("[dsv4-cuda] draft model is missing dspark.* metadata");
+
+            // The drafter has no per-layer swiglu clamp of its own; the module is
+            // trained with the target's single swiglu_limit.
+            float clamp = _swigluClampExp.Length > 0 ? _swigluClampExp[_swigluClampExp.Length - 1] : 0f;
+            float clampSh = _swigluClampShexp.Length > 0 ? _swigluClampShexp[_swigluClampShexp.Length - 1] : clamp;
+
+            // First spelling that exists in the drafter file wins.
+            string Pick(params string[] names)
+            {
+                foreach (string n in names)
+                    if (_tensorMap.ContainsKey(n))
+                        return n;
+                return names[0];
+            }
+
+            var stages = new Dsv4CudaEngine.LayerDesc[nStages];
+            for (int s = 0; s < nStages; s++)
+            {
+                string p = _tensorMap.ContainsKey($"mtp.{s}.attn_norm.weight") ? $"mtp.{s}." : $"dspark.{s}.";
+                stages[s] = new Dsv4CudaEngine.LayerDesc
+                {
+                    Ratio = 0,
+                    ClampExp = clamp,
+                    ClampShexp = clampSh,
+                    AttnNorm = GetF32(p + "attn_norm.weight"),
+                    Sinks = GetF32(p + "attn_sinks.weight"),
+                    WqA = GetQW(p + "attn_q_a.weight"),
+                    QANorm = GetF32(p + "attn_q_a_norm.weight"),
+                    WqB = GetQW(p + "attn_q_b.weight"),
+                    Wkv = GetQW(p + "attn_kv.weight"),
+                    KvNorm = GetF32(p + "attn_kv_a_norm.weight"),
+                    WoA = GetQW(p + "attn_output_a.weight"),
+                    WoB = GetQW(p + "attn_output_b.weight"),
+                    HcAttnFn = GetF32(p + "hc_attn_fn.weight"),
+                    HcAttnScale = GetF32(p + "hc_attn_scale.weight"),
+                    HcAttnBase = GetF32(p + "hc_attn_base.weight"),
+                    HcFfnFn = GetF32(p + "hc_ffn_fn.weight"),
+                    HcFfnScale = GetF32(p + "hc_ffn_scale.weight"),
+                    HcFfnBase = GetF32(p + "hc_ffn_base.weight"),
+                    GateInp = GetF32(p + "ffn_gate_inp.weight"),
+                    ExpProbsBias = GetF32(p + "exp_probs_b.bias", required: false),
+                    FfnNorm = GetF32(p + "ffn_norm.weight"),
+                    GateExps = GetQW(p + "ffn_gate_exps.weight"),
+                    DownExps = GetQW(p + "ffn_down_exps.weight"),
+                    UpExps = GetQW(p + "ffn_up_exps.weight"),
+                    GateShexp = GetQW(p + "ffn_gate_shexp.weight"),
+                    DownShexp = GetQW(p + "ffn_down_shexp.weight"),
+                    UpShexp = GetQW(p + "ffn_up_shexp.weight"),
+                };
+            }
+
+            string first = "mtp.0.";
+            string lastS = $"mtp.{nStages - 1}.";
+            return new Dsv4CudaEngine.DsparkDesc
+            {
+                BlockSize = blockSize,
+                NoiseTokenId = noiseToken,
+                MarkovRank = markovRank,
+                TargetLayerIds = targetLayers,
+                Stages = stages,
+                MainProj = GetQW(Pick(first + "main_proj.weight", "dspark.main_proj.weight")),
+                MainNorm = GetF32(Pick(first + "main_norm.weight", "dspark.main_norm.weight")),
+                Norm = GetF32(Pick(lastS + "norm.weight", "dspark.norm.weight")),
+                HcHeadFn = GetF32(Pick(lastS + "hc_head_fn.weight", "dspark.hc_head_fn.weight")),
+                HcHeadScale = GetF32(Pick(lastS + "hc_head_scale.weight", "dspark.hc_head_scale.weight")),
+                HcHeadBase = GetF32(Pick(lastS + "hc_head_base.weight", "dspark.hc_head_base.weight")),
+                MarkovW1 = GetF32(Pick(lastS + "markov_head.markov_w1.weight", "dspark.markov_w1.weight")),
+                MarkovW2 = GetQW(Pick(lastS + "markov_head.markov_w2.weight", "dspark.markov_w2.weight")),
+                ConfProj = GetF32(Pick(lastS + "confidence_head.proj.weight",
+                                       "dspark.conf_proj.weight", "dspark.confidence_head.weight")),
+            };
         }
 
         /// <summary>

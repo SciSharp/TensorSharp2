@@ -385,7 +385,10 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--prefill-chunk-size <N>` | Chunked-prefill granularity under contention — the maximum prefill tokens scheduled per step while other requests are running, so parallel decodes get frequent turns at the GPU (default: `1024`). Env: `TS_SCHED_PREFILL_CHUNK`. |
 | `--mtp-spec` / `--no-mtp-spec` | Enable NextN/MTP speculative decoding (default off) on models that ship a multi-token-prediction draft head (Qwen 3.6's embedded NextN block, or a Gemma 4 `gemma4-assistant` draft loaded via `--mtp-draft-model`). Engages for solo (non-concurrent) sequences: the draft head proposes up to `--mtp-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode. Engaged automatically only where profitable (ggml backends and the pure-C# `cuda` backend); CPU / MLX serve standard decode. Env: `TS_MTP_SPEC`. |
 | `--mtp-draft <N>` | Maximum tokens drafted per speculative step (default `8`). Env: `TS_MTP_DRAFT`. |
-| `--mtp-pmin <f>` | Minimum draft-head confidence in `(0, 1]` for a drafted token to be kept; drafting stops at the first low-confidence token (default `0.75`). Env: `TS_MTP_PMIN`. |
+| `--mtp-pmin <f>` | Minimum draft confidence in `(0, 1]` for a drafted token to be kept; drafting stops at the first low-confidence token. Default: chosen per drafter kind — `0.75` for a per-token draft head (top-1 probability over its top-10 logits), `0.35` for a block drafter, where the gate is the CUMULATIVE prefix probability and so the same number means something far stricter. Env: `TS_MTP_PMIN`. |
+| `--draft-model <path>` | Speculative-decoding draft model for architectures whose drafter ships as its own file. DeepSeek V4's DSpark support GGUF (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)): it drafts a whole block per step and the trunk verifies it in one batched forward, so greedy output is unchanged. Engages on every single-sequence CLI path — `--input`, `--multi-turn-jsonl` and `--interactive` — with `--backend cuda` or `--backend ggml_cuda`. On the CLI it needs a pure-argmax sampler (any temperature, top-k/p or repetition penalty turns it off, because the standalone decoder verifies with argmax). `TensorSharp.Server` accepts the same flag alongside `--mtp-spec`, where verification runs the request's own sampler and so composes with any sampling settings. Env: `TS_DSV4_DSPARK`. |
+| `--spec-draft-n-max <N>` | Cap on tokens drafted per speculative block (default: the drafter's trained block size). |
+| `--spec-draft-conf-min <p>` | Minimum cumulative acceptance probability (the product of the confidence head's per-position estimates) for a drafted position to be kept (default `0.35`). |
 | `--mtp-draft-model <path>` | Path to a separate MTP draft GGUF for architectures whose draft head ships as its own file (Gemma 4's `gemma4-assistant`). The draft's hidden size must match the target (e.g. pair the 12B target with its 12B draft, not the 26B-A4B draft); a mismatched or incomplete draft fails fast at startup with a remediation hint. Ignored for Qwen 3.6, which embeds its NextN block in the trunk GGUF. Env: `TS_MTP_DRAFT_MODEL`. |
 | `--paged-kv` / `--no-paged-kv` | Legacy compatibility flags for the removed per-session paged-KV manager. Current server KV state is engine-owned; use continuous-batching / `TS_SCHED_*` knobs for the engine. Aliases: `--paged-kv-cache` / `--no-paged-kv-cache`. |
 | `--paged-kv-block-size <N>` | Legacy standalone paged-KV block size. The current server engine uses `TS_SCHED_BLOCK_SIZE`. |
@@ -483,7 +486,7 @@ These gate the optional multi-token-prediction speculative decode path (see [MTP
 |---|---|
 | `TS_MTP_SPEC` | `1` enables MTP/NextN speculative decoding for solo sequences (default `0`). CLI: `--mtp-spec` / `--no-mtp-spec`. |
 | `TS_MTP_DRAFT` | Maximum tokens drafted per speculative step (default `8`). CLI: `--mtp-draft`. |
-| `TS_MTP_PMIN` | Minimum draft-head confidence in `(0, 1]` to keep a drafted token (default `0.75`). CLI: `--mtp-pmin`. |
+| `TS_MTP_PMIN` | Minimum draft confidence in `(0, 1]` to keep a drafted token (default: per drafter kind — `0.75` per-token, `0.35` block). CLI: `--mtp-pmin`. |
 | `TS_MTP_DRAFT_MODEL` | Path to the separate Gemma 4 `gemma4-assistant` draft GGUF. CLI: `--mtp-draft-model`. Ignored by Qwen 3.6 (embedded NextN). |
 | `TS_GMTP_NO_FUSED` | `1` disables the Gemma 4 fused multi-token-verify / draft-step GGML kernels and falls back to the per-op path (A/B testing on ggml backends). |
 | `TS_GMTP_NO_FAST_ROLLBACK` | `1` restores the kept-prefix rollback path instead of the dense exact-match fast rollback used on partial draft acceptance. |
@@ -723,7 +726,7 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 |---|---|---|---|
 | Speculative decode engine (solo sequences) | OFF | **`TS_MTP_SPEC=1`** | `--mtp-spec` / `--no-mtp-spec` |
 | Max tokens drafted per step | `8` | `TS_MTP_DRAFT` | `--mtp-draft N` |
-| Min draft-head confidence to keep a token | `0.75` | `TS_MTP_PMIN` | `--mtp-pmin X` |
+| Min draft confidence to keep a token | per drafter kind (`0.75` / `0.35`) | `TS_MTP_PMIN` | `--mtp-pmin X` |
 | Gemma 4 separate draft GGUF (`gemma4-assistant`) | none | `TS_MTP_DRAFT_MODEL` | `--mtp-draft-model <path>` |
 | Gemma 4 fused verify / draft kernels (ggml) | ON | `TS_GMTP_NO_FUSED=1` falls back to per-op | — |
 | Gemma 4 dense fast rollback on partial accept | ON | `TS_GMTP_NO_FAST_ROLLBACK=1` restores kept-prefix rollback | — |

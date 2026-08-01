@@ -17,6 +17,7 @@ using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Cli.Logging;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Cli
 {
@@ -71,6 +72,16 @@ namespace TensorSharp.Cli
         private int _maxTokens;
         private bool _multilineInput;
 
+        // Block speculative decoding (DeepSeek V4 + a DSpark drafter). The
+        // decoder is built on first use and kept for the session: it carries the
+        // hidden state that pairs the trunk with the drafter, so a turn that
+        // extends the cached prefix continues where the previous one stopped.
+        // Rebuilt whenever /model or /backend swaps the loaded model.
+        private MtpSpeculativeDecoder _specDecoder;
+        private ModelBase _specDecoderModel;
+        private readonly int _specDraftMax;
+        private readonly float _specDraftConfMin;
+
         // Pending attachments to inject into the next user turn. Keeping them as
         // mutable state lets the user run multiple slash commands (e.g. /image,
         // /audio, /video, /text) before submitting the actual question.
@@ -109,7 +120,9 @@ namespace TensorSharp.Cli
             List<ToolFunction> tools,
             bool enableThinking,
             int maxTokens,
-            ILogger log)
+            ILogger log,
+            int specDraftMax = 0,
+            float specDraftConfMin = -1f)
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
             _originalModel = _model;
@@ -123,6 +136,8 @@ namespace TensorSharp.Cli
             _enableThinking = enableThinking;
             _maxTokens = maxTokens > 0 ? maxTokens : 512;
             _log = log;
+            _specDraftMax = specDraftMax;
+            _specDraftConfMin = specDraftConfMin;
         }
 
         /// <summary>
@@ -1088,9 +1103,17 @@ namespace TensorSharp.Cli
                 "interactive prompt tokens={PromptTokens} thinking={Thinking}",
                 inputTokens.Count, _enableThinking);
 
+            // A model with a block drafter (DeepSeek V4 + DSpark) decodes through
+            // the shared draft/verify core instead of one forward per token. Its
+            // prefill has to go through the drafter-aware path too, so the choice
+            // is made before the prompt is forwarded.
+            MtpSpeculativeDecoder specDecoder = ResolveBlockSpeculativeDecoder(renderHistory);
+
             var prefillSw = Stopwatch.StartNew();
-            ReusePlan plan = _kvCache.PlanReuse(inputTokens, _model.SupportsKVCacheTruncation);
-            float[] logits = ApplyReusePlan(plan, inputTokens);
+            ReusePlanKind planKind;
+            float[] logits = specDecoder != null
+                ? SpeculativePrefill(specDecoder, inputTokens, out planKind)
+                : PlainPrefill(inputTokens, out planKind);
             prefillSw.Stop();
             double prefillMs = prefillSw.Elapsed.TotalMilliseconds;
             int promptTokenCount = inputTokens.Count;
@@ -1120,24 +1143,18 @@ namespace TensorSharp.Cli
             // prefill can reuse the cache without re-tokenising.
             string assistantContentBuffer = string.Empty;
             string assistantThinkingBuffer = string.Empty;
+            // Per-turn speculative counters (null when the turn decoded plainly).
+            MtpSpecStats specStats = null;
+            int specWindow = 0;
 
-            for (int step = 0; step < _maxTokens; step++)
+            // Streams one generated token: append its bytes, print the decoded
+            // delta through the output parser, and report whether the turn should
+            // keep going (a stop sequence or Ctrl+C ends it). Shared by the plain
+            // and the speculative loops so both stream identically.
+            bool EmitToken(int token)
             {
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    finishReason = "cancelled";
-                    break;
-                }
-
-                int nextToken = sampler.Sample(logits, generatedTokens);
-                if (_model.Tokenizer.IsEos(nextToken))
-                {
-                    finishReason = "eos";
-                    break;
-                }
-
-                generatedTokens.Add(nextToken);
-                _model.Tokenizer.AppendTokenBytes(nextToken, rawBytes);
+                generatedTokens.Add(token);
+                _model.Tokenizer.AppendTokenBytes(token, rawBytes);
                 int validLen = FindValidUtf8Length(rawBytes);
                 string decoded = Encoding.UTF8.GetString(rawBytes.GetRange(0, validLen).ToArray());
                 string piece = prevCharLen < decoded.Length ? decoded.Substring(prevCharLen) : string.Empty;
@@ -1188,12 +1205,75 @@ namespace TensorSharp.Cli
                     if (shouldStop)
                     {
                         finishReason = "stop_sequence";
-                        break;
+                        return false;
                     }
                 }
 
-                logits = _model.Forward(new[] { nextToken });
-                _kvCache.RecordAppend(nextToken, logits);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    finishReason = "cancelled";
+                    return false;
+                }
+
+                return true;
+            }
+
+            if (specDecoder != null)
+            {
+                // The drafter proposes a block per step and the trunk verifies it in
+                // one batched forward. Verification is argmax, so the emitted stream
+                // is the plain greedy stream (up to batched-vs-sequential float
+                // drift) and this is purely a speed path.
+                int promptCached = _kvCache.Count;
+                specDecoder.Stats.Reset();   // counters are reported per turn
+                List<int> specTokens = specDecoder.GenerateGreedyFrom(logits, promptCached, _maxTokens,
+                    isStopToken: t =>
+                    {
+                        if (!_model.Tokenizer.IsEos(t))
+                            return false;
+                        finishReason = "eos";
+                        return true;
+                    },
+                    onToken: EmitToken);
+
+                // The trunk commits every accepted token plus the corrected one, but
+                // never the token it will forward on the next step. Mirror exactly
+                // what it holds so the next turn's prefix match stays sound. This
+                // reads the decoder's own output, not the streamed tokens: a turn cut
+                // short mid-block (Ctrl+C, a stop sequence) leaves the trunk holding
+                // tokens the console never saw, and a cache that under-reports them
+                // would make the next turn prefill at the wrong position.
+                int trunkGenerated = ((IMtpSpeculativeModel)_model).CacheSeqLen - promptCached;
+                int cachedGenerated = Math.Clamp(trunkGenerated, 0, specTokens.Count);
+                if (cachedGenerated > 0)
+                    _kvCache.RecordAppend(specTokens.GetRange(0, cachedGenerated), null);
+
+                specStats = specDecoder.Stats;
+                specWindow = specDecoder.MaxDraftTokens;
+            }
+            else
+            {
+                for (int step = 0; step < _maxTokens; step++)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        finishReason = "cancelled";
+                        break;
+                    }
+
+                    int nextToken = sampler.Sample(logits, generatedTokens);
+                    if (_model.Tokenizer.IsEos(nextToken))
+                    {
+                        finishReason = "eos";
+                        break;
+                    }
+
+                    if (!EmitToken(nextToken))
+                        break;
+
+                    logits = _model.Forward(new[] { nextToken });
+                    _kvCache.RecordAppend(nextToken, logits);
+                }
             }
             decodeSw.Stop();
 
@@ -1219,12 +1299,27 @@ namespace TensorSharp.Cli
             double tokensPerSec = generatedTokens.Count > 0
                 ? generatedTokens.Count / Math.Max(decodeSw.Elapsed.TotalSeconds, 1e-9)
                 : 0;
-            Console.WriteLine($"[turn complete: tokens={generatedTokens.Count} prefillMs={prefillMs:F0} decodeMs={decodeSw.Elapsed.TotalMilliseconds:F0} tps={tokensPerSec:F1} ttftMs={firstTokenMs} reason={finishReason} kvPlan={plan.Kind}]");
+            string specSummary = specStats == null
+                ? string.Empty
+                : $" spec=window{specWindow}/accepted{specStats.TokensAccepted}of{specStats.TokensDrafted}" +
+                  $"({specStats.AcceptanceRate:P0})";
+            Console.WriteLine($"[turn complete: tokens={generatedTokens.Count} prefillMs={prefillMs:F0} decodeMs={decodeSw.Elapsed.TotalMilliseconds:F0} tps={tokensPerSec:F1} ttftMs={firstTokenMs} reason={finishReason} kvPlan={planKind}{specSummary}]");
 
             _log.LogInformation(LogEventIds.ChatCompleted,
                 "interactive.turn complete tokens={Tokens} promptTokens={PromptTokens} kvPlan={KvPlan} prefillMs={PrefillMs:F0} decodeMs={DecodeMs:F0} tps={TokensPerSec:F1} ttftMs={Ttft} reason={Reason}",
-                generatedTokens.Count, promptTokenCount, plan.Kind, prefillMs,
+                generatedTokens.Count, promptTokenCount, planKind, prefillMs,
                 decodeSw.Elapsed.TotalMilliseconds, tokensPerSec, firstTokenMs, finishReason);
+
+            if (specStats != null)
+            {
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "interactive.turn speculative: window={Window} confMin={ConfMin:F2} drafted={Drafted} accepted={Accepted} " +
+                    "acceptanceRate={Rate:F3} verifySteps={Verify} plainSteps={Plain} rollbacks={Rollbacks} " +
+                    "draftMs={DraftMs:F0} verifyMs={VerifyMs:F0} plainMs={PlainMs:F0} catchUpMs={CatchUpMs:F0}",
+                    specWindow, specDecoder.MinDraftProb, specStats.TokensDrafted, specStats.TokensAccepted,
+                    specStats.AcceptanceRate, specStats.VerifySteps, specStats.PlainSteps, specStats.RollbackSteps,
+                    specStats.DraftMs, specStats.VerifyMs, specStats.PlainMs, specStats.CatchUpMs);
+            }
 
             // Drop pending attachments on success - they belonged to the
             // user turn we just submitted.
@@ -1242,6 +1337,116 @@ namespace TensorSharp.Cli
                 Thinking = assistantThinkingBuffer,
                 RawOutputTokens = new List<int>(generatedTokens),
             });
+        }
+
+        /// <summary>
+        /// The block-speculative decoder to serve this turn with, or null to decode
+        /// one token per forward. Speculation is only offered when the model ships a
+        /// block drafter, the sampler is a plain argmax (verification draws with
+        /// argmax, so any sampler the drafts were not gated against would change the
+        /// emitted stream) and the turn carries no media (the speculative prefill has
+        /// no place to queue the per-chunk vision/audio embeddings).
+        /// </summary>
+        private MtpSpeculativeDecoder ResolveBlockSpeculativeDecoder(List<ChatMessage> renderHistory)
+        {
+            if (_model is not IMtpSpeculativeModel spec || !spec.HasMtp || spec.MtpDraftBlockSize <= 0)
+                return null;
+            if (!IsArgmaxSampling(_samplingConfig))
+                return null;
+            if (HasMediaAttachments(renderHistory))
+                return null;
+
+            if (_specDecoder == null || !ReferenceEquals(_specDecoderModel, _model))
+            {
+                int window = _specDraftMax > 0
+                    ? Math.Min(_specDraftMax, spec.MtpDraftBlockSize)
+                    : spec.MtpDraftBlockSize;
+                _specDecoder = new MtpSpeculativeDecoder(spec, window)
+                {
+                    // Cumulative acceptance gate (see MtpSpeculativeExecution): an
+                    // extra verify row costs ~a quarter of a decode step on a sparse
+                    // MoE trunk, so drafting past a ~0.35 prefix-acceptance estimate
+                    // is expected-negative.
+                    MinDraftProb = _specDraftConfMin >= 0f ? _specDraftConfMin : 0.35f,
+                    PrefillChunkSize = spec.MtpPrefillChunkSize > 0 ? spec.MtpPrefillChunkSize : 512,
+                };
+                _specDecoderModel = _model;
+                _log.LogInformation(LogEventIds.CliStarted,
+                    "interactive block speculative decoding armed: window={Window} confMin={ConfMin:F2}",
+                    _specDecoder.MaxDraftTokens, _specDecoder.MinDraftProb);
+            }
+            return _specDecoder;
+        }
+
+        /// <summary>
+        /// True when <paramref name="cfg"/> selects the most probable token and
+        /// nothing else. <see cref="SamplingConfig.IsGreedy"/> alone is not enough:
+        /// the history penalties still rewrite the logits the drafts would be
+        /// verified against.
+        /// </summary>
+        internal static bool IsArgmaxSampling(SamplingConfig cfg)
+            => cfg != null
+               && cfg.IsGreedy
+               && Math.Abs(cfg.RepetitionPenalty - 1f) < 1e-6f
+               && cfg.PresencePenalty == 0f
+               && cfg.FrequencyPenalty == 0f
+               && (cfg.FirstTokenAllowList == null || cfg.FirstTokenAllowList.Count == 0);
+
+        private static bool HasMediaAttachments(List<ChatMessage> messages)
+        {
+            foreach (var m in messages)
+            {
+                if (m.IsVideo) return true;
+                if (m.ImagePaths != null && m.ImagePaths.Count > 0) return true;
+                if (m.AudioPaths != null && m.AudioPaths.Count > 0) return true;
+            }
+            return false;
+        }
+
+        /// <summary>Ordinary prompt prefill: plan the cache reuse and apply it.</summary>
+        private float[] PlainPrefill(List<int> inputTokens, out ReusePlanKind kind)
+        {
+            ReusePlan plan = _kvCache.PlanReuse(inputTokens, _model.SupportsKVCacheTruncation);
+            kind = plan.Kind;
+            return ApplyReusePlan(plan, inputTokens);
+        }
+
+        /// <summary>
+        /// Prompt prefill for the block-speculative path. Same reuse policy as
+        /// <see cref="PlainPrefill"/> — extend the cache when it is a strict prefix of
+        /// the new prompt, otherwise start over — but every forward runs through the
+        /// drafter-aware path so the drafter's key ring covers the prompt. A cache the
+        /// prompt diverges from is never truncated: the models that carry a block
+        /// drafter compress their caches and cannot rebuild them from a prefix.
+        /// </summary>
+        private float[] SpeculativePrefill(MtpSpeculativeDecoder decoder, List<int> inputTokens,
+            out ReusePlanKind kind)
+        {
+            int cached = _kvCache.Count;
+            bool extend = cached > 0
+                && cached < inputTokens.Count
+                && _kvCache.CommonPrefixLength(inputTokens) == cached;
+
+            if (!extend)
+            {
+                _model.ResetKVCache();
+                _kvCache.Reset();
+                decoder.Reset();
+                kind = ReusePlanKind.Reset;
+
+                var all = inputTokens.ToArray();
+                float[] fullLogits = decoder.Prefill(all);
+                _kvCache.RecordAppend(all, fullLogits);
+                return fullLogits;
+            }
+
+            kind = ReusePlanKind.PartialReuse;
+            var suffix = new int[inputTokens.Count - cached];
+            for (int i = 0; i < suffix.Length; i++)
+                suffix[i] = inputTokens[cached + i];
+            float[] logits = decoder.Prefill(suffix);
+            _kvCache.RecordAppend(suffix, logits);
+            return logits;
         }
 
         private float[] ApplyReusePlan(ReusePlan plan, List<int> inputTokens)

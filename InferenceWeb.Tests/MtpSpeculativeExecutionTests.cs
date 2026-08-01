@@ -14,6 +14,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp.Models;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
@@ -382,12 +383,232 @@ public class MtpSpeculativeExecutionTests
     /// <see cref="ProtocolViolations"/> rather than thrown so a buggy caller
     /// fails the test with a readable message instead of a hung engine.
     /// </summary>
+    // ----- block drafting (DSpark) -----
+
+    [Fact]
+    public void BlockDraft_PerfectBlock_AcceptsWholeBlockInOneDraftCall()
+    {
+        var model = new FakeMtpModel { BlockDraftSize = 5 };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 8);
+
+        // The window is clamped to the drafter's trained block size.
+        Assert.Equal(5, exec.MaxDraftTokens);
+
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        var accepted = new List<int>();
+        var outcome = exec.DecodeStep(lastToken, pos, kMax: 8,
+            drawNext: Argmax, onDraftAccepted: accepted.Add);
+
+        Assert.True(outcome.UsedSpeculation);
+        Assert.Equal(5, outcome.AcceptedCount);
+        Assert.Equal(1, model.BlockDraftCalls); // ONE pass for the whole block
+        Assert.Equal(model.ExpectedNext(pos + 5), outcome.NextToken);
+        Assert.Equal(pos + 6, model.CacheSeqLen);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void BlockDraft_CumulativeConfidenceGate_TruncatesOnPrefixProbability()
+    {
+        // Every position is individually above the gate, but the prefix product
+        // falls below it at position 3 (0.8^3 = 0.512 >= 0.5 > 0.8^4 = 0.41).
+        var model = new FakeMtpModel
+        {
+            BlockDraftSize = 5,
+            BlockConfidences = new[] { 0.8f, 0.8f, 0.8f, 0.8f, 0.8f },
+        };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5) { MinDraftProb = 0.5f };
+
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        var accepted = new List<int>();
+        var outcome = exec.DecodeStep(lastToken, pos, kMax: 5,
+            drawNext: Argmax, onDraftAccepted: accepted.Add);
+
+        Assert.Equal(3, exec.Stats.TokensDrafted);
+        Assert.Equal(3, outcome.AcceptedCount);
+        Assert.Equal(pos + 4, model.CacheSeqLen);
+    }
+
+    [Fact]
+    public void BlockDraft_WrongDraftMidBlock_KeepsPrefixAndCorrects()
+    {
+        var model = new FakeMtpModel { BlockDraftSize = 5 };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        model.DraftWrongPositions.Add(pos + 2); // third drafted token is wrong
+
+        var accepted = new List<int>();
+        var outcome = exec.DecodeStep(lastToken, pos, kMax: 5,
+            drawNext: Argmax, onDraftAccepted: accepted.Add);
+
+        Assert.Equal(2, outcome.AcceptedCount);
+        Assert.Equal(model.ExpectedNext(pos + 2), outcome.NextToken);
+        Assert.Equal(pos + 3, model.CacheSeqLen);
+        Assert.Equal(1, exec.Stats.RollbackSteps);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void PrefillSelfCatchUp_SkipsPerRowCaptureAndCatchUp()
+    {
+        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+
+        var prompt = new int[6];
+        for (int i = 0; i < prompt.Length; i++)
+            prompt[i] = i + 1;
+        exec.PrefillStep(prompt, 0);
+
+        // The drafter still gets the last prompt row's hidden state, and the
+        // block draft's protocol check would flag it if it did not.
+        var outcome = exec.DecodeStep(model.ExpectedNext(prompt.Length - 1), prompt.Length, kMax: 5,
+            drawNext: Argmax);
+        Assert.True(outcome.UsedSpeculation);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    // ----- the confidence gate defaults to the drafter's kind -----
+
+    [Fact]
+    public void MinDraftProb_DefaultsToTheGateMatchingTheDrafterKind()
+    {
+        // The two gates threshold different quantities — a per-token head's
+        // top-1 probability vs a block's CUMULATIVE prefix probability — so one
+        // shared default badly mis-gates whichever it wasn't chosen for.
+        var perToken = new MtpSpeculativeExecution(new FakeMtpModel(), maxDraftTokens: 4);
+        Assert.Equal(MtpSpeculativeExecution.DefaultTokenMinDraftProb, perToken.MinDraftProb);
+
+        var block = new MtpSpeculativeExecution(new FakeMtpModel { BlockDraftSize = 5 }, maxDraftTokens: 8);
+        Assert.Equal(MtpSpeculativeExecution.DefaultBlockMinDraftProb, block.MinDraftProb);
+        Assert.True(block.MinDraftProb < perToken.MinDraftProb);
+        // The window still clamps to what the drafter was trained to propose.
+        Assert.Equal(5, block.MaxDraftTokens);
+    }
+
+    [Fact]
+    public void MinDraftProb_BlockDefault_KeepsRealisticBlocksInsteadOfDroppingThem()
+    {
+        // Regression for the server default: a per-token-sized 0.75 gate against
+        // the cumulative product truncated nearly every block to nothing, so
+        // speculation cost the drafter's time and bought no tokens.
+        var model = new FakeMtpModel
+        {
+            BlockDraftSize = 5,
+            BlockConfidences = new[] { 0.9f, 0.85f, 0.8f, 0.75f, 0.7f },
+        };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        var outcome = exec.DecodeStep(lastToken, pos, kMax: 5, drawNext: Argmax);
+
+        // 0.9*0.85 = 0.765, *0.8 = 0.612, *0.75 = 0.459, *0.7 = 0.321 -> 4 kept.
+        Assert.Equal(4, exec.Stats.TokensDrafted);
+        Assert.True(outcome.UsedSpeculation);
+
+        // The same block under the per-token default keeps half as many: the
+        // product falls under 0.75 already at the third position (0.612).
+        var strictModel = new FakeMtpModel { BlockDraftSize = 5, BlockConfidences = model.BlockConfidences };
+        var strict = new MtpSpeculativeExecution(strictModel, maxDraftTokens: 5)
+        {
+            MinDraftProb = MtpSpeculativeExecution.DefaultTokenMinDraftProb,
+        };
+        int pos2 = PrefillPrompt(strictModel, strict, promptLen: 5, out int lastToken2);
+        strict.DecodeStep(lastToken2, pos2, kMax: 5, drawNext: Argmax);
+        Assert.Equal(2, strict.Stats.TokensDrafted);
+    }
+
+    // ----- streaming / resumable generation (the interactive chat path) -----
+
+    [Fact]
+    public void GenerateGreedy_StreamsEveryEmittedTokenAndWithholdsTheStopToken()
+    {
+        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+
+        var prompt = new[] { 1, 2, 3, 4, 5 };
+        // Generated token j is the trunk's prediction at position prompt.Length-1+j,
+        // so this ends the run on the 8th one.
+        int eos = model.ExpectedNext(prompt.Length + 6);
+
+        var streamed = new List<int>();
+        var output = decoder.GenerateGreedy(prompt, maxNewTokens: 64,
+            isStopToken: t => t == eos,
+            onToken: t => { streamed.Add(t); return true; });
+
+        Assert.Equal(eos, output[^1]);
+        // Everything except the stop token reaches the consumer, in order.
+        Assert.Equal(output.Take(output.Count - 1), streamed);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void GenerateGreedy_ConsumerStopsMidBlock_TrunkStaysAPrefixOfTheOutput()
+    {
+        // The invariant the chat session's KV bookkeeping rests on: on return the
+        // trunk holds exactly a PREFIX OF THE RETURNED OUTPUT. A block step commits
+        // its whole accepted window in one forward, so stopping part-way through
+        // emitting it runs the trunk past the result — the decoder has to drop that
+        // tail rather than leave the caller's cache mirror guessing.
+        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+
+        var prompt = new[] { 1, 2, 3, 4, 5 };
+        var streamed = new List<int>();
+        var output = decoder.GenerateGreedy(prompt, maxNewTokens: 64,
+            isStopToken: null,
+            onToken: t => { streamed.Add(t); return streamed.Count < 3; });
+
+        Assert.Equal(3, streamed.Count);
+        Assert.Equal(streamed, output);
+        int committed = model.CacheSeqLen - prompt.Length;
+        Assert.True(committed <= output.Count);
+        Assert.Equal(output.Take(committed), model.Trunk.Skip(prompt.Length));
+    }
+
+    [Fact]
+    public void GenerateGreedyFrom_ResumesOnTheCachedPrefixWithoutResettingTheTrunk()
+    {
+        // The multi-turn chat path: turn 2 prefills only its new tokens on top of
+        // the cache turn 1 left behind, then decodes from there.
+        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+
+        var prompt = new[] { 1, 2, 3, 4, 5 };
+        var turn1 = decoder.GenerateGreedy(prompt, maxNewTokens: 6);
+        int afterTurn1 = model.CacheSeqLen;
+        // The trunk holds a prefix of what was generated (the final token is only
+        // forwarded when the next step consumes it).
+        Assert.InRange(afterTurn1, prompt.Length + turn1.Count - 1, prompt.Length + turn1.Count);
+
+        // Extend the cache with the next turn's tokens only — no ResetKVCache.
+        var suffix = new[] { 11, 12, 13 };
+        float[] logits = decoder.Prefill(suffix);
+        Assert.Equal(afterTurn1 + suffix.Length, model.CacheSeqLen);
+
+        int resumePos = model.CacheSeqLen;
+        var turn2 = decoder.GenerateGreedyFrom(logits, resumePos, maxNewTokens: 6);
+
+        Assert.Equal(6, turn2.Count);
+        Assert.Equal(model.ExpectedNext(resumePos - 1), turn2[0]);
+        Assert.InRange(model.CacheSeqLen, resumePos + turn2.Count - 1, resumePos + turn2.Count);
+        // The drafter was fed the right hidden state across the turn boundary.
+        Assert.Empty(model.ProtocolViolations);
+        Assert.True(decoder.TokensDrafted > 0);
+    }
+
     private sealed class FakeMtpModel : IMtpBatchedSpeculativeModel
     {
         private readonly List<int> _trunk = new();
         private int _recurrentState;       // advances with the trunk
         private int _recurrentSnapshot = -1;
 
+        // Block drafting (DSpark): a positive size routes the executor through
+        // MtpDraftBlock, and BlockConfidences is what the confidence head
+        // reports for each block position.
+        public int BlockDraftSize { get; set; }
+        public float[] BlockConfidences { get; set; }
+        public int BlockDraftCalls { get; private set; }
+        public bool PrefillSelfCatchUp { get; set; }
         public HashSet<int> DraftWrongPositions { get; } = new();
         public HashSet<int> LowConfidencePositions { get; } = new();
         public List<string> ProtocolViolations { get; } = new();
@@ -420,9 +641,13 @@ public class MtpSpeculativeExecutionTests
             SnapshotCalls = RestoreCalls = 0;
             LinearSpecForwardCalls = BatchedSpecForwardCalls = 0;
             SlotSnapshotCalls = SlotRestoreCalls = 0;
+            BlockDraftCalls = 0;
         }
 
         public int ExpectedNext(int position) => ((position * 13) + 7) % VocabSize;
+
+        /// <summary>Tokens the trunk has actually committed to its KV cache.</summary>
+        public IReadOnlyList<int> Trunk => _trunk;
 
         // ---- IModelArchitecture ----
         public ModelConfig Config { get; } = new ModelConfig
@@ -484,12 +709,17 @@ public class MtpSpeculativeExecutionTests
             _trunk.AddRange(tokens);
             _recurrentState = _trunk.Count;
 
+            // A hidden buffer too small for every row means the caller only
+            // wants the LAST row (the self-catch-up prefill contract).
+            bool lastRowOnly = hAllOut != null && hAllOut.Length < tokens.Length * HiddenSize;
+
             for (int i = 0; i < tokens.Length; i++)
             {
-                if (hAllOut != null)
+                if (hAllOut != null && (!lastRowOnly || i == tokens.Length - 1))
                 {
+                    int row = lastRowOnly ? 0 : i;
                     for (int hh = 0; hh < HiddenSize; hh++)
-                        hAllOut[i * HiddenSize + hh] = startPos + i + 1;
+                        hAllOut[row * HiddenSize + hh] = startPos + i + 1;
                 }
                 if (allLogitsRows)
                 {
@@ -524,6 +754,32 @@ public class MtpSpeculativeExecutionTests
             }
             for (int hh = 0; hh < HiddenSize; hh++)
                 hOut[hh] = pos + 1;
+        }
+
+        public int MtpDraftBlockSize => BlockDraftSize;
+
+        public bool MtpPrefillSelfCatchUp => PrefillSelfCatchUp;
+
+        /// <summary>One-pass block draft: position i predicts the token after
+        /// position pos+i, mirroring what a DSpark block does.</summary>
+        public int MtpDraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
+        {
+            BlockDraftCalls++;
+            float expectH = position == 0 ? 0f : position;
+            if (Math.Abs(hPrev[0] - expectH) > 0.001f)
+                ProtocolViolations.Add($"block draft at pos {position} got hPrev {hPrev[0]} (expected {expectH})");
+
+            int n = Math.Min(BlockDraftSize, draftOut.Length);
+            for (int i = 0; i < n; i++)
+            {
+                int pos = position + i;
+                int predicted = ExpectedNext(pos);
+                if (DraftWrongPositions.Contains(pos))
+                    predicted = (predicted + 1) % VocabSize;
+                draftOut[i] = predicted;
+                confOut[i] = BlockConfidences != null && i < BlockConfidences.Length ? BlockConfidences[i] : 1.0f;
+            }
+            return n;
         }
 
         public void MtpCatchUp(int[] tokens, float[] hRows, int startPos)

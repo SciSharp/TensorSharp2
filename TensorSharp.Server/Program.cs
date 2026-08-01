@@ -191,9 +191,15 @@ if (redisFlagsApplied)
 if (mtpSpecFlagsApplied)
 {
     var schedCfg = TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment();
+    string blockDraft = Environment.GetEnvironmentVariable("TS_DSV4_DSPARK");
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "MTP speculative decoding configured via CLI: enabled={Enabled} maxDraft={MaxDraft} pMin={PMin} (engages on NextN/MTP draft-head models only)",
-        schedCfg.MtpSpeculativeEnabled, schedCfg.MtpMaxDraftTokens, schedCfg.MtpMinDraftProb);
+        "MTP speculative decoding configured via CLI: enabled={Enabled} maxDraft={MaxDraft} pMin={PMin} draftModel={DraftModel} " +
+        "(engages for solo sequences on models that ship a draft head)",
+        schedCfg.MtpSpeculativeEnabled, schedCfg.MtpMaxDraftTokens,
+        schedCfg.MtpMinDraftProb.HasValue
+            ? schedCfg.MtpMinDraftProb.Value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
+            : "auto (per drafter kind)",
+        string.IsNullOrEmpty(blockDraft) ? "(none)" : Path.GetFileName(blockDraft));
 }
 
 if (gpuDeviceFlagApplied)

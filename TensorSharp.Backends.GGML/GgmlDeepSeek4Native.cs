@@ -27,6 +27,22 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv, CharSet = CharSet.Ansi)]
         private static extern IntPtr TSGgml_Dsv4LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads);
 
+        [DllImport(DllName, CallingConvention = Conv, CharSet = CharSet.Ansi)]
+        private static extern IntPtr TSGgml_Dsv4LoadModelDspark(string ggufPath, int nGpu, int nCtx, int nUbatch,
+            int nThreads, string dsparkPath);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_Dsv4DsparkBlockSize(IntPtr handle);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_Dsv4ForwardSpec(IntPtr handle, int* tokens, int nTokens, float* logitsOut);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_Dsv4DsparkDraft(IntPtr handle, int anchorToken, int* toksOut, float* confOut);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_Dsv4Rewind(IntPtr handle, int nPast);
+
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_Dsv4VocabSize(IntPtr handle);
 
@@ -60,6 +76,41 @@ namespace TensorSharp.GGML
 
         public static IntPtr LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads)
             => TSGgml_Dsv4LoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads);
+
+        /// <summary>Load with a DSpark drafter GGUF (see the DeepSeek V4 card).
+        /// A null/empty path is identical to <see cref="LoadModel"/>.</summary>
+        public static IntPtr LoadModelWithDspark(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads,
+            string dsparkPath)
+            => TSGgml_Dsv4LoadModelDspark(ggufPath, nGpu, nCtx, nUbatch, nThreads, dsparkPath ?? string.Empty);
+
+        /// <summary>Tokens the DSpark drafter proposes per block, or 0 when no
+        /// drafter is loaded.</summary>
+        public static int DsparkBlockSize(IntPtr handle) => TSGgml_Dsv4DsparkBlockSize(handle);
+
+        /// <summary>Trunk forward returning logits for EVERY row (the
+        /// speculative verify). Advances the cache like Forward.</summary>
+        public static unsafe bool ForwardSpec(IntPtr handle, int[] tokens, float[] logitsOut)
+        {
+            fixed (int* t = tokens)
+            fixed (float* l = logitsOut)
+            {
+                return TSGgml_Dsv4ForwardSpec(handle, t, tokens.Length, l) != 0;
+            }
+        }
+
+        /// <summary>One DSpark block draft from <paramref name="anchorToken"/>
+        /// at the cache's current position. Returns the number of proposals.</summary>
+        public static unsafe int DsparkDraft(IntPtr handle, int anchorToken, int[] toksOut, float[] confOut)
+        {
+            fixed (int* t = toksOut)
+            fixed (float* c = confOut)
+            {
+                return TSGgml_Dsv4DsparkDraft(handle, anchorToken, t, c);
+            }
+        }
+
+        /// <summary>Drop the KV of rejected speculative tokens (position rewind only).</summary>
+        public static bool Rewind(IntPtr handle, int nPast) => TSGgml_Dsv4Rewind(handle, nPast) != 0;
 
         public static int VocabSize(IntPtr handle) => TSGgml_Dsv4VocabSize(handle);
         public static int CtxSize(IntPtr handle) => TSGgml_Dsv4CtxSize(handle);

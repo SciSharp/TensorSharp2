@@ -32,7 +32,8 @@ namespace TensorSharp.Models
         private DeepSeek4CudaExecutor _cudaExec;
         private readonly object _sync = new object();
 
-        public DeepSeek4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
+        public DeepSeek4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            string draftModelPath = null)
             : base(ggufPath, NormalizeBackend(backend), 1, null)
         {
             string arch = _gguf.GetString("general.architecture") ?? "deepseek4";
@@ -62,14 +63,17 @@ namespace TensorSharp.Models
                 // device memory, layer-split across the visible GPUs, driver-API
                 // kernels only (no ggml).
                 int nGpu = ParseEnvInt("TS_DSV4_NGPU", tpDegree > 1 ? tpDegree : 0); // 0 = all visible GPUs
+                string dspark = ResolveDsparkPath(draftModelPath);
                 Console.WriteLine($"Model: {arch} (direct-CUDA whole-model executor), Layers={Config.NumLayers}, " +
-                    $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}");
-                _cudaExec = new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, nGpu);
+                    $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}" +
+                    (dspark != null ? ", DSpark drafter" : string.Empty));
+                _cudaExec = new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, nGpu, dspark);
             }
             else if (_backend == BackendType.Cpu)
             {
                 // Pure C# whole-model executor: quantized weights served straight
                 // from the memory-mapped GGUF shards, managed SIMD kernels only.
+                WarnDsparkUnavailable(draftModelPath, backend);
                 int nThreads = ParseEnvInt("TS_DSV4_THREADS", Environment.ProcessorCount);
                 Console.WriteLine($"Model: {arch} (pure C# CPU executor), Layers={Config.NumLayers}, " +
                     $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}");
@@ -79,14 +83,46 @@ namespace TensorSharp.Models
             {
                 int nThreads = ParseEnvInt("TS_DSV4_THREADS", Math.Min(Environment.ProcessorCount, 32));
                 int nGpu = ParseEnvInt("TS_DSV4_NGPU", tpDegree > 1 ? tpDegree : 0); // 0 = all visible GPUs
+                string dspark = _backend == BackendType.GgmlCuda ? ResolveDsparkPath(draftModelPath) : null;
+                if (dspark == null)
+                    WarnDsparkUnavailable(draftModelPath, backend);
 
                 Console.WriteLine($"Model: {arch} (native whole-model executor), Layers={Config.NumLayers}, " +
-                    $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}");
+                    $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}" +
+                    (dspark != null ? ", DSpark drafter" : string.Empty));
 
-                _handle = GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads);
+                _handle = dspark != null
+                    ? GgmlDeepSeek4Native.LoadModelWithDspark(ggufPath, nGpu, maxContext, nUbatch, nThreads, dspark)
+                    : GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads);
+                _nativeUBatch = nUbatch;
+                _nativeDsparkBlock = _handle != IntPtr.Zero && dspark != null
+                    ? GgmlDeepSeek4Native.DsparkBlockSize(_handle) : 0;
                 if (_handle == IntPtr.Zero)
                     throw new InvalidOperationException($"Failed to load DeepSeek V4 model from {ggufPath} (see stderr for details).");
             }
+        }
+
+        /// <summary>Draft block size of the native (ggml) executor's drafter,
+        /// 0 when none is loaded.</summary>
+        private int _nativeDsparkBlock;
+
+        /// <summary>Prefill micro-batch of the native executor.</summary>
+        private int _nativeUBatch = 512;
+
+        /// <summary>
+        /// The DSpark drafter is implemented inside the direct-CUDA engine
+        /// (Dsv4CudaEngine.Dspark.cs), on top of that engine's own kernels and
+        /// cache rings. Every other executor serves plain decode, so say so
+        /// instead of silently ignoring the drafter the operator asked for.
+        /// </summary>
+        private static void WarnDsparkUnavailable(string draftModelPath, BackendType backend)
+        {
+            if (ResolveDsparkPath(draftModelPath) == null)
+                return;
+            Console.Error.WriteLine(
+                $"[dsv4] a DSpark drafter was configured but the {backend} backend has no speculative " +
+                "path for DeepSeek V4 (it is implemented in the direct-CUDA and ggml_cuda engines); " +
+                "decoding without it.");
         }
 
         private static BackendType NormalizeBackend(BackendType backend)

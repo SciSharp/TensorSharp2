@@ -347,6 +347,19 @@ namespace TensorSharp.Server.Hosting
                     changed = true;
                     continue;
                 }
+                // Path to a BLOCK drafter GGUF that has to be resident before
+                // the model's layer split runs (DeepSeek V4's DSpark). Unlike
+                // --mtp-draft-model this one is handed to the model factory, so
+                // it is carried as the same env var the CLI's --draft-model
+                // reads and picked up again by a runtime model switch.
+                if (TryReadOption(args, ref i, "--draft-model", out string dsparkOpt))
+                {
+                    if (string.IsNullOrWhiteSpace(dsparkOpt) || !File.Exists(dsparkOpt))
+                        throw new ArgumentException($"--draft-model file not found: '{dsparkOpt}'.");
+                    Environment.SetEnvironmentVariable("TS_DSV4_DSPARK", dsparkOpt);
+                    changed = true;
+                    continue;
+                }
             }
             return changed;
         }
@@ -789,7 +802,8 @@ namespace TensorSharp.Server.Hosting
                 }
                 if (TryReadOption(args, ref i, "--mtp-draft", out _)
                     || TryReadOption(args, ref i, "--mtp-pmin", out _)
-                    || TryReadOption(args, ref i, "--mtp-draft-model", out _))
+                    || TryReadOption(args, ref i, "--mtp-draft-model", out _)
+                    || TryReadOption(args, ref i, "--draft-model", out _))
                 {
                     continue;
                 }
@@ -849,6 +863,7 @@ namespace TensorSharp.Server.Hosting
                 "--continuous-batching", "--no-continuous-batching",
                 "--paged-batching", "--no-paged-batching", "--prefill-chunk-size",
                 "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
+                "--draft-model",
                 "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
                 "--offload-cpu",
                 "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",

@@ -426,7 +426,7 @@ public class ServerOptionsBuilderTests : IDisposable
             "--paged-kv", "--paged-kv-block-size", "--paged-kv-ram-mb",
             "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
             "--continuous-batching", "--prefill-chunk-size",
-            "--mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
+            "--mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model", "--draft-model",
             "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
             "--offload-cpu",
             "--config",
@@ -644,6 +644,50 @@ public class ServerOptionsBuilderTests : IDisposable
             ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(
                 new[] { "--mtp-draft-model", Path.Combine(_baseDir, "does-not-exist.gguf") }));
         Assert.Contains("--mtp-draft-model", ex.Message);
+    }
+
+    [Fact]
+    public void ApplyMtpSpeculativeCliFlags_BlockDraftModel_IsRoutedToItsOwnEnvVar()
+    {
+        // --draft-model (a block drafter handed to the model factory) and
+        // --mtp-draft-model (a draft head attached after load) are different
+        // mechanisms; each must reach its own consumer.
+        _env.Set("TS_DSV4_DSPARK", null);
+        _env.Set("TS_MTP_DRAFT_MODEL", null);
+        string blockDraft = Path.Combine(_baseDir, "dspark.gguf");
+        File.WriteAllText(blockDraft, "stub");
+
+        bool applied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(new[]
+        {
+            "--mtp-spec",
+            "--draft-model", blockDraft,
+        });
+
+        Assert.True(applied);
+        Assert.Equal(blockDraft, Environment.GetEnvironmentVariable("TS_DSV4_DSPARK"));
+        Assert.Null(Environment.GetEnvironmentVariable("TS_MTP_DRAFT_MODEL"));
+    }
+
+    [Fact]
+    public void ApplyMtpSpeculativeCliFlags_MissingBlockDraftFile_ThrowsArgumentException()
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(
+                new[] { "--draft-model", Path.Combine(_baseDir, "does-not-exist.gguf") }));
+        Assert.Contains("--draft-model", ex.Message);
+    }
+
+    [Fact]
+    public void SchedulerConfig_UnsetPmin_LeavesTheGateToTheDrafter()
+    {
+        // A per-token head and a block drafter threshold different quantities,
+        // so an unset --mtp-pmin must stay unset rather than baking in either
+        // one's default.
+        _env.Set("TS_MTP_PMIN", null);
+        Assert.Null(SchedulerConfig.FromEnvironment().MtpMinDraftProb);
+
+        _env.Set("TS_MTP_PMIN", "0.5");
+        Assert.Equal(0.5f, SchedulerConfig.FromEnvironment().MtpMinDraftProb);
     }
 
     [Fact]

@@ -101,7 +101,26 @@ namespace TensorSharp.Server
                             distConfig.LocalDegree, distConfig.NodeId, distConfig.PeerEndpoints);
                 }
 
-                _model = ModelBase.Create(modelPath, _backend, tpGroup: tpGroup);
+                // DeepSeek V4's DSpark drafter ships as a SEPARATE GGUF named by
+                // --draft-model (TS_DSV4_DSPARK). It goes to the factory rather
+                // than being attached afterwards like Gemma 4's draft head: the
+                // drafter's weights have to be counted by the layer split and
+                // uploaded with the trunk.
+                string blockDraftPath = Environment.GetEnvironmentVariable("TS_DSV4_DSPARK");
+                _model = ModelBase.Create(modelPath, _backend, tpGroup: tpGroup, draftModelPath: blockDraftPath);
+
+                // Say so when a drafter was named but the loaded model has no
+                // block-draft head to put it in, instead of leaving the operator
+                // to wonder why speculation never engages.
+                if (!string.IsNullOrEmpty(blockDraftPath)
+                    && _model is not TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel { HasMtp: true })
+                {
+                    _logger.LogWarning(
+                        "--draft-model '{Draft}' was given but the loaded model ({Architecture} on {Backend}) has no " +
+                        "block drafter; serving standard decode. DSpark is implemented for DeepSeek V4 on the " +
+                        "cuda and ggml_cuda backends.",
+                        Path.GetFileName(blockDraftPath), Architecture ?? "unknown", _backend);
+                }
 
                 // A worker node (--tp-node-id > 0) spends its life blocked in a
                 // mirror loop and cannot also serve HTTP requests, so the server

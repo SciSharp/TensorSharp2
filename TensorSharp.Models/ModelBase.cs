@@ -5721,7 +5721,11 @@ namespace TensorSharp.Models
                 allocatorDisposable.Dispose();
         }
 
-        public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
+        /// <param name="draftModelPath">Optional speculative-decoding draft
+        /// model (DeepSeek V4's DSpark support GGUF); ignored by architectures
+        /// that have no drafter.</param>
+        public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            string draftModelPath = null)
         {
             if (tpGroup == null && tpDegree <= 1)
             {
@@ -5744,7 +5748,7 @@ namespace TensorSharp.Models
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend, tpDegree, tpGroup),
                 "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend, tpDegree, tpGroup),
                 "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),
-                "deepseek4" => new DeepSeek4Model(ggufPath, backend, tpDegree, tpGroup),
+                "deepseek4" => new DeepSeek4Model(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };
         }
