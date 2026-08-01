@@ -468,6 +468,55 @@ public class MtpSpeculativeExecutionTests
         Assert.Empty(model.ProtocolViolations);
     }
 
+    // ----- the confidence gate defaults to the drafter's kind -----
+
+    [Fact]
+    public void MinDraftProb_DefaultsToTheGateMatchingTheDrafterKind()
+    {
+        // The two gates threshold different quantities — a per-token head's
+        // top-1 probability vs a block's CUMULATIVE prefix probability — so one
+        // shared default badly mis-gates whichever it wasn't chosen for.
+        var perToken = new MtpSpeculativeExecution(new FakeMtpModel(), maxDraftTokens: 4);
+        Assert.Equal(MtpSpeculativeExecution.DefaultTokenMinDraftProb, perToken.MinDraftProb);
+
+        var block = new MtpSpeculativeExecution(new FakeMtpModel { BlockDraftSize = 5 }, maxDraftTokens: 8);
+        Assert.Equal(MtpSpeculativeExecution.DefaultBlockMinDraftProb, block.MinDraftProb);
+        Assert.True(block.MinDraftProb < perToken.MinDraftProb);
+        // The window still clamps to what the drafter was trained to propose.
+        Assert.Equal(5, block.MaxDraftTokens);
+    }
+
+    [Fact]
+    public void MinDraftProb_BlockDefault_KeepsRealisticBlocksInsteadOfDroppingThem()
+    {
+        // Regression for the server default: a per-token-sized 0.75 gate against
+        // the cumulative product truncated nearly every block to nothing, so
+        // speculation cost the drafter's time and bought no tokens.
+        var model = new FakeMtpModel
+        {
+            BlockDraftSize = 5,
+            BlockConfidences = new[] { 0.9f, 0.85f, 0.8f, 0.75f, 0.7f },
+        };
+        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+        int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
+        var outcome = exec.DecodeStep(lastToken, pos, kMax: 5, drawNext: Argmax);
+
+        // 0.9*0.85 = 0.765, *0.8 = 0.612, *0.75 = 0.459, *0.7 = 0.321 -> 4 kept.
+        Assert.Equal(4, exec.Stats.TokensDrafted);
+        Assert.True(outcome.UsedSpeculation);
+
+        // The same block under the per-token default keeps half as many: the
+        // product falls under 0.75 already at the third position (0.612).
+        var strictModel = new FakeMtpModel { BlockDraftSize = 5, BlockConfidences = model.BlockConfidences };
+        var strict = new MtpSpeculativeExecution(strictModel, maxDraftTokens: 5)
+        {
+            MinDraftProb = MtpSpeculativeExecution.DefaultTokenMinDraftProb,
+        };
+        int pos2 = PrefillPrompt(strictModel, strict, promptLen: 5, out int lastToken2);
+        strict.DecodeStep(lastToken2, pos2, kMax: 5, drawNext: Argmax);
+        Assert.Equal(2, strict.Stats.TokensDrafted);
+    }
+
     // ----- streaming / resumable generation (the interactive chat path) -----
 
     [Fact]

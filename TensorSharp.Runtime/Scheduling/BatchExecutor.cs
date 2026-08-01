@@ -1075,21 +1075,25 @@ namespace TensorSharp.Runtime.Scheduling
             if (work.IsPrefill && prevComputed == 0 && spec.CacheSeqLen == 0)
             {
                 var cfg = _scheduler.Config;
+                var exec = new MtpSpeculativeExecution(spec, cfg.MtpMaxDraftTokens);
+                // Unset means "let the drafter pick": a per-token head and a
+                // block drafter threshold different quantities, so a shared
+                // default would badly mis-gate one of them.
+                if (cfg.MtpMinDraftProb.HasValue)
+                    exec.MinDraftProb = cfg.MtpMinDraftProb.Value;
                 _mtpCtx = new MtpSeqContext
                 {
                     Seq = seq,
-                    Exec = new MtpSpeculativeExecution(spec, cfg.MtpMaxDraftTokens)
-                    {
-                        MinDraftProb = cfg.MtpMinDraftProb,
-                    },
+                    Exec = exec,
                     NextPosition = 0,
                 };
                 seq.SpecStats = _mtpCtx.Exec.Stats;
                 // One line per request so operators can SEE speculation engage
                 // at generation start (the cumulative stats only log at finish).
                 _logger.LogInformation(
-                    "MTP speculative decoding armed for {RequestId} (maxDraft={MaxDraft}, pMin={PMin}, trunk=linear)",
-                    seq.RequestId, cfg.MtpMaxDraftTokens, cfg.MtpMinDraftProb);
+                    "MTP speculative decoding armed for {RequestId} (maxDraft={MaxDraft}, pMin={PMin}, draft={DraftKind}, trunk=linear)",
+                    seq.RequestId, exec.MaxDraftTokens, exec.MinDraftProb,
+                    spec.MtpDraftBlockSize > 0 ? $"block({spec.MtpDraftBlockSize})" : "per-token");
             }
 
             // Continuity gate: same sequence, exact trunk position, and the
@@ -1141,20 +1145,21 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 var cfg = _scheduler.Config;
                 var trunk = new BatchedMtpTrunk(spec, seq, 0);
+                var exec = new MtpSpeculativeExecution(spec, cfg.MtpMaxDraftTokens, trunk);
+                if (cfg.MtpMinDraftProb.HasValue)
+                    exec.MinDraftProb = cfg.MtpMinDraftProb.Value;
                 _mtpCtx = new MtpSeqContext
                 {
                     Seq = seq,
                     BatchedTrunk = trunk,
-                    Exec = new MtpSpeculativeExecution(spec, cfg.MtpMaxDraftTokens, trunk)
-                    {
-                        MinDraftProb = cfg.MtpMinDraftProb,
-                    },
+                    Exec = exec,
                     NextPosition = 0,
                 };
                 seq.SpecStats = _mtpCtx.Exec.Stats;
                 _logger.LogInformation(
-                    "MTP speculative decoding armed for {RequestId} (maxDraft={MaxDraft}, pMin={PMin}, trunk=batched)",
-                    seq.RequestId, cfg.MtpMaxDraftTokens, cfg.MtpMinDraftProb);
+                    "MTP speculative decoding armed for {RequestId} (maxDraft={MaxDraft}, pMin={PMin}, draft={DraftKind}, trunk=batched)",
+                    seq.RequestId, exec.MaxDraftTokens, exec.MinDraftProb,
+                    spec.MtpDraftBlockSize > 0 ? $"block({spec.MtpDraftBlockSize})" : "per-token");
             }
 
             // Continuity gate: a batched context for this exact sequence at

@@ -221,12 +221,19 @@ namespace TensorSharp.Server.Hosting
                     "Maximum draft tokens per step. Default: 8.",
                     "--mtp-draft 4"),
                 new OptionHelp("--mtp-pmin <f>",
-                    "Minimum draft-token probability in (0, 1]; drafting stops below it. Default: 0.75.",
+                    "Minimum draft confidence in (0, 1]; drafting stops below it. Default: per drafter kind " +
+                    "— 0.75 for a per-token draft head, 0.35 for a block drafter (where the gate is the " +
+                    "CUMULATIVE prefix probability, so the same number means something much stricter).",
                     "--mtp-pmin 0.6"),
                 new OptionHelp("--mtp-draft-model <path>",
                     "Separate draft GGUF for models whose draft head ships as its own file (Gemma 4 assistant). " +
                     "Qwen3.6 embeds the draft head and needs no flag. Default: none.",
                     "--mtp-draft-model gemma-4-E4B-it-assistant.Q8_0.gguf"),
+                new OptionHelp("--draft-model <path>",
+                    "Block drafter GGUF for architectures whose drafter must be resident before the layer " +
+                    "split (DeepSeek V4's DSpark). Needs --mtp-spec, engages for solo sequences on the cuda " +
+                    "and ggml_cuda backends. Default: none; env TS_DSV4_DSPARK.",
+                    "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf"),
             }),
             ("Qwen-Image-Edit companion models (qwen_image DiT GGUFs)", new[]
             {

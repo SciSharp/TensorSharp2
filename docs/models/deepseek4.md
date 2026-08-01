@@ -111,11 +111,48 @@ TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --interactive --think --tp 4 --max-tokens 20000
 ```
 
-Speculation needs a pure argmax sampler, so it stays off for anything that
-rewrites the logits it verifies against — a non-zero temperature, top-k/top-p,
-or a repetition/presence/frequency penalty (`/temp`, `/top-k`, … in the REPL
-turn it off from the next turn onward). It also stays off for a turn that
-carries an image or audio attachment.
+On the CLI, speculation needs a pure argmax sampler: the standalone decoder
+verifies each row with argmax, so anything that rewrites those logits — a
+non-zero temperature, top-k/top-p, or a repetition/presence/frequency penalty
+(`/temp`, `/top-k`, … in the REPL) — turns it off from the next turn onward. It
+also stays off for a turn carrying an image or audio attachment.
+
+### On TensorSharp.Server
+
+The same drafter serves the HTTP API. Pass it with `--draft-model` and turn
+speculation on with `--mtp-spec`:
+
+```bash
+TensorSharp.Server --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
+    --backend ggml_cuda --tp 4 \
+    --mtp-spec --draft-model DSpark-drafter-Q2K-Q8-0731.gguf
+```
+
+Unlike the CLI, the engine draws every verify row with the **request's own
+sampler**, so speculation composes with any sampling settings and the output is
+whatever that sampler would have produced anyway. Penalties only cost
+acceptance, and measurably little: the same prompt at `repeat_penalty` 1.1 vs
+1.0 came out at 31.3 vs 32.1 tok/s (66% vs 57% acceptance — the difference is
+which text was generated, not the penalty).
+
+Two engine-level limits are worth knowing. Speculation is armed per request at
+a fresh full prefill, and it serves **solo sequences only**: as soon as a second
+request is in flight the planner logs
+`PerSequenceFused; rejected: MtpPerSequence: multi-sequence step` and DSV4's
+per-sequence slots serve the batch at normal decode speed. Concurrency is safe,
+it just isn't speculative.
+
+Measured on 4×A40 (`--tp 4`, 300-token OpenAI chat completion):
+
+| Config | tok/s |
+|---|---|
+| No drafter | 25.1 |
+| `--mtp-spec --draft-model …` | **31.3 – 32.1 (1.25–1.28x)** |
+
+`--mtp-pmin` defaults to the value matching the loaded drafter — 0.35 for a
+block drafter, 0.75 for a per-token draft head — so it needs no tuning. Setting
+it explicitly still wins; the startup line reports which gate is in force
+(`pMin=0.35, draft=block(5)`).
 
 The two engines implement the same algorithm differently. The **ggml** engine
 builds the drafter as three extra layers of the model graph: the trunk graph

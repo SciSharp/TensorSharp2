@@ -369,13 +369,32 @@ namespace TensorSharp.Runtime.Scheduling
         public int MaxDraftTokens { get; }
 
         /// <summary>
+        /// Default gate for a per-token MTP head: the top-1 probability over the
+        /// head's top-10 logits, thresholded per drafted token (llama.cpp's
+        /// top-k(10) draft sampler with p_min).
+        /// </summary>
+        public const float DefaultTokenMinDraftProb = 0.75f;
+
+        /// <summary>
+        /// Default gate for a BLOCK drafter (DSpark). Much lower than
+        /// <see cref="DefaultTokenMinDraftProb"/> because it thresholds a
+        /// different quantity: the CUMULATIVE prefix probability (the product of
+        /// the confidence head's per-position estimates), which decays with every
+        /// position. 0.35 is the break-even point where an extra verify row stops
+        /// paying for itself on a sparse-MoE trunk; a per-token-sized 0.75 here
+        /// truncates almost every block to nothing.
+        /// </summary>
+        public const float DefaultBlockMinDraftProb = 0.35f;
+
+        /// <summary>
         /// Minimum draft confidence for a drafted token to be kept; drafting
         /// stops at the first token below it. For MTP heads this is the top-1
         /// probability over the head's top-10 logits (llama.cpp's top-k(10)
-        /// draft sampler); for a DSpark block it is the confidence head's
-        /// predicted acceptance probability for that block position.
+        /// draft sampler); for a DSpark block it is the CUMULATIVE product of the
+        /// confidence head's predicted acceptance probabilities. Defaults to the
+        /// constant matching the loaded drafter's kind.
         /// </summary>
-        public float MinDraftProb { get; set; } = 0.75f;
+        public float MinDraftProb { get; set; } = DefaultTokenMinDraftProb;
 
         private readonly int _blockDraft;
         private readonly int[] _blockTokens;
@@ -394,9 +413,14 @@ namespace TensorSharp.Runtime.Scheduling
 
             _blockDraft = model.MtpDraftBlockSize;
             if (_blockDraft > 0)
+            {
                 MaxDraftTokens = maxDraftTokens = Math.Min(maxDraftTokens, _blockDraft);
+                MinDraftProb = DefaultBlockMinDraftProb;
+            }
             else
+            {
                 MaxDraftTokens = maxDraftTokens;
+            }
             _hidden = model.MtpHiddenSize;
             _vocab = model.Config.VocabSize;
             _blockTokens = new int[Math.Max(_blockDraft, 1)];
