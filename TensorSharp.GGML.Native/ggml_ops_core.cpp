@@ -1256,7 +1256,32 @@ namespace tsg
         // ggml_gallocr_alloc_graph reuses the existing buffer when the new graph
         // fits and grows (reallocates) it only when a larger graph appears.
         bool ok = ggml_gallocr_alloc_graph(g_reuse_gallocr, graph);
-        if (ok && vram_log_enabled())
+        if (!ok)
+        {
+            // A FAILED alloc leaves the allocator POISONED, and because this one
+            // is persistent the poison outlives the call. ggml_gallocr_reserve_n
+            // first re-plans node_allocs/leaf_allocs for the new (larger) graph
+            // and frees the old buffer, and only then tries to allocate the new
+            // one; on OOM it returns false with galloc->buffers[i] == NULL while
+            // the plan still claims every tensor is placed.
+            //
+            // The next call is the trap: model graphs have a FIXED topology
+            // (node/leaf counts depend on the layer stack, not the token count),
+            // so a shorter prompt yields the same node count with no-larger
+            // tensors -> ggml_gallocr_needs_realloc() returns false -> the
+            // reserve is skipped -> ggml_gallocr_init_tensor() dereferences the
+            // NULL buffer. That is the 0xC0000005 / SIGSEGV of issue #113: one
+            // OOM on a long prompt crashed the process on the NEXT request.
+            //
+            // There is no ggml API to inspect or repair that state, so drop the
+            // allocator; the next call builds a fresh one and re-reserves from
+            // scratch. The failed reserve already freed the buffer this owned,
+            // so nothing extra is lost by throwing away the bookkeeping.
+            ggml_gallocr_free(g_reuse_gallocr);
+            g_reuse_gallocr = nullptr;
+            return false;
+        }
+        if (vram_log_enabled())
         {
             static std::size_t s_last_size = 0;
             const std::size_t size = ggml_gallocr_get_buffer_size(g_reuse_gallocr, 0);
@@ -1266,7 +1291,7 @@ namespace tsg
                 vram_log("reuse-gallocr(grew)", static_cast<std::int64_t>(size));
             }
         }
-        return ok;
+        return true;
     }
 
     void optimize_graph_for_metal(ggml_cgraph* graph)

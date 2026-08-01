@@ -119,6 +119,12 @@ public static class FeatureCatalog
         Id = "long_text",
         DisplayName = "Long text prompt (~1k tokens, single turn)",
         PromptFile = "prompts/long_text.txt",
+        // The prompt asks for a paragraph of up to six sentences, which does not
+        // fit in DefaultMaxTokens — and a model that reasons before answering
+        // (gemma-4-E4B, gpt-oss) spends the whole budget on the preamble and gets
+        // cut off before writing a single sentence of the summary. That reads as
+        // a correctness failure when the model is fine; give the answer room.
+        MaxTokens = 256,
         // Summary of a paged-KV-cache report. Any correct summary names
         // either the data structure or the technique.
         ExpectedContains = new[] { "paged" },

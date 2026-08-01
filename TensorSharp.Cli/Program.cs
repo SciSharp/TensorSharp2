@@ -997,7 +997,14 @@ namespace TensorSharp.Cli
                 {
                     var doc = JsonDocument.Parse(line);
                     var root = doc.RootElement;
-                    userMsg = root.TryGetProperty("content", out var c) ? c.GetString() : line;
+                    // "content" is the documented key; accept "user" as an alias
+                    // because the object shape invites it. Falling through to the
+                    // raw line for a well-formed object silently feeds the model
+                    // the JSON itself, which reads as a plausible-but-wrong turn
+                    // and makes the run look like a model failure.
+                    userMsg =
+                        root.TryGetProperty("content", out var c) ? c.GetString() :
+                        root.TryGetProperty("user", out var u) ? u.GetString() : line;
                     if (root.TryGetProperty("max_tokens", out var mt))
                         turnMaxTokens = mt.GetInt32();
                     if (root.TryGetProperty("force_reset", out var fr))
