@@ -1712,6 +1712,63 @@ namespace TensorSharp
 			Apply3(result, gate, up, func);
 		}
 
+		/// <summary>
+		/// result = clamp(up, -limit, +limit) * SiLU(min(gate, limit)). limit &lt;= 0
+		/// disables the clamp (plain SiLUMul). Aliasing result == gate is supported,
+		/// which is how the MoE FFN writes the activated hidden state back in place.
+		/// </summary>
+		unsafe static public void SiLUMulClamp(Tensor result, Tensor gate, Tensor up, float limit)
+		{
+			if (!(limit > 0.0f))
+			{
+				SiLUMul(result, gate, up);
+				return;
+			}
+
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(gate, out float* gatePtr, out int gateLength) &&
+                TryGetContiguousFloat(up, out float* upPtr, out int upLength) &&
+                length == gateLength && length == upLength)
+            {
+                SiLUMulClampContiguous(resultPtr, gatePtr, upPtr, length, limit);
+                return;
+            }
+
+			float lim = limit;
+			unsafe void func(float* r, float* g, float* u)
+			{
+				float gv = MathF.Min(*g, lim);
+				float uv = MathF.Min(MathF.Max(*u, -lim), lim);
+				*r = SiLU(gv) * uv;
+			}
+			Apply3(result, gate, up, func);
+		}
+
+		unsafe private static void SiLUMulClampContiguous(float* resultPtr, float* gatePtr, float* upPtr, int length, float limit)
+		{
+			// Clamp both operands into scratch first so the vectorized
+			// sigmoid/multiply below is the same code path SiLUMul uses.
+			float[] gateRent = ArrayPool<float>.Shared.Rent(length);
+			float[] upRent = ArrayPool<float>.Shared.Rent(length);
+			try
+			{
+				Span<float> g = gateRent.AsSpan(0, length);
+				Span<float> u = upRent.AsSpan(0, length);
+				TensorPrimitives.Min(new ReadOnlySpan<float>(gatePtr, length), limit, g);
+				TensorPrimitives.Max(new ReadOnlySpan<float>(upPtr, length), -limit, u);
+				TensorPrimitives.Min(u, limit, u);
+
+				Span<float> output = new Span<float>(resultPtr, length);
+				TensorPrimitives.Sigmoid(g, output);
+				MultiplySiLUGateUp(g, u, output, output);
+			}
+			finally
+			{
+				ArrayPool<float>.Shared.Return(gateRent);
+				ArrayPool<float>.Shared.Return(upRent);
+			}
+		}
+
 		unsafe static public void SigmoidMul(Tensor result, Tensor x, Tensor gate)
 		{
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
@@ -2680,14 +2737,20 @@ namespace TensorSharp
 			int rows,
 			int cols)
 		{
-            if (TryGetContiguousRows(out_, out float* contiguousOut, out int outRows, out int outCols) &&
+            // gamma_ == null means an unweighted RMS norm (x * rsqrt(mean(x^2)+eps)),
+            // which several architectures use for per-head query/key normalization.
+            float* gammaPtr = null;
+            int gammaLength = cols;
+            bool gammaOk = gamma_ == null || TryGetContiguousFloat(gamma_, out gammaPtr, out gammaLength);
+            if (gammaOk &&
+                TryGetContiguousRows(out_, out float* contiguousOut, out int outRows, out int outCols) &&
                 TryGetContiguousRows(in_, out float* contiguousIn, out int inRows, out int inCols) &&
-                TryGetContiguousFloat(gamma_, out float* gammaPtr, out int gammaLength) &&
                 rows == outRows && rows == inRows && cols == outCols && cols == inCols && gammaLength == cols &&
                 (beta_ == null || (TryGetContiguousFloat(beta_, out _, out int betaLength) && betaLength == cols)))
             {
                 float* betaPtr = beta_ != null ? (float*)CpuNativeHelpers.GetBufferStart(beta_) : null;
                 bool hasBiasFast = betaPtr != null;
+                bool hasGamma = gammaPtr != null;
                 float colsAsFloat = cols;
                 int vectorSize = Vector<float>.Count;
 
@@ -2714,7 +2777,19 @@ namespace TensorSharp
                     Vector<float> vecInvRms = new Vector<float>(invRms);
 
                     i = 0;
-                    if (hasBiasFast)
+                    if (!hasGamma)
+                    {
+                        for (; i <= cols - vectorSize; i += vectorSize)
+                        {
+                            StoreVec(yRow + i, LoadVec(xRow + i) * vecInvRms);
+                        }
+
+                        for (; i < cols; i++)
+                        {
+                            yRow[i] = xRow[i] * invRms;
+                        }
+                    }
+                    else if (hasBiasFast)
                     {
                         for (; i <= cols - vectorSize; i += vectorSize)
                         {
@@ -2759,7 +2834,7 @@ namespace TensorSharp
 
 			float* outPtr = (float*)CpuNativeHelpers.GetBufferStart(out_);
 			float* inPtr = (float*)CpuNativeHelpers.GetBufferStart(in_);
-			float* gamma = (float*)CpuNativeHelpers.GetBufferStart(gamma_);
+			float* gamma = (gamma_ != null) ? (float*)CpuNativeHelpers.GetBufferStart(gamma_) : null;
 			float* beta = (beta_ != null) ? (float*)CpuNativeHelpers.GetBufferStart(beta_) : null;
 			bool bias = (beta_ != null);
 
@@ -2783,7 +2858,7 @@ namespace TensorSharp
 				for (int id = 0; id < cols; id++)
 				{
 
-					float gammav = gamma[id];
+					float gammav = gamma != null ? gamma[id] : 1.0f;
 					float xv = xRow[id];
 					float betav = bias ? beta[id] : 0.0f;
 					float rmsNorm = xv / rms;

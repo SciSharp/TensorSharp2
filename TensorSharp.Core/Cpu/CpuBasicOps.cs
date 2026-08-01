@@ -657,6 +657,14 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
+        [RegisterOpStorageType("SiLUMulClamp", typeof(CpuStorage))]
+        public Tensor SiLUMulClamp(Tensor result, Tensor gate, Tensor up, float limit)
+        {
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, gate, false, gate.Sizes);
+            TensorApplyCPU.SiLUMulClamp(writeTarget, gate, up, limit);
+            return writeTarget;
+        }
+
         [RegisterOpStorageType("SigmoidMul", typeof(CpuStorage))]
         public Tensor SigmoidMul(Tensor result, Tensor x, Tensor gate)
         {

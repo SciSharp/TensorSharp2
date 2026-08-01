@@ -120,7 +120,7 @@ internal static class Program
     }
 
     // Isolated perf + correctness harness for the pure-C# quantized linear
-    // (ModelBase.DequantMatMulColumns): loads real DiT weights, times a [seqLen x inDim] x
+    // (ManagedQuantizedOps.DequantMatMulColumns): loads real DiT weights, times a [seqLen x inDim] x
     // W^T matmul across cores, and verifies the result vs a naive scalar dequant+dot reference.
     //   quant-matmul-bench <dit.gguf> [seqLen] [iters]
     private static unsafe int QuantMatMulBench(string[] args)
@@ -163,7 +163,7 @@ internal static class Program
                 float* outpp = (float*)outH.AddrOfPinnedObject();
                 void Run() => System.Threading.Tasks.Parallel.For(0, outDim,
                     () => new float[inDim],
-                    (col, _, w) => { fixed (float* wsc = w) { TensorSharp.Models.ModelBase.DequantMatMulColumns((int)type, wbase, rowBytes, inDim, outDim, actp, inDim, seqLen, outpp, outDim, col, col + 1, wsc); } return w; },
+                    (col, _, w) => { fixed (float* wsc = w) { TensorSharp.Models.ManagedQuantizedOps.DequantMatMulColumns((int)type, wbase, rowBytes, inDim, outDim, actp, inDim, seqLen, outpp, outDim, col, col + 1, wsc); } return w; },
                     _ => { });
                 Run(); // warmup
                 for (int it = 0; it < iters; it++)

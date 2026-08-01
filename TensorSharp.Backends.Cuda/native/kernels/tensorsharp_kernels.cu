@@ -1639,7 +1639,10 @@ extern "C" __global__ void ts_rmsnorm_f32(
 
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
     {
-        float v = x[i] * inv_rms * alpha[i];
+        // alpha == nullptr: unweighted RMS norm (per-head query/key norms).
+        float v = x[i] * inv_rms;
+        if (alpha != 0)
+            v *= alpha[i];
         if (beta != 0)
             v += beta[i];
         y[i] = v;
@@ -7762,6 +7765,32 @@ extern "C" __global__ void ts_silu_mul_f32(float* dst, const float* a, const flo
         return;
     float x = a[i];
     dst[i] = silu(x) * b[i];
+}
+
+// Clamped SwiGLU: dst[i] = clamp(b[i], -limit, +limit) * silu(min(a[i], limit)).
+// The gate is clamped only from above (silu already saturates below); the up
+// projection is clamped on both sides. do_clamp == 0 reduces to ts_silu_mul_f32.
+// In-place safe when dst == a. Shared by DeepSeek V4's MoE / shared expert and
+// any other architecture whose FFN clamps its activations.
+extern "C" __global__ void ts_silu_mul_clamp_f32(
+    float* __restrict__ dst,
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    const long long n,
+    const float limit,
+    const int do_clamp)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    float g = a[i];
+    float u = b[i];
+    if (do_clamp)
+    {
+        u = fminf(fmaxf(u, -limit), limit);
+        g = fminf(g, limit);
+    }
+    dst[i] = u * silu(g);
 }
 
 // Shared-expert gated accumulate for the on-device SwiGLU MoE decode. Computes the

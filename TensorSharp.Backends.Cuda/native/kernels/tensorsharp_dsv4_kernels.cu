@@ -663,47 +663,8 @@ extern "C" __global__ void ts_dsv4_hc_head_f32(
 // norms / rope / attention prologue
 // ---------------------------------------------------------------------------
 
-// In-place RMS norm over rows; weight may be null.
-extern "C" __global__ void ts_dsv4_rmsnorm_f32(
-    float* __restrict__ data,
-    const float* __restrict__ weight,
-    const int rows,
-    const int n,
-    const float eps)
-{
-    const int r = blockIdx.x;
-    if (r >= rows)
-        return;
-    float* row = data + (size_t)r * n;
-
-    __shared__ float red[256];
-    float acc = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-    {
-        const float v = row[i];
-        acc += v * v;
-    }
-    red[threadIdx.x] = acc;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
-    {
-        if (threadIdx.x < s)
-            red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
-    }
-    const float inv = rsqrtf(red[0] / n + eps);
-
-    if (weight != nullptr)
-    {
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-            row[i] = row[i] * inv * weight[i];
-    }
-    else
-    {
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-            row[i] *= inv;
-    }
-}
+// RMS norm now comes from the shared kernel set (ts_rmsnorm_f32, reached via
+// Ops.RMSNorm): identical math, one implementation.
 
 // blockIdx.x in [0, NH]: heads 0..NH-1 per-head-RMS + RoPE q in place; block
 // NH RMS-norms (with weight) + RoPEs kv and commits it (F16) to the SWA ring.
@@ -2158,27 +2119,8 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_f32(
     }
 }
 
-// gate = swiglu_clamp(gate, up): up clamped to [-limit, limit], gate to
-// (-inf, limit], result = silu(gate) * up.
-extern "C" __global__ void ts_dsv4_swiglu_clamp_f32(
-    float* __restrict__ gate,
-    const float* __restrict__ up,
-    const long long n,
-    const float limit,
-    const int doClamp)
-{
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n)
-        return;
-    float g = gate[i];
-    float u = up[i];
-    if (doClamp)
-    {
-        u = fminf(fmaxf(u, -limit), limit);
-        g = fminf(g, limit);
-    }
-    gate[i] = u * (g / (1.0f + expf(-g)));
-}
+// Clamped SwiGLU now comes from the shared kernel set
+// (ts_silu_mul_clamp_f32, reached via Ops.SiLUMulClamp).
 
 // ffnOut[t] = sum_j w[t,j] * downOut[row(t,j)] (+ shexp[t]); rowOfSlot null
 // means identity (decode: slot j -> row j).

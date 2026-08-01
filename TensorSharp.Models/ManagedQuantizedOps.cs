@@ -258,6 +258,120 @@ namespace TensorSharp.Models
             }
         }
 
+
+        /// <summary>
+        /// The pure-C# quantized/dense linear:
+        /// output[row, col] = dot(weightRow(col), input[row]) for every row/col.
+        ///
+        /// One implementation for every managed caller (ModelBase's linear layers,
+        /// the DeepSeek V4 CPU executor, the quant-matmul bench): weight types with
+        /// an integer dot kernel quantize the activations once and run
+        /// <see cref="TryAddmmQuantizedToFloat32(int, IntPtr, long, long, float*, int, int, float*, int)"/>;
+        /// everything else (F16/BF16/F32 and any quant without a direct kernel)
+        /// dequantizes each weight row ONCE into an L1-hot scratch and dots it with
+        /// four activation rows at a time.
+        ///
+        /// Row strides let callers point at a sub-block of a wider scratch buffer,
+        /// and <paramref name="options"/> caps the degree of parallelism (the DSV4
+        /// executor runs under a CPU quota and sets it explicitly).
+        /// </summary>
+        public static unsafe void AddmmQuantizedToFloat32(
+            int ggmlType,
+            IntPtr weights,
+            long ne0,
+            long ne1,
+            float* input,
+            int inputRowStride,
+            int rowCount,
+            float* output,
+            int outputRowStride,
+            ParallelOptions options = null)
+        {
+            if (TryAddmmQuantizedToFloat32(
+                    ggmlType, weights, ne0, ne1, input, inputRowStride, rowCount, output, outputRowStride, options))
+            {
+                return;
+            }
+
+            int inDim = checked((int)ne0);
+            int outDim = checked((int)ne1);
+            long rowBytes = RowSize(ggmlType, ne0);
+            byte* weightBase = (byte*)weights.ToPointer();
+            int dop = options?.MaxDegreeOfParallelism > 0 ? options.MaxDegreeOfParallelism : Environment.ProcessorCount;
+
+            void RunRange(int start, int end, float* w)
+                => DequantMatMulColumns(ggmlType, weightBase, rowBytes, inDim, outDim,
+                    input, inputRowStride, rowCount, output, outputRowStride, start, end, w);
+
+            if (outDim < 128 || (long)rowCount * outDim < 512 || dop <= 1)
+            {
+                float[] scratch = ArrayPool<float>.Shared.Rent(inDim);
+                try
+                {
+                    fixed (float* w = scratch)
+                        RunRange(0, outDim, w);
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(scratch);
+                }
+                return;
+            }
+
+            // Blocked column ranges, not one task per column: a single dequant+dot
+            // column is ~microseconds, so per-column tasks are dominated by
+            // scheduler overhead and stop scaling after a handful of cores.
+            int colBlock = Math.Max(4, outDim / (dop * 8));
+            int nBlocks = (outDim + colBlock - 1) / colBlock;
+            Parallel.For(0, nBlocks, options ?? new ParallelOptions(), b =>
+            {
+                float[] scratch = ArrayPool<float>.Shared.Rent(inDim);
+                try
+                {
+                    fixed (float* w = scratch)
+                        RunRange(b * colBlock, Math.Min(outDim, b * colBlock + colBlock), w);
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(scratch);
+                }
+            });
+        }
+
+        // Core of the pure-C# quantized linear (shared by AddmmQuantManaged and the
+        // quant-matmul benchmark/self-test): for each output column in [startCol,endCol),
+        // dequantize its weight row into <paramref name="wScratch"/> (inDim floats, hot in L1)
+        // and dot it with every activation row using register-blocked VecDot4. Dequant honours
+        // NativeDequant.PreferManaged (managed on the pure-C# CPU backend).
+        public static unsafe void DequantMatMulColumns(
+            int ggmlType, byte* weightBase, long rowBytes, int inDim, int outDim,
+            float* inputPtr, int inputRowStride, int seqLen, float* resultPtr, int outputRowStride,
+            int startCol, int endCol, float* wScratch)
+        {
+            for (int col = startCol; col < endCol; col++)
+            {
+                byte* rowPtr = weightBase + (long)col * rowBytes;
+                NativeDequant.DequantizeToFloat32Native(ggmlType, (IntPtr)rowPtr, (IntPtr)wScratch, inDim);
+
+                int row = 0;
+                for (; row + 4 <= seqLen; row += 4)
+                {
+                    TensorComputePrimitives.Dot4(
+                        inputPtr + (long)row * inputRowStride,
+                        inputPtr + (long)(row + 1) * inputRowStride,
+                        inputPtr + (long)(row + 2) * inputRowStride,
+                        inputPtr + (long)(row + 3) * inputRowStride,
+                        wScratch, inDim, out float r0, out float r1, out float r2, out float r3);
+                    resultPtr[(long)row * outputRowStride + col] = r0;
+                    resultPtr[(long)(row + 1) * outputRowStride + col] = r1;
+                    resultPtr[(long)(row + 2) * outputRowStride + col] = r2;
+                    resultPtr[(long)(row + 3) * outputRowStride + col] = r3;
+                }
+                for (; row < seqLen; row++)
+                    resultPtr[(long)row * outputRowStride + col] = TensorComputePrimitives.Dot(inputPtr + (long)row * inputRowStride, wScratch, inDim);
+            }
+        }
+
         public static unsafe bool TryAddmmQuantizedToFloat32(
             int ggmlType,
             IntPtr weights,
@@ -267,7 +381,8 @@ namespace TensorSharp.Models
             int inputRowStride,
             int rowCount,
             float* output,
-            int outputRowStride)
+            int outputRowStride,
+            ParallelOptions options = null)
         {
             var type = (GgmlTensorType)ggmlType;
             if (ne0 > int.MaxValue || ne1 > int.MaxValue)
@@ -292,11 +407,29 @@ namespace TensorSharp.Models
             {
                 fixed (byte* activationBase = rented)
                 {
-                    for (int row = 0; row < rowCount; row++)
+                    int dop = options?.MaxDegreeOfParallelism > 0 ? options.MaxDegreeOfParallelism : Environment.ProcessorCount;
+                    if (rowCount >= 8 && dop > 1)
                     {
-                        byte* dst = activationBase + (long)row * activationRowBytes;
-                        float* src = input + (long)row * inputRowStride;
-                        QuantizeActivation(src, dst, (int)ne0, activationKind);
+                        // Prefill batches quantize thousands of activation rows;
+                        // serially that is a measurable share of the matmul.
+                        nint actAddr = (nint)activationBase;
+                        nint inAddr = (nint)input;
+                        int actBytes = activationRowBytes;
+                        int width = (int)ne0;
+                        int stride = inputRowStride;
+                        var kind = activationKind;
+                        Parallel.For(0, rowCount, options ?? new ParallelOptions(), row =>
+                            QuantizeActivation((float*)inAddr + (long)row * stride,
+                                (byte*)actAddr + (long)row * actBytes, width, kind));
+                    }
+                    else
+                    {
+                        for (int row = 0; row < rowCount; row++)
+                        {
+                            byte* dst = activationBase + (long)row * activationRowBytes;
+                            float* src = input + (long)row * inputRowStride;
+                            QuantizeActivation(src, dst, (int)ne0, activationKind);
+                        }
                     }
 
                     byte* weightBase = (byte*)weights.ToPointer();
@@ -325,15 +458,15 @@ namespace TensorSharp.Models
                         }
                     }
 
-                    bool useParallel = outDim >= 128 && (long)rowCount * outDim >= 512 && Environment.ProcessorCount > 1;
+                    bool useParallel = outDim >= 128 && (long)rowCount * outDim >= 512 && dop > 1;
                     if (useParallel)
                     {
                         // Blocked ranges: per-column tasks make the scheduler
                         // overhead comparable to the ~0.5-2us dot itself and cap
                         // scaling at a handful of cores.
-                        int colBlock = Math.Max(8, outDim / (Environment.ProcessorCount * 8));
+                        int colBlock = Math.Max(8, outDim / (dop * 8));
                         int nBlocks = (outDim + colBlock - 1) / colBlock;
-                        Parallel.For(0, nBlocks, b =>
+                        Parallel.For(0, nBlocks, options ?? new ParallelOptions(), b =>
                             ComputeColumnRange(b * colBlock, Math.Min(outDim, b * colBlock + colBlock)));
                     }
                     else

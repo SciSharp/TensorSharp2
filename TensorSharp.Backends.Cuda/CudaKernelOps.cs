@@ -606,6 +606,32 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>
+        /// result = clamp(up, ±limit) * SiLU(min(gate, limit)) over contiguous F32
+        /// tensors of matching element count. Aliasing result == gate is supported.
+        /// </summary>
+        public static bool TrySiLUMulClamp(Tensor result, Tensor gate, Tensor up, float limit)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
+                !TryGetContiguousFloat(gate, out CudaStorage gateStorage, out IntPtr gatePtr, out int gateCount) ||
+                !TryGetContiguousFloat(up, out CudaStorage upStorage, out IntPtr upPtr, out int upCount) ||
+                count != gateCount || count != upCount)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            gateStorage.EnsureDeviceCurrent();
+            upStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchSiluMulClampF32(resultPtr, gatePtr, upPtr, count, limit, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryGELUMulSplit(Tensor result, Tensor gateUp, int halfDim)
         {
             if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
@@ -765,12 +791,18 @@ namespace TensorSharp.Cuda
 
         public static bool TryRMSNorm(Tensor result, Tensor src, Tensor alpha, Tensor beta, float eps)
         {
+            // alpha == null is an unweighted RMS norm (per-head query/key norms).
+            CudaStorage alphaStorage = null;
+            IntPtr alphaPtr = IntPtr.Zero;
+            int alphaCount = 0;
+            if (alpha != null && !TryGetContiguousFloat(alpha, out alphaStorage, out alphaPtr, out alphaCount))
+                return false;
+
             if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||
                 !TryGetContiguousRows(src, out CudaStorage srcStorage, out IntPtr srcPtr, out int srcRows, out int srcCols) ||
-                !TryGetContiguousFloat(alpha, out CudaStorage alphaStorage, out IntPtr alphaPtr, out int alphaCount) ||
                 rows != srcRows ||
                 cols != srcCols ||
-                alphaCount != cols)
+                (alpha != null && alphaCount != cols))
             {
                 return false;
             }
@@ -788,7 +820,7 @@ namespace TensorSharp.Cuda
                 return false;
 
             srcStorage.EnsureDeviceCurrent();
-            alphaStorage.EnsureDeviceCurrent();
+            alphaStorage?.EnsureDeviceCurrent();
             betaStorage?.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
             kernels.LaunchRMSNormF32(srcPtr, alphaPtr, betaPtr, resultPtr, rows, cols, eps, allocator.Stream.Handle);

@@ -225,6 +225,39 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuMemFree(ptr);
         }
 
+        /// <summary>
+        /// TS_CUDA_BF16_MATVEC=0 sends single-row BF16 projections through cuBLAS
+        /// instead of the dedicated matvec (A/B switch; the matvec measured ~9%
+        /// faster on a bandwidth-bound BF16 decode). TS_DSV4_BF16_MATVEC is
+        /// accepted as well: this routing used to live in the DeepSeek V4 engine.
+        /// </summary>
+        public static bool Bf16MatvecEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_BF16_MATVEC"), "0", StringComparison.Ordinal) &&
+            !string.Equals(Environment.GetEnvironmentVariable("TS_DSV4_BF16_MATVEC"), "0", StringComparison.Ordinal);
+
+        /// <summary>
+        /// C[rows, outDim] (row-major) = A[rows, inDim] x W[outDim, inDim]^T via
+        /// cuBLAS, for operands already in <paramref name="wType"/>/<paramref name="aType"/>
+        /// device layout. F32 accumulate, F32 output.
+        /// </summary>
+        private static void RunGemm(
+            CudaAllocator allocator, IntPtr weightPtr, int wType, IntPtr aPtr, int aType,
+            IntPtr resultPtr, int inDim, int outDim, int rows)
+        {
+            allocator.Blas.SetStream(allocator.Stream.Handle);
+            float alpha = 1.0f, beta = 0.0f;
+            CublasApi.cublasGemmEx(
+                allocator.Blas.Handle,
+                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                outDim, rows, inDim,
+                ref alpha,
+                weightPtr, wType, inDim,
+                aPtr, aType, inDim,
+                ref beta,
+                resultPtr, CublasApi.CUDA_R_32F, outDim,
+                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+        }
+
         private static void RunF16Gemm(
             CudaAllocator allocator, CudaKernels kernels,
             IntPtr weightPtr, int ggmlType, IntPtr inputPtr, IntPtr resultPtr,
@@ -256,18 +289,8 @@ namespace TensorSharp.Cuda
             // C[rows, outDim] (row-major) == C_col[outDim, rows]:
             //   C_col = (W_col[inDim, outDim])^T x A_col[inDim, rows]
             // f16 inputs, f32 accumulate + f32 output (CUBLAS_COMPUTE_32F).
-            allocator.Blas.SetStream(stream);
-            float alpha = 1.0f, beta = 0.0f;
-            CublasApi.cublasGemmEx(
-                allocator.Blas.Handle,
-                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
-                outDim, rows, inDim,
-                ref alpha,
-                wF16, CublasApi.CUDA_R_16F, inDim,
-                aF16, CublasApi.CUDA_R_16F, inDim,
-                ref beta,
-                resultPtr, CublasApi.CUDA_R_32F, outDim,
-                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            RunGemm(allocator, wF16, CublasApi.CUDA_R_16F, aF16, CublasApi.CUDA_R_16F,
+                resultPtr, inDim, outDim, rows);
         }
 
         // Q4_0 (the dominant dense quant) uses the int8 dp4a matmul for decode AND
@@ -398,6 +421,18 @@ namespace TensorSharp.Cuda
                 ggmlType == 22 ||    // IQ2_S
                 ggmlType == 23;      // IQ4_XS
         }
+
+        /// <summary>
+        /// Unquantized weight types whose resident bytes are directly a cuBLAS
+        /// operand: F32 (0), F16 (1) and BF16 (30). These skip the dequant pass
+        /// entirely (and BF16 must, to stay bit-exact).
+        /// </summary>
+        public static bool IsDenseGemmType(int ggmlType)
+            => ggmlType == 0 || ggmlType == 1 || ggmlType == 30;
+
+        /// <summary>Every weight type <see cref="RunResidentMatmul"/> can serve.</summary>
+        public static bool SupportsMatmulType(int ggmlType)
+            => IsDenseGemmType(ggmlType) || SupportsQuantizedType(ggmlType);
 
         public static void PreloadQuantizedWeight(
             CudaAllocator allocator,
@@ -566,13 +601,14 @@ namespace TensorSharp.Cuda
             long rawBytes,
             int q8Kernel = 0)
         {
-            // ggmlType 1 (F16) is not a block-quantized type but is accepted
-            // here: the resident weight bytes already ARE the f16 cuBLAS
-            // operand (see RunF16Gemm). Without this, an F16 tensor inside a
-            // quantized GGUF (e.g. Gemma E4B's 55 MB per_layer_model_proj)
+            // F16 (1), BF16 (30) and F32 (0) are not block-quantized types but are
+            // accepted here: their resident bytes already ARE the cuBLAS operand
+            // (see RunF16Gemm / RunGemm). Without this, a dense tensor inside a
+            // quantized GGUF (Gemma E4B's 55 MB per_layer_model_proj in F16, or
+            // every dense/attention tensor of a UD-Q8_K_XL DeepSeek V4 in BF16)
             // fell to the managed CPU matmul on EVERY prefill chunk and decode
             // token, with DtoH/HtoD mirror churn on top.
-            if (ggmlType != 1 && !SupportsQuantizedType(ggmlType))
+            if (!IsDenseGemmType(ggmlType) && !SupportsQuantizedType(ggmlType))
                 return false;
 
             if (!CudaKernelOps.TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
@@ -595,19 +631,130 @@ namespace TensorSharp.Cuda
 
             DeviceWeight weight = EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
             inputStorage.EnsureDeviceCurrent();
+            RunResidentMatmul(
+                allocator, kernels, weight.DevicePtr, ggmlType,
+                inputPtr, resultPtr, checked((int)ne0), checked((int)ne1),
+                checked((int)input.Sizes[0]), q8Kernel);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        /// <summary>
+        /// Tensor-level quantized/dense linear against a weight the CALLER already
+        /// holds in device memory: result[rows, ne1] = input[rows, ne0] x W^T.
+        ///
+        /// Same kernel routing as <see cref="TryAddmmQuantizedToFloat32"/>, minus
+        /// the <see cref="EnsureWeight"/> upload cache — for executors that own
+        /// their own weight residency (DeepSeek V4 streams a whole model into
+        /// per-device arenas and layer-splits it across GPUs, so it must not hand
+        /// its weights to a per-allocator cache keyed by host pointer).
+        ///
+        /// <paramref name="result"/> and <paramref name="input"/> must be
+        /// contiguous 2-D F32 tensors on the same CUDA allocator as the weight.
+        /// </summary>
+        public static void AddmmResidentToFloat32(
+            Tensor result,
+            Tensor input,
+            IntPtr deviceWeight,
+            int ggmlType,
+            long ne0,
+            long ne1,
+            int q8Kernel = 0)
+        {
+            if (deviceWeight == IntPtr.Zero)
+                throw new ArgumentException("Resident weight pointer cannot be null.", nameof(deviceWeight));
+            if (!SupportsMatmulType(ggmlType))
+                throw new NotSupportedException($"CUDA matmul does not support ggml weight type {ggmlType}.");
+
+            if (!CudaKernelOps.TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !CudaKernelOps.TryGetContiguousFloat(input, out CudaStorage inputStorage, out IntPtr inputPtr, out int inputCount) ||
+                input.DimensionCount != 2 ||
+                result.DimensionCount != 2 ||
+                input.Sizes[1] != ne0 ||
+                result.Sizes[0] != input.Sizes[0] ||
+                result.Sizes[1] != ne1 ||
+                inputCount != input.Sizes[0] * ne0 ||
+                resultCount != result.Sizes[0] * ne1)
+            {
+                throw new ArgumentException(
+                    $"Resident quantized matmul needs contiguous F32 [rows,{ne0}] x [rows,{ne1}] tensors.");
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            CudaKernels kernels = allocator.Kernels;
+            if (kernels == null)
+                throw new InvalidOperationException("CUDA kernels are unavailable for this allocator.");
+
+            inputStorage.EnsureDeviceCurrent();
+            RunResidentMatmul(
+                allocator, kernels, deviceWeight, ggmlType,
+                inputPtr, resultPtr, checked((int)ne0), checked((int)ne1),
+                checked((int)input.Sizes[0]), q8Kernel);
+            resultStorage.MarkDeviceModified();
+        }
+
+        /// <summary>
+        /// Kernel-selection core of the quantized/dense linear, factored out so it
+        /// can also serve callers that already own their weights in device memory
+        /// (the DeepSeek V4 engine keeps a whole model resident in per-device
+        /// arenas and must not go through the <see cref="EnsureWeight"/> cache).
+        /// Computes result[rows, outDim] = input[rows, inDim] x W^T for the
+        /// resident weight at <paramref name="weightPtr"/>.
+        ///
+        /// This is the ONE place kernel routing lives: everything below dispatches
+        /// on quant type and row count only, so any executor calling it picks up
+        /// the same MMQ / dp4a / dequant+cuBLAS decisions.
+        /// </summary>
+        internal static void RunResidentMatmul(
+            CudaAllocator allocator,
+            CudaKernels kernels,
+            IntPtr weightPtr,
+            int ggmlType,
+            IntPtr inputPtr,
+            IntPtr resultPtr,
+            int inDim,
+            int outDim,
+            int rows,
+            int q8Kernel = 0)
+        {
             allocator.Context.MakeCurrent();
-            int inDim = checked((int)ne0);
-            int outDim = checked((int)ne1);
-            int rows = checked((int)input.Sizes[0]);
 
             // F16 weights: the resident bytes are already the GEMM operand, so
             // every row count (a rows==1 decode is just a GEMV) goes straight
             // to cuBLAS with only the activation's f32->f16 convert on top.
             if (ggmlType == 1)
             {
-                RunF16Gemm(allocator, kernels, weight.DevicePtr, ggmlType, inputPtr, resultPtr, inDim, outDim, rows);
-                resultStorage.MarkDeviceModified();
-                return true;
+                RunF16Gemm(allocator, kernels, weightPtr, ggmlType, inputPtr, resultPtr, inDim, outDim, rows);
+                return;
+            }
+
+            // BF16 weights stay bit-exact in VRAM: converting them to F16 would
+            // flush everything below 6.1e-5 to a subnormal. Decode (rows == 1) is
+            // bandwidth-bound, so the dedicated matvec beats a cuBLAS GEMM with
+            // n = 1; multi-row goes to the Ampere BF16 tensor cores.
+            if (ggmlType == 30)
+            {
+                if (rows == 1 && Bf16MatvecEnabled && (inDim & 7) == 0)
+                {
+                    kernels.LaunchMatvecBf16(weightPtr, inputPtr, resultPtr, inDim, outDim, allocator.Stream.Handle);
+                }
+                else
+                {
+                    IntPtr aBf16 = EnsureScratch(AF16Scratch, allocator, (long)rows * inDim * 2);
+                    kernels.LaunchConvertF32Bf16(inputPtr, aBf16, (long)rows * inDim, allocator.Stream.Handle);
+                    RunGemm(allocator, weightPtr, CublasApi.CUDA_R_16BF, aBf16, CublasApi.CUDA_R_16BF,
+                        resultPtr, inDim, outDim, rows);
+                }
+                return;
+            }
+
+            // F32 weights (small dense tensors kept unquantized: MoE routers, the
+            // hyper-connection mixing matrices) go straight to cuBLAS.
+            if (ggmlType == 0)
+            {
+                RunGemm(allocator, weightPtr, CublasApi.CUDA_R_32F, inputPtr, CublasApi.CUDA_R_32F,
+                    resultPtr, inDim, outDim, rows);
+                return;
             }
 
             // Q8_0 prefill-sized batches: direct int8 tensor-core GEMM over the raw
@@ -626,7 +773,7 @@ namespace TensorSharp.Cuda
                     IntPtr dScratch = EnsureScratch(Q81SplitDScratch, allocator, (long)rows * (inDim / 32) * sizeof(float));
                     kernels.LaunchQuantizeQ81SplitRows(inputPtr, qsScratch, dScratch, inDim, rows, allocator.Stream.Handle);
                     kernels.LaunchQuantMatmulQ80Mmq2(
-                        weight.DevicePtr, qsScratch, dScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
+                        weightPtr, qsScratch, dScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
                 }
                 else
                 {
@@ -635,10 +782,9 @@ namespace TensorSharp.Cuda
                     kernels.LaunchQuantizeQ81Rows(
                         inputPtr, mmqXq, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                     kernels.LaunchQuantMatmulQ80Mmq(
-                        weight.DevicePtr, mmqXq, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
+                        weightPtr, mmqXq, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
                 }
-                resultStorage.MarkDeviceModified();
-                return true;
+                return;
             }
 
             // Prefill-sized batches: dequant-once + tensor-core cuBLAS GEMM (see
@@ -647,9 +793,8 @@ namespace TensorSharp.Cuda
             if (F16GemmEnabled && q8Kernel == 0 && rows >= F16GemmMinRows
                 && 2L * inDim * outDim <= F16GemmMaxWeightBytes)
             {
-                RunF16Gemm(allocator, kernels, weight.DevicePtr, ggmlType, inputPtr, resultPtr, inDim, outDim, rows);
-                resultStorage.MarkDeviceModified();
-                return true;
+                RunF16Gemm(allocator, kernels, weightPtr, ggmlType, inputPtr, resultPtr, inDim, outDim, rows);
+                return;
             }
             // Small multi-row batches (speculative MTP verify windows, short
             // prefill chunks) run the per-row quant kernels once per output row --
@@ -697,10 +842,9 @@ namespace TensorSharp.Cuda
                 && ggmlType != 2 && ggmlType != 8 && ggmlType != 16)
             {
                 kernels.LaunchQuantMatmulBatchedF32(
-                    weight.DevicePtr, inputPtr, resultPtr,
+                    weightPtr, inputPtr, resultPtr,
                     ggmlType, inDim, outDim, rows, allocator.Stream.Handle);
-                resultStorage.MarkDeviceModified();
-                return true;
+                return;
             }
             // Single-token decode for the same generic quant-type set: one BLOCK
             // per output column (full blockDim.x threads via block_reduce_sum),
@@ -720,9 +864,8 @@ namespace TensorSharp.Cuda
                 kernels.LaunchQuantizeQ81Rows(
                     inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                 kernels.LaunchQuantMatmulQ4KDp4a(
-                    weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, allocator.Stream.Handle);
-                resultStorage.MarkDeviceModified();
-                return true;
+                    weightPtr, xqScratch, resultPtr, inDim, outDim, allocator.Stream.Handle);
+                return;
             }
             // Q5_K/Q6_K decode: use the same global q8_1 scratch as Q4_K, with
             // format-specific packed dp4a vec-dots. Keep this strictly rows==1;
@@ -739,17 +882,16 @@ namespace TensorSharp.Cuda
                 if (ggmlType == 13)
                 {
                     kernels.LaunchQuantMatmulQ5KDp4a(
-                        weight.DevicePtr, xqScratch, resultPtr,
+                        weightPtr, xqScratch, resultPtr,
                         inDim, outDim, allocator.Stream.Handle);
                 }
                 else
                 {
                     kernels.LaunchQuantMatmulQ6KDp4a(
-                        weight.DevicePtr, xqScratch, resultPtr,
+                        weightPtr, xqScratch, resultPtr,
                         inDim, outDim, allocator.Stream.Handle);
                 }
-                resultStorage.MarkDeviceModified();
-                return true;
+                return;
             }
             // Decode IQ2 matvec: quantize the activation row once into the global
             // allocator scratch, then four warp-owned output columns per CTA reuse
@@ -765,19 +907,17 @@ namespace TensorSharp.Cuda
                     inputPtr, xqScratch, inDim, 1,
                     allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                 kernels.LaunchQuantMatmulIq2VecQ81F32(
-                    weight.DevicePtr, xqScratch, resultPtr,
+                    weightPtr, xqScratch, resultPtr,
                     ggmlType, inDim, outDim, allocator.Stream.Handle);
-                resultStorage.MarkDeviceModified();
-                return true;
+                return;
             }
             if (VecMatmulEnabled && rows == 1
                 && ggmlType != 2 && ggmlType != 8 && ggmlType != 16)
             {
                 kernels.LaunchQuantMatmulVecF32(
-                    weight.DevicePtr, inputPtr, resultPtr,
+                    weightPtr, inputPtr, resultPtr,
                     ggmlType, inDim, outDim, allocator.Stream.Handle);
-                resultStorage.MarkDeviceModified();
-                return true;
+                return;
             }
             if (ggmlType == 2)
             {
@@ -795,9 +935,8 @@ namespace TensorSharp.Cuda
                     kernels.LaunchQuantizeQ81Rows(
                         inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                     kernels.LaunchQuantMatmulQ40Dp4a(
-                        weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
-                    resultStorage.MarkDeviceModified();
-                    return true;
+                        weightPtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
+                    return;
                 }
                 // FP32 fallback: row-tiled batched kernel for the verify window
                 // (decode each weight nibble ONCE and reuse it across the tile's rows)
@@ -805,13 +944,12 @@ namespace TensorSharp.Cuda
                 if (BatchedMatmulEnabled && rows >= 2 && rows <= CudaKernels.QuantMatmulBatchMaxRows)
                 {
                     kernels.LaunchQuantMatmulQ40BatchedF32(
-                        weight.DevicePtr, inputPtr, resultPtr,
+                        weightPtr, inputPtr, resultPtr,
                         inDim, outDim, rows, allocator.Stream.Handle);
-                    resultStorage.MarkDeviceModified();
-                    return true;
+                    return;
                 }
                 kernels.LaunchQuantMatmulQ40F32(
-                    weight.DevicePtr,
+                    weightPtr,
                     inputPtr,
                     resultPtr,
                     inDim,
@@ -839,18 +977,18 @@ namespace TensorSharp.Cuda
                     inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                 if (useMma)
                     kernels.LaunchQuantMatmulQ80Mma(
-                        weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
+                        weightPtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
                 else if (rows == 1)
                     kernels.LaunchQuantMatmulQ80Vec(
-                        weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, allocator.Stream.Handle);
+                        weightPtr, xqScratch, resultPtr, inDim, outDim, allocator.Stream.Handle);
                 else
                     kernels.LaunchQuantMatmulQ80Dp4a(
-                        weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
+                        weightPtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
             }
             else if (ggmlType == 8)
             {
                 kernels.LaunchQuantMatmulQ80F32(
-                    weight.DevicePtr,
+                    weightPtr,
                     inputPtr,
                     resultPtr,
                     inDim,
@@ -861,7 +999,7 @@ namespace TensorSharp.Cuda
             else if (ggmlType == 16 && (inDim & 255) == 0 && ((inDim / 32) * 36) <= 48 * 1024)
             {
                 kernels.LaunchQuantMatmulIq2XxsQ81F32(
-                    weight.DevicePtr,
+                    weightPtr,
                     inputPtr,
                     resultPtr,
                     inDim,
@@ -872,7 +1010,7 @@ namespace TensorSharp.Cuda
             else
             {
                 kernels.LaunchQuantMatmulF32(
-                    weight.DevicePtr,
+                    weightPtr,
                     inputPtr,
                     resultPtr,
                     ggmlType,
@@ -882,9 +1020,8 @@ namespace TensorSharp.Cuda
                     allocator.Stream.Handle);
             }
 
-            resultStorage.MarkDeviceModified();
-            return true;
         }
+
 
         public static bool TryGetRowsQuantizedToFloat32(
             Tensor result,
