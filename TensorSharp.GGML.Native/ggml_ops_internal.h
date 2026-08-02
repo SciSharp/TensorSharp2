@@ -778,7 +778,10 @@ namespace tsg
     bool prefers_device_local_cache(ggml_backend_dev_t dev);
     bool can_use_host_ptr_buffer(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size);
     bool host_ptr_buffer_capable(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size);
-    void invalidate_cached_buffer(void* data);
+    // Returns true when a cached backend buffer was actually freed. Callers that
+    // must invalidate downstream state keyed on that buffer use the result to skip
+    // the work when the pointer had no device copy to begin with.
+    bool invalidate_cached_buffer(void* data);
 
     // allow_unified_weight: when true the prefers_device_local_cache gate is
     // bypassed and only raw capability (host_ptr_buffer_capable) is required.

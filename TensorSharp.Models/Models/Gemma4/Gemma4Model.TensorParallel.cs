@@ -782,9 +782,15 @@ namespace TensorSharp.Models
             for (int r = 0; r < tp; r++)
                 normed[r].Dispose();
 
+            if (TpDebugLevel >= 2)
+                DumpTpTensorStats(qkvFused[0], $"layer {layer} qkv rank0");
+
             // 3. Per-GPU attention.
             Tensor[] attnOut = Gemma4AttentionTP(qkvFused, layer, seqLen, startPos,
                 isLocal, isShared, headDim, numHeadsPerGpu, numKVHeadsPerGpu, exceptPositions);
+
+            if (TpDebugLevel >= 2)
+                DumpTpTensorStats(attnOut[0], $"layer {layer} attnout rank0 local={isLocal} shared={isShared}");
 
             // 4. Row-parallel output projection + AllReduce.
             Tensor reducedAttn = TpRowParallelLinear(attnOut, $"{prefix}.attn_output.weight");
@@ -915,10 +921,23 @@ namespace TensorSharp.Models
                     vTensor = ApplyGemma4VNormTP(vTensor, numKVHeadsPerGpu, headDim, seqLen, r);
                 }
 
+                if (TpDebugLevel >= 2 && r == 0)
+                {
+                    DumpTpTensorStats(qTensor, $"  L{layer} q-postnorm");
+                    if (kTensor != null) DumpTpTensorStats(kTensor, $"  L{layer} k-postnorm");
+                    if (vTensor != null) DumpTpTensorStats(vTensor, $"  L{layer} v-postnorm");
+                }
+
                 // RoPE.
                 qTensor = ApplyGemma4RoPETP(qTensor, numHeadsPerGpu, headDim, seqLen, startPos, ropeBase);
                 if (!isShared)
                     kTensor = ApplyGemma4RoPETP(kTensor, numKVHeadsPerGpu, headDim, seqLen, startPos, ropeBase);
+
+                if (TpDebugLevel >= 2 && r == 0)
+                {
+                    DumpTpTensorStats(qTensor, $"  L{layer} q-postrope");
+                    if (kTensor != null) DumpTpTensorStats(kTensor, $"  L{layer} k-postrope");
+                }
 
                 // NOTE: no 1/sqrt(headDim) Q scaling here. Gemma4 attention runs at
                 // unit scale — the Q/K RMS norms provide the normalisation and the
@@ -944,22 +963,45 @@ namespace TensorSharp.Models
                     }
 
                     var attnResult = new Tensor(alloc, DType.Float32, 1, numHeadsPerGpu * headDim);
+                    Tensor kCache = _tpKvCacheK[kvCacheLayer][r];
+                    Tensor vCache = _tpKvCacheV[kvCacheLayer][r];
+                    int cacheLen = (int)kCache.Sizes[1];
 
+                    // Prefer the fused on-device GQA decode kernel, exactly as the
+                    // single-GPU path does. The AttentionDecode* fallbacks below run
+                    // on the CPU: they take GetFloatPtr of the KV cache, which drags
+                    // the whole per-rank cache back to host memory once per layer per
+                    // token. That is what made a TP decode step cost seconds rather
+                    // than milliseconds -- the kernels were simply never offered the
+                    // work under TP. The kernel picks its device from the result
+                    // tensor's allocator, so it lands on rank r's GPU.
                     if (isLocal)
                     {
-                        // SWA: circular decode attention.
-                        int cacheLen = (int)_tpKvCacheK[kvCacheLayer][r].Sizes[1];
                         int attendLen = Math.Min(totalSeqLen, _slidingWindow);
-                        AttentionDecodeCircular(qTensor, _tpKvCacheK[kvCacheLayer][r], _tpKvCacheV[kvCacheLayer][r], attnResult,
-                            numHeadsPerGpu, numKVHeadsPerGpu, headDim, headDim,
-                            startPos, attendLen, cacheLen, 1f);
+                        int attendStart = Math.Max(0, startPos + 1 - attendLen);
+                        if (!CudaFusedOps.TryGqaDecodeAttention(
+                                attnResult, qTensor, kCache, vCache,
+                                numHeadsPerGpu, numKVHeadsPerGpu, headDim,
+                                attendStart, startPos + 1 - attendStart, cacheLen, true, 1f))
+                        {
+                            // SWA: circular decode attention.
+                            AttentionDecodeCircular(qTensor, kCache, vCache, attnResult,
+                                numHeadsPerGpu, numKVHeadsPerGpu, headDim, headDim,
+                                startPos, attendLen, cacheLen, 1f);
+                        }
                     }
                     else
                     {
-                        // Global: linear decode attention.
-                        AttentionDecodeWithWindow(qTensor, _tpKvCacheK[kvCacheLayer][r], _tpKvCacheV[kvCacheLayer][r], attnResult,
-                            numHeadsPerGpu, numKVHeadsPerGpu, headDim, headDim,
-                            0, totalSeqLen, 1f);
+                        if (!CudaFusedOps.TryGqaDecodeAttention(
+                                attnResult, qTensor, kCache, vCache,
+                                numHeadsPerGpu, numKVHeadsPerGpu, headDim,
+                                0, totalSeqLen, cacheLen, false, 1f))
+                        {
+                            // Global: linear decode attention.
+                            AttentionDecodeWithWindow(qTensor, kCache, vCache, attnResult,
+                                numHeadsPerGpu, numKVHeadsPerGpu, headDim, headDim,
+                                0, totalSeqLen, 1f);
+                        }
                     }
                     qTensor.Dispose();
 
@@ -1019,18 +1061,26 @@ namespace TensorSharp.Models
                     }
 
                     int groupSize = numHeadsPerGpu / numKVHeadsPerGpu;
-                    Tensor kExpanded, vExpanded;
+
+                    // Resolve the attention K/V source WITHOUT expanding the KV
+                    // heads first. ExpandKVHeads (RepeatInterleave) has no direct
+                    // CUDA kernel and falls back to the CPU, so materialising the
+                    // grouped copy is itself a host round trip; the fused prefill
+                    // kernel below reads the un-expanded heads in place.
+                    Tensor kvSrcK, kvSrcV;
                     int kvAttendLen;
+                    int kvStride;          // -1 => compact [heads, kvLen, dim]
+                    bool ownsKvSrc;        // true => we allocated kvSrcK/V here
 
                     if (freshKHeads != null)
                     {
                         // SWA non-shared: attend the freshly computed K/V directly.
                         // The causal+window mask restricts each query to its window.
-                        kExpanded = ExpandKVHeads(freshKHeads, groupSize, seqLen);
-                        vExpanded = ExpandKVHeads(freshVHeads, groupSize, seqLen);
-                        freshKHeads.Dispose();
-                        freshVHeads.Dispose();
+                        kvSrcK = freshKHeads;
+                        kvSrcV = freshVHeads;
                         kvAttendLen = seqLen;
+                        kvStride = -1;
+                        ownsKvSrc = true;
                     }
                     else if (isLocal)
                     {
@@ -1043,18 +1093,52 @@ namespace TensorSharp.Models
                         var linV = new Tensor(alloc, DType.Float32, numKVHeadsPerGpu, attendLen, headDim);
                         GatherCircularToLinear(_tpKvCacheK[kvCacheLayer][r], linK, attendStart, attendLen, cacheLen, numKVHeadsPerGpu, headDim);
                         GatherCircularToLinear(_tpKvCacheV[kvCacheLayer][r], linV, attendStart, attendLen, cacheLen, numKVHeadsPerGpu, headDim);
-                        kExpanded = ExpandKVHeads(linK, groupSize, attendLen);
-                        vExpanded = ExpandKVHeads(linV, groupSize, attendLen);
-                        linK.Dispose();
-                        linV.Dispose();
+                        kvSrcK = linK;
+                        kvSrcV = linV;
                         kvAttendLen = attendLen;
+                        kvStride = -1;
+                        ownsKvSrc = true;
                     }
                     else
                     {
-                        // Global: linear cache, full history.
-                        kExpanded = ExpandKVHeads(_tpKvCacheK[kvCacheLayer][r], groupSize, totalSeqLen);
-                        vExpanded = ExpandKVHeads(_tpKvCacheV[kvCacheLayer][r], groupSize, totalSeqLen);
+                        // Global: linear cache, full history, read in place.
+                        kvSrcK = _tpKvCacheK[kvCacheLayer][r];
+                        kvSrcV = _tpKvCacheV[kvCacheLayer][r];
                         kvAttendLen = totalSeqLen;
+                        kvStride = (int)kvSrcK.Sizes[1];
+                        ownsKvSrc = false;
+                    }
+
+                    int prefillWindow = isLocal ? _slidingWindow : 0;
+
+                    // Fused flash-style prefill attention on the rank's GPU. Skipped
+                    // when multimodal soft tokens need the bidirectional mask, which
+                    // only the generic ApplyCausalMask path understands.
+                    if (exceptPositions == null)
+                    {
+                        var fusedResult = new Tensor(alloc, DType.Float32, seqLen, numHeadsPerGpu * headDim);
+                        if (CudaFusedOps.TryGqaPrefillAttention(
+                                fusedResult, qHeads, kvSrcK, kvSrcV,
+                                numHeadsPerGpu, numKVHeadsPerGpu, headDim,
+                                seqLen, kvAttendLen,
+                                kvAttendLen - seqLen, prefillWindow, 1.0f, kvStride))
+                        {
+                            qHeads.Dispose();
+                            if (ownsKvSrc) { kvSrcK.Dispose(); kvSrcV.Dispose(); }
+                            results[r] = fusedResult;
+                            continue;
+                        }
+                        fusedResult.Dispose();
+                    }
+
+                    // Generic path: expand the grouped KV heads and run the
+                    // score/mask/softmax/value chain op by op.
+                    Tensor kExpanded = ExpandKVHeads(kvSrcK, groupSize, kvAttendLen);
+                    Tensor vExpanded = ExpandKVHeads(kvSrcV, groupSize, kvAttendLen);
+                    if (ownsKvSrc)
+                    {
+                        kvSrcK.Dispose();
+                        kvSrcV.Dispose();
                     }
 
                     using var kT = kExpanded.Transpose(1, 2);
@@ -1063,7 +1147,6 @@ namespace TensorSharp.Models
                     qHeads.Dispose();
                     kExpanded.Dispose();
 
-                    int windowSize = isLocal ? _slidingWindow : 0;
                     // ApplyCausalMask works in key-index coordinates: key 0 is
                     // absolute position (totalSeqLen - kvAttendLen), and it derives
                     // query positions from that same origin. exceptPositions holds
@@ -1078,7 +1161,7 @@ namespace TensorSharp.Models
                         foreach (int p in exceptPositions)
                             exceptForMask.Add(p - maskShift);
                     }
-                    ApplyCausalMask(scores, seqLen, kvAttendLen, windowSize, exceptForMask);
+                    ApplyCausalMask(scores, seqLen, kvAttendLen, prefillWindow, exceptForMask);
                     Ops.Softmax(scores, scores);
 
                     var attnOutTensor = new Tensor(alloc, DType.Float32, numHeadsPerGpu, seqLen, headDim);
@@ -1664,8 +1747,12 @@ namespace TensorSharp.Models
             return ok;
         }
 
-        /// <summary>TS_TP_DEBUG=1: layer-by-layer activation stats for hunting
-        /// the first divergent op in the tensor-parallel per-op path.</summary>
+        /// <summary>TS_TP_DEBUG: 1 = per-layer activation stats, 2 = per-op stats
+        /// inside the attention block, for hunting the first divergent op in the
+        /// tensor-parallel per-op path.</summary>
+        private static readonly int TpDebugLevel =
+            int.TryParse(Environment.GetEnvironmentVariable("TS_TP_DEBUG"), out int _tpDbgLvl) ? _tpDbgLvl : 0;
+
         private static unsafe void DumpTpTensorStats(Tensor t, string label)
         {
             long n = t.ElementCount();

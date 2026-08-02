@@ -174,6 +174,66 @@ namespace tsg
         g_last_error.clear();
     }
 
+#if defined(GGML_USE_VULKAN)
+    // ggml-vulkan's device query calls ggml_vk_instance_init(), which throws a
+    // vk::SystemError when no usable driver is present. Only ggml_backend_vk_reg()
+    // catches that; every other entry point (get_device_count, vk_init,
+    // get_device_description) lets it escape. Escaping a C++ exception through our
+    // extern "C" boundary into the .NET runtime means std::terminate and a core
+    // dump, so a host that merely lacks a working ICD looked like a TensorSharp
+    // crash. Funnel all Vulkan probing through here and turn the failure into an
+    // ordinary "no devices" answer plus a diagnostic the managed side can surface.
+    //
+    // The most common cause on GPU containers is a missing libEGL.so.1: NVIDIA's
+    // Vulkan ICD dlopens it from vk_icdGetInstanceProcAddr and reports no driver
+    // when it is absent, which is why the hint names it.
+    int vk_device_count_guarded()
+    {
+        try
+        {
+            return ggml_backend_vk_get_device_count();
+        }
+        catch (const std::exception& e)
+        {
+            set_last_error(
+                std::string("Vulkan initialization failed: ") + e.what() +
+                ". No usable Vulkan driver was found. On NVIDIA containers this is "
+                "usually a missing GLVND EGL library -- install libegl1 (and libgl1 / "
+                "libglvnd0) so the NVIDIA Vulkan ICD can load. Diagnose with "
+                "VK_LOADER_DEBUG=all.");
+            return 0;
+        }
+        catch (...)
+        {
+            set_last_error(
+                "Vulkan initialization failed with an unknown error. No usable Vulkan "
+                "driver was found. On NVIDIA containers this is usually a missing GLVND "
+                "EGL library -- install libegl1 so the NVIDIA Vulkan ICD can load.");
+            return 0;
+        }
+    }
+
+    ggml_backend_t vk_init_guarded(int device_index)
+    {
+        try
+        {
+            return ggml_backend_vk_init(static_cast<size_t>(device_index));
+        }
+        catch (const std::exception& e)
+        {
+            set_last_error(std::string("ggml-vulkan backend initialization failed for device ") +
+                std::to_string(device_index) + ": " + e.what());
+            return nullptr;
+        }
+        catch (...)
+        {
+            set_last_error("ggml-vulkan backend initialization failed for device " +
+                std::to_string(device_index) + " with an unknown error.");
+            return nullptr;
+        }
+    }
+#endif
+
     // --- VRAM allocation diagnostics (TS_GGML_LOG_VRAM=1) ---
 
     bool vram_log_enabled()
@@ -239,7 +299,7 @@ namespace tsg
 #endif
 #if defined(GGML_USE_VULKAN)
         if (backend_type == BACKEND_TYPE_VULKAN)
-            return ggml_backend_vk_get_device_count();
+            return vk_device_count_guarded();
 #endif
         (void) backend_type;
         return 1;
@@ -275,15 +335,12 @@ namespace tsg
         if (backend_type == BACKEND_TYPE_VULKAN)
         {
 #if defined(GGML_USE_VULKAN)
-            if (device_index >= ggml_backend_vk_get_device_count())
+            if (device_index >= vk_device_count_guarded())
             {
                 set_last_error("Vulkan device index " + std::to_string(device_index) + " is out of range.");
                 return nullptr;
             }
-            ggml_backend_t backend = ggml_backend_vk_init(static_cast<size_t>(device_index));
-            if (backend == nullptr)
-                set_last_error("ggml-vulkan backend initialization failed for device " + std::to_string(device_index) + ".");
-            return backend;
+            return vk_init_guarded(device_index);
 #else
             set_last_error("The ggml-vulkan backend is not available in this build.");
             return nullptr;
@@ -352,10 +409,13 @@ namespace tsg
             // dev_by_type returns the first registered GPU device, which is
             // ggml-cuda's. The CUDA branch above keeps that behaviour; here the
             // Vulkan device must be picked explicitly.
-            const int device_count = ggml_backend_vk_get_device_count();
+            const int device_count = vk_device_count_guarded();
             if (device_count <= 0)
             {
-                set_last_error("No Vulkan device is available for ggml-vulkan.");
+                // Keep the guard's diagnostic when it explained *why* the driver
+                // is unusable; a bare "no device" would throw that away.
+                if (g_last_error.empty())
+                    set_last_error("No Vulkan device is available for ggml-vulkan.");
                 return nullptr;
             }
 
@@ -367,10 +427,7 @@ namespace tsg
                 return nullptr;
             }
 
-            ggml_backend_t backend = ggml_backend_vk_init(static_cast<size_t>(device_index));
-            if (backend == nullptr)
-                set_last_error("ggml-vulkan backend initialization failed.");
-            return backend;
+            return vk_init_guarded(device_index);
 #else
             set_last_error("The ggml-vulkan backend is not available in this build.");
             return nullptr;
@@ -920,10 +977,10 @@ namespace tsg
         }
     }
 
-    void invalidate_cached_buffer(void* data)
+    bool invalidate_cached_buffer(void* data)
     {
         if (data == nullptr)
-            return;
+            return false;
 
         {
             std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
@@ -932,7 +989,7 @@ namespace tsg
             {
                 ggml_backend_buffer_free(it->second.buffer);
                 g_preloaded_buffer_cache.erase(it);
-                return;
+                return true;
             }
         }
 
@@ -940,7 +997,7 @@ namespace tsg
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
             auto it = g_host_buffer_cache.find(data);
             if (it == g_host_buffer_cache.end())
-                return;
+                return false;
             offloadable_lru_remove_locked(data);
             if (g_offloadable_keys.count(data))
             {
@@ -953,6 +1010,7 @@ namespace tsg
             ggml_backend_buffer_free(it->second.buffer);
             g_host_buffer_cache.erase(it);
         }
+        return true;
     }
 
     bool try_get_host_ptr_buffer(
@@ -2005,7 +2063,7 @@ TSG_EXPORT int TSGgml_GetVulkanDeviceCount()
 {
     clear_last_error();
 #if defined(GGML_USE_VULKAN)
-    return ggml_backend_vk_get_device_count();
+    return vk_device_count_guarded();
 #else
     set_last_error("The ggml-vulkan backend is not available in this build.");
     return 0;
@@ -2021,7 +2079,7 @@ TSG_EXPORT int TSGgml_GetVulkanDeviceDescription(int deviceIndex, char* descript
         return 0;
     }
 #if defined(GGML_USE_VULKAN)
-    if (deviceIndex < 0 || deviceIndex >= ggml_backend_vk_get_device_count())
+    if (deviceIndex < 0 || deviceIndex >= vk_device_count_guarded())
     {
         set_last_error("Vulkan device index " + std::to_string(deviceIndex) + " is out of range.");
         return 0;
@@ -2078,6 +2136,10 @@ extern "C" void TSGgml_Gemma4ResetDecodeCache();
 extern "C" void TSGgml_Qwen35ReleaseVerifyTpGraphs();
 extern "C" void TSGgml_Qwen35ResetDecodeCache();
 extern "C" void TSGgml_Qwen35ResetBatchedDecodeCache();
+extern "C" void TSGgml_Qwen35ResetVerifyCache();
+extern "C" void TSGgml_Gemma4ResetBatchedDecodeCache();
+extern "C" void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
+extern "C" void TSGgml_GptOssResetDecodeCache();
 
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
@@ -2349,10 +2411,11 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
     // The same host pointer can be resident on several ranks (a replicated
     // weight, or an activation the TP forward round-robins); drop all of them.
+    bool freedDeviceCopy = false;
     for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
     {
         tsg::ScopedRank rank(r);
-        invalidate_cached_buffer(ptr);
+        freedDeviceCopy |= invalidate_cached_buffer(ptr);
     }
 
     // The GPT-OSS attention kernel keeps its own device-resident copy of the KV
@@ -2362,6 +2425,35 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     // has to go too — hooking it here keeps the two caches from disagreeing
     // without every call site having to know about both.
     TSGgml_GptOssInvalidateKvCache(ptr, nullptr);
+
+    // Same argument, one level up: the persistent whole-model graphs bake the
+    // buffer we just freed into their nodes, so replaying one after this point is
+    // a use-after-free. ggml-vulkan catches it as
+    // "GGML_ASSERT(buffer != nullptr)" inside ggml_vk_tensor_subbuffer (the freed
+    // ggml_backend_vk_buffer_context reads back a null dev_buffer) and aborts;
+    // ggml-cuda reads the stale allocation instead and silently computes on
+    // freed memory. Reproduced by any multi-turn chat: turn 2 truncates the KV
+    // cache, which invalidates its host buffers, and the very next decode
+    // replays the turn-1 graph.
+    //
+    // Gated on freedDeviceCopy: hot paths call this for pointers that have no
+    // device copy at all (Qwen3.5's gated-delta-net invalidates its conv/delta
+    // state every decode step), and dropping every graph there would rebuild the
+    // whole model graph per token — measured -13% to -48% decode before this
+    // guard. When a buffer really was freed, invalidation happens at most once per
+    // turn (KV truncate / reset / snapshot inject) and each cache simply rebuilds
+    // on its next call.
+    if (!freedDeviceCopy)
+        return;
+
+    TSGgml_Gemma4ResetDecodeCache();
+    TSGgml_Gemma4ResetBatchedDecodeCache();
+    TSGgml_Gemma4ResetMoEBatchedDecodeCache();
+    TSGgml_Gemma4MoEResetDecodeCache();
+    TSGgml_GptOssResetDecodeCache();
+    TSGgml_Qwen35ResetDecodeCache();
+    TSGgml_Qwen35ResetBatchedDecodeCache();
+    TSGgml_Qwen35ResetVerifyCache();
 }
 
 TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)

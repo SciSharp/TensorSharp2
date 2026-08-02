@@ -226,7 +226,8 @@ namespace TensorSharp.Models
         private IntPtr[] _cudaMoEGateUpPtrTable;   // per layer: device u64[numExperts]
         private IntPtr[] _cudaMoEDownPtrTable;      // per layer: device u64[numExperts]
         private IntPtr[] _cudaMoEScalePtr;          // per layer: device f32[numExperts] or Zero
-        private int[] _cudaMoEQuantType;            // per layer expert quant type
+        private int[] _cudaMoEQuantType;            // per layer gate_up expert quant type
+        private int[] _cudaMoEDownQuantType;        // per layer down expert quant type (may differ)
         private int[] _cudaMoENff;                  // per layer per-expert intermediate dim
         private bool _cudaMoETablesReady;           // all layers built (or unavailable)
         private bool _cudaMoEUsable;                // tables built successfully for every MoE layer
@@ -4452,6 +4453,7 @@ namespace TensorSharp.Models
             _cudaMoEDownPtrTable = new IntPtr[numLayers];
             _cudaMoEScalePtr = new IntPtr[numLayers];
             _cudaMoEQuantType = new int[numLayers];
+            _cudaMoEDownQuantType = new int[numLayers];
             _cudaMoENff = new int[numLayers];
 
             for (int l = 0; l < numLayers; l++)
@@ -4463,6 +4465,7 @@ namespace TensorSharp.Models
                 var guPtrs = new IntPtr[_numExperts];
                 var downPtrs = new IntPtr[_numExperts];
                 int quantType = -1;
+                int downQuantType = -1;
                 long gateUpNe1 = 0;
                 bool ok = true;
 
@@ -4471,31 +4474,48 @@ namespace TensorSharp.Models
                     if (!_quantWeights.TryGetValue($"{prefix}.ffn_gate_up_exps.{e}.weight", out var guw)
                         || !_quantWeights.TryGetValue($"{prefix}.ffn_down_exps.{e}.weight", out var dw))
                     {
+                        CudaMoEGateLog(l, e, "per-expert quantized ffn_gate_up_exps/ffn_down_exps tensors not found");
                         ok = false;
                         break;
                     }
 
-                    if (!CudaQuantizedOps.TryGetResidentDevicePtr(cudaAllocator, guw.EnsureDeviceCacheKey(), out IntPtr guDev, out int guType)
-                        || !CudaQuantizedOps.TryGetResidentDevicePtr(cudaAllocator, dw.EnsureDeviceCacheKey(), out IntPtr dDev, out int dType)
-                        || guType != dType)
+                    bool guResident = CudaQuantizedOps.TryGetResidentDevicePtr(cudaAllocator, guw.EnsureDeviceCacheKey(), out IntPtr guDev, out int guType);
+                    bool dResident = CudaQuantizedOps.TryGetResidentDevicePtr(cudaAllocator, dw.EnsureDeviceCacheKey(), out IntPtr dDev, out int dType);
+                    if (!guResident || !dResident)
                     {
+                        // Almost always means the quant type is missing from
+                        // CudaQuantizedOps.SupportsQuantizedType, so the weight was
+                        // never preloaded and dequantizes on the CPU instead.
+                        CudaMoEGateLog(l, e, $"experts not device-resident (gate_up resident={guResident} ggmlType={guw.GgmlType}, down resident={dResident} ggmlType={dw.GgmlType})");
                         ok = false;
                         break;
                     }
-
-                    if (quantType < 0) { quantType = guType; gateUpNe1 = guw.Ne1; }
-                    else if (quantType != guType || gateUpNe1 != guw.Ne1) { ok = false; break; }
+                    // gate_up and down may legitimately differ (unsloth dynamic
+                    // quants pick a type per projection); each kernel takes its own.
+                    // Only uniformity ACROSS EXPERTS is required, since one pointer
+                    // table + one type serves every expert of a layer.
+                    if (quantType < 0) { quantType = guType; downQuantType = dType; gateUpNe1 = guw.Ne1; }
+                    else if (quantType != guType || downQuantType != dType || gateUpNe1 != guw.Ne1)
+                    {
+                        CudaMoEGateLog(l, e, $"expert layout is not uniform across experts (gate_up type {quantType} vs {guType}, down type {downQuantType} vs {dType}, ne1 {gateUpNe1} vs {guw.Ne1})");
+                        ok = false; break;
+                    }
 
                     guPtrs[e] = guDev;
                     downPtrs[e] = dDev;
                 }
 
                 if (!ok || quantType < 0 || (gateUpNe1 & 1) != 0)
+                {
+                    if (ok)
+                        CudaMoEGateLog(l, -1, $"quantType={quantType} gateUpNe1={gateUpNe1} (needs an even gate+up row)");
                     return; // any gap -> keep the host path for the whole model
+                }
 
                 _cudaMoEGateUpPtrTable[l] = CudaQuantizedOps.CreateDevicePointerTable(cudaAllocator, guPtrs);
                 _cudaMoEDownPtrTable[l] = CudaQuantizedOps.CreateDevicePointerTable(cudaAllocator, downPtrs);
                 _cudaMoEQuantType[l] = quantType;
+                _cudaMoEDownQuantType[l] = downQuantType;
                 _cudaMoENff[l] = (int)(gateUpNe1 / 2);
 
                 string scaleKey = $"{prefix}.ffn_down_exps.scale";
@@ -4507,6 +4527,18 @@ namespace TensorSharp.Models
             }
 
             _cudaMoEUsable = true;
+        }
+
+        /// <summary>TS_CUDA_MOE_DEBUG=1: report why the on-device MoE decode path was
+        /// rejected. Without it a model silently falls back to the per-expert host
+        /// loop, which is an order of magnitude slower and looks like an
+        /// unexplained perf cliff on one model.</summary>
+        private static void CudaMoEGateLog(int layer, int expert, string reason)
+        {
+            if (Environment.GetEnvironmentVariable("TS_CUDA_MOE_DEBUG") != "1")
+                return;
+            string where = expert >= 0 ? $"layer {layer} expert {expert}" : $"layer {layer}";
+            Console.WriteLine($"  [cuda-moe] on-device MoE decode disabled at {where}: {reason}");
         }
 
         /// <summary>
@@ -4584,9 +4616,11 @@ namespace TensorSharp.Models
 
             // q8_1 activation scratch for the Q4_0/Q4_K dp4a expert path (UInt8 byte
             // buffers holding ts_block_q8_1 blocks: 36 B per 32-value block).
-            int expertType = _cudaMoEQuantType[layer];
-            bool useDp4a = (expertType == 2 && CudaQuantizedOps.Q40Dp4aEnabled)
-                || (expertType == 12 && CudaQuantizedOps.Q4KDp4aEnabled);
+            int gateUpType = _cudaMoEQuantType[layer];
+            int downType = _cudaMoEDownQuantType[layer];
+            static bool Dp4aCapable(int t) => (t == 2 && CudaQuantizedOps.Q40Dp4aEnabled)
+                || (t == 12 && CudaQuantizedOps.Q4KDp4aEnabled);
+            bool useDp4a = Dp4aCapable(gateUpType) && Dp4aCapable(downType);
             Tensor moeInputQ8 = null, hAllQ8 = null;
             if (useDp4a)
             {
@@ -4597,7 +4631,7 @@ namespace TensorSharp.Models
             bool ok = CudaFusedOps.TryMoEExpertFFNDecode(
                 logits, moeInput, output, selected, routeW, gateUpOut, hAll,
                 _cudaMoEScalePtr[layer], _cudaMoEGateUpPtrTable[layer], _cudaMoEDownPtrTable[layer],
-                _cudaMoEQuantType[layer], _numExperts, nUsed, hiddenDim, nFf,
+                gateUpType, downType, _numExperts, nUsed, hiddenDim, nFf,
                 moeInputQ8, hAllQ8, useDp4a);
 
             // Intermediates are disposed here: inside a graph capture the pool

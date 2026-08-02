@@ -21,9 +21,11 @@
 #define GGML_Q6_K 14
 #define GGML_IQ2_XXS 16
 #define GGML_IQ3_XXS 18
+#define GGML_IQ4_NL 20
 #define GGML_IQ3_S 21
 #define GGML_IQ2_S 22
 #define GGML_IQ4_XS 23
+#define GGML_MXFP4 39
 #define TS_QK8_1 32
 #define TS_Q80_F16_CHUNK 2048
 #define TS_Q80_BLOCK_BYTES 34
@@ -46,6 +48,20 @@
 __device__ static const int8_t ts_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
+
+// MXFP4 (OCP microscaling) E2M1 codebook, doubled -- the per-block E8M0 scale is
+// halved to compensate (ggml kvalues_mxfp4 + GGML_E8M0_TO_FP32_HALF).
+__device__ static const int8_t ts_kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+};
+
+// E8M0 shared exponent -> 0.5 * 2^(e-127), bit-identical to ggml's
+// ggml_e8m0_to_fp32_half (denormal patterns for e < 2).
+__device__ __forceinline__ float ts_e8m0_to_fp32_half(uint8_t e)
+{
+    uint32_t bits = (e < 2) ? (0x00200000u << e) : ((uint32_t)(e - 1) << 23);
+    return __int_as_float((int)bits);
+}
 
 struct ts_block_q8_1
 {
@@ -114,6 +130,8 @@ __device__ __forceinline__ int qrow_bytes(int type, int cols)
         case GGML_IQ3_XXS: return (cols / 256) * 98;
         case GGML_IQ2_S: return (cols / 256) * 82;
         case GGML_IQ3_S: return (cols / 256) * 110;
+        case GGML_IQ4_NL: return (cols / 32) * 18;
+        case GGML_MXFP4: return (cols / 32) * 17;
         case GGML_IQ4_XS: return (cols / 256) * 136;
         default: return 0;
     }
@@ -420,6 +438,38 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
         uint8_t sign_byte = signs[ib32 * 4 + l];
         float v = db * (float)gv;
         return (sign_byte & (1u << p)) ? -v : v;
+    }
+
+    if (type == GGML_MXFP4)
+    {
+        // block_mxfp4: e (E8M0 byte), qs[16] = 17 bytes per 32 elements. Elements
+        // 0..15 take the low nibble of qs[j] and 16..31 the high nibble, through the
+        // E2M1 codebook scaled by the block's shared exponent
+        // (ggml dequantize_row_mxfp4).
+        const uint8_t* block = row + (col / 32) * 17;
+        float d = ts_e8m0_to_fp32_half(block[0]);
+        const uint8_t* qs = block + 1;
+        int within = col & 31;
+        int j = within & 15;
+        uint8_t packed = qs[j];
+        int nib = (within < 16) ? (packed & 0xF) : (packed >> 4);
+        return d * (float)ts_kvalues_mxfp4[nib];
+    }
+
+    if (type == GGML_IQ4_NL)
+    {
+        // block_iq4_nl: d (half), qs[16] = 18 bytes per 32 elements. One scale for
+        // the whole block; elements 0..15 read the low nibble of qs[j] and 16..31
+        // the high nibble, through the same non-linear codebook as IQ4_XS
+        // (ggml dequantize_row_iq4_nl).
+        const uint8_t* block = row + (col / 32) * 18;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+        int within = col & 31;
+        int j = within & 15;
+        uint8_t packed = qs[j];
+        int nib = (within < 16) ? (packed & 0xF) : (packed >> 4);
+        return d * (float)ts_kvalues_iq4nl[nib];
     }
 
     if (type == GGML_IQ4_XS)

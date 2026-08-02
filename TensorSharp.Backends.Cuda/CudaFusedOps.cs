@@ -626,7 +626,12 @@ namespace TensorSharp.Cuda
             IntPtr perExpertScalePtr, // device [numExperts] F32 or IntPtr.Zero
             IntPtr gateUpPtrTable,    // device [numExperts] u64
             IntPtr downPtrTable,      // device [numExperts] u64
-            int quantType, int numExperts, int nUsed, int hiddenDim, int nFf,
+            // Gate+up and down may carry DIFFERENT quant types: "unsloth dynamic"
+            // mixes them per projection (gemma-4-26B UD-IQ4_XS is IQ3_S gate_up +
+            // IQ4_NL down). The gate_up and down kernels each take their own type,
+            // so only this signature ever forced them to agree.
+            int gateUpQuantType, int downQuantType,
+            int numExperts, int nUsed, int hiddenDim, int nFf,
             // Q4_K dp4a fast path (see the ts_moe_expert_*_q4k_dp4a kernels): q8_1
             // scratch for the MoE input (moeInputQ8, hiddenDim/32 blocks) and the
             // GEGLU output (hAllQ8, nUsed * nFf/32 blocks). Both null -> the generic
@@ -641,7 +646,8 @@ namespace TensorSharp.Cuda
             // while nUsed == 0 produces an invalid zero-height expert launch.
             if (!IsMoERouterConfigurationSupported(numExperts, nUsed)
                 || hiddenDim <= 0 || nFf <= 0 || nFf > int.MaxValue / 2
-                || !CudaQuantizedOps.SupportsQuantizedType(quantType))
+                || !CudaQuantizedOps.SupportsQuantizedType(gateUpQuantType)
+                || !CudaQuantizedOps.SupportsQuantizedType(downQuantType))
             {
                 return false;
             }
@@ -699,7 +705,9 @@ namespace TensorSharp.Cuda
             // Both dims are a multiple of 32 (block size) for these quants; falls
             // back to the generic kernels for any other quant type or missing
             // scratch.
-            bool dp4a = useDp4a && (quantType == 2 || quantType == 12)
+            static bool IsDp4aExpertType(int t) => t == 2 || t == 12;
+            bool dp4a = useDp4a
+                && IsDp4aExpertType(gateUpQuantType) && IsDp4aExpertType(downQuantType)
                 && moeInputQ8?.Storage is CudaStorage && hAllQ8?.Storage is CudaStorage
                 && (hiddenDim & 31) == 0 && (nFf & 31) == 0;
 
@@ -708,16 +716,16 @@ namespace TensorSharp.Cuda
                 IntPtr moeInQ8 = DeviceBufferOf(moeInputQ8);
                 IntPtr hQ8 = DeviceBufferOf(hAllQ8);
                 kernels.LaunchQuantizeQ81Rows(moeInPtr, moeInQ8, hiddenDim, 1, stream, warpCooperative: true);
-                kernels.LaunchMoEExpertGateUpDp4a(gateUpPtrTable, selPtr, moeInQ8, guPtr, quantType, hiddenDim, twoNff, nUsed, stream);
+                kernels.LaunchMoEExpertGateUpDp4a(gateUpPtrTable, selPtr, moeInQ8, guPtr, gateUpQuantType, hiddenDim, twoNff, nUsed, stream);
                 kernels.LaunchGELUMulSplitF32(guPtr, hPtr, nUsed, nFf, stream);
                 kernels.LaunchQuantizeQ81Rows(hPtr, hQ8, nFf, nUsed, stream, warpCooperative: true);
-                kernels.LaunchMoEExpertDownDp4a(downPtrTable, selPtr, rwPtr, hQ8, outPtr, quantType, nFf, hiddenDim, nUsed, stream);
+                kernels.LaunchMoEExpertDownDp4a(downPtrTable, selPtr, rwPtr, hQ8, outPtr, downQuantType, nFf, hiddenDim, nUsed, stream);
             }
             else
             {
-                kernels.LaunchMoEExpertGateUpVecF32(gateUpPtrTable, selPtr, moeInPtr, guPtr, quantType, hiddenDim, twoNff, nUsed, stream);
+                kernels.LaunchMoEExpertGateUpVecF32(gateUpPtrTable, selPtr, moeInPtr, guPtr, gateUpQuantType, hiddenDim, twoNff, nUsed, stream);
                 kernels.LaunchGELUMulSplitF32(guPtr, hPtr, nUsed, nFf, stream);
-                kernels.LaunchMoEExpertDownAccumF32(downPtrTable, selPtr, rwPtr, hPtr, outPtr, quantType, nFf, hiddenDim, nUsed, stream);
+                kernels.LaunchMoEExpertDownAccumF32(downPtrTable, selPtr, rwPtr, hPtr, outPtr, downQuantType, nFf, hiddenDim, nUsed, stream);
             }
 
             outStorage.MarkDeviceModified();

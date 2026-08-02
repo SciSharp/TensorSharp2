@@ -1463,7 +1463,7 @@ public class CudaBackendTests
         Assert.False(CudaFusedOps.TryMoEExpertFFNDecode(
             logits, moeInput, output, selected, routingWeights, gateUp, hidden,
             IntPtr.Zero, sentinel, sentinel,
-            quantType: 2, numExperts, nUsed, hiddenDim: 32, nFf: 32));
+            gateUpQuantType: 2, downQuantType: 2, numExperts, nUsed, hiddenDim: 32, nFf: 32));
     }
 
     [Fact]
@@ -2933,6 +2933,157 @@ public class CudaBackendTests
 
     // Builds a byte-valid IQ4_XS weight buffer (any bit pattern is a legal block).
     // block_iq4_xs = d(half) @0, scales_h(uint16) @2, scales_l[4] @4, qs[128] @8 => 136 bytes / 256 elems.
+    [Fact]
+    public void CudaQuantizedMatmul_IQ4NLMatchesNativeReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        // IQ4_NL (ggml type 20) shares IQ4_XS's non-linear codebook but uses a flat
+        // 18-byte / 32-element block with a single scale and no sub-block scales.
+        // "Unsloth dynamic" quants mix it with other types per projection (the
+        // gemma-4-26B UD-IQ4_XS MoE is IQ3_S gate_up + IQ4_NL down), so without
+        // device support those tensors stayed host-backed and every matmul
+        // dequantized on the CPU.
+        const int rows = 3;
+        const int inDim = 256;   // multiple of the 32-element IQ4_NL block
+        const int outDim = 5;
+        byte[] weights = CreateIq4NlRows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 1) * 0.013f) + MathF.Cos((r + 2) * (c + 3) * 0.007f) * 0.3f;
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x767000 + (int)GgmlTensorType.IQ4_NL);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            Assert.True(CudaQuantizedOps.SupportsQuantizedType((int)GgmlTensorType.IQ4_NL));
+            CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, host, (int)GgmlTensorType.IQ4_NL, inDim, outDim, weights.Length);
+
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+            Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                output,
+                inputTensor,
+                cacheKey,
+                IntPtr.Zero,
+                (int)GgmlTensorType.IQ4_NL,
+                inDim,
+                outDim,
+                weights.Length));
+
+            float[] expected = DequantizedMatmulNative(weights, GgmlTensorType.IQ4_NL, outDim, inDim, input);
+            float maxAbs = 0f;
+            foreach (float e in expected)
+                maxAbs = MathF.Max(maxAbs, MathF.Abs(e));
+            AssertClose(expected, output.GetElementsAsFloat(rows * outDim), MathF.Max(5e-2f, maxAbs * 3e-4f));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Fact]
+    public void CudaQuantizedMatmul_MXFP4MatchesNativeReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        // MXFP4 (ggml type 39) is the expert format of gpt-oss. Without device
+        // support its ffn_*_exps tensors stayed host-backed and every MoE matmul
+        // dequantized on the CPU (gpt-oss-20b decode measured 3.3 tok/s vs 150 on
+        // ggml_cuda). 17-byte block: one E8M0 shared exponent + 16 packed nibbles.
+        const int rows = 3;
+        const int inDim = 256;   // multiple of the 32-element MXFP4 block
+        const int outDim = 5;
+        byte[] weights = CreateMxfp4Rows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 1) * 0.017f) + MathF.Cos((r + 2) * (c + 3) * 0.009f) * 0.3f;
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x767000 + (int)GgmlTensorType.MXFP4);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            Assert.True(CudaQuantizedOps.SupportsQuantizedType((int)GgmlTensorType.MXFP4));
+            CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, host, (int)GgmlTensorType.MXFP4, inDim, outDim, weights.Length);
+
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+            Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                output,
+                inputTensor,
+                cacheKey,
+                IntPtr.Zero,
+                (int)GgmlTensorType.MXFP4,
+                inDim,
+                outDim,
+                weights.Length));
+
+            float[] expected = DequantizedMatmulNative(weights, GgmlTensorType.MXFP4, outDim, inDim, input);
+            float maxAbs = 0f;
+            foreach (float e in expected)
+                maxAbs = MathF.Max(maxAbs, MathF.Abs(e));
+            AssertClose(expected, output.GetElementsAsFloat(rows * outDim), MathF.Max(5e-2f, maxAbs * 3e-4f));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    private static byte[] CreateMxfp4Rows(int rows, int cols)
+    {
+        const int blockSize = 32;
+        const int blockBytes = 17;   // E8M0 exponent byte + 16 packed nibble bytes
+        Assert.Equal(0, cols % blockSize);
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int offset = (r * blocksPerRow + b) * blockBytes;
+                // Exponents around the 127 bias, including the e < 2 denormal cases
+                // that take ggml's special branch.
+                raw[offset] = (byte)((r == 0 && b < 2) ? b : (120 + ((r * 3 + b) % 14)));
+                for (int i = 0; i < 16; i++)
+                    raw[offset + 1 + i] = (byte)((r * 31 + b * 19 + i * 13 + 5) & 0xFF);
+            }
+        }
+
+        return raw;
+    }
+
+    private static byte[] CreateIq4NlRows(int rows, int cols)
+    {
+        const int blockSize = 32;
+        const int blockBytes = 18;   // half d + 16 packed nibble bytes
+        Assert.Equal(0, cols % blockSize);
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int offset = (r * blocksPerRow + b) * blockBytes;
+                WriteHalf(raw, offset, 0.0078125f + r * 0.001953125f + b * 0.0009765625f);
+                // Deterministic nibble pattern covering the full 16-entry codebook.
+                for (int i = 0; i < 16; i++)
+                    raw[offset + 2 + i] = (byte)((r * 29 + b * 17 + i * 11 + 7) & 0xFF);
+            }
+        }
+
+        return raw;
+    }
+
     private static byte[] CreateIq4XsRows(int rows, int cols)
     {
         const int blockSize = 256;

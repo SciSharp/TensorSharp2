@@ -417,9 +417,11 @@ namespace TensorSharp.Cuda
                 ggmlType == 14 ||    // Q6_K
                 ggmlType == 16 ||    // IQ2_XXS
                 ggmlType == 18 ||    // IQ3_XXS
+                ggmlType == 20 ||    // IQ4_NL
                 ggmlType == 21 ||    // IQ3_S
                 ggmlType == 22 ||    // IQ2_S
-                ggmlType == 23;      // IQ4_XS
+                ggmlType == 23 ||    // IQ4_XS
+                ggmlType == 39;      // MXFP4 (gpt-oss experts)
         }
 
         /// <summary>
