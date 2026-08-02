@@ -261,4 +261,37 @@ public class HarmonyToolCallTests
         Assert.Equal("Rome", call.Arguments["location"]);
         Assert.Equal("celsius", call.Arguments["unit"]);
     }
+
+    [Fact]
+    public void ToolCallEndingAtEosWithoutClosingTagIsStillEmitted()
+    {
+        // How the streaming server actually drives the parser: the generation is
+        // fed while it arrives, then flushed with Add("", done: true). gpt-oss
+        // stops at EOS *without* a closing <|end|>/<|call|>/<|return|> tag, so by
+        // the time the flush arrives the buffer is empty and the arguments are
+        // already accumulated — the tool call must still come out (it used to be
+        // dropped, leaving the turn empty with finish_reason "stop").
+        var parser = new HarmonyOutputParser();
+        parser.Init(enableThinking: true, tools: WeatherTool());
+
+        var calls = new List<ToolCall>();
+        foreach (var chunk in new[]
+                 {
+                     "<|channel|>analysis<|message|>We need to call get_weather.<|end|>",
+                     "<|start|>assistant<|channel|>commentary to=functions.get_weather ",
+                     "<|constrain|>json<|message|>{\"location\":\"Paris\",",
+                     "\"unit\":\"celsius\"}",
+                 })
+        {
+            var p = parser.Add(chunk, done: false);
+            if (p.ToolCalls != null) calls.AddRange(p.ToolCalls);
+        }
+        var final = parser.Add("", done: true);
+        if (final.ToolCalls != null) calls.AddRange(final.ToolCalls);
+
+        var call = Assert.Single(calls);
+        Assert.Equal("get_weather", call.Name);
+        Assert.Equal("Paris", call.Arguments["location"]);
+        Assert.Equal("celsius", call.Arguments["unit"]);
+    }
 }

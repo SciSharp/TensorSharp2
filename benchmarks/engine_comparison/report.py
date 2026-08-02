@@ -39,24 +39,32 @@ RESULTS_DIR = config.RESULTS_DIR
 REPORT_PATH = config.REPO_ROOT / "docs" / "engine_comparison_report.md"
 CSV_PATH = RESULTS_DIR / "results.csv"
 
-# Columns are (engine, backend) pairs discovered in the results, ordered by the
-# config registries (engine outer, backend inner). Results may contain backend
-# ids that are not in the current config (e.g. the legacy abstract gpu / cpu
-# ids from an older run); those sort after the registry ids and are labeled by
-# their raw id.
+# Columns are (engine, backend, tp) triples discovered in the results, ordered
+# by the config registries (engine outer, backend, then tensor-parallel degree).
+# Results may contain backend ids that are not in the current config (e.g. the
+# legacy abstract gpu / cpu ids from an older run); those sort after the
+# registry ids and are labeled by their raw id.
 def _order_key(col) -> tuple:
     eng_order = list(config.ENGINES.keys())
     b_order = list(config.BACKENDS.keys())
-    e, b = col
+    e, b, tp = col
     return (eng_order.index(e) if e in eng_order else len(eng_order),
-            b_order.index(b) if b in b_order else len(b_order), str(e), str(b))
+            b_order.index(b) if b in b_order else len(b_order), str(e), str(b), int(tp))
 
 
 def _col_label(col) -> str:
-    e, b = col
+    e, b, tp = col
     eng = config.ENGINES.get(e)
     spec = config.BACKENDS.get(b)
-    return f"{eng.display if eng else e} · {spec.display if spec else b}"
+    tag = f" · tp{tp}" if int(tp) > 1 else ""
+    return f"{eng.display if eng else e} · {spec.display if spec else b}{tag}"
+
+
+def _rec_tp(rec) -> int:
+    try:
+        return max(1, int(rec.get("tp", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 # Performance-ratio comparisons: TensorSharp (numerator) vs a reference engine
@@ -68,10 +76,11 @@ _RATIO_REF_ENGINES = ("llamacpp", "vllm")
 def load_all() -> dict:
     """Returns (baseline, rows).
 
-    baseline[model][scenario][(engine,backend)] = record   (only mtp-off,
-    concurrency-1 cells, so the headline per-engine tables stay apples-to-apples).
-    rows = every record (all mtp / concurrency axes), used by the MTP and
-    concurrency sections.
+    baseline[model][scenario][(engine,backend,tp)] = record   (only mtp-off,
+    concurrency-1 cells, so the headline per-engine tables stay apples-to-apples;
+    each tensor-parallel degree is its own column).
+    rows = every record (all mtp / tp / concurrency axes), used by the MTP,
+    tensor-parallelism and concurrency sections.
     """
     out: dict = {}
     rows = []
@@ -84,7 +93,7 @@ def load_all() -> dict:
         rows.append(d)
         if d.get("mtp", False) or int(d.get("concurrency", 1) or 1) != 1:
             continue  # keep the baseline tables to the single-stream, no-MTP point
-        out.setdefault(model, {}).setdefault(scenario, {})[(eng, backend)] = d
+        out.setdefault(model, {}).setdefault(scenario, {})[(eng, backend, _rec_tp(d))] = d
     return out, rows
 
 
@@ -176,7 +185,7 @@ def _present_ratio_pairs(scen_map: dict) -> list:
     out = []
     for ts in sorted((c for c in cols if c[0] == "tensorsharp"), key=_order_key):
         for ref_eng in _RATIO_REF_ENGINES:
-            ref = (ref_eng, ts[1])
+            ref = (ref_eng, ts[1], ts[2])      # same backend AND same tp degree
             if ref not in cols:
                 continue
             if any(_ratio_val(col_map.get(ts), col_map.get(ref), m, hib) > 0
@@ -262,17 +271,24 @@ def _ok_decode(rec) -> float:
     return float(rec.get("decode_tps", 0.0) or 0.0)
 
 
+def _backend_label(rec) -> str:
+    """`backend` (plus the tensor-parallel degree when > 1) for the row-keyed
+    sections, so a tp2 series never merges with its tp1 baseline."""
+    tp = _rec_tp(rec)
+    return f"{rec['backend']}" + (f" · tp{tp}" if tp > 1 else "")
+
+
 def mtp_section(rows: list) -> str:
     """MTP/NextN on-vs-off decode comparison (single-stream, TensorSharp).
 
     Pairs the concurrency-1 records that share (engine, backend, model, scenario)
     but differ on `mtp`, and reports decode tok/s off → on plus the speedup."""
-    # index: (engine, backend, model, scenario) -> {mtp: rec}
+    # index: (engine, backend, tp, model, scenario) -> {mtp: rec}
     idx: dict = {}
     for r in rows:
         if int(r.get("concurrency", 1) or 1) != 1:
             continue
-        key = (r["engine"], r["backend"], r["model"], r["scenario"])
+        key = (r["engine"], _backend_label(r), r["model"], r["scenario"])
         idx.setdefault(key, {})[bool(r.get("mtp", False))] = r
 
     paired = [(k, v) for k, v in idx.items() if True in v and False in v]
@@ -301,10 +317,11 @@ def concurrency_section(rows: list) -> str:
     if levels == [1]:
         return "_No parallel-request cells were run (use `--concurrency 1,4,8`)._"
 
-    # index: (engine, backend, model, scenario, mtp) -> {concurrency: rec}
+    # index: (engine, backend[·tp], model, scenario, mtp) -> {concurrency: rec}
     idx: dict = {}
     for r in rows:
-        key = (r["engine"], r["backend"], r["model"], r["scenario"], bool(r.get("mtp", False)))
+        key = (r["engine"], _backend_label(r), r["model"], r["scenario"],
+               bool(r.get("mtp", False)))
         idx.setdefault(key, {})[int(r.get("concurrency", 1) or 1)] = r
 
     # Only keep series that actually exercise >1 concurrency.
@@ -329,6 +346,52 @@ def concurrency_section(rows: list) -> str:
 
         lines.append(_row("decode/req t/s", "decode_tps"))
         lines.append(_row("aggregate t/s", "aggregate_decode_tps"))
+    return "\n".join(lines)
+
+
+def tp_section(rows: list) -> str:
+    """Tensor-parallel scaling: per (engine, backend, model, scenario), decode
+    and prefill throughput at each `--tp` degree plus the speedup over the
+    lowest degree that ran (usually tp1 — a model that only fits on N GPUs is
+    normalized against its own smallest working degree)."""
+    degrees = sorted({_rec_tp(r) for r in rows})
+    if degrees == [1]:
+        return "_No tensor-parallel cells were run (use `--tp 1,2,4`)._"
+
+    # index: (engine, backend, model, scenario) -> {tp: rec}
+    idx: dict = {}
+    for r in rows:
+        if r.get("mtp", False) or int(r.get("concurrency", 1) or 1) != 1:
+            continue
+        key = (r["engine"], r["backend"], r["model"], r["scenario"])
+        idx.setdefault(key, {})[_rec_tp(r)] = r
+
+    series = {k: v for k, v in idx.items()
+              if any(tp > 1 and (v[tp].get("status") == "ok") for tp in v)}
+    if not series:
+        return "_No tensor-parallel cells produced a result._"
+
+    head = ("| Engine · Backend · Model · Scenario | metric | "
+            + " | ".join(f"tp={t}" for t in degrees) + " | scaling |")
+    sep = "|---|---|" + "|".join(["---:"] * len(degrees)) + "|---:|"
+    lines = [head, sep]
+    for key, by_tp in sorted(series.items()):
+        eng, backend, model, scenario = key
+        label = f"{eng} · {backend} · {model} · {scenario}"
+        ran = sorted(t for t in by_tp if by_tp[t].get("status") == "ok")
+        base_tp = ran[0] if ran else 1
+        top_tp = ran[-1] if ran else 1
+
+        def _row(metric_label, metric_key):
+            cells = [_cell(by_tp.get(t), metric_key) for t in degrees]
+            base = _ok_value(by_tp.get(base_tp), metric_key)
+            top = _ok_value(by_tp.get(top_tp), metric_key)
+            scale = (f"{top / base:.2f}× (tp{base_tp}→tp{top_tp})"
+                     if base > 0 and top > 0 and top_tp != base_tp else "—")
+            return f"| {label} | {metric_label} | " + " | ".join(cells) + f" | {scale} |"
+
+        lines.append(_row("decode t/s", "decode_tps"))
+        lines.append(_row("prefill t/s", "prefill_tps"))
     return "\n".join(lines)
 
 
@@ -371,6 +434,7 @@ def image_edit_section(rows: list) -> str:
     recs = [r for r in rows
             if _is_image_edit_scenario(r.get("scenario", ""))
             and not r.get("mtp", False)
+            and _rec_tp(r) == 1
             and int(r.get("concurrency", 1) or 1) == 1]
     if not recs:
         return "_No image-edit cells were run (see the `image_edit` scenario)._"
@@ -492,10 +556,10 @@ def quality_section(data: dict) -> str:
             if scenario_id.startswith("prefill_") or _is_image_edit_scenario(scenario_id):
                 continue
             col_map = scen_map[scenario_id]
-            backends = sorted({b for (_, b) in col_map})
-            for backend in backends:
-                ts = col_map.get(("tensorsharp", backend))
-                ref = col_map.get((ref_engine, backend))
+            backends = sorted({(b, tp) for (_, b, tp) in col_map})
+            for backend, tp in backends:
+                ts = col_map.get(("tensorsharp", backend, tp))
+                ref = col_map.get((ref_engine, backend, tp))
                 if not ts or not ref or ts.get("status") != "ok" or ref.get("status") != "ok":
                     continue
                 a, b = _norm_ws(_rec_output_text(ts)), _norm_ws(_rec_output_text(ref))
@@ -509,7 +573,9 @@ def quality_section(data: dict) -> str:
                     kind = ""
                 if sim is None and kind not in ("json_mode", "function_call"):
                     continue
-                rows.append((model_id, backend, scenario_id, ts, ref, sim))
+                spec = config.BACKENDS.get(backend)
+                label = (spec.display if spec else backend) + (f" · tp{tp}" if tp > 1 else "")
+                rows.append((model_id, label, scenario_id, ts, ref, sim))
     if not rows:
         return "_No overlapping ok cells with captured output to compare._"
 
@@ -530,10 +596,9 @@ def quality_section(data: dict) -> str:
                       f"ref {_mark(ref.get('tool_call_ok'))}")
         else:
             checks = "—"
-        spec = config.BACKENDS.get(backend)
         sim_s = f"{sim:.2f}" if sim is not None else "—"
         verdict = _similarity_verdict(sim) if sim is not None else "—"
-        out.append(f"| {model_id} | {spec.display if spec else backend} | {scenario_id} | "
+        out.append(f"| {model_id} | {backend} | {scenario_id} | "
                    f"{sim_s} | {verdict} | "
                    f"{ts.get('completion_tokens', 0)} / {ref.get('completion_tokens', 0)} | "
                    f"{ts.get('finish_reason', '') or '—'} / {ref.get('finish_reason', '') or '—'} | "
@@ -565,10 +630,10 @@ def tool_summary(rows: list) -> str:
     if not fc:
         return "_No function-call cells were run._"
     lines = ["| Engine · Backend · Model | tool_call emitted |", "|---|:---:|"]
-    for r in sorted(fc, key=lambda r: (r["engine"], r["backend"], r["model"])):
+    for r in sorted(fc, key=lambda r: (r["engine"], r["backend"], _rec_tp(r), r["model"])):
         ok = r.get("tool_call_ok")
         mark = "yes" if ok else ("no" if ok is False else "?")
-        lines.append(f"| {r['engine']} · {r['backend']} · {r['model']} | {mark} |")
+        lines.append(f"| {r['engine']} · {_backend_label(r)} · {r['model']} | {mark} |")
     return "\n".join(lines)
 
 
@@ -616,9 +681,10 @@ def main():
                "- DiffusionGemma denoises whole blocks (no token stream), so it is run "
                "non-streaming and its `decode_tps` is wall-clock tokens/second.\n"
                "- Greedy sampling (`temperature=0`); one warmup request per server is discarded.\n"
-               "- The headline per-engine tables are the **single-stream, MTP-off** baseline. "
-               "MTP on/off and parallel-request scaling are reported in their own sections "
-               "below.\n")
+               "- The headline per-engine tables are the **single-stream, MTP-off** baseline; "
+               "each tensor-parallel degree (`--tp N`) is its own column, labeled `tpN`. "
+               "MTP on/off, tensor-parallel scaling and parallel-request scaling are "
+               "reported in their own sections below.\n")
 
     out.append("## Performance ratio — TensorSharp vs reference engines\n")
     out.append("Geomean of TensorSharp's per-scenario speedup over each reference engine on "
@@ -695,6 +761,15 @@ def main():
     out.append(mtp_section(rows))
     out.append("")
 
+    out.append("## Tensor parallelism (multi-GPU scaling)\n")
+    out.append("One model split across N GPUs in a single process — TensorSharp `--tp N`, "
+               "llama.cpp `--split-mode tensor` — with each engine pinned to exactly N "
+               "devices. `scaling` is the highest degree that ran over the lowest one "
+               "(a model that does not fit a single GPU is normalized against its own "
+               "smallest working degree). Single-stream, MTP-off cells only.\n")
+    out.append(tp_section(rows))
+    out.append("")
+
     out.append("## Parallel-request scaling (concurrency)\n")
     out.append("`decode/req` is the mean per-request decode tok/s; `aggregate` is the "
                "system-wide decode throughput (total generated tokens / the wall window "
@@ -711,7 +786,7 @@ def main():
     print(f"Wrote {REPORT_PATH}")
 
     # Flat CSV
-    fields = ["engine", "backend", "model", "scenario", "mtp", "concurrency",
+    fields = ["engine", "backend", "model", "scenario", "mtp", "tp", "concurrency",
               "status", "detail", "prompt_tokens", "completion_tokens", "ttft_ms",
               "prefill_tps", "decode_tps", "aggregate_decode_tps", "requests_ok",
               "total_wall_ms", "finish_reason", "tool_call_ok",

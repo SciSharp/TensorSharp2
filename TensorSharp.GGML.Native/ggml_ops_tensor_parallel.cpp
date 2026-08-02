@@ -78,6 +78,17 @@ namespace tsg
         TpComm g_tp_comm;
         std::mutex g_tp_comm_mutex;
 
+        // Set a process environment variable so that native getenv() sees it —
+        // the backend and NCCL both read their configuration that way.
+        void tp_setenv(const char* name, const char* value)
+        {
+#if defined(_WIN32)
+            _putenv_s(name, value);
+#else
+            setenv(name, value, 1);
+#endif
+        }
+
         // Scratch device tensors used by the device AllReduce path. One
         // context+buffer per rank, grown on demand and reused across calls so a
         // steady-state decode never allocates.
@@ -192,15 +203,29 @@ namespace tsg
             return false;
 
 #ifdef TSG_GGML_USE_CUDA
-        // The CUDA comm chain defaults to NCCL on Linux, and NCCL trusts the
-        // driver's P2P capability report. On hosts where that report is a lie
-        // (virtualized cloud boxes), NCCL's init succeeds and its FIRST
-        // collective wedges both GPUs in peer-waiting spin kernels — a model
-        // load that should take seconds appears hung for tens of minutes.
-        // Behaviourally verify the collective up front and, when it proves
-        // unusable, steer ggml's selection to the pinned-host-memory pipeline
-        // before the backend ever creates a communicator. An explicit
-        // GGML_CUDA_ALLREDUCE from the operator wins unconditionally.
+        // Pick a collective that actually works on THIS host, for THIS rank
+        // count, before the backend creates its communicator.
+        //
+        // The CUDA comm chain is nccl -> internal -> none, and each link has a
+        // way of failing quietly:
+        //   * NCCL trusts the driver's P2P capability report. Where that report
+        //     is a lie (virtualized cloud boxes), init succeeds and the FIRST
+        //     collective wedges every GPU in peer-waiting spin kernels.
+        //   * the "internal" pinned-host pipeline only supports exactly 2
+        //     devices, so at 3+ ranks it declines and the chain lands on
+        //     "none", whose AllReduce always returns false. Every segment
+        //     boundary then drains its partials to host RAM and pushes the sum
+        //     back — a correct result at a fraction of the speed.
+        // So a host with false P2P used to lose the device collective entirely
+        // the moment it had more than two GPUs.
+        //
+        // Instead: check peer traffic behaviourally first (no NCCL needed), and
+        // when it is broken, take P2P away from NCCL rather than taking NCCL
+        // away from the model. NCCL then routes over its shared-memory
+        // transport, which keeps the reduction off the per-segment host path and
+        // works for any rank count the backend supports. The internal pipeline
+        // stays as the 2-device fallback for when NCCL is unusable outright.
+        // An explicit GGML_CUDA_ALLREDUCE from the operator wins unconditionally.
         {
             const char* reg_name = ggml_backend_reg_name(reg);
             if (reg_name != nullptr && std::strcmp(reg_name, "CUDA") == 0
@@ -209,17 +234,34 @@ namespace tsg
                 int probe_devices[TSG_MAX_DEVICES];
                 for (int r = 0; r < n; ++r)
                     probe_devices[r] = dev(r).device_index >= 0 ? dev(r).device_index : r;
+
+                // NCCL caches its tunables at the first communicator init in the
+                // process, so this has to happen before any probe touches NCCL.
+                if (std::getenv("NCCL_P2P_DISABLE") == nullptr
+                    && tp_probe_cuda_peer_access(probe_devices, n) == 0)
+                {
+                    tp_setenv("NCCL_P2P_DISABLE", "1");
+                    std::fprintf(stderr,
+                        "[TP] peer access is advertised but non-functional on this host; "
+                        "running NCCL with NCCL_P2P_DISABLE=1 (shared-memory transport).\n");
+                    std::fflush(stderr);
+                }
+
                 if (tp_probe_cuda_collective(probe_devices, n) == 0)
                 {
-#if defined(_WIN32)
-                    _putenv_s("GGML_CUDA_ALLREDUCE", "internal");
-#else
-                    setenv("GGML_CUDA_ALLREDUCE", "internal", 1);
-#endif
+                    // NCCL is unusable even without P2P. The internal pipeline
+                    // is 2-device only; past that the host reduction is all that
+                    // is left, and saying so beats a silent 2x.
+                    tp_setenv("GGML_CUDA_ALLREDUCE", n == 2 ? "internal" : "none");
                     std::fprintf(stderr,
-                        "[TP] device collective (NCCL) is non-functional on this host; "
-                        "using the pinned-host-memory AllReduce instead. Set "
-                        "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n");
+                        n == 2
+                        ? "[TP] device collective (NCCL) is non-functional on this host; "
+                          "using the pinned-host-memory AllReduce instead. Set "
+                          "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n"
+                        : "[TP] device collective (NCCL) is non-functional on this host and the "
+                          "pinned-host-memory AllReduce only supports 2 devices; falling back to "
+                          "the host reduction, which will cost throughput. Set "
+                          "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n");
                     std::fflush(stderr);
                 }
             }
@@ -270,6 +312,66 @@ namespace tsg
         g_tp_comm.free_fn = nullptr;
         g_tp_comm.allreduce_fn = nullptr;
         g_tp_comm.attempted = false;
+    }
+
+    // Whether the backend's collective can actually reduce, verified once by
+    // running a real one-element AllReduce over the per-rank scratch tensors.
+    // `tp_comm_ensure()` alone cannot answer this: the CUDA chain's last link
+    // hands back a context whose AllReduce unconditionally declines, so a
+    // "device collective" that silently reduces through host RAM looks
+    // identical to a working one until throughput is measured.
+    bool tp_device_allreduce_usable()
+    {
+        static std::mutex probe_mutex;
+        static int cached = -1;
+
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        if (cached >= 0)
+            return cached == 1;
+
+        const int n = g_device_count.load(std::memory_order_acquire);
+        if (n <= 1 || !tp_comm_ensure())
+        {
+            cached = 0;
+            return false;
+        }
+
+        // 32 floats, not 1: the internal pipeline asserts that the reduced byte
+        // count is a multiple of 16, so a single-element probe aborts the
+        // process instead of answering the question.
+        constexpr std::int64_t probe_elems = 32;
+
+        ggml_tensor* probe[TSG_MAX_DEVICES] = {};
+        {
+            std::lock_guard<std::mutex> scratch_lock(g_ar_scratch_mutex);
+            for (int r = 0; r < n; ++r)
+            {
+                ScopedRank rank(r);
+                probe[r] = ensure_ar_scratch_locked(r, probe_elems);
+                if (probe[r] == nullptr)
+                {
+                    cached = 0;
+                    return false;
+                }
+            }
+        }
+
+        bool ok;
+        {
+            std::lock_guard<std::mutex> comm_lock(g_tp_comm_mutex);
+            ok = g_tp_comm.ctx != nullptr && g_tp_comm.allreduce_fn != nullptr
+                && g_tp_comm.allreduce_fn(g_tp_comm.ctx, probe);
+        }
+        if (ok)
+        {
+            for (int r = 0; r < n; ++r)
+            {
+                ScopedRank rank(r);
+                ggml_backend_synchronize(g_backend);
+            }
+        }
+        cached = ok ? 1 : 0;
+        return ok;
     }
 
     // In-place AllReduce over device tensors, one per rank. `tensors[r]` must be
@@ -1066,6 +1168,27 @@ TSG_EXPORT int TSGgml_GetGpuDeviceDescription(int backendType, int deviceIndex, 
     }
 }
 
+// Set a process environment variable as native code sees it.
+//
+// .NET's Environment.SetEnvironmentVariable only updates the CLR's own copy of
+// the environment — a native getenv() never observes it. ggml reads every one
+// of its tunables with getenv, and latches some of them into function-local
+// statics on first use, so a managed caller that needs to influence one has to
+// set it here and has to do it before the first call that reads it.
+// `overwrite == 0` leaves an operator-provided value alone.
+TSG_EXPORT int TSGgml_SetNativeEnvironmentVariable(const char* name, const char* value, int overwrite)
+{
+    if (name == nullptr || name[0] == '\0' || value == nullptr)
+        return 0;
+#if defined(_WIN32)
+    if (overwrite == 0 && std::getenv(name) != nullptr)
+        return 1;
+    return _putenv_s(name, value) == 0 ? 1 : 0;
+#else
+    return setenv(name, value, overwrite) == 0 ? 1 : 0;
+#endif
+}
+
 // Bring up `count` backends on the given physical device indices. Rank 0 reuses
 // the already-initialized singleton when its device matches, so a TP run does
 // not pay for a second context on the main GPU. Returns 1 on success.
@@ -1080,27 +1203,31 @@ TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndic
             return 0;
         }
 
-        // ggml-cuda records each graph through cudaStreamBeginCapture. Capture is
-        // a process-wide mode: while one rank's thread is capturing, an "unsafe"
-        // CUDA call from another rank's thread poisons it, and the capture then
-        // fails with "operation failed due to a previous error during capture".
-        // Driving the ranks concurrently is the whole point of TP here, so turn
-        // graph capture off for the run. It only ever helped single-token decode
-        // on one device, and TP already replaces that win by keeping N GPUs busy.
+        // CUDA graph capture used to be switched OFF here for every multi-GPU
+        // run, on the theory that capture is a process-wide mode which a
+        // concurrent rank thread would poison ("operation failed due to a
+        // previous error during capture"). That hazard no longer exists: ggml
+        // captures with cudaStreamCaptureModeRelaxed, which explicitly permits
+        // unrelated CUDA activity on other threads.
         //
-        // Must be set before ggml-cuda reads it into a function-local static on
-        // its first graph_compute — this runs at model load, well ahead of that.
-        // Setting it here (rather than from managed code) is deliberate: .NET's
-        // Environment.SetEnvironmentVariable does not reach the native getenv.
+        // Capture is worth a great deal to TP, because a tensor-parallel token
+        // is dozens of small segment submissions per rank and replaying them
+        // costs a fraction of re-issuing every launch. Measured on 4xA40, decode
+        // tok/s, 8 requests per configuration:
+        //     Qwen3.5-9B  Q8_0     tp4:  ~88 without capture, 128.5 with
+        //     Qwen3.5-35B-A3B IQ4  tp2:  71.3 without capture, 104.1 with
+        // The 35B case is the difference between TP being a regression against a
+        // single GPU (96.0) and being a win.
         //
-        // The fused TP path (TSGgml_TensorParallelExecutePlans) submits every
-        // rank from ONE thread, so capture is safe there and worth having — it
-        // is most of the single-GPU decode speed. Set TS_GGML_TP_CUDA_GRAPHS=1
-        // to keep capture on; only do that when the run will not also drive the
-        // ranks from concurrent worker threads.
+        // TS_GGML_TP_CUDA_GRAPHS=0 restores the old behaviour for diagnosis.
+        // Setting the variable from native code (rather than managed) is
+        // deliberate: .NET's Environment.SetEnvironmentVariable does not reach
+        // getenv. This is only a backstop, though — ggml latches the value into
+        // a function-local static on its first graph_compute, which the model
+        // loader normally reaches before this runs, so the decision that takes
+        // effect is made in GgmlNative's static constructor.
         const char* tp_graphs = std::getenv("TS_GGML_TP_CUDA_GRAPHS");
-        const bool keep_graphs = tp_graphs != nullptr && tp_graphs[0] == '1';
-        if (count > 1 && concurrentRanks != 0 && !keep_graphs)
+        if (count > 1 && tp_graphs != nullptr && tp_graphs[0] == '0')
         {
 #if defined(_WIN32)
             if (std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr)
@@ -1291,9 +1418,15 @@ TSG_EXPORT int TSGgml_GetTensorParallelDegree()
 
 // 1 when AllReduce runs entirely on the devices (NCCL / P2P), 0 when it falls
 // back to the host reduction. Surfaced so the CLI can report the transport.
+//
+// Creating the communicator is not evidence that it works: the backend's chain
+// ends in a stub whose AllReduce always declines, so a context exists even when
+// every collective will fall through to the host. Answer with a real one-element
+// reduction instead, or the startup banner claims a device collective that the
+// model never gets.
 TSG_EXPORT int TSGgml_TensorParallelHasDeviceAllReduce()
 {
-    return tsg::tp_comm_ensure() ? 1 : 0;
+    return tsg::tp_device_allreduce_usable() ? 1 : 0;
 }
 
 // Host AllReduce over `count` per-rank F32 buffers. Used by the managed TP

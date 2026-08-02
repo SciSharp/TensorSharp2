@@ -13,10 +13,18 @@ model-load cost.
 Each cell writes one JSON file to the results directory:
     results/{engine}__{backend}__{model}__{scenario}.json
 
-Two extra axes are optional and default to the single baseline point so old
+Model files are provisioned automatically: any file a selected model resolves to
+that is not on disk yet is downloaded from the source URL its config entry
+declares (`source` / per-file `url`) into exactly that path, so the next run
+reuses it. Disable with `--download never`, re-fetch with `--download force`.
+
+Three extra axes are optional and default to the single baseline point so old
 invocations are unchanged:
     --mtp off|on|off,on    MTP/NextN speculative decoding (TensorSharp only;
                            relaunches the server per mode)
+    --tp 1,2,4             tensor parallelism — split one model across N GPUs
+                           (TensorSharp `--tp N`, llama.cpp `--split-mode tensor`);
+                           relaunches the server per degree
     --concurrency 1,4,8    fire N identical requests in parallel per cell and
                            record system-wide aggregate decode throughput
 
@@ -35,6 +43,10 @@ python run_matrix.py --engines tensorsharp,llamacpp \
 # MTP on vs off (TensorSharp), single-stream
 python run_matrix.py --engines tensorsharp --backends gpu \
     --models qwen36-35b-a3b,gemma4-12b --scenarios text_short --mtp off,on
+
+# Tensor-parallel scaling on a multi-GPU host (both engines), 1 vs 2 vs 4 GPUs
+python run_matrix.py --engines tensorsharp,llamacpp --backends ggml_cuda \
+    --models qwen35-35b-a3b --scenarios text_short,text_long --tp 1,2,4
 
 # Parallel-request scaling (aggregate throughput under load)
 python run_matrix.py --engines tensorsharp,llamacpp --backends gpu \
@@ -72,17 +84,21 @@ if _cfg_arg:
     os.environ["BENCH_CONFIG"] = _cfg_arg
 
 import config
+import downloads
 import engines
 import scenarios as scen
 
 
 def _result_path(results_dir: Path, engine, backend, model_id, scenario,
-                 mtp: bool = False, concurrency: int = 1) -> Path:
-    # Baseline cells (no MTP, single request) keep their historical filename so
-    # prior results stay valid; extra axes only add a suffix when non-default.
+                 mtp: bool = False, concurrency: int = 1, tp: int = 1) -> Path:
+    # Baseline cells (no MTP, single GPU, single request) keep their historical
+    # filename so prior results stay valid; extra axes only add a suffix when
+    # non-default.
     name = f"{engine}__{backend}__{model_id}__{scenario}"
     if mtp:
         name += "__mtp"
+    if tp and tp > 1:
+        name += f"__tp{tp}"
     if concurrency and concurrency > 1:
         name += f"__c{concurrency}"
     return results_dir / f"{name}.json"
@@ -90,15 +106,15 @@ def _result_path(results_dir: Path, engine, backend, model_id, scenario,
 
 def _write(results_dir: Path, res: engines.BenchResult):
     p = _result_path(results_dir, res.engine, res.backend, res.model, res.scenario,
-                     res.mtp, res.concurrency)
+                     res.mtp, res.concurrency, res.tp)
     p.write_text(json.dumps(asdict(res), indent=2), encoding="utf-8")
 
 
 def _run_cell(server, engine_id, backend, model, scenario_id, max_tokens,
-              mtp=False, concurrency=1, results_dir=None) -> engines.BenchResult:
+              mtp=False, concurrency=1, tp=1, results_dir=None) -> engines.BenchResult:
     res = engines.BenchResult(engine=engine_id, backend=backend,
                               model=model.short_id, scenario=scenario_id,
-                              mtp=mtp, concurrency=concurrency)
+                              mtp=mtp, concurrency=concurrency, tp=tp)
     sc = config.SCENARIOS[scenario_id]
 
     # Image-edit (stable-diffusion) cells run through their own engine-native
@@ -144,6 +160,8 @@ def _run_cell(server, engine_id, backend, model, scenario_id, max_tokens,
 
     model_name = engines.served_model_name(engine_id, server, model)
     eff_max_tokens = sc.max_tokens if sc.max_tokens else max_tokens
+    # Put every engine in the SAME reasoning mode (they disagree by default).
+    extra_body = engines.thinking_body(engine_id, config.THINKING)
     try:
         if concurrency > 1:
             m = engines.run_openai_chat_parallel(
@@ -152,6 +170,7 @@ def _run_cell(server, engine_id, backend, model, scenario_id, max_tokens,
                 tools=req.get("tools"),
                 response_format=req.get("response_format"),
                 max_tokens=eff_max_tokens,
+                extra_body=extra_body,
                 stream=not model.is_diffusion)
         else:
             m = engines.run_openai_chat(
@@ -159,6 +178,7 @@ def _run_cell(server, engine_id, backend, model, scenario_id, max_tokens,
                 tools=req.get("tools"),
                 response_format=req.get("response_format"),
                 max_tokens=eff_max_tokens,
+                extra_body=extra_body,
                 stream=not model.is_diffusion)
     except Exception as ex:
         res.status = "fail"
@@ -222,7 +242,7 @@ def _parse_mtp(s: str) -> list:
     return out or list(config.DEFAULT_MTP_MODES)
 
 
-def _parse_concurrency(s: str) -> list:
+def _parse_ints(s: str, flag: str, fallback) -> list:
     """'1,4,8' -> [1, 4, 8] (deduped, positive, ordered)."""
     out = []
     for tok in (s or "").split(","):
@@ -232,12 +252,20 @@ def _parse_concurrency(s: str) -> list:
         try:
             n = int(tok)
         except ValueError:
-            raise SystemExit(f"--concurrency: '{tok}' is not an integer")
+            raise SystemExit(f"{flag}: '{tok}' is not an integer")
         if n < 1:
-            raise SystemExit(f"--concurrency: '{tok}' must be >= 1")
+            raise SystemExit(f"{flag}: '{tok}' must be >= 1")
         if n not in out:
             out.append(n)
-    return out or list(config.DEFAULT_CONCURRENCY)
+    return out or list(fallback)
+
+
+def _parse_concurrency(s: str) -> list:
+    return _parse_ints(s, "--concurrency", config.DEFAULT_CONCURRENCY)
+
+
+def _parse_tp(s: str) -> list:
+    return _parse_ints(s, "--tp", config.DEFAULT_TP_DEGREES)
 
 
 def _csv(s: str) -> list:
@@ -278,9 +306,18 @@ def main():
     ap.add_argument("--mtp", default=None,
                     help="MTP/NextN speculative decoding modes: off | on | off,on "
                          "(TensorSharp only; relaunches the server per mode)")
+    ap.add_argument("--tp", default=None,
+                    help="tensor-parallel degrees, e.g. 1 or 1,2,4 — split one model "
+                         "across N GPUs (TensorSharp `--tp N`, llama.cpp "
+                         "`--split-mode tensor`); relaunches the server per degree "
+                         f"(default from config: {','.join(str(t) for t in config.DEFAULT_TP_DEGREES)})")
     ap.add_argument("--concurrency", default=None,
                     help="parallel identical requests per cell, e.g. 1 or 1,4,8 "
                          "(measures aggregate decode throughput under load)")
+    ap.add_argument("--download", choices=("auto", "never", "force"), default="auto",
+                    help="fetch missing model files from the source URLs declared in "
+                         "the config (auto, the default), never download (never), or "
+                         "re-download everything (force)")
     ap.add_argument("--results", default=None,
                     help="results directory (default from config)")
     ap.add_argument("--max-tokens", type=int, default=None,
@@ -302,6 +339,7 @@ def main():
     model_ids = _csv(args.models) or list(config.DEFAULT_MODELS)
     scenario_ids = _csv(args.scenarios) or list(config.DEFAULT_SCENARIOS)
     mtp_modes = _parse_mtp(args.mtp) if args.mtp else list(config.DEFAULT_MTP_MODES)
+    tp_degrees = _parse_tp(args.tp) if args.tp else list(config.DEFAULT_TP_DEGREES)
     concurrency_levels = _parse_concurrency(args.concurrency) if args.concurrency else list(config.DEFAULT_CONCURRENCY)
     max_tokens = args.max_tokens if args.max_tokens is not None else config.DEFAULT_MAX_TOKENS
     warmup = args.warmup if args.warmup is not None else config.DEFAULT_WARMUP
@@ -329,15 +367,46 @@ def main():
     print(f"models     : {model_ids}")
     print(f"scenarios  : {scenario_ids}")
     print(f"mtp        : {['on' if m else 'off' for m in mtp_modes]}")
+    print(f"tp         : {tp_degrees}"
+          + (f"  (devices {config.TP_DEVICES})" if config.TP_DEVICES else ""))
     print(f"concurrency: {concurrency_levels}")
     print(f"results    : {results_dir}")
     print(f"media      : image={media['image']} audio={media['audio']} video={media['video']}")
+    print(f"download   : {args.download}")
     print()
 
+    # Provision model files up front: anything missing is fetched from the source
+    # URL its config entry declares, into the exact path the config resolves, so
+    # the next run finds it locally. Failures are not fatal here — the group's
+    # pre-flight below records the affected cells as skipped with the reason.
+    fetch_status = {}
+    for model_id in model_ids:
+        model = config.MODELS.get(model_id)
+        if model is None:
+            continue
+        missing = model.missing_files()
+        if not missing and args.download != "force":
+            continue
+        if args.download == "never":
+            fetch_status[model_id] = (False, f"model file not found: {missing[0][1]} "
+                                             f"(downloads disabled)")
+            continue
+        print(f"[{model_id}] re-fetching every model file (--download force)"
+              if args.download == "force"
+              else f"[{model_id}] {len(missing)} model file(s) missing — fetching",
+              flush=True)
+        ok, detail = downloads.ensure_model(model, mode=args.download,
+                                            log=lambda s: print(s, flush=True))
+        fetch_status[model_id] = (ok, detail)
+        if not ok:
+            print(f"[{model_id}] {detail}", flush=True)
+    if fetch_status:
+        print()
+
     # Build the full plan, splitting into gated-skips and runnable cells. The
-    # (engine, backend, model, mtp) tuple fixes how the server is launched; the
-    # concurrency axis is applied per-cell against that one server.
-    plan = []   # (engine, backend, model_id, scenario_id, mtp, applies, reason)
+    # (engine, backend, model, mtp, tp) tuple fixes how the server is launched;
+    # the concurrency axis is applied per-cell against that one server.
+    plan = []   # (engine, backend, model_id, scenario_id, mtp, tp, applies, reason)
     for engine_id in engine_ids:
         if engine_id not in config.ENGINES:
             print(f"  unknown engine '{engine_id}', skipping")
@@ -346,20 +415,23 @@ def main():
             for model_id in model_ids:
                 model = config.MODELS[model_id]
                 for mtp in mtp_modes:
-                    for scenario_id in scenario_ids:
-                        sc = config.SCENARIOS[scenario_id]
-                        ok, why = config.applies(engine_id, backend, model, sc, mtp=mtp)
-                        plan.append((engine_id, backend, model_id, scenario_id, mtp, ok, why))
+                    for tp in tp_degrees:
+                        for scenario_id in scenario_ids:
+                            sc = config.SCENARIOS[scenario_id]
+                            ok, why = config.applies(engine_id, backend, model, sc,
+                                                     mtp=mtp, tp=tp)
+                            plan.append((engine_id, backend, model_id, scenario_id,
+                                         mtp, tp, ok, why))
 
-    runnable = [p for p in plan if p[5]]
-    gated = [p for p in plan if not p[5]]
+    runnable = [p for p in plan if p[6]]
+    gated = [p for p in plan if not p[6]]
 
     # Record gated cells as skips (one per concurrency level) so the matrix is complete.
-    for engine_id, backend, model_id, scenario_id, mtp, _, why in gated:
+    for engine_id, backend, model_id, scenario_id, mtp, tp, _, why in gated:
         for conc in concurrency_levels:
             res = engines.BenchResult(engine=engine_id, backend=backend, model=model_id,
                                       scenario=scenario_id, status="skipped", detail=why,
-                                      mtp=mtp, concurrency=conc)
+                                      mtp=mtp, tp=tp, concurrency=conc)
             _write(results_dir, res)
 
     n_runnable_cells = len(runnable) * len(concurrency_levels)
@@ -367,21 +439,29 @@ def main():
           f"({len(runnable)} scenario-points x {len(concurrency_levels)} concurrency), "
           f"{len(gated) * len(concurrency_levels)} gated (recorded as skipped)\n")
 
-    # Group runnable cells by (engine, backend, model, mtp) so each server starts once.
-    runnable.sort(key=lambda p: (p[0], p[1], p[2], p[4]))
-    groups = [(k, list(g)) for k, g in groupby(runnable, key=lambda p: (p[0], p[1], p[2], p[4]))]
+    # Group runnable cells by (engine, backend, model, mtp, tp) so each server
+    # starts once.
+    def _gkey(p):
+        return (p[0], p[1], p[2], p[4], p[5])
 
-    for (engine_id, backend, model_id, mtp), cells in groups:
+    runnable.sort(key=_gkey)
+    groups = [(k, list(g)) for k, g in groupby(runnable, key=_gkey)]
+
+    for (engine_id, backend, model_id, mtp, tp), cells in groups:
         model = config.MODELS[model_id]
         scen_ids = [c[3] for c in cells]
         mtp_tag = " mtp=on" if mtp else ""
-        header = f"[{engine_id}/{backend}/{model_id}{mtp_tag}]"
+        tp_tag = f" tp={tp}" if tp > 1 else ""
+        header = f"[{engine_id}/{backend}/{model_id}{mtp_tag}{tp_tag}]"
         print(f"=== {header}  scenarios={scen_ids}  concurrency={concurrency_levels} ===", flush=True)
 
-        # Pre-flight: model file and engine binary present?
+        # Pre-flight: model files (all shards + companions) and engine binary present?
         missing = None
-        if not model.gguf.exists():
-            missing = f"model file not found: {model.gguf}"
+        fetched_ok, fetch_detail = fetch_status.get(model_id, (True, ""))
+        model_missing = model.missing_files()
+        if model_missing:
+            missing = (fetch_detail if not fetched_ok
+                       else f"model file not found: {model_missing[0][1]}")
         elif engine_id == "tensorsharp" and not config.TENSORSHARP_SERVER_DLL.exists():
             missing = f"TensorSharp.Server.dll not found: {config.TENSORSHARP_SERVER_DLL}"
         elif engine_id == "llamacpp" and not config.llama_server_exe_for(backend).exists():
@@ -390,11 +470,6 @@ def main():
         elif engine_id == "sdcpp" and not config.sdcpp_exe_for(backend).exists():
             missing = (f"sd-cli for backend '{backend}' not found: "
                        f"{config.sdcpp_exe_for(backend)}")
-        if missing is None and model.components:
-            for cname, cpath in model.components.items():
-                if cpath is not None and not cpath.exists():
-                    missing = f"model component '{cname}' not found: {cpath}"
-                    break
         if missing:
             print(f"    SKIP group: {missing}")
             for c in cells:
@@ -402,16 +477,18 @@ def main():
                     _write(results_dir, engines.BenchResult(
                         engine=engine_id, backend=backend, model=model_id,
                         scenario=c[3], status="skipped", detail=missing,
-                        mtp=mtp, concurrency=conc))
+                        mtp=mtp, tp=tp, concurrency=conc))
             continue
 
-        # Separate log per (engine, backend, model, mtp) so MTP-on / -off don't clobber.
-        log_name = f"{engine_id}__{backend}__{model_id}" + ("__mtp" if mtp else "")
+        # Separate log per (engine, backend, model, mtp, tp) so the MTP / TP
+        # variants of one model don't clobber each other's server log.
+        log_name = (f"{engine_id}__{backend}__{model_id}"
+                    + ("__mtp" if mtp else "") + (f"__tp{tp}" if tp > 1 else ""))
         log_path = results_dir / "logs" / f"{log_name}.log"
         # Server max-tokens must cover the busiest cell: concurrency doesn't raise
         # per-request length, but keep the configured headroom.
         server = engines.make_server(engine_id, model, backend, log_path,
-                                     max_tokens=config.SERVER_MAX_TOKENS, mtp=mtp)
+                                     max_tokens=config.SERVER_MAX_TOKENS, mtp=mtp, tp=tp)
 
         t0 = time.monotonic()
         try:
@@ -424,7 +501,7 @@ def main():
                     _write(results_dir, engines.BenchResult(
                         engine=engine_id, backend=backend, model=model_id,
                         scenario=c[3], status="fail", detail=detail,
-                        mtp=mtp, concurrency=conc))
+                        mtp=mtp, tp=tp, concurrency=conc))
             server.stop()
             continue
         timeout = config.READY_TIMEOUT_S[model.size_class]
@@ -442,7 +519,7 @@ def main():
                     _write(results_dir, engines.BenchResult(
                         engine=engine_id, backend=backend, model=model_id,
                         scenario=c[3], status=status, detail=detail,
-                        mtp=mtp, concurrency=conc))
+                        mtp=mtp, tp=tp, concurrency=conc))
             server.stop()
             continue
         print(f"    server ready in {load_s:.0f}s", flush=True)
@@ -455,7 +532,7 @@ def main():
             scenario_id = c[3]
             for conc in concurrency_levels:
                 out_file = _result_path(results_dir, engine_id, backend, model_id,
-                                        scenario_id, mtp, conc)
+                                        scenario_id, mtp, conc, tp)
                 if args.skip_existing and out_file.exists():
                     try:
                         prev = json.loads(out_file.read_text(encoding="utf-8"))
@@ -466,7 +543,7 @@ def main():
                         pass
                 t = time.monotonic()
                 res = _run_cell(server, engine_id, backend, model, scenario_id,
-                                max_tokens, mtp=mtp, concurrency=conc,
+                                max_tokens, mtp=mtp, concurrency=conc, tp=tp,
                                 results_dir=results_dir)
                 _write(results_dir, res)
                 wall = time.monotonic() - t

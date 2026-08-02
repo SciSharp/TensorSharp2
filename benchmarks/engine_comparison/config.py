@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 # ---------------------------------------------------------------------------
 # Locate + load the config file
@@ -99,8 +101,9 @@ _VARS["gemma4_qat_dir"] = str(GEMMA4_QAT_DIR)
 
 def _path(value, env_key: Optional[str] = None) -> Optional[Path]:
     """Resolve a path-valued config entry. `value` is either a plain string or
-    an object `{"path": ..., "env": "BENCH_..."}` whose `env` var (if set)
-    overrides it. Applies `${var}` substitution. Returns None for null/absent."""
+    an object `{"path": ..., "env": "BENCH_...", "url": ...}` whose `env` var
+    (if set) overrides the path. Applies `${var}` substitution. Returns None for
+    null/absent."""
     if isinstance(value, dict):
         env_key = value.get("env", env_key)
         value = value.get("path")
@@ -108,6 +111,17 @@ def _path(value, env_key: Optional[str] = None) -> Optional[Path]:
     if value in (None, ""):
         return None
     return Path(_subst(str(value)))
+
+
+def _entry_url(value) -> Optional[str]:
+    """The per-file download `url` of a path entry written in object form
+    (`{"path": ..., "url": ...}`), or None. May be absolute or a name/relative
+    path resolved against the model's `source` base URL."""
+    if isinstance(value, dict):
+        u = value.get("url")
+        if u not in (None, ""):
+            return _subst(str(u))
+    return None
 
 
 # Result directory + engine binaries / endpoints / media (env-overridable).
@@ -146,6 +160,78 @@ MEDIA_VIDEO = _path(_media.get("video"), "BENCH_VIDEO") or Path(r"C:/Works/conce
 # ---------------------------------------------------------------------------
 # Model registry
 # ---------------------------------------------------------------------------
+# Split-GGUF naming, e.g. `Foo-00001-of-00005.gguf`. A config entry points at
+# the FIRST shard (what every engine is handed); the remaining shards must be
+# present next to it, and are downloaded alongside it.
+_SHARD_RE = re.compile(r"^(?P<stem>.*)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$",
+                       re.IGNORECASE)
+
+
+def expand_shards(p: Optional[Path]) -> list:
+    """All files a GGUF path actually needs: `[p]`, or every shard of the set
+    when `p` names one part of a split GGUF."""
+    if p is None:
+        return []
+    m = _SHARD_RE.match(p.name)
+    if not m:
+        return [p]
+    total = int(m.group("total"))
+    stem = m.group("stem")
+    return [p.parent / f"{stem}-{i:05d}-of-{total:05d}.gguf" for i in range(1, total + 1)]
+
+
+def _shard_url(url: str, index: int) -> str:
+    """`url` with its split-GGUF shard index set to `index` (unchanged when the
+    URL does not name a shard). Lets a config point one `url` at the first shard
+    and have every other shard resolve from it, even when the remote file names
+    differ from the local ones."""
+    head, _, name = url.rpartition("/")
+    m = _SHARD_RE.match(name)
+    if not m:
+        return url
+    name = f"{m.group('stem')}-{index:05d}-of-{m.group('total')}.gguf"
+    return f"{head}/{name}" if head else name
+
+
+def _hf_base(repo: str, revision: str = "main") -> str:
+    return f"https://huggingface.co/{repo.strip('/')}/resolve/{revision}/"
+
+
+def _source_base(src) -> Optional[str]:
+    """Base URL a model's files are fetched from. `source` may be:
+      * "https://host/dir/"                    - direct base URL
+      * "owner/repo"                           - Hugging Face repo id
+      * {"hf_repo": ..., "revision": ...}      - Hugging Face repo (+ branch/tag)
+      * {"base_url": ...}                      - direct base URL
+    Returns None when the model declares no source."""
+    if src in (None, ""):
+        return None
+    if isinstance(src, str):
+        s = _subst(src.strip())
+        if s.startswith("http://") or s.startswith("https://"):
+            return s if s.endswith("/") else s + "/"
+        return _hf_base(s)
+    if isinstance(src, dict):
+        base = src.get("base_url") or src.get("url")
+        if base:
+            base = _subst(str(base))
+            return base if base.endswith("/") else base + "/"
+        repo = src.get("hf_repo") or src.get("repo") or src.get("hf")
+        if repo:
+            return _hf_base(str(repo), str(src.get("revision", "main") or "main"))
+    return None
+
+
+def _join_url(base: Optional[str], name: str) -> Optional[str]:
+    """Resolve a file's download URL: an absolute `name` wins, otherwise it is
+    appended to the model's source base URL."""
+    if name.startswith("http://") or name.startswith("https://"):
+        return name
+    if not base:
+        return None
+    return base + quote(name.lstrip("/"))
+
+
 @dataclass
 class ModelSpec:
     short_id: str
@@ -165,9 +251,21 @@ class ModelSpec:
     # MTP / NextN speculative decoding (TensorSharp only).
     mtp_supported: bool = False       # model ships a draft head we can engage
     mtp_draft: Optional[Path] = None  # separate draft GGUF (Gemma 4); None = embedded (Qwen 3.6)
+    # Tensor parallelism range this model can be hosted at. Weights that do not
+    # fit one GPU declare e.g. `"min_tp": 4`; architectures whose shards must
+    # divide a small head count declare e.g. `"max_tp": 2` (Gemma 4 26B-A4B has
+    # 2 KV heads, so TensorSharp rejects `--tp 4` at load time). Cells outside
+    # the range are recorded as skipped rather than OOMing or failing the box.
+    min_tp: int = 1
+    max_tp: int = 0                   # 0 = no engine-side limit
+    # Download sources. `source_base` is the model's base URL (a Hugging Face
+    # repo resolves to https://huggingface.co/<repo>/resolve/<rev>/); `urls`
+    # holds any per-file override, keyed by the same role names as `files()`.
+    source_base: Optional[str] = None
+    urls: dict = field(default_factory=dict)
 
     def exists(self) -> bool:
-        return self.gguf.exists()
+        return all(p.exists() for p in expand_shards(self.gguf))
 
     def mtp_available(self) -> bool:
         """MTP can actually run: supported, and (if it needs a separate draft
@@ -175,6 +273,40 @@ class ModelSpec:
         if not self.mtp_supported:
             return False
         return self.mtp_draft is None or self.mtp_draft.exists()
+
+    def files(self) -> list:
+        """Every local file this model needs, as (role, path, source_url).
+
+        Roles are `gguf` / `mmproj` / `mtp_draft` / `component:<name>`; split
+        GGUFs expand to one entry per shard (role `gguf#2`, ...). `source_url`
+        is None when the config declares no source for that file, in which case
+        it must already exist locally."""
+        out: list = []
+
+        def _add(role: str, p: Optional[Path]):
+            if p is None:
+                return
+            shards = expand_shards(p)
+            explicit = self.urls.get(role)
+            for i, sp in enumerate(shards):
+                # An explicit URL names the FIRST shard; the remaining shards
+                # advance the shard index inside that same URL (the remote file
+                # names may differ from the local ones).
+                if explicit:
+                    url = _join_url(self.source_base, _shard_url(explicit, i + 1))
+                else:
+                    url = _join_url(self.source_base, sp.name)
+                out.append((role if i == 0 else f"{role}#{i + 1}", sp, url))
+
+        _add("gguf", self.gguf)
+        _add("mmproj", self.mmproj)
+        _add("mtp_draft", self.mtp_draft)
+        for cname, cpath in (self.components or {}).items():
+            _add(f"component:{cname}", cpath)
+        return out
+
+    def missing_files(self) -> list:
+        return [(role, p, url) for role, p, url in self.files() if not p.exists()]
 
 
 def _build_models(cfg: dict) -> dict:
@@ -184,6 +316,18 @@ def _build_models(cfg: dict) -> dict:
         steps = m.get("diffusion_steps", 32)
         if is_diffusion:                     # DIFFUSION_STEPS env override
             steps = _env_or("DIFFUSION_STEPS", steps)
+        # `_hf` (the legacy documentation-only repo pointer) is accepted as a
+        # source declaration so older configs download without being rewritten.
+        base = _source_base(m.get("source") if m.get("source") is not None else m.get("_hf"))
+        urls = {}
+        for role, key in (("gguf", "gguf"), ("mmproj", "mmproj"), ("mtp_draft", "mtp_draft")):
+            u = _entry_url(m.get(key))
+            if u:
+                urls[role] = u
+        for cname, cval in (m.get("components") or {}).items():
+            u = _entry_url(cval)
+            if u:
+                urls[f"component:{cname}"] = u
         out[short_id] = ModelSpec(
             short_id=short_id,
             display=m["display"],
@@ -198,6 +342,10 @@ def _build_models(cfg: dict) -> dict:
             components={k: _path(v) for k, v in (m.get("components") or {}).items()},
             mtp_supported=bool(m.get("mtp_supported", False)),
             mtp_draft=_path(m.get("mtp_draft")),
+            min_tp=int(m.get("min_tp", 1) or 1),
+            max_tp=int(m.get("max_tp", 0) or 0),
+            source_base=base,
+            urls=urls,
         )
     return out
 
@@ -322,12 +470,27 @@ class BackendSpec:
     ts_backend: Optional[str] = None   # value passed to `--backend`
     ts_extra_args: tuple = ()          # extra server CLI args (e.g. --gpu-device 1)
     ts_env: dict = field(default_factory=dict)   # extra env vars for the server process
+    ts_tp: Optional[bool] = None       # TensorSharp can tensor-parallelize here
+                                       # (None = infer from ts_backend)
+    ts_tp_arg: str = "--tp"            # flag carrying the TP degree
     # llama.cpp mapping (llama_ngl None = llama.cpp cannot run it).
     llama_ngl: Optional[int] = None    # value passed to `-ngl`
     llama_server_exe: Optional[Path] = None      # per-backend build (e.g. a Vulkan
                                                  # llama-server); None = paths.llama_server_exe
     llama_extra_args: tuple = ()
     llama_env: dict = field(default_factory=dict)
+    llama_tp: Optional[bool] = None    # llama.cpp can tensor-parallelize here
+                                       # (None = infer: any gpu-kind backend with -ngl > 0)
+    # llama.cpp's tensor-parallel mode. `tensor` splits weights AND KV across the
+    # GPUs (its true TP path, NCCL-backed); `row` is the older weight-only row
+    # split, which current CUDA builds no longer provide ("device CUDA0 does not
+    # support split buffers") — override per backend for an engine build that
+    # only has the old mode.
+    llama_tp_extra_args: tuple = ("--split-mode", "tensor")
+    # Multi-GPU device selection: the env var that restricts a launched engine to
+    # the first N devices (so a `--tp N` cell really uses N GPUs and a tp=1 cell
+    # really uses one). None = infer from the backend id / TensorSharp backend.
+    visible_devices_env: Optional[str] = None
     # vLLM is connect-only: nothing is launched, this flag just says the
     # external endpoint's numbers belong in this backend's column.
     vllm: bool = False
@@ -360,10 +523,16 @@ def _build_backend(bid: str, b: dict) -> BackendSpec:
         ts_backend=ts.get("backend"),
         ts_extra_args=tuple(str(a) for a in ts.get("extra_args", [])),
         ts_env={str(k): str(v) for k, v in (ts.get("env") or {}).items()},
+        ts_tp=(bool(ts["tp"]) if ts.get("tp") is not None else None),
+        ts_tp_arg=str(ts.get("tp_arg", "--tp")),
         llama_ngl=(int(llama["ngl"]) if llama.get("ngl") is not None else None),
         llama_server_exe=_path(llama.get("server_exe")),
         llama_extra_args=tuple(str(a) for a in llama.get("extra_args", [])),
         llama_env={str(k): str(v) for k, v in (llama.get("env") or {}).items()},
+        llama_tp=(bool(llama["tp"]) if llama.get("tp") is not None else None),
+        llama_tp_extra_args=tuple(str(a) for a in llama.get(
+            "tp_extra_args", ["--split-mode", "row"])),
+        visible_devices_env=b.get("visible_devices_env"),
         vllm=bool(b.get("vllm", False)),
         sdcpp_enabled=sdcpp is not None,
         sdcpp_exe=_path((sdcpp or {}).get("exe")),
@@ -446,6 +615,62 @@ def sdcpp_exe_for(backend: str) -> Path:
     return exe or SDCPP_EXE
 
 
+# ---------------------------------------------------------------------------
+# Tensor parallelism (multi-GPU) helpers
+# ---------------------------------------------------------------------------
+# TensorSharp's `--tp N` splits one model across N local GPUs; llama.cpp's
+# equivalent is `--split-mode row` over N devices. Both are restricted to the
+# selected devices through the backend's visible-devices env var, so a `tp=N`
+# cell really occupies N GPUs and the `tp=1` baseline really occupies one.
+_TS_TP_BACKENDS = ("cuda", "ggml_cuda", "ggml_vulkan")
+
+
+def ts_tp_supported(spec: BackendSpec) -> bool:
+    if spec.ts_tp is not None:
+        return spec.ts_tp
+    return spec.ts_backend in _TS_TP_BACKENDS
+
+
+def llama_tp_supported(spec: BackendSpec) -> bool:
+    if spec.llama_tp is not None:
+        return spec.llama_tp
+    return spec.kind == "gpu" and bool(spec.llama_ngl)
+
+
+def visible_devices_env_for(spec: BackendSpec) -> Optional[str]:
+    """Env var that restricts a launched engine to a subset of GPUs on this
+    backend (explicit config value, else inferred from the backend id)."""
+    if spec.visible_devices_env is not None:
+        return spec.visible_devices_env or None
+    tag = f"{spec.backend_id} {spec.ts_backend or ''}".lower()
+    if "vulkan" in tag:
+        return "GGML_VK_VISIBLE_DEVICES"
+    if "cuda" in tag:
+        return "CUDA_VISIBLE_DEVICES"
+    return None
+
+
+def tp_device_env(backend: str, tp: int) -> dict:
+    """`{VISIBLE_DEVICES_VAR: "0,1,..."}` pinning a launched engine to the first
+    `tp` devices of the configured pool. Empty when the backend has no
+    visible-devices var, or when no device pool is configured and tp == 1 (the
+    historical single-GPU behaviour: let the engine pick)."""
+    spec = BACKENDS.get(backend) or BACKENDS.get(resolve_backend(backend) or "")
+    if spec is None:
+        return {}
+    var = visible_devices_env_for(spec)
+    if not var:
+        return {}
+    pool = TP_DEVICES
+    if not pool:
+        if tp <= 1:
+            return {}
+        pool = list(range(tp))
+    if len(pool) < tp:
+        return {}
+    return {var: ",".join(str(d) for d in pool[:tp])}
+
+
 # llama.cpp server launch options.
 _llama = _CFG.get("llama", {}) or {}
 LLAMA_CONTEXT_SIZE = int(_llama.get("context_size", 8192))
@@ -468,8 +693,30 @@ DEFAULT_BACKENDS = _resolve_backend_list(_defaults.get("backends") or list(BACKE
 # invocations are unchanged):
 #   * mtp         - whether MTP/NextN speculative decoding is engaged (TensorSharp)
 #   * concurrency - number of identical requests fired in parallel at one server
+#   * tp          - tensor-parallel degree (GPUs one model is split across)
 DEFAULT_MTP_MODES = [bool(x) for x in _defaults.get("mtp_modes", [False])]
 DEFAULT_CONCURRENCY = [int(x) for x in _defaults.get("concurrency", [1])]
+DEFAULT_TP_DEGREES = [int(x) for x in _defaults.get("tp_degrees", [1])]
+
+# Ordered pool of GPU device ids the TP axis may use (`defaults.tp_devices`).
+# When set, every launched engine is pinned to the first `tp` of them; when
+# empty, tp=1 leaves device selection to the engine and tp>1 uses devices
+# 0..tp-1. Overridable per host with BENCH_TP_DEVICES="0,1,2,3".
+def _parse_devices(v) -> list:
+    if v in (None, ""):
+        return []
+    if isinstance(v, str):
+        v = [x for x in v.replace(";", ",").split(",") if x.strip()]
+    return [int(str(x).strip()) for x in v]
+
+
+TP_DEVICES = _parse_devices(_env_or("BENCH_TP_DEVICES", _defaults.get("tp_devices")))
+
+# Reasoning ("thinking") mode, applied identically to every engine (each spells
+# it differently and they do NOT default the same way — see engines.thinking_body).
+# Off by default: the answer then fits the per-scenario token budget on both
+# sides, which is what makes the output-quality comparison meaningful.
+THINKING = bool(_defaults.get("thinking", False))
 
 DEFAULT_MAX_TOKENS = int(_defaults.get("max_tokens", 128))
 DEFAULT_WARMUP = int(_defaults.get("warmup", 1))
@@ -481,7 +728,8 @@ SERVER_MAX_TOKENS = int(_defaults.get("server_max_tokens", 512))
 # Applicability gating
 # ---------------------------------------------------------------------------
 def applies(engine: str, backend: str, model: ModelSpec,
-            scenario: ScenarioSpec, mtp: bool = False) -> tuple[bool, str]:
+            scenario: ScenarioSpec, mtp: bool = False,
+            tp: int = 1) -> tuple[bool, str]:
     """Return (runnable, skip_reason). A non-runnable combination is recorded
     as a skip in the result set rather than silently dropped."""
     eng = ENGINES[engine]
@@ -525,6 +773,35 @@ def applies(engine: str, backend: str, model: ModelSpec,
             return False, f"{model.short_id} has no MTP draft head"
         if model.mtp_draft is not None and not model.mtp_draft.exists():
             return False, f"MTP draft GGUF not found: {model.mtp_draft}"
+
+    # Tensor parallelism: one model split across `tp` GPUs. Both server engines
+    # can do it (TensorSharp `--tp N`, llama.cpp `--split-mode row` over N
+    # devices); the connect-only / CLI engines cannot be driven into it here.
+    # A model whose weights do not fit a single GPU declares `min_tp`, and cells
+    # below that degree are skipped rather than left to OOM.
+    tp = int(tp or 1)
+    if tp > 1:
+        if b.kind != "gpu":
+            return False, f"tensor parallelism needs a GPU backend ({b.backend_id} is {b.kind})"
+        if engine == "tensorsharp" and not ts_tp_supported(b):
+            return False, f"TensorSharp has no tensor-parallel path on {b.backend_id}"
+        if engine == "llamacpp" and not llama_tp_supported(b):
+            return False, f"llama.cpp has no tensor-parallel path on {b.backend_id}"
+        if engine in ("vllm", "sdcpp"):
+            return False, f"{eng.display} is not driven into tensor parallelism by this harness"
+        if TP_DEVICES and len(TP_DEVICES) < tp:
+            return False, (f"only {len(TP_DEVICES)} GPU(s) configured "
+                           f"(defaults.tp_devices), need {tp}")
+        if scenario.kind == "image_edit":
+            return False, "image-edit pipeline is single-GPU"
+    if tp < model.min_tp:
+        return False, (f"{model.short_id} needs --tp {model.min_tp} "
+                       f"(does not fit {tp} GPU(s))")
+    # `max_tp` is a TensorSharp-side shard-divisibility limit; llama.cpp splits
+    # the same model differently and is not bound by it.
+    if engine == "tensorsharp" and model.max_tp and tp > model.max_tp:
+        return False, (f"{model.short_id} cannot be split across more than "
+                       f"{model.max_tp} GPU(s) by TensorSharp")
 
     # CPU-kind backends are restricted to small/medium models (large MoE on
     # CPU is impractically slow).

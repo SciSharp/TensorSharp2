@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """
-Download the benchmark models from their Hugging Face pointers.
+Pre-fetch the benchmark models declared in a config file.
 
-Reads a benchmark config (default: benchmark_config_ci.json), and for every
-selected model whose registry entry carries an `_hf` field (the Hugging Face
-repo id the files come from), downloads the model's `gguf` / `mmproj` /
-`mtp_draft` / component files into the exact local paths the config resolves
-them to — so a subsequent `run_matrix.py --config <same config>` finds them.
+`run_matrix.py` already downloads whatever is missing when it starts, so this
+script is only for provisioning a host ahead of time (a CI cache step, a fresh
+GPU box) or for re-fetching a corrupted file with `--force`.
 
-Files already present are skipped (hf_hub_download's local_dir cache), so this
-is cheap to re-run; on CI the model root lives in a persistent directory and
-the download is a one-time cost per file.
+For every selected model it downloads each file the config resolves to a local
+path — `gguf` (all shards of a split GGUF), `mmproj`, `mtp_draft` and any
+`components` — from the model's declared source into exactly that path, so a
+subsequent `run_matrix.py --config <same config>` finds them locally.
+
+Sources are declared per model as `"source": "<hf-repo-id>"` (or
+`{"hf_repo": ..., "revision": ...}`, or a direct base URL), with optional
+per-file `{"path": ..., "url": ...}` overrides; the legacy `_hf` field is
+accepted as a source too. Files already present are skipped, so this is cheap
+to re-run.
 
 Usage:
     python download_models.py [--config benchmark_config_ci.json] \
-        [--models gemma4-12b,qwen36-35b-a3b]
+        [--models gemma4-12b,qwen36-35b-a3b] [--force]
 
 Respects the same env overrides as the rest of the harness (BENCH_MODEL_ROOT,
-BENCH_CONFIG, ...). Requires `pip install -U huggingface_hub`.
+BENCH_CONFIG, ...). Set HF_TOKEN for gated Hugging Face repos.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -42,7 +46,8 @@ _cfg_arg = _peek_config_arg(sys.argv[1:]) or os.environ.get("BENCH_CONFIG") \
     or str(HERE / "benchmark_config_ci.json")
 os.environ["BENCH_CONFIG"] = _cfg_arg
 
-import config  # noqa: E402  (must come after BENCH_CONFIG is set)
+import config      # noqa: E402  (must come after BENCH_CONFIG is set)
+import downloads   # noqa: E402
 
 
 def main():
@@ -53,45 +58,31 @@ def main():
     ap.add_argument("--models", default=None,
                     help="comma list of model ids to fetch (default: the config's "
                          "defaults.models)")
+    ap.add_argument("--force", action="store_true",
+                    help="re-download even when the file is already present")
     args = ap.parse_args()
-
-    from huggingface_hub import hf_hub_download
-
-    # The `_hf` repo pointers are documentation-only fields config.py does not
-    # surface, so read them from the raw JSON alongside the resolved registry.
-    raw_models = json.loads(Path(config.CONFIG_PATH).read_text(encoding="utf-8")).get("models", {})
 
     wanted = [m.strip() for m in (args.models or "").split(",") if m.strip()] \
         or list(config.DEFAULT_MODELS)
+    mode = "force" if args.force else "auto"
+
     failed = []
     for model_id in wanted:
         model = config.MODELS.get(model_id)
-        repo = (raw_models.get(model_id) or {}).get("_hf")
         if model is None:
             print(f"[{model_id}] unknown model id (known: {', '.join(config.MODELS)})")
             failed.append(model_id)
             continue
-        if not repo:
-            print(f"[{model_id}] no `_hf` repo pointer in {config.CONFIG_PATH}; "
-                  f"expecting the files to already exist locally")
-            continue
-        targets = [model.gguf, model.mmproj, model.mtp_draft,
-                   *(model.components or {}).values()]
-        for target in targets:
-            if target is None:
-                continue
-            target = Path(target)
-            if target.exists():
-                print(f"[{model_id}] present: {target}")
-                continue
-            print(f"[{model_id}] downloading {repo} :: {target.name} -> {target.parent}")
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                hf_hub_download(repo_id=repo, filename=target.name,
-                                local_dir=str(target.parent))
-            except Exception as ex:
-                print(f"[{model_id}] FAILED {repo} :: {target.name}: {ex}")
-                failed.append(f"{model_id}:{target.name}")
+        for role, path, url in model.files():
+            if path.exists() and mode != "force":
+                print(f"[{model_id}] present: {path}")
+            elif not url:
+                print(f"[{model_id}] {role}: no source URL in {config.CONFIG_PATH.name}; "
+                      f"expecting {path} to already exist locally")
+        ok, detail = downloads.ensure_model(model, mode=mode)
+        if not ok:
+            print(f"[{model_id}] {detail}")
+            failed.append(model_id)
     if failed:
         raise SystemExit(f"model download(s) failed: {', '.join(failed)}")
     print("all requested model files are in place")

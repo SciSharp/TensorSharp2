@@ -276,10 +276,80 @@ namespace TensorSharp.Runtime
                 }
                 return new ToolCall { Name = name, Arguments = args, Index = _callIndex++ };
             }
-            catch
+            catch (JsonException)
             {
-                return null;
+                // Qwen 3.5 emits the XML-ish call body instead of a JSON object:
+                //   <function=get_weather>
+                //   <parameter=city>\nParis\n</parameter>
+                //   </function>
+                // Dropping it silently loses the whole turn (the text was already
+                // consumed as a tool call), so fall back to that form here.
+                return ParseXmlToolCall(raw);
             }
+        }
+
+        /// <summary>
+        /// Parse the `&lt;function=NAME&gt;&lt;parameter=KEY&gt;VALUE&lt;/parameter&gt;&lt;/function&gt;`
+        /// tool-call body. Each parameter value is trimmed of the surrounding
+        /// newlines the template emits, and parsed as JSON when it is a scalar /
+        /// object / array so numbers and booleans do not arrive quoted.
+        /// </summary>
+        private ToolCall? ParseXmlToolCall(string raw)
+        {
+            const string fnOpen = "<function=";
+            int fnIdx = raw.IndexOf(fnOpen, StringComparison.Ordinal);
+            if (fnIdx < 0) return null;
+            int nameEnd = raw.IndexOf('>', fnIdx + fnOpen.Length);
+            if (nameEnd < 0) return null;
+
+            string name = raw.Substring(fnIdx + fnOpen.Length, nameEnd - fnIdx - fnOpen.Length).Trim();
+            if (name.Length == 0) return null;
+
+            var args = new Dictionary<string, object>();
+            const string paramOpen = "<parameter=";
+            const string paramClose = "</parameter>";
+            int pos = nameEnd + 1;
+            while (true)
+            {
+                int pIdx = raw.IndexOf(paramOpen, pos, StringComparison.Ordinal);
+                if (pIdx < 0) break;
+                int keyEnd = raw.IndexOf('>', pIdx + paramOpen.Length);
+                if (keyEnd < 0) break;
+                string key = raw.Substring(pIdx + paramOpen.Length, keyEnd - pIdx - paramOpen.Length).Trim();
+
+                int valEnd = raw.IndexOf(paramClose, keyEnd + 1, StringComparison.Ordinal);
+                string value = valEnd < 0
+                    ? raw.Substring(keyEnd + 1)
+                    : raw.Substring(keyEnd + 1, valEnd - keyEnd - 1);
+                if (key.Length > 0)
+                    args[key] = ParseScalarOrText(value.Trim());
+
+                if (valEnd < 0) break;
+                pos = valEnd + paramClose.Length;
+            }
+
+            return new ToolCall { Name = name, Arguments = args, Index = _callIndex++ };
+        }
+
+        private static object ParseScalarOrText(string value)
+        {
+            if (value.Length == 0) return value;
+            char c = value[0];
+            bool looksJson = c == '{' || c == '[' || c == '-' || char.IsDigit(c) ||
+                             value == "true" || value == "false" || value == "null";
+            if (looksJson)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(value);
+                    return JsonElementToObject(doc.RootElement);
+                }
+                catch (JsonException)
+                {
+                    // Not JSON after all (e.g. a date like 2026-08-01): keep the text.
+                }
+            }
+            return value;
         }
 
         private static int HoldBackForPartialTag(string buf, params string[] tags)
@@ -672,7 +742,21 @@ namespace TensorSharp.Runtime
             {
                 keepParsing = false;
                 string buf = _buffer.ToString();
-                if (buf.Length == 0) break;
+                if (buf.Length == 0)
+                {
+                    // A generation that stops at EOS emits no closing
+                    // <|end|>/<|call|>/<|return|> tag, and its last content chunk
+                    // may already have been drained into `_toolArgs`. Finalizing
+                    // here is what keeps that trailing message — in particular a
+                    // commentary tool call, the whole answer for a function-call
+                    // turn — from being dropped on the floor.
+                    if (done && _state == HState.ParsingContent)
+                    {
+                        FinalizeMessage(toolCalls);
+                        _state = HState.LookingForStart;
+                    }
+                    break;
+                }
 
                 switch (_state)
                 {
@@ -757,6 +841,7 @@ namespace TensorSharp.Runtime
                             if (buf.Length > 0) EmitContent(buf, contentSb, thinkingSb);
                             FinalizeMessage(toolCalls);
                             _buffer.Clear();
+                            _state = HState.LookingForStart;
                         }
                         break;
                 }
@@ -910,6 +995,272 @@ namespace TensorSharp.Runtime
     }
 
     // ========================================================================
+    // DeepSeek V4 Parser: <think>...</think> for reasoning, and DSML markup for
+    // tool calls:
+    //     <｜DSML｜tool_calls>
+    //     <｜DSML｜invoke name="get_weather">
+    //     <｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>
+    //     </｜DSML｜invoke>
+    //     </｜DSML｜tool_calls>
+    // `string="true"` means the value is the raw text between the tags; anything
+    // else is JSON. Multiple <invoke> blocks in one call block are parallel calls.
+    // ========================================================================
+
+    public class DeepSeek4OutputParser : IOutputParser
+    {
+        private enum State { Content, Thinking, ToolCalls }
+
+        private const string ThinkOpen = "<think>";
+        private const string ThinkClose = "</think>";
+        private const string Dsml = "｜DSML｜";
+        private const string CallsOpen = "<" + Dsml + "tool_calls>";
+        private const string CallsClose = "</" + Dsml + "tool_calls>";
+
+        private State _state;
+        private readonly StringBuilder _buffer = new();
+        private bool _thinkingEnabled;
+        private int _callIndex;
+
+        public bool HasThinkingSupport => true;
+        public bool HasToolSupport => true;
+        public bool AlwaysRequired => true;
+
+        public void Init(bool enableThinking, List<ToolFunction> tools)
+        {
+            _buffer.Clear();
+            _thinkingEnabled = enableThinking;
+            _callIndex = 0;
+            // The generation prompt already emitted `<think>` (thinking) or
+            // `</think>` (not), so the model's own output starts inside the
+            // reasoning block or straight in content.
+            _state = enableThinking ? State.Thinking : State.Content;
+        }
+
+        public ParsedOutput Add(string text, bool done)
+        {
+            _buffer.Append(text);
+            var result = new ParsedOutput();
+            var contentSb = new StringBuilder();
+            var thinkingSb = new StringBuilder();
+            var toolCalls = new List<ToolCall>();
+
+            bool keepParsing = true;
+            while (keepParsing)
+            {
+                keepParsing = false;
+                string buf = _buffer.ToString();
+                if (buf.Length == 0)
+                    break;
+
+                switch (_state)
+                {
+                    case State.Thinking:
+                    {
+                        int closeIdx = buf.IndexOf(ThinkClose, StringComparison.Ordinal);
+                        if (closeIdx >= 0)
+                        {
+                            thinkingSb.Append(buf, 0, closeIdx);
+                            string after = buf.Substring(closeIdx + ThinkClose.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = State.Content;
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (done)
+                        {
+                            thinkingSb.Append(buf);
+                            _buffer.Clear();
+                        }
+                        else
+                        {
+                            int hold = HoldBackForPartialTag(buf, ThinkClose);
+                            if (hold < buf.Length)
+                            {
+                                thinkingSb.Append(buf, 0, buf.Length - hold);
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                        }
+                        break;
+                    }
+
+                    case State.Content:
+                    {
+                        int callIdx = buf.IndexOf(CallsOpen, StringComparison.Ordinal);
+                        if (callIdx >= 0)
+                        {
+                            contentSb.Append(buf, 0, callIdx);
+                            string after = buf.Substring(callIdx + CallsOpen.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = State.ToolCalls;
+                            keepParsing = true;
+                            break;
+                        }
+                        // A late <think> can still open (the model may reason
+                        // before answering even when the prompt closed the block).
+                        int thinkIdx = _thinkingEnabled ? buf.IndexOf(ThinkOpen, StringComparison.Ordinal) : -1;
+                        if (thinkIdx >= 0)
+                        {
+                            contentSb.Append(buf, 0, thinkIdx);
+                            string after = buf.Substring(thinkIdx + ThinkOpen.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = State.Thinking;
+                            keepParsing = after.Length > 0;
+                            break;
+                        }
+                        if (done)
+                        {
+                            contentSb.Append(buf);
+                            _buffer.Clear();
+                        }
+                        else
+                        {
+                            int hold = HoldBackForPartialTag(buf, CallsOpen, ThinkOpen);
+                            if (hold < buf.Length)
+                            {
+                                contentSb.Append(buf, 0, buf.Length - hold);
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                        }
+                        break;
+                    }
+
+                    case State.ToolCalls:
+                    {
+                        int endIdx = buf.IndexOf(CallsClose, StringComparison.Ordinal);
+                        if (endIdx >= 0)
+                        {
+                            ParseInvokes(buf.Substring(0, endIdx), toolCalls);
+                            string after = buf.Substring(endIdx + CallsClose.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = State.Content;
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (done)
+                        {
+                            // Generation stopped inside the block (hit the token
+                            // budget, or EOS right after the last </invoke>):
+                            // surface whatever invokes completed.
+                            ParseInvokes(buf, toolCalls);
+                            _buffer.Clear();
+                            _state = State.Content;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            result.Content = contentSb.ToString();
+            result.Thinking = thinkingSb.ToString();
+            result.ToolCalls = toolCalls.Count > 0 ? toolCalls : null;
+            return result;
+        }
+
+        /// <summary>Parse every complete `&lt;invoke&gt;` block in the body.</summary>
+        private void ParseInvokes(string body, List<ToolCall> toolCalls)
+        {
+            const string invokeOpen = "<" + Dsml + "invoke name=\"";
+            const string invokeClose = "</" + Dsml + "invoke>";
+            const string paramOpen = "<" + Dsml + "parameter name=\"";
+            const string paramClose = "</" + Dsml + "parameter>";
+
+            int pos = 0;
+            while (true)
+            {
+                int start = body.IndexOf(invokeOpen, pos, StringComparison.Ordinal);
+                if (start < 0)
+                    break;
+                int nameEnd = body.IndexOf('"', start + invokeOpen.Length);
+                if (nameEnd < 0)
+                    break;
+                string name = body.Substring(start + invokeOpen.Length, nameEnd - start - invokeOpen.Length);
+
+                int end = body.IndexOf(invokeClose, nameEnd, StringComparison.Ordinal);
+                string inner = end < 0 ? body.Substring(nameEnd) : body.Substring(nameEnd, end - nameEnd);
+
+                var args = new Dictionary<string, object>();
+                int p = 0;
+                while (true)
+                {
+                    int pStart = inner.IndexOf(paramOpen, p, StringComparison.Ordinal);
+                    if (pStart < 0)
+                        break;
+                    int keyEnd = inner.IndexOf('"', pStart + paramOpen.Length);
+                    if (keyEnd < 0)
+                        break;
+                    string key = inner.Substring(pStart + paramOpen.Length, keyEnd - pStart - paramOpen.Length);
+
+                    // string="true|false" decides whether the value is raw text
+                    // or JSON; a missing attribute is treated as text.
+                    int tagEnd = inner.IndexOf('>', keyEnd);
+                    if (tagEnd < 0)
+                        break;
+                    string attrs = inner.Substring(keyEnd, tagEnd - keyEnd);
+                    bool isString = !attrs.Contains("string=\"false\"", StringComparison.Ordinal);
+
+                    int valEnd = inner.IndexOf(paramClose, tagEnd + 1, StringComparison.Ordinal);
+                    string raw = valEnd < 0
+                        ? inner.Substring(tagEnd + 1)
+                        : inner.Substring(tagEnd + 1, valEnd - tagEnd - 1);
+
+                    if (key.Length > 0)
+                        args[key] = isString ? raw.Trim() : ParseJsonValue(raw.Trim());
+
+                    if (valEnd < 0)
+                        break;
+                    p = valEnd + paramClose.Length;
+                }
+
+                if (name.Length > 0)
+                    toolCalls.Add(new ToolCall { Name = name, Arguments = args, Index = _callIndex++ });
+
+                if (end < 0)
+                    break;
+                pos = end + invokeClose.Length;
+            }
+        }
+
+        private static object ParseJsonValue(string value)
+        {
+            if (value.Length == 0)
+                return value;
+            try
+            {
+                using var doc = JsonDocument.Parse(value);
+                return Qwen3OutputParser.JsonElementToObject(doc.RootElement);
+            }
+            catch (JsonException)
+            {
+                // The model labelled it non-string but did not write JSON; the
+                // text is still better than dropping the argument.
+                return value;
+            }
+        }
+
+        private static int HoldBackForPartialTag(string buf, params string[] tags)
+        {
+            int maxOverlap = 0;
+            foreach (var tag in tags)
+            {
+                int max = Math.Min(tag.Length, buf.Length);
+                for (int i = max; i > 0; i--)
+                {
+                    if (buf.EndsWith(tag.Substring(0, i), StringComparison.Ordinal))
+                    {
+                        maxOverlap = Math.Max(maxOverlap, i);
+                        break;
+                    }
+                }
+            }
+            return maxOverlap;
+        }
+    }
+
+    // ========================================================================
     // Factory
     // ========================================================================
 
@@ -923,6 +1274,7 @@ namespace TensorSharp.Runtime
                 "qwen3" => new Qwen3OutputParser(),
                 "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe" => new Qwen35OutputParser(),
                 "gptoss" or "gpt-oss" => new HarmonyOutputParser(),
+                "deepseek4" => new DeepSeek4OutputParser(),
                 "nemotron_h" or "nemotron_h_moe" => new Qwen3OutputParser(),
                 _ => new PassthroughOutputParser()
             };
@@ -930,7 +1282,11 @@ namespace TensorSharp.Runtime
 
         public static bool IsAlwaysRequired(string architecture)
         {
-            return architecture is "gptoss" or "gpt-oss" or "gemma4";
+            // DeepSeek V4 joins this set because its reasoning block and its DSML
+            // tool calls both arrive as plain text: without the parser the
+            // </think> marker and the whole <｜DSML｜tool_calls> block would be
+            // streamed to the client as if they were the answer.
+            return architecture is "gptoss" or "gpt-oss" or "gemma4" or "deepseek4";
         }
     }
 }

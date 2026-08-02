@@ -224,19 +224,15 @@ def _image(engine, model):
 
 
 def _audio(engine, model):
+    # The portable OpenAI `input_audio` content part, sent identically to every
+    # engine (llama.cpp and TensorSharp both accept it), so the audio cells are
+    # as apples-to-apples as the text ones.
     b64 = _b64_file(config.MEDIA_AUDIO)
     fmt = config.MEDIA_AUDIO.suffix.lstrip(".").lower() or "mp3"
-    if engine == "llamacpp":
-        # llama.cpp / OpenAI input_audio content part.
-        return {"messages": [
-            {"role": "user", "content": [
-                {"type": "text", "text": "Transcribe and summarize this audio."},
-                {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}}]}]}
-    # TensorSharp: message-level base64 `audios` array.
     return {"messages": [
-        {"role": "user",
-         "content": "Transcribe and summarize this audio.",
-         "audios": [b64]}]}
+        {"role": "user", "content": [
+            {"type": "text", "text": "Transcribe and summarize this audio."},
+            {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}}]}]}
 
 
 def _video(engine, model):

@@ -657,7 +657,7 @@ namespace TensorSharp.Runtime
                 return RenderMistral3(messages, addGenerationPrompt);
 
             if (architecture == "deepseek4")
-                return RenderDeepSeek4(messages, addGenerationPrompt, enableThinking);
+                return RenderDeepSeek4(messages, addGenerationPrompt, enableThinking, tools);
 
             return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
         }
@@ -670,7 +670,7 @@ namespace TensorSharp.Runtime
         /// token itself is prepended by the tokenizer (add_bos), not emitted here.
         /// </summary>
         public static string RenderDeepSeek4(List<ChatMessage> messages, bool addGenerationPrompt = true,
-            bool enableThinking = false)
+            bool enableThinking = false, List<ToolFunction>? tools = null)
         {
             var sb = new StringBuilder();
 
@@ -683,6 +683,20 @@ namespace TensorSharp.Runtime
                     sb.Append("\n\n");
                 sb.Append(m.Content ?? "");
                 firstSystem = false;
+            }
+
+            // Tools ride on the system prompt, exactly as the model's own template
+            // builds it: header (which teaches the DSML call syntax), one JSON
+            // schema per function, then the footer. A system message that exists
+            // but is empty still contributes its "\n\n" separator.
+            if (tools != null && tools.Count > 0)
+            {
+                if (!firstSystem)
+                    sb.Append("\n\n");
+                sb.Append(DeepSeek4ToolsHeader);
+                foreach (var tool in tools)
+                    sb.Append(ToolFunctionToJson(tool)).Append('\n');
+                sb.Append(DeepSeek4ToolsFooter);
             }
 
             bool inUser = false;
@@ -708,6 +722,7 @@ namespace TensorSharp.Runtime
                         // non-thinking turns start with a closed think block.
                         sb.Append(enableThinking ? "<think></think>" : "</think>");
                         sb.Append(m.Content ?? "");
+                        AppendDeepSeek4ToolCalls(sb, m.ToolCalls);
                         sb.Append("<｜end▁of▁sentence｜>");
                         break;
                 }
@@ -720,6 +735,98 @@ namespace TensorSharp.Runtime
             }
 
             return sb.ToString();
+        }
+
+        // --- DeepSeek V4 tool calling (DSML markup) -------------------------
+        //
+        // DeepSeek V4 does not use a JSON tool-call block. It marks calls up with
+        // its own "DSML" tags, and the model only emits them when the system
+        // prompt has taught it the syntax — which is what DeepSeek4ToolsHeader
+        // is. Both strings are transcribed from the GGUF's own chat template
+        // (`tools_header` / `tools_footer`); keep them byte-identical to it, the
+        // model was trained on this exact wording.
+        internal const string DsmlToken = "｜DSML｜";
+
+        private const string DeepSeek4ToolsHeader =
+            "## Tools\n\nYou have access to a set of tools to help answer the user's question. " +
+            "You can invoke tools by writing a \"<" + DsmlToken + "tool_calls>\" block like the following:\n\n" +
+            "<" + DsmlToken + "tool_calls>\n" +
+            "<" + DsmlToken + "invoke name=\"$TOOL_NAME\">\n" +
+            "<" + DsmlToken + "parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</" + DsmlToken + "parameter>\n" +
+            "...\n" +
+            "</" + DsmlToken + "invoke>\n" +
+            "<" + DsmlToken + "invoke name=\"$TOOL_NAME2\">\n" +
+            "...\n" +
+            "</" + DsmlToken + "invoke>\n" +
+            "</" + DsmlToken + "tool_calls>\n\n" +
+            "String parameters should be specified as is and set `string=\"true\"`. For all other types " +
+            "(numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n" +
+            "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside " +
+            "<think>...</think> BEFORE any tool calls or final response.\n\n" +
+            "Otherwise, output directly after </think> with tool calls or final response.\n\n" +
+            "### Available Tool Schemas\n\n";
+
+        private const string DeepSeek4ToolsFooter =
+            "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
+
+        /// <summary>
+        /// Render an assistant turn's tool calls back into DSML, so a follow-up
+        /// request that replays the conversation shows the model its own calls in
+        /// the form it produced them.
+        /// </summary>
+        private static void AppendDeepSeek4ToolCalls(StringBuilder sb, List<ToolCall>? toolCalls)
+        {
+            if (toolCalls == null || toolCalls.Count == 0)
+                return;
+
+            sb.Append("\n\n<").Append(DsmlToken).Append("tool_calls>\n");
+            foreach (var call in toolCalls)
+            {
+                sb.Append('<').Append(DsmlToken).Append("invoke name=\"").Append(call.Name).Append("\">\n");
+                if (call.Arguments != null)
+                {
+                    foreach (var kv in call.Arguments)
+                    {
+                        // `string="true"` means the value is written raw; anything
+                        // else is JSON, which is how the model is told to read it.
+                        bool isString = kv.Value is string;
+                        sb.Append('<').Append(DsmlToken).Append("parameter name=\"").Append(kv.Key)
+                          .Append("\" string=\"").Append(isString ? "true" : "false").Append("\">")
+                          .Append(isString ? (string)kv.Value : JsonSerializer.Serialize(kv.Value))
+                          .Append("</").Append(DsmlToken).Append("parameter>\n");
+                    }
+                }
+                sb.Append("</").Append(DsmlToken).Append("invoke>\n");
+            }
+            sb.Append("</").Append(DsmlToken).Append("tool_calls>");
+        }
+
+        /// <summary>The tool's JSON schema, in the shape the template's
+        /// `tool['function'] | tojson` produces.</summary>
+        private static string ToolFunctionToJson(ToolFunction tool)
+        {
+            var fn = new Dictionary<string, object?> { ["name"] = tool.Name };
+            if (!string.IsNullOrEmpty(tool.Description))
+                fn["description"] = tool.Description;
+
+            var props = new Dictionary<string, object?>();
+            foreach (var kv in tool.Parameters ?? new Dictionary<string, ToolParameter>())
+            {
+                var p = new Dictionary<string, object?> { ["type"] = kv.Value.Type ?? "string" };
+                if (!string.IsNullOrEmpty(kv.Value.Description))
+                    p["description"] = kv.Value.Description;
+                if (kv.Value.Enum != null && kv.Value.Enum.Count > 0)
+                    p["enum"] = kv.Value.Enum;
+                props[kv.Key] = p;
+            }
+
+            fn["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = props,
+                ["required"] = tool.Required ?? new List<string>(),
+            };
+            return JsonSerializer.Serialize(fn);
         }
 
         private static bool IsQwen35Family(string? architecture)

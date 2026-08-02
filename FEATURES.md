@@ -23,10 +23,11 @@
 - **Streaming** -- token-by-token output via SSE (web) or stdout (console), with abort/stop support for in-flight generations
 - **Text-diffusion generation** -- DiffusionGemma uses an iterative EntropyBound denoising sampler instead of autoregressive `Forward()`. The CLI exposes `--diffusion-steps`, `--diffusion-seed`, and `--diffusion-blocks`; the Web UI streams whole-message `replace` events for live denoising previews and batches concurrent diffusion requests through `DiffusionBatchScheduler`.
 - **Image editing (Qwen-Image-Edit)** -- a prompt plus an input image produces an edited image. The loaded `qwen_image` GGUF is the MMDiT diffusion transformer; TensorSharp resolves two companion GGUFs alongside it — the Qwen-Image VAE (image ↔ 16-channel latent) and the Qwen2.5-VL-7B text encoder (prompt → 3584-dim conditioning, optional vision grounding via an `mmproj`). The pipeline VAE-encodes the reference, builds text (and optional image) conditioning, runs a FlowMatch-Euler true-CFG denoise loop with reference-latent concatenation, then VAE-decodes back to pixels. The whole 60-block DiT forward is CUDA-graph-captured (`TSGgml_QwenImageForward`), flash-attention is on by default, and the target area is auto-clamped to the device VRAM budget. An optional Lightning distillation LoRA (`--qwen-image-lora` / `TS_QWEN_IMAGE_LORA`, `.safetensors`) merges into the DiT weights at load time, cutting the denoise to the LoRA's step count (e.g. 4 or 8) and switching CFG to 1.0 (no negative pass). Driven from C# via `QwenImageModel.EditImage(prompt, RgbImage, QwenImageParams)`, from the CLI image-edit mode (`--image`, `--prompt`, `--cfg`, `--diffusion-steps`, `--diffusion-seed`), and from the Web UI with live denoising previews. → [Qwen-Image-Edit card](docs/models/qwenimage.md)
-- **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model. The Mamba2 step has both a per-sequence native kernel and a batched native kernel (`TSGgml_NemotronMamba2BatchedStepF32`, NEON SIMD + GCD parallelism) used by the batched path.
+- **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model. The Mamba2 step has both a per-sequence native kernel and a batched native kernel (`TSGgml_NemotronMamba2BatchedStepF32`, NEON SIMD + GCD parallelism) used by the batched path. On GGML backends the attention layers decode through the device-side flash-attention kernel against the resident KV cache (`TS_NEMOTRON_FLASH_DECODE=0` restores the host path), so decode no longer degrades with context length.
 - **Hybrid Attention-Recurrent** -- Qwen 3.5/3.6-family models mix full-attention layers with GatedDeltaNet recurrent layers; the batched path keeps recurrent running state in a per-slot recurrent-state pool
 - **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Qwen 3.5/3.6-family MoE (`qwen35moe` / `qwen3next` variants such as Qwen3.5-35B-A3B), and Nemotron-H MoE FFN layers
 - **Batched GPU MoE** -- a single fused GGML graph dispatch handles all selected experts (plus the optional shared expert and residual add) for Qwen 3.5/3.6-family and Nemotron-H decode, eliminating per-expert round-trips
+- **Whole-model fused decode graphs** -- Gemma 4 (dense and MoE), Qwen 3.5/3.6 and GPT OSS run an entire decode token — every layer, the MoE router and experts, the final norm and the LM head — as ONE GGML graph dispatch instead of one submission per layer, so the GPU is never left waiting on the host between layers. On CUDA/Vulkan the graph is built once with stable tensor addresses and replayed (`ggml_set_rows` KV write with the row as an I64 input, a stride-padded attention window with an F16 mask input), which is what lets ggml-cuda capture it as a CUDA graph. GPT OSS decode: 24 → 154 tok/s on an A40, and flat in context length (133 tok/s at 16K) where the per-layer path collapsed to 2.3. Disable per model with `TS_GPTOSS_MODEL_DECODE=0` / `TS_GEMMA4_FD_PERSIST=0` / `TS_QWEN35_FD_PERSIST=0`.
 - **KV cache codecs** -- pluggable codec interface (`IKvBlockCodec`) with a built-in TurboQuant (2-bit affine / Q4 / Q8) compressed codec for paged blocks. The CLI accepts all four `--paged-kv-quant-bits 0|2|4|8` values; the server's legacy standalone flag accepts `0|4|8`, while `TS_KV_PAGED_QUANT_BITS=2` selects the 2-bit codec directly. The 2-bit tier reaches ~10x compression on fp32 blocks for very long contexts.
 - **Message editing** -- edit or delete previous messages in the web chat UI and regenerate from that point
 - **Text/Image/Audio/Video/PDF uploads** -- the web UI accepts file uploads up to 500 MB and preserves text content in full. Born-digital PDFs have their complete text layer extracted and inlined into the prompt (cap pages explicitly with `TS_PDF_MAX_PAGES`); scanned PDFs are rendered to page images for vision-capable models. The final prompt is checked against the model's actual context window instead of an arbitrary upload budget. The CLI accepts a PDF in one-shot mode via `--pdf <file>`
@@ -118,7 +119,20 @@ TP runs on the `cuda` backend and on the GGML CUDA / Vulkan backends
 (`ggml_cuda`, `ggml_vulkan`); MLX is single-device. On the GGML backends each
 rank owns a ggml backend on its own GPU with its own weight shards and KV
 cache, and cross-GPU AllReduce goes through ggml-cuda's collective (NCCL when
-available) or a host reduction for small payloads. GGML TP delivers both
+available) or a host reduction for small payloads. CUDA **graph capture stays on
+under TP** — a tensor-parallel token is dozens of small per-rank submissions, and
+replaying them is worth ~45% of decode throughput (4×A40: Qwen 3.5-9B `--tp 4`
+88 → 128.5 tok/s, Qwen 3.5-35B-A3B `--tp 2` 71.3 → 104.1, the latter being the
+difference between TP losing and winning against a single GPU). Disable with
+`TS_GGML_TP_CUDA_GRAPHS=0`. The collective is chosen by
+measurement, not by capability flags: at startup the group verifies that peer
+copies between the advertised device pairs actually deliver their bytes and that
+a real NCCL AllReduce completes, and it picks the fastest transport that passes.
+Hosts that advertise peer access which never arrives (common on virtualized
+cloud instances) keep the NCCL collective with peer transport disabled rather
+than losing it — which matters past two GPUs, where the pinned-host pipeline
+does not apply and the alternative is reducing through host RAM at every layer
+boundary (measured on 4×A40: 53.5 → 75.1 tok/s decode on Qwen 3.5-9B Q8_0). GGML TP delivers both
 capacity and latency: fused per-rank block graphs (attention, dense FFN, MoE
 trunk, GatedDeltaNet) replaced the op-at-a-time forward, so on 2× RTX 2000 Ada
 `--tp 2` decodes **1.39×** a single GPU on Gemma 4 E4B Q8_0 (51.7 vs 37.3 tok/s)
@@ -155,9 +169,11 @@ Models can invoke user-defined tools and participate in multi-turn tool-call con
 
 Each architecture uses its own wire format for tool calls:
 
-- **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Qwen 3 / Nemotron-H:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Qwen 3.5/3.6-family:** the same `<tool_call>` block, but with an XML body — `<function=NAME><parameter=key>value</parameter></function>` (the JSON form is still accepted)
 - **Gemma 4:** `<|tool_call>call:function_name{args}<tool_call|>`
 - **GPT OSS (Harmony):** tools are declared as a TypeScript namespace in the developer message, and calls are emitted on the commentary channel as `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`
+- **DeepSeek V4:** DSML markup — the system prompt teaches the syntax and carries one JSON schema per function, and the model answers with `<｜DSML｜tool_calls><｜DSML｜invoke name="NAME"><｜DSML｜parameter name="key" string="true|false">value</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`. `string="false"` marks a JSON-typed argument
 
 The output parser (`OutputParser.cs`) automatically extracts tool calls from the model's raw output regardless of architecture.
 

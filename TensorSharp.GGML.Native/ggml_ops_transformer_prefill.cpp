@@ -9,8 +9,14 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_transformer_common.h"
+#include "ggml_ops_gptoss_kv.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 
 using namespace tsg;
 
@@ -888,6 +894,164 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
 // writes the residual (input + attn_out_proj(attn(norm(input)))) back into the
 // same buffer, ready for the MoE FFN to consume.
 // ============================================================================
+// ---------------------------------------------------------------------------
+// Persistent device-side KV windows for the GPT-OSS attention kernel.
+//
+// The kernel used to allocate its KV window per call and upload the whole
+// prefix [0, startPos) into it every time. That is O(context) of PCIe traffic
+// per layer per token — at ~3.2k tokens and 24 layers roughly 315 MB per decoded
+// token, which is why decode sat at single-digit tok/s and got worse as the
+// conversation grew.
+//
+// Instead keep one device buffer per host cache (K and V are separate caches,
+// so the host pointer identifies them), append the fresh rows into it, and only
+// upload a prefix when the device copy cannot already contain it. The host cache
+// stays a correct mirror because the freshly written rows are still downloaded
+// after each call — that part is O(seqLen), not O(context).
+//
+// Staleness: `rows_valid` records how much of the device copy is known good.
+// A caller that rewinds (startPos < rows_valid, e.g. a rejected speculative
+// draft) or jumps forward (startPos > rows_valid, e.g. a restored KV prefix
+// from another sequence) re-uploads what it needs. Anything that rewrites the
+// host cache *in place* without moving startPos must call
+// TSGgml_GptOssInvalidateKvCache.
+// The registry itself lives in namespace tsg_gptoss (declared in
+// ggml_ops_gptoss_kv.h) so the whole-model decode graph in
+// ggml_ops_gptoss_decode.cpp attaches to the SAME device windows instead of
+// keeping a second copy of every cache.
+namespace tsg_gptoss
+{
+namespace
+{
+    std::mutex g_gptoss_kv_mutex;
+    std::map<const void*, KvWindow> g_gptoss_kv;
+
+    void kv_release(KvWindow& w)
+    {
+        if (w.buffer != nullptr) ggml_backend_buffer_free(w.buffer);
+        if (w.ctx != nullptr) ggml_free(w.ctx);
+        w = KvWindow{};
+    }
+} // namespace
+
+std::mutex& kv_mutex() { return g_gptoss_kv_mutex; }
+
+KvWindow* kv_find(const void* host_cache)
+{
+    if (host_cache == nullptr)
+        return nullptr;
+    auto it = g_gptoss_kv.find(host_cache);
+    return (it == g_gptoss_kv.end()) ? nullptr : &it->second;
+}
+
+// Device window for `host_cache`, sized to hold at least `needed_rows`.
+// Returns null when the allocation fails (caller falls back to a per-call
+// window).
+KvWindow* kv_acquire(const void* host_cache, int head_dim, int kv_heads,
+                     ggml_type type, std::int64_t needed_rows, std::int64_t cache_rows)
+{
+    auto it = g_gptoss_kv.find(host_cache);
+    if (it != g_gptoss_kv.end())
+    {
+        KvWindow& w = it->second;
+        const bool compatible = w.tensor != nullptr && w.backend == g_backend &&
+            w.head_dim == head_dim && w.kv_heads == kv_heads &&
+            w.type == static_cast<int>(type) && w.capacity >= needed_rows;
+        if (compatible)
+            return &w;
+        kv_release(w);
+        g_gptoss_kv.erase(it);
+    }
+
+    // Grow in powers of two so a conversation that lengthens gradually does
+    // not reallocate (and re-upload) on every token, capped at the cache the
+    // model actually declared.
+    std::int64_t capacity = 1024;
+    while (capacity < needed_rows)
+        capacity *= 2;
+    if (capacity > cache_rows)
+        capacity = cache_rows;
+    if (capacity < needed_rows)
+        return nullptr;
+
+    KvWindow w;
+    ggml_init_params params = {};
+    params.mem_size = ggml_tensor_overhead() * 2;
+    params.no_alloc = true;
+    w.ctx = ggml_init(params);
+    if (w.ctx == nullptr)
+        return nullptr;
+    w.tensor = ggml_new_tensor_3d(w.ctx, type, head_dim, capacity, kv_heads);
+    if (w.tensor == nullptr) { kv_release(w); return nullptr; }
+    w.buffer = ggml_backend_alloc_ctx_tensors(w.ctx, g_backend);
+    if (w.buffer == nullptr) { kv_release(w); return nullptr; }
+    // Zero the whole window. The whole-model decode graph attends over a window
+    // padded up to a fixed stride, so it READS rows past the end of the written
+    // prefix; recycled VRAM there decodes as F16 NaN, and NaN survives the -inf
+    // padding mask (exp(NaN + -inf) = NaN), poisoning the entire attention row.
+    ggml_backend_buffer_clear(w.buffer, 0);
+
+    w.backend = g_backend;
+    w.capacity = capacity;
+    w.rows_valid = 0;
+    w.head_dim = head_dim;
+    w.kv_heads = kv_heads;
+    w.type = static_cast<int>(type);
+    if (vram_log_enabled())
+        vram_log("gptoss-kv-window", static_cast<std::int64_t>(ggml_nbytes(w.tensor)));
+
+    auto res = g_gptoss_kv.emplace(host_cache, w);
+    return &res.first->second;
+}
+
+// Caller already holds kv_mutex().
+void kv_drop_locked(const void* host_cache)
+{
+    if (host_cache == nullptr)
+        return;
+    auto it = g_gptoss_kv.find(host_cache);
+    if (it == g_gptoss_kv.end())
+        return;
+    kv_release(it->second);
+    g_gptoss_kv.erase(it);
+}
+
+void kv_drop_pair_locked(const void* k_cache, const void* v_cache)
+{
+    kv_drop_locked(k_cache);
+    kv_drop_locked(v_cache);
+}
+
+void kv_drop_all_locked()
+{
+    for (auto& kv : g_gptoss_kv)
+        kv_release(kv.second);
+    g_gptoss_kv.clear();
+}
+} // namespace tsg_gptoss
+
+using GptOssKvWindow = tsg_gptoss::KvWindow;
+
+// Drop both windows of a K/V pair; the caller holds the registry lock.
+static void TSGgml_GptOssInvalidateKvCacheLocked(const void* kCacheData, const void* vCacheData)
+{
+    tsg_gptoss::kv_drop_pair_locked(kCacheData, vCacheData);
+}
+
+// Drop the device-resident copy of a GPT-OSS KV cache. Call this after writing
+// the host cache behind the kernel's back (restoring a KV snapshot, swapping in
+// another sequence's cache, clearing it); passing null clears every window.
+TSG_EXPORT void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData)
+{
+    std::lock_guard<std::mutex> lock(tsg_gptoss::kv_mutex());
+    if (kCacheData == nullptr && vCacheData == nullptr)
+    {
+        tsg_gptoss::kv_drop_all_locked();
+        return;
+    }
+    TSGgml_GptOssInvalidateKvCacheLocked(kCacheData, vCacheData);
+}
+
 TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
     float* hidden_data,        // [seqLen * hiddenSize] in/out (residual is added in place)
     int hiddenSize, int seqLen,
@@ -984,8 +1148,34 @@ TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
         // cache after compute. This keeps GPU residency for the cache to
         // O(kvLen) rather than O(cacheSize) and matches what llama.cpp's
         // build_attn_mha does internally for non-static caches.
-        ggml_tensor* k_cache_t = ggml_new_tensor_3d(ctx, kvType, headDim, kvLen, kvHeads);
-        ggml_tensor* v_cache_t = ggml_new_tensor_3d(ctx, kvType, headDim, kvLen, kvHeads);
+        // Persistent device windows when they can be had; otherwise fall back to
+        // the historical per-call window (allocated with the graph below).
+        std::unique_lock<std::mutex> kv_lock(tsg_gptoss::kv_mutex());
+        GptOssKvWindow* k_win = tsg_gptoss::kv_acquire(kCacheData, headDim, kvHeads, kvType, kvLen, cacheSize);
+        GptOssKvWindow* v_win = k_win == nullptr
+            ? nullptr
+            : tsg_gptoss::kv_acquire(vCacheData, headDim, kvHeads, kvType, kvLen, cacheSize);
+        const bool persistent_kv = k_win != nullptr && v_win != nullptr;
+        if (!persistent_kv)
+        {
+            // Half a pair is worse than none: this call would fall back to
+            // per-call windows and append only to the host cache, leaving the
+            // surviving window's `rows_valid` claiming rows it no longer holds.
+            TSGgml_GptOssInvalidateKvCacheLocked(kCacheData, vCacheData);
+            kv_lock.unlock();
+        }
+
+        // The graph always sees a [headDim, kvLen, kvHeads] view. For the
+        // persistent window that is a strided view into a larger allocation (the
+        // head stride is the window capacity, not kvLen).
+        ggml_tensor* k_cache_t = persistent_kv
+            ? ggml_view_3d(ctx, k_win->tensor, headDim, kvLen, kvHeads,
+                           k_win->tensor->nb[1], k_win->tensor->nb[2], 0)
+            : ggml_new_tensor_3d(ctx, kvType, headDim, kvLen, kvHeads);
+        ggml_tensor* v_cache_t = persistent_kv
+            ? ggml_view_3d(ctx, v_win->tensor, headDim, kvLen, kvHeads,
+                           v_win->tensor->nb[1], v_win->tensor->nb[2], 0)
+            : ggml_new_tensor_3d(ctx, kvType, headDim, kvLen, kvHeads);
 
         ggml_tensor* sinks_t = (sinksData != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, numHeads) : nullptr;
 
@@ -1242,29 +1432,41 @@ TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
         ggml_backend_tensor_set(pos_tensor, pos_data.data(), 0, seqLen * sizeof(int32_t));
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
 
-        // Upload the existing K/V cache prefix [0, startPos) into the per-call
-        // window. Host cache layout is [headDim, cacheSize, kvHeads] (heads
-        // slowest, contiguous within head), and the window is
-        // [headDim, kvLen, kvHeads] — same layout but with kvLen instead of
-        // cacheSize for the position dim. We therefore upload per-head: for
-        // each head h, copy `startPos * headDim * elemSize` bytes from the
-        // host cache (offset h * cacheSize * headDim * elemSize) into the
-        // window (offset h * kvLen * headDim * elemSize). For chunk 1
-        // (startPos == 0) no upload is needed.
+        // Bring the device copy of the prefix [0, startPos) up to date. With a
+        // persistent window this is normally a no-op — the rows are already
+        // there from the calls that produced them — and only a rewind, a jump,
+        // or a fresh allocation pays for an upload. The per-call fallback window
+        // always starts empty, so it uploads the whole prefix as before.
+        //
+        // Host cache layout is [headDim, cacheSize, kvHeads] (heads slowest,
+        // contiguous within a head); the device window is the same layout with
+        // its own row capacity, so the copy is per head.
         const std::size_t elemSize = ggml_type_size(kvType);
-        if (startPos > 0)
+        const std::int64_t deviceRows = persistent_kv ? k_win->capacity : kvLen;
+        std::int64_t uploadFrom = 0;
+        std::int64_t uploadTo = startPos;
+        if (persistent_kv)
         {
-            const std::size_t hostStrideBytes   = static_cast<std::size_t>(cacheSize) * headDim * elemSize;
-            const std::size_t windowStrideBytes = static_cast<std::size_t>(kvLen)     * headDim * elemSize;
-            const std::size_t prefixBytes       = static_cast<std::size_t>(startPos)  * headDim * elemSize;
+            const std::int64_t valid = std::min(k_win->rows_valid, v_win->rows_valid);
+            uploadFrom = (valid >= startPos) ? startPos : valid;   // >= startPos: nothing to do
+            uploadTo = startPos;
+        }
+        if (uploadTo > uploadFrom)
+        {
+            const std::size_t hostStrideBytes   = static_cast<std::size_t>(cacheSize)  * headDim * elemSize;
+            const std::size_t windowStrideBytes = static_cast<std::size_t>(deviceRows) * headDim * elemSize;
+            const std::size_t offsetBytes       = static_cast<std::size_t>(uploadFrom) * headDim * elemSize;
+            const std::size_t prefixBytes       = static_cast<std::size_t>(uploadTo - uploadFrom) * headDim * elemSize;
             char* kHost = static_cast<char*>(kCacheData);
             char* vHost = static_cast<char*>(vCacheData);
+            ggml_tensor* kStore = persistent_kv ? k_win->tensor : k_cache_t;
+            ggml_tensor* vStore = persistent_kv ? v_win->tensor : v_cache_t;
             for (int h = 0; h < kvHeads; h++)
             {
-                ggml_backend_tensor_set(k_cache_t, kHost + h * hostStrideBytes,
-                    h * windowStrideBytes, prefixBytes);
-                ggml_backend_tensor_set(v_cache_t, vHost + h * hostStrideBytes,
-                    h * windowStrideBytes, prefixBytes);
+                ggml_backend_tensor_set(kStore, kHost + h * hostStrideBytes + offsetBytes,
+                    h * windowStrideBytes + offsetBytes, prefixBytes);
+                ggml_backend_tensor_set(vStore, vHost + h * hostStrideBytes + offsetBytes,
+                    h * windowStrideBytes + offsetBytes, prefixBytes);
             }
         }
 
@@ -1284,23 +1486,34 @@ TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
             static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float));
 
         // Download the freshly appended K/V slice [startPos, kvLen) per head
-        // back to the host cache (mirror of the upload step).
+        // back to the host cache. This is O(seqLen), not O(context), and it is
+        // what keeps the host cache a valid mirror for the readers that do not
+        // go through this kernel (the legacy per-op attention path and the
+        // engine's KV snapshot/swap).
         {
-            const std::size_t hostStrideBytes   = static_cast<std::size_t>(cacheSize) * headDim * elemSize;
-            const std::size_t windowStrideBytes = static_cast<std::size_t>(kvLen)     * headDim * elemSize;
-            const std::size_t freshOffsetBytes  = static_cast<std::size_t>(startPos)  * headDim * elemSize;
-            const std::size_t freshBytes        = static_cast<std::size_t>(seqLen)    * headDim * elemSize;
+            const std::size_t hostStrideBytes   = static_cast<std::size_t>(cacheSize)  * headDim * elemSize;
+            const std::size_t windowStrideBytes = static_cast<std::size_t>(deviceRows) * headDim * elemSize;
+            const std::size_t freshOffsetBytes  = static_cast<std::size_t>(startPos)   * headDim * elemSize;
+            const std::size_t freshBytes        = static_cast<std::size_t>(seqLen)     * headDim * elemSize;
             char* kHost = static_cast<char*>(kCacheData);
             char* vHost = static_cast<char*>(vCacheData);
+            ggml_tensor* kStore = persistent_kv ? k_win->tensor : k_cache_t;
+            ggml_tensor* vStore = persistent_kv ? v_win->tensor : v_cache_t;
             for (int h = 0; h < kvHeads; h++)
             {
-                ggml_backend_tensor_get(k_cache_t,
+                ggml_backend_tensor_get(kStore,
                     kHost + h * hostStrideBytes + freshOffsetBytes,
                     h * windowStrideBytes + freshOffsetBytes, freshBytes);
-                ggml_backend_tensor_get(v_cache_t,
+                ggml_backend_tensor_get(vStore,
                     vHost + h * hostStrideBytes + freshOffsetBytes,
                     h * windowStrideBytes + freshOffsetBytes, freshBytes);
             }
+        }
+
+        if (persistent_kv)
+        {
+            k_win->rows_valid = kvLen;
+            v_win->rows_valid = kvLen;
         }
 
         clear_last_error();

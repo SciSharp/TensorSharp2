@@ -1,5 +1,5 @@
 {
-  "_comment": "CI variant of benchmark_config.json used by .github/workflows/test-matrix.yml: TensorSharp vs llama.cpp only, on the ggml_cuda backend, text + prefill scenarios only (no local media assets on the runner). The model registry points at files the workflow downloads from the Hugging Face repos named in each model's `_hf` field, laid out as ${model_root}/<hf-repo-name>/<file> (the `_hf` fields are documentation only — the loader ignores them; keep them in sync with the download step in the workflow). Retarget per host with the usual env overrides: BENCH_MODEL_ROOT, BENCH_LLAMA_SERVER, BENCH_TS_SERVER_DLL, BENCH_RESULTS.",
+  "_comment": "CI variant of benchmark_config.json used by .github/workflows/test-matrix.yml: TensorSharp vs llama.cpp only, on the ggml_cuda backend, text + prefill scenarios only (no local media assets on the runner). Every model declares its `source` (a Hugging Face repo id), so any file that is missing under ${model_root}/<hf-repo-name>/ is downloaded from there on the first run and reused afterwards; a file whose remote name differs from its local name carries its own `url`. Pre-fetch with `python download_models.py --config benchmark_config_ci.json`, or let run_matrix.py do it (`--download never` to require local files). Retarget per host with the usual env overrides: BENCH_MODEL_ROOT, BENCH_LLAMA_SERVER, BENCH_TS_SERVER_DLL, BENCH_RESULTS.",
 
   "paths": {
     "model_root": "${here}/models",
@@ -14,7 +14,7 @@
     "gemma4-12b": {
       "display": "Gemma 4 12B it (QAT UD-Q4_K_XL, dense)",
       "family": "gemma4",
-      "_hf": "unsloth/gemma-4-12B-it-qat-GGUF",
+      "source": "unsloth/gemma-4-12B-it-qat-GGUF",
       "gguf": "${model_root}/gemma-4-12B-it-qat-GGUF/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
       "mmproj": "${model_root}/gemma-4-12B-it-qat-GGUF/mmproj-BF16.gguf",
       "modalities": ["text", "image"],
@@ -25,7 +25,7 @@
     "qwen36-35b-a3b": {
       "display": "Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)",
       "family": "qwen36",
-      "_hf": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "source": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
       "gguf": "${model_root}/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
       "mmproj": "${model_root}/Qwen3.6-35B-A3B-MTP-GGUF/mmproj-F16.gguf",
       "modalities": ["text", "image"],
@@ -36,7 +36,7 @@
     "qwen36-27b": {
       "display": "Qwen 3.6 27B (UD-IQ2_XXS, dense)",
       "family": "qwen36",
-      "_hf": "unsloth/Qwen3.6-27B-MTP-GGUF",
+      "source": "unsloth/Qwen3.6-27B-MTP-GGUF",
       "gguf": "${model_root}/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf",
       "mmproj": "${model_root}/Qwen3.6-27B-MTP-GGUF/mmproj-F16.gguf",
       "modalities": ["text", "image"],
@@ -93,7 +93,10 @@
     "models": ["gemma4-12b", "qwen36-35b-a3b"],
     "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "prefill_2k", "prefill_4k", "prefill_8k"],
     "backends": ["ggml_cuda"],
+    "thinking": false,
     "mtp_modes": [false],
+    "tp_degrees": [1],
+    "tp_devices": [],
     "concurrency": [1],
     "max_tokens": 128,
     "warmup": 1,

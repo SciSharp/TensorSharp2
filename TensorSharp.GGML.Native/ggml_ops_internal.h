@@ -614,10 +614,22 @@ namespace tsg
     // corrupts (the caller reroutes to the pinned-host "internal" AllReduce),
     // -1 when the probe does not apply (Windows, NCCL absent, disabled).
     int tp_probe_cuda_collective(const int* device_indices, int count);
+
+    // Behavioural check that peer copies between the given devices actually
+    // deliver data (some hosts advertise P2P that never completes). 1 = ok,
+    // 0 = advertised but broken, -1 = not applicable. Must be called before the
+    // process creates its first NCCL communicator for its verdict to be
+    // actionable — NCCL caches NCCL_P2P_DISABLE at that point.
+    int tp_probe_cuda_peer_access(const int* device_indices, int count);
     // Release the collective context and every rank's AllReduce scratch buffer.
     void tp_comm_free();
     // In-place device AllReduce (sum) over one contiguous F32 tensor per rank.
     bool tp_device_allreduce(ggml_tensor** tensors);
+
+    // True when the backend's collective really reduces (verified once with a
+    // one-element AllReduce), false when every call would fall through to the
+    // host reduction.
+    bool tp_device_allreduce_usable();
     // In-place host AllReduce (sum) over one contiguous F32 buffer per rank.
     void tp_host_allreduce(float** buffers, int n, std::int64_t count);
     void tp_host_allreduce_mt(float** buffers, int n, std::int64_t count);

@@ -1,5 +1,5 @@
 {
-  "_comment": "Dedicated PREFILL (prompt-processing) benchmark config. Runs only the long-prompt prefill sweep so prefill_tps (= prompt_tokens / ttft) is measured on prompts long enough that fixed per-request overhead no longer dominates. Select it with: python run_matrix.py --config benchmark_config_prefill.json  (and report.py --config benchmark_config_prefill.json). Everything is self-contained, same as benchmark_config.json; only the scenario set, the llama context size, max-tokens, and the defaults differ. The prompt text is sliced from assets/prefill_corpus.txt by scenarios._prefill; the scenario id (prefill_2k / prefill_4k / ...) names the target token count.",
+  "_comment": "Dedicated PREFILL (prompt-processing) benchmark config. Runs only the long-prompt prefill sweep so prefill_tps (= prompt_tokens / ttft) is measured on prompts long enough that fixed per-request overhead no longer dominates. Select it with: python run_matrix.py --config benchmark_config_prefill.json  (and report.py --config benchmark_config_prefill.json). Everything is self-contained, same as benchmark_config.json; only the scenario set, the llama context size, max-tokens, and the defaults differ. Models carry the same `source` / per-file `url` pointers, so missing files are downloaded on the first run; the --tp axis works here too (e.g. --tp 1,2,4 to see how prefill scales across GPUs). The prompt text is sliced from assets/prefill_corpus.txt by scenarios._prefill; the scenario id (prefill_2k / prefill_4k / ...) names the target token count.",
 
   "paths": {
     "model_root": "C:/Works/models",
@@ -21,32 +21,37 @@
     "gemma4-e4b": {
       "display": "Gemma 4 E4B it (Q8_0, dense multimodal)",
       "family": "gemma4",
+      "source": "TrevorJS/gemma-4-E4B-it-uncensored-GGUF",
       "gguf": {"path": "${model_root}/gemma-4-E4B-it-uncensored-Q8_0.gguf", "env": "BENCH_GEMMA4_E4B_GGUF"},
-      "mmproj": {"path": "${model_root}/gemma-4-E4B-mmproj-F16.gguf", "env": "BENCH_GEMMA4_E4B_MMPROJ"},
+      "mmproj": {"path": "${model_root}/gemma-4-E4B-mmproj-F16.gguf", "env": "BENCH_GEMMA4_E4B_MMPROJ",
+                 "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mmproj-F16.gguf"},
       "modalities": ["text", "image", "audio", "video"],
       "size_class": "small"
     },
     "gemma4-12b": {
       "display": "Gemma 4 12B it (QAT UD-Q4_K_XL, dense)",
       "family": "gemma4",
+      "source": "unsloth/gemma-4-12B-it-qat-GGUF",
       "gguf": "${gemma4_qat_dir}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
-      "mmproj": "${gemma4_qat_dir}/gemma-4-12B-mmproj-BF16.gguf",
+      "mmproj": {"path": "${gemma4_qat_dir}/gemma-4-12B-mmproj-BF16.gguf", "url": "mmproj-BF16.gguf"},
       "modalities": ["text", "image", "audio", "video"],
       "size_class": "small"
     },
     "gemma4-26b-a4b": {
       "display": "Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, MoE)",
       "family": "gemma4",
+      "source": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
       "gguf": "${gemma4_qat_dir}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
-      "mmproj": "${gemma4_qat_dir}/gemma-4-26B-A4B-mmproj-BF16.gguf",
+      "mmproj": {"path": "${gemma4_qat_dir}/gemma-4-26B-A4B-mmproj-BF16.gguf", "url": "mmproj-BF16.gguf"},
       "modalities": ["text", "image", "audio", "video"],
       "size_class": "large"
     },
     "qwen36-35b-a3b": {
       "display": "Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)",
       "family": "qwen36",
+      "source": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
       "gguf": "${model_root}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
-      "mmproj": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf",
+      "mmproj": {"path": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf", "url": "mmproj-F16.gguf"},
       "modalities": ["text", "image"],
       "size_class": "large"
     }
@@ -126,7 +131,10 @@
     "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b"],
     "scenarios": ["prefill_2k", "prefill_4k", "prefill_8k", "prefill_16k", "prefill_32k", "prefill_64k", "prefill_128k"],
     "backends": ["ggml_cuda"],
+    "thinking": false,
     "mtp_modes": [false],
+    "tp_degrees": [1],
+    "tp_devices": [],
     "concurrency": [1],
     "max_tokens": 8,
     "warmup": 1,
