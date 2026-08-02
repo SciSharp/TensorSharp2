@@ -84,6 +84,33 @@ namespace
         }
     };
 
+    // TS_GEMMA4_FD_DEBUG=1: report any graph tensor that reached compute without a
+    // backend buffer. ggml-vulkan asserts deep inside ggml_vk_tensor_subbuffer for
+    // these, which gives no hint which node or which path produced it.
+    void g4_debug_check_buffers(ggml_cgraph* graph, const char* where)
+    {
+        static const bool on = []{ const char* e = std::getenv("TS_GEMMA4_FD_DEBUG"); return e != nullptr && e[0] == '1'; }();
+        if (!on || graph == nullptr) return;
+        int bad = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++)
+        {
+            ggml_tensor* n = ggml_graph_node(graph, i);
+            if (n == nullptr) continue;
+            if (n->buffer == nullptr)
+                fprintf(stderr, "[g4-fd %s] node %d '%s' op=%s HAS NULL BUFFER\n",
+                        where, i, n->name, ggml_op_name(n->op)), bad++;
+            for (int j = 0; j < GGML_MAX_SRC; j++)
+            {
+                ggml_tensor* srcj = n->src[j];
+                if (srcj != nullptr && srcj->buffer == nullptr)
+                    fprintf(stderr, "[g4-fd %s] node %d '%s' op=%s src%d '%s' op=%s HAS NULL BUFFER\n",
+                            where, i, n->name, ggml_op_name(n->op), j, srcj->name, ggml_op_name(srcj->op)), bad++;
+            }
+        }
+        fprintf(stderr, "[g4-fd %s] nodes=%d null-buffer findings=%d\n", where, ggml_graph_n_nodes(graph), bad);
+        fflush(stderr);
+    }
+
     // Concurrent (N>=2) requests each decode through their OWN KV-cache holder
     // (Gemma4Model.BindSequenceCache swaps _kvCacheK), so a single shared cache
     // entry — whose identity key includes sig_kcache0, the holder's layer-0 KV
@@ -101,6 +128,7 @@ namespace
     // holder presents its kc0 — a freed-then-reallocated address simply binds the
     // new live holder's buffers. Entries' own ctx/buffer stay alive until reset or
     // LRU eviction; ResetKVCache drops them all.
+
     constexpr int kG4MaxDecodeCaches = 8;
     struct G4DecodeCachePool
     {
@@ -398,6 +426,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 return 1;
             }
 
+            g4_debug_check_buffers(dc->graph, "replay");
             ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
             if (st != GGML_STATUS_SUCCESS)
             {
@@ -1054,6 +1083,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         if (!tp_mode)
         {
             // Execute single graph
+            g4_debug_check_buffers(graph, can_persist ? "build-persist" : "build-transient");
             ggml_status status = ggml_backend_graph_compute(g_backend, graph);
             if (status != GGML_STATUS_SUCCESS)
             {

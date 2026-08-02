@@ -102,7 +102,15 @@ namespace TensorSharp.Cuda
                             $"  TP: P2P DMA self-test FAILED for GPU {i} → GPU {j} " +
                             $"(cuDeviceCanAccessPeer=1 but data is corrupt). " +
                             $"Falling back to host-staged transfers for this pair.");
+                        // Demote BOTH directions. A pair whose DMA is corrupt one
+                        // way is not trustworthy the other way either, and
+                        // CudaStorage.MarkPeerAccessFailed (used by every ordinary
+                        // cross-GPU tensor copy) already demotes the pair
+                        // symmetrically — leaving this table asymmetric would let a
+                        // collective peer-copy over a link that every other code
+                        // path has already given up on.
                         enabled[i * n + j] = false;
+                        enabled[j * n + i] = false;
                         CudaStorage.MarkPeerAccessFailed(
                             allocators[i].DeviceId, allocators[j].DeviceId);
                     }
@@ -186,6 +194,14 @@ namespace TensorSharp.Cuda
             }
         }
 
+        /// <summary>
+        /// True when a peer DMA moving data FROM GPU <paramref name="from"/> TO GPU
+        /// <paramref name="to"/> is known good. Matches the direction convention of
+        /// <see cref="VerifyP2PRoundTrip"/> (which writes on <c>src</c> and reads
+        /// back on <c>dst</c>) and of <see cref="CudaStorage.CopyDeviceFrom"/>.
+        /// Callers must pass the direction the BYTES travel, not the direction of
+        /// the context that happens to enqueue the copy.
+        /// </summary>
         private bool CanAccessPeer(int from, int to) => _p2pEnabled[from * _worldSize + to];
 
         private void EnsureStagingBuffer(long requiredBytes)
@@ -238,7 +254,14 @@ namespace TensorSharp.Cuda
                 IntPtr srcPtr = DevicePtr(tensors[i]);
                 IntPtr dstPtr = DevicePtr(tensors[0]);
 
-                if (CanAccessPeer(0, i) && _allocators[0].Kernels != null)
+                // The bytes travel FROM GPU i TO GPU 0, so that is the direction to
+                // vet. This used to ask CanAccessPeer(0, i) — the opposite link.
+                // On a host where only one direction of a pair is corrupt (the
+                // self-test above flags exactly that) the reduce then ran its
+                // cuMemcpyPeerAsync over the known-bad direction while consulting
+                // the healthy one, silently summing garbage into rank 0 on every
+                // row-parallel layer.
+                if (CanAccessPeer(i, 0) && _allocators[0].Kernels != null)
                 {
                     // P2P copy: GPU i → GPU 0 staging, then add.
                     EnsureStagingBuffer(byteCount);
@@ -269,7 +292,9 @@ namespace TensorSharp.Cuda
                 _allocators[i].Context.MakeCurrent();
                 IntPtr dstPtr = DevicePtr(tensors[i]);
 
-                if (CanAccessPeer(i, 0))
+                // Bytes travel FROM GPU 0 TO GPU i here (the mirror image of the
+                // reduce above), so vet that direction.
+                if (CanAccessPeer(0, i))
                 {
                     CudaDriverApi.cuMemcpyPeerAsync(
                         dstPtr, _allocators[i].Context.Handle,
