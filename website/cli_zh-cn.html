@@ -64,7 +64,13 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;model.gguf&gt; --backend ggml_metal --interactive
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;model.gguf&gt; --backend ggml_metal -i \
-    --system "You are a terse assistant." --temperature 0.7 --top-p 0.9 --think</code></pre>
+    --system "You are a terse assistant." --temperature 0.7 --top-p 0.9 --think
+
+# DSpark 块级投机解码（DeepSeek V4）：--model 指向分片 GGUF 的第一片，
+# --draft-model 指向独立的 DSpark 草稿器。需要贪心采样。
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;DeepSeek-V4-Flash-...-00001-of-00005.gguf&gt; --backend ggml_cuda \
+    --draft-model &lt;DSpark-drafter.gguf&gt; --input prompt.txt --max-tokens 200 --temperature 0</code></pre>
 
   <h3>多模态</h3>
   <pre data-lang="bash"><code># 图像推理（Gemma 3/4、Qwen 3.5-family）
@@ -191,6 +197,9 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>从文本或文件设定会话的系统提示。仅交互式 REPL 与 DiffusionGemma 扩散模式使用它；普通单次文本模式会忽略系统提示。</td></tr>
       <tr><td><code>--think</code></td><td>启用思考 / 推理模式（思维链）。</td></tr>
       <tr><td><code>--tools &lt;path&gt;</code></td><td>含工具 / 函数定义的 JSON 文件。</td></tr>
+      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>草稿器以独立文件发布的架构所用的投机解码草稿 GGUF——目前是 DeepSeek V4 的 DSpark 支持模块。它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。需要 <code>--backend cuda</code> 或 <code>ggml_cuda</code>，并且必须是纯 argmax 采样（任何 temperature、top-k/p 或惩罚项都会将其关闭）。环境变量：<code>TS_DSV4_DSPARK</code>。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
+      <tr><td><code>--spec-draft-n-max &lt;N&gt;</code></td><td>每个投机块最多起草的 token 数（默认：草稿器训练时的块大小，DSpark 为 5）。</td></tr>
+      <tr><td><code>--spec-draft-conf-min &lt;p&gt;</code></td><td>保留某个起草位置所需的最小<em>累积</em>接受概率（默认 <code>0.35</code>）。调低会起草更远、回滚更多；调高则更早退回普通 decode。</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>渲染提示词 + 分词后退出（不生成）。</td></tr>
       <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 在单个进程内把模型切分到 N 张 GPU 上（默认：1）。需要 <code>--backend cuda</code>、<code>ggml_cuda</code> 或 <code>ggml_vulkan</code>；用 <code>TENSORSHARP_TP_DEVICES</code> 指定使用哪几张卡。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
       <tr><td><code>--tp-node-id &lt;N&gt;</code></td><td>多节点分布式张量并行中本节点的 0 起始编号。需与 <code>--tp-peers</code> 一起使用。</td></tr>

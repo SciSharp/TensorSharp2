@@ -15,6 +15,8 @@
 | GGML CPU | `--backend ggml_cpu` | Native CPU kernels | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
 | Pure C# CPU | `--backend cpu` | Portability and debugging | Portable CPU inference with no native dependencies. |
 
+**DeepSeek V4 Flash is the exception to the table above.** Its 284B compressed-sparse-attention MoE stack runs through one of three dedicated whole-model executors rather than the generic per-op path: a direct-CUDA engine (`--backend cuda`), the native ggml executor (`--backend ggml_cuda` / `ggml_vulkan`), and a 100% pure-C# CPU executor (`--backend cpu`) that serves quantized weights straight from the memory-mapped GGUF shards. All three layer-split the weights across every visible GPU (or, on CPU, stream them from the mapped shards), so a model far larger than one card still runs. See the [DeepSeek V4 card](docs/models/deepseek4.md).
+
 ## Configuration file (CLI + Server)
 
 Both `TensorSharp.Cli` and `TensorSharp.Server` can read their options from a JSON
@@ -139,6 +141,12 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prom
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --backend ggml_metal \
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.2 --seed 42
 
+# DSpark block speculative decoding (DeepSeek V4): point --model at the first shard
+# and --draft-model at the DSpark drafter GGUF. Needs greedy sampling.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <DeepSeek-V4-Flash-...-00001-of-00005.gguf> \
+    --backend ggml_cuda --draft-model <DSpark-drafter.gguf> \
+    --input prompt.txt --max-tokens 200 --temperature 0
+
 # Batch processing (JSONL)
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input-jsonl requests.jsonl \
     --output results.txt --backend ggml_metal
@@ -200,6 +208,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
 | `--think` | Enable thinking/reasoning mode (chain-of-thought) |
 | `--tools <path>` | JSON file with tool/function definitions |
+| `--draft-model <path>` | Speculative-decoding drafter GGUF for architectures whose drafter ships as its own file — today DeepSeek V4's DSpark support module (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)). It drafts a whole block per step and the trunk verifies it in one batched forward, so greedy output is unchanged. Engages on every single-sequence path (`--input`, `--input-jsonl`, `--multi-turn-jsonl`, `--interactive`) with `--backend cuda` or `--backend ggml_cuda`, and requires a pure-argmax sampler: any temperature, top-k/p, or repetition/presence/frequency penalty turns it off. Env: `TS_DSV4_DSPARK`. |
+| `--spec-draft-n-max <N>` | Cap on tokens drafted per speculative block (default: the drafter's trained block size, 5 for DSpark) |
+| `--spec-draft-conf-min <p>` | Minimum cumulative acceptance probability — the product of the confidence head's per-position estimates — for a drafted position to be kept (default: `0.35`). Lower drafts further and rolls back more; higher falls back to plain decode more often. |
 | `--temperature <f>` | Sampling temperature (0 = greedy) |
 | `--top-k <N>` | Top-K filtering (0 = disabled) |
 | `--top-p <f>` | Nucleus sampling threshold (1.0 = disabled) |

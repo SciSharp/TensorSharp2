@@ -176,6 +176,25 @@ namespace TensorSharp.Cli
                     "emitted). Repeat the flag for several. Default: none (the model's EOS token always stops).",
                     "--stop \"</s>\" --stop \"<|eot|>\""),
             }),
+            ("Speculative decoding", new[]
+            {
+                new OptionHelp("--draft-model <path>",
+                    "Block drafter GGUF for architectures whose drafter ships as its own file (DeepSeek V4's " +
+                    "DSpark support module). The drafter proposes a whole block of tokens per step and the trunk " +
+                    "verifies it in one batched forward, so greedy output is unchanged. Needs --backend cuda or " +
+                    "ggml_cuda and a pure-argmax sampler: any temperature, top-k/p or penalty turns it off. " +
+                    "Default: none; env TS_DSV4_DSPARK.",
+                    "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf --temperature 0"),
+                new OptionHelp("--spec-draft-n-max <N>",
+                    "Cap on tokens drafted per speculative block. Range: 1 to the drafter's block size. Default: " +
+                    "the drafter's trained block size (5 for DSpark).",
+                    "--spec-draft-n-max 3"),
+                new OptionHelp("--spec-draft-conf-min <p>",
+                    "Minimum CUMULATIVE acceptance probability (the product of the confidence head's per-position " +
+                    "estimates) for a drafted position to be kept. Lower drafts further and rolls back more; " +
+                    "higher falls back to plain decode sooner. Range: 0.0-1.0. Default: 0.35.",
+                    "--spec-draft-conf-min 0.5"),
+            }),
             ("Interactive chat", new[]
             {
                 new OptionHelp("-i | --interactive | --chat",
@@ -408,6 +427,7 @@ namespace TensorSharp.Cli
             writer.WriteLine("  TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --chat --think");
             writer.WriteLine("  TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf --image photo.jpg");
             writer.WriteLine("  TensorSharp.Cli --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2 --chat    (split across 2 GPUs)");
+            writer.WriteLine("  TensorSharp.Cli --model DeepSeek-V4-Flash-00001-of-00005.gguf --backend ggml_cuda --draft-model DSpark-drafter.gguf --temperature 0 --chat    (block speculative decoding)");
             writer.WriteLine("  TensorSharp.Cli --model Qwen-Image-Edit-2511-Q4_K_M.gguf --image in.png --prompt \"Turn it into watercolor\" --output out.png");
             writer.WriteLine("  TensorSharp.Cli --model model.gguf --backend ggml_cuda --benchmark --bench-prefill 512 --bench-decode 128");
             writer.WriteLine("  TensorSharp.Cli --config run.json    (read options from a file)");

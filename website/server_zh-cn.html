@@ -111,8 +111,10 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
       <tr><td><code>--continuous-batching</code> / <code>--no-continuous-batching</code></td><td>启用（默认）或禁用迭代级分页批处理。别名：<code>--paged-batching</code>。</td></tr>
       <tr><td><code>--mtp-spec</code> / <code>--no-mtp-spec</code></td><td>启用 / 禁用 NextN / MTP 推测解码（默认关闭）；只在模型确实带有 MTP/NextN 草稿头时生效。→ <a href="advanced_zh-cn.html#mtp">MTP</a></td></tr>
       <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>每个推测步草拟的最大 token 数（默认 <code>8</code>）。</td></tr>
-      <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>保留某 token 所需的草稿头最低置信度（默认 <code>0.75</code>）。</td></tr>
+      <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>保留某 token 所需的最低草稿置信度。默认值取决于草稿器类型：逐 token 草稿头为 <code>0.75</code>，块级草稿器为 <code>0.35</code>（后者的门限是<em>累积</em>前缀概率，因此同一个数字要严格得多）。</td></tr>
       <tr><td><code>--mtp-draft-model &lt;path&gt;</code></td><td>独立的 MTP 草稿 GGUF（Gemma 4 的 <code>gemma4-assistant</code>）。Qwen 3.6 的 NextN 位于主 GGUF 中，不需要此参数；显式草稿无法激活时启动会失败。</td></tr>
+      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>必须在层切分之前常驻的块级草稿器 GGUF——DeepSeek V4 的 DSpark 支持模块。需要 <code>--mtp-spec</code>；在 <code>cuda</code> 与 <code>ggml_cuda</code> 后端上对单序列请求生效。每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。环境变量：<code>TS_DSV4_DSPARK</code>。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
+      <tr><td><code>--spec-draft-n-max &lt;N&gt;</code> / <code>--spec-draft-conf-min &lt;p&gt;</code></td><td>每个投机块起草的 token 数（默认为草稿器的块大小），以及保留某个起草位置所需的最小累积接受概率（默认 <code>0.35</code>）。</td></tr>
       <tr><td><code>--prefill-chunk-size &lt;N&gt;</code></td><td>每个调度步的最大 prefill token 数（设置 <code>TS_SCHED_PREFILL_CHUNK</code>）。</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>（默认自动，由后端 / 模型选择；环境变量 <code>KV_CACHE_DTYPE</code>）。</td></tr>
       <tr><td><code>--paged-kv</code> / <code>--no-paged-kv</code></td><td>独立 <code>PagedKvCacheManager</code> 的旧兼容开关，不在当前服务请求路径上；活跃请求 KV 由引擎管理。</td></tr>

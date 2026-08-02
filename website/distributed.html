@@ -98,6 +98,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>Block-cyclic V-head ownership for the GatedDeltaNet recurrent layers — each rank keeps its own delta/conv state, device-resident, and needs no cross-rank traffic for the recurrent path. On GGML the whole GDN block runs as one packed per-rank kernel, MoE uses expert parallelism (whole experts per rank, Megatron-split shared expert), and the LM head is column-parallel with no collective at all. Direct CUDA uses expert slicing.</td></tr>
       <tr><td>GPT OSS</td><td class="yes">✅</td><td>MoE expert slicing, attention sinks, YaRN. Runs on the GGML backends too, though the GGML MoE path still walks experts per token per rank rather than using expert parallelism.</td></tr>
       <tr><td>Nemotron-H</td><td class="yes">✅</td><td>MoE expert slicing; Mamba2 SSM layers are computed on rank 0 and broadcast. Same GGML MoE caveat as GPT OSS.</td></tr>
+      <tr><td>DeepSeek V4 Flash</td><td class="yes">✅ (layer split)</td><td>Different mechanism: DSV4's whole-model executors split the model <em>by layer</em> across GPUs rather than sharding every weight, so there is no per-layer AllReduce. <code>--tp N</code> simply caps how many GPUs the split uses (same as <code>TS_DSV4_NGPU</code>); with no flag it uses every visible device. The split balances the largest per-device load, counting the fixed residents — embedding table on the first device, output head and the whole DSpark drafter on the last — where they actually land.</td></tr>
       <tr><td>DiffusionGemma</td><td class="no">—</td><td>Not applicable (text-diffusion sampler, not autoregressive decode).</td></tr>
       <tr><td>Qwen-Image-Edit</td><td class="no">—</td><td>Not applicable (MMDiT image generation).</td></tr>
     </tbody>
@@ -128,6 +129,18 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   </table>
   </div>
   <p>Decode — the memory-bound half TP is meant to help — reaches 1.39× a single GPU on Gemma 4 E4B and 1.06× on Qwen 3.5-9B, with both Gemma 4 models producing output <strong>byte-identical</strong> to their single-GPU runs. Prefill is compute-bound and pays the collectives, so it lands at or below the single-GPU figure for models that fit on one card. Qwen 3.5-35B-A3B does not fit a 16 GB card at all — TP is the only way to run it, and memory splits 9.4 + 8.0 GB across the pair.</p>
+  <h3 id="perf-graphs">CUDA graph capture under TP</h3>
+  <p>A tensor-parallel token is dozens of small per-rank submissions, and replaying them is worth about <strong>45% of decode throughput</strong> — so graph capture stays <em>on</em> under TP (disable with <code>TS_GGML_TP_CUDA_GRAPHS=0</code>). On 4×A40:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Model</th><th>Capture off</th><th>Capture on</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen 3.5-9B, <code>--tp 4</code></td><td>88 tok/s</td><td><strong>128.5 tok/s</strong></td></tr>
+      <tr><td>Qwen 3.5-35B-A3B, <code>--tp 2</code></td><td>71.3 tok/s</td><td><strong>104.1 tok/s</strong> — the difference between TP losing and winning against a single GPU</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The collective transport is likewise chosen by <strong>measurement, not capability flags</strong>: at startup the group verifies that peer copies between the advertised device pairs actually deliver their bytes and that a real NCCL AllReduce completes, then picks the fastest transport that passes. Hosts that advertise peer access which never arrives (common on virtualized cloud instances) keep the NCCL collective with peer transport disabled rather than losing it — which matters past two GPUs, where the pinned-host pipeline does not apply and the alternative is reducing through host RAM at every layer boundary (4×A40, Qwen 3.5-9B Q8_0 decode: 53.5 → 75.1 tok/s).</p>
 
   <h2 id="tuning">Tuning &amp; diagnostics</h2>
   <p>Local AllReduce prefers CUDA peer-to-peer DMA. At startup the group enables peer access for every pair that reports it, then runs a round-trip self-test — some topologies (L4 cards behind certain PCIe switches, IOMMU-enabled hosts, small BAR1 windows) claim peer access but silently transfer corrupt data, and any pair that fails is demoted to host staging permanently. Hardware with no peer access at all (A16 vGPU profiles, most consumer cards) stages through host memory from the start. The fallbacks are automatic; the switches below exist to force them for diagnosis.</p>
@@ -145,6 +158,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td><code>TENSORSHARP_TP_HOST_ALLREDUCE</code></td><td>off</td><td><code>1</code> runs the local AllReduce as device→host, sum on the CPU, host→device. Slower, but mirrors the known-good multi-node reduce exactly.</td></tr>
       <tr><td><code>TS_GGML_TP_DEVICE_AR_THRESHOLD</code></td><td><code>262144</code></td><td>Element count above which AllReduce uses ggml's device collective instead of a host reduction. GGML activations already live in host RAM, so small payloads are cheaper to sum there.</td></tr>
       <tr><td><code>TS_GGML_TP_PARALLEL</code></td><td>on</td><td><code>0</code> drives the ranks sequentially instead of concurrently — a diagnostic, and a large slowdown.</td></tr>
+      <tr><td><code>TS_GGML_TP_CUDA_GRAPHS</code></td><td>on</td><td><code>0</code> turns CUDA graph capture off for multi-GPU runs. Capture is on by default because a tensor-parallel token is dozens of small per-rank submissions that replay far more cheaply than they re-issue (see <a href="#perf-graphs">above</a>). The opt-out is translated into a native <code>GGML_CUDA_DISABLE_GRAPHS</code> before the first backend call, because ggml latches that value on first use.</td></tr>
       <tr><td><code>TS_GEMMA4_TP_FUSED_MOE</code></td><td>on</td><td><code>0</code> falls back from Gemma 4's fused MoE trunk to the whole-expert per-op path.</td></tr>
       <tr><td><code>GGML_CUDA_ALLREDUCE</code></td><td>auto</td><td><code>nccl</code> / <code>internal</code> / <code>none</code>, passed through to ggml's collective selection. Setting it explicitly also skips the NCCL pre-flight probe.</td></tr>
       <tr><td><code>TS_GGML_TP_AR_PROBE</code></td><td>on</td><td>Behavioural pre-flight of the NCCL collective before model load: some cloud hosts advertise GPU P2P that never delivers, and NCCL's first AllReduce then spins both GPUs forever — the classic symptom is a TP model load that hangs at kernel warmup. On a failed probe TensorSharp reroutes to ggml's pinned-host-memory <code>internal</code> pipeline. <code>0</code> skips the probe; <code>force</code> ignores the cached per-host verdict (<code>~/.cache/tensorsharp/tp-collective-probe</code>).</td></tr>

@@ -24,12 +24,13 @@
 
 - **⚡ Trades wins with llama.cpp — from pure .NET.** On identical GGUF files and the same GPU, TensorSharp matches or beats `llama.cpp` on the workloads that matter: Gemma 4 E4B and 2-bit Qwen 3.6 35B-A3B MoE prefill **1.28×** faster on CUDA with first tokens **1.27×** sooner (multi-turn up to **1.49×**); Gemma 4 12B decodes **1.21×** faster on Vulkan (up to **1.32×** on long context). → [Benchmarks](#benchmarks)
 - **🚀 Continuous batching & paged KV cache.** vLLM-style paged KV pool with block-hash prefix sharing and an iteration-level scheduler, on by default in the server. → [deep dive](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
-- **🔮 MTP / NextN speculative decoding.** Multi-token-prediction draft heads accelerate solo decode on Qwen 3.6 (embedded NextN block) and Gemma 4 (separate `gemma4-assistant` draft GGUF) — the draft proposes, the trunk verifies in one batched forward, output identical to standard decode. → [Speculative decoding](FEATURES.md#mtp--nextn-speculative-decoding)
+- **🧬 DeepSeek V4 Flash (284B MoE) with three whole-model executors.** The compressed-sparse-attention 1M-context architecture runs on a direct-CUDA engine (`--backend cuda`), the native ggml executor (`--backend ggml_cuda` / `ggml_vulkan`), *and* a 100% pure-C# CPU executor (`--backend cpu`, no native dependencies). Weights layer-split automatically across every visible GPU, so a model far larger than one card still runs; the server hosts it with per-sequence slots and continuous batching. → [DeepSeek V4 card](docs/models/deepseek4.md)
+- **🔮 Speculative decoding — MTP / NextN *and* DSpark.** Multi-token-prediction draft heads accelerate solo decode on Qwen 3.6 (embedded NextN block) and Gemma 4 (separate `gemma4-assistant` draft GGUF); DeepSeek V4 adds **DSpark** block drafting (`--draft-model`), which proposes a whole block of tokens per step for **1.3–1.4× decode** (up to 2.0× on multi-turn chat). In every case the draft proposes, the trunk verifies in one batched forward, and the output matches standard decode. → [Speculative decoding](FEATURES.md#mtp--nextn-speculative-decoding)
 - **🔗 Tensor parallelism & distributed clustering.** Split a model across multiple GPUs with `--tp N` — on the direct `cuda` backend **and** on GGML CUDA / Vulkan — and extend across machines with peer-to-peer TCP clustering (`--tp-node-id` / `--tp-peers`). Megatron-LM column/row-parallel pattern with hierarchical AllReduce; MoE expert parallelism and per-rank GatedDeltaNet kernels on GGML. Fused per-rank execution makes `--tp 2` decode **1.39×** a single GPU on Gemma 4 E4B, and runs models that do not fit one card at all (Qwen 3.5-35B-A3B). Optional Redis-backed KV cache and Responses API store. → [Tensor Parallelism](USAGE.md#tensor-parallelism--distributed-inference)
 - **🎨 Qwen-Image-Edit image editing.** Prompt + input image → edited image, driving a 60-block MMDiT with a Qwen-Image VAE and Qwen2.5-VL-7B text encoder. CUDA-graph-captured DiT, FlowMatch-Euler true-CFG denoise, live Web UI previews, and Lightning-LoRA fast paths. Beat `stable-diffusion.cpp` **1.19×** on a warm 4-step edit. → [Qwen-Image-Edit card](docs/models/qwenimage.md)
 - **🌫️ DiffusionGemma text diffusion.** Block-wise EntropyBound denoising over a Gemma-4-derived MoE backbone, with CLI flags and a Web UI denoising preview stream. → [DiffusionGemma card](docs/models/diffusiongemma.md)
 - **🖼️ Multimodal.** Image / video / audio (Gemma 4); image input for Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni; PDF documents via CLI and Web UI. → [Multimodal](FEATURES.md#multimodal-support)
-- **🛠️ Tool calling & thinking mode.** Multi-turn tool calls and structured chain-of-thought across Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, and Nemotron-H. → [Features](FEATURES.md)
+- **🛠️ Tool calling & thinking mode.** Multi-turn tool calls and structured chain-of-thought across Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H, and DeepSeek V4 (DSML markup). → [Features](FEATURES.md)
 - **🔌 Ollama- & OpenAI-compatible APIs** plus a browser chat UI — drop-in for existing tooling. → [HTTP APIs](USAGE.md#http-apis)
 - **📄 Config files with auto-download.** Put CLI/Server options in a reusable JSON file with `${variables}` and `{ "path", "urls" }` entries that fetch the model on first run. → [config/README.md](config/README.md)
 - **🧮 Native quantized compute.** Q4_K_M / Q8_0 / MXFP4 / IQ2_XXS and more run in matmul without dequantizing to FP32. Runs on GGML Metal / CUDA / Vulkan, a direct CUDA/cuBLAS backend, MLX (Apple Silicon), and a pure-C# CPU path — all with CPU fallbacks. → [Backends](USAGE.md#compute-backends)
@@ -153,7 +154,7 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 
 | Family | Example model (GGUF) | Image / Video / Audio | Thinking | Tools | Card |
 |---|---|---|---|---|---|
-| DeepSeek V4 Flash | [DeepSeek-V4-Flash](https://huggingface.co/unsloth/DeepSeek-V4-Flash-GGUF) (284B MoE, split GGUF) | — / — / — | ✅ | — | [deepseek4.md](docs/models/deepseek4.md) |
+| DeepSeek V4 Flash | [DeepSeek-V4-Flash-0731](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) (284B MoE, split GGUF) | — / — / — | ✅ | ✅ | [deepseek4.md](docs/models/deepseek4.md) |
 | Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) (also 31B, 26B-A4B MoE) | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4.md](docs/models/gemma4.md) |
 | Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) (also 35B-A3B MoE) | ✅ / — / — | ✅ | ✅ | [qwen35.md](docs/models/qwen35.md) |
 | Qwen 3 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B-GGUF) | — / — / — | ✅ | ✅ | [qwen3.md](docs/models/qwen3.md) |
@@ -168,7 +169,7 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 
 | Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tools | MTP spec | Card |
 |---|---|---|---|---|---|---|---|
-| DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash (284B MoE, 256 experts, compressed sparse attention, 1M context) | Text only | Yes | No | — | [deepseek4.md](docs/models/deepseek4.md) |
+| DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash (284B MoE, 256 experts, compressed sparse attention, 1M context) | Text only | Yes | Yes (DSML) | Yes (DSpark block drafter, separate GGUF) | [deepseek4.md](docs/models/deepseek4.md) |
 | Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes | Yes (separate draft GGUF) | [gemma4.md](docs/models/gemma4.md) |
 | Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No | — | [gemma3.md](docs/models/gemma3.md) |
 | Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes | — | [qwen3.md](docs/models/qwen3.md) |
@@ -223,12 +224,12 @@ New here? The sections above are all you need to get running. Everything else is
 
 | Area | Status |
 |---|---|
-| Model families | Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3. Image editing via Qwen-Image-Edit (`qwen_image` MMDiT). |
+| Model families | DeepSeek V4 Flash (`deepseek4`), Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3. Image editing via Qwen-Image-Edit (`qwen_image` MMDiT). |
 | Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API. |
-| Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA, GGML Vulkan. |
+| Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA, GGML Vulkan. DeepSeek V4 additionally has three whole-model executors of its own — direct-CUDA, native ggml, and a pure-C# CPU one — each layer-splitting the weights across every visible GPU (`--tp N` / `TS_DSV4_NGPU` caps the count). |
 | Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, Nemotron-H Omni image input; PDF documents (CLI `--pdf` + Web UI). |
-| Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (default on; opt-out `--no-continuous-batching`). |
-| Speculative decoding | MTP / NextN draft heads on Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); off by default, opt-in via the server's `--mtp-spec`. |
+| Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (default on; opt-out `--no-continuous-batching`). DeepSeek V4 serves through its own native per-sequence slots on the same engine. |
+| Speculative decoding | MTP / NextN draft heads on Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); DSpark block drafting on DeepSeek V4 (separate drafter GGUF via `--draft-model`, `cuda` / `ggml_cuda`, 1.3–1.4× decode). Off by default; opt-in via the server's `--mtp-spec`, or by passing `--draft-model` on the CLI. |
 | Tensor parallelism | Megatron-LM column/row-parallel TP on the direct `cuda` backend and on GGML CUDA / Vulkan (`--tp N` / `TENSORSHARP_TP_DEGREE`, CLI and server); distributed multi-node TP via peer-to-peer TCP (`--tp-node-id` / `--tp-peers`), with hierarchical AllReduce and automatic host-staging fallback when CUDA P2P is unavailable. All autoregressive architectures; MoE expert parallelism and fused per-rank decode/prefill graphs for Gemma 4 and Qwen 3.5/3.6 on GGML. Optional Redis-backed KV cache and Responses API store. |
 | Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning. |
 | Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI shapes. |

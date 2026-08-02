@@ -98,6 +98,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>GatedDeltaNet 循环层采用块循环 V-head 归属 —— 每个 rank 维护自己的、常驻设备的 delta/conv 状态，循环路径无需跨 rank 通信。GGML 上整个 GDN block 作为一个打包的按 rank 内核运行，MoE 采用专家并行（每个 rank 持有整个专家，shared expert 按 Megatron 切分），LM head 为列并行且完全不需要集合通信。Direct CUDA 使用专家切分。</td></tr>
       <tr><td>GPT OSS</td><td class="yes">✅</td><td>MoE 专家切分、attention sink、YaRN。GGML 后端同样可运行，但 GGML 上的 MoE 路径目前仍按 token 逐个遍历专家，尚未使用专家并行。</td></tr>
       <tr><td>Nemotron-H</td><td class="yes">✅</td><td>MoE 专家切分；Mamba2 SSM 层在 rank 0 上计算后广播。GGML 上的 MoE 限制与 GPT OSS 相同。</td></tr>
+      <tr><td>DeepSeek V4 Flash</td><td class="yes">✅（按层切分）</td><td>机制不同：DSV4 的整模型执行器是把模型<em>按层</em>切分到各 GPU，而不是切分每个权重，因此没有逐层 AllReduce。<code>--tp N</code> 只是限制切分使用几张 GPU（等同 <code>TS_DSV4_NGPU</code>）；不传参数时使用全部可见设备。切分以单卡最大负载为优化目标，并按各设备固定常驻项的实际落点计入——embedding 表在第一张卡，输出头与整个 DSpark 草稿器在最后一张卡。</td></tr>
       <tr><td>DiffusionGemma</td><td class="no">—</td><td>不适用（文本扩散采样器，非自回归 decode）。</td></tr>
       <tr><td>Qwen-Image-Edit</td><td class="no">—</td><td>不适用（MMDiT 图像生成）。</td></tr>
     </tbody>
@@ -129,6 +130,18 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   </div>
   <p>Decode —— TP 本该受益的访存瓶颈部分 —— 在 Gemma 4 E4B 上达到单卡的 1.39×，在 Qwen 3.5-9B 上为 1.06×，且两个 Gemma 4 模型的输出与单卡运行<strong>逐字节一致</strong>。Prefill 受计算约束且要承担集合通信开销，因此在单卡装得下的模型上持平或略低于单卡。Qwen 3.5-35B-A3B 在 16 GB 卡上根本装不下 —— 只有 TP 能跑，两张卡上的显存占用为 9.4 + 8.0 GB。</p>
 
+  <h3 id="perf-graphs">TP 下的 CUDA 图捕获</h3>
+  <p>一个张量并行 token 是几十次按 rank 的小提交，重放它们值约 <strong>45% 的 decode 吞吐</strong> —— 因此 TP 下图捕获保持<em>开启</em>（用 <code>TS_GGML_TP_CUDA_GRAPHS=0</code> 关闭）。4×A40 实测：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>模型</th><th>关闭捕获</th><th>开启捕获</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen 3.5-9B，<code>--tp 4</code></td><td>88 tok/s</td><td><strong>128.5 tok/s</strong></td></tr>
+      <tr><td>Qwen 3.5-35B-A3B，<code>--tp 2</code></td><td>71.3 tok/s</td><td><strong>104.1 tok/s</strong> —— 这正是 TP 输给还是赢过单卡的分界线</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>集合通信的传输方式同样靠<strong>实测而非能力标志位</strong>决定：启动时该组会验证所宣称的设备对之间的 peer copy 是否真的把数据送到，以及一次真实的 NCCL AllReduce 能否完成，然后选出通过检验的最快传输。有些主机（常见于虚拟化云实例）宣称支持 peer access 却从不兑现，此时会保留 NCCL 集合通信但禁用 peer 传输，而不是干脆放弃它——这在超过两张卡时尤为重要，因为那里用不上 pinned-host 流水线，替代方案是每个层边界都经主机内存归约（4×A40，Qwen 3.5-9B Q8_0 decode：53.5 → 75.1 tok/s）。</p>
   <h2 id="tuning">调优与诊断</h2>
   <p>本地 AllReduce 优先使用 CUDA 点对点（P2P）DMA。启动时，并行组会为每一对报告支持 P2P 的设备启用 peer access，随后做一次往返自检——部分拓扑（挂在某些 PCIe 交换机后的 L4、开启 IOMMU 的主机、BAR1 窗口过小）虽然声称支持 P2P，却会静默传输损坏数据，未通过自检的设备对会被永久降级为主机中转。完全不支持 peer access 的硬件（A16 vGPU 配置、大多数消费级显卡）则从一开始就走主机内存中转。这些回退都是自动的；下面的开关用于人为强制走某条路径以便定位问题。</p>
   <div class="table-scroll">
@@ -145,6 +158,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td><code>TENSORSHARP_TP_HOST_ALLREDUCE</code></td><td>关闭</td><td><code>1</code> 表示本地 AllReduce 改为设备→主机、CPU 求和、主机→设备。更慢，但与已知可靠的多节点归约路径完全一致。</td></tr>
       <tr><td><code>TS_GGML_TP_DEVICE_AR_THRESHOLD</code></td><td><code>262144</code></td><td>超过该元素数量时 AllReduce 走 ggml 的设备集合通信，否则在主机内存中归约。GGML 的激活本来就在主机内存里，小载荷在那里求和更划算。</td></tr>
       <tr><td><code>TS_GGML_TP_PARALLEL</code></td><td>开启</td><td><code>0</code> 表示顺序而非并发地驱动各 rank —— 诊断用，会显著变慢。</td></tr>
+      <tr><td><code>TS_GGML_TP_CUDA_GRAPHS</code></td><td>开启</td><td><code>0</code> 关闭多 GPU 运行下的 CUDA 图捕获。默认开启，因为一个张量并行 token 是几十次按 rank 的小提交，重放远比重新下发便宜（见<a href="#perf-graphs">上文</a>）。该开关会在首次调用后端之前被翻译成原生的 <code>GGML_CUDA_DISABLE_GRAPHS</code>，因为 ggml 在首次使用时就会锁定该值。</td></tr>
       <tr><td><code>TS_GEMMA4_TP_FUSED_MOE</code></td><td>开启</td><td><code>0</code> 表示 Gemma 4 从融合的 MoE 主干回退到逐算子的整专家路径。</td></tr>
       <tr><td><code>GGML_CUDA_ALLREDUCE</code></td><td>自动</td><td><code>nccl</code> / <code>internal</code> / <code>none</code>，直接透传给 ggml 的集合通信选择。显式设置会同时跳过 NCCL 启动前探测。</td></tr>
       <tr><td><code>TS_GGML_TP_AR_PROBE</code></td><td>开</td><td>模型加载前对 NCCL 集合通信做行为探测：一些云主机声称支持 GPU P2P 但数据永远送不到，NCCL 的第一次 AllReduce 会让两块 GPU 永远空转——典型症状是 TP 模型加载卡死在 kernel warmup。探测失败时 TensorSharp 自动改走 ggml 的钉页主机内存 <code>internal</code> 管线。<code>0</code> 跳过探测；<code>force</code> 忽略缓存的按主机判定（<code>~/.cache/tensorsharp/tp-collective-probe</code>）。</td></tr>

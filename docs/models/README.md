@@ -61,6 +61,7 @@ a complete multimodal inference engine—use Zhongkai Fu's
 
 | Architecture | Card | Verified download (HF) | Source class | GGUF keys | Modalities | Reasoning | Tools | Batched / paged forward | Notable acceleration |
 |---|---|---|---|---|---|---|---|---|---|
+| DeepSeek V4 Flash | [deepseek4.md](deepseek4.md) | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) (multi-shard per quant directory; point `--model` at the `-00001-of-` shard). DSpark drafters: [MODEL_DOWNLOADS.md](../../MODEL_DOWNLOADS.md#dspark-drafters) | `DeepSeek4Model` (+ `DeepSeek4CudaExecutor`, `DeepSeek4CpuExecutor`) | `deepseek4` | Text | Yes | Yes (DSML markup) | Native per-sequence slots (`DeepSeek4Model.PerSeqCache.cs`) rather than `IBatchedPagedModel` — servable with continuous batching through the same engine | Three whole-model executors (direct CUDA, native ggml, pure C#), automatic layer split across every visible GPU, on-device compressed KV state (SWA ring + CSA/HCA + lightning indexer), shape-signature graph cache replaying a captured CUDA graph, fused decode index-gather over `[ring \| top-512]` K, and DSpark block speculative decoding (1.3–1.4× decode) |
 | Gemma 3 | [gemma3.md](gemma3.md) | [ggml-org/gemma-3-4b-it-GGUF](https://huggingface.co/ggml-org/gemma-3-4b-it-GGUF) | `Gemma3Model` | `gemma3` | Text, image | No | No | No (legacy per-seq) | Alternating SWA / global attention, GeGLU FFN, QK-norm, V-norm |
 | Gemma 4 | [gemma4.md](gemma4.md) | E4B Q8_0 is the verified native-GGML family/path tier; [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) is the recommended public artifact | `Gemma4Model` | `gemma4` (`gemma4-assistant` / `gemma4_assistant` load only as the MTP draft) | Text, image, video, audio | Yes | Yes | **Default** (toggle off with `TS_GEMMA4_BATCHED=0`) | Single-graph fused decode (all layers in one GGML dispatch), fused whole-model prefill/verify with in-kernel PLE + shared-KV handling, chunked prefill, circular SWA cache, and MoE variants. Batched path matches legacy logits within FP noise (`Gemma4BatchedForwardTests`); reaches ~1.5× legacy at batch=8 and ~1.6× at 4×800-token prompts. |
 | DiffusionGemma | [diffusiongemma.md](diffusiongemma.md) | [unsloth/diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) | `DiffusionGemmaModel` + `DiffusionGemmaSampler` | `diffusion-gemma`, `diffusion_gemma` | Text | No | No | Separate Web UI `DiffusionBatchScheduler`; not an autoregressive `IBatchedPagedModel` path | EntropyBound block denoising over `[prompt \| canvas]`, prompt-KV caching on GPU backends, self-conditioning, fused GGML whole-model diffusion decode and fused lm-head tail |
@@ -116,38 +117,45 @@ engine (`--mtp-spec` — a `TensorSharp.Server` flag; the CLI has no MTP flags, 
 `MtpSpeculativeExecution`; per-architecture mechanics are in the Qwen 3.5/3.6 (§12)
 and Gemma 4 (§12) cards.
 
+DeepSeek V4 plugs a *block* drafter into that same core: its DSpark support module
+ships as a separate GGUF loaded with `--draft-model` (on both the CLI and the server)
+and proposes a whole block of tokens per step instead of one at a time. Because the
+drafter's weights must be counted by the layer split, it is passed to
+`ModelBase.Create()` at load time rather than attached afterwards. See the
+[DeepSeek V4 card](deepseek4.md#dspark-speculative-decoding).
+
 ## Architecture comparison
 
-| Feature | Gemma 3 | Gemma 4 | DiffusionGemma | Qwen 3 | Qwen 3.5 / 3.6 family | GPT OSS | Nemotron-H | Mistral 3 |
-|---|---|---|---|---|---|---|---|---|
-| Layer type | Dense | Dense / MoE | Gemma-4-derived MoE encoder/decoder | Dense | Hybrid (Attn + Recurrent) ± MoE | MoE | Hybrid (Mamba2 + Attn + FFN, dense or MoE) | Dense |
-| Attention | SWA + Global | SWA + Global | Region-aware prompt/canvas attention | Full GQA | Full GQA + Sigmoid Gate | Full + Sinks | Full GQA (no RoPE) | Full GQA |
-| FFN activation | GeGLU | GeGLU | Dense GeGLU + top-8 MoE | SwiGLU | SwiGLU | SiLUAlphaLimit (clamped GLU) | ReLU² | SwiGLU |
-| RoPE variant | NeoX (dual base) | NeoX + proportional / partial | NeoX, local/global bases | NeoX | NeoX / MRoPE | NeoX + YaRN | None | GPT-J + YaRN |
-| QK-norm | Yes | Yes | Yes | Yes | Yes | No | No | No |
-| V-norm | No | Yes (unweighted) | Yes (unweighted) | No | No | No | No | No |
-| Bias in projections | No | No | No | No | No | Yes (all linear) | No | No |
-| Per-layer scaling | No | Yes | Encoder / decoder scalars | No | No | No | No | No |
-| Per-Layer Embedding (PLE) | No | Yes | No | No | No | No | No | No |
-| KV sharing | No | Yes (tail layers) | Prompt-KV cache across denoising steps | No | No | No | No | No |
-| Attention sinks | No | No | No | No | No | Yes | No | No |
-| Circular KV cache | No | Yes (SWA layers) | No autoregressive KV | No | No | No | No | No |
-| SSM / recurrent layers | No | No | No | No | Yes (GatedDeltaNet) | No | Yes (Mamba2) | No |
-| Shared experts | No | No | No | No | Yes (qwen35moe / qwen3next) | No | Yes (optional) | No |
-| Latent bottleneck FFN | No | No | No | No | No | No | Yes (optional) | No |
-| Position-dependent Q scaling | No | No | No | No | No | No | No | Yes (with YaRN) |
-| Vision | Yes | Yes | No | No | Yes | No | Yes (Omni) | Yes (Pixtral) |
-| Audio | No | Yes | No | No | No | No | No — image-only Omni (Parakeet log-mel preprocessing exists, but inference needs an audio mmproj that is not shipped) | No |
-| Video | No | Yes | No | No | No | No | No | No |
-| Thinking | No | Yes | No | Yes | Yes | Yes (always) | Yes | No |
-| Tool calling | No | Yes | No | Yes | Yes | Yes | Yes | No |
-| MTP / NextN speculative decoding | No | Yes (separate `gemma4-assistant` draft GGUF) | No | No | Yes on Qwen 3.6 (embedded NextN block) | No | No | No |
-| Fused QKV | No | Yes | Yes | Yes | Mixed (full attention layers split, recurrent layers fuse a 5-way pack) | Yes | Yes | Yes |
-| Fused single-graph decode | No | Yes (Gemma4ModelDecode) | Yes (DiffusionModelDecode + lm-head tail) | Yes (TransformerModelDecode, native loop) | Per-layer fused (Qwen35AttentionLayerDecode, FusedOutProjFFN, FusedOutProjNormRouter) | Per-layer | Per-layer / batched MoE | No |
-| Fused single-graph prefill | No | Yes (whole-model NativeGemma4ModelVerify + per-layer Gemma4LayerPrefill fallback) | Prompt-KV prefill cache | No | Yes (FusedPrefillAttention, FusedOutProjFFN, MoE prefill) | Yes (MoE prefill via mul_mat_id) | No | No |
-| Batched GPU MoE | n/a | Yes for all-MoE variants (fused whole-model MoE decode/verify); mixed dense+MoE pending | Fused per-canvas MoE; concurrent requests batched by diffusion scheduler | n/a | Yes (routed + shared + residual fused) | Yes (stacked weight slabs) | Yes | n/a |
-| Fused vision encoder | n/a | Standard | n/a | n/a | Yes (FusedVisionAttention + FusedVisionMLP) | n/a | Standard (RADIO ViT) | Standard (Pixtral) |
-| Output parser | `PassthroughOutputParser` | `Gemma4OutputParser` | `PassthroughOutputParser` | `Qwen3OutputParser` | `Qwen35OutputParser` | `HarmonyOutputParser` (always required) | `Qwen3OutputParser` | `PassthroughOutputParser` |
+| Feature | DeepSeek V4 | Gemma 3 | Gemma 4 | DiffusionGemma | Qwen 3 | Qwen 3.5 / 3.6 family | GPT OSS | Nemotron-H | Mistral 3 |
+|---|---|---|---|---|---|---|---|---|---|
+| Layer type | MoE (256 routed experts, top-6 + 1 shared) | Dense | Dense / MoE | Gemma-4-derived MoE encoder/decoder | Dense | Hybrid (Attn + Recurrent) ± MoE | MoE | Hybrid (Mamba2 + Attn + FFN, dense or MoE) | Dense |
+| Attention | Raw SWA-128 + compressed CSA 4:1 / HCA 128:1 (lightning-indexer top-512 on CSA layers) | SWA + Global | SWA + Global | Region-aware prompt/canvas attention | Full GQA | Full GQA + Sigmoid Gate | Full + Sinks | Full GQA (no RoPE) | Full GQA |
+| FFN activation | SwiGLU with a per-layer clamp | GeGLU | GeGLU | Dense GeGLU + top-8 MoE | SwiGLU | SwiGLU | SiLUAlphaLimit (clamped GLU) | ReLU² | SwiGLU |
+| RoPE variant | Interleaved-pair + YaRN; separate raw and compress bases, inverted after attention | NeoX (dual base) | NeoX + proportional / partial | NeoX, local/global bases | NeoX | NeoX / MRoPE | NeoX + YaRN | None | GPT-J + YaRN |
+| QK-norm | Q only (per-head RMS) | Yes | Yes | Yes | Yes | Yes | No | No | No |
+| V-norm | No | No | Yes (unweighted) | Yes (unweighted) | No | No | No | No | No |
+| Bias in projections | No (router selection bias only) | No | No | No | No | No | Yes (all linear) | No | No |
+| Per-layer scaling | No (per-layer swiglu clamp and compress ratio instead) | No | Yes | Encoder / decoder scalars | No | No | No | No | No |
+| Per-Layer Embedding (PLE) | No | No | Yes | No | No | No | No | No | No |
+| KV sharing | Yes (one shared 512-dim K=V head for all queries) | No | Yes (tail layers) | Prompt-KV cache across denoising steps | No | No | No | No | No |
+| Attention sinks | Yes | No | No | No | No | No | Yes | No | No |
+| Circular KV cache | Yes (raw SWA-128 ring) | No | Yes (SWA layers) | No autoregressive KV | No | No | No | No | No |
+| SSM / recurrent layers | No (4-stream hyper-connections replace the plain residual) | No | No | No | No | Yes (GatedDeltaNet) | No | Yes (Mamba2) | No |
+| Shared experts | Yes | No | No | No | No | Yes (qwen35moe / qwen3next) | No | Yes (optional) | No |
+| Latent bottleneck FFN | No (LoRA-factored Q / output projections instead) | No | No | No | No | No | No | Yes (optional) | No |
+| Position-dependent Q scaling | No | No | No | No | No | No | No | No | Yes (with YaRN) |
+| Vision | No | Yes | Yes | No | No | Yes | No | Yes (Omni) | Yes (Pixtral) |
+| Audio | No | No | Yes | No | No | No | No | No — image-only Omni (Parakeet log-mel preprocessing exists, but inference needs an audio mmproj that is not shipped) | No |
+| Video | No | No | Yes | No | No | No | No | No | No |
+| Thinking | Yes | No | Yes | No | Yes | Yes | Yes (always) | Yes | No |
+| Tool calling | Yes (DSML markup) | No | Yes | No | Yes | Yes | Yes | Yes | No |
+| MTP / NextN speculative decoding | DSpark block drafter (separate GGUF via `--draft-model`) | No | Yes (separate `gemma4-assistant` draft GGUF) | No | No | Yes on Qwen 3.6 (embedded NextN block) | No | No | No |
+| Fused QKV | n/a (LoRA-factored Q, single shared K=V head) | No | Yes | Yes | Yes | Mixed (full attention layers split, recurrent layers fuse a 5-way pack) | Yes | Yes | Yes |
+| Fused single-graph decode | Yes (whole-model executor, one graph per ubatch, CUDA-graph replayed) | No | Yes (Gemma4ModelDecode) | Yes (DiffusionModelDecode + lm-head tail) | Yes (TransformerModelDecode, native loop) | Per-layer fused (Qwen35AttentionLayerDecode, FusedOutProjFFN, FusedOutProjNormRouter) | Per-layer | Per-layer / batched MoE | No |
+| Fused single-graph prefill | Yes (same whole-model executor, chunked ubatches) | No | Yes (whole-model NativeGemma4ModelVerify + per-layer Gemma4LayerPrefill fallback) | Prompt-KV prefill cache | No | Yes (FusedPrefillAttention, FusedOutProjFFN, MoE prefill) | Yes (MoE prefill via mul_mat_id) | No | No |
+| Batched GPU MoE | Yes (grouped expert kernels) | n/a | Yes for all-MoE variants (fused whole-model MoE decode/verify); mixed dense+MoE pending | Fused per-canvas MoE; concurrent requests batched by diffusion scheduler | n/a | Yes (routed + shared + residual fused) | Yes (stacked weight slabs) | Yes | n/a |
+| Fused vision encoder | n/a | n/a | Standard | n/a | n/a | Yes (FusedVisionAttention + FusedVisionMLP) | n/a | Standard (RADIO ViT) | Standard (Pixtral) |
+| Output parser | `DeepSeek4OutputParser` | `PassthroughOutputParser` | `Gemma4OutputParser` | `PassthroughOutputParser` | `Qwen3OutputParser` | `Qwen35OutputParser` | `HarmonyOutputParser` (always required) | `Qwen3OutputParser` | `PassthroughOutputParser` |
 
 ## Adding a new architecture
 

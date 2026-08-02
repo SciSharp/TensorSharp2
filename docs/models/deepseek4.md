@@ -1,5 +1,7 @@
 # DeepSeek V4 Flash (`deepseek4`)
 
+[← back to model index](README.md) | [中文](deepseek4_zh-cn.md)
+
 DeepSeek V4 Flash is a 284B-parameter MoE (256 routed experts, top-6 + 1 shared)
 with a novel long-context attention stack: a tiny 128-token raw sliding window
 per layer, plus per-layer *compressed* attention over 4:1 (CSA) or 128:1 (HCA)

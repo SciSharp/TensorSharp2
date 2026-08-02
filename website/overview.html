@@ -74,7 +74,7 @@
     <tbody>
       <tr><td><code>TensorSharp.Core/</code></td><td>Tensor library, ops, memory, device abstraction, CPU SIMD/quantized kernels.</td></tr>
       <tr><td><code>TensorSharp.Runtime/</code></td><td>GGUF, tokenizers, templates, sampling; <code>Paged/</code> KV primitives and <code>Scheduling/</code> the inference engine + MTP core.</td></tr>
-      <tr><td><code>TensorSharp.Models/Models/&lt;Family&gt;/</code></td><td>One folder per architecture (Gemma3/4, Qwen3/35, GptOss, Nemotron, Mistral3, DiffusionGemma, QwenImage), each with a legacy and a batched forward.</td></tr>
+      <tr><td><code>TensorSharp.Models/Models/&lt;Family&gt;/</code></td><td>One folder per architecture (DeepSeek4, Gemma3/4, Qwen3/35, GptOss, Nemotron, Mistral3, DiffusionGemma, QwenImage), each with a legacy and a batched forward — except DeepSeek4, which uses whole-model executors instead.</td></tr>
       <tr><td><code>TensorSharp.GGML.Native/</code></td><td>The native C++ bridge to ggml (matmul, fused transformer kernels, paged attention, MoE, Mamba2, GatedDeltaNet, diffusion).</td></tr>
       <tr><td><code>TensorSharp.Server/</code></td><td>ASP.NET Core server: program bootstrap, model service, inference-engine host, chat pipeline, telemetry.</td></tr>
       <tr><td><code>docs/</code></td><td>Per-model architecture cards, paged-attention deep dive, env-var matrix, benchmark matrix.</td></tr>
@@ -87,12 +87,12 @@
   <table>
     <thead><tr><th>Area</th><th>Status</th></tr></thead>
     <tbody>
-      <tr><td>Model families</td><td>Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (<code>qwen35</code>, <code>qwen35moe</code>, <code>qwen3next</code>), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3, and Qwen-Image-Edit (<code>qwen_image</code> image editing).</td></tr>
+      <tr><td>Model families</td><td>DeepSeek V4 Flash (<code>deepseek4</code>), Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (<code>qwen35</code>, <code>qwen35moe</code>, <code>qwen3next</code>), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3, and Qwen-Image-Edit (<code>qwen_image</code> image editing).</td></tr>
       <tr><td>Inference hosts</td><td>CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API.</td></tr>
-      <tr><td>Backends</td><td>Pure C# CPU, direct CUDA/cuBLAS (<code>cuda</code>), MLX Metal (<code>mlx</code>), GGML CPU, GGML Metal, GGML CUDA, GGML Vulkan.</td></tr>
+      <tr><td>Backends</td><td>Pure C# CPU, direct CUDA/cuBLAS (<code>cuda</code>), MLX Metal (<code>mlx</code>), GGML CPU, GGML Metal, GGML CUDA, GGML Vulkan. DeepSeek V4 additionally has three whole-model executors of its own — direct CUDA, native ggml, and a pure-C# CPU one — each layer-splitting the weights across every visible GPU.</td></tr>
       <tr><td>Multimodal</td><td>Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input. PDF documents via Web UI upload and CLI <code>--pdf</code> (text extracted and inlined; scanned pages rendered as images for vision models).</td></tr>
-      <tr><td>Continuous batching</td><td>vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (on by default; opt-out via <code>--no-continuous-batching</code>).</td></tr>
-      <tr><td>Speculative decoding</td><td>MTP / NextN draft heads for Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); off by default, opt-in via the server's <code>--mtp-spec</code> flag (env <code>TS_MTP_SPEC</code>).</td></tr>
+      <tr><td>Continuous batching</td><td>vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (on by default; opt-out via <code>--no-continuous-batching</code>). DeepSeek V4 serves through its own native per-sequence slots on the same engine.</td></tr>
+      <tr><td>Speculative decoding</td><td>MTP / NextN draft heads for Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); DSpark block drafting for DeepSeek V4 (separate drafter GGUF via <code>--draft-model</code> on the <code>cuda</code> / <code>ggml_cuda</code> backends, 1.3–1.4× decode). Off by default — opt in with the server's <code>--mtp-spec</code> flag (env <code>TS_MTP_SPEC</code>), or by passing <code>--draft-model</code> on the CLI. → <a href="advanced.html#dspark">DSpark</a></td></tr>
       <tr><td>Tensor parallelism</td><td>Megatron-LM column/row-parallel TP on the direct <code>cuda</code> backend and on GGML CUDA / Vulkan (<code>--tp N</code> / <code>TENSORSHARP_TP_DEGREE</code>, on both the CLI and the server), plus multi-node distributed TP over a peer-to-peer TCP mesh (<code>--tp-node-id</code> / <code>--tp-peers</code>), for every autoregressive architecture. Fused per-rank graphs and MoE expert parallelism make <code>--tp 2</code> decode faster than one GPU on Gemma 4. Optional Redis-backed shared KV cache and Responses API store. → <a href="distributed.html">Multi-GPU &amp; Multi-Node</a></td></tr>
       <tr><td>Observability</td><td>Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI response shapes.</td></tr>
     </tbody>
