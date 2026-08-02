@@ -24,6 +24,7 @@
   <table>
     <thead><tr><th>Architecture</th><th>GGUF arch keys</th><th>Example models</th><th>Multimodal</th><th>Thinking</th><th>Tools</th><th>MTP spec</th></tr></thead>
     <tbody>
+      <tr><td><strong>DeepSeek V4 Flash</strong></td><td><code>deepseek4</code></td><td>DeepSeek-V4-Flash (284B MoE, 256 experts, compressed sparse attention, 1M context)</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes (DSML)</td><td class="yes">Yes (DSpark block drafter, separate GGUF)</td></tr>
       <tr><td><strong>Gemma 4</strong></td><td><code>gemma4</code></td><td>gemma-4-E4B, 12B, 31B, 26B-A4B (MoE)</td><td>Image, Video, Audio</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes (separate draft)</td></tr>
       <tr><td><strong>Gemma 3</strong></td><td><code>gemma3</code></td><td>gemma-3-4b</td><td>Image</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen 3</strong></td><td><code>qwen3</code></td><td>Qwen3-4B</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
@@ -43,6 +44,8 @@
   <table>
     <thead><tr><th>Architecture</th><th>Model</th><th>Download</th><th>Companion files (mmproj / MTP draft)</th></tr></thead>
     <tbody>
+      <tr><td>DeepSeek V4</td><td>DeepSeek-V4-Flash-0731 (284B MoE)</td><td><a href="https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF" target="_blank" rel="noopener">unsloth/DeepSeek-V4-Flash-0731-GGUF</a></td><td>One subdirectory per quant (<code>UD-Q8_K_XL/</code>, <code>UD-IQ4_XS/</code>, <code>UD-IQ1_S/</code>, …), each a multi-shard set — point <code>--model</code> at the <code>-00001-of-</code> shard. Text only; weights layer-split across every visible GPU</td></tr>
+      <tr><td>DeepSeek V4</td><td>DSpark speculative drafter (optional)</td><td><a href="https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF" target="_blank" rel="noopener">bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF</a></td><td><code>DSpark-drafter-Q2K-Q8-0731.gguf</code> (7.0 GB) for the 0731 release, loaded with <code>--draft-model</code> for ~1.3–1.4× decode. Two other publishers' builds (5.6 GB / 10.9 GB) also load as-is — see <code>MODEL_DOWNLOADS.md</code>. Drafters for other architectures are a different design and are <strong>not</strong> supported</td></tr>
       <tr><td>Gemma 4</td><td>gemma-4-E4B-it</td><td><a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a></td><td>Recommended public artifact for the verified E4B Q8_0 native-GGML tier: <code>gemma-4-E4B-it-Q8_0.gguf</code>. Modalities: <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code> (same repo). MTP draft: <a href="https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF" target="_blank" rel="noopener">AtomicChat/gemma-4-E4B-it-assistant-GGUF</a></td></tr>
       <tr><td>Gemma 4</td><td>gemma-4-12B-it (QAT)</td><td><a href="https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF" target="_blank" rel="noopener">unsloth/gemma-4-12B-it-qat-GGUF</a></td><td>mmproj: <code>mmproj-BF16.gguf</code>; MTP draft: <code>mtp-gemma-4-12B-it.gguf</code> (both in the same repo)</td></tr>
       <tr><td>Gemma 4</td><td>gemma-4-31B-it</td><td><a href="https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-31B-it-GGUF</a></td><td>mmproj: <code>mmproj-gemma-4-31B-it-Q8_0.gguf</code> (same repo)</td></tr>
@@ -84,6 +87,29 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- --model models/gem
 dotnet run --project TensorSharp.Server -c Release --no-build -- --model models/gemma-4-E4B-it-Q8_0.gguf \
     --backend ggml_cuda</code></pre>
   <p>On Apple Silicon, omit the CUDA environment assignment and use <code>ggml_metal</code>; on a supported Windows/Linux Vulkan GPU, request <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> instead and use <code>ggml_vulkan</code>. For image, video, or audio input, also run <code>hf download ggml-org/gemma-4-E4B-it-GGUF mmproj-gemma-4-E4B-it-Q8_0.gguf --local-dir models</code> and pass <code>--mmproj models/mmproj-gemma-4-E4B-it-Q8_0.gguf</code>. The server's browser UI is <code>http://localhost:5000/index.html</code>. See <a href="getting-started.html#e4b-fast-lane">Getting Started</a> for Windows PowerShell and full platform syntax.</p>
+
+  <h3 id="deepseek4">DeepSeek V4 Flash (284B MoE, text, thinking, tools, DSpark)</h3>
+  <p>A 284B mixture-of-experts model with a 128-token raw sliding window plus block-compressed attention (1M advertised context). It does <em>not</em> use the generic per-op forward: TensorSharp runs it through one of three dedicated whole-model executors — <code>--backend cuda</code> (direct CUDA, no ggml), <code>--backend ggml_cuda</code> / <code>ggml_vulkan</code> (native ggml), and <code>--backend cpu</code> (100% pure C#, no native dependencies). All of them layer-split the weights across every visible GPU, so a model far bigger than one card still runs; <code>--tp N</code> (or <code>TS_DSV4_NGPU</code>) caps how many GPUs it uses.</p>
+  <pre data-lang="bash"><code># ~160 GB of weights for the Q8 tier — pick a smaller quant directory if that is too much
+hf download unsloth/DeepSeek-V4-Flash-0731-GGUF --include "UD-Q8_K_XL/*" --local-dir models
+hf download bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF DSpark-drafter-Q2K-Q8-0731.gguf --local-dir models
+
+# Plain decode — point --model at the FIRST shard
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    --backend ggml_cuda --input prompt.txt --max-tokens 200
+
+# DSpark block speculative decoding (~1.3-1.4x decode; needs greedy sampling)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    --backend ggml_cuda --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf \
+    --input prompt.txt --max-tokens 200 --temperature 0
+
+# Served over HTTP, 4 GPUs, with speculation on
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    --backend ggml_cuda --tp 4 --mtp-spec --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf</code></pre>
+  <p>DSpark drafts a whole <em>block</em> of tokens per step and the trunk verifies the block in one batched forward, so greedy output is unchanged. On the CLI it needs a pure-argmax sampler (any temperature, top-k/p, or penalty turns it off); on the server every verify row is drawn with the request's own sampler, so it composes with any sampling settings. See <a href="advanced.html#dspark">DSpark speculative decoding</a>.</p>
 
   <h3>Gemma 3 (text + image)</h3>
   <pre data-lang="bash"><code>hf download ggml-org/gemma-3-4b-it-GGUF gemma-3-4b-it-Q4_K_M.gguf --local-dir models
@@ -188,20 +214,23 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
   <p>Run it from the <a href="cli.html#imageedit">CLI</a> (<code>--image</code> + <code>--prompt</code>), the <a href="server.html#webui">Web UI</a> image-edit flow (with live denoising previews), or in-process from <a href="code-api.html#imageedit">C# via <code>QwenImageModel.EditImage()</code></a>. Full details are in the repository's <code>docs/models/qwenimage.md</code> card.</p>
 
   <h2 id="thinking">Thinking / reasoning mode</h2>
-  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
+  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
   <ul>
     <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags.</li>
     <li><strong>Gemma 4</strong> — <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> tags.</li>
     <li><strong>GPT OSS</strong> — Harmony format: <code>&lt;|channel|&gt;analysis</code> for thinking, <code>&lt;|channel|&gt;final</code> for the answer.</li>
+    <li><strong>DeepSeek V4</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags; the chat template closes the block immediately unless thinking is requested, so reasoning is opt-in.</li>
   </ul>
   <p>Enable it via <code>--think</code> (CLI), <code>"think": true</code> (Ollama API / Web UI), or the thinking toggle in the browser. Responses expose the reasoning separately — e.g. <code>message.thinking</code> in the Ollama chat response.</p>
 
   <h2 id="toolcalling">Tool calling / function calling</h2>
   <p>Models can invoke user-defined tools and participate in multi-turn tool-call conversations. Define tools as JSON and pass them via <code>--tools</code> (CLI) or the <code>tools</code> parameter (API). Each architecture uses its own wire format, but the output parser extracts calls into structured <code>tool_calls</code> regardless:</p>
   <ul>
-    <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Qwen 3 / Nemotron-H</strong> — <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Qwen 3.5 / 3.6</strong> — the same <code>&lt;tool_call&gt;</code> block with an XML body: <code>&lt;function=NAME&gt;&lt;parameter=key&gt;value&lt;/parameter&gt;&lt;/function&gt;</code> (the JSON form is still accepted).</li>
     <li><strong>Gemma 4</strong> — <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
     <li><strong>GPT OSS (Harmony)</strong> — tools declared as a TypeScript namespace; calls emitted on the commentary channel.</li>
+    <li><strong>DeepSeek V4</strong> — DSML markup: the system prompt teaches the syntax and carries one JSON schema per function, and the model answers with <code>&lt;｜DSML｜tool_calls&gt;&lt;｜DSML｜invoke name="NAME"&gt;&lt;｜DSML｜parameter name="key" string="true|false"&gt;value&lt;/｜DSML｜parameter&gt;…</code>.</li>
   </ul>
   <p>See <a href="http-api.html#tools">Tool calling over HTTP</a> for a complete request/response example and the continuation loop.</p>
 

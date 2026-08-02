@@ -4,9 +4,9 @@
 > Part of the [TensorSharp](README.md) documentation.
 
 
-- **Multi-architecture support** -- Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, and Qwen-Image-Edit (image editing)
+- **Multi-architecture support** -- DeepSeek V4 Flash, Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, and Qwen-Image-Edit (image editing)
 - **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni
-- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H)
+- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
 - **GPU-accelerated** -- GGML Metal on macOS, GGML CUDA on Windows/Linux with NVIDIA GPUs, GGML Vulkan on Windows/Linux with AMD/Intel/NVIDIA GPUs, a direct CUDA/cuBLAS backend with PTX kernels, and an MLX backend for Apple Silicon (mlx-c / Metal), all with CPU fallbacks for unsupported ops
@@ -36,11 +36,12 @@
 
 ## Thinking / Reasoning Mode
 
-Models that support thinking mode (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
+Models that support thinking mode (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
 
 - **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H:** uses `<think>...</think>` tags
 - **Gemma 4:** uses `<|channel>thought\n...<channel|>` tags
 - **GPT OSS:** uses Harmony format with `<|channel|>analysis` for thinking and `<|channel|>final` for the response
+- **DeepSeek V4:** uses `<think>...</think>` tags; the chat template closes the block for you unless `--think` is passed, so reasoning is opt-in
 
 Enable via `--think` (console), `"think": true` (Ollama API), or the thinking toggle in the web UI.
 

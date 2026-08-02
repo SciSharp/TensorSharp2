@@ -150,15 +150,22 @@ TensorSharp/
 │   ├── KvBlockHash.cs           # Content-addressed block hash for prefix-cache sharing
 │   └── Logging/                 # JSON-line file logger + per-turn telemetry
 ├── TensorSharp.Models/          # Model architectures and multimodal encoders/injectors
-│   ├── Models/<Family>/         # One folder per architecture (DiffusionGemma, Gemma3, Gemma4, GptOss, Mistral3, Nemotron, Qwen3, Qwen35, QwenImage)
+│   ├── Models/<Family>/         # One folder per architecture (DeepSeek4, DiffusionGemma, Gemma3, Gemma4, GptOss, Mistral3, Nemotron, Qwen3, Qwen35, QwenImage)
 │   │   ├── <Family>Model.cs                # Legacy per-sequence ModelBase implementation
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch — batched/paged path (Mistral3, Gemma4, GptOss, Qwen35, Nemotron, Qwen3)
+│   ├── Models/DeepSeek4/        # DeepSeek V4 Flash: whole-model executors instead of a per-op forward
+│   │   ├── DeepSeek4Model.cs               # GGUF metadata, tokenizer, chat template, executor selection
+│   │   ├── DeepSeek4CudaExecutor.cs        # Bridge to the direct-CUDA whole-model engine
+│   │   ├── DeepSeek4CpuExecutor*.cs        # 100% pure-C# whole-model executor (no native dependencies)
+│   │   ├── DeepSeek4Model.Dspark.cs        # DSpark block drafter (draft / confidence / Markov heads)
+│   │   └── DeepSeek4Model.PerSeqCache.cs   # Native per-sequence slots that make the model servable
 │   ├── Paged/                   # Tensor-side paged-attention helpers (TensorPagedAttention)
 │   ├── KvBlockTransfer.cs       # Helpers for extract/inject of KV blocks across sequences
 │   ├── MtpSpeculativeDecoder.cs # MTP/NextN draft-verify-rollback driver shared by Qwen 3.6 and Gemma 4
 │   └── ModelMultimodalInjector.cs # Vision / audio / video embedding injection
 ├── TensorSharp.Backends.GGML/   # GGML backend bindings (Metal/CUDA/Vulkan/CPU via native library)
 ├── TensorSharp.Backends.Cuda/   # Direct CUDA backend using CUDA Driver API, cuBLAS, and PTX kernels
+│   └── Dsv4/                    # DeepSeek V4 direct-CUDA whole-model engine (ggml-independent): streaming GGUF→VRAM loader, per-device weight arenas, layer split, DSpark drafter
 ├── TensorSharp.Backends.MLX/    # Apple Silicon MLX backend (mlx-c / Metal). Native bridge is built via `build-native-macos.sh`.
 ├── TensorSharp.GGML.Native/     # Native C++ bridge to ggml (builds libGgmlOps, split into focused source files)
 │   ├── ggml_ops_core.cpp                  # Element-wise, reductions, basic shape ops
@@ -171,6 +178,11 @@ TensorSharp/
 │   ├── ggml_ops_transformer_prefill.cpp   # Fused layer prefill (Gemma 4, GPT-OSS, Qwen 3.5)
 │   ├── ggml_ops_qwen35_decode.cpp         # Qwen 3.5/3.6 fused decode (layer, whole-model, batched)
 │   ├── ggml_ops_qwen35_verify.cpp         # Qwen 3.5/3.6 fused multi-token verify
+│   ├── ggml_ops_qwen35_gdn_tp.cpp         # Qwen 3.5/3.6 per-rank packed GatedDeltaNet kernel (tensor parallel)
+│   ├── ggml_ops_qwen35_recurrent_prefill.cpp # Qwen 3.5/3.6 recurrent-layer prefill
+│   ├── ggml_ops_gptoss_decode.cpp         # GPT OSS whole-model decode graph (one dispatch per token, shared KV window)
+│   ├── ggml_ops_deepseek4.cpp             # DeepSeek V4 native whole-model executor (layer split, compressed KV caches, graph cache)
+│   ├── ggml_ops_dsv4_fused.cu / _cpu.cpp  # DeepSeek V4 fused custom ops on ggml-cuda's stream (and their CPU counterparts)
 │   ├── ggml_ops_gemma4_decode.cpp         # Gemma 4 dense whole-model decode (CUDA-graph persisted)
 │   ├── ggml_ops_gemma4_batched.cpp        # Gemma 4 dense + MoE token-batched decode
 │   ├── ggml_ops_gemma4_verify.cpp         # Gemma 4 dense verify + MTP draft step
@@ -179,6 +191,8 @@ TensorSharp/
 │   ├── ggml_ops_gated_delta_net.cpp       # Qwen 3.5/3.6 GatedDeltaNet kernels (per-seq + batched)
 │   ├── ggml_ops_mamba2.cpp                # Nemotron Mamba2 kernels (per-seq + batched SIMD)
 │   ├── ggml_ops_paged_attention.cpp       # Paged-attention native kernel (drives ggml_flash_attn_ext + sinks variant)
+│   ├── ggml_ops_tensor_parallel.cpp       # Multi-rank TP group, segmented fused graph execution, collectives
+│   ├── ggml_ops_tp_probe.cu               # Pre-flight peer-copy / NCCL AllReduce probe that picks the TP transport
 │   ├── ggml_ops_diffusion.cpp             # DiffusionGemma fused decode-layer / whole-model / lm-head kernels
 │   ├── ggml_ops_qwen_image.cpp            # Qwen-Image-Edit MMDiT whole-model forward (CUDA-graph-captured) + CFG-batched kernels
 │   ├── ggml_ops_training.cpp              # Training-only kernels (unused at runtime)
@@ -324,6 +338,9 @@ the fused path engages.
 - **Native quantized compute**: quantized weights (Q4_K_M, Q6_K, Q8_0, IQ2_XXS, MXFP4, etc.) are used directly in matmul without expanding to FP32, saving memory and bandwidth. A batched `AddmmQuantBatch` kernel handles multiple sub-weight matmuls against a single quantized blob in one dispatch.
 - **Direct CUDA kernels**: the `cuda` backend accelerates fill/copy, unary ops, activation fusions, RMSNorm, softmax, index select, causal masking, RoPE/RoPEEx, cuBLAS GEMM, and supported quantized matmul/get-rows while safely falling back for incomplete op coverage.
 - **Batched GPU MoE**: `MoEExpertsSwiGLUResidual` (Qwen 3.5/3.6-family) and `MoEExpertsForward` (Nemotron-H) collapse all selected experts -- and, for Qwen 3.5/3.6-family, the optional shared expert and the residual add -- into a single GGML graph dispatch per MoE layer.
+- **Whole-model fused decode graph** (Gemma 4 dense + MoE, Qwen 3.5/3.6, GPT OSS): an entire decode token — every layer, the MoE router and experts, the final norm, and the LM head — is submitted as ONE GGML graph rather than one dispatch per layer. On CUDA/Vulkan the graph is built once with stable tensor addresses and replayed (`ggml_set_rows` KV write with the row as an I64 input; a stride-padded attention window with an F16 mask input), which is what lets ggml-cuda capture it as a CUDA graph. GPT OSS decode goes from 24 → 154 tok/s on an A40 and stays flat in context length (133 tok/s at 16K) where the per-layer path collapsed to 2.3. Padded attention windows must be zeroed, not left uninitialized — stale VRAM read as F16 produces NaNs that survive a `-inf` mask. Per-model opt-outs: `TS_GPTOSS_MODEL_DECODE=0`, `TS_GEMMA4_FD_PERSIST=0`, `TS_QWEN35_FD_PERSIST=0`.
+- **DeepSeek V4 whole-model executors**: `deepseek4` bypasses the generic per-op forward entirely. The native ggml executor (`ggml_ops_deepseek4.cpp`) loads the split GGUF itself, layer-splits the weights across every visible GPU, owns all DSV4 KV state on-device (raw SWA ring, CSA/HCA compressed-K caches, lightning-indexer cache, compressor state rings), and runs each prefill/decode ubatch as a single `ggml_backend_sched` graph with a shape-signature graph cache, so steady-state decode replays a captured CUDA graph. Decode attention gathers a compact `[ring | top-512]` K through a fused index-gather op instead of scanning the full context. The direct-CUDA engine (`TensorSharp.Backends.Cuda/Dsv4/`) implements the same model without ggml, streaming quantized weights from the shards straight into per-device arenas. Both are built on the shared `Tensor` / `IAllocator` / `Ops` stack; only genuinely DSV4-specific compute lives in the DeepSeek V4 files.
+- **DSpark block speculative decoding** (DeepSeek V4): a separate drafter GGUF (`--draft-model`) proposes a whole block of tokens per step and the trunk verifies the block in one batched forward. On ggml the drafter is three extra graph layers whose key ring the trunk graph commits itself, so speculation costs no host round-trips. Measured 1.3–1.4× decode on 4×A40 (up to 2.0× on multi-turn chat), greedy output byte-identical to the non-speculative baseline.
 - **GEMM-based vision patch embedding** (Qwen 3.5/3.6-family): the patch embedding step is reformulated as parallel im2col + matrix multiplication, replacing a single-threaded scalar quintuple-nested loop with a GPU-accelerated matmul.
 - **Parallelized Q/gate deinterleave** (Qwen 3.5/3.6-family): the Q + sigmoid-gate deinterleave in FullAttention prefill is parallelized across tokens, scaling linearly with CPU core count for long prompts.
 - **Optimized pure C# CPU path**: managed GEMM fast paths and contiguous float32 kernels accelerate decode, softmax, RMSNorm, RoPE, fused activations, and other hot paths while keeping quantized GGUF weights compressed during CPU loading.

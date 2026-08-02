@@ -64,7 +64,13 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;model.gguf&gt; --backend ggml_metal --interactive
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;model.gguf&gt; --backend ggml_metal -i \
-    --system "You are a terse assistant." --temperature 0.7 --top-p 0.9 --think</code></pre>
+    --system "You are a terse assistant." --temperature 0.7 --top-p 0.9 --think
+
+# DSpark block speculative decoding (DeepSeek V4): --model is the FIRST shard of
+# the split GGUF, --draft-model the separate DSpark drafter. Needs greedy sampling.
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;DeepSeek-V4-Flash-...-00001-of-00005.gguf&gt; --backend ggml_cuda \
+    --draft-model &lt;DSpark-drafter.gguf&gt; --input prompt.txt --max-tokens 200 --temperature 0</code></pre>
 
   <h3>Multimodal</h3>
   <pre data-lang="bash"><code># Image inference (Gemma 3/4, Qwen 3.5-family)
@@ -191,6 +197,9 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>Seed the session's system prompt from text or a file. Only the interactive REPL and DiffusionGemma diffusion mode use it — plain one-shot text mode ignores the system prompt.</td></tr>
       <tr><td><code>--think</code></td><td>Enable thinking / reasoning mode (chain-of-thought).</td></tr>
       <tr><td><code>--tools &lt;path&gt;</code></td><td>JSON file with tool / function definitions.</td></tr>
+      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>Speculative-decoding drafter GGUF for architectures whose drafter ships as its own file — today DeepSeek V4's DSpark support module. It drafts a whole block per step and the trunk verifies it in one batched forward, so greedy output is unchanged. Needs <code>--backend cuda</code> or <code>ggml_cuda</code> and a pure-argmax sampler (any temperature, top-k/p, or penalty turns it off). Env: <code>TS_DSV4_DSPARK</code>. → <a href="advanced.html#dspark">DSpark</a></td></tr>
+      <tr><td><code>--spec-draft-n-max &lt;N&gt;</code></td><td>Cap on tokens drafted per speculative block (default: the drafter's trained block size, 5 for DSpark).</td></tr>
+      <tr><td><code>--spec-draft-conf-min &lt;p&gt;</code></td><td>Minimum <em>cumulative</em> acceptance probability for a drafted position to be kept (default <code>0.35</code>). Lower drafts further and rolls back more; higher falls back to plain decode sooner.</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>Render the prompt + tokenization and exit (no generation).</td></tr>
       <tr><td><code>--tp &lt;N&gt;</code></td><td>Tensor parallelism degree — split the model across N GPUs in one process (default: 1). Requires <code>--backend cuda</code>, <code>ggml_cuda</code>, or <code>ggml_vulkan</code>; <code>TENSORSHARP_TP_DEVICES</code> picks which GPUs. → <a href="distributed.html">Multi-GPU &amp; Multi-Node</a></td></tr>
       <tr><td><code>--tp-node-id &lt;N&gt;</code></td><td>This node's 0-based ID for multi-node distributed tensor parallelism. Use together with <code>--tp-peers</code>.</td></tr>

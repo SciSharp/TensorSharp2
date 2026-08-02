@@ -15,6 +15,8 @@
 | GGML CPU | `--backend ggml_cpu` | 原生 CPU 内核 | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
 | 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 无原生依赖的可移植 CPU 推理。 |
 
+**DeepSeek V4 Flash 是上表的例外。** 它那套 284B 的压缩稀疏注意力 MoE 结构不走通用的逐算子路径，而是使用三套专属的整模型执行器之一：Direct CUDA 引擎（`--backend cuda`）、原生 ggml 执行器（`--backend ggml_cuda` / `ggml_vulkan`），以及 100% 纯 C# 的 CPU 执行器（`--backend cpu`，直接从内存映射的 GGUF 分片提供量化权重）。三者都会把权重按层切分到所有可见 GPU（CPU 路径则从映射分片流式读取），因此远大于单卡显存的模型依然跑得起来。详见 [DeepSeek V4 卡片](docs/models/deepseek4_zh-cn.md)。
+
 
 
 ## 配置文件（CLI + Server）
@@ -178,6 +180,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
 | `--think` | 启用思维链/推理模式 |
 | `--tools <path>` | 包含工具/函数定义的 JSON 文件 |
+| `--draft-model <path>` | 投机解码草稿 GGUF，适用于草稿器以独立文件发布的架构——目前是 DeepSeek V4 的 DSpark 支持模块（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）。它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。在所有单序列路径（`--input`、`--input-jsonl`、`--multi-turn-jsonl`、`--interactive`）上生效，需要 `--backend cuda` 或 `--backend ggml_cuda`，并且必须是纯 argmax 采样：任何 temperature、top-k/p 或重复/存在/频率惩罚都会将其关闭。环境变量：`TS_DSV4_DSPARK`。 |
+| `--spec-draft-n-max <N>` | 每个投机块最多起草的 token 数（默认：草稿器训练时的块大小，DSpark 为 5） |
+| `--spec-draft-conf-min <p>` | 保留某个起草位置所需的最小**累积**接受概率（置信度头各位置估计值的乘积，默认 `0.35`）。调低会起草更远、回滚更多；调高则更早退回普通 decode。 |
 | `--temperature <f>` | 采样温度（0 = 贪心） |
 | `--top-k <N>` | Top-K 过滤（0 = 关闭） |
 | `--top-p <f>` | Nucleus 采样阈值（1.0 = 关闭） |
@@ -359,7 +364,10 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `--prefill-chunk-size <N>` | 存在竞争时的分块 prefill 粒度 —— 有其他请求同时运行时，每个调度步最多处理的 prefill token 数；块越小，并行 decode 请求越容易频繁轮到 GPU（默认：`1024`）。环境变量：`TS_SCHED_PREFILL_CHUNK`。 |
 | `--mtp-spec` / `--no-mtp-spec` | 在带有多 token 预测草稿头的模型上启用 NextN/MTP 投机解码（默认关闭）。草稿头可以是 Qwen 3.6 内嵌的 NextN 块，或通过 `--mtp-draft-model` 加载的 Gemma 4 `gemma4-assistant` 草稿。仅对单序列（无并发）请求生效：草稿头每步最多提议 `--mtp-draft` 个 token，主干网络用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，输出与标准 decode 一致。仅在有收益处自动启用（ggml 后端与纯 C# `cuda` 后端）；CPU / MLX 走标准 decode。环境变量：`TS_MTP_SPEC`。 |
 | `--mtp-draft <N>` | 每个投机步最多起草的 token 数（默认 `8`）。环境变量：`TS_MTP_DRAFT`。 |
-| `--mtp-pmin <f>` | 草稿 token 被保留所需的最低置信度，取值 `(0, 1]`；遇到第一个低置信 token 即停止起草（默认 `0.75`）。环境变量：`TS_MTP_PMIN`。 |
+| `--mtp-pmin <f>` | 草稿 token 被保留所需的最低置信度，取值 `(0, 1]`；遇到第一个低置信 token 即停止起草。默认值按草稿器类型选择：逐 token 草稿头为 `0.75`（其 top-10 logits 上的 top-1 概率），块级草稿器为 `0.35`——后者的门限是**累积**前缀概率，因此同一个数字要严格得多。环境变量：`TS_MTP_PMIN`。 |
+| `--draft-model <path>` | 草稿器以独立文件发布的架构所用的投机解码草稿模型，即 DeepSeek V4 的 DSpark 支持 GGUF（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）：它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。需要与 `--mtp-spec` 一起使用，在 `cuda` 与 `ggml_cuda` 后端上对单序列请求生效。与 CLI 不同，服务端的每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。环境变量：`TS_DSV4_DSPARK`。 |
+| `--spec-draft-n-max <N>` | 每个投机块最多起草的 token 数（默认：草稿器训练时的块大小）。 |
+| `--spec-draft-conf-min <p>` | 保留某个起草位置所需的最小累积接受概率（置信度头各位置估计值的乘积，默认 `0.35`）。 |
 | `--mtp-draft-model <path>` | 对于草稿头作为独立文件发布的架构（Gemma 4 的 `gemma4-assistant`），指定其草稿 GGUF 路径。草稿的隐藏维度必须与目标一致（例如 12B 目标配 12B 草稿，而非 26B-A4B 草稿）；草稿不匹配或不完整会在启动时立即失败并给出修复提示。Qwen 3.6 将 NextN 块内嵌在主干 GGUF 中，此参数对其无效。环境变量：`TS_MTP_DRAFT_MODEL`。 |
 | `--paged-kv` / `--no-paged-kv` | 已移除的按会话分页 KV 管理器的兼容参数。当前服务端 KV 状态由引擎持有；请使用连续批处理 / `TS_SCHED_*` 开关调节引擎。别名：`--paged-kv-cache` / `--no-paged-kv-cache`。 |
 | `--paged-kv-block-size <N>` | 旧的独立分页 KV 块大小。当前引擎使用 `TS_SCHED_BLOCK_SIZE`。 |
@@ -454,7 +462,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 |---|---|
 | `TS_MTP_SPEC` | `1` 为单序列启用 MTP/NextN 投机解码（默认 `0`）。CLI：`--mtp-spec` / `--no-mtp-spec`。 |
 | `TS_MTP_DRAFT` | 每个投机步最多起草的 token 数（默认 `8`）。CLI：`--mtp-draft`。 |
-| `TS_MTP_PMIN` | 草稿 token 被保留所需的最低置信度，取值 `(0, 1]`（默认 `0.75`）。CLI：`--mtp-pmin`。 |
+| `TS_MTP_PMIN` | 草稿 token 被保留所需的最低置信度，取值 `(0, 1]`（默认按草稿器类型：逐 token 为 `0.75`，块级为 `0.35`）。CLI：`--mtp-pmin`。 |
 | `TS_MTP_DRAFT_MODEL` | Gemma 4 独立 `gemma4-assistant` 草稿 GGUF 路径。CLI：`--mtp-draft-model`。Qwen 3.6（内嵌 NextN）忽略此项。 |
 | `TS_GMTP_NO_FUSED` | `1` 关闭 Gemma 4 融合多 token 验证 / 草稿步 GGML 内核，回退到逐算子路径（ggml 后端上的 A/B 测试）。 |
 | `TS_GMTP_NO_FAST_ROLLBACK` | `1` 恢复保留前缀的回滚路径，而非部分接受时使用的稠密精确匹配快速回滚。 |
@@ -682,7 +690,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 |---|---|---|---|
 | 投机解码引擎（单序列） | 关闭 | **`TS_MTP_SPEC=1`** | `--mtp-spec` / `--no-mtp-spec` |
 | 每步最多起草 token 数 | `8` | `TS_MTP_DRAFT` | `--mtp-draft N` |
-| 草稿 token 被保留所需最低置信度 | `0.75` | `TS_MTP_PMIN` | `--mtp-pmin X` |
+| 草稿 token 被保留所需最低置信度 | 按草稿器类型（`0.75` / `0.35`） | `TS_MTP_PMIN` | `--mtp-pmin X` |
 | Gemma 4 独立草稿 GGUF（`gemma4-assistant`） | 无 | `TS_MTP_DRAFT_MODEL` | `--mtp-draft-model <path>` |
 | Gemma 4 融合验证 / 草稿内核（ggml） | 开启 | `TS_GMTP_NO_FUSED=1` 回退到逐算子 | — |
 | Gemma 4 部分接受时的稠密快速回滚 | 开启 | `TS_GMTP_NO_FAST_ROLLBACK=1` 恢复保留前缀回滚 | — |

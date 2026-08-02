@@ -39,6 +39,7 @@
       <tr><td><strong>工具 / 函数调用</strong></td><td>模型可请求你的应用运行一个函数（如 “get_weather”）并使用结果。→ <a href="models_zh-cn.html#toolcalling">工具调用</a></td></tr>
       <tr><td><strong>连续批处理</strong></td><td>在单个托管模型上交错运行多个用户的请求，从而同时服务多人，而非一次一个。→ <a href="advanced_zh-cn.html#continuous-batching">深入了解</a></td></tr>
       <tr><td><strong>推测解码</strong></td><td>一个小“草稿”头猜测若干 token；主模型一次性验证它们 —— 输出更快、结果一致。→ <a href="advanced_zh-cn.html#mtp">MTP</a></td></tr>
+      <tr><td><strong>块级草稿器 / DSpark</strong></td><td>一次提议一整<em>块</em> token 而非逐个的投机草稿器，由置信度头决定起草多远。DeepSeek V4 以独立 GGUF 的形式提供了一个。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
       <tr><td><strong>张量并行（TP）</strong></td><td>把<em>一个</em>模型切分到多张 GPU 上，每张卡持有每层权重的一部分 —— 用于单卡装不下的模型。这与运行模型的多个副本不同。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
       <tr><td><strong>AllReduce</strong></td><td>并行组中每张 GPU 把自己的部分结果与其他 GPU 相加的集合通信步骤，结束后所有 GPU 持有相同的值。TensorSharp 在每次行并行投影之后执行它。</td></tr>
       <tr><td><strong>节点 / rank</strong></td><td>在分布式运行中，<em>节点</em>指一台机器，<em>rank</em> 指某张 GPU 在并行组中的位置。全局并行度 = 本机 GPU 数 × 节点数。</td></tr>
@@ -69,7 +70,7 @@
   <ul>
     <li>使用 GPU 后端（<code>ggml_cuda</code>、<code>ggml_vulkan</code> 或 <code>ggml_metal</code>）。</li>
     <li>选更小或量化更激进的模型。</li>
-    <li>在受支持的模型上，用 <code>--mtp-spec</code> 启用<a href="advanced_zh-cn.html#mtp">推测解码</a>。</li>
+    <li>在受支持的模型上，用 <code>--mtp-spec</code> 启用<a href="advanced_zh-cn.html#mtp">推测解码</a>；在 DeepSeek V4 上则用 <code>--draft-model</code> 加载 <a href="advanced_zh-cn.html#dspark">DSpark 块级草稿器</a>。</li>
     <li>复用会话，让 <a href="advanced_zh-cn.html#continuous-batching">KV 缓存前缀</a>在轮次间延续。</li>
   </ul>
 

@@ -61,7 +61,33 @@ dotnet run --project TensorSharp.Server -c Release --no-build -- --model gemma-4
     </tbody>
   </table>
   </div>
-  <p>Tuning: <code>--mtp-draft</code> (default 8) bounds tokens drafted per step; <code>--mtp-pmin</code> (default 0.75) is the minimum draft-head confidence to keep a token. Gemma 4 A/B switches are the <code>TS_GMTP_*</code> env vars.</p>
+  <p>Tuning: <code>--mtp-draft</code> (default 8) bounds tokens drafted per step; <code>--mtp-pmin</code> is the minimum draft confidence to keep a token — its default depends on the drafter kind (<code>0.75</code> for a per-token draft head, <code>0.35</code> for a block drafter, where the gate is the <em>cumulative</em> prefix probability and so the same number is far stricter). Gemma 4 A/B switches are the <code>TS_GMTP_*</code> env vars.</p>
+
+  <h2 id="dspark">DSpark block speculative decoding (DeepSeek V4)</h2>
+  <p>DeepSeek V4 ships <strong>DSpark</strong> ("Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation") as a support module in the checkpoint: three DSV4 blocks that read the trunk's hidden states and propose a whole <strong>block</strong> of tokens per step instead of one, a Markov head that conditions each block position on the token before it, and a confidence head that predicts each position's acceptance probability. The trunk then verifies the block in one batched forward and keeps only the prefix its own sampler would have produced.</p>
+  <p>The drafter is a <strong>separate GGUF</strong> loaded with <code>--draft-model</code> — every GGUF conversion of the trunk drops the <code>mtp.*</code> tensors. Pre-built drafters are listed in the repository's <code>MODEL_DOWNLOADS.md</code>, or you can convert one from the upstream safetensors checkpoint with <code>eng/dsv4-dspark-to-gguf.py</code> (only the three shards holding <code>mtp.*</code> are downloaded).</p>
+  <pre data-lang="bash"><code># CLI — every single-sequence path (--input, --multi-turn-jsonl, --interactive) uses it
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
+    --backend ggml_cuda --draft-model DSpark-drafter-Q2K-Q8-0731.gguf \
+    --input prompt.txt --max-tokens 200 --temperature 0
+
+# Server — same drafter, plus --mtp-spec
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
+    --backend ggml_cuda --tp 4 --mtp-spec --draft-model DSpark-drafter-Q2K-Q8-0731.gguf</code></pre>
+  <p>It runs on <strong>both GPU engines</strong> — <code>--backend cuda</code> (direct CUDA) and <code>--backend ggml_cuda</code> (native ggml); <code>ggml_vulkan</code> and <code>cpu</code> have no speculative path for this architecture and log a warning if a drafter is configured. On ggml the drafter is three extra graph layers whose key ring the trunk graph commits itself, so speculation costs no host round-trips. On the CLI it needs a pure-argmax sampler (any temperature, top-k/p, or repetition penalty turns it off); on the server every verify row is drawn with the request's own sampler, so it composes with any sampling settings. Speculation serves <strong>solo sequences only</strong> — as soon as a second request is in flight, DSV4's per-sequence slots serve the batch at normal decode speed.</p>
+  <h4>Measured (4×A40, DeepSeek-V4-Flash-0731 UD-Q8_K_XL, greedy)</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Metric</th><th><code>cuda</code> baseline</th><th><code>cuda</code> + DSpark</th><th><code>ggml_cuda</code> baseline</th><th><code>ggml_cuda</code> + DSpark</th></tr></thead>
+    <tbody>
+      <tr><td>Decode (200-token generation)</td><td>26.0 tok/s</td><td><strong>34.0 tok/s (1.31×)</strong></td><td>26.4 tok/s</td><td><strong>37.1 tok/s (1.41×)</strong></td></tr>
+      <tr><td>Prefill (15K prompt)</td><td>962 tok/s</td><td>955 tok/s</td><td>952 tok/s</td><td>954 tok/s</td></tr>
+      <tr><td>Acceptance</td><td>—</td><td>69%</td><td>—</td><td>69%</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Multi-turn chat benefits most — a turn that continues an established context is exactly where the drafter is confident. On a 5-turn interactive session the same box measured 1.50× to <strong>2.02×</strong> per turn (66–87% acceptance), with prefill at parity. Greedy output was byte-identical to the non-speculative baseline on both the 200-token and the 15K-context runs.</p>
+  <p>Why 1.3× and not more: the trunk is 6-of-256 sparse, so each extra token in the verify batch pulls its own set of routed experts through VRAM — a verify row costs roughly a quarter of a full decode step no matter how cheap the draft was. <code>--spec-draft-conf-min</code> (default <code>0.35</code>, the minimum <em>cumulative</em> acceptance probability for a drafted position) is the knob that keeps that trade positive; <code>--spec-draft-n-max</code> caps tokens per block.</p>
 
   <h2 id="diffusion">DiffusionGemma text diffusion</h2>
   <p>DiffusionGemma is fundamentally different from autoregressive models: it does not call <code>Forward()</code> one token at a time. Instead it uses block-wise <strong>EntropyBound denoising</strong> over fixed-length canvases on a Gemma-4-derived MoE backbone — the whole answer is refined iteratively rather than written left to right.</p>
@@ -76,6 +102,9 @@ dotnet run --project TensorSharp.Server -c Release --no-build -- --model gemma-4
   <div class="callout tip"><div class="ic">⚡</div><p><strong>Verified Gemma 4 E4B Q8_0 fast path:</strong> repository benchmarks verify the native-GGML E4B Q8_0 family and execution path on GPU backends. Use <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>ggml-org/gemma-4-E4B-it-GGUF</code></a> as the recommended public artifact.</p></div>
   <ul>
     <li><strong>Single-graph GPU decode</strong> (Gemma 4 dense, including E4B) — all transformer layers run in one GGML graph dispatch, cutting CPU↔GPU round-trips from hundreds per token to one (~2.6× over per-op dispatch).</li>
+    <li><strong>Whole-model fused decode graphs</strong> (Gemma 4 dense + MoE, Qwen 3.5/3.6, GPT OSS) — an entire decode token, including the MoE router and experts, the final norm, and the LM head, is submitted as <em>one</em> GGML graph. On CUDA/Vulkan the graph is built once with stable tensor addresses and replayed, which is what lets ggml-cuda capture it as a CUDA graph. GPT OSS decode goes from 24 → 154 tok/s on an A40 and stays flat in context length (133 tok/s at 16K) where the per-layer path collapsed to 2.3. Per-model opt-outs: <code>TS_GPTOSS_MODEL_DECODE=0</code>, <code>TS_GEMMA4_FD_PERSIST=0</code>, <code>TS_QWEN35_FD_PERSIST=0</code>.</li>
+    <li><strong>DeepSeek V4 whole-model executors</strong> — <code>deepseek4</code> bypasses the generic per-op forward entirely. Each executor loads the split GGUF itself, layer-splits the weights across every visible GPU, keeps all DSV4 KV state on-device (raw SWA ring, CSA/HCA compressed-K caches, lightning-indexer cache), and runs each prefill/decode micro-batch as a single graph with a shape-signature cache, so steady-state decode replays a captured CUDA graph. Decode attention gathers a compact <code>[ring | top-512]</code> K through a fused index-gather instead of scanning the whole context.</li>
+    <li><strong>Device-side Nemotron-H decode attention</strong> — on GGML backends the attention layers decode through the flash-attention kernel against the resident KV cache (<code>TS_NEMOTRON_FLASH_DECODE=0</code> restores the host path), so decode no longer degrades with context length.</li>
     <li><strong>Fused prefill / verify with E4B semantics</strong> — the native whole-model path carries per-layer embeddings (PLE) and shared-KV donor mapping through E4B prefill/verify instead of falling back to hundreds of per-op submissions.</li>
     <li><strong>Automatic scheduler N=1 fast path</strong> — when only one sequence is scheduled, the server automatically uses Gemma 4's fused per-sequence forward rather than paying the fully batched path's fixed overhead.</li>
     <li><strong>Chunked prefill</strong> (Gemma 4) — long prompts are split into bounded chunks to avoid O(n²) attention score tensors for sliding-window layers. A solo (uncontended) request runs through the fused whole-graph path with one larger cap, <code>TS_SCHED_SOLO_PREFILL_CHUNK</code> (default 8192); under contention the chunk size drops to <code>TS_SCHED_PREFILL_CHUNK</code> (default 1024).</li>

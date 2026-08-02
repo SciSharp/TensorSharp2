@@ -363,8 +363,11 @@ synchronize every rank; download the result
 Activations never leave VRAM, the collective reduces device buffers in place,
 and the host issues `2·L` graph launches per token instead of ~2000 op round
 trips. Because every rank is submitted from one thread, ggml-cuda's graph
-capture also stays valid (opt in with `TS_GGML_TP_CUDA_GRAPHS=1`; measured
-within noise here, so it is off by default).
+capture also stays valid. Capture is **on by default** under TP: it measured
+within noise on the 2-GPU box this section was written against, but on wider
+groups it is worth ~45% of decode throughput (4×A40: Qwen 3.5-9B `--tp 4`
+88 → 128.5 tok/s, Qwen 3.5-35B-A3B `--tp 2` 71.3 → 104.1). Opt out with
+`TS_GGML_TP_CUDA_GRAPHS=0`.
 
 Everything outside the row-parallel projections is replicated work — each rank
 runs the norms, RoPE, PLE injection and layer scalars on identical values and

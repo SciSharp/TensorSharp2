@@ -71,6 +71,15 @@
     <li><strong>GGML CPU</strong> (<code>ggml_cpu</code>) — native GGML CPU kernels with quantized weights mapped zero-copy from the GGUF file. Faster than pure C# on most CPUs.</li>
   </ul>
 
+  <h3 id="deepseek4">DeepSeek V4: dedicated whole-model executors</h3>
+  <p><code>deepseek4</code> is the one architecture that does not use the generic per-op forward on any backend. Its 284B compressed-sparse-attention MoE stack runs through one of three dedicated whole-model executors instead:</p>
+  <ul>
+    <li><strong><code>--backend cuda</code></strong> — a direct-CUDA engine independent of ggml. Quantized weights stream from the GGUF shards straight into per-device arenas.</li>
+    <li><strong><code>--backend ggml_cuda</code> / <code>ggml_vulkan</code></strong> — the native ggml executor: it loads the split GGUF itself, keeps all DSV4 KV state on-device, and runs each prefill/decode micro-batch as a single graph with a shape-signature cache so steady-state decode replays a captured CUDA graph.</li>
+    <li><strong><code>--backend cpu</code></strong> — a 100% pure-C# executor with no native dependencies, serving quantized weights straight from the memory-mapped GGUF shards.</li>
+  </ul>
+  <p>All three <strong>layer-split the weights across every visible GPU</strong> (the CPU one streams them from the mapped shards), so a model far larger than one card still runs; <code>--tp N</code> or <code>TS_DSV4_NGPU</code> caps how many GPUs are used. Speculative decoding (<a href="advanced.html#dspark">DSpark</a>) is available on the two GPU engines. → <a href="models.html#deepseek4">DeepSeek V4 downloads and commands</a></p>
+
   <div class="callout note"><div class="ic">🔎</div><p>The server reports which backends are actually available on the host in <code>GET /api/models</code> (<code>supportedBackends</code>). If a CUDA or MLX backend is missing, the host did not detect a usable driver/runtime at startup. If <code>ggml_vulkan</code> is missing, the native bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found.</p></div>
 
   <h2 id="native-build">Building the native libraries</h2>

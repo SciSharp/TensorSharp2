@@ -4,9 +4,9 @@
 > [TensorSharp](README_zh-cn.md) 文档的一部分。
 
 
-- **多架构支持** —— Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3，以及 Qwen-Image-Edit（图像编辑）
+- **多架构支持** —— DeepSeek V4 Flash、Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3，以及 Qwen-Image-Edit（图像编辑）
 - **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni）
-- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H）
+- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
 - **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
 - **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）、GGML CUDA（Windows/Linux + NVIDIA）和 GGML Vulkan（Windows/Linux + AMD/Intel/NVIDIA），并提供 Direct CUDA/cuBLAS 后端（含 PTX 内核与未覆盖算子的 CPU 回退），以及面向 Apple Silicon 的 MLX 后端（mlx-c / Metal）
@@ -23,10 +23,11 @@
 - **流式输出** —— 按 token 输出（Web 通过 SSE，控制台通过 stdout），并支持中断/停止正在生成的请求
 - **文本扩散生成** —— DiffusionGemma 使用 EntropyBound 迭代去噪采样器，而不是自回归 `Forward()`。CLI 提供 `--diffusion-steps`、`--diffusion-seed` 与 `--diffusion-blocks`；Web UI 使用整条消息 `replace` 事件展示实时去噪预览，并通过 `DiffusionBatchScheduler` 批处理并发扩散请求。
 - **图像编辑（Qwen-Image-Edit）** —— 提示词加输入图像生成编辑后的图像。所加载的 `qwen_image` GGUF 是 MMDiT 扩散 Transformer；TensorSharp 在其旁解析两个伴随 GGUF——Qwen-Image VAE（图像 ↔ 16 通道潜变量）与 Qwen2.5-VL-7B 文本编码器（提示词 → 3584 维条件，可选通过 `mmproj` 做视觉接地）。流水线对参考图做 VAE 编码、构建文本（及可选图像）条件、运行带参考潜变量拼接的 FlowMatch-Euler true-CFG 去噪循环，再 VAE 解码回像素。整个 60 块 DiT 前向被 CUDA 图捕获（`TSGgml_QwenImageForward`），flash 注意力默认开启，目标面积按设备 VRAM 预算自动钳制。可选的 Lightning 蒸馏 LoRA（`--qwen-image-lora` / `TS_QWEN_IMAGE_LORA`，`.safetensors`）会在加载时合并进 DiT 权重，将去噪步数缩减为该 LoRA 的步数（例如 4 或 8），并把 CFG 切换为 1.0（无负向分支）。可从 C# 通过 `QwenImageModel.EditImage(prompt, RgbImage, QwenImageParams)` 驱动，从 CLI 图像编辑模式（`--image`、`--prompt`、`--cfg`、`--diffusion-steps`、`--diffusion-seed`）驱动，以及从带实时去噪预览的 Web UI 驱动。→ [Qwen-Image-Edit 卡片](docs/models/qwenimage_zh-cn.md)
-- **混合 SSM-Transformer** —— Nemotron-H 在单个模型中混合 Mamba2 SSM 层、纯注意力层和 MoE FFN 层；Mamba2 步现在同时提供单序列原生内核与批处理原生内核（`TSGgml_NemotronMamba2BatchedStepF32`，NEON SIMD + GCD 并行）。
+- **混合 SSM-Transformer** —— Nemotron-H 在单个模型中混合 Mamba2 SSM 层、纯注意力层和 MoE FFN 层；Mamba2 步现在同时提供单序列原生内核与批处理原生内核（`TSGgml_NemotronMamba2BatchedStepF32`，NEON SIMD + GCD 并行）。在 GGML 后端上，注意力层直接用设备侧 flash-attention 内核对常驻 KV 缓存做 decode（`TS_NEMOTRON_FLASH_DECODE=0` 恢复主机路径），decode 速度不再随上下文长度衰减。
 - **混合注意力-递归网络** —— Qwen 3.5/3.6-family 在同一模型中混合全注意力层与 GatedDeltaNet 递归层；批处理路径下递归运行状态保存在每槽位的递归状态池中
 - **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Qwen 3.5/3.6-family MoE（`qwen35moe` / `qwen3next` 变体，例如 Qwen3.5-35B-A3B）以及 Nemotron-H MoE FFN 层
 - **批量 GPU MoE** —— Qwen 3.5/3.6-family 与 Nemotron-H 在 decode 时通过单次融合的 GGML 计算图调度处理所有被选中的专家（Qwen 3.5-family 还包括可选的 shared expert 与残差加法），消除每个专家的 CPU-GPU 往返
+- **整模型融合 decode 计算图** —— Gemma 4（dense 与 MoE）、Qwen 3.5/3.6 与 GPT OSS 把一个 decode token 的全部计算——每一层、MoE 路由与专家、最终 norm 与 LM head——作为**一次** GGML 计算图调度提交，而不是每层提交一次，GPU 因此不会在层与层之间空等主机。在 CUDA/Vulkan 上该图只构建一次、张量地址保持稳定后反复重放（KV 写入用 `ggml_set_rows`、行号作为 I64 输入，注意力窗口按 stride 补齐、掩码作为 F16 输入），这正是 ggml-cuda 能把它捕获成 CUDA 图的前提。GPT OSS decode 在 A40 上从 24 → 154 tok/s，且随上下文长度基本持平（16K 时仍有 133 tok/s，而逐层路径已跌到 2.3）。可按模型用 `TS_GPTOSS_MODEL_DECODE=0` / `TS_GEMMA4_FD_PERSIST=0` / `TS_QWEN35_FD_PERSIST=0` 关闭。
 - **KV 缓存编解码器** —— 通过 `IKvBlockCodec` 接口插件化；内置 TurboQuant（2-bit 仿射 / Q4 / Q8）分页块压缩。CLI 的 `--paged-kv-quant-bits` 接受 `0|2|4|8`；服务端旧式独立分页参数接受 `0|4|8`，也可直接用 `TS_KV_PAGED_QUANT_BITS=2` 选择 2-bit 编解码器。2-bit 档位在 fp32 块上可达约 10 倍压缩，面向超长上下文。
 - **消息编辑** —— 在 Web 聊天界面中编辑或删除历史消息，并从该位置重新生成回复
 - **文本/图像/音频/视频/PDF 上传** —— Web 界面支持最大 500 MB 的文件上传并完整保留文本内容；原生数字 PDF 会完整提取文本层（可通过 `TS_PDF_MAX_PAGES` 显式限制页数）。最终提示词按模型的实际上下文窗口检查，而不是使用任意的上传预算
@@ -35,13 +36,18 @@
 
 ## 思维链 / 推理模式
 
-支持思维链模式的模型（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
+支持思维链模式的模型（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
 
 - **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H：** 使用 `<think>...</think>` 标签
 - **Gemma 4：** 使用 `<|channel>thought\n...<channel|>` 标签
 - **GPT OSS：** 使用 Harmony 格式，以 `<|channel|>analysis` 标记思维过程，以 `<|channel|>final` 标记最终回复
+- **DeepSeek V4：** 使用 `<think>...</think>` 标签；不传 `--think` 时聊天模板会直接闭合该块，因此推理是显式开启的
 
 通过 `--think`（控制台）、`"think": true`（Ollama API）或 Web 界面中的思维链开关启用。
+
+## DSpark 块级投机解码（DeepSeek V4）
+
+DeepSeek V4 的 checkpoint 中随模型附带一个 **DSpark** 支持模块（"Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation"）：三个 DSV4 块读取主干的 hidden states，每步提议**一整块** token 而不是一个；一个 Markov 头让块内每个位置以其前一个 token 为条件；一个置信度头预测每个位置被接受的概率。TensorSharp 把它作为独立的草稿 GGUF 加载（`--draft-model`，可用 `eng/dsv4-dspark-to-gguf.py` 自行转换），并在两个 GPU 引擎（`--backend cuda` 与 `--backend ggml_cuda`）上为贪心单序列生成启用——在 ggml 上草稿器就是计算图里额外的三层，其 key ring 由主干图自己提交，因此投机不产生任何主机往返；主干用一次批量前向验证整块，只保留它本来也会产生的前缀。在 4×A40 上以默认累积置信度门限测得 **decode 提速 1.3–1.4×**；这个门限很关键，因为验证批中每多一行都要把一整套 MoE 专家重新拉过显存。详见 [DeepSeek V4 卡片](docs/models/deepseek4.md#dspark-speculative-decoding)。
 
 ## MTP / NextN 投机解码
 
@@ -109,7 +115,7 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 | GatedDeltaNet SSM（Qwen 3.5/3.6） | 块循环 V-head 分配——各 rank 在自己的 V-head 子集上运行常驻本卡的打包 GDN 内核，delta/conv 状态相互独立；循环路径无需跨 rank 通信 |
 | Mamba2 SSM（Nemotron-H） | 在 rank 0 上复制计算，结果广播给所有 rank |
 
-TP 可运行在 `cuda` 后端以及 GGML CUDA / Vulkan 后端（`ggml_cuda`、`ggml_vulkan`）上；MLX 为单设备。在 GGML 后端上，每个 rank 拥有自己 GPU 上的 ggml 后端、权重分片与 KV 缓存，跨 GPU AllReduce 走 ggml-cuda 的集合通信（可用时用 NCCL），小载荷则在主机内存中归约。GGML 上的 TP 同时带来**容量**与**延迟**收益：融合的按 rank block 计算图（注意力、稠密 FFN、MoE 主干、GatedDeltaNet）取代了逐算子前向，在 2× RTX 2000 Ada 上 `--tp 2` 的 decode 达到单卡的 **1.39×**（Gemma 4 E4B Q8_0，51.7 对 37.3 tok/s）与 **1.06×**（Qwen 3.5-9B Q8_0），且 Gemma 4 的输出与单卡逐字节一致；单卡装不下的模型则只能靠 TP 运行（Qwen 3.5-35B-A3B IQ4_XS 共 16.6 GB，拆到两张 16 GB 卡上，prefill 184 tok/s、decode 18 tok/s）。完整测量数据见 `TENSOR_PARALLELISM_PLAN.md`（Stage 1b 与 1c）。TP 下的批处理 /
+TP 可运行在 `cuda` 后端以及 GGML CUDA / Vulkan 后端（`ggml_cuda`、`ggml_vulkan`）上；MLX 为单设备。在 GGML 后端上，每个 rank 拥有自己 GPU 上的 ggml 后端、权重分片与 KV 缓存，跨 GPU AllReduce 走 ggml-cuda 的集合通信（可用时用 NCCL），小载荷则在主机内存中归约。**TP 下 CUDA 图捕获保持开启**——一个张量并行 token 是几十次按 rank 的小提交，重放它们值约 45% 的 decode 吞吐（4×A40：Qwen 3.5-9B `--tp 4` 从 88 → 128.5 tok/s，Qwen 3.5-35B-A3B `--tp 2` 从 71.3 → 104.1，后者正是 TP 输给还是赢过单卡的分界线）。用 `TS_GGML_TP_CUDA_GRAPHS=0` 关闭。集合通信的选择靠实测而非能力标志位：启动时该组会验证所宣称的设备对之间的 peer copy 是否真的把数据送到，以及一次真实的 NCCL AllReduce 能否完成，然后选出通过检验的最快传输。有些主机（常见于虚拟化云实例）宣称支持 peer access 却从不兑现，此时会保留 NCCL 集合通信但禁用 peer 传输，而不是干脆放弃它——这在超过两张卡时尤为重要，因为那里用不上 pinned-host 流水线，替代方案是每个层边界都经主机内存归约（4×A40 实测：Qwen 3.5-9B Q8_0 decode 53.5 → 75.1 tok/s）。GGML 上的 TP 同时带来**容量**与**延迟**收益：融合的按 rank block 计算图（注意力、稠密 FFN、MoE 主干、GatedDeltaNet）取代了逐算子前向，在 2× RTX 2000 Ada 上 `--tp 2` 的 decode 达到单卡的 **1.39×**（Gemma 4 E4B Q8_0，51.7 对 37.3 tok/s）与 **1.06×**（Qwen 3.5-9B Q8_0），且 Gemma 4 的输出与单卡逐字节一致；单卡装不下的模型则只能靠 TP 运行（Qwen 3.5-35B-A3B IQ4_XS 共 16.6 GB，拆到两张 16 GB 卡上，prefill 184 tok/s、decode 18 tok/s）。完整测量数据见 `TENSOR_PARALLELISM_PLAN.md`（Stage 1b 与 1c）。TP 下的批处理 /
 连续批处理前向目前实现于 Qwen 3 与 Mistral 3；MoE 模型在 TP 下回退到按序列前向。
 
 本地集合通信优先使用 CUDA 点对点（P2P）DMA，但启动时会对每一对支持 P2P 的设备
@@ -132,9 +138,11 @@ Responses API 存储（`TS_RESPONSES_STORE_REDIS_URL`）用于持久化响应。
 
 各架构使用各自的工具调用格式：
 
-- **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H：** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Qwen 3 / Nemotron-H：** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Qwen 3.5/3.6-family：** 同样是 `<tool_call>` 块，但内容为 XML —— `<function=NAME><parameter=key>value</parameter></function>`（JSON 形式仍然被接受）
 - **Gemma 4：** `<|tool_call>call:function_name{args}<tool_call|>`
 - **GPT OSS（Harmony）：** 工具以 TypeScript namespace 形式声明在 developer 消息中，调用通过 commentary channel 输出：`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`
+- **DeepSeek V4：** DSML 标记 —— 系统提示词负责讲解语法并携带每个函数的 JSON schema，模型则以 `<｜DSML｜tool_calls><｜DSML｜invoke name="NAME"><｜DSML｜parameter name="key" string="true|false">value</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>` 作答。`string="false"` 表示该参数是 JSON 类型
 
 输出解析器（`OutputParser.cs`）会自动从模型原始输出中提取工具调用，与架构无关。
 
