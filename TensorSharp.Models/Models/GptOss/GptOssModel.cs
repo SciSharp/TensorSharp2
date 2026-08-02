@@ -618,6 +618,14 @@ namespace TensorSharp.Models
             if (requiredSeqLen > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {requiredSeqLen} exceeds configured max context {_maxContextLength}.");
 
+            // Growth copies the cache through host memory and hands every layer a
+            // NEW host pointer, so the device windows (keyed by the old pointer)
+            // must be flushed back first and then released — otherwise the rows a
+            // fused decode only ever wrote on-device are lost and the old windows
+            // leak their VRAM.
+            EnsureKvCacheHostSynchronized();
+            ResetFusedModelDecodeCache();
+
             int newCapacity = Math.Max(_kvCacheCapacity, 1);
             while (newCapacity < requiredSeqLen)
                 newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
@@ -643,6 +651,8 @@ namespace TensorSharp.Models
                     Ops.Copy(dstV, srcV);
                 }
 
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
                 _kvCacheK[l].Dispose();
                 _kvCacheV[l].Dispose();
                 _kvCacheK[l] = newK;
@@ -659,6 +669,10 @@ namespace TensorSharp.Models
             // _kvCacheK/_kvCacheV arrays are null (TP uses _tpKvCacheK/_tpKvCacheV,
             // overwritten on the next forward), so guard the tensor loop against null.
             _cacheSeqLen = 0;
+            // The device rows are logically gone; nothing to flush, and the
+            // persistent decode graph pins the KV windows the reset invalidates.
+            _kvCacheHostDirty = false;
+            ResetFusedModelDecodeCache();
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
@@ -672,7 +686,12 @@ namespace TensorSharp.Models
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
+            // Flush device-only rows before the invalidation below drops the
+            // windows: the retained prefix has to survive in host memory.
+            EnsureKvCacheHostSynchronized();
             base.TruncateKVCacheCore(tokenCount);
+            _kvCacheHostDirty = false;
+            ResetFusedModelDecodeCache();
             if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -693,6 +712,7 @@ namespace TensorSharp.Models
         {
             if (!SupportsKVStateSnapshot)
                 return false;
+            EnsureKvCacheHostSynchronized();
             return KvBlockTransfer.Extract(
                 _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
                 startToken, tokenCount, destination);
@@ -702,6 +722,10 @@ namespace TensorSharp.Models
         {
             if (!SupportsKVStateSnapshot)
                 return false;
+            // The injected block lands in host memory and the device windows are
+            // dropped below, so whatever only lived on-device has to come back
+            // first or the re-upload would resurrect stale rows around it.
+            EnsureKvCacheHostSynchronized();
             EnsureCacheCapacity(destToken + tokenCount);
             if (!KvBlockTransfer.Inject(
                     _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
@@ -710,6 +734,8 @@ namespace TensorSharp.Models
                 return false;
             }
             _cacheSeqLen = destToken + tokenCount;
+            _kvCacheHostDirty = false;
+            ResetFusedModelDecodeCache();
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 InvalidateTensorDeviceCache(_kvCacheK[l]);
@@ -770,6 +796,9 @@ namespace TensorSharp.Models
             int startPos = _cacheSeqLen;
 
             EnsureCacheCapacity(startPos + seqLen);
+            // A prefill grows the ggml-cuda compute pool, which moves the scratch
+            // addresses the captured decode graph pinned.
+            ResetFusedModelDecodeCache();
 
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
@@ -835,9 +864,38 @@ namespace TensorSharp.Models
 
             EnsureCacheCapacity(startPos + seqLen);
 
+            // Whole-model fused decode: all layers + MoE + final norm + LM head as
+            // ONE graph dispatch. Only the per-op / per-layer fallbacks read the KV
+            // cache from host memory, so the host sync is skipped when this path
+            // will run (it would copy the whole cache back every token).
+            bool useFusedModelDecode = WillUseFusedModelDecode(seqLen);
+            if (seqLen > 1)
+                ResetFusedModelDecodeCache();   // prefill moves the compute pool
+            else if (!useFusedModelDecode)
+                EnsureKvCacheHostSynchronized();
+
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t1;
+
+            if (useFusedModelDecode)
+            {
+                long tFused = Stopwatch.GetTimestamp();
+                bool fused = TryFusedModelDecode(hidden, startPos);
+                _linearTicks += Stopwatch.GetTimestamp() - tFused;
+                if (fused)
+                {
+                    hidden.Dispose();
+                    _logitsBuffer = _foldLogitsBuffer;
+                    _cacheSeqLen += seqLen;
+                    _forwardCount++;
+                    _forwardSw.Stop();
+                    return _logitsBuffer;
+                }
+                // The kernel refused at runtime: the per-layer path below reads the
+                // cache from host memory, so restore the sync we skipped.
+                EnsureKvCacheHostSynchronized();
+            }
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
@@ -924,6 +982,10 @@ namespace TensorSharp.Models
 
             if (!fusedAttnApplied)
             {
+                // The legacy per-op attention reads the KV cache from host memory,
+                // which the whole-model decode graph leaves stale. No-op unless a
+                // fused decode ran since the last sync.
+                EnsureKvCacheHostSynchronized();
                 Tensor normed = RMSNormOp(hidden, wn[0]);
                 Tensor attnOut = Attention(normed, layer, wn, seqLen, startPos);
                 normed.Dispose();
@@ -1987,6 +2049,7 @@ namespace TensorSharp.Models
                 foreach (var handle in _sinksHandles)
                     if (handle.IsAllocated)
                         handle.Free();
+            DisposeFusedModelDecodeState();
             base.Dispose();
         }
     }

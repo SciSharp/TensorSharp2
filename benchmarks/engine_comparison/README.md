@@ -62,12 +62,14 @@ from the result JSONs alone.
 | `config.py` | loads `benchmark_config.json`, resolves `${var}` paths + env overrides, exposes the registries + applicability gating |
 | `engines.py` | OpenAI streaming client + server lifecycle managers (TensorSharp.Server, llama-server, vLLM connector) |
 | `scenarios.py` | per-scenario, engine-aware request builders |
-| `run_matrix.py` | orchestrator — launches one server per `(engine, backend, model)`, runs scenarios, writes per-cell JSON |
+| `run_matrix.py` | orchestrator — launches one server per `(engine, backend, model, mtp, tp)`, runs scenarios, writes per-cell JSON |
 | `report.py` | aggregates `results/*.json` → `docs/engine_comparison_report.md` + `results/results.csv` |
+| `downloads.py` | resumable fetcher — makes a config's model files exist locally (used automatically by `run_matrix.py`) |
 | `assets/` | long-context prompt (`long_text.txt`), prefill corpus (`prefill_corpus.txt`), `tools/weather.json` |
 | `benchmark_config_prefill.json` | **prefill-only** variant — the same long-prompt sweep (2k/4k/8k/16k/32k/64k/128k tokens) but with the multimodal / diffusion scenarios and models stripped out, for a focused prefill run; select with `--config` |
-| `benchmark_config_ci.json` | **CI** variant used by `.github/workflows/test-matrix.yml` — TensorSharp vs llama.cpp only, `ggml_cuda` only, text + prefill scenarios; each model entry carries an `_hf` Hugging Face repo pointer its files are downloaded from |
-| `download_models.py` | downloads the selected models' files from their `_hf` repo pointers into the paths the config resolves them to (skips files already present) |
+| `benchmark_config_multigpu.json` | **multi-GPU** variant — a 4-GPU Linux box (validated on 4×A40), tensor-parallel degrees 1/2/4, including a model that only fits across 4 GPUs (`min_tp`); select with `--config` |
+| `benchmark_config_ci.json` | **CI** variant used by `.github/workflows/test-matrix.yml` — TensorSharp vs llama.cpp only, `ggml_cuda` only, text + prefill scenarios |
+| `download_models.py` | pre-fetches the selected models from the `source` URLs in the config (optional — `run_matrix.py` already downloads what is missing) |
 
 ## Configuration
 
@@ -78,7 +80,14 @@ backend registries (`models`, `scenarios`, `engines`, `backends` — see
 backend entry format), the llama-server launch options (`llama`),
 per-size-class readiness timeouts (`ready_timeout_s`), and the run defaults
 (`defaults`: which engines / models / scenarios / backends to run, MTP modes,
-concurrency levels, max-tokens, warmup count, server max-tokens headroom).
+tensor-parallel degrees + the GPU pool they may use, concurrency levels,
+max-tokens, warmup count, server max-tokens headroom).
+
+Each model entry also declares **where its files come from** (`source`, plus
+per-file `url` overrides) so a fresh host provisions itself — see
+[Model provisioning](#model-provisioning-automatic-downloads) — and, for weights
+that do not fit one GPU, the smallest tensor-parallel degree that can host them
+(`min_tp`).
 
 Values resolve with this precedence (highest first):
 
@@ -89,8 +98,9 @@ Values resolve with this precedence (highest first):
 
 Path strings in the config may use the placeholders `${repo_root}`, `${here}`,
 `${model_root}`, `${gemma4_qat_dir}`. A path may also be written as
-`{"path": "...", "env": "BENCH_X"}` so the named environment variable overrides
-it. Point the harness at an alternate settings file with `--config other.json`
+`{"path": "...", "env": "BENCH_X", "url": "..."}` so the named environment
+variable overrides it and a missing file can be downloaded from `url`.
+Point the harness at an alternate settings file with `--config other.json`
 (or `BENCH_CONFIG=other.json`) — useful for keeping per-host configs side by side.
 
 ## Prerequisites
@@ -135,6 +145,10 @@ python run_matrix.py --engines tensorsharp,llamacpp,vllm --backends ggml_cuda,cp
 python run_matrix.py --engines tensorsharp --backends ggml_cuda \
     --models qwen36-35b-a3b,gemma4-12b --scenarios text_short --mtp off,on
 
+# Tensor parallelism — one model split across 1 / 2 / 4 GPUs (both engines)
+python run_matrix.py --config benchmark_config_multigpu.json \
+    --models qwen35-35b-a3b --scenarios text_short,text_long --tp 1,2,4
+
 # Parallel-request scaling — aggregate decode throughput under load
 python run_matrix.py --engines tensorsharp,llamacpp --backends ggml_cuda \
     --models gemma4-12b --scenarios text_short --concurrency 1,4,8
@@ -151,9 +165,10 @@ section of `benchmark_config.json`. Any flag overrides the corresponding config
 default for that run only (the file is never modified).
 
 Useful flags: `--config <file>` (pick the settings file), `--engines`,
-`--backends`, `--models`, `--scenarios`, `--mtp`, `--concurrency`,
-`--max-tokens N`, `--warmup N` (0 disables), `--skip-existing` (reuse prior `ok`
-cells), `--results <dir>`. `report.py` accepts `--config` and `--results`.
+`--backends`, `--models`, `--scenarios`, `--mtp`, `--tp`, `--concurrency`,
+`--max-tokens N`, `--warmup N` (0 disables), `--download auto|never|force`,
+`--skip-existing` (reuse prior `ok` cells), `--results <dir>`. `report.py`
+accepts `--config` and `--results`.
 
 ### Choosing compute backends (`--backends`)
 
@@ -244,6 +259,112 @@ relocate the whole set with `BENCH_GEMMA4_QAT_DIR`); the E4B draft defaults to
 **MTP on-vs-off** table with the
 per-cell speedup (a value `< 1.0×` means speculation cost more than it saved —
 expected where the fused full-model decode path is already fastest).
+
+### Reasoning mode (`defaults.thinking`)
+
+Every request carries an explicit reasoning-mode flag, spelled per engine —
+TensorSharp's top-level `think`, llama.cpp's `chat_template_kwargs.enable_thinking`
+(which the GGUF's own chat template consumes). This is **not** cosmetic: the
+engines do not default the same way, and with reasoning left on, llama.cpp
+spends the whole per-scenario token budget thinking and never reaches the final
+answer, so its output shares almost nothing with TensorSharp's direct answer and
+its `json_mode` cell returns an unfinished (invalid) object. Pinning both sides
+to the same mode is what makes the output-quality table mean anything — on
+Qwen 3.5 9B it moved cross-engine agreement from 0.07 to 0.42 on `text_short`
+and from 0.04 to **0.98** on `json_mode`. `defaults.thinking` (default `false`)
+sets it for a run.
+
+### Tensor parallelism (`--tp 1,2,4`)
+
+Benchmarks one model **split across N GPUs in a single process**, on both server
+engines. Each degree relaunches the server (it is a load-time decision):
+
+| | how the model is split | how the GPUs are chosen |
+|---|---|---|
+| TensorSharp | `--tp N` | `CUDA_VISIBLE_DEVICES` (or `GGML_VK_VISIBLE_DEVICES` on Vulkan) = the first N ids of `defaults.tp_devices` |
+| llama.cpp | `--split-mode tensor` (weights **and** KV split across the devices, NCCL-backed) | same env pinning |
+
+Because the device set is pinned per cell, a `--tp 4` cell really occupies four
+GPUs and the `tp=1` baseline really occupies one — on a multi-GPU box llama.cpp
+would otherwise spread every model over all of them by default (layer split),
+which is not the same measurement. Set `defaults.tp_devices` to the GPU ids the
+harness may use (`BENCH_TP_DEVICES=0,1,2,3` overrides it per host); leave it
+empty on a single-GPU box and nothing is pinned.
+
+Configuration lives in the `backends` registry:
+`tensorsharp: {"tp": true|false, "tp_arg": "--tp"}` and
+`llamacpp: {"tp": true|false, "tp_extra_args": ["--split-mode", "tensor"]}`,
+plus `"visible_devices_env"`. The defaults are inferred — TensorSharp can
+tensor-parallelize on `cuda` / `ggml_cuda` / `ggml_vulkan`, llama.cpp on any
+gpu-kind backend with `-ngl > 0` — so an existing config needs no edits to gain
+the axis. Cells that cannot run a degree are recorded as skipped with the
+reason (CPU backend, an engine without a TP path, fewer configured GPUs than
+requested, or the image-edit pipeline, which is single-GPU).
+
+A model whose weights do not fit one GPU declares **`"min_tp": N`**; its cells
+below that degree are skipped ("needs `--tp N`") instead of being left to OOM
+the box. **`"max_tp": N`** is the other end: some architectures cannot be
+sharded past a small head count (Gemma 4 26B-A4B has 2 KV heads, so TensorSharp
+rejects `--tp 4` at load time), and declaring it records those cells as skipped
+rather than as a launch failure — llama.cpp splits the same model differently
+and is not bound by it, so its column still fills in.
+
+`report.py` renders each degree as its own column (`… · tp2`) and adds a
+**Tensor parallelism** section with decode/prefill at every degree plus the
+scaling factor over the smallest degree that ran.
+
+Not every model reaches multiple GPUs the same way. A model with its own
+whole-model executor (DeepSeek V4 Flash) passes `tpDegree = 1` down to
+`ModelBase` and reinterprets `--tp N` as "spread my weights over N GPUs",
+**layer-split, with no AllReduce** — that is capacity parallelism (it is what
+makes a 150 GiB model hostable on 4×46 GB at all), not the per-layer tensor
+split the other architectures do. Its row in the tensor-parallelism table is
+therefore the one configuration that runs, not a scaling point; the config
+entry says so in a `_tp_note`.
+
+Two field notes from the 4×A40 validation host:
+
+- Current llama.cpp CUDA builds **no longer implement `--split-mode row`**
+  (`device CUDA0 does not support split buffers`); `--split-mode tensor` is the
+  supported tensor-parallel mode, which is why it is the default here.
+- Some cloud hosts **advertise GPU peer access that does not work**
+  (`nvidia-smi topo -p2p r` says `OK` for every pair). llama.cpp then hangs
+  forever in its first NCCL collective instead of loading; `NCCL_P2P_DISABLE=1`
+  in the backend's `llamacpp.env` (as in `benchmark_config_multigpu.json`) fixes
+  it. TensorSharp needs no such flag: it verifies peer delivery itself before
+  the first communicator exists and, when the advertisement proves false, takes
+  peer transport away from NCCL rather than giving up the device collective.
+
+### Model provisioning (automatic downloads)
+
+Every model entry declares where its files come from, so a run on a host that
+does not have them yet provisions itself and every later run reuses the files:
+
+```jsonc
+"qwen35-9b": {
+  "source": "unsloth/Qwen3.5-9B-GGUF",            // HF repo id, {"hf_repo","revision"}, or a base URL
+  "gguf":   "${model_root}/Qwen3.5-9B-Q8_0.gguf", // -> <repo>/resolve/main/<file name>
+  "mmproj": {"path": "${model_root}/Qwen3.5-9B-Q8_0-mmproj.gguf",
+             "url":  "mmproj-F16.gguf"}           // remote name differs from the local one
+}
+```
+
+A file's `url` may also be an absolute URL from a different repo (the
+image-edit model pulls its DiT, VAE, text encoder and LoRA from four different
+places), and split GGUFs (`-00001-of-00005.gguf`) expand to every shard
+automatically — including deriving each shard's URL from the first one.
+
+`run_matrix.py` fetches whatever is missing before the matrix starts
+(`--download auto`, the default), streaming to `<file>.part` and resuming with a
+range request if interrupted, so a partial file never masquerades as a complete
+model. `--download never` requires the files to already exist (missing ones are
+recorded as skipped cells); `--download force` re-fetches. `HF_TOKEN` is honored
+for gated repos. To provision ahead of time (a CI cache step, a fresh GPU box):
+
+```bash
+python download_models.py --config benchmark_config_multigpu.json
+python download_models.py --config benchmark_config.json --models qwen35-9b,gemma4-12b
+```
 
 ### Prefill (prompt-processing) benchmark (`prefill_2k` / `4k` / `8k` / `16k` / `32k` / `64k` / `128k`)
 
@@ -366,17 +487,19 @@ batching serves them concurrently) and records, per cell:
 at each concurrency). The two axes compose: `--mtp on --concurrency 4` is valid,
 though MTP only engages for solo sequences so it has little effect under load.
 
-Result files keep their historical names for the baseline (`mtp` off,
-`concurrency` 1); non-default cells add a `__mtp` and/or `__c<N>` suffix.
+Result files keep their historical names for the baseline (`mtp` off, `tp` 1,
+`concurrency` 1); non-default cells add a `__mtp`, `__tp<N>` and/or `__c<N>`
+suffix.
 
 ## Output
 
-- `results/{engine}__{backend}__{model}__{scenario}[__mtp][__c<N>].json` — one
-  record per cell (`status` ∈ `ok | fail | skipped`, plus token counts, `mtp`,
-  `concurrency`, `aggregate_decode_tps`, `requests_ok`, and throughput). The
-  baseline (MTP off, single request) keeps the suffix-free name.
-- `results/logs/{engine}__{backend}__{model}.log` — captured server stdout/stderr
-  (the first place to look when a group reports `fail`).
+- `results/{engine}__{backend}__{model}__{scenario}[__mtp][__tp<N>][__c<N>].json`
+  — one record per cell (`status` ∈ `ok | fail | skipped`, plus token counts,
+  `mtp`, `tp`, `concurrency`, `aggregate_decode_tps`, `requests_ok`, and
+  throughput). The baseline (MTP off, one GPU, single request) keeps the
+  suffix-free name.
+- `results/logs/{engine}__{backend}__{model}[__mtp][__tp<N>].log` — captured
+  server stdout/stderr (the first place to look when a group reports `fail`).
 - **Stuck/leftover servers**: a crashed or interrupted run can leave a server
   process squatting its port — in the worst case unkillable (a thread stuck in
   a GPU-driver call survives `taskkill /F` until reboot) while the kernel still
@@ -404,8 +527,8 @@ schedule. Each run:
 1. builds TensorSharp (native GGML CUDA library + `TensorSharp.Server`),
 2. clones and builds **llama.cpp** (CUDA, `llama-server`; pick the ref with the
    `llama_ref` input),
-3. downloads the benchmark models from their Hugging Face pointers via
-   `download_models.py` (the `_hf` fields in `benchmark_config_ci.json`),
+3. downloads the benchmark models via `download_models.py` (from the `source`
+   repo declared by each model in `benchmark_config_ci.json`),
 4. runs `run_matrix.py --config benchmark_config_ci.json` (TensorSharp vs
    llama.cpp on `ggml_cuda`, text + prefill scenarios), and
 5. generates the combined **performance + output-quality** report with

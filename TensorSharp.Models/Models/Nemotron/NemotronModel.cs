@@ -565,12 +565,82 @@ namespace TensorSharp.Models
             _cacheSeqLen = 0;
         }
 
+        // Set when the device-side decode attention (TryFlashAttnDecodeGgml) has
+        // appended KV rows the host mirror does not have. Everything that reads the
+        // cache from host memory calls EnsureKvCacheHostSynchronized first.
+        private bool _kvCacheHostDirty;
+
+        // TS_NEMOTRON_FLASH_DECODE=0 forces the host decode attention back on.
+        private static readonly bool FlashDecodeAttnEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_NEMOTRON_FLASH_DECODE"), "0", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Single-token attention through the GGML flash-attention decode kernel:
+        /// appends K/V to the device-resident cache and attends against it without
+        /// ever bringing the cache back to the host. Returns false when the shapes
+        /// or dtypes are outside what the kernel handles, so the caller can fall
+        /// back to the host path.
+        /// </summary>
+        private bool TryFlashAttnDecodeGgml(Tensor q, Tensor k, Tensor v,
+            Tensor kCache, Tensor vCache, Tensor output,
+            int numHeads, int numKVHeads, int headDim,
+            int maxSeqLen, int position, float scale)
+        {
+            if (!FlashDecodeAttnEnabled)
+                return false;
+            if (q == null || k == null || v == null || kCache == null || vCache == null || output == null)
+                return false;
+            if (q.ElementType != DType.Float32 || k.ElementType != DType.Float32 ||
+                v.ElementType != DType.Float32 || output.ElementType != DType.Float32)
+                return false;
+            if (kCache.ElementType != vCache.ElementType)
+                return false;
+            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
+                return false;
+
+            try
+            {
+                GgmlBasicOps.FlashAttnDecode(q, k, v, kCache, vCache, output,
+                    numHeads, numKVHeads, headDim, maxSeqLen, position, scale);
+                InvalidateTensorDeviceCache(output);
+                _kvCacheHostDirty = true;
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Copy device-side KV rows back into the host mirror. No-op unless a
+        /// device decode wrote rows the host has not seen.
+        /// </summary>
+        private void EnsureKvCacheHostSynchronized()
+        {
+            if (!_kvCacheHostDirty || !IsGgmlBackend || _kvCacheK == null)
+                return;
+
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.Attention)
+                    continue;
+                if (_kvCacheK[l] != null) SyncTensorHostCache(_kvCacheK[l]);
+                if (_kvCacheV[l] != null) SyncTensorHostCache(_kvCacheV[l]);
+            }
+            _kvCacheHostDirty = false;
+        }
+
         private void EnsureCacheCapacity(int requiredSeqLen)
         {
             if (requiredSeqLen <= _kvCacheCapacity)
                 return;
             if (requiredSeqLen > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {requiredSeqLen} exceeds configured max context {_maxContextLength}.");
+
+            // The grow below copies through host memory and hands each layer a new
+            // buffer, so device-only rows have to come back first.
+            EnsureKvCacheHostSynchronized();
 
             int newCapacity = Math.Max(_kvCacheCapacity, 1);
             while (newCapacity < requiredSeqLen)
@@ -850,6 +920,7 @@ namespace TensorSharp.Models
                     GgmlBasicOps.NemotronMamba2DecodeClear(_nativeMamba2DecodeModelId);
             }
             _cacheSeqLen = 0;
+            _kvCacheHostDirty = false;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
@@ -914,6 +985,7 @@ namespace TensorSharp.Models
             if (!SupportsKVStateSnapshot) return false;
             long expected = ComputeKVBlockByteSize(tokenCount);
             if (destination.Length != expected) return false;
+            EnsureKvCacheHostSynchronized();
 
             int offset = 0;
             for (int l = 0; l < Config.NumLayers; l++)
@@ -946,6 +1018,9 @@ namespace TensorSharp.Models
             long expected = ComputeKVBlockByteSize(tokenCount);
             if (source.Length != expected) return false;
 
+            // Injection rewrites host rows; anything still device-only has to be
+            // flushed first so the re-upload does not resurrect stale rows.
+            EnsureKvCacheHostSynchronized();
             EnsureCacheCapacity(destToken + tokenCount);
 
             int offset = 0;
@@ -1488,18 +1563,35 @@ namespace TensorSharp.Models
 
             if (seqLen == 1)
             {
-                CopyToCacheDecode(_kvCacheK[layer], kTensor, _kvCacheV[layer], vTensor,
-                    numKVHeads, headDim, startPos);
+                var attnResult = new Tensor(_allocator, DType.Float32, 1, numHeads * headDim);
+
+                // GGML device path: one kernel appends K/V to the cache and runs
+                // ggml_flash_attn_ext against it. AttentionDecodePureCS below pulls
+                // the WHOLE cache to the host and does the attention in C#, which is
+                // O(context) per attention layer per token — the reason Nemotron
+                // decode collapsed as the conversation grew (28.8 tok/s at 40
+                // tokens of context, 11.1 at 1k). Falls through to the host path
+                // when the kernel refuses the shape.
+                bool attnOk = false;
+                if (IsGgmlBackend)
+                {
+                    attnOk = TryFlashAttnDecodeGgml(qTensor, kTensor, vTensor,
+                        _kvCacheK[layer], _kvCacheV[layer], attnResult,
+                        numHeads, numKVHeads, headDim, _kvCacheCapacity, startPos, scale);
+                }
+
+                if (!attnOk)
+                {
+                    CopyToCacheDecode(_kvCacheK[layer], kTensor, _kvCacheV[layer], vTensor,
+                        numKVHeads, headDim, startPos);
+                }
                 kTensor.Dispose();
                 vTensor.Dispose();
-
-                var attnResult = new Tensor(_allocator, DType.Float32, 1, numHeads * headDim);
 
                 // MLX path: device-side attention via mlx_fast_sdpa. Avoids the
                 // per-layer device→host KV cache download that
                 // AttentionDecodePureCS triggers.
-                bool attnOk = false;
-                if (_backend == BackendType.Mlx)
+                if (!attnOk && _backend == BackendType.Mlx)
                 {
                     attnOk = MlxFusedOps.TryDecodeAttention(
                         attnResult, qTensor, _kvCacheK[layer], _kvCacheV[layer],
@@ -1508,6 +1600,7 @@ namespace TensorSharp.Models
                 }
                 if (!attnOk)
                 {
+                    EnsureKvCacheHostSynchronized();
                     AttentionDecodePureCS(qTensor, _kvCacheK[layer], _kvCacheV[layer],
                         attnResult, numHeads, numKVHeads, headDim, totalSeqLen, scale);
                 }
@@ -1525,6 +1618,10 @@ namespace TensorSharp.Models
                 attnResult.Dispose();
                 return decodeOut;
             }
+
+            // The multi-token path reads the cache from host memory (ExpandKVHeads),
+            // so device-only rows written by the decode kernel have to come back.
+            EnsureKvCacheHostSynchronized();
 
             Tensor qHeads = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
             qTensor.Dispose();
@@ -2778,8 +2875,17 @@ namespace TensorSharp.Models
             int slot = 0)
         {
             output = null;
+            // The native decode kernel keeps the conv/SSM state resident on the
+            // device between tokens (`initialize_state` on the first call,
+            // `downloadState: false` after), which is the whole point: the
+            // managed path round-trips `_convState` / `_ssmState` — plain host
+            // float[] — through PCIe for every layer of every token, and that
+            // dominates decode on a 52-layer hybrid. The kernel itself is
+            // backend-agnostic (its only Metal-specific branches are zero-copy
+            // host-pointer bindings that simply stay false elsewhere), so it was
+            // gated to Metal by development history, not by a constraint.
             if (DisableNativeMamba2Decode
-                || _backend != BackendType.GgmlMetal
+                || (_backend != BackendType.GgmlMetal && _backend != BackendType.GgmlCuda)
                 || seqLen != 1
                 || _mamba2NativeDecodeProjected == null
                 || _mamba2NativeDecodeHidden == null

@@ -2342,6 +2342,9 @@ TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes
     return 1;
 }
 
+// Defined in ggml_ops_transformer_prefill.cpp.
+TSG_EXPORT void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
+
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
     // The same host pointer can be resident on several ranks (a replicated
@@ -2351,6 +2354,14 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
         tsg::ScopedRank rank(r);
         invalidate_cached_buffer(ptr);
     }
+
+    // The GPT-OSS attention kernel keeps its own device-resident copy of the KV
+    // cache keyed by the same host pointer. Every caller that invalidates a
+    // tensor's device copy (KV truncate, snapshot inject, cache reset) means
+    // "the host bytes changed underneath you", which is exactly when that copy
+    // has to go too — hooking it here keeps the two caches from disagreeing
+    // without every call site having to know about both.
+    TSGgml_GptOssInvalidateKvCache(ptr, nullptr);
 }
 
 TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)

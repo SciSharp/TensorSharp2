@@ -1917,6 +1917,26 @@ namespace TensorSharp.GGML
         /// ggml-cuda pool / KV-buffer state.</summary>
         public static void Gemma4MoEResetDecodeCache() => GgmlNative.Gemma4MoEResetDecodeCache();
 
+        /// <summary>Whole GPT-OSS transformer for one token as a single graph
+        /// dispatch (all layers + MoE + folded final norm/LM head). Returns false
+        /// when the kernel refuses the shape so the caller falls back to the
+        /// per-layer path.</summary>
+        public static bool TryGptOssModelDecode(
+            GptOssLayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
+            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
+            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm)
+            => GgmlNative.TryGptOssModelDecode(layers, numLayers, hidden, hiddenSize, position,
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm);
+
+        /// <summary>Drop the persistent GPT-OSS whole-model decode-graph cache.
+        /// Call before any prefill and on KV reset/grow.</summary>
+        public static void GptOssResetDecodeCache() => GgmlNative.GptOssResetDecodeCache();
+
+        /// <summary>Copy the device-resident GPT-OSS KV rows back into the host
+        /// mirror (the fused decode graph never does so per token).</summary>
+        public static void GptOssSyncKvCacheToHost(IntPtr kCache, IntPtr vCache, int cacheSize, int rows)
+            => GgmlNative.GptOssSyncKvCacheToHost(kCache, vCache, cacheSize, rows);
+
         public static void Qwen35ResetVerifyCache() => GgmlNative.Qwen35ResetVerifyCache();
 
         public static bool Qwen35ModelDecode(

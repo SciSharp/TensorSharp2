@@ -1,5 +1,5 @@
 {
-  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\"} so the named environment variable can override it for host retargeting. The `backends` section is a registry of concrete compute backends (ggml_cuda / ggml_vulkan / ggml_metal / ggml_cpu / cpu / ...); pick which to run with --backends or defaults.backends (see the registry's own _comment for the entry format; the legacy list+maps form from older configs is still accepted). The long-prompt PREFILL sweep (prefill_2k / 4k / 8k / 16k / 32k / 64k / 128k) is part of this matrix: each prefill scenario slices assets/prefill_corpus.txt to a target token budget (scenarios._prefill) and is timed by TTFT (max_tokens=8); run_matrix.py auto-raises llama.cpp's context to fit whichever prefill lengths are selected (the long-context 32k/64k/128k lengths are registered but not in the default selection). For a prefill-only run that excludes the multimodal/diffusion scenarios, use --config benchmark_config_prefill.json instead.",
+  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\", \"url\": \"...\"} so the named environment variable can override it for host retargeting, and so a missing file can be downloaded. MODEL PROVISIONING: each model declares where its files come from with a model-level \"source\" (a Hugging Face repo id, {\"hf_repo\": ..., \"revision\": ...}, or a direct base URL); any file the config resolves to a path that is not on disk is fetched from there into exactly that path before the run, and reused by every later run (run_matrix.py --download never|force, or pre-fetch with download_models.py). A file whose remote name differs from its local name carries its own \"url\" (a plain name resolved against the model's source, or an absolute URL from a different repo). Split GGUFs (-00001-of-0000N.gguf) expand to every shard automatically. TENSOR PARALLELISM: --tp 1,2,4 splits one model across N GPUs (TensorSharp --tp N, llama.cpp --split-mode tensor), each server pinned to exactly N devices through the backend's visible-devices env var; set defaults.tp_devices to the GPU ids the harness may use and a model's \"min_tp\" when its weights need more than one GPU. The `backends` section is a registry of concrete compute backends (ggml_cuda / ggml_vulkan / ggml_metal / ggml_cpu / cpu / ...); pick which to run with --backends or defaults.backends (see the registry's own _comment for the entry format; the legacy list+maps form from older configs is still accepted). The long-prompt PREFILL sweep (prefill_2k / 4k / 8k / 16k / 32k / 64k / 128k) is part of this matrix: each prefill scenario slices assets/prefill_corpus.txt to a target token budget (scenarios._prefill) and is timed by TTFT (max_tokens=8); run_matrix.py auto-raises llama.cpp's context to fit whichever prefill lengths are selected (the long-context 32k/64k/128k lengths are registered but not in the default selection). For a prefill-only run that excludes the multimodal/diffusion scenarios, use --config benchmark_config_prefill.json instead.",
 
   "paths": {
     "model_root": "C:/Works/models",
@@ -22,38 +22,46 @@
     "gemma4-e4b": {
       "display": "Gemma 4 E4B it (Q8_0, dense multimodal)",
       "family": "gemma4",
+      "source": "TrevorJS/gemma-4-E4B-it-uncensored-GGUF",
       "gguf": {"path": "${model_root}/gemma-4-E4B-it-uncensored-Q8_0.gguf", "env": "BENCH_GEMMA4_E4B_GGUF"},
-      "mmproj": {"path": "${model_root}/gemma-4-E4B-mmproj-F16.gguf", "env": "BENCH_GEMMA4_E4B_MMPROJ"},
+      "mmproj": {"path": "${model_root}/gemma-4-E4B-mmproj-F16.gguf", "env": "BENCH_GEMMA4_E4B_MMPROJ",
+                 "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mmproj-F16.gguf"},
       "modalities": ["text", "image", "audio", "video"],
       "size_class": "small",
       "mtp_supported": true,
-      "mtp_draft": {"path": "${model_root}/gemma-4-E4B-it-assistant.Q8_0.gguf", "env": "BENCH_GEMMA4_E4B_MTP_DRAFT"}
+      "mtp_draft": {"path": "${model_root}/gemma-4-E4B-it-assistant.Q8_0.gguf", "env": "BENCH_GEMMA4_E4B_MTP_DRAFT",
+                    "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/MTP/mtp-gemma-4-E4B-it-Q8_0.gguf"}
     },
     "gemma4-12b": {
       "display": "Gemma 4 12B it (QAT UD-Q4_K_XL, dense)",
       "family": "gemma4",
+      "source": "unsloth/gemma-4-12B-it-qat-GGUF",
       "gguf": "${gemma4_qat_dir}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
-      "mmproj": "${gemma4_qat_dir}/gemma-4-12B-mmproj-BF16.gguf",
+      "mmproj": {"path": "${gemma4_qat_dir}/gemma-4-12B-mmproj-BF16.gguf", "url": "mmproj-BF16.gguf"},
       "modalities": ["text", "image", "audio", "video"],
       "size_class": "small",
       "mtp_supported": true,
-      "mtp_draft": {"path": "${gemma4_qat_dir}/gemma-4-12B-it-Q4_0-MTP.gguf", "env": "BENCH_GEMMA4_12B_MTP_DRAFT"}
+      "mtp_draft": {"path": "${gemma4_qat_dir}/gemma-4-12B-it-Q4_0-MTP.gguf", "env": "BENCH_GEMMA4_12B_MTP_DRAFT",
+                    "url": "MTP/mtp-gemma-4-12B-it-Q4_0.gguf"}
     },
     "gemma4-26b-a4b": {
       "display": "Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, MoE)",
       "family": "gemma4",
+      "source": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
       "gguf": "${gemma4_qat_dir}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
-      "mmproj": "${gemma4_qat_dir}/gemma-4-26B-A4B-mmproj-BF16.gguf",
+      "mmproj": {"path": "${gemma4_qat_dir}/gemma-4-26B-A4B-mmproj-BF16.gguf", "url": "mmproj-BF16.gguf"},
       "modalities": ["text", "image", "audio", "video"],
       "size_class": "large",
       "mtp_supported": true,
-      "mtp_draft": {"path": "${gemma4_qat_dir}/gemma-4-26B-A4B-it-Q4_0-MTP.gguf", "env": "BENCH_GEMMA4_26B_MTP_DRAFT"}
+      "mtp_draft": {"path": "${gemma4_qat_dir}/gemma-4-26B-A4B-it-Q4_0-MTP.gguf", "env": "BENCH_GEMMA4_26B_MTP_DRAFT",
+                    "url": "MTP/mtp-gemma-4-26B-A4B-it-Q4_0.gguf"}
     },
     "qwen36-35b-a3b": {
       "display": "Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)",
       "family": "qwen36",
+      "source": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
       "gguf": "${model_root}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
-      "mmproj": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf",
+      "mmproj": {"path": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf", "url": "mmproj-F16.gguf"},
       "modalities": ["text", "image"],
       "size_class": "large",
       "mtp_supported": true,
@@ -62,8 +70,9 @@
     "qwen36-35b-a3b-q4": {
       "display": "Qwen 3.6 35B-A3B (UD-Q4_K_M, MoE)",
       "family": "qwen36",
+      "source": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
       "gguf": "${model_root}/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
-      "mmproj": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf",
+      "mmproj": {"path": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf", "url": "mmproj-F16.gguf"},
       "modalities": ["text", "image"],
       "size_class": "large",
       "mtp_supported": true,
@@ -72,8 +81,9 @@
     "qwen36-27b": {
       "display": "Qwen 3.6 27B (UD-IQ2_XXS, dense)",
       "family": "qwen36",
+      "source": "unsloth/Qwen3.6-27B-MTP-GGUF",
       "gguf": "${model_root}/Qwen3.6-27B-UD-IQ2_XXS.gguf",
-      "mmproj": "${model_root}/Qwen3.6-27B-mmproj-F16.gguf",
+      "mmproj": {"path": "${model_root}/Qwen3.6-27B-mmproj-F16.gguf", "url": "mmproj-F16.gguf"},
       "modalities": ["text", "image"],
       "size_class": "large",
       "mtp_supported": true,
@@ -82,6 +92,7 @@
     "qwen35-9b": {
       "display": "Qwen 3.5 9B (Q8_0, dense)",
       "family": "qwen35",
+      "source": "unsloth/Qwen3.5-9B-GGUF",
       "gguf": {"path": "${model_root}/Qwen3.5-9B-Q8_0.gguf", "env": "BENCH_QWEN35_9B_GGUF"},
       "mmproj": null,
       "modalities": ["text"],
@@ -92,22 +103,28 @@
     "qwen-image-edit": {
       "display": "Qwen-Image-Edit 2511 (Q2_K DiT + Lightning 4-step LoRA)",
       "family": "qwenimage",
+      "source": "unsloth/Qwen-Image-Edit-2511-GGUF",
       "gguf": {"path": "${model_root}/qwen-image-edit-2511-Q2_K.gguf", "env": "BENCH_QWEN_IMAGE_DIT"},
       "mmproj": null,
       "modalities": ["image_edit"],
       "size_class": "large",
       "is_image_edit": true,
       "components": {
-        "vae": {"path": "${model_root}/Qwen_Image-VAE.safetensors", "env": "BENCH_QWEN_IMAGE_VAE"},
-        "llm": {"path": "${model_root}/Qwen2.5-VL-7B-Instruct-UD-IQ2_XXS.gguf", "env": "BENCH_QWEN_IMAGE_VL"},
-        "mmproj": {"path": "${model_root}/Qwen2.5-VL-7B-mmproj-BF16.gguf", "env": "BENCH_QWEN_IMAGE_MMPROJ"},
-        "lora": {"path": "${model_root}/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", "env": "BENCH_QWEN_IMAGE_LORA"}
+        "vae": {"path": "${model_root}/Qwen_Image-VAE.safetensors", "env": "BENCH_QWEN_IMAGE_VAE",
+                "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors"},
+        "llm": {"path": "${model_root}/Qwen2.5-VL-7B-Instruct-UD-IQ2_XXS.gguf", "env": "BENCH_QWEN_IMAGE_VL",
+                "url": "https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/Qwen2.5-VL-7B-Instruct-UD-IQ2_XXS.gguf"},
+        "mmproj": {"path": "${model_root}/Qwen2.5-VL-7B-mmproj-BF16.gguf", "env": "BENCH_QWEN_IMAGE_MMPROJ",
+                   "url": "https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/mmproj-BF16.gguf"},
+        "lora": {"path": "${model_root}/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", "env": "BENCH_QWEN_IMAGE_LORA",
+                 "url": "https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"}
       }
     },
     "diffusiongemma": {
-      "display": "DiffusionGemma 26B-A4B it (Q3_K_M, text-diffusion)",
+      "display": "DiffusionGemma 26B-A4B it (Q4_K_M, text-diffusion)",
       "family": "diffusiongemma",
-      "gguf": "${model_root}/diff-q3/diffusiongemma-26B-A4B-it-Q3_K_M.gguf",
+      "source": "unsloth/diffusiongemma-26B-A4B-it-GGUF",
+      "gguf": {"path": "${model_root}/diffusiongemma-26B-A4B-it-Q4_K_M.gguf", "env": "BENCH_DIFFUSIONGEMMA_GGUF"},
       "mmproj": null,
       "modalities": ["text"],
       "size_class": "medium",
@@ -157,7 +174,7 @@
   },
 
   "backends": {
-    "_comment": "Backend registry: one entry per concrete compute backend selectable with --backends (each becomes a report column). `kind` (gpu|cpu) drives generic gating (large models skip cpu-kind; engines.*.backends may list ids and/or kinds). Per-engine sub-objects say how that engine launches on the backend — omit the sub-object and the engine's cells are recorded as skipped. tensorsharp: {backend: --backend value, extra_args: [...], env: {...}}; llamacpp: {ngl: -ngl value, server_exe: per-backend llama-server build (path/env form supported; falls back to paths.llama_server_exe), extra_args, env}; vllm: true marks the column the external vLLM endpoint is comparable on. `aliases` lets old names keep working (legacy `gpu`). NOTE: TensorSharp.Server silently falls back to the first available backend when the requested one is not supported by the build/host — check results/logs/*.log if numbers look implausible.",
+    "_comment": "Backend registry: one entry per concrete compute backend selectable with --backends (each becomes a report column). `kind` (gpu|cpu) drives generic gating (large models skip cpu-kind; engines.*.backends may list ids and/or kinds). Per-engine sub-objects say how that engine launches on the backend — omit the sub-object and the engine's cells are recorded as skipped. tensorsharp: {backend: --backend value, extra_args: [...], env: {...}, tp: whether --tp N works here (default: true for cuda / ggml_cuda / ggml_vulkan), tp_arg: the flag carrying the degree}; llamacpp: {ngl: -ngl value, server_exe: per-backend llama-server build (path/env form supported; falls back to paths.llama_server_exe), extra_args, env, tp: whether tensor parallelism works here (default: any gpu-kind backend with -ngl > 0), tp_extra_args: the flags that turn it on (default --split-mode tensor, llama.cpp's weights+KV tensor-parallel mode; use --split-mode row for engine builds that only have the old row split)}; vllm: true marks the column the external vLLM endpoint is comparable on. `visible_devices_env` names the variable that pins a launched engine to the first N GPUs (default: CUDA_VISIBLE_DEVICES for cuda backends, GGML_VK_VISIBLE_DEVICES for vulkan). `aliases` lets old names keep working (legacy `gpu`). NOTE: TensorSharp.Server silently falls back to the first available backend when the requested one is not supported by the build/host — check results/logs/*.log if numbers look implausible.",
     "ggml_cuda": {
       "display": "CUDA",
       "kind": "gpu",
@@ -215,7 +232,10 @@
     "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b", "qwen36-35b-a3b-q4", "diffusiongemma", "qwen-image-edit"],
     "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video", "image_edit"],
     "backends": ["ggml_cuda", "cpu"],
+    "thinking": false,
     "mtp_modes": [false],
+    "tp_degrees": [1],
+    "tp_devices": [],
     "concurrency": [1],
     "max_tokens": 128,
     "warmup": 1,

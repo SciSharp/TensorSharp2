@@ -133,6 +133,72 @@ internal readonly struct GgmlQuantizedWeight
     }
 }
 
+// Descriptor for the GPT-OSS whole-model decode kernel
+// (TSGgml_GptOssModelDecode). Field order/types MUST match the native
+// TSGgmlGptOssLayerDesc struct EXACTLY: 21 pointers, then 21 int64, then
+// 21 int32, then 5 float. StructBytes is a sizeof() sanity check the native
+// side validates before use.
+[StructLayout(LayoutKind.Sequential)]
+public struct GptOssLayerDecodeArgs
+{
+    // pointers (21)
+    public IntPtr AttnNormW;
+    public IntPtr QkvW;
+    public IntPtr QkvB;
+    public IntPtr KW;
+    public IntPtr KB;
+    public IntPtr VW;
+    public IntPtr VB;
+    public IntPtr OW;
+    public IntPtr OB;
+    public IntPtr KCache;
+    public IntPtr VCache;
+    public IntPtr Sinks;
+    public IntPtr PostAttnNormW;
+    public IntPtr GateInpW;
+    public IntPtr GateInpB;
+    public IntPtr GateExps;
+    public IntPtr GateExpsB;
+    public IntPtr UpExps;
+    public IntPtr UpExpsB;
+    public IntPtr DownExps;
+    public IntPtr DownExpsB;
+
+    // int64 weight shapes (21)
+    public long QkvNe0, QkvNe1, QkvBytes;
+    public long KNe0, KNe1, KBytes;
+    public long VNe0, VNe1, VBytes;
+    public long ONe0, ONe1, OBytes;
+    public long GeNe0, GeNe1, GeBytes;
+    public long UeNe0, UeNe1, UeBytes;
+    public long DeNe0, DeNe1, DeBytes;
+
+    // int32 scalars (21)
+    public int StructBytes;
+    public int HiddenSize;
+    public int NumHeads;
+    public int NumKvHeads;
+    public int HeadDim;
+    public int CacheSize;
+    public int IsSwa;
+    public int SlidingWindow;
+    public int RopeNDims;
+    public int OrigCtxLen;
+    public int KvCacheType;
+    public int NumExperts;
+    public int NumExpertsUsed;
+    public int SeparateQkv;
+    public int QkvType, KType, VType, OType;
+    public int GeType, UeType, DeType;
+
+    // float scalars (5)
+    public float Eps;
+    public float RopeBase;
+    public float RopeFreqScale;
+    public float OaiAlpha;
+    public float OaiLimit;
+}
+
 // Descriptor for the fused single-layer Gemma 4 MoE decode kernel
 // (TSGgml_Gemma4MoELayerDecode). Field order/types MUST match the native
 // TSGgmlGemma4MoELayerDesc struct EXACTLY: all 8-byte fields (pointers then
@@ -603,6 +669,7 @@ internal enum GgmlIndexReductionOp
         static GgmlNative()
         {
             NativeLibrary.SetDllImportResolver(typeof(GgmlNative).Assembly, ImportResolver);
+            ApplyEarlyNativeTunables();
         }
 
         // Forces this type's static constructor so the assembly-wide DllImport
@@ -612,11 +679,74 @@ internal enum GgmlIndexReductionOp
         {
         }
 
+        /// <summary>
+        /// Push the tunables that must be decided before the backend's first
+        /// compute into the *native* environment.
+        ///
+        /// ggml-cuda reads GGML_CUDA_DISABLE_GRAPHS once and caches it in a
+        /// function-local static the first time it considers capturing a graph —
+        /// which happens while the model is still loading, long before the
+        /// tensor-parallel context exists. Deciding this from the TP setup code
+        /// (where the degree is obviously known) is therefore too late to have
+        /// any effect, and .NET's Environment.SetEnvironmentVariable would not
+        /// reach getenv anyway. This runs before the first P/Invoke into
+        /// GgmlOps, which is early enough.
+        ///
+        /// Multi-GPU runs keep capture ON — it is worth 45% of decode throughput
+        /// on a tensor-parallel token, which is dozens of small per-rank
+        /// submissions that replay far more cheaply than they re-issue (4xA40:
+        /// Qwen3.5-9B tp4 88 → 128.5 tok/s, Qwen3.5-35B-A3B tp2 71.3 → 104.1).
+        /// This method exists for the opt-out: TS_GGML_TP_CUDA_GRAPHS=0 has to
+        /// be turned into a native GGML_CUDA_DISABLE_GRAPHS *here*, because by
+        /// the time the TP context is built the loader has already latched the
+        /// old value and the setting would silently do nothing.
+        /// </summary>
+        private static void ApplyEarlyNativeTunables()
+        {
+            try
+            {
+                if (!string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_CUDA_GRAPHS"), "0",
+                                   StringComparison.Ordinal))
+                    return;
+
+                string degreeText = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
+                if (!int.TryParse(degreeText, System.Globalization.NumberStyles.Integer,
+                                  System.Globalization.CultureInfo.InvariantCulture, out int degree)
+                    || degree <= 1)
+                    return;
+
+                SetNativeEnvironmentVariable("GGML_CUDA_DISABLE_GRAPHS", "1", overwrite: false);
+            }
+            catch (DllNotFoundException)
+            {
+                // No native library on this host (e.g. a managed-only unit test):
+                // nothing to configure.
+            }
+            catch (EntryPointNotFoundException)
+            {
+                // Older GgmlOps without the setter; the native-side backstop in
+                // TSGgml_TensorParallelInit still applies where it can.
+            }
+        }
+
+        /// <summary>
+        /// Set an environment variable as native code sees it (see
+        /// <see cref="ApplyEarlyNativeTunables"/> for why managed
+        /// <c>Environment.SetEnvironmentVariable</c> is not enough).
+        /// </summary>
+        internal static bool SetNativeEnvironmentVariable(string name, string value, bool overwrite)
+        {
+            return TSGgml_SetNativeEnvironmentVariable(name, value, overwrite ? 1 : 0) != 0;
+        }
+
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern IntPtr TSGgml_GetLastError();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_IsMetalAvailable();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType, CharSet = CharSet.Ansi)]
+        private static extern int TSGgml_SetNativeEnvironmentVariable(string name, string value, int overwrite);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_CanInitializeBackend(int backendType);
@@ -1773,6 +1903,50 @@ internal enum GgmlIndexReductionOp
         }
 
         // Model-wide MoE decode: the whole transformer as one graph/token.
+        // GPT-OSS whole-model decode: all layers + MoE + folded final norm/LM head
+        // in ONE graph dispatch per token (see ggml_ops_gptoss_decode.cpp).
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GptOssModelDecode(
+            [In] GptOssLayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int position,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm);
+
+        /// <summary>
+        /// Runs the whole GPT-OSS transformer for one token as a single graph.
+        /// Returns false (with the native error recorded) when the kernel cannot
+        /// handle the shape, so the caller can fall back to the per-layer path.
+        /// </summary>
+        public static bool TryGptOssModelDecode(
+            GptOssLayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
+            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
+            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm)
+            => TSGgml_GptOssModelDecode(layers, numLayers, hidden, hiddenSize, position,
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm) != 0;
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_GptOssResetDecodeCache();
+
+        /// <summary>
+        /// Drops every cached GPT-OSS whole-model decode graph. Call before a
+        /// prefill and on any KV reset/grow: the captured graph pins the compute
+        /// pool and the KV windows.
+        /// </summary>
+        public static void GptOssResetDecodeCache() => TSGgml_GptOssResetDecodeCache();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GptOssSyncKvCacheToHost(
+            IntPtr kCache, IntPtr vCache, int cacheSize, int rows);
+
+        /// <summary>
+        /// Copies the device-resident GPT-OSS KV rows back into their host mirror.
+        /// The fused decode graph never writes them back per token, so anything
+        /// reading the host cache must call this first.
+        /// </summary>
+        public static void GptOssSyncKvCacheToHost(IntPtr kCache, IntPtr vCache, int cacheSize, int rows)
+            => TSGgml_GptOssSyncKvCacheToHost(kCache, vCache, cacheSize, rows);
+
         // `layers` is one Gemma4MoELayerDecodeArgs per layer (blittable, marshalled
         // as a contiguous TSGgmlGemma4MoELayerDesc array). hidden/position come from
         // the explicit params; the per-element Hidden/Position fields are ignored.

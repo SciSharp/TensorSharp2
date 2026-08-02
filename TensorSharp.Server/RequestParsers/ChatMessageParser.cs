@@ -125,6 +125,7 @@ namespace TensorSharp.Server.RequestParsers
                     {
                         var textParts = new List<string>();
                         msg.ImagePaths = new List<string>();
+                        msg.AudioPaths = new List<string>();
 
                         foreach (var part in contentEl.EnumerateArray())
                         {
@@ -147,12 +148,37 @@ namespace TensorSharp.Server.RequestParsers
                                     }
                                 }
                             }
+                            else if (type == "input_audio" && part.TryGetProperty("input_audio", out var audioEl))
+                            {
+                                // OpenAI audio part: {"data": "<base64>", "format": "wav"|"mp3"}.
+                                string path = WriteBase64Audio(
+                                    audioEl.TryGetProperty("data", out var aData) ? aData.GetString() : null,
+                                    audioEl.TryGetProperty("format", out var aFmt) ? aFmt.GetString() : null,
+                                    uploadDir);
+                                if (path != null)
+                                    msg.AudioPaths.Add(path);
+                            }
+                            else if (type == "audio_url" && part.TryGetProperty("audio_url", out var audioUrl))
+                            {
+                                // Some clients mirror the image_url shape for audio.
+                                string url = audioUrl.ValueKind == JsonValueKind.String
+                                    ? audioUrl.GetString()
+                                    : (audioUrl.TryGetProperty("url", out var au) ? au.GetString() : null);
+                                string path = WriteBase64AudioDataUri(url, uploadDir);
+                                if (path != null)
+                                    msg.AudioPaths.Add(path);
+                            }
                         }
 
                         msg.Content = string.Join("\n", textParts);
                         if (msg.ImagePaths.Count == 0) msg.ImagePaths = null;
+                        if (msg.AudioPaths.Count == 0) msg.AudioPaths = null;
                     }
                 }
+
+                // Message-level base64 audio array (the same shorthand Ollama uses
+                // for images), accepted alongside the OpenAI content-part form.
+                AppendMessageLevelAudios(msgEl, msg, uploadDir);
 
                 messages.Add(msg);
             }
@@ -214,6 +240,7 @@ namespace TensorSharp.Server.RequestParsers
                 {
                     var textParts = new List<string>();
                     msg.ImagePaths = new List<string>();
+                    msg.AudioPaths = new List<string>();
 
                     foreach (var part in contentEl.EnumerateArray())
                     {
@@ -222,6 +249,15 @@ namespace TensorSharp.Server.RequestParsers
                             part.TryGetProperty("text", out var txt))
                         {
                             textParts.Add(txt.GetString());
+                        }
+                        else if (partType == "input_audio" && part.TryGetProperty("input_audio", out var audioEl))
+                        {
+                            string audioPath = WriteBase64Audio(
+                                audioEl.TryGetProperty("data", out var aData) ? aData.GetString() : null,
+                                audioEl.TryGetProperty("format", out var aFmt) ? aFmt.GetString() : null,
+                                uploadDir);
+                            if (audioPath != null)
+                                msg.AudioPaths.Add(audioPath);
                         }
                         else if (partType == "input_image")
                         {
@@ -242,6 +278,7 @@ namespace TensorSharp.Server.RequestParsers
 
                     msg.Content = string.Join("\n", textParts);
                     if (msg.ImagePaths.Count == 0) msg.ImagePaths = null;
+                    if (msg.AudioPaths.Count == 0) msg.AudioPaths = null;
                 }
 
                 messages.Add(msg);
@@ -278,6 +315,109 @@ namespace TensorSharp.Server.RequestParsers
             string path = Path.Combine(uploadDir, $"{Guid.NewGuid():N}.png");
             File.WriteAllBytes(path, imgData);
             return path;
+        }
+
+        /// <summary>
+        /// Materialise a base64 audio attachment in the upload directory. The
+        /// audio preprocessor picks its decoder from the file extension, so the
+        /// declared <paramref name="format"/> (OpenAI sends "wav" / "mp3") is
+        /// mapped to one — falling back to sniffing the container header when it
+        /// is missing or unrecognised. Returns null for empty/invalid content.
+        /// </summary>
+        private static string WriteBase64Audio(string base64, string format, string uploadDir)
+        {
+            if (string.IsNullOrWhiteSpace(base64))
+                return null;
+
+            // Tolerate a full data URI in the data field.
+            int commaIdx = base64.StartsWith("data:") ? base64.IndexOf(',') : -1;
+            if (commaIdx > 0)
+            {
+                if (string.IsNullOrEmpty(format))
+                    format = MimeToAudioFormat(base64.Substring(5, commaIdx - 5));
+                base64 = base64.Substring(commaIdx + 1);
+            }
+
+            byte[] data;
+            try
+            {
+                data = Convert.FromBase64String(base64);
+            }
+            catch (FormatException)
+            {
+                return null;
+            }
+            if (data.Length == 0)
+                return null;
+
+            string path = Path.Combine(uploadDir, $"{Guid.NewGuid():N}{AudioExtension(format, data)}");
+            File.WriteAllBytes(path, data);
+            return path;
+        }
+
+        private static string WriteBase64AudioDataUri(string url, string uploadDir)
+        {
+            if (string.IsNullOrEmpty(url) || !url.StartsWith("data:"))
+                return null;
+            return WriteBase64Audio(url, null, uploadDir);
+        }
+
+        private static string MimeToAudioFormat(string mimeAndParams)
+        {
+            int semi = mimeAndParams.IndexOf(';');
+            string mime = semi >= 0 ? mimeAndParams.Substring(0, semi) : mimeAndParams;
+            int slash = mime.IndexOf('/');
+            return slash >= 0 ? mime.Substring(slash + 1) : mime;
+        }
+
+        private static string AudioExtension(string format, byte[] data)
+        {
+            switch ((format ?? string.Empty).Trim().TrimStart('.').ToLowerInvariant())
+            {
+                case "wav":
+                case "wave":
+                case "x-wav":
+                case "pcm":
+                    return ".wav";
+                case "mp3":
+                case "mpeg":
+                case "mpga":
+                    return ".mp3";
+                case "ogg":
+                case "oga":
+                case "vorbis":
+                    return ".ogg";
+            }
+
+            if (data.Length >= 12 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F'
+                && data[8] == 'W' && data[9] == 'A' && data[10] == 'V' && data[11] == 'E')
+                return ".wav";
+            if (data.Length >= 4 && data[0] == 'O' && data[1] == 'g' && data[2] == 'g' && data[3] == 'S')
+                return ".ogg";
+            return ".mp3";                 // ID3-tagged or bare MPEG frames
+        }
+
+        /// <summary>
+        /// Read a message-level <c>"audios"</c> array of base64 clips (optionally
+        /// data URIs) and append them to the message's audio attachments.
+        /// </summary>
+        private static void AppendMessageLevelAudios(JsonElement msgEl, ChatMessage msg, string uploadDir)
+        {
+            if (!msgEl.TryGetProperty("audios", out var auds) || auds.ValueKind != JsonValueKind.Array)
+                return;
+
+            foreach (var audEl in auds.EnumerateArray())
+            {
+                string b64 = audEl.ValueKind == JsonValueKind.String
+                    ? audEl.GetString()
+                    : (audEl.TryGetProperty("data", out var d) ? d.GetString() : null);
+                string format = audEl.ValueKind == JsonValueKind.Object &&
+                                audEl.TryGetProperty("format", out var f) ? f.GetString() : null;
+                string path = WriteBase64Audio(b64, format, uploadDir);
+                if (path == null)
+                    continue;
+                (msg.AudioPaths ??= new List<string>()).Add(path);
+            }
         }
     }
 }

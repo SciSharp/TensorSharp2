@@ -461,6 +461,7 @@ namespace TensorSharp.Models
                     if (_kvCacheV[l] != null && seen.Add(_kvCacheV[l].Storage))
                         SyncTensorHostCache(_kvCacheV[l]);
                 }
+                _kvCacheHostDirty = false;
             }
 
             // Cover every block id we'll write into for the attention paged

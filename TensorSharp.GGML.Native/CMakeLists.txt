@@ -190,6 +190,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_fused.cpp
     ggml_ops_transformer.cpp
     ggml_ops_transformer_prefill.cpp
+    ggml_ops_gptoss_decode.cpp
     ggml_ops_qwen35_decode.cpp
     ggml_ops_qwen35_verify.cpp
     ggml_ops_gemma4_decode.cpp

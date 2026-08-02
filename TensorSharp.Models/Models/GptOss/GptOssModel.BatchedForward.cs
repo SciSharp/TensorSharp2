@@ -359,6 +359,8 @@ namespace TensorSharp.Models
             // cache hot in the Metal buffer while the host shadow is stale.
             if (IsGgmlBackend)
             {
+                // Rows the whole-model decode graph only ever wrote on-device.
+                EnsureKvCacheHostSynchronized();
                 var seen = new HashSet<Storage>();
                 for (int l = 0; l < Config.NumLayers; l++)
                 {

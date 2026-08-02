@@ -56,6 +56,7 @@ class BenchResult:
     output_text: str = ""
     # Extra benchmark axes.
     mtp: bool = False                        # MTP/NextN speculative decoding engaged
+    tp: int = 1                              # tensor-parallel degree (GPUs the model is split across)
     concurrency: int = 1                     # parallel identical requests at this cell
     aggregate_decode_tps: float = 0.0        # system-wide decode tok/s across all parallel seqs
     requests_ok: int = 0                     # successful requests out of `concurrency`
@@ -84,11 +85,31 @@ class BenchResult:
 # ---------------------------------------------------------------------------
 # Uniform OpenAI chat runner
 # ---------------------------------------------------------------------------
+def thinking_body(engine: str, enabled: bool) -> dict:
+    """Request fields that put an engine into (or out of) reasoning mode.
+
+    Each engine spells it differently — TensorSharp takes a top-level `think`
+    boolean, llama.cpp passes `enable_thinking` through to the GGUF's chat
+    template — and their DEFAULTS differ, which silently makes the two sides
+    answer different questions: with reasoning left on, llama.cpp spends the
+    whole token budget thinking and never reaches the final answer, so its
+    output shares almost nothing with TensorSharp's direct answer and its
+    `json_mode` cell returns an unfinished (invalid) object. Setting the mode
+    explicitly on both sides is what keeps the output-quality comparison
+    meaningful."""
+    if engine == "tensorsharp":
+        return {"think": bool(enabled)}
+    if engine == "llamacpp":
+        return {"chat_template_kwargs": {"enable_thinking": bool(enabled)}}
+    return {}
+
+
 def run_openai_chat(base_url: str, model_name: str, messages: list, *,
                     tools: Optional[list] = None,
                     response_format: Optional[dict] = None,
                     max_tokens: int = 128,
                     stream: bool = True,
+                    extra_body: Optional[dict] = None,
                     timeout_s: float = 1200.0) -> dict:
     """Run one chat completion and return a metrics dict. Raises on transport
     error; the caller maps that onto a failed BenchResult."""
@@ -100,6 +121,8 @@ def run_openai_chat(base_url: str, model_name: str, messages: list, *,
         "temperature": 0,
         "stream": stream,
     }
+    if extra_body:
+        body.update(extra_body)
     if tools:
         body["tools"] = tools
     if response_format:
@@ -271,6 +294,7 @@ def run_openai_chat_parallel(base_url: str, model_name: str, messages: list, *,
                              response_format: Optional[dict] = None,
                              max_tokens: int = 128,
                              stream: bool = True,
+                             extra_body: Optional[dict] = None,
                              timeout_s: float = 1200.0) -> dict:
     """Fire `concurrency` identical chat completions at the same server at once
     and return one aggregated metrics dict (same keys as `run_openai_chat` plus
@@ -292,7 +316,8 @@ def run_openai_chat_parallel(base_url: str, model_name: str, messages: list, *,
             results[i] = run_openai_chat(
                 base_url, model_name, messages,
                 tools=tools, response_format=response_format,
-                max_tokens=max_tokens, stream=stream, timeout_s=timeout_s)
+                max_tokens=max_tokens, stream=stream,
+                extra_body=extra_body, timeout_s=timeout_s)
         except Exception as ex:  # captured per-request; surfaced in aggregate
             errors[i] = ex
 
@@ -389,6 +414,7 @@ class ServerHandle:
         self.proc: Optional[subprocess.Popen] = None
         self._log_fh = None
         self.ready_hint = ""     # diagnosis when wait_ready gives up early
+        self._served_name = None  # model id from /v1/models (see _note_served_name)
 
     def _spawn(self, cmd: list[str], cwd: Optional[Path], env: Optional[dict]):
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -402,6 +428,17 @@ class ServerHandle:
             stdout=self._log_fh,
             stderr=subprocess.STDOUT,
         )
+
+    def _note_served_name(self, resp):
+        """Remember the model id the server actually advertises, so requests
+        never 404 on a name mismatch (a split GGUF, for instance, is hosted
+        under one id that need not be the shard file name we launched with)."""
+        try:
+            served = [m.get("id") for m in (resp.json().get("data") or []) if m.get("id")]
+        except Exception:
+            return
+        if served:
+            self._served_name = served[0]
 
     def wait_ready(self, timeout_s: float) -> bool:
         url = self.base_url.rstrip("/") + "/v1/models"
@@ -433,6 +470,7 @@ class ServerHandle:
             try:
                 r = requests.get(url, timeout=3)
                 if r.status_code == 200:
+                    self._note_served_name(r)
                     return True
                 silent_but_open = 0
             except requests.RequestException:
@@ -495,13 +533,15 @@ class ServerHandle:
 # ---------------------------------------------------------------------------
 class TensorSharpServer(ServerHandle):
     def __init__(self, model: config.ModelSpec, backend: str, log_path: Path,
-                 max_tokens: int = config.SERVER_MAX_TOKENS, mtp: bool = False):
+                 max_tokens: int = config.SERVER_MAX_TOKENS, mtp: bool = False,
+                 tp: int = 1):
         super().__init__(f"http://127.0.0.1:{config.TENSORSHARP_PORT}",
                          config.TENSORSHARP_PORT, log_path)
         self.model = model
         self.backend = backend
         self.max_tokens = max_tokens
         self.mtp = mtp
+        self.tp = max(1, int(tp or 1))
 
     def start(self):
         spec = config.BACKENDS[self.backend]
@@ -535,8 +575,12 @@ class TensorSharpServer(ServerHandle):
             cmd += ["--mtp-spec"]
             if self.model.mtp_draft is not None:
                 cmd += ["--mtp-draft-model", str(self.model.mtp_draft)]
+        # Tensor parallelism: split the hosted model across `tp` local GPUs.
+        if self.tp > 1:
+            cmd += [spec.ts_tp_arg, str(self.tp)]
         env = os.environ.copy()
         env.update(spec.ts_env)
+        env.update(config.tp_device_env(self.backend, self.tp))
         if self.model.is_diffusion:
             env["DIFFUSION_STEPS"] = str(self.model.diffusion_steps)
         self._spawn(cmd, cwd=config.TENSORSHARP_SERVER_DLL.parent, env=env)
@@ -546,11 +590,13 @@ class TensorSharpServer(ServerHandle):
 # llama.cpp server
 # ---------------------------------------------------------------------------
 class LlamaCppServer(ServerHandle):
-    def __init__(self, model: config.ModelSpec, backend: str, log_path: Path):
+    def __init__(self, model: config.ModelSpec, backend: str, log_path: Path,
+                 tp: int = 1):
         super().__init__(f"http://127.0.0.1:{config.LLAMA_PORT}",
                          config.LLAMA_PORT, log_path)
         self.model = model
         self.backend = backend
+        self.tp = max(1, int(tp or 1))
 
     def start(self):
         spec = config.BACKENDS[self.backend]
@@ -574,12 +620,17 @@ class LlamaCppServer(ServerHandle):
                "-c", str(config.LLAMA_CONTEXT_SIZE)]
         cmd += [str(a) for a in config.LLAMA_EXTRA_ARGS]
         cmd += [str(a) for a in spec.llama_extra_args]
+        # Tensor parallelism: the backend's `tp_extra_args` turn it on
+        # (`--split-mode tensor` by default — weights and KV split across the
+        # devices); the device set itself is pinned through the backend's
+        # visible-devices env var below, so exactly `tp` GPUs are used.
+        if self.tp > 1:
+            cmd += [str(a) for a in spec.llama_tp_extra_args]
         if self.model.mmproj is not None and self.model.mmproj.exists():
             cmd += ["--mmproj", str(self.model.mmproj)]
-        env = None
-        if spec.llama_env:
-            env = os.environ.copy()
-            env.update(spec.llama_env)
+        env = os.environ.copy()
+        env.update(spec.llama_env)
+        env.update(config.tp_device_env(self.backend, self.tp))
         self._spawn(cmd, cwd=exe.parent, env=env)
 
 
@@ -639,11 +690,11 @@ class SdCppCli(ServerHandle):
 
 def make_server(engine: str, model: config.ModelSpec, backend: str,
                 log_path: Path, max_tokens: int = config.SERVER_MAX_TOKENS,
-                mtp: bool = False) -> ServerHandle:
+                mtp: bool = False, tp: int = 1) -> ServerHandle:
     if engine == "tensorsharp":
-        return TensorSharpServer(model, backend, log_path, max_tokens, mtp=mtp)
+        return TensorSharpServer(model, backend, log_path, max_tokens, mtp=mtp, tp=tp)
     if engine == "llamacpp":
-        return LlamaCppServer(model, backend, log_path)
+        return LlamaCppServer(model, backend, log_path, tp=tp)
     if engine == "vllm":
         return VllmConnector(model, backend, log_path)
     if engine == "sdcpp":
@@ -652,10 +703,13 @@ def make_server(engine: str, model: config.ModelSpec, backend: str,
 
 
 def served_model_name(engine: str, server: ServerHandle, model: config.ModelSpec) -> str:
-    """The model id to send in the request body. llama.cpp / TensorSharp accept
-    the GGUF basename; vLLM uses whatever it advertises on /v1/models."""
-    if engine == "vllm" and getattr(server, "_served_name", None):
-        return server._served_name
+    """The model id to send in the request body: whatever the server advertises
+    on `/v1/models` when it names one (vLLM's served name, and TensorSharp's
+    hosted id — which for a split GGUF is not the shard file name), else the
+    GGUF basename, which llama.cpp and TensorSharp both accept."""
+    served = getattr(server, "_served_name", None)
+    if served:
+        return served
     return model.gguf.name
 
 

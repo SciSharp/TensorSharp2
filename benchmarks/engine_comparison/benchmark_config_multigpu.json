@@ -1,0 +1,164 @@
+{
+  "_comment": "Multi-GPU (tensor-parallel) benchmark config, written for a 4-GPU Linux box (validated on 4x NVIDIA A40 48 GB). TensorSharp vs llama.cpp on the same GGUFs, across text / multi-turn / tool / structured / image / audio / video scenarios, at --tp 1, 2 and 4. Select it with: python run_matrix.py --config benchmark_config_multigpu.json --tp 1,2,4 (report.py takes the same --config). TENSOR PARALLELISM: defaults.tp_devices lists the GPU ids the harness may use; every launched server is pinned to the first N of them (CUDA_VISIBLE_DEVICES), so a --tp N cell really occupies N GPUs and the tp=1 baseline really occupies one. TensorSharp splits with `--tp N`, llama.cpp with `--split-mode tensor`. A model too big for one GPU declares `min_tp` (DeepSeek V4 Flash UD-Q8_K_XL is ~154 GB, so it only runs at tp=4 on this box) and its smaller-degree cells are recorded as skipped instead of OOMing. MODEL PROVISIONING: every model declares its Hugging Face `source`, so any missing file is downloaded into ${model_root} on the first run and reused afterwards (`--download never` to require local files, `--download force` to re-fetch); files whose remote name differs from the local one carry their own `url`. Retarget with BENCH_MODEL_ROOT / BENCH_LLAMA_SERVER / BENCH_TS_SERVER_DLL / BENCH_RESULTS / BENCH_TP_DEVICES / BENCH_IMAGE / BENCH_AUDIO / BENCH_VIDEO.",
+
+  "paths": {
+    "model_root": "/workspace/models",
+    "results_dir": "${here}/results_multigpu",
+    "tensorsharp_server_dll": null,
+    "tensorsharp_port": 5000,
+    "llama_server_exe": "/root/llama.cpp/build/bin/llama-server",
+    "llama_port": 5001,
+    "media": {
+      "image": {"path": "/workspace/bench_media/test.jpg", "env": "BENCH_IMAGE"},
+      "audio": {"path": "/workspace/bench_media/speech.wav", "env": "BENCH_AUDIO"},
+      "video": {"path": "/workspace/bench_media/clip.mp4", "env": "BENCH_VIDEO"}
+    }
+  },
+
+  "models": {
+    "gemma4-e4b": {
+      "display": "Gemma 4 E4B it (Q8_0, dense multimodal)",
+      "family": "gemma4",
+      "source": "unsloth/gemma-4-E4B-it-GGUF",
+      "gguf": "${model_root}/gemma-4-E4B-it-Q8_0.gguf",
+      "mmproj": {"path": "${model_root}/gemma-4-E4B-it-mmproj-F16.gguf", "url": "mmproj-F16.gguf"},
+      "modalities": ["text", "image", "audio", "video"],
+      "size_class": "small",
+      "max_tp": 2,
+      "_max_tp_note": "the attention KV-head count (2) must be divisible by the TP degree, so TensorSharp accepts --tp 1 or 2 only",
+      "mtp_supported": true,
+      "mtp_draft": null
+    },
+    "gemma4-26b-a4b": {
+      "display": "Gemma 4 26B-A4B it (UD-IQ4_XS, MoE multimodal)",
+      "family": "gemma4",
+      "source": "unsloth/gemma-4-26B-A4B-it-GGUF",
+      "gguf": "${model_root}/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf",
+      "_mmproj_note": "the published GGUF mmproj for this model is vision-only (clip.has_audio_encoder is absent), unlike E4B's — so no audio scenario here",
+      "mmproj": {"path": "${model_root}/gemma-4-26B-A4B-it-UD-IQ4_XS-mmproj.gguf", "url": "mmproj-F16.gguf"},
+      "modalities": ["text", "image", "video"],
+      "size_class": "medium",
+      "max_tp": 2,
+      "_max_tp_note": "2 KV heads: TensorSharp rejects --tp 4 at load time (Gemma4 TP validation: KV heads must be divisible by the TP degree)",
+      "mtp_supported": true,
+      "mtp_draft": null
+    },
+    "qwen35-9b": {
+      "display": "Qwen 3.5 9B (Q8_0, dense)",
+      "family": "qwen35",
+      "source": "unsloth/Qwen3.5-9B-GGUF",
+      "gguf": "${model_root}/Qwen3.5-9B-Q8_0.gguf",
+      "mmproj": {"path": "${model_root}/Qwen3.5-9B-Q8_0-mmproj.gguf", "url": "mmproj-F16.gguf"},
+      "modalities": ["text", "image"],
+      "size_class": "small",
+      "mtp_supported": true,
+      "mtp_draft": null
+    },
+    "qwen35-35b-a3b": {
+      "display": "Qwen 3.5 35B-A3B (UD-IQ4_XS, MoE)",
+      "family": "qwen35",
+      "source": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "gguf": "${model_root}/Qwen3.5-35B-A3B-UD-IQ4_XS.gguf",
+      "mmproj": {"path": "${model_root}/Qwen3.5-35B-A3B-mmproj.gguf", "url": "mmproj-F16.gguf"},
+      "modalities": ["text", "image"],
+      "size_class": "medium",
+      "max_tp": 2,
+      "_max_tp_note": "the attention KV-head count (2) must be divisible by the TP degree, so TensorSharp accepts --tp 1 or 2 only",
+      "mtp_supported": true,
+      "mtp_draft": null
+    },
+    "nemotron3-omni-30b": {
+      "display": "NVIDIA Nemotron 3 Nano Omni 30B-A3B Reasoning (UD-IQ4_XS, MoE omni)",
+      "family": "nemotron3",
+      "source": "unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF",
+      "gguf": "${model_root}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ4_XS.gguf",
+      "_mmproj_note": "despite the Omni name, the published GGUF mmproj carries only the vision tower (nemotron_v2_vl projector, no audio encoder)",
+      "mmproj": {"path": "${model_root}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-mmproj.gguf", "url": "mmproj-BF16.gguf"},
+      "modalities": ["text", "image", "video"],
+      "size_class": "medium",
+      "max_tp": 2,
+      "_max_tp_note": "the attention KV-head count (2) must be divisible by the TP degree, so TensorSharp accepts --tp 1 or 2 only"
+    },
+    "gpt-oss-20b": {
+      "display": "gpt-oss 20B (Q8_0, MoE)",
+      "family": "gptoss",
+      "source": "unsloth/gpt-oss-20b-GGUF",
+      "gguf": "${model_root}/gpt-oss-20b-Q8_0.gguf",
+      "mmproj": null,
+      "modalities": ["text"],
+      "size_class": "medium"
+    },
+    "dsv4-flash": {
+      "display": "DeepSeek V4 Flash 0731 (UD-Q8_K_XL, ~154 GB — 4 GPUs)",
+      "family": "deepseek4",
+      "source": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": {"path": "${model_root}/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+               "url": "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf"},
+      "mmproj": null,
+      "modalities": ["text"],
+      "size_class": "large",
+      "min_tp": 4,
+      "_tp_note": "DeepSeek V4 has its own whole-model executor and passes tpDegree=1 to ModelBase, so --tp N here is NOT the ggml tensor-parallel path (no AllReduce): N is reinterpreted as the number of GPUs its executor LAYER-splits the 150.7 GiB of weights across. That is what makes the model hostable at all; it is capacity parallelism, not a throughput axis, so read its tp4 row as the only configuration that runs rather than as a scaling point."
+    }
+  },
+
+  "scenarios": {
+    "text_short": {"kind": "text", "description": "Short single-turn text prompt (~2k-token context preamble)", "max_tokens": 256},
+    "text_long": {"kind": "text", "description": "Long-context single-turn text prompt (~2k-token context preamble + passage)", "max_tokens": 256},
+    "multi_turn": {"kind": "multi_turn", "description": "3-turn conversation (~2k-token context preamble), timed on the final turn", "max_tokens": 256},
+    "function_call": {"kind": "function_call", "description": "Tool/function-calling (get_weather) with ~2k-token context preamble", "max_tokens": 256},
+    "json_mode": {"kind": "json_mode", "description": "Structured output (response_format json_object) with ~2k-token context preamble", "max_tokens": 256},
+    "image": {"kind": "image", "description": "Image understanding", "modality": "image", "max_tokens": 256},
+    "audio": {"kind": "audio", "description": "Audio understanding (speech clip)", "modality": "audio", "max_tokens": 256},
+    "video": {"kind": "video", "description": "Video understanding (sampled frames)", "modality": "video", "max_tokens": 256},
+
+    "prefill_2k": {"kind": "text", "description": "Prefill throughput @ ~2k prompt tokens", "max_tokens": 8},
+    "prefill_8k": {"kind": "text", "description": "Prefill throughput @ ~8k prompt tokens", "max_tokens": 8},
+    "prefill_16k": {"kind": "text", "description": "Prefill throughput @ ~16k prompt tokens", "max_tokens": 8}
+  },
+
+  "engines": {
+    "tensorsharp": {"display": "TensorSharp", "transport": "server", "backends": ["gpu", "cpu"]},
+    "llamacpp": {"display": "llama.cpp", "transport": "server", "backends": ["gpu", "cpu"]}
+  },
+
+  "backends": {
+    "_comment": "ggml_cuda is the apples-to-apples column (both engines on the same ggml CUDA kernels). `cuda` is TensorSharp's own direct-CUDA backend — no llama.cpp equivalent, so that column is TensorSharp-only. Both declare CUDA_VISIBLE_DEVICES as the device-pinning variable used by the --tp axis (it is also the inferred default for cuda-tagged backends). llama.cpp tensor parallelism uses --split-mode tensor (weights + KV, NCCL-backed); --split-mode row is gone from current CUDA builds. NCCL_P2P_DISABLE=1 is set for llama.cpp because this host ADVERTISES peer access between all four A40s but does not honour it: with P2P left on, llama-server spins forever in its first NCCL collective (95% CPU, never becomes ready) instead of loading. TensorSharp probes for this at startup and falls back on its own, so it needs no such flag.",
+    "ggml_cuda": {
+      "display": "CUDA",
+      "kind": "gpu",
+      "aliases": ["gpu"],
+      "visible_devices_env": "CUDA_VISIBLE_DEVICES",
+      "tensorsharp": {"backend": "ggml_cuda", "tp": true},
+      "llamacpp": {"ngl": 999, "tp": true, "tp_extra_args": ["--split-mode", "tensor"], "env": {"NCCL_P2P_DISABLE": "1"}}
+    },
+    "cuda": {
+      "display": "Direct CUDA",
+      "kind": "gpu",
+      "visible_devices_env": "CUDA_VISIBLE_DEVICES",
+      "tensorsharp": {"backend": "cuda", "tp": true}
+    }
+  },
+
+  "llama": {
+    "context_size": 24576,
+    "extra_args": ["--jinja"]
+  },
+
+  "ready_timeout_s": {"small": 900, "medium": 1200, "large": 3600},
+
+  "defaults": {
+    "engines": ["tensorsharp", "llamacpp"],
+    "models": ["gemma4-e4b", "gemma4-26b-a4b", "qwen35-9b", "qwen35-35b-a3b", "nemotron3-omni-30b", "gpt-oss-20b", "dsv4-flash"],
+    "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video"],
+    "backends": ["ggml_cuda"],
+    "thinking": false,
+    "mtp_modes": [false],
+    "tp_degrees": [1],
+    "tp_devices": [0, 1, 2, 3],
+    "concurrency": [1],
+    "max_tokens": 256,
+    "warmup": 1,
+    "server_max_tokens": 512
+  }
+}
