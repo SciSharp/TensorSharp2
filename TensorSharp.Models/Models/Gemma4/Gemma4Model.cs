@@ -469,7 +469,15 @@ namespace TensorSharp.Models
             Console.WriteLine($"Sliding window={_slidingWindow}, Softcap={_finalLogitSoftcap}");
             Console.WriteLine($"PLE dim={_pleDim}, SharedKVLayers={_sharedKVLayers}");
             if (_numExperts > 0)
+            {
                 Console.WriteLine($"MoE: {_numExperts} experts, {_numExpertsUsed} used per token");
+                // The host-MoE seam hangs off the GGML MoE FFN kernel (see
+                // TryMoEFusedGEGLU's IsGgmlBackend gate); the pure-C# CUDA path
+                // serves experts from its own stacked-expert device buffer and
+                // has no offload, so the flag would silently do nothing.
+                if (!IsGgmlBackend)
+                    MoeCpuOffloadConfig.WarnUnsupportedBackend("gemma4", _backend.ToString());
+            }
 
             int localCount = 0, globalCount = 0;
             for (int i = 0; i < Config.NumLayers; i++)

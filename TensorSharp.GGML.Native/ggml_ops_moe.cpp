@@ -52,7 +52,73 @@
 #include <mutex>
 #include <thread>
 
+#ifdef __linux__
+#include <sched.h>
+#endif
+
 using namespace tsg;
+
+namespace tsg
+{
+    int available_cpu_parallelism()
+    {
+        const unsigned hw = std::thread::hardware_concurrency();
+        int n = hw > 0 ? static_cast<int>(hw) : 1;
+
+#ifdef __linux__
+        // Affinity mask: taskset / cpuset cgroups pin the process to a subset.
+        {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            if (sched_getaffinity(0, sizeof(set), &set) == 0)
+            {
+                const int c = CPU_COUNT(&set);
+                if (c > 0 && c < n)
+                    n = c;
+            }
+        }
+
+        // CFS bandwidth quota: the count the scheduler will actually let run
+        // concurrently, which is what a spinning worker pool must not exceed.
+        long quota = -1;
+        long period = 0;
+        if (FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r"))   // cgroup v2
+        {
+            char q[64] = { 0 };
+            long p = 0;
+            if (std::fscanf(f, "%63s %ld", q, &p) == 2 && std::strcmp(q, "max") != 0)
+            {
+                quota = std::atol(q);
+                period = p;
+            }
+            std::fclose(f);
+        }
+        if (quota <= 0)                                            // cgroup v1
+        {
+            if (FILE* f = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r"))
+            {
+                if (std::fscanf(f, "%ld", &quota) != 1) quota = -1;
+                std::fclose(f);
+            }
+            if (FILE* f = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r"))
+            {
+                if (std::fscanf(f, "%ld", &period) != 1) period = 0;
+                std::fclose(f);
+            }
+        }
+        if (quota > 0 && period > 0)
+        {
+            // Floor: a fractional CPU cannot carry a spinning worker, it can
+            // only make every other worker wait for it at the next barrier.
+            int c = static_cast<int>(quota / period);
+            if (c < 1) c = 1;
+            if (c < n) n = c;
+        }
+#endif
+
+        return n < 1 ? 1 : n;
+    }
+}
 
 namespace
 {
@@ -80,11 +146,14 @@ namespace
                 if (n > 0)
                     return n;
             }
-            const unsigned hw = std::thread::hardware_concurrency();
+            // available_cpu_parallelism, not hardware_concurrency: on a
+            // cgroup-limited host the two differ by 4x and a pool sized to the
+            // latter spends its life waiting at barriers (see the header).
+            const int avail = available_cpu_parallelism();
             // Leave one core for the GPU submission thread: the host matmul and
             // the accelerator's driver thread run concurrently in this design,
             // and starving the submitter stalls the next layer's dispatch.
-            return hw > 2 ? static_cast<int>(hw - 1) : 1;
+            return avail > 2 ? avail - 1 : 1;
         }
 
         ggml_backend_t moe_cpu_backend()
@@ -326,7 +395,25 @@ namespace
         {
             if (t == nullptr || data == nullptr || bytes == 0)
                 return false;
-            ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(data, bytes);
+
+            // ggml_backend_cpu_buffer_from_ptr ASSERTS TENSOR_ALIGNMENT (32) on
+            // the pointer -- it aborts the process, it does not return null. A
+            // stacked expert tensor inside a memory-mapped GGUF lands wherever
+            // its row size puts it, and quantized rows are not multiples of 32
+            // bytes (an IQ4_XS row of 2816 elements is 11 blocks = 1496 bytes),
+            // so gemma-4-26B-A4B-IQ4_XS aborted here on the first --n-cpu-moe
+            // decode. Wrap an aligned window that CONTAINS the tensor and give
+            // the tensor its true address: only the buffer constructor is
+            // picky, ggml's CPU kernels load unaligned. Aligning DOWN cannot
+            // leave the mapping -- the mmap base is page-aligned, so a pointer
+            // within 31 bytes of it is already aligned -- and the lead bytes
+            // are never read.
+            const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(data);
+            const std::uintptr_t base = raw & ~static_cast<std::uintptr_t>(TENSOR_ALIGNMENT - 1);
+            const std::size_t lead = static_cast<std::size_t>(raw - base);
+
+            ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(
+                reinterpret_cast<void*>(base), bytes + lead);
             if (buf == nullptr)
                 return false;
             buffers.emplace_back(buf);

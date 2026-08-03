@@ -120,6 +120,7 @@ namespace TensorSharp.Models
             _allLayers = false;
             _explicitlySet = false;
             CpuThreads = 0;
+            ResetWarningLatch();
         }
 
         /// <summary>
@@ -232,6 +233,36 @@ namespace TensorSharp.Models
                 else if (layers > 0) SetLayers(layers);
             }
         }
+
+        private static int _unsupportedWarned;
+
+        /// <summary>
+        /// Say, once, that the selected backend has no host-MoE path so this
+        /// policy will not actually move anything off the accelerator.
+        ///
+        /// <para>The offload seam is implemented for the GGML backends (every
+        /// MoE architecture) and, on the pure-C# <c>cuda</c> backend, only for
+        /// DeepSeek V4. Everywhere else the routed experts are still uploaded
+        /// and still multiplied on the GPU. Staying silent is the real hazard:
+        /// the operator asked for a VRAM reduction, measured none, and had
+        /// nothing to tell them why — on gemma-4-26B the flag moved peak VRAM
+        /// from 14261 MiB to 14253 MiB, which reads exactly like a broken
+        /// build.</para>
+        /// </summary>
+        public static void WarnUnsupportedBackend(string architecture, string backend)
+        {
+            if (!IsEnabled)
+                return;
+            if (System.Threading.Interlocked.Exchange(ref _unsupportedWarned, 1) != 0)
+                return;
+            Console.Error.WriteLine(
+                $"[moe-offload] WARNING: --n-cpu-moe / --cpu-moe is not implemented for {architecture} on the " +
+                $"{backend} backend; the routed experts stay on the accelerator and no VRAM is saved. Use " +
+                "--backend ggml_cuda (or ggml_vulkan) for this model if you need the offload.");
+        }
+
+        /// <summary>Reset the once-only warning latch. Tests only.</summary>
+        internal static void ResetWarningLatch() => System.Threading.Interlocked.Exchange(ref _unsupportedWarned, 0);
 
         /// <summary>
         /// Human-readable summary for the model-load banner, e.g.

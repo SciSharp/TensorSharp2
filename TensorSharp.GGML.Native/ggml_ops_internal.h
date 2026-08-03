@@ -741,6 +741,19 @@ namespace tsg
     // backend teardown path so a model reload does not leak worker threads.
     void moe_ffn_host_release();
 
+    // CPU parallelism this process can ACTUALLY use: hardware_concurrency
+    // clamped by the scheduler affinity mask and by the cgroup CPU quota.
+    //
+    // Containers routinely report every host thread (96) while granting a
+    // fraction of them (a 23.8-CPU quota). ggml's worker pool spins at its
+    // per-node barriers, so oversubscribing a quota does not slow down in
+    // proportion — it collapses: every barrier waits for threads the scheduler
+    // will not run until the cgroup refills, which costs whole timeslices. On
+    // the 4x-oversubscribed case measured here that turned a 7.5 ms offloaded
+    // DeepSeek V4 layer into a 330 ms one (4.5 s per token, 25x slower than the
+    // same run with a quota-sized pool).
+    int available_cpu_parallelism();
+
     // ------------------------------------------------------------------
     // Whole-model decode graph segmentation for MoE CPU offload
     // ------------------------------------------------------------------

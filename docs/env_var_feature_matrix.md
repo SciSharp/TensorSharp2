@@ -67,7 +67,7 @@ per-model `TS_*_BATCHED` opt-outs surface as the model's declared
 | `TS_KV_PAGED_QUANT_BITS` | all | TurboQuant paged-KV block codec (2-bit uses the affine min+scale layout) | off (`0`) | `0`, `2`, `4`, `8` | yes |
 | `TS_N_CPU_MOE` | MoE models | Routed experts of the first N layers stay in system RAM and multiply on the host | off (`0`) | `0`, `16`, `32` | no |
 | `TS_CPU_MOE` | MoE models | Offload every layer's routed experts (equivalent to `TS_N_CPU_MOE=all`) | off | `0`, `1` | no |
-| `TS_CPU_MOE_THREADS` | MoE models | Worker threads for the host-side expert matmul | hardware threads minus one | - | no |
+| `TS_CPU_MOE_THREADS` | MoE models | Worker threads for the host-side expert matmul. Defaults to the usable CPU parallelism (hardware threads clamped by the affinity mask and the cgroup CPU quota) minus one; oversubscribing a quota collapses throughput because ggml's pool spins at its barriers | usable CPUs minus one | - | no |
 | `MAX_CONTEXT` | long text / uploaded text | Hard context cap | model default | `4096`, `8192`, `16384` | yes |
 
 ## Prefill / Decode Tuning

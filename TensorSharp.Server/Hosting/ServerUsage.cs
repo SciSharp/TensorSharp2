@@ -177,8 +177,11 @@ namespace TensorSharp.Server.Hosting
                     "(TS_CPU_MOE env var overrides).",
                     "--cpu-moe"),
                 new OptionHelp("--cpu-moe-threads <N>",
-                    "Worker threads for the host-side expert matmul. Default: one less than the hardware thread " +
-                    "count, leaving a core for accelerator submission (TS_CPU_MOE_THREADS env var overrides).",
+                    "Worker threads for the host-side expert matmul. Default: one less than the CPU parallelism " +
+                    "this process can actually use (hardware threads clamped by the affinity mask and the cgroup " +
+                    "CPU quota), leaving a core for accelerator submission. Do not set this above the quota: " +
+                    "ggml's pool spins at its barriers, so oversubscription collapses throughput rather than " +
+                    "degrading it (TS_CPU_MOE_THREADS env var overrides).",
                     "--cpu-moe-threads 12"),
             }),
             ("KV cache", new[]

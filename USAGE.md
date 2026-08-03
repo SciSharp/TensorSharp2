@@ -202,9 +202,18 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0 (env `TS_N_CPU_MOE`). |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0, except DeepSeek V4 on the GPU backends, which defaults to **auto** — it offloads the fewest leading layers that make the model fit the visible VRAM and reports what it chose (env `TS_N_CPU_MOE`). |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off (env `TS_CPU_MOE`). |
-| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: one less than the hardware thread count, leaving a core free for accelerator submission (env `TS_CPU_MOE_THREADS`). |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: one less than the CPU parallelism this process can actually use — `hardware_concurrency` clamped by the scheduler affinity mask and the cgroup CPU quota, leaving a core free for accelerator submission. Sizing this above the quota does not degrade gracefully: ggml's worker pool spins at its per-node barriers, so a pool 4x the quota measured 25x slower than a quota-sized one (env `TS_CPU_MOE_THREADS`). |
+
+**Backend support.** MoE CPU offload is implemented on the GGML backends
+(`ggml_cuda`, `ggml_vulkan`, `ggml_metal`, `ggml_cpu`) for every MoE
+architecture, and on the pure-C# `cuda` backend for DeepSeek V4 only — that
+engine serves experts from its own stacked-expert device buffer everywhere
+else. Asking for offload on a combination that does not implement it prints a
+`[moe-offload] WARNING` and proceeds without saving VRAM, rather than failing
+quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
+15244 → 5756 MiB; `cuda` 14261 → 14253 MiB (no-op, warns).
 | `--kv-cache-dtype <type>` | KV cache precision: `f32`, `f16`, `q8_0`, or `q4_0` (default: auto — the backend/model pick; env `KV_CACHE_DTYPE`). Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) require the native GGML flash path. |
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
@@ -394,9 +403,9 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--frequency-penalty <f>` | Default frequency penalty when a request does not provide one (`0` = disabled) |
 | `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
 | `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0. Env: `TS_N_CPU_MOE`. |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0, except DeepSeek V4 on the GPU backends, which defaults to auto (the fewest layers that fit the visible VRAM). Env: `TS_N_CPU_MOE`. |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off. Env: `TS_CPU_MOE`. |
-| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: hardware threads minus one. Env: `TS_CPU_MOE_THREADS`. |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: one less than the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota — oversubscribing a quota collapses throughput, it does not degrade gracefully). Env: `TS_CPU_MOE_THREADS`. |
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
 | `--prefill-chunk-size <N>` | Chunked-prefill granularity under contention — the maximum prefill tokens scheduled per step while other requests are running, so parallel decodes get frequent turns at the GPU (default: `1024`). Env: `TS_SCHED_PREFILL_CHUNK`. |

@@ -430,8 +430,16 @@ namespace TensorSharp.Models
                 Console.WriteLine($"NextN/MTP: {_numNextnLayers} draft block(s) at layer {_mtpLayerIdx} (excluded from main stack)");
 
             if (_numExperts > 0)
+            {
                 Console.WriteLine($"MoE: experts={_numExperts}, used={_numExpertsUsed}, " +
                     $"expertFFN={_expertFfnLength}, sharedFFN={_sharedExpertFfnLength}");
+                // The host-MoE seam hangs off the GGML MoE FFN kernel; the
+                // pure-C# CUDA path serves experts from its own device-resident
+                // stacked buffer and has no offload, so the flag would silently
+                // do nothing there.
+                if (!IsGgmlBackend)
+                    MoeCpuOffloadConfig.WarnUnsupportedBackend("qwen35moe", _backend.ToString());
+            }
 
             LoadWeights();
             FuseAttentionProjectionWeights();

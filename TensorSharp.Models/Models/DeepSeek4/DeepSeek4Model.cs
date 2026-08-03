@@ -67,7 +67,7 @@ namespace TensorSharp.Models
                 Console.WriteLine($"Model: {arch} (direct-CUDA whole-model executor), Layers={Config.NumLayers}, " +
                     $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}" +
                     (dspark != null ? ", DSpark drafter" : string.Empty));
-                _cudaExec = new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, nGpu, dspark);
+                _cudaExec = new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, nGpu, dspark, ResolveCpuMoeLayers());
             }
             else if (_backend == BackendType.Cpu)
             {
@@ -91,9 +91,15 @@ namespace TensorSharp.Models
                     $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}" +
                     (dspark != null ? ", DSpark drafter" : string.Empty));
 
+                int nCpuMoe = ResolveCpuMoeLayers();
+                // `backend`, not `_backend`: the base ctor coerces everything to
+                // GgmlCpu so no second GPU context is created, but the native
+                // executor still has to pick its devices from the backend the
+                // operator actually asked for.
+                string backendName = BackendRegistryName(backend);
                 _handle = dspark != null
-                    ? GgmlDeepSeek4Native.LoadModelWithDspark(ggufPath, nGpu, maxContext, nUbatch, nThreads, dspark)
-                    : GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads);
+                    ? GgmlDeepSeek4Native.LoadModelWithDspark(ggufPath, nGpu, maxContext, nUbatch, nThreads, dspark, nCpuMoe, backendName)
+                    : GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads, nCpuMoe, backendName);
                 _nativeUBatch = nUbatch;
                 _nativeDsparkBlock = _handle != IntPtr.Zero && dspark != null
                     ? GgmlDeepSeek4Native.DsparkBlockSize(_handle) : 0;
@@ -101,6 +107,42 @@ namespace TensorSharp.Models
                     throw new InvalidOperationException($"Failed to load DeepSeek V4 model from {ggufPath} (see stderr for details).");
             }
         }
+
+        /// <summary>
+        /// Translate the process-wide <see cref="MoeCpuOffloadConfig"/> into the
+        /// native loader's routed-expert offload policy.
+        ///
+        /// <para>Unlike the other MoE models, DeepSeek V4 defaults to
+        /// <see cref="GgmlDeepSeek4Native.CpuMoeAuto"/> instead of "no offload":
+        /// 91% of a V4 Flash checkpoint's bytes are routed experts, and at
+        /// Q8_K_XL the weights (151 GiB) outweigh even three 48 GiB cards, so
+        /// without a spill the load can only end in an out-of-memory abort. Auto
+        /// offloads the fewest leading layers that make it fit and says so; an
+        /// explicit --n-cpu-moe / --cpu-moe is honored as given.</para>
+        /// </summary>
+        private static int ResolveCpuMoeLayers()
+        {
+            if (!MoeCpuOffloadConfig.IsExplicitlySet)
+                return GgmlDeepSeek4Native.CpuMoeAuto;
+            return MoeCpuOffloadConfig.AllLayers ? int.MaxValue : MoeCpuOffloadConfig.CpuMoeLayers;
+        }
+
+        /// <summary>
+        /// ggml backend registry name whose GPU devices the native executor
+        /// should run on. GgmlOps links every backend it was built with and the
+        /// loader enumerates devices in registration order, so without this a
+        /// CUDA-capable box runs <c>--backend ggml_vulkan</c> on its CUDA
+        /// devices and the Vulkan path is never exercised. Null = any GPU.
+        /// </summary>
+        private static string BackendRegistryName(BackendType backend) => backend switch
+        {
+            // GGML_CUDA_NAME is "CUDA" / "ROCm" / "MUSA" depending on how
+            // ggml-cuda was built; the native side treats them as one family.
+            BackendType.GgmlCuda => "CUDA",
+            BackendType.GgmlVulkan => "Vulkan",
+            BackendType.GgmlMetal => "Metal",
+            _ => null,
+        };
 
         /// <summary>Draft block size of the native (ggml) executor's drafter,
         /// 0 when none is loaded.</summary>

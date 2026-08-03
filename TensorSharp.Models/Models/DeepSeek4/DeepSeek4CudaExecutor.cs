@@ -119,7 +119,36 @@ namespace TensorSharp.Models
 
         private GgufFile _dsparkGguf;
 
-        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu, string dsparkPath = null)
+        /// <summary>
+        /// The engine's host-side quantized matmul for <c>--n-cpu-moe</c>
+        /// layers. It lives here because the managed quantized kernels are in
+        /// this assembly, which TensorSharp.Backends.Cuda cannot reference (the
+        /// dependency runs the other way) — same inversion as
+        /// <c>IDsv4WeightSource</c>.
+        /// </summary>
+        private sealed class HostMatMul : IDsv4HostMatMul
+        {
+            public static readonly HostMatMul Instance = new HostMatMul();
+
+            public bool TryMatMulBatch(int ggmlType, int inDim, int inputRowStride,
+                ReadOnlySpan<IDsv4HostMatMul.Job> jobs)
+            {
+                if (jobs.Length == 0)
+                    return true;
+                var mapped = new ManagedQuantizedOps.QuantMatMulJob[jobs.Length];
+                for (int i = 0; i < jobs.Length; i++)
+                    mapped[i] = new ManagedQuantizedOps.QuantMatMulJob(
+                        jobs[i].Weights, jobs[i].Input, jobs[i].Output,
+                        jobs[i].OutDim, jobs[i].RowCount, jobs[i].OutputRowStride);
+                return ManagedQuantizedOps.TryAddmmQuantizedBatch(ggmlType, inDim, inputRowStride, mapped);
+            }
+        }
+
+        /// <param name="nCpuMoe">Routed-expert CPU offload policy: -1 auto (the
+        /// fewest leading layers that make the model fit the visible VRAM), 0
+        /// none, N the first N layers, <see cref="int.MaxValue"/> every layer.</param>
+        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu, string dsparkPath = null,
+            int nCpuMoe = -1)
         {
             var sw = Stopwatch.StartNew();
             bool stats = ParseEnvInt("TS_DSV4_LOAD_STATS", 0) != 0;
@@ -152,7 +181,7 @@ namespace TensorSharp.Models
 
             var desc = BuildModelDesc(nCtx, ubatch);
             Mark("model desc built");
-            _engine = new Dsv4CudaEngine(desc, nGpu);
+            _engine = new Dsv4CudaEngine(desc, nGpu, nCpuMoe);
             Mark("engine ready");
 
             // Everything lives in VRAM now; drop the host-side scraps.
@@ -493,6 +522,7 @@ namespace TensorSharp.Models
                 RopeCompTable = BuildRopeTable(nCtx, comp: true),
                 Layers = new Dsv4CudaEngine.LayerDesc[_nLayer],
                 Dspark = BuildDsparkDesc(),
+                HostMatMul = HostMatMul.Instance,
             };
 
             for (int il = 0; il < _nLayer; il++)
