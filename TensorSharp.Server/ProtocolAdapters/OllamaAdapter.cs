@@ -134,10 +134,13 @@ namespace TensorSharp.Server.ProtocolAdapters
             string prompt = body.TryGetProperty("prompt", out var pp) ? pp.GetString() ?? "" : "";
             bool stream = true;
             if (body.TryGetProperty("stream", out var streamProp)) stream = streamProp.GetBoolean();
-            int maxTokens = 200;
-            var samplingConfig = SamplingConfigParser.ParseOllama(body, _options.DefaultSamplingConfig);
-            if (body.TryGetProperty("options", out var opts) && opts.TryGetProperty("num_predict", out var np))
-                maxTokens = np.GetInt32();
+            var samplingConfig = SamplingConfigParser.ParseOllama(body, _options.SamplingDefaults);
+            // Ollama nests the budget in "options"; -1 ("unbounded") and an
+            // absent key both mean "use the server's --max-tokens".
+            int maxTokens = _options.ResolveMaxTokens(
+                body.TryGetProperty("options", out var opts) && opts.ValueKind == JsonValueKind.Object
+                    ? SamplingConfigParser.ReadRequestedMaxTokens(opts, "num_predict")
+                    : null);
 
             var imagePaths = ChatMessageParser.DecodeBase64Images(body, _options.UploadDirectory);
 
@@ -266,10 +269,11 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             bool stream = true;
             if (body.TryGetProperty("stream", out var streamProp)) stream = streamProp.GetBoolean();
-            int maxTokens = 200;
-            var samplingConfig = SamplingConfigParser.ParseOllama(body, _options.DefaultSamplingConfig);
-            if (body.TryGetProperty("options", out var opts) && opts.TryGetProperty("num_predict", out var np))
-                maxTokens = np.GetInt32();
+            var samplingConfig = SamplingConfigParser.ParseOllama(body, _options.SamplingDefaults);
+            int maxTokens = _options.ResolveMaxTokens(
+                body.TryGetProperty("options", out var opts) && opts.ValueKind == JsonValueKind.Object
+                    ? SamplingConfigParser.ReadRequestedMaxTokens(opts, "num_predict")
+                    : null);
 
             var messages = ChatMessageParser.ParseOllama(messagesEl, _options.UploadDirectory);
             var ollamaTools = ToolFunctionParser.ParseOllama(body);

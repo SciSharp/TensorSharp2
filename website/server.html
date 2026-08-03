@@ -51,7 +51,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda</code></pre>
 
   <h3>Server-wide default sampling</h3>
-  <p>Defaults fill in any field a request omits; per-request values always win. Out of the box the defaults match Ollama: temperature <code>0.8</code>, top-k <code>40</code>, top-p <code>0.9</code>, min-p <code>0</code>, repeat penalty <code>1.1</code>, presence/frequency <code>0</code>, seed <code>-1</code>.</p>
+  <p>Defaults fill in any field a request omits. Out of the box they match Ollama: temperature <code>0.8</code>, top-k <code>40</code>, top-p <code>0.9</code>, min-p <code>0</code>, repeat penalty <code>1.1</code>, presence/frequency <code>0</code>, seed <code>-1</code>. A parameter you set explicitly also <em>overrides</em> the value a client sends for it — many chat clients (VS Code Copilot Chat among them) hardcode <code>temperature</code>/<code>top_p</code> into every request. Add <code>--sampling-precedence request</code> to hand that control back to clients.</p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf --backend ggml_metal \
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
     --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
@@ -104,10 +104,11 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
       <tr><td><code>--list-gpus</code></td><td>List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit.</td></tr>
       <tr><td><code>--help</code></td><td>Print the full parameter reference and exit; it is also shown when no arguments are supplied. Inference always requires a startup <code>--model</code>.</td></tr>
       <tr><td><code>--config &lt;path&gt;</code></td><td>Read options from a JSON <a href="#config">config file</a> (command-line options override it). Supports <code>${variables}</code> and auto-downloading models via <code>{ "path": ..., "urls": [...] }</code>. Repeatable.</td></tr>
-      <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Default generation limit when a request omits it (default: <code>20000</code> for the Web UI; the Ollama/OpenAI compat endpoints fall back to <code>200</code> when the request omits it).</td></tr>
-      <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>Default sampling values when a request does not provide them (defaults: <code>0.8</code> / <code>40</code> / <code>0.9</code> / <code>0</code>).</td></tr>
-      <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>Default penalties and seed (defaults: <code>1.1</code> / <code>0</code> / <code>0</code> / <code>-1</code>).</td></tr>
-      <tr><td><code>--stop &lt;string&gt;</code></td><td>Default stop sequence (repeatable). Per-request <code>stop</code> replaces the list.</td></tr>
+      <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Generation limit for every endpoint (Web UI, Ollama and OpenAI alike): fills in when a request omits it, and caps a request that asks for more (default: <code>20000</code>, which only fills in).</td></tr>
+      <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>Sampling values (defaults: <code>0.8</code> / <code>40</code> / <code>0.9</code> / <code>0</code>).</td></tr>
+      <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>Penalties and seed (defaults: <code>1.1</code> / <code>0</code> / <code>0</code> / <code>-1</code>).</td></tr>
+      <tr><td><code>--stop &lt;string&gt;</code></td><td>Stop sequence (repeatable). Merged with a per-request <code>stop</code> list under <code>config</code> precedence; replaced by it under <code>request</code>.</td></tr>
+      <tr><td><code>--sampling-precedence &lt;config|request&gt;</code></td><td>Who wins when a request also carries a sampling parameter you configured above: <code>config</code> (default) keeps your value, <code>request</code> lets the client's win. Parameters you did not configure always come from the request. Env: <code>TENSORSHARP_SAMPLING_PRECEDENCE</code>.</td></tr>
       <tr><td><code>--continuous-batching</code> / <code>--no-continuous-batching</code></td><td>Enable (default) or disable iteration-level paged batching. Alias: <code>--paged-batching</code>.</td></tr>
       <tr><td><code>--mtp-spec</code> / <code>--no-mtp-spec</code></td><td>Enable / disable NextN / MTP speculative decoding (default off). Only engages on models with an MTP/NextN draft head — for Qwen 3.6 that means a GGUF that retains the NextN block (e.g. the <code>-MTP-</code> repos); base-repo GGUFs strip it and silently fall back to standard decode. → <a href="advanced.html#mtp">MTP</a></td></tr>
       <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>Max tokens drafted per speculative step (default <code>8</code>).</td></tr>
@@ -125,7 +126,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
     </tbody>
   </table>
   </div>
-  <div class="callout tip"><div class="ic">✅</div><p>Per-request fields (<code>temperature</code>, <code>top_p</code>, <code>seed</code>, <code>stop</code>, …) always override these server-wide defaults; the defaults only fill in what a client omits.</p></div>
+  <div class="callout tip"><div class="ic">✅</div><p>Per-request fields (<code>temperature</code>, <code>top_p</code>, <code>seed</code>, <code>stop</code>, …) fill in every parameter you did not configure here. For one you did configure, your value wins unless the server runs with <code>--sampling-precedence request</code>. The <code>chat.start</code> log line prints the sampler each request actually ran with.</p></div>
 
   <h2 id="env">Environment variables</h2>
   <div class="table-scroll">

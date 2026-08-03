@@ -97,9 +97,13 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return;
             }
 
-            bool stream = body.TryGetProperty("stream", out var streamProp) && streamProp.GetBoolean();
-            int maxTokens = body.TryGetProperty("max_tokens", out var mtProp) ? mtProp.GetInt32() : 200;
-            var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.DefaultSamplingConfig);
+            bool stream = body.TryGetProperty("stream", out var streamProp) && streamProp.ValueKind == JsonValueKind.True;
+            // Absent / null / non-positive falls back to the server's
+            // --max-tokens (previously a hard-coded 200 that ignored the
+            // operator's configuration entirely).
+            int maxTokens = _options.ResolveMaxTokens(
+                SamplingConfigParser.ReadRequestedMaxTokens(body, "max_tokens", "max_completion_tokens"));
+            var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
             var messages = ChatMessageParser.ParseOpenAI(messagesEl, _options.UploadDirectory);
             string requestId = OpenAIResponseFactory.NewRequestId();
 

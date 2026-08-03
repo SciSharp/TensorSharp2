@@ -55,6 +55,19 @@ namespace TensorSharp.Server
             });
         }
 
+        /// <summary>
+        /// Compact stop-sequence rendering for the per-request log lines: the
+        /// count plus the sequences themselves, since a stray stop string is a
+        /// common cause of "the model answered with one word".
+        /// </summary>
+        private static string DescribeStopSequences(SamplingConfig cfg)
+        {
+            var stops = cfg?.StopSequences;
+            if (stops == null || stops.Count == 0)
+                return "(none)";
+            return "[" + string.Join(",", stops) + "]";
+        }
+
         public void LogChatStarted(
             string arch,
             int maxTokens,
@@ -98,14 +111,17 @@ namespace TensorSharp.Server
             string turnUploads = SerializeUploadsForLog(lastUserMessage);
             string fullInput = SerializeMessagesForLog(preparedHistory);
 
+            var effective = samplingConfig ?? new SamplingConfig();
             _logger.LogInformation(LogEventIds.ChatStarted,
-                "chat.start arch={Architecture} maxTokens={MaxTokens} thinking={EnableThinking} tools={ToolCount} messages(user={UserMessages},assistant={AssistantMessages},system={SystemMessages}) attachments(image={ImageCount},audio={AudioCount},textFile={TextFileCount}) uploads={Uploads} sampling(temp={Temperature},topK={TopK},topP={TopP},minP={MinP},seed={Seed}) userInput=\"{LastUserContent}\" fullInput={FullInput}",
+                "chat.start arch={Architecture} maxTokens={MaxTokens} thinking={EnableThinking} tools={ToolCount} messages(user={UserMessages},assistant={AssistantMessages},system={SystemMessages}) attachments(image={ImageCount},audio={AudioCount},textFile={TextFileCount}) uploads={Uploads} sampling(temp={Temperature},topK={TopK},topP={TopP},minP={MinP},repeatPenalty={RepeatPenalty},repeatLastN={RepeatLastN},presencePenalty={PresencePenalty},frequencyPenalty={FrequencyPenalty},seed={Seed},stop={StopSequences}) userInput=\"{LastUserContent}\" fullInput={FullInput}",
                 arch, maxTokens, enableThinking, tools?.Count ?? 0,
                 userMessageCount, assistantMessageCount, systemMessageCount,
                 imageAttachments, audioAttachments, textFileAttachments,
                 turnUploads,
-                samplingConfig?.Temperature ?? 0.8f, samplingConfig?.TopK ?? 40,
-                samplingConfig?.TopP ?? 0.9f, samplingConfig?.MinP ?? 0f, samplingConfig?.Seed ?? 0,
+                effective.Temperature, effective.TopK, effective.TopP, effective.MinP,
+                effective.RepetitionPenalty, effective.PenaltyLastN,
+                effective.PresencePenalty, effective.FrequencyPenalty, effective.Seed,
+                DescribeStopSequences(effective),
                 lastUserContent, fullInput);
         }
 
@@ -154,11 +170,14 @@ namespace TensorSharp.Server
             string promptContent = LoggingExtensions.SanitizeForLog(
                 promptPreview, MaxLoggedMessageChars);
             string turnUploads = SerializeUploadsForLog(promptMessage);
+            var effective = samplingConfig ?? new SamplingConfig();
             _logger.LogInformation(LogEventIds.ChatStarted,
-                "generate.start arch={Architecture} maxTokens={MaxTokens} imageAttachments={ImageCount} uploads={Uploads} sampling(temp={Temperature},topK={TopK},topP={TopP},seed={Seed}) prompt=\"{Prompt}\"",
+                "generate.start arch={Architecture} maxTokens={MaxTokens} imageAttachments={ImageCount} uploads={Uploads} sampling(temp={Temperature},topK={TopK},topP={TopP},minP={MinP},repeatPenalty={RepeatPenalty},repeatLastN={RepeatLastN},presencePenalty={PresencePenalty},frequencyPenalty={FrequencyPenalty},seed={Seed},stop={StopSequences}) prompt=\"{Prompt}\"",
                 arch, maxTokens, imageAttachmentCount, turnUploads,
-                samplingConfig?.Temperature ?? 0.8f, samplingConfig?.TopK ?? 40,
-                samplingConfig?.TopP ?? 0.9f, samplingConfig?.Seed ?? 0,
+                effective.Temperature, effective.TopK, effective.TopP, effective.MinP,
+                effective.RepetitionPenalty, effective.PenaltyLastN,
+                effective.PresencePenalty, effective.FrequencyPenalty, effective.Seed,
+                DescribeStopSequences(effective),
                 promptContent);
         }
 

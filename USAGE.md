@@ -393,16 +393,17 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--help` | Print the parameter reference (also shown when the server is started with no arguments) and exit |
-| `--max-tokens <N>` | Default maximum tokens to generate when a request omits the limit (default: `20000`) |
-| `--temperature <f>` | Default sampling temperature when a request does not provide one (`0` = greedy) |
-| `--top-k <N>` | Default top-K filtering when a request does not provide one (`0` = disabled) |
-| `--top-p <f>` | Default nucleus sampling threshold when a request does not provide one (`1.0` = disabled) |
-| `--min-p <f>` | Default min-p filtering when a request does not provide one (`0` = disabled) |
-| `--repeat-penalty <f>` | Default repetition penalty when a request does not provide one (`1.0` = none) |
-| `--presence-penalty <f>` | Default presence penalty when a request does not provide one (`0` = disabled) |
-| `--frequency-penalty <f>` | Default frequency penalty when a request does not provide one (`0` = disabled) |
-| `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
-| `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
+| `--max-tokens <N>` | Maximum tokens to generate: fills in when a request omits its own limit, and caps a request that asks for more. Applies to every endpoint (Web UI, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses`). Default: `20000`, which is a plain default and does not cap. Env: `MAX_TOKENS`. |
+| `--temperature <f>` | Sampling temperature (`0` = greedy) |
+| `--top-k <N>` | Top-K filtering (`0` = disabled) |
+| `--top-p <f>` | Nucleus sampling threshold (`1.0` = disabled) |
+| `--min-p <f>` | Min-p filtering (`0` = disabled) |
+| `--repeat-penalty <f>` | Repetition penalty (`1.0` = none) |
+| `--presence-penalty <f>` | Presence penalty (`0` = disabled) |
+| `--frequency-penalty <f>` | Frequency penalty (`0` = disabled) |
+| `--seed <N>` | Random seed (`-1` = non-deterministic) |
+| `--stop <string>` | Stop sequence (can be repeated). Under `--sampling-precedence config` a per-request `stop`/`stop_sequences` list is merged with these; under `request` it replaces them. |
+| `--sampling-precedence <config\|request>` | Who wins when a request also carries a sampling parameter you set above. `config` (default) keeps your value — clients such as VS Code Copilot Chat hardcode `temperature`/`top_p` into every request and would otherwise silently override your configuration; parameters you did **not** set still come from the request. `request` restores client-always-wins. Env: `TENSORSHARP_SAMPLING_PRECEDENCE`. |
 | `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0, except DeepSeek V4 on the GPU backends, which defaults to auto (the fewest layers that fit the visible VRAM). Env: `TS_N_CPU_MOE`. |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off. Env: `TS_CPU_MOE`. |
 | `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: one less than the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota — oversubscribing a quota collapses throughput, it does not degrade gracefully). Env: `TS_CPU_MOE_THREADS`. |
@@ -428,26 +429,33 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
 `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`,
-`frequency_penalty`, `seed`, `stop`/`stop_sequences`) always win over these
-server-wide defaults; the defaults only fill in fields the client omits.
+`frequency_penalty`, `seed`, `stop`/`stop_sequences`) fill in every parameter
+you did **not** configure above. For a parameter you *did* configure, the
+default `--sampling-precedence config` keeps your value and ignores the
+request's — many chat clients hardcode `temperature`/`top_p` into every call
+with no way for the end user to change them, so an unconfigured server-side
+value is the only one a request can move. Pass `--sampling-precedence request`
+for the inverse (clients always win), which is what versions before this flag
+did unconditionally.
 
 **Runtime environment variables:**
 
 | Variable | Description |
 |---|---|
 | `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
-| `MAX_TOKENS` | Default maximum generation length when neither `--max-tokens` nor a request-level limit is set (default: `20000`) |
+| `MAX_TOKENS` | Maximum generation length when `--max-tokens` is not passed: fills in when a request omits its own limit and caps a request that asks for more (default: `20000`, which is a plain default and does not cap) |
 | `VIDEO_SAMPLE_FPS` | Frames sampled per second of video for video prompts; time-based extraction (default: `1`) |
 | `VIDEO_MAX_FRAMES` | Optional upper bound on extracted video frames (evenly down-sampled); unset/`0` means no cap (default: no cap) |
 | `PORT` / `ASPNETCORE_URLS` | Currently overridden by the fixed `http://0.0.0.0:5000` listener in `Program.cs`; Docker Space images rewrite that constant with `APP_PORT` at build time. |
-| `TENSORSHARP_TEMPERATURE` | Default sampling temperature when neither `--temperature` nor the request body sets one |
-| `TENSORSHARP_TOP_K` | Default top-K when neither `--top-k` nor the request body sets one |
-| `TENSORSHARP_TOP_P` | Default top-P when neither `--top-p` nor the request body sets one |
-| `TENSORSHARP_MIN_P` | Default min-P when neither `--min-p` nor the request body sets one |
-| `TENSORSHARP_REPEAT_PENALTY` | Default repetition penalty when neither `--repeat-penalty` nor the request body sets one |
-| `TENSORSHARP_PRESENCE_PENALTY` | Default presence penalty when neither `--presence-penalty` nor the request body sets one |
-| `TENSORSHARP_FREQUENCY_PENALTY` | Default frequency penalty when neither `--frequency-penalty` nor the request body sets one |
-| `TENSORSHARP_SEED` | Default random seed when neither `--seed` nor the request body sets one |
+| `TENSORSHARP_TEMPERATURE` | Sampling temperature when `--temperature` is not passed. Counts as operator-configured, so it also outranks the request body under the default `--sampling-precedence config` |
+| `TENSORSHARP_TOP_K` | Top-K when `--top-k` is not passed (same precedence rule as `TENSORSHARP_TEMPERATURE`) |
+| `TENSORSHARP_TOP_P` | Top-P when `--top-p` is not passed (same precedence rule) |
+| `TENSORSHARP_MIN_P` | Min-P when `--min-p` is not passed (same precedence rule) |
+| `TENSORSHARP_REPEAT_PENALTY` | Repetition penalty when `--repeat-penalty` is not passed (same precedence rule) |
+| `TENSORSHARP_PRESENCE_PENALTY` | Presence penalty when `--presence-penalty` is not passed (same precedence rule) |
+| `TENSORSHARP_FREQUENCY_PENALTY` | Frequency penalty when `--frequency-penalty` is not passed (same precedence rule) |
+| `TENSORSHARP_SEED` | Random seed when `--seed` is not passed (same precedence rule) |
+| `TENSORSHARP_SAMPLING_PRECEDENCE` | `config` (default) or `request`: whether server-configured sampling parameters outrank the ones a client sends. `--sampling-precedence` overrides it |
 | `TENSORSHARP_LOG_LEVEL` | Minimum log level for both console and file loggers: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` (default: `Information`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
@@ -530,12 +538,20 @@ These gate the optional multi-token-prediction speculative decode path (see [MTP
 | `DIFFUSION_BATCHED_FORWARD` | Set to `1` to use true batched `DecodeCanvasBatched` for active diffusion canvases; default time-slices the faster fused single-canvas path. |
 | `DIFFUSION_LMHEAD_BATCH_CAP_MB` | Memory cap for batched diffusion lm-head logits before falling back to per-sequence lm-head (default: `300`). |
 
-Sampling parameter precedence (highest wins):
+Sampling parameter precedence (highest wins), with the default
+`--sampling-precedence config`:
 
-1. Per-request JSON fields in the API call (e.g. `temperature`, `top_p`, `stop`).
-2. Server-wide CLI flags (e.g. `--temperature`, `--top-p`, `--stop`).
-3. `TENSORSHARP_*` environment variables listed above.
-4. Built-in `SamplingConfig` defaults (`temperature=1.0`, `top_k=0`, `top_p=1.0`, `min_p=0`, `repeat_penalty=1.0`, presence/frequency penalties `0`, `seed=-1`, no stop sequences).
+1. Server-wide CLI flags / config-file keys (e.g. `--temperature`, `--top-p`, `--stop`).
+2. `TENSORSHARP_*` environment variables listed above.
+3. Per-request JSON fields in the API call (e.g. `temperature`, `top_p`, `stop`)
+   — for every parameter that steps 1 and 2 did not set.
+4. Built-in `SamplingConfig` defaults (`temperature=0.8`, `top_k=40`, `top_p=0.9`, `min_p=0`, `repeat_penalty=1.1`, `repeat_last_n=64`, presence/frequency penalties `0`, `seed=-1`, no stop sequences).
+
+With `--sampling-precedence request`, steps 1–3 swap: the request wins over the
+server-wide flags and env vars for parameters it sends, and they still fill in
+the rest. Either way `--stop` sequences pinned on the server stay in force under
+`config` (merged with the request's) and are replaced by the request under
+`request`.
 
 ## Mixture-of-Experts CPU offload (`--n-cpu-moe`)
 
@@ -880,7 +896,9 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 
 #### Sampling defaults (server-only)
 
-These fill in fields the request body omits; per-request JSON always wins, CLI flags win over env vars.
+These fill in fields the request body omits. CLI flags win over env vars, and
+anything set through either outranks the request body unless the server runs
+with `--sampling-precedence request` (see [Web Application](#web-application)).
 
 | Sampling field | Env var | CLI equivalent |
 |---|---|---|
@@ -894,6 +912,7 @@ These fill in fields the request body omits; per-request JSON always wins, CLI f
 | `seed` | `TENSORSHARP_SEED` | `--seed` |
 | max tokens | `MAX_TOKENS` | `--max-tokens` |
 | stop sequences | — (CLI / per-request only) | `--stop` (repeatable) |
+| sampling precedence | `TENSORSHARP_SAMPLING_PRECEDENCE` | `--sampling-precedence` |
 
 #### Hosting & uploads (server-only)
 

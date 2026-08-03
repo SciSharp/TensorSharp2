@@ -128,10 +128,11 @@ namespace TensorSharp.Server.Hosting
                     "(TENSORSHARP_TP_PEERS env var overrides).",
                     "--tp-peers 192.168.1.10:9500,192.168.1.11:9500"),
             }),
-            ("Generation defaults (used when a request omits the field)", new[]
+            ("Generation defaults (pinned values also override requests — see --sampling-precedence)", new[]
             {
                 new OptionHelp("--max-tokens <N>",
-                    "Maximum tokens to generate per request. Default: 20000 (MAX_TOKENS env var overrides).",
+                    "Maximum tokens to generate per request: fills in when the request omits a limit, and caps a " +
+                    "request that asks for more. Default: 20000, uncapped (MAX_TOKENS env var overrides).",
                     "--max-tokens 4096"),
                 new OptionHelp("--temperature <f>",
                     "Sampling temperature; 0 = greedy. Default: 0.8 (TENSORSHARP_TEMPERATURE env var).",
@@ -163,6 +164,14 @@ namespace TensorSharp.Server.Hosting
                 new OptionHelp("--stop <text>",
                     "Stop sequence; repeat the flag to pin several. Default: none.",
                     "--stop \"</s>\" --stop \"<|eot|>\""),
+                new OptionHelp("--sampling-precedence <config|request>",
+                    "Who wins when a request also carries a sampling parameter you pinned above. 'config' " +
+                    "(default) keeps your values — clients such as VS Code Copilot Chat hardcode temperature/top_p " +
+                    "into every request and would otherwise silently override them; parameters you did NOT pin " +
+                    "still come from the request. 'request' restores client-always-wins. Pinned stop sequences " +
+                    "are merged with the request's rather than replacing them " +
+                    "(TENSORSHARP_SAMPLING_PRECEDENCE env var overrides).",
+                    "--sampling-precedence request"),
             }),
             ("Mixture-of-Experts CPU offload", new[]
             {

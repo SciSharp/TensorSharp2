@@ -55,10 +55,11 @@ namespace TensorSharp.Server.Hosting
             }
 
             logger.LogInformation(LogEventIds.HostConfiguration,
-                "Server configuration: hostedModel={HostedModel} hostedMmProj={HostedMmProj} defaultWebMaxTokens={DefaultWebMaxTokens} videoSampleFps={VideoSampleFps} videoMaxFrames={VideoMaxFrames} listen={ListenAddress}",
+                "Server configuration: hostedModel={HostedModel} hostedMmProj={HostedMmProj} defaultMaxTokens={DefaultMaxTokens}{MaxTokensPinned} videoSampleFps={VideoSampleFps} videoMaxFrames={VideoMaxFrames} listen={ListenAddress}",
                 options.StartupModelPath ?? "(none)",
                 options.StartupMmProjPath ?? "(none)",
-                options.DefaultWebMaxTokens,
+                options.DefaultMaxTokens,
+                options.MaxTokensPinned ? " (server cap)" : string.Empty,
                 MediaHelper.GetConfiguredVideoSampleFps().ToString("0.###", CultureInfo.InvariantCulture),
                 MediaHelper.GetConfiguredMaxVideoFrames(),
                 listenAddress);
@@ -82,6 +83,14 @@ namespace TensorSharp.Server.Hosting
                 sampling.StopSequences != null && sampling.StopSequences.Count > 0
                     ? "[" + string.Join(", ", sampling.StopSequences.Select(s => "\"" + s + "\"")) + "]"
                     : "(none)");
+
+            // Which of those defaults a request can talk the server out of.
+            // Without this line an operator whose client hardcodes temperature
+            // (VS Code Copilot Chat does) has no way to tell whether their
+            // config is in charge — see issue #113.
+            logger.LogInformation(LogEventIds.HostConfiguration,
+                "Sampling precedence: {SamplingPrecedence}",
+                options.SamplingDefaults.DescribePolicy());
 
             logger.LogInformation(LogEventIds.HostStarting,
                 "Starting TensorSharp.Server on {ListenAddress}", listenAddress);

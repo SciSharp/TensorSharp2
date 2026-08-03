@@ -25,7 +25,7 @@ namespace TensorSharp.Server.Hosting
     /// </summary>
     internal static class ServerOptionsBuilder
     {
-        private const int DefaultWebMaxTokensFallback = 20000;
+        private const int DefaultMaxTokensFallback = 20000;
 
         public static ServerHostingOptions Build(string[] args, string baseDirectory)
         {
@@ -37,7 +37,8 @@ namespace TensorSharp.Server.Hosting
                 out string configuredMmProj,
                 out string configuredBackend,
                 out int? configuredMaxTokens,
-                out SamplingOverrides configuredSampling);
+                out SamplingOverrides configuredSampling,
+                out SamplingPrecedence? configuredPrecedence);
 
             if (!string.IsNullOrWhiteSpace(configuredMmProj) && string.IsNullOrWhiteSpace(configuredModel))
                 throw new ArgumentException("--mmproj requires --model.");
@@ -51,10 +52,21 @@ namespace TensorSharp.Server.Hosting
             var supportedBackends = BackendCatalog.GetSupportedBackends().ToArray();
             string defaultBackend = BackendCatalog.ResolveDefaultBackend(requestedBackend, supportedBackends);
 
-            int defaultWebMaxTokens = configuredMaxTokens
-                ?? (TryParsePositiveInt(Environment.GetEnvironmentVariable("MAX_TOKENS"), out int envMaxTokens)
-                    ? envMaxTokens
-                    : DefaultWebMaxTokensFallback);
+            bool maxTokensPinned = configuredMaxTokens.HasValue;
+            int defaultMaxTokens;
+            if (configuredMaxTokens.HasValue)
+            {
+                defaultMaxTokens = configuredMaxTokens.Value;
+            }
+            else if (TryParsePositiveInt(Environment.GetEnvironmentVariable("MAX_TOKENS"), out int envMaxTokens))
+            {
+                defaultMaxTokens = envMaxTokens;
+                maxTokensPinned = true;
+            }
+            else
+            {
+                defaultMaxTokens = DefaultMaxTokensFallback;
+            }
 
             string uploadDirectory = Path.Combine(baseDirectory, "uploads");
             Directory.CreateDirectory(uploadDirectory);
@@ -68,14 +80,15 @@ namespace TensorSharp.Server.Hosting
                 "0",
                 StringComparison.Ordinal);
 
-            SamplingConfig defaultSampling = ResolveDefaultSamplingConfig(configuredSampling);
+            SamplingDefaults defaultSampling = ResolveDefaultSamplingConfig(configuredSampling, configuredPrecedence);
 
             return new ServerHostingOptions(
                 startupModelPath,
                 startupMmProjPath,
                 defaultBackend,
                 supportedBackends,
-                defaultWebMaxTokens,
+                defaultMaxTokens,
+                maxTokensPinned,
                 uploadDirectory,
                 logDirectory,
                 fileLoggingEnabled,
@@ -85,7 +98,7 @@ namespace TensorSharp.Server.Hosting
         /// <summary>Backend originally requested via <c>--backend</c> / <c>BACKEND</c> (without the OS-default fallback).</summary>
         public static string ReadConfiguredBackendInput(string[] args)
         {
-            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _);
+            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _);
             return configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
         }
 
@@ -660,13 +673,15 @@ namespace TensorSharp.Server.Hosting
             out string configuredMmProj,
             out string configuredBackend,
             out int? configuredMaxTokens,
-            out SamplingOverrides configuredSampling)
+            out SamplingOverrides configuredSampling,
+            out SamplingPrecedence? configuredPrecedence)
         {
             configuredModel = null;
             configuredMmProj = null;
             configuredBackend = null;
             configuredMaxTokens = null;
             configuredSampling = default;
+            configuredPrecedence = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -756,6 +771,12 @@ namespace TensorSharp.Server.Hosting
                     // sequences (e.g. `--stop "</s>" --stop "<|eot|>"`).
                     configuredSampling.StopSequences ??= new List<string>();
                     configuredSampling.StopSequences.Add(stopOption);
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--sampling-precedence", out string precedenceOption))
+                {
+                    configuredPrecedence = ParseSamplingPrecedence("--sampling-precedence", precedenceOption);
                     continue;
                 }
 
@@ -918,7 +939,7 @@ namespace TensorSharp.Server.Hosting
                 "--model", "--mmproj", "--backend", "--max-tokens",
                 "--temperature", "--top-k", "--top-p", "--min-p",
                 "--repeat-penalty", "--repeat-last-n", "--presence-penalty", "--frequency-penalty",
-                "--seed", "--stop",
+                "--seed", "--stop", "--sampling-precedence",
                 "--paged-kv", "--paged-kv-cache", "--no-paged-kv", "--no-paged-kv-cache",
                 "--paged-kv-block-size", "--paged-kv-ram-mb",
                 "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
@@ -981,44 +1002,82 @@ namespace TensorSharp.Server.Hosting
         /// Returning a fresh instance instead of <c>null</c> lets adapters call
         /// <see cref="SamplingConfig.Clone"/> on it without worrying about it
         /// being missing.
+        ///
+        /// Every value that came from a flag or an env var — as opposed to the
+        /// type's built-in default — is also recorded in the returned
+        /// <see cref="SamplingDefaults.Pinned"/> mask, because only those
+        /// represent a decision the operator actually made and therefore only
+        /// those outrank a client's request under
+        /// <see cref="SamplingPrecedence.Config"/>.
         /// </summary>
-        private static SamplingConfig ResolveDefaultSamplingConfig(SamplingOverrides overrides)
+        private static SamplingDefaults ResolveDefaultSamplingConfig(
+            SamplingOverrides overrides,
+            SamplingPrecedence? configuredPrecedence)
         {
             var resolved = new SamplingConfig();
+            var pinned = SamplingField.None;
 
-            if (overrides.Temperature.HasValue) resolved.Temperature = overrides.Temperature.Value;
-            else if (TryReadEnvFloat("TENSORSHARP_TEMPERATURE", out float envTemp)) resolved.Temperature = envTemp;
+            if (overrides.Temperature.HasValue) { resolved.Temperature = overrides.Temperature.Value; pinned |= SamplingField.Temperature; }
+            else if (TryReadEnvFloat("TENSORSHARP_TEMPERATURE", out float envTemp)) { resolved.Temperature = envTemp; pinned |= SamplingField.Temperature; }
 
-            if (overrides.TopK.HasValue) resolved.TopK = overrides.TopK.Value;
-            else if (TryReadEnvInt("TENSORSHARP_TOP_K", out int envTopK)) resolved.TopK = envTopK;
+            if (overrides.TopK.HasValue) { resolved.TopK = overrides.TopK.Value; pinned |= SamplingField.TopK; }
+            else if (TryReadEnvInt("TENSORSHARP_TOP_K", out int envTopK)) { resolved.TopK = envTopK; pinned |= SamplingField.TopK; }
 
-            if (overrides.TopP.HasValue) resolved.TopP = overrides.TopP.Value;
-            else if (TryReadEnvFloat("TENSORSHARP_TOP_P", out float envTopP)) resolved.TopP = envTopP;
+            if (overrides.TopP.HasValue) { resolved.TopP = overrides.TopP.Value; pinned |= SamplingField.TopP; }
+            else if (TryReadEnvFloat("TENSORSHARP_TOP_P", out float envTopP)) { resolved.TopP = envTopP; pinned |= SamplingField.TopP; }
 
-            if (overrides.MinP.HasValue) resolved.MinP = overrides.MinP.Value;
-            else if (TryReadEnvFloat("TENSORSHARP_MIN_P", out float envMinP)) resolved.MinP = envMinP;
+            if (overrides.MinP.HasValue) { resolved.MinP = overrides.MinP.Value; pinned |= SamplingField.MinP; }
+            else if (TryReadEnvFloat("TENSORSHARP_MIN_P", out float envMinP)) { resolved.MinP = envMinP; pinned |= SamplingField.MinP; }
 
-            if (overrides.RepetitionPenalty.HasValue) resolved.RepetitionPenalty = overrides.RepetitionPenalty.Value;
-            else if (TryReadEnvFloat("TENSORSHARP_REPEAT_PENALTY", out float envRep)) resolved.RepetitionPenalty = envRep;
+            if (overrides.RepetitionPenalty.HasValue) { resolved.RepetitionPenalty = overrides.RepetitionPenalty.Value; pinned |= SamplingField.RepetitionPenalty; }
+            else if (TryReadEnvFloat("TENSORSHARP_REPEAT_PENALTY", out float envRep)) { resolved.RepetitionPenalty = envRep; pinned |= SamplingField.RepetitionPenalty; }
 
-            if (overrides.PenaltyLastN.HasValue) resolved.PenaltyLastN = overrides.PenaltyLastN.Value;
-            else if (TryReadEnvInt("TENSORSHARP_REPEAT_LAST_N", out int envLastN)) resolved.PenaltyLastN = envLastN;
+            if (overrides.PenaltyLastN.HasValue) { resolved.PenaltyLastN = overrides.PenaltyLastN.Value; pinned |= SamplingField.PenaltyLastN; }
+            else if (TryReadEnvInt("TENSORSHARP_REPEAT_LAST_N", out int envLastN)) { resolved.PenaltyLastN = envLastN; pinned |= SamplingField.PenaltyLastN; }
 
-            if (overrides.PresencePenalty.HasValue) resolved.PresencePenalty = overrides.PresencePenalty.Value;
-            else if (TryReadEnvFloat("TENSORSHARP_PRESENCE_PENALTY", out float envPres)) resolved.PresencePenalty = envPres;
+            if (overrides.PresencePenalty.HasValue) { resolved.PresencePenalty = overrides.PresencePenalty.Value; pinned |= SamplingField.PresencePenalty; }
+            else if (TryReadEnvFloat("TENSORSHARP_PRESENCE_PENALTY", out float envPres)) { resolved.PresencePenalty = envPres; pinned |= SamplingField.PresencePenalty; }
 
-            if (overrides.FrequencyPenalty.HasValue) resolved.FrequencyPenalty = overrides.FrequencyPenalty.Value;
-            else if (TryReadEnvFloat("TENSORSHARP_FREQUENCY_PENALTY", out float envFreq)) resolved.FrequencyPenalty = envFreq;
+            if (overrides.FrequencyPenalty.HasValue) { resolved.FrequencyPenalty = overrides.FrequencyPenalty.Value; pinned |= SamplingField.FrequencyPenalty; }
+            else if (TryReadEnvFloat("TENSORSHARP_FREQUENCY_PENALTY", out float envFreq)) { resolved.FrequencyPenalty = envFreq; pinned |= SamplingField.FrequencyPenalty; }
 
-            if (overrides.Seed.HasValue) resolved.Seed = overrides.Seed.Value;
-            else if (TryReadEnvInt("TENSORSHARP_SEED", out int envSeed)) resolved.Seed = envSeed;
+            if (overrides.Seed.HasValue) { resolved.Seed = overrides.Seed.Value; pinned |= SamplingField.Seed; }
+            else if (TryReadEnvInt("TENSORSHARP_SEED", out int envSeed)) { resolved.Seed = envSeed; pinned |= SamplingField.Seed; }
 
             // Stop sequences only support CLI overrides for now: the env var
             // would need an unambiguous list separator and that's overkill.
             if (overrides.StopSequences != null)
+            {
                 resolved.StopSequences = new List<string>(overrides.StopSequences);
+                pinned |= SamplingField.StopSequences;
+            }
 
-            return resolved;
+            SamplingPrecedence precedence = configuredPrecedence
+                ?? ReadEnvSamplingPrecedence()
+                ?? SamplingPrecedence.Config;
+
+            return new SamplingDefaults(resolved, pinned, precedence);
+        }
+
+        /// <summary>Parse the <c>config</c>/<c>request</c> value of <c>--sampling-precedence</c>.</summary>
+        private static SamplingPrecedence ParseSamplingPrecedence(string flag, string value)
+        {
+            if (string.Equals(value, "config", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(value, "server", StringComparison.OrdinalIgnoreCase))
+                return SamplingPrecedence.Config;
+            if (string.Equals(value, "request", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(value, "client", StringComparison.OrdinalIgnoreCase))
+                return SamplingPrecedence.Request;
+            throw new ArgumentException(
+                $"Invalid value for {flag}: '{value}'. Expected 'config' (server-pinned values win) or 'request' (client values win).");
+        }
+
+        private static SamplingPrecedence? ReadEnvSamplingPrecedence()
+        {
+            string raw = Environment.GetEnvironmentVariable("TENSORSHARP_SAMPLING_PRECEDENCE");
+            if (string.IsNullOrWhiteSpace(raw))
+                return null;
+            return ParseSamplingPrecedence("TENSORSHARP_SAMPLING_PRECEDENCE", raw.Trim());
         }
 
         private static bool TryReadEnvFloat(string name, out float value)

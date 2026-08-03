@@ -160,7 +160,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 architecture = _svc.Architecture,
                 hostedModelPath = _options.StartupModelPath,
                 hostedMmProjPath = _options.StartupMmProjPath,
-                defaultMaxTokens = _options.DefaultWebMaxTokens,
+                defaultMaxTokens = _options.DefaultMaxTokens,
             });
         }
 
@@ -868,9 +868,10 @@ namespace TensorSharp.Server.ProtocolAdapters
             }
 
             var messagesEl = body.GetProperty("messages");
-            int maxTokens = body.TryGetProperty("maxTokens", out var mt) ? mt.GetInt32() : _options.DefaultWebMaxTokens;
+            int maxTokens = _options.ResolveMaxTokens(
+                SamplingConfigParser.ReadRequestedMaxTokens(body, "maxTokens", "max_tokens"));
 
-            var samplingConfig = SamplingConfigParser.ParseWebUi(body, _options.DefaultSamplingConfig);
+            var samplingConfig = SamplingConfigParser.ParseWebUi(body, _options.SamplingDefaults);
             bool uiThink = body.TryGetProperty("think", out var uiThinkProp) && uiThinkProp.GetBoolean();
             List<ToolFunction> uiTools = null;
             if (body.TryGetProperty("tools", out var uiToolsEl) && uiToolsEl.ValueKind == JsonValueKind.Array)

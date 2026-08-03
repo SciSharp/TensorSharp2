@@ -821,27 +821,4 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.Contains("embedding_length_out", msg);
     }
 
-    /// <summary>
-    /// Disposable helper that snapshots and restores environment variables
-    /// touched during a test. Without this, the env vars set by one test could
-    /// leak into another test that runs in the same process.
-    /// </summary>
-    private sealed class EnvScope : IDisposable
-    {
-        private readonly Dictionary<string, string?> _originals = new();
-
-        public void Set(string name, string value)
-        {
-            if (!_originals.ContainsKey(name))
-                _originals[name] = Environment.GetEnvironmentVariable(name);
-            Environment.SetEnvironmentVariable(name, value);
-        }
-
-        public void Dispose()
-        {
-            foreach (var kv in _originals)
-                Environment.SetEnvironmentVariable(kv.Key, kv.Value);
-            _originals.Clear();
-        }
-    }
 }

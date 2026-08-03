@@ -91,20 +91,25 @@ namespace TensorSharp.Server.ProtocolAdapters
             bool stream = body.TryGetProperty("stream", out var streamProp) && streamProp.ValueKind == JsonValueKind.True;
             bool store = !body.TryGetProperty("store", out var storeProp) || storeProp.ValueKind != JsonValueKind.False;
 
-            int maxOutputTokens = 200;
+            int? requestedOutputTokens = null;
             if (body.TryGetProperty("max_output_tokens", out var motProp) &&
                 motProp.ValueKind != JsonValueKind.Null && motProp.ValueKind != JsonValueKind.Undefined)
             {
-                if (motProp.ValueKind != JsonValueKind.Number || !motProp.TryGetInt32(out maxOutputTokens))
+                if (motProp.ValueKind != JsonValueKind.Number || !motProp.TryGetInt32(out int parsedOutputTokens))
                 {
                     logger.LogWarning(LogEventIds.HttpRequestRejected,
                         "/v1/responses rejected: max_output_tokens must be an integer (model={Model})", modelName);
                     await WriteErrorAsync(ctx, 400, "max_output_tokens must be an integer");
                     return;
                 }
+                requestedOutputTokens = parsedOutputTokens;
             }
 
-            var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.DefaultSamplingConfig);
+            // No request limit means the server's --max-tokens, not a
+            // hard-coded 200 that silently ignored the operator's config.
+            int maxOutputTokens = _options.ResolveMaxTokens(requestedOutputTokens);
+
+            var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
             var messages = ChatMessageParser.ParseResponsesInput(inputEl, instructions, _options.UploadDirectory);
             var tools = ToolFunctionParser.ParseOpenAIResponses(body);
             bool enableThinking = body.TryGetProperty("reasoning", out var reasoningEl) && reasoningEl.ValueKind == JsonValueKind.Object;
