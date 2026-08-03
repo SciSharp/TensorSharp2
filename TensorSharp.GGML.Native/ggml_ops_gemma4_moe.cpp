@@ -14,6 +14,10 @@
 
 using namespace tsg;
 
+// Kernel name for MoE CPU offload diagnostics (see tsg::HostMoeSegment).
+static constexpr const char* kG4MoeLayerKernel = "Gemma4 MoE layer decode";
+static constexpr const char* kG4MoeVerifyKernel = "Gemma4 MoE model verify";
+
 // ============================================================================
 // Fused single-layer MoE decode (seqLen == 1): runs an ENTIRE Gemma 4 MoE
 // transformer block as one GGML graph on the device, eliminating the ~18-20
@@ -102,8 +106,14 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
         ggml_tensor* gate_inp_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, nExp);
         ggml_tensor* gate_inp_scale_t = (d->gate_inp_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
         ggml_tensor* pre_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-        ggml_tensor* gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->gue_type), d->gue_ne0, d->gue_ne1, nExp);
-        ggml_tensor* down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->de_type), d->de_ne0, d->de_ne1, nExp);
+        // MoE CPU offload: leave the routed-expert tensors null so the bind pass
+        // below never asks for a device copy of them. That omission IS the VRAM
+        // saving - the host reads the same bytes from the GGUF mmap.
+        const bool cpu_moe = d->cpu_moe != 0 && !host_moe_verify_enabled();
+        ggml_tensor* gate_up_exps_t = cpu_moe ? nullptr
+            : ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->gue_type), d->gue_ne0, d->gue_ne1, nExp);
+        ggml_tensor* down_exps_t = cpu_moe ? nullptr
+            : ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->de_type), d->de_ne0, d->de_ne1, nExp);
         ggml_tensor* down_exps_scale_t = (d->down_exps_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nExp) : nullptr;
         ggml_tensor* post_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         ggml_tensor* post_ffw_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
@@ -244,22 +254,60 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
 
         // ===================== MoE experts =====================
         ggml_tensor* moe_in = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, residual1, H, 1), eps), pre_ffw_norm_2_w);
-        ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
-        ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps_t, moe_in_3d, sel);   // [2*ffMoe, nUsed, 1]
-        ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-        ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
-        ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);               // [ffMoe, nUsed, 1]
-        ggml_tensor* moe_down = ggml_mul_mat_id(ctx, down_exps_t, moe_act, sel);       // [H, nUsed, 1]
-        ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);                     // broadcast [H, nUsed, 1]
-
-        // aggregate over the nUsed dim → [H, 1]
-        ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
-        for (int u = 1; u < nUsed; ++u)
+        std::vector<tsg::HostMoeSegment> host_moe;
+        ggml_tensor* moe_out_1d = nullptr;
+        if (cpu_moe)
         {
-            ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
-            moe_out = ggml_add(ctx, moe_out, view_u);
+            // ---- MoE CPU offload seam (see tsg::HostMoeSegment) ----
+            // Same seam the whole-model kernel uses, with a single segment: the
+            // graph pauses after the router, the host multiplies the selected
+            // experts straight out of the GGUF mmap, and the rest of the layer
+            // (norms, the dense FFN and the residual tail) stays on the GPU.
+            tsg::HostMoeSegment hm;
+            hm.layer = 0;
+            hm.moe_in = ggml_cont(ctx, ggml_reshape_1d(ctx, moe_in, H));
+            hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel, nUsed));
+            hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, nUsed));
+            ggml_set_output(hm.moe_in);
+            ggml_set_output(hm.sel_ids);
+            ggml_set_output(hm.weights);
+
+            moe_out_1d = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+            ggml_set_input(moe_out_1d);
+            ggml_set_output(moe_out_1d);
+
+            hm.moe_out = moe_out_1d;
+            hm.gate_data = d->gate_up_exps; hm.gate_type = d->gue_type;
+            hm.gate_ne0 = d->gue_ne0;       hm.gate_ne1 = d->gue_ne1;  hm.gate_bytes = d->gue_bytes;
+            hm.down_data = d->down_exps;    hm.down_type = d->de_type;
+            hm.down_ne0 = d->de_ne0;        hm.down_ne1 = d->de_ne1;   hm.down_bytes = d->de_bytes;
+            hm.activation = 2;              // gelu(gate) * up
+            hm.num_experts = nExp;
+            hm.n_used = nUsed;
+            hm.n_ff = (int) ffMoe;
+            hm.seq_len = 1;
+            hm.hidden = H;
+            host_moe.push_back(hm);
         }
-        ggml_tensor* moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
+        else
+        {
+            ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
+            ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps_t, moe_in_3d, sel);   // [2*ffMoe, nUsed, 1]
+            ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+            ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
+            ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);               // [ffMoe, nUsed, 1]
+            ggml_tensor* moe_down = ggml_mul_mat_id(ctx, down_exps_t, moe_act, sel);       // [H, nUsed, 1]
+            ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);                     // broadcast [H, nUsed, 1]
+
+            // aggregate over the nUsed dim -> [H, 1]
+            ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
+            for (int u = 1; u < nUsed; ++u)
+            {
+                ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
+                moe_out = ggml_add(ctx, moe_out, view_u);
+            }
+            moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
+        }
         ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out_1d, eps), post_ffw_norm_2_w);
         mlp = ggml_add(ctx, mlp, moe_normed);
 
@@ -277,7 +325,19 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, 2048, false);
         if (k_cpy != nullptr) ggml_build_forward_expand(graph, k_cpy);
         if (v_cpy != nullptr) ggml_build_forward_expand(graph, v_cpy);
+        // The host-MoE boundary tensors are not on out_cpy's dependency chain (the
+        // expert matmuls were replaced by an input tensor), so expand them first.
+        for (const tsg::HostMoeSegment& hm : host_moe)
+        {
+            ggml_build_forward_expand(graph, hm.moe_in);
+            ggml_build_forward_expand(graph, hm.sel_ids);
+            ggml_build_forward_expand(graph, hm.weights);
+        }
         ggml_build_forward_expand(graph, out_cpy);
+
+        std::vector<int> host_moe_seg_end;
+        if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kG4MoeLayerKernel))
+            return 0;
 
         // --- bind tensors ---
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -372,10 +432,22 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
         if (freq_factors_t != nullptr)
             ggml_backend_tensor_set(freq_factors_t, d->freq_factors, 0, static_cast<std::size_t>(d->freq_factors_len) * sizeof(float));
 
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        // MoE CPU offload pauses the graph after the router so the host can
+        // multiply the selected experts; everything else stays one submission.
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (!host_moe.empty())
+        {
+            if (!host_moe_execute_segments(graph, host_moe, host_moe_seg_end, kG4MoeLayerKernel))
+                status = GGML_STATUS_FAILED;
+        }
+        else
+        {
+            status = ggml_backend_graph_compute(g_backend, graph);
+        }
         if (status != GGML_STATUS_SUCCESS)
         {
-            set_last_error("Gemma4 MoE layer decode: graph execution failed.");
+            if (host_moe.empty())
+                set_last_error("Gemma4 MoE layer decode: graph execution failed.");
             return 0;
         }
 
@@ -438,6 +510,7 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
 namespace
 {
     constexpr int kG4MoePersistKvStride = 256;
+    constexpr const char* kG4MoeDecodeKernel = "Gemma4 MoE model decode";
 
     struct G4MoEDecodeCache
     {
@@ -460,6 +533,13 @@ namespace
         // Tensor-parallel plan: this rank's graph cut at the three row-parallel
         // projections per layer (attention output, dense FFN down, MoE down).
         tsg::TpRankPlan tp_plan;
+        // MoE CPU offload: the layers whose routed experts the host multiplies,
+        // and the node index each accelerator segment stops at (one per entry in
+        // host_moe, plus a final entry for the tail = graph node count). The
+        // REPLAY path needs these too — a cached graph run end-to-end would read
+        // whatever stale bytes moe_out still held from the previous token.
+        std::vector<tsg::HostMoeSegment> host_moe;
+        std::vector<int> host_moe_seg_end;
 
         void reset()
         {
@@ -468,6 +548,7 @@ namespace
             graph = nullptr; valid = false;
             hidden_in = hidden_out = pos_tensor = nullptr;
             kv_index.clear(); attn_mask.clear(); layer_window.clear();
+            host_moe.clear(); host_moe_seg_end.clear();
             sig_disc = sig_kcache0 = nullptr;
             num_layers = hidden_size = 0;
             folded = false; out_count = 0;
@@ -563,6 +644,21 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             {
                 set_last_error("Gemma4 MoE model decode: KV-donor (shared) layers unsupported; use per-layer path.");
                 return 0;
+            }
+        }
+        // MoE CPU offload and tensor parallelism both segment this graph, and the
+        // TP driver owns the segment schedule across ranks. Rather than nest the
+        // two, decline the fused path so the caller falls back to the per-op
+        // forward, whose MoE dispatch honours the per-layer CPU placement.
+        if (tp_mode)
+        {
+            for (int l = 0; l < num_layers; l++)
+            {
+                if (layers[l].cpu_moe != 0)
+                {
+                    set_last_error("Gemma4 MoE model decode: MoE CPU offload is not supported on the fused tensor-parallel path.");
+                    return 0;
+                }
             }
         }
 
@@ -670,10 +766,22 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                 return 1;
             }
 
-            ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
+            // MoE CPU offload replays with the same segment cuts the build pass
+            // recorded; everything else still goes out as one submission.
+            ggml_status st = GGML_STATUS_SUCCESS;
+            if (!dc->host_moe.empty())
+            {
+                if (!host_moe_execute_segments(dc->graph, dc->host_moe, dc->host_moe_seg_end, kG4MoeDecodeKernel))
+                    st = GGML_STATUS_FAILED;
+            }
+            else
+            {
+                st = ggml_backend_graph_compute(g_backend, dc->graph);
+            }
             if (st != GGML_STATUS_SUCCESS)
             {
-                set_last_error("Gemma4 MoE model decode: cached graph execution failed.");
+                if (dc->host_moe.empty())
+                    set_last_error("Gemma4 MoE model decode: cached graph execution failed.");
                 dc->reset();
                 return 0;
             }
@@ -726,6 +834,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             tp_partial.reserve(static_cast<std::size_t>(num_layers) * 3);
             tp_boundary.reserve(static_cast<std::size_t>(num_layers) * 3);
         }
+
+        // MoE CPU offload: filled per offloaded layer while the graph is built,
+        // then turned into segment boundaries after ggml_build_forward_expand
+        // has fixed the node order.
+        std::vector<tsg::HostMoeSegment> host_moe;
 
         ggml_tensor* hidden_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
@@ -813,8 +926,19 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             t.gate_inp_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, nExp);
             t.gate_inp_scale_t = (d.gate_inp_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
             t.pre_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-            t.gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gue_type), d.gue_ne0, d.gue_ne1, nExp);
-            t.down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
+            // MoE CPU offload: leave the routed-expert tensors null so the bind
+            // pass below never asks for a device copy of them. That omission IS
+            // the VRAM saving - the host reads the same bytes from the GGUF mmap.
+            if (d.cpu_moe == 0 || host_moe_verify_enabled())
+            {
+                t.gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gue_type), d.gue_ne0, d.gue_ne1, nExp);
+                t.down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
+            }
+            else
+            {
+                t.gate_up_exps_t = nullptr;
+                t.down_exps_t = nullptr;
+            }
             t.down_exps_scale_t = (d.down_exps_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nExp) : nullptr;
             t.post_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
             t.post_ffw_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
@@ -975,22 +1099,88 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
 
             // ===== MoE experts =====
             ggml_tensor* moe_in = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, residual1, H, 1), eps), t.pre_ffw_norm_2_w);
-            ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
-            ggml_tensor* gate_up = ggml_mul_mat_id(ctx, t.gate_up_exps_t, moe_in_3d, sel);
-            ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-            ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
-            ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);
-            ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps_t, moe_act, sel);
-            ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
-
-            ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
-            for (int u = 1; u < nUsed; ++u)
+            ggml_tensor* moe_out_1d = nullptr;
+            if (d.cpu_moe != 0)
             {
-                ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
-                moe_out = ggml_add(ctx, moe_out, view_u);
+                // ---- MoE CPU offload seam (see tsg::HostMoeSegment) ----
+                // Hand the host everything it needs to reproduce exactly what the
+                // mul_mat_id chain below would have computed: the expert-input
+                // norm and the router's own top-k ids and final weights (which
+                // already fold in down_exps_scale, so the host stays identical to
+                // the resident path). Contiguous copies rather than the raw views
+                // keep each download a single flat memcpy and stop the allocator
+                // recycling their storage before we read it.
+                tsg::HostMoeSegment hm;
+                hm.layer = l;
+                hm.moe_in = ggml_cont(ctx, ggml_reshape_1d(ctx, moe_in, H));
+                hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel, nUsed));
+                hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, nUsed));
+                ggml_set_output(hm.moe_in);
+                ggml_set_output(hm.sel_ids);
+                ggml_set_output(hm.weights);
+
+                // The host writes here between segments. Flagged BOTH input and
+                // output: ggml-alloc pre-allocates inputs but still frees them
+                // after their last consumer, and this one is written from outside
+                // the graph, so it has to stay pinned for the whole pass.
+                moe_out_1d = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+                ggml_set_input(moe_out_1d);
+                ggml_set_output(moe_out_1d);
+
+                hm.moe_out = moe_out_1d;
+                // Gemma 4 stacks gate and up into ONE tensor: up_data == nullptr
+                // selects that layout in the host builder, which splits it the
+                // same way this graph's two views do.
+                hm.gate_data = d.gate_up_exps; hm.gate_type = d.gue_type;
+                hm.gate_ne0 = d.gue_ne0;       hm.gate_ne1 = d.gue_ne1;  hm.gate_bytes = d.gue_bytes;
+                hm.down_data = d.down_exps;    hm.down_type = d.de_type;
+                hm.down_ne0 = d.de_ne0;        hm.down_ne1 = d.de_ne1;   hm.down_bytes = d.de_bytes;
+                hm.activation = 2;             // gelu(gate) * up
+                hm.num_experts = nExp;
+                hm.n_used = nUsed;
+                hm.n_ff = ffMoe;
+                hm.seq_len = 1;
+                hm.hidden = H;
+
+                if (host_moe_verify_enabled())
+                {
+                    ggml_tensor* vin = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
+                    ggml_tensor* vgu = ggml_mul_mat_id(ctx, t.gate_up_exps_t, vin, sel);
+                    ggml_tensor* vg = ggml_view_3d(ctx, vgu, ffMoe, vgu->ne[1], vgu->ne[2], vgu->nb[1], vgu->nb[2], 0);
+                    ggml_tensor* vu = ggml_view_3d(ctx, vgu, ffMoe, vgu->ne[1], vgu->ne[2], vgu->nb[1], vgu->nb[2], static_cast<std::size_t>(ffMoe) * vgu->nb[0]);
+                    ggml_tensor* vd = ggml_mul_mat_id(ctx, t.down_exps_t, ggml_geglu_split(ctx, vg, vu), sel);
+                    ggml_tensor* vw = ggml_mul(ctx, vd, w_final);
+                    ggml_tensor* vsum = ggml_view_2d(ctx, vw, H, 1, vw->nb[2], 0);
+                    for (int u = 1; u < nUsed; ++u)
+                    {
+                        ggml_tensor* vv = ggml_view_2d(ctx, vw, H, 1, vw->nb[2], static_cast<std::size_t>(u) * vw->nb[1]);
+                        vsum = ggml_add(ctx, vsum, vv);
+                    }
+                    hm.verify_gpu = ggml_cont(ctx, ggml_reshape_1d(ctx, vsum, H));
+                    ggml_set_output(hm.verify_gpu);
+                }
+
+                host_moe.push_back(hm);
             }
-            ggml_tensor* moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
-            if (tp_mode) { tp_partial.push_back(moe_out); tp_boundary.push_back(moe_out_1d); }
+            else
+            {
+                ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
+                ggml_tensor* gate_up = ggml_mul_mat_id(ctx, t.gate_up_exps_t, moe_in_3d, sel);
+                ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+                ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
+                ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);
+                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps_t, moe_act, sel);
+                ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
+
+                ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
+                for (int u = 1; u < nUsed; ++u)
+                {
+                    ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
+                    moe_out = ggml_add(ctx, moe_out, view_u);
+                }
+                moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
+                if (tp_mode) { tp_partial.push_back(moe_out); tp_boundary.push_back(moe_out_1d); }
+            }
             ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out_1d, eps), t.post_ffw_norm_2_w);
             mlp = ggml_add(ctx, mlp, moe_normed);
 
@@ -1038,6 +1228,15 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         // model-wide decode).
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 160 + 512;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        // Expand layer by layer. ggml_build_forward_expand appends each root's
+        // not-yet-emitted dependencies in topological order, so walking the
+        // layers in order — KV writes first, then the layer's host-MoE boundary
+        // if it has one — lays the nodes out as
+        //   [... layer l attention ...][layer l norms + router][... layer l+1 ...]
+        // which is exactly where the accelerator has to pause for the host. The
+        // trailing expand of out_cpy then picks up every remaining node (the
+        // dense FFN tail, residual adds, the final norm and the LM head).
+        std::size_t next_host_moe = 0;
         for (int l = 0; l < num_layers; l++)
         {
             if (lt[l].k_cpy != nullptr)
@@ -1045,8 +1244,28 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                 ggml_build_forward_expand(graph, lt[l].k_cpy);
                 ggml_build_forward_expand(graph, lt[l].v_cpy);
             }
+            if (next_host_moe < host_moe.size() && host_moe[next_host_moe].layer == l)
+            {
+                const tsg::HostMoeSegment& hm = host_moe[next_host_moe];
+                ggml_build_forward_expand(graph, hm.moe_in);
+                ggml_build_forward_expand(graph, hm.sel_ids);
+                ggml_build_forward_expand(graph, hm.weights);
+                if (hm.verify_gpu != nullptr)
+                    ggml_build_forward_expand(graph, hm.verify_gpu);
+                ++next_host_moe;
+            }
         }
         ggml_build_forward_expand(graph, out_cpy);
+
+        // Turn the recorded boundaries into node cut points (see
+        // host_moe_build_segment_ends). It fails when the builder and the
+        // expander disagree, which would silently feed the host stale values.
+        std::vector<int> host_moe_seg_end;
+        if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kG4MoeDecodeKernel))
+        {
+            if (can_persist) ggml_free(ctx);
+            return 0;
+        }
 
         // --- bind tensors ---
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -1193,10 +1412,23 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
 
         if (!tp_mode)
         {
-            ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+            // MoE CPU offload runs the graph in segments, pausing at each
+            // offloaded layer for the host expert matmul. Everything else still
+            // goes out as one graph submission.
+            ggml_status status = GGML_STATUS_SUCCESS;
+            if (!host_moe.empty())
+            {
+                if (!host_moe_execute_segments(graph, host_moe, host_moe_seg_end, kG4MoeDecodeKernel))
+                    status = GGML_STATUS_FAILED;
+            }
+            else
+            {
+                status = ggml_backend_graph_compute(g_backend, graph);
+            }
             if (status != GGML_STATUS_SUCCESS)
             {
-                set_last_error("Gemma4 MoE model decode: graph execution failed.");
+                if (host_moe.empty())
+                    set_last_error("Gemma4 MoE model decode: graph execution failed.");
                 if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
                 return 0;
             }
@@ -1222,6 +1454,12 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             g4moe->attn_mask.resize(num_layers);
             for (int l = 0; l < num_layers; l++) g4moe->attn_mask[l] = lt[l].attn_mask;
             g4moe->layer_window = pwindow;
+            // MoE CPU offload: the replay path re-runs these segments, so the
+            // plan has to live in the cache slot. Without it a cached graph
+            // would run end to end and read whatever stale bytes moe_out still
+            // held from the previous token.
+            g4moe->host_moe = host_moe;
+            g4moe->host_moe_seg_end = host_moe_seg_end;
             g4moe->sig_disc = g4moe_sig;
             g4moe->sig_kcache0 = g4moe_kc0;
             g4moe->num_layers = num_layers;
@@ -1371,6 +1609,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         // tile, when the tiled path runs — both ranks tile identically, so the
         // segment structure still matches).
         std::vector<ggml_tensor*> tp_partial;
+        // MoE CPU offload: one entry per (offloaded layer, query tile). Pushed in
+        // layer_tail below, which the tiled path calls once per tile — push order
+        // therefore matches graph dependency order, which is what the segment cuts
+        // require.
+        std::vector<tsg::HostMoeSegment> host_moe;
         if (layers[0].struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlGemma4MoELayerDesc)))
         {
             set_last_error("Gemma4 MoE model verify: descriptor size mismatch (C#/native struct layout drift).");
@@ -1508,8 +1751,21 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             t.gate_inp_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, nExp);
             t.gate_inp_scale_t = (d.gate_inp_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
             t.pre_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-            t.gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gue_type), d.gue_ne0, d.gue_ne1, nExp);
-            t.down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
+            // MoE CPU offload: leave the routed-expert tensors null so the bind
+            // pass below never asks for a device copy of them. Prefill is where the
+            // whole expert set would otherwise land in VRAM (the decode graph alone
+            // touches the same weights), so this is the binding that actually makes
+            // --n-cpu-moe save memory.
+            if (d.cpu_moe == 0)
+            {
+                t.gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gue_type), d.gue_ne0, d.gue_ne1, nExp);
+                t.down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
+            }
+            else
+            {
+                t.gate_up_exps_t = nullptr;
+                t.down_exps_t = nullptr;
+            }
             t.down_exps_scale_t = (d.down_exps_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nExp) : nullptr;
             t.post_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
             t.post_ffw_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
@@ -1872,18 +2128,59 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                 ggml_tensor* w_final = ggml_reshape_3d(ctx, w_2d, 1, nUsed, M);
                 // MoE experts (M is already tile-bounded — no inner token tiling needed)
                 ggml_tensor* moe_in = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), t.pre_ffw_norm_2_w);  // [H, M]
-                ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, M);
-                ggml_tensor* gate_up = ggml_mul_mat_id(ctx, t.gate_up_exps_t, moe_in_3d, sel);   // [2*ffMoe, nUsed, M]
-                ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-                ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
-                ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);                  // [ffMoe, nUsed, M]
-                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps_t, moe_act, sel);       // [H, nUsed, M]
-                ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);                        // [H, nUsed, M]
-                ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, M, weighted->nb[2], 0);
-                for (int u = 1; u < nUsed; ++u)
+                ggml_tensor* moe_out = nullptr;
+                if (d.cpu_moe != 0)
                 {
-                    ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, M, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
-                    moe_out = ggml_add(ctx, moe_out, view_u);
+                    // ---- MoE CPU offload seam (see tsg::HostMoeSegment) ----
+                    // Prefill hands the host all M tokens of this tile at once, so
+                    // the offloaded side is a genuine GEMM over the tile rather than
+                    // M matvecs — the same shape llama.cpp's CPU buffer-type override
+                    // computes. Everything else (attention, dense FFN, the router)
+                    // stays in the one fused graph.
+                    tsg::HostMoeSegment hm;
+                    hm.layer = l;
+                    hm.moe_in = ggml_cont(ctx, moe_in);
+                    hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel, (std::int64_t) nUsed * M));
+                    hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, (std::int64_t) nUsed * M));
+                    ggml_set_output(hm.moe_in);
+                    ggml_set_output(hm.sel_ids);
+                    ggml_set_output(hm.weights);
+
+                    // Written by the host between segments; flagged BOTH input and
+                    // output so ggml-alloc pre-allocates it and never recycles the
+                    // block behind our back.
+                    moe_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, M);
+                    ggml_set_input(moe_out);
+                    ggml_set_output(moe_out);
+
+                    hm.moe_out = moe_out;
+                    hm.gate_data = d.gate_up_exps; hm.gate_type = d.gue_type;
+                    hm.gate_ne0 = d.gue_ne0;       hm.gate_ne1 = d.gue_ne1;  hm.gate_bytes = d.gue_bytes;
+                    hm.down_data = d.down_exps;    hm.down_type = d.de_type;
+                    hm.down_ne0 = d.de_ne0;        hm.down_ne1 = d.de_ne1;   hm.down_bytes = d.de_bytes;
+                    hm.activation = 2;             // gelu(gate) * up
+                    hm.num_experts = nExp;
+                    hm.n_used = nUsed;
+                    hm.n_ff = (int) ffMoe;
+                    hm.seq_len = M;
+                    hm.hidden = H;
+                    host_moe.push_back(hm);
+                }
+                else
+                {
+                    ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, M);
+                    ggml_tensor* gate_up = ggml_mul_mat_id(ctx, t.gate_up_exps_t, moe_in_3d, sel);   // [2*ffMoe, nUsed, M]
+                    ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+                    ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
+                    ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);                  // [ffMoe, nUsed, M]
+                    ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps_t, moe_act, sel);       // [H, nUsed, M]
+                    ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);                        // [H, nUsed, M]
+                    moe_out = ggml_view_2d(ctx, weighted, H, M, weighted->nb[2], 0);
+                    for (int u = 1; u < nUsed; ++u)
+                    {
+                        ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, M, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
+                        moe_out = ggml_add(ctx, moe_out, view_u);
+                    }
                 }
                 if (tp_mode) tp_partial.push_back(moe_out);
                 ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out, eps), t.post_ffw_norm_2_w);
@@ -2036,14 +2333,46 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             if (lt[l].k_prev != nullptr) ggml_build_forward_expand(graph, lt[l].k_prev);
             if (lt[l].v_prev != nullptr) ggml_build_forward_expand(graph, lt[l].v_prev);
         }
+        // Expand layer by layer, KV writes then that layer's host-MoE boundaries.
+        //
+        // The interleaving is load-bearing for MoE CPU offload. A boundary tensor is
+        // a `cont` nothing consumes, so it is only emitted when explicitly expanded;
+        // expanding every layer's KV write first would drag the WHOLE model's
+        // forward chain into the node list ahead of layer 0's cut, and every
+        // offloaded layer would then read a moe_out the host had not written yet.
+        // Per layer, the KV write still precedes that layer's attention read (which
+        // arrives with the boundary expansion or with out_cpy), which is the
+        // ordering the cache aliasing requires.
+        std::size_t next_host_moe = 0;
         for (int l = 0; l < num_layers; l++)
         {
             ggml_build_forward_expand(graph, lt[l].k_cpy);
             ggml_build_forward_expand(graph, lt[l].v_cpy);
             if (lt[l].k_cpy2 != nullptr) ggml_build_forward_expand(graph, lt[l].k_cpy2);
             if (lt[l].v_cpy2 != nullptr) ggml_build_forward_expand(graph, lt[l].v_cpy2);
+            // One entry per query tile for this layer, in the order layer_tail
+            // pushed them.
+            while (next_host_moe < host_moe.size() && host_moe[next_host_moe].layer == l)
+            {
+                const tsg::HostMoeSegment& hm = host_moe[next_host_moe];
+                ggml_build_forward_expand(graph, hm.moe_in);
+                ggml_build_forward_expand(graph, hm.sel_ids);
+                ggml_build_forward_expand(graph, hm.weights);
+                ++next_host_moe;
+            }
         }
         ggml_build_forward_expand(graph, out_cpy);
+
+        std::vector<int> host_moe_seg_end;
+        if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kG4MoeVerifyKernel))
+            return 0;
+        // The tensor-parallel driver owns its own segment schedule; nesting the two
+        // is not supported, so decline and let the caller fall back to per-op.
+        if (tp_mode && !host_moe.empty())
+        {
+            set_last_error("Gemma4 MoE model verify: MoE CPU offload is not supported on the fused tensor-parallel path.");
+            return 0;
+        }
 
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
@@ -2186,10 +2515,22 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             return 1;
         }
 
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        // MoE CPU offload runs the graph in segments, pausing at each offloaded
+        // layer (and query tile) for the host expert GEMM over its M tokens.
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (!host_moe.empty())
+        {
+            if (!host_moe_execute_segments(graph, host_moe, host_moe_seg_end, kG4MoeVerifyKernel))
+                status = GGML_STATUS_FAILED;
+        }
+        else
+        {
+            status = ggml_backend_graph_compute(g_backend, graph);
+        }
         if (status != GGML_STATUS_SUCCESS)
         {
-            set_last_error("Gemma4 MoE model verify: graph execution failed.");
+            if (host_moe.empty())
+                set_last_error("Gemma4 MoE model verify: graph execution failed.");
             return 0;
         }
 

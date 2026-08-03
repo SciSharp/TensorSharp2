@@ -1425,6 +1425,12 @@ namespace TensorSharp.Models
                         a.GateExps = sg.Data; a.GateExpsType = sg.GgmlType; a.GateExpsBytes = sg.TotalRawBytes;
                         a.UpExps = su.Data; a.UpExpsType = su.GgmlType; a.UpExpsBytes = su.TotalRawBytes;
                         a.DownExps = sd.Data; a.DownExpsType = sd.GgmlType; a.DownExpsBytes = sd.TotalRawBytes;
+                        // MoE CPU offload: the kernel omits this layer's expert
+                        // matmuls from the accelerator graph, pauses after the
+                        // router, and multiplies the selected experts on the host
+                        // straight out of the GGUF mmap. The pointers above are
+                        // what it reads; nothing is uploaded.
+                        a.CpuMoe = MoeCpuOffloadConfig.IsLayerOnCpu(l) ? 1 : 0;
                         var shg = ResolveW(_ffnGateShexpQW[l], _ffnGateShexpF32[l]);
                         var shu = ResolveW(_ffnUpShexpQW[l], _ffnUpShexpF32[l]);
                         var shd = ResolveW(_ffnDownShexpQW[l], _ffnDownShexpF32[l]);

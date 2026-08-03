@@ -365,7 +365,8 @@ namespace TensorSharp.Models
                         u.Data, u.GgmlType, u.PerExpertNe0, u.PerExpertNe1, u.TotalRawBytes,
                         d.Data, d.GgmlType, d.PerExpertNe0, d.PerExpertNe1, d.TotalRawBytes,
                         gateBias: null, upBias: null, downBias: null,
-                        activation: GgmlBasicOps.MoEActivation.SwiGLUSplit);
+                        activation: GgmlBasicOps.MoEActivation.SwiGLUSplit,
+                        runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
                     InvalidateTensorDeviceCache(output);
                 }
                 catch (Exception)

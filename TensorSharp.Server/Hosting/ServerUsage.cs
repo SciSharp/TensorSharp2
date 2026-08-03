@@ -164,6 +164,23 @@ namespace TensorSharp.Server.Hosting
                     "Stop sequence; repeat the flag to pin several. Default: none.",
                     "--stop \"</s>\" --stop \"<|eot|>\""),
             }),
+            ("Mixture-of-Experts CPU offload", new[]
+            {
+                new OptionHelp("--n-cpu-moe <N> | -ncmoe <N>",
+                    "Keep the routed MoE expert weights of the first N layers in system RAM and multiply them on " +
+                    "the CPU; attention, norms, the router and the shared expert stay on the accelerator. This is " +
+                    "what makes a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass 'all' " +
+                    "for every layer. Default: 0 (everything on the accelerator; TS_N_CPU_MOE env var overrides).",
+                    "--n-cpu-moe 32"),
+                new OptionHelp("--cpu-moe | -cmoe",
+                    "Shorthand for --n-cpu-moe all: every routed expert stays in system RAM. Default: off " +
+                    "(TS_CPU_MOE env var overrides).",
+                    "--cpu-moe"),
+                new OptionHelp("--cpu-moe-threads <N>",
+                    "Worker threads for the host-side expert matmul. Default: one less than the hardware thread " +
+                    "count, leaving a core for accelerator submission (TS_CPU_MOE_THREADS env var overrides).",
+                    "--cpu-moe-threads 12"),
+            }),
             ("KV cache", new[]
             {
                 new OptionHelp("--kv-cache-dtype <t>",
@@ -189,7 +206,8 @@ namespace TensorSharp.Server.Hosting
                     "SSD budget for spilled KV blocks, in MB. Default: 16384.",
                     "--paged-kv-ssd-mb 32768"),
                 new OptionHelp("--paged-kv-quant-bits <b>",
-                    "Quantize spilled KV blocks: 0 (off), 4, or 8 bits. Default: 0.",
+                    "Quantize spilled KV blocks with the TurboQuant codec: 0 (off), 2, 4, or 8 bits per element. " +
+                    "2-bit uses an affine min+scale layout (~4x smaller than the f16 payload). Default: 0.",
                     "--paged-kv-quant-bits 8"),
                 new OptionHelp("--paged-kv-redis-url <url>",
                     "Redis connection string for a shared KV cache tier (e.g. localhost:6379). Default: disabled.",

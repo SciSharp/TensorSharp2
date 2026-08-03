@@ -1869,8 +1869,13 @@ namespace TensorSharp.Models
         /// prefill paths serve MoE experts exclusively through the stacked-expert
         /// device buffer override this to return false for the per-expert split
         /// views, avoiding a second full copy of the experts in VRAM.
+        ///
+        /// Overrides MUST keep the <see cref="MoeCpuOffloadConfig"/> term: a routed
+        /// expert belonging to a <c>--n-cpu-moe</c> layer is multiplied on the host
+        /// and uploading it would spend exactly the VRAM the flag exists to save.
         /// </summary>
-        protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName) => true;
+        protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
+            => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName);
 
         protected bool CanUseGgmlQuantizedGetRows(int ggmlType)
         {

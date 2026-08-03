@@ -63,6 +63,7 @@ namespace
 {
     constexpr int kGptOssPersistKvStride = 256;
     constexpr int kGptOssMaxDecodeCaches = 8;
+    constexpr const char* kGptOssDecodeKernel = "GPT-OSS model decode";
 
     struct GptOssDecodeCache
     {
@@ -85,6 +86,12 @@ namespace
         int hidden_size = 0;
         bool folded = false;
         int out_count = 0;
+        // MoE CPU offload: the layers whose routed experts the host multiplies,
+        // and the node index each accelerator segment stops at. The REPLAY path
+        // needs these too - a cached graph run end-to-end would read whatever
+        // stale bytes moe_out still held from the previous token.
+        std::vector<tsg::HostMoeSegment> host_moe;
+        std::vector<int> host_moe_seg_end;
 
         void reset()
         {
@@ -95,6 +102,7 @@ namespace
             kv_index.clear(); attn_mask.clear();
             layer_wstart.clear(); layer_wlen.clear();
             k_win_addr.clear(); v_win_addr.clear();
+            host_moe.clear(); host_moe_seg_end.clear();
             sig_disc = sig_kcache0 = nullptr;
             num_layers = hidden_size = 0;
             folded = false; out_count = 0;
@@ -375,10 +383,22 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
                 }
             }
 
-            ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
+            // MoE CPU offload replays with the same segment cuts the build pass
+            // recorded; everything else still goes out as one submission.
+            ggml_status st = GGML_STATUS_SUCCESS;
+            if (!dc->host_moe.empty())
+            {
+                if (!host_moe_execute_segments(dc->graph, dc->host_moe, dc->host_moe_seg_end, kGptOssDecodeKernel))
+                    st = GGML_STATUS_FAILED;
+            }
+            else
+            {
+                st = ggml_backend_graph_compute(g_backend, dc->graph);
+            }
             if (st != GGML_STATUS_SUCCESS)
             {
-                set_last_error("GPT-OSS model decode: cached graph execution failed.");
+                if (dc->host_moe.empty())
+                    set_last_error("GPT-OSS model decode: cached graph execution failed.");
                 dc->reset();
                 return 0;
             }
@@ -447,6 +467,9 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
             std::vector<ggml_fp16_t> mask_data;
         };
         std::vector<LayerTensors> lt(num_layers);
+        // MoE CPU offload: filled per offloaded layer while the graph is built,
+        // then turned into segment boundaries once the node order is fixed.
+        std::vector<tsg::HostMoeSegment> host_moe;
 
         ggml_tensor* hidden_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
@@ -487,12 +510,19 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
             t.post_attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
             t.gate_inp_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, nExp);
             if (d.gate_inp_b != nullptr) t.gate_inp_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nExp);
-            t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.ge_type), d.ge_ne0, d.ge_ne1, nExp);
-            t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.ue_type), d.ue_ne0, d.ue_ne1, nExp);
-            t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
-            if (d.gate_exps_b != nullptr) t.gate_exps_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d.ge_ne1, nExp);
-            if (d.up_exps_b != nullptr) t.up_exps_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d.ue_ne1, nExp);
-            if (d.down_exps_b != nullptr) t.down_exps_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d.de_ne1, nExp);
+            // MoE CPU offload: leave the routed-expert tensors (and their
+            // per-expert biases) null so the bind pass below never asks for a
+            // device copy. That omission IS the VRAM saving - the host reads the
+            // same bytes straight out of the GGUF mmap.
+            if (d.cpu_moe == 0 || host_moe_verify_enabled())
+            {
+                t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.ge_type), d.ge_ne0, d.ge_ne1, nExp);
+                t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.ue_type), d.ue_ne0, d.ue_ne1, nExp);
+                t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
+                if (d.gate_exps_b != nullptr) t.gate_exps_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d.ge_ne1, nExp);
+                if (d.up_exps_b != nullptr) t.up_exps_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d.ue_ne1, nExp);
+                if (d.down_exps_b != nullptr) t.down_exps_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d.de_ne1, nExp);
+            }
         }
 
         ggml_tensor* hidden = hidden_t;
@@ -634,24 +664,97 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
             ggml_tensor* w_soft = ggml_soft_max(ctx, ggml_reshape_2d(ctx, w, nUsed, 1));
             ggml_tensor* w_final = ggml_reshape_3d(ctx, w_soft, 1, nUsed, 1);
 
-            ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
-            ggml_tensor* gate = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel);     // [nFf, nUsed, 1]
-            if (t.gate_exps_b != nullptr) gate = ggml_add_id(ctx, gate, t.gate_exps_b, sel);
-            ggml_tensor* up = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel);
-            if (t.up_exps_b != nullptr) up = ggml_add_id(ctx, up, t.up_exps_b, sel);
-            ggml_tensor* act = ggml_swiglu_oai(ctx, gate, up, d.oai_alpha, d.oai_limit);
-            ggml_tensor* down = ggml_mul_mat_id(ctx, t.down_exps, act, sel);           // [H, nUsed, 1]
-            if (t.down_exps_b != nullptr) down = ggml_add_id(ctx, down, t.down_exps_b, sel);
-            ggml_tensor* weighted = ggml_mul(ctx, down, w_final);
-
-            ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
-            for (int u = 1; u < nUsed; ++u)
+            ggml_tensor* moe_out_1d = nullptr;
+            if (d.cpu_moe != 0)
             {
-                ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2],
-                    static_cast<std::size_t>(u) * weighted->nb[1]);
-                moe_out = ggml_add(ctx, moe_out, view_u);
+                // ---- MoE CPU offload seam (see tsg::HostMoeSegment) ----
+                // Hand the host everything it needs to reproduce exactly what the
+                // mul_mat_id chain below would have computed: the MoE input norm
+                // and the router's own top-k ids and softmaxed weights. GPT-OSS
+                // gates with SOFTMAX_WEIGHT, so w_final is already final - the
+                // host applies it unchanged, and the per-expert bias tensors ride
+                // along as plain host pointers.
+                tsg::HostMoeSegment hm;
+                hm.layer = l;
+                hm.moe_in = ggml_cont(ctx, ggml_reshape_1d(ctx, moe_in, H));
+                hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel, nUsed));
+                hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, nUsed));
+                ggml_set_output(hm.moe_in);
+                ggml_set_output(hm.sel_ids);
+                ggml_set_output(hm.weights);
+
+                // The host writes here between segments. Flagged BOTH input and
+                // output: ggml-alloc pre-allocates inputs but still frees them
+                // after their last consumer, and this one is written from outside
+                // the graph, so it has to stay pinned for the whole pass.
+                moe_out_1d = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+                ggml_set_input(moe_out_1d);
+                ggml_set_output(moe_out_1d);
+
+                hm.moe_out = moe_out_1d;
+                hm.gate_data = d.gate_exps; hm.gate_type = d.ge_type;
+                hm.gate_ne0 = d.ge_ne0;     hm.gate_ne1 = d.ge_ne1;  hm.gate_bytes = d.ge_bytes;
+                hm.up_data = d.up_exps;     hm.up_type = d.ue_type;
+                hm.up_ne0 = d.ue_ne0;       hm.up_ne1 = d.ue_ne1;    hm.up_bytes = d.ue_bytes;
+                hm.down_data = d.down_exps; hm.down_type = d.de_type;
+                hm.down_ne0 = d.de_ne0;     hm.down_ne1 = d.de_ne1;  hm.down_bytes = d.de_bytes;
+                hm.gate_bias = static_cast<const float*>(d.gate_exps_b);
+                hm.up_bias = static_cast<const float*>(d.up_exps_b);
+                hm.down_bias = static_cast<const float*>(d.down_exps_b);
+                hm.activation = 1;          // gpt-oss clamped SwiGLU
+                hm.oai_alpha = d.oai_alpha;
+                hm.oai_limit = d.oai_limit;
+                hm.num_experts = nExp;
+                hm.n_used = nUsed;
+                hm.n_ff = nFf;
+                hm.seq_len = 1;
+                hm.hidden = H;
+
+                if (host_moe_verify_enabled())
+                {
+                    ggml_tensor* vin = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
+                    ggml_tensor* vg = ggml_mul_mat_id(ctx, t.gate_exps, vin, sel);
+                    if (t.gate_exps_b != nullptr) vg = ggml_add_id(ctx, vg, t.gate_exps_b, sel);
+                    ggml_tensor* vu = ggml_mul_mat_id(ctx, t.up_exps, vin, sel);
+                    if (t.up_exps_b != nullptr) vu = ggml_add_id(ctx, vu, t.up_exps_b, sel);
+                    ggml_tensor* vd = ggml_mul_mat_id(ctx, t.down_exps,
+                        ggml_swiglu_oai(ctx, vg, vu, d.oai_alpha, d.oai_limit), sel);
+                    if (t.down_exps_b != nullptr) vd = ggml_add_id(ctx, vd, t.down_exps_b, sel);
+                    ggml_tensor* vw = ggml_mul(ctx, vd, w_final);
+                    ggml_tensor* vsum = ggml_view_2d(ctx, vw, H, 1, vw->nb[2], 0);
+                    for (int u = 1; u < nUsed; ++u)
+                    {
+                        ggml_tensor* vv = ggml_view_2d(ctx, vw, H, 1, vw->nb[2], static_cast<std::size_t>(u) * vw->nb[1]);
+                        vsum = ggml_add(ctx, vsum, vv);
+                    }
+                    hm.verify_gpu = ggml_cont(ctx, ggml_reshape_1d(ctx, vsum, H));
+                    ggml_set_output(hm.verify_gpu);
+                }
+
+                host_moe.push_back(hm);
             }
-            hidden = ggml_add(ctx, ffn_inp, ggml_reshape_1d(ctx, moe_out, H));
+            else
+            {
+                ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
+                ggml_tensor* gate = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel);     // [nFf, nUsed, 1]
+                if (t.gate_exps_b != nullptr) gate = ggml_add_id(ctx, gate, t.gate_exps_b, sel);
+                ggml_tensor* up = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel);
+                if (t.up_exps_b != nullptr) up = ggml_add_id(ctx, up, t.up_exps_b, sel);
+                ggml_tensor* act = ggml_swiglu_oai(ctx, gate, up, d.oai_alpha, d.oai_limit);
+                ggml_tensor* down = ggml_mul_mat_id(ctx, t.down_exps, act, sel);           // [H, nUsed, 1]
+                if (t.down_exps_b != nullptr) down = ggml_add_id(ctx, down, t.down_exps_b, sel);
+                ggml_tensor* weighted = ggml_mul(ctx, down, w_final);
+
+                ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
+                for (int u = 1; u < nUsed; ++u)
+                {
+                    ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2],
+                        static_cast<std::size_t>(u) * weighted->nb[1]);
+                    moe_out = ggml_add(ctx, moe_out, view_u);
+                }
+                moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
+            }
+            hidden = ggml_add(ctx, ffn_inp, moe_out_1d);
             (void)nFf;
         }
 
@@ -679,12 +782,38 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
         // KV writes first so they are ordered before the reads.
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 160 + 512;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        // Expand layer by layer. ggml_build_forward_expand appends each root's
+        // not-yet-emitted dependencies in topological order, so walking the
+        // layers in order - KV writes first, then the layer's host-MoE boundary
+        // if it has one - puts the cut exactly where the accelerator has to pause
+        // for the host. The trailing expand of out_cpy picks up the rest.
+        std::size_t next_host_moe = 0;
         for (int l = 0; l < num_layers; l++)
         {
             ggml_build_forward_expand(graph, lt[l].k_cpy);
             ggml_build_forward_expand(graph, lt[l].v_cpy);
+            if (next_host_moe < host_moe.size() && host_moe[next_host_moe].layer == l)
+            {
+                const tsg::HostMoeSegment& hm = host_moe[next_host_moe];
+                ggml_build_forward_expand(graph, hm.moe_in);
+                ggml_build_forward_expand(graph, hm.sel_ids);
+                ggml_build_forward_expand(graph, hm.weights);
+                if (hm.verify_gpu != nullptr)
+                    ggml_build_forward_expand(graph, hm.verify_gpu);
+                ++next_host_moe;
+            }
         }
         ggml_build_forward_expand(graph, out_cpy);
+
+        // Turn the recorded boundaries into node cut points (see
+        // host_moe_build_segment_ends). It fails when the builder and the
+        // expander disagree, which would silently feed the host stale values.
+        std::vector<int> host_moe_seg_end;
+        if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kGptOssDecodeKernel))
+        {
+            if (can_persist) ggml_free(ctx);
+            return 0;
+        }
 
         // ---- bind ----
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -823,10 +952,24 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
             }
         }
 
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        // MoE CPU offload runs the graph in segments, pausing at each offloaded
+        // layer for the host expert matmul. Everything else still goes out as one
+        // graph submission.
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (!host_moe.empty())
+        {
+            if (!host_moe_execute_segments(graph, host_moe, host_moe_seg_end, kGptOssDecodeKernel))
+                status = GGML_STATUS_FAILED;
+        }
+        else
+        {
+            status = ggml_backend_graph_compute(g_backend, graph);
+        }
         if (status != GGML_STATUS_SUCCESS)
         {
-            set_last_error("GPT-OSS model decode: graph execution failed.");
+            // The segmented path already set a specific error.
+            if (host_moe.empty())
+                set_last_error("GPT-OSS model decode: graph execution failed.");
             if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
             return 0;
         }
@@ -852,6 +995,12 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
             }
             dcache->layer_wstart = wstart;
             dcache->layer_wlen = wlen;
+            // MoE CPU offload: the replay path re-runs these segments, so the
+            // plan has to live in the cache slot. Without it a cached graph would
+            // run end to end and read whatever stale bytes moe_out still held
+            // from the previous token.
+            dcache->host_moe = host_moe;
+            dcache->host_moe_seg_end = host_moe_seg_end;
             dcache->k_win_addr = k_addr;
             dcache->v_win_addr = v_addr;
             dcache->sig_disc = sig_disc;

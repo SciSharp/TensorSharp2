@@ -96,6 +96,11 @@ bool qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlag
 // Must run before the startup model is loaded so InitKVCache sees the choice.
 TensorSharp.Models.KvCacheDtypeConfig.ConfigureFromEnvironment();
 bool kvCacheDtypeFlagApplied = ServerOptionsBuilder.ApplyKvCacheDtypeCliFlag(args);
+// Translate --n-cpu-moe / --cpu-moe into MoeCpuOffloadConfig (or honor the
+// TS_N_CPU_MOE / TS_CPU_MOE env vars). Must run before the startup model is
+// loaded: weight residency is decided while preparing the quantized weights.
+TensorSharp.Models.MoeCpuOffloadConfig.ConfigureFromEnvironment();
+bool moeCpuOffloadFlagsApplied = ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags(args);
 // Translate --gpu-device into TS_GGML_VULKAN_DEVICE so multi-GPU hosts can pick
 // which Vulkan device the ggml_vulkan backend initializes on. Must run before
 // the startup model is loaded (the device is fixed at first backend init).
@@ -216,6 +221,16 @@ if (tensorParallelFlagsApplied)
         Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE") ?? "1",
         Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID") ?? "(single-node)",
         Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS") ?? "(none)");
+}
+
+if (moeCpuOffloadFlagsApplied || TensorSharp.Models.MoeCpuOffloadConfig.IsEnabled)
+{
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "MoE CPU offload active: routed experts of {Layers} stay in system RAM and run on the host ({Threads} threads)",
+        TensorSharp.Models.MoeCpuOffloadConfig.Describe() ?? "no layers",
+        TensorSharp.Models.MoeCpuOffloadConfig.CpuThreads > 0
+            ? TensorSharp.Models.MoeCpuOffloadConfig.CpuThreads.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : "auto");
 }
 
 if (qwenImageFlagsApplied)

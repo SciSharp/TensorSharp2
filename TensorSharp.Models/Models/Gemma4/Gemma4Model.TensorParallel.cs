@@ -1725,7 +1725,8 @@ namespace TensorSharp.Models
                         upData, upType, upNe0, upNe1, upBytes,
                         d.Data, d.GgmlType, d.PerExpertNe0, d.PerExpertNe1, d.TotalRawBytes,
                         gateBias: null, upBias: null, downBias: null,
-                        activation: GgmlBasicOps.MoEActivation.GEGLUSplit);
+                        activation: GgmlBasicOps.MoEActivation.GEGLUSplit,
+                        runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
                     InvalidateTensorDeviceCache(output);
                     moeResults[r] = output;
                 }

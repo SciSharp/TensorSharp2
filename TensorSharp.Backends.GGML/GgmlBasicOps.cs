@@ -3149,7 +3149,8 @@ namespace TensorSharp.GGML
             float[] downBias,         // null to skip; otherwise [hiddenDim, numExperts]
             MoEActivation activation,
             float oaiAlpha = 1.702f,
-            float oaiLimit = 7.0f)
+            float oaiLimit = 7.0f,
+            bool runOnCpu = false)
         {
             if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
             if (hiddenOut == null) throw new ArgumentNullException(nameof(hiddenOut));
@@ -3226,7 +3227,7 @@ namespace TensorSharp.GGML
                     gateBias != null ? (IntPtr)gateBiasPtr : IntPtr.Zero,
                     upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
                     downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
-                    activationType, oaiAlpha, oaiLimit);
+                    activationType, oaiAlpha, oaiLimit, runOnCpu);
             }
         }
 
@@ -3278,7 +3279,8 @@ namespace TensorSharp.GGML
             float[] downBias,
             MoEActivation activation = MoEActivation.GEGLUSplit,
             float oaiAlpha = 1.702f,
-            float oaiLimit = 7.0f)
+            float oaiLimit = 7.0f,
+            bool runOnCpu = false)
         {
             if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
             if (residual == null) throw new ArgumentNullException(nameof(residual));
@@ -3363,7 +3365,7 @@ namespace TensorSharp.GGML
                     gateBias != null ? (IntPtr)gateBiasPtr : IntPtr.Zero,
                     upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
                     downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
-                    activationType, oaiAlpha, oaiLimit);
+                    activationType, oaiAlpha, oaiLimit, runOnCpu);
             }
         }
 
@@ -3391,7 +3393,8 @@ namespace TensorSharp.GGML
             float[] downBias,
             bool useSwiGLUOAI,
             float oaiAlpha = 1.702f,
-            float oaiLimit = 7.0f)
+            float oaiLimit = 7.0f,
+            bool runOnCpu = false)
         {
             MoEFFNPrefill(
                 hiddenIn, hiddenOut, seqLen, hiddenDim, nFf, numExperts, nUsed,
@@ -3401,7 +3404,7 @@ namespace TensorSharp.GGML
                 downData, downGgmlType, downNe0, downNe1, downTotalBytes,
                 gateBias, upBias, downBias,
                 useSwiGLUOAI ? MoEActivation.SwiGLUOAI : MoEActivation.SwiGLUSplit,
-                oaiAlpha, oaiLimit);
+                oaiAlpha, oaiLimit, runOnCpu);
         }
 
         [RegisterOpStorageType("scaled_dot_product_attention", typeof(GgmlStorage))]

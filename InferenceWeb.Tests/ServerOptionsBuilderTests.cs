@@ -429,6 +429,7 @@ public class ServerOptionsBuilderTests : IDisposable
             "--mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model", "--draft-model",
             "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
             "--offload-cpu",
+            "--n-cpu-moe", "--cpu-moe", "--cpu-moe-threads",
             "--config",
             "--help",
         };
@@ -437,6 +438,114 @@ public class ServerOptionsBuilderTests : IDisposable
 
         Assert.Contains("Default:", usage);
         Assert.Contains("Example:", usage);
+    }
+
+    // ---- MoE CPU offload (--n-cpu-moe / --cpu-moe) ----
+    // These translate into the process-wide MoeCpuOffloadConfig BEFORE the
+    // startup model loads, because weight residency is decided while preparing
+    // the quantized weights. A parse bug here silently costs the operator the
+    // VRAM the flag exists to save, so cover every accepted spelling.
+
+    [Fact]
+    public void ApplyMoeCpuOffloadCliFlags_ParsesLayerCount()
+    {
+        try
+        {
+            Assert.True(ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags(
+                new[] { "--model", "m.gguf", "--n-cpu-moe", "32" }));
+            Assert.Equal(32, TensorSharp.Models.MoeCpuOffloadConfig.CpuMoeLayers);
+            Assert.False(TensorSharp.Models.MoeCpuOffloadConfig.AllLayers);
+        }
+        finally { TensorSharp.Models.MoeCpuOffloadConfig.Reset(); }
+    }
+
+    [Fact]
+    public void ApplyMoeCpuOffloadCliFlags_ParsesShortAlias()
+    {
+        try
+        {
+            Assert.True(ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags(new[] { "-ncmoe", "8" }));
+            Assert.Equal(8, TensorSharp.Models.MoeCpuOffloadConfig.CpuMoeLayers);
+        }
+        finally { TensorSharp.Models.MoeCpuOffloadConfig.Reset(); }
+    }
+
+    [Theory]
+    [InlineData("--cpu-moe")]
+    [InlineData("-cmoe")]
+    public void ApplyMoeCpuOffloadCliFlags_ParsesAllLayersSwitch(string flag)
+    {
+        try
+        {
+            Assert.True(ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags(new[] { flag }));
+            Assert.True(TensorSharp.Models.MoeCpuOffloadConfig.AllLayers);
+            Assert.True(TensorSharp.Models.MoeCpuOffloadConfig.IsLayerOnCpu(99));
+        }
+        finally { TensorSharp.Models.MoeCpuOffloadConfig.Reset(); }
+    }
+
+    [Fact]
+    public void ApplyMoeCpuOffloadCliFlags_ParsesAllKeyword()
+    {
+        try
+        {
+            Assert.True(ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags(new[] { "--n-cpu-moe", "all" }));
+            Assert.True(TensorSharp.Models.MoeCpuOffloadConfig.AllLayers);
+        }
+        finally { TensorSharp.Models.MoeCpuOffloadConfig.Reset(); }
+    }
+
+    [Fact]
+    public void ApplyMoeCpuOffloadCliFlags_ParsesThreadCount()
+    {
+        try
+        {
+            Assert.True(ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags(new[] { "--cpu-moe-threads", "12" }));
+            Assert.Equal(12, TensorSharp.Models.MoeCpuOffloadConfig.CpuThreads);
+        }
+        finally
+        {
+            TensorSharp.Models.MoeCpuOffloadConfig.Reset();
+            Environment.SetEnvironmentVariable("TS_CPU_MOE_THREADS", null);
+        }
+    }
+
+    [Fact]
+    public void ApplyMoeCpuOffloadCliFlags_AbsentLeavesConfigUntouched()
+    {
+        try
+        {
+            Assert.False(ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags(
+                new[] { "--model", "m.gguf", "--temperature", "0.7" }));
+            Assert.False(TensorSharp.Models.MoeCpuOffloadConfig.IsEnabled);
+        }
+        finally { TensorSharp.Models.MoeCpuOffloadConfig.Reset(); }
+    }
+
+    [Theory]
+    [InlineData("-1")]
+    [InlineData("half")]
+    public void ApplyMoeCpuOffloadCliFlags_RejectsInvalidValue(string value)
+    {
+        try
+        {
+            Assert.Throws<ArgumentException>(() =>
+                ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags(new[] { "--n-cpu-moe", value }));
+        }
+        finally { TensorSharp.Models.MoeCpuOffloadConfig.Reset(); }
+    }
+
+    [Fact]
+    public void Build_DoesNotTripTheUnknownArgTrapOnMoeOffloadFlags()
+    {
+        // The offload flags are consumed by a separate earlier pass, so Build
+        // must skip them (and their values) rather than reject them.
+        var options = ServerOptionsBuilder.Build(new[]
+        {
+            "--model", Path.Combine(_baseDir, "m.gguf"),
+            "--n-cpu-moe", "32", "--cpu-moe-threads", "8", "--cpu-moe",
+        }, _baseDir);
+        Assert.NotNull(options);
     }
 
     [Fact]

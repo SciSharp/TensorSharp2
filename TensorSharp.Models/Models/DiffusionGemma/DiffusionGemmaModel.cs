@@ -441,6 +441,12 @@ namespace TensorSharp.Models
             }
             for (int l = 0; l < L; l++)
             {
+                // MoE CPU offload: this layer's experts are multiplied on the host
+                // straight out of the GGUF mmap, so they must not be preloaded —
+                // uploading them here would spend exactly the VRAM --n-cpu-moe
+                // exists to free, and the decode graph never reads the device copy.
+                if (MoeCpuOffloadConfig.IsLayerOnCpu(l))
+                    continue;
                 var gu = _stackedGateUp[l];
                 var dn = _stackedDown[l];
                 if (gu != null) priority.Add((gu.Data, gu.Data, gu.GgmlType, gu.PerExpertNe0, gu.PerExpertNe1 * _numExperts, gu.TotalRawBytes));
@@ -1663,6 +1669,10 @@ namespace TensorSharp.Models
                     QType = qw.GgmlType, KType = kw.GgmlType, VType = vwType, OType = ow.GgmlType,
                     GateType = gatew.GgmlType, UpType = upw.GgmlType, DownType = downw.GgmlType,
                     GueType = gateUp.GgmlType, DeType = down.GgmlType,
+                    // MoE CPU offload: this layer's routed experts stay in system
+                    // RAM and its expert matmuls run on the host between
+                    // accelerator graph segments.
+                    CpuMoe = MoeCpuOffloadConfig.IsLayerOnCpu(layer) ? 1 : 0,
 
                     Eps = Config.Eps,
                     RopeBase = local ? _ropeLocalBase : _ropeGlobalBase,
@@ -2051,7 +2061,8 @@ namespace TensorSharp.Models
                     IntPtr.Zero, 0, 0L, 0L, 0L,             // up == null -> fused gate_up, kernel splits internally
                     down.Data, down.GgmlType, down.PerExpertNe0, down.PerExpertNe1, down.TotalRawBytes,
                     gateBias: null, upBias: null, downBias: null,
-                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit);
+                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit,
+                    runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
                 InvalidateTensorDeviceCache(output);
                 return true;
             }

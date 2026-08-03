@@ -259,6 +259,10 @@ struct TSGgmlQwen35LayerDesc
     std::int32_t separate_qkv, k_type, v_type;
     std::int32_t gate_inp_type, gate_exps_type, up_exps_type, down_exps_type;
     std::int32_t shexp_gate_type, shexp_up_type, shexp_down_type;
+    // MoE CPU offload (--n-cpu-moe): non-zero keeps this layer's routed experts
+    // in system RAM. The whole-model decode graph then omits their mul_mat_id
+    // chain, pauses after the router, and lets the host multiply them.
+    std::int32_t cpu_moe;
 };
 
 // Per-layer descriptor for the GPT-OSS whole-model decode kernel
@@ -316,6 +320,10 @@ struct TSGgmlGptOssLayerDesc
     std::int32_t separate_qkv;
     std::int32_t qkv_type, k_type, v_type, o_type;
     std::int32_t ge_type, ue_type, de_type;
+    // MoE CPU offload (--n-cpu-moe): non-zero keeps this layer's routed experts
+    // in system RAM. The whole-model decode graph then omits their mul_mat_id
+    // chain, pauses after the router, and lets the host multiply them.
+    std::int32_t cpu_moe;
 
     // --- float scalars ---
     float eps;
@@ -394,6 +402,10 @@ struct TSGgmlGemma4MoELayerDesc
     std::int32_t gue_type;
     std::int32_t de_type;
     std::int32_t separate_qkv;
+    // MoE CPU offload (--n-cpu-moe): non-zero keeps this layer's routed experts
+    // in system RAM. The whole-model decode graph then omits their mul_mat_id
+    // chain, pauses after the router, and lets the host multiply them.
+    std::int32_t cpu_moe;
 
     // --- float scalars ---
     float eps;

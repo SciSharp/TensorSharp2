@@ -245,12 +245,19 @@ namespace TensorSharp.Models
         // (TSGgml_Gemma4MoELayerDecode). Disable via TS_GGML_MOE_FUSED_DECODE=0
         // for A/B comparison against the per-op TransformerBlock path. Flipped
         // off at runtime if the kernel ever throws (graceful degradation).
+        // MoE CPU offload stays on this path too: both the per-layer kernel and
+        // the whole-model graph below segment at the offloaded layers' routers so
+        // the host multiplies those experts (see tsg::HostMoeSegment).
         private bool _moeFusedDecodeEnabled =
             Environment.GetEnvironmentVariable("TS_GGML_MOE_FUSED_DECODE") != "0";
         // Model-wide MoE decode (TSGgml_Gemma4MoEModelDecode): runs the whole
         // transformer as ONE fused GGML graph per token instead of one graph per
         // layer, amortising the per-layer build/encode/sync that leaves the GPU
         // idle (~60% util) for MoE Gemma 4. Disable via TS_GEMMA4_MOE_MODEL_DECODE=0.
+        // MoE CPU offload stays ON this path: the native graph is segmented at
+        // each offloaded layer's router so the host multiplies those experts
+        // while attention, norms, the dense FFN and the LM head keep running as
+        // one fused graph (see tsg::HostMoeSegment).
         private static readonly bool s_MoeModelDecodeEnabled =
             Environment.GetEnvironmentVariable("TS_GEMMA4_MOE_MODEL_DECODE") != "0";
 
@@ -563,7 +570,8 @@ namespace TensorSharp.Models
         /// view stays mapped so the rare per-op fallback can still reach the bytes.
         /// </summary>
         protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
-            => !_stackedExpertMemberNames.Contains(weightName);
+            => !_stackedExpertMemberNames.Contains(weightName)
+               && base.ShouldPreloadCudaQuantWeightToDevice(weightName);
 
         private bool IsLocalLayer(int layer) =>
             _slidingWindowPattern != null && layer < _slidingWindowPattern.Length && _slidingWindowPattern[layer];
@@ -3539,6 +3547,10 @@ namespace TensorSharp.Models
                 NumExperts = _numExperts,
                 NumExpertsUsed = _numExpertsUsed,
                 SeparateQkv = a.K[layer] != IntPtr.Zero ? 1 : 0,
+                // MoE CPU offload: this layer's routed experts stay in system RAM
+                // and its expert matmuls run on the host between accelerator
+                // graph segments.
+                CpuMoe = MoeCpuOffloadConfig.IsLayerOnCpu(layer) ? 1 : 0,
 
                 Eps = Config.Eps,
                 RopeBase = a.RopeBase[layer],
@@ -4872,7 +4884,8 @@ namespace TensorSharp.Models
                     upData,     upType,        upNe0,              upNe1,              upBytes,
                     downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, downW.TotalRawBytes,
                     gateBias: null, upBias: null, downBias: null,
-                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit);
+                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit,
+                    runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
                 InvalidateTensorDeviceCache(output);
                 return true;
             }
@@ -5115,7 +5128,8 @@ namespace TensorSharp.Models
                     upData,     upType,        upNe0,              upNe1,              upBytes,
                     downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, downW.TotalRawBytes,
                     gateBias: null, upBias: null, downBias: null,
-                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit);
+                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit,
+                    runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
                 InvalidateTensorDeviceCache(residual);
                 return true;
             }

@@ -202,6 +202,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0 (env `TS_N_CPU_MOE`). |
+| `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off (env `TS_CPU_MOE`). |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: one less than the hardware thread count, leaving a core free for accelerator submission (env `TS_CPU_MOE_THREADS`). |
 | `--kv-cache-dtype <type>` | KV cache precision: `f32`, `f16`, `q8_0`, or `q4_0` (default: auto — the backend/model pick; env `KV_CACHE_DTYPE`). Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) require the native GGML flash path. |
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
@@ -391,6 +394,9 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--frequency-penalty <f>` | Default frequency penalty when a request does not provide one (`0` = disabled) |
 | `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
 | `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0. Env: `TS_N_CPU_MOE`. |
+| `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off. Env: `TS_CPU_MOE`. |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: hardware threads minus one. Env: `TS_CPU_MOE_THREADS`. |
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
 | `--prefill-chunk-size <N>` | Chunked-prefill granularity under contention — the maximum prefill tokens scheduled per step while other requests are running, so parallel decodes get frequent turns at the GPU (default: `1024`). Env: `TS_SCHED_PREFILL_CHUNK`. |
@@ -521,6 +527,90 @@ Sampling parameter precedence (highest wins):
 2. Server-wide CLI flags (e.g. `--temperature`, `--top-p`, `--stop`).
 3. `TENSORSHARP_*` environment variables listed above.
 4. Built-in `SamplingConfig` defaults (`temperature=1.0`, `top_k=0`, `top_p=1.0`, `min_p=0`, `repeat_penalty=1.0`, presence/frequency penalties `0`, `seed=-1`, no stop sequences).
+
+## Mixture-of-Experts CPU offload (`--n-cpu-moe`)
+
+Large MoE models spend almost all of their bytes on routed experts while
+activating only a small fraction of them per token — Qwen3.6-35B-A3B is ~11 GB
+of weights for ~3B active parameters. `--n-cpu-moe N` keeps the routed experts
+of the first N layers in system RAM and multiplies them on the CPU, leaving
+attention, the norms, the router and the always-active shared expert on the
+accelerator. Only the layer activation crosses the bus each layer
+(`hidden_size` floats — 8 KB for a decode step), so the split is bounded by host
+matmul throughput rather than by transfers.
+
+The offloaded layers stay inside the fused whole-model graph: the accelerator
+pauses after each offloaded layer's router, the host multiplies the selected
+experts straight out of the GGUF mmap, and the result is handed back before the
+next segment runs. Everything else in the token — attention, the shared or dense
+FFN, the LM head — stays in one graph submission. This holds for Qwen3.5/3.6,
+Gemma 4 MoE, GPT-OSS and DiffusionGemma; Gemma 4 MoE segments its prefill graph
+the same way, and DiffusionGemma's block decode hands the host all of the canvas
+positions at once so its offloaded side is a GEMM rather than a matvec.
+
+Measured on Qwen3.6-35B-A3B (UD-IQ2_XXS, RTX 3080 Laptop 16 GB, i7-11800H):
+
+| Setting | Peak VRAM | Decode | Prefill (pp2048) |
+| --- | --- | --- | --- |
+| default (all experts on GPU) | 13.4 GB | 71 tok/s | 1.2 s |
+| `--n-cpu-moe 16` | 11.0 GB | 37 tok/s | 20 s |
+| `--n-cpu-moe 32` | 7.0 GB | 24 tok/s | 38 s |
+| `--cpu-moe` (all 41 layers) | 4.6 GB | 18 tok/s | 48 s |
+
+(A later re-measure on a short prompt reads 11.6 GB / 72 tok/s default,
+5.8 GB / 23 tok/s at `--n-cpu-moe 32` and 4.0 GB / 15.6 tok/s at `--cpu-moe`;
+peak VRAM depends on how far the KV cache has grown, so treat these as the
+shape of the trade rather than absolutes.)
+
+Greedy output is unchanged at every setting on this model.
+
+The other MoE architectures on the same machine (96-token generation, peak VRAM
+sampled from `nvidia-smi`). Note how far under the card's 16 GB the offloaded
+configurations sit — both the GPT-OSS and DiffusionGemma baselines were over the
+WDDM spill threshold, which is why offload makes them *faster* as well as
+smaller:
+
+| Model | Setting | Peak VRAM | Prefill | Decode |
+| --- | --- | --- | --- | --- |
+| gemma-4-26B-A4B (Q4_K_XL) | default | 16.1 GB | 190 tok/s | 39.7 tok/s |
+| | `--n-cpu-moe 8` | 13.1 GB | 52 tok/s | 38.6 tok/s |
+| | `--n-cpu-moe 16` | 10.2 GB | 24 tok/s | 21.6 tok/s |
+| | `--cpu-moe` (30 layers) | 4.8 GB | 15 tok/s | 17.7 tok/s |
+| gpt-oss-20b (Q8_0) | default | 16.2 GB | 2.7 tok/s | 0.3 tok/s |
+| | `--n-cpu-moe 12` | 14.0 GB | 58 tok/s | 25.4 tok/s |
+| | `--cpu-moe` (24 layers) | 2.9 GB | 29 tok/s | 12.1 tok/s |
+| diffusiongemma-26B-A4B (Q4_K_M) | default | 16.0 GB | — | 1709 ms/step |
+| | `--n-cpu-moe 16` | 9.8 GB | — | 2287 ms/step |
+| | `--cpu-moe` (30 layers) | 3.0 GB | — | 4697 ms/step |
+
+Notes:
+
+* **Pick the smallest N that fits.** Each offloaded layer costs decode
+  throughput, so offload only as many layers as you need to free the VRAM the
+  KV cache wants.
+* **Prefill pays the most.** Prompt processing is a real GEMM over every token,
+  so it becomes host-compute-bound. Decode only touches `n_expert_used` experts
+  per token and stays fast.
+* **Routing stays on the accelerator**, so expert selection and weights are the
+  same ones the fully resident path would pick.
+* **The fused whole-model graph is kept.** Qwen3.5/3.6, Gemma 4 MoE, GPT-OSS and
+  DiffusionGemma each run a whole token (for DiffusionGemma, a whole canvas
+  block) as ONE accelerator graph, and offload does not give that up. Each
+  offloaded layer's expert matmuls are cut out of the graph; everything else —
+  attention, norms, the router, the shared/dense FFN and the LM head — keeps
+  running fused, with the accelerator pausing only to hand the host that layer's
+  routed-expert work. Gemma 4 MoE segments its *prefill* graph the same way, so a
+  prompt chunk is still one dispatch with the host doing a real GEMM over every
+  token in it.
+* Nemotron-H has no whole-model fused graph to preserve — its hybrid
+  Mamba2/attention/MoE decode is dispatched per layer regardless — so offload
+  there simply routes each layer's MoE through the host path.
+* Not combined with tensor parallelism on the fused TP path: with `--tp > 1` the
+  fused path stands down and the per-op forward honours the placement instead.
+* `TS_HOST_MOE_VERIFY=1` builds the on-GPU expert chain alongside the host one
+  and reports their per-layer divergence — a diagnostic for validating the seam
+  on a model that also fits in VRAM. `TS_HOST_MOE_DEBUG=1` prints the segment
+  plan (the node cuts) and each seam's activation norms.
 
 ## Tensor Parallelism & Distributed Inference
 

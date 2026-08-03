@@ -1822,7 +1822,8 @@ namespace TensorSharp.Models
                     gateBias, upBias, downBias,
                     useSwiGLUOAI: true,
                     oaiAlpha: SiluAlpha,
-                    oaiLimit: SiluLimit);
+                    oaiLimit: SiluLimit,
+                    runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
                 InvalidateTensorDeviceCache(output);
                 return true;
             }

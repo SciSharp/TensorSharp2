@@ -34,20 +34,71 @@
 #include "ggml_ops_internal.h"
 
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
+// ggml_graph_view: host_moe_execute_segments runs [i0, i1) slices of an
+// already-built whole-model decode graph, pausing at each offloaded layer for
+// the host expert matmul. Same internal API the tensor-parallel executor uses.
+#include "ggml-impl.h"
 
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <vector>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <thread>
 
 using namespace tsg;
 
 namespace
 {
+        // ------------------------------------------------------------------
+        // MoE CPU offload (llama.cpp's --n-cpu-moe / --cpu-moe equivalent)
+        // ------------------------------------------------------------------
+        // A dedicated, persistent ggml CPU backend used to run the routed-expert
+        // FFN of layers the caller asked to keep in system RAM. It is separate
+        // from g_backend (which stays on the accelerator for everything else)
+        // and from the CPU backend ggml_ops_core may create when the *whole*
+        // model runs on the CPU.
+        //
+        // Persisting it matters: ggml_backend_cpu_init allocates a thread pool,
+        // and the offload path is entered once per offloaded layer per forward
+        // (~32x per token for a --n-cpu-moe 32 run), so a per-call init would
+        // dominate the very cost this feature exists to pay down.
+        std::mutex g_moe_cpu_backend_mutex;
+        ggml_backend_t g_moe_cpu_backend = nullptr;
+
+        int moe_cpu_thread_count()
+        {
+            if (const char* e = std::getenv("TS_CPU_MOE_THREADS"))
+            {
+                const int n = std::atoi(e);
+                if (n > 0)
+                    return n;
+            }
+            const unsigned hw = std::thread::hardware_concurrency();
+            // Leave one core for the GPU submission thread: the host matmul and
+            // the accelerator's driver thread run concurrently in this design,
+            // and starving the submitter stalls the next layer's dispatch.
+            return hw > 2 ? static_cast<int>(hw - 1) : 1;
+        }
+
+        ggml_backend_t moe_cpu_backend()
+        {
+            std::lock_guard<std::mutex> lock(g_moe_cpu_backend_mutex);
+            if (g_moe_cpu_backend == nullptr)
+            {
+                g_moe_cpu_backend = ggml_backend_cpu_init();
+                if (g_moe_cpu_backend != nullptr)
+                    ggml_backend_cpu_set_n_threads(g_moe_cpu_backend, moe_cpu_thread_count());
+            }
+            return g_moe_cpu_backend;
+        }
+
         // Bind a read-only weight tensor to its host data via the cacheable buffer
         // path when possible (so subsequent calls hit the cached backend buffer),
         // otherwise via the host-pointer mapped buffer (zero-copy on Metal /
@@ -211,7 +262,145 @@ namespace
         float* residual_in_out = nullptr;
         const float* post_norm_w = nullptr;
         float post_norm_eps = 1e-6f;
+
+        // MoE CPU offload: run this layer's expert matmuls on the host ggml CPU
+        // backend, reading the stacked expert weights zero-copy out of the GGUF
+        // mmap instead of uploading them to the accelerator. Set per layer by
+        // the caller from MoeCpuOffloadConfig.IsLayerOnCpu(layer).
+        bool run_on_cpu = false;
     };
+
+    // Execute an already-built MoE FFN graph on the host CPU backend.
+    //
+    // Every buffer this path touches is host memory the caller already owns, so
+    // each large tensor is wrapped zero-copy with ggml_backend_cpu_buffer_from_ptr:
+    //   * gate / up / down: the stacked per-expert GGUF blocks, still mmap'd.
+    //     Nothing is copied and nothing is uploaded, which is precisely the VRAM
+    //     that offload is buying back.
+    //   * hidden_in / hidden_out: the caller's F32 activation tensors.
+    // Only the tiny ids / routing-weight / bias tensors and the graph's
+    // intermediates get a real allocation.
+    //
+    // Note this deliberately does NOT go through try_get_cacheable_tensor_buffer:
+    // that cache is keyed on the host pointer and would hand back an accelerator
+    // buffer previously created for the same weight, silently putting the bytes
+    // back in VRAM.
+    struct MoECpuGraphBinding
+    {
+        ggml_tensor* hidden_t = nullptr;
+        ggml_tensor* hidden_out_t = nullptr;
+        ggml_tensor* post_norm_w_t = nullptr;
+        ggml_tensor* gate_w = nullptr;
+        ggml_tensor* up_w = nullptr;
+        ggml_tensor* down_w = nullptr;
+        ggml_tensor* ids_t = nullptr;
+        ggml_tensor* weights_t = nullptr;
+        ggml_tensor* gate_bias_t = nullptr;
+        ggml_tensor* up_bias_t = nullptr;
+        ggml_tensor* down_bias_t = nullptr;
+        std::int64_t gate_bias_dim = 0;
+        std::size_t hidden_bytes = 0;
+        float* out_buffer_ptr = nullptr;
+    };
+
+    int moe_ffn_execute_on_cpu(
+        ggml_context* ctx,
+        ggml_cgraph* graph,
+        const MoEFFNGraphParams& p,
+        const MoECpuGraphBinding& b)
+    {
+        ggml_backend_t cpu = moe_cpu_backend();
+        if (cpu == nullptr)
+        {
+            set_last_error("MoE CPU offload: failed to initialise the host ggml CPU backend.");
+            return 0;
+        }
+
+        // The accelerator may still have writes in flight targeting hidden_in
+        // (the previous layer's output) and the routing arrays. The host is
+        // about to read them directly, so drain first.
+        host_read_barrier();
+
+        std::vector<BufferHandle> buffers;
+        auto wrap_host = [&](ggml_tensor* t, void* data, std::size_t bytes) -> bool
+        {
+            if (t == nullptr || data == nullptr || bytes == 0)
+                return false;
+            ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(data, bytes);
+            if (buf == nullptr)
+                return false;
+            buffers.emplace_back(buf);
+            return ggml_backend_tensor_alloc(buf, t, data) == GGML_STATUS_SUCCESS;
+        };
+
+        if (!wrap_host(b.hidden_t, p.hidden_in, b.hidden_bytes) ||
+            !wrap_host(b.hidden_out_t, b.out_buffer_ptr, b.hidden_bytes) ||
+            !wrap_host(b.gate_w, p.gate_data, static_cast<std::size_t>(p.gate_total_bytes)) ||
+            !wrap_host(b.down_w, p.down_data, static_cast<std::size_t>(p.down_total_bytes)))
+        {
+            set_last_error("MoE CPU offload: failed to wrap a host buffer for the expert weights.");
+            return 0;
+        }
+        if (b.up_w != nullptr &&
+            !wrap_host(b.up_w, p.up_data, static_cast<std::size_t>(p.up_total_bytes)))
+        {
+            set_last_error("MoE CPU offload: failed to wrap the up-projection host buffer.");
+            return 0;
+        }
+
+        // Everything still unbound (ids, routing weights, biases, post-norm
+        // weight, and all graph intermediates) is small; allocate it in one
+        // CPU-backend buffer freed when this call returns.
+        BufferHandle scratch(ggml_backend_alloc_ctx_tensors(ctx, cpu));
+        if (scratch.value == nullptr)
+        {
+            set_last_error("MoE CPU offload: failed to allocate the host scratch buffer.");
+            return 0;
+        }
+
+        ggml_backend_tensor_set(b.ids_t, p.selected_experts, 0,
+            static_cast<std::size_t>(p.seq_len) *
+            static_cast<std::size_t>(p.n_used) * sizeof(std::int32_t));
+        ggml_backend_tensor_set(b.weights_t, p.routing_weights, 0,
+            static_cast<std::size_t>(p.seq_len) *
+            static_cast<std::size_t>(p.n_used) * sizeof(float));
+
+        if (b.post_norm_w_t != nullptr)
+        {
+            ggml_backend_tensor_set(b.post_norm_w_t, p.post_norm_w, 0,
+                static_cast<std::size_t>(p.hidden_dim) * sizeof(float));
+        }
+        if (b.gate_bias_t != nullptr)
+        {
+            ggml_backend_tensor_set(b.gate_bias_t, p.gate_bias, 0,
+                static_cast<std::size_t>(b.gate_bias_dim) *
+                static_cast<std::size_t>(p.num_experts) * sizeof(float));
+        }
+        if (b.up_bias_t != nullptr)
+        {
+            ggml_backend_tensor_set(b.up_bias_t, p.up_bias, 0,
+                static_cast<std::size_t>(p.n_ff) *
+                static_cast<std::size_t>(p.num_experts) * sizeof(float));
+        }
+        if (b.down_bias_t != nullptr)
+        {
+            ggml_backend_tensor_set(b.down_bias_t, p.down_bias, 0,
+                static_cast<std::size_t>(p.hidden_dim) *
+                static_cast<std::size_t>(p.num_experts) * sizeof(float));
+        }
+
+        const ggml_status status = ggml_backend_graph_compute(cpu, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("MoE CPU offload: host graph compute failed.");
+            return 0;
+        }
+
+        // hidden_out_t was wrapped around the caller's buffer, so the result is
+        // already where the caller expects it - no download, no barrier.
+        clear_last_error();
+        return 1;
+    }
 
     int moe_ffn_prefill_graph_impl(const MoEFFNGraphParams& p)
     {
@@ -640,6 +829,29 @@ namespace
         }
         ggml_build_forward_expand(graph, output);
 
+        // --- MoE CPU offload: run the whole thing on the host instead ---
+        // Taken before any accelerator binding happens, so none of this layer's
+        // expert bytes ever reach device memory.
+        if (p.run_on_cpu)
+        {
+            MoECpuGraphBinding b;
+            b.hidden_t = hidden_t;
+            b.hidden_out_t = hidden_out_t;
+            b.post_norm_w_t = post_norm_w_t;
+            b.gate_w = gate_w;
+            b.up_w = up_w;
+            b.down_w = down_w;
+            b.ids_t = ids_t;
+            b.weights_t = weights_t;
+            b.gate_bias_t = gate_bias_t;
+            b.up_bias_t = up_bias_t;
+            b.down_bias_t = down_bias_t;
+            b.gate_bias_dim = gate_bias_dim;
+            b.hidden_bytes = hidden_bytes;
+            b.out_buffer_ptr = residual_mode ? residual_in_out : hidden_out;
+            return moe_ffn_execute_on_cpu(ctx, graph, p, b);
+        }
+
         // --- Bind tensors to backend memory ---
         // hidden_in / hidden_out (or residual_in_out): try zero-copy host-pointer
         // mapping first (saves ~hidden_bytes upload + download per call on
@@ -837,7 +1049,8 @@ namespace
         const float* down_bias,
         int activation_type,
         float oai_alpha,
-        float oai_limit)
+        float oai_limit,
+        int run_on_cpu)
     {
         MoEFFNGraphParams p;
         p.hidden_in = hidden_in;
@@ -870,6 +1083,7 @@ namespace
         p.activation_type = activation_type;
         p.oai_alpha = oai_alpha;
         p.oai_limit = oai_limit;
+        p.run_on_cpu = run_on_cpu != 0;
         return moe_ffn_prefill_graph_impl(p);
     }
 
@@ -899,7 +1113,8 @@ namespace
         const float* down_bias,
         int activation_type,
         float oai_alpha,
-        float oai_limit)
+        float oai_limit,
+        int run_on_cpu)
     {
         MoEFFNGraphParams p;
         p.hidden_in = hidden_in;
@@ -934,9 +1149,298 @@ namespace
         p.activation_type = activation_type;
         p.oai_alpha = oai_alpha;
         p.oai_limit = oai_limit;
+        p.run_on_cpu = run_on_cpu != 0;
         return moe_ffn_prefill_graph_impl(p);
     }
 } // namespace
+
+namespace tsg
+{
+    // Host-side routed-expert FFN, shared by the standalone MoE op (when the
+    // caller passes run_on_cpu) and by the whole-model decode graphs' CPU
+    // offload segments. Declared in ggml_ops_internal.h; see there for the
+    // buffer contract.
+    //
+    // Routing is decided by the caller — the whole-model graphs keep the router
+    // on the accelerator and hand down the ids/weights they computed — so the
+    // host and device paths select the same experts with the same weights and
+    // differ only in where the three matmuls run.
+    bool moe_ffn_host_experts(
+        const float* hidden_in,
+        float* hidden_out,
+        int seq_len,
+        int hidden_dim,
+        int n_ff,
+        int num_experts,
+        int n_used,
+        const std::int32_t* selected_experts,
+        const float* routing_weights,
+        void* gate_data, int gate_type, std::int64_t gate_ne0, std::int64_t gate_ne1, std::int64_t gate_bytes,
+        void* up_data,   int up_type,   std::int64_t up_ne0,   std::int64_t up_ne1,   std::int64_t up_bytes,
+        void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_bytes,
+        const float* gate_bias, const float* up_bias, const float* down_bias,
+        int activation_type, float oai_alpha, float oai_limit)
+    {
+        MoEFFNGraphParams p;
+        // The graph builder takes a mutable input pointer because the
+        // accelerator path may bind it as a zero-copy read-write buffer; the
+        // host path only ever reads it.
+        p.hidden_in = const_cast<float*>(hidden_in);
+        p.hidden_out = hidden_out;
+        p.seq_len = seq_len;
+        p.hidden_dim = hidden_dim;
+        p.n_ff = n_ff;
+        p.num_experts = num_experts;
+        p.n_used = n_used;
+        p.selected_experts = selected_experts;
+        p.routing_weights = routing_weights;
+        p.gate_data = gate_data;
+        p.gate_type = gate_type;
+        p.gate_ne0 = gate_ne0;
+        p.gate_ne1 = gate_ne1;
+        p.gate_total_bytes = gate_bytes;
+        p.up_data = up_data;
+        p.up_type = up_type;
+        p.up_ne0 = up_ne0;
+        p.up_ne1 = up_ne1;
+        p.up_total_bytes = up_bytes;
+        p.down_data = down_data;
+        p.down_type = down_type;
+        p.down_ne0 = down_ne0;
+        p.down_ne1 = down_ne1;
+        p.down_total_bytes = down_bytes;
+        p.gate_bias = gate_bias;
+        p.up_bias = up_bias;
+        p.down_bias = down_bias;
+        p.activation_type = activation_type;
+        p.oai_alpha = oai_alpha;
+        p.oai_limit = oai_limit;
+        p.run_on_cpu = true;
+        return moe_ffn_prefill_graph_impl(p) != 0;
+    }
+
+    void moe_ffn_host_release()
+    {
+        std::lock_guard<std::mutex> lock(g_moe_cpu_backend_mutex);
+        if (g_moe_cpu_backend != nullptr)
+        {
+            ggml_backend_free(g_moe_cpu_backend);
+            g_moe_cpu_backend = nullptr;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Whole-model decode graph segmentation (see ggml_ops_internal.h)
+    // ------------------------------------------------------------------
+    bool host_moe_verify_enabled()
+    {
+        static const bool s_on = []() {
+            const char* e = std::getenv("TS_HOST_MOE_VERIFY");
+            if (e == nullptr)
+                // Kept for the Qwen3.5 debugging sessions this seam was first
+                // built against; the new name covers every model.
+                e = std::getenv("TS_QWEN35_HOST_MOE_VERIFY");
+            return e != nullptr && e[0] == '1';
+        }();
+        return s_on;
+    }
+
+    int host_moe_graph_node_index(ggml_cgraph* graph, ggml_tensor* t)
+    {
+        if (graph == nullptr || t == nullptr)
+            return -1;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i)
+            if (ggml_graph_node(graph, i) == t)
+                return i;
+        return -1;
+    }
+
+    bool host_moe_build_segment_ends(
+        ggml_cgraph* graph,
+        const std::vector<HostMoeSegment>& segments,
+        std::vector<int>& seg_end,
+        const char* kernel_name)
+    {
+        seg_end.clear();
+        if (segments.empty())
+            return true;
+        if (graph == nullptr)
+        {
+            set_last_error(std::string(kernel_name) + ": host-MoE segmentation needs a built graph.");
+            return false;
+        }
+
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        seg_end.reserve(segments.size() + 1);
+        for (const HostMoeSegment& hm : segments)
+        {
+            const int i_in = host_moe_graph_node_index(graph, hm.moe_in);
+            const int i_id = host_moe_graph_node_index(graph, hm.sel_ids);
+            const int i_w  = host_moe_graph_node_index(graph, hm.weights);
+            if (i_in < 0 || i_id < 0 || i_w < 0)
+            {
+                set_last_error(std::string(kernel_name) + ": host-MoE boundary tensor missing from the graph.");
+                seg_end.clear();
+                return false;
+            }
+            int cut = (i_in > i_id ? (i_in > i_w ? i_in : i_w) : (i_id > i_w ? i_id : i_w)) + 1;
+            if (hm.verify_gpu != nullptr)
+            {
+                const int i_v = host_moe_graph_node_index(graph, hm.verify_gpu);
+                if (i_v + 1 > cut) cut = i_v + 1;
+            }
+            if (!seg_end.empty() && cut <= seg_end.back())
+            {
+                set_last_error(std::string(kernel_name) + ": host-MoE segments are not in graph order.");
+                seg_end.clear();
+                return false;
+            }
+            seg_end.push_back(cut);
+        }
+        seg_end.push_back(n_nodes);
+        return true;
+    }
+
+    bool host_moe_execute_segments(
+        ggml_cgraph* graph,
+        const std::vector<HostMoeSegment>& segments,
+        const std::vector<int>& seg_end,
+        const char* kernel_name)
+    {
+        if (graph == nullptr || seg_end.empty())
+        {
+            set_last_error(std::string(kernel_name) + ": empty host-MoE segment plan.");
+            return false;
+        }
+
+        // Scratch reused across layers and tokens. The shapes are fixed for a
+        // given model, so after the first token these never reallocate.
+        static thread_local std::vector<float> s_moe_in;
+        static thread_local std::vector<float> s_moe_out;
+        static thread_local std::vector<float> s_weights;
+        static thread_local std::vector<std::int32_t> s_ids;
+
+        // TS_HOST_MOE_DEBUG=1: print the segment plan and each seam's activation
+        // norms. An all-zero moe_in means the cut fired before the layer actually
+        // produced it — the failure mode this seam is easiest to get wrong in.
+        static const bool s_debug = []() {
+            const char* e = std::getenv("TS_HOST_MOE_DEBUG");
+            return e != nullptr && e[0] == '1';
+        }();
+        static int s_debug_calls = 0;
+        const bool debug_this_call = s_debug && s_debug_calls < 3;
+        if (debug_this_call)
+        {
+            ++s_debug_calls;
+            std::fprintf(stderr, "[HOSTMOE-DBG] %s: %d nodes, %d segments, cuts=",
+                kernel_name, ggml_graph_n_nodes(graph), (int) segments.size());
+            for (int c : seg_end) std::fprintf(stderr, "%d ", c);
+            std::fprintf(stderr, "\n");
+        }
+
+        int begin = 0;
+        for (std::size_t seg = 0; seg < seg_end.size(); ++seg)
+        {
+            const int end = seg_end[seg];
+            if (end > begin)
+            {
+                ggml_cgraph view = ggml_graph_view(graph, begin, end);
+                if (ggml_backend_graph_compute(g_backend, &view) != GGML_STATUS_SUCCESS)
+                {
+                    set_last_error(std::string(kernel_name) + ": host-MoE segment execution failed.");
+                    return false;
+                }
+            }
+            begin = end;
+
+            if (seg >= segments.size())
+                continue;
+
+            const HostMoeSegment& hm = segments[seg];
+            if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
+                hm.weights == nullptr || hm.moe_out == nullptr)
+            {
+                set_last_error(std::string(kernel_name) + ": incomplete host-MoE segment binding.");
+                return false;
+            }
+
+            const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);
+            const std::size_t route_count = static_cast<std::size_t>(hm.n_used) * static_cast<std::size_t>(hm.seq_len);
+            s_moe_in.resize(act_count);
+            s_moe_out.resize(act_count);
+            s_ids.resize(route_count);
+            s_weights.resize(route_count);
+
+            // ggml_backend_graph_compute above already synchronized, so these
+            // reads see the segment's results.
+            ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
+            ggml_backend_tensor_get(hm.sel_ids, s_ids.data(), 0, route_count * sizeof(std::int32_t));
+            ggml_backend_tensor_get(hm.weights, s_weights.data(), 0, route_count * sizeof(float));
+
+            if (!moe_ffn_host_experts(
+                    s_moe_in.data(), s_moe_out.data(),
+                    hm.seq_len, hm.hidden, hm.n_ff,
+                    hm.num_experts, hm.n_used,
+                    s_ids.data(), s_weights.data(),
+                    hm.gate_data, hm.gate_type, hm.gate_ne0, hm.gate_ne1, hm.gate_bytes,
+                    hm.up_data,   hm.up_type,   hm.up_ne0,   hm.up_ne1,   hm.up_bytes,
+                    hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
+                    hm.gate_bias, hm.up_bias, hm.down_bias,
+                    hm.activation, hm.oai_alpha, hm.oai_limit))
+            {
+                // moe_ffn_host_experts already set a specific error.
+                return false;
+            }
+
+            if (hm.verify_gpu != nullptr)
+            {
+                static thread_local std::vector<float> s_ref;
+                s_ref.resize(act_count);
+                ggml_backend_tensor_get(hm.verify_gpu, s_ref.data(), 0, act_count * sizeof(float));
+                double num = 0.0, den = 0.0, maxabs = 0.0;
+                for (std::size_t i = 0; i < act_count; ++i)
+                {
+                    const double dlt = (double) s_moe_out[i] - (double) s_ref[i];
+                    num += dlt * dlt;
+                    den += (double) s_ref[i] * (double) s_ref[i];
+                    const double ad = dlt < 0 ? -dlt : dlt;
+                    if (ad > maxabs) maxabs = ad;
+                }
+                static int s_vcalls = 0;
+                if (s_vcalls < 24)
+                {
+                    ++s_vcalls;
+                    std::fprintf(stderr,
+                        "[HOSTMOE-VERIFY] %s layer=%d relL2=%.5f maxAbsDiff=%.6f host[0..2]=%.5f,%.5f,%.5f gpu[0..2]=%.5f,%.5f,%.5f\n",
+                        kernel_name, hm.layer, den > 0 ? std::sqrt(num / den) : 0.0, maxabs,
+                        s_moe_out[0], s_moe_out[1], s_moe_out[2],
+                        s_ref[0], s_ref[1], s_ref[2]);
+                    std::fflush(stderr);
+                }
+            }
+
+            ggml_backend_tensor_set(hm.moe_out, s_moe_out.data(), 0, act_count * sizeof(float));
+
+            if (debug_this_call)
+            {
+                double nin = 0.0, nout = 0.0;
+                for (std::size_t i = 0; i < act_count; ++i)
+                {
+                    nin += (double) s_moe_in[i] * s_moe_in[i];
+                    nout += (double) s_moe_out[i] * s_moe_out[i];
+                }
+                std::fprintf(stderr,
+                    "[HOSTMOE-DBG]   seg=%d layer=%d seq=%d |in|=%.4f |out|=%.4f ids[0..3]=%d,%d,%d,%d w[0..1]=%.4f,%.4f\n",
+                    (int) seg, hm.layer, hm.seq_len, std::sqrt(nin), std::sqrt(nout),
+                    s_ids[0], s_ids.size() > 1 ? s_ids[1] : -1,
+                    s_ids.size() > 2 ? s_ids[2] : -1, s_ids.size() > 3 ? s_ids[3] : -1,
+                    s_weights[0], s_weights.size() > 1 ? s_weights[1] : 0.0f);
+                std::fflush(stderr);
+            }
+        }
+        return true;
+    }
+}
 
 extern "C"
 {
@@ -991,7 +1495,8 @@ extern "C"
         const float* down_bias,
         int activation_type,
         float oai_alpha,
-        float oai_limit)
+        float oai_limit,
+        int run_on_cpu)
     {
         try
         {
@@ -1002,7 +1507,7 @@ extern "C"
                 up_data,   up_type,   up_ne0,   up_ne1,   up_total_bytes,
                 down_data, down_type, down_ne0, down_ne1, down_total_bytes,
                 gate_bias, up_bias, down_bias,
-                activation_type, oai_alpha, oai_limit);
+                activation_type, oai_alpha, oai_limit, run_on_cpu);
         }
         catch (const std::exception& ex)
         {
@@ -1077,7 +1582,8 @@ extern "C"
         const float* down_bias,
         int activation_type,
         float oai_alpha,
-        float oai_limit)
+        float oai_limit,
+        int run_on_cpu)
     {
         try
         {
@@ -1089,7 +1595,7 @@ extern "C"
                 up_data,   up_type,   up_ne0,   up_ne1,   up_total_bytes,
                 down_data, down_type, down_ne0, down_ne1, down_total_bytes,
                 gate_bias, up_bias, down_bias,
-                activation_type, oai_alpha, oai_limit);
+                activation_type, oai_alpha, oai_limit, run_on_cpu);
         }
         catch (const std::exception& ex)
         {

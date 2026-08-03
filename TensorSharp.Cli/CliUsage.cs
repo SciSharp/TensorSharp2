@@ -220,6 +220,23 @@ namespace TensorSharp.Cli
                     "without running inference. Default: off.",
                     "--input prompt.txt --dump-prompt"),
             }),
+            ("Mixture-of-Experts CPU offload", new[]
+            {
+                new OptionHelp("--n-cpu-moe <N> | -ncmoe <N>",
+                    "Keep the routed MoE expert weights of the first N layers in system RAM and multiply them on " +
+                    "the CPU; attention, norms, the router and the shared expert stay on the accelerator. This is " +
+                    "what makes a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass 'all' " +
+                    "for every layer. Default: 0 (everything on the accelerator; TS_N_CPU_MOE env var overrides).",
+                    "--n-cpu-moe 32"),
+                new OptionHelp("--cpu-moe | -cmoe",
+                    "Shorthand for --n-cpu-moe all: every routed expert stays in system RAM. Default: off " +
+                    "(TS_CPU_MOE env var overrides).",
+                    "--cpu-moe"),
+                new OptionHelp("--cpu-moe-threads <N>",
+                    "Worker threads for the host-side expert matmul. Default: one less than the hardware thread " +
+                    "count, leaving a core for accelerator submission (TS_CPU_MOE_THREADS env var overrides).",
+                    "--cpu-moe-threads 12"),
+            }),
             ("KV cache", new[]
             {
                 new OptionHelp("--kv-cache-dtype <t>",

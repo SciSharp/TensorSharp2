@@ -108,6 +108,10 @@ namespace TensorSharp.Models
         {
             if (_bfdUnsupported) return null;
             if (_backend != BackendType.GgmlCuda) return null;
+            // This kernel inlines every layer's expert matmuls on the accelerator,
+            // so running it under MoE CPU offload would upload exactly the experts
+            // the flag keeps in system RAM.
+            if (MoeCpuOffloadConfig.IsEnabled) return null;
             if (numTokens != numSeqs) return null;        // V1: pure decode, 1 token/seq
             if (_lmHeadQW == null && _lmHeadF32 == null) return null;
             if (hiddenStates.ElementType != DType.Float32 || hiddenStates.DimensionCount != 2) return null;

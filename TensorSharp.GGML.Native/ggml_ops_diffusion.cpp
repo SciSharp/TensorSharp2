@@ -53,6 +53,10 @@ using namespace tsg;
 
 namespace {
 
+// Kernel names for MoE CPU offload diagnostics (see tsg::HostMoeSegment).
+constexpr const char* kDiffusionLayerKernel = "Diffusion decode layer";
+constexpr const char* kDiffusionModelKernel = "Diffusion model decode";
+
 // Decode-mask host cache. The rectangular decode mask depends only on
 // (C, kvLen, klo, kvPad): identical for every denoising step of a block and
 // shared by every layer of the same type (local/global). Caching the host
@@ -166,6 +170,11 @@ struct TSGgmlDiffusionDecodeLayerDesc
     std::int32_t q_type, k_type, v_type, o_type;
     std::int32_t gate_type, up_type, down_type;
     std::int32_t gue_type, de_type;
+    // MoE CPU offload (--n-cpu-moe): non-zero keeps this layer's routed experts
+    // in system RAM. The decode graph then omits their mul_mat_id chain, pauses
+    // after the router, and lets the host multiply the selected experts for all
+    // C canvas positions at once.
+    std::int32_t cpu_moe;
 
     // --- float scalars ---
     float eps;
@@ -244,8 +253,14 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
         ggml_tensor* gate_inp_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, nExp);
         ggml_tensor* gate_inp_scale_t = (d->gate_inp_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
         ggml_tensor* pre_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-        ggml_tensor* gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->gue_type), d->gue_ne0, d->gue_ne1, nExp);
-        ggml_tensor* down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->de_type), d->de_ne0, d->de_ne1, nExp);
+        // MoE CPU offload: leave the routed-expert tensors null so the bind pass
+        // below never asks for a device copy of them. That omission IS the VRAM
+        // saving - the host reads the same bytes from the GGUF mmap.
+        const bool cpu_moe = d->cpu_moe != 0 && !host_moe_verify_enabled();
+        ggml_tensor* gate_up_exps_t = cpu_moe ? nullptr
+            : ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->gue_type), d->gue_ne0, d->gue_ne1, nExp);
+        ggml_tensor* down_exps_t = cpu_moe ? nullptr
+            : ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->de_type), d->de_ne0, d->de_ne1, nExp);
         ggml_tensor* down_exps_scale_t = (d->down_exps_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nExp) : nullptr;
         ggml_tensor* post_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         ggml_tensor* post_ffw_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
@@ -358,20 +373,64 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
 
         // ===================== MoE experts =====================
         ggml_tensor* moe_in = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), pre_ffw_norm_2_w);  // [H, C]
-        ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, C);
-        ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps_t, moe_in_3d, sel);   // [2*ffMoe, nUsed, C]
-        ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-        ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
-        ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);                // [ffMoe, nUsed, C]
-        ggml_tensor* moe_down = ggml_mul_mat_id(ctx, down_exps_t, moe_act, sel);        // [H, nUsed, C]
-        ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);                       // broadcast [H, nUsed, C]
-
-        // aggregate over the nUsed dim -> [H, C]
-        ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, C, weighted->nb[2], 0);
-        for (int u = 1; u < nUsed; ++u)
+        std::vector<tsg::HostMoeSegment> host_moe;
+        ggml_tensor* moe_out = nullptr;
+        if (cpu_moe)
         {
-            ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, C, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
-            moe_out = ggml_add(ctx, moe_out, view_u);
+            // ---- MoE CPU offload seam (see tsg::HostMoeSegment) ----
+            // Diffusion decoding runs C canvas positions per step, so one host
+            // call covers all of them: seq_len = C, ids [nUsed, C], weights
+            // [1, nUsed, C]. That is a real GEMM rather than C matvecs, which is
+            // why block decoding tolerates offload far better than autoregressive
+            // decode does.
+            tsg::HostMoeSegment hm;
+            hm.layer = 0;
+            hm.moe_in = ggml_cont(ctx, moe_in);
+            hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel, (std::int64_t) nUsed * C));
+            hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, (std::int64_t) nUsed * C));
+            ggml_set_output(hm.moe_in);
+            ggml_set_output(hm.sel_ids);
+            ggml_set_output(hm.weights);
+
+            // Written by the host between segments; flagged BOTH input and output
+            // so ggml-alloc pre-allocates it and never recycles the block.
+            moe_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, C);
+            ggml_set_input(moe_out);
+            ggml_set_output(moe_out);
+
+            hm.moe_out = moe_out;
+            // Gemma-family experts stack gate and up into ONE tensor: up_data ==
+            // nullptr selects that layout in the host builder, which splits it
+            // exactly like this graph's two views.
+            hm.gate_data = d->gate_up_exps; hm.gate_type = d->gue_type;
+            hm.gate_ne0 = d->gue_ne0;       hm.gate_ne1 = d->gue_ne1;  hm.gate_bytes = d->gue_bytes;
+            hm.down_data = d->down_exps;    hm.down_type = d->de_type;
+            hm.down_ne0 = d->de_ne0;        hm.down_ne1 = d->de_ne1;   hm.down_bytes = d->de_bytes;
+            hm.activation = 2;              // gelu(gate) * up
+            hm.num_experts = nExp;
+            hm.n_used = nUsed;
+            hm.n_ff = (int) ffMoe;
+            hm.seq_len = C;
+            hm.hidden = H;
+            host_moe.push_back(hm);
+        }
+        else
+        {
+            ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, C);
+            ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps_t, moe_in_3d, sel);   // [2*ffMoe, nUsed, C]
+            ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+            ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
+            ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);                // [ffMoe, nUsed, C]
+            ggml_tensor* moe_down = ggml_mul_mat_id(ctx, down_exps_t, moe_act, sel);        // [H, nUsed, C]
+            ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);                       // broadcast [H, nUsed, C]
+
+            // aggregate over the nUsed dim -> [H, C]
+            moe_out = ggml_view_2d(ctx, weighted, H, C, weighted->nb[2], 0);
+            for (int u = 1; u < nUsed; ++u)
+            {
+                ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, C, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
+                moe_out = ggml_add(ctx, moe_out, view_u);
+            }
         }
         ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out, eps), post_ffw_norm_2_w);
         mlp = ggml_add(ctx, mlp, moe_normed);
@@ -387,8 +446,21 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
         ggml_set_output(out_cpy);
 
         // --- build graph ---
+        // The host-MoE boundary tensors are not on out_cpy's dependency chain
+        // (the expert matmuls were replaced by an input tensor), so expand them
+        // first: that also fixes the cut point ahead of everything downstream.
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, 4096, false);
+        for (const tsg::HostMoeSegment& hm : host_moe)
+        {
+            ggml_build_forward_expand(graph, hm.moe_in);
+            ggml_build_forward_expand(graph, hm.sel_ids);
+            ggml_build_forward_expand(graph, hm.weights);
+        }
         ggml_build_forward_expand(graph, out_cpy);
+
+        std::vector<int> host_moe_seg_end;
+        if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kDiffusionLayerKernel))
+            return 0;
 
         // --- bind tensors ---
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -485,10 +557,22 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
         if (freq_factors_t != nullptr)
             ggml_backend_tensor_set(freq_factors_t, d->freq_factors, 0, static_cast<std::size_t>(d->freq_factors_len) * sizeof(float));
 
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        // MoE CPU offload pauses the graph after the router so the host can
+        // multiply the selected experts; everything else stays one submission.
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (!host_moe.empty())
+        {
+            if (!host_moe_execute_segments(graph, host_moe, host_moe_seg_end, kDiffusionLayerKernel))
+                status = GGML_STATUS_FAILED;
+        }
+        else
+        {
+            status = ggml_backend_graph_compute(g_backend, graph);
+        }
         if (status != GGML_STATUS_SUCCESS)
         {
-            set_last_error("Diffusion decode layer: graph execution failed.");
+            if (host_moe.empty())
+                set_last_error("Diffusion decode layer: graph execution failed.");
             return 0;
         }
 
@@ -580,6 +664,9 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
             ggml_fp16_t* mask_data;   // step-invariant cached mask (stable pointer, cacheable bind)
         };
         std::vector<LT> lt(num_layers);
+        // MoE CPU offload: filled per offloaded layer while the graph is built,
+        // then turned into segment boundaries once the node order is fixed.
+        std::vector<tsg::HostMoeSegment> host_moe;
 
         ggml_tensor* hidden = hidden_t;
         for (int l = 0; l < num_layers; l++)
@@ -616,8 +703,14 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
             t.gate_inp_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, nExp);
             t.gate_inp_scale_t = (d.gate_inp_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
             t.pre_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-            t.gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gue_type), d.gue_ne0, d.gue_ne1, nExp);
-            t.down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
+            // MoE CPU offload: leave the routed-expert tensors null so the bind
+            // pass below never asks for a device copy of them. That omission IS
+            // the VRAM saving - the host reads the same bytes from the GGUF mmap.
+            const bool layer_cpu_moe = d.cpu_moe != 0 && !host_moe_verify_enabled();
+            t.gate_up_exps_t = layer_cpu_moe ? nullptr
+                : ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gue_type), d.gue_ne0, d.gue_ne1, nExp);
+            t.down_exps_t = layer_cpu_moe ? nullptr
+                : ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
             t.down_exps_scale_t = (d.down_exps_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nExp) : nullptr;
             t.post_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
             t.post_ffw_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
@@ -677,15 +770,57 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
             }
             ggml_tensor* w_final = ggml_reshape_3d(ctx, w_2d, 1, nUsed, C);
 
-            ggml_tensor* moe_in = ggml_reshape_3d(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), t.pre_ffw_norm_2_w), H, 1, C);
-            ggml_tensor* gate_up = ggml_mul_mat_id(ctx, t.gate_up_exps_t, moe_in, sel);   // [2*ffMoe, nUsed, C]
-            ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-            ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
-            ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps_t, ggml_geglu_split(ctx, moe_gate, moe_up), sel);   // [H, nUsed, C]
-            ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
-            ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, C, weighted->nb[2], 0);
-            for (int u = 1; u < nUsed; ++u)
-                moe_out = ggml_add(ctx, moe_out, ggml_view_2d(ctx, weighted, H, C, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]));
+            ggml_tensor* moe_in_2d = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), t.pre_ffw_norm_2_w);   // [H, C]
+            ggml_tensor* moe_out = nullptr;
+            if (layer_cpu_moe)
+            {
+                // ---- MoE CPU offload seam (see tsg::HostMoeSegment) ----
+                // One host call covers all C canvas positions: seq_len = C, ids
+                // [nUsed, C], weights [1, nUsed, C] (already carrying the
+                // down_exps_scale factor, so the host stays identical to the
+                // resident path). That makes the host side a real GEMM rather
+                // than C matvecs.
+                tsg::HostMoeSegment hm;
+                hm.layer = l;
+                hm.moe_in = ggml_cont(ctx, moe_in_2d);
+                hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel, (std::int64_t) nUsed * C));
+                hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, (std::int64_t) nUsed * C));
+                ggml_set_output(hm.moe_in);
+                ggml_set_output(hm.sel_ids);
+                ggml_set_output(hm.weights);
+
+                // Written by the host between segments; flagged BOTH input and
+                // output so ggml-alloc pre-allocates it and never recycles the
+                // block behind our back.
+                moe_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, C);
+                ggml_set_input(moe_out);
+                ggml_set_output(moe_out);
+
+                hm.moe_out = moe_out;
+                hm.gate_data = d.gate_up_exps; hm.gate_type = d.gue_type;
+                hm.gate_ne0 = d.gue_ne0;       hm.gate_ne1 = d.gue_ne1;  hm.gate_bytes = d.gue_bytes;
+                hm.down_data = d.down_exps;    hm.down_type = d.de_type;
+                hm.down_ne0 = d.de_ne0;        hm.down_ne1 = d.de_ne1;   hm.down_bytes = d.de_bytes;
+                hm.activation = 2;             // gelu(gate) * up
+                hm.num_experts = nExp;
+                hm.n_used = nUsed;
+                hm.n_ff = (int) ffMoe;
+                hm.seq_len = C;
+                hm.hidden = H;
+                host_moe.push_back(hm);
+            }
+            else
+            {
+                ggml_tensor* moe_in = ggml_reshape_3d(ctx, moe_in_2d, H, 1, C);
+                ggml_tensor* gate_up = ggml_mul_mat_id(ctx, t.gate_up_exps_t, moe_in, sel);   // [2*ffMoe, nUsed, C]
+                ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+                ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
+                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps_t, ggml_geglu_split(ctx, moe_gate, moe_up), sel);   // [H, nUsed, C]
+                ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
+                moe_out = ggml_view_2d(ctx, weighted, H, C, weighted->nb[2], 0);
+                for (int u = 1; u < nUsed; ++u)
+                    moe_out = ggml_add(ctx, moe_out, ggml_view_2d(ctx, weighted, H, C, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]));
+            }
             mlp = ggml_add(ctx, mlp, ggml_mul(ctx, ggml_rms_norm(ctx, moe_out, eps), t.post_ffw_norm_2_w));
 
             ggml_tensor* result = ggml_add(ctx, residual1, ggml_mul(ctx, ggml_rms_norm(ctx, mlp, eps), t.post_ffw_norm_w));
@@ -727,8 +862,23 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
         }
         ggml_set_output(out_cpy);
 
+        // Expand each offloaded layer's boundary in layer order BEFORE out_cpy.
+        // Those tensors are not on out_cpy's dependency chain (their expert
+        // matmuls were replaced by an input tensor), and expanding them in order
+        // pulls in each layer's preceding work, laying the nodes out so every cut
+        // lands exactly where the accelerator has to pause for the host.
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, static_cast<std::size_t>(num_layers) * 200 + 512, false);
+        for (const tsg::HostMoeSegment& hm : host_moe)
+        {
+            ggml_build_forward_expand(graph, hm.moe_in);
+            ggml_build_forward_expand(graph, hm.sel_ids);
+            ggml_build_forward_expand(graph, hm.weights);
+        }
         ggml_build_forward_expand(graph, out_cpy);
+
+        std::vector<int> host_moe_seg_end;
+        if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kDiffusionModelKernel))
+            return 0;
 
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
@@ -815,8 +965,25 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
         ggml_backend_tensor_set(pos_tensor, pos_data.data(), 0, (std::size_t)C * sizeof(std::int32_t));
         if (freq_factors_t != nullptr) ggml_backend_tensor_set(freq_factors_t, freq_data, 0, (std::size_t)freq_len * sizeof(float));
 
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
-        if (status != GGML_STATUS_SUCCESS) { ggml_gallocr_free(galloc); set_last_error("Diffusion model decode: graph execution failed."); return 0; }
+        // MoE CPU offload pauses the graph at each offloaded layer so the host
+        // can multiply the selected experts; everything else stays one submission.
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (!host_moe.empty())
+        {
+            if (!host_moe_execute_segments(graph, host_moe, host_moe_seg_end, kDiffusionModelKernel))
+                status = GGML_STATUS_FAILED;
+        }
+        else
+        {
+            status = ggml_backend_graph_compute(g_backend, graph);
+        }
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            ggml_gallocr_free(galloc);
+            if (host_moe.empty())
+                set_last_error("Diffusion model decode: graph execution failed.");
+            return 0;
+        }
 
         finalize_compute_with_download(download_t, download_dst, download_bytes);
         // When the lm_head is folded in (do_lm_head), download_dst is a raw caller-owned host buffer that
