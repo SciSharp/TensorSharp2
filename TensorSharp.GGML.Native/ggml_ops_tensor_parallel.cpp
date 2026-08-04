@@ -475,33 +475,101 @@ namespace tsg
     bool tp_plan_segments(TpRankPlan& plan, const std::vector<ggml_tensor*>& boundary)
     {
         plan.seg_end.clear();
+        plan.host_moe_at.clear();
         if (plan.graph == nullptr)
             return false;
 
         const int n_nodes = ggml_graph_n_nodes(plan.graph);
-        // One linear sweep over the node list resolves every boundary at once:
-        // the boundaries appear in graph order (a layer's output projection
-        // cannot precede an earlier layer's), so a single cursor suffices and a
-        // 40-layer model costs one pass instead of 80 searches.
-        std::size_t next = 0;
-        for (int i = 0; i < n_nodes && next < boundary.size(); ++i)
+        // Index the node list once, then resolve each boundary against it. The
+        // cut order is the GRAPH's, not the order the builder recorded them in:
+        // those agree only while every node is emitted by one trailing
+        // build_forward_expand. A kernel that expands anything early -- an
+        // offloaded layer's MoE seam, say -- pulls part of a later layer's chain
+        // forward and the two orders diverge, which is why this cannot be a
+        // single forward cursor. Sorting by node index is correct regardless:
+        // each partial is reduced immediately after the node that completes it.
+        std::unordered_map<const ggml_tensor*, int> node_index;
+        node_index.reserve(static_cast<std::size_t>(n_nodes) * 2);
+        for (int i = 0; i < n_nodes; ++i)
+            node_index.emplace(plan.graph->nodes[i], i);
+
+        std::vector<std::pair<int, ggml_tensor*>> ar_at;
+        ar_at.reserve(boundary.size());
+        for (std::size_t b = 0; b < boundary.size(); ++b)
         {
-            if (plan.graph->nodes[i] == boundary[next])
+            auto it = node_index.find(boundary[b]);
+            if (it == node_index.end())
             {
-                plan.seg_end.push_back(i + 1);
-                ++next;
+                set_last_error("Tensor-parallel plan: a segment boundary tensor is not a node of the built graph.");
+                return false;
             }
+            ar_at.emplace_back(it->second + 1,
+                b < plan.ar_tensor.size() ? plan.ar_tensor[b] : nullptr);
         }
-        if (next != boundary.size())
+        std::sort(ar_at.begin(), ar_at.end(),
+            [](const std::pair<int, ggml_tensor*>& a, const std::pair<int, ggml_tensor*>& b) { return a.first < b.first; });
+
+        std::vector<int> ar_cut;
+        std::vector<ggml_tensor*> ar_in;
+        ar_cut.reserve(ar_at.size());
+        ar_in.reserve(ar_at.size());
+        for (const auto& e : ar_at)
         {
-            set_last_error("Tensor-parallel plan: a segment boundary tensor is not a node of the built graph.");
-            plan.seg_end.clear();
-            return false;
+            // Two partials completing on the same node would need two reductions
+            // at one cut; the schedule has room for exactly one, so keep the
+            // first and let the second share its boundary (it cannot be later).
+            if (!ar_cut.empty() && ar_cut.back() == e.first)
+                continue;
+            ar_cut.push_back(e.first);
+            ar_in.push_back(e.second);
         }
-        // Trailing segment: everything after the last AllReduce (final norm, LM
-        // head, the output copy).
-        if (plan.seg_end.empty() || plan.seg_end.back() != n_nodes)
-            plan.seg_end.push_back(n_nodes);
+
+        // MoE CPU offload adds its own pauses (see HostMoeSegment). Merge the
+        // two cut lists into ONE schedule rather than nesting them: an offloaded
+        // layer's seam sits between the AllReduce that completes the previous
+        // layer and the one that completes this layer's FFN, so both kinds of
+        // boundary are just points where the segment loop stops.
+        std::vector<int> hm_cut;
+        if (!plan.host_moe.empty())
+        {
+            // The trailing n_nodes entry this appends is dropped below; the
+            // merge re-adds it once.
+            if (!host_moe_build_segment_ends(plan.graph, plan.host_moe, hm_cut, "Tensor-parallel plan"))
+                return false;
+            if (!hm_cut.empty())
+                hm_cut.pop_back();
+        }
+
+        plan.ar_tensor.clear();
+        std::size_t ia = 0, ih = 0;
+        while (ia < ar_cut.size() || ih < hm_cut.size())
+        {
+            const int cut = (ih == hm_cut.size()) ? ar_cut[ia]
+                          : (ia == ar_cut.size()) ? hm_cut[ih]
+                          : (ar_cut[ia] < hm_cut[ih] ? ar_cut[ia] : hm_cut[ih]);
+            // A seam and a reduction can only land on the same node if the
+            // builder recorded both for one tensor; keep them on one boundary
+            // (the host writes moe_out, then the collective reduces) instead of
+            // emitting a zero-length segment between them.
+            ggml_tensor* ar = nullptr;
+            int hm = -1;
+            if (ia < ar_cut.size() && ar_cut[ia] == cut)
+            {
+                ar = ia < ar_in.size() ? ar_in[ia] : nullptr;
+                ++ia;
+            }
+            if (ih < hm_cut.size() && hm_cut[ih] == cut) { hm = static_cast<int>(ih); ++ih; }
+            plan.seg_end.push_back(cut);
+            plan.ar_tensor.push_back(ar);
+            plan.host_moe_at.push_back(hm);
+        }
+
+        // Trailing segment: everything after the last boundary (final norm, LM
+        // head, the output copy). Pushed unconditionally so there is always
+        // exactly one more segment than there are actions — when the last
+        // boundary IS the final node the tail is simply empty, and the loop
+        // skips it while still performing that boundary's action.
+        plan.seg_end.push_back(n_nodes);
         return true;
     }
 
@@ -674,10 +742,13 @@ namespace tsg
         }
 
         const std::size_t n_seg = plans[0]->seg_end.size();
+        const std::size_t n_host_moe = plans[0]->host_moe.size();
         for (int r = 0; r < rank_count; ++r)
         {
             if (plans[r] == nullptr || !plans[r]->valid() || plans[r]->seg_end.size() != n_seg ||
-                plans[r]->ar_tensor.size() + 1 != n_seg)
+                plans[r]->ar_tensor.size() + 1 != n_seg ||
+                plans[r]->host_moe.size() != n_host_moe ||
+                (n_host_moe != 0 && plans[r]->host_moe_at.size() + 1 != n_seg))
             {
                 set_last_error("Tensor-parallel execution plans disagree on their segment structure.");
                 return false;
@@ -711,7 +782,47 @@ namespace tsg
                 }
             }
 
-            if (s + 1 < n_seg)
+            if (s + 1 >= n_seg)
+                continue;
+
+            // MoE CPU offload seam. The offloaded layer is computed ONCE, from
+            // rank 0's copy of the inputs: the router and the residual stream it
+            // reads are replicated across ranks (the previous boundary's
+            // AllReduce made them so), and the host expert backend is a single
+            // mutex-guarded thread pool, so splitting the matmul per rank would
+            // serialize anyway while paying an extra download each.
+            const int hm_idx = (n_host_moe != 0) ? plans[0]->host_moe_at[s] : -1;
+            if (hm_idx >= 0)
+            {
+                static thread_local std::vector<float> s_moe_out;
+                // Every rank has to land before any moe_out is written: the
+                // segments were submitted async, and a rank still in flight
+                // could otherwise see the upload out of order.
+                for (int r = 0; r < rank_count; ++r)
+                {
+                    ScopedRank rank(r);
+                    ggml_backend_synchronize(g_backend);
+                }
+                {
+                    ScopedRank rank(0);
+                    if (!host_moe_compute_segment(plans[0]->host_moe[static_cast<std::size_t>(hm_idx)],
+                                                  s_moe_out, "Tensor-parallel host MoE"))
+                        return false;
+                }
+                for (int r = 0; r < rank_count; ++r)
+                {
+                    ScopedRank rank(r);
+                    const HostMoeSegment& hm = plans[r]->host_moe[static_cast<std::size_t>(hm_idx)];
+                    // tp_reduced: the graph still sums this layer's MoE output
+                    // across ranks, so only rank 0 may carry it.
+                    if (hm.tp_reduced != 0 && r != 0)
+                        host_moe_zero_segment(hm);
+                    else
+                        host_moe_upload_segment(hm, s_moe_out.data());
+                }
+            }
+
+            if (plans[0]->ar_tensor[s] != nullptr)
             {
                 for (int r = 0; r < rank_count; ++r)
                     nodes[static_cast<std::size_t>(r)] = plans[r]->ar_tensor[s];

@@ -1869,8 +1869,13 @@ namespace TensorSharp.Models
         /// prefill paths serve MoE experts exclusively through the stacked-expert
         /// device buffer override this to return false for the per-expert split
         /// views, avoiding a second full copy of the experts in VRAM.
+        ///
+        /// Overrides MUST keep the <see cref="MoeCpuOffloadConfig"/> term: a routed
+        /// expert belonging to a <c>--n-cpu-moe</c> layer is multiplied on the host
+        /// and uploading it would spend exactly the VRAM the flag exists to save.
         /// </summary>
-        protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName) => true;
+        protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
+            => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName);
 
         protected bool CanUseGgmlQuantizedGetRows(int ggmlType)
         {
@@ -3446,7 +3451,11 @@ namespace TensorSharp.Models
                 foreach (var kv in _tpQuantWeights)
                 {
                     var qw = kv.Value[r];
-                    if (!qw.HasHostData)
+                    // Same residency policy as the single-GPU preload: a routed
+                    // expert belonging to a --n-cpu-moe layer is multiplied on the
+                    // host, and uploading its shard would spend exactly the VRAM
+                    // the flag exists to save.
+                    if (!qw.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key))
                         continue;
 
                     IntPtr cacheKey = qw.EnsureDeviceCacheKey();
@@ -3590,7 +3599,11 @@ namespace TensorSharp.Models
                 for (int r = 0; r < shards.Length; r++)
                 {
                     var qw = shards[r];
-                    if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
+                    if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType)
+                        // A routed expert on a --n-cpu-moe layer stays in system
+                        // RAM; uploading its shard would spend exactly the VRAM
+                        // the flag exists to save.
+                        || !ShouldPreloadCudaQuantWeightToDevice(kv.Key))
                     {
                         if (kv.Key.Contains("_exps."))
                             skippedExpertShards++;

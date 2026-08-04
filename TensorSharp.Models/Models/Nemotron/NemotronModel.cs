@@ -2591,7 +2591,8 @@ namespace TensorSharp.Models
                     gateBias: null,
                     upBias: null,
                     downBias: null,
-                    activation: GgmlBasicOps.MoEActivation.ReluSquared);
+                    activation: GgmlBasicOps.MoEActivation.ReluSquared,
+                    runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
                 _linearTicks += Stopwatch.GetTimestamp() - t0exp;
                 InvalidateTensorDeviceCache(moeOut);
                 return true;

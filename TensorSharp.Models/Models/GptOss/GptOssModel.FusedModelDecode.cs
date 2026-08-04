@@ -112,6 +112,10 @@ namespace TensorSharp.Models
         {
             if (!FusedModelDecodeEnabled || _modelDecodeUnavailable || IsTensorParallel)
                 return false;
+            // MoE CPU offload stays on this path: the native graph is segmented at
+            // each offloaded layer's router so the host multiplies those experts
+            // while attention, norms and the LM head keep running as one fused
+            // graph (see tsg::HostMoeSegment).
             if (seqLen != 1 || !IsGgmlBackend || _layerStackedReady == 0)
                 return false;
             int kvType = _kvCacheDtype.GgmlType();
@@ -236,6 +240,10 @@ namespace TensorSharp.Models
                     GeType = gateW.GgmlType,
                     UeType = upW.GgmlType,
                     DeType = downW.GgmlType,
+                    // MoE CPU offload: this layer's routed experts stay in system
+                    // RAM and its expert matmuls run on the host between
+                    // accelerator graph segments.
+                    CpuMoe = MoeCpuOffloadConfig.IsLayerOnCpu(l) ? 1 : 0,
 
                     Eps = Config.Eps,
                     RopeBase = Config.RopeBase,

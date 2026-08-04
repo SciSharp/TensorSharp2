@@ -288,6 +288,12 @@ namespace TensorSharp.Models
                 }
             }
 
+            // A shard cut short by an interrupted download would otherwise fail
+            // as a short read well into materialization, after the loader has
+            // already committed its buffers.
+            foreach (var shard in _shards)
+                shard.ThrowIfTruncated();
+
             foreach (var shard in _shards)
                 foreach (var kv in shard.Tensors)
                     _tensorMap[kv.Key] = (shard, kv.Value);

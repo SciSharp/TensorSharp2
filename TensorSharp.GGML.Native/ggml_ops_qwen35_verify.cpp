@@ -330,6 +330,14 @@ namespace
         // 2D set_rows PER HEAD (llama.cpp's proven KV-write shape) made reuse stable
         // (validated 252 reuses, no crash). Reuse: setup ~8 ms + compute ~12-20 ms vs
         // ~61 ms non-persist build. TS_Q35_VERIFY_PERSIST=0 forces the rebuild path.
+        constexpr const char* kQ35VerifyKernel = "Qwen3.5 model verify";
+        // MoE CPU offload segments this graph, and the persist replay below
+        // re-runs the cached graph as ONE submission — which would skip every
+        // seam. The persist path only serves the small MTP-verify shapes, so
+        // decline it rather than teach it a second execution mode.
+        bool any_cpu_moe = false;
+        for (int l = 0; l < num_layers; l++)
+            if (layers[l].is_moe != 0 && layers[l].cpu_moe != 0) { any_cpu_moe = true; break; }
         static const bool fv_persist_cfg = []{ const char* e = std::getenv("TS_Q35_VERIFY_PERSIST"); return e == nullptr || e[0] != '0'; }();
         // Multimodal MRoPE: per-axis positions (T/H/W/E axis-concatenated, [4N] I32)
         // route the attention RoPE through ggml_rope_multi (interleaved MRoPE, the
@@ -353,7 +361,7 @@ namespace
         // TP always takes the non-persist path: the plan executes after this
         // call returns, so the context is parked in g_q35v_tp instead, and a
         // prefill-sized graph never repeats its exact shape anyway.
-        const bool fv_persist = fv_persist_cfg && (n_logits >= N) && !use_mrope && num_layers > 1 && !tp_mode;
+        const bool fv_persist = fv_persist_cfg && (n_logits >= N) && !use_mrope && num_layers > 1 && !tp_mode && !any_cpu_moe;
 
         const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
         const std::size_t deltaStateBytes = static_cast<std::size_t>(head_k_dim) * head_v_dim * num_v_heads * sizeof(float);
@@ -638,11 +646,17 @@ namespace
             else
             {
                 t.gate_inp_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gate_inp_type), d.gate_inp_ne0, d.gate_inp_ne1);
-                // Under TP the stacked expert tensors hold only this rank's
-                // whole-expert slice; the router dims stay global.
-                t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gate_exps_type), hidden_size, expert_ff, stacked_experts);
-                t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.up_exps_type), hidden_size, expert_ff, stacked_experts);
-                t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.down_exps_type), expert_ff, hidden_size, stacked_experts);
+                // MoE CPU offload: leave the routed-expert tensors null so the
+                // bind pass never asks for a device copy of them. That omission
+                // IS the VRAM saving - the host reads the same GGUF mmap bytes.
+                if (d.cpu_moe == 0)
+                {
+                    // Under TP the stacked expert tensors hold only this rank's
+                    // whole-expert slice; the router dims stay global.
+                    t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gate_exps_type), hidden_size, expert_ff, stacked_experts);
+                    t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.up_exps_type), hidden_size, expert_ff, stacked_experts);
+                    t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.down_exps_type), expert_ff, hidden_size, stacked_experts);
+                }
                 t.shexp_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_gate_type), d.shexp_gate_ne0, d.shexp_gate_ne1);
                 t.shexp_up_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_up_type), d.shexp_up_ne0, d.shexp_up_ne1);
                 t.shexp_down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_down_type), d.shexp_down_ne0, d.shexp_down_ne1);
@@ -665,9 +679,13 @@ namespace
         std::vector<float> ep_mask_data;
         if (tp_mode && num_experts > 0)
         {
+            // Only layers whose experts are RESIDENT need the LUT. With
+            // --cpu-moe every MoE layer takes the global-routing branch,
+            // so the LUT would end up in no graph node at all -- and the
+            // upload below would then fault on its missing buffer.
             bool any_moe = false;
             for (int l = 0; l < num_layers; l++)
-                if (layers[l].is_moe != 0) { any_moe = true; break; }
+                if (layers[l].is_moe != 0 && layers[l].cpu_moe == 0) { any_moe = true; break; }
             if (any_moe)
             {
                 ep_lut = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, num_experts);
@@ -697,6 +715,11 @@ namespace
             tp_partial.reserve(static_cast<std::size_t>(num_layers) * 2);
             tp_boundary.reserve(static_cast<std::size_t>(num_layers) * 2);
         }
+
+        // MoE CPU offload: filled per offloaded layer while the graph is built
+        // (its boundary tensors are expanded in place, inside the layer loop),
+        // then turned into segment cut points once the node order is fixed.
+        std::vector<tsg::HostMoeSegment> host_moe;
 
         // --- build the chained graph over N tokens ---
         // The graph is created BEFORE the layer loop and each layer's KV writes +
@@ -1033,7 +1056,10 @@ namespace
                 ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, num_experts, N);
                 ggml_tensor* sel_ids;
                 ggml_tensor* w_final;
-                if (ep_lut == nullptr)
+                // An offloaded layer runs once on the host over the unsharded
+                // expert stack, so it takes the global-routing branch even under
+                // TP: global ids, unmasked weights (see HostMoeSegment).
+                if (ep_lut == nullptr || d.cpu_moe != 0)
                 {
                     ggml_tensor* sel = ggml_top_k(ctx, probs, num_experts_used);          // [num_used, N]
                     ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                     // [1, num_used, N]
@@ -1112,19 +1138,77 @@ namespace
                     sel_ids = ggml_reshape_2d(ctx, local_ids, num_experts_used, N);
                 }
 
-                ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, ffn_normed, H, 1, N);
-                ggml_tensor* g_exp = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel_ids); // [expert_ff, num_used, N]
-                ggml_tensor* u_exp = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel_ids);
-                ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, g_exp), u_exp);
-                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps, act, sel_ids);    // [H, num_used, N]
-                ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
-                ggml_tensor* moe_out = ggml_cont(ctx, ggml_view_3d(ctx, weighted, H, 1, N, weighted->nb[1], weighted->nb[2], 0));
-                for (int u = 1; u < num_experts_used; ++u)
+                ggml_tensor* moe_out_2d;
+                if (d.cpu_moe != 0)
                 {
-                    ggml_tensor* vu = ggml_view_3d(ctx, weighted, H, 1, N, weighted->nb[1], weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
-                    moe_out = ggml_add(ctx, moe_out, vu);
+                    // ---- MoE CPU offload seam (see tsg::HostMoeSegment) ----
+                    // Prefill hands the host all N tokens at once, so the
+                    // offloaded side is a real GEMM over the chunk rather than N
+                    // matvecs. Attention, the GDN blocks, the router, the shared
+                    // expert and the LM head all stay in this one fused graph.
+                    tsg::HostMoeSegment hm;
+                    hm.layer = l;
+                    hm.moe_in = ggml_cont(ctx, ffn_normed);
+                    hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel_ids, static_cast<std::int64_t>(num_experts_used) * N));
+                    hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, static_cast<std::int64_t>(num_experts_used) * N));
+                    ggml_set_output(hm.moe_in);
+                    ggml_set_output(hm.sel_ids);
+                    ggml_set_output(hm.weights);
+
+                    // Written by the host between segments; flagged BOTH input
+                    // and output so ggml-alloc pre-allocates it and never
+                    // recycles the block behind our back.
+                    ggml_tensor* moe_host_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, N);
+                    ggml_set_input(moe_host_out);
+                    ggml_set_output(moe_host_out);
+
+                    hm.moe_out = moe_host_out;
+                    hm.gate_data = d.gate_exps;   hm.gate_type = d.gate_exps_type;
+                    hm.gate_ne0 = H;              hm.gate_ne1 = expert_ff;   hm.gate_bytes = d.gate_exps_bytes;
+                    hm.up_data = d.up_exps;       hm.up_type = d.up_exps_type;
+                    hm.up_ne0 = H;                hm.up_ne1 = expert_ff;     hm.up_bytes = d.up_exps_bytes;
+                    hm.down_data = d.down_exps;   hm.down_type = d.down_exps_type;
+                    hm.down_ne0 = expert_ff;      hm.down_ne1 = H;           hm.down_bytes = d.down_exps_bytes;
+                    hm.activation = 0;            // silu(gate) * up
+                    // The offloaded stack is never sharded (the descriptor points
+                    // at the whole GGUF tensor even under TP), so the host sees
+                    // the global expert count and the global ids above.
+                    hm.num_experts = num_experts;
+                    hm.n_used = num_experts_used;
+                    hm.n_ff = expert_ff;
+                    hm.seq_len = N;
+                    hm.hidden = H;
+                    // ffn_out below sums this with the Megatron-split shared
+                    // expert, and that sum IS the layer's AllReduce point.
+                    hm.tp_reduced = tp_mode ? 1 : 0;
+
+                    // Expand the seam's boundary tensors HERE, right after this
+                    // layer's KV/state writes: the cut has to land where the
+                    // accelerator actually reaches the router, and a trailing
+                    // expand would drag the whole model's forward chain ahead of
+                    // layer 0's cut instead.
+                    ggml_build_forward_expand(graph, hm.moe_in);
+                    ggml_build_forward_expand(graph, hm.sel_ids);
+                    ggml_build_forward_expand(graph, hm.weights);
+                    host_moe.push_back(hm);
+                    moe_out_2d = moe_host_out;
                 }
-                ggml_tensor* moe_out_2d = ggml_reshape_2d(ctx, moe_out, H, N);
+                else
+                {
+                    ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, ffn_normed, H, 1, N);
+                    ggml_tensor* g_exp = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel_ids); // [expert_ff, num_used, N]
+                    ggml_tensor* u_exp = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel_ids);
+                    ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, g_exp), u_exp);
+                    ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps, act, sel_ids);    // [H, num_used, N]
+                    ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
+                    ggml_tensor* moe_out = ggml_cont(ctx, ggml_view_3d(ctx, weighted, H, 1, N, weighted->nb[1], weighted->nb[2], 0));
+                    for (int u = 1; u < num_experts_used; ++u)
+                    {
+                        ggml_tensor* vu = ggml_view_3d(ctx, weighted, H, 1, N, weighted->nb[1], weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
+                        moe_out = ggml_add(ctx, moe_out, vu);
+                    }
+                    moe_out_2d = ggml_reshape_2d(ctx, moe_out, H, N);
+                }
 
                 ggml_tensor* sh_g = ggml_mul_mat(ctx, t.shexp_gate_w, ffn_normed); // [shared_ff, N]
                 ggml_tensor* sh_u = ggml_mul_mat(ctx, t.shexp_up_w, ffn_normed);
@@ -1170,6 +1254,16 @@ namespace
             ggml_build_forward_expand(graph, normed_cpy);
         ggml_build_forward_expand(graph, logits_cpy);
 
+        // Turn the recorded seams into node cut points (see
+        // host_moe_build_segment_ends). It fails when the builder and the
+        // expander disagree, which would silently feed the host stale values.
+        std::vector<int> host_moe_seg_end;
+        if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kQ35VerifyKernel))
+        {
+            if (fv_persist) ggml_free(ctx);
+            return 0;
+        }
+
         // --- bind tensors ---
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
@@ -1212,9 +1306,12 @@ namespace
             else
             {
                 bind_or_mark(t.gate_inp_w, d.gate_inp_w, static_cast<std::size_t>(d.gate_inp_bytes), true);
-                bind_or_mark(t.gate_exps, d.gate_exps, static_cast<std::size_t>(d.gate_exps_bytes), true);
-                bind_or_mark(t.up_exps, d.up_exps, static_cast<std::size_t>(d.up_exps_bytes), true);
-                bind_or_mark(t.down_exps, d.down_exps, static_cast<std::size_t>(d.down_exps_bytes), true);
+                if (t.gate_exps != nullptr)
+                {
+                    bind_or_mark(t.gate_exps, d.gate_exps, static_cast<std::size_t>(d.gate_exps_bytes), true);
+                    bind_or_mark(t.up_exps, d.up_exps, static_cast<std::size_t>(d.up_exps_bytes), true);
+                    bind_or_mark(t.down_exps, d.down_exps, static_cast<std::size_t>(d.down_exps_bytes), true);
+                }
                 bind_or_mark(t.shexp_gate_w, d.shexp_gate_w, static_cast<std::size_t>(d.shexp_gate_bytes), true);
                 bind_or_mark(t.shexp_up_w, d.shexp_up_w, static_cast<std::size_t>(d.shexp_up_bytes), true);
                 bind_or_mark(t.shexp_down_w, d.shexp_down_w, static_cast<std::size_t>(d.shexp_down_bytes), true);
@@ -1354,6 +1451,9 @@ namespace
             pending.plan.clear();
             pending.plan.graph = graph;
             pending.plan.ar_tensor = tp_partial;
+            // Offloaded layers pause this graph too; tp_plan_segments merges
+            // their cuts into the same schedule as the AllReduce ones.
+            pending.plan.host_moe = host_moe;
             if (!tp_plan_segments(pending.plan, tp_boundary))
             {
                 pending.reset();
@@ -1391,16 +1491,33 @@ namespace
         // and 48 delta-state downloads while the long prefill graph is running.
         // The final host_read_barrier below remains the single synchronization
         // point. Other backends retain their established synchronous path.
-        ggml_status status =
-            g_backend_type == BACKEND_TYPE_METAL &&
-            g_async_compute_enabled.load(std::memory_order_acquire)
-                ? ggml_backend_graph_compute_async(g_backend, graph)
-                : ggml_backend_graph_compute(g_backend, graph);
+        // MoE CPU offload runs the graph in segments, pausing at each offloaded
+        // layer for the host expert matmul. Everything else still goes out as
+        // one graph submission.
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (!host_moe.empty())
+        {
+            if (!host_moe_execute_segments(graph, host_moe, host_moe_seg_end, kQ35VerifyKernel))
+                status = GGML_STATUS_FAILED;
+        }
+        else
+        {
+            // On Metal, submit without waiting so the CPU can enqueue the 48
+            // conv-state and 48 delta-state downloads while the long prefill
+            // graph is running. The final host_read_barrier below remains the
+            // single synchronization point.
+            status =
+                g_backend_type == BACKEND_TYPE_METAL &&
+                g_async_compute_enabled.load(std::memory_order_acquire)
+                    ? ggml_backend_graph_compute_async(g_backend, graph)
+                    : ggml_backend_graph_compute(g_backend, graph);
+        }
         if (status != GGML_STATUS_SUCCESS)
         {
             if (persist_buf != nullptr) ggml_backend_buffer_free(persist_buf);
             if (fv_persist) ggml_free(ctx);
-            set_last_error("Qwen3.5 model verify: graph execution failed.");
+            if (host_moe.empty())
+                set_last_error("Qwen3.5 model verify: graph execution failed.");
             return 0;
         }
         if (vram_log_enabled())

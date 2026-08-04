@@ -177,7 +177,7 @@ namespace TensorSharp.Models.QwenImage
         // scratch, causing the 16 GB spill/OOM). Skip it on the native path; the managed
         // path still needs the resident weights.
         protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
-            => !NativeBlockOn;
+            => !NativeBlockOn && base.ShouldPreloadCudaQuantWeightToDevice(weightName);
 
         internal static string Stat(float[] a, int n)
         {

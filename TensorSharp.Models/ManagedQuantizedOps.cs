@@ -372,6 +372,187 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// One <c>output = input * weights^T</c> in a batch that shares a single
+        /// parallel dispatch. See <see cref="TryAddmmQuantizedBatch"/>.
+        /// </summary>
+        public readonly struct QuantMatMulJob
+        {
+            /// <summary>Quantized <c>[OutDim, InDim]</c> block matrix.</summary>
+            public readonly IntPtr Weights;
+            /// <summary><c>float*</c>, <c>[RowCount, inDim]</c>.</summary>
+            public readonly IntPtr Input;
+            /// <summary><c>float*</c>, <c>[RowCount, OutDim]</c>.</summary>
+            public readonly IntPtr Output;
+            public readonly int OutDim;
+            public readonly int RowCount;
+            public readonly int OutputRowStride;
+
+            public QuantMatMulJob(IntPtr weights, IntPtr input, IntPtr output, int outDim, int rowCount,
+                int outputRowStride)
+            {
+                Weights = weights;
+                Input = input;
+                Output = output;
+                OutDim = outDim;
+                RowCount = rowCount;
+                OutputRowStride = outputRowStride;
+            }
+        }
+
+        /// <summary>
+        /// Several small quantized matmuls under ONE parallel dispatch.
+        ///
+        /// <para>A Mixture-of-Experts FFN on the host is a pile of tiny matmuls —
+        /// at decode width, <c>n_expert_used</c> matvecs per projection per
+        /// layer. Run through <see cref="TryAddmmQuantizedToFloat32"/> one at a
+        /// time, each pays a <see cref="Parallel.For"/> ramp that is comparable
+        /// to the arithmetic it schedules; a DeepSeek V4 token with 13 offloaded
+        /// layers issued 234 of them and spent most of the time in the
+        /// scheduler. Batching flattens every job's column blocks into one index
+        /// space, so a layer costs one dispatch per projection stage instead of
+        /// one per (expert, projection).</para>
+        ///
+        /// <para>All jobs share <paramref name="ggmlType"/>, <paramref name="inDim"/>
+        /// and <paramref name="inputRowStride"/>. Jobs whose <c>Input</c> pointer
+        /// repeats (a gate and an up projection over the same rows) quantize
+        /// those activations once.</para>
+        /// </summary>
+        public static unsafe bool TryAddmmQuantizedBatch(
+            int ggmlType,
+            int inDim,
+            int inputRowStride,
+            ReadOnlySpan<QuantMatMulJob> jobs,
+            ParallelOptions options = null)
+        {
+            if (jobs.Length == 0)
+                return true;
+            var type = (GgmlTensorType)ggmlType;
+            if (!TryGetDirectMatMulPlan(type, inDim, out ActivationQuantKind activationKind, out int activationRowBytes))
+                return false;
+
+            // --- quantize each DISTINCT input block once ---
+            int n = jobs.Length;
+            var actOf = new int[n];          // job -> index into the activation blocks
+            var blockInput = new IntPtr[n];
+            var blockRows = new int[n];
+            var blockOffset = new long[n];
+            int nBlocks = 0;
+            long totalRows = 0;
+            for (int j = 0; j < n; j++)
+            {
+                int found = -1;
+                for (int b = 0; b < nBlocks; b++)
+                    if (blockInput[b] == jobs[j].Input && blockRows[b] == jobs[j].RowCount)
+                    {
+                        found = b;
+                        break;
+                    }
+                if (found < 0)
+                {
+                    found = nBlocks++;
+                    blockInput[found] = jobs[j].Input;
+                    blockRows[found] = jobs[j].RowCount;
+                    blockOffset[found] = totalRows;
+                    totalRows += jobs[j].RowCount;
+                }
+                actOf[j] = found;
+            }
+
+            long totalActivationBytes = totalRows * activationRowBytes;
+            if (totalActivationBytes > int.MaxValue)
+                return false;
+
+            int dop = options?.MaxDegreeOfParallelism > 0 ? options.MaxDegreeOfParallelism : Environment.ProcessorCount;
+            byte[] rented = ArrayPool<byte>.Shared.Rent((int)totalActivationBytes);
+            try
+            {
+                fixed (byte* activationBase = rented)
+                {
+                    for (int b = 0; b < nBlocks; b++)
+                    {
+                        float* src = (float*)blockInput[b];
+                        byte* dst = activationBase + blockOffset[b] * activationRowBytes;
+                        for (int row = 0; row < blockRows[b]; row++)
+                            QuantizeActivation(src + (long)row * inputRowStride,
+                                dst + (long)row * activationRowBytes, inDim, activationKind);
+                    }
+
+                    // --- flatten every job's output columns into one block space ---
+                    int weightRowBytes = (int)RowSize(ggmlType, inDim);
+                    var blockStart = new int[n + 1];
+                    int colBlock = 0;
+                    {
+                        long totalCols = 0;
+                        for (int j = 0; j < n; j++) totalCols += jobs[j].OutDim;
+                        // Aim for a few chunks per worker: fewer and the tail
+                        // straggles, more and the per-chunk bookkeeping shows up.
+                        colBlock = (int)Math.Max(8, totalCols / Math.Max(1, dop * 8));
+                    }
+                    int totalBlocks = 0;
+                    for (int j = 0; j < n; j++)
+                    {
+                        blockStart[j] = totalBlocks;
+                        totalBlocks += (jobs[j].OutDim + colBlock - 1) / colBlock;
+                    }
+                    blockStart[n] = totalBlocks;
+
+                    // Span cannot cross the lambda, so copy the jobs' raw fields.
+                    var wPtr = new nint[n];
+                    var oPtr = new nint[n];
+                    var outDim = new int[n];
+                    var rowCnt = new int[n];
+                    var outStride = new int[n];
+                    var actOff = new long[n];
+                    for (int j = 0; j < n; j++)
+                    {
+                        wPtr[j] = jobs[j].Weights;
+                        oPtr[j] = jobs[j].Output;
+                        outDim[j] = jobs[j].OutDim;
+                        rowCnt[j] = jobs[j].RowCount;
+                        outStride[j] = jobs[j].OutputRowStride;
+                        actOff[j] = blockOffset[actOf[j]] * activationRowBytes;
+                    }
+                    nint actAddr = (nint)activationBase;
+                    int width = inDim;
+                    int actBytes = activationRowBytes;
+
+                    void RunBlock(int block)
+                    {
+                        // locate the job owning this block (n is small: experts
+                        // per layer, at most a few hundred)
+                        int j = 0;
+                        while (j + 1 < n && blockStart[j + 1] <= block) j++;
+                        int local = block - blockStart[j];
+                        int startCol = local * colBlock;
+                        int endCol = Math.Min(outDim[j], startCol + colBlock);
+
+                        byte* act = (byte*)actAddr + actOff[j];
+                        byte* w = (byte*)wPtr[j];
+                        float* outp = (float*)oPtr[j];
+                        for (int col = startCol; col < endCol; col++)
+                        {
+                            byte* weightRow = w + (long)col * weightRowBytes;
+                            for (int row = 0; row < rowCnt[j]; row++)
+                                outp[(long)row * outStride[j] + col] =
+                                    DotQuantized(type, weightRow, act + (long)row * actBytes, width);
+                        }
+                    }
+
+                    if (totalBlocks > 1 && dop > 1)
+                        Parallel.For(0, totalBlocks, options ?? new ParallelOptions(), RunBlock);
+                    else
+                        for (int b = 0; b < totalBlocks; b++) RunBlock(b);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+
+            return true;
+        }
+
         public static unsafe bool TryAddmmQuantizedToFloat32(
             int ggmlType,
             IntPtr weights,

@@ -90,6 +90,10 @@ namespace TensorSharp.Cuda
             public bool ExpertWeightsNorm;
             public int NCtx, NUbatch;
             public QuantWeightDesc TokEmbd, Output;
+            /// <summary>Host quantized matmul for <c>--n-cpu-moe</c> layers; see
+            /// <see cref="IDsv4HostMatMul"/>. Required only when the engine
+            /// decides to offload (it will say so and throw if it is null).</summary>
+            public IDsv4HostMatMul HostMatMul;
             public float[] OutputNorm, HcHeadFn, HcHeadScale, HcHeadBase;
             public float[] RopeRawTable, RopeCompTable; // [nCtx * nRot] interleaved cos/sin
             public LayerDesc[] Layers;
@@ -216,7 +220,12 @@ namespace TensorSharp.Cuda
         /// touched expert's weights for half as many tokens.</summary>
         public int UBatch => _m.NUbatch;
 
-        public Dsv4CudaEngine(ModelDesc m, int nGpu)
+        /// <param name="nCpuMoe">Routed-expert CPU offload: 0 none (the default —
+        /// offload is opt-in, and a model that does not fit is refused with the
+        /// number of layers that would make it fit), N the first N layers,
+        /// int.MaxValue every layer, -1 auto (the fewest leading layers that make
+        /// the model fit; opt-in only). See Dsv4CudaEngine.HostMoe.cs.</param>
+        public Dsv4CudaEngine(ModelDesc m, int nGpu, int nCpuMoe = 0)
         {
             _m = m ?? throw new ArgumentNullException(nameof(m));
             if (m.HeadDim != 512)
@@ -251,51 +260,9 @@ namespace TensorSharp.Cuda
             _compRowsCsa = m.NCtx / CsaRatio + 1;
             _compRowsHca = m.NCtx / HcaRatio + 1;
 
-            // ---- layer placement: contiguous ranges balanced by quantized bytes ----
-            var layerBytes = new long[m.NLayer];
-            long totalBytes = 0;
-            for (int il = 0; il < m.NLayer; il++)
-            {
-                var L = m.Layers[il];
-                long b = 0;
-                foreach (var qw in EnumerateQuantWeights(L))
-                    b += qw.TotalBytes;
-                layerBytes[il] = b;
-                totalBytes += b;
-            }
-
-            long dsparkBytes = DsparkBytes(m.Dspark);
-            var assignment = new int[m.NLayer];
-            {
-                // Contiguous ranges chosen to MINIMIZE THE LARGEST per-device
-                // load, counting the drafter as a fixed load on its hosting
-                // (last) device. Filling each device to the average instead
-                // overflows the first device as soon as something else takes
-                // space on the last one: the average rises, device 0 accepts
-                // one more layer than fits, and the model OOMs on a split the
-                // devices could have held.
-                long lo = 0;
-                long hi = dsparkBytes;
-                foreach (long b in layerBytes)
-                {
-                    lo = Math.Max(lo, b);
-                    hi += b;
-                }
-                lo += dsparkBytes;
-                while (lo < hi)
-                {
-                    long mid = lo + (hi - lo) / 2;
-                    if (TrySplit(layerBytes, dsparkBytes, useDevs, mid, null))
-                        hi = mid;
-                    else
-                        lo = mid + 1;
-                }
-                if (!TrySplit(layerBytes, dsparkBytes, useDevs, lo, assignment))
-                    throw new InvalidOperationException("[dsv4-cuda] cannot split the model across the visible GPUs");
-            }
-            _lastDev = useDevs - 1;
-
             // ---- devices ----
+            // Created before the layer split, which needs each device's free
+            // VRAM (cuMemGetInfo wants a current context) to size its share.
             _devs = new Dev[useDevs];
             for (int d = 0; d < useDevs; d++)
             {
@@ -307,6 +274,31 @@ namespace TensorSharp.Cuda
                 dev.Event = ev;
                 _devs[d] = dev;
             }
+
+            // ---- layer placement: contiguous ranges balanced by quantized bytes ----
+            var layerBytes = new long[m.NLayer];
+            var layerExpBytes = new long[m.NLayer];
+            long totalBytes = 0;
+            for (int il = 0; il < m.NLayer; il++)
+            {
+                var L = m.Layers[il];
+                long b = 0;
+                foreach (var qw in EnumerateQuantWeights(L))
+                    b += qw.TotalBytes;
+                layerBytes[il] = b;
+                layerExpBytes[il] = L.GateExps.TotalBytes + L.UpExps.TotalBytes + L.DownExps.TotalBytes;
+                totalBytes += b;
+            }
+
+            long dsparkBytes = DsparkBytes(m.Dspark);
+            var assignment = new int[m.NLayer];
+            _nCpuMoe = PlaceLayers(m, useDevs, layerBytes, layerExpBytes, dsparkBytes, nCpuMoe, assignment);
+            _hostMatMul = m.HostMatMul;
+            if (_nCpuMoe > 0 && _hostMatMul == null)
+                throw new InvalidOperationException(
+                    "[dsv4-cuda] routed-expert CPU offload is required to fit this model but no host matmul was " +
+                    "supplied (ModelDesc.HostMatMul).");
+            _lastDev = useDevs - 1;
 
             // per-device boundary staging (pinned + events)
             long xsBytes = (long)m.NUbatch * HC * m.NEmbd * 4;
@@ -329,7 +321,7 @@ namespace TensorSharp.Cuda
             for (int il = 0; il < m.NLayer; il++)
             {
                 int d = assignment[il];
-                foreach (var qw in EnumerateQuantWeights(m.Layers[il]))
+                foreach (var qw in EnumerateQuantWeights(m.Layers[il], skipRoutedExperts: il < _nCpuMoe))
                     arenaNeed[d] += Align(qw.TotalBytes);
             }
             arenaNeed[0] += Align(m.TokEmbd.TotalBytes);
@@ -346,6 +338,7 @@ namespace TensorSharp.Cuda
 
             // ---- upload weights (parallel across devices) ----
             _layers = new DevLayer[m.NLayer];
+            _hostMoe = new HostMoeLayer[m.NLayer];
             for (int il = 0; il < m.NLayer; il++)
                 _layers[il] = new DevLayer { Device = assignment[il], Ratio = m.Layers[il].Ratio };
 
@@ -437,35 +430,186 @@ namespace TensorSharp.Cuda
         /// least one layer and the last device owns the tail, which is what the
         /// output head and the boundary hand-offs assume.
         /// </summary>
-        private static bool TrySplit(long[] layerBytes, long extraLast, int nDev, long limit, int[] assignment)
+        /// <summary>
+        /// Choose the routed-expert CPU offload count and the layer→device
+        /// split, both sized against the VRAM each device actually has free.
+        ///
+        /// <para>Two things the old byte-balanced split could not do. It divided
+        /// the weights evenly no matter what each card had free, so one device
+        /// hosting a display (or another process) OOM'd on a split its siblings
+        /// could have absorbed. And it had no answer at all when the model
+        /// simply outweighed the cards — a 151 GiB V4 Flash checkpoint against
+        /// 139 GiB of VRAM could only end in `CUDA error 2: out of memory`.
+        /// Here every device is filled to the same FRACTION of its own budget,
+        /// and when even a perfect split does not fit, the leading layers' routed
+        /// experts (91% of the bytes) move to system RAM — the fewest that make
+        /// it fit, since each one costs a host matmul per token.</para>
+        /// </summary>
+        /// <returns>Number of leading layers whose routed experts stay on the host.</returns>
+        private int PlaceLayers(ModelDesc m, int nDev, long[] layerBytes, long[] layerExpBytes,
+            long dsparkBytes, int nCpuMoeReq, int[] assignment)
         {
-            int n = layerBytes.Length;
-            if (n < nDev)
-                return false;
+            int nLayer = m.NLayer;
 
-            int dev = 0, onDev = 0;
-            long acc = 0;
-            for (int il = 0; il < n; il++)
+            // Per-device budget: free VRAM now, minus the run-time residents the
+            // split cannot attribute to a layer (per-device scratch, rope tables,
+            // the logits staging and the allocator's own slack).
+            long reserveMb = EnvInt("TS_DSV4_VRAM_RESERVE_MB", 2048);
+            var budget = new long[nDev];
+            var freeBytes = new long[nDev];
+            for (int d = 0; d < nDev; d++)
             {
-                long budget = limit - (dev == nDev - 1 ? extraLast : 0);
-                bool mustMove = onDev > 0 && (acc + layerBytes[il] > budget || n - il <= nDev - 1 - dev);
-                if (mustMove)
-                {
-                    if (dev == nDev - 1)
-                        return false;
-                    dev++;
-                    onDev = 0;
-                    acc = 0;
-                    budget = limit - (dev == nDev - 1 ? extraLast : 0);
-                }
-                acc += layerBytes[il];
-                onDev++;
-                if (assignment != null)
-                    assignment[il] = dev;
-                if (acc > budget)
-                    return false;
+                _devs[d].MakeCurrent();
+                CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr _).ThrowOnError();
+                freeBytes[d] = (long)free.ToUInt64();
+                long reserve = reserveMb * 1024 * 1024 + PerDeviceFixedBytes(m);
+                budget[d] = Math.Max(freeBytes[d] - reserve, 0);
             }
-            return dev == nDev - 1;
+
+            // Fixed residents the split places explicitly: embedding table on the
+            // first device, output head + drafter on the last.
+            var fixedBytes = new long[nDev];
+            fixedBytes[0] += Align(m.TokEmbd.TotalBytes);
+            fixedBytes[nDev - 1] += Align(m.Output.TotalBytes) + dsparkBytes;
+
+            long Cost(int il, int nCpu)
+            {
+                long b = layerBytes[il];
+                if (il < nCpu) b -= layerExpBytes[il];
+                return Align(b) + LayerCacheBytes(m, il);
+            }
+
+            // Layers stay in pipeline order, so every device takes one contiguous
+            // run: fill each up to `frac` of its budget and report whether all of
+            // them fit.
+            bool Pack(double frac, int nCpu, int[] outAssign)
+            {
+                int dev = 0;
+                long used = fixedBytes[0];
+                for (int il = 0; il < nLayer; il++)
+                {
+                    long cost = Cost(il, nCpu);
+                    while (used + cost > (long)(budget[dev] * frac))
+                    {
+                        if (dev + 1 >= nDev)
+                            return false;
+                        used = fixedBytes[++dev];
+                    }
+                    used += cost;
+                    if (outAssign != null)
+                        outAssign[il] = dev;
+                }
+                return true;
+            }
+
+            int need = 0;
+            while (need <= nLayer && !Pack(1.0, need, null))
+                need++;
+
+            if (need > nLayer)
+            {
+                long freeTotal = 0, expTotal = 0;
+                for (int d = 0; d < nDev; d++) freeTotal += freeBytes[d];
+                foreach (long b in layerExpBytes) expTotal += b;
+                long weights = 0;
+                foreach (long b in layerBytes) weights += b;
+                throw new InvalidOperationException(
+                    $"[dsv4-cuda] model does not fit: {(weights + dsparkBytes) / (double)(1L << 30):F1} GiB of weights " +
+                    $"({expTotal / (double)(1L << 30):F1} GiB of them routed experts) against " +
+                    $"{freeTotal / (double)(1L << 30):F1} GiB free across {nDev} device(s), even with every expert on " +
+                    "the host. Free VRAM, add devices, or use a smaller quantization.");
+            }
+
+            int nCpuMoe;
+            if (nCpuMoeReq < 0)
+            {
+                nCpuMoe = need;   // opt-in auto
+            }
+            else
+            {
+                nCpuMoe = Math.Min(nCpuMoeReq, nLayer);   // operator's choice
+                if (nCpuMoe < need)
+                {
+                    // Decline instead of loading into a certain out-of-memory
+                    // abort. Naming WHICH number would work is the whole value
+                    // here: the operator cannot derive it from the model size,
+                    // because what has to fit is the weights PLUS this context's
+                    // KV caches.
+                    long freeTotal = 0;
+                    for (int d = 0; d < nDev; d++) freeTotal += freeBytes[d];
+                    long weightBytes = dsparkBytes, wouldFree = 0;
+                    foreach (long b in layerBytes) weightBytes += b;
+                    for (int il = 0; il < need && il < nLayer; il++) wouldFree += layerExpBytes[il];
+                    throw new InvalidOperationException(
+                        $"[dsv4-cuda] not enough VRAM: {weightBytes / (double)(1L << 30):F1} GiB of weights plus " +
+                        $"this context's KV caches against {freeTotal / (double)(1L << 30):F1} GiB free across " +
+                        $"{nDev} device(s)" + (nCpuMoe > 0 ? " at the requested offload" : string.Empty) +
+                        $". Re-run with --n-cpu-moe {need} (moves the routed experts of the first {need} layer(s), " +
+                        $"{wouldFree / (double)(1L << 30):F1} GiB, to system RAM) or --cpu-moe to offload every layer.");
+                }
+            }
+
+            // Balance: smallest peak budget fraction that still fits.
+            double lo = 0.0, hi = 1.0;
+            for (int i = 0; i < 40; i++)
+            {
+                double mid = 0.5 * (lo + hi);
+                if (Pack(mid, nCpuMoe, null)) hi = mid; else lo = mid;
+            }
+            if (!Pack(hi, nCpuMoe, assignment))
+                throw new InvalidOperationException("[dsv4-cuda] cannot split the model across the visible GPUs");
+
+            if (nCpuMoe > 0)
+            {
+                long host = 0;
+                for (int il = 0; il < nCpuMoe; il++) host += layerExpBytes[il];
+                Console.Error.WriteLine($"[dsv4-cuda] MoE CPU offload: routed experts of layers 0..{nCpuMoe - 1} " +
+                    $"({host / (double)(1L << 30):F1} GiB) stay in system RAM and run on the host" +
+                    (nCpuMoeReq < 0 ? " (auto: the model does not fit the visible VRAM otherwise)" : string.Empty));
+            }
+            return nCpuMoe;
+        }
+
+        /// <summary>
+        /// Per-layer device memory beyond the packed weights: the raw SWA ring,
+        /// the CSA/HCA compressed-K caches, the indexer cache and the compressor
+        /// state rings, all allocated on the layer's own device. A split that
+        /// ignores them fits the weights and then dies allocating the caches.
+        /// </summary>
+        private long LayerCacheBytes(ModelDesc m, int il)
+        {
+            int ratio = m.Layers[il].Ratio;
+            int hd = m.HeadDim;
+            long b = (long)_ringRaw * hd * 2;                 // RingK (F16)
+            if (ratio == CsaRatio)
+            {
+                b += (long)_compRowsCsa * hd * 2;             // CompK  (F16)
+                b += (long)_compRowsCsa * m.IdxHeadSize * 2;  // LidK   (F16)
+                b += 2L * (2 * CsaRatio + _maxDraft) * 2 * hd * 4;                // Hist kv+score (F32)
+                b += 2L * (2 * CsaRatio + _maxDraft) * 2 * m.IdxHeadSize * 4;     // LidHist kv+score (F32)
+            }
+            else if (ratio == HcaRatio)
+            {
+                b += (long)_compRowsHca * hd * 2;             // CompK  (F16)
+                b += 2L * (HcaRatio + _maxDraft) * hd * 4;                        // Hist kv+score (F32)
+            }
+            return b;
+        }
+
+        /// <summary>Device-resident scratch that every device carries regardless
+        /// of how many layers it hosts (rope tables + the per-ubatch working
+        /// set sized in <see cref="AllocateScratch"/>).</summary>
+        private static long PerDeviceFixedBytes(ModelDesc m)
+        {
+            long nt = m.NUbatch;
+            long e = m.NEmbd;
+            long s = nt * m.NExpertUsed;
+            long b = 2L * m.NCtx * m.NRot * 4;            // rope raw + comp tables
+            b += 2 * nt * HC * e * 4;                     // Xs / XsOut
+            b += 2 * s * m.NFfExp * 4;                    // ExpGate / ExpUp
+            b += s * e * 4;                               // ExpDown
+            b += 4 * nt * (long)m.NHead * m.HeadDim * 4;  // Q / AttnO / OGrouped (+slack)
+            return b;
         }
 
         private static int[] CountPerDev(int[] assignment, int nDev)
@@ -485,7 +629,10 @@ namespace TensorSharp.Cuda
         private static int Pad(int v, int p) => (v + p - 1) / p * p;
         private static long Align(long v) => (v + 255) & ~255L;
 
-        private IEnumerable<QuantWeightDesc> EnumerateQuantWeights(LayerDesc l)
+        /// <param name="skipRoutedExperts"><c>--n-cpu-moe</c>: this layer's
+        /// stacked expert tensors never reach VRAM, so they must not be counted
+        /// into the arena or planned for upload either.</param>
+        private IEnumerable<QuantWeightDesc> EnumerateQuantWeights(LayerDesc l, bool skipRoutedExperts = false)
         {
             yield return l.WqA;
             yield return l.WqB;
@@ -498,9 +645,12 @@ namespace TensorSharp.Cuda
             if (l.IdxQB.IsValid) yield return l.IdxQB;
             if (l.IdxCompWkv.IsValid) yield return l.IdxCompWkv;
             if (l.IdxCompWgate.IsValid) yield return l.IdxCompWgate;
-            yield return l.GateExps;
-            yield return l.UpExps;
-            yield return l.DownExps;
+            if (!skipRoutedExperts)
+            {
+                yield return l.GateExps;
+                yield return l.UpExps;
+                yield return l.DownExps;
+            }
             yield return l.GateShexp;
             yield return l.UpShexp;
             yield return l.DownShexp;
@@ -731,9 +881,21 @@ namespace TensorSharp.Cuda
             dst.IdxQB = UploadQuant(dev, src.IdxQB);
             dst.IdxCompWkv = UploadQuant(dev, src.IdxCompWkv);
             dst.IdxCompWgate = UploadQuant(dev, src.IdxCompWgate);
-            dst.GateExps = UploadQuant(dev, src.GateExps);
-            dst.UpExps = UploadQuant(dev, src.UpExps);
-            dst.DownExps = UploadQuant(dev, src.DownExps);
+            if (il < _nCpuMoe)
+            {
+                // --n-cpu-moe: the stacked experts stay in system RAM and their
+                // FFN runs on the host (Dsv4CudaEngine.HostMoe.cs). Leaving the
+                // DevQW entries invalid is deliberate — MoeFfn dispatches on
+                // _hostMoe[il], and a stray device read would be a null deref
+                // rather than silently wrong output.
+                _hostMoe[il] = LoadHostExperts(src);
+            }
+            else
+            {
+                dst.GateExps = UploadQuant(dev, src.GateExps);
+                dst.UpExps = UploadQuant(dev, src.UpExps);
+                dst.DownExps = UploadQuant(dev, src.DownExps);
+            }
             dst.GateShexp = UploadQuant(dev, src.GateShexp);
             dst.UpShexp = UploadQuant(dev, src.UpShexp);
             dst.DownShexp = UploadQuant(dev, src.DownShexp);
@@ -1422,6 +1584,26 @@ namespace TensorSharp.Cuda
             CheckSync(dev, $"shexp L{il}");
 
             // routed experts
+            //
+            // The DSpark drafter's stages are appended past the trunk and run
+            // through this same MoE builder with il >= NLayer. They are never
+            // offloaded (they live on the output-head device and _hostMoe is
+            // sized to the trunk), so anything outside the trunk range is
+            // resident by definition — indexing _hostMoe unguarded threw
+            // IndexOutOfRange on the first drafted block.
+            HostMoeLayer hostExperts = (uint)il < (uint)_hostMoe.Length ? _hostMoe[il] : null;
+            if (hostExperts != null)
+            {
+                // Offloaded layer: the host fills ExpDown in slot order, so the
+                // weighted-sum + shared-expert epilogue below is shared with the
+                // resident path unchanged.
+                MoeFfnHost(dev, hostExperts, il, nt);
+                dev.DK.MoeScatterAdd(dev.ExpDown, null, dev.SelW, dev.ShDown, dev.FfnOut, nt, nUsed, e, dev.Stream);
+                StageEnd(dev, 8);
+                CheckSync(dev, $"host experts L{il}");
+                return;
+            }
+
             int guType = l.GateExps.Type;
             int downType = l.DownExps.Type;
             if (l.UpExps.Type != guType)
@@ -1571,6 +1753,7 @@ namespace TensorSharp.Cuda
 
         public void Dispose()
         {
+            FreeHostMoeBuffers();
             foreach (var dev in _devs)
             {
                 if (dev == null)

@@ -95,9 +95,9 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/gemma-
 DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
   dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_metal
 
-# Override the Web UI default token budget (default 20000). The Ollama/OpenAI
-# compatibility endpoints instead default to 200 when a request omits
-# max_tokens / num_predict — set the value per request there.
+# Override the default token budget (default 20000). It applies to every
+# endpoint — Web UI, Ollama and OpenAI — whenever a request omits max_tokens /
+# num_predict, and caps requests that ask for more.
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
@@ -851,14 +851,17 @@ edits are serialized by a process-wide lock.
 The defaults are the server's configured sampling defaults (Ollama-compatible).
 They can be changed at startup with the matching server flags (`--temperature`,
 `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--presence-penalty`,
-`--frequency-penalty`, `--seed`) or `TENSORSHARP_*` environment variables;
-per-request values always win.
+`--frequency-penalty`, `--seed`) or `TENSORSHARP_*` environment variables.
+A parameter the operator configured that way wins over the request body by
+default; start the server with `--sampling-precedence request` to let per-request
+values win instead. Parameters the operator did not configure always come from
+the request.
 
 ### OpenAI-style options (top-level)
 
 | Parameter           | Type        | Default | Description                        |
 | ------------------- | ----------- | ------- | ---------------------------------- |
-| `max_tokens`        | int         | 200     | Maximum tokens to generate         |
+| `max_tokens`        | int         | `--max-tokens` (20000) | Maximum tokens to generate; `max_completion_tokens` also accepted |
 | `temperature`       | float       | 0.8     | Sampling temperature               |
 | `top_p`             | float       | 0.9     | Nucleus sampling threshold         |
 | `presence_penalty`  | float       | 0       | Presence penalty                   |

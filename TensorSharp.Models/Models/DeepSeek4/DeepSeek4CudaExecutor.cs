@@ -119,7 +119,38 @@ namespace TensorSharp.Models
 
         private GgufFile _dsparkGguf;
 
-        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu, string dsparkPath = null)
+        /// <summary>
+        /// The engine's host-side quantized matmul for <c>--n-cpu-moe</c>
+        /// layers. It lives here because the managed quantized kernels are in
+        /// this assembly, which TensorSharp.Backends.Cuda cannot reference (the
+        /// dependency runs the other way) — same inversion as
+        /// <c>IDsv4WeightSource</c>.
+        /// </summary>
+        private sealed class HostMatMul : IDsv4HostMatMul
+        {
+            public static readonly HostMatMul Instance = new HostMatMul();
+
+            public bool TryMatMulBatch(int ggmlType, int inDim, int inputRowStride,
+                ReadOnlySpan<IDsv4HostMatMul.Job> jobs)
+            {
+                if (jobs.Length == 0)
+                    return true;
+                var mapped = new ManagedQuantizedOps.QuantMatMulJob[jobs.Length];
+                for (int i = 0; i < jobs.Length; i++)
+                    mapped[i] = new ManagedQuantizedOps.QuantMatMulJob(
+                        jobs[i].Weights, jobs[i].Input, jobs[i].Output,
+                        jobs[i].OutDim, jobs[i].RowCount, jobs[i].OutputRowStride);
+                return ManagedQuantizedOps.TryAddmmQuantizedBatch(ggmlType, inDim, inputRowStride, mapped);
+            }
+        }
+
+        /// <param name="nCpuMoe">Routed-expert CPU offload policy: 0 none (the
+        /// default — offload is opt-in, and a model that does not fit is refused
+        /// with the number of layers that would make it fit), N the first N
+        /// layers, <see cref="int.MaxValue"/> every layer, -1 auto (the fewest
+        /// leading layers that make the model fit; opt-in only).</param>
+        public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu, string dsparkPath = null,
+            int nCpuMoe = 0)
         {
             var sw = Stopwatch.StartNew();
             bool stats = ParseEnvInt("TS_DSV4_LOAD_STATS", 0) != 0;
@@ -152,7 +183,7 @@ namespace TensorSharp.Models
 
             var desc = BuildModelDesc(nCtx, ubatch);
             Mark("model desc built");
-            _engine = new Dsv4CudaEngine(desc, nGpu);
+            _engine = new Dsv4CudaEngine(desc, nGpu, nCpuMoe);
             Mark("engine ready");
 
             // Everything lives in VRAM now; drop the host-side scraps.
@@ -232,6 +263,12 @@ namespace TensorSharp.Models
                 _shards.Add(_dsparkGguf);
                 _shardPaths.Add(dsparkPath);
             }
+
+            // Before the split sizes anything: a shard cut short by an
+            // interrupted download would otherwise fail as a short read well
+            // into the upload, with the weight buffers already committed.
+            foreach (var shard in _shards)
+                shard.ThrowIfTruncated();
 
             for (int s = 0; s < _shards.Count; s++)
             {
@@ -493,6 +530,7 @@ namespace TensorSharp.Models
                 RopeCompTable = BuildRopeTable(nCtx, comp: true),
                 Layers = new Dsv4CudaEngine.LayerDesc[_nLayer],
                 Dspark = BuildDsparkDesc(),
+                HostMatMul = HostMatMul.Instance,
             };
 
             for (int il = 0; il < _nLayer; il++)

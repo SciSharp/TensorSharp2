@@ -19,7 +19,15 @@ DeepSeek V4 has three whole-model executors:
   arenas and are layer-split across every visible GPU, so a model larger than
   one GPU's VRAM is hosted across several.
 - **GPU backends** (`--backend ggml_cuda` / `ggml_vulkan`): the native ggml
-  executor described below.
+  executor described below. ggml ships DeepSeek-V4's four architecture-specific
+  ops (the three hyper-connection ops and the lightning indexer) for CPU and
+  CUDA only. On any other backend `hc_pre` / `hc_post` are built instead out of
+  batched `mul_mat` — they are exactly a contraction over the stream axis — so
+  the whole layer stays on the accelerator; `hc_comb` (a 20-iteration Sinkhorn
+  over a 4x4 matrix) and the lightning indexer still take the scheduler's CPU
+  fallback, which is what is left of the Vulkan/CUDA gap. The decomposition is
+  worth +34% prefill and +14% decode on Vulkan and is chosen automatically by a
+  load-time `ggml_backend_supports_op` probe (`TS_DSV4_HC_NATIVE=0/1` to A/B).
 - **`--backend cpu`**: a **100% pure C# whole-model executor**
   (`TensorSharp.Models/Models/DeepSeek4/DeepSeek4CpuExecutor.cs`) — no native
   dependencies at all. It serves the quantized weights straight from the
@@ -54,6 +62,96 @@ The native whole-model executor
 The C# side (`TensorSharp.Models/Models/DeepSeek4/DeepSeek4Model.cs`) handles
 GGUF metadata, the `joyai-llm` BPE pre-tokenizer, the DeepSeek V4 chat template
 (`<｜User｜>…<｜Assistant｜></think>`, `--think` opens `<think>`), and sampling.
+
+### Fitting the model: VRAM-aware split, and MoE CPU offload when you ask for it
+
+Both GPU engines — the native ggml executor and the direct-CUDA one — size the
+layer split against the VRAM each device *actually has free right now*, not
+against an equal share of the bytes. Two things follow from that.
+
+**The split is budget-proportional.** Every device is filled to the same
+fraction of its own free VRAM, minus a run-time reserve (the scheduler's
+compute buffers, `TS_DSV4_VRAM_RESERVE_MB`, default 2048 MiB per device) and
+minus the KV caches and compressor state rings the split can compute exactly.
+A device with a display attached, or one already hosting another process, gets
+proportionally fewer layers instead of the OOM an equal-bytes split would hand
+it.
+
+**Routed experts spill to system RAM only when you ask.** 91% of a V4 Flash
+checkpoint is routed-expert weights (137 of 151 GiB at UD-Q8_K_XL), so they are
+the only knob with enough range — but offload is OFF by default here exactly as
+it is for every other architecture. Choosing it silently is the wrong trade on a
+host that *does* have the VRAM: it moves tens of GiB of experts to the CPU and
+costs most of the decode throughput for no reason.
+
+When the model does not fit, the loader says so and names the number that would
+work, instead of loading into an out-of-memory abort:
+
+```
+[dsv4] not enough VRAM: 150.7 GiB of weights plus this context's KV caches
+       against 152.9 GiB free across 7 device(s). Re-run with --n-cpu-moe 9
+       (moves the routed experts of the first 9 layer(s), 28.7 GiB, to system
+       RAM) or --cpu-moe to offload every layer.
+```
+
+Note what that example shows: the weights alone can look like they fit and still
+not, because each device also holds its KV caches and the `TS_DSV4_VRAM_RESERVE_MB`
+compute reserve (2048 MiB per device by default — 14 GiB across 7).
+
+`--n-cpu-moe N` / `--cpu-moe` then keep the routed experts (`ffn_gate_exps` /
+`ffn_up_exps` / `ffn_down_exps`) of the first N layers in host RAM and run their
+`mul_mat_id` chain on the ggml CPU backend; the router, the norms, the attention
+stack and the always-active shared expert stay on the accelerator, so only
+`[n_embd, n_tokens]` activations cross the bus in each direction per offloaded
+layer. Asking for more layers than needed trades decode speed for VRAM.
+
+`--backend cuda` runs the same seam on its own kernels: the offloaded layers'
+experts are multiplied by `ManagedQuantizedOps` and the weighted-sum epilogue
+stays the device `moe_scatter_add`, so a layer is interchangeably resident or
+offloaded. Its host FFN batches every selected expert's projection into one
+parallel dispatch per stage — one per (expert, projection) spent more time in
+the scheduler than in the arithmetic (226 → 105 ms per token).
+
+Measured on 3×RTX A6000 48 GB (UD-Q8_K_XL, 151 GiB of weights against 139 GiB
+of VRAM, 2-socket Xeon Gold 6342 under a 23.8-CPU cgroup quota; another process
+held ~15 GiB during the `ggml_cuda` runs, which is why it offloaded 13 layers
+against the direct engine's 9):
+
+| Metric | `ggml_cuda` (8 offloaded) | `cuda` (9 offloaded) | `ggml_vulkan` (7 offloaded) |
+|---|---|---|---|
+| Decode | 14.7 tok/s | 8.9 tok/s | 6.5 tok/s |
+| Prefill (1024–2048) | 206 tok/s | — | 138 tok/s |
+| Prefill (8.7K) | 195 tok/s | 43.6 tok/s | 73 tok/s |
+| Host cost per offloaded layer | ~5.4 ms/token | ~8.3 ms/token | ~5.4 ms/token |
+
+Vulkan's remaining decode gap is not the expert offload — it is the per-layer
+CPU round trip for `hc_comb` and the lightning indexer, the two ops the
+decomposition deliberately leaves alone (decomposing a 20-iteration Sinkhorn
+costs more tiny dispatches than the boundary it removes, and expanding the
+indexer would materialize an `[n_kv, n_head, n_tokens]` score tensor that is
+2.2 GB at a 1024-token prefill chunk).
+
+### DSpark and MoE CPU offload together
+
+Both engines run the drafter alongside an offloaded MoE, and the automatic
+split accounts for the drafter's own VRAM — loading one shifts exactly one more
+layer's experts to the host. Whether speculation still pays depends on how fast
+the host MoE is, because a verify batch of B tokens pulls B rows' worth of
+experts through it:
+
+| Engine | no DSpark | + DSpark | acceptance |
+|---|---|---|---|
+| `ggml_cuda` | 14.4 tok/s | **16.7 tok/s (1.16x)** | — |
+| `cuda` | 8.9 tok/s | 6.2 tok/s (0.70x) | 51% |
+
+So pair `--draft-model` with `--backend ggml_cuda` when experts are offloaded;
+on the direct engine the managed host matmul is slow enough that the extra
+verify rows cost more than the accepted tokens save.
+
+Each offloaded layer reads ~80 MB of MXFP4 expert blocks per token, so the
+loader offloading the *minimum* is what keeps this usable. **Size the host pool
+to the CPUs the process may actually use, not to `nproc`** — see
+`TS_CPU_MOE_THREADS` below.
 
 ## Usage
 
@@ -281,6 +379,9 @@ confidence gate is what keeps that trade positive.
 | `MAX_CONTEXT` | 65536 | Context window (caches scale with it; metadata allows 1M) |
 | `TS_DSV4_UBATCH` | 512 CPU / 1024 GPU | Prefill micro-batch |
 | `TS_DSV4_NGPU` | all | Number of GPUs to layer-split across (GPU backends) |
+| `TS_DSV4_VRAM_RESERVE_MB` | 2048 | GPU backends: VRAM held back per device for the scheduler's compute buffers. Lower it to offload fewer expert layers; raise it if a long prompt fails to allocate its graph |
+| `TS_N_CPU_MOE` / `TS_CPU_MOE` | 0 (off) | Leading layers whose routed experts stay in system RAM (same as `--n-cpu-moe` / `--cpu-moe`). Off by default; a model that does not fit is refused with the number that would work |
+| `TS_CPU_MOE_THREADS` | half the usable CPUs | Worker threads for the host expert matmul. `hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota, then halved on hosts with more than 8 — the accelerator submission threads (and, when hosted, Kestrel and the scheduler) have to be schedulable too. Sizing this near the quota collapses rather than degrades: 96 threads on a 23.8-CPU quota measured **25x** slower than 23, and on a 95-CPU quota a hosted MoE ran 8.2 tok/s at 71 threads against 20.7 at 64 |
 | `TS_DSV4_LOAD_THREADS` | 16 | `--backend cuda`: reader threads for the stream-to-VRAM loader |
 | `TS_DSV4_LOAD_STATS` | 0 | `--backend cuda`: 1 = per-stage loader timings |
 | `TS_DSV4_STAGED_EXPERTS` | 1 | `--backend cuda`: 0 = per-token expert kernels (A/B) |

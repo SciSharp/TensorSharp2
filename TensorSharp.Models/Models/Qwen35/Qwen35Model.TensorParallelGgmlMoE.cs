@@ -195,6 +195,10 @@ namespace TensorSharp.Models
             {
                 if (_isMoeLayer == null || !_isMoeLayer[layer] || _tpStackedGate[layer] == null)
                     continue;
+                // --n-cpu-moe: this layer's experts are multiplied on the host
+                // out of the GGUF mmap. Not uploading them IS the VRAM saving.
+                if (MoeCpuOffloadConfig.IsLayerOnCpu(layer))
+                    continue;
                 PreloadStackedShard(_tpStackedGate[layer][rank], bytesPerRank, countPerRank, rank);
                 PreloadStackedShard(_tpStackedUp[layer][rank], bytesPerRank, countPerRank, rank);
                 PreloadStackedShard(_tpStackedDown[layer][rank], bytesPerRank, countPerRank, rank);
@@ -365,7 +369,8 @@ namespace TensorSharp.Models
                         u.Data, u.GgmlType, u.PerExpertNe0, u.PerExpertNe1, u.TotalRawBytes,
                         d.Data, d.GgmlType, d.PerExpertNe0, d.PerExpertNe1, d.TotalRawBytes,
                         gateBias: null, upBias: null, downBias: null,
-                        activation: GgmlBasicOps.MoEActivation.SwiGLUSplit);
+                        activation: GgmlBasicOps.MoEActivation.SwiGLUSplit,
+                        runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
                     InvalidateTensorDeviceCache(output);
                 }
                 catch (Exception)

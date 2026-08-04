@@ -233,6 +233,97 @@ public class ManagedQuantizedOpsTests
         AssertClose(expected, actual, 0.03f);
     }
 
+    /// <summary>
+    /// The batched entry point exists purely to collapse a Mixture-of-Experts
+    /// layer's many tiny matmuls into one parallel dispatch (DeepSeek V4's
+    /// --n-cpu-moe layers issue one per selected expert per projection). It has
+    /// to agree with the one-at-a-time path element for element — including the
+    /// case two jobs share an input block, where the batch quantizes those
+    /// activations once and both jobs read the same quantized rows.
+    /// </summary>
+    [Fact]
+    public void TryAddmmQuantizedBatch_MatchesPerJobResults()
+    {
+        const int inDim = 64;
+        const int outDim = 5;
+        const int rows = 3;
+        const int jobCount = 4;
+
+        var weights = new byte[jobCount][];
+        for (int j = 0; j < jobCount; j++)
+        {
+            float[] w = Enumerable.Range(0, outDim * inDim)
+                .Select(i => MathF.Sin((i + j * 31) * 0.07f) * 0.35f)
+                .ToArray();
+            weights[j] = QuantizeRowsQ80(w, outDim, inDim);
+        }
+
+        // Two distinct input blocks; jobs 0/1 share the first (the gate/up
+        // pattern), jobs 2/3 the second.
+        float[] inputA = Enumerable.Range(0, rows * inDim).Select(i => MathF.Cos(i * 0.11f) * 0.2f).ToArray();
+        float[] inputB = Enumerable.Range(0, rows * inDim).Select(i => MathF.Sin(i * 0.13f) * 0.3f).ToArray();
+
+        var perJob = new float[jobCount][];
+        var batched = new float[jobCount][];
+        for (int j = 0; j < jobCount; j++)
+        {
+            perJob[j] = new float[rows * outDim];
+            batched[j] = new float[rows * outDim];
+        }
+
+        unsafe
+        {
+            fixed (float* pa = inputA)
+            fixed (float* pb = inputB)
+            fixed (byte* w0 = weights[0])
+            fixed (byte* w1 = weights[1])
+            fixed (byte* w2 = weights[2])
+            fixed (byte* w3 = weights[3])
+            fixed (float* r0 = perJob[0])
+            fixed (float* r1 = perJob[1])
+            fixed (float* r2 = perJob[2])
+            fixed (float* r3 = perJob[3])
+            fixed (float* b0 = batched[0])
+            fixed (float* b1 = batched[1])
+            fixed (float* b2 = batched[2])
+            fixed (float* b3 = batched[3])
+            {
+                byte*[] w = { w0, w1, w2, w3 };
+                float*[] inp = { pa, pa, pb, pb };
+                float*[] outPer = { r0, r1, r2, r3 };
+                float*[] outBatch = { b0, b1, b2, b3 };
+
+                for (int j = 0; j < jobCount; j++)
+                {
+                    Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+                        (int)GgmlTensorType.Q8_0, (IntPtr)w[j], inDim, outDim,
+                        inp[j], inDim, rows, outPer[j], outDim));
+                }
+
+                var jobs = new ManagedQuantizedOps.QuantMatMulJob[jobCount];
+                for (int j = 0; j < jobCount; j++)
+                    jobs[j] = new ManagedQuantizedOps.QuantMatMulJob(
+                        (IntPtr)w[j], (IntPtr)inp[j], (IntPtr)outBatch[j], outDim, rows, outDim);
+
+                Assert.True(ManagedQuantizedOps.TryAddmmQuantizedBatch(
+                    (int)GgmlTensorType.Q8_0, inDim, inDim, jobs));
+            }
+        }
+
+        for (int j = 0; j < jobCount; j++)
+            AssertClose(perJob[j], batched[j], 1e-6f);
+    }
+
+    [Fact]
+    public void TryAddmmQuantizedBatch_RejectsTypeWithoutDirectKernel()
+    {
+        // No direct host kernel => false, so the caller reports an unsupported
+        // offload instead of shipping wrong numbers.
+        Assert.False(ManagedQuantizedOps.TryAddmmQuantizedBatch(
+            (int)GgmlTensorType.IQ1_S, 256, 256,
+            new[] { new ManagedQuantizedOps.QuantMatMulJob(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 1, 1, 1) }));
+    }
+
     [Fact]
     public void TryAddmmQuantizedToFloat32_UsesDirectQ4KPath()
     {

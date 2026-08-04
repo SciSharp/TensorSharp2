@@ -133,6 +133,10 @@ namespace TensorSharp.Cli
             // before parsing CLI args. The --kv-cache-dtype flag below overrides this.
             KvCacheDtypeConfig.ConfigureFromEnvironment();
 
+            // Same contract for MoE CPU offload: TS_N_CPU_MOE / TS_CPU_MOE seed the
+            // default, --n-cpu-moe / --cpu-moe below override it.
+            MoeCpuOffloadConfig.ConfigureFromEnvironment();
+
             string modelPath = null;
             string inputFile = null;
             string pdfPath = null;
@@ -328,6 +332,23 @@ namespace TensorSharp.Cli
                             KvCacheDtypeConfig.Set(kvDtype);
                             break;
                         }
+                    case "-ncmoe":
+                    case "--n-cpu-moe":
+                        {
+                            string ncmoeStr = args[++i];
+                            if (!MoeCpuOffloadConfig.TryParse(ncmoeStr, out int ncmoeLayers, out bool ncmoeAll))
+                                throw new ArgumentException($"Invalid --n-cpu-moe value '{ncmoeStr}'. Expected a non-negative integer or 'all'.");
+                            if (ncmoeAll) MoeCpuOffloadConfig.SetAllLayers();
+                            else MoeCpuOffloadConfig.SetLayers(ncmoeLayers);
+                            break;
+                        }
+                    case "-cmoe":
+                    case "--cpu-moe":
+                        MoeCpuOffloadConfig.SetAllLayers();
+                        break;
+                    case "--cpu-moe-threads":
+                        MoeCpuOffloadConfig.SetCpuThreads(int.Parse(args[++i], CultureInfo.InvariantCulture));
+                        break;
                     case "-i":
                     case "--interactive":
                     case "--chat":
@@ -454,6 +475,16 @@ namespace TensorSharp.Cli
             // pipeline also auto-engages it when the target resolution needs the VRAM).
             if (offloadCpu)
                 Environment.SetEnvironmentVariable("TS_QWEN_IMAGE_OFFLOAD_CPU", "1");
+
+            if (MoeCpuOffloadConfig.IsEnabled)
+            {
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "MoE CPU offload active: routed experts of {Layers} stay in system RAM and run on the host ({Threads} threads)",
+                    MoeCpuOffloadConfig.Describe(),
+                    MoeCpuOffloadConfig.CpuThreads > 0
+                        ? MoeCpuOffloadConfig.CpuThreads.ToString(CultureInfo.InvariantCulture)
+                        : "auto");
+            }
 
             string requestedDtype = KvCacheDtypeConfig.IsExplicitlySet
                 ? KvCacheDtypeConfig.Current.ToShortString()

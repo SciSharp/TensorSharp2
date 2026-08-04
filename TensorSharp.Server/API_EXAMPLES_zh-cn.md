@@ -828,13 +828,15 @@ curl -N -X POST http://localhost:5000/api/image-edit/stream \
 这些默认值是服务端配置的采样默认值（与 Ollama 兼容）。可在启动时通过对应的服
 务器标志（`--temperature`、`--top-k`、`--top-p`、`--min-p`、`--repeat-penalty`、
 `--presence-penalty`、`--frequency-penalty`、`--seed`）或 `TENSORSHARP_*` 环境
-变量修改；请求中显式给出的值始终优先。
+变量修改。默认情况下，运维方以这种方式配置过的参数优先于请求体；若希望请求中
+的值优先，请以 `--sampling-precedence request` 启动服务。运维方未配置过的参数
+始终取请求中的值。
 
 ### OpenAI 风格选项（位于顶层）
 
 | 参数                | 类型        | 默认值  | 描述                                |
 | ------------------- | ----------- | ------- | ----------------------------------- |
-| `max_tokens`        | int         | 200     | 生成的最大 token 数                 |
+| `max_tokens`        | int         | `--max-tokens`（20000） | 生成的最大 token 数；同时接受 `max_completion_tokens` |
 | `temperature`       | float       | 0.8     | 采样温度                            |
 | `top_p`             | float       | 0.9     | 核采样阈值                          |
 | `presence_penalty`  | float       | 0       | 出现惩罚                            |

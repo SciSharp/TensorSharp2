@@ -202,6 +202,18 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0 on every architecture, DeepSeek V4 included — a model that does not fit is refused at load with the number of layers that would make it fit, rather than silently offloaded (env `TS_N_CPU_MOE`). |
+| `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off (env `TS_CPU_MOE`). |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: **half** the CPU parallelism this process can actually use (`hardware_concurrency` clamped by the scheduler affinity mask and the cgroup CPU quota) on hosts with more than 8, all but one below that. The other half is not waste — the accelerator submission threads, and in `TensorSharp.Server` Kestrel and the scheduler, have to be schedulable too, and .NET sizes its own pool from the machine's CPU count rather than the cgroup quota. Sizing this near the quota is a cliff, not a slope: on a 95-CPU quota the hosted 26B MoE measured 20.7 tok/s at 64 threads and 8.2 at 71. Raise it on a dedicated box (env `TS_CPU_MOE_THREADS`). |
+
+**Backend support.** MoE CPU offload is implemented on the GGML backends
+(`ggml_cuda`, `ggml_vulkan`, `ggml_metal`, `ggml_cpu`) for every MoE
+architecture, and on the pure-C# `cuda` backend for DeepSeek V4 only — that
+engine serves experts from its own stacked-expert device buffer everywhere
+else. Asking for offload on a combination that does not implement it prints a
+`[moe-offload] WARNING` and proceeds without saving VRAM, rather than failing
+quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
+15244 → 5756 MiB; `cuda` 14261 → 14253 MiB (no-op, warns).
 | `--kv-cache-dtype <type>` | KV cache precision: `f32`, `f16`, `q8_0`, or `q4_0` (default: auto — the backend/model pick; env `KV_CACHE_DTYPE`). Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) require the native GGML flash path. |
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
@@ -381,16 +393,20 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--help` | Print the parameter reference (also shown when the server is started with no arguments) and exit |
-| `--max-tokens <N>` | Default maximum tokens to generate when a request omits the limit (default: `20000`) |
-| `--temperature <f>` | Default sampling temperature when a request does not provide one (`0` = greedy) |
-| `--top-k <N>` | Default top-K filtering when a request does not provide one (`0` = disabled) |
-| `--top-p <f>` | Default nucleus sampling threshold when a request does not provide one (`1.0` = disabled) |
-| `--min-p <f>` | Default min-p filtering when a request does not provide one (`0` = disabled) |
-| `--repeat-penalty <f>` | Default repetition penalty when a request does not provide one (`1.0` = none) |
-| `--presence-penalty <f>` | Default presence penalty when a request does not provide one (`0` = disabled) |
-| `--frequency-penalty <f>` | Default frequency penalty when a request does not provide one (`0` = disabled) |
-| `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
-| `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
+| `--max-tokens <N>` | Maximum tokens to generate: fills in when a request omits its own limit, and caps a request that asks for more. Applies to every endpoint (Web UI, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses`). Default: `20000`, which is a plain default and does not cap. Env: `MAX_TOKENS`. |
+| `--temperature <f>` | Sampling temperature (`0` = greedy) |
+| `--top-k <N>` | Top-K filtering (`0` = disabled) |
+| `--top-p <f>` | Nucleus sampling threshold (`1.0` = disabled) |
+| `--min-p <f>` | Min-p filtering (`0` = disabled) |
+| `--repeat-penalty <f>` | Repetition penalty (`1.0` = none) |
+| `--presence-penalty <f>` | Presence penalty (`0` = disabled) |
+| `--frequency-penalty <f>` | Frequency penalty (`0` = disabled) |
+| `--seed <N>` | Random seed (`-1` = non-deterministic) |
+| `--stop <string>` | Stop sequence (can be repeated). Under `--sampling-precedence config` a per-request `stop`/`stop_sequences` list is merged with these; under `request` it replaces them. |
+| `--sampling-precedence <config\|request>` | Who wins when a request also carries a sampling parameter you set above. `config` (default) keeps your value — clients such as VS Code Copilot Chat hardcode `temperature`/`top_p` into every request and would otherwise silently override your configuration; parameters you did **not** set still come from the request. `request` restores client-always-wins. Env: `TENSORSHARP_SAMPLING_PRECEDENCE`. |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0 on every architecture, DeepSeek V4 included; a model that does not fit is refused at load with the number of layers that would make it fit. Env: `TS_N_CPU_MOE`. |
+| `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off. Env: `TS_CPU_MOE`. |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: half the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota) on hosts with more than 8 cores. The server needs the other half for Kestrel, the scheduler and the accelerator submission threads; sizing this near the quota collapses throughput rather than degrading (20.7 tok/s at 64 threads vs 8.2 at 71 on a 95-CPU quota). Env: `TS_CPU_MOE_THREADS`. |
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
 | `--prefill-chunk-size <N>` | Chunked-prefill granularity under contention — the maximum prefill tokens scheduled per step while other requests are running, so parallel decodes get frequent turns at the GPU (default: `1024`). Env: `TS_SCHED_PREFILL_CHUNK`. |
@@ -413,26 +429,33 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
 `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`,
-`frequency_penalty`, `seed`, `stop`/`stop_sequences`) always win over these
-server-wide defaults; the defaults only fill in fields the client omits.
+`frequency_penalty`, `seed`, `stop`/`stop_sequences`) fill in every parameter
+you did **not** configure above. For a parameter you *did* configure, the
+default `--sampling-precedence config` keeps your value and ignores the
+request's — many chat clients hardcode `temperature`/`top_p` into every call
+with no way for the end user to change them, so an unconfigured server-side
+value is the only one a request can move. Pass `--sampling-precedence request`
+for the inverse (clients always win), which is what versions before this flag
+did unconditionally.
 
 **Runtime environment variables:**
 
 | Variable | Description |
 |---|---|
 | `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
-| `MAX_TOKENS` | Default maximum generation length when neither `--max-tokens` nor a request-level limit is set (default: `20000`) |
+| `MAX_TOKENS` | Maximum generation length when `--max-tokens` is not passed: fills in when a request omits its own limit and caps a request that asks for more (default: `20000`, which is a plain default and does not cap) |
 | `VIDEO_SAMPLE_FPS` | Frames sampled per second of video for video prompts; time-based extraction (default: `1`) |
 | `VIDEO_MAX_FRAMES` | Optional upper bound on extracted video frames (evenly down-sampled); unset/`0` means no cap (default: no cap) |
 | `PORT` / `ASPNETCORE_URLS` | Currently overridden by the fixed `http://0.0.0.0:5000` listener in `Program.cs`; Docker Space images rewrite that constant with `APP_PORT` at build time. |
-| `TENSORSHARP_TEMPERATURE` | Default sampling temperature when neither `--temperature` nor the request body sets one |
-| `TENSORSHARP_TOP_K` | Default top-K when neither `--top-k` nor the request body sets one |
-| `TENSORSHARP_TOP_P` | Default top-P when neither `--top-p` nor the request body sets one |
-| `TENSORSHARP_MIN_P` | Default min-P when neither `--min-p` nor the request body sets one |
-| `TENSORSHARP_REPEAT_PENALTY` | Default repetition penalty when neither `--repeat-penalty` nor the request body sets one |
-| `TENSORSHARP_PRESENCE_PENALTY` | Default presence penalty when neither `--presence-penalty` nor the request body sets one |
-| `TENSORSHARP_FREQUENCY_PENALTY` | Default frequency penalty when neither `--frequency-penalty` nor the request body sets one |
-| `TENSORSHARP_SEED` | Default random seed when neither `--seed` nor the request body sets one |
+| `TENSORSHARP_TEMPERATURE` | Sampling temperature when `--temperature` is not passed. Counts as operator-configured, so it also outranks the request body under the default `--sampling-precedence config` |
+| `TENSORSHARP_TOP_K` | Top-K when `--top-k` is not passed (same precedence rule as `TENSORSHARP_TEMPERATURE`) |
+| `TENSORSHARP_TOP_P` | Top-P when `--top-p` is not passed (same precedence rule) |
+| `TENSORSHARP_MIN_P` | Min-P when `--min-p` is not passed (same precedence rule) |
+| `TENSORSHARP_REPEAT_PENALTY` | Repetition penalty when `--repeat-penalty` is not passed (same precedence rule) |
+| `TENSORSHARP_PRESENCE_PENALTY` | Presence penalty when `--presence-penalty` is not passed (same precedence rule) |
+| `TENSORSHARP_FREQUENCY_PENALTY` | Frequency penalty when `--frequency-penalty` is not passed (same precedence rule) |
+| `TENSORSHARP_SEED` | Random seed when `--seed` is not passed (same precedence rule) |
+| `TENSORSHARP_SAMPLING_PRECEDENCE` | `config` (default) or `request`: whether server-configured sampling parameters outrank the ones a client sends. `--sampling-precedence` overrides it |
 | `TENSORSHARP_LOG_LEVEL` | Minimum log level for both console and file loggers: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` (default: `Information`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
@@ -515,12 +538,134 @@ These gate the optional multi-token-prediction speculative decode path (see [MTP
 | `DIFFUSION_BATCHED_FORWARD` | Set to `1` to use true batched `DecodeCanvasBatched` for active diffusion canvases; default time-slices the faster fused single-canvas path. |
 | `DIFFUSION_LMHEAD_BATCH_CAP_MB` | Memory cap for batched diffusion lm-head logits before falling back to per-sequence lm-head (default: `300`). |
 
-Sampling parameter precedence (highest wins):
+Sampling parameter precedence (highest wins), with the default
+`--sampling-precedence config`:
 
-1. Per-request JSON fields in the API call (e.g. `temperature`, `top_p`, `stop`).
-2. Server-wide CLI flags (e.g. `--temperature`, `--top-p`, `--stop`).
-3. `TENSORSHARP_*` environment variables listed above.
-4. Built-in `SamplingConfig` defaults (`temperature=1.0`, `top_k=0`, `top_p=1.0`, `min_p=0`, `repeat_penalty=1.0`, presence/frequency penalties `0`, `seed=-1`, no stop sequences).
+1. Server-wide CLI flags / config-file keys (e.g. `--temperature`, `--top-p`, `--stop`).
+2. `TENSORSHARP_*` environment variables listed above.
+3. Per-request JSON fields in the API call (e.g. `temperature`, `top_p`, `stop`)
+   — for every parameter that steps 1 and 2 did not set.
+4. Built-in `SamplingConfig` defaults (`temperature=0.8`, `top_k=40`, `top_p=0.9`, `min_p=0`, `repeat_penalty=1.1`, `repeat_last_n=64`, presence/frequency penalties `0`, `seed=-1`, no stop sequences).
+
+With `--sampling-precedence request`, steps 1–3 swap: the request wins over the
+server-wide flags and env vars for parameters it sends, and they still fill in
+the rest. Either way `--stop` sequences pinned on the server stay in force under
+`config` (merged with the request's) and are replaced by the request under
+`request`.
+
+## Mixture-of-Experts CPU offload (`--n-cpu-moe`)
+
+Large MoE models spend almost all of their bytes on routed experts while
+activating only a small fraction of them per token — Qwen3.6-35B-A3B is ~11 GB
+of weights for ~3B active parameters. `--n-cpu-moe N` keeps the routed experts
+of the first N layers in system RAM and multiplies them on the CPU, leaving
+attention, the norms, the router and the always-active shared expert on the
+accelerator. Only the layer activation crosses the bus each layer
+(`hidden_size` floats — 8 KB for a decode step), so the split is bounded by host
+matmul throughput rather than by transfers.
+
+The offloaded layers stay inside the fused whole-model graph: the accelerator
+pauses after each offloaded layer's router, the host multiplies the selected
+experts straight out of the GGUF mmap, and the result is handed back before the
+next segment runs. Everything else in the token — attention, the shared or dense
+FFN, the LM head — stays in one graph submission. This holds for Qwen3.5/3.6,
+Gemma 4 MoE, GPT-OSS and DiffusionGemma; Gemma 4 MoE segments its prefill graph
+the same way, and DiffusionGemma's block decode hands the host all of the canvas
+positions at once so its offloaded side is a GEMM rather than a matvec. Qwen3.5/3.6
+segments its prefill graph the same way, and both it and Gemma 4 MoE keep the
+fused graph under tensor parallelism too (see the `--tp` note below).
+
+Measured on Qwen3.6-35B-A3B (UD-IQ2_XXS, RTX 3080 Laptop 16 GB, i7-11800H):
+
+| Setting | Peak VRAM | Decode | Prefill (pp2048) |
+| --- | --- | --- | --- |
+| default (all experts on GPU) | 13.4 GB | 71 tok/s | 1.2 s |
+| `--n-cpu-moe 16` | 11.0 GB | 37 tok/s | 20 s |
+| `--n-cpu-moe 32` | 7.0 GB | 24 tok/s | 38 s |
+| `--cpu-moe` (all 41 layers) | 4.6 GB | 18 tok/s | 48 s |
+
+(A later re-measure on a short prompt reads 11.6 GB / 72 tok/s default,
+5.8 GB / 23 tok/s at `--n-cpu-moe 32` and 4.0 GB / 15.6 tok/s at `--cpu-moe`;
+peak VRAM depends on how far the KV cache has grown, so treat these as the
+shape of the trade rather than absolutes.)
+
+Greedy output is unchanged at every setting on this model.
+
+The other MoE architectures on the same machine (96-token generation, peak VRAM
+sampled from `nvidia-smi`). Note how far under the card's 16 GB the offloaded
+configurations sit — both the GPT-OSS and DiffusionGemma baselines were over the
+WDDM spill threshold, which is why offload makes them *faster* as well as
+smaller:
+
+| Model | Setting | Peak VRAM | Prefill | Decode |
+| --- | --- | --- | --- | --- |
+| gemma-4-26B-A4B (Q4_K_XL) | default | 16.1 GB | 190 tok/s | 39.7 tok/s |
+| | `--n-cpu-moe 8` | 13.1 GB | 52 tok/s | 38.6 tok/s |
+| | `--n-cpu-moe 16` | 10.2 GB | 24 tok/s | 21.6 tok/s |
+| | `--cpu-moe` (30 layers) | 4.8 GB | 15 tok/s | 17.7 tok/s |
+| gpt-oss-20b (Q8_0) | default | 16.2 GB | 2.7 tok/s | 0.3 tok/s |
+| | `--n-cpu-moe 12` | 14.0 GB | 58 tok/s | 25.4 tok/s |
+| | `--cpu-moe` (24 layers) | 2.9 GB | 29 tok/s | 12.1 tok/s |
+| diffusiongemma-26B-A4B (Q4_K_M) | default | 16.0 GB | — | 1709 ms/step |
+| | `--n-cpu-moe 16` | 9.8 GB | — | 2287 ms/step |
+| | `--cpu-moe` (30 layers) | 3.0 GB | — | 4697 ms/step |
+
+Notes:
+
+* **Pick the smallest N that fits.** Each offloaded layer costs decode
+  throughput, so offload only as many layers as you need to free the VRAM the
+  KV cache wants.
+* **Prefill pays the most.** Prompt processing is a real GEMM over every token,
+  so it becomes host-compute-bound. Decode only touches `n_expert_used` experts
+  per token and stays fast.
+* **Routing stays on the accelerator**, so expert selection and weights are the
+  same ones the fully resident path would pick.
+* **The fused whole-model graph is kept.** Qwen3.5/3.6, Gemma 4 MoE, GPT-OSS and
+  DiffusionGemma each run a whole token (for DiffusionGemma, a whole canvas
+  block) as ONE accelerator graph, and offload does not give that up. Each
+  offloaded layer's expert matmuls are cut out of the graph; everything else —
+  attention, norms, the router, the shared/dense FFN and the LM head — keeps
+  running fused, with the accelerator pausing only to hand the host that layer's
+  routed-expert work. Gemma 4 MoE segments its *prefill* graph the same way, so a
+  prompt chunk is still one dispatch with the host doing a real GEMM over every
+  token in it.
+* Nemotron-H has no whole-model fused graph to preserve — its hybrid
+  Mamba2/attention/MoE decode is dispatched per layer regardless — so offload
+  there simply routes each layer's MoE through the host path.
+* **Combines with tensor parallelism.** Under `--tp N` the offloaded layers'
+  seams are merged into the same segment schedule the ranks already use for
+  their AllReduce points, so the fused multi-rank graph is kept — Qwen3.5/3.6
+  and Gemma 4 MoE run both decode and prefill fused. Each offloaded layer is
+  evaluated ONCE, on the host, over the unsharded expert stack: the host expert
+  backend is a single thread pool, so splitting that matmul per rank would only
+  serialize on it while paying an extra download each. The single result is then
+  placed so the graph's own reduction lands on the single-GPU value (rank 0 only
+  where the layer output feeds a later AllReduce, every rank where it does not).
+  Measured on 2x L4 24 GB (short prompt, prefill 512 / decode 64):
+
+  | Model | Setting | Resident weights (GPU0 + GPU1) | Prefill | Decode |
+  | --- | --- | --- | --- | --- |
+  | Qwen3.5-35B-A3B (UD-IQ4_XS) | `--tp 2` | 9397 + 8032 MB | 1942 tok/s | 76.5 tok/s |
+  | | `--tp 2 --cpu-moe` | 2277 + 912 MB | 66 tok/s | 17.8 tok/s |
+  | gemma-4-26B-A4B (UD-IQ4_XS) | `--tp 2` | 6835 + 6087 MB | 3062 tok/s | 59.7 tok/s |
+  | | `--tp 2 --n-cpu-moe 8` | 5459 + 4711 MB | 217 tok/s | 36.5 tok/s |
+  | | `--tp 2 --cpu-moe` | 1588 + 840 MB | 60 tok/s | 13.2 tok/s |
+
+  Greedy output on Gemma 4 is byte-identical to the same `--tp N` run without
+  offload on most prompts and, on the rest, agrees for hundreds of characters
+  before taking an equivalent alternative ending; Qwen3.5 likewise tracks the
+  resident run to a paraphrase point. Both are deterministic — the gap is the
+  host expert matmul's activation quantization, the same ~1-5% relative
+  difference `TS_HOST_MOE_VERIFY=1` reports on a single GPU. The pure-C# `cuda`
+  backend has no host-MoE seam, so `--tp N --cpu-moe` there prints the
+  `[moe-offload] WARNING` and keeps the experts resident.
+* `TS_HOST_MOE_VERIFY=1` builds the on-GPU expert chain alongside the host one
+  and reports their per-layer divergence — a diagnostic for validating the seam
+  on a model that also fits in VRAM. `TS_HOST_MOE_DEBUG=1` prints the segment
+  plan (the node cuts) and each seam's activation norms. `TS_HOST_MOE_TIMING=1`
+  reports the offloaded side's wall clock split into per-call setup and host
+  matmul, which is what tells you whether a slow run is the expert GEMM or the
+  scaffolding around it.
 
 ## Tensor Parallelism & Distributed Inference
 
@@ -597,8 +742,8 @@ must be reachable between all nodes.
 | Gemma 3 | ✅ | Separate Q/K/V, GELU, sliding window |
 | Gemma 4 | ✅ | Dense TP + MoE. On GGML the fused whole-model MoE trunk splits *inside* each expert (gate/up column-parallel, down row-parallel) so global expert ids keep working; `TS_GEMMA4_TP_FUSED_MOE=0` falls back to the whole-expert per-op path. Per-expert slicing on direct CUDA |
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership; expert-parallel MoE on GGML (whole experts per rank, Megatron-split shared expert), expert slicing on direct CUDA. Runs on both `cuda` and `ggml_cuda` / `ggml_vulkan` — the GGML path uses the packed per-rank GDN kernel (`TSGgml_Qwen35GdnLayerTP`) with device-resident recurrent state |
-| GPT OSS | ✅ | MoE expert slicing, attention sinks, YaRN. Runs on `cuda` and the GGML backends; the GGML path still walks experts per token per rank (no expert parallelism yet) |
-| Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing. Same GGML caveat as GPT OSS |
+| GPT OSS | ✅ | Attention sinks, YaRN. Runs on `cuda` and the GGML backends; the GGML path is expert-parallel (whole experts per rank, one batched `ggml_mul_mat_id` dispatch per projection per layer) and falls back to per-expert slicing only when the expert count does not divide the TP degree |
+| Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing. Still walks experts per token per rank on GGML (no expert parallelism yet) |
 | DiffusionGemma | — | Not applicable (diffusion model) |
 | Qwen-Image-Edit | — | Not applicable (image generation) |
 
@@ -648,6 +793,11 @@ one card. Qwen 3.5-35B does not fit a 16 GB card at all, so TP is the only way
 to run it. See `TENSOR_PARALLELISM_PLAN.md` (Stages 1b and 1c) for the full
 measurements and what is left to fuse.
 
+TP composes with MoE CPU offload: `--tp N --n-cpu-moe M` keeps the fused
+multi-rank graph and drops the offloaded layers' expert bytes from every rank's
+VRAM. See [Mixture-of-Experts CPU offload](#mixture-of-experts-cpu-offload---n-cpu-moe)
+for the combined numbers.
+
 | Variable | Effect |
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`) |
@@ -655,7 +805,7 @@ measurements and what is left to fuse.
 | `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
-| `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode |
+| `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode. Layers offloaded by `--n-cpu-moe` are skipped by that materialization — they never run on the accelerator — so `--cpu-moe` also removes the load-time cost |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | Payload size above which ggml-cuda's collective converts F32 to BF16 before reducing. TensorSharp raises ggml's default (1 byte — i.e. always) to 1 MB so decode-sized collectives reduce exactly; `0` disables the conversion entirely |
 | `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |
@@ -781,7 +931,9 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 
 #### Sampling defaults (server-only)
 
-These fill in fields the request body omits; per-request JSON always wins, CLI flags win over env vars.
+These fill in fields the request body omits. CLI flags win over env vars, and
+anything set through either outranks the request body unless the server runs
+with `--sampling-precedence request` (see [Web Application](#web-application)).
 
 | Sampling field | Env var | CLI equivalent |
 |---|---|---|
@@ -795,6 +947,7 @@ These fill in fields the request body omits; per-request JSON always wins, CLI f
 | `seed` | `TENSORSHARP_SEED` | `--seed` |
 | max tokens | `MAX_TOKENS` | `--max-tokens` |
 | stop sequences | — (CLI / per-request only) | `--stop` (repeatable) |
+| sampling precedence | `TENSORSHARP_SAMPLING_PRECEDENCE` | `--sampling-precedence` |
 
 #### Hosting & uploads (server-only)
 

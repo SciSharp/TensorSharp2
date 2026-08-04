@@ -1447,6 +1447,17 @@ namespace TensorSharp.GGML
         public static void SyncHostBuffer(IntPtr ptr, long byteCount) => GgmlNative.SyncHostBuffer(ptr, byteCount);
         public static void SetAsyncCompute(bool enabled) => GgmlNative.SetAsyncCompute(enabled);
         public static bool GetAsyncCompute() => GgmlNative.GetAsyncCompute();
+
+        /// <summary>
+        /// The native bridge's last error string. Lets a model report WHY a fused
+        /// kernel declined instead of falling through silently to a slower path.
+        /// </summary>
+        public static string LastNativeError(string fallback = "(no native error)")
+            => GgmlNative.LastNativeError(fallback);
+
+        /// <summary>Worker threads for the host-side MoE matmul (<c>--cpu-moe-threads</c>); 0 = default.</summary>
+        public static void SetHostMoeThreads(int threads) => GgmlNative.SetHostMoeThreads(threads);
+
         public static void HostReadBarrier() => GgmlNative.HostReadBarrier();
         public static bool CanInitializeBackend(GgmlBackendType backendType) => GgmlNative.CanInitialize(backendType);
         public static void EnsureBackendAvailable(GgmlBackendType backendType) => GgmlNative.EnsureAvailable(backendType);
@@ -3149,7 +3160,8 @@ namespace TensorSharp.GGML
             float[] downBias,         // null to skip; otherwise [hiddenDim, numExperts]
             MoEActivation activation,
             float oaiAlpha = 1.702f,
-            float oaiLimit = 7.0f)
+            float oaiLimit = 7.0f,
+            bool runOnCpu = false)
         {
             if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
             if (hiddenOut == null) throw new ArgumentNullException(nameof(hiddenOut));
@@ -3226,7 +3238,7 @@ namespace TensorSharp.GGML
                     gateBias != null ? (IntPtr)gateBiasPtr : IntPtr.Zero,
                     upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
                     downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
-                    activationType, oaiAlpha, oaiLimit);
+                    activationType, oaiAlpha, oaiLimit, runOnCpu);
             }
         }
 
@@ -3278,7 +3290,8 @@ namespace TensorSharp.GGML
             float[] downBias,
             MoEActivation activation = MoEActivation.GEGLUSplit,
             float oaiAlpha = 1.702f,
-            float oaiLimit = 7.0f)
+            float oaiLimit = 7.0f,
+            bool runOnCpu = false)
         {
             if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
             if (residual == null) throw new ArgumentNullException(nameof(residual));
@@ -3363,7 +3376,7 @@ namespace TensorSharp.GGML
                     gateBias != null ? (IntPtr)gateBiasPtr : IntPtr.Zero,
                     upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
                     downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
-                    activationType, oaiAlpha, oaiLimit);
+                    activationType, oaiAlpha, oaiLimit, runOnCpu);
             }
         }
 
@@ -3391,7 +3404,8 @@ namespace TensorSharp.GGML
             float[] downBias,
             bool useSwiGLUOAI,
             float oaiAlpha = 1.702f,
-            float oaiLimit = 7.0f)
+            float oaiLimit = 7.0f,
+            bool runOnCpu = false)
         {
             MoEFFNPrefill(
                 hiddenIn, hiddenOut, seqLen, hiddenDim, nFf, numExperts, nUsed,
@@ -3401,7 +3415,7 @@ namespace TensorSharp.GGML
                 downData, downGgmlType, downNe0, downNe1, downTotalBytes,
                 gateBias, upBias, downBias,
                 useSwiGLUOAI ? MoEActivation.SwiGLUOAI : MoEActivation.SwiGLUSplit,
-                oaiAlpha, oaiLimit);
+                oaiAlpha, oaiLimit, runOnCpu);
         }
 
         [RegisterOpStorageType("scaled_dot_product_attention", typeof(GgmlStorage))]

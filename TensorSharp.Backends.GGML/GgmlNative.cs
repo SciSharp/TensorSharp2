@@ -190,6 +190,9 @@ public struct GptOssLayerDecodeArgs
     public int SeparateQkv;
     public int QkvType, KType, VType, OType;
     public int GeType, UeType, DeType;
+    /// <summary>Non-zero keeps this layer's routed experts in system RAM and runs its
+    /// MoE FFN on the host (MoeCpuOffloadConfig / --n-cpu-moe).</summary>
+    public int CpuMoe;
 
     // float scalars (5)
     public float Eps;
@@ -268,6 +271,9 @@ public struct Gemma4MoELayerDecodeArgs
     public int GueType;
     public int DeType;
     public int SeparateQkv;
+    /// <summary>Non-zero keeps this layer's routed experts in system RAM and runs its
+    /// MoE FFN on the host (MoeCpuOffloadConfig / --n-cpu-moe).</summary>
+    public int CpuMoe;
 
     // float scalars (4)
     public float Eps;
@@ -346,6 +352,9 @@ public struct Qwen35LayerDecodeArgs
     public int SeparateQkv, KType, VType;
     public int GateInpType, GateExpsType, UpExpsType, DownExpsType;
     public int ShexpGateType, ShexpUpType, ShexpDownType;
+    /// <summary>Non-zero keeps this layer's routed experts in system RAM and runs its
+    /// MoE FFN on the host (MoeCpuOffloadConfig / --n-cpu-moe).</summary>
+    public int CpuMoe;
 }
 
 // Descriptor for the fused DiffusionGemma decode-layer kernel
@@ -410,6 +419,9 @@ public struct DiffusionDecodeLayerArgs
     public int QType, KType, VType, OType;
     public int GateType, UpType, DownType;
     public int GueType, DeType;
+    /// <summary>Non-zero keeps this layer's routed experts in system RAM and runs its
+    /// MoE FFN on the host (MoeCpuOffloadConfig / --n-cpu-moe).</summary>
+    public int CpuMoe;
 
     // float scalars (4)
     public float Eps;
@@ -1131,7 +1143,8 @@ internal enum GgmlIndexReductionOp
             IntPtr downBias,           // optional float* [hiddenDim, numExperts]
             int activationType,        // 0 = SwiGLU split, 1 = SwiGLU OAI, 2 = GEGLU split, 3 = ReLU-squared
             float oaiAlpha,
-            float oaiLimit);
+            float oaiLimit,
+            int runOnCpu);            // non-zero: run this layer on the host ggml CPU backend (MoE CPU offload)
 
         // Gemma 4 MoE GEGLU + post_norm + residual add fused kernel.
         // Computes residual_in_out += rms_norm(moe_ffn(hidden_in), eps) * post_norm_w
@@ -1160,7 +1173,8 @@ internal enum GgmlIndexReductionOp
             IntPtr downBias,
             int activationType,
             float oaiAlpha,
-            float oaiLimit);
+            float oaiLimit,
+            int runOnCpu);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_ScaledDotProductAttentionF32(
@@ -2519,6 +2533,9 @@ internal enum GgmlIndexReductionOp
         private static extern void TSGgml_SetAsyncCompute(int enabled);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_SetHostMoeThreads(int threads);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GetAsyncCompute();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -3254,7 +3271,8 @@ internal enum GgmlIndexReductionOp
             IntPtr downBias,
             int activationType,
             float oaiAlpha,
-            float oaiLimit)
+            float oaiLimit,
+            bool runOnCpu = false)
         {
             CheckResult(TSGgml_MoEFFNPrefillSwiGLUQuantF32(
                 hiddenIn, hiddenOut, seqLen, hiddenDim, nFf,
@@ -3263,7 +3281,7 @@ internal enum GgmlIndexReductionOp
                 upData,   upType,   upNe0,   upNe1,   upTotalBytes,
                 downData, downType, downNe0, downNe1, downTotalBytes,
                 gateBias, upBias, downBias,
-                activationType, oaiAlpha, oaiLimit),
+                activationType, oaiAlpha, oaiLimit, runOnCpu ? 1 : 0),
                 "moe_ffn_prefill_swiglu_quant");
         }
 
@@ -3287,7 +3305,8 @@ internal enum GgmlIndexReductionOp
             IntPtr downBias,
             int activationType,
             float oaiAlpha,
-            float oaiLimit)
+            float oaiLimit,
+            bool runOnCpu = false)
         {
             CheckResult(TSGgml_Gemma4MoEGEGLUResidualF32(
                 hiddenIn, residualInOut, postNormW, postNormEps,
@@ -3297,7 +3316,7 @@ internal enum GgmlIndexReductionOp
                 upData,   upType,   upNe0,   upNe1,   upTotalBytes,
                 downData, downType, downNe0, downNe1, downTotalBytes,
                 gateBias, upBias, downBias,
-                activationType, oaiAlpha, oaiLimit),
+                activationType, oaiAlpha, oaiLimit, runOnCpu ? 1 : 0),
                 "gemma4_moe_geglu_residual");
         }
 
@@ -4285,6 +4304,19 @@ internal enum GgmlIndexReductionOp
             TSGgml_SetAsyncCompute(enabled ? 1 : 0);
         }
 
+        /// <summary>
+        /// Worker threads for the host-side MoE matmul (<c>--cpu-moe-threads</c>);
+        /// 0 restores the default. Passed explicitly rather than through
+        /// <c>TS_CPU_MOE_THREADS</c> because .NET's
+        /// <see cref="Environment.SetEnvironmentVariable(string,string)"/> writes
+        /// only the managed environment on Linux, so the native
+        /// <c>std::getenv</c> never observed the flag.
+        /// </summary>
+        public static void SetHostMoeThreads(int threads)
+        {
+            TSGgml_SetHostMoeThreads(threads);
+        }
+
         /// <summary>True if async compute is currently enabled on the GGML backend.</summary>
         public static bool GetAsyncCompute()
         {
@@ -4624,6 +4656,13 @@ internal enum GgmlIndexReductionOp
             return markers.Any(marker => File.Exists(Path.Combine(path, marker)))
                 || Directory.Exists(Path.Combine(path, ".git"));
         }
+
+        /// <summary>
+        /// The native bridge's last error string. Public so the model layer can
+        /// report WHY a fused kernel declined: a silent fall-through to a slower
+        /// (or, under TP, unsupported) path is how that class of bug hides.
+        /// </summary>
+        public static string LastNativeError(string fallback = "(no native error)") => GetLastErrorMessage(fallback);
 
         private static string GetLastErrorMessage(string fallback)
         {

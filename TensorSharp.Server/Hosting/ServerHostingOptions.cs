@@ -27,11 +27,12 @@ namespace TensorSharp.Server.Hosting
             string startupMmProjPath,
             string defaultBackend,
             IReadOnlyList<BackendOption> supportedBackends,
-            int defaultWebMaxTokens,
+            int defaultMaxTokens,
+            bool maxTokensPinned,
             string uploadDirectory,
             string logDirectory,
             bool fileLoggingEnabled,
-            SamplingConfig defaultSamplingConfig)
+            SamplingDefaults samplingDefaults)
         {
             StartupModelPath = startupModelPath;
             StartupMmProjPath = startupMmProjPath;
@@ -40,11 +41,12 @@ namespace TensorSharp.Server.Hosting
             SupportedBackendValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < SupportedBackends.Count; i++)
                 SupportedBackendValues.Add(SupportedBackends[i].Value);
-            DefaultWebMaxTokens = defaultWebMaxTokens;
+            DefaultMaxTokens = defaultMaxTokens;
+            MaxTokensPinned = maxTokensPinned;
             UploadDirectory = uploadDirectory;
             LogDirectory = logDirectory;
             FileLoggingEnabled = fileLoggingEnabled;
-            DefaultSamplingConfig = defaultSamplingConfig ?? new SamplingConfig();
+            SamplingDefaults = samplingDefaults ?? new SamplingDefaults(new SamplingConfig());
         }
 
         /// <summary>Absolute path of the model the server was launched with, or null when no model is hosted.</summary>
@@ -62,8 +64,20 @@ namespace TensorSharp.Server.Hosting
         /// <summary>Fast lookup over <see cref="SupportedBackends"/>.</summary>
         internal HashSet<string> SupportedBackendValues { get; }
 
-        /// <summary>Default token budget for the Web UI's chat endpoint.</summary>
-        public int DefaultWebMaxTokens { get; }
+        /// <summary>
+        /// Default generation budget applied by every endpoint (Web UI, Ollama,
+        /// OpenAI chat + responses) when the request does not carry its own
+        /// limit. Resolved from <c>--max-tokens</c> / <c>MAX_TOKENS</c>, falling
+        /// back to 20000.
+        /// </summary>
+        public int DefaultMaxTokens { get; }
+
+        /// <summary>
+        /// True when <see cref="DefaultMaxTokens"/> came from <c>--max-tokens</c>
+        /// or <c>MAX_TOKENS</c> rather than the built-in fallback. A pinned value
+        /// also caps requests that ask for more (see <see cref="ResolveMaxTokens"/>).
+        /// </summary>
+        public bool MaxTokensPinned { get; }
 
         /// <summary>Absolute path to the directory used for user uploads.</summary>
         public string UploadDirectory { get; }
@@ -75,13 +89,33 @@ namespace TensorSharp.Server.Hosting
         public bool FileLoggingEnabled { get; }
 
         /// <summary>
-        /// Default sampling parameters resolved from CLI flags / environment.
-        /// Adapters seed per-request configs from this object so unspecified
-        /// fields take the operator-configured defaults instead of the
-        /// hard-coded library defaults.
-        /// Never null; returns a fresh <see cref="SamplingConfig"/> when no
-        /// overrides were supplied.
+        /// Default sampling parameters resolved from CLI flags / environment,
+        /// together with which of them the operator pinned and whether those
+        /// pins outrank a client's request. Adapters seed per-request configs
+        /// from this object so unspecified fields take the operator-configured
+        /// defaults instead of the hard-coded library defaults. Never null.
         /// </summary>
-        public SamplingConfig DefaultSamplingConfig { get; }
+        public SamplingDefaults SamplingDefaults { get; }
+
+        /// <summary>The resolved default sampling values (without the pinning metadata).</summary>
+        public SamplingConfig DefaultSamplingConfig => SamplingDefaults.Values;
+
+        /// <summary>
+        /// Resolve the generation budget for one request. An absent (or
+        /// non-positive, e.g. Ollama's <c>num_predict: -1</c>) request value
+        /// takes the server default. A request that asks for more than a pinned
+        /// <c>--max-tokens</c> is clamped to it — the flag names a *maximum*, and
+        /// an operator who sized it against their KV cache should not have a
+        /// client talk them out of it. A request asking for less is always
+        /// honoured, so short completions stay short.
+        /// </summary>
+        public int ResolveMaxTokens(int? requestedMaxTokens)
+        {
+            if (!requestedMaxTokens.HasValue || requestedMaxTokens.Value <= 0)
+                return DefaultMaxTokens;
+            return MaxTokensPinned
+                ? Math.Min(requestedMaxTokens.Value, DefaultMaxTokens)
+                : requestedMaxTokens.Value;
+        }
     }
 }

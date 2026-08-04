@@ -2251,6 +2251,10 @@ TSG_EXPORT void TSGgml_Shutdown()
     // CUDA driver is still alive; leaving them to thread_local destructors
     // aborts the process on exit ("CUDA error: driver shutting down").
     free_prefill_attn_sessions();
+    // MoE CPU offload keeps a persistent ggml CPU backend (and its worker thread
+    // pool) for the host-side expert matmuls. It is independent of g_backend, so
+    // it has to be released explicitly or the threads outlive the shutdown.
+    tsg::moe_ffn_host_release();
 
     for (int r = 0; r < ranks; ++r)
     {

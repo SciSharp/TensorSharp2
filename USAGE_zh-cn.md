@@ -349,16 +349,17 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
 | `--help` | 打印参数说明后退出（不带任何参数启动服务时也会显示） |
-| `--max-tokens <N>` | 当请求未携带 max-tokens 时使用的默认上限（默认：`20000`） |
-| `--temperature <f>` | 当请求未提供时使用的默认采样温度（`0` = 贪心） |
-| `--top-k <N>` | 当请求未提供时使用的默认 Top-K 过滤（`0` = 关闭） |
-| `--top-p <f>` | 当请求未提供时使用的默认 Nucleus 采样阈值（`1.0` = 关闭） |
-| `--min-p <f>` | 当请求未提供时使用的默认 min-p 过滤（`0` = 关闭） |
-| `--repeat-penalty <f>` | 当请求未提供时使用的默认重复惩罚（`1.0` = 无） |
-| `--presence-penalty <f>` | 当请求未提供时使用的默认存在惩罚（`0` = 关闭） |
-| `--frequency-penalty <f>` | 当请求未提供时使用的默认频率惩罚（`0` = 关闭） |
-| `--seed <N>` | 当请求未提供时使用的默认随机种子（`-1` = 非确定性） |
-| `--stop <string>` | 默认停止序列（可重复指定）。请求体里的 `stop`/`stop_sequences` 会**完全替换**默认列表，而不是与之合并。 |
+| `--max-tokens <N>` | 最大生成 token 数：请求未携带上限时用它填充，请求要求更多时按它截断。对所有端点生效（Web UI、`/api/chat`、`/api/generate`、`/v1/chat/completions`、`/v1/responses`）。默认：`20000`，此默认值只用于填充、不做截断。环境变量：`MAX_TOKENS`。 |
+| `--temperature <f>` | 采样温度（`0` = 贪心） |
+| `--top-k <N>` | Top-K 过滤（`0` = 关闭） |
+| `--top-p <f>` | Nucleus 采样阈值（`1.0` = 关闭） |
+| `--min-p <f>` | min-p 过滤（`0` = 关闭） |
+| `--repeat-penalty <f>` | 重复惩罚（`1.0` = 无） |
+| `--presence-penalty <f>` | 存在惩罚（`0` = 关闭） |
+| `--frequency-penalty <f>` | 频率惩罚（`0` = 关闭） |
+| `--seed <N>` | 随机种子（`-1` = 非确定性） |
+| `--stop <string>` | 停止序列（可重复指定）。在默认的 `--sampling-precedence config` 下，请求体里的 `stop`/`stop_sequences` 会与这里的列表**合并**；在 `request` 下则完全替换。 |
+| `--sampling-precedence <config\|request>` | 当请求同时携带了你在上面配置过的采样参数时，以谁为准。`config`（默认）保留你的配置值 —— VS Code Copilot Chat 等客户端会把 `temperature`/`top_p` 硬编码进每一次请求，否则就会静默覆盖你的配置；你**没有**配置过的参数仍然取请求中的值。`request` 恢复“客户端优先”。环境变量：`TENSORSHARP_SAMPLING_PRECEDENCE`。 |
 | `--kv-cache-dtype <type>` | 托管模型的 KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（量化缓存以微小数值漂移换取内存节省；各档位的取舍见上文 CLI 参数表）。默认：自动 —— 由后端 / 模型决定。环境变量：`KV_CACHE_DTYPE`。 |
 | `--continuous-batching` / `--no-continuous-batching` | 启用（默认）或关闭迭代级分页批处理。启用时服务会在批内动态加入 / 抢占序列，并在实现了 `IBatchedPagedModel` 的模型上将多个序列打包到一次前向中执行。`--no-continuous-batching` 会让所有模型回退到按序列 KV 交换。别名：`--paged-batching` / `--no-paged-batching`。 |
 | `--prefill-chunk-size <N>` | 存在竞争时的分块 prefill 粒度 —— 有其他请求同时运行时，每个调度步最多处理的 prefill token 数；块越小，并行 decode 请求越容易频繁轮到 GPU（默认：`1024`）。环境变量：`TS_SCHED_PREFILL_CHUNK`。 |
@@ -378,26 +379,31 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 
 请求 JSON 中的字段（如 `temperature`、`top_p`、`top_k`、`min_p`、
 `repeat_penalty`、`presence_penalty`、`frequency_penalty`、`seed`、
-`stop`/`stop_sequences`）始终优先于上述服务端默认值；这些默认值仅
-用于填充客户端未指定的字段。
+`stop`/`stop_sequences`）会填充所有你**没有**在上面配置过的参数。对于你
+**已经**配置过的参数，默认的 `--sampling-precedence config` 保留你的取值
+并忽略请求中的值 —— 很多聊天客户端会把 `temperature`/`top_p` 硬编码进每一
+次调用，终端用户无从修改，因此只有服务端未配置的参数才应由请求决定。若需
+要相反的行为（客户端始终优先，也就是本参数出现之前的固定行为），请使用
+`--sampling-precedence request`。
 
 **运行时环境变量：**
 
 | 变量 | 说明 |
 |---|---|
 | `BACKEND` | 未传 `--backend` 时使用的默认计算后端（`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan`；默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
-| `MAX_TOKENS` | 当 `--max-tokens` 与请求级上限均未指定时使用的默认生成长度（默认：`20000`） |
+| `MAX_TOKENS` | 未传 `--max-tokens` 时的最大生成长度：请求未携带上限时用它填充，请求要求更多时按它截断（默认：`20000`，该默认值只填充、不截断） |
 | `VIDEO_SAMPLE_FPS` | 视频提示词每秒抽取的帧数；基于时间的抽帧（默认：`1`） |
 | `VIDEO_MAX_FRAMES` | 抽取视频帧数量的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制） |
 | `PORT` / `ASPNETCORE_URLS` | 当前会被 `Program.cs` 中固定的 `http://0.0.0.0:5000` 监听地址覆盖；Docker Space 镜像会在构建时用 `APP_PORT` 改写该常量。 |
-| `TENSORSHARP_TEMPERATURE` | `--temperature` 与请求体均未指定时的默认采样温度 |
-| `TENSORSHARP_TOP_K` | `--top-k` 与请求体均未指定时的默认 Top-K |
-| `TENSORSHARP_TOP_P` | `--top-p` 与请求体均未指定时的默认 Top-P |
-| `TENSORSHARP_MIN_P` | `--min-p` 与请求体均未指定时的默认 min-P |
-| `TENSORSHARP_REPEAT_PENALTY` | `--repeat-penalty` 与请求体均未指定时的默认重复惩罚 |
-| `TENSORSHARP_PRESENCE_PENALTY` | `--presence-penalty` 与请求体均未指定时的默认存在惩罚 |
-| `TENSORSHARP_FREQUENCY_PENALTY` | `--frequency-penalty` 与请求体均未指定时的默认频率惩罚 |
-| `TENSORSHARP_SEED` | `--seed` 与请求体均未指定时的默认随机种子 |
+| `TENSORSHARP_TEMPERATURE` | 未传 `--temperature` 时的采样温度。它同样算作“运维方已配置”，因此在默认的 `--sampling-precedence config` 下也优先于请求体 |
+| `TENSORSHARP_TOP_K` | 未传 `--top-k` 时的 Top-K（优先级规则同 `TENSORSHARP_TEMPERATURE`） |
+| `TENSORSHARP_TOP_P` | 未传 `--top-p` 时的 Top-P（优先级规则同上） |
+| `TENSORSHARP_MIN_P` | 未传 `--min-p` 时的 min-P（优先级规则同上） |
+| `TENSORSHARP_REPEAT_PENALTY` | 未传 `--repeat-penalty` 时的重复惩罚（优先级规则同上） |
+| `TENSORSHARP_PRESENCE_PENALTY` | 未传 `--presence-penalty` 时的存在惩罚（优先级规则同上） |
+| `TENSORSHARP_FREQUENCY_PENALTY` | 未传 `--frequency-penalty` 时的频率惩罚（优先级规则同上） |
+| `TENSORSHARP_SEED` | 未传 `--seed` 时的随机种子（优先级规则同上） |
+| `TENSORSHARP_SAMPLING_PRECEDENCE` | `config`（默认）或 `request`：服务端配置的采样参数是否优先于客户端发来的值。`--sampling-precedence` 可覆盖它 |
 | `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
@@ -480,12 +486,16 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `DIFFUSION_BATCHED_FORWARD` | 设为 `1` 后，对活跃 diffusion canvas 使用真正的 `DecodeCanvasBatched`；默认按请求时间片执行更快的融合单 canvas 路径。 |
 | `DIFFUSION_LMHEAD_BATCH_CAP_MB` | diffusion lm-head logits 批处理内存上限，超过后回退到按序列 lm-head（默认：`300`）。 |
 
-采样参数的优先级（从高到低）：
+采样参数的优先级（从高到低，对应默认的 `--sampling-precedence config`）：
 
-1. API 请求 JSON 中的字段（如 `temperature`、`top_p`、`stop`）。
-2. 服务端命令行参数（如 `--temperature`、`--top-p`、`--stop`）。
-3. 上面列出的 `TENSORSHARP_*` 环境变量。
-4. `SamplingConfig` 内置默认值（`temperature=1.0`、`top_k=0`、`top_p=1.0`、`min_p=0`、`repeat_penalty=1.0`、存在/频率惩罚均为 `0`、`seed=-1`、无停止序列）。
+1. 服务端命令行参数 / 配置文件键（如 `--temperature`、`--top-p`、`--stop`）。
+2. 上面列出的 `TENSORSHARP_*` 环境变量。
+3. API 请求 JSON 中的字段（如 `temperature`、`top_p`、`stop`）—— 仅对第 1、2 步未设置的参数生效。
+4. `SamplingConfig` 内置默认值（`temperature=0.8`、`top_k=40`、`top_p=0.9`、`min_p=0`、`repeat_penalty=1.1`、`repeat_last_n=64`、存在/频率惩罚均为 `0`、`seed=-1`、无停止序列）。
+
+使用 `--sampling-precedence request` 时，第 1~3 步互换：请求中出现的参数优先
+于服务端参数与环境变量，其余参数仍由服务端填充。无论哪种模式，服务端 `--stop`
+在 `config` 下始终生效（与请求的列表合并），在 `request` 下则被请求替换。
 
 ## 张量并行与分布式推理
 
@@ -734,7 +744,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 
 #### 采样默认值（仅服务端）
 
-这些变量用于填充请求体未提供的字段；请求 JSON 字段始终优先于 CLI 参数，CLI 参数优先于环境变量。
+这些变量用于填充请求体未提供的字段。CLI 参数优先于环境变量；除非服务以
+`--sampling-precedence request` 启动，否则通过二者之一配置的参数还会优先于请求体。
 
 | 采样字段 | 环境变量 | CLI 等价参数 |
 |---|---|---|
@@ -748,6 +759,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 | `seed` | `TENSORSHARP_SEED` | `--seed` |
 | 最大 token 数 | `MAX_TOKENS` | `--max-tokens` |
 | 停止序列 | —（仅 CLI / 请求体支持） | `--stop`（可重复） |
+| 采样优先级 | `TENSORSHARP_SAMPLING_PRECEDENCE` | `--sampling-precedence` |
 
 #### 服务托管与上传（仅服务端）
 

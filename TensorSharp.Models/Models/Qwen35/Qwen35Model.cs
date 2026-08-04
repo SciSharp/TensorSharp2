@@ -430,8 +430,16 @@ namespace TensorSharp.Models
                 Console.WriteLine($"NextN/MTP: {_numNextnLayers} draft block(s) at layer {_mtpLayerIdx} (excluded from main stack)");
 
             if (_numExperts > 0)
+            {
                 Console.WriteLine($"MoE: experts={_numExperts}, used={_numExpertsUsed}, " +
                     $"expertFFN={_expertFfnLength}, sharedFFN={_sharedExpertFfnLength}");
+                // The host-MoE seam hangs off the GGML MoE FFN kernel; the
+                // pure-C# CUDA path serves experts from its own device-resident
+                // stacked buffer and has no offload, so the flag would silently
+                // do nothing there.
+                if (!IsGgmlBackend)
+                    MoeCpuOffloadConfig.WarnUnsupportedBackend("qwen35moe", _backend.ToString());
+            }
 
             LoadWeights();
             FuseAttentionProjectionWeights();
@@ -1130,7 +1138,8 @@ namespace TensorSharp.Models
         /// sequential fallback can still stream the bytes on demand.
         /// </summary>
         protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
-            => !_stackedExpertMemberNames.Contains(weightName);
+            => !_stackedExpertMemberNames.Contains(weightName)
+               && base.ShouldPreloadCudaQuantWeightToDevice(weightName);
 
         protected override void ResetKVCacheCore()
         {
@@ -4965,7 +4974,8 @@ namespace TensorSharp.Models
                     upW.Data, upW.GgmlType, upW.PerExpertNe0, upW.PerExpertNe1, upW.TotalRawBytes,
                     downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, downW.TotalRawBytes,
                     gateBias: null, upBias: null, downBias: null,
-                    activation: GgmlBasicOps.MoEActivation.SwiGLUSplit);
+                    activation: GgmlBasicOps.MoEActivation.SwiGLUSplit,
+                    runOnCpu: MoeCpuOffloadConfig.IsLayerOnCpu(layer));
             }
             catch (Exception)
             {

@@ -186,9 +186,13 @@ public class Qwen35TokenDecodeContractTests
         FieldInfo[] fields = typeof(Qwen35LayerDecodeArgs).GetFields(
             BindingFlags.Public | BindingFlags.Instance);
 
+        // 24 int32s: the 23 original scalars plus CpuMoe, the per-layer MoE CPU
+        // offload flag (--n-cpu-moe). It is appended at the END of the int32 run
+        // so the struct stays a pointers / int64 / int32 sequence and the native
+        // TSGgmlQwen35LayerDesc keeps the same offsets for every field before it.
         Assert.Equal(33, fields.Count(field => field.FieldType == typeof(IntPtr)));
         Assert.Equal(48, fields.Count(field => field.FieldType == typeof(long)));
-        Assert.Equal(23, fields.Count(field => field.FieldType == typeof(int)));
+        Assert.Equal(24, fields.Count(field => field.FieldType == typeof(int)));
         Assert.All(fields, field => Assert.True(
             field.FieldType == typeof(IntPtr) ||
             field.FieldType == typeof(long) ||
@@ -201,7 +205,7 @@ public class Qwen35TokenDecodeContractTests
         long int64Start = Align(33L * IntPtr.Size, sizeof(long));
         long int32Start = int64Start + 48L * sizeof(long);
         long expectedSize = Align(
-            int32Start + 23L * sizeof(int),
+            int32Start + 24L * sizeof(int),
             Math.Max(IntPtr.Size, sizeof(long)));
 
         Assert.Equal(0, Marshal.OffsetOf<Qwen35LayerDecodeArgs>(
@@ -211,5 +215,12 @@ public class Qwen35TokenDecodeContractTests
         Assert.Equal(int32Start, Marshal.OffsetOf<Qwen35LayerDecodeArgs>(
             nameof(Qwen35LayerDecodeArgs.StructBytes)).ToInt64());
         Assert.Equal(expectedSize, Marshal.SizeOf<Qwen35LayerDecodeArgs>());
+
+        // CpuMoe must stay last: the native side reads it by name, but the
+        // struct_bytes handshake only catches a size change, not a reordering
+        // of the int32 run.
+        Assert.Equal(
+            int32Start + 23L * sizeof(int),
+            Marshal.OffsetOf<Qwen35LayerDecodeArgs>(nameof(Qwen35LayerDecodeArgs.CpuMoe)).ToInt64());
     }
 }

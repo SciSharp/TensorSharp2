@@ -153,9 +153,18 @@ namespace TensorSharp.Models
                         var gi = ResolveW(_ffnGateInpQW[l], _ffnGateInpF32[l]);
                         a.GateInpW = gi.ptr; a.GateInpType = gi.type; a.GateInpNe0 = gi.ne0; a.GateInpNe1 = gi.ne1; a.GateInpBytes = gi.bytes;
 
-                        var sg = _tpStackedGate?[l]?[r];
-                        var su = _tpStackedUp?[l]?[r];
-                        var sd = _tpStackedDown?[l]?[r];
+                        // MoE CPU offload: an offloaded layer is evaluated once on
+                        // the host, over the WHOLE expert stack, and the driver
+                        // gives that single result to rank 0 (the layer's
+                        // AllReduce then spreads it). So point the descriptor at
+                        // the unsharded tensors — the rank slices exist only for
+                        // the layers that stay on the accelerator, and nothing
+                        // uploads these. See tsg::HostMoeSegment::tp_reduced.
+                        bool layerOnCpu = MoeCpuOffloadConfig.IsLayerOnCpu(l);
+                        a.CpuMoe = layerOnCpu ? 1 : 0;
+                        var sg = layerOnCpu ? _layerStackedGate?[l] : _tpStackedGate?[l]?[r];
+                        var su = layerOnCpu ? _layerStackedUp?[l] : _tpStackedUp?[l]?[r];
+                        var sd = layerOnCpu ? _layerStackedDown?[l] : _tpStackedDown?[l]?[r];
                         if (sg == null || su == null || sd == null)
                             return false;
                         a.GateExps = sg.Data; a.GateExpsType = sg.GgmlType; a.GateExpsBytes = sg.TotalRawBytes;

@@ -128,10 +128,11 @@ namespace TensorSharp.Server.Hosting
                     "(TENSORSHARP_TP_PEERS env var overrides).",
                     "--tp-peers 192.168.1.10:9500,192.168.1.11:9500"),
             }),
-            ("Generation defaults (used when a request omits the field)", new[]
+            ("Generation defaults (pinned values also override requests — see --sampling-precedence)", new[]
             {
                 new OptionHelp("--max-tokens <N>",
-                    "Maximum tokens to generate per request. Default: 20000 (MAX_TOKENS env var overrides).",
+                    "Maximum tokens to generate per request: fills in when the request omits a limit, and caps a " +
+                    "request that asks for more. Default: 20000, uncapped (MAX_TOKENS env var overrides).",
                     "--max-tokens 4096"),
                 new OptionHelp("--temperature <f>",
                     "Sampling temperature; 0 = greedy. Default: 0.8 (TENSORSHARP_TEMPERATURE env var).",
@@ -163,6 +164,34 @@ namespace TensorSharp.Server.Hosting
                 new OptionHelp("--stop <text>",
                     "Stop sequence; repeat the flag to pin several. Default: none.",
                     "--stop \"</s>\" --stop \"<|eot|>\""),
+                new OptionHelp("--sampling-precedence <config|request>",
+                    "Who wins when a request also carries a sampling parameter you pinned above. 'config' " +
+                    "(default) keeps your values — clients such as VS Code Copilot Chat hardcode temperature/top_p " +
+                    "into every request and would otherwise silently override them; parameters you did NOT pin " +
+                    "still come from the request. 'request' restores client-always-wins. Pinned stop sequences " +
+                    "are merged with the request's rather than replacing them " +
+                    "(TENSORSHARP_SAMPLING_PRECEDENCE env var overrides).",
+                    "--sampling-precedence request"),
+            }),
+            ("Mixture-of-Experts CPU offload", new[]
+            {
+                new OptionHelp("--n-cpu-moe <N> | -ncmoe <N>",
+                    "Keep the routed MoE expert weights of the first N layers in system RAM and multiply them on " +
+                    "the CPU; attention, norms, the router and the shared expert stay on the accelerator. This is " +
+                    "what makes a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass 'all' " +
+                    "for every layer. Default: 0 (everything on the accelerator; TS_N_CPU_MOE env var overrides).",
+                    "--n-cpu-moe 32"),
+                new OptionHelp("--cpu-moe | -cmoe",
+                    "Shorthand for --n-cpu-moe all: every routed expert stays in system RAM. Default: off " +
+                    "(TS_CPU_MOE env var overrides).",
+                    "--cpu-moe"),
+                new OptionHelp("--cpu-moe-threads <N>",
+                    "Worker threads for the host-side expert matmul. Default: one less than the CPU parallelism " +
+                    "this process can actually use (hardware threads clamped by the affinity mask and the cgroup " +
+                    "CPU quota), leaving a core for accelerator submission. Do not set this above the quota: " +
+                    "ggml's pool spins at its barriers, so oversubscription collapses throughput rather than " +
+                    "degrading it (TS_CPU_MOE_THREADS env var overrides).",
+                    "--cpu-moe-threads 12"),
             }),
             ("KV cache", new[]
             {
@@ -189,7 +218,8 @@ namespace TensorSharp.Server.Hosting
                     "SSD budget for spilled KV blocks, in MB. Default: 16384.",
                     "--paged-kv-ssd-mb 32768"),
                 new OptionHelp("--paged-kv-quant-bits <b>",
-                    "Quantize spilled KV blocks: 0 (off), 4, or 8 bits. Default: 0.",
+                    "Quantize spilled KV blocks with the TurboQuant codec: 0 (off), 2, 4, or 8 bits per element. " +
+                    "2-bit uses an affine min+scale layout (~4x smaller than the f16 payload). Default: 0.",
                     "--paged-kv-quant-bits 8"),
                 new OptionHelp("--paged-kv-redis-url <url>",
                     "Redis connection string for a shared KV cache tier (e.g. localhost:6379). Default: disabled.",

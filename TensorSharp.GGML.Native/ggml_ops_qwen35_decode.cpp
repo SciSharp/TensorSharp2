@@ -10,6 +10,8 @@
 #include "ggml_ops_internal.h"
 #include "ggml_ops_transformer_common.h"
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 
 using namespace tsg;
@@ -401,6 +403,17 @@ namespace
     // CUDA/Vulkan update KV with SET_ROWS. Metal re-encodes movable CPY destination
     // views and uses a measured 64-token attention bucket; other backends use 256.
     // A graph is rebuilt when its bucket/input mode changes or state needs reseeding.
+    // One CPU-offloaded MoE layer inside the whole-model decode graph
+    // (--n-cpu-moe) is described by tsg::HostMoeSegment and executed by the
+    // shared segment runner in ggml_ops_moe.cpp — see ggml_ops_internal.h for
+    // the seam's contract.
+    //
+    // Only the three routed-expert matmuls move. The router stays on the GPU so
+    // expert selection and weights are bit-identical to the fully resident path,
+    // and so does the always-active shared expert (small, and moving it would
+    // buy no memory while costing a second round trip).
+    constexpr const char* kQ35DecodeKernel = "Qwen3.5 model decode";
+
     struct Q35DecodeCache
     {
         bool valid = false;
@@ -441,6 +454,11 @@ namespace
         // Tensor-parallel plan over this cache's graph: one entry per rank-local
         // build (each rank keeps its own pool slot, keyed by its KV pointer).
         tsg::TpRankPlan tp_plan;
+        // MoE CPU offload: the layers whose experts the host multiplies, and the
+        // node index each accelerator segment stops at (one per entry in
+        // host_moe, plus a final entry for the tail = graph node count).
+        std::vector<tsg::HostMoeSegment> host_moe;
+        std::vector<int> host_moe_seg_end;
 
         void reset()
         {
@@ -452,6 +470,8 @@ namespace
             gdn_conv_state.clear();
             gdn_delta_state.clear();
             movable_kv_copies.clear();
+            host_moe.clear();
+            host_moe_seg_end.clear();
             sig_disc = sig_kcache0 = nullptr; num_layers = hidden_size = window = 0;
             sig_token_embd = nullptr;
             token_embd_type = -1;
@@ -550,6 +570,7 @@ namespace
         const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
         if (tp_mode)
             *tp_plan_out = nullptr;
+
         const int tp_rank = tp_mode ? g_active_rank : 0;
         const int stacked_experts = tp_mode && num_experts > 0 ? num_experts / tp_degree : num_experts;
         if (tp_mode && num_experts > 0 &&
@@ -842,12 +863,23 @@ namespace
                 clear_last_error();
                 return 1;
             }
-            ggml_status st = use_metal_async_submit
-                ? ggml_backend_graph_compute_async(g_backend, dc->graph)
-                : ggml_backend_graph_compute(g_backend, dc->graph);
+            ggml_status st = GGML_STATUS_SUCCESS;
+            if (!dc->host_moe.empty())
+            {
+                // Replay with the same segment cuts the build pass recorded.
+                if (!host_moe_execute_segments(dc->graph, dc->host_moe, dc->host_moe_seg_end, kQ35DecodeKernel))
+                    st = GGML_STATUS_FAILED;
+            }
+            else
+            {
+                st = use_metal_async_submit
+                    ? ggml_backend_graph_compute_async(g_backend, dc->graph)
+                    : ggml_backend_graph_compute(g_backend, dc->graph);
+            }
             if (st != GGML_STATUS_SUCCESS)
             {
-                set_last_error("Qwen3.5 model decode: cached graph execution failed.");
+                if (dc->host_moe.empty())
+                    set_last_error("Qwen3.5 model decode: cached graph execution failed.");
                 dc->reset();
                 return 0;
             }
@@ -1011,11 +1043,23 @@ namespace
             else
             {
                 t.gate_inp_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gate_inp_type), d.gate_inp_ne0, d.gate_inp_ne1);
-                // Under TP the stacked expert tensors hold only this rank's
-                // whole-expert slice; the router dims stay global.
-                t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gate_exps_type), hidden_size, expert_ff, stacked_experts);
-                t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.up_exps_type), hidden_size, expert_ff, stacked_experts);
-                t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.down_exps_type), expert_ff, hidden_size, stacked_experts);
+                // MoE CPU offload: leave the routed-expert tensors null so the
+                // bind pass below never asks for a device copy of them. That
+                // omission IS the VRAM saving - the host reads the same bytes
+                // from the GGUF mmap instead.
+                // TS_HOST_MOE_VERIFY builds an on-GPU reference chain alongside
+                // the host one, which needs the experts resident. It cannot do
+                // that under TP for an offloaded layer: there the descriptor
+                // points at the UNSHARDED stack (the host computes the layer
+                // once) while this tensor would be declared rank-sized.
+                if (d.cpu_moe == 0 || (host_moe_verify_enabled() && !tp_mode))
+                {
+                    // Under TP the stacked expert tensors hold only this rank's
+                    // whole-expert slice; the router dims stay global.
+                    t.gate_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gate_exps_type), hidden_size, expert_ff, stacked_experts);
+                    t.up_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.up_exps_type), hidden_size, expert_ff, stacked_experts);
+                    t.down_exps = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.down_exps_type), expert_ff, hidden_size, stacked_experts);
+                }
                 t.shexp_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_gate_type), d.shexp_gate_ne0, d.shexp_gate_ne1);
                 t.shexp_up_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_up_type), d.shexp_up_ne0, d.shexp_up_ne1);
                 t.shexp_down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.shexp_down_type), d.shexp_down_ne0, d.shexp_down_ne1);
@@ -1041,9 +1085,13 @@ namespace
         std::vector<float> ep_mask_data;
         if (tp_mode && num_experts > 0)
         {
+            // Only layers whose experts are RESIDENT need the LUT. With
+            // --cpu-moe every MoE layer takes the global-routing branch,
+            // so the LUT would end up in no graph node at all -- and the
+            // upload below would then fault on its missing buffer.
             bool any_moe = false;
             for (int l = 0; l < num_layers; l++)
-                if (layers[l].is_moe != 0) { any_moe = true; break; }
+                if (layers[l].is_moe != 0 && layers[l].cpu_moe == 0) { any_moe = true; break; }
             if (any_moe)
             {
                 ep_lut = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, num_experts);
@@ -1071,6 +1119,11 @@ namespace
             tp_partial.reserve(static_cast<std::size_t>(num_layers) * 2);
             tp_boundary.reserve(static_cast<std::size_t>(num_layers) * 2);
         }
+
+        // MoE CPU offload: filled per offloaded layer while the graph is built,
+        // then turned into segment boundaries after ggml_build_forward_expand
+        // has fixed the node order.
+        std::vector<tsg::HostMoeSegment> host_moe;
 
         // --- build the chained graph ---
         ggml_tensor* hidden = token_input
@@ -1432,8 +1485,15 @@ namespace
                 // nullified through the weight mask. The renormalization above
                 // ran on the global weights first, so every rank's masked
                 // weights sum to the single-GPU values across the group.
+                //
+                // An OFFLOADED layer skips all of that: it is evaluated once on
+                // the host over the unsharded expert stack (splitting it per rank
+                // would only serialize on the host backend's one thread pool), so
+                // it keeps the global ids and the unmasked weights and the driver
+                // hands the single result to rank 0 alone — see
+                // HostMoeSegment::tp_reduced.
                 ggml_tensor* sel_ids = sel;
-                if (ep_lut != nullptr)
+                if (ep_lut != nullptr && d.cpu_moe == 0)
                 {
                     ggml_tensor* lut_r = ggml_reshape_3d(ctx, ep_lut, 1, num_experts, 1);
                     ggml_tensor* local_ids = ggml_get_rows(ctx, lut_r, sel);                  // [1, num_used, 1] I32
@@ -1443,20 +1503,93 @@ namespace
                     w_final = ggml_mul(ctx, w_final, own_mask);
                 }
 
-                ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, ffn_normed, H, 1, 1);
-                ggml_tensor* g_exp = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel_ids);   // [expert_ff, num_used, 1]
-                ggml_tensor* u_exp = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel_ids);
-                ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, g_exp), u_exp);               // [expert_ff, num_used, 1]
-                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps, act, sel_ids);      // [hidden, num_used, 1]
-                ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
-
-                ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
-                for (int u = 1; u < num_experts_used; ++u)
+                ggml_tensor* moe_out_1d = nullptr;
+                if (d.cpu_moe != 0)
                 {
-                    ggml_tensor* vu = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
-                    moe_out = ggml_add(ctx, moe_out, vu);
+                    // ---- MoE CPU offload seam ----
+                    // Hand the host everything it needs to reproduce exactly what
+                    // the mul_mat_id chain below would have computed: the layer
+                    // input and the router's own top-k ids and weights. Making
+                    // these contiguous copies (rather than reading the views
+                    // directly) keeps the download a single flat memcpy and stops
+                    // the allocator from recycling their storage before we read.
+                    tsg::HostMoeSegment hm;
+                    hm.layer = l;
+                    hm.moe_in = ggml_cont(ctx, ffn_normed);
+                    hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel_ids, num_experts_used));
+                    hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, num_experts_used));
+                    ggml_set_output(hm.moe_in);
+                    ggml_set_output(hm.sel_ids);
+                    ggml_set_output(hm.weights);
+
+                    // The host writes here between segments; marking it an input
+                    // keeps it live for the whole graph instead of being treated
+                    // as a dead intermediate with no producer.
+                    moe_out_1d = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+                    ggml_set_input(moe_out_1d);
+                    // Also flag it an output: ggml-alloc pre-allocates inputs but
+                    // still frees them after their last consumer, which lets a
+                    // later tensor take the block. The host writes this one from
+                    // outside the graph, so pin it for the whole pass.
+                    ggml_set_output(moe_out_1d);
+
+                    hm.moe_out = moe_out_1d;
+                    hm.gate_data = d.gate_exps;   hm.gate_type = d.gate_exps_type;
+                    hm.gate_ne0 = H;              hm.gate_ne1 = expert_ff;           hm.gate_bytes = d.gate_exps_bytes;
+                    hm.up_data = d.up_exps;       hm.up_type = d.up_exps_type;
+                    hm.up_ne0 = H;                hm.up_ne1 = expert_ff;             hm.up_bytes = d.up_exps_bytes;
+                    hm.down_data = d.down_exps;   hm.down_type = d.down_exps_type;
+                    hm.down_ne0 = expert_ff;      hm.down_ne1 = H;                   hm.down_bytes = d.down_exps_bytes;
+                    hm.activation = 0;            // silu(gate) * up
+                    // The offloaded stack is never sharded (the descriptor points
+                    // at the whole GGUF tensor even under TP), so the host always
+                    // sees the global expert count and the global ids above.
+                    hm.num_experts = num_experts;
+                    hm.n_used = num_experts_used;
+                    hm.n_ff = expert_ff;
+                    hm.seq_len = 1;
+                    hm.hidden = H;
+                    // ffn_down below sums this with the Megatron-split shared
+                    // expert, and that sum IS the layer's AllReduce point.
+                    hm.tp_reduced = tp_mode ? 1 : 0;
+
+                    if (host_moe_verify_enabled() && !tp_mode)
+                    {
+                        ggml_tensor* vin = ggml_reshape_3d(ctx, ffn_normed, H, 1, 1);
+                        ggml_tensor* vg = ggml_mul_mat_id(ctx, t.gate_exps, vin, sel_ids);
+                        ggml_tensor* vu = ggml_mul_mat_id(ctx, t.up_exps, vin, sel_ids);
+                        ggml_tensor* va = ggml_mul(ctx, ggml_silu(ctx, vg), vu);
+                        ggml_tensor* vd = ggml_mul_mat_id(ctx, t.down_exps, va, sel_ids);
+                        ggml_tensor* vw = ggml_mul(ctx, vd, w_final);
+                        ggml_tensor* vsum = ggml_view_2d(ctx, vw, H, 1, vw->nb[2], 0);
+                        for (int u = 1; u < num_experts_used; ++u)
+                        {
+                            ggml_tensor* vv = ggml_view_2d(ctx, vw, H, 1, vw->nb[2], static_cast<std::size_t>(u) * vw->nb[1]);
+                            vsum = ggml_add(ctx, vsum, vv);
+                        }
+                        hm.verify_gpu = ggml_cont(ctx, ggml_reshape_1d(ctx, vsum, H));
+                        ggml_set_output(hm.verify_gpu);
+                    }
+
+                    host_moe.push_back(hm);
                 }
-                ggml_tensor* moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
+                else
+                {
+                    ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, ffn_normed, H, 1, 1);
+                    ggml_tensor* g_exp = ggml_mul_mat_id(ctx, t.gate_exps, moe_in_3d, sel_ids);   // [expert_ff, num_used, 1]
+                    ggml_tensor* u_exp = ggml_mul_mat_id(ctx, t.up_exps, moe_in_3d, sel_ids);
+                    ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, g_exp), u_exp);               // [expert_ff, num_used, 1]
+                    ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps, act, sel_ids);      // [hidden, num_used, 1]
+                    ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);
+
+                    ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
+                    for (int u = 1; u < num_experts_used; ++u)
+                    {
+                        ggml_tensor* vu = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
+                        moe_out = ggml_add(ctx, moe_out, vu);
+                    }
+                    moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
+                }
 
                 // gated shared expert
                 ggml_tensor* sh_g = ggml_mul_mat(ctx, t.shexp_gate_w, ffn_normed_2d);         // [shared_ff, 1]
@@ -1499,6 +1632,15 @@ namespace
 
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 160 + 512;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        // Expand layer by layer. ggml_build_forward_expand appends each root's
+        // not-yet-emitted dependencies in topological order, so walking the
+        // layers in order - KV writes first, then the layer's host-MoE boundary
+        // if it has one - lays the nodes out as
+        //   [... layer l attention ...][layer l norm + router][... layer l+1 ...]
+        // which is exactly where the accelerator has to pause for the host. A
+        // single trailing expand of graph_out then picks up every remaining node
+        // (shared experts, residual adds, the final norm and the LM head).
+        std::size_t next_host_moe = 0;
         for (int l = 0; l < num_layers; l++)
         {
             if (layers[l].is_recurrent == 0)
@@ -1526,8 +1668,29 @@ namespace
                     ggml_build_forward_expand(graph, lt[l].delta_state_out);
                 }
             }
+
+            if (next_host_moe < host_moe.size() && host_moe[next_host_moe].layer == l)
+            {
+                const tsg::HostMoeSegment& hm = host_moe[next_host_moe];
+                ggml_build_forward_expand(graph, hm.moe_in);
+                ggml_build_forward_expand(graph, hm.sel_ids);
+                ggml_build_forward_expand(graph, hm.weights);
+                if (hm.verify_gpu != nullptr)
+                    ggml_build_forward_expand(graph, hm.verify_gpu);
+                ++next_host_moe;
+            }
         }
         ggml_build_forward_expand(graph, graph_out);
+
+        // Turn the recorded boundaries into node cut points (see
+        // host_moe_build_segment_ends). It fails when the builder and the
+        // expander disagree, which would silently feed the host stale values.
+        std::vector<int> host_moe_seg_end;
+        if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kQ35DecodeKernel))
+        {
+            if (persist) { ggml_free(ctx); }
+            return 0;
+        }
 
         // --- bind tensors ---
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -1841,6 +2004,9 @@ namespace
             slot->tp_plan.clear();
             slot->tp_plan.graph = graph;
             slot->tp_plan.ar_tensor = tp_partial;
+            // Offloaded layers pause this graph too; tp_plan_segments merges
+            // their cuts into the same schedule as the AllReduce ones.
+            slot->tp_plan.host_moe = host_moe;
             if (!tp_plan_segments(slot->tp_plan, tp_boundary))
             {
                 slot->tp_plan.clear();
@@ -1874,6 +2040,8 @@ namespace
                     slot->movable_kv_copies.push_back(lt[l].v_cpy);
                 }
             }
+            slot->host_moe = host_moe;
+            slot->host_moe_seg_end = host_moe_seg_end;
             slot->sig_disc = sig_disc;
             slot->sig_kcache0 = sig_kcache0;
             slot->sig_token_embd = token_embd_data;
@@ -1893,12 +2061,25 @@ namespace
             return 1;
         }
 
-        ggml_status status = use_metal_async_submit
-            ? ggml_backend_graph_compute_async(g_backend, graph)
-            : ggml_backend_graph_compute(g_backend, graph);
+        // MoE CPU offload runs the graph in segments, pausing at each offloaded
+        // layer for the host expert matmul. Everything else still goes out as one
+        // graph submission.
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (!host_moe.empty())
+        {
+            if (!host_moe_execute_segments(graph, host_moe, host_moe_seg_end, kQ35DecodeKernel))
+                status = GGML_STATUS_FAILED;
+        }
+        else
+        {
+            status = use_metal_async_submit
+                ? ggml_backend_graph_compute_async(g_backend, graph)
+                : ggml_backend_graph_compute(g_backend, graph);
+        }
         if (status != GGML_STATUS_SUCCESS)
         {
-            set_last_error("Qwen3.5 model decode: graph execution failed.");
+            if (host_moe.empty())
+                set_last_error("Qwen3.5 model decode: graph execution failed.");
             if (persist)
             {
                 ggml_backend_buffer_free(persist_buf);
@@ -1939,6 +2120,12 @@ namespace
                     dcb->movable_kv_copies.push_back(lt[l].v_cpy);
                 }
             }
+            // MoE CPU offload: the replay path re-runs these segments, so the
+            // plan has to live in the cache slot. Without it a cached graph
+            // would run end to end and read whatever stale bytes moe_out still
+            // held from the previous token.
+            dcb->host_moe = host_moe;
+            dcb->host_moe_seg_end = host_moe_seg_end;
             dcb->sig_disc = sig_disc;
             dcb->sig_kcache0 = sig_kcache0;
             dcb->sig_token_embd = token_embd_data;
