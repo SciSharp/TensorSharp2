@@ -162,13 +162,31 @@ namespace TensorSharp.Runtime
             "string", "number", "integer", "boolean", "object", "array", "null"
         };
 
+        /// <summary>
+        /// Schema keywords a request is rejected for using.
+        /// </summary>
+        /// <remarks>
+        /// This list used to also contain <c>allOf</c>, <c>minLength</c>,
+        /// <c>maxLength</c>, <c>pattern</c>, <c>format</c>, <c>minimum</c>,
+        /// <c>maximum</c>, <c>minItems</c> and <c>maxItems</c> — not because they
+        /// are meaningless, but because nothing enforced them when structured
+        /// output was prompt-plus-repair. The grammar compiler now compiles each
+        /// of them into the decoder's constraint, so rejecting them would refuse
+        /// requests the engine can honour.
+        /// <para>
+        /// What remains is what a context-free grammar genuinely cannot express:
+        /// negation and conditionals (<c>not</c>, <c>if</c>/<c>then</c>/<c>else</c>,
+        /// <c>dependentSchemas</c>, <c>dependentRequired</c>), arithmetic
+        /// divisibility (<c>multipleOf</c>), and per-key pattern dispatch
+        /// (<c>patternProperties</c>). These are refused up front rather than
+        /// silently ignored, so a caller is never told a constraint was applied
+        /// when it was not.
+        /// </para>
+        /// </remarks>
         private static readonly HashSet<string> UnsupportedKeywords = new(StringComparer.Ordinal)
         {
-            "allOf", "not", "dependentRequired", "dependentSchemas", "if", "then", "else",
-            "minLength", "maxLength", "pattern", "format",
-            "minimum", "maximum", "multipleOf",
-            "patternProperties",
-            "minItems", "maxItems"
+            "not", "dependentRequired", "dependentSchemas", "if", "then", "else",
+            "multipleOf", "patternProperties"
         };
 
         public static StructuredOutputSchemaValidationResult ValidateSchema(StructuredOutputFormat format)

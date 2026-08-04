@@ -805,8 +805,15 @@ namespace tsg
                 }
                 {
                     ScopedRank rank(0);
+                    // allow_device_stream=false: the offloaded layer is evaluated
+                    // ONCE here, on the host, over the unsharded expert stack,
+                    // and the ranks differ only in where that one result lands
+                    // (tp_reduced, below). Streaming it to rank 0's accelerator
+                    // instead would put a whole layer of experts back on one
+                    // device while the other ranks idle.
                     if (!host_moe_compute_segment(plans[0]->host_moe[static_cast<std::size_t>(hm_idx)],
-                                                  s_moe_out, "Tensor-parallel host MoE"))
+                                                  s_moe_out, "Tensor-parallel host MoE",
+                                                  nullptr, /*allow_device_stream*/ false))
                         return false;
                 }
                 for (int r = 0; r < rank_count; ++r)

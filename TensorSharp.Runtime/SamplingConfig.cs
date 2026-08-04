@@ -102,6 +102,22 @@ namespace TensorSharp.Runtime
         public IReadOnlyList<int>? FirstTokenAllowList { get; set; }
 
         /// <summary>
+        /// Grammar constraint enforced at every decode step: tokens the grammar
+        /// cannot accept are removed before any other sampling stage runs, so the
+        /// output is structurally valid by construction rather than by inspection
+        /// afterwards.
+        /// </summary>
+        /// <remarks>
+        /// This is per-sequence mutable state, not a setting — it carries the
+        /// live parser position — so a <see cref="Clone"/>d config deliberately
+        /// does <b>not</b> copy it. Callers running more than one sequence must
+        /// give each its own instance, otherwise two sequences would advance the
+        /// same parser and constrain each other. See
+        /// <c>TensorSharp.Runtime.Grammar.GrammarConstraint</c>.
+        /// </remarks>
+        public Grammar.GrammarConstraint? Grammar { get; set; }
+
+        /// <summary>
         /// Returns true if this config is effectively greedy decoding.
         /// </summary>
         public bool IsGreedy => Temperature <= 0f && TopK <= 0 && TopP >= 1.0f && MinP <= 0f;
@@ -138,6 +154,12 @@ namespace TensorSharp.Runtime
         /// then override individual fields without mutating the shared instance.
         /// The <see cref="StopSequences"/> list is duplicated so adding entries
         /// to the clone does not bleed back into the source config.
+        /// <para>
+        /// <see cref="Grammar"/> is intentionally <b>not</b> copied: it holds a
+        /// live parser position, so sharing one across cloned configs would make
+        /// concurrent sequences advance each other's state. Each sequence must be
+        /// given its own constraint after cloning.
+        /// </para>
         /// </summary>
         public SamplingConfig Clone()
         {

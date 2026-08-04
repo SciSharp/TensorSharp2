@@ -20,8 +20,23 @@ namespace TensorSharp.Runtime
     /// Spaces are replaced with ▁ (U+2581) before tokenization.
     /// Falls back to byte tokens (&lt;0xNN&gt;) for unknown characters.
     /// </summary>
-    public class SentencePieceTokenizer : ITokenizer
+    public class SentencePieceTokenizer : ITokenizer, ISpecialTokenVocabulary
     {
+        private int[]? _specialTokenIds;
+
+        /// <inheritdoc/>
+        public IReadOnlyCollection<int> SpecialTokenIds =>
+            _specialTokenIds ??= BuildSpecialTokenIds();
+
+        private int[] BuildSpecialTokenIds()
+        {
+            var ids = new List<int>(_specialTokens.Count);
+            foreach (string s in _specialTokens)
+                if (_vocabLookup.TryGetValue(s, out int id)) ids.Add(id);
+            foreach (int id in _eosTokenIds) ids.Add(id);
+            return ids.Distinct().ToArray();
+        }
+
         private const string SpaceReplacement = "▁";
 
         private readonly string[] _vocab;

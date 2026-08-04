@@ -203,6 +203,11 @@ namespace TensorSharp.Runtime.Scheduling
         public void AppendOutputToken(int token)
         {
             OutputTokens.Add(token);
+            // Advance the grammar here rather than at the sampler, because this
+            // is the one place every committed token passes through: ordinary
+            // decode, and each speculative draft the verifier accepts. Advancing
+            // at sample time would double-count drafts that are later rejected.
+            SamplingConfig?.Grammar?.Accept(token);
         }
 
         /// <summary>

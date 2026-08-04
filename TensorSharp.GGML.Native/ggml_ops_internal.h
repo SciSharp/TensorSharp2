@@ -808,7 +808,13 @@ namespace tsg
         void* up_data,   int up_type,   std::int64_t up_ne0,   std::int64_t up_ne1,   std::int64_t up_bytes,
         void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_bytes,
         const float* gate_bias, const float* up_bias, const float* down_bias,
-        int activation_type, float oai_alpha, float oai_limit);
+        int activation_type, float oai_alpha, float oai_limit,
+        // Whether a prefill-sized batch may be evaluated on the accelerator with
+        // the experts streamed in for that one graph instead of on the host (the
+        // experts are never left resident either way). False under tensor
+        // parallelism, which needs the single host evaluation over the unsharded
+        // stack. See moe_offload_stream_batch_threshold.
+        bool allow_device_stream = true);
 
     // Worker-thread count for the host MoE matmul (--cpu-moe-threads). Zero
     // restores the default (available_cpu_parallelism() - 1). Must be an
@@ -905,7 +911,8 @@ namespace tsg
         const float* weights = nullptr;
     };
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
-                                  HostMoeStagedInputs* staged = nullptr);
+                                  HostMoeStagedInputs* staged = nullptr,
+                                  bool allow_device_stream = true);
     void host_moe_upload_segment(const HostMoeSegment& hm, const float* data);
     void host_moe_zero_segment(const HostMoeSegment& hm);
 
@@ -944,6 +951,12 @@ namespace tsg
     // MTP MoE verify) whose per-call gallocr alloc/free would fragment Metal VRAM.
     // Returns false if unavailable (caller falls back to its own gallocr).
     bool alloc_graph_reuse_gallocr(ggml_cgraph* graph);
+
+    // Same, but backed by a SEPARATE persistent allocator reserved for the
+    // MoE-offload streaming graphs. They run nested inside a partially executed
+    // outer graph, so they must not re-plan the allocator that outer graph's
+    // tensors are placed in. See alloc_graph_in_gallocr_slot.
+    bool alloc_graph_moe_stream_gallocr(ggml_cgraph* graph);
     // Run Metal's backend graph optimizer before any graph allocation. Direct
     // backend graph_compute calls do not invoke this hook themselves.
     void optimize_graph_for_metal(ggml_cgraph* graph);

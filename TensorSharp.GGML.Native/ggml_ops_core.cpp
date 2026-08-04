@@ -1245,11 +1245,25 @@ namespace tsg
         std::mutex mutex;
         ggml_gallocr_t gallocr = nullptr;
         ggml_backend_t backend = nullptr;
+        std::size_t last_logged_size = 0;
     };
     static ReuseGallocrSlot g_reuse_gallocr_slots[TSG_MAX_DEVICES];
 #define g_reuse_gallocr_mutex   (g_reuse_gallocr_slots[::tsg::g_active_rank].mutex)
 #define g_reuse_gallocr         (g_reuse_gallocr_slots[::tsg::g_active_rank].gallocr)
 #define g_reuse_gallocr_backend (g_reuse_gallocr_slots[::tsg::g_active_rank].backend)
+
+    // A SECOND, independent set of slots for the MoE-offload streaming graphs.
+    // Those are built and run *inside* a partially executed outer graph (the
+    // host-MoE seam cuts the whole-model graph and evaluates the offloaded layer
+    // between two slices), and ggml_gallocr_alloc_graph re-plans the allocator
+    // it is handed for whatever graph it is given -- re-planning the outer
+    // graph's allocator mid-pass moves the tensors that graph's remaining nodes
+    // still point at. Symptom is not a wrong number but a hard
+    // GGML_ASSERT(device >= 0 && device < info.device_count) once a relocated
+    // tensor is read back through a stale buffer.
+    static ReuseGallocrSlot g_moe_stream_gallocr_slots[TSG_MAX_DEVICES];
+
+    bool alloc_graph_in_gallocr_slot(ggml_cgraph* graph, ReuseGallocrSlot* slots, const char* log_tag);
 
     void free_reuse_compute_buffer()
     {
@@ -1269,16 +1283,21 @@ namespace tsg
 
     void free_reuse_gallocr()
     {
-        for (int r = 0; r < TSG_MAX_DEVICES; ++r)
+        ReuseGallocrSlot* const all[] = { g_reuse_gallocr_slots, g_moe_stream_gallocr_slots };
+        for (ReuseGallocrSlot* slots : all)
         {
-            auto& slot = g_reuse_gallocr_slots[r];
-            std::lock_guard<std::mutex> lock(slot.mutex);
-            if (slot.gallocr != nullptr)
+            for (int r = 0; r < TSG_MAX_DEVICES; ++r)
             {
-                ggml_gallocr_free(slot.gallocr);
-                slot.gallocr = nullptr;
+                auto& slot = slots[r];
+                std::lock_guard<std::mutex> lock(slot.mutex);
+                if (slot.gallocr != nullptr)
+                {
+                    ggml_gallocr_free(slot.gallocr);
+                    slot.gallocr = nullptr;
+                }
+                slot.backend = nullptr;
+                slot.last_logged_size = 0;
             }
-            slot.backend = nullptr;
         }
     }
 
@@ -1288,32 +1307,43 @@ namespace tsg
     // The caller must NOT free the gallocr; it lives for the backend's lifetime.
     bool alloc_graph_reuse_gallocr(ggml_cgraph* graph)
     {
+        return alloc_graph_in_gallocr_slot(graph, g_reuse_gallocr_slots, "reuse-gallocr");
+    }
+
+    bool alloc_graph_moe_stream_gallocr(ggml_cgraph* graph)
+    {
+        return alloc_graph_in_gallocr_slot(graph, g_moe_stream_gallocr_slots, "moe-stream-gallocr");
+    }
+
+    bool alloc_graph_in_gallocr_slot(ggml_cgraph* graph, ReuseGallocrSlot* slots, const char* log_tag)
+    {
         // Escape hatch (shares the reuse-buffer toggle): TS_GGML_REUSE_COMPUTE_BUF=0
         // disables both so A/B testing can isolate the persistent allocators.
         static const bool s_disabled = []() {
             const char* e = std::getenv("TS_GGML_REUSE_COMPUTE_BUF");
             return e != nullptr && e[0] == '0';
         }();
-        if (s_disabled || g_backend == nullptr || graph == nullptr)
+        if (s_disabled || g_backend == nullptr || graph == nullptr || slots == nullptr)
             return false;
 
-        std::lock_guard<std::mutex> lock(g_reuse_gallocr_mutex);
-        if (g_reuse_gallocr_backend != g_backend)
+        ReuseGallocrSlot& slot = slots[::tsg::g_active_rank];
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        if (slot.backend != g_backend)
         {
             // Backend swapped (model reload). The old backend freed its buffers on
             // teardown, so drop the stale handle rather than freeing through it.
-            g_reuse_gallocr = nullptr;
-            g_reuse_gallocr_backend = g_backend;
+            slot.gallocr = nullptr;
+            slot.backend = g_backend;
         }
-        if (g_reuse_gallocr == nullptr)
+        if (slot.gallocr == nullptr)
         {
-            g_reuse_gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-            if (g_reuse_gallocr == nullptr)
+            slot.gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+            if (slot.gallocr == nullptr)
                 return false;
         }
         // ggml_gallocr_alloc_graph reuses the existing buffer when the new graph
         // fits and grows (reallocates) it only when a larger graph appears.
-        bool ok = ggml_gallocr_alloc_graph(g_reuse_gallocr, graph);
+        bool ok = ggml_gallocr_alloc_graph(slot.gallocr, graph);
         if (!ok)
         {
             // A FAILED alloc leaves the allocator POISONED, and because this one
@@ -1335,18 +1365,17 @@ namespace tsg
             // allocator; the next call builds a fresh one and re-reserves from
             // scratch. The failed reserve already freed the buffer this owned,
             // so nothing extra is lost by throwing away the bookkeeping.
-            ggml_gallocr_free(g_reuse_gallocr);
-            g_reuse_gallocr = nullptr;
+            ggml_gallocr_free(slot.gallocr);
+            slot.gallocr = nullptr;
             return false;
         }
         if (vram_log_enabled())
         {
-            static std::size_t s_last_size = 0;
-            const std::size_t size = ggml_gallocr_get_buffer_size(g_reuse_gallocr, 0);
-            if (size != s_last_size)
+            const std::size_t size = ggml_gallocr_get_buffer_size(slot.gallocr, 0);
+            if (size != slot.last_logged_size)
             {
-                s_last_size = size;
-                vram_log("reuse-gallocr(grew)", static_cast<std::int64_t>(size));
+                slot.last_logged_size = size;
+                vram_log(log_tag, static_cast<std::int64_t>(size));
             }
         }
         return true;

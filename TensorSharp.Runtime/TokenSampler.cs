@@ -42,6 +42,18 @@ namespace TensorSharp.Runtime
         {
             int vocabSize = logits.Length;
 
+            // Grammar-constrained decoding. Applied FIRST and by rewriting the
+            // logits themselves, so every downstream stage — penalties, top-k,
+            // top-p, min-p, temperature, and the greedy shortcut below — can only
+            // ever see legal tokens. Filtering afterwards would not be equivalent:
+            // top-p would compute its nucleus over a distribution including
+            // tokens that cannot be emitted, and could leave nothing behind.
+            var grammar = _config.Grammar;
+            if (grammar != null && !grammar.IsDead)
+            {
+                grammar.ApplyMask(logits, allowEos: grammar.IsComplete);
+            }
+
             // First-token constraint (structured output): pick the most probable
             // of the allowed ids. Applies only before anything has been generated;
             // later tokens sample normally.
@@ -306,30 +318,83 @@ namespace TensorSharp.Runtime
         /// Returns indices of top-K tokens sorted by probability (descending).
         /// If topK is 0, returns all indices sorted by probability.
         /// </summary>
+        /// <summary>
+        /// Select the <c>top_k</c> highest-scoring token ids, ordered by score
+        /// descending.
+        /// </summary>
+        /// <remarks>
+        /// Uses a bounded min-heap (O(n log k), one pass) rather than a
+        /// quickselect. The quickselect this replaced picked the last element as
+        /// its pivot and partitioned with <c>&gt;=</c>, which degrades to O(n²)
+        /// when many scores are EQUAL: every element lands on the same side and
+        /// the range shrinks by one per pass. That never showed up on raw logits,
+        /// which are all distinct, but grammar-constrained decoding sets every
+        /// forbidden token to -inf — ~99.9% of a 248k vocabulary — and the sampler
+        /// stalled for minutes on a single token. A heap is indifferent to
+        /// duplicates.
+        /// <para>
+        /// Ties break by ascending token id so the result is deterministic
+        /// (quickselect left it dependent on the input permutation).
+        /// </para>
+        /// </remarks>
         private int[] ApplyTopK(float[] scores)
         {
             int n = scores.Length;
             int k = _config.TopK > 0 ? Math.Min(_config.TopK, n) : n;
 
-            // Build index array and partial sort
             int[] indices = _indexBuffer != null && _indexBuffer.Length == n
                 ? _indexBuffer
                 : (_indexBuffer = new int[n]);
             for (int i = 0; i < n; i++) indices[i] = i;
 
-            if (k < n)
+            if (k >= n)
             {
-                // Partial sort: find top-K elements
-                PartialSort(indices, scores, 0, n - 1, k);
-                // Sort the top-K by logit descending.
-                Array.Sort(indices, 0, k, new ScoreComparer(scores));
-                int[] topK = new int[k];
-                Array.Copy(indices, topK, k);
-                return topK;
+                Array.Sort(indices, new ScoreComparer(scores));
+                return indices;
             }
 
-            Array.Sort(indices, new ScoreComparer(scores));
-            return indices;
+            // heap[0..k) is a min-heap on (score, -id): its root is the weakest
+            // member of the running top-k, so one comparison rejects most tokens.
+            var heap = new int[k];
+            int count = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (count < k)
+                {
+                    heap[count++] = i;
+                    if (count == k)
+                        for (int j = (k >> 1) - 1; j >= 0; j--) SiftDown(heap, scores, j, k);
+                }
+                else if (Weaker(scores, heap[0], i))
+                {
+                    heap[0] = i;
+                    SiftDown(heap, scores, 0, k);
+                }
+            }
+
+            Array.Sort(heap, 0, count, new ScoreComparer(scores));
+            return count == k ? heap : heap.AsSpan(0, count).ToArray();
+        }
+
+        /// <summary>True when token <paramref name="a"/> ranks below <paramref name="b"/>.</summary>
+        private static bool Weaker(float[] scores, int a, int b)
+        {
+            float sa = scores[a], sb = scores[b];
+            if (sa != sb) return sa < sb;
+            return a > b;      // equal scores: lower id wins, for determinism
+        }
+
+        private static void SiftDown(int[] heap, float[] scores, int root, int count)
+        {
+            while (true)
+            {
+                int child = 2 * root + 1;
+                if (child >= count) return;
+                if (child + 1 < count && Weaker(scores, heap[child + 1], heap[child])) child++;
+                if (!Weaker(scores, heap[child], heap[root])) return;
+                (heap[root], heap[child]) = (heap[child], heap[root]);
+                root = child;
+            }
         }
 
         private sealed class ScoreComparer : IComparer<int>
@@ -337,35 +402,6 @@ namespace TensorSharp.Runtime
             private readonly float[] _scores;
             public ScoreComparer(float[] scores) => _scores = scores;
             public int Compare(int a, int b) => _scores[b].CompareTo(_scores[a]);
-        }
-
-        private static void PartialSort(int[] indices, float[] scores, int lo, int hi, int k)
-        {
-            while (lo < hi)
-            {
-                int pivot = Partition(indices, scores, lo, hi);
-                if (pivot == k) return;
-                if (pivot < k)
-                    lo = pivot + 1;
-                else
-                    hi = pivot - 1;
-            }
-        }
-
-        private static int Partition(int[] indices, float[] scores, int lo, int hi)
-        {
-            float pivotVal = scores[indices[hi]];
-            int store = lo;
-            for (int i = lo; i < hi; i++)
-            {
-                if (scores[indices[i]] >= pivotVal)
-                {
-                    (indices[store], indices[i]) = (indices[i], indices[store]);
-                    store++;
-                }
-            }
-            (indices[store], indices[hi]) = (indices[hi], indices[store]);
-            return store;
         }
 
         #endregion

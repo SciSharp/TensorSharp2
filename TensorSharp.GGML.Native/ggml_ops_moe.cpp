@@ -258,10 +258,25 @@ namespace
             std::size_t bytes,
             ggml_tensor* tensor,
             std::vector<WeightUploadInfo>& uploads,
-            std::vector<BufferHandle>& ephem_buffers)
+            std::vector<BufferHandle>& ephem_buffers,
+            bool stream_only = false)
         {
             if (tensor == nullptr || host_data == nullptr || bytes == 0)
                 return false;
+
+            // MoE CPU offload, large-batch path: the caller wants these experts
+            // computed on the accelerator but NOT resident there. Both binding
+            // shortcuts below would defeat that -- the cacheable buffer keeps a
+            // permanent per-tensor VRAM copy (offload would save nothing), and
+            // the host-pointer buffer makes the kernel read the experts over the
+            // bus element-by-element instead of as one bulk upload. Go straight
+            // to the deferred upload, which lands in the REUSED graph buffer and
+            // is therefore bounded by the largest single layer, not the model.
+            if (stream_only)
+            {
+                uploads.push_back({tensor, host_data, bytes, true});
+                return true;
+            }
 
             if (dev != nullptr && bytes >= 4096)
             {
@@ -406,7 +421,60 @@ namespace
         // mmap instead of uploading them to the accelerator. Set per layer by
         // the caller from MoeCpuOffloadConfig.IsLayerOnCpu(layer).
         bool run_on_cpu = false;
+
+        // Whether run_on_cpu may be satisfied by streaming the experts to the
+        // accelerator for one graph instead of computing them on the host (see
+        // moe_offload_stream_batch_threshold). Cleared by tensor parallelism,
+        // where the offloaded layer is deliberately evaluated once on the host
+        // over the UNSHARDED expert stack and the ranks differ only in where
+        // the single result lands (HostMoeSegment::tp_reduced).
+        bool allow_device_stream = true;
     };
+
+    // MoE CPU offload: the batch size at or above which an offloaded layer is
+    // computed on the accelerator with its experts streamed in for that one
+    // graph, rather than on the host.
+    //
+    // Offload exists to keep the experts OUT of VRAM, and at decode (one token)
+    // the host is the right answer: the matmul is tiny and streaming hundreds of
+    // MB per layer per token would be absurd. Prefill inverts that -- the upload
+    // is a FIXED cost per layer that the whole batch amortizes, and the
+    // arithmetic is what the GPU is for. llama.cpp makes the same trade in its
+    // scheduler (ggml_backend_sched_backend_id_from_cur ->
+    // ggml_backend_cuda_device_offload_op), which is the entire reason its
+    // prefill with -ncmoe stays 4-8x ahead of a host-only seam.
+    //
+    // The crossover is where (expert bytes / PCIe bandwidth) meets
+    // (batch * per-token host matmul). Measured on gemma-4-26B-A4B --cpu-moe,
+    // RTX 3080 Laptop + i7-11800H (12.1 GiB of experts, ~8 GB/s pageable H2D,
+    // best of 3, prefill ms, lower is better):
+    //
+    //   batch |  32  |  64  | 128  | 256
+    //   host  |  580 | 1081 | 2309 | 4266
+    //   strm  | 1857 | 1234 | 1254 | 1329
+    //
+    // i.e. streaming LOSES 3.2x at 32 and 1.1x at 64, then wins 1.8x at 128 and
+    // 3.2x at 256. llama.cpp's own constant here is 32, which on this box is on
+    // the wrong side of its own crossover; 128 sits just past it with margin and
+    // still catches every real prefill (chunked at ubatch 256/512) while leaving
+    // small block-decode batches -- DiffusionGemma's denoising blocks -- on the
+    // host where they belong.
+    //
+    // 0 disables the device path (TS_HOST_MOE_DEVICE_MIN_BATCH=0), restoring
+    // host-only offload.
+    int moe_offload_stream_batch_threshold()
+    {
+        static const int s_threshold = []() {
+            if (const char* e = std::getenv("TS_HOST_MOE_DEVICE_MIN_BATCH"))
+            {
+                const int n = std::atoi(e);
+                if (n >= 0)
+                    return n;
+            }
+            return 128;
+        }();
+        return s_threshold;
+    }
 
     // Execute an already-built MoE FFN graph on the host CPU backend.
     //
@@ -1012,10 +1080,22 @@ namespace
         }
         ggml_build_forward_expand(graph, output);
 
-        // --- MoE CPU offload: run the whole thing on the host instead ---
-        // Taken before any accelerator binding happens, so none of this layer's
-        // expert bytes ever reach device memory.
-        if (p.run_on_cpu)
+        // --- MoE CPU offload: host compute, or accelerator with streamed experts ---
+        // An offloaded layer never gets a PERMANENT device copy of its experts.
+        // How it is evaluated still depends on the batch: at decode the host
+        // wins outright, but for a prefill-sized batch the upload is amortized
+        // over every token in it and computing on the accelerator is several
+        // times faster end to end. `stream_experts` picks the second; the branch
+        // below (taken before any accelerator binding) is the first.
+        const int stream_threshold = moe_offload_stream_batch_threshold();
+        const bool stream_experts =
+            p.run_on_cpu &&
+            p.allow_device_stream &&
+            stream_threshold > 0 &&
+            seq_len >= stream_threshold &&
+            g_backend != nullptr;
+
+        if (p.run_on_cpu && !stream_experts)
         {
             MoECpuGraphBinding b;
             b.hidden_t = hidden_t;
@@ -1084,14 +1164,17 @@ namespace
         // Quantized expert weights: cacheable read-only path (reused across
         // calls), falling back to host-ptr mapping or deferred upload.
         bind_readonly_weight_3d(ctx, g_backend, dev, gate_data,
-            static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers);
+            static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers,
+            stream_experts);
         if (!fused_gate_up && !single_projection_activation)
         {
             bind_readonly_weight_3d(ctx, g_backend, dev, up_data,
-                static_cast<std::size_t>(up_total_bytes), up_w, uploads, ephem_buffers);
+                static_cast<std::size_t>(up_total_bytes), up_w, uploads, ephem_buffers,
+                stream_experts);
         }
         bind_readonly_weight_3d(ctx, g_backend, dev, down_data,
-            static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers);
+            static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers,
+            stream_experts);
 
         // Allocate any tensors not bound above (hidden in/out fallback, ids,
         // weights, biases, and all per-graph intermediates) into the persistent,
@@ -1105,7 +1188,14 @@ namespace
         // Falls back to per-call allocation when the reuse path is unavailable
         // (TS_GGML_REUSE_COMPUTE_BUF=0 / unsupported backend).
         BufferHandle backend_buffer(nullptr);
-        if (!alloc_graph_reuse_gallocr(graph))
+        // A streamed offload graph runs BETWEEN two slices of the outer
+        // whole-model graph, whose tensors are placed in the shared reuse
+        // allocator; re-planning that allocator here would move them out from
+        // under the nodes still to come. Use the allocator kept for this path.
+        const bool graph_allocated = stream_experts
+            ? alloc_graph_moe_stream_gallocr(graph)
+            : alloc_graph_reuse_gallocr(graph);
+        if (!graph_allocated)
         {
             backend_buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (backend_buffer.value == nullptr)
@@ -1267,6 +1357,11 @@ namespace
         p.oai_alpha = oai_alpha;
         p.oai_limit = oai_limit;
         p.run_on_cpu = run_on_cpu != 0;
+        // Host-only for the per-op entry points. Unlike the fused seam,
+        // these are reachable through RunPerRank under tensor parallelism,
+        // where every rank would stream its own copy of the same unsharded
+        // expert layer to its own device at once.
+        p.allow_device_stream = false;
         return moe_ffn_prefill_graph_impl(p);
     }
 
@@ -1333,6 +1428,11 @@ namespace
         p.oai_alpha = oai_alpha;
         p.oai_limit = oai_limit;
         p.run_on_cpu = run_on_cpu != 0;
+        // Host-only for the per-op entry points. Unlike the fused seam,
+        // these are reachable through RunPerRank under tensor parallelism,
+        // where every rank would stream its own copy of the same unsharded
+        // expert layer to its own device at once.
+        p.allow_device_stream = false;
         return moe_ffn_prefill_graph_impl(p);
     }
 } // namespace
@@ -1362,7 +1462,8 @@ namespace tsg
         void* up_data,   int up_type,   std::int64_t up_ne0,   std::int64_t up_ne1,   std::int64_t up_bytes,
         void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_bytes,
         const float* gate_bias, const float* up_bias, const float* down_bias,
-        int activation_type, float oai_alpha, float oai_limit)
+        int activation_type, float oai_alpha, float oai_limit,
+        bool allow_device_stream)
     {
         MoEFFNGraphParams p;
         // The graph builder takes a mutable input pointer because the
@@ -1399,6 +1500,7 @@ namespace tsg
         p.oai_alpha = oai_alpha;
         p.oai_limit = oai_limit;
         p.run_on_cpu = true;
+        p.allow_device_stream = allow_device_stream;
         return moe_ffn_prefill_graph_impl(p) != 0;
     }
 
@@ -1500,7 +1602,7 @@ namespace tsg
     }
 
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
-                                  HostMoeStagedInputs* staged)
+                                  HostMoeStagedInputs* staged, bool allow_device_stream)
     {
         if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
             hm.weights == nullptr || hm.moe_out == nullptr)
@@ -1544,7 +1646,8 @@ namespace tsg
             hm.up_data,   hm.up_type,   hm.up_ne0,   hm.up_ne1,   hm.up_bytes,
             hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
             hm.gate_bias, hm.up_bias, hm.down_bias,
-            hm.activation, hm.oai_alpha, hm.oai_limit);
+            hm.activation, hm.oai_alpha, hm.oai_limit,
+            allow_device_stream);
     }
 
     void host_moe_upload_segment(const HostMoeSegment& hm, const float* data)

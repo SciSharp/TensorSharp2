@@ -1063,6 +1063,22 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
 
 # Structured outputs (OpenAI response_format)
+#
+# Enforced by grammar-constrained decoding: the schema is compiled to a grammar
+# and any token that would break it is removed from the distribution before
+# sampling, so the response is structurally valid by construction rather than
+# repaired afterwards. Supported keywords: type, enum, const, properties,
+# required, additionalProperties, items, prefixItems, min/maxItems, anyOf, oneOf,
+# allOf, $ref/$defs (including recursive), min/maxLength, pattern, the
+# date/time/date-time/uuid formats, and integer minimum/maximum.
+# Refused up front (a CFG cannot express them): not, if/then/else,
+# dependentSchemas, dependentRequired, multipleOf, patternProperties.
+# Set TS_JSON_GRAMMAR=0 to fall back to the older prompt-and-repair behaviour.
+#
+# NOTE: the grammar guarantees what it emits is well-formed, but it cannot
+# guarantee the document FITS in max_tokens. Because end-of-sequence stays
+# masked until the JSON is complete, too small a budget truncates mid-object.
+# Give structured requests enough headroom.
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
