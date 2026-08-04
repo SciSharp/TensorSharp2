@@ -204,7 +204,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0, except DeepSeek V4 on the GPU backends, which defaults to **auto** — it offloads the fewest leading layers that make the model fit the visible VRAM and reports what it chose (env `TS_N_CPU_MOE`). |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off (env `TS_CPU_MOE`). |
-| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: one less than the CPU parallelism this process can actually use — `hardware_concurrency` clamped by the scheduler affinity mask and the cgroup CPU quota, leaving a core free for accelerator submission. Sizing this above the quota does not degrade gracefully: ggml's worker pool spins at its per-node barriers, so a pool 4x the quota measured 25x slower than a quota-sized one (env `TS_CPU_MOE_THREADS`). |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: **half** the CPU parallelism this process can actually use (`hardware_concurrency` clamped by the scheduler affinity mask and the cgroup CPU quota) on hosts with more than 8, all but one below that. The other half is not waste — the accelerator submission threads, and in `TensorSharp.Server` Kestrel and the scheduler, have to be schedulable too, and .NET sizes its own pool from the machine's CPU count rather than the cgroup quota. Sizing this near the quota is a cliff, not a slope: on a 95-CPU quota the hosted 26B MoE measured 20.7 tok/s at 64 threads and 8.2 at 71. Raise it on a dedicated box (env `TS_CPU_MOE_THREADS`). |
 
 **Backend support.** MoE CPU offload is implemented on the GGML backends
 (`ggml_cuda`, `ggml_vulkan`, `ggml_metal`, `ggml_cpu`) for every MoE
@@ -406,7 +406,7 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--sampling-precedence <config\|request>` | Who wins when a request also carries a sampling parameter you set above. `config` (default) keeps your value — clients such as VS Code Copilot Chat hardcode `temperature`/`top_p` into every request and would otherwise silently override your configuration; parameters you did **not** set still come from the request. `request` restores client-always-wins. Env: `TENSORSHARP_SAMPLING_PRECEDENCE`. |
 | `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0, except DeepSeek V4 on the GPU backends, which defaults to auto (the fewest layers that fit the visible VRAM). Env: `TS_N_CPU_MOE`. |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off. Env: `TS_CPU_MOE`. |
-| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: one less than the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota — oversubscribing a quota collapses throughput, it does not degrade gracefully). Env: `TS_CPU_MOE_THREADS`. |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: half the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota) on hosts with more than 8 cores. The server needs the other half for Kestrel, the scheduler and the accelerator submission threads; sizing this near the quota collapses throughput rather than degrading (20.7 tok/s at 64 threads vs 8.2 at 71 on a 95-CPU quota). Env: `TS_CPU_MOE_THREADS`. |
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
 | `--prefill-chunk-size <N>` | Chunked-prefill granularity under contention — the maximum prefill tokens scheduled per step while other requests are running, so parallel decodes get frequent turns at the GPU (default: `1024`). Env: `TS_SCHED_PREFILL_CHUNK`. |
@@ -571,7 +571,9 @@ next segment runs. Everything else in the token — attention, the shared or den
 FFN, the LM head — stays in one graph submission. This holds for Qwen3.5/3.6,
 Gemma 4 MoE, GPT-OSS and DiffusionGemma; Gemma 4 MoE segments its prefill graph
 the same way, and DiffusionGemma's block decode hands the host all of the canvas
-positions at once so its offloaded side is a GEMM rather than a matvec.
+positions at once so its offloaded side is a GEMM rather than a matvec. Qwen3.5/3.6
+segments its prefill graph the same way, and both it and Gemma 4 MoE keep the
+fused graph under tensor parallelism too (see the `--tp` note below).
 
 Measured on Qwen3.6-35B-A3B (UD-IQ2_XXS, RTX 3080 Laptop 16 GB, i7-11800H):
 
@@ -630,12 +632,40 @@ Notes:
 * Nemotron-H has no whole-model fused graph to preserve — its hybrid
   Mamba2/attention/MoE decode is dispatched per layer regardless — so offload
   there simply routes each layer's MoE through the host path.
-* Not combined with tensor parallelism on the fused TP path: with `--tp > 1` the
-  fused path stands down and the per-op forward honours the placement instead.
+* **Combines with tensor parallelism.** Under `--tp N` the offloaded layers'
+  seams are merged into the same segment schedule the ranks already use for
+  their AllReduce points, so the fused multi-rank graph is kept — Qwen3.5/3.6
+  and Gemma 4 MoE run both decode and prefill fused. Each offloaded layer is
+  evaluated ONCE, on the host, over the unsharded expert stack: the host expert
+  backend is a single thread pool, so splitting that matmul per rank would only
+  serialize on it while paying an extra download each. The single result is then
+  placed so the graph's own reduction lands on the single-GPU value (rank 0 only
+  where the layer output feeds a later AllReduce, every rank where it does not).
+  Measured on 2x L4 24 GB (short prompt, prefill 512 / decode 64):
+
+  | Model | Setting | Resident weights (GPU0 + GPU1) | Prefill | Decode |
+  | --- | --- | --- | --- | --- |
+  | Qwen3.5-35B-A3B (UD-IQ4_XS) | `--tp 2` | 9397 + 8032 MB | 1942 tok/s | 76.5 tok/s |
+  | | `--tp 2 --cpu-moe` | 2277 + 912 MB | 66 tok/s | 17.8 tok/s |
+  | gemma-4-26B-A4B (UD-IQ4_XS) | `--tp 2` | 6835 + 6087 MB | 3062 tok/s | 59.7 tok/s |
+  | | `--tp 2 --n-cpu-moe 8` | 5459 + 4711 MB | 217 tok/s | 36.5 tok/s |
+  | | `--tp 2 --cpu-moe` | 1588 + 840 MB | 60 tok/s | 13.2 tok/s |
+
+  Greedy output on Gemma 4 is byte-identical to the same `--tp N` run without
+  offload on most prompts and, on the rest, agrees for hundreds of characters
+  before taking an equivalent alternative ending; Qwen3.5 likewise tracks the
+  resident run to a paraphrase point. Both are deterministic — the gap is the
+  host expert matmul's activation quantization, the same ~1-5% relative
+  difference `TS_HOST_MOE_VERIFY=1` reports on a single GPU. The pure-C# `cuda`
+  backend has no host-MoE seam, so `--tp N --cpu-moe` there prints the
+  `[moe-offload] WARNING` and keeps the experts resident.
 * `TS_HOST_MOE_VERIFY=1` builds the on-GPU expert chain alongside the host one
   and reports their per-layer divergence — a diagnostic for validating the seam
   on a model that also fits in VRAM. `TS_HOST_MOE_DEBUG=1` prints the segment
-  plan (the node cuts) and each seam's activation norms.
+  plan (the node cuts) and each seam's activation norms. `TS_HOST_MOE_TIMING=1`
+  reports the offloaded side's wall clock split into per-call setup and host
+  matmul, which is what tells you whether a slow run is the expert GEMM or the
+  scaffolding around it.
 
 ## Tensor Parallelism & Distributed Inference
 
@@ -763,6 +793,11 @@ one card. Qwen 3.5-35B does not fit a 16 GB card at all, so TP is the only way
 to run it. See `TENSOR_PARALLELISM_PLAN.md` (Stages 1b and 1c) for the full
 measurements and what is left to fuse.
 
+TP composes with MoE CPU offload: `--tp N --n-cpu-moe M` keeps the fused
+multi-rank graph and drops the offloaded layers' expert bytes from every rank's
+VRAM. See [Mixture-of-Experts CPU offload](#mixture-of-experts-cpu-offload---n-cpu-moe)
+for the combined numbers.
+
 | Variable | Effect |
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`) |
@@ -770,7 +805,7 @@ measurements and what is left to fuse.
 | `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
-| `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode |
+| `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode. Layers offloaded by `--n-cpu-moe` are skipped by that materialization — they never run on the accelerator — so `--cpu-moe` also removes the load-time cost |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | Payload size above which ggml-cuda's collective converts F32 to BF16 before reducing. TensorSharp raises ggml's default (1 byte — i.e. always) to 1 MB so decode-sized collectives reduce exactly; `0` disables the conversion entirely |
 | `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
 | `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |

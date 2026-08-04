@@ -375,7 +375,7 @@ confidence gate is what keeps that trade positive.
 | `TS_DSV4_NGPU` | all | Number of GPUs to layer-split across (GPU backends) |
 | `TS_DSV4_VRAM_RESERVE_MB` | 2048 | GPU backends: VRAM held back per device for the scheduler's compute buffers. Lower it to offload fewer expert layers; raise it if a long prompt fails to allocate its graph |
 | `TS_N_CPU_MOE` / `TS_CPU_MOE` | auto | Leading layers whose routed experts stay in system RAM (same as `--n-cpu-moe` / `--cpu-moe`). Auto = the fewest that make the model fit |
-| `TS_CPU_MOE_THREADS` | usable CPUs | Worker threads for the host expert matmul. The default is `hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota — ggml's pool spins at its barriers, so oversubscribing a quota collapses rather than degrades (96 threads on a 23.8-CPU quota measured **25x** slower than 23) |
+| `TS_CPU_MOE_THREADS` | half the usable CPUs | Worker threads for the host expert matmul. `hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota, then halved on hosts with more than 8 — the accelerator submission threads (and, when hosted, Kestrel and the scheduler) have to be schedulable too. Sizing this near the quota collapses rather than degrades: 96 threads on a 23.8-CPU quota measured **25x** slower than 23, and on a 95-CPU quota a hosted MoE ran 8.2 tok/s at 71 threads against 20.7 at 64 |
 | `TS_DSV4_LOAD_THREADS` | 16 | `--backend cuda`: reader threads for the stream-to-VRAM loader |
 | `TS_DSV4_LOAD_STATS` | 0 | `--backend cuda`: 1 = per-stage loader timings |
 | `TS_DSV4_STAGED_EXPERTS` | 1 | `--backend cuda`: 0 = per-token expert kernels (A/B) |

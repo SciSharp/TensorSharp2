@@ -1831,6 +1831,34 @@ namespace TensorSharp.Models
             {
                 return false;
             }
+            catch (InvalidOperationException ex)
+            {
+                // The batched kernel could not run — on a VRAM-tight card that
+                // is its graph buffer failing to allocate, which for gpt-oss-20b
+                // Q8_0 happens on the 2048-token warmup of a 24 GB GPU (11.5 GB
+                // of weights leaves too little for a 32-expert prefill graph).
+                // The per-expert loop below this call is a complete fallback, so
+                // degrade to it instead of killing the process; say so once,
+                // because it is much slower and --n-cpu-moe is the real answer.
+                WarnMoEFusedUnavailable(ex.Message);
+                return false;
+            }
+        }
+
+        private int _moeFusedWarned;
+
+        /// <summary>
+        /// Report, once, that the batched MoE kernel is unusable and the slow
+        /// per-expert loop is carrying the layer instead.
+        /// </summary>
+        private void WarnMoEFusedUnavailable(string reason)
+        {
+            if (System.Threading.Interlocked.Exchange(ref _moeFusedWarned, 1) != 0)
+                return;
+            Console.Error.WriteLine(
+                $"[gpt-oss] WARNING: the batched MoE kernel is unavailable ({reason}) — falling back to the " +
+                "per-expert loop, which is far slower. On a VRAM-tight GPU use --n-cpu-moe / --cpu-moe to move " +
+                "the routed experts to system RAM and free the space the prefill graph needs.");
         }
 
         private unsafe (float[] routingWeights, int[] selectedExperts) MoERoute(

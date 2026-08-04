@@ -195,6 +195,10 @@ namespace TensorSharp.Models
             {
                 if (_isMoeLayer == null || !_isMoeLayer[layer] || _tpStackedGate[layer] == null)
                     continue;
+                // --n-cpu-moe: this layer's experts are multiplied on the host
+                // out of the GGUF mmap. Not uploading them IS the VRAM saving.
+                if (MoeCpuOffloadConfig.IsLayerOnCpu(layer))
+                    continue;
                 PreloadStackedShard(_tpStackedGate[layer][rank], bytesPerRank, countPerRank, rank);
                 PreloadStackedShard(_tpStackedUp[layer][rank], bytesPerRank, countPerRank, rank);
                 PreloadStackedShard(_tpStackedDown[layer][rank], bytesPerRank, countPerRank, rank);

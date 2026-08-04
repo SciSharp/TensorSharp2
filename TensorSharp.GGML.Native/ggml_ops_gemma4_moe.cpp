@@ -646,21 +646,6 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                 return 0;
             }
         }
-        // MoE CPU offload and tensor parallelism both segment this graph, and the
-        // TP driver owns the segment schedule across ranks. Rather than nest the
-        // two, decline the fused path so the caller falls back to the per-op
-        // forward, whose MoE dispatch honours the per-layer CPU placement.
-        if (tp_mode)
-        {
-            for (int l = 0; l < num_layers; l++)
-            {
-                if (layers[l].cpu_moe != 0)
-                {
-                    set_last_error("Gemma4 MoE model decode: MoE CPU offload is not supported on the fused tensor-parallel path.");
-                    return 0;
-                }
-            }
-        }
 
         const int H = hidden_size;
         const int totalSeqLen = position + 1;
@@ -929,7 +914,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             // MoE CPU offload: leave the routed-expert tensors null so the bind
             // pass below never asks for a device copy of them. That omission IS
             // the VRAM saving - the host reads the same bytes from the GGUF mmap.
-            if (d.cpu_moe == 0 || host_moe_verify_enabled())
+            // TS_HOST_MOE_VERIFY's on-GPU reference chain needs the experts
+            // resident, which cannot work under TP for an offloaded layer: the
+            // descriptor points at the UNSHARDED stack there (the host computes
+            // the layer once) while these would be the rank's Megatron slice.
+            if (d.cpu_moe == 0 || (host_moe_verify_enabled() && !tp_mode))
             {
                 t.gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.gue_type), d.gue_ne0, d.gue_ne1, nExp);
                 t.down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d.de_type), d.de_ne0, d.de_ne1, nExp);
@@ -1141,8 +1130,12 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                 hm.n_ff = ffMoe;
                 hm.seq_len = 1;
                 hm.hidden = H;
+                // Nothing downstream reduces an offloaded layer's MoE output
+                // (the tp_partial push below belongs to the resident branch
+                // only), so every rank takes the one host result verbatim.
+                hm.tp_reduced = 0;
 
-                if (host_moe_verify_enabled())
+                if (host_moe_verify_enabled() && !tp_mode)
                 {
                     ggml_tensor* vin = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
                     ggml_tensor* vgu = ggml_mul_mat_id(ctx, t.gate_up_exps_t, vin, sel);
@@ -1479,6 +1472,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             g4moe->tp_plan.clear();
             g4moe->tp_plan.graph = graph;
             g4moe->tp_plan.ar_tensor = tp_partial;
+            // Offloaded layers pause this graph too; tp_plan_segments merges
+            // their cuts into the same schedule as the AllReduce ones.
+            g4moe->tp_plan.host_moe = host_moe;
             if (!tp_plan_segments(g4moe->tp_plan, tp_boundary))
             {
                 g4moe->reset();
@@ -2164,6 +2160,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                     hm.n_ff = (int) ffMoe;
                     hm.seq_len = M;
                     hm.hidden = H;
+                    // Nothing downstream reduces it (see the tp_partial guard
+                    // below), so every rank takes the one host result verbatim.
+                    hm.tp_reduced = 0;
                     host_moe.push_back(hm);
                 }
                 else
@@ -2182,7 +2181,10 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                         moe_out = ggml_add(ctx, moe_out, view_u);
                     }
                 }
-                if (tp_mode) tp_partial.push_back(moe_out);
+                // An offloaded layer's moe_out is an INPUT the host writes with
+                // the complete (unsharded) result, so there is nothing to reduce
+                // — and it is not a graph node the planner could cut on anyway.
+                if (tp_mode && d.cpu_moe == 0) tp_partial.push_back(moe_out);
                 ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out, eps), t.post_ffw_norm_2_w);
                 mlp = ggml_add(ctx, mlp, moe_normed);
                 // final residual + layer scale
@@ -2366,13 +2368,6 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         std::vector<int> host_moe_seg_end;
         if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kG4MoeVerifyKernel))
             return 0;
-        // The tensor-parallel driver owns its own segment schedule; nesting the two
-        // is not supported, so decline and let the caller fall back to per-op.
-        if (tp_mode && !host_moe.empty())
-        {
-            set_last_error("Gemma4 MoE model verify: MoE CPU offload is not supported on the fused tensor-parallel path.");
-            return 0;
-        }
 
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
@@ -2495,6 +2490,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             pending.plan.clear();
             pending.plan.graph = graph;
             pending.plan.ar_tensor = tp_partial;
+            // Offloaded layers pause this graph too; tp_plan_segments merges
+            // their cuts into the same schedule as the AllReduce ones.
+            pending.plan.host_moe = host_moe;
             if (!tp_plan_segments(pending.plan, tp_partial))
             {
                 pending.reset();

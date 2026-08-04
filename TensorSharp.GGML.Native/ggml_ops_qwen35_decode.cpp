@@ -570,21 +570,7 @@ namespace
         const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
         if (tp_mode)
             *tp_plan_out = nullptr;
-        // MoE CPU offload and tensor parallelism both segment this graph, and the
-        // TP driver owns the segment schedule across ranks. Rather than nest the
-        // two, decline the fused path so the caller falls back to the per-op
-        // forward, whose MoE dispatch honours the per-layer CPU placement.
-        if (tp_mode)
-        {
-            for (int l = 0; l < num_layers; l++)
-            {
-                if (layers[l].cpu_moe != 0)
-                {
-                    set_last_error("Qwen3.5 model decode: MoE CPU offload is not supported on the fused tensor-parallel path.");
-                    return 0;
-                }
-            }
-        }
+
         const int tp_rank = tp_mode ? g_active_rank : 0;
         const int stacked_experts = tp_mode && num_experts > 0 ? num_experts / tp_degree : num_experts;
         if (tp_mode && num_experts > 0 &&
@@ -1061,7 +1047,12 @@ namespace
                 // bind pass below never asks for a device copy of them. That
                 // omission IS the VRAM saving - the host reads the same bytes
                 // from the GGUF mmap instead.
-                if (d.cpu_moe == 0 || host_moe_verify_enabled())
+                // TS_HOST_MOE_VERIFY builds an on-GPU reference chain alongside
+                // the host one, which needs the experts resident. It cannot do
+                // that under TP for an offloaded layer: there the descriptor
+                // points at the UNSHARDED stack (the host computes the layer
+                // once) while this tensor would be declared rank-sized.
+                if (d.cpu_moe == 0 || (host_moe_verify_enabled() && !tp_mode))
                 {
                     // Under TP the stacked expert tensors hold only this rank's
                     // whole-expert slice; the router dims stay global.
@@ -1094,9 +1085,13 @@ namespace
         std::vector<float> ep_mask_data;
         if (tp_mode && num_experts > 0)
         {
+            // Only layers whose experts are RESIDENT need the LUT. With
+            // --cpu-moe every MoE layer takes the global-routing branch,
+            // so the LUT would end up in no graph node at all -- and the
+            // upload below would then fault on its missing buffer.
             bool any_moe = false;
             for (int l = 0; l < num_layers; l++)
-                if (layers[l].is_moe != 0) { any_moe = true; break; }
+                if (layers[l].is_moe != 0 && layers[l].cpu_moe == 0) { any_moe = true; break; }
             if (any_moe)
             {
                 ep_lut = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, num_experts);
@@ -1490,8 +1485,15 @@ namespace
                 // nullified through the weight mask. The renormalization above
                 // ran on the global weights first, so every rank's masked
                 // weights sum to the single-GPU values across the group.
+                //
+                // An OFFLOADED layer skips all of that: it is evaluated once on
+                // the host over the unsharded expert stack (splitting it per rank
+                // would only serialize on the host backend's one thread pool), so
+                // it keeps the global ids and the unmasked weights and the driver
+                // hands the single result to rank 0 alone — see
+                // HostMoeSegment::tp_reduced.
                 ggml_tensor* sel_ids = sel;
-                if (ep_lut != nullptr)
+                if (ep_lut != nullptr && d.cpu_moe == 0)
                 {
                     ggml_tensor* lut_r = ggml_reshape_3d(ctx, ep_lut, 1, num_experts, 1);
                     ggml_tensor* local_ids = ggml_get_rows(ctx, lut_r, sel);                  // [1, num_used, 1] I32
@@ -1539,13 +1541,19 @@ namespace
                     hm.down_data = d.down_exps;   hm.down_type = d.down_exps_type;
                     hm.down_ne0 = expert_ff;      hm.down_ne1 = H;                   hm.down_bytes = d.down_exps_bytes;
                     hm.activation = 0;            // silu(gate) * up
-                    hm.num_experts = stacked_experts;
+                    // The offloaded stack is never sharded (the descriptor points
+                    // at the whole GGUF tensor even under TP), so the host always
+                    // sees the global expert count and the global ids above.
+                    hm.num_experts = num_experts;
                     hm.n_used = num_experts_used;
                     hm.n_ff = expert_ff;
                     hm.seq_len = 1;
                     hm.hidden = H;
+                    // ffn_down below sums this with the Megatron-split shared
+                    // expert, and that sum IS the layer's AllReduce point.
+                    hm.tp_reduced = tp_mode ? 1 : 0;
 
-                    if (host_moe_verify_enabled())
+                    if (host_moe_verify_enabled() && !tp_mode)
                     {
                         ggml_tensor* vin = ggml_reshape_3d(ctx, ffn_normed, H, 1, 1);
                         ggml_tensor* vg = ggml_mul_mat_id(ctx, t.gate_exps, vin, sel_ids);
@@ -1996,6 +2004,9 @@ namespace
             slot->tp_plan.clear();
             slot->tp_plan.graph = graph;
             slot->tp_plan.ar_tensor = tp_partial;
+            // Offloaded layers pause this graph too; tp_plan_segments merges
+            // their cuts into the same schedule as the AllReduce ones.
+            slot->tp_plan.host_moe = host_moe;
             if (!tp_plan_segments(slot->tp_plan, tp_boundary))
             {
                 slot->tp_plan.clear();

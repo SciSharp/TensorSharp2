@@ -145,6 +145,13 @@ namespace TensorSharp.Models
 
             Parallel.ForEach(work, item =>
             {
+                // An offloaded layer never runs on the accelerator, so it needs
+                // no per-rank slice: the host reads the whole expert stack out of
+                // the GGUF mmap. Skipping it is not just a load-time saving —
+                // materializing the slices would cost a second full copy of the
+                // experts in RAM, which is the opposite of what --cpu-moe is for.
+                if (MoeCpuOffloadConfig.IsLayerOnCpu(item.layer))
+                    return;
                 if (item.isDown)
                     down[item.layer][item.rank] = SliceDownRowParallel(_layerStackedDown[item.layer], item.rank, tp);
                 else
@@ -153,7 +160,7 @@ namespace TensorSharp.Models
 
             for (int layer = 0; layer < n; layer++)
                 for (int r = 0; r < tp; r++)
-                    totalBytes += gateUp[layer][r].TotalRawBytes + down[layer][r].TotalRawBytes;
+                    totalBytes += (gateUp[layer][r]?.TotalRawBytes ?? 0) + (down[layer][r]?.TotalRawBytes ?? 0);
 
             _tpSlicedGateUp = gateUp;
             _tpSlicedDown = down;
@@ -252,6 +259,9 @@ namespace TensorSharp.Models
         {
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
+                // Offloaded layers have no slice at all (see
+                // BuildGemma4TensorSlicedExpertShards); PreloadStackedShard
+                // no-ops on the nulls, and that omission IS the VRAM saving.
                 PreloadStackedShard(_tpSlicedGateUp[layer]?[rank], bytesPerRank, countPerRank, rank);
                 PreloadStackedShard(_tpSlicedDown[layer]?[rank], bytesPerRank, countPerRank, rank);
             }
@@ -323,8 +333,16 @@ namespace TensorSharp.Models
             if (_weights.TryGetValue(downScaleKey, out var downScaleT))
                 downScalePtr = (IntPtr)GetFloatPtr(downScaleT);
 
-            var gu = _tpSlicedGateUp[layer][rank];
-            var dn = _tpSlicedDown[layer][rank];
+            // MoE CPU offload: an offloaded layer is evaluated once on the host,
+            // over the WHOLE expert stack, and every rank takes that one result
+            // (nothing reduces it — see tsg::HostMoeSegment::tp_reduced). So it
+            // has no per-rank slice and the descriptor points at the unsharded
+            // tensors; nothing uploads them.
+            bool layerOnCpu = MoeCpuOffloadConfig.IsLayerOnCpu(layer);
+            var gu = layerOnCpu ? _layerStackedGate[layer] : _tpSlicedGateUp[layer][rank];
+            var dn = layerOnCpu ? _layerStackedDown[layer] : _tpSlicedDown[layer][rank];
+            if (gu == null || dn == null)
+                return false;
 
             args = new Gemma4MoELayerDecodeArgs
             {
@@ -349,6 +367,7 @@ namespace TensorSharp.Models
                 GateUpExps = gu.Data, GueType = gu.GgmlType, GueNe0 = gu.PerExpertNe0, GueNe1 = gu.PerExpertNe1, GueBytes = gu.TotalRawBytes,
                 DownExps = dn.Data, DeType = dn.GgmlType, DeNe0 = dn.PerExpertNe0, DeNe1 = dn.PerExpertNe1, DeBytes = dn.TotalRawBytes,
                 DownExpsScale = downScalePtr,
+                CpuMoe = layerOnCpu ? 1 : 0,
                 PostFfwNorm2W = (IntPtr)GetFloatPtr(postNorm2W),
                 PostFfwNormW = a.PostFfnNorm[layer],
 
@@ -430,7 +449,10 @@ namespace TensorSharp.Models
                             tpDegree: tp, tpPlanOut: planSlot);
 
                         if (planSlot[0] == IntPtr.Zero)
+                        {
+                            WarnTpMoeFusedDeclined("decode", 1);
                             return false;
+                        }
                         _tpMoePlans[r] = planSlot[0];
                     }
 
@@ -502,6 +524,11 @@ namespace TensorSharp.Models
                             mmIsExcept: isExcept, tpDegree: tp, tpPlanOut: planSlot)
                         || planSlot[0] == IntPtr.Zero)
                     {
+                        // Say why, once. The per-op TP fallback below is orders of
+                        // magnitude slower (and, with tensor-sliced experts, cannot
+                        // serve this layer at all), so a silent decline reads as a
+                        // hang or a crash rather than as a fallback.
+                        WarnTpMoeFusedDeclined("prefill", n);
                         return false;
                     }
                     _tpMoePlans[r] = planSlot[0];
@@ -528,5 +555,21 @@ namespace TensorSharp.Models
         }
 
         private bool _tpMoeVerifyLogged;
+        private bool _tpMoeDeclineLogged;
+
+        /// <summary>
+        /// Report, once, that the fused tensor-parallel MoE trunk declined and
+        /// why. Worth a warning rather than a silent fallback: the per-op TP path
+        /// it drops to is ~50x slower, and when the experts are tensor-sliced it
+        /// has no per-expert weights to run at all.
+        /// </summary>
+        private void WarnTpMoeFusedDeclined(string phase, int tokens)
+        {
+            if (_tpMoeDeclineLogged) return;
+            _tpMoeDeclineLogged = true;
+            Console.Error.WriteLine(
+                $"[gemma4-tp] WARNING: the fused tensor-parallel MoE {phase} kernel declined at {tokens} token(s): " +
+                GgmlBasicOps.LastNativeError() + " — falling back to the per-op path.");
+        }
     }
 }

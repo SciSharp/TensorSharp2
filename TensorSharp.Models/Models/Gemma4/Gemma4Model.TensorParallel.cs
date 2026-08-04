@@ -178,6 +178,9 @@ namespace TensorSharp.Models
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 if (!HasMoE(layer)) continue;
+                // --n-cpu-moe: this layer's experts are multiplied on the host
+                // out of the GGUF mmap. Not uploading them IS the VRAM saving.
+                if (MoeCpuOffloadConfig.IsLayerOnCpu(layer)) continue;
                 PreloadStackedShard(_tpStackedGate[layer]?[rank], bytesPerRank, countPerRank, rank);
                 PreloadStackedShard(_tpStackedUp?[layer]?[rank], bytesPerRank, countPerRank, rank);
                 PreloadStackedShard(_tpStackedDown[layer]?[rank], bytesPerRank, countPerRank, rank);
@@ -1597,32 +1600,56 @@ namespace TensorSharp.Models
             var gateShards = _tpStackedGate?[layer];
             var downShards = _tpStackedDown?[layer];
             StackedExpertWeights[] upShards = null;
-            // Megatron-sliced mode: every rank holds ALL experts at 1/tp of the
-            // FFN width (fused [gate|up] layout), so the dispatch runs with
-            // global expert ids and the row-parallel down projection's partial
-            // sums meet in the caller's AllReduce — the same reduction the
-            // whole-expert split needs.
-            bool sliced = gateShards == null || downShards == null;
-            if (sliced)
+            // Two shard layouts and one host layout, in the order they are
+            // checked. Megatron-sliced: every rank holds ALL experts at 1/tp of
+            // the FFN width (fused [gate|up]), so the dispatch runs with global
+            // expert ids and the row-parallel down projection's partial sums meet
+            // in the caller's AllReduce — the same reduction the whole-expert
+            // split needs.
+            //
+            // A layer offloaded by --n-cpu-moe has no per-rank shard at all: its
+            // experts stay in system RAM, unsharded. Reaching here means the fused
+            // trunk declined this shape (a multimodal chunk past position 0, say),
+            // so serve the layer the way that trunk would have — once, on the host,
+            // over the whole expert stack — and give the result to rank 0 alone so
+            // the caller's AllReduce reproduces the single-GPU value exactly.
+            bool layerOnCpu = MoeCpuOffloadConfig.IsLayerOnCpu(layer);
+            bool sliced;
+            if (layerOnCpu)
             {
-                gateShards = _tpSlicedGateUp?[layer];
-                downShards = _tpSlicedDown?[layer];
-                if (gateShards == null || downShards == null)
+                if (_layerStackedGate?[layer] == null || _layerStackedDown?[layer] == null)
                     return false;
+                sliced = true;              // global expert ids, no per-rank filtering
+                gateShards = null;          // resolved per rank below
+                downShards = null;
             }
             else
             {
-                upShards = _tpStackedUp?[layer];
+                sliced = gateShards == null || downShards == null;
+                if (sliced)
+                {
+                    gateShards = _tpSlicedGateUp?[layer];
+                    downShards = _tpSlicedDown?[layer];
+                    if (gateShards == null || downShards == null)
+                        return false;
+                }
+                else
+                {
+                    upShards = _tpStackedUp?[layer];
+                }
             }
 
             int tp = TpDegree;
             int rankOffset = TpRankOffset;
             int nUsed = _numExpertsUsed;
             int perRank = sliced ? _numExperts : _tpExpertsPerRank;
-            bool fusedGateUp = upShards == null;
+            // An offloaded layer reads the unsharded stacks; every other mode
+            // reads its rank's shard (identical shapes across ranks).
+            StackedExpertWeights gateShape = layerOnCpu ? _layerStackedGate[layer] : gateShards[0];
+            bool fusedGateUp = layerOnCpu ? (_layerStackedUp?[layer] == null) : (upShards == null);
             int nFf = fusedGateUp
-                ? (int)(gateShards[0].PerExpertNe1 / 2)
-                : (int)gateShards[0].PerExpertNe1;
+                ? (int)(gateShape.PerExpertNe1 / 2)
+                : (int)gateShape.PerExpertNe1;
 
             float[] perExpertScale = _layerPerExpertScale?[layer];
             int totalRoutes = seqLen * nUsed;
@@ -1693,8 +1720,8 @@ namespace TensorSharp.Models
                 string.Equals(Environment.GetEnvironmentVariable("TS_GGML_LOG_VRAM"), "1", StringComparison.Ordinal))
             {
                 _loggedExpertParallelShapes = true;
-                var g0 = gateShards[0];
-                var d0 = downShards[0];
+                var g0 = gateShape;
+                var d0 = layerOnCpu ? _layerStackedDown[layer] : downShards[0];
                 Console.WriteLine($"  [MoE-EP] seqLen={seqLen} hidden={hiddenSize} nFf={nFf} perRank={perRank} nUsed={nUsed} " +
                     $"fusedGateUp={fusedGateUp} gate=[{g0.PerExpertNe0}x{g0.PerExpertNe1}x{g0.NumExperts}] type={g0.GgmlType} bytes={g0.TotalRawBytes} " +
                     $"down=[{d0.PerExpertNe0}x{d0.PerExpertNe1}x{d0.NumExperts}] type={d0.GgmlType} bytes={d0.TotalRawBytes}");
@@ -1705,9 +1732,18 @@ namespace TensorSharp.Models
             {
                 var alloc = _tpGroup.GetAllocator(r);
                 var output = new Tensor(alloc, DType.Float32, seqLen, hiddenSize);
-                var g = gateShards[r];
-                var d = downShards[r];
-                var u = upShards?[r];
+                // Offloaded: only rank 0 evaluates the (unsharded) experts on the
+                // host; the others contribute zeros, so the AllReduce that
+                // follows yields exactly the single-GPU value.
+                if (layerOnCpu && r != 0)
+                {
+                    Ops.Fill(output, 0f);
+                    moeResults[r] = output;
+                    return;
+                }
+                var g = layerOnCpu ? _layerStackedGate[layer] : gateShards[r];
+                var d = layerOnCpu ? _layerStackedDown[layer] : downShards[r];
+                var u = layerOnCpu ? _layerStackedUp?[layer] : upShards?[r];
 
                 IntPtr upData = u == null ? IntPtr.Zero : u.Data;
                 int upType = u == null ? 0 : u.GgmlType;

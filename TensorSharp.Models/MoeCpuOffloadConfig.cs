@@ -103,11 +103,23 @@ namespace TensorSharp.Models
         public static void SetCpuThreads(int threads)
         {
             CpuThreads = threads > 0 ? threads : 0;
-            // The host matmul runs inside GgmlOps.dll, which reads its thread
-            // count straight from the environment. Publishing it here keeps the
-            // CLI flag and the native default on one source of truth.
+            // The host matmul runs inside GgmlOps, and it must be TOLD the count:
+            // .NET's SetEnvironmentVariable writes only the managed environment on
+            // Linux, so the native std::getenv(TS_CPU_MOE_THREADS) never saw the
+            // flag and --cpu-moe-threads silently did nothing there. The env var
+            // is still published so a child process (and TS_CPU_MOE_THREADS set
+            // from outside) keeps working.
             Environment.SetEnvironmentVariable(EnvVarThreads,
                 CpuThreads > 0 ? CpuThreads.ToString(CultureInfo.InvariantCulture) : null);
+            try
+            {
+                TensorSharp.GGML.GgmlBasicOps.SetHostMoeThreads(CpuThreads);
+            }
+            catch (Exception)
+            {
+                // No GGML native library on this platform/build (MLX-only, say).
+                // The thread count is advisory; never fail start-up over it.
+            }
         }
 
         /// <summary>

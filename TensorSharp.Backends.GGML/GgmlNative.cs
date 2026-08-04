@@ -2533,6 +2533,9 @@ internal enum GgmlIndexReductionOp
         private static extern void TSGgml_SetAsyncCompute(int enabled);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_SetHostMoeThreads(int threads);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GetAsyncCompute();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -4301,6 +4304,19 @@ internal enum GgmlIndexReductionOp
             TSGgml_SetAsyncCompute(enabled ? 1 : 0);
         }
 
+        /// <summary>
+        /// Worker threads for the host-side MoE matmul (<c>--cpu-moe-threads</c>);
+        /// 0 restores the default. Passed explicitly rather than through
+        /// <c>TS_CPU_MOE_THREADS</c> because .NET's
+        /// <see cref="Environment.SetEnvironmentVariable(string,string)"/> writes
+        /// only the managed environment on Linux, so the native
+        /// <c>std::getenv</c> never observed the flag.
+        /// </summary>
+        public static void SetHostMoeThreads(int threads)
+        {
+            TSGgml_SetHostMoeThreads(threads);
+        }
+
         /// <summary>True if async compute is currently enabled on the GGML backend.</summary>
         public static bool GetAsyncCompute()
         {
@@ -4640,6 +4656,13 @@ internal enum GgmlIndexReductionOp
             return markers.Any(marker => File.Exists(Path.Combine(path, marker)))
                 || Directory.Exists(Path.Combine(path, ".git"));
         }
+
+        /// <summary>
+        /// The native bridge's last error string. Public so the model layer can
+        /// report WHY a fused kernel declined: a silent fall-through to a slower
+        /// (or, under TP, unsupported) path is how that class of bug hides.
+        /// </summary>
+        public static string LastNativeError(string fallback = "(no native error)") => GetLastErrorMessage(fallback);
 
         private static string GetLastErrorMessage(string fallback)
         {

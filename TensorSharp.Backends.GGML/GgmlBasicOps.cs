@@ -1447,6 +1447,17 @@ namespace TensorSharp.GGML
         public static void SyncHostBuffer(IntPtr ptr, long byteCount) => GgmlNative.SyncHostBuffer(ptr, byteCount);
         public static void SetAsyncCompute(bool enabled) => GgmlNative.SetAsyncCompute(enabled);
         public static bool GetAsyncCompute() => GgmlNative.GetAsyncCompute();
+
+        /// <summary>
+        /// The native bridge's last error string. Lets a model report WHY a fused
+        /// kernel declined instead of falling through silently to a slower path.
+        /// </summary>
+        public static string LastNativeError(string fallback = "(no native error)")
+            => GgmlNative.LastNativeError(fallback);
+
+        /// <summary>Worker threads for the host-side MoE matmul (<c>--cpu-moe-threads</c>); 0 = default.</summary>
+        public static void SetHostMoeThreads(int threads) => GgmlNative.SetHostMoeThreads(threads);
+
         public static void HostReadBarrier() => GgmlNative.HostReadBarrier();
         public static bool CanInitializeBackend(GgmlBackendType backendType) => GgmlNative.CanInitialize(backendType);
         public static void EnsureBackendAvailable(GgmlBackendType backendType) => GgmlNative.EnsureAvailable(backendType);

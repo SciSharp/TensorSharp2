@@ -137,9 +137,20 @@ namespace
         // dominate the very cost this feature exists to pay down.
         std::mutex g_moe_cpu_backend_mutex;
         ggml_backend_t g_moe_cpu_backend = nullptr;
+        ggml_threadpool_t g_moe_cpu_threadpool = nullptr;
+
+        // Set by TSGgml_SetHostMoeThreads (the --cpu-moe-threads flag). It
+        // cannot travel through TS_CPU_MOE_THREADS alone: .NET's
+        // Environment.SetEnvironmentVariable writes only the managed
+        // environment on Linux, so std::getenv here never sees it and the flag
+        // silently did nothing.
+        std::atomic<int> g_moe_cpu_threads_override{ 0 };
 
         int moe_cpu_thread_count()
         {
+            const int forced = g_moe_cpu_threads_override.load(std::memory_order_relaxed);
+            if (forced > 0)
+                return forced;
             if (const char* e = std::getenv("TS_CPU_MOE_THREADS"))
             {
                 const int n = std::atoi(e);
@@ -150,10 +161,59 @@ namespace
             // cgroup-limited host the two differ by 4x and a pool sized to the
             // latter spends its life waiting at barriers (see the header).
             const int avail = available_cpu_parallelism();
-            // Leave one core for the GPU submission thread: the host matmul and
-            // the accelerator's driver thread run concurrently in this design,
-            // and starving the submitter stalls the next layer's dispatch.
-            return avail > 2 ? avail - 1 : 1;
+            // Leave the REST OF THE PROCESS room, not just one core. The old
+            // avail-1 assumed a single other busy thread; a hosted run has a GPU
+            // submission thread per rank plus Kestrel and the scheduler, and
+            // .NET sizes its own pool from the machine's CPU count rather than
+            // the cgroup quota. Sized to the quota, the MoE pool then leaves the
+            // scheduler nowhere to run those threads and every barrier waits out
+            // whole timeslices.
+            //
+            // Measured, gemma-4-26B-A4B --tp 2 --cpu-moe on a 95-CPU quota
+            // (TensorSharp.Server, 128-token generation): 71 threads 8.2 tok/s,
+            // 64 threads 20.7, 56 threads 21.2 — a cliff, not a slope. The CLI,
+            // which has far fewer background threads, is FLAT from 16 to 94
+            // (prefill 49-62 tok/s), so the pool gains nothing above ~32 anyway
+            // and capping it costs ~3% there while removing a 3x hazard.
+            //
+            // Small hosts keep almost everything: there the pool IS the machine
+            // and the background threads are few. --cpu-moe-threads overrides.
+            if (avail <= 2) return 1;
+            if (avail <= 8) return avail - 1;
+            return avail / 2;
+        }
+
+        // Build (or rebuild) the pool the host MoE runs on. Owned here rather
+        // than left to ggml's per-call default because of `poll`.
+        //
+        // ggml's default worker pool SPINS at every barrier. That is a good
+        // trade when the process owns the machine, and a cliff when it does not:
+        // this backend shares its cgroup quota with the accelerator submission
+        // threads and, in TensorSharp.Server, with Kestrel and the scheduler. A
+        // pool sized to the quota then leaves the scheduler no room to run those
+        // threads, so every barrier waits out whole timeslices. Measured on the
+        // 26B MoE at --tp 2 --cpu-moe: 7.0 tok/s spinning at the quota-sized
+        // default against 19.8 with a pool that leaves headroom. poll = 0 makes
+        // the workers block on a condvar instead, so oversubscription now costs
+        // a wake-up rather than collapsing.
+        void rebuild_moe_cpu_threadpool_locked()
+        {
+            if (g_moe_cpu_backend == nullptr)
+                return;
+            ggml_threadpool_params tpp = ggml_threadpool_params_default(moe_cpu_thread_count());
+            tpp.poll = 0;
+            ggml_threadpool_t pool = ggml_threadpool_new(&tpp);
+            if (pool == nullptr)
+            {
+                // Fall back to ggml's own pool; the thread count still applies.
+                ggml_backend_cpu_set_n_threads(g_moe_cpu_backend, moe_cpu_thread_count());
+                return;
+            }
+            ggml_backend_cpu_set_threadpool(g_moe_cpu_backend, pool);
+            ggml_backend_cpu_set_n_threads(g_moe_cpu_backend, moe_cpu_thread_count());
+            if (g_moe_cpu_threadpool != nullptr)
+                ggml_threadpool_free(g_moe_cpu_threadpool);
+            g_moe_cpu_threadpool = pool;
         }
 
         ggml_backend_t moe_cpu_backend()
@@ -162,8 +222,7 @@ namespace
             if (g_moe_cpu_backend == nullptr)
             {
                 g_moe_cpu_backend = ggml_backend_cpu_init();
-                if (g_moe_cpu_backend != nullptr)
-                    ggml_backend_cpu_set_n_threads(g_moe_cpu_backend, moe_cpu_thread_count());
+                rebuild_moe_cpu_threadpool_locked();
             }
             return g_moe_cpu_backend;
         }
@@ -378,6 +437,7 @@ namespace
         const MoEFFNGraphParams& p,
         const MoECpuGraphBinding& b)
     {
+        const auto t_enter = std::chrono::steady_clock::now();
         ggml_backend_t cpu = moe_cpu_backend();
         if (cpu == nullptr)
         {
@@ -476,7 +536,30 @@ namespace
                 static_cast<std::size_t>(p.num_experts) * sizeof(float));
         }
 
+        // TS_HOST_MOE_TIMING=1: where an offloaded layer's wall clock goes.
+        // Split out because "the host matmul is slow" and "the per-call scratch
+        // allocation is slow" want completely different fixes.
+        static const bool s_timing = []() {
+            const char* e = std::getenv("TS_HOST_MOE_TIMING");
+            return e != nullptr && e[0] == '1';
+        }();
+        const auto t_compute = std::chrono::steady_clock::now();
         const ggml_status status = ggml_backend_graph_compute(cpu, graph);
+        if (s_timing)
+        {
+            const auto t_end = std::chrono::steady_clock::now();
+            static thread_local double acc_setup = 0.0, acc_compute = 0.0;
+            static thread_local int acc_calls = 0;
+            acc_setup += std::chrono::duration<double, std::milli>(t_compute - t_enter).count();
+            acc_compute += std::chrono::duration<double, std::milli>(t_end - t_compute).count();
+            if (++acc_calls % 30 == 0)
+            {
+                std::fprintf(stderr, "[HOSTMOE-TIME] seq=%d calls=%d setup=%.1f ms compute=%.1f ms\n",
+                    p.seq_len, acc_calls, acc_setup, acc_compute);
+                std::fflush(stderr);
+                acc_setup = acc_compute = 0.0;
+            }
+        }
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("MoE CPU offload: host graph compute failed.");
@@ -1306,6 +1389,16 @@ namespace tsg
         return moe_ffn_prefill_graph_impl(p) != 0;
     }
 
+    void moe_set_host_thread_count(int threads)
+    {
+        g_moe_cpu_threads_override.store(threads > 0 ? threads : 0, std::memory_order_relaxed);
+        // The pool latches its thread count at creation, so rebuild it when one
+        // already exists (the flag is parsed before the model loads, but a
+        // reload must not keep the previous run's count either).
+        std::lock_guard<std::mutex> lock(g_moe_cpu_backend_mutex);
+        rebuild_moe_cpu_threadpool_locked();
+    }
+
     void moe_ffn_host_release()
     {
         std::lock_guard<std::mutex> lock(g_moe_cpu_backend_mutex);
@@ -1313,6 +1406,11 @@ namespace tsg
         {
             ggml_backend_free(g_moe_cpu_backend);
             g_moe_cpu_backend = nullptr;
+        }
+        if (g_moe_cpu_threadpool != nullptr)
+        {
+            ggml_threadpool_free(g_moe_cpu_threadpool);
+            g_moe_cpu_threadpool = nullptr;
         }
     }
 
@@ -1388,6 +1486,69 @@ namespace tsg
         return true;
     }
 
+    bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
+                                  HostMoeStagedInputs* staged)
+    {
+        if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
+            hm.weights == nullptr || hm.moe_out == nullptr)
+        {
+            set_last_error(std::string(kernel_name) + ": incomplete host-MoE segment binding.");
+            return false;
+        }
+
+        // Scratch reused across layers, tokens and ranks. The shapes are fixed
+        // for a given model, so after the first token these never reallocate.
+        static thread_local std::vector<float> s_moe_in;
+        static thread_local std::vector<float> s_weights;
+        static thread_local std::vector<std::int32_t> s_ids;
+
+        const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);
+        const std::size_t route_count = static_cast<std::size_t>(hm.n_used) * static_cast<std::size_t>(hm.seq_len);
+        s_moe_in.resize(act_count);
+        s_ids.resize(route_count);
+        s_weights.resize(route_count);
+        out.resize(act_count);
+
+        // The caller synchronized the segment that produced these, so the reads
+        // see its results.
+        ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
+        ggml_backend_tensor_get(hm.sel_ids, s_ids.data(), 0, route_count * sizeof(std::int32_t));
+        ggml_backend_tensor_get(hm.weights, s_weights.data(), 0, route_count * sizeof(float));
+
+        if (staged != nullptr)
+        {
+            staged->moe_in = s_moe_in.data();
+            staged->sel_ids = s_ids.data();
+            staged->weights = s_weights.data();
+        }
+
+        return moe_ffn_host_experts(
+            s_moe_in.data(), out.data(),
+            hm.seq_len, hm.hidden, hm.n_ff,
+            hm.num_experts, hm.n_used,
+            s_ids.data(), s_weights.data(),
+            hm.gate_data, hm.gate_type, hm.gate_ne0, hm.gate_ne1, hm.gate_bytes,
+            hm.up_data,   hm.up_type,   hm.up_ne0,   hm.up_ne1,   hm.up_bytes,
+            hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
+            hm.gate_bias, hm.up_bias, hm.down_bias,
+            hm.activation, hm.oai_alpha, hm.oai_limit);
+    }
+
+    void host_moe_upload_segment(const HostMoeSegment& hm, const float* data)
+    {
+        const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);
+        ggml_backend_tensor_set(hm.moe_out, data, 0, act_count * sizeof(float));
+    }
+
+    void host_moe_zero_segment(const HostMoeSegment& hm)
+    {
+        static thread_local std::vector<float> s_zeros;
+        const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);
+        if (s_zeros.size() < act_count)
+            s_zeros.assign(act_count, 0.0f);
+        ggml_backend_tensor_set(hm.moe_out, s_zeros.data(), 0, act_count * sizeof(float));
+    }
+
     bool host_moe_execute_segments(
         ggml_cgraph* graph,
         const std::vector<HostMoeSegment>& segments,
@@ -1400,12 +1561,10 @@ namespace tsg
             return false;
         }
 
-        // Scratch reused across layers and tokens. The shapes are fixed for a
-        // given model, so after the first token these never reallocate.
-        static thread_local std::vector<float> s_moe_in;
+        // One result buffer reused across layers and tokens; the seam helper
+        // owns the input staging. Shapes are fixed for a given model, so after
+        // the first token neither reallocates.
         static thread_local std::vector<float> s_moe_out;
-        static thread_local std::vector<float> s_weights;
-        static thread_local std::vector<std::int32_t> s_ids;
 
         // TS_HOST_MOE_DEBUG=1: print the segment plan and each seam's activation
         // norms. An all-zero moe_in means the cut fired before the layer actually
@@ -1443,41 +1602,15 @@ namespace tsg
             if (seg >= segments.size())
                 continue;
 
+            // ggml_backend_graph_compute above already synchronized, so the
+            // helper's reads see this segment's results.
             const HostMoeSegment& hm = segments[seg];
-            if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
-                hm.weights == nullptr || hm.moe_out == nullptr)
-            {
-                set_last_error(std::string(kernel_name) + ": incomplete host-MoE segment binding.");
+            HostMoeStagedInputs staged;
+            if (!host_moe_compute_segment(hm, s_moe_out, kernel_name, &staged))
                 return false;
-            }
 
             const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);
             const std::size_t route_count = static_cast<std::size_t>(hm.n_used) * static_cast<std::size_t>(hm.seq_len);
-            s_moe_in.resize(act_count);
-            s_moe_out.resize(act_count);
-            s_ids.resize(route_count);
-            s_weights.resize(route_count);
-
-            // ggml_backend_graph_compute above already synchronized, so these
-            // reads see the segment's results.
-            ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
-            ggml_backend_tensor_get(hm.sel_ids, s_ids.data(), 0, route_count * sizeof(std::int32_t));
-            ggml_backend_tensor_get(hm.weights, s_weights.data(), 0, route_count * sizeof(float));
-
-            if (!moe_ffn_host_experts(
-                    s_moe_in.data(), s_moe_out.data(),
-                    hm.seq_len, hm.hidden, hm.n_ff,
-                    hm.num_experts, hm.n_used,
-                    s_ids.data(), s_weights.data(),
-                    hm.gate_data, hm.gate_type, hm.gate_ne0, hm.gate_ne1, hm.gate_bytes,
-                    hm.up_data,   hm.up_type,   hm.up_ne0,   hm.up_ne1,   hm.up_bytes,
-                    hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
-                    hm.gate_bias, hm.up_bias, hm.down_bias,
-                    hm.activation, hm.oai_alpha, hm.oai_limit))
-            {
-                // moe_ffn_host_experts already set a specific error.
-                return false;
-            }
 
             if (hm.verify_gpu != nullptr)
             {
@@ -1506,22 +1639,22 @@ namespace tsg
                 }
             }
 
-            ggml_backend_tensor_set(hm.moe_out, s_moe_out.data(), 0, act_count * sizeof(float));
+            host_moe_upload_segment(hm, s_moe_out.data());
 
             if (debug_this_call)
             {
                 double nin = 0.0, nout = 0.0;
                 for (std::size_t i = 0; i < act_count; ++i)
                 {
-                    nin += (double) s_moe_in[i] * s_moe_in[i];
+                    nin += (double) staged.moe_in[i] * staged.moe_in[i];
                     nout += (double) s_moe_out[i] * s_moe_out[i];
                 }
                 std::fprintf(stderr,
                     "[HOSTMOE-DBG]   seg=%d layer=%d seq=%d |in|=%.4f |out|=%.4f ids[0..3]=%d,%d,%d,%d w[0..1]=%.4f,%.4f\n",
                     (int) seg, hm.layer, hm.seq_len, std::sqrt(nin), std::sqrt(nout),
-                    s_ids[0], s_ids.size() > 1 ? s_ids[1] : -1,
-                    s_ids.size() > 2 ? s_ids[2] : -1, s_ids.size() > 3 ? s_ids[3] : -1,
-                    s_weights[0], s_weights.size() > 1 ? s_weights[1] : 0.0f);
+                    staged.sel_ids[0], route_count > 1 ? staged.sel_ids[1] : -1,
+                    route_count > 2 ? staged.sel_ids[2] : -1, route_count > 3 ? staged.sel_ids[3] : -1,
+                    staged.weights[0], route_count > 1 ? staged.weights[1] : 0.0f);
                 std::fflush(stderr);
             }
         }
@@ -1531,6 +1664,15 @@ namespace tsg
 
 extern "C"
 {
+    // Worker threads for the host-side MoE matmul (--cpu-moe-threads). 0 =
+    // default (available_cpu_parallelism() - 1). Safe to call before any
+    // backend exists; it re-applies to a live one.
+    TSG_EXPORT void TSGgml_SetHostMoeThreads(int threads)
+    {
+        try { tsg::moe_set_host_thread_count(threads); }
+        catch (...) { /* thread count is advisory; never fail the caller */ }
+    }
+
     // Fused MoE FFN prefill (Mixture-of-Experts SwiGLU FFN).
     //
     // Computes the standard MoE FFN body in a single GGML graph dispatch:

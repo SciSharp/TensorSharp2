@@ -647,13 +647,84 @@ namespace tsg
     // asynchronously, AllReduce the segment's partials on-device, move to k+1 —
     // so the activations never leave VRAM and the host issues 2*L graph launches
     // per token instead of ~L*30 op round trips.
+    //
+    // HostMoeSegment (MoE CPU offload, --n-cpu-moe) is the second kind of pause
+    // the same graph can need, so it is declared here rather than down in the
+    // MoE section: a TpRankPlan carries the offloaded layers' seams and the two
+    // schedules merge into one seg_end list. Its own contract is documented
+    // under "Whole-model decode graph segmentation for MoE CPU offload" below.
+    struct HostMoeSegment
+    {
+        int layer = 0;
+
+        // --- graph tensors ---
+        // Read back from the accelerator after the segment ends.
+        ggml_tensor* moe_in = nullptr;     // F32 [hidden, seq]
+        ggml_tensor* sel_ids = nullptr;    // I32 [n_used, seq]
+        ggml_tensor* weights = nullptr;    // F32 [n_used, seq] (or [1, n_used, seq])
+        // Written by the host before the next segment runs. Must be flagged BOTH
+        // input and output: ggml-alloc pre-allocates inputs but still frees them
+        // after their last consumer, and this one is written from outside the
+        // graph, so it has to stay pinned for the whole pass.
+        ggml_tensor* moe_out = nullptr;    // F32 [hidden, seq]
+        // Optional on-GPU reference chain (TS_HOST_MOE_VERIFY=1).
+        ggml_tensor* verify_gpu = nullptr;
+
+        // --- host expert weights (never uploaded) ---
+        void* gate_data = nullptr;  int gate_type = 0;  std::int64_t gate_ne0 = 0, gate_ne1 = 0, gate_bytes = 0;
+        void* up_data = nullptr;    int up_type = 0;    std::int64_t up_ne0 = 0,   up_ne1 = 0,   up_bytes = 0;
+        void* down_data = nullptr;  int down_type = 0;  std::int64_t down_ne0 = 0, down_ne1 = 0, down_bytes = 0;
+        const float* gate_bias = nullptr;
+        const float* up_bias = nullptr;
+        const float* down_bias = nullptr;
+
+        int activation = 0;          // tsg MoE activation enum (see moe_ffn_host_experts)
+        float oai_alpha = 1.702f;
+        float oai_limit = 7.0f;
+
+        int num_experts = 0;
+        int n_used = 0;
+        int seq_len = 1;             // 1 for autoregressive decode, C for DiffusionGemma blocks
+        int hidden = 0;
+        int n_ff = 0;
+
+        // --- tensor parallelism ---
+        // Under TP the offloaded layer is computed ONCE, on the host, from the
+        // unsharded expert weights: the host backend is a single mutex-guarded
+        // thread pool, so splitting the matmul across ranks would serialize
+        // anyway while costing an extra download per rank. What differs is
+        // where the one result goes, and that depends on whether the graph
+        // still reduces it downstream:
+        //
+        //   tp_reduced = 1  the layer's MoE output feeds a later AllReduce
+        //                   (Qwen3.5: moe_out + Megatron shared expert). Rank 0
+        //                   gets the full value, every other rank gets zeros, so
+        //                   the collective sums to exactly the single-GPU value.
+        //   tp_reduced = 0  nothing reduces it (Gemma 4 skips the MoE partial
+        //                   when the layer is offloaded). Every rank gets the
+        //                   full value.
+        //
+        // Ignored outside tp_execute_plans.
+        int tp_reduced = 0;
+    };
+
     struct TpRankPlan
     {
         ggml_cgraph* graph = nullptr;
         // Exclusive end node index of each segment; the last entry is n_nodes.
         std::vector<int> seg_end;
         // Partial tensor to reduce after segment k (size == seg_end.size()-1).
+        // May be null at a boundary that exists only to hand a layer's MoE to
+        // the host — see host_moe below.
         std::vector<ggml_tensor*> ar_tensor;
+        // MoE CPU offload under tensor parallelism. The offloaded layers' seams
+        // are boundaries too, so the two segment schedules are MERGED into the
+        // one seg_end above rather than nested: host_moe_at[k] is the index into
+        // host_moe of the seam that runs after segment k, or -1 when segment k
+        // ends in an AllReduce only. Filled by tp_plan_segments from host_moe,
+        // which the kernel sets before planning.
+        std::vector<HostMoeSegment> host_moe;
+        std::vector<int> host_moe_at;
         // Optional result download, performed after the final synchronize.
         ggml_tensor* out_tensor = nullptr;
         void* out_host = nullptr;
@@ -668,6 +739,8 @@ namespace tsg
             graph = nullptr;
             seg_end.clear();
             ar_tensor.clear();
+            host_moe.clear();
+            host_moe_at.clear();
             out_tensor = nullptr;
             out_host = nullptr;
             out_bytes = 0;
@@ -737,6 +810,13 @@ namespace tsg
         const float* gate_bias, const float* up_bias, const float* down_bias,
         int activation_type, float oai_alpha, float oai_limit);
 
+    // Worker-thread count for the host MoE matmul (--cpu-moe-threads). Zero
+    // restores the default (available_cpu_parallelism() - 1). Must be an
+    // explicit call rather than an environment variable: .NET's
+    // Environment.SetEnvironmentVariable does not write the native environment
+    // on Linux, so std::getenv here never observed the flag.
+    void moe_set_host_thread_count(int threads);
+
     // Free the persistent host MoE backend (thread pool). Called from the
     // backend teardown path so a model reload does not leak worker threads.
     void moe_ffn_host_release();
@@ -778,41 +858,9 @@ namespace tsg
     // This is the same segmented-replay mechanism tp_execute_plans uses for
     // tensor parallelism, factored out so all four kernels share one
     // implementation (and one place where the seam can be got wrong).
-    struct HostMoeSegment
-    {
-        int layer = 0;
-
-        // --- graph tensors ---
-        // Read back from the accelerator after the segment ends.
-        ggml_tensor* moe_in = nullptr;     // F32 [hidden, seq]
-        ggml_tensor* sel_ids = nullptr;    // I32 [n_used, seq]
-        ggml_tensor* weights = nullptr;    // F32 [n_used, seq] (or [1, n_used, seq])
-        // Written by the host before the next segment runs. Must be flagged BOTH
-        // input and output: ggml-alloc pre-allocates inputs but still frees them
-        // after their last consumer, and this one is written from outside the
-        // graph, so it has to stay pinned for the whole pass.
-        ggml_tensor* moe_out = nullptr;    // F32 [hidden, seq]
-        // Optional on-GPU reference chain (TS_HOST_MOE_VERIFY=1).
-        ggml_tensor* verify_gpu = nullptr;
-
-        // --- host expert weights (never uploaded) ---
-        void* gate_data = nullptr;  int gate_type = 0;  std::int64_t gate_ne0 = 0, gate_ne1 = 0, gate_bytes = 0;
-        void* up_data = nullptr;    int up_type = 0;    std::int64_t up_ne0 = 0,   up_ne1 = 0,   up_bytes = 0;
-        void* down_data = nullptr;  int down_type = 0;  std::int64_t down_ne0 = 0, down_ne1 = 0, down_bytes = 0;
-        const float* gate_bias = nullptr;
-        const float* up_bias = nullptr;
-        const float* down_bias = nullptr;
-
-        int activation = 0;          // tsg MoE activation enum (see moe_ffn_host_experts)
-        float oai_alpha = 1.702f;
-        float oai_limit = 7.0f;
-
-        int num_experts = 0;
-        int n_used = 0;
-        int seq_len = 1;             // 1 for autoregressive decode, C for DiffusionGemma blocks
-        int hidden = 0;
-        int n_ff = 0;
-    };
+    // HostMoeSegment itself is declared above, next to TpRankPlan: a tensor-
+    // parallel plan carries the offloaded layers' seams, so the two segment
+    // schedules merge into one and the type has to precede both.
 
     // TS_HOST_MOE_VERIFY=1: build the on-GPU expert chain alongside the host one
     // and print their divergence per layer. Only for A/B validating the seam on
@@ -841,6 +889,25 @@ namespace tsg
         const std::vector<HostMoeSegment>& segments,
         const std::vector<int>& seg_end,
         const char* kernel_name);
+
+    // One seam, split so tensor parallelism can reuse it. `compute` downloads
+    // the segment's inputs from the ACTIVE rank and leaves the expert result in
+    // `out` (resized to hidden*seq_len) without uploading; `upload` pushes a
+    // result into the active rank's moe_out, and `zero` fills it with zeros for
+    // the ranks that must not contribute (see HostMoeSegment::tp_reduced).
+    // Staged copies of a seam's inputs, valid until the next
+    // host_moe_compute_segment call on the same thread. Only the diagnostics
+    // want them; pass nullptr otherwise.
+    struct HostMoeStagedInputs
+    {
+        const float* moe_in = nullptr;
+        const std::int32_t* sel_ids = nullptr;
+        const float* weights = nullptr;
+    };
+    bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
+                                  HostMoeStagedInputs* staged = nullptr);
+    void host_moe_upload_segment(const HostMoeSegment& hm, const float* data);
+    void host_moe_zero_segment(const HostMoeSegment& hm);
 
     // Memoized static device properties. ggml_backend_dev_get_props also
     // refreshes free/total device memory, which some backends answer with an

@@ -1493,12 +1493,7 @@ namespace TensorSharp.Models
         // GGML graph for all layers). Default on; TS_QWEN35_PREFILL_VERIFY=0 forces
         // the per-op layer loop for A/B comparison.
         private static readonly bool _prefillVerifyEnabled =
-            !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_PREFILL_VERIFY"), "0", StringComparison.Ordinal)
-        // MoE CPU offload keeps some layers' experts in system RAM; the fused
-        // whole-model graph inlines every expert matmul into ONE accelerator
-        // graph and would upload them again. Route those runs through the
-        // per-layer path, whose MoE dispatch honours the per-layer placement.
-        && !MoeCpuOffloadConfig.IsEnabled;
+            !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_PREFILL_VERIFY"), "0", StringComparison.Ordinal);
 
         /// <summary>
         /// Whether a dense (text-only) prefill chunk can run through the fused
