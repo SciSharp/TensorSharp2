@@ -112,18 +112,20 @@ namespace TensorSharp.Models
         /// Translate the process-wide <see cref="MoeCpuOffloadConfig"/> into the
         /// native loader's routed-expert offload policy.
         ///
-        /// <para>Unlike the other MoE models, DeepSeek V4 defaults to
-        /// <see cref="GgmlDeepSeek4Native.CpuMoeAuto"/> instead of "no offload":
-        /// 91% of a V4 Flash checkpoint's bytes are routed experts, and at
-        /// Q8_K_XL the weights (151 GiB) outweigh even three 48 GiB cards, so
-        /// without a spill the load can only end in an out-of-memory abort. Auto
-        /// offloads the fewest leading layers that make it fit and says so; an
-        /// explicit --n-cpu-moe / --cpu-moe is honored as given.</para>
+        /// <para>Offload is OFF unless the operator asks for it, exactly as it is
+        /// for every other architecture. DeepSeek V4 used to default to an
+        /// automatic spill because a Q8_K_XL checkpoint (151 GiB) outweighs most
+        /// hosts, but choosing that silently is the wrong trade on a host that
+        /// *does* have the VRAM: it moves ~29 GiB of experts to the CPU and costs
+        /// most of the decode throughput for no reason. A host that genuinely
+        /// cannot fit the model now gets a load error naming the fewest layers
+        /// that would (see the "[dsv4] does not fit" message), which is a better
+        /// answer than a silent slowdown or an out-of-memory abort.</para>
         /// </summary>
         private static int ResolveCpuMoeLayers()
         {
             if (!MoeCpuOffloadConfig.IsExplicitlySet)
-                return GgmlDeepSeek4Native.CpuMoeAuto;
+                return 0;
             return MoeCpuOffloadConfig.AllLayers ? int.MaxValue : MoeCpuOffloadConfig.CpuMoeLayers;
         }
 

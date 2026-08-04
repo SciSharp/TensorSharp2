@@ -1354,15 +1354,32 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
 
         if (n_cpu_moe_req < 0)
         {
-            n_cpu_moe = std::min(need_cpu_moe, hp.n_layer);   // auto
+            n_cpu_moe = std::min(need_cpu_moe, hp.n_layer);   // opt-in auto
         }
         else
         {
-            n_cpu_moe = std::min(n_cpu_moe_req, hp.n_layer);  // operator's choice, honored as asked
+            n_cpu_moe = std::min(n_cpu_moe_req, hp.n_layer);  // operator's choice
             if (n_cpu_moe < need_cpu_moe && need_cpu_moe <= hp.n_layer)
-                fprintf(stderr, "[dsv4] --n-cpu-moe %d does not free enough VRAM for this model on %d device(s); "
-                        "%d is the fewest layers that fit. Loading as asked -- expect an out-of-memory failure.\n",
-                        n_cpu_moe, n_gpu, need_cpu_moe);
+            {
+                // Decline instead of loading into a certain out-of-memory
+                // abort. Naming WHICH number would work is the whole value
+                // here: the operator cannot derive it from the model size,
+                // because what has to fit is the weights PLUS this context's
+                // KV caches.
+                size_t free_total = 0;
+                for (int d = 0; d < n_gpu; d++) free_total += dev_free[d];
+                size_t would_free = 0;
+                for (int il = 0; il < need_cpu_moe && il < hp.n_layer; il++) would_free += layer_exps_bytes[il];
+                fprintf(stderr,
+                        "[dsv4] not enough VRAM: %.1f GiB of weights plus this context's KV caches against "
+                        "%.1f GiB free across %d device(s)%s. Re-run with --n-cpu-moe %d (moves the routed "
+                        "experts of the first %d layer(s), %.1f GiB, to system RAM) or --cpu-moe to offload "
+                        "every layer.\n",
+                        total_bytes / 1073741824.0, free_total / 1073741824.0, n_gpu,
+                        n_cpu_moe > 0 ? " at the requested offload" : "",
+                        need_cpu_moe, need_cpu_moe, would_free / 1073741824.0);
+                return nullptr;
+            }
         }
 
         if (need_cpu_moe > hp.n_layer)

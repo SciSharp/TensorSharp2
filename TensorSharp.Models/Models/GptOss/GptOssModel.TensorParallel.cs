@@ -55,7 +55,10 @@ namespace TensorSharp.Models
                 errors.Add($"Attention heads ({Config.NumHeads}) not divisible by global TP degree ({tp})");
             if (Config.NumKVHeads % tp != 0)
                 errors.Add($"KV heads ({Config.NumKVHeads}) not divisible by global TP degree ({tp})");
-            if (_expertFfnLength > 0 && _expertFfnLength % tp != 0)
+            // Expert parallelism partitions whole experts, so it constrains the
+            // expert COUNT and places nothing on the per-expert FFN width. Only
+            // the per-expert slicing path needs that.
+            if (_expertFfnLength > 0 && _expertFfnLength % tp != 0 && !CanUseGgmlExpertParallelMoE())
                 errors.Add($"Expert FFN length ({_expertFfnLength}) not divisible by global TP degree ({tp})");
             // Tensor parallelism runs on the multi-GPU backends: direct CUDA and
             // the GGML CUDA/Vulkan backends (one ggml backend per GPU).
@@ -94,11 +97,13 @@ namespace TensorSharp.Models
                     Config.NumKVHeads * headDim);  // V
             }
 
+            // MoE expert weights: whole-expert partitioning when the batched
+            // dispatch can take it, per-expert slicing otherwise. FIRST, because
+            // the bias sharding below asks which layout won.
+            ShardGptOssMoeWeightsForTP();
+
             // Shard QKV bias (column-parallel: split along output dim)
             ShardGptOssBiasesForTP();
-
-            // MoE expert weights: tensor-parallel experts
-            ShardGptOssMoeWeightsForTP();
 
             Console.WriteLine($"  GptOss TP weight sharding complete ({TpDegree} GPUs).");
         }
@@ -126,6 +131,9 @@ namespace TensorSharp.Models
                     Config.NumKVHeads * headDim);  // V
 
                 // Expert gate_up biases: segment-aware column-parallel [gate|up].
+                // Expert-parallel ranks own whole experts, so they take the
+                // bias whole (sliced by expert at load, not by width).
+                if (UsesExpertParallelMoE) continue;
                 for (int e = 0; e < _numExperts; e++)
                     ShardFusedGateUpBiasColumnParallel(prefix + $"ffn_gate_up_exps.{e}.bias");
             }
@@ -134,6 +142,14 @@ namespace TensorSharp.Models
         private void ShardGptOssMoeWeightsForTP()
         {
             int tp = TpDegree;
+
+            // First choice: partition WHOLE experts across ranks. That is a
+            // zero-copy view and it keeps the batched mul_mat_id dispatch the
+            // single-GPU path uses; slicing inside each expert forces the
+            // per-(token, expert) host loop below, which measured 34x slower
+            // than one GPU. See GptOssModel.TensorParallelGgmlMoE.cs.
+            if (BuildGptOssExpertParallelShards())
+                return;
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
@@ -827,6 +843,15 @@ namespace TensorSharp.Models
                     tokenMap[pos] = s;
                     weightMap[pos] = routeWeights[s * nUsed + k];
                 }
+
+            // Expert-parallel: each rank runs ONE batched dispatch over the
+            // experts it owns, instead of walking all 32 through host staging.
+            if (UsesExpertParallelMoE
+                && TryGptOssMoEExpertParallel(normed, results, selectedExperts, routeWeights, layer, seqLen))
+            {
+                _tpGroup.AllReduce(results);
+                return results;
+            }
 
             long rowBytes = (long)hiddenSize * sizeof(float);
 

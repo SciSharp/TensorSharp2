@@ -522,15 +522,30 @@ namespace TensorSharp.Cuda
             int nCpuMoe;
             if (nCpuMoeReq < 0)
             {
-                nCpuMoe = need;   // auto
+                nCpuMoe = need;   // opt-in auto
             }
             else
             {
-                nCpuMoe = Math.Min(nCpuMoeReq, nLayer);   // operator's choice, honored as asked
+                nCpuMoe = Math.Min(nCpuMoeReq, nLayer);   // operator's choice
                 if (nCpuMoe < need)
-                    Console.Error.WriteLine($"[dsv4-cuda] --n-cpu-moe {nCpuMoe} does not free enough VRAM for this " +
-                        $"model on {nDev} device(s); {need} is the fewest layers that fit. Loading as asked -- " +
-                        "expect an out-of-memory failure.");
+                {
+                    // Decline instead of loading into a certain out-of-memory
+                    // abort. Naming WHICH number would work is the whole value
+                    // here: the operator cannot derive it from the model size,
+                    // because what has to fit is the weights PLUS this context's
+                    // KV caches.
+                    long freeTotal = 0;
+                    for (int d = 0; d < nDev; d++) freeTotal += freeBytes[d];
+                    long weightBytes = dsparkBytes, wouldFree = 0;
+                    foreach (long b in layerBytes) weightBytes += b;
+                    for (int il = 0; il < need && il < nLayer; il++) wouldFree += layerExpBytes[il];
+                    throw new InvalidOperationException(
+                        $"[dsv4-cuda] not enough VRAM: {weightBytes / (double)(1L << 30):F1} GiB of weights plus " +
+                        $"this context's KV caches against {freeTotal / (double)(1L << 30):F1} GiB free across " +
+                        $"{nDev} device(s)" + (nCpuMoe > 0 ? " at the requested offload" : string.Empty) +
+                        $". Re-run with --n-cpu-moe {need} (moves the routed experts of the first {need} layer(s), " +
+                        $"{wouldFree / (double)(1L << 30):F1} GiB, to system RAM) or --cpu-moe to offload every layer.");
+                }
             }
 
             // Balance: smallest peak budget fraction that still fits.

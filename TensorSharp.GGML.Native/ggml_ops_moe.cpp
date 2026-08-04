@@ -139,6 +139,16 @@ namespace
         ggml_backend_t g_moe_cpu_backend = nullptr;
         ggml_threadpool_t g_moe_cpu_threadpool = nullptr;
 
+        // ONE host MoE runs at a time. The backend is a singleton with a shared
+        // work buffer and a shared thread pool, so two callers computing on it
+        // concurrently corrupt each other — which is exactly what a tensor-
+        // parallel MoE layer does: RunPerRank drives every rank at once, and
+        // with the experts offloaded each rank asks this backend for its slice.
+        // (It crashed in the GPT-OSS expert-parallel path; every other caller
+        // was single-threaded by luck rather than by design.) Serializing costs
+        // nothing real: the pool already owns every core it is allowed to use.
+        std::mutex g_moe_cpu_compute_mutex;
+
         // Set by TSGgml_SetHostMoeThreads (the --cpu-moe-threads flag). It
         // cannot travel through TS_CPU_MOE_THREADS alone: .NET's
         // Environment.SetEnvironmentVariable writes only the managed
@@ -444,6 +454,9 @@ namespace
             set_last_error("MoE CPU offload: failed to initialise the host ggml CPU backend.");
             return 0;
         }
+        // Held for the whole body: the scratch allocation, the host-pointer
+        // wraps and the compute all run against the one shared backend.
+        std::lock_guard<std::mutex> compute_lock(g_moe_cpu_compute_mutex);
 
         // The accelerator may still have writes in flight targeting hidden_in
         // (the previous layer's output) and the routing arrays. The host is

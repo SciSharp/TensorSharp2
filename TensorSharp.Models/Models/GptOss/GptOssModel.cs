@@ -197,6 +197,11 @@ namespace TensorSharp.Models
             FuseExpertGateUpWeights();
             FuseQKVWeights();
 
+            // Before the TP sharding, not after: whole-expert partitioning is
+            // built from these stacked tensors, so the sharder has to be able to
+            // ask whether they exist (see BuildGptOssExpertParallelShards).
+            InitMoeStackedWeights(preFuseGateBias, preFuseUpBias);
+
             if (IsTensorParallel)
             {
                 ValidateGptOssTpConstraints();
@@ -219,7 +224,6 @@ namespace TensorSharp.Models
                 InitKVCache(initialCacheLength, maxContextLength);
 
             PrecomputeConstants();
-            InitMoeStackedWeights(preFuseGateBias, preFuseUpBias);
         }
 
         // Build a per-(layer,expert) snapshot of bias arrays before FuseExpertGateUpWeights
