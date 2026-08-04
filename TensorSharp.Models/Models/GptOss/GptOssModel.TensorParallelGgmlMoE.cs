@@ -50,6 +50,11 @@ namespace TensorSharp.Models
         private int _tpExpertsPerRank;
         private bool _tpEpLogged;
 
+        /// <summary>Disable with TS_GPTOSS_TP_EXPERT_PARALLEL=0 (A/B against the
+        /// per-expert slicing path).</summary>
+        private static readonly bool _tpExpertParallelEnabled =
+            Environment.GetEnvironmentVariable("TS_GPTOSS_TP_EXPERT_PARALLEL") != "0";
+
         /// <summary>
         /// True when the routed experts are partitioned by whole expert rather
         /// than sliced inside each expert.
@@ -64,7 +69,7 @@ namespace TensorSharp.Models
         private bool CanUseGgmlExpertParallelMoE()
         {
             int tp = GlobalTpDegree;
-            if (!IsGgmlBackend || _numExperts <= 0 || tp <= 1 || (_numExperts % tp) != 0)
+            if (!_tpExpertParallelEnabled || !IsGgmlBackend || _numExperts <= 0 || tp <= 1 || (_numExperts % tp) != 0)
                 return false;
             // A foreign route is neutralised by pointing it at an unused LOCAL
             // expert id, which requires there to be one.

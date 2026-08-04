@@ -144,11 +144,13 @@ namespace TensorSharp.Models
             }
         }
 
-        /// <param name="nCpuMoe">Routed-expert CPU offload policy: -1 auto (the
-        /// fewest leading layers that make the model fit the visible VRAM), 0
-        /// none, N the first N layers, <see cref="int.MaxValue"/> every layer.</param>
+        /// <param name="nCpuMoe">Routed-expert CPU offload policy: 0 none (the
+        /// default — offload is opt-in, and a model that does not fit is refused
+        /// with the number of layers that would make it fit), N the first N
+        /// layers, <see cref="int.MaxValue"/> every layer, -1 auto (the fewest
+        /// leading layers that make the model fit; opt-in only).</param>
         public DeepSeek4CudaExecutor(string ggufPath, int maxContext, int nUbatch, int nGpu, string dsparkPath = null,
-            int nCpuMoe = -1)
+            int nCpuMoe = 0)
         {
             var sw = Stopwatch.StartNew();
             bool stats = ParseEnvInt("TS_DSV4_LOAD_STATS", 0) != 0;
@@ -261,6 +263,12 @@ namespace TensorSharp.Models
                 _shards.Add(_dsparkGguf);
                 _shardPaths.Add(dsparkPath);
             }
+
+            // Before the split sizes anything: a shard cut short by an
+            // interrupted download would otherwise fail as a short read well
+            // into the upload, with the weight buffers already committed.
+            foreach (var shard in _shards)
+                shard.ThrowIfTruncated();
 
             for (int s = 0; s < _shards.Count; s++)
             {

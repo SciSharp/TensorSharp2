@@ -77,20 +77,25 @@ namespace TensorSharp.GGML
 
         /// <summary>
         /// Routed-expert CPU offload policy passed to the native loader:
-        /// <c>-1</c> auto (offload the fewest leading layers that make the model
-        /// fit the visible VRAM), <c>0</c> none, <c>N</c> the first N layers,
-        /// <see cref="int.MaxValue"/> every layer.
+        /// <c>0</c> none (the default — offload is opt-in, and a model that does
+        /// not fit is refused at load with the number of layers that would make
+        /// it fit), <c>N</c> the first N layers, <see cref="int.MaxValue"/> every
+        /// layer, <c>-1</c> auto (the fewest leading layers that make the model
+        /// fit the visible VRAM; opt-in only).
         /// </summary>
         public const int CpuMoeAuto = -1;
 
+        /// <summary>No routed-expert offload — what an unspecified policy means.</summary>
+        public const int CpuMoeNone = 0;
+
         public static IntPtr LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads,
-            int nCpuMoe = CpuMoeAuto, string backendName = null)
+            int nCpuMoe = CpuMoeNone, string backendName = null)
             => TSGgml_Dsv4LoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads, nCpuMoe, backendName ?? string.Empty);
 
         /// <summary>Load with a DSpark drafter GGUF (see the DeepSeek V4 card).
         /// A null/empty path is identical to <see cref="LoadModel"/>.</summary>
         public static IntPtr LoadModelWithDspark(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads,
-            string dsparkPath, int nCpuMoe = CpuMoeAuto, string backendName = null)
+            string dsparkPath, int nCpuMoe = CpuMoeNone, string backendName = null)
             => TSGgml_Dsv4LoadModelDspark(ggufPath, nGpu, nCtx, nUbatch, nThreads, dsparkPath ?? string.Empty, nCpuMoe,
                 backendName ?? string.Empty);
 

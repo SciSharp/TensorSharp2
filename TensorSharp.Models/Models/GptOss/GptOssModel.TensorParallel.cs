@@ -846,11 +846,21 @@ namespace TensorSharp.Models
 
             // Expert-parallel: each rank runs ONE batched dispatch over the
             // experts it owns, instead of walking all 32 through host staging.
-            if (UsesExpertParallelMoE
-                && TryGptOssMoEExpertParallel(normed, results, selectedExperts, routeWeights, layer, seqLen))
+            if (UsesExpertParallelMoE)
             {
-                _tpGroup.AllReduce(results);
-                return results;
+                if (TryGptOssMoEExpertParallel(normed, results, selectedExperts, routeWeights, layer, seqLen))
+                {
+                    _tpGroup.AllReduce(results);
+                    return results;
+                }
+                // The per-expert loop below cannot stand in: whole-expert
+                // partitioning means there are no per-(layer, expert) shards for
+                // it to read. Say that, rather than fault several frames deeper
+                // on a missing weight.
+                throw new InvalidOperationException(
+                    $"GPT-OSS layer {layer}: the batched expert-parallel MoE dispatch failed and the per-expert " +
+                    "tensor-parallel path has no shards to fall back to. Re-run with " +
+                    "TS_GPTOSS_TP_EXPERT_PARALLEL=0 to use per-expert slicing instead.");
             }
 
             long rowBytes = (long)hiddenSize * sizeof(float);

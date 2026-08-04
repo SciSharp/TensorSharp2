@@ -599,6 +599,53 @@ static ggml_tensor * dsv4_create_weight(
     return t;
 }
 
+static size_t dsv4_file_size(const char * path)
+{
+    FILE * f = fopen(path, "rb");
+    if (!f) return (size_t) -1;
+#if defined(_WIN32)
+    _fseeki64(f, 0, SEEK_END);
+    long long sz = _ftelli64(f);
+#else
+    fseeko(f, 0, SEEK_END);
+    off_t sz = ftello(f);
+#endif
+    fclose(f);
+    return sz < 0 ? (size_t) -1 : (size_t) sz;
+}
+
+// A truncated shard - an interrupted download or copy is the usual cause -
+// otherwise surfaces as a "short read" tens of seconds into loading, long
+// after the split has committed every GPU's weight buffer, which reads as a
+// bug in the loader rather than a bad file. The header says exactly how many
+// bytes of tensor data the shard should hold, so check it against the file
+// before allocating anything.
+static bool dsv4_check_shard_complete(const char * path, gguf_context * g, ggml_context * meta)
+{
+    const size_t fsz = dsv4_file_size(path);
+    if (fsz == (size_t) -1) return true; // unreadable size: let the read path report it
+
+    const size_t data_off = gguf_get_data_offset(g);
+    const int64_t n_tensors = gguf_get_n_tensors(g);
+    size_t needed = data_off;
+    const char * last = nullptr;
+    for (int64_t ti = 0; ti < n_tensors; ti++)
+    {
+        const char * name = gguf_get_tensor_name(g, ti);
+        ggml_tensor * mt = ggml_get_tensor(meta, name);
+        if (!mt) continue;
+        const size_t end = data_off + gguf_get_tensor_offset(g, ti) + ggml_nbytes(mt);
+        if (end > needed) { needed = end; last = name; }
+    }
+    if (needed <= fsz) return true;
+
+    fprintf(stderr, "[dsv4] %s is incomplete: the file is %zu bytes but its %" PRId64 " tensors need %zu "
+                    "(%.2f GiB missing; %s is the last one). Re-download this file.\n",
+            path, fsz, n_tensors, needed, (needed - fsz) / (1024.0 * 1024.0 * 1024.0),
+            last ? last : "?");
+    return false;
+}
+
 // One chunk of one weight tensor: read [file_off, file_off+len) from its
 // shard and land it at tensor_off inside the (already allocated) tensor.
 struct load_job
@@ -661,7 +708,10 @@ static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_jo
 #endif
             if (fread(staging.data(), 1, j.len, f) != j.len)
             {
-                fprintf(stderr, "[dsv4] short read for %s\n", j.t->name);
+                // Not a truncated file (dsv4_check_shard_complete already ruled
+                // that out), so name the exact read that failed.
+                fprintf(stderr, "[dsv4] short read for %s: %zu bytes at offset %zu of %s\n",
+                        j.t->name, j.len, j.file_off, shards.paths[j.shard].c_str());
                 failed.store(true, std::memory_order_relaxed);
                 break;
             }
@@ -873,6 +923,11 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
     if (!g)
     {
         fprintf(stderr, "[dsv4] failed to open DSpark drafter %s\n", dspark_path);
+        return false;
+    }
+    if (!dsv4_check_shard_complete(dspark_path, g, meta))
+    {
+        gguf_free(g); if (meta) ggml_free(meta);
         return false;
     }
 
@@ -1180,6 +1235,12 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         if (!g)
         {
             fprintf(stderr, "[dsv4] failed to open shard %s\n", shards.paths[si].c_str());
+            return nullptr;
+        }
+        if (!dsv4_check_shard_complete(shards.paths[si].c_str(), g, meta))
+        {
+            gguf_free(g);
+            ggml_free(meta);
             return nullptr;
         }
         const size_t data_off = gguf_get_data_offset(g);

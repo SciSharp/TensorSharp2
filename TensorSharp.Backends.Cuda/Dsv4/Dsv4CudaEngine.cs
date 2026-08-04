@@ -220,11 +220,12 @@ namespace TensorSharp.Cuda
         /// touched expert's weights for half as many tokens.</summary>
         public int UBatch => _m.NUbatch;
 
-        /// <param name="nCpuMoe">Routed-expert CPU offload: -1 auto (offload the
-        /// fewest leading layers that make the model fit the visible VRAM), 0
-        /// none, N the first N layers, int.MaxValue every layer. See
-        /// Dsv4CudaEngine.HostMoe.cs.</param>
-        public Dsv4CudaEngine(ModelDesc m, int nGpu, int nCpuMoe = -1)
+        /// <param name="nCpuMoe">Routed-expert CPU offload: 0 none (the default —
+        /// offload is opt-in, and a model that does not fit is refused with the
+        /// number of layers that would make it fit), N the first N layers,
+        /// int.MaxValue every layer, -1 auto (the fewest leading layers that make
+        /// the model fit; opt-in only). See Dsv4CudaEngine.HostMoe.cs.</param>
+        public Dsv4CudaEngine(ModelDesc m, int nGpu, int nCpuMoe = 0)
         {
             _m = m ?? throw new ArgumentNullException(nameof(m));
             if (m.HeadDim != 512)

@@ -283,6 +283,54 @@ namespace TensorSharp.Runtime
             DataOffset = pos + (alignment - pos % alignment) % alignment;
         }
 
+        /// <summary>
+        /// Byte length this file must have for every tensor in its table to be
+        /// present: where the last tensor's data ends. Tensors whose footprint
+        /// this reader cannot size (an unknown quantization type) are skipped
+        /// rather than throwing, so this stays usable as a sanity check on a
+        /// file the caller may only want metadata from.
+        /// </summary>
+        public long GetRequiredLength(out string? lastTensorName)
+        {
+            long required = DataOffset;
+            lastTensorName = null;
+            foreach (var t in Tensors.Values)
+            {
+                long bytes;
+                try { bytes = GetTensorByteCount(t); }
+                catch (NotSupportedException) { continue; }
+                catch (IndexOutOfRangeException) { continue; }
+
+                long end = DataOffset + (long)t.Offset + bytes;
+                if (end > required)
+                {
+                    required = end;
+                    lastTensorName = t.Name;
+                }
+            }
+            return required;
+        }
+
+        /// <summary>
+        /// Throws when the file is shorter than its tensor table says it should
+        /// be. A truncated GGUF (an interrupted download or copy) otherwise
+        /// fails as a short read deep inside weight loading, after the loader
+        /// has already committed its buffers - which reads as a loader bug
+        /// rather than a bad file. Call this before allocating anything.
+        /// </summary>
+        public void ThrowIfTruncated()
+        {
+            long required = GetRequiredLength(out string? lastTensorName);
+            long actual = _stream.Length;
+            if (actual >= required)
+                return;
+            double missingGiB = (required - actual) / (1024.0 * 1024.0 * 1024.0);
+            throw new IOException(
+                $"{_path} is incomplete: the file is {actual} bytes but its {Tensors.Count} tensors need " +
+                $"{required} ({missingGiB:F2} GiB missing; {lastTensorName ?? "?"} is the last one). " +
+                "Re-download this file.");
+        }
+
         public string? GetString(string key, string? defaultValue = null)
         {
             if (!Metadata.TryGetValue(key, out var v)) return defaultValue;
