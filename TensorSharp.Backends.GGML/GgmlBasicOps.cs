@@ -1939,6 +1939,18 @@ namespace TensorSharp.GGML
             => GgmlNative.TryGptOssModelDecode(layers, numLayers, hidden, hiddenSize, position,
                 logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm);
 
+        /// <summary>Whole GPT-OSS transformer over a prompt chunk as a single
+        /// graph dispatch (all layers + MoE + folded final norm/LM head over the
+        /// last token). Returns false when the kernel refuses the shape so the
+        /// caller falls back to the per-layer path.</summary>
+        public static bool TryGptOssModelPrefill(
+            GptOssLayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize,
+            int numTokens, int startPos,
+            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
+            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm)
+            => GgmlNative.TryGptOssModelPrefill(layers, numLayers, hidden, hiddenSize, numTokens, startPos,
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm);
+
         /// <summary>Drop the persistent GPT-OSS whole-model decode-graph cache.
         /// Call before any prefill and on KV reset/grow.</summary>
         public static void GptOssResetDecodeCache() => GgmlNative.GptOssResetDecodeCache();

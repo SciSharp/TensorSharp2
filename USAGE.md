@@ -601,31 +601,37 @@ prefill graph the same way, and DiffusionGemma's block decode hands the host all
 of the canvas positions at once so its offloaded side is a GEMM rather than a
 matvec. Qwen3.5/3.6 segments its prefill graph the same way, and both it and
 Gemma 4 MoE keep the fused graph under tensor parallelism too (see the `--tp`
-note below). Architectures without a fused whole-model *prefill* graph (GPT-OSS,
-Nemotron-H) reach the same streamed path through their per-layer MoE op, on a
-single device; under `--tp N` they stay host-side so that N ranks do not each
-stream their own copy of the same unsharded experts.
+note below). GPT-OSS now has a fused whole-model prefill graph as well, so its
+offloaded prefill is segmented rather than dispatched per layer. Architectures
+that still lack one (Nemotron-H) reach the streamed path through their per-layer
+MoE op, on a single device; under `--tp N` they stay host-side so that N ranks do
+not each stream their own copy of the same unsharded experts.
 
-Measured on 2 x Xeon 6952P + RTX PRO 6000 Blackwell (PCIe 5.0 x16), pp512 /
-tg128, peak per-process VRAM. The full 30-cell comparison against llama.cpp,
-including DeepSeek V4 Flash across two GPUs, is in
+Measured on 2 x Xeon 6952P + RTX PRO 6000 Blackwell (PCIe 5.0 x16), **pp8192 /
+tg128**, peak per-process VRAM. The full comparison against llama.cpp — two prompt
+lengths, five offload depths per model, including DeepSeek V4 Flash across two
+GPUs — is in
 [docs/moe_cpu_offload_benchmark.md](docs/moe_cpu_offload_benchmark.md):
 
 | Model | Setting | Peak VRAM | Prefill | Decode |
 | --- | --- | --- | --- | --- |
-| gemma-4-26B-A4B (UD-IQ4_XS) | default | 13.9 GiB | 7,109 tok/s | 167 tok/s |
-| | `--n-cpu-moe 8` | 11.7 GiB | 3,893 tok/s | 80 tok/s |
-| | `--n-cpu-moe 16` | 9.1 GiB | 3,148 tok/s | 62 tok/s |
-| | `--cpu-moe` (30 layers) | 4.5 GiB | 1,925 tok/s | 43 tok/s |
-| Qwen3.5-35B-A3B (UD-IQ4_XS) | default | 18.3 GiB | 5,832 tok/s | 165 tok/s |
-| | `--n-cpu-moe 24` | 10.5 GiB | 1,991 tok/s | 52 tok/s |
-| | `--cpu-moe` (48 layers) | 5.1 GiB | 1,634 tok/s | 38 tok/s |
-| gpt-oss-20b (Q8_0/MXFP4) | default | 24.2 GiB | 1,031 tok/s | 282 tok/s |
-| | `--n-cpu-moe 12` | 13.8 GiB | 691 tok/s | 72 tok/s |
-| | `--cpu-moe` (24 layers) | 3.0 GiB | 676 tok/s | 35 tok/s |
-| DeepSeek-V4-Flash (UD-Q8_K_XL, 2 GPUs) | default | 152.8 GiB | 2,778 tok/s | 54 tok/s |
-| | `--n-cpu-moe 12` | 114.5 GiB | 447 tok/s | 10 tok/s |
-| | `--n-cpu-moe 24` | 76.2 GiB | 216 tok/s | 5.7 tok/s |
+| gemma-4-26B-A4B (UD-IQ4_XS) | default | 16.4 GiB | 11,274 tok/s | 161 tok/s |
+| | `--n-cpu-moe 8` | 15.4 GiB | 6,500 tok/s | 80 tok/s |
+| | `--n-cpu-moe 16` | 13.8 GiB | 4,888 tok/s | 55 tok/s |
+| | `--cpu-moe` (30 layers) | 10.8 GiB | 3,072 tok/s | 40 tok/s |
+| Qwen3.5-35B-A3B (UD-IQ4_XS) | default | 19.4 GiB | 9,405 tok/s | 160 tok/s |
+| | `--n-cpu-moe 24` | 15.1 GiB | 5,259 tok/s | 52 tok/s |
+| | `--cpu-moe` (48 layers) | 11.3 GiB | 3,709 tok/s | 39 tok/s |
+| gpt-oss-20b (Q8_0/MXFP4) | default | 12.9 GiB | 12,925 tok/s | 213 tok/s |
+| | `--n-cpu-moe 12` | 9.2 GiB | 6,394 tok/s | 52 tok/s |
+| | `--cpu-moe` (24 layers) | 4.7 GiB | 3,798 tok/s | 28 tok/s |
+| DeepSeek-V4-Flash (UD-Q8_K_XL, 2 GPUs) | default | 165.2 GiB | 4,387 tok/s | 51 tok/s |
+| | `--n-cpu-moe 12` | 128.7 GiB | 428 tok/s | 10 tok/s |
+| | `--n-cpu-moe 24` | 77.9 GiB | 236 tok/s | 5.3 tok/s |
+
+At every offload depth that is **4.5-10.9x** llama.cpp's prefill and **2.5-4.5x**
+its decode on the three seam models. Peak VRAM is higher than llama.cpp's (1.1x
+resident, up to 3.5x fully offloaded) — see the report's VRAM note.
 
 Greedy output is **token-identical** at every offload depth on gemma-4-26B-A4B.
 

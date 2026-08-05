@@ -350,17 +350,11 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
             if (t == nullptr || data == nullptr) return;
             if (cacheable && bytes >= 4096)
             {
-                ggml_backend_buffer_t buf = nullptr;
-                void* addr = nullptr;
                 bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
+                if (try_bind_cached_tensor(g_backend, dev, t, data, bytes, needs_upload, usage))
                 {
-                    if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
-                    {
-                        if (needs_upload) upload_list.push_back({t, data, bytes});
-                        return;
-                    }
-                    invalidate_cached_buffer(data);
+                    if (needs_upload) upload_list.push_back({t, data, bytes});
+                    return;
                 }
             }
             if (bytes >= 4096)
@@ -761,7 +755,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             }
             else
             {
-                st = ggml_backend_graph_compute(g_backend, dc->graph);
+                st = tsg::graph_compute_profiled(g_backend, dc->graph, "gemma4 MoE model decode");
             }
             if (st != GGML_STATUS_SUCCESS)
             {
@@ -1271,17 +1265,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             if (tgt == nullptr || data == nullptr) return;
             if (cacheable && bytes >= 4096)
             {
-                ggml_backend_buffer_t buf = nullptr;
-                void* addr = nullptr;
                 bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, tgt, data, bytes, buf, addr, needs_upload, usage))
+                if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
                 {
-                    if (ggml_backend_tensor_alloc(buf, tgt, addr) == GGML_STATUS_SUCCESS)
-                    {
-                        if (needs_upload) upload_list.push_back({tgt, data, bytes});
-                        return;
-                    }
-                    invalidate_cached_buffer(data);
+                    if (needs_upload) upload_list.push_back({tgt, data, bytes});
+                    return;
                 }
             }
             if (bytes >= 4096)
@@ -1291,7 +1279,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                 {
                     if (!cacheable) ephemeral_bufs.emplace_back(buf);
                     if (ggml_backend_tensor_alloc(buf, tgt, data) == GGML_STATUS_SUCCESS)
+                    {
                         return;
+                    }
                 }
             }
             upload_list.push_back({tgt, data, bytes});
@@ -1585,6 +1575,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
     // Tensor parallelism — same contract as TSGgml_Gemma4MoEModelDecode.
     int tp_degree, void** tp_plan_out)
 {
+    tsg::PhaseTimer pt("gemma4 MoE model verify");
     try
     {
         if (!ensure_backend())
@@ -1610,6 +1601,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         // therefore matches graph dependency order, which is what the segment cuts
         // require.
         std::vector<tsg::HostMoeSegment> host_moe;
+        // Per-layer root of the MoE gating chain. Expanded on its own below so
+        // the chain's nodes land contiguously in ggml-cuda's fusable order.
+        std::vector<ggml_tensor*> routing_root(num_layers, nullptr);
         if (layers[0].struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlGemma4MoELayerDesc)))
         {
             set_last_error("Gemma4 MoE model verify: descriptor size mismatch (C#/native struct layout drift).");
@@ -2108,20 +2102,26 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                 if (t.gate_inp_scale_t != nullptr)
                     route_n = ggml_mul(ctx, route_n, t.gate_inp_scale_t);
                 ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, route_n);  // [nExp, M]
-                ggml_tensor* probs = ggml_soft_max(ctx, router_logits);                 // [nExp, M]
-                ggml_tensor* sel = ggml_top_k(ctx, probs, nUsed);                       // [nUsed, M] i32
-                ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, nExp, M);
-                ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                      // [1, nUsed, M]
-                ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, nUsed, M);                  // [nUsed, M]
-                ggml_tensor* w_sum = ggml_sum_rows(ctx, w_2d);                          // [1, M]
-                w_2d = ggml_div(ctx, w_2d, w_sum);                                      // renormalise over selected
+                // Emitted in ggml-cuda's fusable order (see build_topk_moe_routing);
+                // the caller expands `routing_root` per layer so the chain lands
+                // contiguously and the fused top-k-MoE kernel matches it.
+                tsg::MoeTopKRouting routing =
+                    tsg::build_topk_moe_routing(ctx, router_logits, nExp, nUsed, M, /*norm_topk=*/true);
+                ggml_tensor* sel = routing.ids;
+                ggml_tensor* probs_r = routing.probs_3d;
+                ggml_tensor* w_2d = routing.weights_2d;
+                ggml_tensor* w_final = routing.weights_3d;
                 if (t.down_exps_scale_t != nullptr)
                 {
+                    // A per-expert output scale gathered off probs_r gives the
+                    // chain an outside reader, so this branch is deliberately
+                    // unfusable; correctness first.
                     ggml_tensor* scale_b = ggml_repeat(ctx, ggml_reshape_3d(ctx, t.down_exps_scale_t, 1, nExp, 1), probs_r);  // [1, nExp, M]
                     ggml_tensor* sel_scale = ggml_get_rows(ctx, scale_b, sel);          // [1, nUsed, M]
                     w_2d = ggml_mul(ctx, w_2d, ggml_reshape_2d(ctx, sel_scale, nUsed, M));
+                    w_final = ggml_reshape_3d(ctx, w_2d, 1, nUsed, M);
                 }
-                ggml_tensor* w_final = ggml_reshape_3d(ctx, w_2d, 1, nUsed, M);
+                routing_root[l] = w_final;
                 // MoE experts (M is already tile-bounded — no inner token tiling needed)
                 ggml_tensor* moe_in = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), t.pre_ffw_norm_2_w);  // [H, M]
                 ggml_tensor* moe_out = nullptr;
@@ -2136,7 +2136,10 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                     tsg::HostMoeSegment hm;
                     hm.layer = l;
                     hm.moe_in = ggml_cont(ctx, moe_in);
-                    hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel, (std::int64_t) nUsed * M));
+                    // sel is a VIEW of the argsort (see build_topk_moe_routing), so it
+                    // must be made contiguous BEFORE reshaping - ggml_reshape asserts
+                    // contiguity and would abort every offloaded layer.
+                    hm.sel_ids = ggml_reshape_1d(ctx, ggml_cont(ctx, sel), (std::int64_t) nUsed * M);
                     hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, (std::int64_t) nUsed * M));
                     ggml_set_output(hm.moe_in);
                     ggml_set_output(hm.sel_ids);
@@ -2326,6 +2329,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         const int attnTilesPerLayer = moe_attn_tiled ? ((N + moe_attn_tile - 1) / moe_attn_tile) : 1;
         const std::size_t graph_size = static_cast<std::size_t>(num_layers)
             * (128 + static_cast<std::size_t>(attnTilesPerLayer) * 56) + 512;
+        pt.mark("build");
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
         // swaPrev: add the prev-window F32 copies FIRST so they are ordered ahead of
         // the cache writes below — on the single execution stream they then read the
@@ -2352,6 +2356,13 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             ggml_build_forward_expand(graph, lt[l].v_cpy);
             if (lt[l].k_cpy2 != nullptr) ggml_build_forward_expand(graph, lt[l].k_cpy2);
             if (lt[l].v_cpy2 != nullptr) ggml_build_forward_expand(graph, lt[l].v_cpy2);
+            // The gating chain as one unit: expanding it here emits
+            // SOFT_MAX -> RESHAPE -> ARGSORT -> VIEW -> GET_ROWS -> RESHAPE ->
+            // SUM_ROWS -> CLAMP -> DIV -> RESHAPE back to back, which is what
+            // ggml-cuda's fused top-k-MoE kernel matches. Left to the expert
+            // matmuls to pull in, the ids half and the weights half would be
+            // emitted at different points and nothing would fuse.
+            if (routing_root[l] != nullptr) ggml_build_forward_expand(graph, routing_root[l]);
             // One entry per query tile for this layer, in the order layer_tail
             // pushed them.
             while (next_host_moe < host_moe.size() && host_moe[next_host_moe].layer == l)
@@ -2369,6 +2380,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kG4MoeVerifyKernel))
             return 0;
 
+        pt.mark("expand");
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
@@ -2378,15 +2390,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             if (tgt == nullptr || data == nullptr) return;
             if (cacheable && bytes >= 4096)
             {
-                ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, tgt, data, bytes, buf, addr, needs_upload, usage))
+                bool needs_upload = false;
+                if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
                 {
-                    if (ggml_backend_tensor_alloc(buf, tgt, addr) == GGML_STATUS_SUCCESS)
-                    {
-                        if (needs_upload) upload_list.push_back({tgt, data, bytes});
-                        return;
-                    }
-                    invalidate_cached_buffer(data);
+                    if (needs_upload) upload_list.push_back({tgt, data, bytes});
+                    return;
                 }
             }
             if (bytes >= 4096)
@@ -2457,6 +2465,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         // (kIOGPUCommandBufferCallbackErrorOutOfMemory). Reusing one gallocr keeps
         // the buffer resident and stable, which removes the fragmentation source
         // (and the per-call ~20 ms allocation).
+        pt.mark("bind");
         if (!alloc_graph_reuse_gallocr(graph))
         {
             set_last_error("Gemma4 MoE model verify: graph allocation failed.");
@@ -2465,6 +2474,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
 
         host_read_barrier();
 
+        pt.mark("alloc");
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
 
@@ -2523,7 +2533,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         }
         else
         {
-            status = ggml_backend_graph_compute(g_backend, graph);
+            status = tsg::graph_compute_profiled(g_backend, graph, "gemma4 MoE model verify");
         }
         if (status != GGML_STATUS_SUCCESS)
         {
@@ -2538,7 +2548,9 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         // by the C# caller's first logits read (host_read_barrier in
         // GetFloatPointer) or by the next verify's leading host_read_barrier
         // before it reuses the buffer, so there is no read-after-write hazard.
+        pt.mark("compute");
         finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(H) * N * sizeof(float));
+        pt.mark("download");
         clear_last_error();
         return 1;
     }

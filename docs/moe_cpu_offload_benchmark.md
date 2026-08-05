@@ -1,226 +1,708 @@
 # MoE CPU-offload benchmark — TensorSharp vs llama.cpp
 
-What `--n-cpu-moe N` (llama.cpp `-ncmoe N`) costs and saves on both engines: the same GGUF files, the same host, the same benchmark shape. Three mixture-of-experts models × five offload depths (none → every layer) × two engines = 30 cells, plus a 150.7 GiB DeepSeek V4 Flash across two GPUs at three depths.
+What `--n-cpu-moe N` (llama.cpp `-ncmoe N`) costs and saves on both engines: the
+same GGUF files, the same host, the same benchmark shape. Three mixture-of-experts
+models x five offload depths x two engines, plus a 150.7 GiB DeepSeek V4 Flash
+across two GPUs at three depths.
 
-**Peak VRAM** is the per-process figure in MiB (lower is better); **pp512** is prefill and **tg128** decode throughput in tokens/second (higher is better).
+Prompts are **4,096 and 8,192 tokens** — the sizes a document, a code file or a
+long chat history actually arrives at. **Peak VRAM** is the per-process figure in
+MiB (lower is better); **pp4096** / **pp8192** are prefill and **tg128** decode
+throughput in tokens/second (higher is better).
 
 ## Headline
 
-Offload works on both engines and saves the same memory on both — a Gemma 4 26B-A4B that needs 14.3 GiB runs in 4.5 GiB with every expert in system RAM. What differs is what it costs:
+Offload trades VRAM for throughput, and on long prompts TensorSharp trades it far
+better. A Gemma 4 26B-A4B that needs 16.4 GiB runs in 10.8 GiB with every expert
+in system RAM, and prefills **5.6-6.2x faster** than llama.cpp does in the same
+configuration:
 
-| Model | `--n-cpu-moe` | TensorSharp pp512 | llama.cpp pp512 | TensorSharp tg128 | llama.cpp tg128 |
+| Model | `--n-cpu-moe` | TS pp8192 | llama pp8192 | TS tg128 | llama tg128 |
 |---|---|---:|---:|---:|---:|
-| Gemma 4 26B-A4B | 16 of 30 | **3,148** | 1,063 | **62.1** | 21.7 |
-| Gemma 4 26B-A4B | all 30 | **1,925** | 522 | **42.7** | 13.3 |
-| Qwen 3.5 35B-A3B | 24 of 48 | **1,991** | 598 | **52.2** | 16.2 |
-| Qwen 3.5 35B-A3B | all 48 | **1,634** | 496 | **38.3** | 10.2 |
-| GPT-OSS 20B | all 24 | **676** | 570 | **34.9** | 10.4 |
-| DeepSeek V4 Flash (2 GPUs) | 12 of 43 | **447** | 130 | 10.1 | **12.3** |
+| Gemma 4 26B-A4B | 16 of 30 | **4,888** | 854 | **54.5** | 21.9 |
+| Gemma 4 26B-A4B | all 30 | **3,072** | 495 | **39.7** | 12.9 |
+| Qwen 3.5 35B-A3B | 24 of 48 | **5,259** | 484 | **52.3** | 15.8 |
+| Qwen 3.5 35B-A3B | all 48 | **3,709** | 457 | **38.6** | 10.2 |
+| GPT-OSS 20B | 12 of 24 | **6,394** | 1,188 | **51.7** | 18.3 |
+| GPT-OSS 20B | all 24 | **3,798** | 548 | **27.7** | 9.4 |
+| DeepSeek V4 (2 GPUs) | 24 of 43 | **236** | 63 | 5.3 | **7.2** |
 
-Offloaded prefill is **2.0–4.1× faster** than llama.cpp on the Gemma/Qwen models and **2.4–3.4×** on DeepSeek V4; offloaded decode is **2.5–3.9× faster** on the three models that use the host-MoE seam. Without offload TensorSharp is *behind* llama.cpp on this host for the small models (0.6–0.7× prefill, 0.7–0.8× decode) and ahead on DeepSeek V4 (1.25× / 1.04×) — the resident-path gap is separate, pre-existing, and untouched by this work.
+Across every offloaded depth on the three seam models, prefill is **4.5-10.9x**
+faster than llama.cpp and decode **2.5-4.5x**, at 1.0-3.5x the VRAM. DeepSeek V4
+offloads through a different mechanism and is the one model where llama.cpp's
+offloaded decode is ahead — see its section.
+
+On the **resident** path (`--n-cpu-moe 0`) at these prompt lengths TensorSharp is
+ahead of llama.cpp's default configuration on Gemma 4 (1.03-1.06x) and Qwen 3.5
+(1.16-1.17x), and ahead on DeepSeek V4 (1.44-1.97x). That lead is a batching
+difference rather than a kernel one and it reverses when llama.cpp's ubatch is
+matched to our chunk — the numbers are in [Is the win just chunk
+size?](#is-the-win-just-chunk-size).
+
+**Moving the benchmark from 512- to 8,192-token prompts found a real defect**, in
+code added earlier in this same pass: GPT-OSS's new whole-model prefill kernel
+built one attention mask per layer instead of one per distinct geometry, which is
+invisible at 512 tokens and cost it more than half its throughput at 8,192.
+Fixing it took GPT-OSS pp8192 from 5,825 to **12,925 tok/s**.
+
+Also fixed here, all on the resident path, all recorded as pre-existing and
+deferred by the previous revision:
+
+| | before | after | llama.cpp |
+|---|---:|---:|---:|
+| GPT-OSS pp512, `--n-cpu-moe 0` | 1,030 | **12,291** | 17,349 |
+| GPT-OSS peak VRAM | 24,816 MiB | **12,482 MiB** | 12,020 MiB |
+| GPT-OSS JSON mode | `{"city":"...","population":0}` | **`{"city":"Paris","population":2140526}`** | — |
+| Gemma 4 image on `--backend cuda` | hallucinated | **reads it correctly** | — |
+| `TensorSharp.Cli --tools` on a JSON-Schema tool file | crashed (exit 134) | **works** | — |
+
+Correctness across all of it: **182 checks, all passing** — 110 server (19
+configurations x 6 capabilities across three GPU backends, ±offload, TP2) and 72
+CLI (5 models x 3 backends x 5 features) — plus DeepSeek V4 speculative decoding
+at 1.39x. The GPT-OSS server cells were re-run after the mask change above and
+pass 20/20 on `ggml_cuda` (±offload), `ggml_vulkan` and `cuda`.
+
 
 ## Host and software
 
 | Component | Detail |
 |---|---|
-| GPU | 2 × NVIDIA RTX PRO 6000 Blackwell Server Edition, 97,887 MiB each, driver 580.126.20, PCIe 5.0 x16 |
-| CPU | 2 × Intel Xeon 6952P (96 cores / 192 threads each; 384 threads total, 6 NUMA nodes), cgroup quota 81.6 CPUs |
+| GPU | 2 x NVIDIA RTX PRO 6000 Blackwell Server Edition, 97,887 MiB each, driver 580.126.20, PCIe 5.0 x16 |
+| CPU | 2 x Intel Xeon 6952P (384 threads, 6 NUMA nodes), cgroup quota 81.6 CPUs |
 | RAM | 1,511 GiB |
 | Storage | Models on a MooseFS network mount (page-cache warm for every measured run) |
-| OS | Ubuntu 24.04, CUDA 12.8 |
-| TensorSharp | branch `feature/support_moe_offload_to_cpu`, .NET 10, backend `ggml_cuda` |
+| OS | Ubuntu 24.04.3 LTS, CUDA 12.8 |
+| TensorSharp | branch `feature/support_moe_offload_to_cpu`, .NET 10.0.110, backend `ggml_cuda` |
 | llama.cpp | `llama-bench` build 4308a4f, CUDA backend, default `-t 192` |
-| Date | 2026-08-05 |
 
 ## Methodology
 
-- **Identical shape on both engines**: 512 synthetic prompt tokens, 128 decode steps. `llama-bench -p 512 -n 128 -r 3`; TensorSharp `--benchmark --bench-prefill 512 --bench-decode 128 --bench-runs 4 --bench-fixed-tokens`, which keeps sampling out of the timed loop the same way `llama-bench` does. Best-of is reported on both sides.
-- **One GPU per cell** (`CUDA_VISIBLE_DEVICES=0`) except DeepSeek V4, which needs both.
-- **Peak VRAM** is `nvidia-smi --query-compute-apps=pid,used_memory` sampled every 200 ms over the process's lifetime and summed across the run's PIDs — a real per-process figure, not a whole-device delta.
-- **Matched context**: TensorSharp is pinned with `MAX_CONTEXT=1024`; `llama-bench` fixes `n_ctx = n_prompt + n_gen = 640`. The difference is tens of MiB of KV against multi-GiB weight footprints.
-- Every cell is a cold process, run one at a time, with a 5 s settle between cells.
-- Both engines were left on their own default thread counts (llama.cpp picks 192 here; TensorSharp picks 40 — see [Thread count](#thread-count-is-a-cliff-not-a-slope)).
+- **Identical shape on both engines**: 4,096 and 8,192 synthetic prompt tokens,
+  128 decode steps. `llama-bench -p 4096,8192 -n 128 -r 2`; TensorSharp
+  `--benchmark --bench-prefill {4096,8192} --bench-decode 128 --bench-runs 3
+  --bench-fixed-tokens`, which keeps sampling out of the timed loop the way
+  `llama-bench` does. Best-of is reported on both sides.
+- **Matched context.** `llama-bench` fixes `n_ctx = n_prompt + n_gen`; TensorSharp
+  is pinned to the same figure rounded up to a multiple of 256 (`MAX_CONTEXT=4352`
+  and `8448`), because ggml-cuda's flash-attention kernel selection aborts on a
+  Gemma 4 KV size that is not a multiple of 256.
+- **Peak VRAM** is `nvidia-smi --query-compute-apps=pid,used_memory` sampled every
+  250 ms over the process's lifetime and summed across the run's PIDs — a real
+  per-process figure, not a whole-device delta. The reported number is the larger
+  of the 4,096- and 8,192-token runs.
+- **One GPU per cell** (`CUDA_VISIBLE_DEVICES=0`) except DeepSeek V4, which needs
+  both.
+- Every cell is a cold process, run one at a time, on an otherwise idle host.
+- **The decode column is not measured at the same context on both engines.**
+  `llama-bench` runs `tg128` as its own test at `n_ctx = 128`; TensorSharp's
+  `--bench-decode` runs after the prefill in the same process, i.e. decoding at
+  ~8K context. Re-measuring TensorSharp's decode at a short context to match:
+  gemma-4-26B **165.7** (vs 161.4 after the 8K prefill), Qwen 3.5-35B **160.6**
+  (vs 160.0), GPT-OSS **297.8** (vs 212.8). It barely moves the two models whose
+  decode is dominated by the whole-model graph, and it moves GPT-OSS a lot — so
+  the GPT-OSS resident decode ratio below reads 0.62x where the matched-context
+  figure is 0.87x. The offloaded decode ratios are, if anything, understated.
+- **Each engine uses its own default batching.** TensorSharp prefills in
+  2,048-token chunks; llama.cpp's default `n_ubatch` is 512. A control run with
+  matched `-ub 2048` is reported alongside — see
+  [Is the win just chunk size?](#is-the-win-just-chunk-size).
 
 ## Results by model
 
+Ratios are TensorSharp / llama.cpp: **>1.0x means TensorSharp is faster**, and for
+VRAM **>1.0x means TensorSharp is heavier**.
+
 ### Gemma 4 26B-A4B it (UD-IQ4_XS, 30 MoE layers)
 
-| `--n-cpu-moe` | TS VRAM (MiB) | TS pp512 | TS tg128 | llama VRAM (MiB) | llama pp512 | llama tg128 |
-|---|---:|---:|---:|---:|---:|---:|
-| 0 _(baseline)_ | 14,264 | 7,108.6 | 167.1 | 14,246 | 10,733.5 | 206.3 |
-| 8 | 11,994 | 3,892.5 | 80.4 | 11,524 | 1,906.2 | 32.8 |
-| 16 | 9,312 | 3,147.7 | 62.1 | 8,772 | 1,062.8 | 21.7 |
-| 24 | 6,598 | 2,147.9 | 48.7 | 6,018 | 579.2 | 16.0 |
-| 30 _(`--cpu-moe`)_ | 4,568 | 1,925.2 | 42.7 | 3,784 | 522.0 | 13.3 |
+| `--n-cpu-moe` | TS VRAM (MiB) | TS pp4096 | TS pp8192 | TS tg128 | llama VRAM (MiB) | llama pp4096 | llama pp8192 | llama tg128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 _(baseline)_ | 16,822 | 11,173 | 11,274 | 161.4 | 14,602 | 10,843 | 10,628 | 206.7 |
+| 8 | 15,724 | 7,063 | 6,500 | 80.2 | 11,874 | 1,459 | 1,459 | 32.7 |
+| 16 | 14,128 | 4,183 | 4,888 | 54.5 | 9,122 | 833 | 854 | 21.9 |
+| 24 | 12,346 | 3,500 | 3,958 | 49.1 | 6,368 | 667 | 689 | 16.7 |
+| 30 _(`--cpu-moe`)_ | 11,038 | 3,035 | 3,072 | 39.7 | 4,134 | 543 | 495 | 12.9 |
 
-TensorSharp ÷ llama.cpp (>1.0× = TensorSharp faster; VRAM >1.0× = heavier):
-
-| `--n-cpu-moe` | VRAM | pp512 | tg128 |
-|---|---:|---:|---:|
-| 0 | 1.00× | 0.66× | 0.81× |
-| 8 | 1.04× | **2.04×** | **2.45×** |
-| 16 | 1.06× | **2.96×** | **2.86×** |
-| 24 | 1.10× | **3.71×** | **3.04×** |
-| 30 | 1.21× | **3.69×** | **3.21×** |
+| `--n-cpu-moe` | VRAM | pp4096 | pp8192 | tg128 |
+|---|---:|---:|---:|---:|
+| 0 | 1.15x | **1.03x** | **1.06x** | 0.78x |
+| 8 | 1.32x | **4.84x** | **4.46x** | **2.45x** |
+| 16 | 1.55x | **5.02x** | **5.72x** | **2.49x** |
+| 24 | 1.94x | **5.25x** | **5.74x** | **2.93x** |
+| 30 | 2.67x | **5.59x** | **6.21x** | **3.07x** |
 
 ### Qwen 3.5 35B-A3B (UD-IQ4_XS, 48 MoE layers)
 
-| `--n-cpu-moe` | TS VRAM (MiB) | TS pp512 | TS tg128 | llama VRAM (MiB) | llama pp512 | llama tg128 |
-|---|---:|---:|---:|---:|---:|---:|
-| 0 _(baseline)_ | 18,698 | 5,832.0 | 165.4 | 17,372 | 8,182.3 | 228.8 |
-| 12 | 14,928 | 3,109.0 | 81.2 | 13,132 | 1,010.1 | 27.5 |
-| 24 | 10,716 | 1,990.7 | 52.2 | 8,860 | 598.4 | 16.2 |
-| 36 | 6,584 | 1,737.7 | 41.1 | 4,588 | 427.5 | 10.5 |
-| 48 _(`--cpu-moe`)_ | 5,192 | 1,634.4 | 38.3 | 3,164 | 496.5 | 10.2 |
+| `--n-cpu-moe` | TS VRAM (MiB) | TS pp4096 | TS pp8192 | TS tg128 | llama VRAM (MiB) | llama pp4096 | llama pp8192 | llama tg128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 _(baseline)_ | 19,862 | 9,538 | 9,405 | 160.0 | 17,522 | 8,149 | 8,073 | 228.4 |
+| 12 | 18,148 | 6,755 | 6,648 | 75.4 | 13,282 | 988 | 954 | 27.5 |
+| 24 | 15,414 | 4,412 | 5,259 | 52.3 | 9,010 | 498 | 484 | 15.8 |
+| 36 | 12,684 | 3,772 | 4,223 | 50.7 | 4,738 | 523 | 517 | 11.3 |
+| 48 _(`--cpu-moe`)_ | 11,606 | 3,917 | 3,709 | 38.6 | 3,314 | 477 | 457 | 10.2 |
 
-TensorSharp ÷ llama.cpp:
-
-| `--n-cpu-moe` | VRAM | pp512 | tg128 |
-|---|---:|---:|---:|
-| 0 | 1.08× | 0.71× | 0.72× |
-| 12 | 1.14× | **3.08×** | **2.95×** |
-| 24 | 1.21× | **3.33×** | **3.22×** |
-| 36 | 1.44× | **4.06×** | **3.91×** |
-| 48 | 1.64× | **3.29×** | **3.75×** |
+| `--n-cpu-moe` | VRAM | pp4096 | pp8192 | tg128 |
+|---|---:|---:|---:|---:|
+| 0 | 1.13x | **1.17x** | **1.16x** | 0.70x |
+| 12 | 1.37x | **6.84x** | **6.97x** | **2.74x** |
+| 24 | 1.71x | **8.85x** | **10.86x** | **3.31x** |
+| 36 | 2.68x | **7.21x** | **8.17x** | **4.50x** |
+| 48 | 3.50x | **8.21x** | **8.11x** | **3.77x** |
 
 ### GPT-OSS 20B (Q8_0 / MXFP4, 24 MoE layers)
 
-| `--n-cpu-moe` | TS VRAM (MiB) | TS pp512 | TS tg128 | llama VRAM (MiB) | llama pp512 | llama tg128 |
-|---|---:|---:|---:|---:|---:|---:|
-| 0 _(baseline)_ | 24,816 | 1,030.5 | 281.7 | 12,018 | 17,141.4 | 343.8 |
-| 6 | 19,676 | 840.3 | 91.8 | 9,648 | 1,540.6 | 35.2 |
-| 12 | 14,180 | 691.3 | 72.2 | 7,224 | 1,104.9 | 19.0 |
-| 18 | 8,658 | 636.5 | 45.1 | 4,798 | 886.7 | 13.4 |
-| 24 _(`--cpu-moe`)_ | 3,074 | 676.2 | 34.9 | 2,350 | 570.4 | 10.4 |
+| `--n-cpu-moe` | TS VRAM (MiB) | TS pp4096 | TS pp8192 | TS tg128 | llama VRAM (MiB) | llama pp4096 | llama pp8192 | llama tg128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 _(baseline)_ | 13,186 | 13,964 | 12,925 | 212.8 | 12,204 | 17,856 | 17,642 | 344.2 |
+| 6 | 11,560 | 8,975 | 7,617 | 85.8 | 9,812 | 1,747 | 1,666 | 32.2 |
+| 12 | 9,378 | 6,470 | 6,394 | 51.7 | 7,386 | 1,176 | 1,188 | 18.3 |
+| 18 | 7,192 | 4,315 | 4,393 | 30.7 | 4,962 | 807 | 751 | 12.1 |
+| 24 _(`--cpu-moe`)_ | 4,762 | 4,277 | 3,798 | 27.7 | 2,536 | 568 | 548 | 9.4 |
 
-TensorSharp ÷ llama.cpp:
+| `--n-cpu-moe` | VRAM | pp4096 | pp8192 | tg128 |
+|---|---:|---:|---:|---:|
+| 0 | 1.08x | 0.78x | 0.73x | 0.62x |
+| 6 | 1.18x | **5.14x** | **4.57x** | **2.67x** |
+| 12 | 1.27x | **5.50x** | **5.38x** | **2.83x** |
+| 18 | 1.45x | **5.35x** | **5.85x** | **2.54x** |
+| 24 | 1.88x | **7.53x** | **6.93x** | **2.95x** |
 
-| `--n-cpu-moe` | VRAM | pp512 | tg128 |
-|---|---:|---:|---:|
-| 0 | 2.06× | 0.06× | 0.82× |
-| 6 | 2.04× | 0.55× | **2.61×** |
-| 12 | 1.96× | 0.63× | **3.79×** |
-| 18 | 1.80× | 0.72× | **3.37×** |
-| 24 | 1.31× | **1.19×** | **3.36×** |
+> GPT-OSS is the one model still behind on the resident path at these prompt
+> lengths (0.73–0.78x). Moving to 4,096/8,192-token prompts is what exposed it:
+> the whole-model prefill kernel built **one attention mask per layer** where only
+> two distinct geometries exist (the sliding-window one on even layers, the full
+> causal one on odd layers). At an 8,192-token chunk that was ~200M fp16 host
+> writes and ~380 MB of uploads per forward for masks that are bit-identical in
+> pairs. Sharing them by geometry took pp8192 from **5,825 to 12,925 tok/s
+> (2.2x)** and pp4096 from 7,055 to 13,964 — and it also flipped the chunk-size
+> choice back: with the mask cost gone, 2,048 beats 512 again.
 
-> **GPT-OSS carries a pre-existing, non-offload defect on `ggml_cuda`.** Its *baseline* prefill is 1,030 t/s against llama.cpp's 17,141 (0.06×) and it holds 24.8 GiB against llama.cpp's 12.0 GiB with nothing offloaded at all. Offload cannot repair what the resident path already loses: the offloaded prefill numbers above inherit that handicap, which is why GPT-OSS is the one model where TensorSharp's offloaded prefill only pulls ahead once *every* layer is offloaded (and the resident part of the model is small enough to stop mattering). Decode — which does not go through the same path — is 2.6–3.8× ahead at every depth. Tracking this separately.
 
 ### DeepSeek V4 Flash (UD-Q8_K_XL, 5 shards / 150.7 GiB, 43 layers, both GPUs)
 
-DeepSeek V4 does not use the host-MoE seam: it hands its offloaded layers to `ggml_backend_sched`, which streams the weights back to the GPU for a prefill-sized batch exactly the way llama.cpp does. What it gained here is the **page-locking**, applied to the host-resident expert ranges at load (`[dsv4] page-locked … GiB of host experts`).
+DeepSeek V4 does not use the host-MoE seam: it hands its offloaded layers to
+`ggml_backend_sched`, which streams the weights back to the GPU for a
+prefill-sized batch exactly the way llama.cpp does.
 
-| `--n-cpu-moe` | TS VRAM (MiB) | TS pp512 | TS tg128 | llama VRAM (MiB) | llama pp512 | llama tg128 |
-|---|---:|---:|---:|---:|---:|---:|
-| 0 _(baseline, both GPUs)_ | 156,436 | 2,778.4 | 53.8 | 155,518 | 2,222.6 | 51.5 |
-| 12 | 117,212 | 447.1 | 10.1 | 117,092 | 129.9 | 12.3 |
-| 24 | 77,978 | 216.1 | 5.7 | 78,898 | 88.6 | 6.2 |
+| `--n-cpu-moe` | TS VRAM (MiB) | TS pp4096 | TS pp8192 | TS tg128 | llama VRAM (MiB) | llama pp4096 | llama pp8192 | llama tg128 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 _(baseline, both GPUs)_ | 169,132 | 3,448 | 4,387 | 51.1 | 155,608 | 2,398 | 2,232 | 49.6 |
+| 12 | 131,818 | 392 | 428 | 10.3 | 117,150 | 126 | 124 | 13.7 |
+| 24 | 79,742 | 218 | 236 | 5.3 | 78,954 | 64 | 63 | 7.2 |
 
-| `--n-cpu-moe` | VRAM | pp512 | tg128 | pp512 before pinning | gain |
-|---|---:|---:|---:|---:|---:|
-| 0 | 1.01× | **1.25×** | **1.04×** | — | — |
-| 12 | 1.00× | **3.44×** | 0.82× | 358.6 | **+25%** |
-| 24 | 0.99× | **2.44×** | 0.91× | 153.2 | **+41%** |
+| `--n-cpu-moe` | VRAM | pp4096 | pp8192 | tg128 |
+|---|---:|---:|---:|---:|
+| 0 | 1.09x | **1.44x** | **1.97x** | **1.03x** |
+| 12 | 1.13x | **3.11x** | **3.46x** | 0.75x |
+| 24 | 1.01x | **3.42x** | **3.72x** | 0.74x |
 
-Greedy output is token-identical at every depth. DeepSeek V4 is the one model where llama.cpp's offloaded *decode* is ahead (0.82–0.91×): both engines run that matmul through the same ggml CPU backend, and DSV4's per-token host read is ~260 MB (6 of 256 experts, `n_ff` 2048, `n_embd` 7168) against ~40 MB for the seam architectures, which puts it in a different part of the thread-scaling curve. That is why DSV4 keeps `available_cpu_parallelism()` workers rather than the seam's capped default.
+DeepSeek V4 remains the one model where llama.cpp's offloaded *decode* is ahead
+(0.74–0.75x): both engines run that matmul through the same ggml CPU backend, and
+DSV4's per-token host read is ~260 MB (6 of 256 experts, `n_ff` 2048, `n_embd`
+7168) against ~40 MB for the seam architectures, which puts it in a different part
+of the thread-scaling curve. That is why DSV4 keeps
+`available_cpu_parallelism()` workers rather than the seam's capped default.
+
+### A note on VRAM
+
+TensorSharp is heavier, and **the gap widens with both context and offload
+depth** — 1.13–1.15x at `--n-cpu-moe 0` but 2.7–3.5x with every expert offloaded.
+Once the experts are on the host, what is left in VRAM is the KV cache and the
+compute buffers, and that is where the difference lives: llama.cpp sizes a
+sliding-window layer's KV to the window rather than to the full context, and its
+512-token ubatch needs proportionally smaller activation buffers than our
+2,048-token chunk. Both are real and neither is measured apart here; it is the
+clearest remaining item on the offload path, and it did not show up in the
+previous 512-token revision of this document (1.20–1.64x) because at that context
+the KV is noise next to the weights.
+
+### Is the win just chunk size?
+
+Partly, and it matters enough to state plainly. TensorSharp prefills a long
+prompt in **2,048-token chunks**; llama.cpp's default `n_ubatch` is **512**. Those
+are the two engines' own defaults, and the tables above compare them as shipped.
+Re-running llama.cpp with a matched `-ub 2048 -b 8192`:
+
+| model | llama `-ub 512` (default) | llama `-ub 2048` | TensorSharp |
+|---|---:|---:|---:|
+| gemma-4-26B pp4096 / pp8192 | 10,815 / 10,608 | **14,485 / 14,643** | 11,173 / 11,274 |
+| Qwen 3.5-35B pp4096 / pp8192 | 8,117 / 8,006 | **11,655 / 11,855** | 9,538 / 9,405 |
+| gpt-oss-20B pp4096 / pp8192 | 17,712 / 17,504 | **20,728 / 21,668** | 13,964 / 12,925 |
+
+So: **at each engine's defaults TensorSharp leads on resident prefill for Gemma 4
+and Qwen 3.5 (1.03–1.17x); with llama.cpp's batch matched to ours it does not
+(0.77–0.82x).** The lead is a batching-configuration difference, not a
+kernel-efficiency one, and it would be dishonest to report the first number
+without the second.
+
+The reverse control says our chunk is not the knob: TensorSharp is flat across
+chunk sizes at pp8192 (`TS_PREFILL_CHUNK`), so we are already on the plateau and
+llama.cpp is simply getting more out of the same 2,048-token batch.
+
+| chunk | gemma-4-26B pp8192 | Qwen 3.5-35B pp8192 |
+|---|---:|---:|
+| 2,048 _(default)_ | 11,119 | 9,386 |
+| 4,096 | 11,445 | 9,204 |
+| 8,192 | 11,194 | 9,215 |
+
+None of this touches the offload results, which are the point of this document:
+there the margin is **4.5–10.9x on prefill** and **2.5–4.5x on decode**, far
+outside anything batch size accounts for.
+
+> **A note on run-to-run variance.** The offloaded cells move around between runs
+> more than the resident ones do — both engines' offloaded paths end in a host
+> matmul whose throughput depends on how the scheduler places threads across two
+> sockets. Treat a single offloaded ratio as ±30% and the shape of the curve as
+> the result.
+
+
 
 ## What changed in this pass
 
-The starting point was the state described in the previous revision of this document: offload worked, decode was competitive, and prefill had just been moved off the host onto the accelerator with the experts streamed in for one graph. Five things were added, in the order they were found.
+The previous revision of this document recorded four defects on the *resident*
+(`--n-cpu-moe 0`) path as pre-existing and deferred them. All four are fixed here,
+plus a fifth the widened test sweep turned up and a sixth that only appeared once
+the benchmark moved to 8,192-token prompts.
 
-### 1. The host pages are locked (the big one)
+### 1. GPT-OSS had no whole-model prefill graph
 
-A `cudaMemcpy` out of a **pageable** mapping cannot DMA — the driver copies it through its own small pinned staging buffer. The GGUF is an mmap, so every streamed expert was paying that. Measured on this host with 1 GiB transfers:
+GPT-OSS was the one MoE architecture still prefilling **layer by layer**, and per
+layer that cost:
 
-| Source | H2D bandwidth |
-|---|---:|
-| mmap, pageable | 9.3 GB/s |
-| mmap, `cudaHostRegister` | **55.6 GB/s** |
-| `cudaHostAlloc` | 55.6 GB/s |
+```
+fused attention graph → post-attn RMSNorm → router mul_mat → DOWNLOAD the router
+scores → host top-k → fill(0) → fused MoE graph (rebuilt each call, with the
+stacked expert biases re-uploaded) → DOWNLOAD the MoE output → residual add
+```
 
-Registering the expert ranges as they are first streamed costs ~65 ms/GiB, once, and buys the full link speed with **no extra host memory** — unlike staging through a pinned mirror, which would need a second copy of every offloaded expert. `ggml` exposes `ggml_backend_cuda_register_host_buffer` for exactly this and llama.cpp never calls it, which is most of why the numbers above look the way they do.
+Six graph submissions and **two host round trips per layer**, 24 layers deep,
+twice over because anything past 256 tokens was chunked. 512 tokens took ~510 ms
+against llama.cpp's ~30 ms.
 
-Guard rails, because pinned pages are unswappable: a budget (default 60% of the cgroup/host memory limit, `TS_HOST_MOE_PIN_MAX_MB`), a refusal to lock any single range larger than half of `MemAvailable`, interval bookkeeping so overlapping page-aligned ranges cannot fail registration, and `TS_HOST_MOE_PIN=0` to turn it all off. Pinning is skipped entirely when the accelerator is not CUDA (on Vulkan a `cudaHostRegister` would spin up a CUDA primary context for a device nothing is using).
+`TSGgml_GptOssModelPrefill` (`ggml_ops_gptoss_prefill.cpp`) is the sibling of the
+existing whole-model *decode* kernel with the token axis restored: hidden is
+`[H, N]`, RoPE positions are an `I32[N]`, the KV write is one `ggml_cpy` per layer
+into a `[start_pos, start_pos+N)` row view, and the mask is F16 `[window, N]`
+filled causally with the sliding-window floor on GPT-OSS's even layers. The router
+top-k runs on the accelerator (`ggml_top_k` over the raw logits, the SOFTMAX_WEIGHT
+gate llama.cpp's `build_moe_ffn` uses for this architecture), so **nothing crosses
+the bus** between the embeddings going in and the logits coming out. Offloaded
+layers keep their host-MoE seam, so `--n-cpu-moe` still works — the graph just
+pauses at each offloaded router instead of at every layer.
 
-`TS_HOST_MOE_TIMING=1` confirms it in situ — `pinned=10.2 GiB … experts=53/128 bytes=3095 MiB` for gemma-4-26B at `--cpu-moe`. The rate that line prints (~20 GB/s) is *not* the link rate: its window ends at the first synchronizing call, so it also contains the outer graph's own compute. The 55.6 GB/s figure is the isolated transfer.
-
-### 2. Only the experts the batch actually routes to are streamed
-
-llama.cpp's scheduler builds a used-expert bitset from the ids tensor and copies consecutive runs; TensorSharp now does the same, with the same trailing pad (MMQ reads a tile past the last row it needs, and whatever the reused graph buffer happened to hold there could decode to NaN). On a 128-expert model a 512-token batch typically touches a fraction of the pool, and at the small batches speculative verification and light serving produce the saving is larger still. `TS_HOST_MOE_EXPERT_FILTER=0` restores whole-stack uploads.
-
-### 3. The copies are asynchronous
-
-The uploads now go through `ggml_backend_tensor_set_async` onto the backend's own stream and synchronize once, with the graph, instead of three times per offloaded layer.
-
-Effect of 1–3 together, gemma-4-26B, pp512 (best of 5):
-
-| `--n-cpu-moe` | before | after | gain | vs llama.cpp |
-|---|---:|---:|---:|---|
-| 8 | 1,110 | 3,616 | **3.3×** | 0.89× → **2.04×** |
-| 16 | 713 | 2,906 | **4.1×** | 0.95× → **2.96×** |
-| 30 | 315 | 1,970 | **6.3×** | 0.67× → **3.69×** |
-
-Greedy output is **token-identical** across `--n-cpu-moe` 0 / 8 / 16 / 30 (`prefillTopToken=102`, then `103,104,105,108,109,…` in every configuration).
-
-### 4. DeepSeek V4's host experts are locked at load
-
-DSV4 never used the seam — it routes offloaded layers through `ggml_backend_sched`, which streams them back to the GPU for a prefill batch on its own. Registering those ranges once at load (rather than never) is worth **+25% at `-ncmoe 12` and +41% at `-ncmoe 24`** on a 150.7 GiB checkpoint, and costs one line of load-time output.
-
-### 5. Architectures without a fused prefill graph now stream too
-
-GPT-OSS and Nemotron-H have no whole-model *prefill* graph, so their offloaded layers go through the per-layer MoE op rather than the seam. That entry point was hard-wired to the host path because it is reachable through `RunPerRank` under tensor parallelism, where N ranks would each stream their own copy of the same unsharded experts. The guard is now the actual condition (`device_count <= 1`) instead of a blanket refusal:
-
-| GPT-OSS 20B `--n-cpu-moe` | before | after | gain |
+| gpt-oss-20b pp512 | before | after | gain |
 |---|---:|---:|---:|
-| 6 | 332 | 789 | 2.4× |
-| 12 | 197 | 853 | 4.3× |
-| 24 (`--cpu-moe`) | 49 | 640 | **13.1×** |
+| `--n-cpu-moe 0` | 1,030.5 | **12,290.7** | 11.9x |
+| `--n-cpu-moe 6` | 840.3 | 5,109.4 | 6.1x |
+| `--n-cpu-moe 12` | 691.3 | 2,814.8 | 4.1x |
 
-### Thread count is a cliff, not a slope
+The sliding-window layers also stopped attending over the whole cache: a query at
+position `p` reads keys `[p-127, p]`, so the graph views only
+`[start_pos-127, totalSeqLen)` for those layers.
 
-The host-side matmul at decode is one token wide: a few MB of expert rows read from RAM with a barrier after every ggml op. Past a few dozen workers each extra thread only adds a barrier participant, and on a 2-socket machine it starts adding cross-socket traffic. Measured here (gemma-4-26B `--cpu-moe`, ms of host matmul per 30 offloaded layers):
+With the O(seqLen²) score tensor gone, the prefill chunk is no longer capped at
+256 tokens — it is sized for GEMM efficiency instead (2048, `TS_GPTOSS_PREFILL_CHUNK`).
 
-| threads | 8 | 16 | 32 | 64 | 96 | 192 |
-|---|---:|---:|---:|---:|---:|---:|
-| ms | 45 | 35 | **17.6** | **17.3** | 26 | 120 |
+### 2. GPT-OSS held every expert byte in VRAM twice
 
-The old default (`usable_cpus / 2`) picks 192 on a bare-metal host like this one and pays 7×; it only ever looked safe because every previously tested box had a cgroup quota that clamped it into the flat part of the curve. The default is now `min(usable/2, 64)`, overridable with `--cpu-moe-threads`. (This host's own 81.6-CPU quota means the measured runs above used 40 either way.)
+24,816 MiB resident against llama.cpp's 12,018 for the same 11.5 GiB of weights.
+`TS_GGML_LOG_VRAM=1` puts the second copy on the record: `preload-weight` totals
+11,501 MB and then `devcopy` climbs to **9,717 MB** on top of it.
 
-## Correctness sweep
+The routed experts live in the GGUF as one 3-D block per tensor, which the loader
+both splits into per-expert 2-D views *and* keeps as a stacked block. Every graph
+that matters — whole-model decode, the new whole-model prefill, the fused MoE
+kernel — reads the **stacked** block, which gets its own device copy on first use.
+Preloading the per-expert views as well is a second full copy of every expert.
+Gemma 4 and Qwen 3.5 already excluded them; GPT-OSS's exclusion was gated on
+`UsesExpertParallelMoE`, so it only applied under tensor parallelism (where the
+same bug had been caught from the other direction — rank 0 holding 16,019 MB
+against rank 1's 5,163). Single-GPU took the double copy and nothing excluded it.
 
-Offload is only worth measuring if the answers stay right. Fourteen server configurations (`TensorSharp.Server`, OpenAI-compatible endpoint) × six capabilities, on the three GPU backends, with and without offload:
+| gpt-oss-20b, `--n-cpu-moe 0` | before | after | llama.cpp |
+|---|---:|---:|---:|
+| peak VRAM (MiB) | 24,816 | **12,482** | 12,020 |
+| device-resident preload | 11,501 MB / 1,586 tensors | 1,819 MB / 50 tensors | — |
+
+### 3. Gemma 4 vision was broken on the pure-C# `cuda` backend
+
+Asked to describe a picture of a red circle, a blue square and the text
+"APPLE 42", the `cuda` backend answered *"a red circle on the left and a blue
+square on the right, both set against a light gray background. Below these shapes
+is a large, realistic image of a red apple. There is no text written in the
+image."* — some vision signal was arriving, and the rest was invention. The same
+model on `ggml_cuda` and `ggml_vulkan` described it correctly.
+
+`TS_VISION_TRACE=1` (new) prints per-stage activation statistics through the
+encoder. All 27 encoder blocks matched the working backend to five decimal
+places; the divergence appeared in a single stage:
+
+| stage | `ggml_cuda` | `cuda` (before) |
+|---|---|---|
+| `pool.scale` | mean −32.31, rms 2413.3 | mean −32.32, rms 2413.5 |
+| `pool.std` | mean **0.008**, rms **1.13** | mean −31.82, rms 2397.9 |
+
+`PoolAndProject` standardises the pooled patches with
+`Ops.Sub(pooled, pooled, stdBias)` then `Ops.Mul(pooled, pooled, stdScale)` —
+`x[130, 1152] OP bias[1152]`, a row broadcast. `Add` had a dedicated broadcast
+path; **`Sub`, `Mul` and `Div` did not**, and the generic `Apply3` fallback they
+land on advances all three iterators together and stops at the shortest operand's
+last block. Only the first of 130 patches was ever standardised, and the other 129
+went into the projection with values ~2000× too large.
+
+Fixed at the root, in `TensorApplyCPU`, so it holds for the CPU backend and for
+every backend whose kernel falls back to it; the CUDA backend also gets a proper
+row-broadcast kernel (`ts_binary_row_bcast_f32`) so the shape no longer leaves the
+GPU at all. `ElementwiseRowBroadcastTests` covers all four operators.
+
+### 4. GPT-OSS JSON mode answered the shape instead of the question
+
+`{"city":"...","population":0}` — schema-valid, semantically empty, on every
+backend. GPT-OSS speaks the harmony format: its first emitted token is
+`<|channel|>`, it reasons in the `analysis` channel, and only then answers in
+`final`. A grammar armed from token 0 **forbids the model's own first token**, so
+it was pushed straight into a JSON object having done no reasoning at all.
+
+`GrammarConstraint.ActivateAfter(trigger)` holds the constraint dormant — masking
+nothing, feeding the grammar nothing — until the trigger text has been generated.
+For harmony that is `final<|message|>`, so the analysis channel runs free and the
+schema constrains only the answer. Mirrors llama.cpp's lazy grammar triggers.
+
+| gpt-oss-20b, JSON schema `{city, population}` | result |
+|---|---|
+| before | `{"city":"...","population":1}` |
+| after | `{"city":"Paris","population":2140526}` |
+
+### 5. `TensorSharp.Cli --tools` crashed on the standard tool format
+
+Found by running the CLI sweep rather than only the server one. The CLI
+deserialized the `--tools` file straight into `List<ToolFunction>`, whose
+`Parameters` is a flat `Dictionary<string, ToolParameter>`. A tool definition in
+the **JSON Schema** shape — the one anyone copying a tool out of an API request
+has, and the one the server already accepts —
+
+```json
+"parameters": { "type": "object", "properties": { "city": {...} }, "required": ["city"] }
+```
+
+made the deserializer try to read the schema's own `"type": "object"` as a
+`ToolParameter` and the process died with an unhandled `JsonException` (exit
+134) before the model was even loaded.
+
+`ToolFunction.ParseList` now accepts the flat shape, the JSON Schema shape and
+either of them inside the OpenAI `{"type":"function","function":{…}}` wrapper,
+and the CLI reports a bad file as one error line instead of a stack trace.
+`ToolFunctionParseTests` covers all three shapes plus the malformed cases.
+
+### 6. GPT-OSS built one attention mask per layer
+
+Found by moving the benchmark from 512- to 8,192-token prompts — a regression in
+the whole-model prefill kernel added earlier in this same pass, invisible at the
+old size.
+
+The kernel gave every layer its own F16 `[window, N]` causal mask. GPT-OSS has
+exactly **two** distinct geometries: the sliding-window one on even layers and the
+full causal one on odd layers, so 24 masks were being built where 2 would do. At
+an 8,192-token chunk that is ~200M fp16 host writes and ~380 MB of uploads per
+forward, all of it duplicated. Masks are now shared by
+`(wstart, wlen, is_swa, sliding_window)`.
+
+| gpt-oss-20b, `--n-cpu-moe 0` | before | after | gain |
+|---|---:|---:|---:|
+| pp4096 | 7,055 | **13,964** | 1.98x |
+| pp8192 | 5,825 | **12,925** | 2.22x |
+
+It also flipped the prefill chunk choice back. With the mask cost in place a
+512-token chunk beat 2,048 (7,419 vs 6,717 at pp8192) because it made each mask
+smaller; with it gone, 2,048 wins again (13,898 vs 11,533), which is the default.
+
+Greedy output is unchanged, and the GPT-OSS server suite passes 20/20 on
+`ggml_cuda` (with and without offload), `ggml_vulkan` and `cuda`.
+
+### Also
+
+- **Redundant per-bind tensor init removed.** A whole-model graph binds ~600
+  weights per call and each bind re-ran the backend's `init_tensor`, which for a
+  quantized weight on ggml-cuda is a `cudaMemset` over the block padding. The
+  cache entry now records the alloc size it was initialised at and repeat binds
+  attach directly (`try_bind_cached_tensor`).
+- **Two new diagnostics**, both env-gated and both used to produce the numbers in
+  this document: `TS_GGML_PHASE_TIMING` (build / bind / alloc / upload / compute /
+  download per whole-model kernel) and `TS_GGML_NODE_PROFILE` (per-op-type cost
+  inside a whole-model graph).
+
+## Correctness
+
+Offload is only worth measuring if the answers stay right, and a perf fix is only
+worth shipping if it does not move them. Both serving surfaces were swept across
+all three GPU backends: **182 checks, all passing** — 110 through the server and
+72 through the CLI.
+
+### Server
+
+Nineteen configurations (`TensorSharp.Server`, OpenAI-compatible endpoint) × six
+capabilities, with and without offload and with tensor parallelism:
 
 | Configuration | short text | long text | multi-turn | tools | JSON mode | image |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | gemma4-26B `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | gemma4-26B `ggml_cuda` `-ncmoe 16` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | gemma4-26B `ggml_cuda` `--cpu-moe` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| gemma4-26B `ggml_cuda` `--tp 2 -ncmoe 8` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | gemma4-26B `ggml_vulkan` `-ncmoe 16` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| gemma4-26B `cuda` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| gemma4-26B `cuda` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gemma4-26B `ggml_cuda` `--tp 2 -ncmoe 8` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | gemma4-E4B `ggml_cuda` (dense) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| qwen35-35B `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| qwen35-35B `ggml_cuda` `-ncmoe 20` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| qwen35-35B `ggml_vulkan` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| qwen35-9B `ggml_cuda` (dense) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| qwen35-9B `cuda` (dense) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| gptoss-20B `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ❌ | — |
-| gptoss-20B `ggml_cuda` `-ncmoe 12` | ✅ | ✅ | ✅ | ✅ | ❌ | — |
+| gemma4-E4B `cuda` (dense) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gemma4-E4B `ggml_vulkan` (dense) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-35B `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-35B `ggml_cuda` `-ncmoe 20` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-35B `ggml_vulkan` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-9B `ggml_cuda` (dense) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-9B `cuda` (dense) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-9B `ggml_vulkan` (dense) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gptoss-20B `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| gptoss-20B `ggml_cuda` `-ncmoe 12` | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| gptoss-20B `ggml_vulkan` | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| gptoss-20B `cuda` | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 
-77 of 82 checks pass. **Every failure reproduces identically with and without offload**, so none of them is an offload regression:
+**110 of 110 checks pass**, against the previous revision's 77 of 82 with five
+image failures and two JSON-mode failures left open. The four GPT-OSS rows were
+re-run after the JSON-mode fix landed — they were the only red cells in the first
+pass of this sweep, all at `json_mode`; every other row is from the single
+19-configuration run.
 
-- **Qwen 3.5 image (5 cells).** The model misreads the test image's text on `ggml_cuda`, `ggml_vulkan` and `cuda` alike. llama.cpp's `llama-mtmd-cli` on the same GGUF + mmproj + image returns the **same wrong answer, token for token** (`areplay` for the 9B) — TensorSharp matches the reference implementation exactly, and the limitation is the model/projector pair on this synthetic input, not the engine.
-- **GPT-OSS JSON mode (2 cells).** Structured output is schema-valid but semantically empty (`{"city":"..??..","population":0}`). The other four models answer correctly under the same schema, so this is a GPT-OSS-specific interaction between grammar-constrained decoding and its channel format. Pre-existing, tracked separately.
-- **Gemma 4 26B image on the pure-C# `cuda` backend (1 cell).** The reply echoes the prompt instead of describing the image. Text features on that backend are fine, and the same model+image works on both GGML backends. Pre-existing, tracked separately.
+### The image check now measures vision, not OCR
 
-Beyond the pass/fail checks, the greedy benchmark chain on gemma-4-26B is **token-identical** across `--n-cpu-moe` 0 / 8 / 16 / 24 / 30.
+The previous revision's image test showed a 512×256 PNG of the words "APPLE 42"
+(with the "2" clipped by the frame) and asked *"What text is written in this
+image?"*. That is an OCR test on rendered text, and it is a poor proxy for
+whether the engine's vision path works: llama.cpp's own `llama-mtmd-cli` returns
+the same wrong answer as TensorSharp on the same file for Qwen 3.5 9B
+(`areplay`), token for token, so those five red cells were measuring the
+checkpoint rather than the engine.
 
-The same sweep on the **CLI** surface, through `TensorSharp.TestMatrix` (5 models × 3 backends × {short text, image} × `TS_N_CPU_MOE` ∈ {baseline, 0, 16, all}), is **52 of 57 cells green** — the five reds are the same Qwen 3.5 image cells. Every offload cell passes on every backend, which is what the new `TS_N_CPU_MOE` entry in `EnvVarMatrix` now keeps sweeping.
+The test image is now a red circle, a blue square and the text "APPLE 42" with
+margins, and the prompt asks the model to describe it. The check is that both
+shapes arrive with the right colours — a property that fails loudly when the
+embeddings are wrong and passes on every checkpoint whose vision tower works.
+That is what caught the real bug: Gemma 4 on `--backend cuda` got the two shapes
+right and then invented an apple and a grey background (see
+[What changed](#3-gemma-4-vision-was-broken-on-the-pure-c-cuda-backend)).
 
-**Speculative decoding** (the only drafter pair on this host, DeepSeek V4 Flash + its DSpark drafter, both GPUs, 128 tokens): 53.0 → **74.5 tok/s (1.41×)**, acceptance 0.658 over a 5-token window, 51 verify steps and 26 rollbacks. Unaffected by this work, checked because the offload path shares the verify batch shapes.
+### The same models through the CLI
 
-## What did not work
+`TensorSharp.TestMatrix` drives `TensorSharp.Cli` as a subprocess: 5 models × 3
+backends × 5 features. (There is no `json_mode` here — structured output is a
+server-request feature, and the server sweep above covers it.)
 
-**A device-resident seam.** With the experts already being streamed and the matmul already running on the accelerator, the seam still stages its activations through the host: the whole-model graph's `moe_in` / ids / routing weights are downloaded and the result uploaded, four transfers and four synchronizes per offloaded layer. Rewriting the seam graph to read and write the outer graph's own tensors removed all of that and was worth ~25% more prefill — and produced wrong output. The offloaded layer's `moe_in` **changes value across the seam call** (330.4 → 248.2 at layer 0), i.e. the nested graph's allocator writes over the outer graph's buffers; the corruption disappears with `TS_GGML_REUSE_COMPUTE_BUF=0`, which points at the persistent gallocr rather than at ggml-alloc's view handling. Reverted rather than shipped. The ~135 ms/forward it would save on a 30-layer full offload is the largest single item left on the table.
+| Model | Backend | short text | long text | multi-turn | tools | image |
+|---|---|:--:|:--:|:--:|:--:|:--:|
+| gemma4-26B-A4B | `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gemma4-26B-A4B | `ggml_vulkan` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gemma4-26B-A4B | `cuda` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gemma4-E4B | `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gemma4-E4B | `ggml_vulkan` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gemma4-E4B | `cuda` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-35B-A3B | `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-35B-A3B | `ggml_vulkan` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-35B-A3B | `cuda` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-9B | `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-9B | `ggml_vulkan` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| qwen35-9B | `cuda` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| gptoss-20B | `ggml_cuda` | ✅ | ✅ | ✅ | ✅ | — |
+| gptoss-20B | `ggml_vulkan` | ✅ | ✅ | ✅ | ✅ | — |
+| gptoss-20B | `cuda` | ✅ | ✅ | ✅ | ✅ | — |
+
+**72 of 72 cells pass.** The first pass of this sweep did not: `tools` aborted
+on six cells before the model was even loaded (defect 5 above), and GPT-OSS's
+`multi_turn` came back empty on a 32-token-per-turn budget (see below).
+
+### Speculative decoding
+
+The only drafter pair on this host is DeepSeek V4 Flash with its DSpark drafter
+(3 stages, block size 5, target layers 40–42, drafter on device 1). Same prompt,
+same 128 generated tokens, both GPUs:
+
+| | tok/s | wall |
+|---|---:|---:|
+| no drafter | 52.7 | 2,429.6 ms |
+| DSpark drafter | **73.5** | 1,740.5 ms |
+
+**1.39x**, at acceptance 0.658 over a 5-token window — 117 drafted, 77 accepted,
+51 verify steps and 26 rollbacks for 128 tokens. Unchanged by this work; checked
+because the whole-model prefill graph shares the verify batch shapes.
+
+### One harness correction
+
+The matrix's multi-turn recall file gave each turn a 32-token budget. That is
+fine for a model that answers directly and not for one that reasons first:
+GPT-OSS spends its first ~30 tokens in the `analysis` channel, hits the cap
+before reaching `final`, and returns empty content — which reads as a recall
+failure but is a budget failure. Raised to 96, at which GPT-OSS answers "Alex"
+and "teal" on turns 2 and 3 with room to spare. The engine was never wrong here;
+the test was measuring the wrong thing, the same way the old image check was.
+
+### Unit coverage added
+
+- `ElementwiseRowBroadcastTests` — Add/Sub/Mul/Div with a `[cols]` right operand
+  must reach every row, plus an in-place case and a same-shape control.
+- `GrammarConstrainedDecodingTests` — a lazily-armed constraint masks nothing
+  before its trigger, enforces from the token after it, and does not feed the
+  prelude to the grammar; an un-triggered constraint still enforces from token 0.
+
+## The prefill curve: why the ratio moves with prompt length
+
+The tables above are at 4,096 and 8,192 tokens, where TensorSharp is ahead of
+llama.cpp's default configuration. It was not always: the ratio climbs steadily
+with prompt length, because the difference is cost that does **not** scale with
+the token count — dominant at 128 tokens, invisible at 8,192. This section is the
+measurement of that cost, and what came off it.
+
+Two pieces of it were removed in a follow-up pass (see
+[Cutting the fixed cost](#cutting-the-fixed-cost)); prefill throughput before and
+after, best of 3 cold runs at `MAX_CONTEXT=1024`, `ggml_cuda`:
+
+| model | | pp128 | pp512 |
+|---|---|---:|---:|
+| gemma-4-26B-A4B | before | 2,293 | 6,663 |
+| | **after** | **3,021** | **8,214** |
+| | llama.cpp | 4,409 | 10,571 |
+| | ratio before → after | 0.52x → **0.69x** | 0.62x → **0.78x** |
+| Qwen 3.5-35B-A3B | before | 1,583 | 5,060 |
+| | **after** | **2,150** | **6,108** |
+| | llama.cpp | 3,450 | 8,048 |
+| | ratio before → after | 0.45x → **0.62x** | 0.62x → **0.76x** |
+
+**+21% to +36%**, and the ordering is unchanged: TensorSharp still trails at
+pp128/pp512 and leads from pp2048 up. Greedy output is token-identical before and
+after on both models, on `ggml_cuda`, `ggml_vulkan` and with `--n-cpu-moe`.
+
+The earlier measurement of the same curve, for the fixed/marginal split:
+
+| model | pp128 | pp512 | pp2048 |
+|---|---:|---:|---:|
+| gemma-4-26B-A4B TensorSharp | 2,293 | 7,683 | **11,872** |
+| gemma-4-26B-A4B llama.cpp | 4,434 | 10,610 | 10,869 |
+| ratio | 0.52x | 0.72x | **1.09x** |
+| Qwen 3.5-35B-A3B TensorSharp | 1,583 | 5,060 | **8,768** |
+| Qwen 3.5-35B-A3B llama.cpp | 3,479 | 8,157 | 8,212 |
+| ratio | 0.45x | 0.62x | **1.07x** |
+
+Fitting `time = fixed + marginal × tokens` over the 512→2048 range:
+
+| | fixed cost per forward | marginal cost per token |
+|---|---:|---:|
+| gemma-4-26B TensorSharp | **31.4 ms** | 0.069 ms |
+| gemma-4-26B llama.cpp | 1.5 ms | 0.091 ms |
+| Qwen 3.5-35B TensorSharp | **57.1 ms** | 0.086 ms |
+| Qwen 3.5-35B llama.cpp | 0.6 ms | 0.122 ms |
+
+TensorSharp's *per-token* cost is already lower than llama.cpp's on both models —
+the kernels are not the problem. What it pays instead is 31–57 ms of per-call
+overhead, which is half the wall clock at 512 tokens and noise at 2048. (The
+fixed cost tracks layer count: 30 layers → 31 ms, 48 layers → 57 ms, i.e. about
+1.2 ms per layer.)
+
+The dense controls say the same thing from another angle — a dense model has no
+MoE routing, expert gather or expert sum, so its graph is far smaller:
+
+| model (`--n-cpu-moe 0`) | TS pp512 | llama pp512 | ratio | TS tg128 | llama tg128 | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| gemma-4-E4B Q8_0 (dense) | 13,084 | 12,818 | **1.02x** | 165.6 | 177.2 | 0.93x |
+| Qwen 3.5-9B Q8_0 (dense + GDN) | 7,170 | 10,067 | 0.71x | 130.8 | 139.7 | 0.94x |
+
+`TS_GGML_PHASE_TIMING=1` splits the call (gemma-4-26B, pp512, steady state):
+
+```
+[phase] gemma4 MoE model verify total=63.88ms build=0.58 expand=0.19 \
+        bind=7.86 alloc=0.21 compute=54.28 download=0.75
+```
+
+- **bind = 7.9 ms.** The graph is rebuilt per call, so every weight in it (about
+  20 per layer over 30 layers, plus the LM head) is re-bound to its cached device
+  buffer on every prefill. llama.cpp binds once at load into a model buffer.
+- **compute = 54.3 ms**, of which ~22 ms does not scale with N. `TS_GGML_NODE_PROFILE`
+  puts the verify graph at **2,791 nodes for 30 layers** — 93 per layer, of which
+  ~55 launch a kernel: 12 `MUL`, 11 `RMS_NORM`, 10 `ADD`, 5 `MUL_MAT`, 2
+  `MUL_MAT_ID` and the rest routing/attention plumbing. The elementwise count is
+  where the launches are: the MoE expert weighting and its `n_used`-way sum, the
+  routing gather and the per-head norms are each separate ops.
+
+### Cutting the fixed cost
+
+Two of those were attacked directly; both come from comparing what ggml-cuda does
+for llama.cpp's graph and not for ours.
+
+**1. The MoE gating chain was invisible to ggml-cuda's fused top-k kernel.**
+ggml-cuda collapses a router's entire gating chain into one kernel
+(`ggml_cuda_op_topk_moe`), but `ggml_cuda_topk_moe_fusion` recognises it by
+literal node sequence — `SOFT_MAX → RESHAPE → ARGSORT → VIEW → GET_ROWS →
+RESHAPE → SUM_ROWS → CLAMP → DIV → RESHAPE`, which is what llama.cpp's
+`build_moe_ffn` emits. TensorSharp used `ggml_top_k`, which is its own op
+(`GGML_OP_TOP_K`), so the pattern never matched. Three things followed from that:
+the chain ran as ~10 separate kernels per layer instead of 1; `ggml_top_k` fully
+sorts all `n_expert` scores per token where the fused kernel does a partial
+selection; and its compact `[k, tokens]` output could not have been used by the
+fused kernel anyway, which recovers `n_expert` from the ids' row stride
+(`ids->nb[1] / ids->nb[0]`) and so *needs* the argsort view.
+
+`build_topk_moe_routing` now emits llama.cpp's shape, and the callers expand the
+chain into the graph as a unit — left to the expert matmuls to pull in, the ids
+half and the weights half are emitted at different points and nothing fuses.
+
+**2. Every weight was re-bound to its device buffer on every prefill.**
+llama.cpp binds its weights once at load into a model buffer and never touches
+them again; TensorSharp rebuilds the graph per call and re-bound ~450 weights
+each time, at ~17 µs apiece. Not slow for any single reason — two mutexes and a
+backend alloc-size query in the lookup, then `ggml_backend_tensor_alloc` running
+the backend's `init_tensor`, which on ggml-cuda is a `cudaMemset` over the quant
+padding — just slow 450 times, for 8 ms a call. The cache entry now records the
+address the first bind resolved to, so a repeat bind is two assignments and no
+backend calls at all.
+
+| gemma-4-26B pp512, phase | before | after |
+|---|---:|---:|
+| weight bind | 8.2 ms | **6.1 ms** |
+| compute | 52.8 ms | **49.9 ms** |
+| whole kernel call | 63.8 ms | **57.1 ms** |
+
+**What is left.** The remaining fixed cost is ~6 ms of weight binding plus ~1.2 ms
+of graph build/alloc/download inside the kernel, and ~5.7 ms on the C# side of the
+call (host embedding gather, logits copy). Removing all of it would put the call
+at ~50 ms against llama.cpp's 47.3 at 512 tokens — i.e. **graph reuse alone does
+not overtake llama.cpp there**; the compute would have to come down too, and at
+49.9 ms it is already within ~8% of llama.cpp's entire forward.
+
+That ~8% is the same thing the matched-ubatch control above exposes at long
+prompts: with `-ub 2048` llama.cpp gets 14,485 tok/s out of a 2,048-token batch
+on gemma-4-26B where we get 11,119, and our own chunk sweep shows we are already
+on the plateau. So the outstanding item is per-batch compute efficiency, not
+batching and not host overhead. The two concrete leads are a shape-keyed reuse of
+the built-and-bound graph (worth the ~7 ms of host cost per call) and closing the
+~150-node gap against llama.cpp's 2,644-node graph (ours is 2,791) — mostly the
+5 `CONT` copies per layer in the attention path.
+
+Decode is a narrower story: the dense models are at 0.93–0.94x and the MoE models
+at 0.73–0.82x, against the same per-token whole-model graph submission.
+
+### Things ruled out along the way
+
+- **Prefill is not chunked at 512.** Gemma 4's chunk is 2048; GPT-OSS's is now
+  2048 too.
+- **The kernels are the same.** Both engines link the same vendored ggml, and the
+  MMQ-vs-cuBLAS decision is made inside it from the same shapes.
+- **The GPT-OSS whole-model prefill graph does not cost decode.** A/B on the same
+  cells with `TS_GPTOSS_MODEL_PREFILL=0`:
+
+  | gpt-oss `--n-cpu-moe` | prefill graph | pp512 | tg128 |
+  |---|---|---:|---:|
+  | 6 | on | **4,464** | 99.2 |
+  | 6 | off (per-layer) | 995 | 95.8 |
+  | 12 | on | **3,102** | 69.3 |
+  | 12 | off (per-layer) | 834 | 68.7 |
+
+  Decode is unchanged (and the offloaded decode figures in the results tables sit
+  below these because that sweep ran while the host was busier — see the note
+  about offloaded variance).
 
 ## Reproducing
 
@@ -232,6 +714,29 @@ MAX_CONTEXT=1024 TensorSharp.Cli --model <model.gguf> --backend ggml_cuda \
 
 # llama.cpp
 llama-bench -m <model.gguf> -p 512 -n 128 -r 3 -ncmoe <N>
+
+# CLI capability sweep (models x backends x features)
+dotnet TensorSharp.TestMatrix/bin/TensorSharp.TestMatrix.dll --config <matrix.json> \
+    --features short_text,long_text,multi_turn,tools,image --env-vars none
+
+# speculative decoding
+TensorSharp.Cli --model <model.gguf> --backend ggml_cuda \
+    --draft-model <drafter.gguf> --input <prompt.txt> --max-tokens 128
 ```
 
-Diagnostics worth knowing: `TS_HOST_MOE_TIMING=1` splits an offloaded layer's wall clock into setup vs host matmul, and prints streamed bytes, used experts and effective bandwidth for the accelerator path; `=2` adds a per-weight transfer rate (and a synchronize, so it changes what it measures). `TS_HOST_MOE_DEBUG=1` prints the segment plan and each seam's activation norms. `TS_HOST_MOE_VERIFY=1` runs the on-GPU expert chain alongside the host one and reports the divergence.
+The server sweep is a per-host script rather than a checked-in harness: it starts
+`TensorSharp.Server` per configuration and drives `/v1/chat/completions` for the
+six capabilities. `--env-vars none` on the matrix runner turns off the offload
+cross-product, which the server sweep already covers.
+
+Diagnostics worth knowing:
+
+| Env var | What it does |
+|---|---|
+| `TS_GGML_PHASE_TIMING=1` | Splits a whole-model prefill kernel into graph build / weight bind / buffer alloc / upload / compute / download. |
+| `TS_GGML_NODE_PROFILE=1` | Runs a whole-model graph node by node and dumps the cost per op type. `TS_GGML_NODE_PROFILE_EVERY` sets the dump interval (default 64 graphs). |
+| `TS_VISION_TRACE=1` | Per-stage mean/rms/min/max of the Gemma 4 vision encoder — how the backend divergence below was located. |
+| `TS_HOST_MOE_TIMING=1` | Splits an offloaded layer into setup vs host matmul; prints streamed bytes, used experts, effective bandwidth. `=2` adds a per-weight transfer rate. |
+| `TS_HOST_MOE_DEBUG=1` | Prints the segment plan and each seam's activation norms. |
+| `TS_HOST_MOE_VERIFY=1` | Runs the on-GPU expert chain alongside the host one and reports the divergence. |
+| `TS_GPTOSS_MODEL_PREFILL=0` | Falls back to GPT-OSS's per-layer prefill (for A/B). |

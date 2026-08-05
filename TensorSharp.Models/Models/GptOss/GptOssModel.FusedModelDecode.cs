@@ -37,8 +37,13 @@ namespace TensorSharp.Models
         private static readonly bool FusedModelDecodeEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_GPTOSS_MODEL_DECODE"), "0", StringComparison.Ordinal);
 
+        // TS_GPTOSS_MODEL_PREFILL=0 falls back to the per-layer prefill path.
+        private static readonly bool FusedModelPrefillEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_GPTOSS_MODEL_PREFILL"), "0", StringComparison.Ordinal);
+
         private GptOssLayerDecodeArgs[] _modelDecodeArgs;
         private bool _modelDecodeUnavailable;
+        private bool _modelPrefillUnavailable;
         private bool _kvCacheHostDirty;
         private float[] _foldLogitsBuffer;
         private GCHandle _foldLogitsHandle;
@@ -307,6 +312,85 @@ namespace TensorSharp.Models
 
             if (ok)
                 _kvCacheHostDirty = true;
+            return ok;
+        }
+
+        /// <summary>
+        /// True when the whole-model prefill kernel can serve this chunk. Same
+        /// gate as the decode one plus a seqLen &gt; 1, and it answers before the
+        /// KV host sync is skipped, so it must not depend on anything the kernel
+        /// only discovers at runtime.
+        /// </summary>
+        private bool WillUseFusedModelPrefill(int seqLen)
+        {
+            if (!FusedModelPrefillEnabled || _modelPrefillUnavailable || _modelDecodeUnavailable || IsTensorParallel)
+                return false;
+            if (seqLen <= 1 || !IsGgmlBackend || _layerStackedReady == 0)
+                return false;
+            int kvType = _kvCacheDtype.GgmlType();
+            return kvType == 0 /* F32 */ || kvType == 1 /* F16 */;
+        }
+
+        /// <summary>
+        /// Runs the whole model over a prompt chunk in a single graph dispatch.
+        /// On success the pinned fold-logits buffer holds the last token's
+        /// LM-head output and the caller skips its own final-norm / LM-head tail.
+        ///
+        /// This is what replaced GPT-OSS's per-layer prefill: that path spent two
+        /// host round trips per layer (the router scores came back to do top-k on
+        /// the CPU, the MoE result went back up) on top of ~6 graph submissions,
+        /// which is why a 512-token prefill measured 987 tok/s against
+        /// llama.cpp's 17k on the same card.
+        /// </summary>
+        private unsafe bool TryFusedModelPrefill(Tensor hidden, int startPos, int seqLen)
+        {
+            if (!TryBuildModelDecodeArgs())
+                return false;
+
+            if (!_quantWeights.TryGetValue("output.weight", out var lmHead) &&
+                !_quantWeights.TryGetValue("token_embd.weight", out lmHead))
+            {
+                _modelPrefillUnavailable = true;
+                return false;
+            }
+            if (!_weights.TryGetValue("output_norm.weight", out var finalNorm))
+            {
+                _modelPrefillUnavailable = true;
+                return false;
+            }
+
+            EnsureFoldLogitsBuffer();
+
+            int numLayers = Config.NumLayers;
+            int cacheSize = (int)_kvCacheK[0].Sizes[1];
+            for (int l = 0; l < numLayers; l++)
+            {
+                _modelDecodeArgs[l].KCache = TensorComputePrimitives.GetStoragePointer(_kvCacheK[l]);
+                _modelDecodeArgs[l].VCache = TensorComputePrimitives.GetStoragePointer(_kvCacheV[l]);
+                _modelDecodeArgs[l].CacheSize = cacheSize;
+            }
+
+            bool ok = GgmlBasicOps.TryGptOssModelPrefill(
+                _modelDecodeArgs, numLayers,
+                (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, seqLen, startPos,
+                _foldLogitsPtr, Config.VocabSize,
+                lmHead.CacheKey, lmHead.GgmlType, lmHead.Ne0, lmHead.Ne1, lmHead.RawBytes,
+                (IntPtr)GetFloatPtr(finalNorm));
+
+            if (ok)
+            {
+                _kvCacheHostDirty = true;
+            }
+            else
+            {
+                // A refusal is structural (a shape or a weight the kernel cannot
+                // bind), not transient: stop paying the setup cost every chunk.
+                // Say so once — the per-layer fallback is an order of magnitude
+                // slower, so a silent demotion looks exactly like a perf bug.
+                _modelPrefillUnavailable = true;
+                Console.WriteLine("  GPT-OSS whole-model prefill unavailable, falling back to the per-layer path: "
+                    + GgmlBasicOps.LastNativeError());
+            }
             return ok;
         }
 

@@ -242,8 +242,16 @@ namespace TensorSharp.Server.ProtocolAdapters
                     // One constraint per request: it holds the live parse
                     // position, so sharing it across sequences would let them
                     // advance each other's parser.
-                    withGrammar.Grammar =
+                    var constraint =
                         TensorSharp.Runtime.Grammar.GrammarLibrary.NewConstraint(cache, tok);
+                    // A model that reasons before it answers must be allowed to
+                    // do so: enforcing the schema from token 0 forbids its own
+                    // channel header and it answers the shape instead of the
+                    // question (see OutputParserFactory.GrammarActivationTrigger).
+                    string trigger = OutputParserFactory.GrammarActivationTrigger(_svc.Architecture);
+                    if (trigger != null)
+                        constraint.ActivateAfter(trigger);
+                    withGrammar.Grammar = constraint;
                     return withGrammar;
                 }
                 catch (Exception ex)

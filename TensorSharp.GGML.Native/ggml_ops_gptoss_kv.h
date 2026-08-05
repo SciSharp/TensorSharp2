@@ -10,6 +10,7 @@
 #pragma once
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_transformer_common.h"   // TSGgmlGptOssLayerDesc (kv_acquire_pair)
 
 #include <cstdint>
 #include <mutex>
@@ -63,4 +64,26 @@ namespace tsg_gptoss
     void kv_drop_locked(const void* host_cache);
     void kv_drop_pair_locked(const void* k_cache, const void* v_cache);
     void kv_drop_all_locked();
+
+    // ------------------------------------------------------------------
+    // Window <-> host mirror transfers, shared by the whole-model decode and
+    // prefill kernels. Both expect kv_mutex() held.
+    // ------------------------------------------------------------------
+
+    // Rows of a device window copied back into its host mirror. The window and
+    // the host cache share the [head_dim, rows, kv_heads] layout but not the row
+    // capacity, so the copy is per head.
+    void kv_download(KvWindow* w, void* host_cache, int cache_rows, std::int64_t rows);
+
+    // Rows [from_row, to_row) of the host mirror pushed into the device window.
+    void kv_upload(KvWindow* w, const void* host_cache, int cache_rows,
+                   std::int64_t from_row, std::int64_t to_row);
+
+    // Acquire the K/V window pair for a layer, preserving whatever the device
+    // already holds when the window has to grow. Growth reallocates, which would
+    // otherwise drop rows that only exist on the device (decode never writes them
+    // back), so the old contents are flushed to the host mirror first and the
+    // freshly allocated window re-uploads them from there.
+    bool kv_acquire_pair(const TSGgmlGptOssLayerDesc& d, std::int64_t needed_rows,
+                         KvWindow*& k_win, KvWindow*& v_win);
 }

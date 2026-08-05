@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using TensorSharp.Cuda.Interop;
@@ -20,6 +20,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr fillF16;
         private readonly IntPtr unaryF32;
         private readonly IntPtr binaryF32;
+        private readonly IntPtr binaryRowBcastF32;
         private readonly IntPtr scalarF32;
         private readonly IntPtr ternaryF32;
         private readonly IntPtr addMulScalarF32;
@@ -186,6 +187,7 @@ namespace TensorSharp.Cuda
             fillF16 = module.GetFunction("ts_fill_f16");
             unaryF32 = module.GetFunction("ts_unary_f32");
             binaryF32 = module.GetFunction("ts_binary_f32");
+            binaryRowBcastF32 = module.GetFunction("ts_binary_row_bcast_f32");
             scalarF32 = module.GetFunction("ts_scalar_f32");
             ternaryF32 = module.GetFunction("ts_ternary_f32");
             addMulScalarF32 = module.GetFunction("ts_addmul_scalar_f32");
@@ -423,6 +425,21 @@ namespace TensorSharp.Cuda
             int opArg = op;
             void** args = stackalloc void*[] { &lhsArg, &rhsArg, &outputArg, &countArg, &opArg };
             Launch(binaryF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchBinaryRowBroadcastF32(IntPtr lhs, IntPtr rhs, IntPtr output,
+            int rows, int cols, int rhsCols, int op, IntPtr stream)
+        {
+            IntPtr lhsArg = lhs;
+            IntPtr rhsArg = rhs;
+            IntPtr outputArg = output;
+            int rowsArg = rows;
+            int colsArg = cols;
+            int rhsColsArg = rhsCols;
+            int opArg = op;
+            int count = checked(rows * cols);
+            void** args = stackalloc void*[] { &lhsArg, &rhsArg, &outputArg, &rowsArg, &colsArg, &rhsColsArg, &opArg };
+            Launch(binaryRowBcastF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchScalarF32(IntPtr input, IntPtr output, int count, float value, int op, IntPtr stream)

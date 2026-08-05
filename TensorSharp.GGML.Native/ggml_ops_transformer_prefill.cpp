@@ -1028,6 +1028,62 @@ void kv_drop_all_locked()
         kv_release(kv.second);
     g_gptoss_kv.clear();
 }
+
+void kv_download(KvWindow* w, void* host_cache, int cache_rows, std::int64_t rows)
+{
+    if (w == nullptr || w->tensor == nullptr || host_cache == nullptr || rows <= 0)
+        return;
+    rows = std::min<std::int64_t>(rows, std::min<std::int64_t>(w->capacity, cache_rows));
+    const std::size_t row_bytes = ggml_row_size(static_cast<ggml_type>(w->type), w->head_dim);
+    const std::size_t host_stride = static_cast<std::size_t>(cache_rows) * row_bytes;
+    const std::size_t win_stride = static_cast<std::size_t>(w->capacity) * row_bytes;
+    const std::size_t bytes = static_cast<std::size_t>(rows) * row_bytes;
+    char* host = static_cast<char*>(host_cache);
+    for (int h = 0; h < w->kv_heads; h++)
+        ggml_backend_tensor_get(w->tensor, host + h * host_stride, h * win_stride, bytes);
+}
+
+void kv_upload(KvWindow* w, const void* host_cache, int cache_rows,
+               std::int64_t from_row, std::int64_t to_row)
+{
+    if (w == nullptr || w->tensor == nullptr || host_cache == nullptr || to_row <= from_row)
+        return;
+    const std::size_t row_bytes = ggml_row_size(static_cast<ggml_type>(w->type), w->head_dim);
+    const std::size_t host_stride = static_cast<std::size_t>(cache_rows) * row_bytes;
+    const std::size_t win_stride = static_cast<std::size_t>(w->capacity) * row_bytes;
+    const std::size_t offset = static_cast<std::size_t>(from_row) * row_bytes;
+    const std::size_t bytes = static_cast<std::size_t>(to_row - from_row) * row_bytes;
+    const char* host = static_cast<const char*>(host_cache);
+    for (int h = 0; h < w->kv_heads; h++)
+        ggml_backend_tensor_set(w->tensor, host + h * host_stride + offset,
+                                h * win_stride + offset, bytes);
+}
+
+bool kv_acquire_pair(const TSGgmlGptOssLayerDesc& d, std::int64_t needed_rows,
+                     KvWindow*& k_win, KvWindow*& v_win)
+{
+    const ggml_type kvType = static_cast<ggml_type>(d.kv_cache_type);
+    KvWindow* existing_k = kv_find(d.k_cache);
+    KvWindow* existing_v = kv_find(d.v_cache);
+    if (existing_k != nullptr && existing_k->capacity < needed_rows)
+        kv_download(existing_k, d.k_cache, d.cache_size, existing_k->rows_valid);
+    if (existing_v != nullptr && existing_v->capacity < needed_rows)
+        kv_download(existing_v, d.v_cache, d.cache_size, existing_v->rows_valid);
+
+    k_win = kv_acquire(d.k_cache, d.head_dim, d.num_kv_heads, kvType, needed_rows, d.cache_size);
+    v_win = (k_win == nullptr)
+        ? nullptr
+        : kv_acquire(d.v_cache, d.head_dim, d.num_kv_heads, kvType, needed_rows, d.cache_size);
+    if (k_win == nullptr || v_win == nullptr)
+    {
+        // Half a pair is worse than none: drop both so the per-layer path
+        // rebuilds from the host mirror rather than trusting a stale
+        // rows_valid on the survivor.
+        kv_drop_pair_locked(d.k_cache, d.v_cache);
+        return false;
+    }
+    return true;
+}
 } // namespace tsg_gptoss
 
 using GptOssKvWindow = tsg_gptoss::KvWindow;

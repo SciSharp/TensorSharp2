@@ -196,6 +196,11 @@ namespace TensorSharp.Runtime.Grammar
         private readonly List<byte> _tokenBytes = new(64);
         private readonly ITokenizer _tokenizer;
 
+        // --- lazy activation (see ActivateAfter) ---
+        private string? _triggerText;
+        private System.Text.StringBuilder? _preludeTail;
+        private bool _active = true;
+
         public GrammarConstraint(Grammar grammar, ITokenizer tokenizer)
             : this(new GrammarMaskCache(grammar, GrammarTokenVocabulary.ForTokenizer(tokenizer)), tokenizer)
         {
@@ -209,8 +214,36 @@ namespace TensorSharp.Runtime.Grammar
             _partial = PartialUtf8.Empty;
         }
 
+        /// <summary>
+        /// Hold the constraint dormant until <paramref name="triggerText"/> has
+        /// been generated, then enforce the grammar over everything after it.
+        ///
+        /// This is what makes structured output work on a model that speaks
+        /// before it answers. GPT-OSS's harmony format opens every reply with a
+        /// channel header (<c>&lt;|channel|&gt;analysis&lt;|message|&gt;…</c>),
+        /// so a grammar armed from token 0 forbids the model's own first token
+        /// and it is pushed straight into a JSON object it has done no reasoning
+        /// for. It answers the shape and not the question — schema-valid
+        /// <c>{"city":"...","population":1}</c>. Arming on the final channel's
+        /// header instead lets the analysis channel run free and constrains only
+        /// the answer. Mirrors llama.cpp's lazy grammar triggers.
+        ///
+        /// While dormant the constraint masks nothing and feeds the grammar
+        /// nothing: the prelude is not part of the structured output.
+        /// </summary>
+        public void ActivateAfter(string triggerText)
+        {
+            if (string.IsNullOrEmpty(triggerText)) return;
+            _triggerText = triggerText;
+            _preludeTail = new System.Text.StringBuilder();
+            _active = false;
+        }
+
+        /// <summary>Whether the grammar is currently enforcing (see <see cref="ActivateAfter"/>).</summary>
+        public bool IsActive => _active;
+
         /// <summary>The grammar can legally end here, so EOS is permitted.</summary>
-        public bool IsComplete => _partial.Remaining == 0 && _state.CanTerminate;
+        public bool IsComplete => !_active || (_partial.Remaining == 0 && _state.CanTerminate);
 
         /// <summary>
         /// No continuation exists. Should not happen while the sampler honours
@@ -272,6 +305,12 @@ namespace TensorSharp.Runtime.Grammar
             }
             if (_tokenBytes.Count == 0) return;
 
+            if (!_active)
+            {
+                ScanForTrigger();
+                return;
+            }
+
             for (int i = 0; i < _tokenBytes.Count; i++)
             {
                 if (!GrammarMatcher.TryFeedByte(ref _partial, _tokenBytes[i], out uint cp, out bool complete))
@@ -293,8 +332,35 @@ namespace TensorSharp.Runtime.Grammar
         /// <param name="allowEos">
         /// Whether EOS ids may survive; callers pass <see cref="IsComplete"/>.
         /// </param>
+        /// <summary>
+        /// Consume the just-accepted token's text while dormant, looking for the
+        /// activation trigger. Only the trigger's own length (plus one token's
+        /// worth of slack) is retained, so a long reasoning channel costs a fixed
+        /// few bytes.
+        /// </summary>
+        private void ScanForTrigger()
+        {
+            string trigger = _triggerText!;
+            var tail = _preludeTail!;
+            for (int i = 0; i < _tokenBytes.Count; i++)
+                tail.Append((char)_tokenBytes[i]);   // trigger markers are ASCII
+
+            int hit = tail.ToString().IndexOf(trigger, StringComparison.Ordinal);
+            if (hit >= 0)
+            {
+                _active = true;
+                _triggerText = null;
+                _preludeTail = null;
+                return;
+            }
+            int keep = trigger.Length + 8;
+            if (tail.Length > keep)
+                tail.Remove(0, tail.Length - keep);
+        }
+
         public void ApplyMask(float[] logits, bool allowEos)
         {
+            if (!_active) return;
             if (logits == null) throw new ArgumentNullException(nameof(logits));
             ulong[] mask = CurrentMask();
             int vocab = Math.Min(logits.Length, _cache.Vocabulary.VocabSize);

@@ -116,6 +116,71 @@ namespace tsg
             ggml_backend_tensor_set(tensor, data, 0, bytes);
     }
 
+    // ------------------------------------------------------------------
+    // Softmax-gated top-k MoE routing, in the shape ggml-cuda can fuse
+    // ------------------------------------------------------------------
+    // ggml-cuda collapses a MoE router's whole gating chain into ONE kernel
+    // (`ggml_cuda_op_topk_moe`), but `ggml_cuda_topk_moe_fusion` recognises it
+    // by literal node sequence:
+    //
+    //   SOFT_MAX -> RESHAPE -> ARGSORT -> VIEW -> GET_ROWS
+    //            [-> RESHAPE -> SUM_ROWS -> CLAMP -> DIV -> RESHAPE]   (norm)
+    //
+    // which is exactly what llama.cpp's `build_moe_ffn` emits. Two things kept
+    // TensorSharp off it:
+    //
+    //  * `ggml_top_k` is its own op (GGML_OP_TOP_K), not `argsort + view`, so
+    //    the pattern never matched. It is also strictly more work — a full sort
+    //    of all n_expert scores per token where the fused kernel does a partial
+    //    selection — and it hands back a COMPACT [k, tokens] tensor, whereas the
+    //    fused kernel recovers n_expert from the ids' row stride
+    //    (`ids->nb[1] / ids->nb[0]`), which only holds for the argsort view.
+    //  * the reshape of `probs` has to be emitted between the softmax and the
+    //    argsort, which is a consequence of build order, not of the maths.
+    //
+    // Emitting the chain through this helper and expanding `weights` into the
+    // graph as a unit (see the callers) gives the DFS the required order.
+    //
+    // Fusion additionally requires that nothing outside the chain consumes its
+    // intermediates: only the ids and the final weights may have external
+    // readers. A model that gathers a per-expert scale off `probs_3d` (Gemma 4's
+    // `down_exps_scale`) therefore stays unfused, and correctly so.
+    struct MoeTopKRouting
+    {
+        ggml_tensor* ids = nullptr;        // I32 [n_used, n_tokens] — argsort view
+        ggml_tensor* weights_3d = nullptr; // F32 [1, n_used, n_tokens]
+        ggml_tensor* weights_2d = nullptr; // F32 [n_used, n_tokens]
+        ggml_tensor* probs_3d = nullptr;   // F32 [1, n_expert, n_tokens]
+    };
+
+    inline MoeTopKRouting build_topk_moe_routing(
+        ggml_context* ctx,
+        ggml_tensor* logits,        // [n_expert, n_tokens]
+        int n_expert,
+        int n_expert_used,
+        std::int64_t n_tokens,
+        bool norm_topk)
+    {
+        MoeTopKRouting r;
+        ggml_tensor* probs = ggml_soft_max(ctx, logits);                     // SOFT_MAX
+        r.probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);     // RESHAPE
+        r.ids = ggml_argsort_top_k(ctx, probs, n_expert_used);               // ARGSORT + VIEW
+        ggml_tensor* w = ggml_get_rows(ctx, r.probs_3d, r.ids);              // GET_ROWS -> [1, n_used, T]
+
+        ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, n_expert_used, n_tokens);
+        if (norm_topk)
+        {
+            ggml_tensor* w_sum = ggml_sum_rows(ctx, w_2d);                   // SUM_ROWS
+            // The clamp is part of the pattern, and is what keeps the division
+            // finite when every selected probability underflows.
+            w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);       // CLAMP
+            w_2d = ggml_div(ctx, w_2d, w_sum);                               // DIV
+        }
+        r.weights_2d = w_2d;
+        r.weights_3d = ggml_reshape_3d(ctx, w_2d, 1, n_expert_used, n_tokens);
+        return r;
+    }
+
     inline ggml_tensor* view_kv_cache_window(
         ggml_context* ctx,
         ggml_tensor* cache,

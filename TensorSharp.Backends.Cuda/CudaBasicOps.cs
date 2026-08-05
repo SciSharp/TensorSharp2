@@ -171,22 +171,30 @@ namespace TensorSharp.Cuda
         public static Tensor ModValue(Tensor result, Tensor lhs, float rhs) => ScalarFallback("modv", result, lhs, rhs);
 
         [RegisterOpStorageType("addt", typeof(CudaStorage))]
-        public static Tensor AddTensor(Tensor result, Tensor lhs, Tensor rhs)
-        {
-            // Row-broadcast add (x[rows, cols] + bias[cols]) — the shape the linear
-            // layers use for their bias. The elementwise kernel requires identical
-            // shapes and the CPU fallback's Apply3 stops iterating at the shorter
-            // operand's last block, which silently biases row 0 only. Route it to
-            // the row-bias kernel instead.
-            if (TryAddRowBroadcast(result, lhs, rhs, out Tensor broadcast))
-                return broadcast;
+        public static Tensor AddTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("addt", result, lhs, rhs, CudaBinaryOp.Add);
 
-            return Binary("addt", result, lhs, rhs, CudaBinaryOp.Add);
-        }
+        [RegisterOpStorageType("subt", typeof(CudaStorage))]
+        public static Tensor SubTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("subt", result, lhs, rhs, CudaBinaryOp.Sub);
 
-        private static bool TryAddRowBroadcast(Tensor result, Tensor lhs, Tensor rhs, out Tensor writeTarget)
+        [RegisterOpStorageType("mult", typeof(CudaStorage))]
+        public static Tensor MulTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("mult", result, lhs, rhs, CudaBinaryOp.Mul);
+
+        [RegisterOpStorageType("divt", typeof(CudaStorage))]
+        public static Tensor DivTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("divt", result, lhs, rhs, CudaBinaryOp.Div);
+
+        /// <summary>
+        /// True when <paramref name="rhs"/> is one row broadcast down every row of
+        /// <paramref name="lhs"/> (x[rows, cols] OP bias[cols]) — a per-channel
+        /// bias or scale. All four elementwise kernels need identical shapes, and
+        /// the host fallback they would otherwise degrade to stops iterating at the
+        /// shorter operand's last block, which applies the row to row 0 and
+        /// silently leaves the rest of the tensor untouched. That is not a
+        /// hypothetical: Gemma 4's vision projector standardises its pooled patches
+        /// with exactly this shape (Sub then Mul), so on this backend only the
+        /// first patch was being standardised and the model hallucinated the image.
+        /// </summary>
+        private static bool IsRowBroadcast(Tensor lhs, Tensor rhs)
         {
-            writeTarget = null;
             if (lhs == null || rhs == null || lhs.DimensionCount < 2 || rhs.DimensionCount > lhs.DimensionCount)
                 return false;
 
@@ -200,26 +208,8 @@ namespace TensorSharp.Cuda
                 if (rhs.Sizes[i] != 1)
                     return false;
             }
-
-            Tensor target = TensorResultBuilder.GetWriteTarget(result, lhs, false, lhs.Sizes);
-            if (!ReferenceEquals(target, lhs))
-                Ops.Copy(target, lhs);
-
-            if (!CudaKernelOps.TryAddBiasRows(target, rhs))
-                return false;
-
-            writeTarget = target;
             return true;
         }
-
-        [RegisterOpStorageType("subt", typeof(CudaStorage))]
-        public static Tensor SubTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("subt", result, lhs, rhs, CudaBinaryOp.Sub);
-
-        [RegisterOpStorageType("mult", typeof(CudaStorage))]
-        public static Tensor MulTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("mult", result, lhs, rhs, CudaBinaryOp.Mul);
-
-        [RegisterOpStorageType("divt", typeof(CudaStorage))]
-        public static Tensor DivTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("divt", result, lhs, rhs, CudaBinaryOp.Div);
 
         [RegisterOpStorageType("modt", typeof(CudaStorage))]
         public static Tensor ModTensor(Tensor result, Tensor lhs, Tensor rhs) => BinaryFallback("modt", result, lhs, rhs);
@@ -580,6 +570,9 @@ namespace TensorSharp.Cuda
         {
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, lhs, false, lhs.Sizes);
             if (CudaKernelOps.TryBinary(writeTarget, lhs, rhs, cudaOp))
+                return writeTarget;
+
+            if (IsRowBroadcast(lhs, rhs) && CudaKernelOps.TryBinaryRowBroadcast(writeTarget, lhs, rhs, cudaOp))
                 return writeTarget;
 
             return CudaCpuFallback.InvokeTensor(opName, writeTarget, writeTarget, lhs, rhs);

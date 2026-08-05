@@ -473,6 +473,38 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>
+        /// Elementwise binary with <paramref name="rhs"/> broadcast down the rows
+        /// of <paramref name="lhs"/> (x[..., cols] OP bias[cols]) — a per-channel
+        /// scale or bias. <see cref="TryBinary"/> needs matching shapes, and the
+        /// host fallback it would otherwise degrade to writes row 0 only.
+        /// </summary>
+        public static bool TryBinaryRowBroadcast(Tensor result, Tensor lhs, Tensor rhs, CudaBinaryOp op)
+        {
+            if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||
+                !TryGetContiguousFloat(lhs, out CudaStorage lhsStorage, out IntPtr lhsPtr, out int lhsCount) ||
+                !TryGetContiguousFloat(rhs, out CudaStorage rhsStorage, out IntPtr rhsPtr, out int rhsCount) ||
+                lhsCount != rows * cols ||
+                rhsCount <= 0 ||
+                rhsCount != cols ||
+                !SameShape(result, lhs))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            lhsStorage.EnsureDeviceCurrent();
+            rhsStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchBinaryRowBroadcastF32(lhsPtr, rhsPtr, resultPtr, rows, cols, rhsCount,
+                (int)op, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryScalar(Tensor result, Tensor lhs, float rhs, CudaScalarOp op)
         {
             if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||

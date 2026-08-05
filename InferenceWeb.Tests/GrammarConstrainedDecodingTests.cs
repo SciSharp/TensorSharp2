@@ -572,4 +572,70 @@ public class GrammarConstrainedDecodingTests
         var tok = new PieceTokenizer("{", "}", "a");
         Assert.Same(GrammarTokenVocabulary.ForTokenizer(tok), GrammarTokenVocabulary.ForTokenizer(tok));
     }
+
+    // ---- lazy activation (reasoning-channel models) ----------------------
+
+    /// <summary>
+    /// GPT-OSS opens every reply with a harmony channel header and reasons in
+    /// the analysis channel first. A grammar armed from token 0 forbids that
+    /// header, and the model — pushed into JSON with no reasoning behind it —
+    /// fills the schema with placeholders. The constraint therefore stays
+    /// dormant until the final channel's header has been generated.
+    /// </summary>
+    [Fact]
+    public void LazyConstraintMasksNothingBeforeItsTrigger()
+    {
+        var tok = new PieceTokenizer("<|channel|>", "analysis", "final", "<|message|>", "{", "}", "\"", "a", "The");
+        var c = new GrammarConstraint(Grammar.JsonObject(), tok);
+        c.ActivateAfter("final<|message|>");
+
+        Assert.False(c.IsActive);
+        // The channel header and prose are not JSON, and must not be blocked.
+        var logits = new float[tok.VocabSize];
+        c.ApplyMask(logits, allowEos: false);
+        Assert.All(logits, v => Assert.False(float.IsNegativeInfinity(v)));
+
+        c.Accept(tok.LookupToken("<|channel|>"));
+        c.Accept(tok.LookupToken("analysis"));
+        c.Accept(tok.LookupToken("<|message|>"));
+        c.Accept(tok.LookupToken("The"));
+        Assert.False(c.IsActive);
+    }
+
+    [Fact]
+    public void LazyConstraintEnforcesAfterItsTrigger()
+    {
+        var tok = new PieceTokenizer("<|channel|>", "analysis", "final", "<|message|>", "{", "}", "\"", "a", "The");
+        var c = new GrammarConstraint(Grammar.JsonObject(), tok);
+        c.ActivateAfter("final<|message|>");
+
+        c.Accept(tok.LookupToken("<|channel|>"));
+        c.Accept(tok.LookupToken("analysis"));
+        c.Accept(tok.LookupToken("<|message|>"));
+        c.Accept(tok.LookupToken("The"));
+        c.Accept(tok.LookupToken("<|channel|>"));
+        c.Accept(tok.LookupToken("final"));
+        c.Accept(tok.LookupToken("<|message|>"));
+
+        Assert.True(c.IsActive);
+        // The prelude was not fed to the grammar: the parser is still at the
+        // start of the object, so only "{" is legal.
+        Assert.True(Allows(c, tok.LookupToken("{")));
+        Assert.False(Allows(c, tok.LookupToken("The")));
+
+        var logits = new float[tok.VocabSize];
+        for (int i = 0; i < logits.Length; i++) logits[i] = 1.0f;
+        c.ApplyMask(logits, allowEos: false);
+        Assert.True(float.IsNegativeInfinity(logits[tok.LookupToken("The")]));
+        Assert.False(float.IsNegativeInfinity(logits[tok.LookupToken("{")]));
+    }
+
+    [Fact]
+    public void ConstraintWithoutATriggerEnforcesImmediately()
+    {
+        var tok = new PieceTokenizer("{", "}", "a");
+        var c = new GrammarConstraint(Grammar.JsonObject(), tok);
+        Assert.True(c.IsActive);
+        Assert.False(Allows(c, tok.LookupToken("a")));
+    }
 }

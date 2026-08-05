@@ -1939,6 +1939,30 @@ internal enum GgmlIndexReductionOp
             => TSGgml_GptOssModelDecode(layers, numLayers, hidden, hiddenSize, position,
                 logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm) != 0;
 
+        // GPT-OSS whole-model prefill: N tokens through every layer + MoE +
+        // folded final norm/LM head in ONE graph (see ggml_ops_gptoss_prefill.cpp).
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GptOssModelPrefill(
+            [In] GptOssLayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int numTokens, int startPos,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm);
+
+        /// <summary>
+        /// Runs the whole GPT-OSS transformer over a prompt chunk as a single
+        /// graph, leaving the last token's logits in <paramref name="logits"/>.
+        /// Returns false (with the native error recorded) when the kernel cannot
+        /// handle the shape, so the caller can fall back to the per-layer path.
+        /// </summary>
+        public static bool TryGptOssModelPrefill(
+            GptOssLayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize,
+            int numTokens, int startPos,
+            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType,
+            long lmHeadNe0, long lmHeadNe1, long lmHeadBytes, IntPtr finalNorm)
+            => TSGgml_GptOssModelPrefill(layers, numLayers, hidden, hiddenSize, numTokens, startPos,
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm) != 0;
+
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_GptOssResetDecodeCache();
 

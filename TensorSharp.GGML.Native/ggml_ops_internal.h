@@ -207,6 +207,23 @@ namespace tsg
         std::size_t bytes = 0;
         std::size_t buffer_size = 0;
         CachedBufferMode mode = CachedBufferMode::HostPtr;
+        // Allocation size (0 = never) that has been through the backend's
+        // init_tensor for this buffer. Every later graph binds a FRESH
+        // ggml_tensor to the same buffer and address, and re-running
+        // init_tensor is not free: ggml-cuda zeroes a quantized tensor's
+        // padding with a cudaMemset, so a 600-weight prefill graph issued 600
+        // of them re-zeroing padding that has been zero since the weight was
+        // first uploaded.
+        //
+        // Matched on the ALLOC size rather than a bare flag: that is what
+        // decides how much padding init_tensor would zero, so skipping it for
+        // a larger tensor would leave the extra padding holding whatever the
+        // allocator last put there - which a quantized matmul reads as NaN.
+        std::size_t initialized_alloc_size = 0;
+        // Address the first successful bind resolved to (the device copy's base,
+        // or the host pointer for a zero-copy wrap). Recording it lets a repeat
+        // bind attach with two assignments and no backend calls at all.
+        void* bound_addr = nullptr;
     };
 
     // --- Multi-device (tensor-parallel) state -------------------------------
@@ -901,6 +918,71 @@ namespace tsg
     // Node index of `t` in `graph`, or -1 when the builder never emitted it.
     int host_moe_graph_node_index(ggml_cgraph* graph, ggml_tensor* t);
 
+    // ------------------------------------------------------------------
+    // Whole-model graph profiler (TS_GGML_NODE_PROFILE)
+    // ------------------------------------------------------------------
+    // Drop-in for ggml_backend_graph_compute in the whole-model kernels. Unset,
+    // it IS ggml_backend_graph_compute — same call, no branch worth measuring.
+    // Set to 1 it runs the graph one node at a time with a synchronize around
+    // each, accumulates the cost per op type (and per (op, shape) for the worst
+    // offenders) and dumps a table every TS_GGML_NODE_PROFILE_EVERY calls
+    // (default 64).
+    //
+    // The per-node synchronize is itself ~5-10 us, so the profiled total runs
+    // well above the real graph time; the dump prints both so the launch tax is
+    // visible rather than hidden. What it is for is the SHAPE of the cost — which
+    // op type owns the graph — which is exactly what a "we are 0.7x llama.cpp"
+    // gap needs before anything is rewritten.
+    bool graph_node_profile_enabled();
+    ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag);
+
+    // ------------------------------------------------------------------
+    // Whole-model kernel phase timer (TS_GGML_PHASE_TIMING)
+    // ------------------------------------------------------------------
+    // A prefill kernel is graph build -> weight bind -> buffer alloc -> input
+    // upload -> compute -> result download, and only the compute part scales
+    // with the token count. When a prefill is fast at 2048 tokens and slow at
+    // 512 the cost is in the other five, and this says which. Zero cost when the
+    // env var is unset (one relaxed atomic load per mark).
+    bool phase_timing_enabled();
+    void phase_timing_report(const char* tag, const char* const* phases, const double* ms, int count);
+
+    struct PhaseTimer
+    {
+        explicit PhaseTimer(const char* tag) : tag_(tag), on_(phase_timing_enabled())
+        {
+            if (on_) last_ = now();
+        }
+
+        void mark(const char* phase)
+        {
+            if (!on_ || count_ >= kMaxPhases) return;
+            const double t = now();
+            phases_[count_] = phase;
+            ms_[count_] = t - last_;
+            last_ = t;
+            ++count_;
+        }
+
+        ~PhaseTimer()
+        {
+            if (on_ && count_ > 0) phase_timing_report(tag_, phases_, ms_, count_);
+        }
+
+        PhaseTimer(const PhaseTimer&) = delete;
+        PhaseTimer& operator=(const PhaseTimer&) = delete;
+
+    private:
+        static double now();
+        static constexpr int kMaxPhases = 12;
+        const char* tag_;
+        bool on_;
+        double last_ = 0.0;
+        int count_ = 0;
+        const char* phases_[kMaxPhases] = {};
+        double ms_[kMaxPhases] = {};
+    };
+
     // Turn recorded segments into node cut points. The cut for a segment goes
     // after the last of its boundary tensors, whichever order the expander
     // emitted them in; `seg_end` ends with the graph's node count so the tail
@@ -1050,6 +1132,25 @@ namespace tsg
         ggml_backend_t backend, ggml_backend_dev_t dev,
         ggml_tensor* tensor, void* data, std::size_t bytes,
         ggml_backend_buffer_t& out_buffer, void*& out_addr, bool& out_needs_upload,
+        enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // Bind `tensor` to the cached device buffer for `data`, doing the lookup and
+    // the attach in one step. Returns false when there is no usable cached
+    // buffer (the caller falls back to a host-pointer wrap or an upload).
+    //
+    // The reason this exists rather than callers pairing
+    // try_get_cacheable_tensor_buffer with ggml_backend_tensor_alloc: the second
+    // half of that pair runs the backend's init_tensor every time, and for a
+    // quantized weight ggml-cuda's init_tensor issues a cudaMemset to zero the
+    // block padding. A whole-model prefill graph binds ~600 weights per call, so
+    // that was ~600 memsets per prefill (7.5 ms on a 30-layer Gemma 4 — half the
+    // gap to llama.cpp at 512 tokens) re-zeroing padding that has been zero since
+    // the weight was first uploaded. The cache entry remembers that it has been
+    // initialized, and repeat binds attach directly. The flag lives in the entry,
+    // so freeing/evicting the buffer clears it with the rest.
+    bool try_bind_cached_tensor(
+        ggml_backend_t backend, ggml_backend_dev_t dev,
+        ggml_tensor* tensor, void* data, std::size_t bytes, bool& out_needs_upload,
         enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     bool sync_cached_buffer_to_host(void* data, std::size_t bytes);

@@ -25,6 +25,132 @@ namespace TensorSharp.Runtime
         public string Description { get; set; } = string.Empty;
         public Dictionary<string, ToolParameter> Parameters { get; set; } = new();
         public List<string> Required { get; set; } = new();
+
+        /// <summary>
+        /// Parse a list of tool definitions from JSON, accepting every shape a
+        /// caller plausibly writes:
+        ///
+        /// <list type="bullet">
+        /// <item>this type's own flat shape —
+        ///   <c>{"name", "description", "parameters": {"city": {...}}, "required": [...]}</c></item>
+        /// <item>the JSON Schema shape the OpenAI API uses, where
+        ///   <c>parameters</c> is a schema object —
+        ///   <c>{"name", "parameters": {"type": "object", "properties": {...}, "required": [...]}}</c></item>
+        /// <item>either of those inside the OpenAI tools wrapper —
+        ///   <c>{"type": "function", "function": {...}}</c></item>
+        /// </list>
+        ///
+        /// The second is what anyone copying a tool definition out of an API
+        /// request writes, and the server has always accepted it; the CLI's
+        /// <c>--tools</c> flag used to deserialize straight into this type and
+        /// die with an unhandled <c>JsonException</c> ("The JSON value could not
+        /// be converted to ToolParameter") on the schema's own <c>"type":
+        /// "object"</c>.
+        /// </summary>
+        /// <exception cref="JsonException">
+        /// The document is not valid JSON, or is not an array/object of tool
+        /// definitions. The message names what was expected.
+        /// </exception>
+        public static List<ToolFunction> ParseList(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+                return new List<ToolFunction>();
+
+            using JsonDocument doc = JsonDocument.Parse(json);
+            JsonElement root = doc.RootElement;
+
+            // Tolerate a single object, and the OpenAI request shape where the
+            // array hangs off a "tools" property.
+            if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("tools", out JsonElement toolsProp))
+                root = toolsProp;
+
+            var result = new List<ToolFunction>();
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                result.Add(ParseOne(root));
+                return result;
+            }
+            if (root.ValueKind != JsonValueKind.Array)
+                throw new JsonException(
+                    "Tool definitions must be a JSON array of objects (or a single object), " +
+                    $"but the document root is {root.ValueKind}.");
+
+            foreach (JsonElement entry in root.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object)
+                    throw new JsonException(
+                        $"Each tool definition must be a JSON object, but found {entry.ValueKind}.");
+                result.Add(ParseOne(entry));
+            }
+            return result;
+        }
+
+        private static ToolFunction ParseOne(JsonElement entry)
+        {
+            // OpenAI wrapper: {"type": "function", "function": {...}}
+            if (entry.TryGetProperty("function", out JsonElement inner) && inner.ValueKind == JsonValueKind.Object)
+                entry = inner;
+
+            var fn = new ToolFunction
+            {
+                Name = GetString(entry, "name") ?? string.Empty,
+                Description = GetString(entry, "description") ?? string.Empty,
+            };
+
+            if (!entry.TryGetProperty("parameters", out JsonElement parameters)
+                || parameters.ValueKind != JsonValueKind.Object)
+            {
+                CollectRequired(entry, fn.Required);
+                return fn;
+            }
+
+            // JSON Schema shape: the properties live one level down and the
+            // required list belongs to the schema, not the function.
+            JsonElement propertyBag = parameters;
+            if (parameters.TryGetProperty("properties", out JsonElement properties)
+                && properties.ValueKind == JsonValueKind.Object)
+            {
+                propertyBag = properties;
+                CollectRequired(parameters, fn.Required);
+            }
+
+            foreach (JsonProperty prop in propertyBag.EnumerateObject())
+            {
+                if (prop.Value.ValueKind != JsonValueKind.Object)
+                    continue;   // a schema keyword sitting next to "properties" ("type", "$schema", ...)
+                var param = new ToolParameter
+                {
+                    Type = GetString(prop.Value, "type") ?? string.Empty,
+                    Description = GetString(prop.Value, "description") ?? string.Empty,
+                };
+                if (prop.Value.TryGetProperty("enum", out JsonElement enumValues)
+                    && enumValues.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement v in enumValues.EnumerateArray())
+                        param.Enum.Add(v.ValueKind == JsonValueKind.String ? v.GetString() : v.ToString());
+                }
+                fn.Parameters[prop.Name] = param;
+            }
+
+            // A flat definition carries "required" on the function itself.
+            if (fn.Required.Count == 0)
+                CollectRequired(entry, fn.Required);
+            return fn;
+        }
+
+        private static string GetString(JsonElement obj, string name)
+            => obj.TryGetProperty(name, out JsonElement v) && v.ValueKind == JsonValueKind.String
+                ? v.GetString()
+                : null;
+
+        private static void CollectRequired(JsonElement obj, List<string> into)
+        {
+            if (!obj.TryGetProperty("required", out JsonElement req) || req.ValueKind != JsonValueKind.Array)
+                return;
+            foreach (JsonElement v in req.EnumerateArray())
+                if (v.ValueKind == JsonValueKind.String)
+                    into.Add(v.GetString());
+        }
     }
 
     public class ToolParameter
@@ -1279,6 +1405,21 @@ namespace TensorSharp.Runtime
                 _ => new PassthroughOutputParser()
             };
         }
+
+        /// <summary>
+        /// Text after which a structured-output grammar may start enforcing, or
+        /// null when the model's very first token is already part of the answer.
+        ///
+        /// GPT-OSS opens every reply with a harmony channel header and reasons in
+        /// the <c>analysis</c> channel before answering in <c>final</c>. A grammar
+        /// armed from token 0 forbids that header, so the model is pushed straight
+        /// into a JSON object having done no reasoning and fills the schema with
+        /// placeholders. Arming on the final channel's header instead lets it
+        /// think and constrains only the answer. See
+        /// <c>GrammarConstraint.ActivateAfter</c>.
+        /// </summary>
+        public static string? GrammarActivationTrigger(string architecture)
+            => architecture is "gptoss" or "gpt-oss" ? "final<|message|>" : null;
 
         public static bool IsAlwaysRequired(string architecture)
         {

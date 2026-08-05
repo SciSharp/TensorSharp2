@@ -1052,8 +1052,6 @@ namespace
             else
             {
                 ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, ffn_normed); // [num_experts, N]
-                ggml_tensor* probs = ggml_soft_max(ctx, router_logits);
-                ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, num_experts, N);
                 ggml_tensor* sel_ids;
                 ggml_tensor* w_final;
                 // An offloaded layer runs once on the host over the unsharded
@@ -1061,18 +1059,21 @@ namespace
                 // TP: global ids, unmasked weights (see HostMoeSegment).
                 if (ep_lut == nullptr || d.cpu_moe != 0)
                 {
-                    ggml_tensor* sel = ggml_top_k(ctx, probs, num_experts_used);          // [num_used, N]
-                    ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                     // [1, num_used, N]
-                    ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, num_experts_used, N);
-                    if (norm_topk != 0)
-                    {
-                        ggml_tensor* w_sum = ggml_sum_rows(ctx, w_2d);
-                        w_2d = ggml_div(ctx, w_2d, w_sum);
-                    }
+                    // ggml-cuda's fusable gating shape (see build_topk_moe_routing).
+                    // Expanded here, as a unit: this kernel builds and expands layer
+                    // by layer, so emitting it now keeps the chain contiguous instead
+                    // of letting the expert matmuls pull in its halves separately.
+                    tsg::MoeTopKRouting r = tsg::build_topk_moe_routing(
+                        ctx, router_logits, num_experts, num_experts_used, N, norm_topk != 0);
+                    ggml_tensor* w_2d = r.weights_2d;
+                    w_final = r.weights_3d;
                     if (expert_weights_scale != 1.0f)
+                    {
                         w_2d = ggml_scale(ctx, w_2d, expert_weights_scale);
-                    w_final = ggml_reshape_3d(ctx, w_2d, 1, num_experts_used, N);
-                    sel_ids = sel;
+                        w_final = ggml_reshape_3d(ctx, w_2d, 1, num_experts_used, N);
+                    }
+                    sel_ids = r.ids;
+                    ggml_build_forward_expand(graph, w_final);
                 }
                 else
                 {
@@ -1097,6 +1098,10 @@ namespace
                     // cannot be gathered directly. Gather ALL sorted probs once and
                     // slice the k-th column as a view — the elementwise consumers
                     // below carry offsets in their push constants.
+                    // Its own softmax/reshape: this branch masks and re-sorts,
+                    // so it can never match the fused gating shape above.
+                    ggml_tensor* probs = ggml_soft_max(ctx, router_logits);
+                    ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, num_experts, N);
                     ggml_tensor* sorted_g = ggml_argsort(ctx, probs, GGML_SORT_ORDER_DESC); // I32 [num_experts, N]
                     ggml_tensor* sorted_p = ggml_reshape_2d(ctx,
                         ggml_get_rows(ctx, probs_r, sorted_g), num_experts, N);            // probs, descending per token
@@ -1149,7 +1154,10 @@ namespace
                     tsg::HostMoeSegment hm;
                     hm.layer = l;
                     hm.moe_in = ggml_cont(ctx, ffn_normed);
-                    hm.sel_ids = ggml_cont(ctx, ggml_reshape_1d(ctx, sel_ids, static_cast<std::int64_t>(num_experts_used) * N));
+                    // sel_ids is a VIEW of the argsort on the fusable path (see
+                    // build_topk_moe_routing): cont BEFORE reshape, or ggml_reshape
+                    // asserts on the non-contiguous source.
+                    hm.sel_ids = ggml_reshape_1d(ctx, ggml_cont(ctx, sel_ids), static_cast<std::int64_t>(num_experts_used) * N);
                     hm.weights = ggml_cont(ctx, ggml_reshape_1d(ctx, w_final, static_cast<std::int64_t>(num_experts_used) * N));
                     ggml_set_output(hm.moe_in);
                     ggml_set_output(hm.sel_ids);
@@ -1275,12 +1283,8 @@ namespace
             if (cacheable && bytes >= 4096)
             {
                 ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, tgt, data, bytes, buf, addr, needs_upload, usage))
-                {
-                    if (ggml_backend_tensor_alloc(buf, tgt, addr) == GGML_STATUS_SUCCESS)
-                    { if (needs_upload) upload_list.push_back({tgt, data, bytes}); return; }
-                    invalidate_cached_buffer(data);
-                }
+                if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
+                { if (needs_upload) upload_list.push_back({tgt, data, bytes}); return; }
             }
             if (bytes >= 4096)
             {
@@ -1510,7 +1514,7 @@ namespace
                 g_backend_type == BACKEND_TYPE_METAL &&
                 g_async_compute_enabled.load(std::memory_order_acquire)
                     ? ggml_backend_graph_compute_async(g_backend, graph)
-                    : ggml_backend_graph_compute(g_backend, graph);
+                    : tsg::graph_compute_profiled(g_backend, graph, "qwen35 model verify");
         }
         if (status != GGML_STATUS_SUCCESS)
         {

@@ -751,16 +751,12 @@ namespace TensorSharp.Models
         // Chunk size for ForwardRefill: long prompts are processed in this-many-token
         // chunks so the per-layer attention-score allocation stays bounded.
         // Override with TS_PREFILL_CHUNK when tuning.
-        private static int ResolvePrefillChunkSize()
+        private int ResolvePrefillChunkSize()
         {
             string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
             if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
                 return v;
-            // Default to the fused-attention cap: every chunk then runs on the
-            // fast fused on-device kernel. A larger chunk (the old 2048) fell off
-            // the fused path (cap 256) onto the per-op host-attention path, which
-            // is ~8x slower and OOMs the Metal command buffer (see Forward).
-            return FusedAttnMaxSeqLen;
+            return PrefillChunkCap();
         }
 
         protected override float[] ForwardRefillCore(int[] tokens)
@@ -808,6 +804,17 @@ namespace TensorSharp.Models
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t1;
 
+            // Intermediate chunks only need their KV rows, which the whole-model
+            // prefill graph writes exactly the same way; its logits are ignored.
+            if (WillUseFusedModelPrefill(seqLen) && TryFusedModelPrefill(hidden, startPos, seqLen))
+            {
+                hidden.Dispose();
+                _cacheSeqLen += seqLen;
+                _forwardSw.Stop();
+                return;
+            }
+            EnsureKvCacheHostSynchronized();
+
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 bool isLastLayer = (layer == Config.NumLayers - 1);
@@ -822,6 +829,25 @@ namespace TensorSharp.Models
             hidden.Dispose();
             _cacheSeqLen += seqLen;
             _forwardSw.Stop();
+        }
+
+        /// <summary>
+        /// Tokens per prefill pass.
+        ///
+        /// The 256 floor belongs to the per-layer path, whose attention builds an
+        /// O(seqLen^2) score tensor per layer: a larger chunk there fell off the
+        /// fused attention kernel onto the per-op host path (~8x slower, and it
+        /// OOMs the Metal command buffer). The whole-model prefill graph has no
+        /// such tensor — flash attention over a windowed cache — so when it is
+        /// available the chunk is sized for GEMM efficiency instead. Tunable via
+        /// TS_GPTOSS_PREFILL_CHUNK.
+        /// </summary>
+        private int PrefillChunkCap()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_GPTOSS_PREFILL_CHUNK");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return WillUseFusedModelPrefill(2) ? 2048 : FusedAttnMaxSeqLen;
         }
 
         protected override float[] ForwardCore(int[] tokens)
@@ -839,9 +865,10 @@ namespace TensorSharp.Models
             // to a single pass (causal attention + KV cache), so the returned
             // last-token logits are unchanged. Decode (seqLen == 1) and short
             // prompts (<= cap) skip the loop and run a single pass.
-            if (tokens != null && tokens.Length > FusedAttnMaxSeqLen && IsGgmlBackend)
+            int chunkCap = PrefillChunkCap();
+            if (tokens != null && tokens.Length > chunkCap && IsGgmlBackend)
             {
-                int cap = FusedAttnMaxSeqLen;
+                int cap = chunkCap;
                 int total = tokens.Length;
                 int pos = 0;
                 // All but the final (<= cap) chunk only append KV; the last chunk
@@ -873,6 +900,7 @@ namespace TensorSharp.Models
             // cache from host memory, so the host sync is skipped when this path
             // will run (it would copy the whole cache back every token).
             bool useFusedModelDecode = WillUseFusedModelDecode(seqLen);
+            bool useFusedModelPrefill = WillUseFusedModelPrefill(seqLen);
             if (seqLen > 1)
                 ResetFusedModelDecodeCache();   // prefill moves the compute pool
             else if (!useFusedModelDecode)
@@ -881,6 +909,25 @@ namespace TensorSharp.Models
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t1;
+
+            if (useFusedModelPrefill)
+            {
+                long tFused = Stopwatch.GetTimestamp();
+                bool fused = TryFusedModelPrefill(hidden, startPos, seqLen);
+                _linearTicks += Stopwatch.GetTimestamp() - tFused;
+                if (fused)
+                {
+                    hidden.Dispose();
+                    _logitsBuffer = _foldLogitsBuffer;
+                    _cacheSeqLen += seqLen;
+                    _forwardCount++;
+                    _forwardSw.Stop();
+                    return _logitsBuffer;
+                }
+                // The kernel refused: the per-layer path below reads the cache
+                // from host memory, so restore the sync the prefill branch skipped.
+                EnsureKvCacheHostSynchronized();
+            }
 
             if (useFusedModelDecode)
             {
