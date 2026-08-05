@@ -786,6 +786,32 @@ extern "C" __global__ void ts_binary_f32(const float* lhs, const float* rhs, flo
         output[i] = x / y;
 }
 
+// Elementwise binary where `rhs` is one row broadcast down every row of `lhs`
+// (x[rows, cols] OP bias[cols], the shape a per-channel scale/bias takes). The
+// plain ts_binary_f32 above needs matching counts, and the host fallback it used
+// to degrade to stops at the shorter operand's last block — which applies the
+// row to row 0 and silently leaves every other row untouched.
+extern "C" __global__ void ts_binary_row_bcast_f32(
+    const float* lhs, const float* rhs, float* output, int rows, int cols, int rhs_cols, int op)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = rows * cols;
+    if (i >= count)
+        return;
+
+    int col = i - (i / cols) * cols;
+    float x = lhs[i];
+    float y = (col < rhs_cols) ? rhs[col] : (op == 2 || op == 3 ? 1.0f : 0.0f);
+    if (op == 0)
+        output[i] = x + y;
+    else if (op == 1)
+        output[i] = x - y;
+    else if (op == 2)
+        output[i] = x * y;
+    else
+        output[i] = x / y;
+}
+
 extern "C" __global__ void ts_scalar_f32(const float* input, float* output, int count, float value, int op)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

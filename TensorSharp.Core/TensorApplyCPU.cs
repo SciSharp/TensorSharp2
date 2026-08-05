@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -924,7 +924,17 @@ namespace TensorSharp
 		// result[r, c] = lhs[r, c] + rhs[c] for contiguous result/lhs and a
 		// trailing-dimension rhs. Returns false when the operands are not that
 		// shape, leaving the caller on its generic path.
-		unsafe static bool TryAddRowBroadcast(Tensor result, Tensor lhs, Tensor rhs)
+		internal enum RowBroadcastOp { Add, Sub, Mul, Div }
+
+		/// <summary>
+		/// Elementwise <paramref name="lhs"/> OP <paramref name="rhs"/> where rhs is
+		/// one row broadcast down every row of lhs (x[rows, cols] OP bias[cols]) — the
+		/// shape a per-channel bias or scale takes. Apply3 below cannot express it: it
+		/// advances all three iterators together and stops as soon as the shortest one
+		/// runs out of blocks, so a [cols] rhs would touch row 0 only and leave the
+		/// rest of the tensor silently unchanged.
+		/// </summary>
+		unsafe static bool TryRowBroadcast(Tensor result, Tensor lhs, Tensor rhs, RowBroadcastOp op)
 		{
 			if (result == null || lhs == null || rhs == null || lhs.DimensionCount < 2)
 				return false;
@@ -963,10 +973,29 @@ namespace TensorSharp
 				float* dst = resultPtr + (long)r * colCount;
 				float* src = lhsPtr + (long)r * colCount;
 				int c = 0;
-				for (; c <= colCount - simdWidth; c += simdWidth)
-					StoreVec(dst + c, LoadVec(src + c) + LoadVec(rhsPtr + c));
-				for (; c < colCount; c++)
-					dst[c] = src[c] + rhsPtr[c];
+				switch (op)
+				{
+					case RowBroadcastOp.Add:
+						for (; c <= colCount - simdWidth; c += simdWidth)
+							StoreVec(dst + c, LoadVec(src + c) + LoadVec(rhsPtr + c));
+						for (; c < colCount; c++) dst[c] = src[c] + rhsPtr[c];
+						break;
+					case RowBroadcastOp.Sub:
+						for (; c <= colCount - simdWidth; c += simdWidth)
+							StoreVec(dst + c, LoadVec(src + c) - LoadVec(rhsPtr + c));
+						for (; c < colCount; c++) dst[c] = src[c] - rhsPtr[c];
+						break;
+					case RowBroadcastOp.Mul:
+						for (; c <= colCount - simdWidth; c += simdWidth)
+							StoreVec(dst + c, LoadVec(src + c) * LoadVec(rhsPtr + c));
+						for (; c < colCount; c++) dst[c] = src[c] * rhsPtr[c];
+						break;
+					default:
+						for (; c <= colCount - simdWidth; c += simdWidth)
+							StoreVec(dst + c, LoadVec(src + c) / LoadVec(rhsPtr + c));
+						for (; c < colCount; c++) dst[c] = src[c] / rhsPtr[c];
+						break;
+				}
 			});
 
 			return true;
@@ -994,11 +1023,8 @@ namespace TensorSharp
                 return;
             }
 
-            // Row-broadcast (x[rows, cols] + bias[cols]) — the shape linear layers
-            // use for their bias. Apply3 below cannot express it: it advances all
-            // three iterators together and stops as soon as the shortest one runs
-            // out of blocks, so a [cols] rhs would bias row 0 only.
-            if (TryAddRowBroadcast(result, lhs, rhs))
+            // Row-broadcast (x[rows, cols] + bias[cols]) - see TryRowBroadcast.
+            if (TryRowBroadcast(result, lhs, rhs, RowBroadcastOp.Add))
                 return;
 
 			int vectorSize = Vector<float>.Count;
@@ -1053,6 +1079,11 @@ namespace TensorSharp
 
                 return;
             }
+
+            // Row-broadcast (x[rows, cols] OP bias[cols]) - see TryRowBroadcast.
+            if (TryRowBroadcast(result, lhs, rhs, RowBroadcastOp.Sub))
+                return;
+
 
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && lhs.Strides[^1] == 1 && rhs.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
@@ -1323,6 +1354,11 @@ namespace TensorSharp
                 return;
             }
 
+            // Row-broadcast (x[rows, cols] OP bias[cols]) - see TryRowBroadcast.
+            if (TryRowBroadcast(result, lhs, rhs, RowBroadcastOp.Mul))
+                return;
+
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && lhs.Strides[^1] == 1 && rhs.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -1356,6 +1392,10 @@ namespace TensorSharp
 
 		unsafe public static void Div(Tensor result, Tensor lhs, Tensor rhs)
 		{
+			// Row-broadcast (x[rows, cols] / bias[cols]) - see TryRowBroadcast.
+			if (TryRowBroadcast(result, lhs, rhs, RowBroadcastOp.Div))
+				return;
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && lhs.Strides[^1] == 1 && rhs.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -1483,6 +1523,7 @@ namespace TensorSharp
                 TensorPrimitives.Sigmoid(new ReadOnlySpan<float>(srcPtr, length), new Span<float>(resultPtr, length));
                 return;
             }
+
 
 			unsafe void func(float* r, float* s)
 			{

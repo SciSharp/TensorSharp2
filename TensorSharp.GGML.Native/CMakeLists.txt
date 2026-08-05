@@ -191,6 +191,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_transformer.cpp
     ggml_ops_transformer_prefill.cpp
     ggml_ops_gptoss_decode.cpp
+    ggml_ops_gptoss_prefill.cpp
     ggml_ops_qwen35_decode.cpp
     ggml_ops_qwen35_verify.cpp
     ggml_ops_gemma4_decode.cpp
@@ -214,6 +215,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_mask.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_dsv4_fused.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
 endif()
 
 add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})

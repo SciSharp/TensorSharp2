@@ -15,6 +15,24 @@ using System.Text.RegularExpressions;
 
 namespace TensorSharp.Runtime
 {
+    /// <summary>
+    /// Optional capability for tokenizers that know which of their ids are
+    /// control / special tokens rather than literal text.
+    /// </summary>
+    /// <remarks>
+    /// Grammar-constrained decoding needs this: a control token such as
+    /// <c>&lt;|im_start|&gt;</c> has a printable spelling, so a grammar that
+    /// admits ordinary characters (any JSON string, say) would happily accept it
+    /// as if the model had typed those angle brackets. Excluding them from the
+    /// vocabulary trie keeps constraint decisions about *text*.
+    /// Implemented by the real tokenizers; test doubles need not.
+    /// </remarks>
+    public interface ISpecialTokenVocabulary
+    {
+        /// <summary>Ids that are control/special markers, not literal text.</summary>
+        IReadOnlyCollection<int> SpecialTokenIds { get; }
+    }
+
     public interface ITokenizer
     {
         string[] Vocab { get; }
@@ -28,8 +46,23 @@ namespace TensorSharp.Runtime
         int LookupToken(string tokenStr);
     }
 
-    public class BpeTokenizer : ITokenizer
+    public class BpeTokenizer : ITokenizer, ISpecialTokenVocabulary
     {
+        private int[]? _specialTokenIds;
+
+        /// <inheritdoc/>
+        public IReadOnlyCollection<int> SpecialTokenIds =>
+            _specialTokenIds ??= BuildSpecialTokenIds();
+
+        private int[] BuildSpecialTokenIds()
+        {
+            var ids = new List<int>(_specialTokens.Count);
+            foreach (string s in _specialTokens)
+                if (_vocabLookup.TryGetValue(s, out int id)) ids.Add(id);
+            foreach (int id in _eosTokenIds) ids.Add(id);
+            return ids.Distinct().ToArray();
+        }
+
         private readonly string[] _vocab;
         private readonly Dictionary<string, int> _vocabLookup;
         private readonly Dictionary<string, int> _mergeLookup;

@@ -392,8 +392,16 @@ namespace TensorSharp.Cli
                     _log.LogError(LogEventIds.CliFailed, "Tools file not found: {ToolsFile}", toolsFile);
                     return;
                 }
-                tools = JsonSerializer.Deserialize<List<ToolFunction>>(File.ReadAllText(toolsFile),
-                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                try
+                {
+                    tools = ToolFunction.ParseList(File.ReadAllText(toolsFile));
+                }
+                catch (JsonException ex)
+                {
+                    _log.LogError(LogEventIds.CliFailed,
+                        "Tools file {ToolsFile} is not a usable tool definition list: {Error}", toolsFile, ex.Message);
+                    return;
+                }
                 _log.LogInformation(LogEventIds.HostConfiguration,
                     "Loaded {ToolCount} tool definition(s) from {ToolsFile}", tools.Count, toolsFile);
             }

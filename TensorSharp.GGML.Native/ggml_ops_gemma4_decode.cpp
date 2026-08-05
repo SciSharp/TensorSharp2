@@ -427,7 +427,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             }
 
             g4_debug_check_buffers(dc->graph, "replay");
-            ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
+            ggml_status st = tsg::graph_compute_profiled(g_backend, dc->graph, "gemma4 model decode");
             if (st != GGML_STATUS_SUCCESS)
             {
                 set_last_error("Gemma4 model decode: cached graph execution failed.");
@@ -920,17 +920,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 ggml_backend_buffer_t buf = nullptr;
                 void* addr = nullptr;
                 bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
+                if (try_bind_cached_tensor(g_backend, dev, t, data, bytes, needs_upload, usage))
                 {
-                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
-                    if (st == GGML_STATUS_SUCCESS)
-                    {
-                        if (needs_upload)
-                            upload_list.push_back({t, data, bytes});
-                        return;
-                    }
-
-                    invalidate_cached_buffer(data);
+                    if (needs_upload)
+                        upload_list.push_back({t, data, bytes});
+                    return;
                 }
             }
 

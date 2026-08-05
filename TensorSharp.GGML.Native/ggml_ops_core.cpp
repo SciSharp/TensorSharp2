@@ -32,6 +32,9 @@
 #include "ggml-vulkan.h"
 #endif
 
+#include "ggml-impl.h"   // ggml_graph_view, for the node profiler
+
+#include <chrono>
 #include <cstdio>
 #include <thread>
 
@@ -1205,6 +1208,138 @@ namespace tsg
         return true;
     }
 
+    // Mark a cached entry as having been through the backend's init_tensor, so
+    // the next graph that binds the same weight can attach directly. Looks in
+    // both caches because a weight can be in either (preloaded vs. bound on
+    // first use); the flag rides along with the entry, so an eviction clears it.
+    namespace
+    {
+        void mark_cached_buffer_initialized(void* data, ggml_backend_buffer_t buffer, std::size_t alloc_size)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+                auto it = g_preloaded_buffer_cache.find(data);
+                if (it != g_preloaded_buffer_cache.end() && it->second.buffer == buffer)
+                {
+                    it->second.initialized_alloc_size = alloc_size;
+                    return;
+                }
+            }
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            auto it = g_host_buffer_cache.find(data);
+            if (it != g_host_buffer_cache.end() && it->second.buffer == buffer)
+                it->second.initialized_alloc_size = alloc_size;
+        }
+
+        bool cached_buffer_is_initialized(void* data, ggml_backend_buffer_t buffer, std::size_t alloc_size)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+                auto it = g_preloaded_buffer_cache.find(data);
+                if (it != g_preloaded_buffer_cache.end() && it->second.buffer == buffer)
+                    return it->second.initialized_alloc_size == alloc_size;
+            }
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            auto it = g_host_buffer_cache.find(data);
+            return it != g_host_buffer_cache.end() && it->second.buffer == buffer
+                && it->second.initialized_alloc_size == alloc_size;
+        }
+    }
+
+    namespace
+    {
+        // Repeat bind: the weight is already resident, already initialised, and
+        // the address it resolved to last time is recorded. Attaching is then two
+        // assignments — which is what llama.cpp effectively does by binding its
+        // weights once at load and never touching them again.
+        //
+        // This exists because the slow path is not slow for any one reason, it is
+        // slow ~450 times: try_get_cacheable_tensor_buffer takes two mutexes and
+        // asks the backend for an allocation size, then ggml_backend_tensor_alloc
+        // runs the backend's init_tensor (a cudaMemset over the quant padding on
+        // ggml-cuda). At ~17 us a weight that is 8 ms per prefill on a 30-layer
+        // Gemma 4 — 13% of the call, and pure repetition.
+        bool try_attach_bound_tensor(ggml_tensor* tensor, void* data, std::size_t bytes)
+        {
+            auto attach = [&](std::unordered_map<void*, CachedHostBuffer>& cache) {
+                auto it = cache.find(data);
+                if (it == cache.end() || it->second.bytes != bytes ||
+                    it->second.bound_addr == nullptr || it->second.initialized_alloc_size == 0)
+                    return false;
+                tensor->buffer = it->second.buffer;
+                tensor->data = it->second.bound_addr;
+                return true;
+            };
+            {
+                std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+                if (attach(g_preloaded_buffer_cache)) return true;
+            }
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            return attach(g_host_buffer_cache);
+        }
+
+        void record_bound_addr(void* data, ggml_backend_buffer_t buffer, void* addr)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+                auto it = g_preloaded_buffer_cache.find(data);
+                if (it != g_preloaded_buffer_cache.end() && it->second.buffer == buffer)
+                {
+                    it->second.bound_addr = addr;
+                    return;
+                }
+            }
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            auto it = g_host_buffer_cache.find(data);
+            if (it != g_host_buffer_cache.end() && it->second.buffer == buffer)
+                it->second.bound_addr = addr;
+        }
+    }
+
+    bool try_bind_cached_tensor(
+        ggml_backend_t backend, ggml_backend_dev_t dev,
+        ggml_tensor* tensor, void* data, std::size_t bytes, bool& out_needs_upload,
+        enum ggml_backend_buffer_usage usage)
+    {
+        out_needs_upload = false;
+
+        // The overwhelmingly common case: this weight was bound by an earlier
+        // graph and nothing has evicted it since.
+        if (try_attach_bound_tensor(tensor, data, bytes))
+            return true;
+
+        ggml_backend_buffer_t buf = nullptr;
+        void* addr = nullptr;
+        if (!try_get_cacheable_tensor_buffer(backend, dev, tensor, data, bytes, buf, addr, out_needs_upload, usage))
+            return false;
+
+        const std::size_t alloc_size = ggml_backend_buffer_get_alloc_size(buf, tensor);
+
+        // Already initialised at this alloc size (the entry just had no recorded
+        // address yet, e.g. it was created by the weight preload): attach without
+        // running init_tensor again.
+        if (!out_needs_upload && cached_buffer_is_initialized(data, buf, alloc_size))
+        {
+            tensor->buffer = buf;
+            tensor->data = addr;
+            record_bound_addr(data, buf, addr);
+            return true;
+        }
+
+        if (ggml_backend_tensor_alloc(buf, tensor, addr) != GGML_STATUS_SUCCESS)
+        {
+            invalidate_cached_buffer(data);
+            return false;
+        }
+        mark_cached_buffer_initialized(data, buf, alloc_size);
+        // Only a bind that needed no upload is safe to short-circuit next time;
+        // one that did needs the upload_list entry the caller builds from
+        // out_needs_upload.
+        if (!out_needs_upload)
+            record_bound_addr(data, buf, addr);
+        return true;
+    }
+
     // --- Reusable compute buffer for per-graph intermediate tensors ---
     //
     // Per-layer Gemma4 prefill builds a fresh ggml graph each layer and used to
@@ -1245,11 +1380,25 @@ namespace tsg
         std::mutex mutex;
         ggml_gallocr_t gallocr = nullptr;
         ggml_backend_t backend = nullptr;
+        std::size_t last_logged_size = 0;
     };
     static ReuseGallocrSlot g_reuse_gallocr_slots[TSG_MAX_DEVICES];
 #define g_reuse_gallocr_mutex   (g_reuse_gallocr_slots[::tsg::g_active_rank].mutex)
 #define g_reuse_gallocr         (g_reuse_gallocr_slots[::tsg::g_active_rank].gallocr)
 #define g_reuse_gallocr_backend (g_reuse_gallocr_slots[::tsg::g_active_rank].backend)
+
+    // A SECOND, independent set of slots for the MoE-offload streaming graphs.
+    // Those are built and run *inside* a partially executed outer graph (the
+    // host-MoE seam cuts the whole-model graph and evaluates the offloaded layer
+    // between two slices), and ggml_gallocr_alloc_graph re-plans the allocator
+    // it is handed for whatever graph it is given -- re-planning the outer
+    // graph's allocator mid-pass moves the tensors that graph's remaining nodes
+    // still point at. Symptom is not a wrong number but a hard
+    // GGML_ASSERT(device >= 0 && device < info.device_count) once a relocated
+    // tensor is read back through a stale buffer.
+    static ReuseGallocrSlot g_moe_stream_gallocr_slots[TSG_MAX_DEVICES];
+
+    bool alloc_graph_in_gallocr_slot(ggml_cgraph* graph, ReuseGallocrSlot* slots, const char* log_tag);
 
     void free_reuse_compute_buffer()
     {
@@ -1269,16 +1418,21 @@ namespace tsg
 
     void free_reuse_gallocr()
     {
-        for (int r = 0; r < TSG_MAX_DEVICES; ++r)
+        ReuseGallocrSlot* const all[] = { g_reuse_gallocr_slots, g_moe_stream_gallocr_slots };
+        for (ReuseGallocrSlot* slots : all)
         {
-            auto& slot = g_reuse_gallocr_slots[r];
-            std::lock_guard<std::mutex> lock(slot.mutex);
-            if (slot.gallocr != nullptr)
+            for (int r = 0; r < TSG_MAX_DEVICES; ++r)
             {
-                ggml_gallocr_free(slot.gallocr);
-                slot.gallocr = nullptr;
+                auto& slot = slots[r];
+                std::lock_guard<std::mutex> lock(slot.mutex);
+                if (slot.gallocr != nullptr)
+                {
+                    ggml_gallocr_free(slot.gallocr);
+                    slot.gallocr = nullptr;
+                }
+                slot.backend = nullptr;
+                slot.last_logged_size = 0;
             }
-            slot.backend = nullptr;
         }
     }
 
@@ -1288,32 +1442,43 @@ namespace tsg
     // The caller must NOT free the gallocr; it lives for the backend's lifetime.
     bool alloc_graph_reuse_gallocr(ggml_cgraph* graph)
     {
+        return alloc_graph_in_gallocr_slot(graph, g_reuse_gallocr_slots, "reuse-gallocr");
+    }
+
+    bool alloc_graph_moe_stream_gallocr(ggml_cgraph* graph)
+    {
+        return alloc_graph_in_gallocr_slot(graph, g_moe_stream_gallocr_slots, "moe-stream-gallocr");
+    }
+
+    bool alloc_graph_in_gallocr_slot(ggml_cgraph* graph, ReuseGallocrSlot* slots, const char* log_tag)
+    {
         // Escape hatch (shares the reuse-buffer toggle): TS_GGML_REUSE_COMPUTE_BUF=0
         // disables both so A/B testing can isolate the persistent allocators.
         static const bool s_disabled = []() {
             const char* e = std::getenv("TS_GGML_REUSE_COMPUTE_BUF");
             return e != nullptr && e[0] == '0';
         }();
-        if (s_disabled || g_backend == nullptr || graph == nullptr)
+        if (s_disabled || g_backend == nullptr || graph == nullptr || slots == nullptr)
             return false;
 
-        std::lock_guard<std::mutex> lock(g_reuse_gallocr_mutex);
-        if (g_reuse_gallocr_backend != g_backend)
+        ReuseGallocrSlot& slot = slots[::tsg::g_active_rank];
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        if (slot.backend != g_backend)
         {
             // Backend swapped (model reload). The old backend freed its buffers on
             // teardown, so drop the stale handle rather than freeing through it.
-            g_reuse_gallocr = nullptr;
-            g_reuse_gallocr_backend = g_backend;
+            slot.gallocr = nullptr;
+            slot.backend = g_backend;
         }
-        if (g_reuse_gallocr == nullptr)
+        if (slot.gallocr == nullptr)
         {
-            g_reuse_gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-            if (g_reuse_gallocr == nullptr)
+            slot.gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+            if (slot.gallocr == nullptr)
                 return false;
         }
         // ggml_gallocr_alloc_graph reuses the existing buffer when the new graph
         // fits and grows (reallocates) it only when a larger graph appears.
-        bool ok = ggml_gallocr_alloc_graph(g_reuse_gallocr, graph);
+        bool ok = ggml_gallocr_alloc_graph(slot.gallocr, graph);
         if (!ok)
         {
             // A FAILED alloc leaves the allocator POISONED, and because this one
@@ -1335,18 +1500,17 @@ namespace tsg
             // allocator; the next call builds a fresh one and re-reserves from
             // scratch. The failed reserve already freed the buffer this owned,
             // so nothing extra is lost by throwing away the bookkeeping.
-            ggml_gallocr_free(g_reuse_gallocr);
-            g_reuse_gallocr = nullptr;
+            ggml_gallocr_free(slot.gallocr);
+            slot.gallocr = nullptr;
             return false;
         }
         if (vram_log_enabled())
         {
-            static std::size_t s_last_size = 0;
-            const std::size_t size = ggml_gallocr_get_buffer_size(g_reuse_gallocr, 0);
-            if (size != s_last_size)
+            const std::size_t size = ggml_gallocr_get_buffer_size(slot.gallocr, 0);
+            if (size != slot.last_logged_size)
             {
-                s_last_size = size;
-                vram_log("reuse-gallocr(grew)", static_cast<std::int64_t>(size));
+                slot.last_logged_size = size;
+                vram_log(log_tag, static_cast<std::int64_t>(size));
             }
         }
         return true;
@@ -2000,6 +2164,163 @@ namespace tsg
         }
 
         return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Whole-model graph profiler (TS_GGML_NODE_PROFILE) — see the header.
+    // ------------------------------------------------------------------
+    bool graph_node_profile_enabled()
+    {
+        static const bool on = []{
+            const char* e = std::getenv("TS_GGML_NODE_PROFILE");
+            return e != nullptr && e[0] != '0';
+        }();
+        return on;
+    }
+
+    namespace
+    {
+        struct NodeProfileBucket
+        {
+            double us = 0.0;
+            std::int64_t calls = 0;
+            std::string shape;   // widest shape seen, for the per-op detail line
+            double shape_us = 0.0;
+        };
+
+        struct NodeProfileState
+        {
+            std::mutex mu;
+            std::unordered_map<std::string, NodeProfileBucket> buckets;
+            double total_us = 0.0;
+            std::int64_t graphs = 0;
+            int nodes = 0;
+        };
+
+        NodeProfileState& node_profile_state()
+        {
+            static NodeProfileState s;
+            return s;
+        }
+
+        int node_profile_every()
+        {
+            static const int every = []{
+                const char* e = std::getenv("TS_GGML_NODE_PROFILE_EVERY");
+                int v = (e != nullptr) ? std::atoi(e) : 0;
+                return v > 0 ? v : 64;
+            }();
+            return every;
+        }
+
+        std::string node_shape_label(const ggml_tensor* t)
+        {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "[%lld,%lld,%lld]",
+                          static_cast<long long>(t->ne[0]),
+                          static_cast<long long>(t->ne[1]),
+                          static_cast<long long>(t->ne[2]));
+            return std::string(buf);
+        }
+    }
+
+    ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag)
+    {
+        if (!graph_node_profile_enabled())
+            return ggml_backend_graph_compute(backend, graph);
+
+        const int n = ggml_graph_n_nodes(graph);
+        std::vector<double> per_node(static_cast<std::size_t>(n), 0.0);
+
+        ggml_backend_synchronize(backend);
+        const auto t_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < n; i++)
+        {
+            ggml_cgraph view = ggml_graph_view(graph, i, i + 1);
+            const auto t0 = std::chrono::steady_clock::now();
+            ggml_status st = ggml_backend_graph_compute(backend, &view);
+            ggml_backend_synchronize(backend);
+            const auto t1 = std::chrono::steady_clock::now();
+            if (st != GGML_STATUS_SUCCESS)
+                return st;
+            per_node[static_cast<std::size_t>(i)] =
+                std::chrono::duration<double, std::micro>(t1 - t0).count();
+        }
+        const auto t_end = std::chrono::steady_clock::now();
+
+        NodeProfileState& s = node_profile_state();
+        std::lock_guard<std::mutex> lock(s.mu);
+        for (int i = 0; i < n; i++)
+        {
+            ggml_tensor* node = ggml_graph_node(graph, i);
+            const double us = per_node[static_cast<std::size_t>(i)];
+            NodeProfileBucket& b = s.buckets[ggml_op_name(node->op)];
+            b.us += us;
+            b.calls++;
+            if (us > b.shape_us) { b.shape_us = us; b.shape = node_shape_label(node); }
+        }
+        s.total_us += std::chrono::duration<double, std::micro>(t_end - t_start).count();
+        s.graphs++;
+        s.nodes = n;
+
+        if (s.graphs % node_profile_every() == 0)
+        {
+            std::vector<std::pair<std::string, NodeProfileBucket>> sorted(s.buckets.begin(), s.buckets.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+            std::printf("[node-profile] %s: %lld graphs x %d nodes, %.3f ms/graph (profiled, includes a synchronize per node)\n",
+                        tag != nullptr ? tag : "graph",
+                        static_cast<long long>(s.graphs), s.nodes,
+                        s.total_us / 1000.0 / static_cast<double>(s.graphs));
+            for (std::size_t i = 0; i < sorted.size() && i < 16; i++)
+            {
+                const NodeProfileBucket& b = sorted[i].second;
+                std::printf("    %-18s %8.3f ms/graph  %6.1f%%  %6lld nodes/graph  worst %s\n",
+                            sorted[i].first.c_str(),
+                            b.us / 1000.0 / static_cast<double>(s.graphs),
+                            100.0 * b.us / s.total_us,
+                            static_cast<long long>(b.calls / s.graphs),
+                            b.shape.c_str());
+            }
+            std::fflush(stdout);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // ------------------------------------------------------------------
+    // Whole-model kernel phase timer (TS_GGML_PHASE_TIMING) - see the header.
+    // ------------------------------------------------------------------
+    bool phase_timing_enabled()
+    {
+        static const bool on = []{
+            const char* e = std::getenv("TS_GGML_PHASE_TIMING");
+            return e != nullptr && e[0] != '0';
+        }();
+        return on;
+    }
+
+    double PhaseTimer::now()
+    {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void phase_timing_report(const char* tag, const char* const* phases, const double* ms, int count)
+    {
+        double total = 0.0;
+        for (int i = 0; i < count; i++) total += ms[i];
+        std::string line = "[phase] ";
+        line += (tag != nullptr ? tag : "kernel");
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), " total=%.2fms", total);
+        line += buf;
+        for (int i = 0; i < count; i++)
+        {
+            std::snprintf(buf, sizeof(buf), " %s=%.2f", phases[i], ms[i]);
+            line += buf;
+        }
+        std::printf("%s\n", line.c_str());
+        std::fflush(stdout);
     }
 
 } // namespace tsg

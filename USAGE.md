@@ -558,44 +558,88 @@ the rest. Either way `--stop` sequences pinned on the server stay in force under
 Large MoE models spend almost all of their bytes on routed experts while
 activating only a small fraction of them per token — Qwen3.6-35B-A3B is ~11 GB
 of weights for ~3B active parameters. `--n-cpu-moe N` keeps the routed experts
-of the first N layers in system RAM and multiplies them on the CPU, leaving
-attention, the norms, the router and the always-active shared expert on the
-accelerator. Only the layer activation crosses the bus each layer
-(`hidden_size` floats — 8 KB for a decode step), so the split is bounded by host
-matmul throughput rather than by transfers.
+of the first N layers in system RAM, leaving attention, the norms, the router
+and the always-active shared expert on the accelerator. `--n-cpu-moe` therefore
+means "these experts do not live in VRAM" — not "these experts are multiplied on
+the CPU". Where they are multiplied depends on the batch:
+
+* **Decode (one token, or any batch under `TS_HOST_MOE_DEVICE_MIN_BATCH`, default
+  128).** The host multiplies them, reading the quantized blocks zero-copy out of
+  the GGUF mmap. One token only touches `n_expert_used` experts, so this is a few
+  MB of RAM traffic per layer against the hundreds of MB an upload would cost.
+* **Prefill (a real batch).** The experts are *streamed* to the accelerator for
+  that one graph and multiplied there, then the staging memory is reused by the
+  next layer — they are never made resident. A 512-token batch amortizes the
+  upload over every token in it, and the arithmetic is what the GPU is for.
+  llama.cpp's scheduler makes the same call (`ggml_backend_sched` sends an op
+  whose weights live in a host buffer back to the GPU above
+  `op_offload_min_batch_size`).
+
+Three things make the streamed side fast, and they are why TensorSharp's
+offloaded prefill runs several times faster than llama.cpp's on the same files:
+
+1. **The host pages are locked.** A copy out of a pageable mmap cannot DMA — the
+   driver stages it through a small pinned buffer. `cudaHostRegister` on the
+   expert range costs ~65 ms/GiB once and takes the transfer from 9.3 GB/s to
+   55.6 GB/s on PCIe 5.0 x16. Disable with `TS_HOST_MOE_PIN=0`; bound it with
+   `TS_HOST_MOE_PIN_MAX_MB` (default: 60% of the cgroup/host memory limit).
+2. **Only the experts this batch routes to are sent**, grouped into consecutive
+   runs — the same trick llama.cpp's scheduler plays with its used-expert bitset.
+   At 512 tokens a large expert pool is only partly covered, and at the small
+   batches speculative verification and light serving produce it is a large
+   saving. `TS_HOST_MOE_EXPERT_FILTER=0` restores whole-stack uploads.
+3. **The copies are issued asynchronously** on the backend's own stream and
+   synchronize once, with the graph, instead of three times per layer.
 
 The offloaded layers stay inside the fused whole-model graph: the accelerator
-pauses after each offloaded layer's router, the host multiplies the selected
-experts straight out of the GGUF mmap, and the result is handed back before the
-next segment runs. Everything else in the token — attention, the shared or dense
-FFN, the LM head — stays in one graph submission. This holds for Qwen3.5/3.6,
-Gemma 4 MoE, GPT-OSS and DiffusionGemma; Gemma 4 MoE segments its prefill graph
-the same way, and DiffusionGemma's block decode hands the host all of the canvas
-positions at once so its offloaded side is a GEMM rather than a matvec. Qwen3.5/3.6
-segments its prefill graph the same way, and both it and Gemma 4 MoE keep the
-fused graph under tensor parallelism too (see the `--tp` note below).
+pauses after each offloaded layer's router, the experts are multiplied (on the
+host, or on the accelerator from streamed weights), and the result is handed back
+before the next segment runs. Everything else in the token — attention, the
+shared or dense FFN, the LM head — stays in one graph submission. This holds for
+Qwen3.5/3.6, Gemma 4 MoE, GPT-OSS and DiffusionGemma; Gemma 4 MoE segments its
+prefill graph the same way, and DiffusionGemma's block decode hands the host all
+of the canvas positions at once so its offloaded side is a GEMM rather than a
+matvec. Qwen3.5/3.6 segments its prefill graph the same way, and both it and
+Gemma 4 MoE keep the fused graph under tensor parallelism too (see the `--tp`
+note below). GPT-OSS now has a fused whole-model prefill graph as well, so its
+offloaded prefill is segmented rather than dispatched per layer. Architectures
+that still lack one (Nemotron-H) reach the streamed path through their per-layer
+MoE op, on a single device; under `--tp N` they stay host-side so that N ranks do
+not each stream their own copy of the same unsharded experts.
 
-Measured on Qwen3.6-35B-A3B (UD-IQ2_XXS, RTX 3080 Laptop 16 GB, i7-11800H):
+Measured on 2 x Xeon 6952P + RTX PRO 6000 Blackwell (PCIe 5.0 x16), **pp8192 /
+tg128**, peak per-process VRAM. The full comparison against llama.cpp — two prompt
+lengths, five offload depths per model, including DeepSeek V4 Flash across two
+GPUs — is in
+[docs/moe_cpu_offload_benchmark.md](docs/moe_cpu_offload_benchmark.md):
 
-| Setting | Peak VRAM | Decode | Prefill (pp2048) |
-| --- | --- | --- | --- |
-| default (all experts on GPU) | 13.4 GB | 71 tok/s | 1.2 s |
-| `--n-cpu-moe 16` | 11.0 GB | 37 tok/s | 20 s |
-| `--n-cpu-moe 32` | 7.0 GB | 24 tok/s | 38 s |
-| `--cpu-moe` (all 41 layers) | 4.6 GB | 18 tok/s | 48 s |
+| Model | Setting | Peak VRAM | Prefill | Decode |
+| --- | --- | --- | --- | --- |
+| gemma-4-26B-A4B (UD-IQ4_XS) | default | 16.4 GiB | 11,274 tok/s | 161 tok/s |
+| | `--n-cpu-moe 8` | 15.4 GiB | 6,500 tok/s | 80 tok/s |
+| | `--n-cpu-moe 16` | 13.8 GiB | 4,888 tok/s | 55 tok/s |
+| | `--cpu-moe` (30 layers) | 10.8 GiB | 3,072 tok/s | 40 tok/s |
+| Qwen3.5-35B-A3B (UD-IQ4_XS) | default | 19.4 GiB | 9,405 tok/s | 160 tok/s |
+| | `--n-cpu-moe 24` | 15.1 GiB | 5,259 tok/s | 52 tok/s |
+| | `--cpu-moe` (48 layers) | 11.3 GiB | 3,709 tok/s | 39 tok/s |
+| gpt-oss-20b (Q8_0/MXFP4) | default | 12.9 GiB | 12,925 tok/s | 213 tok/s |
+| | `--n-cpu-moe 12` | 9.2 GiB | 6,394 tok/s | 52 tok/s |
+| | `--cpu-moe` (24 layers) | 4.7 GiB | 3,798 tok/s | 28 tok/s |
+| DeepSeek-V4-Flash (UD-Q8_K_XL, 2 GPUs) | default | 165.2 GiB | 4,387 tok/s | 51 tok/s |
+| | `--n-cpu-moe 12` | 128.7 GiB | 428 tok/s | 10 tok/s |
+| | `--n-cpu-moe 24` | 77.9 GiB | 236 tok/s | 5.3 tok/s |
 
-(A later re-measure on a short prompt reads 11.6 GB / 72 tok/s default,
-5.8 GB / 23 tok/s at `--n-cpu-moe 32` and 4.0 GB / 15.6 tok/s at `--cpu-moe`;
-peak VRAM depends on how far the KV cache has grown, so treat these as the
-shape of the trade rather than absolutes.)
+At every offload depth that is **4.5-10.9x** llama.cpp's prefill and **2.5-4.5x**
+its decode on the three seam models. Peak VRAM is higher than llama.cpp's (1.1x
+resident, up to 3.5x fully offloaded) — see the report's VRAM note.
 
-Greedy output is unchanged at every setting on this model.
+Greedy output is **token-identical** at every offload depth on gemma-4-26B-A4B.
 
-The other MoE architectures on the same machine (96-token generation, peak VRAM
-sampled from `nvidia-smi`). Note how far under the card's 16 GB the offloaded
-configurations sit — both the GPT-OSS and DiffusionGemma baselines were over the
-WDDM spill threshold, which is why offload makes them *faster* as well as
-smaller:
+A small-machine picture from the same feature on a laptop (RTX 3080 Laptop
+16 GB / i7-11800H, 96-token generation) — note how far under the card's 16 GB
+the offloaded configurations sit, and that both the GPT-OSS and DiffusionGemma
+baselines were over the WDDM spill threshold, which is why offload makes them
+*faster* as well as smaller there:
 
 | Model | Setting | Peak VRAM | Prefill | Decode |
 | --- | --- | --- | --- | --- |
@@ -610,14 +654,25 @@ smaller:
 | | `--n-cpu-moe 16` | 9.8 GB | — | 2287 ms/step |
 | | `--cpu-moe` (30 layers) | 3.0 GB | — | 4697 ms/step |
 
+(Those laptop prefill numbers predate the streamed-expert path; the same
+configurations are several times faster now.)
+
 Notes:
 
 * **Pick the smallest N that fits.** Each offloaded layer costs decode
   throughput, so offload only as many layers as you need to free the VRAM the
   KV cache wants.
-* **Prefill pays the most.** Prompt processing is a real GEMM over every token,
-  so it becomes host-compute-bound. Decode only touches `n_expert_used` experts
-  per token and stays fast.
+* **Decode pays the most, proportionally.** Prompt processing streams the
+  experts to the accelerator and stays within a small factor of the resident
+  run; decode is bounded by how fast the host can read `n_expert_used` experts
+  per layer out of RAM, which is where the throughput goes.
+* **The worker count is capped at 64.** The decode-side matmul is one token
+  wide — memory-bound work with a barrier after every op — so past a few dozen
+  threads each extra worker only adds a barrier participant, and on a 2-socket
+  host it adds cross-socket traffic too. Measured on 2x Xeon 6952P
+  (192 cores / 384 threads), gemma-4-26B `--cpu-moe`, ms of host matmul per 30
+  offloaded layers: 8 threads 45, 16 threads 35, 32 threads 17.6, 64 threads
+  17.3, 96 threads 26, 192 threads 120. `--cpu-moe-threads N` overrides.
 * **Routing stays on the accelerator**, so expert selection and weights are the
   same ones the fully resident path would pick.
 * **The fused whole-model graph is kept.** Qwen3.5/3.6, Gemma 4 MoE, GPT-OSS and
@@ -1063,6 +1118,22 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
 
 # Structured outputs (OpenAI response_format)
+#
+# Enforced by grammar-constrained decoding: the schema is compiled to a grammar
+# and any token that would break it is removed from the distribution before
+# sampling, so the response is structurally valid by construction rather than
+# repaired afterwards. Supported keywords: type, enum, const, properties,
+# required, additionalProperties, items, prefixItems, min/maxItems, anyOf, oneOf,
+# allOf, $ref/$defs (including recursive), min/maxLength, pattern, the
+# date/time/date-time/uuid formats, and integer minimum/maximum.
+# Refused up front (a CFG cannot express them): not, if/then/else,
+# dependentSchemas, dependentRequired, multipleOf, patternProperties.
+# Set TS_JSON_GRAMMAR=0 to fall back to the older prompt-and-repair behaviour.
+#
+# NOTE: the grammar guarantees what it emits is well-formed, but it cannot
+# guarantee the document FITS in max_tokens. Because end-of-sequence stays
+# masked until the JSON is complete, too small a budget truncates mid-object.
+# Give structured requests enough headroom.
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{

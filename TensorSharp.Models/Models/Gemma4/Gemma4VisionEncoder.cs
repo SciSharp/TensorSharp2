@@ -193,12 +193,15 @@ namespace TensorSharp.Models
 
 
             var hidden = PatchEmbed(pixelValues, imgWidth, imgHeight, patchesX, patchesY);
+            VisionTrace("patch_embed", hidden);
             AddPositionEmbedding2D(hidden, ropeCache, numPatches);
+            VisionTrace("pos_embed", hidden);
 
             for (int i = 0; i < _blockCount; i++)
             {
                 Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
                 hidden = EncoderBlock(hidden, i, numPatches, headDim, ropeCache);
+                VisionTrace($"block{i}", hidden);
                 // Yield the GPU compute lock between encoder blocks so the
                 // engine worker can run an inference step. Without this,
                 // a single image encode (16–32 blocks, 100ms–2s+ total)
@@ -212,10 +215,39 @@ namespace TensorSharp.Models
             Console.WriteLine(" done");
 
             var projected = PoolAndProject(hidden, patchesX, patchesY, numPatches);
+            VisionTrace("projected", projected);
             hidden.Dispose();
 
 
             return projected;
+        }
+
+        // TS_VISION_TRACE=1: mean / rms / min / max of a stage's activations.
+        // The encoder is backend-agnostic C# over Ops, so when one backend reads
+        // an image correctly and another hallucinates, the divergence is in a
+        // single op and this is what finds which one.
+        private static readonly bool VisionTraceEnabled =
+            Environment.GetEnvironmentVariable("TS_VISION_TRACE") is string v && v.Length > 0 && v != "0";
+
+        private static unsafe void VisionTrace(string stage, Tensor t)
+        {
+            if (!VisionTraceEnabled || t == null) return;
+            long n = 1;
+            for (int i = 0; i < t.Sizes.Length; i++) n *= t.Sizes[i];
+            float* p = GetFloatPtr(t);
+            double sum = 0, sumSq = 0;
+            float lo = float.MaxValue, hi = float.MinValue;
+            int nan = 0;
+            for (long i = 0; i < n; i++)
+            {
+                float x = p[i];
+                if (float.IsNaN(x) || float.IsInfinity(x)) { nan++; continue; }
+                sum += x; sumSq += (double)x * x;
+                if (x < lo) lo = x;
+                if (x > hi) hi = x;
+            }
+            Console.WriteLine($"[vision-trace] {stage,-12} n={n} mean={sum / n:F6} rms={Math.Sqrt(sumSq / n):F6} " +
+                              $"min={lo:F4} max={hi:F4} nonfinite={nan}");
         }
 
         /// <summary>
@@ -825,9 +857,12 @@ namespace TensorSharp.Models
                 }
             });
 
+            VisionTrace("pool.mean", pooled);
+
             // Scale by sqrt(hiddenSize)
             float scale = MathF.Sqrt(_hiddenSize);
             Ops.Mul(pooled, pooled, scale);
+            VisionTrace("pool.scale", pooled);
 
             // Vision standardization before projection (matches Ollama)
             if (_weights.TryGetValue("v.std_bias", out var stdBias) &&
@@ -835,10 +870,12 @@ namespace TensorSharp.Models
             {
                 Ops.Sub(pooled, pooled, stdBias);
                 Ops.Mul(pooled, pooled, stdScale);
+                VisionTrace("pool.std", pooled);
             }
 
             // Project to text dimension + unweighted RMSNorm
             var projected = LinearProjection(pooled, "mm.input_projection.weight");
+            VisionTrace("pool.proj", projected);
             pooled.Dispose();
 
             ApplyUnweightedRMSNorm(projected, mergedPatches, _projectionDim);

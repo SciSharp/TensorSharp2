@@ -1117,7 +1117,12 @@ namespace TensorSharp.Models
         /// Kept internal so tokenizer-oracle tests exercise the exact production
         /// dispatch instead of duplicating the metadata branching.
         /// </summary>
-        internal static ITokenizer CreateTokenizerFromGguf(GgufFile gguf)
+        /// <summary>
+        /// Build just the tokenizer described by a GGUF's metadata, without
+        /// loading any weights. Useful for vocabulary-only work such as
+        /// compiling a grammar's token masks.
+        /// </summary>
+        public static ITokenizer CreateTokenizerFromGguf(GgufFile gguf)
         {
             if (gguf == null)
                 throw new ArgumentNullException(nameof(gguf));
@@ -5657,7 +5662,17 @@ namespace TensorSharp.Models
         public int Sample(float[] logits, SamplingConfig config, IList<int> generatedTokenIds = null)
         {
             if (config == null || config.IsGreedy)
+            {
+                // The greedy shortcut skips TokenSampler, so the grammar mask has
+                // to be applied here too. Structured output is very often run at
+                // temperature 0, which is exactly this branch -- leaving it out
+                // would make constrained decoding silently do nothing in the case
+                // that needs it most.
+                var g = config?.Grammar;
+                if (g != null && !g.IsDead)
+                    g.ApplyMask(logits, allowEos: g.IsComplete);
                 return SampleGreedy(logits);
+            }
             var sampler = new TokenSampler(config);
             return sampler.Sample(logits, generatedTokenIds);
         }

@@ -172,17 +172,25 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// With whole-expert partitioning the per-expert <c>_exps.E.weight</c>
-        /// split views are never dispatched — the batched kernel reads the
-        /// stacked tensor each rank owns a slice of. They are still in
-        /// <c>_quantWeights</c> (unsharded, because the expert-parallel path
-        /// skips the per-expert sharder), and the TP preload treats an unsharded
-        /// weight as replicated and puts it on rank 0. That handed rank 0 the
-        /// whole expert set a SECOND time: 16019 MB resident against rank 1's
-        /// 5163. Exclude them.
+        /// The per-expert <c>_exps.E.weight</c> split views are never dispatched
+        /// once the STACKED expert blocks are available: the whole-model decode
+        /// and prefill graphs, the fused MoE kernel and (under TP) the batched
+        /// expert-parallel kernel all read the stacked tensor, which gets its own
+        /// device copy on first use. Preloading the split views as well puts a
+        /// SECOND full copy of every expert byte in VRAM.
+        ///
+        /// That was worth 9.7 GB on gpt-oss-20b: 24.8 GB resident against
+        /// llama.cpp's 12.0 GB for the same 11.5 GB of weights. Under TP it had
+        /// already been caught in one direction (rank 0 held 16019 MB against
+        /// rank 1's 5163) and fixed with the <c>UsesExpertParallelMoE</c> term
+        /// below — but single-GPU took the same double copy and nothing was
+        /// excluding it there. The stacked-weights term covers both.
+        ///
+        /// The host views stay mapped either way, so the per-expert fallback loop
+        /// can still stream the bytes if a graph ever refuses at runtime.
         /// </summary>
         protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
-            => !(UsesExpertParallelMoE && IsPerExpertView(weightName))
+            => !((UsesExpertParallelMoE || _layerStackedReady != 0) && IsPerExpertView(weightName))
                && base.ShouldPreloadCudaQuantWeightToDevice(weightName);
 
         /// <summary>

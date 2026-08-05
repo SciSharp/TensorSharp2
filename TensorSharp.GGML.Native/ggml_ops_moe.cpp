@@ -190,7 +190,27 @@ namespace
             // and the background threads are few. --cpu-moe-threads overrides.
             if (avail <= 2) return 1;
             if (avail <= 8) return avail - 1;
-            return avail / 2;
+
+            // ABSOLUTE CAP, independent of how many CPUs the host has. An
+            // offloaded layer at decode is ONE token wide: a few MB of expert
+            // rows read from RAM and a handful of ggml ops. That is memory-bound
+            // work with a barrier after every op, so past a few dozen workers
+            // each extra thread adds a barrier participant and buys no
+            // bandwidth — and once the pool spans both sockets of a 2-socket
+            // machine it starts costing cross-socket traffic as well.
+            //
+            // Measured on a 2x Xeon 6952P (192 cores / 384 threads, 6 NUMA
+            // nodes), gemma-4-26B-A4B --cpu-moe, ms of host matmul per 30
+            // offloaded layers (lower is better):
+            //
+            //   threads |  8  | 16 |  32  |  64  | 96 | 192
+            //   ms      | 45  | 35 | 17.6 | 17.3 | 26 | 120
+            //
+            // The old `avail / 2` rule picks 192 on that host and pays 7x. It
+            // only looked safe because every box tested before had a cgroup
+            // quota that clamped it into the flat part of the curve.
+            const int n = avail / 2;
+            return n > 64 ? 64 : n;
         }
 
         // Build (or rebuild) the pool the host MoE runs on. Owned here rather
@@ -258,10 +278,25 @@ namespace
             std::size_t bytes,
             ggml_tensor* tensor,
             std::vector<WeightUploadInfo>& uploads,
-            std::vector<BufferHandle>& ephem_buffers)
+            std::vector<BufferHandle>& ephem_buffers,
+            bool stream_only = false)
         {
             if (tensor == nullptr || host_data == nullptr || bytes == 0)
                 return false;
+
+            // MoE CPU offload, large-batch path: the caller wants these experts
+            // computed on the accelerator but NOT resident there. Both binding
+            // shortcuts below would defeat that -- the cacheable buffer keeps a
+            // permanent per-tensor VRAM copy (offload would save nothing), and
+            // the host-pointer buffer makes the kernel read the experts over the
+            // bus element-by-element instead of as one bulk upload. Go straight
+            // to the deferred upload, which lands in the REUSED graph buffer and
+            // is therefore bounded by the largest single layer, not the model.
+            if (stream_only)
+            {
+                uploads.push_back({tensor, host_data, bytes, true});
+                return true;
+            }
 
             if (dev != nullptr && bytes >= 4096)
             {
@@ -406,7 +441,214 @@ namespace
         // mmap instead of uploading them to the accelerator. Set per layer by
         // the caller from MoeCpuOffloadConfig.IsLayerOnCpu(layer).
         bool run_on_cpu = false;
+
+        // Whether run_on_cpu may be satisfied by streaming the experts to the
+        // accelerator for one graph instead of computing them on the host (see
+        // moe_offload_stream_batch_threshold). Cleared by tensor parallelism,
+        // where the offloaded layer is deliberately evaluated once on the host
+        // over the UNSHARDED expert stack and the ranks differ only in where
+        // the single result lands (HostMoeSegment::tp_reduced).
+        bool allow_device_stream = true;
     };
+
+    // MoE CPU offload: the batch size at or above which an offloaded layer is
+    // computed on the accelerator with its experts streamed in for that one
+    // graph, rather than on the host.
+    //
+    // Offload exists to keep the experts OUT of VRAM, and at decode (one token)
+    // the host is the right answer: the matmul is tiny and streaming hundreds of
+    // MB per layer per token would be absurd. Prefill inverts that -- the upload
+    // is a FIXED cost per layer that the whole batch amortizes, and the
+    // arithmetic is what the GPU is for. llama.cpp makes the same trade in its
+    // scheduler (ggml_backend_sched_backend_id_from_cur ->
+    // ggml_backend_cuda_device_offload_op), which is the entire reason its
+    // prefill with -ncmoe stays 4-8x ahead of a host-only seam.
+    //
+    // The crossover is where (expert bytes / PCIe bandwidth) meets
+    // (batch * per-token host matmul). Measured on gemma-4-26B-A4B --cpu-moe,
+    // RTX 3080 Laptop + i7-11800H (12.1 GiB of experts, ~8 GB/s pageable H2D,
+    // best of 3, prefill ms, lower is better):
+    //
+    //   batch |  32  |  64  | 128  | 256
+    //   host  |  580 | 1081 | 2309 | 4266
+    //   strm  | 1857 | 1234 | 1254 | 1329
+    //
+    // i.e. streaming LOSES 3.2x at 32 and 1.1x at 64, then wins 1.8x at 128 and
+    // 3.2x at 256. llama.cpp's own constant here is 32, which on this box is on
+    // the wrong side of its own crossover; 128 sits just past it with margin and
+    // still catches every real prefill (chunked at ubatch 256/512) while leaving
+    // small block-decode batches -- DiffusionGemma's denoising blocks -- on the
+    // host where they belong.
+    //
+    // 0 disables the device path (TS_HOST_MOE_DEVICE_MIN_BATCH=0), restoring
+    // host-only offload.
+    int moe_offload_stream_batch_threshold()
+    {
+        static const int s_threshold = []() {
+            if (const char* e = std::getenv("TS_HOST_MOE_DEVICE_MIN_BATCH"))
+            {
+                const int n = std::atoi(e);
+                if (n >= 0)
+                    return n;
+            }
+            return 128;
+        }();
+        return s_threshold;
+    }
+
+    // ------------------------------------------------------------------
+    // Streamed-expert upload (MoE CPU offload, prefill-sized batches)
+    // ------------------------------------------------------------------
+    // An offloaded layer above the batch threshold is computed on the
+    // accelerator with its experts pushed over the bus for that one graph. Two
+    // things decide how long that push takes, and both are handled here:
+    //
+    //  1. WHICH BYTES. Only the experts this batch actually routes to are
+    //     needed. llama.cpp's scheduler does the same (ggml-backend.cpp builds
+    //     a used-expert bitset from the ids tensor and copies consecutive runs);
+    //     the saving is large at the small batches speculative verification and
+    //     lightly-loaded serving produce, and nil at 512 tokens where every
+    //     expert is drawn at least once. A trailing pad matches llama.cpp's:
+    //     MMQ reads a tile past the last row it needs, and whatever the reused
+    //     graph buffer happened to hold there could decode to NaN.
+    //
+    //  2. HOW FAST. See host_pin_range: page-locking the mmap turns a 9.3 GB/s
+    //     staged copy into a 55.6 GB/s DMA on PCIe 5.0.
+    //
+    // The copies are issued with ggml_backend_tensor_set_async and land on the
+    // backend's own stream, so they are ordered before the compute that follows
+    // without a host round trip per tensor (the old code synchronized three
+    // times per offloaded layer).
+    struct ExpertRuns
+    {
+        // [first, last] inclusive expert index runs, in ascending order.
+        std::vector<std::pair<int, int>> runs;
+        int used = 0;
+    };
+
+    void build_expert_runs(const std::int32_t* ids, std::size_t count, int num_experts, ExpertRuns& out)
+    {
+        out.runs.clear();
+        out.used = 0;
+        if (ids == nullptr || count == 0 || num_experts <= 0)
+            return;
+
+        static thread_local std::vector<std::uint8_t> s_seen;
+        s_seen.assign(static_cast<std::size_t>(num_experts), 0);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const std::int32_t e = ids[i];
+            if (e >= 0 && e < num_experts && !s_seen[static_cast<std::size_t>(e)])
+            {
+                s_seen[static_cast<std::size_t>(e)] = 1;
+                ++out.used;
+            }
+        }
+        int run_start = -1;
+        for (int e = 0; e < num_experts; ++e)
+        {
+            if (s_seen[static_cast<std::size_t>(e)])
+            {
+                if (run_start < 0)
+                    run_start = e;
+            }
+            else if (run_start >= 0)
+            {
+                out.runs.emplace_back(run_start, e - 1);
+                run_start = -1;
+            }
+        }
+        if (run_start >= 0)
+            out.runs.emplace_back(run_start, num_experts - 1);
+    }
+
+    // Push a stacked expert weight to the device, restricted to `runs` when the
+    // stacked layout is known to be contiguous per expert. Returns the bytes
+    // actually transferred.
+    std::size_t stream_expert_weight(
+        ggml_backend_t backend,
+        ggml_tensor* tensor,
+        const void* host_data,
+        std::size_t total_bytes,
+        int num_experts,
+        const ExpertRuns& runs)
+    {
+        if (tensor == nullptr || host_data == nullptr || total_bytes == 0)
+            return 0;
+
+        // Page-locking is a CUDA driver call: only worth doing — and only safe
+        // to do — when the accelerator this streams to IS CUDA. On a Vulkan or
+        // Metal run cudaHostRegister would spin up a CUDA primary context (and
+        // its VRAM) for a device nothing is using.
+        const bool pinned = (g_backend_type == BACKEND_TYPE_CUDA) &&
+                            host_pin_range(host_data, total_bytes);
+
+        // TS_HOST_MOE_TIMING=2: per-weight transfer rate. Needs a synchronize
+        // after each tensor, so it changes what it measures — only for finding
+        // out whether the pin actually took.
+        static const int s_probe = []() {
+            const char* e = std::getenv("TS_HOST_MOE_TIMING");
+            return (e != nullptr && e[0] == '2') ? 1 : 0;
+        }();
+        std::chrono::steady_clock::time_point t_probe;
+        if (s_probe)
+            t_probe = std::chrono::steady_clock::now();
+
+        // TS_HOST_MOE_EXPERT_FILTER=0 sends the whole stack every time (the
+        // A/B for "is a partially-populated expert buffer to blame").
+        static const bool s_filter = []() {
+            const char* e = std::getenv("TS_HOST_MOE_EXPERT_FILTER");
+            return !(e != nullptr && e[0] == '0');
+        }();
+
+        const std::size_t stride = num_experts > 0 ? tensor->nb[2] : 0;
+        const bool per_expert_ok =
+            s_filter &&
+            num_experts > 0 && stride > 0 &&
+            stride * static_cast<std::size_t>(num_experts) == total_bytes &&
+            !runs.runs.empty() &&
+            runs.used < num_experts;
+
+        std::size_t sent = 0;
+        if (!per_expert_ok)
+        {
+            ggml_backend_tensor_set_async(backend, tensor, host_data, 0, total_bytes);
+            sent = total_bytes;
+        }
+        else
+        {
+            const std::size_t pad = stride < 512 ? stride : 512;
+            for (const auto& run : runs.runs)
+            {
+                const std::size_t offset = static_cast<std::size_t>(run.first) * stride;
+                std::size_t len = static_cast<std::size_t>(run.second - run.first + 1) * stride;
+                if (run.second < num_experts - 1)
+                    len += pad;                   // MMQ tile overrun guard
+                if (offset + len > total_bytes)
+                    len = total_bytes - offset;
+                ggml_backend_tensor_set_async(backend, tensor,
+                    static_cast<const std::uint8_t*>(host_data) + offset, offset, len);
+                sent += len;
+            }
+        }
+
+        if (s_probe)
+        {
+            ggml_backend_synchronize(backend);
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_probe).count();
+            static thread_local int s_n = 0;
+            if (s_n++ < 12)
+            {
+                std::fprintf(stderr, "[HOSTMOE-COPY] %s pinned=%d copies=%d %.1f MiB in %.2f ms = %.1f GB/s\n",
+                    ggml_get_name(tensor), pinned ? 1 : 0,
+                    per_expert_ok ? (int) runs.runs.size() : 1,
+                    sent / 1048576.0, ms, sent / 1e9 / (ms / 1000.0));
+                std::fflush(stderr);
+            }
+        }
+        return sent;
+    }
 
     // Execute an already-built MoE FFN graph on the host CPU backend.
     //
@@ -1012,10 +1254,22 @@ namespace
         }
         ggml_build_forward_expand(graph, output);
 
-        // --- MoE CPU offload: run the whole thing on the host instead ---
-        // Taken before any accelerator binding happens, so none of this layer's
-        // expert bytes ever reach device memory.
-        if (p.run_on_cpu)
+        // --- MoE CPU offload: host compute, or accelerator with streamed experts ---
+        // An offloaded layer never gets a PERMANENT device copy of its experts.
+        // How it is evaluated still depends on the batch: at decode the host
+        // wins outright, but for a prefill-sized batch the upload is amortized
+        // over every token in it and computing on the accelerator is several
+        // times faster end to end. `stream_experts` picks the second; the branch
+        // below (taken before any accelerator binding) is the first.
+        const int stream_threshold = moe_offload_stream_batch_threshold();
+        const bool stream_experts =
+            p.run_on_cpu &&
+            p.allow_device_stream &&
+            stream_threshold > 0 &&
+            seq_len >= stream_threshold &&
+            g_backend != nullptr;
+
+        if (p.run_on_cpu && !stream_experts)
         {
             MoECpuGraphBinding b;
             b.hidden_t = hidden_t;
@@ -1083,15 +1337,20 @@ namespace
 
         // Quantized expert weights: cacheable read-only path (reused across
         // calls), falling back to host-ptr mapping or deferred upload.
+        // `stream_experts` skips both shortcuts (see bind_readonly_weight_3d)
+        // and records the tensor for the streamed upload below.
         bind_readonly_weight_3d(ctx, g_backend, dev, gate_data,
-            static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers);
+            static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers,
+            stream_experts);
         if (!fused_gate_up && !single_projection_activation)
         {
             bind_readonly_weight_3d(ctx, g_backend, dev, up_data,
-                static_cast<std::size_t>(up_total_bytes), up_w, uploads, ephem_buffers);
+                static_cast<std::size_t>(up_total_bytes), up_w, uploads, ephem_buffers,
+                stream_experts);
         }
         bind_readonly_weight_3d(ctx, g_backend, dev, down_data,
-            static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers);
+            static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers,
+            stream_experts);
 
         // Allocate any tensors not bound above (hidden in/out fallback, ids,
         // weights, biases, and all per-graph intermediates) into the persistent,
@@ -1105,7 +1364,14 @@ namespace
         // Falls back to per-call allocation when the reuse path is unavailable
         // (TS_GGML_REUSE_COMPUTE_BUF=0 / unsupported backend).
         BufferHandle backend_buffer(nullptr);
-        if (!alloc_graph_reuse_gallocr(graph))
+        // A streamed offload graph runs BETWEEN two slices of the outer
+        // whole-model graph, whose tensors are placed in the shared reuse
+        // allocator; re-planning that allocator here would move them out from
+        // under the nodes still to come. Use the allocator kept for this path.
+        const bool graph_allocated = stream_experts
+            ? alloc_graph_moe_stream_gallocr(graph)
+            : alloc_graph_reuse_gallocr(graph);
+        if (!graph_allocated)
         {
             backend_buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (backend_buffer.value == nullptr)
@@ -1119,9 +1385,36 @@ namespace
         // `selected_experts` / `routing_weights` from the previous op.
         host_read_barrier();
 
+        // TS_HOST_MOE_TIMING=1 covers the streamed path too: "how many bytes
+        // crossed the bus and how long the graph took" is the whole story of an
+        // offloaded prefill, and it is the number to watch when tuning
+        // TS_HOST_MOE_DEVICE_MIN_BATCH.
+        static const bool s_stream_timing = []() {
+            const char* e = std::getenv("TS_HOST_MOE_TIMING");
+            return e != nullptr && e[0] == '1';
+        }();
+        const auto t_upload = std::chrono::steady_clock::now();
+        std::size_t streamed_bytes = 0;
+
+        ExpertRuns expert_runs;
+        if (stream_experts)
+        {
+            const std::size_t id_count =
+                static_cast<std::size_t>(seq_len) * static_cast<std::size_t>(n_used);
+            build_expert_runs(selected_experts, id_count, num_experts, expert_runs);
+        }
+
         for (const WeightUploadInfo& u : uploads)
         {
-            if (u.needs_upload && u.tensor != nullptr && u.host_data != nullptr && u.bytes > 0)
+            if (!u.needs_upload || u.tensor == nullptr || u.host_data == nullptr || u.bytes == 0)
+                continue;
+            if (stream_experts &&
+                (u.tensor == gate_w || u.tensor == up_w || u.tensor == down_w))
+            {
+                streamed_bytes += stream_expert_weight(
+                    g_backend, u.tensor, u.host_data, u.bytes, num_experts, expert_runs);
+            }
+            else
             {
                 ggml_backend_tensor_set(u.tensor, u.host_data, 0, u.bytes);
             }
@@ -1182,11 +1475,31 @@ namespace
                 static_cast<std::size_t>(num_experts) * sizeof(float));
         }
 
+        const auto t_compute = std::chrono::steady_clock::now();
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("MoE prefill: ggml_backend_graph_compute failed.");
             return 0;
+        }
+        if (s_stream_timing && stream_experts)
+        {
+            const auto t_end = std::chrono::steady_clock::now();
+            static thread_local double acc_up = 0.0, acc_gpu = 0.0, acc_mb = 0.0;
+            static thread_local int acc_calls = 0;
+            acc_up += std::chrono::duration<double, std::milli>(t_compute - t_upload).count();
+            acc_gpu += std::chrono::duration<double, std::milli>(t_end - t_compute).count();
+            acc_mb += streamed_bytes / 1048576.0;
+            if (++acc_calls % 30 == 0)
+            {
+                std::fprintf(stderr,
+                    "[HOSTMOE-STREAM] seq=%d calls=%d experts=%d/%d bytes=%.0f MiB issue=%.1f ms (%.1f GB/s) gpu=%.1f ms pinned=%.1f GiB\n",
+                    seq_len, acc_calls, expert_runs.used, num_experts, acc_mb,
+                    acc_up, acc_mb / 1024.0 / (acc_up / 1000.0), acc_gpu,
+                    host_pinned_bytes() / 1073741824.0);
+                std::fflush(stderr);
+                acc_up = acc_gpu = acc_mb = 0.0;
+            }
         }
 
         // Result publish. With a zero-copy host-mapped output buffer, the
@@ -1267,6 +1580,16 @@ namespace
         p.oai_alpha = oai_alpha;
         p.oai_limit = oai_limit;
         p.run_on_cpu = run_on_cpu != 0;
+        // The per-op entry points may stream their experts too, but ONLY
+        // outside tensor parallelism: under TP they are driven through
+        // RunPerRank, where every rank would stream its own copy of the
+        // same unsharded expert layer to its own device at once. A single
+        // device is the case that matters here — it is the path GPT-OSS
+        // and Nemotron-H take at prefill (no fused whole-model prefill
+        // graph, hence no seam), and leaving it host-only cost gpt-oss-20b
+        // 4-10x against llama.cpp on every offloaded prefill.
+        p.allow_device_stream =
+            tsg::g_device_count.load(std::memory_order_acquire) <= 1;
         return moe_ffn_prefill_graph_impl(p);
     }
 
@@ -1333,6 +1656,16 @@ namespace
         p.oai_alpha = oai_alpha;
         p.oai_limit = oai_limit;
         p.run_on_cpu = run_on_cpu != 0;
+        // The per-op entry points may stream their experts too, but ONLY
+        // outside tensor parallelism: under TP they are driven through
+        // RunPerRank, where every rank would stream its own copy of the
+        // same unsharded expert layer to its own device at once. A single
+        // device is the case that matters here — it is the path GPT-OSS
+        // and Nemotron-H take at prefill (no fused whole-model prefill
+        // graph, hence no seam), and leaving it host-only cost gpt-oss-20b
+        // 4-10x against llama.cpp on every offloaded prefill.
+        p.allow_device_stream =
+            tsg::g_device_count.load(std::memory_order_acquire) <= 1;
         return moe_ffn_prefill_graph_impl(p);
     }
 } // namespace
@@ -1362,7 +1695,8 @@ namespace tsg
         void* up_data,   int up_type,   std::int64_t up_ne0,   std::int64_t up_ne1,   std::int64_t up_bytes,
         void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_bytes,
         const float* gate_bias, const float* up_bias, const float* down_bias,
-        int activation_type, float oai_alpha, float oai_limit)
+        int activation_type, float oai_alpha, float oai_limit,
+        bool allow_device_stream)
     {
         MoEFFNGraphParams p;
         // The graph builder takes a mutable input pointer because the
@@ -1399,7 +1733,17 @@ namespace tsg
         p.oai_alpha = oai_alpha;
         p.oai_limit = oai_limit;
         p.run_on_cpu = true;
+        p.allow_device_stream = allow_device_stream;
         return moe_ffn_prefill_graph_impl(p) != 0;
+    }
+
+    // The worker count the host expert matmul uses by default, so other
+    // host-MoE callers (DeepSeek V4 drives its own ggml CPU backend through
+    // the scheduler rather than through this seam) inherit the same measured
+    // rule instead of re-deriving one.
+    int host_moe_default_thread_count()
+    {
+        return moe_cpu_thread_count();
     }
 
     void moe_set_host_thread_count(int threads)
@@ -1414,6 +1758,10 @@ namespace tsg
 
     void moe_ffn_host_release()
     {
+        // Give the locked expert pages back first: a model reload maps a new
+        // GGUF, and leaving the previous one pinned would charge its bytes to
+        // the pin budget forever.
+        host_pin_release_all();
         std::lock_guard<std::mutex> lock(g_moe_cpu_backend_mutex);
         if (g_moe_cpu_backend != nullptr)
         {
@@ -1500,7 +1848,7 @@ namespace tsg
     }
 
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
-                                  HostMoeStagedInputs* staged)
+                                  HostMoeStagedInputs* staged, bool allow_device_stream)
     {
         if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
             hm.weights == nullptr || hm.moe_out == nullptr)
@@ -1544,7 +1892,8 @@ namespace tsg
             hm.up_data,   hm.up_type,   hm.up_ne0,   hm.up_ne1,   hm.up_bytes,
             hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
             hm.gate_bias, hm.up_bias, hm.down_bias,
-            hm.activation, hm.oai_alpha, hm.oai_limit);
+            hm.activation, hm.oai_alpha, hm.oai_limit,
+            allow_device_stream);
     }
 
     void host_moe_upload_segment(const HostMoeSegment& hm, const float* data)
@@ -1618,6 +1967,12 @@ namespace tsg
             // ggml_backend_graph_compute above already synchronized, so the
             // helper's reads see this segment's results.
             const HostMoeSegment& hm = segments[seg];
+
+            // Prefill-sized batch: evaluate the layer on the accelerator with
+            // its experts streamed in, reading and writing the whole-model
+            // graph's own tensors. Nothing to download, nothing to upload.
+            // (The verify chain wants the host result to compare against, so it
+            // keeps the staged path.)
             HostMoeStagedInputs staged;
             if (!host_moe_compute_segment(hm, s_moe_out, kernel_name, &staged))
                 return false;

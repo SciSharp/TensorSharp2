@@ -912,13 +912,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             if (cacheable && bytes >= 512)
             {
                 ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
-                bool got = try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage);
-                if (got)
-                {
-                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
-                    if (st == GGML_STATUS_SUCCESS) { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
-                    invalidate_cached_buffer(data);
-                }
+                if (try_bind_cached_tensor(g_backend, dev, t, data, bytes, needs_upload, usage))
+                { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
             }
             if (bytes >= 4096)
             {
@@ -1120,7 +1115,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             return 1;
         }
 
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        ggml_status status = tsg::graph_compute_profiled(g_backend, graph, "gemma4 model verify");
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("ggml backend graph execution failed for Gemma4 model verify.");
@@ -1329,12 +1324,8 @@ TSG_EXPORT int TSGgml_Gemma4DraftStep(
             if (cacheable && bytes >= 4096)
             {
                 ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
-                {
-                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
-                    if (st == GGML_STATUS_SUCCESS) { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
-                    invalidate_cached_buffer(data);
-                }
+                if (try_bind_cached_tensor(g_backend, dev, t, data, bytes, needs_upload, usage))
+                { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
             }
             if (bytes >= 4096)
             {

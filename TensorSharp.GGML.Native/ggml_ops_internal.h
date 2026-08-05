@@ -207,6 +207,23 @@ namespace tsg
         std::size_t bytes = 0;
         std::size_t buffer_size = 0;
         CachedBufferMode mode = CachedBufferMode::HostPtr;
+        // Allocation size (0 = never) that has been through the backend's
+        // init_tensor for this buffer. Every later graph binds a FRESH
+        // ggml_tensor to the same buffer and address, and re-running
+        // init_tensor is not free: ggml-cuda zeroes a quantized tensor's
+        // padding with a cudaMemset, so a 600-weight prefill graph issued 600
+        // of them re-zeroing padding that has been zero since the weight was
+        // first uploaded.
+        //
+        // Matched on the ALLOC size rather than a bare flag: that is what
+        // decides how much padding init_tensor would zero, so skipping it for
+        // a larger tensor would leave the extra padding holding whatever the
+        // allocator last put there - which a quantized matmul reads as NaN.
+        std::size_t initialized_alloc_size = 0;
+        // Address the first successful bind resolved to (the device copy's base,
+        // or the host pointer for a zero-copy wrap). Recording it lets a repeat
+        // bind attach with two assignments and no backend calls at all.
+        void* bound_addr = nullptr;
     };
 
     // --- Multi-device (tensor-parallel) state -------------------------------
@@ -808,7 +825,32 @@ namespace tsg
         void* up_data,   int up_type,   std::int64_t up_ne0,   std::int64_t up_ne1,   std::int64_t up_bytes,
         void* down_data, int down_type, std::int64_t down_ne0, std::int64_t down_ne1, std::int64_t down_bytes,
         const float* gate_bias, const float* up_bias, const float* down_bias,
-        int activation_type, float oai_alpha, float oai_limit);
+        int activation_type, float oai_alpha, float oai_limit,
+        // Whether a prefill-sized batch may be evaluated on the accelerator with
+        // the experts streamed in for that one graph instead of on the host (the
+        // experts are never left resident either way). False under tensor
+        // parallelism, which needs the single host evaluation over the unsharded
+        // stack. See moe_offload_stream_batch_threshold.
+        bool allow_device_stream = true);
+
+    // ------------------------------------------------------------------
+    // Host page-locking for the streamed-expert path (see ggml_ops_host_pin.cu)
+    // ------------------------------------------------------------------
+    // Page-locks the host range holding an offloaded expert stack so the H2D
+    // stream DMAs instead of trickling through the driver's staging buffer:
+    // measured 9.3 -> 55.6 GB/s on PCIe 5.0 x16 with the GGUF mmap. Costs no
+    // extra host memory (the mmap's own pages are locked) and ~65 ms/GiB once.
+    // Returns false when pinning is disabled, over budget, or unsupported, in
+    // which case the caller simply gets the slower pageable copy.
+#if defined(TSG_GGML_USE_CUDA)
+    bool host_pin_range(const void* ptr, std::size_t bytes);
+    std::size_t host_pinned_bytes();
+    void host_pin_release_all();
+#else
+    inline bool host_pin_range(const void*, std::size_t) { return false; }
+    inline std::size_t host_pinned_bytes() { return 0; }
+    inline void host_pin_release_all() {}
+#endif
 
     // Worker-thread count for the host MoE matmul (--cpu-moe-threads). Zero
     // restores the default (available_cpu_parallelism() - 1). Must be an
@@ -816,6 +858,12 @@ namespace tsg
     // Environment.SetEnvironmentVariable does not write the native environment
     // on Linux, so std::getenv here never observed the flag.
     void moe_set_host_thread_count(int threads);
+
+    // Default worker count for a host-side expert matmul: half the usable CPU
+    // parallelism, capped at 64 (the decode-side matmul is one token wide, so
+    // beyond a few dozen workers each extra thread is a barrier participant,
+    // not bandwidth). Shared so every host-MoE caller picks the same number.
+    int host_moe_default_thread_count();
 
     // Free the persistent host MoE backend (thread pool). Called from the
     // backend teardown path so a model reload does not leak worker threads.
@@ -870,6 +918,71 @@ namespace tsg
     // Node index of `t` in `graph`, or -1 when the builder never emitted it.
     int host_moe_graph_node_index(ggml_cgraph* graph, ggml_tensor* t);
 
+    // ------------------------------------------------------------------
+    // Whole-model graph profiler (TS_GGML_NODE_PROFILE)
+    // ------------------------------------------------------------------
+    // Drop-in for ggml_backend_graph_compute in the whole-model kernels. Unset,
+    // it IS ggml_backend_graph_compute — same call, no branch worth measuring.
+    // Set to 1 it runs the graph one node at a time with a synchronize around
+    // each, accumulates the cost per op type (and per (op, shape) for the worst
+    // offenders) and dumps a table every TS_GGML_NODE_PROFILE_EVERY calls
+    // (default 64).
+    //
+    // The per-node synchronize is itself ~5-10 us, so the profiled total runs
+    // well above the real graph time; the dump prints both so the launch tax is
+    // visible rather than hidden. What it is for is the SHAPE of the cost — which
+    // op type owns the graph — which is exactly what a "we are 0.7x llama.cpp"
+    // gap needs before anything is rewritten.
+    bool graph_node_profile_enabled();
+    ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag);
+
+    // ------------------------------------------------------------------
+    // Whole-model kernel phase timer (TS_GGML_PHASE_TIMING)
+    // ------------------------------------------------------------------
+    // A prefill kernel is graph build -> weight bind -> buffer alloc -> input
+    // upload -> compute -> result download, and only the compute part scales
+    // with the token count. When a prefill is fast at 2048 tokens and slow at
+    // 512 the cost is in the other five, and this says which. Zero cost when the
+    // env var is unset (one relaxed atomic load per mark).
+    bool phase_timing_enabled();
+    void phase_timing_report(const char* tag, const char* const* phases, const double* ms, int count);
+
+    struct PhaseTimer
+    {
+        explicit PhaseTimer(const char* tag) : tag_(tag), on_(phase_timing_enabled())
+        {
+            if (on_) last_ = now();
+        }
+
+        void mark(const char* phase)
+        {
+            if (!on_ || count_ >= kMaxPhases) return;
+            const double t = now();
+            phases_[count_] = phase;
+            ms_[count_] = t - last_;
+            last_ = t;
+            ++count_;
+        }
+
+        ~PhaseTimer()
+        {
+            if (on_ && count_ > 0) phase_timing_report(tag_, phases_, ms_, count_);
+        }
+
+        PhaseTimer(const PhaseTimer&) = delete;
+        PhaseTimer& operator=(const PhaseTimer&) = delete;
+
+    private:
+        static double now();
+        static constexpr int kMaxPhases = 12;
+        const char* tag_;
+        bool on_;
+        double last_ = 0.0;
+        int count_ = 0;
+        const char* phases_[kMaxPhases] = {};
+        double ms_[kMaxPhases] = {};
+    };
+
     // Turn recorded segments into node cut points. The cut for a segment goes
     // after the last of its boundary tensors, whichever order the expander
     // emitted them in; `seg_end` ends with the graph's node count so the tail
@@ -905,7 +1018,8 @@ namespace tsg
         const float* weights = nullptr;
     };
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
-                                  HostMoeStagedInputs* staged = nullptr);
+                                  HostMoeStagedInputs* staged = nullptr,
+                                  bool allow_device_stream = true);
     void host_moe_upload_segment(const HostMoeSegment& hm, const float* data);
     void host_moe_zero_segment(const HostMoeSegment& hm);
 
@@ -944,6 +1058,12 @@ namespace tsg
     // MTP MoE verify) whose per-call gallocr alloc/free would fragment Metal VRAM.
     // Returns false if unavailable (caller falls back to its own gallocr).
     bool alloc_graph_reuse_gallocr(ggml_cgraph* graph);
+
+    // Same, but backed by a SEPARATE persistent allocator reserved for the
+    // MoE-offload streaming graphs. They run nested inside a partially executed
+    // outer graph, so they must not re-plan the allocator that outer graph's
+    // tensors are placed in. See alloc_graph_in_gallocr_slot.
+    bool alloc_graph_moe_stream_gallocr(ggml_cgraph* graph);
     // Run Metal's backend graph optimizer before any graph allocation. Direct
     // backend graph_compute calls do not invoke this hook themselves.
     void optimize_graph_for_metal(ggml_cgraph* graph);
@@ -1012,6 +1132,25 @@ namespace tsg
         ggml_backend_t backend, ggml_backend_dev_t dev,
         ggml_tensor* tensor, void* data, std::size_t bytes,
         ggml_backend_buffer_t& out_buffer, void*& out_addr, bool& out_needs_upload,
+        enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // Bind `tensor` to the cached device buffer for `data`, doing the lookup and
+    // the attach in one step. Returns false when there is no usable cached
+    // buffer (the caller falls back to a host-pointer wrap or an upload).
+    //
+    // The reason this exists rather than callers pairing
+    // try_get_cacheable_tensor_buffer with ggml_backend_tensor_alloc: the second
+    // half of that pair runs the backend's init_tensor every time, and for a
+    // quantized weight ggml-cuda's init_tensor issues a cudaMemset to zero the
+    // block padding. A whole-model prefill graph binds ~600 weights per call, so
+    // that was ~600 memsets per prefill (7.5 ms on a 30-layer Gemma 4 — half the
+    // gap to llama.cpp at 512 tokens) re-zeroing padding that has been zero since
+    // the weight was first uploaded. The cache entry remembers that it has been
+    // initialized, and repeat binds attach directly. The flag lives in the entry,
+    // so freeing/evicting the buffer clears it with the rest.
+    bool try_bind_cached_tensor(
+        ggml_backend_t backend, ggml_backend_dev_t dev,
+        ggml_tensor* tensor, void* data, std::size_t bytes, bool& out_needs_upload,
         enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     bool sync_cached_buffer_to_host(void* data, std::size_t bytes);

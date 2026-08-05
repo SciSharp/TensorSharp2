@@ -144,69 +144,12 @@ namespace
     GptOssDecodeCachePool g_gptoss_dc_pools[tsg::TSG_MAX_DEVICES];
     GptOssDecodeCachePool& gptoss_pool() { return g_gptoss_dc_pools[tsg::g_active_rank]; }
 
-    // Rows of a device window copied back into its host mirror. The window and
-    // the host cache share the [head_dim, rows, kv_heads] layout but not the row
-    // capacity, so the copy is per head.
-    void gptoss_kv_download(tsg_gptoss::KvWindow* w, void* host_cache, int cache_rows, std::int64_t rows)
-    {
-        if (w == nullptr || w->tensor == nullptr || host_cache == nullptr || rows <= 0)
-            return;
-        rows = std::min<std::int64_t>(rows, std::min<std::int64_t>(w->capacity, cache_rows));
-        const std::size_t row_bytes = ggml_row_size(static_cast<ggml_type>(w->type), w->head_dim);
-        const std::size_t host_stride = static_cast<std::size_t>(cache_rows) * row_bytes;
-        const std::size_t win_stride = static_cast<std::size_t>(w->capacity) * row_bytes;
-        const std::size_t bytes = static_cast<std::size_t>(rows) * row_bytes;
-        char* host = static_cast<char*>(host_cache);
-        for (int h = 0; h < w->kv_heads; h++)
-            ggml_backend_tensor_get(w->tensor, host + h * host_stride, h * win_stride, bytes);
-    }
-
-    void gptoss_kv_upload(tsg_gptoss::KvWindow* w, const void* host_cache, int cache_rows,
-                          std::int64_t from_row, std::int64_t to_row)
-    {
-        if (w == nullptr || w->tensor == nullptr || host_cache == nullptr || to_row <= from_row)
-            return;
-        const std::size_t row_bytes = ggml_row_size(static_cast<ggml_type>(w->type), w->head_dim);
-        const std::size_t host_stride = static_cast<std::size_t>(cache_rows) * row_bytes;
-        const std::size_t win_stride = static_cast<std::size_t>(w->capacity) * row_bytes;
-        const std::size_t offset = static_cast<std::size_t>(from_row) * row_bytes;
-        const std::size_t bytes = static_cast<std::size_t>(to_row - from_row) * row_bytes;
-        const char* host = static_cast<const char*>(host_cache);
-        for (int h = 0; h < w->kv_heads; h++)
-            ggml_backend_tensor_set(w->tensor, host + h * host_stride + offset,
-                                    h * win_stride + offset, bytes);
-    }
-
-    // Acquire the K/V window pair for a layer, preserving whatever the device
-    // already holds when the window has to grow. Growth reallocates, which would
-    // otherwise drop rows that only exist on the device (decode never writes them
-    // back), so the old contents are flushed to the host mirror first and the
-    // freshly allocated window re-uploads them from there.
-    bool gptoss_acquire_pair(const TSGgmlGptOssLayerDesc& d, std::int64_t needed_rows,
-                             tsg_gptoss::KvWindow*& k_win, tsg_gptoss::KvWindow*& v_win)
-    {
-        const ggml_type kvType = static_cast<ggml_type>(d.kv_cache_type);
-        tsg_gptoss::KvWindow* existing_k = tsg_gptoss::kv_find(d.k_cache);
-        tsg_gptoss::KvWindow* existing_v = tsg_gptoss::kv_find(d.v_cache);
-        if (existing_k != nullptr && existing_k->capacity < needed_rows)
-            gptoss_kv_download(existing_k, d.k_cache, d.cache_size, existing_k->rows_valid);
-        if (existing_v != nullptr && existing_v->capacity < needed_rows)
-            gptoss_kv_download(existing_v, d.v_cache, d.cache_size, existing_v->rows_valid);
-
-        k_win = tsg_gptoss::kv_acquire(d.k_cache, d.head_dim, d.num_kv_heads, kvType, needed_rows, d.cache_size);
-        v_win = (k_win == nullptr)
-            ? nullptr
-            : tsg_gptoss::kv_acquire(d.v_cache, d.head_dim, d.num_kv_heads, kvType, needed_rows, d.cache_size);
-        if (k_win == nullptr || v_win == nullptr)
-        {
-            // Half a pair is worse than none: drop both so the per-layer path
-            // rebuilds from the host mirror rather than trusting a stale
-            // rows_valid on the survivor.
-            tsg_gptoss::kv_drop_pair_locked(d.k_cache, d.v_cache);
-            return false;
-        }
-        return true;
-    }
+    // The window <-> host mirror transfers and the pair acquire live in
+    // tsg_gptoss (ggml_ops_gptoss_kv.h) so the whole-model prefill kernel
+    // shares exactly the same residency contract.
+    using tsg_gptoss::kv_download;
+    using tsg_gptoss::kv_upload;
+    using tsg_gptoss::kv_acquire_pair;
 
     // Window mask for a single decode query at absolute `position`: unmasked iff
     // the cache row holds a real position that the query may attend to.
@@ -284,7 +227,7 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
         std::vector<tsg_gptoss::KvWindow*> v_wins(num_layers, nullptr);
         for (int l = 0; l < num_layers; l++)
         {
-            if (!gptoss_acquire_pair(layers[l], totalSeqLen, k_wins[l], v_wins[l]))
+            if (!kv_acquire_pair(layers[l], totalSeqLen, k_wins[l], v_wins[l]))
             {
                 set_last_error("GPT-OSS model decode: failed to acquire a device KV window.");
                 return 0;
@@ -342,8 +285,8 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
             const TSGgmlGptOssLayerDesc& d = layers[l];
             const std::int64_t kvalid = std::min<std::int64_t>(k_wins[l]->rows_valid, position);
             const std::int64_t vvalid = std::min<std::int64_t>(v_wins[l]->rows_valid, position);
-            gptoss_kv_upload(k_wins[l], d.k_cache, d.cache_size, kvalid, position);
-            gptoss_kv_upload(v_wins[l], d.v_cache, d.cache_size, vvalid, position);
+            kv_upload(k_wins[l], d.k_cache, d.cache_size, kvalid, position);
+            kv_upload(v_wins[l], d.v_cache, d.cache_size, vvalid, position);
         }
 
         const void* sig_disc = layers[0].attn_norm_w;
@@ -393,7 +336,7 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
             }
             else
             {
-                st = ggml_backend_graph_compute(g_backend, dc->graph);
+                st = tsg::graph_compute_profiled(g_backend, dc->graph, "gpt-oss model decode");
             }
             if (st != GGML_STATUS_SUCCESS)
             {
@@ -826,17 +769,11 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
             if (tgt == nullptr || data == nullptr) return;
             if (cacheable && bytes >= 4096)
             {
-                ggml_backend_buffer_t buf = nullptr;
-                void* addr = nullptr;
                 bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, tgt, data, bytes, buf, addr, needs_upload, usage))
+                if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
                 {
-                    if (ggml_backend_tensor_alloc(buf, tgt, addr) == GGML_STATUS_SUCCESS)
-                    {
-                        if (needs_upload) upload_list.push_back({tgt, data, bytes});
-                        return;
-                    }
-                    invalidate_cached_buffer(data);
+                    if (needs_upload) upload_list.push_back({tgt, data, bytes});
+                    return;
                 }
             }
             if (bytes >= 4096)
@@ -963,7 +900,7 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
         }
         else
         {
-            status = ggml_backend_graph_compute(g_backend, graph);
+            status = tsg::graph_compute_profiled(g_backend, graph, "gpt-oss model decode (build)");
         }
         if (status != GGML_STATUS_SUCCESS)
         {
@@ -1058,9 +995,9 @@ TSG_EXPORT int TSGgml_GptOssSyncKvCacheToHost(
             return 0;
         ggml_backend_synchronize(g_backend);
         if (kw != nullptr)
-            gptoss_kv_download(kw, k_cache, cache_size, std::min<std::int64_t>(rows, kw->rows_valid));
+            kv_download(kw, k_cache, cache_size, std::min<std::int64_t>(rows, kw->rows_valid));
         if (vw != nullptr)
-            gptoss_kv_download(vw, v_cache, cache_size, std::min<std::int64_t>(rows, vw->rows_valid));
+            kv_download(vw, v_cache, cache_size, std::min<std::int64_t>(rows, vw->rows_valid));
         clear_last_error();
         return 1;
     }

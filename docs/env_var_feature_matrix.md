@@ -65,9 +65,13 @@ per-model `TS_*_BATCHED` opt-outs surface as the model's declared
 |---|---|---|---|---|---|
 | `KV_CACHE_DTYPE` | all | KV cache element type | auto (model-aligned: `f16` when the model's weights are below F32, else `f32`) | `f32`, `f16`, `q8_0` (runtime also accepts `q4_0`, not swept) | yes |
 | `TS_KV_PAGED_QUANT_BITS` | all | TurboQuant paged-KV block codec (2-bit uses the affine min+scale layout) | off (`0`) | `0`, `2`, `4`, `8` | yes |
-| `TS_N_CPU_MOE` | MoE models | Routed experts of the first N layers stay in system RAM and multiply on the host | off (`0`) | `0`, `16`, `32` | no |
+| `TS_N_CPU_MOE` | MoE models | Routed experts of the first N layers stay in system RAM: multiplied on the host at decode, streamed to the accelerator for one graph at prefill | off (`0`) | `0`, `16`, `all` | yes (GGML backends, MoE families) |
 | `TS_CPU_MOE` | MoE models | Offload every layer's routed experts (equivalent to `TS_N_CPU_MOE=all`) | off | `0`, `1` | no |
-| `TS_CPU_MOE_THREADS` | MoE models | Worker threads for the host-side expert matmul. Defaults to the usable CPU parallelism (hardware threads clamped by the affinity mask and the cgroup CPU quota) minus one; oversubscribing a quota collapses throughput because ggml's pool spins at its barriers | usable CPUs minus one | - | no |
+| `TS_CPU_MOE_THREADS` | MoE models | Worker threads for the host-side expert matmul. Default is half the usable CPU parallelism (hardware threads clamped by the affinity mask and the cgroup CPU quota), capped at 64: the decode-side matmul is one token wide, so past a few dozen workers each extra thread only adds a barrier participant (measured 7x slower at 192 threads than at 32 on a 2-socket Xeon) | min(usable/2, 64) | - | no |
+| `TS_HOST_MOE_DEVICE_MIN_BATCH` | MoE models with offload | Batch size at or above which an offloaded layer is computed on the accelerator with its experts streamed in, rather than on the host. `0` restores host-only offload | `128` | `0`, `32`, `128` | no |
+| `TS_HOST_MOE_PIN` | MoE models with offload | Page-lock (`cudaHostRegister`) the offloaded expert ranges so the streamed prefill DMAs instead of staging through the driver (9.3 -> 55.6 GB/s on PCIe 5.0) | ON | `0`, `1` | no |
+| `TS_HOST_MOE_PIN_MAX_MB` | MoE models with offload | Budget for the pinned expert ranges | 60% of the cgroup/host memory limit | - | no |
+| `TS_HOST_MOE_EXPERT_FILTER` | MoE models with offload | Stream only the experts the batch actually routes to, grouped into consecutive runs | ON | `0`, `1` | no |
 | `MAX_CONTEXT` | long text / uploaded text | Hard context cap | model default | `4096`, `8192`, `16384` | yes |
 
 ## Prefill / Decode Tuning

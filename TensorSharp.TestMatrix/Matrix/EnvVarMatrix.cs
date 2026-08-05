@@ -119,6 +119,25 @@ public static class EnvVarMatrix
             Notes: "Hard cap on context length.",
             AppliesTo: (m, b, f) => f.Id is "long_text" or "uploaded_text"),
 
+        // MoE CPU offload (--n-cpu-moe / --cpu-moe)
+        new(
+            Name: "TS_N_CPU_MOE",
+            Category: "MoeOffload",
+            Values: new[] { "0", "16", "all" },
+            DefaultValue: "0",
+            Notes: "Routed experts of the first N layers stay in system RAM: multiplied on the host at decode, "
+                 + "streamed to the accelerator for one graph at prefill. 'all' offloads every MoE layer. "
+                 + "Only meaningful on the GGML backends, where the host-MoE seam exists.",
+            AppliesTo: (m, b, f) =>
+                (b.Id is "ggml_cuda" or "ggml_vulkan" or "ggml_metal")
+                && (string.Equals(m.Family, "gptoss", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(m.Family, "gemma4", StringComparison.OrdinalIgnoreCase)
+                    || m.Family.StartsWith("qwen35", StringComparison.OrdinalIgnoreCase)
+                    || m.Family.StartsWith("qwen36", StringComparison.OrdinalIgnoreCase)
+                    || m.Family.StartsWith("deepseek", StringComparison.OrdinalIgnoreCase))
+                && f.Kind is FeatureKind.Text or FeatureKind.UploadedText or FeatureKind.MultiTurn
+                          or FeatureKind.Tools or FeatureKind.SyntheticPrefill or FeatureKind.SyntheticDecode),
+
         // Prefill / decode
         new(
             Name: "TS_PREFILL_CHUNK",

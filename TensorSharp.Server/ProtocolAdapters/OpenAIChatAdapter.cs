@@ -203,6 +203,69 @@ namespace TensorSharp.Server.ProtocolAdapters
         private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, int[]>
             s_jsonOpenerTokens = new();
 
+        /// <summary>
+        /// Attach a grammar constraint for the requested structured-output
+        /// format, so the decoder can only emit tokens that keep the response
+        /// structurally valid.
+        /// </summary>
+        /// <remarks>
+        /// This replaces prompt-and-hope. Previously JSON mode asked the model
+        /// nicely and repaired the result afterwards, which cannot guarantee
+        /// anything — a truncated or malformed object still reached the client,
+        /// and a tool call built on it failed. With a grammar the invalid tokens
+        /// are simply not available to sample.
+        /// <para>
+        /// Falls back to the old first-token nudge if a grammar cannot be built
+        /// (an exotic schema, say): a request that degrades to the previous
+        /// behaviour is far better than one that 500s. <c>TS_JSON_GRAMMAR=0</c>
+        /// forces that fallback for A/B testing.
+        /// </para>
+        /// </remarks>
+        private SamplingConfig WithStructuredOutputConstraint(
+            SamplingConfig samplingConfig, StructuredOutputFormat responseFormat)
+        {
+            if (responseFormat == null || samplingConfig == null)
+                return samplingConfig;
+            var tok = _svc.Model?.Tokenizer;
+            if (tok == null)
+                return samplingConfig;
+
+            if (!string.Equals(Environment.GetEnvironmentVariable("TS_JSON_GRAMMAR"), "0", StringComparison.Ordinal))
+            {
+                try
+                {
+                    var cache = responseFormat.Kind == StructuredOutputKind.JsonSchema
+                        ? TensorSharp.Runtime.Grammar.GrammarLibrary.ForJsonSchema(responseFormat.SchemaJson, tok)
+                        : TensorSharp.Runtime.Grammar.GrammarLibrary.ForJsonObject(tok);
+
+                    var withGrammar = samplingConfig.Clone();
+                    // One constraint per request: it holds the live parse
+                    // position, so sharing it across sequences would let them
+                    // advance each other's parser.
+                    var constraint =
+                        TensorSharp.Runtime.Grammar.GrammarLibrary.NewConstraint(cache, tok);
+                    // A model that reasons before it answers must be allowed to
+                    // do so: enforcing the schema from token 0 forbids its own
+                    // channel header and it answers the shape instead of the
+                    // question (see OutputParserFactory.GrammarActivationTrigger).
+                    string trigger = OutputParserFactory.GrammarActivationTrigger(_svc.Architecture);
+                    if (trigger != null)
+                        constraint.ActivateAfter(trigger);
+                    withGrammar.Grammar = constraint;
+                    return withGrammar;
+                }
+                catch (Exception ex)
+                {
+                    _loggerFactory.CreateLogger("TensorSharp.Server.OpenAI.StructuredOutput")
+                        .LogWarning(ex,
+                            "Could not build a grammar for {Kind}; falling back to the " +
+                            "first-token constraint.", responseFormat.Kind);
+                }
+            }
+
+            return WithJsonFirstTokenConstraint(samplingConfig, responseFormat);
+        }
+
         private SamplingConfig WithJsonFirstTokenConstraint(
             SamplingConfig samplingConfig, StructuredOutputFormat responseFormat)
         {
@@ -303,7 +366,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return;
             }
 
-            samplingConfig = WithJsonFirstTokenConstraint(samplingConfig, responseFormat);
+            samplingConfig = WithStructuredOutputConstraint(samplingConfig, responseFormat);
 
             bool useStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0)
                 || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
@@ -516,7 +579,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return;
             }
 
-            samplingConfig = WithJsonFirstTokenConstraint(samplingConfig, responseFormat);
+            samplingConfig = WithStructuredOutputConstraint(samplingConfig, responseFormat);
 
             var sb = new StringBuilder();
             int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;

@@ -46,6 +46,53 @@ public class VisionEncoderCudaTests
         AssertClose(expected, tensor.GetElementsAsFloat(rows * cols));
     }
 
+    // Sub / Mul / Div take the same shape and had the same defect, and unlike Add
+    // they had no dedicated broadcast path at all until 2026-08-05. Gemma 4's
+    // vision projector standardises its pooled patches with Sub-then-Mul against
+    // a [cols] vector, so on this backend exactly one of 130 patches was being
+    // standardised and the model hallucinated the image contents.
+    [Theory]
+    [InlineData("sub", 130, 1152)]
+    [InlineData("mul", 130, 1152)]
+    [InlineData("div", 33, 129)]
+    [InlineData("sub", 1, 8)]
+    [InlineData("mul", 7, 3)]
+    public void CudaBinary_RowBroadcast_AppliesToEveryRow(string op, int rows, int cols)
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        float[] baseValues = MakePattern(rows * cols, 0.7f, 0.1f);
+        // Offset away from zero so the division case stays well conditioned.
+        float[] rowValues = MakePattern(cols, 1.3f, 2.5f);
+
+        using var tensor = new Tensor(allocator, DType.Float32, rows, cols);
+        tensor.SetElementsAsFloat(baseValues);
+        using var row = new Tensor(allocator, DType.Float32, cols);
+        row.SetElementsAsFloat(rowValues);
+
+        Func<float, float, float> scalar = op switch
+        {
+            "sub" => (x, y) => x - y,
+            "mul" => (x, y) => x * y,
+            _ => (x, y) => x / y,
+        };
+        switch (op)
+        {
+            case "sub": Ops.Sub(tensor, tensor, row); break;
+            case "mul": Ops.Mul(tensor, tensor, row); break;
+            default: Ops.Div(tensor, tensor, row); break;
+        }
+
+        float[] expected = new float[rows * cols];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                expected[r * cols + c] = scalar(baseValues[r * cols + c], rowValues[c]);
+
+        AssertClose(expected, tensor.GetElementsAsFloat(rows * cols));
+    }
+
     // Same defect on the CPU allocator: TensorApplyCPU.Add reaches the same
     // Apply3 for a trailing-dimension rhs.
     [Fact]

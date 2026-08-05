@@ -874,7 +874,7 @@ namespace
             {
                 st = use_metal_async_submit
                     ? ggml_backend_graph_compute_async(g_backend, dc->graph)
-                    : ggml_backend_graph_compute(g_backend, dc->graph);
+                    : tsg::graph_compute_profiled(g_backend, dc->graph, "qwen35 model decode");
             }
             if (st != GGML_STATUS_SUCCESS)
             {
@@ -1704,18 +1704,12 @@ namespace
             if (tgt == nullptr || data == nullptr) return;
             if (cacheable && bytes >= 4096)
             {
-                ggml_backend_buffer_t buf = nullptr;
-                void* addr = nullptr;
                 bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, tgt, data, bytes, buf, addr, needs_upload, usage))
+                if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
                 {
-                    if (ggml_backend_tensor_alloc(buf, tgt, addr) == GGML_STATUS_SUCCESS)
-                    {
-                        if (needs_upload || force_upload)
-                            upload_list.push_back({tgt, data, bytes});
-                        return;
-                    }
-                    invalidate_cached_buffer(data);
+                    if (needs_upload || force_upload)
+                        upload_list.push_back({tgt, data, bytes});
+                    return;
                 }
             }
             if (bytes >= 4096)
