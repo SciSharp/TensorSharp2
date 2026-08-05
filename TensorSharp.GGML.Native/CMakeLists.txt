@@ -214,6 +214,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_mask.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_dsv4_fused.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
 endif()
 
 add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})

@@ -1099,6 +1099,12 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         // to 96 hardware threads under a 24-CPU cgroup quota measured 25x
         // slower than sizing it to the quota. TS_CPU_MOE_THREADS (published by
         // MoeCpuOffloadConfig) overrides.
+        //
+        // Deliberately NOT host_moe_default_thread_count(): that rule caps at
+        // 64 because the seam architectures read ~40 MB of expert rows per
+        // offloaded layer per token, so the pool runs out of work before it
+        // runs out of cores. DSV4 reads ~260 MB (6 of 256 experts, n_ff 2048,
+        // n_embd 7168) and keeps scaling past that point.
         int cpu_threads = n_threads > 0 ? n_threads : 16;
         if (n_cpu_moe_req != 0)
             cpu_threads = tsg::available_cpu_parallelism();
@@ -1760,6 +1766,38 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         }
         if (!sizes_ok) return nullptr;
         if (!dsv4_upload_parallel(shards, jobs, load_threads)) return nullptr;
+
+        // Page-lock the offloaded experts. DSV4 hands its offloaded layers to
+        // ggml_backend_sched, which — with op_offload on — sends their
+        // mul_mat_id back to the GPU for a prefill-sized batch and streams the
+        // weights over for that one graph. Those copies come out of a PAGEABLE
+        // host buffer, which cannot DMA: measured 9.3 GB/s against 55.6 GB/s
+        // once the range is registered (PCIe 5.0 x16). Registering costs
+        // ~65 ms/GiB, once, here rather than in the middle of the first prompt.
+        // Failures (no budget, driver refusal) are silent and simply leave the
+        // slower path in place — see host_pin_range.
+        if (n_cpu_moe > 0)
+        {
+            const auto t_pin = std::chrono::steady_clock::now();
+            std::size_t pinned = 0;
+            for (int il = 0; il < hp.n_layer; il++)
+            {
+                const dsv4_layer & L = m->layers[il];
+                if (!L.cpu_moe) continue;
+                for (ggml_tensor * t : { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps })
+                {
+                    if (t == nullptr || t->data == nullptr) continue;
+                    if (tsg::host_pin_range(t->data, ggml_nbytes(t)))
+                        pinned += ggml_nbytes(t);
+                }
+            }
+            if (pinned > 0)
+            {
+                fprintf(stderr, "[dsv4] page-locked %.1f GiB of host experts in %.1fs (streamed prefill DMAs at full link speed)\n",
+                        pinned / 1073741824.0,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pin).count());
+            }
+        }
 
         auto t_end = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(t_end - t_start).count();

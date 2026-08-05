@@ -816,12 +816,37 @@ namespace tsg
         // stack. See moe_offload_stream_batch_threshold.
         bool allow_device_stream = true);
 
+    // ------------------------------------------------------------------
+    // Host page-locking for the streamed-expert path (see ggml_ops_host_pin.cu)
+    // ------------------------------------------------------------------
+    // Page-locks the host range holding an offloaded expert stack so the H2D
+    // stream DMAs instead of trickling through the driver's staging buffer:
+    // measured 9.3 -> 55.6 GB/s on PCIe 5.0 x16 with the GGUF mmap. Costs no
+    // extra host memory (the mmap's own pages are locked) and ~65 ms/GiB once.
+    // Returns false when pinning is disabled, over budget, or unsupported, in
+    // which case the caller simply gets the slower pageable copy.
+#if defined(TSG_GGML_USE_CUDA)
+    bool host_pin_range(const void* ptr, std::size_t bytes);
+    std::size_t host_pinned_bytes();
+    void host_pin_release_all();
+#else
+    inline bool host_pin_range(const void*, std::size_t) { return false; }
+    inline std::size_t host_pinned_bytes() { return 0; }
+    inline void host_pin_release_all() {}
+#endif
+
     // Worker-thread count for the host MoE matmul (--cpu-moe-threads). Zero
     // restores the default (available_cpu_parallelism() - 1). Must be an
     // explicit call rather than an environment variable: .NET's
     // Environment.SetEnvironmentVariable does not write the native environment
     // on Linux, so std::getenv here never observed the flag.
     void moe_set_host_thread_count(int threads);
+
+    // Default worker count for a host-side expert matmul: half the usable CPU
+    // parallelism, capped at 64 (the decode-side matmul is one token wide, so
+    // beyond a few dozen workers each extra thread is a barrier participant,
+    // not bandwidth). Shared so every host-MoE caller picks the same number.
+    int host_moe_default_thread_count();
 
     // Free the persistent host MoE backend (thread pool). Called from the
     // backend teardown path so a model reload does not leak worker threads.
