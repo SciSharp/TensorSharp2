@@ -1789,6 +1789,34 @@ namespace TensorSharp.GGML
         /// from RAM per call. Set per request together with <see cref="SetDeviceCopyBudget"/>.</summary>
         public static void QwenImageSetOffload(bool on) => GgmlNative.QwenImageSetOffload(on);
 
+        /// <summary>Whole UMT5-XXL text-encoder forward (24 layers, per-layer relative attention
+        /// bias) in ONE resident-weight ggml graph: token ids in, final hidden states out.</summary>
+        public static bool TryWanT5Encode(in WanT5EncodeArgs args)
+        {
+            return GgmlNative.TryWanT5Encode(in args);
+        }
+
+        /// <summary>Whole Wan DiT forward (one denoising-step velocity prediction) in ONE
+        /// resident-weight ggml graph; persistent + CUDA-graph-captured per shape on CUDA.</summary>
+        public static bool TryWanDitForward(in WanDitForwardArgs args)
+        {
+            return GgmlNative.TryWanDitForward(in args);
+        }
+
+        /// <summary>Whole Wan causal 3D video-VAE decode in ONE ggml graph (temporal chunks
+        /// iterated in-graph with the causal feature cache carried between them).</summary>
+        public static bool TryWanVaeDecode(in WanVaeDecodeArgs args)
+        {
+            return GgmlNative.TryWanVaeDecode(in args);
+        }
+
+        /// <summary>Whole Wan causal 3D video-VAE encode (pixels -> posterior mean) in ONE
+        /// ggml graph; 1+4k pixel-frame chunks iterated in-graph with the causal caches.</summary>
+        public static bool TryWanVaeEncode(in WanVaeEncodeArgs args)
+        {
+            return GgmlNative.TryWanVaeEncode(in args);
+        }
+
         /// <summary>Single 2D convolution on the active GGML device (ggml_conv_2d). Used to move the
         /// Qwen-Image VAE conv stack off the CPU. Layouts match VaeReferenceMath (no transposes).</summary>
         public static bool TryConv2d(in Conv2dArgs args)

@@ -33,6 +33,14 @@ namespace TensorSharp.Server.Endpoints
             endpoints.MapPost("/api/image-edit/stream",
                 (HttpContext ctx, WebUiAdapter adapter) => adapter.ImageEditStreamAsync(ctx))
                 .DisableRequestTimeout();
+            // Wan text-to-video: prompt -> generated (downloadable) MP4.
+            endpoints.MapPost("/api/video-generate",
+                (HttpRequest req, WebUiAdapter adapter) => adapter.VideoGenerateAsync(req))
+                .DisableRequestTimeout();
+            // Streaming variant: SSE with per-step denoising progress (used by the Web UI).
+            endpoints.MapPost("/api/video-generate/stream",
+                (HttpContext ctx, WebUiAdapter adapter) => adapter.VideoGenerateStreamAsync(ctx))
+                .DisableRequestTimeout();
             return endpoints;
         }
     }

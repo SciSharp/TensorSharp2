@@ -384,6 +384,38 @@ namespace TensorSharp.Cli
                     "but native ~1 MP edits fit on small cards. Default: auto (engages only when the target " +
                     "resolution does not fit beside the resident weights).",
                     "--offload-cpu"),
+                new OptionHelp("--video-frames <N>",
+                    "Wan video generation: number of output frames, snapped to 4k+1 (the VAE's temporal grid); " +
+                    "1 = a single still image. Default: 33 (49 for Wan2.2-TI2V). With a Wan 2.2 model, " +
+                    "--image <file> supplies the first frame for image-to-video.",
+                    "--video-frames 81"),
+                new OptionHelp("--fps <N>",
+                    "Wan video generation: playback frame rate of the saved MP4. Default: 16 " +
+                    "(24 for Wan2.2-TI2V, the models' training rates).",
+                    "--fps 24"),
+                new OptionHelp("--flow-shift <F>",
+                    "Wan FlowMatch timestep shift. Default: 0 — the model's official recipe (5.0 for Wan 2.2, " +
+                    "12.0 for A14B T2V; Wan 2.1: 8.0 for the 1.3B model's video runs, else 3.0 at <= 480p, " +
+                    "5.0 above).",
+                    "--flow-shift 5.0"),
+                new OptionHelp("--sampler <name>",
+                    "Wan sampler: unipc (the official Wan sampler; multistep predictor-corrector, " +
+                    "better quality at the same step count) or euler. Default: unipc.",
+                    "--sampler unipc"),
+                new OptionHelp("--negative-prompt <text>",
+                    "Wan video generation: negative prompt for classifier-free guidance. Default: the official " +
+                    "Wan negative prompt.",
+                    "--negative-prompt \"static, blurry\""),
+                new OptionHelp("--wan-vae <path>",
+                    "Wan video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B). Default: " +
+                    "same-directory scan next to the DiT model, VAE/ subfolders included (TS_WAN_VAE env var " +
+                    "also works).",
+                    "--wan-vae Wan2.2_VAE.safetensors"),
+                new OptionHelp("--wan-te <path>",
+                    "UMT5-XXL text-encoder GGUF for Wan video generation. Default: same-directory scan " +
+                    "(TS_WAN_TE env var also works). Wan 2.2 A14B also auto-resolves the second high/low-noise " +
+                    "expert GGUF by name (TS_WAN_DIT2 env var overrides).",
+                    "--wan-te umt5-xxl-encoder-Q8_0.gguf"),
             }),
             ("Configuration file", new[]
             {

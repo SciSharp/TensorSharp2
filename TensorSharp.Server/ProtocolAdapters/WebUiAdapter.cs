@@ -609,6 +609,302 @@ namespace TensorSharp.Server.ProtocolAdapters
             return null;
         }
 
+        // ---- Text-to-video (Wan) ---------------------------------------------
+
+        private static readonly object _videoGenLock = new();
+
+        private sealed class VideoFrame
+        {
+            public int Step, Total;
+            public bool Final;
+            public string Url;
+            public int Width, Height, Frames, Fps;
+            public long Seed;
+            public string Codec;
+            public double Seconds;
+            public string Error;
+        }
+
+        private TensorSharp.Models.WanVideo.WanVideoParams ParseVideoParams(JsonElement root, out string error)
+        {
+            error = null;
+            var p = new TensorSharp.Models.WanVideo.WanVideoParams();
+            if (root.TryGetProperty("width", out var w) && w.TryGetInt32(out int wi)) p.Width = wi;
+            if (root.TryGetProperty("height", out var h) && h.TryGetInt32(out int hi)) p.Height = hi;
+            if (root.TryGetProperty("frames", out var f) && f.TryGetInt32(out int fi)) p.Frames = fi;
+            if (root.TryGetProperty("steps", out var st) && st.TryGetInt32(out int si)) p.Steps = si;
+            if (root.TryGetProperty("cfg", out var cf) && cf.TryGetSingle(out float cv)) p.CfgScale = cv;
+            if (root.TryGetProperty("cfg2", out var cf2) && cf2.TryGetSingle(out float cv2)) p.CfgScale2 = cv2;
+            if (root.TryGetProperty("seed", out var se) && se.TryGetInt64(out long sv) && sv != 0) p.Seed = sv;
+            if (root.TryGetProperty("fps", out var fp) && fp.TryGetInt32(out int fv)) p.Fps = fv;
+            if (root.TryGetProperty("flowShift", out var fs) && fs.TryGetSingle(out float fsv)) p.FlowShift = fsv;
+            if (root.TryGetProperty("negativePrompt", out var np) && np.ValueKind == JsonValueKind.String)
+                p.NegativePrompt = np.GetString();
+            if (root.TryGetProperty("sampler", out var sm) && sm.ValueKind == JsonValueKind.String)
+                p.Sampler = sm.GetString();
+
+            // Conditioning image for Wan 2.2 image-to-video: either a previously uploaded
+            // file ("imagePath", Web UI flow) or inline base64 ("image", API flow; a
+            // data:...;base64, prefix is accepted).
+            if (root.TryGetProperty("imagePath", out var ip) && ip.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(ip.GetString()))
+            {
+                string uploadRoot = Path.GetFullPath(_options.UploadDirectory);
+                string full = Path.GetFullPath(ip.GetString());
+                if (!full.StartsWith(uploadRoot, StringComparison.OrdinalIgnoreCase) || !File.Exists(full))
+                {
+                    error = "imagePath must reference a previously uploaded file.";
+                    return p;
+                }
+                p.ImageBytes = File.ReadAllBytes(full);
+            }
+            else if (root.TryGetProperty("image", out var ib) && ib.ValueKind == JsonValueKind.String
+                     && !string.IsNullOrWhiteSpace(ib.GetString()))
+            {
+                string b64 = ib.GetString();
+                int comma = b64.IndexOf(',');
+                if (b64.StartsWith("data:", StringComparison.OrdinalIgnoreCase) && comma > 0)
+                    b64 = b64[(comma + 1)..];
+                try { p.ImageBytes = Convert.FromBase64String(b64); }
+                catch (FormatException) { error = "image must be base64-encoded (optionally a data: URL)."; }
+            }
+            return p;
+        }
+
+        /// <summary>
+        /// <c>POST /api/video-generate</c> — JSON <c>{ prompt, width?, height?, frames?, steps?,
+        /// cfg?, seed?, fps?, flowShift?, negativePrompt? }</c>. Runs the loaded Wan text-to-video
+        /// model and returns a downloadable URL to the generated MP4.
+        /// </summary>
+        public async Task<IResult> VideoGenerateAsync(HttpRequest req)
+        {
+            var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
+            if (_svc.Model is not TensorSharp.Models.WanVideo.WanVideoModel videoModel)
+                return Results.BadRequest(new { error = "The loaded model is not a Wan video-generation model." });
+
+            var body = await JsonDocument.ParseAsync(req.Body);
+            var root = body.RootElement;
+            string prompt = root.TryGetProperty("prompt", out var pr) ? pr.GetString() ?? "" : "";
+            if (string.IsNullOrWhiteSpace(prompt))
+                return Results.BadRequest(new { error = "prompt is required." });
+            var p = ParseVideoParams(root, out string imgError);
+            if (imgError != null)
+                return Results.BadRequest(new { error = imgError });
+
+            string outName = $"video-{Guid.NewGuid():N}.mp4";
+            string outPath = Path.Combine(_options.UploadDirectory, outName);
+            logger.LogInformation(LogEventIds.UploadReceived,
+                "Video generate: prompt='{Prompt}' {W}x{H}x{F} steps={Steps} i2v={I2V}",
+                prompt, p.Width, p.Height, p.Frames, p.Steps, p.ImageBytes != null);
+
+            var sw = Stopwatch.StartNew();
+            var result = await Task.Run(() =>
+            {
+                lock (_videoGenLock)
+                {
+                    var video = videoModel.GenerateVideo(prompt, p);
+                    string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outPath, video.Frames, video.Fps);
+                    return (video, codec);
+                }
+            });
+            sw.Stop();
+
+            string url = BuildUploadUrl(outName);
+            logger.LogInformation(LogEventIds.UploadReceived,
+                "Video generate done: {F} frames -> {Url} ({Sec:F1}s)", result.video.Frames.Length, url, sw.Elapsed.TotalSeconds);
+            return Results.Json(new
+            {
+                ok = true, url,
+                width = result.video.Frames[0].Width, height = result.video.Frames[0].Height,
+                frames = result.video.Frames.Length, fps = result.video.Fps,
+                seed = result.video.Seed, codec = result.codec,
+                elapsedSeconds = sw.Elapsed.TotalSeconds,
+            });
+        }
+
+        /// <summary>
+        /// <c>POST /v1/videos/generations</c> — OpenAI-images-style envelope for Wan
+        /// text-to-video: <c>{ prompt, size?: "832x480", frames?, steps?, cfg?, seed?,
+        /// fps?, negative_prompt?, response_format?: "url"|"b64_json" }</c> returns
+        /// <c>{ created, data: [{ url, b64_json? }], ... }</c>.
+        /// </summary>
+        public async Task<IResult> OpenAIVideoGenerationsAsync(HttpRequest req)
+        {
+            var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
+            if (_svc.Model is not TensorSharp.Models.WanVideo.WanVideoModel videoModel)
+                return Results.BadRequest(new { error = new { message = "The loaded model is not a Wan video-generation model.", type = "invalid_request_error" } });
+
+            var body = await JsonDocument.ParseAsync(req.Body);
+            var root = body.RootElement;
+            string prompt = root.TryGetProperty("prompt", out var pr) ? pr.GetString() ?? "" : "";
+            if (string.IsNullOrWhiteSpace(prompt))
+                return Results.BadRequest(new { error = new { message = "prompt is required.", type = "invalid_request_error" } });
+
+            var p = ParseVideoParams(root, out string imgError);
+            if (imgError != null)
+                return Results.BadRequest(new { error = new { message = imgError, type = "invalid_request_error" } });
+            if (root.TryGetProperty("size", out var sz) && sz.ValueKind == JsonValueKind.String)
+            {
+                var parts = (sz.GetString() ?? "").Split('x');
+                if (parts.Length == 2 && int.TryParse(parts[0], out int sw_) && int.TryParse(parts[1], out int sh_))
+                {
+                    p.Width = sw_;
+                    p.Height = sh_;
+                }
+            }
+            if (root.TryGetProperty("negative_prompt", out var np2) && np2.ValueKind == JsonValueKind.String)
+                p.NegativePrompt = np2.GetString();
+            bool wantB64 = root.TryGetProperty("response_format", out var rf) &&
+                           rf.ValueKind == JsonValueKind.String && rf.GetString() == "b64_json";
+
+            string outName = $"video-{Guid.NewGuid():N}.mp4";
+            string outPath = Path.Combine(_options.UploadDirectory, outName);
+            var sw = Stopwatch.StartNew();
+            var result = await Task.Run(() =>
+            {
+                lock (_videoGenLock)
+                {
+                    var video = videoModel.GenerateVideo(prompt, p);
+                    string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outPath, video.Frames, video.Fps);
+                    return (video, codec);
+                }
+            });
+            sw.Stop();
+
+            string url = BuildUploadUrl(outName);
+            logger.LogInformation(LogEventIds.UploadReceived,
+                "OpenAI video generation done: {F} frames -> {Url} ({Sec:F1}s)",
+                result.video.Frames.Length, url, sw.Elapsed.TotalSeconds);
+            string b64 = wantB64 ? Convert.ToBase64String(await File.ReadAllBytesAsync(outPath)) : null;
+            return Results.Json(new
+            {
+                created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                data = new[] { new { url, b64_json = b64 } },
+                width = result.video.Frames[0].Width,
+                height = result.video.Frames[0].Height,
+                frames = result.video.Frames.Length,
+                fps = result.video.Fps,
+                seed = result.video.Seed,
+                codec = result.codec,
+                elapsed_seconds = sw.Elapsed.TotalSeconds,
+            });
+        }
+
+        /// <summary>
+        /// <c>POST /api/video-generate/stream</c> — same JSON body as
+        /// <see cref="VideoGenerateAsync"/> but streams SSE progress events
+        /// (<c>{ videoGen, step, total }</c> per denoising step, then
+        /// <c>{ done, url, ... }</c>) so the Web UI can show live progress.
+        /// </summary>
+        public async Task VideoGenerateStreamAsync(HttpContext ctx)
+        {
+            var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
+            SseWriter.ApplyHeaders(ctx.Response);
+            var ct = ctx.RequestAborted;
+
+            if (_svc.Model is not TensorSharp.Models.WanVideo.WanVideoModel videoModel)
+            {
+                await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = "The loaded model is not a Wan video-generation model." }, ct);
+                return;
+            }
+
+            string prompt;
+            TensorSharp.Models.WanVideo.WanVideoParams p;
+            try
+            {
+                var body = await JsonDocument.ParseAsync(ctx.Request.Body, cancellationToken: ct);
+                var root = body.RootElement;
+                prompt = root.TryGetProperty("prompt", out var pr) ? pr.GetString() ?? "" : "";
+                p = ParseVideoParams(root, out string imgError);
+                if (imgError != null)
+                {
+                    await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = imgError }, ct);
+                    return;
+                }
+                if (string.IsNullOrWhiteSpace(prompt))
+                {
+                    await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = "prompt is required." }, ct);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = "Bad request: " + ex.Message }, ct);
+                return;
+            }
+
+            string outName = $"video-{Guid.NewGuid():N}.mp4";
+            string outPath = Path.Combine(_options.UploadDirectory, outName);
+            logger.LogInformation(LogEventIds.UploadReceived,
+                "Video generate (stream): prompt='{Prompt}' {W}x{H}x{F}", prompt, p.Width, p.Height, p.Frames);
+
+            var channel = Channel.CreateUnbounded<VideoFrame>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+
+            var genTask = Task.Run(() =>
+            {
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    lock (_videoGenLock)
+                    {
+                        p.OnStep = (step, total) =>
+                        {
+                            if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
+                            channel.Writer.TryWrite(new VideoFrame { Step = step, Total = total });
+                        };
+                        var video = videoModel.GenerateVideo(prompt, p);
+                        string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outPath, video.Frames, video.Fps);
+                        channel.Writer.TryWrite(new VideoFrame
+                        {
+                            Final = true, Url = BuildUploadUrl(outName),
+                            Width = video.Frames[0].Width, Height = video.Frames[0].Height,
+                            Frames = video.Frames.Length, Fps = video.Fps, Seed = video.Seed,
+                            Codec = codec, Seconds = sw.Elapsed.TotalSeconds,
+                        });
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    channel.Writer.TryWrite(new VideoFrame { Final = true, Error = "cancelled" });
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(LogEventIds.ChatFailed, ex, "Video generate (stream) failed");
+                    channel.Writer.TryWrite(new VideoFrame { Final = true, Error = ex.Message });
+                }
+                finally { channel.Writer.Complete(); }
+            }, CancellationToken.None);
+
+            try
+            {
+                await foreach (var f in channel.Reader.ReadAllAsync(ct))
+                {
+                    if (f.Final)
+                    {
+                        if (f.Error == "cancelled") break;
+                        if (f.Error != null)
+                            await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = f.Error }, ct);
+                        else
+                            await SseWriter.WriteEventAsync(ctx.Response, new
+                            {
+                                done = true, url = f.Url, width = f.Width, height = f.Height,
+                                frames = f.Frames, fps = f.Fps, seed = f.Seed, codec = f.Codec,
+                                elapsedSeconds = f.Seconds,
+                            }, ct);
+                        logger.LogInformation(LogEventIds.UploadReceived,
+                            "Video generate (stream) done: {F} frames -> {Url} ({Sec:F1}s)", f.Frames, f.Url, f.Seconds);
+                    }
+                    else
+                    {
+                        await SseWriter.WriteEventAsync(ctx.Response,
+                            new { videoGen = true, step = f.Step, total = f.Total }, ct);
+                    }
+                }
+            }
+            catch (OperationCanceledException) { /* client went away; the worker sees ct and stops */ }
+            await genTask;
+        }
+
         // A live denoising frame surfaced from the edit worker to the SSE writer: a progress tick
         // (Png == null) or a decoded preview image; the terminal frame carries the final result.
         private sealed class EditFrame

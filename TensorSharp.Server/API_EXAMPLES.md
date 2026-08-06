@@ -829,6 +829,54 @@ followed by a final
 Requests against a model that is not Qwen-Image-Edit return 400; concurrent
 edits are serialized by a process-wide lock.
 
+### Video Generation (`/v1/videos/generations`, Wan)
+
+When the hosted `--model` is a Wan DiT GGUF (architecture `wan` — Wan 2.1 T2V,
+Wan 2.2 TI2V-5B, or Wan 2.2 A14B), a prompt generates an H.264 MP4 (see
+[docs/models/wan.md](../docs/models/wan.md) for the companion models):
+
+```bash
+curl -X POST http://localhost:5000/v1/videos/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a lovely cat", "size": "832x480", "frames": 49, "seed": 7}'
+```
+
+**Image-to-video** (Wan 2.2 models): add `"image"` with the base64-encoded
+first frame (a `data:image/...;base64,` prefix is accepted) — the video starts
+from that image and the prompt drives motion, camera and scene changes:
+
+```bash
+curl -X POST http://localhost:5000/v1/videos/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "the cat runs toward the camera, cinematic tracking shot",
+       "image": "data:image/png;base64,'"$(base64 -w0 first_frame.png)"'",
+       "frames": 81, "seed": 7}'
+```
+
+Response (add `"response_format": "b64_json"` to inline the MP4 bytes):
+
+```json
+{"created": 1780000000, "data": [{"url": "/uploads/video-<guid>.mp4"}],
+ "width": 832, "height": 480, "frames": 81, "fps": 24, "seed": 7,
+ "codec": "h264", "elapsed_seconds": 270.0}
+```
+
+Optional fields: `cfg` and `cfg2` (per-model official defaults — TI2V-5B 5.0;
+A14B I2V 3.5/3.5, T2V 4.0/3.0, `cfg2` being the low-noise expert's scale;
+Wan 2.1 6.0), `steps` (50 TI2V / 40 A14B / 30 Wan 2.1), `fps` (24 TI2V, else
+16), `sampler` (`"unipc"` default / `"euler"`), `flowShift` (official recipes),
+`negative_prompt` (defaults to the official Wan negative prompt), `frames`
+snapped to `4k+1` (`1` = a still image). When `image` is given without an
+explicit `size`, the output follows the image's aspect ratio.
+`POST /api/video-generate` accepts the same body with `width`/`height` instead
+of `size` plus `imagePath` (a previously uploaded file from `/api/upload`) and
+returns an `{ ok, url, ... }` envelope; the streaming variant
+`POST /api/video-generate/stream` (used by the Web UI chat) emits
+`{"videoGen": true, "step": 12, "total": 30}` SSE events per denoising step and
+a final `{"done": true, "url": ..., "frames": 81, "fps": 24, ...}`. Requests
+against a model that is not Wan return 400; concurrent generations are
+serialized by a process-wide lock.
+
 ---
 
 ## 4. Sampling Options

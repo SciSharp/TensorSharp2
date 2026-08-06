@@ -27,6 +27,9 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Qwen-Image-Edit | MMDiT DiT（必需） | [unsloth/Qwen-Image-Edit-2511-GGUF](https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF)，如 `qwen-image-edit-2511-Q4_K_M.gguf` |
 | Qwen-Image-Edit | VAE + Qwen2.5-VL（必需） | [QuantStack VAE](https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF) 中的 `VAE/Qwen_Image-VAE.safetensors` + [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) |
 | Qwen-Image-Edit | Lightning LoRA（可选） | [lightx2v/Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning)，如 4-step `.safetensors`；通过 `--qwen-image-lora` 加载 |
+| Wan 视频生成 | Wan DiT（`--model` GGUF） | Wan 2.2 文/图生视频：[QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF)（如 `Wan2.2-TI2V-5B-Q8_0.gguf`）或 [QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF)（HighNoise + LowNoise 两个专家）；Wan 2.1 文生视频：[samuelchristlie/Wan2.1-T2V-1.3B-GGUF](https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF) 或 [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf)；`general.architecture` = `wan`。参见 [docs/models/wan.md](docs/models/wan.md) |
+| Wan 视频生成 | UMT5-XXL 文本编码器（必需） | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf)（`umt5-xxl-encoder-Q8_0.gguf`）—— 放在 DiT 旁或用 `--wan-te` / `TS_WAN_TE` 指定 |
+| Wan 视频生成 | 视频 VAE（必需） | Wan 2.1 + A14B：[`wan_2.1_vae.safetensors`](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors)；TI2V-5B：[`Wan2.2_VAE.safetensors`](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE) —— 放在 DiT 旁（`VAE/` 子目录亦可）或用 `--wan-vae` / `TS_WAN_VAE` 指定 |
 
 ### DSpark draft 模型
 

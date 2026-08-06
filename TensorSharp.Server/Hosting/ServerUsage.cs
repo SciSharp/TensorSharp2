@@ -287,6 +287,18 @@ namespace TensorSharp.Server.Hosting
                     "target resolution does not fit beside the resident weights).",
                     "--offload-cpu"),
             }),
+            ("Wan video-generation companion models (wan DiT GGUFs)", new[]
+            {
+                new OptionHelp("--wan-vae <path>",
+                    "Wan video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B). " +
+                    "Default: same-directory scan next to the DiT model, VAE/ subfolders included " +
+                    "(TS_WAN_VAE).",
+                    "--wan-vae Wan2.2_VAE.safetensors"),
+                new OptionHelp("--wan-te <path>",
+                    "UMT5-XXL text-encoder GGUF. Default: same-directory scan (TS_WAN_TE). Wan 2.2 A14B " +
+                    "also auto-resolves the second high/low-noise expert GGUF by name (TS_WAN_DIT2).",
+                    "--wan-te umt5-xxl-encoder-Q8_0.gguf"),
+            }),
             ("Configuration file", new[]
             {
                 new OptionHelp("--config <path>",
