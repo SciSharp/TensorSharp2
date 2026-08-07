@@ -54,6 +54,13 @@
 #include <numeric>
 #include <thread>
 
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace tsg_dsv4
 {
 
@@ -387,6 +394,17 @@ struct dsv4_model
     ggml_context * c_ctx[MAX_GPUS + 1] = {};
     ggml_backend_buffer_t c_buf[MAX_GPUS + 1] = {};
 
+    // GGUF shard mmaps backing the host-resident (cpu_moe) expert tensors.
+    // File-backed pages are page cache the kernel can evict and re-read, so a
+    // model whose offloaded experts outweigh what the host allows this process
+    // (cgroup memory limit on containers — `free` lies there) loads and runs
+    // at page-cache speed instead of being OOM-killed mid-copy. Indexed by
+    // shard; null when that shard is not mapped.
+    std::vector<void *> mmap_addrs;
+    std::vector<size_t> mmap_sizes;
+    std::vector<ggml_backend_buffer_t> mmap_bufs;
+    size_t mmap_weight_bytes = 0; // tensor bytes served from the mappings
+
     ggml_tensor * tok_embd = nullptr;
     ggml_tensor * output_norm = nullptr;
     ggml_tensor * output = nullptr;
@@ -459,6 +477,19 @@ struct dsv4_model
             if (c_ctx[i]) ggml_free(c_ctx[i]);
             if (w_buf[i]) ggml_backend_buffer_free(w_buf[i]);
             if (w_ctx[i]) ggml_free(w_ctx[i]);
+        }
+        if (!mmap_addrs.empty())
+        {
+            // Expert ranges inside the mappings may be cudaHostRegister'ed
+            // (host_pin_range at load); munmap of still-registered pages
+            // leaves them pinned in the driver forever, so unregister first.
+            tsg::host_pin_release_all();
+            for (ggml_backend_buffer_t b : mmap_bufs)
+                if (b) ggml_backend_buffer_free(b); // from_ptr: frees the wrapper only
+#if !defined(_WIN32)
+            for (size_t i = 0; i < mmap_addrs.size(); i++)
+                if (mmap_addrs[i]) munmap(mmap_addrs[i], mmap_sizes[i]);
+#endif
         }
         for (int i = 0; i < MAX_GPUS; i++)
             if (ts_backends[i]) ggml_backend_free(ts_backends[i]);
@@ -644,6 +675,89 @@ static bool dsv4_check_shard_complete(const char * path, gguf_context * g, ggml_
             path, fsz, n_tensors, needed, (needed - fsz) / (1024.0 * 1024.0 * 1024.0),
             last ? last : "?");
     return false;
+}
+
+// Memory this process is actually allowed to keep resident: the cgroup limit
+// when the process runs under one (containers — /proc/meminfo shows the HOST
+// there and is off by an order of magnitude), MemTotal otherwise. 0 = unknown.
+static size_t dsv4_host_mem_allowance()
+{
+    size_t limit = 0;
+#ifdef __linux__
+    if (FILE * f = fopen("/sys/fs/cgroup/memory.max", "r"))   // cgroup v2
+    {
+        char v[64] = { 0 };
+        if (fscanf(f, "%63s", v) == 1 && strcmp(v, "max") != 0)
+            limit = (size_t) atoll(v);
+        fclose(f);
+    }
+    if (limit == 0)
+    {
+        if (FILE * f = fopen("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r"))   // cgroup v1
+        {
+            long long v = 0;
+            if (fscanf(f, "%lld", &v) == 1 && v > 0 && v < (1ll << 62))
+                limit = (size_t) v;
+            fclose(f);
+        }
+    }
+    if (limit == 0)
+    {
+        if (FILE * f = fopen("/proc/meminfo", "r"))
+        {
+            long long kb = 0;
+            if (fscanf(f, "MemTotal: %lld kB", &kb) == 1 && kb > 0)
+                limit = (size_t) kb * 1024ull;
+            fclose(f);
+        }
+    }
+#endif
+    return limit;
+}
+
+// Map shard `si` read-only and wrap the mapping in a CPU-backend buffer so
+// host-resident weights can point straight into the file. Returns the buffer
+// (cached in m.mmap_bufs) or null; every failure is non-fatal — the caller
+// falls back to the allocate+copy path.
+static ggml_backend_buffer_t dsv4_mmap_shard(dsv4_model & m, const shard_files & shards, int si)
+{
+#if defined(_WIN32)
+    (void) m; (void) shards; (void) si;
+    return nullptr;
+#else
+    if (si < 0 || si >= (int) shards.paths.size()) return nullptr;
+    if (m.mmap_bufs.size() < shards.paths.size())
+    {
+        m.mmap_addrs.resize(shards.paths.size(), nullptr);
+        m.mmap_sizes.resize(shards.paths.size(), 0);
+        m.mmap_bufs.resize(shards.paths.size(), nullptr);
+    }
+    if (m.mmap_bufs[si]) return m.mmap_bufs[si];
+
+    const char * path = shards.paths[si].c_str();
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return nullptr;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0)
+    {
+        close(fd);
+        return nullptr;
+    }
+    void * addr = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd); // the mapping keeps its own reference
+    if (addr == MAP_FAILED) return nullptr;
+
+    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(addr, (size_t) st.st_size);
+    if (!buf)
+    {
+        munmap(addr, (size_t) st.st_size);
+        return nullptr;
+    }
+    m.mmap_addrs[si] = addr;
+    m.mmap_sizes[si] = (size_t) st.st_size;
+    m.mmap_bufs[si] = buf;
+    return buf;
+#endif
 }
 
 // One chunk of one weight tensor: read [file_off, file_off+len) from its
@@ -1715,12 +1829,69 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     }
 
     // --- allocate + upload ---
+
+    // Host-resident weights (the cpu_moe experts) are served straight from the
+    // GGUF mmap instead of a private copy. The copy path allocates their full
+    // size as ANONYMOUS memory, which the kernel cannot reclaim: a 137 GiB
+    // expert set under a container memory quota is not a slow load, it is a
+    // silent SIGKILL from the OOM killer with no error output at all. File
+    // pages are evictable, so the same model loads everywhere and degrades to
+    // page-cache/storage speed only when the host genuinely lacks the memory.
+    // TS_DSV4_MOE_MMAP=0 restores the copy path (tensors the mapping cannot
+    // serve fall back to it automatically, e.g. on Windows).
+    {
+        const char * e = getenv("TS_DSV4_MOE_MMAP");
+        const bool want_mmap = !(e && atoi(e) == 0);
+        if (want_mmap)
+        {
+            ggml_context * hctx = m->w_ctx[n_gpu];
+            for (ggml_tensor * t = ggml_get_first_tensor(hctx); t; t = ggml_get_next_tensor(hctx, t))
+            {
+                auto it = sources.find(t->name);
+                if (it == sources.end()) continue;
+                const tensor_source & src = it->second;
+                if (ggml_nbytes(t) != src.size) continue; // size mismatch reported by the copy path
+                ggml_backend_buffer_t buf = dsv4_mmap_shard(*m, shards, src.shard);
+                if (!buf) continue;
+                char * base = (char *) m->mmap_addrs[src.shard];
+                if (ggml_backend_tensor_alloc(buf, t, base + src.offset) != GGML_STATUS_SUCCESS)
+                    continue;
+                m->mmap_weight_bytes += ggml_nbytes(t);
+            }
+            if (m->mmap_weight_bytes > 0)
+            {
+                const size_t allow = dsv4_host_mem_allowance();
+                fprintf(stderr, "[dsv4] host experts are served from the GGUF mapping (%.1f GiB, no private copy)\n",
+                        m->mmap_weight_bytes / 1073741824.0);
+                if (allow > 0 && m->mmap_weight_bytes + (size_t) 8 * 1024 * 1024 * 1024 > allow)
+                {
+                    fprintf(stderr,
+                            "[dsv4] note: %.1f GiB of host experts against a %.1f GiB process memory allowance "
+                            "(cgroup limit; `free` shows the host, not this container). The kernel will evict and "
+                            "re-read expert pages from storage on demand, so decode speed is bound by the model "
+                            "file's storage, not by compute.\n",
+                            m->mmap_weight_bytes / 1073741824.0, allow / 1073741824.0);
+                }
+            }
+        }
+    }
+
     for (int d = 0; d <= n_gpu; d++)
     {
         if (ggml_get_first_tensor(m->w_ctx[d]) != nullptr)
         {
-            m->w_buf[d] = ggml_backend_alloc_ctx_tensors(m->w_ctx[d], m->backends[d]);
-            if (!m->w_buf[d]) { fprintf(stderr, "[dsv4] weight alloc failed on device %d\n", d); return nullptr; }
+            // Tensors the mmap already placed keep their file backing;
+            // ggml_backend_alloc_ctx_tensors only allocates the rest. All
+            // mapped = nothing left to allocate = a null buffer that means
+            // "empty", not failure.
+            bool unallocated = false;
+            for (ggml_tensor * t = ggml_get_first_tensor(m->w_ctx[d]); t; t = ggml_get_next_tensor(m->w_ctx[d], t))
+                if (t->data == nullptr) { unallocated = true; break; }
+            if (unallocated)
+            {
+                m->w_buf[d] = ggml_backend_alloc_ctx_tensors(m->w_ctx[d], m->backends[d]);
+                if (!m->w_buf[d]) { fprintf(stderr, "[dsv4] weight alloc failed on device %d\n", d); return nullptr; }
+            }
         }
         if (ggml_get_first_tensor(m->c_ctx[d]) != nullptr)
         {
@@ -1751,6 +1922,9 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             {
                 auto it = sources.find(t->name);
                 if (it == sources.end()) continue; // cache tensors etc.
+                if (t->buffer != nullptr &&
+                    std::find(m->mmap_bufs.begin(), m->mmap_bufs.end(), t->buffer) != m->mmap_bufs.end())
+                    continue; // served from the GGUF mapping, nothing to copy
                 const tensor_source & src = it->second;
                 const size_t total = ggml_nbytes(t);
                 if (total != src.size)
@@ -1767,6 +1941,48 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         if (!sizes_ok) return nullptr;
         if (!dsv4_upload_parallel(shards, jobs, load_threads)) return nullptr;
 
+        // Warm the mmapped experts with the same parallelism the copy path had.
+        // Lazy faulting would make the first prompt pay for the whole read at
+        // single-stream storage speed, mid-generation. Only when they actually
+        // fit: warming 137 GiB into an 87 GiB allowance just evicts itself (and
+        // everything else) for nothing, so there lazy-on-demand IS the plan.
+        if (m->mmap_weight_bytes > 0)
+        {
+            const size_t allow = dsv4_host_mem_allowance();
+            const size_t headroom = (size_t) 8 * 1024 * 1024 * 1024;
+            if (allow == 0 || m->mmap_weight_bytes + headroom <= allow)
+            {
+                const auto t_warm = std::chrono::steady_clock::now();
+                std::vector<std::pair<const volatile char *, size_t>> ranges;
+                ggml_context * hctx = m->w_ctx[n_gpu];
+                for (ggml_tensor * t = ggml_get_first_tensor(hctx); t; t = ggml_get_next_tensor(hctx, t))
+                {
+                    if (t->buffer == nullptr ||
+                        std::find(m->mmap_bufs.begin(), m->mmap_bufs.end(), t->buffer) == m->mmap_bufs.end())
+                        continue;
+                    ranges.emplace_back((const volatile char *) t->data, ggml_nbytes(t));
+                }
+                std::atomic<size_t> r_cursor(0);
+                auto warm_worker = [&]()
+                {
+                    for (;;)
+                    {
+                        const size_t i = r_cursor.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= ranges.size()) break;
+                        const volatile char * p = ranges[i].first;
+                        for (size_t off = 0; off < ranges[i].second; off += 4096)
+                            (void) p[off];
+                    }
+                };
+                std::vector<std::thread> warm_pool;
+                for (int i = 0; i < load_threads; i++) warm_pool.emplace_back(warm_worker);
+                for (auto & th : warm_pool) th.join();
+                fprintf(stderr, "[dsv4] prefaulted %.1f GiB of mmapped host experts in %.1fs\n",
+                        m->mmap_weight_bytes / 1073741824.0,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count());
+            }
+        }
+
         // Page-lock the offloaded experts. DSV4 hands its offloaded layers to
         // ggml_backend_sched, which — with op_offload on — sends their
         // mul_mat_id back to the GPU for a prefill-sized batch and streams the
@@ -1776,7 +1992,15 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         // ~65 ms/GiB, once, here rather than in the middle of the first prompt.
         // Failures (no budget, driver refusal) are silent and simply leave the
         // slower path in place — see host_pin_range.
-        if (n_cpu_moe > 0)
+        //
+        // Not when the mmapped experts outweigh the host allowance: registering
+        // faults the pages in at storage speed (minutes on a network FS) and
+        // every pinned page is one the kernel can no longer evict, which is
+        // exactly the headroom an over-committed page cache lives on.
+        const bool experts_over_allowance = m->mmap_weight_bytes > 0 &&
+            [&]{ const size_t a = dsv4_host_mem_allowance();
+                 return a > 0 && m->mmap_weight_bytes + (size_t) 8 * 1024 * 1024 * 1024 > a; }();
+        if (n_cpu_moe > 0 && !experts_over_allowance)
         {
             const auto t_pin = std::chrono::steady_clock::now();
             std::size_t pinned = 0;
@@ -1801,10 +2025,12 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
 
         auto t_end = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(t_end - t_start).count();
-        fprintf(stderr, "[dsv4] loaded %.1f GiB across %d GPU(s) in %.1fs (%.2f GiB/s, %d load threads; n_ctx=%d, ring=%" PRId64 ", csa_rows=%" PRId64 ", hca_rows=%" PRId64 ")\n",
+        fprintf(stderr, "[dsv4] loaded %.1f GiB across %d GPU(s) in %.1fs (%.2f GiB/s, %d load threads%s; n_ctx=%d, ring=%" PRId64 ", csa_rows=%" PRId64 ", hca_rows=%" PRId64 ")\n",
                 uploaded / (1024.0 * 1024.0 * 1024.0), n_gpu, secs,
                 secs > 0 ? uploaded / (1024.0 * 1024.0 * 1024.0) / secs : 0.0,
-                load_threads, m->n_ctx, m->ring_raw, m->n_csa_rows, m->n_hca_rows);
+                load_threads,
+                m->mmap_weight_bytes > 0 ? "; host experts mmapped" : "",
+                m->n_ctx, m->ring_raw, m->n_csa_rows, m->n_hca_rows);
 
         // What the split actually did, and what is left for the compute
         // buffers — the number to look at before changing

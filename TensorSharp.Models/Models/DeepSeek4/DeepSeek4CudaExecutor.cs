@@ -58,10 +58,20 @@ namespace TensorSharp.Models
         /// while the same 16 threads on their own descriptors read at 2.4 GB/s,
         /// independent of the access pattern.
         /// </remarks>
-        private sealed class ShardSource : IDsv4WeightSource, IDisposable
+        private sealed class ShardSource : IDsv4WeightSource, IDsv4MappedWeightSource, IDisposable
         {
             private readonly string _path;
             private readonly ThreadLocal<Microsoft.Win32.SafeHandles.SafeFileHandle> _handles;
+
+            // Whole-file read-only mapping, created lazily by TryMapRange. The
+            // engine borrows raw pointers into it for as long as it lives, so
+            // the mapping survives DisposeReaders (the post-load cleanup) and
+            // only Dispose — called after the engine is gone — releases it.
+            private readonly object _mapLock = new object();
+            private System.IO.MemoryMappedFiles.MemoryMappedFile _map;
+            private System.IO.MemoryMappedFiles.MemoryMappedViewAccessor _view;
+            private byte* _mapBase;
+            private long _mapLength;
 
             public ShardSource(string path)
             {
@@ -86,11 +96,70 @@ namespace TensorSharp.Models
                 }
             }
 
-            public void Dispose()
+            public bool HasMapping => _mapBase != null;
+
+            public bool TryMapRange(long offset, long bytes, out IntPtr ptr)
+            {
+                ptr = IntPtr.Zero;
+                if (offset < 0 || bytes <= 0)
+                    return false;
+                lock (_mapLock)
+                {
+                    if (_mapBase == null)
+                    {
+                        try
+                        {
+                            long length = new FileInfo(_path).Length;
+                            var map = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(
+                                _path, FileMode.Open, mapName: null, 0,
+                                System.IO.MemoryMappedFiles.MemoryMappedFileAccess.Read);
+                            var view = map.CreateViewAccessor(0, 0,
+                                System.IO.MemoryMappedFiles.MemoryMappedFileAccess.Read);
+                            byte* b = null;
+                            view.SafeMemoryMappedViewHandle.AcquirePointer(ref b);
+                            _map = map;
+                            _view = view;
+                            _mapBase = b;
+                            _mapLength = length;
+                        }
+                        catch
+                        {
+                            return false; // caller copies instead
+                        }
+                    }
+                    if (offset + bytes > _mapLength)
+                        return false;
+                    ptr = (IntPtr)(_mapBase + offset);
+                    return true;
+                }
+            }
+
+            /// <summary>Drops the per-thread read handles (only needed while the
+            /// loader streams weights) but keeps any mapping the engine borrowed
+            /// pointers into.</summary>
+            public void DisposeReaders()
             {
                 foreach (var h in _handles.Values)
                     h?.Dispose();
                 _handles.Dispose();
+            }
+
+            public void Dispose()
+            {
+                try { DisposeReaders(); } catch (ObjectDisposedException) { }
+                lock (_mapLock)
+                {
+                    if (_mapBase != null)
+                    {
+                        _view.SafeMemoryMappedViewHandle.ReleasePointer();
+                        _view.Dispose();
+                        _map.Dispose();
+                        _view = null;
+                        _map = null;
+                        _mapBase = null;
+                        _mapLength = 0;
+                    }
+                }
             }
         }
 
@@ -191,7 +260,7 @@ namespace TensorSharp.Models
             foreach (var p in _ownedBuffers)
                 Marshal.FreeHGlobal(p);
             _ownedBuffers.Clear();
-            DisposeShardSources();
+            ReleaseShardReaders();
 
             Console.Error.WriteLine($"[dsv4-cuda] model ready in {sw.Elapsed.TotalSeconds:F1}s");
         }
@@ -314,6 +383,28 @@ namespace TensorSharp.Models
                 _prefetched[names[i]] = slots[i];
                 _ownedBuffers.Add(slots[i]);
             }
+        }
+
+        /// <summary>
+        /// Post-load cleanup: the per-thread pread handles only serve the load,
+        /// but a source whose mapping the engine borrowed (<c>--n-cpu-moe</c>
+        /// experts point straight into it) must stay alive until
+        /// <see cref="Dispose"/>.
+        /// </summary>
+        private void ReleaseShardReaders()
+        {
+            if (_shardSources == null)
+                return;
+            bool anyMapped = false;
+            foreach (var s in _shardSources)
+            {
+                if (s == null)
+                    continue;
+                s.DisposeReaders();
+                anyMapped |= s.HasMapping;
+            }
+            if (!anyMapped)
+                _shardSources = null;
         }
 
         private void DisposeShardSources()

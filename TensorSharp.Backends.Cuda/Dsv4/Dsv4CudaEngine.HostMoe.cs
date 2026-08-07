@@ -97,6 +97,15 @@ namespace TensorSharp.Cuda
                 // no second 3 GiB of RAM per layer.
                 host = d.HostPtr;
             }
+            else if (d.Source is IDsv4MappedWeightSource ms && ms.TryMapRange(d.SourceOffset, bytes, out IntPtr mapped))
+            {
+                // Borrow the shard's file mapping. File-backed pages are page
+                // cache the kernel can evict and re-read on demand, so experts
+                // that outweigh the host allowance (cgroup limit on containers)
+                // run at storage speed instead of OOM-SIGKILLing the process
+                // the way a 137 GiB AllocHGlobal copy does.
+                host = mapped;
+            }
             else
             {
                 host = Marshal.AllocHGlobal((nint)bytes);
