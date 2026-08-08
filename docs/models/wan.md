@@ -34,6 +34,34 @@ VRAM is roughly `max(TE, DiT + attention, VAE)` — TI2V-5B Q8_0 generates
 81-frame 480p image-to-video on a 16 GB GPU in under 8 minutes, and both A14B
 Q4_K_M experts run sequentially on the same card.
 
+## Backends
+
+Video generation runs on every TensorSharp backend:
+
+| `--backend` | Path | Notes |
+|---|---|---|
+| `ggml_cuda` | GGML whole-graph kernels | fastest; persistent DiT graph + CUDA-graph capture |
+| `ggml_vulkan` | GGML whole-graph kernels | AMD/Intel/NVIDIA via Vulkan; the VAE stays on the banded conv path (Vulkan drivers reject multi-GB arenas) |
+| `ggml_cpu` | GGML whole-graph kernels | CPU-only machines; slow but exact |
+| `cuda` | direct CUDA (`WanDirect*`) | ggml-independent: quantized weights resident via TensorSharp's own MMQ/dp4a/cuBLAS routing, streaming online-softmax attention kernels, channels-last im2col VAE |
+| `cpu` | direct pure-C# (`WanDirect*`) | no native dependencies beyond the managed runtime; parallel SIMD GEMM/attention kernels |
+
+All backends produce numerically equivalent videos (verified against each other
+and against diffusers' reference implementation on identical seeds/embeddings —
+final-latent cosine ≥ 0.999 between backends, ≈ 0.994 vs the bf16 diffusers
+reference with quantized checkpoints). The `cpu` / `ggml_cpu` backends are for
+functional use — a 480p multi-second video takes tens of minutes on a
+high-core-count machine.
+
+Reference timings (RTX 2000 Ada 16 GB, Wan2.1-1.3B F16, 832×480, 33 frames,
+30 UniPC steps — the official 480p recipe): `ggml_cuda` 12.0 s/step (445 s
+total), `ggml_vulkan` 17.2 s/step (625 s), direct `cuda` 19.3 s/step (700 s).
+On shorter sequences the direct backend matches `ggml_cuda` (TI2V-5B
+480×480×9f: 1.1 s/step on both); at the 14k-token recipe its F32 attention
+path trails ggml's F16 flash attention. Long-sequence attention routes through
+chunked cuBLAS GEMM+softmax automatically (`TS_WAN_DIRECT_FUSED_ATTN=0` forces
+it everywhere).
+
 ## CLI
 
 Text-to-video (any family):

@@ -42,17 +42,32 @@ namespace TensorSharp.Models.WanVideo
             "毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
         private readonly WanVideoModel _model;
-        private WanTextEncoder _te;
-        private WanDiT _dit;        // single-model variants (and the A14B high-noise expert)
-        private WanDiT _ditLow;     // A14B low-noise expert
-        private WanVae _vae;
+        private readonly bool _direct;   // BackendType.Cuda / Cpu: direct tensor path
+        private WanDirectContext _dctx;
+        private IWanTextEncoder _te;
+        private IWanDit _dit;       // single-model variants (and the A14B high-noise expert)
+        private IWanDit _ditLow;    // A14B low-noise expert
+        private WanVaeBase _vae;
 
-        public WanVideoPipeline(WanVideoModel model) { _model = model; }
+        public WanVideoPipeline(WanVideoModel model)
+        {
+            _model = model;
+            _direct = model.Backend is BackendType.Cuda or BackendType.Cpu;
+        }
 
-        private WanTextEncoder Te => _te ??= new WanTextEncoder(_model.TePath);
-        private WanDiT Dit => _dit ??= new WanDiT(_model.HighNoiseGguf ?? _model.DitGguf);
-        private WanDiT DitLow => _ditLow ??= new WanDiT(_model.LowNoiseGguf);
-        private WanVae Vae => _vae ??= new WanVae(_model.VaePath);
+        private WanDirectContext Dctx => _dctx ??= new WanDirectContext(_model.DirectAllocator);
+        private IWanTextEncoder Te => _te ??= _direct
+            ? new WanDirectT5(Dctx, _model.TePath)
+            : new WanTextEncoder(_model.TePath);
+        private IWanDit Dit => _dit ??= _direct
+            ? new WanDirectDiT(Dctx, _model.HighNoiseGguf ?? _model.DitGguf)
+            : new WanDiT(_model.HighNoiseGguf ?? _model.DitGguf);
+        private IWanDit DitLow => _ditLow ??= _direct
+            ? new WanDirectDiT(Dctx, _model.LowNoiseGguf)
+            : new WanDiT(_model.LowNoiseGguf);
+        private WanVaeBase Vae => _vae ??= _direct
+            ? new WanDirectVae(Dctx, _model.VaePath)
+            : new WanVae(_model.VaePath);
 
         public GeneratedVideo Generate(string prompt, WanVideoParams p)
         {
@@ -71,24 +86,40 @@ namespace TensorSharp.Models.WanVideo
 
         private void ReleaseDeviceMemory()
         {
-            if (_model.Backend is BackendType.GgmlCuda)
+            if (_model.Backend is BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal)
             {
+                // Hand back the finished stage's device residency (weights, reuse
+                // gallocr). Vulkan in particular cannot fit the UMT5 + DiT + VAE
+                // graph all resident on a 16 GB card.
                 GgmlBasicOps.ReleaseReuseComputeBuffers();
                 GgmlBasicOps.ClearHostBufferCache();
+            }
+            else if (_model.Backend is BackendType.Cuda && _dctx != null)
+            {
+                // Evict the resident quantized weights of the finished stage (the
+                // UMT5's ~6 GB, the DiT's blocks) and hand the pool's cached
+                // transients back — the next stage's tensor shapes are disjoint
+                // (denoise [seq, dim] rows vs VAE [T, H, W, C] planes).
+                TensorSharp.Cuda.CudaQuantizedOps.ClearDeviceCache(_dctx.CudaAllocator);
+                _dctx.CudaAllocator.TrimPool();
             }
         }
 
         private GeneratedVideo GenerateCore(string prompt, WanVideoParams p)
         {
-            // All the networks run through the native GGML whole-graph kernels on
-            // the model's backend; make sure that backend is the active one.
-            GgmlBasicOps.EnsureBackendAvailable(_model.Backend switch
+            // On the GGML backends the networks run through the native whole-graph
+            // kernels; make sure that backend is the active one. The direct
+            // Cuda/Cpu path runs on the model's allocator instead.
+            if (!_direct)
             {
-                BackendType.GgmlCuda => GgmlBackendType.Cuda,
-                BackendType.GgmlMetal => GgmlBackendType.Metal,
-                BackendType.GgmlVulkan => GgmlBackendType.Vulkan,
-                _ => GgmlBackendType.Cpu,
-            });
+                GgmlBasicOps.EnsureBackendAvailable(_model.Backend switch
+                {
+                    BackendType.GgmlCuda => GgmlBackendType.Cuda,
+                    BackendType.GgmlMetal => GgmlBackendType.Metal,
+                    BackendType.GgmlVulkan => GgmlBackendType.Vulkan,
+                    _ => GgmlBackendType.Cpu,
+                });
+            }
 
             var total = Stopwatch.StartNew();
             var phase = Stopwatch.StartNew();
@@ -271,7 +302,7 @@ namespace TensorSharp.Models.WanVideo
             for (int i = 0; i < steps; i++)
             {
                 float t = timesteps[i];
-                WanDiT cur = Dit;
+                IWanDit cur = Dit;
                 float curCfg = cfg;
                 if (dualExpert && t < boundaryT)
                 {
@@ -453,6 +484,7 @@ namespace TensorSharp.Models.WanVideo
             _dit?.Dispose();
             _ditLow?.Dispose();
             _vae?.Dispose();
+            _dctx?.Dispose();
         }
     }
 

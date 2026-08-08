@@ -945,6 +945,13 @@ static long long wan_vae_gemm_budget()
 {
     const char* e = std::getenv("TS_WAN_VAE_GEMM_MAX_MB");
     if (e != nullptr) return std::strtoll(e, nullptr, 10) * 1024 * 1024;
+    // Non-CUDA device backends (Vulkan) stay at the banded floor: their
+    // drivers reject the multi-GB single gallocr arena that an unbanded
+    // full-plane im2col produces (Vulkan maxMemoryAllocationSize is commonly
+    // 4 GB or less), and the CPU backend gains nothing from bigger scratch.
+    const char* name = g_backend != nullptr ? ggml_backend_name(g_backend) : nullptr;
+    if (name == nullptr || std::strncmp(name, "CUDA", 4) != 0)
+        return 384LL << 20;
     std::size_t freeB = 0, totalB = 0;
     ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
     if (dev != nullptr) ggml_backend_dev_memory(dev, &freeB, &totalB);

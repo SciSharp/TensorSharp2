@@ -25,11 +25,12 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.WanVideo
 {
-    internal sealed class WanTextEncoder : IDisposable
+    internal sealed class WanTextEncoder : IWanTextEncoder
     {
         public const int TextLen = 512;
 
         private readonly GgufFile _gguf;
+        internal GgufFile Gguf => _gguf;
         private readonly UnigramTokenizer _tokenizer;
         private readonly bool _addSpacePrefix;
         private readonly int _eosId;

@@ -21,7 +21,7 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.WanVideo
 {
-    internal sealed class WanDiT : IDisposable
+    internal sealed class WanDiT : IWanDit
     {
         public const int FreqDim = 256;
         public const int TextDim = 4096;
@@ -185,16 +185,21 @@ namespace TensorSharp.Models.WanVideo
                 foreach (var h in handles) h.Free();
             }
 
-            // The head's output features are laid out (p_t, p_h, p_w, c) with the CHANNEL
-            // fastest (Wan unpatchify: view(*grid, *patch_size, c)), while the input patch
-            // features are (c, kh, kw) with kw fastest (the conv kernel layout). Reorder the
-            // velocity into the input layout so token-space Euler stepping and Unpatchify
-            // use one convention.
-            int oc = OutDim;
+            return ReorderHeadOutput(outTokens, seq, OutDim);
+        }
+
+        // The head's output features are laid out (p_t, p_h, p_w, c) with the CHANNEL
+        // fastest (Wan unpatchify: view(*grid, *patch_size, c)), while the input patch
+        // features are (c, kh, kw) with kw fastest (the conv kernel layout). Reorder the
+        // velocity into the input layout so token-space Euler stepping and Unpatchify
+        // use one convention. Shared with the direct-backend WanDirectDiT.
+        internal static float[] ReorderHeadOutput(float[] outTokens, int seq, int oc)
+        {
+            int outTok = oc * PatchH * PatchW;
             var reordered = new float[outTokens.Length];
             System.Threading.Tasks.Parallel.For(0, seq, tok =>
             {
-                long src = (long)tok * OutTok, dst = src;
+                long src = (long)tok * outTok, dst = src;
                 for (int kh = 0; kh < PatchH; kh++)
                     for (int kw = 0; kw < PatchW; kw++)
                         for (int c = 0; c < oc; c++)

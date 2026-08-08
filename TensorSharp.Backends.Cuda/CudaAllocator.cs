@@ -125,7 +125,20 @@ namespace TensorSharp.Cuda
         private IntPtr AllocateDeviceMemory(long allocationBytes)
         {
             Context.MakeCurrent();
-            CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)allocationBytes)).ThrowOnError();
+            int rc = CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)allocationBytes));
+            if (rc == 2 /* CUDA_ERROR_OUT_OF_MEMORY */)
+            {
+                // Storages whose last reference is an unreachable-but-unfinalized
+                // tensor (view chains) only release on collection; reclaim them and
+                // the pool's cached blocks before giving up.
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                Stream.Synchronize();
+                pool.DrainAndFree();
+                rc = CudaDriverApi.cuMemAlloc(out ptr, new UIntPtr((ulong)allocationBytes));
+            }
+            rc.ThrowOnError();
             return ptr;
         }
 
@@ -193,6 +206,19 @@ namespace TensorSharp.Cuda
         {
             Context.MakeCurrent();
             Stream.Synchronize();
+        }
+
+        /// <summary>Free every pooled (returned) block back to the driver. For
+        /// pipeline stage boundaries where the next stage's working set has a
+        /// different shape profile (e.g. a diffusion denoise handing over to a
+        /// video VAE): live allocations are untouched, but the caller must ensure
+        /// no concurrent Rent/Return on this allocator.</summary>
+        public void TrimPool()
+        {
+            ThrowIfDisposed();
+            Context.MakeCurrent();
+            Stream.Synchronize();
+            pool.DrainAndFree();
         }
 
         public void Dispose()

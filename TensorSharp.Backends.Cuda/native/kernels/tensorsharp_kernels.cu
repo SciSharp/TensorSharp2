@@ -8177,3 +8177,331 @@ extern "C" __global__ void ts_moe_scatter_add_weighted_rows_f32(
     for (int col = threadIdx.x; col < hidden; col += blockDim.x)
         dst[col] += weight * src[col];
 }
+
+// ============================================================================
+// Wan video direct-backend kernels (WanDirectT5 / WanDirectDiT / WanDirectVae).
+// Token-major layouts throughout: activations are [seq, heads, D] flat.
+// ============================================================================
+
+// Streaming online-softmax attention with independent KV length and an optional
+// additive per-head bias (T5 relative position bias): out = softmax(scale*QK^T
+// + bias) V. Same design as ts_vision_attention_body; bias is [heads, sq, sk]
+// or null.
+#define TS_WAN_ATTN_WARPS 8
+#define TS_WAN_ATTN_QPW 4
+#define TS_WAN_ATTN_TILE_K 32
+#define TS_WAN_ATTN_PAD 1
+
+// Streaming attention, 4 queries per warp, KEY-PER-LANE scoring: for each
+// staged 32-key tile every lane computes one key's full dot product (the
+// essential FLOPs, no cross-lane traffic), the online-softmax max/denom are two
+// butterfly reductions per tile (not five shuffles per key), and the P*V
+// accumulation reads the per-key probabilities from a small shared staging
+// buffer with the lanes splitting the head dim. K/V tile rows are padded by
+// one float so the per-lane row reads spread across all 32 banks (stride
+// D+1 makes lane r's bank (r + d) mod 32 — distinct per lane).
+template <int D>
+__device__ __forceinline__ void ts_wan_attention_body(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int num_heads,
+    int seq_q,
+    int seq_k,
+    float scale)
+{
+    constexpr int R = D / 32;
+    constexpr int Q = TS_WAN_ATTN_QPW;
+    constexpr int STRIDE = D + TS_WAN_ATTN_PAD;
+    __shared__ float k_tile[TS_WAN_ATTN_TILE_K * STRIDE];
+    __shared__ float v_tile[TS_WAN_ATTN_TILE_K * STRIDE];
+    __shared__ float p_stage[TS_WAN_ATTN_WARPS][Q][TS_WAN_ATTN_TILE_K];
+
+    const int head = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int q_base = (blockIdx.x * TS_WAN_ATTN_WARPS + warp) * Q;
+
+    float acc[Q][R];
+    float m[Q];
+    float denom[Q];
+    const float* qp[Q];
+#pragma unroll
+    for (int qq = 0; qq < Q; qq++)
+    {
+        m[qq] = -FLT_MAX;
+        denom[qq] = 0.0f;
+        qp[qq] = q_base + qq < seq_q
+            ? query + ((size_t)(q_base + qq) * num_heads + head) * D
+            : nullptr;
+#pragma unroll
+        for (int i = 0; i < R; i++)
+            acc[qq][i] = 0.0f;
+    }
+    const float* bias_base = bias != nullptr
+        ? bias + ((size_t)head * seq_q + q_base) * seq_k
+        : nullptr;
+
+    for (int k0 = 0; k0 < seq_k; k0 += TS_WAN_ATTN_TILE_K)
+    {
+        int tile = min(TS_WAN_ATTN_TILE_K, seq_k - k0);
+
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < tile * D; idx += TS_WAN_ATTN_WARPS * 32)
+        {
+            int r = idx / D;
+            int c = idx - r * D;
+            size_t src = ((size_t)(k0 + r) * num_heads + head) * D + c;
+            k_tile[r * STRIDE + c] = key[src];
+            v_tile[r * STRIDE + c] = value[src];
+        }
+        __syncthreads();
+
+        if (qp[0] == nullptr)
+            continue;
+
+        // Phase 1: one key per lane — full-D dot against each of the Q queries.
+        // (Inactive tail lanes score -inf so they drop out of the softmax.)
+        float s[Q];
+        const bool laneActive = lane < tile;
+        const float* ks = k_tile + lane * STRIDE;
+#pragma unroll
+        for (int qq = 0; qq < Q; qq++)
+        {
+            float dot = 0.0f;
+            if (laneActive && qp[qq] != nullptr)
+            {
+                const float* qrow = qp[qq];
+#pragma unroll
+                for (int d = 0; d < D; d++)
+                    dot += qrow[d] * ks[d];
+                dot *= scale;
+                if (bias_base != nullptr)
+                    dot += bias_base[(size_t)qq * seq_k + k0 + lane];
+            }
+            else
+            {
+                dot = -FLT_MAX;
+            }
+            s[qq] = dot;
+        }
+
+        // Phase 2: per-query online-softmax update — two butterfly reductions per
+        // tile, then stage the per-key probabilities for phase 3.
+#pragma unroll
+        for (int qq = 0; qq < Q; qq++)
+        {
+            float mx = s[qq];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            float m_new = fmaxf(m[qq], mx);
+            float p = __expf(s[qq] - m_new);        // exp(-inf) == 0 for inactive lanes
+            float sum = p;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                sum += __shfl_xor_sync(0xffffffffu, sum, off);
+            float corr = __expf(m[qq] - m_new);
+            denom[qq] = denom[qq] * corr + sum;
+            m[qq] = m_new;
+            p_stage[warp][qq][lane] = p;
+            // fold the rescale into the accumulator now
+#pragma unroll
+            for (int i = 0; i < R; i++)
+                acc[qq][i] *= corr;
+        }
+        __syncwarp();
+
+        // Phase 3: P*V with the lanes splitting the head dim.
+        for (int r = 0; r < tile; r++)
+        {
+            const float* vs = v_tile + r * STRIDE;
+            float v0 = vs[lane];
+            float v1 = R > 1 ? vs[lane + 32] : 0.0f;
+            float v2 = R > 2 ? vs[lane + 64] : 0.0f;
+            float v3 = R > 3 ? vs[lane + 96] : 0.0f;
+#pragma unroll
+            for (int qq = 0; qq < Q; qq++)
+            {
+                float p = p_stage[warp][qq][r];
+                acc[qq][0] += p * v0;
+                if (R > 1) acc[qq][1] += p * v1;
+                if (R > 2) acc[qq][2] += p * v2;
+                if (R > 3) acc[qq][3] += p * v3;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int qq = 0; qq < Q; qq++)
+    {
+        if (qp[qq] == nullptr)
+            continue;
+        float inv = denom[qq] > 0.0f ? 1.0f / denom[qq] : 0.0f;
+        float* op = output + ((size_t)(q_base + qq) * num_heads + head) * D;
+#pragma unroll
+        for (int i = 0; i < R; i++)
+            op[lane + 32 * i] = acc[qq][i] * inv;
+    }
+}
+
+#define TS_WAN_ATTENTION_KERNEL(NAME, D)                                             extern "C" __global__ __launch_bounds__(TS_WAN_ATTN_WARPS * 32) void NAME(           const float* __restrict__ query,                                                 const float* __restrict__ key,                                                   const float* __restrict__ value,                                                 const float* __restrict__ bias,                                                  float* __restrict__ output,                                                      int num_heads,                                                                   int seq_q,                                                                       int seq_k,                                                                       float scale)                                                                 {                                                                                    ts_wan_attention_body<D>(query, key, value, bias, output, num_heads, seq_q, seq_k, scale);     }
+
+TS_WAN_ATTENTION_KERNEL(ts_wan_attention_d64_f32, 64)
+TS_WAN_ATTENTION_KERNEL(ts_wan_attention_d128_f32, 128)
+
+// In-place interleaved-pair RoPE over x [seq, heads, head_dim] with
+// pair-duplicated cos/sin tables [seq, head_dim] (cos[t, 2p] == cos[t, 2p+1]).
+extern "C" __global__ void ts_wan_rope_f32(
+    float* __restrict__ x,
+    const float* __restrict__ cost,
+    const float* __restrict__ sint,
+    int heads,
+    int seq,
+    int head_dim)
+{
+    const int half = head_dim / 2;
+    const long long total = (long long)seq * heads * half;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total)
+        return;
+    const int p = (int)(idx % half);
+    const long long th = idx / half;            // token * heads + head
+    const long long t = th / heads;
+    float* row = x + th * head_dim;
+    const float c = cost[t * head_dim + 2 * p];
+    const float s = sint[t * head_dim + 2 * p];
+    const float e = row[2 * p];
+    const float o = row[2 * p + 1];
+    row[2 * p] = e * c - o * s;
+    row[2 * p + 1] = o * c + e * s;
+}
+
+// AdaLN modulate: y[r, c] = x[r, c] * (1 + scale[c]) + shift[c] over the row
+// range [row_from, row_from + row_count).
+extern "C" __global__ void ts_wan_modulate_f32(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const float* __restrict__ shift,
+    const float* __restrict__ scale,
+    long long row_from,
+    long long row_count,
+    int cols)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = row_count * cols;
+    if (idx >= total)
+        return;
+    long long r = row_from + idx / cols;
+    int c = (int)(idx % cols);
+    y[r * cols + c] = x[r * cols + c] * (1.0f + scale[c]) + shift[c];
+}
+
+// Gated residual: x[r, c] += v[r, c] * gate[c] over [row_from, row_from + row_count).
+extern "C" __global__ void ts_wan_gate_add_f32(
+    float* __restrict__ x,
+    const float* __restrict__ v,
+    const float* __restrict__ gate,
+    long long row_from,
+    long long row_count,
+    int cols)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = row_count * cols;
+    if (idx >= total)
+        return;
+    long long r = row_from + idx / cols;
+    int c = (int)(idx % cols);
+    x[r * cols + c] += v[r * cols + c] * gate[c];
+}
+
+// Rowwise column scale: x[r, c] *= gain[c].
+extern "C" __global__ void ts_wan_scale_cols_f32(
+    float* __restrict__ x,
+    const float* __restrict__ gain,
+    long long rows,
+    int cols)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = rows * cols;
+    if (idx >= total)
+        return;
+    x[idx] *= gain[idx % cols];
+}
+
+// im2col over one CHANNELS-LAST [H, W, C] frame into row-major columns
+// [band_oh*OW, C*KH*KW] (k index ic-major: ic*KH*KW + kh*KW + kw, matching the
+// flattened torch [oc, ic, kh, kw] GEMM weight), covering output rows
+// [oy0, oy0 + band_oh). Zero padding via the bounds check (which also provides
+// the encoder's implicit right/bottom padding), arbitrary stride.
+extern "C" __global__ void ts_wan_im2col_f32(
+    const float* __restrict__ input,
+    float* __restrict__ col,
+    int C, int H, int W,
+    int KH, int KW,
+    int OH, int OW,
+    int pad_h, int pad_w,
+    int stride_h, int stride_w,
+    int oy0, int band_oh)
+{
+    const long long K = (long long)C * KH * KW;
+    const long long total = (long long)band_oh * OW * K;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total)
+        return;
+    const long long p = idx / K;                 // (oy - oy0)*OW + ox
+    const long long k = idx % K;                 // c*KH*KW + kh*KW + kw
+    const int kw = (int)(k % KW);
+    const int kh = (int)((k / KW) % KH);
+    const int c = (int)(k / (KW * KH));
+    const int ox = (int)(p % OW);
+    const int oy = oy0 + (int)(p / OW);
+    const int iy = oy * stride_h - pad_h + kh;
+    const int ix = ox * stride_w - pad_w + kw;
+    float vv = 0.0f;
+    if (iy >= 0 && iy < H && ix >= 0 && ix < W)
+        vv = input[((size_t)iy * W + ix) * C + c];
+    col[idx] = vv;
+}
+
+// Channel RMS norm over a [C, HW] frame: at each spatial position p, normalize
+// x[:, p] by rms over channels, then scale by gamma[c]. In place.
+extern "C" __global__ void ts_wan_chan_rms_f32(
+    float* __restrict__ x,
+    const float* __restrict__ gamma,
+    int C,
+    long long HW,
+    float eps)
+{
+    long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= HW)
+        return;
+    float ss = 0.0f;
+    for (int c = 0; c < C; c++)
+    {
+        float vv = x[(size_t)c * HW + p];
+        ss += vv * vv;
+    }
+    float inv = rsqrtf(ss / C + eps);
+    for (int c = 0; c < C; c++)
+        x[(size_t)c * HW + p] = x[(size_t)c * HW + p] * inv * gamma[c];
+}
+
+// Nearest x2 spatial upsample: src [C, H, W] -> dst [C, 2H, 2W].
+extern "C" __global__ void ts_wan_upsample2x_f32(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int C, int H, int W)
+{
+    const long long total = (long long)C * 2 * H * 2 * W;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total)
+        return;
+    const int W2 = 2 * W;
+    const int ox = (int)(idx % W2);
+    const int oy = (int)((idx / W2) % (2 * H));
+    const int c = (int)(idx / ((long long)W2 * 2 * H));
+    dst[idx] = src[((size_t)c * H + (oy >> 1)) * W + (ox >> 1)];
+}

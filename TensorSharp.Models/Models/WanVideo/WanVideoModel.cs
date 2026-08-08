@@ -7,6 +7,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using TensorSharp;
 using TensorSharp.Core;
 using TensorSharp.Runtime;
 
@@ -53,6 +54,7 @@ namespace TensorSharp.Models.WanVideo
         internal string VaePath => _vaePath;
         internal string TePath => _tePath;
         internal BackendType Backend => _backend;
+        internal IAllocator DirectAllocator => _allocator;
 
         /// <summary>Checkpoint family (see <see cref="WanVariant"/>).</summary>
         public WanVariant Variant { get; }
@@ -78,10 +80,12 @@ namespace TensorSharp.Models.WanVideo
 
         public WanVideoModel(string ggufPath, BackendType backend) : base(ggufPath, backend)
         {
-            if (backend is not (BackendType.GgmlCuda or BackendType.GgmlCpu or BackendType.GgmlMetal or BackendType.GgmlVulkan))
+            if (backend is not (BackendType.GgmlCuda or BackendType.GgmlCpu or BackendType.GgmlMetal
+                or BackendType.GgmlVulkan or BackendType.Cuda or BackendType.Cpu))
                 throw new NotSupportedException(
                     "Wan video generation runs on the GGML backends (ggml_cuda, ggml_cpu, ggml_metal, " +
-                    $"ggml_vulkan); backend '{backend}' is not supported. Pass e.g. --backend ggml_cuda.");
+                    $"ggml_vulkan) and the direct cuda / cpu backends; backend '{backend}' is not supported. " +
+                    "Pass e.g. --backend ggml_cuda.");
 
             _ditPath = ggufPath;
             Config = new ModelConfig
