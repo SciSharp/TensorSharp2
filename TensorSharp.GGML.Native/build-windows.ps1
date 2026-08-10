@@ -50,6 +50,32 @@ function Test-CudaToolkit {
     return $false
 }
 
+function Resolve-CudaToolkitBinDir {
+    # Returns the CUDA toolkit bin directory when nvcc.exe is not already on
+    # PATH but an installed toolkit advertises itself via CUDA_PATH/CUDA_HOME
+    # (the NVIDIA installer always sets CUDA_PATH). CMake's CUDA compiler
+    # detection searches PATH, so without this a toolkit that is installed but
+    # not on PATH fails the configure with "No CMAKE_CUDA_COMPILER could be
+    # found" even though Test-CudaToolkit auto-enabled the backend.
+    if (Get-Command nvcc.exe -ErrorAction SilentlyContinue) {
+        return ""
+    }
+
+    foreach ($variableName in @("CUDA_PATH", "CUDA_HOME")) {
+        $root = [Environment]::GetEnvironmentVariable($variableName)
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            continue
+        }
+
+        $binDir = Join-Path $root "bin"
+        if (Test-Path (Join-Path $binDir "nvcc.exe")) {
+            return $binDir
+        }
+    }
+
+    return ""
+}
+
 function Read-CachedBackendSetting([string] $CacheVariable) {
     $cacheFile = Join-Path $BuildDir "CMakeCache.txt"
     if (-not (Test-Path $cacheFile)) {
@@ -301,6 +327,14 @@ if ($EnableVulkan -eq "ON") {
     }
 }
 
+if ($EnableCuda -eq "ON") {
+    $CudaBinDir = Resolve-CudaToolkitBinDir
+    if (-not [string]::IsNullOrWhiteSpace($CudaBinDir)) {
+        Write-Host "nvcc.exe is not on PATH; using the CUDA toolkit at '$CudaBinDir' (from CUDA_PATH/CUDA_HOME) for this build."
+        $env:PATH = "$CudaBinDir;$env:PATH"
+    }
+}
+
 if ($EnableCuda -eq "ON" -and [string]::IsNullOrWhiteSpace($CudaArchitectures) -and -not $UserSetCudaArchitectures) {
     $detectedArchitectures = Detect-LocalCudaArchitectures
     if (-not [string]::IsNullOrWhiteSpace($detectedArchitectures)) {
@@ -392,6 +426,25 @@ elseif ([string]::IsNullOrWhiteSpace($effectiveGenerator) -or $effectiveGenerato
         "serial NMake Makefiles generator, which ignores --parallel and compiles one file at a time. Install the " +
         "'C++ CMake tools for Windows' VS component (it provides ninja), put ninja.exe on PATH, or set " +
         "TENSORSHARP_VS_INSTALL_DIR to a working Visual Studio installation.")
+}
+
+if ($EnableCuda -eq "ON" -and $effectiveGenerator -like "Visual Studio*" -and $null -ne $VisualStudio) {
+    # The "Visual Studio NN" generators find nvcc through the CUDA toolkit's
+    # MSBuild integration (CUDA *.props under the VS instance), not through
+    # PATH. The CUDA installer only lays that integration down for VS versions
+    # it supports - e.g. CUDA 12.x predates VS 2026 - and without it the
+    # configure fails with the opaque "No CMAKE_CUDA_COMPILER could be found".
+    $cudaBuildCustomizations = Join-Path $VisualStudio.Path "MSBuild\Microsoft\VC"
+    $hasCudaVsIntegration = (Test-Path $cudaBuildCustomizations) -and
+        @(Get-ChildItem -Path $cudaBuildCustomizations -Recurse -Filter "CUDA *.props" -ErrorAction SilentlyContinue).Count -gt 0
+    if (-not $hasCudaVsIntegration) {
+        Write-Warning ("CUDA is enabled and the '$effectiveGenerator' generator was selected, but the Visual Studio " +
+            "instance at '$($VisualStudio.Path)' has no CUDA MSBuild integration (no 'CUDA *.props' under " +
+            "MSBuild\Microsoft\VC). The configure step will likely fail with 'No CMAKE_CUDA_COMPILER could be found'. " +
+            "Install the 'C++ CMake tools for Windows' VS component so this script can use the Ninja generator " +
+            "(which drives nvcc directly and needs no VS integration), or install a CUDA toolkit that supports " +
+            "this Visual Studio version.")
+    }
 }
 
 # The generator is sticky in the CMake cache and CMake refuses to reconfigure an

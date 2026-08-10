@@ -27,7 +27,7 @@ See Microsoft's [cross-platform .NET installation overview](https://learn.micros
 
 - **`git` and network access:** the GGML/CUDA native builds clone the ggml sources from [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) into `ExternalProjects/ggml/` on first build (see `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`). The clone tracks ggml's default branch (`master`); pin a different ref with `TENSORSHARP_GGML_GIT_REF`, or set `TENSORSHARP_GGML_NO_UPDATE=1` to skip the network update once cloned (offline rebuilds)
 - **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library; the MLX backend additionally builds `libmlxc` from `TensorSharp.Backends.MLX/Native/` via `bash TensorSharp.Backends.MLX/build-native-macos.sh`
-- **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
+- **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 or 2026 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS. With Visual Studio 2026, whose MSVC 14.5x toolset is newer than current CUDA toolkits officially accept as a host compiler, the build passes `-allow-unsupported-compiler` to `nvcc` automatically; include the "C++ CMake tools for Windows" component so the build can use the Ninja generator (the Visual Studio generator additionally needs a CUDA toolkit that ships MSBuild integration for your VS version)
 - **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
 - **Windows (GGML Vulkan backend):** enabled automatically when the machine has a Vulkan runtime (`System32\vulkan-1.dll`, shipped by every recent GPU driver). With a [LunarG Vulkan SDK](https://vulkan.lunarg.com/) installed it is used directly; without one the build auto-provisions a portable toolchain (Vulkan-Headers, a vulkan-1 import library generated from the system loader, glslc, SPIRV-Headers) into `ExternalProjects/vulkan-toolchain/` via `eng/fetch-vulkan-toolchain.ps1`. Opt out with `build-windows.ps1 --no-vulkan` or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`. A GPU driver with Vulkan 1.3 support is required at runtime
 - **Linux (GGML Vulkan backend):** enabled automatically when a Vulkan loader (`libvulkan.so.1`) is installed. Distro dev packages are used when present (`apt install libvulkan-dev glslc spirv-headers`); otherwise the build auto-provisions the missing pieces (Vulkan-Headers, glslc from the shaderc CI prebuilts, SPIRV-Headers) into `ExternalProjects/vulkan-toolchain/` via `eng/fetch-vulkan-toolchain.sh`. Opt out with `build-linux.sh --no-vulkan` or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`
@@ -40,6 +40,8 @@ See Microsoft's [cross-platform .NET installation overview](https://learn.micros
 ```bash
 dotnet build TensorSharp.slnx
 ```
+
+The solution build defaults to the `Any CPU` platform (`Directory.Solution.props`), so it also works from Visual Studio developer prompts, which export `Platform=x64` into the environment and would otherwise steer the build to a nonexistent `Release|x64` solution configuration. An explicit `-p:Platform=...` still takes precedence.
 
 ### Build individual applications
 
@@ -121,7 +123,13 @@ $env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'; dotnet build TensorSharp.Cli/Tens
 
 On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Windows and Linux, the native scripts preserve an existing CUDA-enabled build and auto-enable GGML_CUDA when a CUDA toolchain is detected; `build-windows.ps1 --cuda`, `build-linux.sh --cuda`, and `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` force CUDA explicitly. The GGML Vulkan backend is auto-enabled the same way when the machine has a Vulkan runtime, downloading its build toolchain on first use; `--vulkan` / `--no-vulkan` or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON/OFF` force the choice explicitly, and an explicit choice sticks across rebuilds (see [Prerequisites](#prerequisites) for the Vulkan toolchain the build auto-provisions). The build output is automatically copied to the application's output directory.
 
-The direct `cuda` backend is built as managed C# plus PTX kernels. During `dotnet build`, `TensorSharp.Backends.Cuda` compiles `native/kernels/*.cu` to `native/ptx/*.ptx` when `nvcc` is available; if `nvcc` is missing, the build continues and PTX-backed ops use CPU fallbacks. cuBLAS-backed GEMM still requires the CUDA runtime libraries to be discoverable at run time.
+The direct `cuda` backend is built as managed C# plus PTX kernels. During `dotnet build`, `TensorSharp.Backends.Cuda` compiles `native/kernels/*.cu` to PTX in its intermediate directory (`obj/cuda_ptx/ptx/`) when `nvcc` is available, and that locally compiled PTX is what lands in every output's `cuda_kernels/` folder — building never modifies the git-tracked files under `native/ptx/`. If `nvcc` is missing, the committed PTX baseline in `native/ptx/` is used instead; if that also fails to load, PTX-backed ops use CPU fallbacks. cuBLAS-backed GEMM still requires the CUDA runtime libraries to be discoverable at run time.
+
+After editing a `.cu` kernel, refresh the committed PTX baseline explicitly and commit the diff — machines without `nvcc` run the committed PTX, so an unrefreshed kernel change ships silently-stale kernels to them:
+
+```powershell
+dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -p:TensorSharpUpdateCommittedPtx=true
+```
 
 ### Build the native MLX library (macOS only)
 
