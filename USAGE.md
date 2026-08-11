@@ -383,7 +383,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basic.json --backend ggml_cpu
 ```
 
-Open `http://localhost:5000/index.html` in your browser (`GET /` is the liveness endpoint). The web interface supports:
+Open `http://localhost:5000` in your browser — the root URL serves the chat UI (`GET /health` is the liveness endpoint). The web interface supports:
 
 - Multi-turn chat conversations
 - Per-tab chat sessions: each browser tab owns its own tracked conversation history; KV blocks are owned by the inference engine

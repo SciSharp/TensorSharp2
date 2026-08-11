@@ -62,7 +62,7 @@ curl -s http://localhost:5000/v1/chat/completions \
   -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'
 ```
 
-内置 UI 的地址是 **<http://localhost:5000/index.html>**。`GET /` 是存活检查接口，返回 `"TensorSharp.Server is running"`。
+内置 UI 的地址是 **<http://localhost:5000>** —— `GET /` 直接返回 `index.html`（显式的 `/index.html` 地址同样可用）。`GET /health` 是存活检查接口，返回 `"TensorSharp.Server is running"`；只有在没有 `wwwroot` 内容的无界面部署中，`GET /` 才会返回同样的响应。
 
 ### 已构建或已解压的应用目录
 
@@ -98,8 +98,8 @@ DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
-API 默认监听 `http://localhost:5000`；Web UI 地址为
-`http://localhost:5000/index.html`。可以用 `--port` 修改监听端口（用 `--host`
+API 默认监听 `http://localhost:5000`；Web UI 就在同一个根地址上提供。
+可以用 `--port` 修改监听端口（用 `--host`
 限制绑定的网卡），也可以使用 `PORT` / `HOST` 环境变量——Docker Space 镜像即设置
 了 `PORT=7860`：
 

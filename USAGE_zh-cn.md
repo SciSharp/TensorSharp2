@@ -317,7 +317,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basic.json --backend ggml_cpu
 ```
 
-在浏览器中打开 `http://localhost:5000/index.html`（`GET /` 是存活检查接口）。Web 界面支持：
+在浏览器中打开 `http://localhost:5000` —— 根地址即为聊天界面（`GET /health` 是存活检查接口）。Web 界面支持：
 
 - 多轮聊天
 - 每个浏览器 Tab 独立的会话：每个 Tab 拥有自己的对话历史；KV block 由推理引擎统一管理

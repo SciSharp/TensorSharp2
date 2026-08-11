@@ -119,7 +119,7 @@ node runs a `TensorSharp.Cli` worker. Full reference:
 **[Tensor Parallelism & Distributed Inference](USAGE.md#tensor-parallelism--distributed-inference)**.
 
 
-Host the same model as a server (browser UI at <http://localhost:5000/index.html>, plus Ollama/OpenAI APIs):
+Host the same model as a server (browser UI at <http://localhost:5000>, plus Ollama/OpenAI APIs):
 
 ```bash
 dotnet run --project TensorSharp.Server -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 512

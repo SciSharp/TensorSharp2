@@ -244,9 +244,10 @@ if (qwenImageFlagsApplied)
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);
 
 app.UseTensorSharpRequestLogging();
-// Serve the bundled static UI at /index.html. The explicit GET / endpoint
-// remains the plain liveness response; headless deployments can still start
-// when no wwwroot content is present.
+// Serve the bundled static UI. GET / sends index.html too (see
+// HealthEndpoints), so a bare http://host:port/ opens the chat UI; the plain
+// liveness response moved to GET /health and still answers / on headless
+// deployments that ship no wwwroot content.
 app.UseDefaultFiles();
 app.UseStaticFiles();
 // The default content-type provider has no HEIC/HEIF mapping, so uploaded iPhone

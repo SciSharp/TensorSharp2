@@ -131,6 +131,26 @@ Direct `cuda` 后端由托管 C# 代码和 PTX 内核组成。执行 `dotnet bui
 dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -p:TensorSharpUpdateCommittedPtx=true
 ```
 
+#### Apple Silicon 上的 Metal 4 tensor API
+
+在 M5 及更新的 GPU 上，ggml 可以让矩阵乘走 Metal 4 tensor API，在 M5 Pro 上实测 **prefill 吞吐提升 2.6 倍**（807 → 2107 tok/s，Gemma 4 E4B Q8_0，2048 token prefill）。decode 不受影响，这符合预期——单序列 decode 受内存带宽限制。
+
+ggml 只有在运行时成功编译一个包含 `<metal_tensor>` 的探测 kernel 后才会启用它，而编译该探测 kernel 使用的是*默认*的 Metal Shading Language 版本。这个默认值由 Metal 依据**主可执行文件**中记录的 SDK 推导，而不是依据 `libGgmlOps.dylib`。微软预先构建并分发的 .NET apphost（以及 `dotnet` 启动器）是针对 macOS 15.5 SDK 编译的，因此 .NET 进程的默认值是 MSL 3.2，在该版本下 `<metal_tensor>` 不声明任何内容，于是 ggml 会在完全支持该特性的硬件上禁用 tensor API：
+
+```
+ggml_metal_device_init: - the tensor API is not supported in this environment - disabling
+ggml_metal_device_init: has tensor            = false
+```
+
+`tsg_metal_msl_default.m` 在我们自己的库中修正这个默认值，而这也是该修复唯一能放置的位置：`ExternalProjects/ggml` 不纳入 git 跟踪，且 `eng/fetch-ggml.sh` 每次构建都会将其硬重置到上游，因此写在那里的改动会被下一次构建抹掉。仅当 GPU 声明支持 Metal 4 family、且继承到的默认值更旧时，它才会把进程级默认值提升到 MSL 4.0——也就是原生链接的宿主本来就会得到的值。自行设置 `languageVersion` 的代码保持其自身选择，因此 MLX 后端不受影响（MLX 总是显式设置该值）。生效时它会输出一行日志，`has tensor` 随之变为 `true`。
+
+| 环境变量 | 作用 |
+|---|---|
+| `TENSORSHARP_METAL_MSL_DEFAULT=off` | 保留宿主过时的默认值（恢复 `has tensor = false`） |
+| `TENSORSHARP_METAL_MSL_DEFAULT=<主版本>.<次版本>` | 强制指定默认 MSL 版本，例如 `4.0` |
+
+ggml 自身的开关依然在此之上生效：`GGML_METAL_TENSOR_DISABLE=1` 关闭 tensor API，`GGML_METAL_TENSOR_ENABLE=1` 则绕过 ggml 将其限制在 M5/M6/A19/A20 设备的白名单。
+
 ### 构建原生 MLX 库（仅 macOS）
 
 MLX 后端依赖 `libmlxc`（[MLX](https://github.com/ml-explore/mlx) 的 C 绑定）。仓库在 `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` 中固定了已知可用的 `mlx-c` tag，并提供一个辅助脚本来获取和构建：

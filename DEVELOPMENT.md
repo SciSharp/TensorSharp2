@@ -131,6 +131,26 @@ After editing a `.cu` kernel, refresh the committed PTX baseline explicitly and 
 dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -p:TensorSharpUpdateCommittedPtx=true
 ```
 
+#### Metal 4 tensor API on Apple silicon
+
+On M5 and newer GPUs ggml can route matmuls through the Metal 4 tensor API, which measured **2.6× prefill throughput** on an M5 Pro (807 → 2107 tok/s, Gemma 4 E4B Q8_0, 2048-token prefill). Decode is unchanged, as expected — single-sequence decode is memory-bandwidth bound.
+
+ggml enables it only if a probe kernel including `<metal_tensor>` compiles at run time, and it compiles that probe at the *default* Metal Shading Language version. Metal derives that default from the SDK recorded in the **main executable**, not from `libGgmlOps.dylib`. Microsoft ships the .NET apphost — and the `dotnet` muxer — prebuilt against the macOS 15.5 SDK, so a .NET process defaults to MSL 3.2 where `<metal_tensor>` declares nothing, and ggml disables the tensor API on perfectly capable hardware:
+
+```
+ggml_metal_device_init: - the tensor API is not supported in this environment - disabling
+ggml_metal_device_init: has tensor            = false
+```
+
+`tsg_metal_msl_default.m` corrects the default from inside our own library, which is where the fix has to live: `ExternalProjects/ggml` is git-ignored and `eng/fetch-ggml.sh` hard-resets it to upstream on every build, so an edit there would be erased by the next build. It raises the process-wide default to MSL 4.0 — the value a natively linked host already gets — only when the GPU advertises the Metal 4 family and only when the inherited default is older. Code that sets `languageVersion` itself keeps its own choice, so the MLX backend is unaffected (MLX always sets it explicitly). When it acts it logs one line, and `has tensor` becomes `true`.
+
+| Environment variable | Effect |
+|---|---|
+| `TENSORSHARP_METAL_MSL_DEFAULT=off` | Leave the host's stale default in place (restores `has tensor = false`) |
+| `TENSORSHARP_METAL_MSL_DEFAULT=<major>.<minor>` | Force a specific default MSL version, for example `4.0` |
+
+ggml's own switches still apply on top: `GGML_METAL_TENSOR_DISABLE=1` turns the tensor API off, and `GGML_METAL_TENSOR_ENABLE=1` bypasses ggml's allowlist that restricts it to M5/M6/A19/A20 devices.
+
 ### Build the native MLX library (macOS only)
 
 The MLX backend depends on `libmlxc` (the C bindings for [MLX](https://github.com/ml-explore/mlx)). The repository pins a known-good tag of `mlx-c` in `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` and a helper script fetches and builds it:

@@ -61,10 +61,10 @@ git push
 ## Space `README.md` template
 
 Put this at the top of the Space's `README.md`. In the current server contract,
-`GET /` is the liveness endpoint and the chat UI is `/index.html`. Use
-`https://<user>-<space>.hf.space/index.html` as the direct UI link. Do not claim
-that the bare Space root opens the UI; it returns
-`"TensorSharp.Server is running"`.
+`GET /` serves the chat UI, so the bare Space root
+(`https://<user>-<space>.hf.space/`) is the UI link; `/index.html` still works
+as an explicit alias. The plain liveness response
+(`"TensorSharp.Server is running"`) lives at `/health`.
 
 ```yaml
 ---
@@ -132,11 +132,12 @@ live denoising previews while the compatibility APIs return final text.
 
 ## Space root shows "TensorSharp.Server is running"
 
-That is the expected current behavior: `GET /` is the liveness route. Open
-`/index.html` for the UI, for example
-`https://<user>-<space>.hf.space/index.html`. Static image/CSS paths also work
-when the app is launched from the published application directory, as both
-Dockerfiles do.
+That means the image is serving without the Web UI assets: `GET /` sends
+`wwwroot/index.html` when it is present and falls back to the liveness response
+when it is not. Check that `wwwroot/` was published into the application
+directory the container launches from, as both Dockerfiles do — static
+image/CSS paths depend on the same thing. The liveness response is always
+available at `/health`.
 
 Also note `GET /api/chat` returns 404 in a browser because it is a **POST**-only
 endpoint — the web UI calls it with POST; it is not a deployment error.
@@ -146,7 +147,7 @@ endpoint — the web UI calls it with POST; it is not a deployment error.
 ```bash
 docker build -f TensorSharp.Server/Dockers/Dockerfile_CPU.txt -t tensorsharp-server .
 docker run --rm -p 7860:7860 tensorsharp-server
-# open http://localhost:7860/index.html
+# open http://localhost:7860
 
 # Use the exact MODEL_FILE configured at image build time.
 curl -s http://localhost:7860/v1/chat/completions \
@@ -179,8 +180,8 @@ NVIDIA path).
    creates the UID‑1000 user Spaces run as, downloads the model, and launches
    with `--backend ggml_cuda`.
 
-The `PORT=7860` default and the chat UI at `/index.html` work exactly as in the
-CPU file; `/` remains the liveness endpoint.
+The `PORT=7860` default and the chat UI at `/` work exactly as in the CPU file;
+`/health` remains the liveness endpoint.
 
 ## CUDA architectures (build host has no GPU)
 
@@ -269,5 +270,5 @@ Ollama-compatible HTTP APIs. See https://github.com/zhongkaifu/TensorSharp.
 docker build -f TensorSharp.Server/Dockers/Dockerfile_GPU.txt \
   --build-arg CUDA_ARCHS=75-real -t tensorsharp-server-gpu .
 docker run --rm --gpus all -p 7860:7860 tensorsharp-server-gpu
-# open http://localhost:7860/index.html
+# open http://localhost:7860
 ```
