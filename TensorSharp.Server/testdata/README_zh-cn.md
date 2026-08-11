@@ -106,7 +106,7 @@ python3 test_multiturn.py
 - 结构化输出遵循 Chat Completions 的 `response_format` 协议。`json_schema` 与 `tools` 或 `think` 同时使用时预期返回 HTTP `400`。
 - Ollama 与 OpenAI 兼容方案仍在持续演进。这些脚本与服务端当前的契约以及在思维链、工具调用、结构化输出方面的文档化行为保持一致。
 - DiffusionGemma 可以通过 append-oriented 兼容端点返回最终文本，但只有 Web UI `/api/chat` 会暴露实时去噪 `replace` 帧。
-- 浏览器 UI 位于 `http://localhost:5000/index.html`；`GET /` 是存活检查接口。
+- 浏览器 UI 位于 `http://localhost:5000`（`GET /` 直接返回 `index.html`）；`GET /health` 是存活检查接口。
 
 ## 使用方法
 

@@ -111,7 +111,7 @@ Unsupported architectures are reported as `SKIP`, not `FAIL`.
 - Structured outputs follow the Chat Completions `response_format` contract. `json_schema` requests combined with `tools` or `think` are expected to return HTTP `400`.
 - The Ollama and OpenAI compatibility projects continue to evolve. These scripts are aligned with the server's current contract plus the current documented behavior around thinking, tool calling, and structured outputs.
 - DiffusionGemma can return final text through append-oriented compatibility endpoints, but only Web UI `/api/chat` exposes the live denoising `replace` frames.
-- The browser UI is at `http://localhost:5000/index.html`; `GET /` is the liveness endpoint.
+- The browser UI is at `http://localhost:5000` (`GET /` serves `index.html`); `GET /health` is the liveness endpoint.
 
 ## Usage
 

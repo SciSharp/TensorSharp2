@@ -821,4 +821,185 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.Contains("embedding_length_out", msg);
     }
 
+    // ---- Listen address (--port / --host / --urls) -------------------------
+    // The ambient environment can carry PORT / HOST / ASPNETCORE_URLS (container
+    // platforms inject them), so every test here clears all three first and then
+    // sets only what it is exercising.
+
+    private void ClearListenEnv()
+    {
+        _env.Set("PORT", null);
+        _env.Set("HOST", null);
+        _env.Set("ASPNETCORE_URLS", null);
+    }
+
+    private string BuildListenUrls(params string[] args)
+    {
+        return ServerOptionsBuilder.Build(args, _baseDir).ListenUrls;
+    }
+
+    [Fact]
+    public void Build_NoListenFlags_UsesDefaultAddress()
+    {
+        ClearListenEnv();
+        Assert.Equal("http://0.0.0.0:5000", BuildListenUrls());
+    }
+
+    [Fact]
+    public void Build_PortFlag_OverridesDefaultPortAndKeepsDefaultHost()
+    {
+        ClearListenEnv();
+        Assert.Equal("http://0.0.0.0:8080", BuildListenUrls("--port", "8080"));
+        // The `--flag=value` form is supported by TryReadOption for every option.
+        Assert.Equal("http://0.0.0.0:8080", BuildListenUrls("--port=8080"));
+    }
+
+    [Fact]
+    public void Build_HostFlagAlone_KeepsDefaultPort()
+    {
+        ClearListenEnv();
+        Assert.Equal("http://127.0.0.1:5000", BuildListenUrls("--host", "127.0.0.1"));
+    }
+
+    [Fact]
+    public void Build_HostAndPortFlags_CombineIntoOneUrl()
+    {
+        ClearListenEnv();
+        Assert.Equal("http://127.0.0.1:8080", BuildListenUrls("--host", "127.0.0.1", "--port", "8080"));
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("65536")]
+    [InlineData("-1")]
+    [InlineData("abc")]
+    [InlineData("")]
+    public void Build_InvalidPort_Throws(string port)
+    {
+        ClearListenEnv();
+        var ex = Assert.Throws<ArgumentException>(() => BuildListenUrls("--port", port));
+        Assert.Contains("--port", ex.Message);
+    }
+
+    [Fact]
+    public void Build_UrlsFlag_IsUsedVerbatim()
+    {
+        ClearListenEnv();
+        Assert.Equal(
+            "http://0.0.0.0:8080;https://0.0.0.0:8443",
+            BuildListenUrls("--urls", "http://0.0.0.0:8080;https://0.0.0.0:8443"));
+    }
+
+    [Fact]
+    public void Build_PortFlag_WinsOverUrlsFlag()
+    {
+        // --port is the more specific expression of intent, so it takes the
+        // whole binding rather than being merged into the --urls list.
+        ClearListenEnv();
+        Assert.Equal("http://0.0.0.0:9999", BuildListenUrls("--urls", "http://0.0.0.0:8080", "--port", "9999"));
+    }
+
+    [Fact]
+    public void Build_PortEnvVar_UsedWhenNoFlag()
+    {
+        ClearListenEnv();
+        _env.Set("PORT", "7860");
+        Assert.Equal("http://0.0.0.0:7860", BuildListenUrls());
+    }
+
+    [Fact]
+    public void Build_HostEnvVar_UsedWhenNoFlag()
+    {
+        ClearListenEnv();
+        _env.Set("HOST", "127.0.0.1");
+        Assert.Equal("http://127.0.0.1:5000", BuildListenUrls());
+    }
+
+    [Fact]
+    public void Build_PortFlag_WinsOverPortEnvVar()
+    {
+        ClearListenEnv();
+        _env.Set("PORT", "7860");
+        Assert.Equal("http://0.0.0.0:8080", BuildListenUrls("--port", "8080"));
+    }
+
+    [Fact]
+    public void Build_InvalidPortEnvVar_Throws()
+    {
+        ClearListenEnv();
+        _env.Set("PORT", "not-a-port");
+        var ex = Assert.Throws<ArgumentException>(() => BuildListenUrls());
+        Assert.Contains("PORT", ex.Message);
+    }
+
+    [Fact]
+    public void Build_AspNetCoreUrlsEnvVar_HonouredInsteadOfSilentlyIgnored()
+    {
+        // app.Run(url) overrides whatever the host builder picked up, so this
+        // variable only works because the resolver folds it in explicitly.
+        ClearListenEnv();
+        _env.Set("ASPNETCORE_URLS", "http://0.0.0.0:6001");
+        Assert.Equal("http://0.0.0.0:6001", BuildListenUrls());
+    }
+
+    [Fact]
+    public void Build_PortEnvVar_WinsOverAspNetCoreUrls()
+    {
+        ClearListenEnv();
+        _env.Set("ASPNETCORE_URLS", "http://0.0.0.0:6001");
+        _env.Set("PORT", "7860");
+        Assert.Equal("http://0.0.0.0:7860", BuildListenUrls());
+    }
+
+    [Fact]
+    public void Build_CliFlags_WinOverAspNetCoreUrls()
+    {
+        ClearListenEnv();
+        _env.Set("ASPNETCORE_URLS", "http://0.0.0.0:6001");
+        Assert.Equal("http://0.0.0.0:8080", BuildListenUrls("--port", "8080"));
+    }
+
+    [Fact]
+    public void Build_IPv6Host_IsBracketedIntoAValidUrl()
+    {
+        ClearListenEnv();
+        Assert.Equal("http://[::1]:8080", BuildListenUrls("--host", "::1", "--port", "8080"));
+        // Already-bracketed input must not be double-bracketed.
+        Assert.Equal("http://[::1]:8080", BuildListenUrls("--host", "[::1]", "--port", "8080"));
+    }
+
+    [Fact]
+    public void Build_HostWithScheme_PreservesScheme()
+    {
+        ClearListenEnv();
+        Assert.Equal("https://0.0.0.0:8443", BuildListenUrls("--host", "https://0.0.0.0", "--port", "8443"));
+    }
+
+    [Fact]
+    public void Build_ResolvedListenUrls_IsAParseableUrl()
+    {
+        // Guards the string composition: whatever we hand to app.Run has to be
+        // something Kestrel can actually parse as an endpoint.
+        ClearListenEnv();
+        foreach (string[] args in new[]
+        {
+            new[] { "--port", "8080" },
+            new[] { "--host", "127.0.0.1", "--port", "8080" },
+            new[] { "--host", "::1", "--port", "8080" },
+            Array.Empty<string>(),
+        })
+        {
+            string url = BuildListenUrls(args);
+            Assert.True(Uri.TryCreate(url, UriKind.Absolute, out Uri parsed), $"not a valid URL: {url}");
+            Assert.Equal("http", parsed.Scheme);
+        }
+    }
+
+    [Fact]
+    public void Build_UnknownPortLikeFlag_SuggestsPort()
+    {
+        ClearListenEnv();
+        var ex = Assert.Throws<ArgumentException>(() => BuildListenUrls("--prot", "8080"));
+        Assert.Contains("--port", ex.Message);
+    }
 }

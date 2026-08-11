@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System.IO;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -17,34 +18,58 @@ using Microsoft.AspNetCore.Routing;
 namespace TensorSharp.Server.Endpoints
 {
     /// <summary>
-    /// Liveness check at <c>GET /</c> plus a SPA-style fallback that serves the
-    /// Web UI's <c>index.html</c> for any path that doesn't match a route or
-    /// static file.
+    /// Serves the Web UI's <c>index.html</c> at <c>GET /</c> so the bare
+    /// host:port URL opens the chat UI, keeps the plain liveness response at
+    /// <c>GET /health</c> (and at <c>GET /</c> for headless deployments that
+    /// ship no <c>wwwroot</c> content), plus a SPA-style fallback that serves
+    /// <c>index.html</c> for any path that doesn't match a route or static file.
     /// </summary>
     internal static class HealthEndpoints
     {
+        private const string LivenessMessage = "TensorSharp.Server is running";
+
         public static IEndpointRouteBuilder MapHealthEndpoints(this IEndpointRouteBuilder endpoints, IWebHostEnvironment environment)
         {
-            endpoints.MapGet("/", () => Results.Ok("TensorSharp.Server is running"));
+            // UseDefaultFiles() cannot rewrite "/" to "/index.html" for us:
+            // WebApplication runs routing ahead of the static-file middleware,
+            // which then bails out because this endpoint is already selected.
+            // Sending the file from the endpoint itself is what makes a bare
+            // http://host:port/ open the UI instead of the liveness text.
+            endpoints.MapGet("/", async ctx =>
+            {
+                if (await TrySendIndexAsync(ctx, environment))
+                    return;
+                await Results.Ok(LivenessMessage).ExecuteAsync(ctx);
+            });
+
+            // Liveness probes that want the plain response rather than the UI
+            // keep a stable route now that "/" serves index.html.
+            endpoints.MapGet("/health", () => Results.Ok(LivenessMessage));
 
             endpoints.MapFallback(async ctx =>
             {
-                string root = environment.WebRootPath;
-                if (root != null)
-                {
-                    var indexPath = Path.Combine(root, "index.html");
-                    if (File.Exists(indexPath))
-                    {
-                        ctx.Response.ContentType = "text/html";
-                        await ctx.Response.SendFileAsync(indexPath);
-                        return;
-                    }
-                }
+                if (await TrySendIndexAsync(ctx, environment))
+                    return;
                 ctx.Response.StatusCode = 404;
-                await ctx.Response.WriteAsync("index.html not found. WebRootPath: " + (root ?? "(null)"));
+                await ctx.Response.WriteAsync("index.html not found. WebRootPath: " + (environment.WebRootPath ?? "(null)"));
             });
 
             return endpoints;
+        }
+
+        private static async Task<bool> TrySendIndexAsync(HttpContext ctx, IWebHostEnvironment environment)
+        {
+            string root = environment.WebRootPath;
+            if (string.IsNullOrEmpty(root))
+                return false;
+
+            var indexPath = Path.Combine(root, "index.html");
+            if (!File.Exists(indexPath))
+                return false;
+
+            ctx.Response.ContentType = "text/html";
+            await ctx.Response.SendFileAsync(indexPath);
+            return true;
         }
     }
 }

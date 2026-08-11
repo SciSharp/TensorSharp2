@@ -21,6 +21,10 @@
     <MlxNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlxc.dylib</MlxNativeBinaryName>
     <MlxNativeDependencyName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlx.dylib</MlxNativeDependencyName>
     <MlxNativeJacclName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libjaccl.dylib</MlxNativeJacclName>
+    <!-- MLX's precompiled Metal kernels; mlx loads it from the directory holding
+         libmlx.dylib, so it has to travel with the dylibs. See
+         TensorSharp.Backends.MLX.csproj for the full rationale. -->
+    <MlxNativeMetallibName Condition="$([MSBuild]::IsOSPlatform('OSX'))">mlx.metallib</MlxNativeMetallibName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
@@ -46,6 +50,8 @@
       <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeDependencyName)" Condition="'$(MlxNativeDependencyName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeDependencyName)')" />
       <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeJacclName)')" />
       <MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)')" />
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)')" />
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And !Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)') And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)')" />
     </ItemGroup>
     <Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>

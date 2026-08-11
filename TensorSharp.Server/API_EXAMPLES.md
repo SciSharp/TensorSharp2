@@ -65,7 +65,7 @@ curl -s http://localhost:5000/v1/chat/completions \
   -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'
 ```
 
-Open the bundled UI at **<http://localhost:5000/index.html>**. `GET /` is the liveness endpoint and returns `"TensorSharp.Server is running"`.
+Open the bundled UI at **<http://localhost:5000>** — `GET /` serves `index.html` (the explicit `/index.html` URL still works). `GET /health` is the liveness endpoint and returns `"TensorSharp.Server is running"`; `GET /` returns that same response only on headless deployments that ship no `wwwroot` content.
 
 ### Already-built or extracted application folder
 
@@ -101,10 +101,18 @@ DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
-The API starts on `http://localhost:5000`; the Web UI is
-`http://localhost:5000/index.html`. The current binary passes a fixed
-`http://0.0.0.0:5000` listen address to ASP.NET Core; the Docker Space files
-patch that constant to `7860` during image build.
+The API starts on `http://localhost:5000`; the Web UI is served from that same
+root URL. Change the listener with `--port` (and
+`--host` to restrict the interface), or with the `PORT` / `HOST` environment
+variables — the Docker Space images set `PORT=7860`:
+
+```bash
+# macOS note: port 5000 is taken by the AirPlay Receiver, so pick another one.
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend ggml_metal --port 8080
+
+# Bind loopback only, so the server is not reachable from other machines.
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --host 127.0.0.1 --port 8080
+```
 
 `--model` is required for inference. Starting with only `--backend` produces a
 model-less status server, but `/api/models/load` cannot select a file that was
