@@ -23,8 +23,36 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $ToolchainDir = Join-Path $RepoRoot "ExternalProjects\vulkan-toolchain"
 
+# Get-VisualStudioInstallation / Import-VcVarsEnvironment. A bare
+# `vswhere -latest` cannot be trusted (it silently skips installer instances
+# flagged incomplete); see eng/vs-locate.ps1.
+. (Join-Path $ScriptDir "vs-locate.ps1")
+
 function Test-Truthy([string] $Value) {
     return $Value -match '^(1|ON|on|On|TRUE|true|True|YES|yes|Yes)$'
+}
+
+function Invoke-CMakeDefanged([string] $FailureMessage, [string[]] $Arguments) {
+    # This script usually runs inside an MSBuild Exec task, whose logger scans
+    # every output line for the canonical MSBuild error/warning format and fails
+    # the managed build when one matches - even when the caller catches the
+    # failure and deliberately degrades to a CPU/CUDA-only build. CMake's
+    # "CMake Error: ..." diagnostics match that format, so capture the output
+    # and re-emit it with the "<keyword> :" pattern broken.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & cmake @Arguments 2>&1
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+
+    foreach ($line in @($output)) {
+        Write-Host ("$line" -replace '(?i)\b(error|warning)(\s+[A-Z0-9]+)?\s*:', '$1$2 -')
+    }
+
+    if ($LASTEXITCODE -ne 0) { throw $FailureMessage }
 }
 
 function Test-VulkanSdkComplete {
@@ -60,6 +88,15 @@ if (Test-ToolchainComplete) {
 Write-Host "vulkan-toolchain: provisioning portable Vulkan toolchain in $ToolchainDir"
 New-Item -ItemType Directory -Force -Path $ToolchainDir | Out-Null
 
+# Steps 2 and 4 need the MSVC toolset (a C/C++ compiler for the SPIRV-Headers
+# configure, dumpbin/lib.exe for the vulkan-1 import library). Locate it up
+# front so a box without Visual Studio fails fast instead of after the downloads.
+$VisualStudio = Get-VisualStudioInstallation
+if ($null -eq $VisualStudio) {
+    throw ("No Visual Studio installation with the MSVC x64 C++ toolset was found; it is required to build the " +
+        "SPIRV-Headers package and the vulkan-1 import library. Set TENSORSHARP_VS_INSTALL_DIR to a VS installation root.")
+}
+
 # --- 1. Vulkan headers -------------------------------------------------------
 $HeadersDir = Join-Path $ToolchainDir "Vulkan-Headers"
 if (-not (Test-Path (Join-Path $HeadersDir "include\vulkan\vulkan.h"))) {
@@ -77,10 +114,19 @@ if (-not (Test-Path (Join-Path $SpirvInstallDir "share\cmake\SPIRV-Headers\SPIRV
         git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git $SpirvSrcDir
         if ($LASTEXITCODE -ne 0) { throw "git clone SPIRV-Headers failed" }
     }
-    cmake -S $SpirvSrcDir -B (Join-Path $SpirvSrcDir "build") "-DCMAKE_INSTALL_PREFIX=$SpirvInstallDir"
-    if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers cmake configure failed" }
-    cmake --install (Join-Path $SpirvSrcDir "build") --config Release
-    if ($LASTEXITCODE -ne 0) { throw "SPIRV-Headers cmake install failed" }
+    # This script runs in its own powershell process, so a plain `dotnet build`
+    # reaches this point without a compiler on PATH; CMake then cannot enable a
+    # language ("CMAKE_C_COMPILER not set, after EnableLanguage"), because its
+    # own Visual Studio discovery trusts the installer state the way
+    # `vswhere -latest` does. Import vcvars and pin the NMake generator (cl.exe
+    # from PATH); SPIRV-Headers is header-only, so nothing is actually compiled.
+    Import-VcVarsEnvironment $VisualStudio.VcVars64
+    $SpirvBuildDir = Join-Path $SpirvSrcDir "build"
+    if (Test-Path $SpirvBuildDir) { Remove-Item -Recurse -Force $SpirvBuildDir }
+    Invoke-CMakeDefanged "SPIRV-Headers cmake configure failed" @(
+        "-S", $SpirvSrcDir, "-B", $SpirvBuildDir, "-G", "NMake Makefiles",
+        "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_INSTALL_PREFIX=$SpirvInstallDir")
+    Invoke-CMakeDefanged "SPIRV-Headers cmake install failed" @("--install", $SpirvBuildDir, "--config", "Release")
 }
 
 # --- 3. glslc (Google shaderc CI prebuilt) -----------------------------------
@@ -143,12 +189,11 @@ if (-not (Test-Path (Join-Path $LoaderDir "vulkan-1.lib"))) {
         throw "No Vulkan runtime found at $systemDll - install a GPU driver with Vulkan support (or the LunarG Vulkan SDK)."
     }
 
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found - Visual Studio with C++ tools is required." }
-    $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsRoot)) { throw "No Visual Studio installation with C++ tools found." }
-    $vcVersion = (Get-Content (Join-Path $vsRoot "VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt")).Trim()
-    $vcBin = Join-Path $vsRoot "VC\Tools\MSVC\$vcVersion\bin\Hostx64\x64"
+    $vcVersion = (Get-Content (Join-Path $VisualStudio.Path "VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt")).Trim()
+    $vcBin = Join-Path $VisualStudio.Path "VC\Tools\MSVC\$vcVersion\bin\Hostx64\x64"
+    if (-not (Test-Path (Join-Path $vcBin "lib.exe"))) {
+        throw "MSVC binaries not found under $vcBin - the Visual Studio installation at '$($VisualStudio.Path)' has no x64 C++ toolset."
+    }
 
     New-Item -ItemType Directory -Force -Path $LoaderDir | Out-Null
     $exports = & (Join-Path $vcBin "dumpbin.exe") /exports $systemDll

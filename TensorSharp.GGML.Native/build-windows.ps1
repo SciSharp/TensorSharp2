@@ -296,6 +296,7 @@ if ([string]::IsNullOrWhiteSpace($EnableVulkan)) {
 }
 
 $VulkanCMakeArgs = New-Object System.Collections.Generic.List[string]
+$VulkanDegraded = $false
 if ($EnableVulkan -eq "ON") {
     try {
         # Ensure the Vulkan build toolchain (headers, loader import lib, glslc,
@@ -324,6 +325,7 @@ if ($EnableVulkan -eq "ON") {
             "$($_.Exception.Message) Building without the ggml-vulkan backend; pass --vulkan to make this an error.")
         $EnableVulkan = "OFF"
         $VulkanCMakeArgs.Clear()
+        $VulkanDegraded = $true
     }
 }
 
@@ -487,4 +489,22 @@ if ((Normalize-Bool $BuildTests) -eq "ON") {
 }
 else {
     cmake @BuildArgs --target GgmlOps
+}
+if ($LASTEXITCODE -ne 0) { throw "cmake build failed with exit code $LASTEXITCODE" }
+
+# Record whether an auto-enabled Vulkan backend had to be dropped. The build
+# itself succeeded either way, so MSBuild would otherwise freshen its
+# up-to-date stamp and skip this script on every later build - leaving a
+# silently Vulkan-less GgmlOps.dll even after the cause (no network, no MSVC)
+# is fixed. TensorSharp.Backends.GGML.csproj invalidates that stamp while this
+# marker exists, so provisioning is retried until it succeeds.
+$VulkanDegradedMarker = Join-Path $BuildDir "vulkan-degraded.marker"
+if ($VulkanDegraded) {
+    Set-Content -Path $VulkanDegradedMarker -Encoding ascii -Value @(
+        "The ggml-vulkan backend was auto-enabled but its build toolchain could not be provisioned,",
+        "so this build produced GgmlOps.dll without Vulkan support. Delete this file to stop retrying,",
+        "or pass --no-vulkan to disable the backend explicitly.")
+}
+elseif (Test-Path $VulkanDegradedMarker) {
+    Remove-Item -Force $VulkanDegradedMarker
 }
