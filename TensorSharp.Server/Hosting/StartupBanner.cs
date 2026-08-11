@@ -25,7 +25,8 @@ namespace TensorSharp.Server.Hosting
     {
         private static readonly string[] EndpointSummary =
         {
-            "GET  /                         - Health check",
+            "GET  /                          - Web UI (index.html)",
+            "GET  /health                    - Health check",
             "GET  /api/tags                  - List hosted models (Ollama)",
             "POST /api/show                  - Show model details (Ollama)",
             "POST /api/generate              - Generate text (Ollama)",

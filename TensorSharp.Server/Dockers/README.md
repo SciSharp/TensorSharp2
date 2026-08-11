@@ -24,12 +24,19 @@ Target Space: <https://huggingface.co/spaces/zhongkaifu/tensorsharp>
 
 ### Port
 
-`TensorSharp.Server` hard-codes its listen address to `http://0.0.0.0:5000` and
-passes it to `app.Run`, which overrides `PORT`/`ASPNETCORE_URLS`. The build
-stage rewrites that constant to **7860** (the Docker Space default port) with
-`sed`, so the app binds the port the Space routes to — **no `app_port` setting
-is required**. To use a different port, pass `--build-arg APP_PORT=<port>` and
-set a matching `app_port` in the Space README.
+`TensorSharp.Server` listens on `http://0.0.0.0:5000` by default and honours the
+`PORT` environment variable (as well as `--port` / `--host` / `--urls` on the
+command line). The runtime stage sets `PORT=7860` — the Docker Space default
+port — so the app binds the port the Space routes to and **no `app_port` setting
+is required**.
+
+To use a different port, either rebuild with `--build-arg APP_PORT=<port>` and
+set a matching `app_port` in the Space README, or override it at run time on any
+other host:
+
+```bash
+docker run --rm -e PORT=8080 -p 8080:8080 tensorsharp-server
+```
 
 ## Configure the Space — copy `Dockerfile_CPU.txt` to `Dockerfile`
 
@@ -54,10 +61,10 @@ git push
 ## Space `README.md` template
 
 Put this at the top of the Space's `README.md`. In the current server contract,
-`GET /` is the liveness endpoint and the chat UI is `/index.html`. Use
-`https://<user>-<space>.hf.space/index.html` as the direct UI link. Do not claim
-that the bare Space root opens the UI; it returns
-`"TensorSharp.Server is running"`.
+`GET /` serves the chat UI, so the bare Space root
+(`https://<user>-<space>.hf.space/`) is the UI link; `/index.html` still works
+as an explicit alias. The plain liveness response
+(`"TensorSharp.Server is running"`) lives at `/health`.
 
 ```yaml
 ---
@@ -125,11 +132,12 @@ live denoising previews while the compatibility APIs return final text.
 
 ## Space root shows "TensorSharp.Server is running"
 
-That is the expected current behavior: `GET /` is the liveness route. Open
-`/index.html` for the UI, for example
-`https://<user>-<space>.hf.space/index.html`. Static image/CSS paths also work
-when the app is launched from the published application directory, as both
-Dockerfiles do.
+That means the image is serving without the Web UI assets: `GET /` sends
+`wwwroot/index.html` when it is present and falls back to the liveness response
+when it is not. Check that `wwwroot/` was published into the application
+directory the container launches from, as both Dockerfiles do — static
+image/CSS paths depend on the same thing. The liveness response is always
+available at `/health`.
 
 Also note `GET /api/chat` returns 404 in a browser because it is a **POST**-only
 endpoint — the web UI calls it with POST; it is not a deployment error.
@@ -139,7 +147,7 @@ endpoint — the web UI calls it with POST; it is not a deployment error.
 ```bash
 docker build -f TensorSharp.Server/Dockers/Dockerfile_CPU.txt -t tensorsharp-server .
 docker run --rm -p 7860:7860 tensorsharp-server
-# open http://localhost:7860/index.html
+# open http://localhost:7860
 
 # Use the exact MODEL_FILE configured at image build time.
 curl -s http://localhost:7860/v1/chat/completions \
@@ -172,8 +180,8 @@ NVIDIA path).
    creates the UID‑1000 user Spaces run as, downloads the model, and launches
    with `--backend ggml_cuda`.
 
-The port rewrite to 7860 and the chat UI at `/index.html` work exactly as in the
-CPU file; `/` remains the liveness endpoint.
+The `PORT=7860` default and the chat UI at `/` work exactly as in the CPU file;
+`/health` remains the liveness endpoint.
 
 ## CUDA architectures (build host has no GPU)
 
@@ -262,5 +270,5 @@ Ollama-compatible HTTP APIs. See https://github.com/zhongkaifu/TensorSharp.
 docker build -f TensorSharp.Server/Dockers/Dockerfile_GPU.txt \
   --build-arg CUDA_ARCHS=75-real -t tensorsharp-server-gpu .
 docker run --rm --gpus all -p 7860:7860 tensorsharp-server-gpu
-# open http://localhost:7860/index.html
+# open http://localhost:7860
 ```

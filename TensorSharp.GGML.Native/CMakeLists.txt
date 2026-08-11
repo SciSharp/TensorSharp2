@@ -226,6 +226,11 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_paged_attention.cpp
     ggml_ops_tensor_parallel.cpp
 )
+if (APPLE)
+    # Raises the process-wide default MSL version so ggml's Metal 4 tensor-API probe can compile
+    # under the .NET apphost's stale recorded SDK. See the file header for the full story.
+    list(APPEND TSG_GGMLOPS_SOURCES tsg_metal_msl_default.m)
+endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_mask.cu)
@@ -286,6 +291,11 @@ target_link_libraries(GgmlOps PRIVATE ggml)
 
 if (APPLE)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_METAL=1)
+
+    # tsg_metal_msl_default.m talks to Metal and the Objective-C runtime directly.
+    find_library(TSG_FOUNDATION_LIBRARY Foundation REQUIRED)
+    find_library(TSG_METAL_FRAMEWORK    Metal      REQUIRED)
+    target_link_libraries(GgmlOps PRIVATE ${TSG_FOUNDATION_LIBRARY} ${TSG_METAL_FRAMEWORK})
 endif()
 
 set_target_properties(GgmlOps PROPERTIES

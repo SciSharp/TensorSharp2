@@ -27,7 +27,6 @@ using TensorSharp.Server.ProtocolAdapters;
 using TensorSharp.Server.Responses;
 using TensorSharp.Runtime.Redis;
 
-const string ListenAddress = "http://0.0.0.0:5000";
 const long MaxRequestBodyBytes = 500L * 1024L * 1024L;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
@@ -245,9 +244,10 @@ if (qwenImageFlagsApplied)
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);
 
 app.UseTensorSharpRequestLogging();
-// Serve the bundled static UI at /index.html. The explicit GET / endpoint
-// remains the plain liveness response; headless deployments can still start
-// when no wwwroot content is present.
+// Serve the bundled static UI. GET / sends index.html too (see
+// HealthEndpoints), so a bare http://host:port/ opens the chat UI; the plain
+// liveness response moved to GET /health and still answers / on headless
+// deployments that ship no wwwroot content.
 app.UseDefaultFiles();
 app.UseStaticFiles();
 // The default content-type provider has no HEIC/HEIF mapping, so uploaded iPhone
@@ -277,7 +277,7 @@ StartupModelLoader.LoadIfConfigured(
     configuredBackendInput,
     startupLogger);
 
-StartupBanner.Emit(startupLogger, hostingOptions, ListenAddress);
+StartupBanner.Emit(startupLogger, hostingOptions, hostingOptions.ListenUrls);
 
 // Tear down the process-global GGML backend after the host stops. On macOS
 // the ggml-metal device's C++ static destructor asserts that its resource
@@ -290,4 +290,8 @@ StartupBanner.Emit(startupLogger, hostingOptions, ListenAddress);
 app.Lifetime.ApplicationStopped.Register(static () => GgmlBasicOps.Shutdown());
 AppDomain.CurrentDomain.ProcessExit += static (_, _) => GgmlBasicOps.Shutdown();
 
-app.Run(ListenAddress);
+// Bind the address resolved by ServerOptionsBuilder (--port / --host / --urls,
+// then PORT / HOST / ASPNETCORE_URLS, then http://0.0.0.0:5000). Passing it to
+// Run() overrides anything the host builder configured, so ASPNETCORE_URLS is
+// folded into that resolution rather than being silently discarded here.
+app.Run(hostingOptions.ListenUrls);

@@ -38,7 +38,8 @@ namespace TensorSharp.Server.Hosting
                 out string configuredBackend,
                 out int? configuredMaxTokens,
                 out SamplingOverrides configuredSampling,
-                out SamplingPrecedence? configuredPrecedence);
+                out SamplingPrecedence? configuredPrecedence,
+                out ListenOverrides configuredListen);
 
             if (!string.IsNullOrWhiteSpace(configuredMmProj) && string.IsNullOrWhiteSpace(configuredModel))
                 throw new ArgumentException("--mmproj requires --model.");
@@ -82,6 +83,8 @@ namespace TensorSharp.Server.Hosting
 
             SamplingDefaults defaultSampling = ResolveDefaultSamplingConfig(configuredSampling, configuredPrecedence);
 
+            string listenUrls = ResolveListenUrls(configuredListen);
+
             return new ServerHostingOptions(
                 startupModelPath,
                 startupMmProjPath,
@@ -92,14 +95,113 @@ namespace TensorSharp.Server.Hosting
                 uploadDirectory,
                 logDirectory,
                 fileLoggingEnabled,
-                defaultSampling);
+                defaultSampling,
+                listenUrls);
         }
 
         /// <summary>Backend originally requested via <c>--backend</c> / <c>BACKEND</c> (without the OS-default fallback).</summary>
         public static string ReadConfiguredBackendInput(string[] args)
         {
-            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _);
+            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _);
             return configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
+        }
+
+        /// <summary>Listen address overrides captured from the CLI.</summary>
+        private struct ListenOverrides
+        {
+            public int? Port;
+            public string Host;
+            public string Urls;
+        }
+
+        /// <summary>
+        /// Resolve the address Kestrel binds. Highest precedence first:
+        /// <list type="number">
+        ///   <item><c>--port</c> / <c>--host</c> — the most specific operator intent.</item>
+        ///   <item><c>--urls</c> — full control (multiple bindings, https).</item>
+        ///   <item><c>PORT</c> / <c>HOST</c> env vars — the convention most container
+        ///         platforms (Cloud Run, Heroku, Hugging Face Spaces) inject.</item>
+        ///   <item><c>ASPNETCORE_URLS</c> — the stock ASP.NET Core variable.</item>
+        ///   <item><see cref="ServerHostingOptions.DefaultListenUrls"/>.</item>
+        /// </list>
+        /// A partial choice still resolves: <c>--port</c> alone keeps the default
+        /// host and vice versa, so <c>--host 127.0.0.1</c> binds loopback on 5000.
+        /// The result is handed to <c>app.Run(url)</c>, which is why
+        /// <c>ASPNETCORE_URLS</c> has to be read here — that call overrides
+        /// anything the host builder picked up on its own, so leaving it out
+        /// would silently ignore the variable.
+        /// </summary>
+        private static string ResolveListenUrls(ListenOverrides cli)
+        {
+            if (cli.Port.HasValue || !string.IsNullOrWhiteSpace(cli.Host))
+                return BuildListenUrl(cli.Host ?? ReadEnvHost() ?? DefaultHost,
+                                      cli.Port ?? ReadEnvPort() ?? ServerHostingOptions.DefaultPort);
+
+            if (!string.IsNullOrWhiteSpace(cli.Urls))
+                return cli.Urls.Trim();
+
+            int? envPort = ReadEnvPort();
+            string envHost = ReadEnvHost();
+            if (envPort.HasValue || envHost != null)
+                return BuildListenUrl(envHost ?? DefaultHost, envPort ?? ServerHostingOptions.DefaultPort);
+
+            string aspnetUrls = Environment.GetEnvironmentVariable("ASPNETCORE_URLS");
+            if (!string.IsNullOrWhiteSpace(aspnetUrls))
+                return aspnetUrls.Trim();
+
+            return ServerHostingOptions.DefaultListenUrls;
+        }
+
+        private const string DefaultHost = "0.0.0.0";
+
+        /// <summary>
+        /// Compose <c>http://host:port</c>. A bare IPv6 literal is bracketed
+        /// (<c>::1</c> -&gt; <c>[::1]</c>) so the result is a well-formed URL;
+        /// a host that already carries a scheme is honoured as written, which
+        /// lets <c>--host https://0.0.0.0</c> serve TLS.
+        /// </summary>
+        private static string BuildListenUrl(string host, int port)
+        {
+            host = host.Trim();
+
+            string scheme = "http://";
+            int schemeIndex = host.IndexOf("://", StringComparison.Ordinal);
+            if (schemeIndex >= 0)
+            {
+                scheme = host.Substring(0, schemeIndex + 3);
+                host = host.Substring(schemeIndex + 3);
+            }
+
+            // Bracket an unbracketed IPv6 literal. Detected by a second colon:
+            // "::1" and "fe80::1" have one, "localhost" and "10.0.0.1" do not.
+            if (host.IndexOf(':') != host.LastIndexOf(':') && !host.StartsWith("[", StringComparison.Ordinal))
+                host = "[" + host + "]";
+
+            return $"{scheme}{host}:{port.ToString(CultureInfo.InvariantCulture)}";
+        }
+
+        /// <summary>Read <c>PORT</c>, the variable container platforms inject.</summary>
+        private static int? ReadEnvPort()
+        {
+            string raw = Environment.GetEnvironmentVariable("PORT");
+            if (string.IsNullOrWhiteSpace(raw))
+                return null;
+            if (!TryParsePort(raw.Trim(), out int port))
+                throw new ArgumentException($"Invalid PORT environment variable: '{raw}'. Expected a port between 1 and 65535.");
+            return port;
+        }
+
+        private static string ReadEnvHost()
+        {
+            string raw = Environment.GetEnvironmentVariable("HOST");
+            return string.IsNullOrWhiteSpace(raw) ? null : raw.Trim();
+        }
+
+        private static bool TryParsePort(string value, out int port)
+        {
+            return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out port)
+                && port >= 1
+                && port <= 65535;
         }
 
         /// <summary>
@@ -688,7 +790,8 @@ namespace TensorSharp.Server.Hosting
             out string configuredBackend,
             out int? configuredMaxTokens,
             out SamplingOverrides configuredSampling,
-            out SamplingPrecedence? configuredPrecedence)
+            out SamplingPrecedence? configuredPrecedence,
+            out ListenOverrides configuredListen)
         {
             configuredModel = null;
             configuredMmProj = null;
@@ -696,6 +799,7 @@ namespace TensorSharp.Server.Hosting
             configuredMaxTokens = null;
             configuredSampling = default;
             configuredPrecedence = null;
+            configuredListen = default;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -714,6 +818,31 @@ namespace TensorSharp.Server.Hosting
                 if (TryReadOption(args, ref i, "--backend", out string backendOption))
                 {
                     configuredBackend = backendOption;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--port", out string portOption))
+                {
+                    if (!TryParsePort(portOption, out int parsedPort))
+                        throw new ArgumentException(
+                            $"Invalid value for --port: '{portOption}'. Expected a port between 1 and 65535.");
+                    configuredListen.Port = parsedPort;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--host", out string hostOption))
+                {
+                    if (string.IsNullOrWhiteSpace(hostOption))
+                        throw new ArgumentException("Missing value for option '--host'.");
+                    configuredListen.Host = hostOption;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--urls", out string urlsOption))
+                {
+                    if (string.IsNullOrWhiteSpace(urlsOption))
+                        throw new ArgumentException("Missing value for option '--urls'.");
+                    configuredListen.Urls = urlsOption;
                     continue;
                 }
 
@@ -951,6 +1080,7 @@ namespace TensorSharp.Server.Hosting
             string[] knownFlags = new[]
             {
                 "--model", "--mmproj", "--backend", "--max-tokens",
+                "--port", "--host", "--urls",
                 "--temperature", "--top-k", "--top-p", "--min-p",
                 "--repeat-penalty", "--repeat-last-n", "--presence-penalty", "--frequency-penalty",
                 "--seed", "--stop", "--sampling-precedence",

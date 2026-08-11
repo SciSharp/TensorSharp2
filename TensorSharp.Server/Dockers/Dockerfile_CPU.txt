@@ -8,10 +8,9 @@
 #      (it must contain `sdk: docker`).
 #   3. Push. The Space builds the image and starts the server.
 #
-# Program.cs hard-codes the listen address to port 5000 and passes it to
-# app.Run(), which overrides PORT / ASPNETCORE_URLS. The build stage below
-# patches it to 7860 (the Hugging Face Spaces default port), so the Space needs
-# no `app_port` override.
+# The server listens on 0.0.0.0:5000 by default; the runtime stage sets PORT to
+# 7860 (the Hugging Face Spaces default port), so the Space needs no `app_port`
+# override.
 
 ############################################################
 # Stage 1 — build the server and the native GGML CPU bridge
@@ -36,19 +35,10 @@ ARG TENSORSHARP_REF=main
 WORKDIR /src
 RUN git clone --depth 1 --branch ${TENSORSHARP_REF} ${TENSORSHARP_REPO} .
 
-# The listen address is hard-coded to 0.0.0.0:5000 in Program.cs and passed to
-# app.Run(), which overrides PORT / ASPNETCORE_URLS. Rewrite the constant to
-# 7860 (the Hugging Face Spaces default port) so the app binds the port the
-# Space routes to. The grep asserts the rewrite took effect — it keeps the build
-# green if upstream already uses 7860, and fails loudly if neither matches.
-ARG APP_PORT=7860
-RUN sed -i "s#0.0.0.0:5000#0.0.0.0:${APP_PORT}#g" TensorSharp.Server/Program.cs \
-    && grep -q "0.0.0.0:${APP_PORT}" TensorSharp.Server/Program.cs
-
 # The app serves the chat UI at "/" itself: Program.cs calls app.UseDefaultFiles(),
 # which rewrites "/" to /index.html ahead of the plain-text health route, so the
 # Space root (https://<user>-<space>.hf.space) shows the chatbot UI directly. No
-# source patch is needed here for that — only the port rewrite above.
+# source patch is needed for that.
 
 # Building the server transitively builds Runtime/Models/Backends and runs the
 # native GGML CMake build. No nvcc is present, so ggml-cuda is auto-disabled and
@@ -104,12 +94,17 @@ RUN if [ -n "${MMPROJ_FILE}" ]; then \
         wget -q -O "/home/user/app/models/${MMPROJ_FILE}" "${MMPROJ_URL}"; \
     fi
 
+# 7860 is the port Hugging Face Spaces routes to by default (no app_port needed).
+# The server reads PORT, so this is all it takes to move the listener; override
+# it at `docker run` time (-e PORT=8080 -p 8080:8080) for other hosts.
+ARG APP_PORT=7860
+ENV PORT=${APP_PORT}
+
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
     BACKEND=ggml_cpu
 
-# 7860 is the port Hugging Face Spaces routes to by default (no app_port needed).
-EXPOSE 7860
+EXPOSE ${APP_PORT}
 
 # Shell form so the variables expand. Host the model (and its projector, when
 # MMPROJ_FILE is set) on the native GGML CPU backend.

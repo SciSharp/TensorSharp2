@@ -94,6 +94,23 @@ namespace TensorSharp.Server.Hosting
                     "Requires --model. Default: none — pass the matching projector explicitly.",
                     "--mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf"),
             }),
+            ("Network", new[]
+            {
+                new OptionHelp("--port <N>",
+                    "TCP port to listen on (1-65535). Default: 5000 (PORT env var overrides). On macOS, port 5000 is " +
+                    "taken by the AirPlay Receiver in Control Center, so pick another port or turn that off.",
+                    "--port 8080"),
+                new OptionHelp("--host <address>",
+                    "Interface to bind. Default: 0.0.0.0 — every interface, so the server is reachable from other " +
+                    "machines and from outside a container. Use 127.0.0.1 to restrict it to this machine " +
+                    "(HOST env var overrides).",
+                    "--host 127.0.0.1 --port 8080"),
+                new OptionHelp("--urls <urls>",
+                    "Full listen URL(s), semicolon-separated, for cases --port/--host cannot express (HTTPS, or " +
+                    "binding several endpoints at once). Overridden by --port/--host when both are given; falls back " +
+                    "to the ASPNETCORE_URLS env var.",
+                    "--urls \"http://0.0.0.0:8080;https://0.0.0.0:8443\""),
+            }),
             ("Compute backend", new[]
             {
                 new OptionHelp("--backend <type>",
@@ -324,8 +341,8 @@ namespace TensorSharp.Server.Hosting
             writer.WriteLine("Usage: TensorSharp.Server [options]");
             writer.WriteLine();
             writer.WriteLine("Hosts an OpenAI- and Ollama-compatible inference server (plus a built-in web chat UI)");
-            writer.WriteLine("on http://0.0.0.0:5000. Run with no arguments to show this help; pass at least one");
-            writer.WriteLine("option to start the server.");
+            writer.WriteLine("on http://0.0.0.0:5000 by default (change it with --port / --host). Run with no");
+            writer.WriteLine("arguments to show this help; pass at least one option to start the server.");
 
             foreach (var (section, options) in Sections)
             {

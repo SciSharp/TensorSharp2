@@ -26,7 +26,7 @@ dotnet --list-sdks
 ### 其他构建前置
 
 - **`git` 与网络访问：** GGML/CUDA 原生构建会在首次构建时从 [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) 克隆 ggml 源码到 `ExternalProjects/ggml/`（参见 `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`）。克隆默认跟踪 ggml 的默认分支（`master`）；可用 `TENSORSHARP_GGML_GIT_REF` 指定其他引用，或在克隆完成后设置 `TENSORSHARP_GGML_NO_UPDATE=1` 跳过网络更新（用于离线重建）
-- **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具；若需使用 MLX 后端，还需通过 `bash TensorSharp.Backends.MLX/build-native-macos.sh` 从 `TensorSharp.Backends.MLX/Native/` 构建 `libmlxc`
+- **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具——GGML 以源码形式内嵌 Metal kernel 并在运行时编译，因此构建期不需要 Metal 编译器。若需使用 MLX 后端，还需通过 `bash TensorSharp.Backends.MLX/build-native-macos.sh` 从 `TensorSharp.Backends.MLX/Native/` 构建 `libmlxc`；该构建**会**编译 Metal shader，因此需要**完整的 Xcode 以及 Metal 工具链**，仅安装命令行工具是不够的。首次构建时 `eng/ensure-metal-toolchain.sh` 会自动完成这一准备工作，详见[构建原生 MLX 库](#构建原生-mlx-库仅-macos)
 - **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本。Visual Studio 2026 的 MSVC 14.5x 工具集比当前 CUDA 工具包官方支持的宿主编译器更新，构建会自动向 `nvcc` 传递 `-allow-unsupported-compiler`；请同时安装“适用于 Windows 的 C++ CMake 工具”组件，以便构建使用 Ninja 生成器（Visual Studio 生成器还额外需要为对应 VS 版本提供 MSBuild 集成的 CUDA 工具包）
 - **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本
 - **Windows（GGML Vulkan 后端）：** 机器有 Vulkan 运行时（每个较新的 GPU 驱动都带的 `System32\vulkan-1.dll`）时自动启用。已安装 [LunarG Vulkan SDK](https://vulkan.lunarg.com/) 时直接使用；未安装时构建会通过 `eng/fetch-vulkan-toolchain.ps1` 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 vulkan-1 导入库、glslc、SPIRV-Headers）准备到 `ExternalProjects/vulkan-toolchain/`。用 `build-windows.ps1 --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出。运行时需要支持 Vulkan 1.3 的 GPU 驱动
@@ -131,6 +131,26 @@ Direct `cuda` 后端由托管 C# 代码和 PTX 内核组成。执行 `dotnet bui
 dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -p:TensorSharpUpdateCommittedPtx=true
 ```
 
+#### Apple Silicon 上的 Metal 4 tensor API
+
+在 M5 及更新的 GPU 上，ggml 可以让矩阵乘走 Metal 4 tensor API，在 M5 Pro 上实测 **prefill 吞吐提升 2.6 倍**（807 → 2107 tok/s，Gemma 4 E4B Q8_0，2048 token prefill）。decode 不受影响，这符合预期——单序列 decode 受内存带宽限制。
+
+ggml 只有在运行时成功编译一个包含 `<metal_tensor>` 的探测 kernel 后才会启用它，而编译该探测 kernel 使用的是*默认*的 Metal Shading Language 版本。这个默认值由 Metal 依据**主可执行文件**中记录的 SDK 推导，而不是依据 `libGgmlOps.dylib`。微软预先构建并分发的 .NET apphost（以及 `dotnet` 启动器）是针对 macOS 15.5 SDK 编译的，因此 .NET 进程的默认值是 MSL 3.2，在该版本下 `<metal_tensor>` 不声明任何内容，于是 ggml 会在完全支持该特性的硬件上禁用 tensor API：
+
+```
+ggml_metal_device_init: - the tensor API is not supported in this environment - disabling
+ggml_metal_device_init: has tensor            = false
+```
+
+`tsg_metal_msl_default.m` 在我们自己的库中修正这个默认值，而这也是该修复唯一能放置的位置：`ExternalProjects/ggml` 不纳入 git 跟踪，且 `eng/fetch-ggml.sh` 每次构建都会将其硬重置到上游，因此写在那里的改动会被下一次构建抹掉。仅当 GPU 声明支持 Metal 4 family、且继承到的默认值更旧时，它才会把进程级默认值提升到 MSL 4.0——也就是原生链接的宿主本来就会得到的值。自行设置 `languageVersion` 的代码保持其自身选择，因此 MLX 后端不受影响（MLX 总是显式设置该值）。生效时它会输出一行日志，`has tensor` 随之变为 `true`。
+
+| 环境变量 | 作用 |
+|---|---|
+| `TENSORSHARP_METAL_MSL_DEFAULT=off` | 保留宿主过时的默认值（恢复 `has tensor = false`） |
+| `TENSORSHARP_METAL_MSL_DEFAULT=<主版本>.<次版本>` | 强制指定默认 MSL 版本，例如 `4.0` |
+
+ggml 自身的开关依然在此之上生效：`GGML_METAL_TENSOR_DISABLE=1` 关闭 tensor API，`GGML_METAL_TENSOR_ENABLE=1` 则绕过 ggml 将其限制在 M5/M6/A19/A20 设备的白名单。
+
 ### 构建原生 MLX 库（仅 macOS）
 
 MLX 后端依赖 `libmlxc`（[MLX](https://github.com/ml-explore/mlx) 的 C 绑定）。仓库在 `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` 中固定了已知可用的 `mlx-c` tag，并提供一个辅助脚本来获取和构建：
@@ -139,7 +159,26 @@ MLX 后端依赖 `libmlxc`（[MLX](https://github.com/ml-explore/mlx) 的 C 绑�
 bash TensorSharp.Backends.MLX/build-native-macos.sh
 ```
 
-脚本会把生成的库（`libmlxc.dylib`、`libmlx.dylib` 以及任何后端依赖）写入 `TensorSharp.Backends.MLX/Native/dist/`。运行时后端会优先在应用目录下查找；也可以使用 `TENSORSHARP_MLX_LIBRARY=<libmlxc.dylib 路径>` 或 `TENSORSHARP_MLX_LIBRARY_DIR=<包含 libmlxc 的目录>` 指定自定义安装位置。如果找不到对应库，后端会报告不可用，启动时 `--backend mlx` 会被拒绝。
+脚本会把生成的库（`libmlxc.dylib`、`libmlx.dylib` 以及任何后端依赖）写入 `TensorSharp.Backends.MLX/Native/dist/`，构建过程会将它们连同 `mlx.metallib` 一起复制到输出目录。该 metallib 包含 MLX 预编译的 Metal kernel，体积较大（约 150 MB）但**不可省略**：MLX 通过对自身代码调用 `dladdr` 来定位它，因此它必须与 `libmlx.dylib` **位于同一目录**。它唯一的兜底路径是编译期写死的、指向构建目录的路径，所以缺少该文件的部署可以正常加载，却会在第一次 GPU 运算时抛出 `Failed to load the default metallib`。如需自行打包，请务必把它与这些 dylib 放在一起。运行时后端会优先在应用目录下查找；也可以使用 `TENSORSHARP_MLX_LIBRARY=<libmlxc.dylib 路径>` 或 `TENSORSHARP_MLX_LIBRARY_DIR=<包含 libmlxc 的目录>` 指定自定义安装位置。如果找不到对应库，后端会报告不可用，启动时 `--backend mlx` 会被拒绝。
+
+#### Metal 工具链（自动准备）
+
+MLX 在构建期需要编译 Metal shader，因此 `xcrun metal` 必须可用。有两个常见原因会导致它不可用，`build-native-macos.sh` 会在 configure 之前调用 `eng/ensure-metal-toolchain.sh` 来自动修复：
+
+1. **当前激活的 developer 目录是命令行工具。** `/Library/Developer/CommandLineTools` 完全不包含 Metal 编译器，因此当 `xcode-select -p` 指向它时会报 `xcrun: error: unable to find utility "metal", not a developer tool or in PATH`。脚本会定位已安装的 `Xcode.app`，并将 `DEVELOPER_DIR` 指向它来构建。脚本**不会**执行 `sudo xcode-select -s`——该覆盖仅对本次构建生效；如需全局生效请自行执行该命令。
+2. **Xcode 16 及更高版本不再内置 Metal 编译器。** 它是一个约 700 MB 的独立可下载组件；缺少它时 `metal` 虽然存在但无法运行（`cannot execute tool 'metal' due to missing Metal Toolchain`）。脚本会通过 `xcodebuild -downloadComponent MetalToolchain` 下载，该操作不需要 `sudo`，安装到系统资产库后可被所有项目共享，并且在 Xcode 升级后依然有效。
+
+这两个问题在 MLX 中都会表现为不易理解的 `error Metal compiler header resolution failed for .../reduce_utils.h`。
+
+Xcode 本身无法无人值守地自动下载（App Store 与 developer.apple.com 都要求登录 Apple ID），因此当系统中没有 `Xcode.app` 时，脚本会中止并给出安装指引。相关开关：
+
+| 变量 | 作用 |
+| --- | --- |
+| `TENSORSHARP_XCODE_DEVELOPER_DIR` | 指定使用的 `<Xcode.app>/Contents/Developer`，跳过自动探测（适用于多版本并存或 beta 版 Xcode） |
+| `TENSORSHARP_MLX_SKIP_METAL_SETUP` | `1`/`true`——完全跳过工具链检查，适用于已在别处准备好环境的机器 |
+| `TENSORSHARP_MLX_NATIVE_SKIP` | `true`——完全跳过 MLX 原生构建，以便在没有 Metal 工具链的情况下构建 TensorSharp 的其余部分 |
+
+切换 developer 目录会使 CMake 缓存失效（旧的 SDK 已固化在 `CMakeCache.txt` 中），因此脚本会丢弃过期的构建树并重新 configure。已获取的 `_deps/*-src` 源码目录会被保留，因此代价只是重新 configure，而不需要重新克隆 MLX。
 
 
 ## 项目结构

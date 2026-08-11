@@ -209,7 +209,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in libmlxc.dylib libmlx.dylib libjaccl.dylib; do
+          # mlx.metallib holds MLX's precompiled Metal kernels. It is large
+          # (~150 MB) but not optional: mlx locates it via dladdr on its own
+          # code, so it has to ship next to libmlx.dylib. Its only fallback is a
+          # METAL_PATH baked in at compile time pointing into the CI build tree,
+          # which does not exist on an end user's machine -- without it the MLX
+          # backend loads and then throws "Failed to load the default metallib"
+          # on first use.
+          for f in libmlxc.dylib libmlx.dylib libjaccl.dylib mlx.metallib; do
             src="TensorSharp.Backends.MLX/Native/dist/$f"
             [ -f "$src" ] || src="TensorSharp.Backends.MLX/Native/dist/lib/$f"
             if [ -f "$src" ]; then
