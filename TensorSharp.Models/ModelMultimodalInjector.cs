@@ -155,6 +155,9 @@ namespace TensorSharp.Models
                 case NemotronModel nem:
                     nem.LoadVisionEncoder(mmProjPath);
                     break;
+                case MuseGlimmerModel mg:
+                    mg.LoadVisionEncoder(mmProjPath);
+                    break;
             }
         }
 
@@ -181,6 +184,8 @@ namespace TensorSharp.Models
                 return ProcessMistral3History(m3, history, inputTokens);
             if (_model is NemotronModel nem)
                 return ProcessNemotronHistory(nem, history, inputTokens);
+            if (_model is MuseGlimmerModel mg)
+                return ProcessMuseGlimmerHistory(mg, history, inputTokens);
 
             return inputTokens;
         }
@@ -385,6 +390,65 @@ namespace TensorSharp.Models
             }
 
             return inputTokens;
+        }
+
+        /// <summary>
+        /// Muse-Glimmer renders an image part as a single &lt;|patch|&gt; token. Each one is
+        /// expanded in place to [&lt;|image_start|&gt;, N filler rows, &lt;|image_end|&gt;] where N is
+        /// the encoder's merged-patch count for that image; the filler rows are overwritten
+        /// by the projected vision embeddings before the layer loop. This mirrors llama.cpp's
+        /// mtmd chunking for PROJECTOR_TYPE_MUSE_GLIMMER (img_beg "&lt;|image_start|&gt;",
+        /// img_end "&lt;|image_end|&gt;").
+        /// </summary>
+        private List<int> ProcessMuseGlimmerHistory(MuseGlimmerModel model, List<ChatMessage> history, List<int> inputTokens)
+        {
+            if (model.VisionEncoder == null)
+                return inputTokens;
+
+            int patchId = _model.Tokenizer.LookupToken("<|patch|>");
+            int imageStartId = _model.Tokenizer.LookupToken("<|image_start|>");
+            int imageEndId = _model.Tokenizer.LookupToken("<|image_end|>");
+            if (patchId < 0 || imageStartId < 0 || imageEndId < 0)
+                return inputTokens;
+
+            var processor = model.VisionEncoder.ImageProcessor;
+            int searchFrom = 0;
+
+            foreach (var message in history)
+            {
+                if (message.ImagePaths == null)
+                    continue;
+
+                foreach (var imagePath in message.ImagePaths)
+                {
+                    CachedEmbedding cached = GetOrCreateMuseGlimmerVisionEmbedding(model, processor, imagePath);
+                    int tokenPosition = FindTokenPosition(inputTokens, patchId, searchFrom);
+                    if (tokenPosition < 0)
+                        continue;
+
+                    inputTokens = ExpandSingleTokenPlaceholder(
+                        inputTokens, tokenPosition, imageStartId, cached.TokenCount, imageEndId);
+                    _preparedVisionEmbeddings.Add(new PreparedEmbeddingSpan(
+                        cached,
+                        tokenPosition + 1,
+                        tokenPosition,
+                        tokenPosition + cached.TokenCount + 2));
+                    searchFrom = tokenPosition + cached.TokenCount + 2;
+                }
+            }
+
+            return inputTokens;
+        }
+
+        private CachedEmbedding GetOrCreateMuseGlimmerVisionEmbedding(
+            MuseGlimmerModel model, MuseGlimmerImageProcessor processor, string imagePath)
+        {
+            return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
+            {
+                var (pixels, imageWidth, imageHeight) = processor.ProcessImage(fullPath);
+                Tensor embeddings = model.VisionEncoder.Encode(pixels, imageWidth, imageHeight);
+                return CreateCachedEmbedding(fullPath, embeddings);
+            });
         }
 
         private List<int> ProcessGemma3History(Gemma3Model model, List<ChatMessage> history, List<int> inputTokens)

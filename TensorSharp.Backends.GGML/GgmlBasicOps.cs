@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -1467,6 +1467,128 @@ namespace TensorSharp.GGML
         public static void SetVulkanDeviceIndex(int deviceIndex) => GgmlNative.SetVulkanDeviceIndex(deviceIndex);
         public static int GetVulkanDeviceCount() => GgmlNative.GetVulkanDeviceCount();
         public static string GetVulkanDeviceDescription(int deviceIndex) => GgmlNative.GetVulkanDeviceDescription(deviceIndex);
+
+
+        /// <summary>DFlash PASS A+B (encode + ring KV injection) in one GGML graph.</summary>
+        public static bool DFlashInject(
+            float[] featRows, int featureSize, int nRows,
+            long[] ringRowsIdx, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale,
+            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
+            IntPtr encNormData,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype)
+            => GgmlNative.DFlashInject(featRows, featureSize, nRows, ringRowsIdx, positions,
+                numLayers, hiddenSize, headDim, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale, fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                kNormArr, ringKArr, ringVArr, ringDtype);
+
+        /// <summary>DFlash PASS C (block draft + borrowed LM head + softmax + on-device top-1) in one GGML graph.</summary>
+        public static bool DFlashDraftBlock(
+            int[] blockIds, int blockLen, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale, float kqScale,
+            int[] ringSlotPos, int slidingWindow,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
+            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
+            IntPtr outNormData,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocabSize, int[] idsOut, float[] confOut)
+            => GgmlNative.DFlashDraftBlock(blockIds, blockLen, positions,
+                numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
+                attnNormArr,
+                qArr, qTypeArr, qNe0Arr, qNe1Arr, qBytesArr,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                qNormArr, kNormArr,
+                oArr, oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                ffnNormArr,
+                gateArr, gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr,
+                upArr, upTypeArr, upNe0Arr, upNe1Arr, upBytesArr,
+                downArr, downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                ringKArr, ringVArr, ringDtype, outNormData,
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                vocabSize, idsOut, confOut);
+
+        /// <summary>Drop the persistent DFlash graphs.</summary>
+        public static void DFlashResetCaches() => GgmlNative.DFlashResetCaches();
+
+        /// <summary>
+        /// Whole-model Muse-Glimmer forward in one GGML graph. nTokens == 1 replays a
+        /// persistent CUDA-graph-captured graph; nTokens &gt; 1 is a transient prefill
+        /// graph. Returns false when the kernel declines so the caller can fall back
+        /// to the per-op path.
+        /// </summary>
+        public static bool MuseGlimmerModelForward(
+            IntPtr hiddenData, int hiddenSize, int nTokens, int numLayers,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr, IntPtr[] gateArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr,
+            IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] guArr, IntPtr[] downArr,
+            IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] isSwaArr,
+            int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int numKvHeads, int headDim, int cacheSize, int swaCacheSize,
+            int startPos, int slidingWindow,
+            float eps, float postNormEps, float ropeBase, float ropeFreqScale,
+            float kqScale, int kvCacheType,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitScale, float logitSoftcap,
+            IntPtr captureData, int[] captureLayers, int captureCount,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            int[] tokenIds, int allLogitsRows)
+        {
+            return GgmlNative.MuseGlimmerModelForward(
+                hiddenData, hiddenSize, nTokens, numLayers,
+                attnNormArr, qArr, kArr, vArr, gateArr, qNormArr, kNormArr, oArr,
+                postAttnNormArr, ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr, isSwaArr,
+                qTypeArr, qNe0Arr, qNe1Arr, qBytesArr,
+                kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, numKvHeads, headDim, cacheSize, swaCacheSize, startPos, slidingWindow,
+                eps, postNormEps, ropeBase, ropeFreqScale, kqScale, kvCacheType,
+                logitsData, vocabSize,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNormData, logitScale, logitSoftcap,
+                captureData, captureLayers, captureCount,
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, tokenIds, allLogitsRows);
+        }
+
+        /// <summary>Drop the persistent Muse-Glimmer decode graphs (see the native comment).</summary>
+        public static void MuseGlimmerResetDecodeCache() => GgmlNative.MuseGlimmerResetDecodeCache();
+
 
         public static void TransformerModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,

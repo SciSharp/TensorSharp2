@@ -5777,6 +5777,7 @@ namespace TensorSharp.Models
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend, tpDegree, tpGroup),
                 "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend, tpDegree, tpGroup),
                 "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),
+                "muse-glimmer" or "muse_glimmer" => new MuseGlimmerModel(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 "deepseek4" => new DeepSeek4Model(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };

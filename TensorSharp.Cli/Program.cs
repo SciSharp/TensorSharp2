@@ -1841,6 +1841,82 @@ namespace TensorSharp.Cli
                             "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
                     }
                 }
+                else if (arch == "muse-glimmer" || arch == "muse_glimmer")
+                {
+                    // The chat template renders an image part as a single <|patch|>.
+                    // llama.cpp's mtmd wraps the image chunk in <|image_start|> ... <|image_end|>,
+                    // so each <|patch|> expands to [start, N filler rows, end] and the filler
+                    // rows are overwritten by the projected vision embeddings.
+                    int patchId = model.Tokenizer.LookupToken("<|patch|>");
+                    int imageStartId = model.Tokenizer.LookupToken("<|image_start|>");
+                    int imageEndId = model.Tokenizer.LookupToken("<|image_end|>");
+
+                    if (model is MuseGlimmerModel mg && mg.VisionEncoder != null)
+                    {
+                        if (patchId < 0 || imageStartId < 0 || imageEndId < 0)
+                        {
+                            _log.LogWarning(LogEventIds.HostConfiguration,
+                                "Muse-Glimmer vision: missing marker token(s) patch={Patch} start={Start} end={End}",
+                                patchId, imageStartId, imageEndId);
+                        }
+                        else
+                        {
+                            var proc = mg.VisionEncoder.ImageProcessor;
+                            int searchFrom = 0;
+
+                            foreach (var imgP in imagePaths)
+                            {
+                                var (pixels, imgW, imgH) = proc.ProcessImage(imgP);
+                                var visionEmb = mg.VisionEncoder.Encode(pixels, imgW, imgH);
+                                int numVisionTokens = (int)visionEmb.Sizes[0];
+
+                                _log.LogInformation(LogEventIds.HostConfiguration,
+                                    "Muse-Glimmer vision: source={Source} resized={Width}x{Height} grid={GridW}x{GridH} tokens={Tokens}",
+                                    imgP, imgW, imgH,
+                                    imgW / proc.PatchSize / proc.MergeSize,
+                                    imgH / proc.PatchSize / proc.MergeSize,
+                                    numVisionTokens);
+
+                                int patchPos = -1;
+                                for (int i = searchFrom; i < inputTokens.Count; i++)
+                                {
+                                    if (inputTokens[i] == patchId) { patchPos = i; break; }
+                                }
+
+                                if (patchPos < 0)
+                                {
+                                    _log.LogWarning(LogEventIds.HostConfiguration,
+                                        "Muse-Glimmer vision: no more <|patch|> placeholders for {Source}", imgP);
+                                    visionEmb.Dispose();
+                                    continue;
+                                }
+
+                                var expanded = new List<int>(inputTokens.Count + numVisionTokens + 1);
+                                for (int i = 0; i < patchPos; i++)
+                                    expanded.Add(inputTokens[i]);
+                                expanded.Add(imageStartId);
+                                for (int i = 0; i < numVisionTokens; i++)
+                                    expanded.Add(patchId);
+                                expanded.Add(imageEndId);
+                                for (int i = patchPos + 1; i < inputTokens.Count; i++)
+                                    expanded.Add(inputTokens[i]);
+                                inputTokens = expanded;
+
+                                int insertPos = patchPos + 1;
+                                mg.SetVisionEmbeddings(visionEmb, insertPos);
+                                searchFrom = insertPos + numVisionTokens + 1;
+                            }
+
+                            _log.LogInformation(LogEventIds.HostConfiguration,
+                                "Total tokens after Muse-Glimmer image expansion: {TotalTokens}", inputTokens.Count);
+                        }
+                    }
+                    else if (imagePaths.Count > 0)
+                    {
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                    }
+                }
                 else if (arch == "nemotron_h_omni" || arch == "nemotron_h" || arch == "nemotron_h_moe")
                 {
                     int imageTokenId = model.Tokenizer.LookupToken("<image>");
@@ -2205,10 +2281,10 @@ namespace TensorSharp.Cli
                     "Reduce --max-tokens, use a shorter PDF, or choose a model with a larger context window.");
             }
 
-            // Block speculative decoding (DeepSeek V4 + DSpark): the drafter
-            // proposes a block per step and the trunk verifies it in one batched
-            // forward. Greedy verification keeps the emitted stream identical to
-            // plain greedy decoding, so it is only a speed path.
+            // Block speculative decoding (DeepSeek V4 + DSpark, Muse-Glimmer +
+            // DFlash): the drafter proposes a block per step and the trunk verifies
+            // it in one batched forward. Greedy verification keeps the emitted
+            // stream identical to plain greedy decoding, so it is only a speed path.
             {
                 var specCfg = samplingConfig ?? SamplingConfig.Greedy;
                 if (InteractiveSession.IsArgmaxSampling(specCfg)

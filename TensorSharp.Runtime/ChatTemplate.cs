@@ -933,7 +933,11 @@ namespace TensorSharp.Runtime
         /// Pre-process messages to inject multimodal placeholder tokens into the content string
         /// so the Jinja2 template's {{ message['content'] }} renders them correctly.
         /// </summary>
-        private static List<ChatMessage> InjectMultimodalTokens(List<ChatMessage> messages, string? architecture)
+        // internal (not private) so the per-architecture marker mapping can be
+        // unit-tested without a GGUF: a missing branch here means the image marker
+        // never reaches the prompt, the vision encoder still runs, and its
+        // embeddings are silently discarded.
+        internal static List<ChatMessage> InjectMultimodalTokens(List<ChatMessage> messages, string? architecture)
         {
             var result = new List<ChatMessage>(messages.Count);
             foreach (var msg in messages)
@@ -973,6 +977,18 @@ namespace TensorSharp.Runtime
                     if (msg.ImagePaths != null)
                         foreach (var _ in msg.ImagePaths)
                             sb.Append("[IMG]");
+                }
+                else if (architecture is "muse-glimmer" or "muse_glimmer")
+                {
+                    // The GGUF Jinja template renders an image content part as a
+                    // single <|patch|> and a video part as <|video|>. The host
+                    // (CLI / ModelMultimodalInjector) later expands each <|patch|>
+                    // into <|image_start|> + N filler rows + <|image_end|>, matching
+                    // llama.cpp's mtmd chunking for PROJECTOR_TYPE_MUSE_GLIMMER.
+                    if (msg.IsVideo && msg.ImagePaths != null)
+                        sb.Append("<|video|>");
+                    else if (msg.ImagePaths != null)
+                        foreach (var _ in msg.ImagePaths) sb.Append("<|patch|>");
                 }
 
                 sb.Append(msg.Content ?? "");

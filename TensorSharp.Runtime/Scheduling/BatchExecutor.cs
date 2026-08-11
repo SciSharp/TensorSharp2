@@ -1663,7 +1663,9 @@ namespace TensorSharp.Runtime.Scheduling
             if (!_model.SupportsKVStateSnapshot || !_model.SupportsCrossSequenceKvReuse) return;
             if (tokensInModel <= 0) return;
 
-            int blocks = seq.BlockTable.NumBlocks;
+            int blocks = Math.Min(
+                seq.BlockTable.NumBlocks,
+                CapturableBlocks((tokensInModel + _blockSize - 1) / _blockSize));
             for (int b = 0; b < blocks; b++)
             {
                 int startToken = b * _blockSize;
@@ -1758,7 +1760,7 @@ namespace TensorSharp.Runtime.Scheduling
             int fullBlocksNow = seq.NumComputedTokens / _blockSize;
             int captured = 0;
             int previouslyFull = fullBlocksNow;
-            for (int b = 0; b < fullBlocksNow && b < seq.BlockTable.NumBlocks; b++)
+            for (int b = 0; b < CapturableBlocks(fullBlocksNow) && b < seq.BlockTable.NumBlocks; b++)
             {
                 var block = seq.BlockTable.Blocks[b];
                 if (block.Used == _blockSize) continue; // already captured
@@ -1782,6 +1784,24 @@ namespace TensorSharp.Runtime.Scheduling
                 _scheduler.OnBlocksCommitted(seq, previouslyFull * _blockSize);
 
             return captured;
+        }
+
+        /// <summary>
+        /// Blocks worth snapshotting out of <paramref name="fullBlocks"/>. A model
+        /// with a circular / ring KV cache (Gemma 4, Muse-Glimmer) caps how long a
+        /// pooled prefix it can faithfully restore, and <see cref="EnsureOwnership"/>
+        /// discards any snapshot longer than that cap rather than injecting it. So
+        /// blocks past the cap are captured, stored and never used - and on a
+        /// device-resident cache each capture round drags the whole K/V back over
+        /// PCIe first. Reuse beyond the cap comes from live-cache / retained-fused
+        /// continuation, neither of which reads the pool.
+        /// </summary>
+        private int CapturableBlocks(int fullBlocks)
+        {
+            int cap = _model.MaxReusablePrefixTokens;
+            if (cap == int.MaxValue)
+                return fullBlocks;
+            return Math.Min(fullBlocks, cap / _blockSize);
         }
 
         private void EnsureScratch(int bytes)

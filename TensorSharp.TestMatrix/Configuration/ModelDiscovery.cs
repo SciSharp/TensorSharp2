@@ -119,6 +119,7 @@ public static class ModelDiscovery
             "mistral3" => new[] { "ministral", "mistral", "mmproj" },
             "qwen35" or "qwen36" => new[] { "qwen", "mmproj" },
             "nemotron" => new[] { "nemotron", "mmproj" },
+            "muse-glimmer" => new[] { "muse-glimmer", "muse_glimmer", "mmproj" },
             _ => new[] { "mmproj" },
         };
         foreach (string needle in needles)

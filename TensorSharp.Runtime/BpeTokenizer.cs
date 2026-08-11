@@ -114,9 +114,27 @@ namespace TensorSharp.Runtime
                 }
             }
 
-            string pattern = preTokenizerType switch
+            string pattern = ResolvePreTokenizerPattern(preTokenizerType);
+
+            _pretokenizerRegex = new Regex(pattern, RegexOptions.Compiled);
+        }
+
+        /// <summary>
+        /// The pre-tokenizer split regex for a given <c>tokenizer.ggml.pre</c> value,
+        /// mirroring llama.cpp's <c>LLAMA_VOCAB_PRE_TYPE_*</c> table. Extracted from the
+        /// constructor so the mapping can be unit-tested without a vocabulary.
+        /// </summary>
+        internal static string ResolvePreTokenizerPattern(string preTokenizerType)
+        {
+            return preTokenizerType switch
             {
-                "gpt-4o" =>
+                // llama.cpp maps tokenizer.ggml.pre in {gpt-4o, llama4, kanana2, talkie}
+                // to the same LLAMA_VOCAB_PRE_TYPE_GPT4O regex (llama-vocab.cpp:2293-2299).
+                // Without "llama4" here these vocabs fell through to the default
+                // pattern, whose \p{N} splits every digit individually - so "17"
+                // tokenized as '1','7' instead of the single "17" token and every
+                // numeric prompt diverged from llama.cpp.
+                "gpt-4o" or "llama4" or "kanana2" or "talkie" =>
                     @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|" +
                     @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|" +
                     @"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
@@ -149,8 +167,6 @@ namespace TensorSharp.Runtime
                 _ =>
                     @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             };
-
-            _pretokenizerRegex = new Regex(pattern, RegexOptions.Compiled);
         }
 
         public List<int> Encode(string text, bool addSpecial = true)

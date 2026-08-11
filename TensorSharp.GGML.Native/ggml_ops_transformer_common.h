@@ -17,6 +17,8 @@
 // eliminating the host fill + H2D upload. Bit-identical to the host path.
 extern "C" bool tsg_cuda_fill_causal_mask_f16(
     void* mask_dev, int kvLen, int N, int nPast, int window, int validLen);
+extern "C" bool tsg_cuda_fill_ring_mask_f16(
+    void* mask_dev, int ringRows, int N, int startPos, int window);
 extern "C" bool tsg_cuda_sync_stream0(void);
 #endif
 
