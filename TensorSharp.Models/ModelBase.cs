@@ -5773,6 +5773,7 @@ namespace TensorSharp.Models
                 "gemma4" => new Gemma4Model(ggufPath, backend, tpDegree, tpGroup),
                 "diffusion-gemma" or "diffusion_gemma" => new DiffusionGemmaModel(ggufPath, backend),
                 "qwen_image" or "qwen-image" => new QwenImage.QwenImageModel(ggufPath, backend),
+                "wan" or "wan2.1" or "wan2.2" => new WanVideo.WanVideoModel(ggufPath, backend),
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend, tpDegree, tpGroup),
                 "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend, tpDegree, tpGroup),
                 "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),

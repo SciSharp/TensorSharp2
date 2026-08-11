@@ -3137,7 +3137,7 @@ namespace TensorSharp.Cuda
             return true;
         }
 
-        private static bool TryGetKernels(CudaAllocator allocator, out CudaKernels kernels)
+        internal static bool TryGetKernels(CudaAllocator allocator, out CudaKernels kernels)
         {
             kernels = allocator.Kernels;
             return kernels != null;

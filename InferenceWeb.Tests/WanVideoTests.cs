@@ -1,0 +1,264 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// Wan text-to-video unit tests: the pure-managed pieces (scheduler sigmas,
+// T5 relative-attention buckets, patchify/unpatchify round trip, parameter
+// snapping, RoPE axis split) plus — when the local model files are present —
+// the UMT5 tokenizer against ids produced by the HuggingFace reference
+// tokenizer (google/umt5-xxl via Wan-AI/Wan2.1-T2V-1.3B-Diffusers).
+using System;
+using System.IO;
+using TensorSharp.Models.WanVideo;
+using Xunit;
+
+namespace InferenceWeb.Tests
+{
+    public class WanVideoTests
+    {
+        // ---- scheduler --------------------------------------------------------
+
+        [Fact]
+        public void SchedulerSigmasMatchFlowShiftFormula()
+        {
+            // shift*s/(1+(shift-1)*s) over s = linspace(1, 1/N, N), N=4, shift=3
+            var sch = new WanScheduler(4, 3.0f);
+            Assert.Equal(5, sch.Sigmas.Length);
+            Assert.Equal(1.0f, sch.Sigmas[0], 5);        // s=1 -> 1
+            Assert.Equal(0.9f, sch.Sigmas[1], 5);        // s=0.75 -> 2.25/2.5
+            Assert.Equal(0.75f, sch.Sigmas[2], 5);       // s=0.5 -> 1.5/2
+            Assert.Equal(0.5f, sch.Sigmas[3], 5);        // s=0.25 -> 0.75/1.5
+            Assert.Equal(0f, sch.Sigmas[4], 5);
+            Assert.Equal(1000f, sch.Timesteps[0], 3);
+        }
+
+        [Fact]
+        public void SchedulerEulerStepMovesTowardVelocity()
+        {
+            var sch = new WanScheduler(2, 3.0f);
+            var x = new float[] { 1f, -1f };
+            var v = new float[] { 2f, 2f };
+            float dt = sch.Sigmas[1] - sch.Sigmas[0];   // negative
+            sch.Step(x, v, 0);
+            Assert.Equal(1f + dt * 2f, x[0], 5);
+            Assert.Equal(-1f + dt * 2f, x[1], 5);
+        }
+
+        // ---- T5 relative position buckets ------------------------------------
+
+        [Fact]
+        public void RelativeBucketsMatchT5Reference()
+        {
+            // Reference values from transformers T5Attention._relative_position_bucket
+            // (bidirectional=True, num_buckets=32, max_distance=128).
+            int n = 40;
+            int[] b = WanTextEncoder.ComputeRelativeBuckets(n);
+            Assert.Equal(0, b[0]);                 // rel 0
+            Assert.Equal(16 + 1, b[0 * n + 1]);    // rel +1 -> future bucket 17
+            Assert.Equal(1, b[1 * n + 0]);         // rel -1 -> bucket 1
+            Assert.Equal(16 + 7, b[0 * n + 7]);    // rel +7 (exact range)
+            Assert.Equal(7, b[7 * n + 0]);         // rel -7
+            // rel +8 enters the log range: 8 + int(log(8/8)/log(128/8)*8) = 8
+            Assert.Equal(16 + 8, b[0 * n + 8]);
+            // rel +16: 8 + int(log(2)/log(16)*8) = 8 + 2 = 10
+            Assert.Equal(16 + 10, b[0 * n + 16]);
+            // rel +32: 8 + int(log(4)/log(16)*8) = 8 + 4 = 12
+            Assert.Equal(16 + 12, b[0 * n + 32]);
+            // rel -39: 8 + int(log(39/8)/log(16)*8) = 8 + 4 = 12
+            Assert.Equal(12, b[39 * n + 0]);
+        }
+
+        // ---- patchify ---------------------------------------------------------
+
+        [Fact]
+        public void PatchifyUnpatchifyRoundTrip()
+        {
+            int lt = 3, lh = 6, lw = 4;
+            var rng = new Random(1);
+            var latent = new float[16 * lt * lh * lw];
+            for (int i = 0; i < latent.Length; i++) latent[i] = (float)rng.NextDouble();
+            var tokens = new float[latent.Length];
+            WanVideoPipeline.Patchify(latent, tokens, lt, lh, lw, 16, 64, 0);
+            var back = new float[latent.Length];
+            WanVideoPipeline.Unpatchify(tokens, back, lt, lh, lw, 16, 64);
+            Assert.Equal(latent, back);
+        }
+
+        [Fact]
+        public void PatchifyUnpatchifyRoundTrip48Channels()
+        {
+            // Wan 2.2 TI2V: 48-channel latent, 192-wide tokens.
+            int lt = 2, lh = 4, lw = 4;
+            var rng = new Random(7);
+            var latent = new float[48 * lt * lh * lw];
+            for (int i = 0; i < latent.Length; i++) latent[i] = (float)rng.NextDouble();
+            var tokens = new float[latent.Length];
+            WanVideoPipeline.Patchify(latent, tokens, lt, lh, lw, 48, 192, 0);
+            var back = new float[latent.Length];
+            WanVideoPipeline.Unpatchify(tokens, back, lt, lh, lw, 48, 192);
+            Assert.Equal(latent, back);
+        }
+
+        [Fact]
+        public void PatchifyFeatureLayoutIsConvKernelOrder()
+        {
+            // feature index must be kw + 2*kh + 4*c (the flattened GGUF conv kernel
+            // layout [kw, kh, kd, ic, oc]).
+            int lt = 1, lh = 2, lw = 2;
+            var latent = new float[16 * lt * lh * lw];
+            // channel c=3, position (h=1, w=0) => kh=1, kw=0 of token 0
+            latent[3 * (lh * lw) + 1 * lw + 0] = 42f;
+            var tokens = new float[latent.Length];
+            WanVideoPipeline.Patchify(latent, tokens, lt, lh, lw, 16, 64, 0);
+            Assert.Equal(42f, tokens[0 + 2 * 1 + 4 * 3]);
+        }
+
+        [Fact]
+        public void PatchifyChannelOffsetWritesBehindNoiseFeatures()
+        {
+            // A14B I2V: the 20 conditioning channels (4 mask + 16 image latent) land at
+            // feature offset 64 of the 144-wide token (global channel index 16 + c).
+            int lt = 1, lh = 2, lw = 2;
+            var cond = new float[20 * lt * lh * lw];
+            cond[0] = 7f;                       // mask channel 0 at (h=0, w=0)
+            var tokens = new float[144];
+            WanVideoPipeline.Patchify(cond, tokens, lt, lh, lw, 20, 80, 0);
+            var full = new float[144];
+            Array.Copy(tokens, 0, full, 64, 80);
+            Assert.Equal(7f, full[64 + 0]);     // feature kw=0,kh=0 of global channel 16
+        }
+
+        // ---- parameter snapping ----------------------------------------------
+
+        [Theory]
+        [InlineData(832, 832)]
+        [InlineData(830, 832)]
+        [InlineData(1, 16)]
+        [InlineData(479, 480)]
+        public void SnapDimRoundsToSixteen(int input, int expected)
+            => Assert.Equal(expected, WanVideoPipeline.SnapDim(input));
+
+        [Theory]
+        [InlineData(1, 1)]
+        [InlineData(2, 5)]
+        [InlineData(33, 33)]
+        [InlineData(30, 33)]
+        [InlineData(16, 17)]
+        public void SnapFramesRoundsToVaeTemporalGrid(int input, int expected)
+            => Assert.Equal(expected, WanVideoPipeline.SnapFrames(input));
+
+        // ---- RoPE -------------------------------------------------------------
+
+        [Fact]
+        public void RopeAxisSplitIs44_42_42()
+        {
+            // head_dim 128 splits t/h/w = 44/42/42 (diffusers WanRotaryPosEmbed).
+            var rope = WanRope.Build(2, 3, 4);
+            Assert.Equal(2 * 3 * 4 * 128, rope.Cos.Length);
+            // pair-duplicated layout: cos[2i] == cos[2i+1]
+            for (int i = 0; i < 64; i++)
+                Assert.Equal(rope.Cos[2 * i], rope.Cos[2 * i + 1]);
+            // token (t=0,h=0,w=0) has angle 0 everywhere -> cos 1, sin 0
+            for (int i = 0; i < 128; i++)
+            {
+                Assert.Equal(1f, rope.Cos[i], 5);
+                Assert.Equal(0f, rope.Sin[i], 5);
+            }
+            // token (t=1,h=0,w=0): first t-axis pair rotates by angle 1 (pos 1, freq 1)
+            long o = (long)(1 * 3 * 4) * 0;   // token index for t=1 is 12
+            long tok12 = 12 * 128;
+            Assert.Equal(MathF.Cos(1f), rope.Cos[tok12 + 0], 5);
+            // h/w-axis pairs of that token stay at angle 0 (h=w=0)
+            Assert.Equal(1f, rope.Cos[tok12 + 2 * 22], 5);
+            Assert.Equal(1f, rope.Cos[tok12 + 2 * 43], 5);
+        }
+
+        // ---- UniPC scheduler ---------------------------------------------------
+
+        [Fact]
+        public void UniPCMatchesDiffusersOracle()
+        {
+            // Reference trajectory from diffusers UniPCMultistepScheduler
+            // (prediction_type="flow_prediction", use_flow_sigmas=True, flow_shift=8,
+            // solver_order=2), 10 steps over x0 = cos(i+1) with the deterministic
+            // fake model v = sin(0.7*x + 0.3*k) + 0.1*x.
+            var sch = new WanUniPCScheduler(10, 8.0f);
+            Assert.Equal(0.999999f, sch.Sigmas[0], 5);
+            Assert.Equal(0.9863164f, sch.Sigmas[1], 5);
+            Assert.Equal(0.4730704f, sch.Sigmas[9], 5);
+            Assert.Equal(0f, sch.Sigmas[10], 5);
+            Assert.Equal(999f, sch.Timesteps[0]);
+            Assert.Equal(986f, sch.Timesteps[1]);
+            Assert.Equal(473f, sch.Timesteps[9]);
+
+            int n = 8;
+            var x = new float[n];
+            for (int i = 0; i < n; i++) x[i] = MathF.Cos(i + 1);
+            for (int k = 0; k < sch.Steps; k++)
+            {
+                var v = new float[n];
+                for (int i = 0; i < n; i++) v[i] = MathF.Sin(x[i] * 0.7f + k * 0.3f) + 0.1f * x[i];
+                x = sch.Step(x, v);
+            }
+            float[] expected = { 0.038064f, -1.197444f, -1.761833f, -1.445976f, -0.329927f, 0.685251f, 0.361508f, -0.886314f };
+            for (int i = 0; i < n; i++)
+                Assert.True(Math.Abs(x[i] - expected[i]) < 2e-4,
+                    $"lane {i}: {x[i]} vs diffusers {expected[i]}");
+        }
+
+        // ---- timestep sinusoid -------------------------------------------------
+
+        [Fact]
+        public void SinusoidIsCosThenSin()
+        {
+            var dst = new float[256];
+            WanDiT.FillSinusoid(dst, 0f);
+            for (int i = 0; i < 128; i++) Assert.Equal(1f, dst[i], 5);       // cos(0)
+            for (int i = 128; i < 256; i++) Assert.Equal(0f, dst[i], 5);     // sin(0)
+            WanDiT.FillSinusoid(dst, 1000f);
+            Assert.Equal(MathF.Cos(1000f), dst[0], 3);
+            Assert.Equal(MathF.Sin(1000f), dst[128], 3);
+            // freq j: 10000^(-j/128)
+            Assert.Equal(MathF.Cos(1000f * MathF.Pow(10000f, -1f / 128f)), dst[1], 3);
+        }
+
+        // ---- tokenizer vs HuggingFace reference (needs the local UMT5 GGUF) ----
+
+        private const string TePath = @"C:\Works\models\wan\umt5-xxl-encoder-Q8_0.gguf";
+
+        [Fact]
+        public void TokenizerMatchesHuggingFaceReference()
+        {
+            if (!File.Exists(TePath)) return;   // model not present on this machine
+            using var te = new WanTextEncoder(TePath);
+
+            // Reference ids from transformers AutoTokenizer
+            // (Wan-AI/Wan2.1-T2V-1.3B-Diffusers, subfolder=tokenizer), add_special_tokens=True.
+            AssertTokens(te, "a lovely cat", new[] { 289, 51486, 6283, 1 });
+            AssertTokens(te,
+                "a close-up photo of a fluffy orange cat sitting on a wooden table, warm lighting",
+                new[] { 289, 13304, 280, 1753, 7821, 329, 289, 8778, 139412, 36062, 6283, 83267,
+                        369, 289, 129805, 8338, 275, 13809, 76320, 1 });
+            // CJK coverage: a prefix of the official Wan negative prompt.
+            AssertTokens(te,
+                "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量",
+                new[] { 273, 1838, 8483, 181911, 30993, 356, 4915, 85615, 356, 15665, 13607, 356,
+                        17121, 8024, 7921, 162805, 1013, 3815, 356, 5549, 16096, 356, 6865, 3967,
+                        356, 9103, 356, 7084, 2354, 356, 16927, 356, 15665, 10671, 356, 44776,
+                        2390, 46846, 356, 2740, 5731, 20499, 356, 3846, 20499, 1 });
+        }
+
+        private static void AssertTokens(WanTextEncoder te, string text, int[] expected)
+        {
+            int[] padded = te.PrepareTokens(text, out int realLen);
+            Assert.Equal(expected.Length, realLen);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], padded[i]);
+            for (int i = realLen; i < padded.Length; i++)
+                Assert.Equal(0, padded[i]);
+        }
+    }
+}

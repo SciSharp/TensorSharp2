@@ -200,6 +200,7 @@ namespace TensorSharp.Cli
             float cfgScale = 2.5f;   // Qwen-Image-Edit-2511 recommendation; 4.0 over-guides (distorts faces)
             bool cfgScaleSet = false;          // explicit --cfg (image edit passes 0 = auto otherwise)
             bool diffusionStepsSet = false;    // explicit --diffusion-steps (image edit passes 0 = auto otherwise)
+            bool diffusionSeedSet = false;     // explicit --diffusion-seed (video draws a random seed otherwise)
             // Qwen-Image-Edit companion GGUFs. The qwen_image DiT GGUF (passed via
             // --model) carries none of these, so the operator can point at them
             // explicitly instead of relying on a same-directory scan / env vars.
@@ -208,6 +209,14 @@ namespace TensorSharp.Cli
             string qwenImageMmprojPath = null;
             string qwenImageLoraPath = null;
             bool offloadCpu = false;
+            // Wan text-to-video knobs.
+            int videoFrames = 0;       // 0 = model default (33)
+            int videoFps = 0;          // 0 = model default (16)
+            float flowShift = 0f;      // 0 = auto (8.0 for 1.3B video; 3.0/5.0 otherwise)
+            string videoSampler = null;   // null = unipc (the official Wan sampler)
+            string negativePrompt = null;
+            string wanVaePath = null;
+            string wanTePath = null;
             string draftModelPath = null;
             int specDraftMax = 0;
             float specDraftConfMin = -1f;
@@ -230,6 +239,13 @@ namespace TensorSharp.Cli
                     case "--qwen-image-vl": qwenImageVlPath = args[++i]; break;
                     case "--qwen-image-mmproj": qwenImageMmprojPath = args[++i]; break;
                     case "--qwen-image-lora": qwenImageLoraPath = args[++i]; break;
+                    case "--video-frames": videoFrames = int.Parse(args[++i]); break;
+                    case "--fps": videoFps = int.Parse(args[++i]); break;
+                    case "--flow-shift": flowShift = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                    case "--sampler": videoSampler = args[++i]; break;
+                    case "--negative-prompt": negativePrompt = args[++i]; break;
+                    case "--wan-vae": wanVaePath = args[++i]; break;
+                    case "--wan-te": wanTePath = args[++i]; break;
                     case "--offload-cpu": offloadCpu = true; break;
                     case "--audio": audioPath = args[++i]; break;
                     case "--video": videoPath = args[++i]; break;
@@ -320,7 +336,7 @@ namespace TensorSharp.Cli
                     }
                     case "--warmup-runs": warmupInferenceRuns = int.Parse(args[++i]); break;
                     case "--diffusion-steps": diffusionSteps = int.Parse(args[++i]); diffusionStepsSet = true; break;
-                    case "--diffusion-seed": diffusionSeed = int.Parse(args[++i]); break;
+                    case "--diffusion-seed": diffusionSeed = int.Parse(args[++i]); diffusionSeedSet = true; break;
                     case "--width": imageWidth = int.Parse(args[++i]); break;
                     case "--height": imageHeight = int.Parse(args[++i]); break;
                     case "--diffusion-blocks": diffusionBlocks = int.Parse(args[++i]); break;
@@ -484,6 +500,10 @@ namespace TensorSharp.Cli
             if (offloadCpu)
                 Environment.SetEnvironmentVariable("TS_QWEN_IMAGE_OFFLOAD_CPU", "1");
 
+            // Wan T2V: companion overrides (same env-var mechanism WanVideoModel reads).
+            ApplyQwenImageCompanionOverride("--wan-vae", "TS_WAN_VAE", wanVaePath);
+            ApplyQwenImageCompanionOverride("--wan-te", "TS_WAN_TE", wanTePath);
+
             if (MoeCpuOffloadConfig.IsEnabled)
             {
                 _log.LogInformation(LogEventIds.HostConfiguration,
@@ -540,6 +560,28 @@ namespace TensorSharp.Cli
                     ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : "");
                 string outPath = outputFile ?? "edited.png";
                 RunImageEdit(qwenImageModel, imagePathList, prompt, outPath, diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f, diffusionSeed, imageWidth, imageHeight);
+                return;
+            }
+
+            // Wan video generation: prompt (+ optional --image for Wan 2.2 image-to-video)
+            // -> MP4 (no autoregressive path).
+            if (model is TensorSharp.Models.WanVideo.WanVideoModel wanModel)
+            {
+                string prompt = editPrompt
+                    ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : null);
+                if (string.IsNullOrWhiteSpace(prompt))
+                {
+                    Console.Error.WriteLine("Wan video generation requires --prompt \"<description>\" (or --input prompt.txt). " +
+                        "Optionally --image first_frame.png (Wan 2.2 image-to-video), --output out.mp4, --width, " +
+                        "--height, --video-frames, --fps, --diffusion-steps, --cfg, --flow-shift, " +
+                        "--negative-prompt, --diffusion-seed.");
+                    return;
+                }
+                RunVideoGeneration(wanModel, prompt, outputFile ?? "wan_video.mp4",
+                    imageWidth, imageHeight, videoFrames,
+                    diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f,
+                    diffusionSeedSet ? diffusionSeed : -1, flowShift, videoFps, negativePrompt,
+                    videoSampler, imagePath);
                 return;
             }
 
@@ -1522,6 +1564,60 @@ namespace TensorSharp.Cli
             TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, output);
             Console.WriteLine($"Saved {output.Width}x{output.Height} edited image to {outputPath} " +
                 $"({sw.Elapsed.TotalSeconds:F1}s, {sw.Elapsed.TotalMilliseconds / Math.Max(1, steps):F0} ms/step)");
+        }
+
+        static void RunVideoGeneration(TensorSharp.Models.WanVideo.WanVideoModel model,
+            string prompt, string outputPath, int width, int height, int frames,
+            int steps, float cfgScale, int seed, float flowShift, int fps, string negativePrompt,
+            string sampler = null, string imagePath = null)
+        {
+            Console.WriteLine(imagePath != null ? "=== Wan Image-to-Video ===" : "=== Wan Text-to-Video ===");
+            Console.WriteLine($"  prompt : {prompt}");
+            if (imagePath != null)
+            {
+                if (!File.Exists(imagePath))
+                {
+                    Console.Error.WriteLine($"Conditioning image not found: {imagePath}");
+                    return;
+                }
+                Console.WriteLine($"  image  : {imagePath}");
+            }
+            Console.WriteLine($"  -> {outputPath}");
+
+            var p = new TensorSharp.Models.WanVideo.WanVideoParams
+            {
+                Width = width,
+                Height = height,
+                Frames = frames,
+                Steps = steps,
+                CfgScale = cfgScale,
+                Seed = seed,
+                FlowShift = flowShift,
+                Fps = fps,
+                NegativePrompt = negativePrompt,
+                Sampler = sampler,
+                ImagePath = imagePath,
+            };
+            var sw = Stopwatch.StartNew();
+            var video = model.GenerateVideo(prompt, p);
+            sw.Stop();
+            string codec;
+            if (outputPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+            {
+                // Single-frame (text-to-image) convenience: --output out.png writes the
+                // first frame as a PNG (additional frames as out_00001.png, ...).
+                TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, video.Frames[0]);
+                for (int i = 1; i < video.Frames.Length; i++)
+                    TensorSharp.Models.QwenImage.ImageIO.SavePng(
+                        Path.ChangeExtension(outputPath, null) + $"_{i:D5}.png", video.Frames[i]);
+                codec = "png";
+            }
+            else
+            {
+                codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outputPath, video.Frames, video.Fps);
+            }
+            Console.WriteLine($"Saved {video.Frames[0].Width}x{video.Frames[0].Height} x {video.Frames.Length} frames " +
+                $"({codec}, {video.Fps} fps, seed {video.Seed}) to {outputPath} in {sw.Elapsed.TotalSeconds:F1}s");
         }
 
         static void RunDiffusion(DiffusionGemmaModel model, string rawText, string systemPrompt,

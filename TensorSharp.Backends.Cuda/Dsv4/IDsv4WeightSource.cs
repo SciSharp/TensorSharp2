@@ -25,4 +25,25 @@ namespace TensorSharp.Cuda
         /// </summary>
         void Read(long offset, IntPtr dst, long bytes);
     }
+
+    /// <summary>
+    /// Optional capability of an <see cref="IDsv4WeightSource"/>: hand out a
+    /// stable read-only pointer into a file mapping of the shard. Weights that
+    /// stay in host RAM for the engine's lifetime (the <c>--n-cpu-moe</c>
+    /// routed experts) borrow the mapping instead of taking a private copy:
+    /// file-backed pages are page cache the kernel can evict and re-read, so
+    /// experts that outweigh the host's memory allowance (the cgroup limit on
+    /// containers, where a private 137 GiB copy is a silent OOM SIGKILL)
+    /// degrade to storage speed instead of killing the process.
+    /// </summary>
+    public interface IDsv4MappedWeightSource : IDsv4WeightSource
+    {
+        /// <summary>
+        /// Maps <c>[offset, offset+bytes)</c> of the shard read-only. The
+        /// pointer stays valid until the source is disposed, which therefore
+        /// must not happen before the engine that borrowed it. False when the
+        /// platform or filesystem cannot map; callers fall back to a copy.
+        /// </summary>
+        bool TryMapRange(long offset, long bytes, out IntPtr ptr);
+    }
 }

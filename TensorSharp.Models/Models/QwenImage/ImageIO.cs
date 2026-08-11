@@ -75,6 +75,9 @@ namespace TensorSharp.Models.QwenImage
         public static RgbImage Decode(byte[] data)
         {
             using var image = new MagickImage(data);
+            // Apply the EXIF orientation (phone photos are stored rotated with an
+            // orientation tag; the reference pipelines' loaders all honor it).
+            image.AutoOrient();
             image.Alpha(AlphaOption.Off);
             if (image.ColorSpace != ColorSpace.sRGB)
                 image.ColorSpace = ColorSpace.sRGB;

@@ -47,6 +47,16 @@ namespace TensorSharp.Cuda
         // head_dim -> ts_vision_attention_d<D>_f32 (bidirectional flash attention
         // for vision encoders). Only the instantiated head dims are present.
         private readonly System.Collections.Generic.Dictionary<int, IntPtr> visionAttentionF32 = new();
+        // Wan video direct-backend kernels (optional: absent from PTX built before
+        // they existed; callers must check the Has* accessors).
+        private readonly System.Collections.Generic.Dictionary<int, IntPtr> wanAttentionF32 = new();
+        private readonly IntPtr wanRopeF32;
+        private readonly IntPtr wanModulateF32;
+        private readonly IntPtr wanGateAddF32;
+        private readonly IntPtr wanScaleColsF32;
+        private readonly IntPtr wanIm2colF32;
+        private readonly IntPtr wanChanRmsF32;
+        private readonly IntPtr wanUpsample2xF32;
         private readonly IntPtr gqaPrefillAttentionF32;
         private readonly IntPtr gqaPrefillAttentionF16;
         private readonly IntPtr gqaPrefillAttentionGroup4D256F32;
@@ -218,6 +228,18 @@ namespace TensorSharp.Cuda
                 try { visionAttentionF32[headDim] = module.GetFunction($"ts_vision_attention_d{headDim}_f32"); }
                 catch { }
             }
+            foreach (int headDim in new[] { 64, 128 })
+            {
+                try { wanAttentionF32[headDim] = module.GetFunction($"ts_wan_attention_d{headDim}_f32"); }
+                catch { }
+            }
+            wanRopeF32 = GetOptionalFunction(module, "ts_wan_rope_f32");
+            wanModulateF32 = GetOptionalFunction(module, "ts_wan_modulate_f32");
+            wanGateAddF32 = GetOptionalFunction(module, "ts_wan_gate_add_f32");
+            wanScaleColsF32 = GetOptionalFunction(module, "ts_wan_scale_cols_f32");
+            wanIm2colF32 = GetOptionalFunction(module, "ts_wan_im2col_f32");
+            wanChanRmsF32 = GetOptionalFunction(module, "ts_wan_chan_rms_f32");
+            wanUpsample2xF32 = GetOptionalFunction(module, "ts_wan_upsample2x_f32");
             gqaPrefillAttentionF32 = module.GetFunction("ts_gqa_prefill_attention_f32");
             gqaPrefillAttentionF16 = module.GetFunction("ts_gqa_prefill_attention_f16");
             gqaPrefillAttentionGroup4D256F32 = module.GetFunction("ts_gqa_prefill_attention_group4_d256_f32");
@@ -872,6 +894,137 @@ namespace TensorSharp.Cuda
             const int threads = 128; // must match TS_VISION_ATTN_THREADS
             uint qBlocks = (uint)((seq + threads - 1) / threads);
             Launch(visionAttentionF32[headDim], qBlocks, (uint)numHeads, 1, threads, 1, 1, 0, stream, args);
+        }
+
+        private static IntPtr GetOptionalFunction(CudaModule module, string name)
+        {
+            try { return module.GetFunction(name); }
+            catch { return IntPtr.Zero; }
+        }
+
+        private static uint GridLong(long count)
+        {
+            long blocks = (count + BlockSize - 1) / BlockSize;
+            return (uint)Math.Max(1, Math.Min(blocks, uint.MaxValue));
+        }
+
+        public bool HasWanAttentionF32(int headDim) => wanAttentionF32.ContainsKey(headDim);
+        public bool HasWanRopeF32 => wanRopeF32 != IntPtr.Zero;
+        public bool HasWanModulateF32 => wanModulateF32 != IntPtr.Zero;
+        public bool HasWanGateAddF32 => wanGateAddF32 != IntPtr.Zero;
+        public bool HasWanScaleColsF32 => wanScaleColsF32 != IntPtr.Zero;
+        public bool HasWanIm2colF32 => wanIm2colF32 != IntPtr.Zero;
+        public bool HasWanChanRmsF32 => wanChanRmsF32 != IntPtr.Zero;
+        public bool HasWanUpsample2xF32 => wanUpsample2xF32 != IntPtr.Zero;
+
+        /// <summary>Streaming attention over token-major [seq, heads, head_dim] q/k/v with
+        /// independent kv length and optional additive [heads, sq, sk] bias (IntPtr.Zero = none).</summary>
+        public void LaunchWanAttentionF32(
+            IntPtr query, IntPtr key, IntPtr value, IntPtr bias, IntPtr output,
+            int numHeads, int seqQ, int seqK, int headDim, float scale, IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr biasArg = bias;
+            IntPtr outputArg = output;
+            int numHeadsArg = numHeads;
+            int seqQArg = seqQ;
+            int seqKArg = seqK;
+            float scaleArg = scale;
+            void** args = stackalloc void*[]
+            { &queryArg, &keyArg, &valueArg, &biasArg, &outputArg, &numHeadsArg, &seqQArg, &seqKArg, &scaleArg };
+            const int warps = 8;             // must match TS_WAN_ATTN_WARPS
+            const int queriesPerWarp = 4;    // must match TS_WAN_ATTN_QPW
+            int qPerBlock = warps * queriesPerWarp;
+            uint qBlocks = (uint)((seqQ + qPerBlock - 1) / qPerBlock);
+            Launch(wanAttentionF32[headDim], qBlocks, (uint)numHeads, 1, warps * 32, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchWanRopeF32(IntPtr x, IntPtr cos, IntPtr sin, int heads, int seq, int headDim, IntPtr stream)
+        {
+            IntPtr xArg = x;
+            IntPtr cosArg = cos;
+            IntPtr sinArg = sin;
+            int headsArg = heads;
+            int seqArg = seq;
+            int headDimArg = headDim;
+            void** args = stackalloc void*[] { &xArg, &cosArg, &sinArg, &headsArg, &seqArg, &headDimArg };
+            Launch(wanRopeF32, GridLong((long)seq * heads * (headDim / 2)), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchWanModulateF32(IntPtr y, IntPtr x, IntPtr shift, IntPtr scale,
+            long rowFrom, long rowCount, int cols, IntPtr stream)
+        {
+            IntPtr yArg = y;
+            IntPtr xArg = x;
+            IntPtr shiftArg = shift;
+            IntPtr scaleArg = scale;
+            long rowFromArg = rowFrom;
+            long rowCountArg = rowCount;
+            int colsArg = cols;
+            void** args = stackalloc void*[] { &yArg, &xArg, &shiftArg, &scaleArg, &rowFromArg, &rowCountArg, &colsArg };
+            Launch(wanModulateF32, GridLong(rowCount * cols), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchWanGateAddF32(IntPtr x, IntPtr v, IntPtr gate,
+            long rowFrom, long rowCount, int cols, IntPtr stream)
+        {
+            IntPtr xArg = x;
+            IntPtr vArg = v;
+            IntPtr gateArg = gate;
+            long rowFromArg = rowFrom;
+            long rowCountArg = rowCount;
+            int colsArg = cols;
+            void** args = stackalloc void*[] { &xArg, &vArg, &gateArg, &rowFromArg, &rowCountArg, &colsArg };
+            Launch(wanGateAddF32, GridLong(rowCount * cols), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchWanScaleColsF32(IntPtr x, IntPtr gain, long rows, int cols, IntPtr stream)
+        {
+            IntPtr xArg = x;
+            IntPtr gainArg = gain;
+            long rowsArg = rows;
+            int colsArg = cols;
+            void** args = stackalloc void*[] { &xArg, &gainArg, &rowsArg, &colsArg };
+            Launch(wanScaleColsF32, GridLong(rows * cols), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchWanIm2colF32(IntPtr input, IntPtr col,
+            int c, int h, int w, int kh, int kw, int oh, int ow,
+            int padH, int padW, int strideH, int strideW, int oy0, int bandOh, IntPtr stream)
+        {
+            IntPtr inputArg = input;
+            IntPtr colArg = col;
+            int cArg = c, hArg = h, wArg = w, khArg = kh, kwArg = kw, ohArg = oh, owArg = ow;
+            int padHArg = padH, padWArg = padW, strideHArg = strideH, strideWArg = strideW;
+            int oy0Arg = oy0, bandOhArg = bandOh;
+            void** args = stackalloc void*[]
+            {
+                &inputArg, &colArg, &cArg, &hArg, &wArg, &khArg, &kwArg, &ohArg, &owArg,
+                &padHArg, &padWArg, &strideHArg, &strideWArg, &oy0Arg, &bandOhArg,
+            };
+            Launch(wanIm2colF32, GridLong((long)c * kh * kw * bandOh * ow), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchWanChanRmsF32(IntPtr x, IntPtr gamma, int c, long hw, float eps, IntPtr stream)
+        {
+            IntPtr xArg = x;
+            IntPtr gammaArg = gamma;
+            int cArg = c;
+            long hwArg = hw;
+            float epsArg = eps;
+            void** args = stackalloc void*[] { &xArg, &gammaArg, &cArg, &hwArg, &epsArg };
+            Launch(wanChanRmsF32, GridLong(hw), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchWanUpsample2xF32(IntPtr src, IntPtr dst, int c, int h, int w, IntPtr stream)
+        {
+            IntPtr srcArg = src;
+            IntPtr dstArg = dst;
+            int cArg = c, hArg = h, wArg = w;
+            void** args = stackalloc void*[] { &srcArg, &dstArg, &cArg, &hArg, &wArg };
+            Launch(wanUpsample2xF32, GridLong((long)c * 4 * h * w), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchRMSNormF32(IntPtr input, IntPtr alpha, IntPtr beta, IntPtr output, int rows, int cols, float eps, IntPtr stream)

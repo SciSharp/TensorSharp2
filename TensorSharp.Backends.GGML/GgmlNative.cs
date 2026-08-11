@@ -605,6 +605,180 @@ public struct QwenImageForwardArgs
     public float Eps;
 }
 
+// One (possibly quantized) weight matrix + optional F32 bias for the Wan video
+// kernels. MUST match native TSGWanW exactly.
+[StructLayout(LayoutKind.Sequential)]
+public struct WanW
+{
+    public IntPtr W;
+    public int Type;
+    public int Reserved;
+    public long Ne0, Ne1;      // ggml dims: ne0 = input dim, ne1 = output dim
+    public long Bytes;
+    public IntPtr B;           // [Ne1] F32 bias or zero
+}
+
+// One UMT5 encoder layer. MUST match native TSGWanT5LayerW.
+[StructLayout(LayoutKind.Sequential)]
+public struct WanT5LayerW
+{
+    public WanW Q, K, V, O;
+    public WanW Gate, Up, Down;      // wi_0 / wi_1 / wo
+    public IntPtr AttnNorm;          // [dim] F32 RMS gain
+    public IntPtr FfnNorm;           // [dim] F32 RMS gain
+    public IntPtr RelB;              // [heads, 32] F32 relative-attention bias
+}
+
+// Whole UMT5 encoder forward (TSGgml_WanT5Encode). MUST match native TSGgmlWanT5Desc.
+[StructLayout(LayoutKind.Sequential)]
+public struct WanT5EncodeArgs
+{
+    public IntPtr Tokens;            // I32 [NTokens]
+    public IntPtr RelBucket;         // I32 [NTokens * NTokens], bucket[q*n + k]
+    public IntPtr AttnMask;          // F32 [NTokens] additive (0 / -inf) or zero
+    public WanW TokEmbd;
+    public IntPtr Layers;            // -> WanT5LayerW[NumLayers]
+    public IntPtr FinalNorm;         // [dim] F32
+    public IntPtr Out;               // F32 [dim * NTokens] written
+    public int NTokens, NumLayers, Dim, Ff, Heads, HeadDim;
+    public float Eps;
+    public int StructBytes;
+}
+
+// One Wan DiT block. MUST match native TSGWanDitBlockW.
+[StructLayout(LayoutKind.Sequential)]
+public struct WanDitBlockW
+{
+    public IntPtr Modulation;        // [6*dim] F32
+    public WanW SQ, SK, SV, SO;      // self-attention (+bias)
+    public IntPtr SNormQ, SNormK;    // [dim] F32 full-dim RMS gains
+    public IntPtr Norm3W, Norm3B;    // [dim] F32 cross-attn LayerNorm affine
+    public WanW XQ, XK, XV, XO;      // cross-attention (+bias)
+    public IntPtr XNormQ, XNormK;    // [dim] F32
+    public WanW Ffn0, Ffn2;          // FFN (+bias)
+}
+
+// One Wan DiT denoising-step forward (TSGgml_WanDitForward). MUST match native
+// TSGgmlWanDitDesc.
+[StructLayout(LayoutKind.Sequential)]
+public struct WanDitForwardArgs
+{
+    public IntPtr X;                 // F32 [in_tok, Seq] patchified tokens (in)
+    public IntPtr Out;               // F32 [out_tok, Seq] velocity tokens (out)
+    public IntPtr Context;           // F32 [TextDim, CtxLen]
+    public IntPtr TSin;              // F32 [FreqDim] sinusoidal timestep embedding
+    public IntPtr TSin0;             // F32 [FreqDim] sinusoid for tokens [0, Seq0) or zero
+    public IntPtr CosF, SinF;        // F32 [HeadDim, Seq] pair-duplicated RoPE tables
+    public WanW Patch;               // [in_tok, dim] (+bias)
+    public WanW Text0, Text2;
+    public WanW Time0, Time2;
+    public WanW TProj;
+    public WanW Head;
+    public IntPtr HeadMod;           // [2*dim] F32
+    public IntPtr Blocks;            // -> WanDitBlockW[NumLayers]
+    // Seq0 > 0: tokens [0, Seq0) are AdaLN-modulated with TSin0's timestep (Wan 2.2
+    // TI2V i2v conditions the first latent frame at timestep 0). 0 = uniform.
+    public int NumLayers, Dim, Ff, Heads, HeadDim, Seq, CtxLen, FreqDim, TextDim, Seq0;
+    public float Eps;
+    public int StructBytes;
+}
+
+// One causal conv3d of the Wan VAE, pre-sliced by temporal tap on the managed side.
+// MUST match native TSGWanVaeConv.
+[StructLayout(LayoutKind.Sequential)]
+public struct WanVaeConv
+{
+    public IntPtr Tap0, Tap1, Tap2;  // [k, k, ic, oc] F32 kernels (Tap1/2 zero when Kd == 1)
+    public IntPtr Bias;              // [oc] F32 or zero
+    public int Kd, K, Ic, Oc;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WanVaeNorm
+{
+    public IntPtr Gamma;             // [C] F32
+    public int C, Pad;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WanVaeResBlockW
+{
+    public WanVaeNorm N0, N3;
+    public WanVaeConv C2, C6;
+    public WanVaeConv Shortcut;      // Tap0 == zero => identity
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WanVaeAttnW
+{
+    public WanVaeNorm Norm;
+    public IntPtr QkvW;              // [c, 3c] F32
+    public IntPtr QkvB;              // [3c] F32
+    public IntPtr ProjW;             // [c, c] F32
+    public IntPtr ProjB;             // [c] F32
+    public int C, Pad;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WanVaeUpsampleW
+{
+    public WanVaeConv TimeConv;      // (3,1,1) dim -> 2*dim; Tap0 == zero => spatial-only
+    public WanVaeConv SConv;         // 3x3 2D conv after nearest x2
+}
+
+// Whole Wan VAE decode (TSGgml_WanVaeDecode). MUST match native
+// TSGgmlWanVaeDecodeDesc exactly (Res0..Res11 = 4 scales x 3 residual blocks).
+[StructLayout(LayoutKind.Sequential)]
+public struct WanVaeDecodeArgs
+{
+    public IntPtr Z;                 // F32 [zw, zh, zc, zt] ([W,H,C,T] layout)
+    public IntPtr Out;               // F32 [zw*8*patch, zh*8*patch, 3, 1+(zt-1)*4] written
+    public long OutLen;
+    public WanVaeConv Conv2;         // post-quant 1x1x1
+    public WanVaeConv Conv1;         // 3x3x3 (zc -> 384 / 1024)
+    public WanVaeResBlockW Mid0, Mid2;
+    public WanVaeAttnW Mid1;
+    public WanVaeResBlockW Res0, Res1, Res2, Res3, Res4, Res5, Res6, Res7, Res8, Res9, Res10, Res11;
+    public WanVaeUpsampleW Up0, Up1, Up2;
+    public WanVaeNorm HeadNorm;
+    public WanVaeConv HeadConv;      // 3x3x3 (96 -> 3, or 256 -> 12 for wan2.2)
+    public int Zw, Zh, Zt, Zc;
+    public int Version;              // 1 (or 0) = wan2.1; 2 = wan2.2 TI2V
+    public int PatchSize;            // pixel unpatchify factor (2 for wan2.2, else 1)
+    public int StructBytes;
+}
+
+// One encoder Resample stage. MUST match native TSGWanVaeDownW.
+[StructLayout(LayoutKind.Sequential)]
+public struct WanVaeDownW
+{
+    public WanVaeConv SConv;         // 3x3 stride-2 2D conv (Kd == 1)
+    public WanVaeConv TConv;         // (3,1,1) stride-2 temporal conv; Tap0 == zero => downsample2d
+}
+
+// Whole Wan VAE encode (TSGgml_WanVaeEncode). MUST match native
+// TSGgmlWanVaeEncodeDesc exactly (Res0..Res7 = 4 scales x 2 residual blocks).
+[StructLayout(LayoutKind.Sequential)]
+public struct WanVaeEncodeArgs
+{
+    public IntPtr X;                 // F32 [PxW, PxH, PxC, PxT] pixels in [-1,1] ([W,H,C,T] layout)
+    public IntPtr Out;               // F32 [lw, lh, ZDim, lt] posterior mean, written
+    public long OutLen;
+    public WanVaeConv Stem;          // encoder conv1 (PxC -> dim, 3x3x3 causal)
+    public WanVaeResBlockW Res0, Res1, Res2, Res3, Res4, Res5, Res6, Res7;
+    public WanVaeDownW Down0, Down1, Down2;
+    public WanVaeResBlockW Mid0, Mid2;
+    public WanVaeAttnW Mid1;
+    public WanVaeNorm HeadNorm;
+    public WanVaeConv HeadConv;      // 3x3x3 -> 2*ZDim
+    public WanVaeConv Quant;         // 1x1x1 (2z -> 2z)
+    public int PxW, PxH, PxC, PxT;
+    public int ZDim;
+    public int Version;              // 1 (or 0) = wan2.1; 2 = wan2.2 TI2V
+    public int StructBytes;
+    public int Reserved;
+}
+
 internal enum GgmlUnaryOp
 {
     Neg = 1,
@@ -1816,6 +1990,55 @@ internal enum GgmlIndexReductionOp
             int r = TSGgml_QwenImageForward(in desc);
             if (r == 0)
                 Console.Error.WriteLine($"[qwen-image-forward FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_WanT5Encode(in WanT5EncodeArgs desc);
+
+        // Whole UMT5-XXL encoder forward in one resident-weight graph.
+        public static bool TryWanT5Encode(in WanT5EncodeArgs desc)
+        {
+            int r = TSGgml_WanT5Encode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[wan-t5 FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_WanDitForward(in WanDitForwardArgs desc);
+
+        // Whole Wan DiT forward (one denoising-step velocity prediction) in one
+        // resident-weight graph; persistent + CUDA-graph-captured per shape on CUDA.
+        public static bool TryWanDitForward(in WanDitForwardArgs desc)
+        {
+            int r = TSGgml_WanDitForward(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[wan-dit FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_WanVaeDecode(in WanVaeDecodeArgs desc);
+
+        // Whole Wan 2.1 video VAE decode (chunked causal 3D decoder) in one graph.
+        public static bool TryWanVaeDecode(in WanVaeDecodeArgs desc)
+        {
+            int r = TSGgml_WanVaeDecode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[wan-vae FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_WanVaeEncode(in WanVaeEncodeArgs desc);
+
+        // Whole Wan video VAE encode (chunked causal 3D encoder) in one graph.
+        public static bool TryWanVaeEncode(in WanVaeEncodeArgs desc)
+        {
+            int r = TSGgml_WanVaeEncode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[wan-vae-encode FAIL] {GetLastErrorMessage("(no native error)")}");
             return r != 0;
         }
 

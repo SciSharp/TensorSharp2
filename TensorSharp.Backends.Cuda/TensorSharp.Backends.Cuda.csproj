@@ -16,7 +16,13 @@
 
   <PropertyGroup>
     <CudaKernelDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'kernels'))</CudaKernelDir>
-    <PtxOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'ptx'))</PtxOutputDir>
+    <!-- Committed PTX baseline, used when nvcc is unavailable. nvcc output goes to
+         the intermediate directory below so that building never modifies files
+         tracked in git (see discussion #130); refresh the committed baseline
+         explicitly with `dotnet build -p:TensorSharpUpdateCommittedPtx=true`
+         after editing a kernel, and commit the resulting diff. -->
+    <CudaCommittedPtxDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'ptx'))</CudaCommittedPtxDir>
+    <PtxOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ptx', 'ptx'))</PtxOutputDir>
     <CudaPtxStampDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ptx'))</CudaPtxStampDir>
     <CudaArchResolverPs1>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'resolve-cuda-arch.ps1'))</CudaArchResolverPs1>
     <CudaArchResolverSh>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'resolve-cuda-arch.sh'))</CudaArchResolverSh>
@@ -35,7 +41,11 @@
     <!-- Headers the kernels #include (e.g. the vendored IQ2_XXS tables). Tracked as
          build inputs so editing them re-triggers the PTX compile below. -->
     <CudaKernelHeader Include="$(CudaKernelDir)/*.cuh" />
-    <Content Include="$(PtxOutputDir)/*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" Condition="Exists('$(PtxOutputDir)')">
+    <!-- The committed PTX baseline flows to this project's output, to referencing
+         projects and to publish layouts as cuda_kernels/*.ptx. On machines with
+         nvcc, SelectCudaPtxContent below swaps these for the locally compiled
+         PTX before target paths are assigned. -->
+    <Content Include="$(CudaCommittedPtxDir)/*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" Condition="Exists('$(CudaCommittedPtxDir)')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
@@ -66,6 +76,27 @@
              Importance="high"
              Text="WARNING: TensorSharp CUDA architecture detection failed; using $(CudaArchFallback)." />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="TensorSharp CUDA build: PTX target is $(_ResolvedCudaArch)" />
+  </Target>
+
+  <!-- When nvcc is available, replace the committed PTX Content items with the
+       locally compiled ones from the intermediate directory, so this project's
+       output, referencing projects and publish layouts all receive PTX that
+       matches the local kernel sources and GPU. Hooked before AssignTargetPaths
+       so the swapped items flow through GetCopyToOutputDirectoryItems to
+       consumers; skipped for IDE design-time builds, which should not probe
+       nvcc. CompileCudaPtx (BeforeTargets=BeforeBuild) has produced the files
+       by the time anything copies them. -->
+  <Target Name="SelectCudaPtxContent"
+          BeforeTargets="AssignTargetPaths"
+          DependsOnTargets="ResolveCudaPtxBuildSettings"
+          Condition="'$(DesignTimeBuild)' != 'true'">
+    <ItemGroup Condition="'$(_NvccExitCode)' == '0'">
+      <Content Remove="$(CudaCommittedPtxDir)/*.ptx" />
+      <Content Include="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')">
+        <Link>cuda_kernels\%(Filename).ptx</Link>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </Content>
+    </ItemGroup>
   </Target>
 
   <!-- The CUDA kernels are self-contained: the only data they needed from ggml
@@ -102,10 +133,18 @@
       <_ClExeDirClean>$(_ClExeDir.Split(';')[0].Trim().TrimEnd('\'))</_ClExeDirClean>
       <_CompilerBinDir>--compiler-bindir=&quot;$(_ClExeDirClean)&quot;</_CompilerBinDir>
     </PropertyGroup>
+    <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$(_CompilerBinDir)' != ''">
+      <!-- MSVC 14.5x toolsets (VS 2026) are newer than the host-compiler range
+           current CUDA toolkits accept, so nvcc aborts in host_config.h with
+           "unsupported Microsoft Visual Studio version!". Let it proceed; the
+           flag is a no-op once the installed CUDA toolkit officially supports
+           the toolset. -->
+      <_NvccAllowUnsupportedCompilerFlag Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(_CompilerBinDir)', 'MSVC\\14\.[5-9][0-9]'))">-allow-unsupported-compiler</_NvccAllowUnsupportedCompilerFlag>
+    </PropertyGroup>
     <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir);$(CudaPtxStampDir)" />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX for $(_ResolvedCudaArch)" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="nvcc -ptx -arch=$(_ResolvedCudaArch) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="nvcc -ptx -arch=$(_ResolvedCudaArch) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
     <WriteLinesToFile Condition="'$(_NvccExitCode)' == '0'"
                       File="$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp"
@@ -122,5 +161,22 @@
           DestinationFolder="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))"
           SkipUnchangedFiles="true"
           Condition="'@(_CompiledPtx)' != ''" />
+  </Target>
+
+  <!-- Explicit opt-in that copies the freshly compiled PTX over the committed
+       baseline in native/ptx:
+         dotnet build TensorSharp.Backends.Cuda -p:TensorSharpUpdateCommittedPtx=true
+       Run this after editing a .cu kernel and commit the resulting diff -
+       machines without nvcc run the committed PTX, so a kernel change that is
+       not regenerated here ships silently-stale kernels to them. Keep the
+       committed baseline's architecture stable (see DEVELOPMENT.md) so diffs
+       reflect real kernel changes. -->
+  <Target Name="UpdateCommittedCudaPtx"
+          AfterTargets="CompileCudaPtx"
+          Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(_NvccExitCode)' == '0'">
+    <Copy SourceFiles="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')"
+          DestinationFolder="$(CudaCommittedPtxDir)"
+          SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="Updated committed PTX baseline in $(CudaCommittedPtxDir) (arch $(_ResolvedCudaArch)); review and commit the diff." />
   </Target>
 </Project>

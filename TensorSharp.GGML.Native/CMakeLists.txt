@@ -85,6 +85,19 @@ if (APPLE)
 endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+    # MSVC 14.50+ (Visual Studio 2026) is newer than the host-compiler range
+    # current CUDA toolkits accept, so nvcc aborts in host_config.h with
+    # "unsupported Microsoft Visual Studio version!" - which surfaces here as
+    # a failed CUDA compiler identification ("No CMAKE_CUDA_COMPILER could be
+    # found" / "not able to compile a simple test program"). Pass
+    # -allow-unsupported-compiler so nvcc proceeds; the flag must be in
+    # CMAKE_CUDA_FLAGS *before* enable_language(CUDA) because CMake uses those
+    # flags during compiler identification too. It becomes a no-op once a CUDA
+    # toolkit that officially supports the installed toolset is used.
+    if (MSVC AND MSVC_VERSION GREATER_EQUAL 1950 AND NOT "${CMAKE_CUDA_FLAGS}" MATCHES "allow-unsupported-compiler")
+        string(APPEND CMAKE_CUDA_FLAGS " -allow-unsupported-compiler")
+        message(STATUS "MSVC ${MSVC_VERSION} (VS 2026+) is newer than this CUDA toolkit officially supports; adding -allow-unsupported-compiler to CMAKE_CUDA_FLAGS")
+    endif()
     # GgmlOps itself compiles a CUDA source (the on-device diffusion sampler), so it needs the
     # CUDA language enabled. CMAKE_CUDA_ARCHITECTURES is normally supplied by build-windows.ps1
     # (detected from the local GPU); fall back to a broad default if the caller did not set it.
@@ -200,6 +213,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gemma4_moe.cpp
     ggml_ops_diffusion.cpp
     ggml_ops_qwen_image.cpp
+    ggml_ops_wan.cpp
     ggml_ops_gated_delta_net.cpp
     ggml_ops_qwen35_recurrent_prefill.cpp
     ggml_ops_qwen35_gdn_tp.cpp

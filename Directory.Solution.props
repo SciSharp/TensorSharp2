@@ -1,0 +1,15 @@
+<Project>
+  <!-- Imported by the solution-level (metaproj) build only; project builds import
+       Directory.Build.props instead. -->
+  <PropertyGroup>
+    <!-- Default the solution build to the "Any CPU" solution platform. Visual
+         Studio developer prompts (vcvars64.bat, "x64 Native Tools") export
+         Platform=x64 into the environment, and MSBuild would otherwise resolve
+         `dotnet build TensorSharp.slnx -c Release` to the nonexistent
+         "Release|x64" solution configuration and fail with MSB4126. A property
+         set here overrides the environment value; an explicit
+         -p:Platform=... on the command line is a global property and still
+         takes precedence over this default. -->
+    <Platform>Any CPU</Platform>
+  </PropertyGroup>
+</Project>

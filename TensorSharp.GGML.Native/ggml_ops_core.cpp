@@ -2443,6 +2443,8 @@ TSG_EXPORT void TSGgml_AlignedFree(void* ptr)
 // Defined in ggml_ops_qwen_image.cpp; drops the persistent whole-model graphs whose
 // resident weights live in the caches cleared below.
 extern "C" void TSGgml_QwenImageResetForwardCache();
+// Defined in ggml_ops_wan.cpp; same contract for the Wan DiT persistent graphs.
+extern "C" void TSGgml_WanResetForwardCache();
 
 // Tensor-parallel graphs held across calls, defined in their own kernels.
 // TSGgml_Shutdown releases them while the backends are still alive.
@@ -2468,6 +2470,7 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // GGUF pointer (shared via these caches), so freeing the caches below would leave
     // their captured graphs pointing at freed device memory.
     TSGgml_QwenImageResetForwardCache();
+    TSGgml_WanResetForwardCache();
     TSGgml_Qwen35ResetDecodeCache();
     TSGgml_Qwen35ResetBatchedDecodeCache();
     TSGgml_Qwen35ReleaseVerifyTpGraphs();

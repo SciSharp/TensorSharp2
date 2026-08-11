@@ -229,14 +229,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ptx="TensorSharp.Backends.Cuda/native/ptx/tensorsharp_kernels.ptx"
-          if [ ! -f "$ptx" ]; then
-            echo "::error::CUDA PTX kernel not found at $ptx (was nvcc available during publish?)." >&2
+          # nvcc writes the PTX to the intermediate directory (never into the
+          # committed native/ptx baseline, which is the no-nvcc fallback and
+          # targets one specific GPU arch; this build's PTX targets the portable
+          # fallback arch so it JIT-compiles on any release GPU).
+          ptxdir="TensorSharp.Backends.Cuda/obj/cuda_ptx/ptx"
+          if [ ! -f "$ptxdir/tensorsharp_kernels.ptx" ]; then
+            echo "::error::CUDA PTX kernel not found at $ptxdir/tensorsharp_kernels.ptx (was nvcc available during publish?)." >&2
             exit 1
           fi
           for app in server cli; do
             mkdir -p "publish/$app/cuda_kernels"
-            cp "$ptx" "publish/$app/cuda_kernels/"
+            cp "$ptxdir"/*.ptx "publish/$app/cuda_kernels/"
           done
 
       - name: Stage CUDA runtime (Linux)

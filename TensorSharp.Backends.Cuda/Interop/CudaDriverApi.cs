@@ -83,6 +83,9 @@ namespace TensorSharp.Cuda.Interop
         [DllImport(LibName, EntryPoint = "cuMemsetD8_v2")]
         public static extern int cuMemsetD8(IntPtr dstDevice, byte value, UIntPtr count);
 
+        [DllImport(LibName, EntryPoint = "cuMemsetD8Async")]
+        public static extern int cuMemsetD8Async(IntPtr dstDevice, byte value, UIntPtr count, IntPtr stream);
+
         [DllImport(LibName)]
         public static extern int cuModuleLoadData(out IntPtr module, IntPtr image);
 

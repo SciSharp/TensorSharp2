@@ -1281,6 +1281,85 @@ async function runImageEdit(userMsg, bubbleText, statsDiv, queueDiv) {
   }
 }
 
+async function runVideoGenerate(userMsg, bubbleText, statsDiv, queueDiv) {
+  if (queueDiv) queueDiv.style.display = 'none';
+  bubbleText.textContent = 'Starting video generation… (this takes a few minutes)';
+  const i2vImage = userMsg.imagePaths && userMsg.imagePaths.length > 0 ? userMsg.imagePaths[0] : null;
+  statsDiv.textContent = i2vImage ? 'Wan Image-to-Video' : 'Wan Text-to-Video';
+  const t0 = performance.now();
+
+  try {
+    const payload = { prompt: userMsg.content || '' };
+    if (i2vImage) payload.imagePath = i2vImage;
+    const res = await fetch('/api/video-generate/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: currentAbortController.signal
+    });
+    if (!res.ok) {
+      let err = 'HTTP ' + res.status;
+      try { const j = await res.json(); if (j && j.error) err = j.error; } catch {}
+      bubbleText.textContent = 'Video generation failed: ' + err;
+      statsDiv.textContent = 'Failed';
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(line.slice(6)); } catch { continue; }
+
+        if (data.videoGen) {
+          if (data.total > 0) {
+            statsDiv.textContent = `Denoising… step ${data.step}/${data.total}`;
+            bubbleText.textContent = `Generating video… step ${data.step} of ${data.total} (then decoding frames)`;
+          }
+        } else if (data.done) {
+          if (data.error) {
+            bubbleText.textContent = 'Video generation failed: ' + data.error;
+            statsDiv.textContent = 'Failed';
+          } else {
+            bubbleText.innerHTML = '';
+            const vid = document.createElement('video');
+            vid.src = data.url;
+            vid.controls = true;
+            vid.autoplay = true;
+            vid.loop = true;
+            vid.muted = true;
+            vid.playsInline = true;
+            vid.style.maxWidth = '640px';
+            vid.style.maxHeight = '480px';
+            vid.style.borderRadius = '8px';
+            vid.style.display = 'block';
+            bubbleText.appendChild(vid);
+            const dl = document.createElement('a');
+            dl.href = data.url;
+            dl.setAttribute('download', '');
+            dl.textContent = '⬇ Download video';
+            dl.style.cssText = 'display:inline-block;margin-top:8px;color:var(--accent);';
+            bubbleText.appendChild(dl);
+            statsDiv.textContent = `${data.width}×${data.height} · ${data.frames} frames @ ${data.fps} fps · seed ${data.seed} · ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+          }
+          scrollChatToBottom();
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') { bubbleText.textContent = 'Video generation cancelled.'; statsDiv.textContent = 'Stopped by user'; }
+    else { bubbleText.textContent = 'Video generation error: ' + e.message; statsDiv.textContent = 'Failed'; }
+  }
+}
+
 async function requestAssistantResponse() {
   if (isGenerating) return;
   if (!currentLoadedModel) return;
@@ -1307,6 +1386,13 @@ async function requestAssistantResponse() {
     const _lastUser = chatHistory[chatHistory.length - 1];
     if (currentArchitecture === 'qwen_image' && _lastUser && _lastUser.imagePaths && _lastUser.imagePaths.length > 0) {
       await runImageEdit(_lastUser, bubbleText, statsDiv, queueDiv);
+      return;
+    }
+
+    // Wan video generation: the prompt (plus an optional attached image as the
+    // first frame, Wan 2.2 image-to-video) produces a video, not chat text.
+    if (currentArchitecture === 'wan' && _lastUser) {
+      await runVideoGenerate(_lastUser, bubbleText, statsDiv, queueDiv);
       return;
     }
 

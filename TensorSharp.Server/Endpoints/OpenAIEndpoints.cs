@@ -30,6 +30,12 @@ namespace TensorSharp.Server.Endpoints
                 (HttpContext ctx, OpenAIResponsesAdapter adapter) => adapter.CreateResponseAsync(ctx));
             endpoints.MapGet("/v1/responses/{id}",
                 (HttpContext ctx, OpenAIResponsesAdapter adapter, string id) => adapter.GetResponseAsync(ctx, id));
+            // Text-to-video generation (Wan models). OpenAI has no stable public video
+            // API yet; this follows the images/generations envelope: prompt in, a data
+            // array with url and (optionally) b64_json out.
+            endpoints.MapPost("/v1/videos/generations",
+                (HttpRequest req, WebUiAdapter adapter) => adapter.OpenAIVideoGenerationsAsync(req))
+                .DisableRequestTimeout();
             return endpoints;
         }
     }

@@ -130,6 +130,21 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <qwen-image-edit-DiT.gguf
     --prompt "Make the sky a dramatic sunset." --output edited.png \
     --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0
 
+# Wan video generation (prompt -> H.264 MP4). The UMT5-XXL text-encoder GGUF and
+# video-VAE companions are resolved next to the DiT GGUF (or set --wan-te /
+# --wan-vae). Wan 2.1 T2V, Wan 2.2 TI2V-5B, and Wan 2.2 A14B (both experts)
+# are auto-detected. See docs/models/wan.md.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <Wan2.2-TI2V-5B.gguf> \
+    --prompt "a lovely cat walking through a garden" --output cat.mp4 \
+    --width 832 --height 480 --video-frames 49 --backend ggml_cuda \
+    --diffusion-seed 7
+
+# Wan 2.2 image-to-video: --image supplies the first frame; the prompt controls
+# motion, camera and scene changes (TI2V-5B or I2V-A14B checkpoints).
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <Wan2.2-TI2V-5B.gguf> \
+    --prompt "the cat runs toward the camera, cinematic tracking shot" \
+    --image first_frame.png --output cat_run.mp4 --backend ggml_cuda
+
 # Thinking / reasoning mode
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --backend ggml_metal --think
 
@@ -255,6 +270,13 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--qwen-image-vl <path>` | Override the resolved Qwen2.5-VL-7B text-encoder GGUF. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen2.5-VL mmproj (vision grounding) GGUF. |
 | `--qwen-image-lora <path>` | Qwen-Image-Edit Lightning distillation LoRA (`.safetensors`), merged into the DiT at load time. Auto-derives the step count (e.g. 4 or 8) and switches CFG to 1.0. Env: `TS_QWEN_IMAGE_LORA`. |
+| `--video-frames <N>` | Wan video frame count, snapped to `4k+1` (default: 33; 49 for Wan2.2-TI2V). `1` generates a still image (use `--output out.png`). |
+| `--fps <N>` | Wan video playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). |
+| `--flow-shift <F>` | Wan FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1). |
+| `--sampler <name>` | Wan sampler: `unipc` (official Wan sampler, default) or `euler`. |
+| `--negative-prompt <text>` | Wan negative prompt (default: the official Wan negative prompt). |
+| `--wan-vae <path>` | Override the resolved Wan video VAE (`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`). Env: `TS_WAN_VAE`. |
+| `--wan-te <path>` | Override the resolved UMT5-XXL text-encoder GGUF. Env: `TS_WAN_TE`. Wan 2.2 A14B additionally resolves the second high/low-noise expert automatically (env: `TS_WAN_DIT2`). |
 | `--tp <N>` | Tensor parallelism degree — split the model across N GPUs in a single process (default: `1`). Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. Requires `--tp-peers`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. |

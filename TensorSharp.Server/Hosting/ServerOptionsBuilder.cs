@@ -597,6 +597,20 @@ namespace TensorSharp.Server.Hosting
                     changed = true;
                     continue;
                 }
+                // Wan text-to-video companions (same env-var override mechanism,
+                // read by WanVideoModel).
+                if (TryReadOption(args, ref i, "--wan-vae", out string wanVaeOpt))
+                {
+                    SetQwenImageCompanionEnv("--wan-vae", "TS_WAN_VAE", wanVaeOpt);
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--wan-te", out string wanTeOpt))
+                {
+                    SetQwenImageCompanionEnv("--wan-te", "TS_WAN_TE", wanTeOpt);
+                    changed = true;
+                    continue;
+                }
                 // Fixed output size for every edit (bypasses the auto VRAM area clamp, but is still
                 // capped at the hardware memory ceiling so an oversized request can't OOM into
                 // garbage). Read by QwenImagePipeline as TS_QWEN_IMAGE_WIDTH/HEIGHT. Per-request

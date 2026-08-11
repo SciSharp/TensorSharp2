@@ -85,7 +85,7 @@ namespace TensorSharp.Runtime
         /// <summary>Absolute byte offset where the tensor data blob begins (8 + header length).</summary>
         public long DataOffset { get; private set; }
 
-        private readonly long _fileLength;
+        private long _fileLength;
         private MemoryMappedFile? _mappedFile;
         private MemoryMappedViewAccessor? _mappedView;
         private unsafe byte* _mappedBase;
@@ -94,13 +94,15 @@ namespace TensorSharp.Runtime
         public SafetensorsFile(string path)
         {
             Path = path;
-            _fileLength = new FileInfo(path).Length;
             ParseHeader();
         }
 
         private void ParseHeader()
         {
             using var fs = File.OpenRead(Path);
+            // FileInfo.Length reports the link size for symlinks (common in model
+            // caches); the opened stream's length is the real file's.
+            _fileLength = fs.Length;
             Span<byte> lenBytes = stackalloc byte[8];
             fs.ReadExactly(lenBytes);
             ulong headerLen = BitConverter.ToUInt64(lenBytes);

@@ -63,6 +63,12 @@ nunit-*.xml
 # IDE/build caches
 *.csproj.lscache
 
+# Visual Studio IDE state
+.vs/
+
+# Visual Studio generates per-user debug profiles on F5; they are machine-local.
+launchSettings.json
+
 # Benchmark tooling artifacts
 benchmarks/engine_comparison/__pycache__/
 benchmarks/engine_comparison/results/
