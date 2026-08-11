@@ -22,6 +22,17 @@ namespace TensorSharp.Server.Hosting
     /// </summary>
     internal sealed class ServerHostingOptions
     {
+        /// <summary>
+        /// Address the server binds when the operator does not choose one.
+        /// <c>0.0.0.0</c> (all interfaces) rather than <c>localhost</c> because
+        /// the server is routinely reached from another machine or from outside
+        /// a container.
+        /// </summary>
+        public const string DefaultListenUrls = "http://0.0.0.0:5000";
+
+        /// <summary>Port used by <see cref="DefaultListenUrls"/>.</summary>
+        public const int DefaultPort = 5000;
+
         public ServerHostingOptions(
             string startupModelPath,
             string startupMmProjPath,
@@ -32,8 +43,10 @@ namespace TensorSharp.Server.Hosting
             string uploadDirectory,
             string logDirectory,
             bool fileLoggingEnabled,
-            SamplingDefaults samplingDefaults)
+            SamplingDefaults samplingDefaults,
+            string listenUrls = DefaultListenUrls)
         {
+            ListenUrls = string.IsNullOrWhiteSpace(listenUrls) ? DefaultListenUrls : listenUrls;
             StartupModelPath = startupModelPath;
             StartupMmProjPath = startupMmProjPath;
             DefaultBackend = defaultBackend;
@@ -48,6 +61,14 @@ namespace TensorSharp.Server.Hosting
             FileLoggingEnabled = fileLoggingEnabled;
             SamplingDefaults = samplingDefaults ?? new SamplingDefaults(new SamplingConfig());
         }
+
+        /// <summary>
+        /// Semicolon-separated URL(s) Kestrel binds, resolved from
+        /// <c>--port</c>/<c>--host</c>, <c>--urls</c>, the <c>PORT</c>/<c>HOST</c>
+        /// or <c>ASPNETCORE_URLS</c> environment variables, or
+        /// <see cref="DefaultListenUrls"/>. Never null or empty.
+        /// </summary>
+        public string ListenUrls { get; }
 
         /// <summary>Absolute path of the model the server was launched with, or null when no model is hosted.</summary>
         public string StartupModelPath { get; }

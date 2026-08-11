@@ -24,12 +24,19 @@ Target Space: <https://huggingface.co/spaces/zhongkaifu/tensorsharp>
 
 ### Port
 
-`TensorSharp.Server` hard-codes its listen address to `http://0.0.0.0:5000` and
-passes it to `app.Run`, which overrides `PORT`/`ASPNETCORE_URLS`. The build
-stage rewrites that constant to **7860** (the Docker Space default port) with
-`sed`, so the app binds the port the Space routes to — **no `app_port` setting
-is required**. To use a different port, pass `--build-arg APP_PORT=<port>` and
-set a matching `app_port` in the Space README.
+`TensorSharp.Server` listens on `http://0.0.0.0:5000` by default and honours the
+`PORT` environment variable (as well as `--port` / `--host` / `--urls` on the
+command line). The runtime stage sets `PORT=7860` — the Docker Space default
+port — so the app binds the port the Space routes to and **no `app_port` setting
+is required**.
+
+To use a different port, either rebuild with `--build-arg APP_PORT=<port>` and
+set a matching `app_port` in the Space README, or override it at run time on any
+other host:
+
+```bash
+docker run --rm -e PORT=8080 -p 8080:8080 tensorsharp-server
+```
 
 ## Configure the Space — copy `Dockerfile_CPU.txt` to `Dockerfile`
 
@@ -172,7 +179,7 @@ NVIDIA path).
    creates the UID‑1000 user Spaces run as, downloads the model, and launches
    with `--backend ggml_cuda`.
 
-The port rewrite to 7860 and the chat UI at `/index.html` work exactly as in the
+The `PORT=7860` default and the chat UI at `/index.html` work exactly as in the
 CPU file; `/` remains the liveness endpoint.
 
 ## CUDA architectures (build host has no GPU)

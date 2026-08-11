@@ -102,9 +102,17 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3-
 ```
 
 The API starts on `http://localhost:5000`; the Web UI is
-`http://localhost:5000/index.html`. The current binary passes a fixed
-`http://0.0.0.0:5000` listen address to ASP.NET Core; the Docker Space files
-patch that constant to `7860` during image build.
+`http://localhost:5000/index.html`. Change the listener with `--port` (and
+`--host` to restrict the interface), or with the `PORT` / `HOST` environment
+variables — the Docker Space images set `PORT=7860`:
+
+```bash
+# macOS note: port 5000 is taken by the AirPlay Receiver, so pick another one.
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend ggml_metal --port 8080
+
+# Bind loopback only, so the server is not reachable from other machines.
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --host 127.0.0.1 --port 8080
+```
 
 `--model` is required for inference. Starting with only `--backend` produces a
 model-less status server, but `/api/models/load` cannot select a file that was

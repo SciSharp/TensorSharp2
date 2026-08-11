@@ -394,7 +394,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `MAX_TOKENS` | 未传 `--max-tokens` 时的最大生成长度：请求未携带上限时用它填充，请求要求更多时按它截断（默认：`20000`，该默认值只填充、不截断） |
 | `VIDEO_SAMPLE_FPS` | 视频提示词每秒抽取的帧数；基于时间的抽帧（默认：`1`） |
 | `VIDEO_MAX_FRAMES` | 抽取视频帧数量的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制） |
-| `PORT` / `ASPNETCORE_URLS` | 当前会被 `Program.cs` 中固定的 `http://0.0.0.0:5000` 监听地址覆盖；Docker Space 镜像会在构建时用 `APP_PORT` 改写该常量。 |
+| `PORT` / `HOST` | 未传 `--port` / `--host` 时的监听端口与绑定网卡（默认：`5000`、`0.0.0.0`） |
+| `ASPNETCORE_URLS` | 当 `--port`、`--host`、`--urls`、`PORT`、`HOST` 均未设置时使用的完整监听 URL |
 | `TENSORSHARP_TEMPERATURE` | 未传 `--temperature` 时的采样温度。它同样算作“运维方已配置”，因此在默认的 `--sampling-precedence config` 下也优先于请求体 |
 | `TENSORSHARP_TOP_K` | 未传 `--top-k` 时的 Top-K（优先级规则同 `TENSORSHARP_TEMPERATURE`） |
 | `TENSORSHARP_TOP_P` | 未传 `--top-p` 时的 Top-P（优先级规则同上） |
@@ -765,7 +766,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 
 | 功能 | 默认 | 环境变量 |
 |---|---|---|
-| ASP.NET Core 监听 | `http://0.0.0.0:5000` | 固定在 `Program.cs`；Docker Space 镜像用 `APP_PORT` 构建参数改写 |
+| ASP.NET Core 监听 | `http://0.0.0.0:5000` | `--port` / `--host` / `--urls`，其次 `PORT` / `HOST`，再次 `ASPNETCORE_URLS` |
 | 文本及原生数字 PDF 上传 | 保留全部提取内容；最终渲染的提示词必须能放入已加载模型的上下文 | — |
 | 视频帧抽取 | 1 fps（基于时间，不限制） | `VIDEO_SAMPLE_FPS`、`VIDEO_MAX_FRAMES` |
 | DiffusionGemma Web UI 去噪 | 48 步，最大 batch 2 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH` |

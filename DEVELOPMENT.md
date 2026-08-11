@@ -26,7 +26,7 @@ See Microsoft's [cross-platform .NET installation overview](https://learn.micros
 ### Other build prerequisites
 
 - **`git` and network access:** the GGML/CUDA native builds clone the ggml sources from [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) into `ExternalProjects/ggml/` on first build (see `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`). The clone tracks ggml's default branch (`master`); pin a different ref with `TENSORSHARP_GGML_GIT_REF`, or set `TENSORSHARP_GGML_NO_UPDATE=1` to skip the network update once cloned (offline rebuilds)
-- **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library; the MLX backend additionally builds `libmlxc` from `TensorSharp.Backends.MLX/Native/` via `bash TensorSharp.Backends.MLX/build-native-macos.sh`
+- **macOS (Metal backend):** CMake 3.20+ and the Xcode command-line tools for building the native GGML library — it embeds its Metal kernels as source and compiles them at run time, so it needs no Metal compiler at build time. The MLX backend additionally builds `libmlxc` from `TensorSharp.Backends.MLX/Native/` via `bash TensorSharp.Backends.MLX/build-native-macos.sh`, and that build *does* compile Metal shaders, so it needs a **full Xcode plus the Metal toolchain** — the command-line tools alone are not enough. `eng/ensure-metal-toolchain.sh` provisions this automatically on first build; see [Build the native MLX library](#build-the-native-mlx-library-macos-only)
 - **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 or 2026 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS. With Visual Studio 2026, whose MSVC 14.5x toolset is newer than current CUDA toolkits officially accept as a host compiler, the build passes `-allow-unsupported-compiler` to `nvcc` automatically; include the "C++ CMake tools for Windows" component so the build can use the Ninja generator (the Visual Studio generator additionally needs a CUDA toolkit that ships MSBuild integration for your VS version)
 - **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
 - **Windows (GGML Vulkan backend):** enabled automatically when the machine has a Vulkan runtime (`System32\vulkan-1.dll`, shipped by every recent GPU driver). With a [LunarG Vulkan SDK](https://vulkan.lunarg.com/) installed it is used directly; without one the build auto-provisions a portable toolchain (Vulkan-Headers, a vulkan-1 import library generated from the system loader, glslc, SPIRV-Headers) into `ExternalProjects/vulkan-toolchain/` via `eng/fetch-vulkan-toolchain.ps1`. Opt out with `build-windows.ps1 --no-vulkan` or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`. A GPU driver with Vulkan 1.3 support is required at runtime
@@ -139,7 +139,26 @@ The MLX backend depends on `libmlxc` (the C bindings for [MLX](https://github.co
 bash TensorSharp.Backends.MLX/build-native-macos.sh
 ```
 
-The script writes the resulting libraries (`libmlxc.dylib`, `libmlx.dylib`, and any backend deps) into `TensorSharp.Backends.MLX/Native/dist/`. At run time the backend probes the application directory first; you can also point it to a custom install with `TENSORSHARP_MLX_LIBRARY=<path-to-libmlxc.dylib>` or `TENSORSHARP_MLX_LIBRARY_DIR=<dir-with-libmlxc>`. If the library cannot be located the backend reports unavailable and `--backend mlx` is rejected at startup.
+The script writes the resulting libraries (`libmlxc.dylib`, `libmlx.dylib`, and any backend deps) into `TensorSharp.Backends.MLX/Native/dist/`, and the build copies them to the output directory alongside `mlx.metallib`. That metallib holds MLX's precompiled Metal kernels and is large (~150 MB) but not optional: MLX locates it by `dladdr` on its own code, so it must sit **in the same directory as `libmlx.dylib`**. Its only fallback is a path baked in at compile time that points into the build tree, so a deployment that omits it loads fine and then throws `Failed to load the default metallib` on the first GPU operation. Keep it next to the dylibs in any hand-rolled packaging. At run time the backend probes the application directory first; you can also point it to a custom install with `TENSORSHARP_MLX_LIBRARY=<path-to-libmlxc.dylib>` or `TENSORSHARP_MLX_LIBRARY_DIR=<dir-with-libmlxc>`. If the library cannot be located the backend reports unavailable and `--backend mlx` is rejected at startup.
+
+#### Metal toolchain (provisioned automatically)
+
+MLX compiles Metal shaders during the build, so `xcrun metal` has to work. Two things commonly stop that, and `build-native-macos.sh` repairs both by calling `eng/ensure-metal-toolchain.sh` before configuring:
+
+1. **The active developer directory is the command-line tools.** `/Library/Developer/CommandLineTools` ships no Metal compiler at all, so `xcode-select -p` pointing there gives `xcrun: error: unable to find utility "metal", not a developer tool or in PATH`. The script locates an installed `Xcode.app` and builds with `DEVELOPER_DIR` set to it. It does **not** run `sudo xcode-select -s` — the override applies to the build only. Run that command yourself if you want it machine-wide.
+2. **Xcode 16 and later do not bundle the Metal compiler.** It is a separately downloadable ~700 MB component; without it `metal` exists but refuses to run (`cannot execute tool 'metal' due to missing Metal Toolchain`). The script downloads it with `xcodebuild -downloadComponent MetalToolchain`, which needs no `sudo` and installs into the system asset store, so it is shared with every other project and survives Xcode updates.
+
+Either problem surfaces from MLX as the much less obvious `error Metal compiler header resolution failed for .../reduce_utils.h`.
+
+Xcode itself cannot be fetched unattended (the App Store and developer.apple.com both require a signed-in Apple ID), so if no `Xcode.app` is present the script stops with install instructions. Relevant knobs:
+
+| Variable | Effect |
+| --- | --- |
+| `TENSORSHARP_XCODE_DEVELOPER_DIR` | Use this `<Xcode.app>/Contents/Developer` instead of autodetecting (useful for side-by-side or beta Xcode installs) |
+| `TENSORSHARP_MLX_SKIP_METAL_SETUP` | `1`/`true` — skip the toolchain check entirely, for machines provisioned out of band |
+| `TENSORSHARP_MLX_NATIVE_SKIP` | `true` — skip the MLX native build altogether, to build the rest of TensorSharp without a Metal toolchain |
+
+Switching developer directories invalidates the CMake cache (the previous SDK is frozen into `CMakeCache.txt`), so the script discards the stale build tree and reconfigures. The fetched `_deps/*-src` checkouts are preserved, so this costs a reconfigure rather than a re-clone of MLX.
 
 
 ## Project Structure

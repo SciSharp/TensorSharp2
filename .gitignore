@@ -25,6 +25,12 @@ artifacts/
 TensorSharp.GGML.Native/build/
 TensorSharp.GGML.Native/build-windows/
 
+# mlx-c/mlx are fetched and built at build time by
+# TensorSharp.Backends.MLX/build-native-macos.sh; neither the build tree nor the
+# installed dylibs/metallib are committed.
+TensorSharp.Backends.MLX/Native/build/
+TensorSharp.Backends.MLX/Native/dist/
+
 # ggml sources are cloned at build time from https://github.com/ggml-org/ggml
 # (see eng/fetch-ggml.sh / eng/fetch-ggml.ps1), not committed.
 ExternalProjects/.ggml-fetch.lock

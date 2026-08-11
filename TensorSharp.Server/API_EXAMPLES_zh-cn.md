@@ -99,9 +99,17 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3-
 ```
 
 API 默认监听 `http://localhost:5000`；Web UI 地址为
-`http://localhost:5000/index.html`。当前二进制会把固定的
-`http://0.0.0.0:5000` 监听地址传给 ASP.NET Core；Docker Space 文件会在镜像构建时
-把这个常量改写为 `7860`。
+`http://localhost:5000/index.html`。可以用 `--port` 修改监听端口（用 `--host`
+限制绑定的网卡），也可以使用 `PORT` / `HOST` 环境变量——Docker Space 镜像即设置
+了 `PORT=7860`：
+
+```bash
+# macOS 注意：5000 端口已被 AirPlay 接收器占用，请换一个端口。
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend ggml_metal --port 8080
+
+# 仅绑定环回地址，使服务无法被其他机器访问。
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --host 127.0.0.1 --port 8080
+```
 
 推理必须在启动时提供 `--model`。只传 `--backend` 可以启动一个无模型的状态服务，
 但 `/api/models/load` 无法选择启动时未提供的文件。多模态推理始终需要显式传入
