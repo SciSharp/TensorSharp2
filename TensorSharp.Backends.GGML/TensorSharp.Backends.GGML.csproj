@@ -68,6 +68,15 @@
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cuh" />
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/CMakeLists.txt" />
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/$(GgmlNativeBuildScript)" Condition="'$(GgmlNativeBuildScript)' != ''" />
+    <!-- The build script defers to these helper scripts (VS discovery, ggml
+         checkout, Vulkan toolchain provisioning); a fix there must re-run the
+         native build too. Each platform lists only the helpers its own
+         build-* script actually invokes. -->
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/../eng/vs-locate.ps1" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/../eng/fetch-ggml.ps1" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/../eng/fetch-vulkan-toolchain.ps1" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/../eng/fetch-ggml.sh" Condition="!$([MSBuild]::IsOSPlatform('Windows'))" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/../eng/fetch-vulkan-toolchain.sh" Condition="!$([MSBuild]::IsOSPlatform('Windows')) And !$([MSBuild]::IsOSPlatform('OSX'))" />
     <GgmlNativeSource Include="$(MSBuildProjectFullPath)" />
   </ItemGroup>
   <!-- Records the native build config (currently the CUDA on/off selection). The
@@ -87,6 +96,15 @@
     <MakeDir Directories="$(IntermediateOutputPath)" />
     <WriteLinesToFile File="$(_GgmlNativeConfigStamp)" Lines="$(_GgmlNativeConfigKey)" Overwrite="true"
                       Condition="'$(_GgmlNativeConfigPrev)' != '$(_GgmlNativeConfigKey)'" />
+    <!-- A build that auto-enabled Vulkan but could not provision its toolchain
+         still succeeds (the backend is dropped with a warning), so the build
+         stamp below would be freshened and this project would never run the
+         native build again — pinning a silently Vulkan-less binary even after
+         the cause is fixed. The build scripts leave vulkan-degraded.marker in
+         that case; dropping the stamp makes the next build retry provisioning,
+         and the marker is removed as soon as it succeeds. -->
+    <Delete Files="$(IntermediateOutputPath)$(GgmlNativeBuildStampName)"
+            Condition="Exists('$(GgmlNativeBuildDir)/vulkan-degraded.marker')" />
   </Target>
   <!-- The native library is not embedded in the produced NuGet package (only the
        managed assemblies are), so packaging does not need it built. Setting

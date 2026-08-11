@@ -283,6 +283,7 @@ if [[ "${ENABLE_VULKAN}" == "ON" ]] && ! prepare_vulkan_toolchain; then
     echo "warning: this machine supports Vulkan but the ggml-vulkan build toolchain could not be provisioned;" >&2
     echo "         building without the ggml-vulkan backend. Pass --vulkan to make this an error." >&2
     ENABLE_VULKAN=OFF
+    VULKAN_DEGRADED=ON
 fi
 
 if [[ "${ENABLE_CUDA}" == "ON" && -z "${CUDA_ARCHITECTURES}" && "${USER_SET_CMAKE_CUDA_ARCHITECTURES}" != "ON" ]]; then
@@ -338,4 +339,21 @@ if [[ "${BUILD_TESTS}" == "ON" ]]; then
     cmake --build "${BUILD_DIR}" --config Release "${BUILD_PARALLEL_ARGS[@]}"
 else
     cmake --build "${BUILD_DIR}" --config Release "${BUILD_PARALLEL_ARGS[@]}" --target GgmlOps
+fi
+
+# Record whether an auto-enabled Vulkan backend had to be dropped. The build
+# itself succeeded either way, so MSBuild would otherwise freshen its
+# up-to-date stamp and skip this script on every later build - leaving a
+# silently Vulkan-less libGgmlOps.so even after the cause (no network, no
+# loader) is fixed. TensorSharp.Backends.GGML.csproj invalidates that stamp
+# while this marker exists, so provisioning is retried until it succeeds.
+VULKAN_DEGRADED_MARKER="${BUILD_DIR}/vulkan-degraded.marker"
+if [[ "${VULKAN_DEGRADED:-OFF}" == "ON" ]]; then
+    cat > "${VULKAN_DEGRADED_MARKER}" <<'EOF'
+The ggml-vulkan backend was auto-enabled but its build toolchain could not be provisioned,
+so this build produced libGgmlOps.so without Vulkan support. Delete this file to stop retrying,
+or pass --no-vulkan to disable the backend explicitly.
+EOF
+else
+    rm -f "${VULKAN_DEGRADED_MARKER}"
 fi
