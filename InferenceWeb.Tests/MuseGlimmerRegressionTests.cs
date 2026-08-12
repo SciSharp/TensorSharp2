@@ -23,12 +23,33 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
+using TensorSharp.Models;
 using TensorSharp.Runtime;
 
 namespace InferenceWeb.Tests;
 
 public class MuseGlimmerRegressionTests
 {
+    [Fact]
+    public void ImageGeometry_IosPortrait_UsesBoundedReferenceGrid()
+    {
+        var processor = new MuseGlimmerImageProcessor(
+            patchSize: 14,
+            mergeSize: 2,
+            maxTokens: 4096);
+
+        var (width, height) = processor.ComputeTargetSize(
+            imgWidth: 3808,
+            imgHeight: 5712);
+
+        Assert.Equal(1456, width);
+        Assert.Equal(2184, height);
+
+        int rawPatchCount = (width / processor.PatchSize) * (height / processor.PatchSize);
+        Assert.Equal(16_224, rawPatchCount);
+        Assert.Equal(4_056, processor.ComputeTokenCount(3808, 5712));
+    }
+
     // ---------------------------------------------------------------------
     // Bug 1: llama4 pre-tokenizer
     // ---------------------------------------------------------------------

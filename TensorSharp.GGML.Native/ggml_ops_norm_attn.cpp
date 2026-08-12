@@ -1300,15 +1300,21 @@ namespace {
             return 0;
         }
 
-        if (query_desc.ne2 != key_desc.ne2 || query_desc.ne2 != value_desc.ne2)
+        if (query_desc.ne1 != key_desc.ne1 || query_desc.ne1 != value_desc.ne1)
         {
-            set_last_error("scaled_dot_product_attention expects matching head dimensions.");
+            set_last_error("scaled_dot_product_attention expects matching head counts.");
             return 0;
         }
 
         if (query_desc.ne0 != key_desc.ne0)
         {
             set_last_error("scaled_dot_product_attention expects query and key to share the key dimension.");
+            return 0;
+        }
+
+        if (key_desc.ne2 != value_desc.ne2)
+        {
+            set_last_error("scaled_dot_product_attention expects key and value to share the sequence dimension.");
             return 0;
         }
 
@@ -1410,39 +1416,81 @@ namespace {
 
         ggml_tensor* query_perm = ggml_permute(context.value, query_binding.tensor, 0, 2, 1, 3);
         ggml_tensor* key_perm = ggml_permute(context.value, key_binding.tensor, 0, 2, 1, 3);
-        ggml_tensor* value_perm = ggml_permute(context.value, value_binding.tensor, 1, 2, 0, 3);
-        value_perm = value_perm == nullptr ? nullptr : ggml_cont(context.value, value_perm);
-        if (query_perm == nullptr || key_perm == nullptr || value_perm == nullptr)
+        if (query_perm == nullptr || key_perm == nullptr)
         {
             set_last_error("Failed to create ggml attention permutation nodes.");
             return 0;
         }
 
-        ggml_tensor* scores = ggml_mul_mat(context.value, key_perm, query_perm);
-        if (scores == nullptr)
+        // Prefer ggml's streaming flash-attention kernel for unmasked attention.
+        // The old graph below materializes both the F32 score and probability
+        // tensors.  That is catastrophic for long bidirectional vision sequences:
+        // Muse-Glimmer reaches ~16K patches, where those two [K,Q,H] tensors alone
+        // require roughly 32 GiB.  Besides being much faster, flash attention keeps
+        // the working set linear in the sequence length.  Match llama.cpp's CLIP
+        // path by casting K/V to F16 while retaining F32 output/accumulation.
+        ggml_tensor* output_value = nullptr;
+        // Limit the precision-policy change to the CUDA path validated here.
+        // Other backends retain their previous F32 reference behavior.
+        if (!has_mask && g_backend_type == BACKEND_TYPE_CUDA)
         {
-            set_last_error("Failed to create ggml attention score node.");
-            return 0;
+            ggml_tensor* value_flash = ggml_permute(context.value, value_binding.tensor, 0, 2, 1, 3);
+            ggml_tensor* key_f16 = key_perm == nullptr ? nullptr : ggml_cast(context.value, key_perm, GGML_TYPE_F16);
+            ggml_tensor* value_f16 = value_flash == nullptr ? nullptr : ggml_cast(context.value, value_flash, GGML_TYPE_F16);
+            ggml_tensor* flash = (key_f16 == nullptr || value_f16 == nullptr)
+                ? nullptr
+                : ggml_flash_attn_ext(context.value, query_perm, key_f16, value_f16,
+                    nullptr, scale, 0.0f, 0.0f);
+            if (flash != nullptr)
+            {
+                ggml_flash_attn_ext_set_prec(flash, GGML_PREC_F32);
+                if (backend_supports_op(flash))
+                    output_value = flash; // [value_dim, heads, seq_q, batch]
+            }
         }
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
 
-        ggml_tensor* probs = ggml_soft_max_ext(context.value, scores, has_mask ? mask_binding.tensor : nullptr, scale, 0.0f);
-        if (probs == nullptr)
+        // Portable/reference fallback for masks or backends without a flash
+        // kernel for this geometry.  Callers that can present very long masked
+        // sequences must chunk them before reaching this generic primitive.
+        if (output_value == nullptr)
         {
-            set_last_error("Failed to create ggml soft_max_ext node.");
-            return 0;
+            ggml_tensor* value_perm = ggml_permute(context.value, value_binding.tensor, 1, 2, 0, 3);
+            value_perm = value_perm == nullptr ? nullptr : ggml_cont(context.value, value_perm);
+            if (value_perm == nullptr)
+            {
+                set_last_error("Failed to create ggml attention value permutation node.");
+                return 0;
+            }
+
+            ggml_tensor* scores = ggml_mul_mat(context.value, key_perm, query_perm);
+            if (scores == nullptr)
+            {
+                set_last_error("Failed to create ggml attention score node.");
+                return 0;
+            }
+            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+
+            ggml_tensor* probs = ggml_soft_max_ext(context.value, scores,
+                has_mask ? mask_binding.tensor : nullptr, scale, 0.0f);
+            if (probs == nullptr)
+            {
+                set_last_error("Failed to create ggml soft_max_ext node.");
+                return 0;
+            }
+
+            output_value = ggml_mul_mat(context.value, value_perm, probs);
+            output_value = output_value == nullptr ? nullptr
+                : ggml_permute(context.value, output_value, 0, 2, 1, 3);
+            output_value = output_value == nullptr ? nullptr
+                : ggml_cont(context.value, output_value);
+            if (output_value == nullptr)
+            {
+                set_last_error("Failed to create ggml attention output node.");
+                return 0;
+            }
         }
 
-        ggml_tensor* context_tensor = ggml_mul_mat(context.value, value_perm, probs);
-        context_tensor = context_tensor == nullptr ? nullptr : ggml_permute(context.value, context_tensor, 0, 2, 1, 3);
-        context_tensor = context_tensor == nullptr ? nullptr : ggml_cont(context.value, context_tensor);
-        if (context_tensor == nullptr)
-        {
-            set_last_error("Failed to create ggml attention output node.");
-            return 0;
-        }
-
-        ggml_tensor* output_tensor = ggml_cpy(context.value, context_tensor, result_binding.tensor);
+        ggml_tensor* output_tensor = ggml_cpy(context.value, output_value, result_binding.tensor);
         if (output_tensor == nullptr)
         {
             set_last_error("Failed to create ggml attention output copy node.");

@@ -86,8 +86,16 @@ TensorSharp.Cli --model HighNoise/Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf \
 ## 服务器
 
 ```bash
-TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda
+TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+  --video-frames 121 --fps 24
 ```
+
+`--video-frames` 与 `--fps` 为 Web UI 和下述三个视频端点设置服务启动默认值。
+Web UI 不会发送这两个字段，因此上例会以 24 fps 生成 121 帧（播放时长约 5.04 秒）。
+API 请求显式提供的 `frames` 或 `fps` 会分别覆盖对应的启动默认值；这些值是默认值，
+不是上限。如果启动参数和请求字段均省略，则采用模型配方：TI2V-5B 为 49 帧 / 24 fps，
+其余模型为 33 帧 / 16 fps。帧数会对齐到 `4k+1`。要调整时长，建议保持模型原生
+帧率并修改帧数；仅改变 FPS 会改变播放速度。
 
 - **Web UI**（`http://localhost:5000`）：在聊天框输入提示词 —— 附带一张图片即为
   图生视频（图片成为首帧）；回复即是带实时去噪进度的生成视频。

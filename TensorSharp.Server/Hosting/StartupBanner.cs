@@ -56,11 +56,17 @@ namespace TensorSharp.Server.Hosting
             }
 
             logger.LogInformation(LogEventIds.HostConfiguration,
-                "Server configuration: hostedModel={HostedModel} hostedMmProj={HostedMmProj} defaultMaxTokens={DefaultMaxTokens}{MaxTokensPinned} videoSampleFps={VideoSampleFps} videoMaxFrames={VideoMaxFrames} listen={ListenAddress}",
+                "Server configuration: hostedModel={HostedModel} hostedMmProj={HostedMmProj} defaultMaxTokens={DefaultMaxTokens}{MaxTokensPinned} wanVideoFrames={WanVideoFrames} wanVideoFps={WanVideoFps} videoSampleFps={VideoSampleFps} videoMaxFrames={VideoMaxFrames} listen={ListenAddress}",
                 options.StartupModelPath ?? "(none)",
                 options.StartupMmProjPath ?? "(none)",
                 options.DefaultMaxTokens,
                 options.MaxTokensPinned ? " (server cap)" : string.Empty,
+                options.DefaultWanVideoFrames > 0
+                    ? options.DefaultWanVideoFrames.ToString(CultureInfo.InvariantCulture)
+                    : "model-default",
+                options.DefaultWanVideoFps > 0
+                    ? options.DefaultWanVideoFps.ToString(CultureInfo.InvariantCulture)
+                    : "model-default",
                 MediaHelper.GetConfiguredVideoSampleFps().ToString("0.###", CultureInfo.InvariantCulture),
                 MediaHelper.GetConfiguredMaxVideoFrames(),
                 listenAddress);

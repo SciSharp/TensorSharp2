@@ -2755,9 +2755,6 @@ TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes
     return 1;
 }
 
-// Defined in ggml_ops_transformer_prefill.cpp.
-TSG_EXPORT void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
-
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
     // The same host pointer can be resident on several ranks (a replicated

@@ -11,7 +11,7 @@
 // exactly the work being optimized.
 //
 // Env knobs:
-//   TS_VBENCH_TYPE    gemma4 | mistral3 | qwen35   (default gemma4)
+//   TS_VBENCH_TYPE    gemma4 | mistral3 | qwen35 | muse-glimmer (default gemma4)
 //   TS_VBENCH_MMPROJ  path to the mmproj .gguf
 //   TS_VBENCH_IMAGE   path to a test image (default imgs/banner_1.png)
 //   TS_VBENCH_ITERS   timed iterations (default 5)
@@ -42,6 +42,7 @@ string mmproj = Env("TS_VBENCH_MMPROJ", type switch
 {
     "mistral3" => @"C:\Works\models\Ministral-3-8B-Instruct-2512-BF16-mmproj.gguf",
     "qwen35" => @"C:\Works\models\Qwen3.6-35B-A3B-mmproj-F16.gguf",
+    "muse-glimmer" or "muse_glimmer" => @"C:\Works\models\muse-glimmer\mmproj-Muse-Glimmer-30B-Q8_0.gguf",
     _ => @"C:\Works\models\mmproj-Gemma4-F16.gguf",
 });
 
@@ -81,6 +82,17 @@ string geom;
 
 switch (type)
 {
+    case "muse-glimmer":
+    case "muse_glimmer":
+    {
+        var enc = new MuseGlimmerVisionEncoder(mmproj, allocator);
+        var (pixels, w, h) = enc.ImageProcessor.ProcessImage(image);
+        int rawPatches = (w / enc.PatchSize) * (h / enc.PatchSize);
+        int mergedTokens = rawPatches / (enc.MergeSize * enc.MergeSize);
+        geom = $"{w}x{h}, patch={enc.PatchSize}, merge={enc.MergeSize}, rawPatches={rawPatches}, mergedTokens={mergedTokens}";
+        encodeOnce = () => enc.Encode(pixels, w, h);
+        break;
+    }
     case "mistral3":
     {
         var enc = new Mistral3VisionEncoder(mmproj, allocator);

@@ -131,6 +131,13 @@ namespace TensorSharp.Models
         private static readonly bool s_geluTanh =
             Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_GELU_TANH") == "1";
 
+        // The fused GGML path preserves the reference math while keeping a whole
+        // block on-device. Disable only for parity/performance A/B diagnostics.
+        private static readonly bool s_fusedVisionBlocks =
+            Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_VENC_FUSED") != "0";
+
+        private bool _fusedVisionBlockUnavailable;
+
         // TS_MUSE_GLIMMER_VENC_TRACE=1 prints a checksum of the residual stream at
         // every encoder stage, for localizing a numeric divergence against
         // llama.cpp's cb() dumps. Forces a host read, so it is debug-only.
@@ -473,6 +480,13 @@ namespace TensorSharp.Models
             /// </summary>
             public float[] RopeCos;
             public float[] RopeSin;
+
+            /// <summary>
+            /// 1-indexed width/height positions in sparse-permuted token order.
+            /// The fused GGML block feeds these directly to ggml_rope_ext.
+            /// </summary>
+            public int[] RopePosW;
+            public int[] RopePosH;
         }
 
         private Geometry GetOrCreateGeometry(int gridW, int gridH)
@@ -528,11 +542,15 @@ namespace TensorSharp.Models
 
             var ropeCos = new float[(long)numTokens * pairs];
             var ropeSin = new float[(long)numTokens * pairs];
+            var ropePosW = new int[numTokens];
+            var ropePosH = new int[numTokens];
             for (int i = 0; i < numTokens; i++)
             {
                 int orig = spPerm[i];
                 int posW = (orig % gridW) + 1;     // 1-indexed, as in clip.cpp set_input
                 int posH = (orig / gridW) + 1;
+                ropePosW[i] = posW;
+                ropePosH[i] = posH;
                 long b = (long)i * pairs;
                 for (int j = 0; j < pairsPerHalf; j++)
                 {
@@ -574,6 +592,8 @@ namespace TensorSharp.Models
                 MergeGather = mergeGather,
                 RopeCos = ropeCos,
                 RopeSin = ropeSin,
+                RopePosW = ropePosW,
+                RopePosH = ropePosH,
             };
             _geometryCache[key] = cached;
             return cached;
@@ -748,6 +768,9 @@ namespace TensorSharp.Models
             string prefix = _blockPrefixes[blockIdx];
             int numTokens = geo.NumTokens;
 
+            if (TryFusedEncoderBlock(x, prefix, geo, isGlobal))
+                return;
+
             Tensor q, k, v;
             using (Tensor ln1 = LayerNormOp(x, $"{prefix}.ln1.weight", $"{prefix}.ln1.bias"))
             {
@@ -793,6 +816,66 @@ namespace TensorSharp.Models
                 up.Dispose();
                 Ops.Add(x, x, down);
                 down.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// One exact, bounded GGML graph for LN/QKV/RoPE/windowed-or-global
+        /// flash-attention/output projection plus the erf-GELU MLP. The portable
+        /// implementation below remains authoritative on other allocators or if
+        /// the active GGML backend cannot execute head-dim-96 flash attention.
+        /// </summary>
+        private bool TryFusedEncoderBlock(Tensor x, string prefix, Geometry geo, bool isGlobal)
+        {
+            // CUDA is the validated high-performance target. Metal/Vulkan keep
+            // the existing portable path until this graph has backend-specific
+            // numerical and allocator coverage there.
+            if (!_useNativeAttention || _allocator is not GgmlAllocator ggmlAllocator ||
+                ggmlAllocator.Context.BackendType != GgmlBackendType.Cuda ||
+                !s_fusedVisionBlocks || s_geluTanh || _fusedVisionBlockUnavailable)
+                return false;
+
+            if (!_quantWeights.TryGetValue($"{prefix}.attn_q.weight", out QuantizedWeight q) ||
+                !_quantWeights.TryGetValue($"{prefix}.attn_k.weight", out QuantizedWeight k) ||
+                !_quantWeights.TryGetValue($"{prefix}.attn_v.weight", out QuantizedWeight v) ||
+                !_quantWeights.TryGetValue($"{prefix}.attn_out.weight", out QuantizedWeight o) ||
+                !_quantWeights.TryGetValue($"{prefix}.ffn_up.weight", out QuantizedWeight up) ||
+                !_quantWeights.TryGetValue($"{prefix}.ffn_down.weight", out QuantizedWeight down))
+            {
+                return false;
+            }
+
+            try
+            {
+                bool ok = GgmlBasicOps.TryMuseGlimmerVisionBlock(
+                    x,
+                    _weights[$"{prefix}.ln1.weight"], _weights[$"{prefix}.ln1.bias"],
+                    q.CacheKey, q.GgmlType, q.Ne0, q.Ne1, q.RawBytes, _weights[$"{prefix}.attn_q.bias"],
+                    k.CacheKey, k.GgmlType, k.Ne0, k.Ne1, k.RawBytes, _weights[$"{prefix}.attn_k.bias"],
+                    v.CacheKey, v.GgmlType, v.Ne0, v.Ne1, v.RawBytes, _weights[$"{prefix}.attn_v.bias"],
+                    o.CacheKey, o.GgmlType, o.Ne0, o.Ne1, o.RawBytes, _weights[$"{prefix}.attn_out.bias"],
+                    _weights[$"{prefix}.ln2.weight"], _weights[$"{prefix}.ln2.bias"],
+                    up.CacheKey, up.GgmlType, up.Ne0, up.Ne1, up.RawBytes, _weights[$"{prefix}.ffn_up.bias"],
+                    down.CacheKey, down.GgmlType, down.Ne0, down.Ne1, down.RawBytes, _weights[$"{prefix}.ffn_down.bias"],
+                    geo.RopePosW, geo.RopePosH, geo.WindowOffsets, isGlobal,
+                    _numHeads, _headDim, _eps, _ropeTheta);
+                if (ok)
+                    return true;
+
+                // A geometry/backend rejection is stable for the rest of this
+                // encoder instance. Avoid paying 49 more failed graph builds.
+                _fusedVisionBlockUnavailable = true;
+                return false;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _fusedVisionBlockUnavailable = true;
+                return false;
+            }
+            catch (DllNotFoundException)
+            {
+                _fusedVisionBlockUnavailable = true;
+                return false;
             }
         }
 

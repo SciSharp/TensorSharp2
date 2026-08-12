@@ -305,6 +305,11 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf
 # 多模态模型：同时显式指定投影器
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
 
+# Wan 视频生成：当 Web UI 或 API 请求未提供自己的 frames / fps 时，
+# 默认以 24 fps 生成 121 帧（约五秒）。
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/Wan2.2-TI2V-5B.gguf --backend ggml_cuda \
+    --video-frames 121 --fps 24
+
 # 配置服务端默认采样参数（仅在请求未自行覆盖时生效）
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf --backend ggml_metal \
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
@@ -350,6 +355,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
 | `--help` | 打印参数说明后退出（不带任何参数启动服务时也会显示） |
 | `--max-tokens <N>` | 最大生成 token 数：请求未携带上限时用它填充，请求要求更多时按它截断。对所有端点生效（Web UI、`/api/chat`、`/api/generate`、`/v1/chat/completions`、`/v1/responses`）。默认：`20000`，此默认值只用于填充、不做截断。环境变量：`MAX_TOKENS`。 |
+| `--video-frames <N>` | Web UI 或 API 请求未提供 `frames` 时，Wan 视频生成使用的默认输出帧数。VAE 会将其对齐到 `4k+1`；以 24 fps 生成 `121` 帧约为五秒。未指定此参数时沿用模型回退值：通常为 `33`，Wan 2.2 TI2V-5B 为 `49`。请求中显式提供的 `frames` 会覆盖此默认值。 |
+| `--fps <N>` | Web UI 或 API 请求未提供 `fps` 时，Wan MP4 输出使用的默认播放帧率。未指定此参数时沿用模型回退值：通常为 `16` fps，Wan 2.2 TI2V-5B 为 `24` fps。请求中显式提供的 `fps` 会覆盖此默认值；仅改变 FPS 会改变播放速度，而不会改变生成的帧数。 |
 | `--temperature <f>` | 采样温度（`0` = 贪心） |
 | `--top-k <N>` | Top-K 过滤（`0` = 关闭） |
 | `--top-p <f>` | Nucleus 采样阈值（`1.0` = 关闭） |
@@ -392,8 +399,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 |---|---|
 | `BACKEND` | 未传 `--backend` 时使用的默认计算后端（`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan`；默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `MAX_TOKENS` | 未传 `--max-tokens` 时的最大生成长度：请求未携带上限时用它填充，请求要求更多时按它截断（默认：`20000`，该默认值只填充、不截断） |
-| `VIDEO_SAMPLE_FPS` | 视频提示词每秒抽取的帧数；基于时间的抽帧（默认：`1`） |
-| `VIDEO_MAX_FRAMES` | 抽取视频帧数量的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制） |
+| `VIDEO_SAMPLE_FPS` | 输入视频作为多模态提示词时每秒抽取的帧数；基于时间的抽帧（默认：`1`）。它与 Wan 生成视频的输出 `--fps` 无关 |
+| `VIDEO_MAX_FRAMES` | 输入视频作为多模态提示词时抽取帧数的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制）。它与 Wan 生成视频的输出 `--video-frames` 无关 |
 | `PORT` / `HOST` | 未传 `--port` / `--host` 时的监听端口与绑定网卡（默认：`5000`、`0.0.0.0`） |
 | `ASPNETCORE_URLS` | 当 `--port`、`--host`、`--urls`、`PORT`、`HOST` 均未设置时使用的完整监听 URL |
 | `TENSORSHARP_TEMPERATURE` | 未传 `--temperature` 时的采样温度。它同样算作“运维方已配置”，因此在默认的 `--sampling-precedence config` 下也优先于请求体 |

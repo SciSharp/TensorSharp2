@@ -841,13 +841,31 @@ edits are serialized by a process-wide lock.
 
 When the hosted `--model` is a Wan DiT GGUF (architecture `wan` — Wan 2.1 T2V,
 Wan 2.2 TI2V-5B, or Wan 2.2 A14B), a prompt generates an H.264 MP4 (see
-[docs/models/wan.md](../docs/models/wan.md) for the companion models):
+[docs/models/wan.md](../docs/models/wan.md) for the companion models). Launch
+the server in one terminal; these flags set defaults for the Web UI and requests
+that omit `frames`/`fps`. At the model's native 24 fps, 121 frames is about five
+seconds of playback:
+
+```bash
+TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+  --video-frames 121 --fps 24
+```
+
+In another terminal, this request omits `frames`/`fps` and therefore uses the
+startup defaults above:
 
 ```bash
 curl -X POST http://localhost:5000/v1/videos/generations \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "a lovely cat", "size": "832x480", "frames": 49, "seed": 7}'
+  -d '{"prompt": "a lovely cat", "size": "832x480", "seed": 7}'
 ```
+
+The flags are defaults, not caps. A request that supplies `frames` or `fps`
+overrides the corresponding startup value independently. With no startup flag
+and no request field, Wan uses its model recipe: 49 frames at 24 fps for
+TI2V-5B, and 33 frames at 16 fps otherwise. Frame counts are snapped to `4k+1`;
+keep the native FPS and adjust `frames` to change duration, since changing only
+FPS changes playback speed.
 
 **Image-to-video** (Wan 2.2 models): add `"image"` with the base64-encoded
 first frame (a `data:image/...;base64,` prefix is accepted) — the video starts
@@ -872,7 +890,8 @@ Response (add `"response_format": "b64_json"` to inline the MP4 bytes):
 Optional fields: `cfg` and `cfg2` (per-model official defaults — TI2V-5B 5.0;
 A14B I2V 3.5/3.5, T2V 4.0/3.0, `cfg2` being the low-noise expert's scale;
 Wan 2.1 6.0), `steps` (50 TI2V / 40 A14B / 30 Wan 2.1), `fps` (24 TI2V, else
-16), `sampler` (`"unipc"` default / `"euler"`), `flowShift` (official recipes),
+16 when neither the request nor server startup supplies it), `sampler`
+(`"unipc"` default / `"euler"`), `flowShift` (official recipes),
 `negative_prompt` (defaults to the official Wan negative prompt), `frames`
 snapped to `4k+1` (`1` = a still image). When `image` is given without an
 explicit `size`, the output follows the image's aspect ratio.

@@ -524,6 +524,7 @@ partials in a different order.
 | `TS_MUSE_GLIMMER_INGRAPH_EMBED` | `1` = force the in-graph embedding stage even for an untied LM head |
 | `TS_MUSE_GLIMMER_DFLASH` | DFlash drafter GGUF path (same as `--draft-model`) |
 | `TS_MUSE_GLIMMER_VENC_F32` | `1` = dequantize the vision tower to F32 (A/B; ~7.4 GB) |
+| `TS_MUSE_GLIMMER_VENC_FUSED` | `0` = disable the CUDA fused vision-block/flash-attention path (diagnostic fallback) |
 | `TS_MUSE_GLIMMER_GELU_TANH` | `1` = use the tanh GELU approximation in the tower instead of exact erf |
 | `TS_MUSE_GLIMMER_VENC_TRACE` | `1` = per-stage checksums of the vision residual stream |
 | `TS_MUSE_GLIMMER_LAYER_TRACE` | `1` = print a checksum of the residual *entering* every layer. Both the fused kernel and the per-op loop emit it, so diffing a fused run against a `TS_MUSE_GLIMMER_FUSED=0` run localizes a divergence to a layer |
