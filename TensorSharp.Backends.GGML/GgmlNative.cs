@@ -114,6 +114,75 @@ internal readonly struct GgmlContiguousTensor
     }
 }
 
+// Field order and packing must match MuseGlimmerVisionBlockDesc in
+// ggml_ops_muse_glimmer_vision.cpp. Keep all pointer-sized fields first, then
+// int64 shapes, int32 scalars, and floats so the native sizeof guard catches an
+// accidental ABI drift.
+[StructLayout(LayoutKind.Sequential)]
+internal struct GgmlMuseGlimmerVisionBlockArgs
+{
+    public GgmlTensorView2D Hidden;
+
+    public IntPtr Ln1W;
+    public IntPtr Ln1B;
+    public IntPtr QW;
+    public IntPtr QB;
+    public IntPtr KW;
+    public IntPtr KB;
+    public IntPtr VW;
+    public IntPtr VB;
+    public IntPtr OutW;
+    public IntPtr OutB;
+
+    public IntPtr Ln2W;
+    public IntPtr Ln2B;
+    public IntPtr UpW;
+    public IntPtr UpB;
+    public IntPtr DownW;
+    public IntPtr DownB;
+
+    public IntPtr PosW;
+    public IntPtr PosH;
+    public IntPtr WindowOffsets;
+
+    public long QNe0;
+    public long QNe1;
+    public long QBytes;
+    public long KNe0;
+    public long KNe1;
+    public long KBytes;
+    public long VNe0;
+    public long VNe1;
+    public long VBytes;
+    public long OutNe0;
+    public long OutNe1;
+    public long OutBytes;
+    public long UpNe0;
+    public long UpNe1;
+    public long UpBytes;
+    public long DownNe0;
+    public long DownNe1;
+    public long DownBytes;
+
+    public int StructBytes;
+    public int HiddenSize;
+    public int IntermediateSize;
+    public int NumTokens;
+    public int NumHeads;
+    public int HeadDim;
+    public int WindowCount;
+    public int IsGlobal;
+    public int QType;
+    public int KType;
+    public int VType;
+    public int OutType;
+    public int UpType;
+    public int DownType;
+
+    public float Eps;
+    public float RopeTheta;
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal readonly struct GgmlQuantizedWeight
 {
@@ -1079,6 +1148,10 @@ internal enum GgmlIndexReductionOp
             IntPtr downB, int downBDim);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_MuseGlimmerVisionBlockQuantF32(
+            in GgmlMuseGlimmerVisionBlockArgs args);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_FusedOutProjFFNQuantF32(
             GgmlTensorView2D residual, GgmlTensorView2D input,
             IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outRawBytes,
@@ -1405,6 +1478,7 @@ internal enum GgmlIndexReductionOp
             IntPtr hiddenData, int hiddenSize,
             IntPtr attnNormData,
             IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvBiasData,
             IntPtr qNormData, IntPtr kNormData, int headDim,
             IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
             IntPtr ffnNormData,
@@ -1758,6 +1832,13 @@ internal enum GgmlIndexReductionOp
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
             IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
             IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            IntPtr[] qkvBiasArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
+            int[] splitTypeArr, long[] splitBytesArr,
+            int[] qkvTypeArr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oBytesArr,
+            int[] guTypeArr, long[] guBytesArr,
+            int[] downTypeArr, long[] downBytesArr,
             int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
             int oType, long oNe0, long oNe1, long oBytes,
             int guType, long guNe0, long guNe1, long guBytes,
@@ -1803,6 +1884,231 @@ internal enum GgmlIndexReductionOp
             long pleModelProjNe0, long pleModelProjNe1, long pleModelProjBytes,
             IntPtr pleModelProjNormData,
             int tpDegree, out IntPtr tpPlanOut);
+
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_DFlashInject(
+            float[] featRows, int featureSize, int nRows,
+            long[] ringRowsIdx, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale,
+            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
+            IntPtr encNormData,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] kNormArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr,
+            int ringDtype);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_DFlashDraftBlock(
+            int[] blockIds, int blockLen, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale, float kqScale,
+            int[] ringSlotPos, int slidingWindow,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
+            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
+            IntPtr outNormData,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocabSize, int[] idsOut, float[] confOut);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_DFlashResetCaches();
+
+        /// <summary>DFlash PASS A+B in one graph. False = declined, caller falls back.</summary>
+        public static bool DFlashInject(
+            float[] featRows, int featureSize, int nRows,
+            long[] ringRowsIdx, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale,
+            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
+            IntPtr encNormData,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype)
+            => TSGgml_DFlashInject(featRows, featureSize, nRows, ringRowsIdx, positions,
+                numLayers, hiddenSize, headDim, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale,
+                fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                kNormArr, ringKArr, ringVArr, ringDtype) != 0;
+
+        /// <summary>DFlash PASS C in one graph, returning the on-device argmax id and its softmax probability per row.</summary>
+        public static bool DFlashDraftBlock(
+            int[] blockIds, int blockLen, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale, float kqScale,
+            int[] ringSlotPos, int slidingWindow,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
+            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
+            IntPtr outNormData,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocabSize, int[] idsOut, float[] confOut)
+            => TSGgml_DFlashDraftBlock(blockIds, blockLen, positions,
+                numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
+                attnNormArr,
+                qArr, qTypeArr, qNe0Arr, qNe1Arr, qBytesArr,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                qNormArr, kNormArr,
+                oArr, oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                ffnNormArr,
+                gateArr, gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr,
+                upArr, upTypeArr, upNe0Arr, upNe1Arr, upBytesArr,
+                downArr, downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                ringKArr, ringVArr, ringDtype, outNormData,
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                vocabSize, idsOut, confOut) != 0;
+
+        /// <summary>Drop the persistent DFlash graphs (ring reallocation / KV reset).</summary>
+        public static void DFlashResetCaches() => TSGgml_DFlashResetCaches();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_MuseGlimmerModelForward(
+            IntPtr hiddenData, int hiddenSize, int nTokens, int numLayers,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr, IntPtr[] gateArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr,
+            IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] guArr, IntPtr[] downArr,
+            IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] isSwaArr,
+            int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int numKvHeads, int headDim, int cacheSize, int swaCacheSize,
+            int startPos, int slidingWindow,
+            float eps, float postNormEps, float ropeBase, float ropeFreqScale,
+            float kqScale, int kvCacheType,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitScale, float logitSoftcap,
+            IntPtr captureData, int[] captureLayers, int captureCount,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            int[] tokenIds, int allLogitsRows,
+            int tpDegree, [In, Out] IntPtr[] tpPlanOut);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_MuseGlimmerResetDecodeCache();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_MuseGlimmerReleaseTpGraphs();
+
+        /// <summary>
+        /// Whole-model Muse-Glimmer forward in a single GGML graph. nTokens == 1 uses
+        /// a persistent, CUDA-graph-capturable graph; nTokens &gt; 1 builds a transient
+        /// prefill graph. Returns false (without throwing) when the kernel declines,
+        /// so the caller can fall back to the per-op path.
+        /// <para>
+        /// With <paramref name="tpDegree"/> &gt; 1 and a non-null
+        /// <paramref name="tpPlanOut"/> the kernel BUILDS the graph for the currently
+        /// active rank (see <c>SetActiveRank</c>) and returns its execution plan in
+        /// <c>tpPlanOut[0]</c> instead of running it; the caller collects one plan per
+        /// rank and executes them together through <c>TensorParallelExecutePlans</c>,
+        /// which AllReduces the per-layer partial sums at the segment boundaries.
+        /// </para>
+        /// </summary>
+        public static bool MuseGlimmerModelForward(
+            IntPtr hiddenData, int hiddenSize, int nTokens, int numLayers,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr, IntPtr[] gateArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr,
+            IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] guArr, IntPtr[] downArr,
+            IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] isSwaArr,
+            int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int numKvHeads, int headDim, int cacheSize, int swaCacheSize,
+            int startPos, int slidingWindow,
+            float eps, float postNormEps, float ropeBase, float ropeFreqScale,
+            float kqScale, int kvCacheType,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitScale, float logitSoftcap,
+            IntPtr captureData, int[] captureLayers, int captureCount,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            int[] tokenIds, int allLogitsRows,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+        {
+            if (tpPlanOut != null) tpPlanOut[0] = IntPtr.Zero;
+            return TSGgml_MuseGlimmerModelForward(
+                hiddenData, hiddenSize, nTokens, numLayers,
+                attnNormArr, qArr, kArr, vArr, gateArr, qNormArr, kNormArr, oArr,
+                postAttnNormArr, ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr, isSwaArr,
+                qTypeArr, qNe0Arr, qNe1Arr, qBytesArr,
+                kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, numKvHeads, headDim, cacheSize, swaCacheSize, startPos, slidingWindow,
+                eps, postNormEps, ropeBase, ropeFreqScale, kqScale, kvCacheType,
+                logitsData, vocabSize,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNormData, logitScale, logitSoftcap,
+                captureData, captureLayers, captureCount,
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, tokenIds, allLogitsRows,
+                tpDegree, tpPlanOut) != 0;
+        }
+
+        /// <summary>
+        /// Drop the persistent (CUDA-graph-captured) Muse-Glimmer decode graphs. The
+        /// captured graph pins ggml-cuda's scratch-pool and KV-cache device addresses,
+        /// which a prefill or a KV reset/grow can move; a stale replay then hangs.
+        /// </summary>
+        public static void MuseGlimmerResetDecodeCache() => TSGgml_MuseGlimmerResetDecodeCache();
+
+        /// <summary>
+        /// Release every rank's parked tensor-parallel Muse-Glimmer graph (the
+        /// transient prefill path's ggml context and per-call buffers). Call on
+        /// dispose and on KV reset, while the backends are still alive.
+        /// </summary>
+        public static void MuseGlimmerReleaseTpGraphs()
+        {
+            try { TSGgml_MuseGlimmerReleaseTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
+        }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4ModelDecodeBatched(
@@ -3291,6 +3597,14 @@ internal enum GgmlIndexReductionOp
                 downW, downNe0, downNe1, downBytes, downB, downBDim), "fused_vision_mlp");
         }
 
+        /// <summary>
+        /// Runs one exact Muse-Glimmer vision block as a bounded, on-device graph.
+        /// False means the backend/geometry is unsupported or workspace allocation
+        /// failed; the caller retains its portable block implementation as fallback.
+        /// </summary>
+        internal static bool MuseGlimmerVisionBlock(in GgmlMuseGlimmerVisionBlockArgs args)
+            => TSGgml_MuseGlimmerVisionBlockQuantF32(in args) != 0;
+
         public static void FusedVisionAttention(
             GgmlTensorView2D hidden,
             IntPtr lnW, IntPtr lnB, int lnDim, float eps,
@@ -3771,10 +4085,16 @@ internal enum GgmlIndexReductionOp
                 "rope_ex_ff");
         }
 
+        /// <param name="qkvBiasData">
+        /// Optional fused Q|K|V bias vector (IntPtr.Zero when the architecture has none).
+        /// Qwen2 / Qwen2.5-VL carry a QKV bias and no QK norm; Qwen3 is the reverse.
+        /// <paramref name="qNormData"/>/<paramref name="kNormData"/> may likewise be Zero.
+        /// </param>
         public static void TransformerLayerDecode(
             IntPtr hiddenData, int hiddenSize,
             IntPtr attnNormData,
             IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvBiasData,
             IntPtr qNormData, IntPtr kNormData, int headDim,
             IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
             IntPtr ffnNormData,
@@ -3791,6 +4111,7 @@ internal enum GgmlIndexReductionOp
                 hiddenData, hiddenSize,
                 attnNormData,
                 qkvData, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qkvBiasData,
                 qNormData, kNormData, headDim,
                 oData, oType, oNe0, oNe1, oBytes,
                 ffnNormData,
@@ -4073,6 +4394,13 @@ internal enum GgmlIndexReductionOp
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
             IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
             IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            IntPtr[] qkvBiasArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
+            int[] splitTypeArr, long[] splitBytesArr,
+            int[] qkvTypeArr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oBytesArr,
+            int[] guTypeArr, long[] guBytesArr,
+            int[] downTypeArr, long[] downBytesArr,
             int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
             int oType, long oNe0, long oNe1, long oBytes,
             int guType, long guNe0, long guNe1, long guBytes,
@@ -4088,6 +4416,13 @@ internal enum GgmlIndexReductionOp
                 attnNormArr, qkvArr, qNormArr, kNormArr,
                 oArr, ffnNormArr, guArr, downArr,
                 kCacheArr, vCacheArr,
+                qkvBiasArr,
+                qArr, kArr, vArr,
+                splitTypeArr, splitBytesArr,
+                qkvTypeArr, qkvBytesArr,
+                oTypeArr, oBytesArr,
+                guTypeArr, guBytesArr,
+                downTypeArr, downBytesArr,
                 qkvType, qkvNe0, qkvNe1, qkvBytes,
                 oType, oNe0, oNe1, oBytes,
                 guType, guNe0, guNe1, guBytes,

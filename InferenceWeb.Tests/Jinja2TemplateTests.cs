@@ -104,4 +104,43 @@ public class Jinja2TemplateTests
         Assert.Equal("EMIT", Render(tmpl, new Dictionary<string, object> { ["enable_thinking"] = false }));
         Assert.Equal("", Render(tmpl, new Dictionary<string, object> { ["enable_thinking"] = true }));
     }
+
+    [Fact]
+    public void ListPlusList_Concatenates()
+    {
+        // Jinja2 `+` on two sequences concatenates them. This used to fall through
+        // to Stringify() and render the .NET type name
+        // ("System.Collections.Generic.List`1[System.Object]").
+        Assert.Equal("a,b,c",
+            Render("{{ (['a', 'b'] + ['c']) | join(',') }}", new Dictionary<string, object>()));
+    }
+
+    [Fact]
+    public void NamespaceListAccumulator_SurvivesJoin()
+    {
+        // Muse-Glimmer's render_system_meta() builds its recipient list with the
+        // namespace accumulator idiom and then joins it. Before list concatenation
+        // was implemented this emitted
+        //   "# Valid recipients: System.Collections.Generic.List`1[System.Object]
+        //    System.Collections.Generic.List`1[System.Object]."
+        // into every rendered system prompt.
+        const string tmpl =
+            "{%- set ns = namespace(recipients=['\"self\"']) -%}" +
+            "{%- for t in tools -%}{%- set ns.recipients = ns.recipients + ['\"' + t + '.*\"'] -%}{%- endfor -%}" +
+            "{%- set ns.recipients = ns.recipients + ['\"user\"'] -%}" +
+            "{{- '# Valid recipients: ' + ns.recipients | join(', ') + '.' -}}";
+        Assert.Equal("# Valid recipients: \"self\", \"user\".",
+            Render(tmpl, new Dictionary<string, object> { ["tools"] = new List<object>() }));
+        Assert.Equal("# Valid recipients: \"self\", \"weather.*\", \"user\".",
+            Render(tmpl, new Dictionary<string, object> { ["tools"] = new List<object> { "weather" } }));
+    }
+
+    [Fact]
+    public void NumericAddition_StaysNumeric()
+    {
+        // int + int must not degrade to text, and a float on either side must stay
+        // arithmetic rather than concatenate.
+        Assert.Equal("3", Render("{{ 1 + 2 }}", new Dictionary<string, object>()));
+        Assert.Equal("3.5", Render("{{ 1.5 + 2 }}", new Dictionary<string, object>()));
+    }
 }

@@ -362,9 +362,9 @@ TSG_EXPORT int TSGgml_GptOssModelPrefill(
             t.v_cpy = ggml_cpy(ctx, v_write, v_dst);
 
             ggml_tensor* k_full = view_kv_cache_window(ctx, t.k_cache, hd,
-                static_cast<int>(k_wins[l]->capacity), kvH, wstart[l], wlen[l], kvType);
+                static_cast<int>(k_wins[l]->capacity), kvH, wstart[l], wlen[l], kvType, N);
             ggml_tensor* v_full = view_kv_cache_window(ctx, t.v_cache, hd,
-                static_cast<int>(v_wins[l]->capacity), kvH, wstart[l], wlen[l], kvType);
+                static_cast<int>(v_wins[l]->capacity), kvH, wstart[l], wlen[l], kvType, N);
             if (k_full == nullptr || v_full == nullptr)
             {
                 set_last_error("GPT-OSS model prefill: failed to build KV cache views.");

@@ -128,6 +128,42 @@ public class WanDirectOpsTests
                     ot.GetElementsAsFloat(sq * heads * hd), 2e-4f);
     }
 
+    // Exercise both tail dimensions of the direct CUDA streaming-attention
+    // kernel without an additive mask: a non-aligned KV length and a
+    // non-aligned bidirectional self-attention length. Wan's DiT attention is
+    // unmasked, and neither length is a multiple of its 32/256-wide tiling.
+    [Theory]
+    [InlineData(37, 257)]
+    [InlineData(513, 513)]
+    public void CudaWanAttention_UnmaskedNonAlignedLengths_MatchesNaive(int sq, int sk)
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int heads = 1, hd = 64;
+        float[] q = Rand(sq * heads * hd, 14);
+        float[] k = Rand(sk * heads * hd, 15);
+        float[] v = Rand(sk * heads * hd, 16);
+        float scale = 1f / MathF.Sqrt(hd);
+
+        using var alloc = new CudaAllocator();
+        using var ctx = new WanDirectContext(alloc);
+        using var qt = ctx.FromFloats(q, sq, heads * hd);
+        using var kt = ctx.FromFloats(k, sk, heads * hd);
+        using var vt = ctx.FromFloats(v, sk, heads * hd);
+        using var ot = ctx.NewF32(sq, heads * hd);
+
+        Assert.True(
+            CudaWanOps.TryAttention(ot, qt, kt, vt, null,
+                heads, sq, sk, hd, scale),
+            $"Direct CUDA Wan attention kernel unavailable for sq={sq}, sk={sk}, hd={hd}.");
+
+        AssertClose(
+            NaiveAttention(q, k, v, null, heads, hd, sq, sk, scale),
+            ot.GetElementsAsFloat(sq * heads * hd),
+            5e-4f);
+    }
+
     [Fact]
     public void CpuRopeModulateGateBias_MatchReference()
     {

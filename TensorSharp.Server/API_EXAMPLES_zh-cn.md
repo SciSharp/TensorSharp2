@@ -814,6 +814,69 @@ curl -N -X POST http://localhost:5000/api/image-edit/stream \
 `{"done": true, "url": "/uploads/edit-<guid>.png", "width": 1184, "height": 544, "elapsedSeconds": 40.4}`。
 对非 Qwen-Image-Edit 模型发起的请求返回 400；并发编辑由进程级锁串行执行。
 
+### 视频生成（`/v1/videos/generations`，Wan）
+
+当通过 `--model` 承载的是 Wan DiT GGUF（架构 `wan` —— Wan 2.1 T2V、
+Wan 2.2 TI2V-5B 或 Wan 2.2 A14B）时，输入提示词即可生成 H.264 MP4（配套模型
+请参阅 [docs/models/wan_zh-cn.md](../docs/models/wan_zh-cn.md)）。先在一个终端中启动
+服务器；下列参数为 Web UI 以及省略 `frames`/`fps` 的请求设置默认值。以模型原生的
+24 fps 生成 121 帧，播放时长约为五秒：
+
+```bash
+TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+  --video-frames 121 --fps 24
+```
+
+再在另一个终端中发起请求。此请求省略 `frames`/`fps`，因此采用上述启动默认值：
+
+```bash
+curl -X POST http://localhost:5000/v1/videos/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "一只可爱的猫", "size": "832x480", "seed": 7}'
+```
+
+这些启动参数是默认值，而不是上限。请求中显式提供的 `frames` 或 `fps` 会分别覆盖
+对应的启动值。如果启动参数和请求字段均省略，则采用模型配方：TI2V-5B 为 49 帧 /
+24 fps，其余模型为 33 帧 / 16 fps。帧数会对齐到 `4k+1`；要改变时长，请保持
+模型原生 FPS 并调整 `frames`，因为仅改变 FPS 会改变播放速度。
+
+**图生视频**（Wan 2.2 模型）：在 `"image"` 中加入 base64 编码的首帧（接受
+`data:image/...;base64,` 前缀）—— 视频从该图像开始，提示词控制动作、镜头和
+场景变化：
+
+```bash
+curl -X POST http://localhost:5000/v1/videos/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "猫向镜头跑来，电影感追踪镜头",
+       "image": "data:image/png;base64,'"$(base64 -w0 first_frame.png)"'",
+       "frames": 81, "seed": 7}'
+```
+
+响应（添加 `"response_format": "b64_json"` 可在响应中内联 MP4 字节）：
+
+```json
+{"created": 1780000000, "data": [{"url": "/uploads/video-<guid>.mp4"}],
+ "width": 832, "height": 480, "frames": 81, "fps": 24, "seed": 7,
+ "codec": "h264", "elapsed_seconds": 270.0}
+```
+
+可选字段：`cfg` 与 `cfg2`（各模型的官方默认值 —— TI2V-5B 为 5.0；A14B I2V
+为 3.5/3.5，T2V 为 4.0/3.0，`cfg2` 是低噪专家的引导系数；Wan 2.1 为 6.0）、
+`steps`（TI2V 为 50 / A14B 为 40 / Wan 2.1 为 30）、`fps`（当请求和服务启动
+均未指定时，TI2V 为 24，其他模型为 16）、`sampler`（默认 `"unipc"` /
+也可选 `"euler"`）、`flowShift`（官方配方）、
+`negative_prompt`（默认为官方 Wan 负向提示词），以及会对齐到 `4k+1` 的 `frames`
+（`1` = 静态图像）。未显式指定 `size` 而提供了 `image` 时，输出会遵循图像的
+纵横比。
+
+`POST /api/video-generate` 接受相同的请求体，但以 `width`/`height` 代替 `size`，
+并额外支持 `imagePath`（引用先前通过 `/api/upload` 上传的文件）；其响应使用
+`{ ok, url, ... }` 外层结构。流式变体 `POST /api/video-generate/stream`（Web UI
+使用）会在每个去噪步骤发送形如
+`{"videoGen": true, "step": 12, "total": 30}` 的 SSE 事件，最后发送
+`{"done": true, "url": ..., "frames": 81, "fps": 24, ...}`。对非 Wan 模型
+发起的请求返回 400；并发生成由进程级锁串行执行。
+
 ---
 
 ## 4. 采样选项

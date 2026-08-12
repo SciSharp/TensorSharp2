@@ -6,8 +6,23 @@ namespace TensorSharp.MLX
     public static class MlxFusedOps
     {
         private static readonly int Qwen35GdnPackedMinSeqLen = ResolveQwen35GdnPackedMinSeqLen();
+        // Packed multi-row GatedDeltaNet kernel, ON by default (opt out with
+        // TS_MLX_QWEN35_GDN_PACKED_KERNELS=0).
+        //
+        // It has to be the default because the UNPACKED prefill path leaves an
+        // incorrect recurrent state behind on MLX. The giveaway is that prefill
+        // itself looks fine - Qwen3.5-9B's prefill logits match ggml_metal to 4
+        // decimal places - but the FIRST decode token after a >=64-token prompt is
+        // wrong (argmax 8160 vs 248068), because in a GatedDeltaNet the context
+        // lives in the recurrent state rather than a KV cache. Downstream that
+        // reads as "the model answered a question it was never asked".
+        //
+        // Verified with the packed kernel on: Qwen3.5-9B decode0 becomes 248068,
+        // matching ggml_metal exactly, and Qwen3.6-27B / Qwen3.6-35B-A3B are
+        // bit-for-bit unchanged (they were already correct), so this is a strict
+        // improvement rather than a trade between models.
         private static readonly bool Qwen35GdnPackedKernelsEnabled =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QWEN35_GDN_PACKED_KERNELS"), "1", StringComparison.Ordinal);
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QWEN35_GDN_PACKED_KERNELS"), "0", StringComparison.Ordinal);
 
         private static int ResolveQwen35GdnPackedMinSeqLen()
         {
@@ -15,7 +30,15 @@ namespace TensorSharp.MLX
             if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int parsed) && parsed > 0)
                 return parsed;
 
-            return 64;
+            // 1, i.e. the packed kernel handles EVERY prefill length. This used to
+            // be 64 as a perf heuristic, but that made the threshold part of the
+            // bug described on Qwen35GdnPackedKernelsEnabled: below it the broken
+            // unpacked prefill ran, and Qwen3.5-9B produced the exact same decode
+            // trace for two completely different short prompts (271/8160/369/264)
+            // because the recurrent state it carried out of prefill did not depend
+            // on the prompt at all. At 1, short and medium prompts both match
+            // ggml_metal token for token.
+            return 1;
         }
 
         public static bool TryEvaluate(Tensor tensor)
@@ -578,6 +601,153 @@ namespace TensorSharp.MLX
             {
                 MlxNative.FreeArray(gateUpView);
                 MlxNative.FreeArray(output);
+            }
+        }
+
+        /// <summary>
+        /// Fused clamped-SwiGLU (the GPT-OSS "swiglu_oai" variant) over separate
+        /// gate / up matrices with the per-expert gate/up bias rows gathered by
+        /// expert id inside the kernel:
+        ///   g = gate[r,c] + gateBias[experts[r], c];  u = up[r,c] + upBias[experts[r], c]
+        ///   out[r,c] = min(g,limit) * sigmoid(alpha * min(g,limit)) * (clamp(u,-limit,limit) + 1)
+        /// One dispatch replaces {2 bias-row gathers, 2 adds, min/clamp/sigmoid
+        /// chain, mul} in the batched MoE FFN path.
+        /// </summary>
+        public static bool TrySwiGluOaiGatherBias(
+            Tensor result, Tensor gate, Tensor up,
+            Tensor gateBias, Tensor upBias, Tensor expertIndices,
+            float alpha, float limit)
+        {
+            if (!CanUseResult(result)
+                || !CanUseResult(gate)
+                || !CanUseResult(up)
+                || !CanUseResult(gateBias)
+                || !CanUseResult(upBias)
+                || !CanUseInt32Vector(expertIndices)
+                || result.DimensionCount != 2
+                || gate.DimensionCount != 2
+                || up.DimensionCount != 2
+                || gateBias.DimensionCount != 2
+                || upBias.DimensionCount != 2
+                || result.Sizes[0] != gate.Sizes[0]
+                || result.Sizes[1] != gate.Sizes[1]
+                || up.Sizes[0] != gate.Sizes[0]
+                || up.Sizes[1] != gate.Sizes[1]
+                || gateBias.Sizes[1] != gate.Sizes[1]
+                || upBias.Sizes[0] != gateBias.Sizes[0]
+                || upBias.Sizes[1] != gateBias.Sizes[1]
+                || expertIndices.Sizes[0] != gate.Sizes[0])
+            {
+                return false;
+            }
+
+            int rows = checked((int)gate.Sizes[0]);
+            int dim = checked((int)gate.Sizes[1]);
+            MlxNative.MlxArray gateView = default;
+            MlxNative.MlxArray upView = default;
+            MlxNative.MlxArray gateBiasView = default;
+            MlxNative.MlxArray upBiasView = default;
+            MlxNative.MlxArray expertsView = default;
+            MlxNative.MlxArray output = default;
+            try
+            {
+                gateView = GetView(gate);
+                upView = GetView(up);
+                gateBiasView = GetView(gateBias);
+                upBiasView = GetView(upBias);
+                expertsView = GetView(expertIndices);
+                output = MlxNative.SwigluOaiGatherBias(
+                    gateView, upView, gateBiasView, upBiasView, expertsView, alpha, limit, rows, dim);
+                SetDeviceResult(result, output);
+                output = default;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                MlxNative.FreeArray(gateView);
+                MlxNative.FreeArray(upView);
+                MlxNative.FreeArray(gateBiasView);
+                MlxNative.FreeArray(upBiasView);
+                MlxNative.FreeArray(expertsView);
+                MlxNative.FreeArray(output);
+            }
+        }
+
+        /// <summary>
+        /// Routing-weighted MoE combine with fused per-expert down-bias gather
+        /// and unsort. <paramref name="downRows"/> holds the [N*K, D] expert
+        /// down-projection rows in expert-sorted pair order (the order the
+        /// sorted gather_qmm path produces); <paramref name="invOrder"/> maps
+        /// original pair p = n*K+k to its sorted row. Writes
+        ///   output[n, d] = Σ_k routeWeights[n*K+k] *
+        ///       (downRows[invOrder[n*K+k], d] + downBias[expertsSorted[invOrder[n*K+k]], d])
+        /// overwriting <paramref name="output"/> entirely. Pass
+        /// <paramref name="downBias"/> = null to skip the bias term.
+        /// </summary>
+        public static bool TryMoeBiasWeightedSum(
+            Tensor output, Tensor downRows, Tensor downBias,
+            Tensor expertsSorted, Tensor invOrder, Tensor routeWeights, int expertsPerToken)
+        {
+            bool hasBias = downBias != null;
+            if (!CanUseResult(output)
+                || !CanUseResult(downRows)
+                || (hasBias && (!CanUseResult(downBias) || downBias.DimensionCount != 2 || downBias.Sizes[1] != output.Sizes[1]))
+                || !CanUseInt32Vector(expertsSorted)
+                || !CanUseInt32Vector(invOrder)
+                || !CanUseResult(routeWeights)
+                || output.DimensionCount != 2
+                || downRows.DimensionCount != 2
+                || routeWeights.DimensionCount != 1
+                || expertsPerToken <= 0
+                || downRows.Sizes[0] != output.Sizes[0] * expertsPerToken
+                || downRows.Sizes[1] != output.Sizes[1]
+                || expertsSorted.Sizes[0] != downRows.Sizes[0]
+                || invOrder.Sizes[0] != downRows.Sizes[0]
+                || routeWeights.Sizes[0] != downRows.Sizes[0])
+            {
+                return false;
+            }
+
+            int n = checked((int)output.Sizes[0]);
+            int dim = checked((int)output.Sizes[1]);
+            MlxNative.MlxArray downView = default;
+            MlxNative.MlxArray biasView = default;
+            MlxNative.MlxArray expertsView = default;
+            MlxNative.MlxArray invOrderView = default;
+            MlxNative.MlxArray weightsView = default;
+            MlxNative.MlxArray result = default;
+            try
+            {
+                downView = GetView(downRows);
+                // The kernel signature always binds a down_bias buffer; without
+                // a bias the rows array doubles as an (unread) placeholder.
+                biasView = hasBias ? GetView(downBias) : GetView(downRows);
+                expertsView = GetView(expertsSorted);
+                invOrderView = GetView(invOrder);
+                weightsView = GetView(routeWeights);
+                result = MlxNative.MoeBiasWeightedSum(
+                    downView, biasView, hasBias, expertsView, invOrderView, weightsView,
+                    n, expertsPerToken, dim);
+                SetDeviceResult(output, result);
+                result = default;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                MlxNative.FreeArray(downView);
+                MlxNative.FreeArray(biasView);
+                MlxNative.FreeArray(expertsView);
+                MlxNative.FreeArray(invOrderView);
+                MlxNative.FreeArray(weightsView);
+                MlxNative.FreeArray(result);
             }
         }
 
@@ -1999,6 +2169,58 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(output);
             }
         }
+
+        /// <summary>
+        /// Build a WHOLE decode sub-graph inside ONE <see cref="MlxWorker"/>
+        /// round-trip. Same mechanism as <see cref="TryDecodeAttention"/>'s
+        /// wrapper, scaled up from one attention block to an entire layer —
+        /// or, as Muse-Glimmer's pipelined decode uses it, to all 52 layers
+        /// plus the LM head, the on-device argmax and the next token's
+        /// embedding lookup.
+        ///
+        /// Every <c>MlxWorker.Shared.Invoke</c> is a queue hand-off plus a
+        /// <c>ManualResetEventSlim.Wait</c> — measured at ~5 µs each. A
+        /// Muse-Glimmer decode layer issues ~22 of them (4 projections, 2 QK
+        /// norms, 2 RoPEs, 2 KV writes, attention, gate, o_proj, 4 RMSNorms,
+        /// 2 residual adds, gate_up / SwiGLU / down), so a 52-layer token pays
+        /// ~1150 hand-offs. Wrapping the build in this helper puts the caller
+        /// ON the worker thread, where <see cref="MlxWorker.IsOnWorkerThread"/>
+        /// short-circuits every nested Invoke to a direct call: 1150 hand-offs
+        /// collapse to 1.
+        ///
+        /// The callback must only BUILD graph nodes — anything that host-reads
+        /// a tensor (Tensor.GetElementsAsFloat, GetFloatPtr, …) still forces an
+        /// mlx_eval, and running that on the worker thread does not make it any
+        /// cheaper. Nested Invokes are safe and free; nested host syncs are not.
+        ///
+        /// Measured on Muse-Glimmer-30B-UD-IQ2_XXS / M5 Pro: the host-side
+        /// graph build for one decode token is ~6 ms of the ~280 ms token, so
+        /// this removes the hand-off cost but does not by itself close the gap
+        /// to ggml_metal — see MuseGlimmerModel.MlxDecode.cs for the numbers.
+        /// </summary>
+        public static T RunDecodeGraphBatched<T>(Func<T> build)
+        {
+            if (build == null)
+                throw new ArgumentNullException(nameof(build));
+
+            return MlxWorker.Shared.Invoke(build);
+        }
+
+        /// <summary>Void overload of <see cref="RunDecodeGraphBatched{T}"/>.</summary>
+        public static void RunDecodeGraphBatched(Action build)
+        {
+            if (build == null)
+                throw new ArgumentNullException(nameof(build));
+
+            MlxWorker.Shared.Invoke(build);
+        }
+
+        /// <summary>
+        /// True when the caller already runs on the MLX worker thread, i.e.
+        /// inside a <see cref="RunDecodeGraphBatched{T}"/> callback, so further
+        /// MLX calls cost a direct call rather than a queue hand-off.
+        /// </summary>
+        public static bool IsBuildingBatchedGraph => MlxWorker.Shared.IsOnWorkerThread;
 
         public static bool TryDecodeAttention(
             Tensor result,

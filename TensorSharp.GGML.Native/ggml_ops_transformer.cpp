@@ -245,6 +245,7 @@ namespace
         float* hidden_data, int hidden_size,
         float* attn_norm_data,
         void* qkv_data, int qkv_type, std::int64_t qkv_ne0, std::int64_t qkv_ne1, std::int64_t qkv_bytes,
+        float* qkv_bias_data,
         float* q_norm_data, float* k_norm_data, int head_dim,
         void* o_data, int o_type, std::int64_t o_ne0, std::int64_t o_ne1, std::int64_t o_bytes,
         float* ffn_norm_data,
@@ -278,8 +279,11 @@ namespace
         // === Input / weight tensors ===
         ggml_tensor* input        = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
         ggml_tensor* attn_norm_w  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
-        ggml_tensor* q_norm_w     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
-        ggml_tensor* k_norm_w     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        // Qwen3 normalizes Q/K per head; Qwen2/Qwen2.5-VL instead carry a QKV
+        // bias and no QK norm. Both are optional and signalled by a null pointer.
+        ggml_tensor* q_norm_w     = q_norm_data != nullptr ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim) : nullptr;
+        ggml_tensor* k_norm_w     = k_norm_data != nullptr ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim) : nullptr;
+        ggml_tensor* qkv_bias_w   = qkv_bias_data != nullptr ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, qDim + 2 * kDim) : nullptr;
         ggml_tensor* ffn_norm_w   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
 
         ggml_tensor* qkv_w  = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(qkv_type), qkv_ne0, qkv_ne1);
@@ -308,6 +312,8 @@ namespace
         // 2. Fused QKV projection (quantized matmul)
         ggml_tensor* normed_2d = ggml_reshape_2d(ctx, normed, hidden_size, 1);
         ggml_tensor* qkv_flat  = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, qkv_w, normed_2d), qDim + 2 * kDim);
+        if (qkv_bias_w != nullptr)
+            qkv_flat = ggml_add(ctx, qkv_flat, qkv_bias_w);
 
         // 3. Split Q, K, V
         ggml_tensor* q_raw = ggml_view_1d(ctx, qkv_flat, qDim, 0);
@@ -318,8 +324,8 @@ namespace
         ggml_tensor* q_2d = ggml_reshape_2d(ctx, q_raw, head_dim, num_heads);
         ggml_tensor* k_2d = ggml_reshape_2d(ctx, k_raw, head_dim, num_kv_heads);
 
-        ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_2d, eps), q_norm_w);
-        ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_2d, eps), k_norm_w);
+        ggml_tensor* q_normed = q_norm_w != nullptr ? ggml_mul(ctx, ggml_rms_norm(ctx, q_2d, eps), q_norm_w) : q_2d;
+        ggml_tensor* k_normed = k_norm_w != nullptr ? ggml_mul(ctx, ggml_rms_norm(ctx, k_2d, eps), k_norm_w) : k_2d;
 
         // 5. RoPE (NeoX mode)
         // ggml_rope_ext expects: ne[0]=head_dim, ne[1]=n_heads, ne[2]=seqLen
@@ -457,6 +463,7 @@ namespace
         bind_or_mark(ffn_norm_w,  ffn_norm_data,  static_cast<std::size_t>(hidden_size) * sizeof(float), true);
         bind_or_mark(q_norm_w,    q_norm_data,    static_cast<std::size_t>(head_dim) * sizeof(float), true);
         bind_or_mark(k_norm_w,    k_norm_data,    static_cast<std::size_t>(head_dim) * sizeof(float), true);
+        bind_or_mark(qkv_bias_w,  qkv_bias_data,  static_cast<std::size_t>(qDim + 2 * kDim) * sizeof(float), true);
         bind_or_mark(k_cache_base, k_cache_data, kv_cache_bytes(num_kv_heads, max_seq_len, head_dim, kv_cache_type), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         bind_or_mark(v_cache_base, v_cache_data, kv_cache_bytes(num_kv_heads, max_seq_len, head_dim, kv_cache_type), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         if (attn_mask != nullptr && !attn_mask_data.empty())
@@ -502,6 +509,7 @@ TSG_EXPORT int TSGgml_TransformerLayerDecode(
     float* hidden_data, int hidden_size,
     float* attn_norm_data,
     void* qkv_data, int qkv_type, std::int64_t qkv_ne0, std::int64_t qkv_ne1, std::int64_t qkv_bytes,
+    float* qkv_bias_data,
     float* q_norm_data, float* k_norm_data, int head_dim,
     void* o_data, int o_type, std::int64_t o_ne0, std::int64_t o_ne1, std::int64_t o_bytes,
     float* ffn_norm_data,
@@ -520,6 +528,7 @@ TSG_EXPORT int TSGgml_TransformerLayerDecode(
             hidden_data, hidden_size,
             attn_norm_data,
             qkv_data, qkv_type, qkv_ne0, qkv_ne1, qkv_bytes,
+            qkv_bias_data,
             q_norm_data, k_norm_data, head_dim,
             o_data, o_type, o_ne0, o_ne1, o_bytes,
             ffn_norm_data,
@@ -595,6 +604,18 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
     void** attn_norm_arr, void** qkv_arr, void** q_norm_arr, void** k_norm_arr,
     void** o_arr, void** ffn_norm_arr, void** gu_arr, void** down_arr,
     void** k_cache_arr, void** v_cache_arr,
+    void** qkv_bias_arr,
+    void** q_arr, void** k_arr, void** v_arr,
+    int* split_type_arr, std::int64_t* split_bytes_arr,
+    // Per-layer type/size for each weight class. A *_K_M quant does NOT use one
+    // type throughout: Qwen2.5-VL-7B Q4_K_M stores ffn_down as Q6_K on 14 of its
+    // 28 layers and Q4_K on the rest. Reading layer 0's type for every layer
+    // dequantizes half the model with the wrong block format, which is silent -
+    // no assert, just garbage logits. Null falls back to the scalars below.
+    int* qkv_type_arr, std::int64_t* qkv_bytes_arr,
+    int* o_type_arr, std::int64_t* o_bytes_arr,
+    int* gu_type_arr, std::int64_t* gu_bytes_arr,
+    int* down_type_arr, std::int64_t* down_bytes_arr,
     int qkv_type, std::int64_t qkv_ne0, std::int64_t qkv_ne1, std::int64_t qkv_bytes,
     int o_type, std::int64_t o_ne0, std::int64_t o_ne1, std::int64_t o_bytes,
     int gu_type, std::int64_t gu_ne0, std::int64_t gu_ne1, std::int64_t gu_bytes,
@@ -641,6 +662,10 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         struct LayerTensors {
             ggml_tensor* attn_norm_w;
             ggml_tensor* qkv_w;
+            ggml_tensor* q_w;
+            ggml_tensor* k_w;
+            ggml_tensor* v_w;
+            ggml_tensor* qkv_bias_w;
             ggml_tensor* q_norm_w;
             ggml_tensor* k_norm_w;
             ggml_tensor* o_w;
@@ -654,17 +679,49 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         };
         std::vector<LayerTensors> layers(num_layers);
 
+        auto layer_type  = [&](int* a, int scalar, int l) { return a != nullptr ? a[l] : scalar; };
+        auto layer_bytes = [&](std::int64_t* a, std::int64_t scalar, int l) { return a != nullptr ? a[l] : scalar; };
+
         for (int l = 0; l < num_layers; l++)
         {
             auto& lt = layers[l];
             lt.attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
-            lt.qkv_w  = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(qkv_type), qkv_ne0, qkv_ne1);
-            lt.q_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
-            lt.k_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
-            lt.o_w    = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(o_type), o_ne0, o_ne1);
+            // Q/K/V come either pre-concatenated (one matmul) or as three separate
+            // weights. The split form is not a slow fallback for exotic files: a
+            // *_K_M quant stores attn_v as Q6_K on some layers and Q4_K on the
+            // rest, and a ggml tensor holds exactly one type, so those layers can
+            // never be concatenated. Handling both here is what keeps the whole
+            // model in ONE graph instead of dropping to per-op dispatch.
+            const bool split_qkv = (qkv_arr == nullptr || qkv_arr[l] == nullptr);
+            lt.qkv_w = nullptr; lt.q_w = nullptr; lt.k_w = nullptr; lt.v_w = nullptr;
+            if (split_qkv)
+            {
+                if (q_arr == nullptr || k_arr == nullptr || v_arr == nullptr ||
+                    split_type_arr == nullptr || split_bytes_arr == nullptr)
+                {
+                    set_last_error("Model decode: layer has no fused QKV weight and no split Q/K/V weights.");
+                    return 0;
+                }
+                lt.q_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(split_type_arr[3 * l + 0]), qkv_ne0, qDim);
+                lt.k_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(split_type_arr[3 * l + 1]), qkv_ne0, kDim);
+                lt.v_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(split_type_arr[3 * l + 2]), qkv_ne0, kDim);
+            }
+            else
+            {
+                lt.qkv_w = ggml_new_tensor_2d(ctx,
+                    static_cast<ggml_type>(layer_type(qkv_type_arr, qkv_type, l)), qkv_ne0, qkv_ne1);
+            }
+            // Optional per-layer QKV bias / QK norm: see transformer_layer_decode_impl.
+            lt.qkv_bias_w = (qkv_bias_arr != nullptr && qkv_bias_arr[l] != nullptr)
+                ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, qDim + 2 * kDim) : nullptr;
+            lt.q_norm_w = (q_norm_arr != nullptr && q_norm_arr[l] != nullptr)
+                ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim) : nullptr;
+            lt.k_norm_w = (k_norm_arr != nullptr && k_norm_arr[l] != nullptr)
+                ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim) : nullptr;
+            lt.o_w    = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(layer_type(o_type_arr, o_type, l)), o_ne0, o_ne1);
             lt.ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
-            lt.gu_w   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(gu_type), gu_ne0, gu_ne1);
-            lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type), down_ne0, down_ne1);
+            lt.gu_w   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(layer_type(gu_type_arr, gu_type, l)), gu_ne0, gu_ne1);
+            lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(layer_type(down_type_arr, down_type, l)), down_ne0, down_ne1);
             lt.k_cache_base = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), head_dim, max_seq_len, num_kv_heads);
             lt.v_cache_base = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), head_dim, max_seq_len, num_kv_heads);
         }
@@ -681,19 +738,44 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
 
             // Fused QKV projection
             ggml_tensor* normed_2d = ggml_reshape_2d(ctx, normed, hidden_size, 1);
-            ggml_tensor* qkv_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lt.qkv_w, normed_2d), qDim + 2 * kDim);
+            ggml_tensor* q_raw = nullptr;
+            ggml_tensor* k_raw = nullptr;
+            ggml_tensor* v_raw = nullptr;
+            if (lt.qkv_w != nullptr)
+            {
+                ggml_tensor* qkv_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lt.qkv_w, normed_2d), qDim + 2 * kDim);
+                if (lt.qkv_bias_w != nullptr)
+                    qkv_flat = ggml_add(ctx, qkv_flat, lt.qkv_bias_w);
 
-            // Split Q, K, V
-            ggml_tensor* q_raw = ggml_view_1d(ctx, qkv_flat, qDim, 0);
-            ggml_tensor* k_raw = ggml_view_1d(ctx, qkv_flat, kDim, static_cast<std::size_t>(qDim) * sizeof(float));
-            ggml_tensor* v_raw = ggml_view_1d(ctx, qkv_flat, kDim, static_cast<std::size_t>(qDim + kDim) * sizeof(float));
+                // Split Q, K, V
+                q_raw = ggml_view_1d(ctx, qkv_flat, qDim, 0);
+                k_raw = ggml_view_1d(ctx, qkv_flat, kDim, static_cast<std::size_t>(qDim) * sizeof(float));
+                v_raw = ggml_view_1d(ctx, qkv_flat, kDim, static_cast<std::size_t>(qDim + kDim) * sizeof(float));
+            }
+            else
+            {
+                // Concatenate the three projections back into one Q|K|V vector so
+                // everything downstream - bias add, the Q/K/V views, RoPE - is the
+                // exact same graph as the fused case. The concat moves 4608 floats
+                // per layer, which is nothing next to the projections themselves.
+                ggml_tensor* q_mm = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lt.q_w, normed_2d), qDim);
+                ggml_tensor* k_mm = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lt.k_w, normed_2d), kDim);
+                ggml_tensor* v_mm = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lt.v_w, normed_2d), kDim);
+                ggml_tensor* qkv_flat = ggml_concat(ctx, ggml_concat(ctx, q_mm, k_mm, 0), v_mm, 0);
+                if (lt.qkv_bias_w != nullptr)
+                    qkv_flat = ggml_add(ctx, qkv_flat, lt.qkv_bias_w);
+
+                q_raw = ggml_view_1d(ctx, qkv_flat, qDim, 0);
+                k_raw = ggml_view_1d(ctx, qkv_flat, kDim, static_cast<std::size_t>(qDim) * sizeof(float));
+                v_raw = ggml_view_1d(ctx, qkv_flat, kDim, static_cast<std::size_t>(qDim + kDim) * sizeof(float));
+            }
 
             // Per-head QK norm
             ggml_tensor* q_2d = ggml_reshape_2d(ctx, q_raw, head_dim, num_heads);
             ggml_tensor* k_2d = ggml_reshape_2d(ctx, k_raw, head_dim, num_kv_heads);
 
-            ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_2d, eps), lt.q_norm_w);
-            ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_2d, eps), lt.k_norm_w);
+            ggml_tensor* q_normed = lt.q_norm_w != nullptr ? ggml_mul(ctx, ggml_rms_norm(ctx, q_2d, eps), lt.q_norm_w) : q_2d;
+            ggml_tensor* k_normed = lt.k_norm_w != nullptr ? ggml_mul(ctx, ggml_rms_norm(ctx, k_2d, eps), lt.k_norm_w) : k_2d;
 
             // RoPE
             ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_normed, head_dim, num_heads, 1);
@@ -770,8 +852,6 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             ggml_build_forward_expand(graph, layers[l].v_cache_cpy);
         }
         ggml_build_forward_expand(graph, out_hidden);
-
-        // Bind weights via cached host_ptr
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
 
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
@@ -820,15 +900,27 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         for (int l = 0; l < num_layers; l++)
         {
             auto& lt = layers[l];
-            bind_or_mark(lt.qkv_w,  qkv_arr[l],  static_cast<std::size_t>(qkv_bytes), true);
-            bind_or_mark(lt.o_w,    o_arr[l],     static_cast<std::size_t>(o_bytes), true);
-            bind_or_mark(lt.gu_w,   gu_arr[l],    static_cast<std::size_t>(gu_bytes), true);
-            bind_or_mark(lt.down_w, down_arr[l],  static_cast<std::size_t>(down_bytes), true);
+            if (lt.qkv_w != nullptr)
+            {
+                bind_or_mark(lt.qkv_w, qkv_arr[l],
+                             static_cast<std::size_t>(layer_bytes(qkv_bytes_arr, qkv_bytes, l)), true);
+            }
+            else
+            {
+                bind_or_mark(lt.q_w, q_arr[l], static_cast<std::size_t>(split_bytes_arr[3 * l + 0]), true);
+                bind_or_mark(lt.k_w, k_arr[l], static_cast<std::size_t>(split_bytes_arr[3 * l + 1]), true);
+                bind_or_mark(lt.v_w, v_arr[l], static_cast<std::size_t>(split_bytes_arr[3 * l + 2]), true);
+            }
+            bind_or_mark(lt.o_w,    o_arr[l],     static_cast<std::size_t>(layer_bytes(o_bytes_arr, o_bytes, l)), true);
+            bind_or_mark(lt.gu_w,   gu_arr[l],    static_cast<std::size_t>(layer_bytes(gu_bytes_arr, gu_bytes, l)), true);
+            bind_or_mark(lt.down_w, down_arr[l],  static_cast<std::size_t>(layer_bytes(down_bytes_arr, down_bytes, l)), true);
 
             bind_or_mark(lt.attn_norm_w, attn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
             bind_or_mark(lt.ffn_norm_w,  ffn_norm_arr[l],  static_cast<std::size_t>(hidden_size) * sizeof(float), true);
-            bind_or_mark(lt.q_norm_w,    q_norm_arr[l],    static_cast<std::size_t>(head_dim) * sizeof(float), true);
-            bind_or_mark(lt.k_norm_w,    k_norm_arr[l],    static_cast<std::size_t>(head_dim) * sizeof(float), true);
+            bind_or_mark(lt.q_norm_w,    q_norm_arr != nullptr ? q_norm_arr[l] : nullptr, static_cast<std::size_t>(head_dim) * sizeof(float), true);
+            bind_or_mark(lt.k_norm_w,    k_norm_arr != nullptr ? k_norm_arr[l] : nullptr, static_cast<std::size_t>(head_dim) * sizeof(float), true);
+            bind_or_mark(lt.qkv_bias_w,  qkv_bias_arr != nullptr ? qkv_bias_arr[l] : nullptr,
+                         static_cast<std::size_t>(qDim + 2 * kDim) * sizeof(float), true);
             bind_or_mark(lt.k_cache_base, k_cache_arr[l], kv_cache_bytes(num_kv_heads, max_seq_len, head_dim, kv_cache_type), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             bind_or_mark(lt.v_cache_base, v_cache_arr[l], kv_cache_bytes(num_kv_heads, max_seq_len, head_dim, kv_cache_type), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         }

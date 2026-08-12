@@ -211,6 +211,9 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gemma4_batched.cpp
     ggml_ops_gemma4_verify.cpp
     ggml_ops_gemma4_moe.cpp
+    ggml_ops_muse_glimmer.cpp
+    ggml_ops_muse_glimmer_vision.cpp
+    ggml_ops_dflash.cpp
     ggml_ops_diffusion.cpp
     ggml_ops_qwen_image.cpp
     ggml_ops_wan.cpp

@@ -836,6 +836,9 @@ namespace TensorSharp.Runtime
         // Tags whose partial suffixes must be held back while streaming content.
         private static readonly string[] HoldTags = { MsgEndTag, CallTag, ReturnTag, MsgStartTag };
 
+        /// <summary>Safety valve: a "header" this long means the stream never closed one.</summary>
+        private const int MaxHeaderChars = 512;
+
         public bool HasThinkingSupport => true;
         public bool HasToolSupport => true;
         public bool AlwaysRequired => true;
@@ -923,11 +926,20 @@ namespace TensorSharp.Runtime
                         }
                         else if (!done)
                         {
-                            int hold = HoldBack(buf, HeaderEndTag);
-                            if (hold > 0 && hold < buf.Length)
+                            // Keep the WHOLE header buffered until <|message|>
+                            // arrives. The previous holdback trimmed the buffer to
+                            // the partial-tag suffix, which discarded
+                            // "<|channel|>analysis" (and any "to=functions.NAME")
+                            // whenever a chunk boundary fell inside <|message|> —
+                            // the header then parsed as channel "final" and the
+                            // model's chain of thought was streamed to the user as
+                            // the answer. Headers are short; the cap only guards a
+                            // stream that never closes one.
+                            if (buf.Length > MaxHeaderChars)
                             {
+                                EmitContent(buf, contentSb, thinkingSb);
                                 _buffer.Clear();
-                                _buffer.Append(buf.Substring(buf.Length - hold));
+                                _state = HState.ParsingContent;
                             }
                         }
                         break;
@@ -1387,6 +1399,334 @@ namespace TensorSharp.Runtime
     }
 
     // ========================================================================
+    // Muse-Glimmer Parser
+    //
+    // Same <|start|>HEADER<|message|>BODY framing as harmony, but the channel is
+    // carried by the header's recipient rather than a <|channel|> tag, and a
+    // message ends at <|eom|> (more to come this turn) or <|eot|> (turn over):
+    //
+    //   <|start|>assistant to=self<|message|>...reasoning...<|eom|>
+    //   <|start|>assistant to=weather.get<|message|><atem:function_calls>...<|eom|>
+    //   <|start|>assistant<|message|>...the answer...<|eot|>
+    //
+    // Without this the framing and the whole reasoning channel were streamed to
+    // the user verbatim, so every reply opened with a literal
+    // " to=self<|message|>" followed by the model restating the prompt.
+    // ========================================================================
+
+    public class MuseGlimmerOutputParser : IOutputParser
+    {
+        private enum MState { LookingForStart, ParsingHeader, ParsingContent }
+
+        private MState _state;
+        private readonly StringBuilder _buffer = new();
+        private readonly StringBuilder _toolArgs = new();
+        private string? _currentRecipient;
+        private int _callIndex;
+
+        private const string MsgStartTag = "<|start|>";
+        private const string HeaderEndTag = "<|message|>";
+        private const string EomTag = "<|eom|>";
+        private const string EotTag = "<|eot|>";
+
+        private static readonly string[] EndTags = { EomTag, EotTag };
+        private static readonly string[] HoldTags = { EomTag, EotTag, MsgStartTag };
+
+        /// <summary>Safety valve: a "header" this long means the stream never closed one.</summary>
+        private const int MaxHeaderChars = 512;
+
+        public bool HasThinkingSupport => true;
+        public bool HasToolSupport => true;
+        // The framing tokens are always emitted, so the parser is never optional:
+        // skipping it would leak "<|start|>assistant to=self<|message|>" verbatim.
+        public bool AlwaysRequired => true;
+
+        public void Init(bool enableThinking, List<ToolFunction> tools)
+        {
+            _buffer.Clear();
+            _toolArgs.Clear();
+            _state = MState.ParsingHeader;
+            _currentRecipient = null;
+            _callIndex = 0;
+            // The prompt's generation marker is "<|start|>assistant", so the first
+            // token the model emits belongs to that message's HEADER (" to=self" or
+            // straight to "<|message|>"). Start mid-header rather than hunting for
+            // a <|start|> that has already been consumed by the prompt.
+        }
+
+        public ParsedOutput Add(string text, bool done)
+        {
+            _buffer.Append(text);
+            var result = new ParsedOutput();
+            var contentSb = new StringBuilder();
+            var thinkingSb = new StringBuilder();
+            var toolCalls = new List<ToolCall>();
+
+            bool keepParsing = true;
+            while (keepParsing)
+            {
+                keepParsing = false;
+                string buf = _buffer.ToString();
+                if (buf.Length == 0)
+                {
+                    if (done && _state == MState.ParsingContent)
+                    {
+                        FinalizeMessage(toolCalls);
+                        _state = MState.LookingForStart;
+                    }
+                    break;
+                }
+
+                switch (_state)
+                {
+                    case MState.LookingForStart:
+                        int startIdx = buf.IndexOf(MsgStartTag, StringComparison.Ordinal);
+                        if (startIdx >= 0)
+                        {
+                            _buffer.Clear();
+                            _buffer.Append(buf.Substring(startIdx + MsgStartTag.Length));
+                            _state = MState.ParsingHeader;
+                            keepParsing = true;
+                        }
+                        else if (!done)
+                        {
+                            int hold = HarmonyHoldBack(buf, MsgStartTag);
+                            if (hold > 0)
+                            {
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                            else
+                            {
+                                _buffer.Clear();
+                            }
+                        }
+                        break;
+
+                    case MState.ParsingHeader:
+                        int headerEnd = buf.IndexOf(HeaderEndTag, StringComparison.Ordinal);
+                        if (headerEnd >= 0)
+                        {
+                            ParseHeader(buf.Substring(0, headerEnd));
+                            string after = buf.Substring(headerEnd + HeaderEndTag.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = MState.ParsingContent;
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (!done)
+                        {
+                            // Keep the WHOLE header buffered until <|message|>
+                            // arrives. Trimming it to the partial-tag suffix (the
+                            // holdback the content state uses) would throw away the
+                            // "to=..." recipient whenever a chunk boundary lands
+                            // inside <|message|>, and an unrecognised recipient
+                            // silently routes the reasoning channel to the user.
+                            // Headers are a handful of characters; the cap is only
+                            // a guard against a stream that never closes one.
+                            if (buf.Length > MaxHeaderChars)
+                            {
+                                EmitContent(buf, contentSb, thinkingSb);
+                                _buffer.Clear();
+                                _state = MState.ParsingContent;
+                            }
+                        }
+                        break;
+
+                    case MState.ParsingContent:
+                        int endIdx = FindEarliestEnd(buf, out int tagLen);
+                        if (endIdx >= 0)
+                        {
+                            EmitContent(buf.Substring(0, endIdx), contentSb, thinkingSb);
+                            string after = buf.Substring(endIdx + tagLen);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            FinalizeMessage(toolCalls);
+                            _state = MState.LookingForStart;
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (!done)
+                        {
+                            int hold = HarmonyHoldBack(buf, HoldTags);
+                            if (hold > 0)
+                            {
+                                string emit = buf.Substring(0, buf.Length - hold);
+                                if (emit.Length > 0) EmitContent(emit, contentSb, thinkingSb);
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                            else
+                            {
+                                EmitContent(buf, contentSb, thinkingSb);
+                                _buffer.Clear();
+                            }
+                        }
+                        else
+                        {
+                            EmitContent(buf, contentSb, thinkingSb);
+                            _buffer.Clear();
+                            FinalizeMessage(toolCalls);
+                            _state = MState.LookingForStart;
+                        }
+                        break;
+                }
+            }
+
+            result.Content = contentSb.ToString();
+            result.Thinking = thinkingSb.ToString();
+            if (toolCalls.Count > 0)
+                result.ToolCalls = toolCalls;
+            return result;
+        }
+
+        /// <summary>Header text between &lt;|start|&gt; and &lt;|message|&gt;, e.g. "assistant to=self".</summary>
+        private void ParseHeader(string header)
+        {
+            _currentRecipient = null;
+            int toIdx = header.IndexOf("to=", StringComparison.Ordinal);
+            if (toIdx < 0) return;
+            string rest = header.Substring(toIdx + 3);
+            int end = 0;
+            while (end < rest.Length && !char.IsWhiteSpace(rest[end]) && rest[end] != '<')
+                end++;
+            if (end > 0)
+                _currentRecipient = rest.Substring(0, end);
+        }
+
+        private bool IsThinking() => string.Equals(_currentRecipient, "self", StringComparison.Ordinal);
+
+        private bool IsToolCall() =>
+            _currentRecipient != null &&
+            !string.Equals(_currentRecipient, "self", StringComparison.Ordinal) &&
+            !string.Equals(_currentRecipient, "user", StringComparison.Ordinal);
+
+        private void EmitContent(string content, StringBuilder contentSb, StringBuilder thinkingSb)
+        {
+            if (content.Length == 0) return;
+            if (IsToolCall()) _toolArgs.Append(content);
+            else if (IsThinking()) thinkingSb.Append(content);
+            else contentSb.Append(content);
+        }
+
+        private void FinalizeMessage(List<ToolCall> toolCalls)
+        {
+            if (IsToolCall())
+            {
+                var tc = BuildAtemToolCall(_currentRecipient!, _toolArgs.ToString(), _callIndex);
+                if (tc != null) { toolCalls.Add(tc); _callIndex++; }
+            }
+            _toolArgs.Clear();
+            _currentRecipient = null;
+        }
+
+        /// <summary>
+        /// Parse the ATEM XML block the chat template documents:
+        /// <![CDATA[
+        /// <atem:function_calls><atem:invoke name="NAME">
+        ///   <atem:parameter name="k">v</atem:parameter>
+        /// </atem:invoke></atem:function_calls>
+        /// ]]>
+        /// Values are JSON-decoded when they parse as JSON (lists/objects/numbers/
+        /// booleans, which is how the template serialises them) and kept as text
+        /// otherwise.
+        /// </summary>
+        internal static ToolCall? BuildAtemToolCall(string recipient, string body, int index)
+        {
+            string name = recipient;
+            const string invokeOpen = "<atem:invoke name=\"";
+            int inv = body.IndexOf(invokeOpen, StringComparison.Ordinal);
+            if (inv >= 0)
+            {
+                int nameStart = inv + invokeOpen.Length;
+                int nameEnd = body.IndexOf('"', nameStart);
+                if (nameEnd > nameStart) name = body.Substring(nameStart, nameEnd - nameStart);
+            }
+            if (string.IsNullOrEmpty(name)) return null;
+
+            var args = new Dictionary<string, object>();
+            const string paramOpen = "<atem:parameter name=\"";
+            const string paramClose = "</atem:parameter>";
+            int pos = 0;
+            while (true)
+            {
+                int p = body.IndexOf(paramOpen, pos, StringComparison.Ordinal);
+                if (p < 0) break;
+                int keyStart = p + paramOpen.Length;
+                int keyEnd = body.IndexOf('"', keyStart);
+                if (keyEnd < 0) break;
+                int valStart = body.IndexOf('>', keyEnd);
+                if (valStart < 0) break;
+                valStart++;
+                int valEnd = body.IndexOf(paramClose, valStart, StringComparison.Ordinal);
+                if (valEnd < 0) break;
+                string key = body.Substring(keyStart, keyEnd - keyStart);
+                string raw = body.Substring(valStart, valEnd - valStart);
+                args[key] = ParseAtemValue(raw);
+                pos = valEnd + paramClose.Length;
+            }
+            return new ToolCall { Name = name, Arguments = args, Index = index };
+        }
+
+        private static object ParseAtemValue(string raw)
+        {
+            string t = raw.Trim();
+            if (t.Length == 0) return raw;
+            if (t == "true") return true;
+            if (t == "false") return false;
+            if (t == "null") return string.Empty;
+            char c0 = t[0];
+            if (c0 == '[' || c0 == '{' || c0 == '-' || (c0 >= '0' && c0 <= '9'))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(t);
+                    return Qwen3OutputParser.JsonElementToObject(doc.RootElement);
+                }
+                catch
+                {
+                    // Not JSON after all - fall through to the raw text.
+                }
+            }
+            return raw;
+        }
+
+        private static int FindEarliestEnd(string buf, out int tagLen)
+        {
+            int best = -1;
+            tagLen = 0;
+            foreach (var tag in EndTags)
+            {
+                int idx = buf.IndexOf(tag, StringComparison.Ordinal);
+                if (idx >= 0 && (best < 0 || idx < best))
+                {
+                    best = idx;
+                    tagLen = tag.Length;
+                }
+            }
+            return best;
+        }
+
+        /// <summary>Longest suffix of <paramref name="buf"/> that is a prefix of any tag.</summary>
+        private static int HarmonyHoldBack(string buf, params string[] tags)
+        {
+            int maxOverlap = 0;
+            foreach (var tag in tags)
+            {
+                int max = Math.Min(tag.Length - 1, buf.Length);
+                for (int i = max; i > 0; i--)
+                {
+                    if (string.CompareOrdinal(buf, buf.Length - i, tag, 0, i) == 0)
+                    {
+                        maxOverlap = Math.Max(maxOverlap, i);
+                        break;
+                    }
+                }
+            }
+            return maxOverlap;
+        }
+    }
+
+    // ========================================================================
     // Factory
     // ========================================================================
 
@@ -1400,6 +1740,7 @@ namespace TensorSharp.Runtime
                 "qwen3" => new Qwen3OutputParser(),
                 "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe" => new Qwen35OutputParser(),
                 "gptoss" or "gpt-oss" => new HarmonyOutputParser(),
+                "muse-glimmer" => new MuseGlimmerOutputParser(),
                 "deepseek4" => new DeepSeek4OutputParser(),
                 "nemotron_h" or "nemotron_h_moe" => new Qwen3OutputParser(),
                 _ => new PassthroughOutputParser()
@@ -1427,7 +1768,11 @@ namespace TensorSharp.Runtime
             // tool calls both arrive as plain text: without the parser the
             // </think> marker and the whole <｜DSML｜tool_calls> block would be
             // streamed to the client as if they were the answer.
-            return architecture is "gptoss" or "gpt-oss" or "gemma4" or "deepseek4";
+            // Muse-Glimmer likewise: every assistant message is wrapped in
+            // <|start|>...<|message|>...<|eom|>/<|eot|> framing and its reasoning
+            // arrives on the "to=self" channel, so an unparsed stream shows the
+            // raw tags and the whole chain of thought as if it were the answer.
+            return architecture is "gptoss" or "gpt-oss" or "gemma4" or "deepseek4" or "muse-glimmer";
         }
     }
 }

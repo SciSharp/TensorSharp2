@@ -1527,6 +1527,10 @@ async function requestAssistantResponse() {
                   : (100 * reused / data.promptTokens);
                 stats += ` \u00B7 KV ${reused}/${data.promptTokens} (${pct.toFixed(0)}%)`;
               }
+              // The reply stopped because it ran out of max-tokens budget, not
+              // because the model was done. Say so, otherwise an answer that
+              // ends mid-word just looks like the model broke.
+              if (data.truncated) stats += ' \u00B7 truncated (max tokens reached)';
               statsDiv.textContent = stats;
             }
           }

@@ -26,14 +26,14 @@ Zhongkai Fu 所著的 **[From Tensors to Tokens: Building a Multimodal LLM Infer
 - **🚀 连续批处理 & 分页 KV 缓存。** vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
 - **🧬 DeepSeek V4 Flash（284B MoE），三套整模型执行器。** 这套压缩稀疏注意力、1M 上下文的架构可运行在 Direct CUDA 引擎（`--backend cuda`）、原生 ggml 执行器（`--backend ggml_cuda` / `ggml_vulkan`），以及 **100% 纯 C# 的 CPU 执行器**（`--backend cpu`，零原生依赖）上。权重会自动按层切分到所有可见 GPU，因此远大于单卡显存的模型依然跑得起来；服务端以原生 per-sequence slot + 连续批处理托管它。→ [DeepSeek V4 卡片](docs/models/deepseek4.md)
 - **🔮 投机解码——MTP / NextN 与 DSpark。** 多 token 预测草稿头加速单序列 decode：Qwen 3.6（内嵌 NextN 块）与 Gemma 4（独立 `gemma4-assistant` 草稿 GGUF）；DeepSeek V4 则新增 **DSpark** 块级起草（`--draft-model`），每步提议一整块 token，decode 提速 **1.3–1.4×**（多轮对话最高 2.0×）。三者都是草稿提议、主干一次批量前向验证，输出与标准 decode 一致。→ [投机解码](FEATURES_zh-cn.md#mtp--nextn-投机解码)
-- **🔗 张量并行与分布式集群。** 用 `--tp N` 把一个模型切分到多张 GPU 上——Direct `cuda` 后端**以及** GGML CUDA / Vulkan 后端均支持——再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。采用 Megatron-LM 列/行并行范式与分层 AllReduce；GGML 上提供 MoE 专家并行与按 rank 的 GatedDeltaNet 融合内核。融合式按 rank 执行让 Gemma 4 E4B 上 `--tp 2` 的 decode 达到单卡的 **1.39×**，也让单卡装不下的模型（Qwen 3.5-35B-A3B）得以运行。可选 Redis 支撑的 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
+- **🔗 张量并行与分布式集群。** 用 `--tp N` 把一个模型切分到多张 GPU 上——Direct `cuda` 后端**以及** GGML CUDA / Vulkan 后端均支持——再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。采用 Megatron-LM 列/行并行范式与分层 AllReduce；GGML 上提供 MoE 专家并行与按 rank 的 GatedDeltaNet 融合内核。融合式按 rank 执行让 Gemma 4 E4B 上 `--tp 2` 的 decode 达到单卡的 **1.39×**、Muse-Glimmer 30B 达到 **1.57×**（其 prefill 同时提升 **1.34×**——是这里唯一在两个阶段都超过单卡的模型），也让单卡装不下的模型（Qwen 3.5-35B-A3B；24 GB 卡上 28.2 GB 的 Muse-Glimmer 30B Q8_0）得以运行。可选 Redis 支撑的 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
 - **🎨 Qwen-Image-Edit 图像编辑。** 提示词 + 输入图像 → 编辑后的图像，驱动 60 块 MMDiT，配以 Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器。CUDA 图捕获的整 DiT、FlowMatch-Euler true-CFG 去噪、Web UI 实时预览，以及 Lightning-LoRA 快速路径。热态 4 步编辑比 `stable-diffusion.cpp` 快 **1.19×**。→ [Qwen-Image-Edit 卡片](docs/models/qwenimage_zh-cn.md)
 - **🌫️ DiffusionGemma 文本扩散。** 基于 Gemma-4 派生 MoE backbone 的分块 EntropyBound 去噪，提供 CLI 参数与 Web UI 实时去噪预览。→ [DiffusionGemma 卡片](docs/models/diffusiongemma_zh-cn.md)
-- **🖼️ 多模态。** 图像 / 视频 / 音频（Gemma 4）；图像输入（Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni）；CLI 与 Web UI 支持 PDF。→ [多模态](FEATURES_zh-cn.md#多模态支持)
-- **🛠️ 工具调用与思维链。** Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4（DSML 标记）均支持多轮工具调用与结构化思维链。→ [功能特性](FEATURES_zh-cn.md)
+- **🖼️ 多模态。** 图像 / 视频 / 音频（Gemma 4）；图像输入（Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni、Muse-Glimmer）；CLI 与 Web UI 支持 PDF。→ [多模态](FEATURES_zh-cn.md#多模态支持)
+- **🛠️ 工具调用与思维链。** Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer（ATEM 标记）、DeepSeek V4（DSML 标记）均支持多轮工具调用与结构化思维链。→ [功能特性](FEATURES_zh-cn.md)
 - **🔌 兼容 Ollama 与 OpenAI 的 API**，外加浏览器聊天 UI——现有工具可直接接入。→ [HTTP API](USAGE_zh-cn.md#http-api)
 - **📄 配置文件 + 自动下载。** 把 CLI/Server 参数写进可复用的 JSON 文件，支持 `${变量}` 与首次运行自动下载模型的 `{ "path", "urls" }` 条目。→ [config/README.md](config/README.md)
-- **🧮 原生量化计算。** Q4_K_M / Q8_0 / MXFP4 / IQ2_XXS 等直接参与 matmul，无需反量化为 FP32。可运行于 GGML Metal / CUDA / Vulkan、Direct CUDA/cuBLAS、MLX（Apple Silicon）与纯 C# CPU 路径，均带 CPU 回退。→ [后端](USAGE_zh-cn.md#计算后端)
+- **🧮 原生量化计算。** Q4_K_M / Q8_0 / MXFP4 / IQ2_XXS / IQ2_S / IQ3_S / IQ3_XXS / IQ4_XS 等直接参与 matmul，无需反量化为 FP32。可运行于 GGML Metal / CUDA / Vulkan、Direct CUDA/cuBLAS、MLX（Apple Silicon）与纯 C# CPU 路径，均带 CPU 回退。MLX 上的 IQ 解码内核把码本与 scale 的读取摊销到整个子块（而非每权重重读一次），使混合 IQ 量化的 30B 在 M5 Pro 上从 3.6 提升到 **14.3 tok/s**（达融合 ggml-metal 图的 67%，输出逐字节一致）。→ [后端](USAGE_zh-cn.md#计算后端)
 
 ## 快速开始
 
@@ -172,6 +172,7 @@ dotnet run --project TensorSharp.Server -c Release -- --help
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持（始终） | 支持 | — | [gptoss](docs/models/gptoss_zh-cn.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B/47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni | 图像（Omni） | 支持 | 支持 | — | [nemotron](docs/models/nemotron_zh-cn.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 | — | [mistral3](docs/models/mistral3_zh-cn.md) |
+| Muse-Glimmer | `muse-glimmer` | Muse-Glimmer-30B（交错滑动窗口 + NoPE 全注意力层，注意力输出门控） | 图像 | 支持 | 支持（ATEM） | 支持（DFlash 块级草稿，独立 GGUF） | [muse-glimmer](docs/models/muse-glimmer.md) |
 | DiffusionGemma | `diffusion-gemma` | diffusion-gemma 文本扩散 GGUF | 仅文本 | 不支持 | 不支持 | — | [diffusiongemma](docs/models/diffusiongemma_zh-cn.md) |
 | Qwen-Image-Edit | `qwen_image` | qwen-image-edit MMDiT GGUF（+ VAE 与 Qwen2.5-VL） | 图像编辑（图像+文本 → 图像） | 不支持 | 不支持 | — | [qwenimage](docs/models/qwenimage_zh-cn.md) |
 
@@ -222,7 +223,7 @@ TensorSharp 在 CUDA 的 prefill / 首 token 延迟上明显领先（多轮 pref
 | 模型家族 | DeepSeek V4 Flash（`deepseek4`）、Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3。图像编辑通过 Qwen-Image-Edit（`qwen_image` MMDiT）。 |
 | 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA、GGML Vulkan。DeepSeek V4 另有三套专属的整模型执行器——Direct CUDA、原生 ggml 与纯 C# CPU——都会把权重按层切分到所有可见 GPU（`--tp N` / `TS_DSV4_NGPU` 限定卡数）。 |
-| 多模态 | Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 图像输入；PDF（CLI `--pdf` + Web UI）。 |
+| 多模态 | Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni、Muse-Glimmer 图像输入；PDF（CLI `--pdf` + Web UI）。 |
 | 连续批处理 | vLLM 风格分页 KV 缓存、基于内容哈希的前缀共享、迭代级调度器（默认启用，`--no-continuous-batching` 关闭）。DeepSeek V4 在同一引擎上通过其原生 per-sequence slot 提供服务。 |
 | 投机解码 | Qwen 3.6（内嵌）与 Gemma 4（独立草稿 GGUF）的 MTP / NextN 草稿头；DeepSeek V4 的 DSpark 块级起草（`--draft-model` 指定独立草稿 GGUF，`cuda` / `ggml_cuda`，decode 提速 1.3–1.4×）。默认关闭；服务端用 `--mtp-spec` 启用，CLI 直接传 `--draft-model` 即可。 |
 | 张量并行 | Direct `cuda` 后端与 GGML CUDA / Vulkan 后端上的 Megatron-LM 列/行并行 TP（`--tp N` / `TENSORSHARP_TP_DEGREE`，CLI 与服务端均支持）；通过点对点 TCP 的多节点分布式 TP（`--tp-node-id` / `--tp-peers`），采用分层 AllReduce，CUDA P2P 不可用时自动回退到主机中转。覆盖全部自回归架构；GGML 上 Gemma 4 与 Qwen 3.5/3.6 使用 MoE 专家并行与融合的按 rank decode/prefill 计算图。可选 Redis 支撑的 KV 缓存与 Responses API 存储。 |

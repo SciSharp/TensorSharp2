@@ -17,6 +17,8 @@
 // eliminating the host fill + H2D upload. Bit-identical to the host path.
 extern "C" bool tsg_cuda_fill_causal_mask_f16(
     void* mask_dev, int kvLen, int N, int nPast, int window, int validLen);
+extern "C" bool tsg_cuda_fill_ring_mask_f16(
+    void* mask_dev, int ringRows, int N, int startPos, int window);
 extern "C" bool tsg_cuda_sync_stream0(void);
 #endif
 
@@ -181,6 +183,109 @@ namespace tsg
         return r;
     }
 
+    // Does a [head_dim, length, kv_heads] window that starts at row `start_idx`
+    // of a `cache_size`-row cache have to be MATERIALISED before ggml-cuda's
+    // flash attention may read it?
+    //
+    // ggml-cuda's flash-attention VEC kernel - the one it selects for a
+    // SINGLE-ROW decode (fattn.cu `ggml_cuda_get_best_fattn_kernel`, Q->ne[1] == 1
+    // on Ada+ with an unquantized KV cache) - returns wrong results when K/V is a
+    // view whose ne[1] is a truncated prefix of a longer axis, i.e. one where
+    // nb[2] != ne[1]*nb[1]. That is exactly the shape every caller of
+    // view_kv_cache_window produces once the live sequence is shorter than the
+    // allocated cache: the KV-head stride jumps over the rows the window skips.
+    //
+    // Measured on Muse-Glimmer (52-token prompt, 8192-row cache, 256-row padded
+    // window, 32 query heads over 2 KV heads, F16 cache): with the strided view
+    // the first full-attention layer's flash-attention output came back with
+    // sum 195.95 against 78.31 for the materialised window, from BYTE-IDENTICAL
+    // K, V, Q and mask (verified by hashing the logical window out of the cache
+    // after the graph ran), and the error compounded through the remaining layers
+    // into a different token stream - fluent but wrong. Forcing the same layer
+    // onto the non-flash soft_max path, or widening the window until it covers
+    // the whole cache, both reproduce the materialised result.
+    //
+    // The two narrowings below are what keep this from taxing every decode:
+    //
+    //  * `length % kFlashAttnKvStride != 0` - ggml-cuda can only choose the vec
+    //    kernel when K->ne[1] is a multiple of FATTN_KQ_STRIDE (fattn.cu,
+    //    `can_use_vector_kernel`). A window sized to the exact live length lands
+    //    on the MMA/tile kernels instead, and those honour the strides: the same
+    //    Muse-Glimmer prefill (52 query rows, MMA, same strided 256-row window)
+    //    produced bit-identical hidden states with and without the copy.
+    //
+    //  * head dims the vec kernel has no instance for - it needs
+    //    Q->ne[0] <= 256, a multiple of 64, and not 192 (same predicate). This is
+    //    what keeps the 512/576-dim MLA attention, whose KV length
+    //    flash_attn_kv_length() ALWAYS pads to the stride, off the copy.
+    //
+    //  * `fattn_query_rows != 1` - every vec selection for an UNQUANTIZED K/V in
+    //    ggml_cuda_get_best_fattn_kernel requires Q->ne[1] == 1, except Volta's
+    //    `Q->ne[1] * gqa_ratio_eff <= 2`, which admits 2 rows only when the
+    //    gqa_ratio is odd - i.e. MHA - and every multi-row caller here (verify,
+    //    prefill, batched) is GQA. Multi-row graphs land on the MMA/tile kernels,
+    //    which honour the strides (measured: see above). Callers whose window is
+    //    not read by flash attention at all (materialising ggml_cpy gathers, the
+    //    draft head's explicit soft_max attention, concat inputs) pass 0.
+    //
+    //  * F32 caches - launch_fattn converts a non-F16 K/V to F16 BEFORE the
+    //    kernel runs (need_f16_K/V for every vec instance), and the conversion
+    //    (to_fp16_nc_cuda / the contiguously-allocated fast path) honours the
+    //    source strides, so the kernel never sees the truncated view's nb[2].
+    //    Only an F16 cache is handed to the vec kernel with its raw strides.
+    //
+    //  * block-quantized caches - ggml_cuda_cpy has no q8_0->q8_0 / q4_0->q4_0
+    //    kernel, so ggml_cont of such a window ABORTS the process. Those caches
+    //    keep the raw view. (They also take the vec kernel's quantized path for
+    //    Q->ne[1] <= 2; whether that path shares the fault is checked empirically
+    //    per model - the F16 default cache is what every shipped config uses.)
+    //
+    // NOTE ON THE PREDICATE: it has to be "the window is a sub-range of the
+    // cache", NOT `!ggml_is_contiguous(view)`. ggml_is_contiguous_n SKIPS
+    // dimensions whose ne is 1, so with a SINGLE KV head - which is what every
+    // rank holds under --tp 2 - a truncated window reports itself contiguous and
+    // the guard would let the bad shape straight through. --tp 2 reproduced the
+    // identical wrong token stream until this predicate stopped consulting
+    // ggml_is_contiguous.
+    //
+    // Restricted to CUDA: Metal, Vulkan and CPU were never affected and keep
+    // their exact graphs.
+    inline bool kv_window_needs_cuda_flash_attn_copy(
+        int head_dim, int cache_size, int start_idx, int length, int kv_cache_type,
+        int fattn_query_rows)
+    {
+        if (g_backend_type != BACKEND_TYPE_CUDA)
+            return false;
+        // Diagnostic kill-switch (TS_KV_FATTN_COPY=0): hand flash attention the
+        // raw strided views again. This is how the fault is REPRODUCED for an
+        // A/B inside one binary - never set it in production.
+        static const bool copy_enabled = [] {
+            const char* e = std::getenv("TS_KV_FATTN_COPY");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (!copy_enabled)
+            return false;
+        if (fattn_query_rows != 1)
+            return false;                               // vec needs Q->ne[1] == 1
+        if (start_idx == 0 && length >= cache_size)
+            return false;                               // window IS the cache
+        if (length % kFlashAttnKvStride != 0)
+            return false;                               // vec kernel unreachable
+        if (head_dim > 256 || head_dim % 64 != 0 || head_dim == 192)
+            return false;                               // no vec instance
+        if (static_cast<ggml_type>(kv_cache_type) != GGML_TYPE_F16)
+            return false;                               // F32 is converted with
+                                                        // stride-aware kernels;
+                                                        // quantized can't be cont'd
+        return true;
+    }
+
+    // `fattn_query_rows`: ne[1] of the Q tensor of the ggml_flash_attn_ext that
+    // reads this window DIRECTLY, 0 if no flash-attention op does (the window
+    // feeds a cpy/concat/soft_max chain instead). Defaults to 1 - the shape every
+    // single-token decode graph has, and the only one ggml-cuda's vec kernel (the
+    // one that misreads truncated views; see kv_window_needs_cuda_flash_attn_copy)
+    // can be selected for with an F16/F32 cache.
     inline ggml_tensor* view_kv_cache_window(
         ggml_context* ctx,
         ggml_tensor* cache,
@@ -189,7 +294,8 @@ namespace tsg
         int kv_heads,
         int start_idx,
         int length,
-        int kv_cache_type = GGML_TYPE_F32)
+        int kv_cache_type = GGML_TYPE_F32,
+        int fattn_query_rows = 1)
     {
         if (ctx == nullptr || cache == nullptr || head_dim <= 0 || cache_size <= 0 || kv_heads <= 0 || length <= 0)
             return nullptr;
@@ -206,7 +312,7 @@ namespace tsg
 
         if (start_idx + length <= cache_size)
         {
-            return ggml_view_3d(
+            ggml_tensor* window = ggml_view_3d(
                 ctx,
                 cache,
                 head_dim,
@@ -215,6 +321,16 @@ namespace tsg
                 nb1,
                 nb2,
                 static_cast<std::size_t>(start_idx) * nb1);
+            if (window != nullptr &&
+                kv_window_needs_cuda_flash_attn_copy(head_dim, cache_size, start_idx, length, kv_cache_type,
+                                                     fattn_query_rows))
+            {
+                // See kv_window_needs_cuda_flash_attn_copy above. One copy of the
+                // window per affected cache per forward; it only fires when the
+                // window is a strict sub-range, so a full-cache read costs nothing.
+                window = ggml_cont(ctx, window);
+            }
+            return window;
         }
 
         const int tail_length = cache_size - start_idx;

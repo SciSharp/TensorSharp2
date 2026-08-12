@@ -304,8 +304,16 @@ namespace TensorSharp.Server.Hosting
                     "target resolution does not fit beside the resident weights).",
                     "--offload-cpu"),
             }),
-            ("Wan video-generation companion models (wan DiT GGUFs)", new[]
+            ("Wan video-generation defaults and companion models (wan DiT GGUFs)", new[]
             {
+                new OptionHelp("--video-frames <N>",
+                    "Default output frame count when a Wan request omits 'frames'. The count is snapped to the " +
+                    "VAE temporal grid (4k+1). Model default: 33, or 49 for Wan2.2-TI2V. A request value overrides it.",
+                    "--video-frames 121"),
+                new OptionHelp("--fps <N>",
+                    "Default MP4 playback rate when a Wan request omits 'fps'. Model default: 16, or 24 for " +
+                    "Wan2.2-TI2V. A request value overrides it; FPS changes playback rate, not generation work.",
+                    "--fps 24"),
                 new OptionHelp("--wan-vae <path>",
                     "Wan video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B). " +
                     "Default: same-directory scan next to the DiT model, VAE/ subfolders included " +
@@ -361,6 +369,7 @@ namespace TensorSharp.Server.Hosting
             writer.WriteLine("  TensorSharp.Server --model C:\\models\\gemma-4-E4B-it-Q8_0.gguf --backend ggml_cpu");
             writer.WriteLine("  TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda");
             writer.WriteLine("  TensorSharp.Server --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2    (split across 2 GPUs)");
+            writer.WriteLine("  TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda --video-frames 121 --fps 24");
             writer.WriteLine("  TensorSharp.Server --backend ggml_cpu    (model-less status process; inference unavailable)");
             writer.WriteLine("  TensorSharp.Server --config server.json    (read options from a file)");
             writer.WriteLine("  TensorSharp.Server --config server.json --backend ggml_cuda    (file, but override the backend)");

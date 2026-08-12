@@ -189,12 +189,17 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return;
             }
 
-            await foreach (var (piece, done, promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs)
+            await foreach (var update
                 in _svc.GenerateStreamAsync(prompt, imagePaths, maxTokens, ctx.RequestAborted, samplingConfig))
             {
-                object resp = done
-                    ? OllamaResponseFactory.GenerateFinalChunk(_svc.LoadedModelName, promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs)
-                    : OllamaResponseFactory.GenerateTokenChunk(_svc.LoadedModelName, piece);
+                // /api/generate has no tool-call surface, so the only distinction
+                // that matters here is truncated vs. finished.
+                object resp = update.Done
+                    ? OllamaResponseFactory.GenerateFinalChunk(_svc.LoadedModelName,
+                        FinishReasonMapper.ToOllamaDoneReason(update.FinishReason, hasToolCalls: false),
+                        update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens,
+                        update.TotalNs, update.PromptNs, update.EvalNs)
+                    : OllamaResponseFactory.GenerateTokenChunk(_svc.LoadedModelName, update.Piece);
 
                 await NdJsonWriter.WriteLineAsync(ctx.Response, resp, ctx.RequestAborted);
             }
@@ -222,22 +227,28 @@ namespace TensorSharp.Server.ProtocolAdapters
             var sb = new StringBuilder();
             int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
             long totalNs = 0, promptNs = 0, evalNs = 0;
+            string pipelineFinishReason = null;
 
-            await foreach (var (piece, done, pt, et, kr, tn, pn, en)
+            await foreach (var update
                 in _svc.GenerateStreamAsync(prompt, imagePaths, maxTokens, ctx.RequestAborted, samplingConfig))
             {
-                if (!done)
-                    sb.Append(piece);
+                if (!update.Done)
+                {
+                    sb.Append(update.Piece);
+                }
                 else
                 {
-                    promptTokens = pt; evalTokens = et; kvReusedTokens = kr;
-                    totalNs = tn; promptNs = pn; evalNs = en;
+                    promptTokens = update.PromptTokens; evalTokens = update.EvalTokens; kvReusedTokens = update.KvCacheReusedTokens;
+                    totalNs = update.TotalNs; promptNs = update.PromptNs; evalNs = update.EvalNs;
+                    pipelineFinishReason = update.FinishReason;
                 }
             }
 
             await ctx.Response.WriteAsJsonAsync(
                 OllamaResponseFactory.GenerateNonStreamingResponse(
-                    _svc.LoadedModelName, sb.ToString(), promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs));
+                    _svc.LoadedModelName, sb.ToString(),
+                    FinishReasonMapper.ToOllamaDoneReason(pipelineFinishReason, hasToolCalls: false),
+                    promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs));
         }
 
         // ---- Chat ------------------------------------------------------------
@@ -331,15 +342,15 @@ namespace TensorSharp.Server.ProtocolAdapters
             bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
             List<ToolCall> collectedToolCalls = null;
 
-            await foreach (var (piece, done, promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs)
+            await foreach (var update
                 in _svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
                     tools, enableThinking))
             {
-                if (!done)
+                if (!update.Done)
                 {
                     object resp = useParser
-                        ? BuildParsedChatChunk(_svc.LoadedModelName, parser, piece, ref collectedToolCalls, out bool emit)
-                        : OllamaResponseFactory.ChatRawTokenChunk(_svc.LoadedModelName, piece);
+                        ? BuildParsedChatChunk(_svc.LoadedModelName, parser, update.Piece, ref collectedToolCalls, out bool emit)
+                        : OllamaResponseFactory.ChatRawTokenChunk(_svc.LoadedModelName, update.Piece);
 
                     if (useParser && resp == null)
                         continue;
@@ -364,15 +375,21 @@ namespace TensorSharp.Server.ProtocolAdapters
                         }
 
                         await NdJsonWriter.WriteLineAsync(ctx.Response,
-                            OllamaResponseFactory.ChatParsedFinalChunk(_svc.LoadedModelName, collectedToolCalls,
-                                promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs),
+                            OllamaResponseFactory.ChatParsedFinalChunk(_svc.LoadedModelName,
+                                FinishReasonMapper.ToOllamaDoneReason(update.FinishReason,
+                                    collectedToolCalls != null && collectedToolCalls.Count > 0),
+                                collectedToolCalls,
+                                update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens,
+                                update.TotalNs, update.PromptNs, update.EvalNs),
                             ctx.RequestAborted, JsonOptions.IgnoreNulls);
                     }
                     else
                     {
                         await NdJsonWriter.WriteLineAsync(ctx.Response,
                             OllamaResponseFactory.ChatRawFinalChunk(_svc.LoadedModelName,
-                                promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs),
+                                FinishReasonMapper.ToOllamaDoneReason(update.FinishReason, hasToolCalls: false),
+                                update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens,
+                                update.TotalNs, update.PromptNs, update.EvalNs),
                             ctx.RequestAborted, JsonOptions.IgnoreNulls);
                     }
                 }
@@ -432,17 +449,21 @@ namespace TensorSharp.Server.ProtocolAdapters
             var sb = new StringBuilder();
             int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
             long totalNs = 0, promptNs = 0, evalNs = 0;
+            string pipelineFinishReason = null;
 
-            await foreach (var (piece, done, pt, et, kr, tn, pn, en)
+            await foreach (var update
                 in _svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
                     tools, enableThinking))
             {
-                if (!done)
-                    sb.Append(piece);
+                if (!update.Done)
+                {
+                    sb.Append(update.Piece);
+                }
                 else
                 {
-                    promptTokens = pt; evalTokens = et; kvReusedTokens = kr;
-                    totalNs = tn; promptNs = pn; evalNs = en;
+                    promptTokens = update.PromptTokens; evalTokens = update.EvalTokens; kvReusedTokens = update.KvCacheReusedTokens;
+                    totalNs = update.TotalNs; promptNs = update.PromptNs; evalNs = update.EvalNs;
+                    pipelineFinishReason = update.FinishReason;
                 }
             }
 
@@ -452,15 +473,14 @@ namespace TensorSharp.Server.ProtocolAdapters
             bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
 
             object finalMessage;
-            string doneReason = "stop";
+            bool sawToolCalls = false;
 
             if (useParser)
             {
                 var parsed = parser.Add(rawOutput, true);
                 string thinkingOut = enableThinking && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
                 finalMessage = OllamaResponseFactory.ChatNonStreamingMessage(parsed.Content, thinkingOut, parsed.ToolCalls);
-                if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
-                    doneReason = "tool_calls";
+                sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;
             }
             else
             {
@@ -468,7 +488,8 @@ namespace TensorSharp.Server.ProtocolAdapters
             }
 
             await ctx.Response.WriteAsync(JsonSerializer.Serialize(
-                OllamaResponseFactory.ChatNonStreamingResponse(_svc.LoadedModelName, finalMessage, doneReason,
+                OllamaResponseFactory.ChatNonStreamingResponse(_svc.LoadedModelName, finalMessage,
+                    FinishReasonMapper.ToOllamaDoneReason(pipelineFinishReason, sawToolCalls),
                     promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs),
                 JsonOptions.IgnoreNulls));
         }

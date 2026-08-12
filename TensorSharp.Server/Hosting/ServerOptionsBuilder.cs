@@ -37,6 +37,8 @@ namespace TensorSharp.Server.Hosting
                 out string configuredMmProj,
                 out string configuredBackend,
                 out int? configuredMaxTokens,
+                out int? configuredWanVideoFrames,
+                out int? configuredWanVideoFps,
                 out SamplingOverrides configuredSampling,
                 out SamplingPrecedence? configuredPrecedence,
                 out ListenOverrides configuredListen);
@@ -92,6 +94,8 @@ namespace TensorSharp.Server.Hosting
                 supportedBackends,
                 defaultMaxTokens,
                 maxTokensPinned,
+                configuredWanVideoFrames ?? 0,
+                configuredWanVideoFps ?? 0,
                 uploadDirectory,
                 logDirectory,
                 fileLoggingEnabled,
@@ -102,7 +106,7 @@ namespace TensorSharp.Server.Hosting
         /// <summary>Backend originally requested via <c>--backend</c> / <c>BACKEND</c> (without the OS-default fallback).</summary>
         public static string ReadConfiguredBackendInput(string[] args)
         {
-            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _);
+            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _, out _, out _);
             return configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
         }
 
@@ -789,6 +793,8 @@ namespace TensorSharp.Server.Hosting
             out string configuredMmProj,
             out string configuredBackend,
             out int? configuredMaxTokens,
+            out int? configuredWanVideoFrames,
+            out int? configuredWanVideoFps,
             out SamplingOverrides configuredSampling,
             out SamplingPrecedence? configuredPrecedence,
             out ListenOverrides configuredListen)
@@ -797,6 +803,8 @@ namespace TensorSharp.Server.Hosting
             configuredMmProj = null;
             configuredBackend = null;
             configuredMaxTokens = null;
+            configuredWanVideoFrames = null;
+            configuredWanVideoFps = null;
             configuredSampling = default;
             configuredPrecedence = null;
             configuredListen = default;
@@ -851,6 +859,24 @@ namespace TensorSharp.Server.Hosting
                     if (!TryParsePositiveInt(maxTokensOption, out int parsedMaxTokens))
                         throw new ArgumentException($"Invalid value for --max-tokens: '{maxTokensOption}'.");
                     configuredMaxTokens = parsedMaxTokens;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--video-frames", out string videoFramesOption))
+                {
+                    if (!TryParsePositiveInt(videoFramesOption, out int parsedVideoFrames))
+                        throw new ArgumentException(
+                            $"Invalid value for --video-frames: '{videoFramesOption}'. Expected a positive integer.");
+                    configuredWanVideoFrames = parsedVideoFrames;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--fps", out string fpsOption))
+                {
+                    if (!TryParsePositiveInt(fpsOption, out int parsedFps))
+                        throw new ArgumentException(
+                            $"Invalid value for --fps: '{fpsOption}'. Expected a positive integer.");
+                    configuredWanVideoFps = parsedFps;
                     continue;
                 }
 
@@ -1079,7 +1105,7 @@ namespace TensorSharp.Server.Hosting
         {
             string[] knownFlags = new[]
             {
-                "--model", "--mmproj", "--backend", "--max-tokens",
+                "--model", "--mmproj", "--backend", "--max-tokens", "--video-frames", "--fps",
                 "--port", "--host", "--urls",
                 "--temperature", "--top-k", "--top-p", "--min-p",
                 "--repeat-penalty", "--repeat-last-n", "--presence-penalty", "--frequency-penalty",

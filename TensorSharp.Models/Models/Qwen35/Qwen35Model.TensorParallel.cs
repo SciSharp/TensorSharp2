@@ -667,6 +667,24 @@ namespace TensorSharp.Models
                 // Quantized row-parallel: gather block-aligned columns per V head.
                 var type = (GgmlTensorType)qw.GgmlType;
                 long blockSize = GgufFile.GetBlockSize(type);
+
+                // The per-V-head gather below moves whole quant blocks, so it
+                // requires the per-head slice (headVDim columns) to be a whole
+                // number of blocks. Super-block types (Q4_K/Q6_K/IQ*: 256
+                // elements per block) fail that for headVDim=128 — the old math
+                // silently produced blocksPerVHead = 0 and a ZERO-BYTE shard
+                // that crashed the TP preload ("PreloadQuantizedWeight requires
+                // valid cache key, host data, and size"). UD-quant mixes hit
+                // this (ssm_out is Q4_K in Qwen3.5-9B-UD-IQ2_XXS; the Q8_0
+                // reference model divides fine at 32 elements/block).
+                // Re-encode instead of crashing: dequantise each source row,
+                // gather the per-V-head slices in F32, requantise to Q8_0.
+                if (SelectSsmOutShardEncoding(type, _headVDim) != SsmOutShardEncoding.SourceBlocks)
+                {
+                    ShardSsmOutWeightRequantized(weightName, qw);
+                    return;
+                }
+
                 long typeSize = GgufFile.GetTypeSize(type);
                 long srcRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
                 int blocksPerVHead = _headVDim / (int)blockSize;
@@ -746,6 +764,132 @@ namespace TensorSharp.Models
                 _weights.Remove(weightName);
                 w.Dispose();
             }
+        }
+
+        /// <summary>
+        /// How a quantized ssm_out.weight can be sharded per V head. The
+        /// block-cyclic gather moves whole quant blocks, so it needs
+        /// headVDim % blockSize == 0; otherwise the shard must be re-encoded
+        /// (Q8_0 when its 32-element block divides headVDim, F32 as the last
+        /// resort). Extracted as a pure decision so the UD-quant fallback is
+        /// unit-testable without a model file.
+        /// </summary>
+        internal enum SsmOutShardEncoding { SourceBlocks, RequantQ8, Float32 }
+
+        internal static SsmOutShardEncoding SelectSsmOutShardEncoding(GgmlTensorType type, int headVDim)
+        {
+            long blockSize = GgufFile.GetBlockSize(type);
+            if (blockSize > 0 && headVDim % blockSize == 0)
+                return SsmOutShardEncoding.SourceBlocks;
+            return headVDim % 32 == 0 ? SsmOutShardEncoding.RequantQ8 : SsmOutShardEncoding.Float32;
+        }
+
+        /// <summary>
+        /// Fallback for <see cref="ShardSsmOutWeight"/> when the source quant
+        /// type's block (e.g. Q4_K's 256 elements) does not divide the per-V-head
+        /// column width, so the block-cyclic gather cannot move source blocks.
+        /// Each source row is dequantised, its V-head slices gathered in F32 in
+        /// block-cyclic order, and the permuted row re-encoded as Q8_0 (32-element
+        /// blocks divide any power-of-two head dim; int8-with-per-32-scale
+        /// re-encoding of an already ≤6-bit weight is lossless in practice), so
+        /// the shard stays on the quantized fast path. Falls back to plain F32
+        /// shards in the (unexpected) case that even 32 does not divide headVDim.
+        /// </summary>
+        private void ShardSsmOutWeightRequantized(string weightName, QuantizedWeight qw)
+        {
+            int tp = TpDegree;
+            int globalTp = GlobalTpDegree;
+            int rankOffset = TpRankOffset;
+            int localVHeads = _numVHeads / globalTp;
+            long ne0PerShard = (long)localVHeads * _headVDim;
+            long srcRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+            const int q8Type = (int)GgmlTensorType.Q8_0;
+            bool useQ8 = SelectSsmOutShardEncoding((GgmlTensorType)qw.GgmlType, _headVDim)
+                == SsmOutShardEncoding.RequantQ8;
+
+            Console.WriteLine($"  {weightName}: {(GgmlTensorType)qw.GgmlType} block " +
+                $"({GgufFile.GetBlockSize((GgmlTensorType)qw.GgmlType)} elems) does not divide headVDim={_headVDim}; " +
+                $"re-encoding TP shards as {(useQ8 ? "Q8_0" : "F32")}.");
+
+            if (useQ8)
+            {
+                long dstRowBytes = NativeDequant.RowSize(q8Type, ne0PerShard);
+                long totalBytesPerShard = qw.Ne1 * dstRowBytes;
+                var shards = new QuantizedWeight[tp];
+                for (int r = 0; r < tp; r++)
+                {
+                    int globalRank = rankOffset + r;
+                    int[] vHeads = ComputeBlockCyclicVHeads(globalRank, globalTp, _numVHeads, _numKHeads);
+                    IntPtr shardPtr = QuantizedWeight.AllocateBuffer(totalBytesPerShard);
+                    unsafe
+                    {
+                        byte* src = (byte*)qw.Data.ToPointer();
+                        byte* dst = (byte*)shardPtr.ToPointer();
+                        var srcRowArr = new float[qw.Ne0];
+                        var dstRowArr = new float[ne0PerShard];
+                        fixed (float* srcF = srcRowArr)
+                        fixed (float* dstF = dstRowArr)
+                        {
+                            for (long row = 0; row < qw.Ne1; row++)
+                            {
+                                NativeDequant.DequantizeToFloat32Native(
+                                    qw.GgmlType, (IntPtr)(src + row * srcRowBytes), (IntPtr)srcF, qw.Ne0);
+                                for (int vhIdx = 0; vhIdx < vHeads.Length; vhIdx++)
+                                {
+                                    Buffer.MemoryCopy(
+                                        srcF + (long)vHeads[vhIdx] * _headVDim,
+                                        dstF + (long)vhIdx * _headVDim,
+                                        (long)_headVDim * sizeof(float),
+                                        (long)_headVDim * sizeof(float));
+                                }
+                                ManagedQuantizedOps.QuantizeRowFromFloat32(
+                                    q8Type, dstF, (IntPtr)(dst + row * dstRowBytes), ne0PerShard);
+                            }
+                        }
+                    }
+                    shards[r] = new QuantizedWeight(shardPtr, totalBytesPerShard,
+                        q8Type, ne0PerShard, qw.Ne1);
+                }
+                _tpQuantWeights[weightName] = shards;
+            }
+            else
+            {
+                var shards = new Tensor[tp];
+                for (int r = 0; r < tp; r++)
+                {
+                    int globalRank = rankOffset + r;
+                    int[] vHeads = ComputeBlockCyclicVHeads(globalRank, globalTp, _numVHeads, _numKHeads);
+                    var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, qw.Ne1, ne0PerShard);
+                    unsafe
+                    {
+                        byte* src = (byte*)qw.Data.ToPointer();
+                        float* dstBase = GetFloatPtr(shard);
+                        var srcRowArr = new float[qw.Ne0];
+                        fixed (float* srcF = srcRowArr)
+                        {
+                            for (long row = 0; row < qw.Ne1; row++)
+                            {
+                                NativeDequant.DequantizeToFloat32Native(
+                                    qw.GgmlType, (IntPtr)(src + row * srcRowBytes), (IntPtr)srcF, qw.Ne0);
+                                float* dstRow = dstBase + row * ne0PerShard;
+                                for (int vhIdx = 0; vhIdx < vHeads.Length; vhIdx++)
+                                {
+                                    Buffer.MemoryCopy(
+                                        srcF + (long)vHeads[vhIdx] * _headVDim,
+                                        dstRow + (long)vhIdx * _headVDim,
+                                        (long)_headVDim * sizeof(float),
+                                        (long)_headVDim * sizeof(float));
+                                }
+                            }
+                        }
+                    }
+                    shards[r] = shard;
+                }
+                _tpWeights[weightName] = shards;
+            }
+
+            _quantWeights.Remove(weightName);
+            qw.Dispose();
         }
 
         /// <summary>

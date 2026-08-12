@@ -46,9 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 using namespace tsg;
@@ -333,28 +331,12 @@ inline bool wan_flash_enabled()
     return on;
 }
 
-constexpr int kWanKvStride = 256;   // ggml-cuda FATTN_KQ_STRIDE
-
-// Bidirectional flash mask for `n` real tokens padded to the KV stride: zeros for
-// real keys, -inf for padded keys. Cached per n (stable pointer -> resident bind).
-const ggml_fp16_t* wan_attn_mask_host(int n, int& n_pad)
-{
-    n_pad = ((n + kWanKvStride - 1) / kWanKvStride) * kWanKvStride;
-    static std::unordered_map<int, std::vector<ggml_fp16_t>> cache;
-    auto it = cache.find(n);
-    if (it != cache.end()) return it->second.data();
-    std::vector<ggml_fp16_t>& m = cache[n];
-    m.assign(static_cast<std::size_t>(n_pad) * n_pad, ggml_fp32_to_fp16(0.0f));
-    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
-    for (int q = 0; q < n_pad; q++)
-        for (int kv = n; kv < n_pad; kv++)
-            m[static_cast<std::size_t>(q) * n_pad + kv] = ninf;
-    return m.data();
-}
-
-// Attention over q [hd, n_q, heads], k/v [hd, n_kv, heads]. When `mask` is given
-// (F16 [kv_pad, q_pad]) and flash is enabled+supported, k/v must already be padded
-// to kv_pad rows. Falls back to materialized scores+softmax otherwise.
+// Attention over q [hd, n_q, heads], k/v [hd, n_kv, heads]. Wan DiT
+// self-attention is fully bidirectional, so its flash path must be unmasked.
+// ggml-cuda handles a non-aligned KV tail directly; padding it to 256 used to
+// require a dense [seq_pad, seq_pad] F16 mask, which is quadratic (about 18 GiB
+// for a 245-frame 480p request) and contains no useful model information.
+// Falls back to materialized scores+softmax on backends without flash support.
 // Returns [hd*heads, n_q].
 ggml_tensor* wan_attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
                            ggml_tensor* mask, int dim, int n_q, float scale)
@@ -496,8 +478,7 @@ struct WanDitGraph
 {
     ggml_cgraph* graph = nullptr;
     ggml_tensor *xIn = nullptr, *ctxIn = nullptr, *tsinIn = nullptr, *tsin0In = nullptr;
-    ggml_tensor *cosIn = nullptr, *sinIn = nullptr, *mask = nullptr, *outT = nullptr;
-    const ggml_fp16_t* maskHost = nullptr; int seq_pad = 0;
+    ggml_tensor *cosIn = nullptr, *sinIn = nullptr, *outT = nullptr;
     std::vector<WanUpload> uploads;
     // TS_WAN_DIT_TRACE: named intermediates flagged as graph outputs (so gallocr
     // cannot alias their buffers) whose stats are printed after compute.
@@ -549,12 +530,6 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
     g.cosIn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, seq);
     g.sinIn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, seq);
     g.outT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, static_cast<int>(d->head.ne1), seq);
-
-    if (wan_flash_enabled())
-    {
-        g.maskHost = wan_attn_mask_host(seq, g.seq_pad);
-        g.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, g.seq_pad, g.seq_pad);
-    }
 
     // ---- prelude weights ----
     ggml_tensor *patchB, *t0B, *t2B, *ti0B, *ti2B, *tpB, *headB;
@@ -672,12 +647,7 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
         ggml_tensor* qa = wan_heads_seq(ctx, q3);                    // [hd, seq, heads]
         ggml_tensor* ka = wan_heads_seq(ctx, k3);
         ggml_tensor* va = wan_heads_seq(ctx, ggml_reshape_3d(ctx, v, hd, heads, seq));
-        if (g.mask != nullptr && g.seq_pad > seq)
-        {
-            ka = ggml_pad(ctx, ka, 0, g.seq_pad - seq, 0, 0);
-            va = ggml_pad(ctx, va, 0, g.seq_pad - seq, 0, 0);
-        }
-        ggml_tensor* attn = wan_attention(ctx, qa, ka, va, g.mask, dim, seq, scale);
+        ggml_tensor* attn = wan_attention(ctx, qa, ka, va, nullptr, dim, seq, scale);
         attn = wan_lin(ctx, b.sow, attn, b.sob);
         x = ggml_add(ctx, x, segGate(attn, eGateA, eGateAB));
 
@@ -736,28 +706,6 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
     if (g.tsin0In != nullptr) ggml_set_input(g.tsin0In);
     ggml_set_input(g.cosIn); ggml_set_input(g.sinIn);
 
-    // Bind the flash mask resident (stable cached host pointer, uploaded once).
-    bool maskResident = false;
-    if (g.mask != nullptr && g.maskHost != nullptr)
-    {
-        const std::size_t mbytes = static_cast<std::size_t>(g.seq_pad) * g.seq_pad * sizeof(ggml_fp16_t);
-        void* mhost = const_cast<ggml_fp16_t*>(g.maskHost);
-        ggml_backend_buffer_t mbuf = nullptr; void* maddr = nullptr; bool mneeds = false;
-        if (try_get_cacheable_tensor_buffer(g_backend, wb.dev, g.mask, mhost, mbytes, mbuf, maddr, mneeds)
-            && ggml_backend_tensor_alloc(mbuf, g.mask, maddr) == GGML_STATUS_SUCCESS)
-        {
-            maskResident = true;
-            if (mneeds) wb.uploads.push_back({g.mask, mhost, mbytes});
-        }
-        else invalidate_cached_buffer(mhost);
-    }
-    if (g.mask != nullptr && !maskResident)
-    {
-        ggml_set_input(g.mask);
-        wb.uploads.push_back({g.mask, const_cast<ggml_fp16_t*>(g.maskHost),
-                              static_cast<std::size_t>(g.seq_pad) * g.seq_pad * sizeof(ggml_fp16_t)});
-    }
-
     g.uploads = std::move(wb.uploads);
     return true;
 }
@@ -805,13 +753,18 @@ bool wan_dit_capture_enabled()
 
 void wan_dit_upload_inputs(const WanDitGraph& g, const TSGgmlWanDitDesc* d)
 {
-    ggml_backend_tensor_set(g.xIn, d->x, 0, static_cast<std::size_t>(d->patch.ne0) * d->seq * sizeof(float));
-    ggml_backend_tensor_set(g.ctxIn, d->context, 0, static_cast<std::size_t>(d->text_dim) * d->ctx_len * sizeof(float));
-    ggml_backend_tensor_set(g.tsinIn, d->tsin, 0, static_cast<std::size_t>(d->freq_dim) * sizeof(float));
-    if (g.tsin0In != nullptr && d->tsin0 != nullptr)
+    if (g.xIn != nullptr && g.xIn->buffer != nullptr)
+        ggml_backend_tensor_set(g.xIn, d->x, 0, static_cast<std::size_t>(d->patch.ne0) * d->seq * sizeof(float));
+    if (g.ctxIn != nullptr && g.ctxIn->buffer != nullptr)
+        ggml_backend_tensor_set(g.ctxIn, d->context, 0, static_cast<std::size_t>(d->text_dim) * d->ctx_len * sizeof(float));
+    if (g.tsinIn != nullptr && g.tsinIn->buffer != nullptr)
+        ggml_backend_tensor_set(g.tsinIn, d->tsin, 0, static_cast<std::size_t>(d->freq_dim) * sizeof(float));
+    if (g.tsin0In != nullptr && g.tsin0In->buffer != nullptr && d->tsin0 != nullptr)
         ggml_backend_tensor_set(g.tsin0In, d->tsin0, 0, static_cast<std::size_t>(d->freq_dim) * sizeof(float));
-    ggml_backend_tensor_set(g.cosIn, d->cosf, 0, static_cast<std::size_t>(d->head_dim) * d->seq * sizeof(float));
-    ggml_backend_tensor_set(g.sinIn, d->sinf, 0, static_cast<std::size_t>(d->head_dim) * d->seq * sizeof(float));
+    if (g.cosIn != nullptr && g.cosIn->buffer != nullptr)
+        ggml_backend_tensor_set(g.cosIn, d->cosf, 0, static_cast<std::size_t>(d->head_dim) * d->seq * sizeof(float));
+    if (g.sinIn != nullptr && g.sinIn->buffer != nullptr)
+        ggml_backend_tensor_set(g.sinIn, d->sinf, 0, static_cast<std::size_t>(d->head_dim) * d->seq * sizeof(float));
 }
 
 // TS_WAN_DIT_TRACE=1: after compute, scan the graph nodes for the first one whose
@@ -902,7 +855,11 @@ WanDitPersist* wan_dit_build_persist(const TSGgmlWanDitDesc* d)
     }
 
     host_read_barrier();
-    for (auto& u : g.uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+    // Debug layer truncation can leave declared prelude weights unreachable
+    // from the final graph. Gallocr intentionally does not allocate those
+    // unused leaves, so do not try to upload them.
+    for (auto& u : g.uploads)
+        if (u.t->buffer != nullptr) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
 
     WanDitPersist* e = nullptr;
     for (auto& c : g_wanDit) if (!c.valid) { e = &c; break; }
@@ -978,6 +935,50 @@ ggml_tensor* wan_vae_conv_w(WanVaeBuild& b, void* tap, const TSGWanVaeConv& c)
 // cross-chunk feature caches that filled a 16 GB card into WDDM paging (decode
 // 51 s -> 180 s depending on what else held VRAM). Banding is exact — each band
 // gets its vertical context rows from a single pre-padded copy of the input.
+// ggml_pad_ext with LEADING padding, built so it runs on every backend.
+//
+// ggml-metal implements only trailing padding: ggml_metal_device_supports_op
+// returns false for GGML_OP_PAD whenever any of op_params 0/2/4/6 (the lo pads)
+// is non-zero, and ggml_metal_op_encode_impl then ABORTS THE PROCESS with
+// "unsupported op 'PAD'". The Wan VAE leans on leading pads throughout - the
+// causal 3D convolutions zero-pad the FRONT of the temporal axis, and the banded
+// 2D conv pre-pads the top row band - so every Wan video generation died in
+// TSGgml_WanVaeDecode on Metal (SIGABRT) after a perfectly good denoise loop.
+//
+// Trailing pads still go through ggml_pad_ext. Each leading pad is prepended as a
+// zeroed strip of the tensor itself (view -> cont -> scale 0 -> concat), which
+// uses only ops every backend implements. The strips are 1-2 slices wide, so the
+// extra work is negligible next to the convolutions around them.
+static ggml_tensor* wan_pad_ext_compat(ggml_context* ctx, ggml_tensor* x,
+                                       int lp0, int rp0, int lp1, int rp1,
+                                       int lp2, int rp2, int lp3, int rp3)
+{
+    const int lead[4] = { lp0, lp1, lp2, lp3 };
+    if (lead[0] <= 0 && lead[1] <= 0 && lead[2] <= 0 && lead[3] <= 0)
+        return ggml_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+
+    ggml_tensor* t = (rp0 > 0 || rp1 > 0 || rp2 > 0 || rp3 > 0)
+        ? ggml_pad_ext(ctx, x, 0, rp0, 0, rp1, 0, rp2, 0, rp3)
+        : x;
+
+    for (int d = 0; d < 4; d++)
+    {
+        int remaining = lead[d];
+        while (remaining > 0)
+        {
+            // A prefix along any single axis is a valid strided view of t.
+            const std::int64_t take = std::min<std::int64_t>(remaining, t->ne[d]);
+            std::int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+            ne[d] = take;
+            ggml_tensor* strip = ggml_cont(ctx, ggml_view_4d(ctx, t, ne[0], ne[1], ne[2], ne[3],
+                                                             t->nb[1], t->nb[2], t->nb[3], 0));
+            t = ggml_concat(ctx, ggml_scale(ctx, strip, 0.0f), t, d);
+            remaining -= static_cast<int>(take);
+        }
+    }
+    return t;
+}
+
 ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int pad, int stride = 1)
 {
     const long long gemmMax = b.gemmMax;
@@ -998,7 +999,7 @@ ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int
     // Banded path: pre-pad vertically once, then convolve horizontal bands whose
     // views carry their own context rows (horizontal padding stays in the conv).
     long long bandRows = std::max<long long>(1, gemmMax / std::max<long long>(1, rowBytes));
-    ggml_tensor* xp = pad > 0 ? ggml_pad_ext(ctx, x, 0, 0, pad, pad, 0, 0, 0, 0) : x;
+    ggml_tensor* xp = pad > 0 ? wan_pad_ext_compat(ctx, x, 0, 0, pad, pad, 0, 0, 0, 0) : x;
     ggml_tensor* out = nullptr;
     for (long long y = 0; y < OH; y += bandRows)
     {
@@ -1034,14 +1035,14 @@ ggml_tensor* wan_vae_causal_conv(WanVaeBuild& b, const TSGWanVaeConv& c, ggml_te
         if (prev == nullptr)
         {
             // first chunk: 2 zero frames in front (causal zero padding)
-            xin = ggml_pad_ext(ctx, x, 0, 0, 0, 0, 0, 0, 2, 0);
+            xin = wan_pad_ext_compat(ctx, x, 0, 0, 0, 0, 0, 0, 2, 0);
         }
         else
         {
             if (prev->ne[3] < 2)
             {
                 // previous chunk had a single frame: zero-pad its front once
-                prev = ggml_pad_ext(ctx, prev, 0, 0, 0, 0, 0, 0, 2 - static_cast<int>(prev->ne[3]), 0);
+                prev = wan_pad_ext_compat(ctx, prev, 0, 0, 0, 0, 0, 0, 2 - static_cast<int>(prev->ne[3]), 0);
             }
             xin = ggml_concat(ctx, prev, x, 3);
         }
@@ -1175,7 +1176,7 @@ ggml_tensor* wan_vae_upsample(WanVaeBuild& b, const TSGWanVaeUpsampleW& u, ggml_
             ggml_tensor* prev = b.cache[idx] != nullptr ? ggml_cast(ctx, b.cache[idx], GGML_TYPE_F32) : nullptr;
             ggml_tensor* xin;
             if (prev == nullptr)
-                xin = ggml_pad_ext(ctx, x, 0, 0, 0, 0, 0, 0, 2, 0);
+                xin = wan_pad_ext_compat(ctx, x, 0, 0, 0, 0, 0, 0, 2, 0);
             else
                 xin = ggml_concat(ctx, prev, x, 3);
             // cache = trailing 2 frames of x (zero-front-padded when T == 1 on the
@@ -1190,7 +1191,7 @@ ggml_tensor* wan_vae_upsample(WanVaeBuild& b, const TSGWanVaeUpsampleW& u, ggml_
                 nc = ggml_concat(ctx, lastPrev, x, 3);
             }
             else
-                nc = ggml_pad_ext(ctx, x, 0, 0, 0, 0, 0, 0, 1, 0);
+                nc = wan_pad_ext_compat(ctx, x, 0, 0, 0, 0, 0, 0, 1, 0);
             b.cache[idx] = ggml_cast(ctx, nc, GGML_TYPE_F16);
 
             // temporal conv (kd=3, 1x1 spatial): per-tap 1x1 conv over the window
@@ -1328,7 +1329,7 @@ ggml_tensor* wan_vae_enc_resample(WanVaeBuild& b, const TSGWanVaeDownW& u, ggml_
 {
     ggml_context* ctx = b.ctx;
 
-    ggml_tensor* xp = ggml_pad_ext(ctx, x, 0, 1, 0, 1, 0, 0, 0, 0);
+    ggml_tensor* xp = wan_pad_ext_compat(ctx, x, 0, 1, 0, 1, 0, 0, 0, 0);
     ggml_tensor* wt = wan_vae_conv_w(b, u.sconv.tap0, u.sconv);
     ggml_tensor* y = wan_vae_conv2d(b, wt, xp, 0, 2);
     if (u.sconv.bias != nullptr)
@@ -1392,7 +1393,7 @@ ggml_tensor* wan_vae_avg_down(WanVaeBuild& b, ggml_tensor* x, int ft, int fs)
     if (ft == 2)
     {
         if (x->ne[3] % 2 == 1)
-            x = ggml_pad_ext(ctx, x, 0, 0, 0, 0, 0, 0, 1, 0);       // front zero frame
+            x = wan_pad_ext_compat(ctx, x, 0, 0, 0, 0, 0, 0, 1, 0);       // front zero frame
         const std::int64_t W = x->ne[0], H = x->ne[1], C = x->ne[2], T = x->ne[3];
         ggml_tensor* r = ggml_reshape_4d(ctx, x, W * H, C, 2, T / 2);
         r = ggml_cont(ctx, ggml_permute(ctx, r, 0, 2, 1, 3));       // [WH, 2, C, T/2]
@@ -1662,15 +1663,36 @@ TSG_EXPORT int TSGgml_WanDitForward(const TSGgmlWanDitDesc* d)
         if (!wan_dit_build_graph(context.value, d, g))
         { set_last_error("WanDitForward: graph build failed."); return 0; }
 
-        BufferHandle buffer(nullptr);
+        // A whole-DiT context contains every intermediate from every block.
+        // It must always use the graph allocator so mutually exclusive tensor
+        // lifetimes share storage. Falling back to alloc_ctx_tensors after a
+        // gallocr OOM sums all block temporaries (several TiB at long video
+        // lengths) and can never improve on the lifetime-packed allocation.
+        ggml_gallocr_t localGalloc = nullptr;
+        struct LocalGallocGuard
+        {
+            ggml_gallocr_t& value;
+            ~LocalGallocGuard() { if (value != nullptr) ggml_gallocr_free(value); }
+        } localGallocGuard{localGalloc};
         if (!alloc_graph_reuse_gallocr(g.graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(context.value, g_backend);
-            if (buffer.value == nullptr) { set_last_error("WanDitForward: buffer alloc failed."); return 0; }
+            // The shared allocator can be disabled for diagnostics, so retain a
+            // dedicated gallocr fallback. If the shared attempt really was an
+            // OOM this may fail too, but it remains lifetime-packed and reports
+            // the real requirement instead of attempting a context-wide buffer.
+            localGalloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+            if (localGalloc == nullptr || !ggml_gallocr_alloc_graph(localGalloc, g.graph))
+            {
+                set_last_error(
+                    "WanDitForward: lifetime-packed graph buffer allocation failed. "
+                    "Reduce video frames/resolution or free device memory.");
+                return 0;
+            }
         }
 
         host_read_barrier();
-        for (auto& u : g.uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+        for (auto& u : g.uploads)
+            if (u.t->buffer != nullptr) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
         wan_dit_upload_inputs(g, d);
 
         if (ggml_backend_graph_compute(g_backend, g.graph) != GGML_STATUS_SUCCESS)

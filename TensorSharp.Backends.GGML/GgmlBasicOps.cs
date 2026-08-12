@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -1089,6 +1089,136 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Exact Muse-Glimmer vision block using quantized projection weights,
+        /// NORMAL-order 2D RoPE, packed local windows, flash attention, and
+        /// erf-GELU in one lifetime-planned graph. Returns false so callers can
+        /// retain a portable fallback on unsupported GGML backends.
+        /// </summary>
+        public static unsafe bool TryMuseGlimmerVisionBlock(
+            Tensor hidden,
+            Tensor ln1Weight, Tensor ln1Bias,
+            IntPtr qData, int qType, long qNe0, long qNe1, long qBytes, Tensor qBias,
+            IntPtr kData, int kType, long kNe0, long kNe1, long kBytes, Tensor kBias,
+            IntPtr vData, int vType, long vNe0, long vNe1, long vBytes, Tensor vBias,
+            IntPtr outData, int outType, long outNe0, long outNe1, long outBytes, Tensor outBias,
+            Tensor ln2Weight, Tensor ln2Bias,
+            IntPtr upData, int upType, long upNe0, long upNe1, long upBytes, Tensor upBias,
+            IntPtr downData, int downType, long downNe0, long downNe1, long downBytes, Tensor downBias,
+            int[] posW, int[] posH, int[] windowOffsets, bool isGlobal,
+            int numHeads, int headDim, float eps, float ropeTheta)
+        {
+            // Native upload/download is intentionally contiguous. The current
+            // encoder residual satisfies this; reject padded/narrowed callers so
+            // this public helper cannot silently ignore its strides.
+            if (!HasNativeBufferStorage(hidden) || !IsContiguousNonNarrowed(hidden) ||
+                !TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView))
+                return false;
+
+            int numTokens = checked((int)hidden.Sizes[0]);
+            int hiddenSize = checked((int)hidden.Sizes[1]);
+            int intermediateSize = checked((int)upNe1);
+            if (numTokens <= 0 || hiddenSize <= 0 || intermediateSize <= 0 ||
+                posW == null || posH == null || posW.Length != numTokens || posH.Length != numTokens ||
+                windowOffsets == null || windowOffsets.Length < 2 ||
+                numHeads <= 0 || headDim <= 0 || numHeads * headDim != hiddenSize)
+            {
+                return false;
+            }
+
+            static IntPtr TensorPointer(Tensor tensor, int expectedCount)
+            {
+                if (!HasNativeBufferStorage(tensor) || tensor.ElementType != DType.Float32 ||
+                    tensor.ElementCount() != expectedCount)
+                {
+                    return IntPtr.Zero;
+                }
+                return GetBufferStart(tensor);
+            }
+
+            IntPtr ln1W = TensorPointer(ln1Weight, hiddenSize);
+            IntPtr ln1B = TensorPointer(ln1Bias, hiddenSize);
+            IntPtr qB = TensorPointer(qBias, hiddenSize);
+            IntPtr kB = TensorPointer(kBias, hiddenSize);
+            IntPtr vB = TensorPointer(vBias, hiddenSize);
+            IntPtr outB = TensorPointer(outBias, hiddenSize);
+            IntPtr ln2W = TensorPointer(ln2Weight, hiddenSize);
+            IntPtr ln2B = TensorPointer(ln2Bias, hiddenSize);
+            IntPtr upB = TensorPointer(upBias, intermediateSize);
+            IntPtr downB = TensorPointer(downBias, hiddenSize);
+            if (ln1W == IntPtr.Zero || ln1B == IntPtr.Zero || qB == IntPtr.Zero ||
+                kB == IntPtr.Zero || vB == IntPtr.Zero || outB == IntPtr.Zero ||
+                ln2W == IntPtr.Zero || ln2B == IntPtr.Zero || upB == IntPtr.Zero ||
+                downB == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            fixed (int* posWPtr = posW)
+            fixed (int* posHPtr = posH)
+            fixed (int* offsetsPtr = windowOffsets)
+            {
+                var args = new GgmlMuseGlimmerVisionBlockArgs
+                {
+                    Hidden = hiddenView,
+                    Ln1W = ln1W,
+                    Ln1B = ln1B,
+                    QW = qData,
+                    QB = qB,
+                    KW = kData,
+                    KB = kB,
+                    VW = vData,
+                    VB = vB,
+                    OutW = outData,
+                    OutB = outB,
+                    Ln2W = ln2W,
+                    Ln2B = ln2B,
+                    UpW = upData,
+                    UpB = upB,
+                    DownW = downData,
+                    DownB = downB,
+                    PosW = (IntPtr)posWPtr,
+                    PosH = (IntPtr)posHPtr,
+                    WindowOffsets = (IntPtr)offsetsPtr,
+                    QNe0 = qNe0,
+                    QNe1 = qNe1,
+                    QBytes = qBytes,
+                    KNe0 = kNe0,
+                    KNe1 = kNe1,
+                    KBytes = kBytes,
+                    VNe0 = vNe0,
+                    VNe1 = vNe1,
+                    VBytes = vBytes,
+                    OutNe0 = outNe0,
+                    OutNe1 = outNe1,
+                    OutBytes = outBytes,
+                    UpNe0 = upNe0,
+                    UpNe1 = upNe1,
+                    UpBytes = upBytes,
+                    DownNe0 = downNe0,
+                    DownNe1 = downNe1,
+                    DownBytes = downBytes,
+                    HiddenSize = hiddenSize,
+                    IntermediateSize = intermediateSize,
+                    NumTokens = numTokens,
+                    NumHeads = numHeads,
+                    HeadDim = headDim,
+                    WindowCount = windowOffsets.Length - 1,
+                    IsGlobal = isGlobal ? 1 : 0,
+                    QType = qType,
+                    KType = kType,
+                    VType = vType,
+                    OutType = outType,
+                    UpType = upType,
+                    DownType = downType,
+                    Eps = eps,
+                    RopeTheta = ropeTheta,
+                };
+                args.StructBytes = Marshal.SizeOf<GgmlMuseGlimmerVisionBlockArgs>();
+                return GgmlNative.MuseGlimmerVisionBlock(in args);
+            }
+        }
+
+        /// <summary>
         /// Fused vision attention: LN + QKV + bias + RoPE + SDPA + out + bias + residual
         /// as a single GGML graph dispatch. Replaces ~8 separate dispatches with 1.
         /// </summary>
@@ -1438,6 +1568,15 @@ namespace TensorSharp.GGML
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
         public static void Shutdown() => GgmlNative.Shutdown();
+
+        /// <summary>
+        /// Set an environment variable as the NATIVE library sees it. Managed
+        /// <c>Environment.SetEnvironmentVariable</c> does not reach native getenv on
+        /// every platform, and some ggml tunables are read once at device probe, so
+        /// they have to be set through this before the backend initialises.
+        /// </summary>
+        public static bool SetNativeEnvironmentVariable(string name, string value, bool overwrite)
+            => GgmlNative.SetNativeEnvironmentVariable(name, value, overwrite);
         public static void ReleaseReuseComputeBuffers() => GgmlNative.ReleaseReuseComputeBuffers();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
         public static long DeviceCopyCacheResidentBytes() => GgmlNative.DeviceCopyCacheResidentBytes();
@@ -1468,11 +1607,157 @@ namespace TensorSharp.GGML
         public static int GetVulkanDeviceCount() => GgmlNative.GetVulkanDeviceCount();
         public static string GetVulkanDeviceDescription(int deviceIndex) => GgmlNative.GetVulkanDeviceDescription(deviceIndex);
 
+
+        /// <summary>DFlash PASS A+B (encode + ring KV injection) in one GGML graph.</summary>
+        public static bool DFlashInject(
+            float[] featRows, int featureSize, int nRows,
+            long[] ringRowsIdx, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale,
+            IntPtr fcData, int fcType, long fcNe0, long fcNe1, long fcBytes,
+            IntPtr encNormData,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] kNormArr, IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype)
+            => GgmlNative.DFlashInject(featRows, featureSize, nRows, ringRowsIdx, positions,
+                numLayers, hiddenSize, headDim, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale, fcData, fcType, fcNe0, fcNe1, fcBytes, encNormData,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                kNormArr, ringKArr, ringVArr, ringDtype);
+
+        /// <summary>DFlash PASS C (block draft + borrowed LM head + softmax + on-device top-1) in one GGML graph.</summary>
+        public static bool DFlashDraftBlock(
+            int[] blockIds, int blockLen, int[] positions,
+            int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
+            float eps, float ropeBase, float ropeFreqScale, float kqScale,
+            int[] ringSlotPos, int slidingWindow,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            IntPtr[] upArr, int[] upTypeArr, long[] upNe0Arr, long[] upNe1Arr, long[] upBytesArr,
+            IntPtr[] downArr, int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            IntPtr[] ringKArr, IntPtr[] ringVArr, int ringDtype,
+            IntPtr outNormData,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocabSize, int[] idsOut, float[] confOut)
+            => GgmlNative.DFlashDraftBlock(blockIds, blockLen, positions,
+                numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
+                eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
+                attnNormArr,
+                qArr, qTypeArr, qNe0Arr, qNe1Arr, qBytesArr,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                qNormArr, kNormArr,
+                oArr, oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                ffnNormArr,
+                gateArr, gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr,
+                upArr, upTypeArr, upNe0Arr, upNe1Arr, upBytesArr,
+                downArr, downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                ringKArr, ringVArr, ringDtype, outNormData,
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                vocabSize, idsOut, confOut);
+
+        /// <summary>Drop the persistent DFlash graphs.</summary>
+        public static void DFlashResetCaches() => GgmlNative.DFlashResetCaches();
+
+        /// <summary>
+        /// Whole-model Muse-Glimmer forward in one GGML graph. nTokens == 1 replays a
+        /// persistent CUDA-graph-captured graph; nTokens &gt; 1 is a transient prefill
+        /// graph. Returns false when the kernel declines so the caller can fall back
+        /// to the per-op path.
+        /// <para>
+        /// Tensor parallelism: with <paramref name="tpDegree"/> &gt; 1 and a non-null
+        /// <paramref name="tpPlanOut"/> every pointer above is the CURRENTLY ACTIVE
+        /// rank's shard (<see cref="SetActiveRank"/>), numHeads / numKvHeads are
+        /// already this rank's head counts, and the kernel builds and binds the graph
+        /// instead of running it - returning a plan in <c>tpPlanOut[0]</c> cut at the
+        /// two row-parallel projections per layer (attention o_proj, FFN down). Drive
+        /// one plan per rank through <see cref="TensorParallelExecutePlans"/>, which
+        /// AllReduces the partials at those boundaries. On a decline the call returns
+        /// false and leaves <c>tpPlanOut[0]</c> at <see cref="IntPtr.Zero"/>.
+        /// </para>
+        /// </summary>
+        public static bool MuseGlimmerModelForward(
+            IntPtr hiddenData, int hiddenSize, int nTokens, int numLayers,
+            IntPtr[] attnNormArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr, IntPtr[] gateArr,
+            IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr,
+            IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr,
+            IntPtr[] guArr, IntPtr[] downArr,
+            IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] isSwaArr,
+            int[] qTypeArr, long[] qNe0Arr, long[] qNe1Arr, long[] qBytesArr,
+            int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            int[] gateTypeArr, long[] gateNe0Arr, long[] gateNe1Arr, long[] gateBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int numKvHeads, int headDim, int cacheSize, int swaCacheSize,
+            int startPos, int slidingWindow,
+            float eps, float postNormEps, float ropeBase, float ropeFreqScale,
+            float kqScale, int kvCacheType,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitScale, float logitSoftcap,
+            IntPtr captureData, int[] captureLayers, int captureCount,
+            IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
+            int[] tokenIds, int allLogitsRows,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+        {
+            return GgmlNative.MuseGlimmerModelForward(
+                hiddenData, hiddenSize, nTokens, numLayers,
+                attnNormArr, qArr, kArr, vArr, gateArr, qNormArr, kNormArr, oArr,
+                postAttnNormArr, ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr, isSwaArr,
+                qTypeArr, qNe0Arr, qNe1Arr, qBytesArr,
+                kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                gateTypeArr, gateNe0Arr, gateNe1Arr, gateBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, numKvHeads, headDim, cacheSize, swaCacheSize, startPos, slidingWindow,
+                eps, postNormEps, ropeBase, ropeFreqScale, kqScale, kvCacheType,
+                logitsData, vocabSize,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNormData, logitScale, logitSoftcap,
+                captureData, captureLayers, captureCount,
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, tokenIds, allLogitsRows,
+                tpDegree, tpPlanOut);
+        }
+
+        /// <summary>Drop the persistent Muse-Glimmer decode graphs (see the native comment).</summary>
+        public static void MuseGlimmerResetDecodeCache() => GgmlNative.MuseGlimmerResetDecodeCache();
+
+        /// <summary>Release every rank's parked tensor-parallel Muse-Glimmer graph.
+        /// Call on dispose and on KV reset.</summary>
+        public static void MuseGlimmerReleaseTpGraphs() => GgmlNative.MuseGlimmerReleaseTpGraphs();
+
+
         public static void TransformerModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
             IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
             IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            IntPtr[] qkvBiasArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
+            int[] splitTypeArr, long[] splitBytesArr,
+            int[] qkvTypeArr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oBytesArr,
+            int[] guTypeArr, long[] guBytesArr,
+            int[] downTypeArr, long[] downBytesArr,
             int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
             int oType, long oNe0, long oNe1, long oBytes,
             int guType, long guNe0, long guNe1, long guBytes,
@@ -1488,6 +1773,13 @@ namespace TensorSharp.GGML
                 attnNormArr, qkvArr, qNormArr, kNormArr,
                 oArr, ffnNormArr, guArr, downArr,
                 kCacheArr, vCacheArr,
+                qkvBiasArr,
+                qArr, kArr, vArr,
+                splitTypeArr, splitBytesArr,
+                qkvTypeArr, qkvBytesArr,
+                oTypeArr, oBytesArr,
+                guTypeArr, guBytesArr,
+                downTypeArr, downBytesArr,
                 qkvType, qkvNe0, qkvNe1, qkvBytes,
                 oType, oNe0, oNe1, oBytes,
                 guType, guNe0, guNe1, guBytes,
@@ -1506,6 +1798,7 @@ namespace TensorSharp.GGML
             IntPtr hiddenData, int hiddenSize,
             IntPtr attnNormData,
             IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvBiasData,
             IntPtr qNormData, IntPtr kNormData, int headDim,
             IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
             IntPtr ffnNormData,
@@ -1522,6 +1815,7 @@ namespace TensorSharp.GGML
                 hiddenData, hiddenSize,
                 attnNormData,
                 qkvData, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qkvBiasData,
                 qNormData, kNormData, headDim,
                 oData, oType, oNe0, oNe1, oBytes,
                 ffnNormData,

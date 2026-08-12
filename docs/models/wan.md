@@ -123,8 +123,19 @@ TensorSharp.Cli --model HighNoise/Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf \
 ## Server
 
 ```bash
-TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda
+TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+  --video-frames 121 --fps 24
 ```
+
+`--video-frames` and `--fps` set server-wide defaults for the Web UI and all
+three video endpoints below. The Web UI does not send either field, so the
+example produces 121 frames at 24 fps (about 5.04 seconds of playback). An API
+request that supplies `frames` or `fps` overrides the corresponding startup
+default independently; these are defaults, not caps. If the flags and request
+fields are both omitted, the model recipes apply: 49 frames at 24 fps for
+TI2V-5B, and 33 frames at 16 fps otherwise. Frame counts are snapped to `4k+1`.
+Keep the model's native FPS and adjust the frame count when changing duration;
+changing only FPS changes playback speed.
 
 - **Web UI** (`http://localhost:5000`): type a prompt in the chat — attach an
   image to get image-to-video (the image becomes the first frame); the reply is

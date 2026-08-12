@@ -63,6 +63,9 @@ namespace TensorSharp.MLX
         private static MlxFastMetalKernel iq3SMatmulKernel;
         private static MlxFastMetalKernel iq3SMatmulSimdgroupKernel;
         private static MlxFastMetalKernel iq3SGetRowsKernel;
+        private static MlxFastMetalKernel iq3XxsMatmulKernel;
+        private static MlxFastMetalKernel iq3XxsMatmulSimdgroupKernel;
+        private static MlxFastMetalKernel iq3XxsGetRowsKernel;
         private static MlxFastMetalKernel q4KMatmulKernel;
         private static MlxFastMetalKernel q4KMatmulSimdgroupKernel;
         private static MlxFastMetalKernel q4KGetRowsKernel;
@@ -94,6 +97,8 @@ namespace TensorSharp.MLX
         private static MlxFastMetalKernel q8MatmulKernel;
         private static MlxFastMetalKernel decodeAttentionHeadDim512Kernel;
         private static MlxFastMetalKernel q8MatmulGeluMulKernel;
+        private static MlxFastMetalKernel swigluOaiGatherBiasKernel;
+        private static MlxFastMetalKernel moeBiasWeightedSumKernel;
         private static bool iq4XsMatmulKernelDisabled;
         private static bool iq4XsMatmulSimdgroupKernelDisabled;
         private static bool iq4XsMatmul4KernelDisabled;
@@ -117,6 +122,9 @@ namespace TensorSharp.MLX
         private static bool iq3SMatmulKernelDisabled;
         private static bool iq3SMatmulSimdgroupKernelDisabled;
         private static bool iq3SGetRowsKernelDisabled;
+        private static bool iq3XxsMatmulKernelDisabled;
+        private static bool iq3XxsMatmulSimdgroupKernelDisabled;
+        private static bool iq3XxsGetRowsKernelDisabled;
         private static bool q4KMatmulKernelDisabled;
         private static bool q4KMatmulSimdgroupKernelDisabled;
         private static bool q4KGetRowsKernelDisabled;
@@ -148,6 +156,8 @@ namespace TensorSharp.MLX
         private static bool q8MatmulKernelDisabled;
         private static bool decodeAttentionHeadDim512KernelDisabled;
         private static bool q8MatmulGeluMulKernelDisabled;
+        private static bool swigluOaiGatherBiasKernelDisabled;
+        private static bool moeBiasWeightedSumKernelDisabled;
 
         private const string Iq4NlLookupHeader = @"
 constexpr constant float kIq4NlValues[16] = {
@@ -271,6 +281,150 @@ inline float tensorsharp_dequant_iq2_xxs(const device uchar * block, int within_
     const ulong packed_grid = kIq2XxsGrid[grid_index];
     const uint grid = static_cast<uint>((packed_grid >> (8 * j)) & 255);
     return db * static_cast<float>(grid) * ((signs & (1u << j)) != 0 ? -1.0f : 1.0f);
+}
+
+// Block-amortized dot product: 8 CONSECUTIVE weights starting at
+// within_block (a multiple of 8) share one grid codebook entry, one sign
+// byte and one scale, so the header loads and the 256-entry table lookup
+// happen ONCE for the group instead of once per weight.
+//
+// The per-element helper above costs ~5 dependent loads + 1 codebook lookup
+// for every single weight value, which is what made the decode matmul run at
+// ~35 GB/s against a ~205 GB/s roofline (ggml-metal's kernels amortize the
+// same way, over a whole 32-value sub-block). Folding the block scale out of
+// the inner loop re-associates the sum - the result is not bit-identical to
+// the per-element form, but it is the same arithmetic ggml does, and the
+// simd_sum reduction that follows already makes bit-exactness order-dependent.
+inline float tensorsharp_dot8_iq2_xxs(const device uchar * block, int within_block, thread const float * xv) {
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const device ushort * qs = reinterpret_cast<const device ushort *>(block + 2);
+    const int ib32 = within_block >> 5;
+    const int lane = (within_block >> 3) & 3;
+
+    const uint aux_g =
+        static_cast<uint>(qs[4 * ib32 + 0]) |
+        (static_cast<uint>(qs[4 * ib32 + 1]) << 16);
+    const uint aux_s =
+        static_cast<uint>(qs[4 * ib32 + 2]) |
+        (static_cast<uint>(qs[4 * ib32 + 3]) << 16);
+    const uint grid_index = (aux_g >> (8 * lane)) & 255;
+    const uint signs = tensorsharp_iq2_signs((aux_s >> (7 * lane)) & 127);
+    const float db = static_cast<float>(d_half) * (0.5f + static_cast<float>(aux_s >> 28)) * 0.25f;
+    const ulong packed_grid = kIq2XxsGrid[grid_index];
+
+    float acc = 0.0f;
+    for (int j = 0; j < 8; ++j) {
+        const float g = static_cast<float>(static_cast<uint>((packed_grid >> (8 * j)) & 255));
+        acc += xv[j] * (((signs >> j) & 1u) != 0u ? -g : g);
+    }
+    return db * acc;
+}
+";
+
+        // IQ3_XXS (3.0625 bpw). Reuses the IQ2_XXS sign helper
+        // (tensorsharp_iq2_signs == ggml's ksigns_iq2xs) and adds the distinct
+        // 256-entry iq3xxs_grid codebook, where each entry packs FOUR 8-bit
+        // magnitudes (vs IQ2_XXS's eight). Table copied verbatim from
+        // ggml-common.h / TensorSharp.Models.IQuantGrids.iq3xxs_grid.
+        private const string Iq3XxsHelpersHeader = Iq2XxsLookupHeader + @"
+constexpr constant uint kIq3XxsGrid[256] = {
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+};
+
+// block_iq3_xxs: d (half, 2 bytes) | qs[3*QK_K/8] (96 bytes) = 98 bytes per
+// 256-element super-block. qs[0..63] are grid indices (8 bytes per 32-element
+// group, one index per 4 weights); qs[64..95] are eight little-endian uint32
+// words, one per group, packing a 4-bit scale (top nibble) plus four 7-bit
+// sign selectors. Ported from ggml dequantize_row_iq3_xxs — matches
+// ManagedQuantizedOps.DequantizeIq3Xxs bit for bit.
+inline float tensorsharp_dequant_iq3_xxs(const device uchar * block, int within_block) {
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const device uchar * qs = block + 2;
+    const device uchar * scales_and_signs = qs + 64;
+    const int ib32 = within_block >> 5;
+    const int within_32 = within_block & 31;
+    const int lane = within_32 >> 3;   // 0..3: which (grid pair, sign) tuple
+    const int p = within_32 & 7;       // 0..7: position inside the 8-weight tuple
+
+    // Byte-wise load: the super-block stride is 98, so scales_and_signs is only
+    // 2-byte aligned and a uint reinterpret_cast would fault / misread.
+    const device uchar * aux_bytes = scales_and_signs + 4 * ib32;
+    const uint aux32 =
+        static_cast<uint>(aux_bytes[0]) |
+        (static_cast<uint>(aux_bytes[1]) << 8) |
+        (static_cast<uint>(aux_bytes[2]) << 16) |
+        (static_cast<uint>(aux_bytes[3]) << 24);
+
+    const float db = static_cast<float>(d_half) * (0.5f + static_cast<float>(aux32 >> 28)) * 0.5f;
+    const uint grid_index = static_cast<uint>(qs[8 * ib32 + 2 * lane + (p >> 2)]);
+    const uint packed_grid = kIq3XxsGrid[grid_index];
+    const uint grid = (packed_grid >> (8 * (p & 3))) & 255u;
+    const uint signs = tensorsharp_iq2_signs((aux32 >> (7 * lane)) & 127u);
+    return db * static_cast<float>(grid) * ((signs & (1u << p)) != 0 ? -1.0f : 1.0f);
+}
+
+// 8 consecutive IQ3_XXS weights: one aux32 (scale + signs) and TWO codebook
+// entries (each iq3xxs_grid entry packs four 8-bit magnitudes), against ~4
+// dependent loads plus a lookup per weight in the per-element helper.
+inline float tensorsharp_dot8_iq3_xxs(const device uchar * block, int within_block, thread const float * xv) {
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const device uchar * qs = block + 2;
+    const device uchar * scales_and_signs = qs + 64;
+    const int ib32 = within_block >> 5;
+    const int lane = (within_block >> 3) & 3;
+
+    // Byte-wise load: the super-block stride is 98, so scales_and_signs is only
+    // 2-byte aligned and a uint reinterpret_cast would fault / misread.
+    const device uchar * aux_bytes = scales_and_signs + 4 * ib32;
+    const uint aux32 =
+        static_cast<uint>(aux_bytes[0]) |
+        (static_cast<uint>(aux_bytes[1]) << 8) |
+        (static_cast<uint>(aux_bytes[2]) << 16) |
+        (static_cast<uint>(aux_bytes[3]) << 24);
+
+    const float db = static_cast<float>(d_half) * (0.5f + static_cast<float>(aux32 >> 28)) * 0.5f;
+    const uint packed_lo = kIq3XxsGrid[static_cast<uint>(qs[8 * ib32 + 2 * lane + 0])];
+    const uint packed_hi = kIq3XxsGrid[static_cast<uint>(qs[8 * ib32 + 2 * lane + 1])];
+    const uint signs = tensorsharp_iq2_signs((aux32 >> (7 * lane)) & 127u);
+
+    float acc = 0.0f;
+    for (int p = 0; p < 8; ++p) {
+        const uint packed = p < 4 ? packed_lo : packed_hi;
+        const float g = static_cast<float>((packed >> (8 * (p & 3))) & 255u);
+        acc += xv[p] * (((signs >> p) & 1u) != 0u ? -g : g);
+    }
+    return db * acc;
 }
 ";
 
@@ -642,6 +796,66 @@ inline float tensorsharp_dequant_iq3_s(const device uchar * block, int within_bl
     const uint signs = signs_base[4 * ib32 + 2 * half16 + (grid_lane >> 1)];
     const uint sign_bit = static_cast<uint>(j + ((grid_lane & 1) << 2));
     return db * static_cast<float>(grid) * ((signs & (1u << sign_bit)) != 0 ? -1.0f : 1.0f);
+}
+
+// 8 consecutive IQ2_S weights: one 1024-entry codebook lookup (each entry
+// packs eight 8-bit magnitudes), one sign byte, one 4-bit scale.
+inline float tensorsharp_dot8_iq2_s(const device uchar * block, int within_block, thread const float * xv) {
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const device uchar * qs = block + 2;
+    const device uchar * signs_base = qs + 32;
+    const device uchar * qh = qs + 64;
+    const device uchar * scales = qh + 8;
+    const int ib32 = within_block >> 5;
+    const int lane = (within_block >> 3) & 3;
+
+    const uchar qh_byte = qh[ib32];
+    const uint grid_index = static_cast<uint>(qs[4 * ib32 + lane]) | ((static_cast<uint>(qh_byte) << (8 - 2 * lane)) & 0x300u);
+    const uchar scale_byte = scales[ib32];
+    const uint scale = lane < 2 ? (scale_byte & 0x0fu) : (scale_byte >> 4);
+    const float db = static_cast<float>(d_half) * (0.5f + static_cast<float>(scale)) * 0.25f;
+    const ulong packed_grid = kIq2SGrid[grid_index];
+    const uint signs = signs_base[4 * ib32 + lane];
+
+    float acc = 0.0f;
+    for (int j = 0; j < 8; ++j) {
+        const float g = static_cast<float>(static_cast<uint>((packed_grid >> (8 * j)) & 255));
+        acc += xv[j] * (((signs >> j) & 1u) != 0u ? -g : g);
+    }
+    return db * acc;
+}
+
+// 8 consecutive IQ3_S weights. Unlike IQ2_S an iq3s_grid entry only covers
+// FOUR magnitudes, so a run of 8 spans two adjacent grid lanes - but both
+// lanes share the same sign byte (index (grid_lane >> 1) is equal for the
+// pair) and the same 4-bit scale, so the amortization still holds.
+inline float tensorsharp_dot8_iq3_s(const device uchar * block, int within_block, thread const float * xv) {
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const device uchar * qs = block + 2;
+    const device uchar * qh = qs + 64;
+    const device uchar * signs_base = qh + 8;
+    const device uchar * scales = signs_base + 32;
+    const int ib32 = within_block >> 5;
+    const int within_32 = within_block & 31;
+    const int half16 = within_32 >> 4;
+    const int grid_lane0 = (within_32 >> 2) & 3;   // always even: 0 or 2
+    const uint qh_nibble = static_cast<uint>(qh[ib32] >> (4 * half16));
+    const uint scale = (scales[ib32 >> 1] >> (4 * (ib32 & 1))) & 0x0fu;
+    const float db = static_cast<float>(d_half) * static_cast<float>(1 + 2 * scale);
+    const uint signs = signs_base[4 * ib32 + 2 * half16 + (grid_lane0 >> 1)];
+
+    float acc = 0.0f;
+    for (int gl = 0; gl < 2; ++gl) {
+        const int grid_lane = grid_lane0 + gl;
+        const uint grid_index = static_cast<uint>(qs[8 * ib32 + 4 * half16 + grid_lane]) | ((qh_nibble << (8 - grid_lane)) & 256u);
+        const uint packed_grid = kIq3SGrid[grid_index];
+        for (int j = 0; j < 4; ++j) {
+            const float g = static_cast<float>((packed_grid >> (8 * j)) & 255u);
+            const uint sign_bit = static_cast<uint>(j + ((grid_lane & 1) << 2));
+            acc += xv[4 * gl + j] * (((signs >> sign_bit) & 1u) != 0u ? -g : g);
+        }
+    }
+    return db * acc;
 }
 ";
 
@@ -1250,6 +1464,58 @@ float up = gate_up[base + HalfDim + col];
 float gate3 = gate * gate * gate;
 float gelu = 0.5f * gate * (1.0f + tanh(0.7978845608f * (gate + 0.044715f * gate3)));
 out_y[row * HalfDim + col] = gelu * up;
+";
+
+        // Clamped SwiGLU (the GPT-OSS / OpenAI-MoE "swiglu_oai" variant) over
+        // separate gate / up matrices with a fused per-expert bias gather:
+        //   g = gate[row] + gate_bias[experts[row]]
+        //   u = up[row]   + up_bias[experts[row]]
+        //   x = min(g, limit); y = clamp(u, -limit, limit)
+        //   out = (x * sigmoid(alpha * x)) * (y + 1)
+        // Mirrors GptOssModel.ApplySwiGluOaiInPlace / ggml's swiglu_oai.
+        // alpha_v / limit_v are 0-d scalar inputs (passed by value by MLX).
+        private const string SwigluOaiGatherBiasSource = @"
+auto col = thread_position_in_grid.x;
+auto row = thread_position_in_grid.y;
+if (col >= Dim || row >= Rows) {
+    return;
+}
+
+int e = experts[row];
+float g = gate_in[row * Dim + col] + gate_bias[e * Dim + col];
+float u = up_in[row * Dim + col] + up_bias[e * Dim + col];
+float x = min(g, limit_v);
+float y = clamp(u, -limit_v, limit_v);
+float glu = x / (1.0f + exp(-alpha_v * x));
+out_y[row * Dim + col] = glu * (y + 1.0f);
+";
+
+        // Routing-weighted MoE combine with a fused per-expert down-bias
+        // gather and unsort. The K down-projection rows of token n live at
+        // sorted positions inv_order[n*K+k] of down_rows (the caller sorted
+        // the (token, expert) pairs by expert for gather_qmm's grouped-GEMM
+        // mode). Computes, per token n and output column d:
+        //   out[n, d] = sum_k w[n*K+k] * (down_rows[inv_order[n*K+k], d]
+        //                                 + down_bias[experts_sorted[inv_order[n*K+k]], d])
+        // HasBias=0 skips the bias term (down_bias may then be any array).
+        private const string MoeBiasWeightedSumSource = @"
+auto col = thread_position_in_grid.x;
+auto n = thread_position_in_grid.y;
+if (col >= Dim || n >= Rows) {
+    return;
+}
+
+float acc = 0.0f;
+for (int k = 0; k < K; ++k) {
+    int p = n * K + k;
+    int srow = inv_order[p];
+    float v = down_rows[srow * Dim + col];
+    if (HasBias != 0) {
+        v += down_bias[experts_sorted[srow] * Dim + col];
+    }
+    acc += route_weights[p] * v;
+}
+out_y[n * Dim + col] = acc;
 ";
 
         private const string FlatToHeadFirstSource = @"
@@ -2012,22 +2278,72 @@ const uchar q = within_32 < 16 ? (packed & 0x0f) : (packed >> 4);
 y[out_row * InDim + col] = static_cast<float>(d_half) * static_cast<float>(ls - 32) * kIq4NlValues[q];
 ";
 
-        // Phase 8: simdgroup-fast reduction (same pattern as Q4KMatmul).
-        private const string Iq2XxsMatmulSource = @"
+        // ===================================================================
+        // Decode / short-batch IQ matmul body (shared by IQ2_XXS, IQ2_S,
+        // IQ3_S and IQ3_XXS - the four only differ in super-block stride and
+        // dequant helper)
+        // ===================================================================
+        //
+        // Grid (256, OutDim, InRows) with a 256-thread group: one threadgroup
+        // per output column, the 256 threads splitting InDim and reducing
+        // through simd_sum. Only rows < Iq2XxsMatmulSimdgroupMinRows reach
+        // here; prefill goes to the simdgroup_matrix kernels.
+        //
+        // DOT8 (default): each thread takes 8 CONSECUTIVE weights per step, so
+        // the super-block header loads and the 256/1024-entry codebook lookup
+        // are paid once per 8 values instead of once per value - the same
+        // amortization ggml-metal's iq kernels do over a 32-value sub-block.
+        // The legacy per-element body ran the Muse-Glimmer-30B-UD-IQ2_XXS
+        // decode FFN (IQ2_S gate/up + IQ3_XXS down, 74% of the token's weight
+        // bytes) at ~34 GB/s against a ~205 GB/s memory roofline; the token was
+        // 98% GPU wait with no host thread busy, so the cost was the dequant
+        // instruction stream, not bandwidth or scheduling.
+        //
+        // TS_MLX_IQ_DECODE_DOT8=0 restores the per-element body for an A/B.
+        private static readonly bool IQuantDecodeDot8Enabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_IQ_DECODE_DOT8"), "0", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Emit the decode matmul body for one IQ quant type.
+        /// <paramref name="blockBytes"/> is the GGUF super-block stride (256
+        /// weights per block for every type here), and the DOT8 body relies on
+        /// the dispatch guard that InDim is a multiple of 256 - so every
+        /// 8-element group lands inside one super-block and starts on a
+        /// multiple of 8, which is what lets one codebook entry cover it.
+        /// </summary>
+        private static string BuildIQuantMatmulSource(string dot8Helper, string scalarHelper, int blockBytes)
+        {
+            string reduction = IQuantDecodeDot8Enabled
+                ? $@"
+float sum = 0.0f;
+for (int base_k = static_cast<int>(tid) * 8; base_k < InDim; base_k += 256 * 8) {{
+    int block_in_row = base_k >> 8;
+    int within_block = base_k & 255;
+    auto block = w + (out_col * BlocksPerRow + block_in_row) * {blockBytes};
+    int xbase = static_cast<int>(row_idx) * InDim + base_k;
+    float xv[8];
+    for (int j = 0; j < 8; ++j) {{
+        xv[j] = x[xbase + j];
+    }}
+    sum += {dot8Helper}(block, within_block, xv);
+}}"
+                : $@"
+float sum = 0.0f;
+for (int k = static_cast<int>(tid); k < InDim; k += 256) {{
+    int block_in_row = k >> 8;
+    int within_block = k & 255;
+    auto block = w + (out_col * BlocksPerRow + block_in_row) * {blockBytes};
+    sum += x[static_cast<int>(row_idx) * InDim + k] * {scalarHelper}(block, within_block);
+}}";
+
+            return $@"
 auto tid = thread_position_in_threadgroup.x;
 auto out_col = thread_position_in_grid.y;
 auto row_idx = thread_position_in_grid.z;
 auto simd_lane = tid & 31u;
 auto simd_id = tid >> 5;
 threadgroup float simd_partial[8];
-
-float sum = 0.0f;
-for (int k = static_cast<int>(tid); k < InDim; k += 256) {
-    int block_in_row = k >> 8;
-    int within_block = k & 255;
-    auto block = w + (out_col * BlocksPerRow + block_in_row) * 66;
-    sum += x[row_idx * InDim + k] * tensorsharp_dequant_iq2_xxs(block, within_block);
-}
+{reduction}
 
 float simd_total = simd_sum(sum);
 if (simd_lane == 0) simd_partial[simd_id] = simd_total;
@@ -2035,10 +2351,14 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 float lane_v = simd_lane < 8u ? simd_partial[simd_lane] : 0.0f;
 float final_sum = simd_sum(lane_v);
 
-if (tid == 0) {
+if (tid == 0) {{
     y[row_idx * OutDim + out_col] = final_sum;
-}
+}}
 ";
+        }
+
+        private static readonly string Iq2XxsMatmulSource =
+            BuildIQuantMatmulSource("tensorsharp_dot8_iq2_xxs", "tensorsharp_dequant_iq2_xxs", 66);
 
         // IQ2_XXS matmul using Apple's simdgroup_matrix hardware
         // primitives. For batches >= 8 each SIMD group computes an
@@ -2288,32 +2608,8 @@ if (tid == 0) {
 ";
 
 
-        private const string Iq2SMatmulSource = @"
-auto tid = thread_position_in_threadgroup.x;
-auto out_col = thread_position_in_grid.y;
-auto row_idx = thread_position_in_grid.z;
-auto simd_lane = tid & 31u;
-auto simd_id = tid >> 5;
-threadgroup float simd_partial[8];
-
-float sum = 0.0f;
-for (int k = static_cast<int>(tid); k < InDim; k += 256) {
-    int block_in_row = k >> 8;
-    int within_block = k & 255;
-    auto block = w + (out_col * BlocksPerRow + block_in_row) * 82;
-    sum += x[row_idx * InDim + k] * tensorsharp_dequant_iq2_s(block, within_block);
-}
-
-float simd_total = simd_sum(sum);
-if (simd_lane == 0) simd_partial[simd_id] = simd_total;
-threadgroup_barrier(mem_flags::mem_threadgroup);
-float lane_v = simd_lane < 8u ? simd_partial[simd_lane] : 0.0f;
-float final_sum = simd_sum(lane_v);
-
-if (tid == 0) {
-    y[row_idx * OutDim + out_col] = final_sum;
-}
-";
+        private static readonly string Iq2SMatmulSource =
+            BuildIQuantMatmulSource("tensorsharp_dot8_iq2_s", "tensorsharp_dequant_iq2_s", 82);
 
         private const string Iq2SGetRowsSource = @"
 auto col = thread_position_in_grid.x;
@@ -2330,32 +2626,8 @@ y[out_row * InDim + col] = tensorsharp_dequant_iq2_s(block, within_block);
 ";
 
         // Phase 8: simdgroup-fast reduction (same pattern as Q4KMatmul).
-        private const string Iq3SMatmulSource = @"
-auto tid = thread_position_in_threadgroup.x;
-auto out_col = thread_position_in_grid.y;
-auto row_idx = thread_position_in_grid.z;
-auto simd_lane = tid & 31u;
-auto simd_id = tid >> 5;
-threadgroup float simd_partial[8];
-
-float sum = 0.0f;
-for (int k = static_cast<int>(tid); k < InDim; k += 256) {
-    int block_in_row = k >> 8;
-    int within_block = k & 255;
-    auto block = w + (out_col * BlocksPerRow + block_in_row) * 110;
-    sum += x[row_idx * InDim + k] * tensorsharp_dequant_iq3_s(block, within_block);
-}
-
-float simd_total = simd_sum(sum);
-if (simd_lane == 0) simd_partial[simd_id] = simd_total;
-threadgroup_barrier(mem_flags::mem_threadgroup);
-float lane_v = simd_lane < 8u ? simd_partial[simd_lane] : 0.0f;
-float final_sum = simd_sum(lane_v);
-
-if (tid == 0) {
-    y[row_idx * OutDim + out_col] = final_sum;
-}
-";
+        private static readonly string Iq3SMatmulSource =
+            BuildIQuantMatmulSource("tensorsharp_dot8_iq3_s", "tensorsharp_dequant_iq3_s", 110);
 
         private const string Iq3SGetRowsSource = @"
 auto col = thread_position_in_grid.x;
@@ -2369,6 +2641,26 @@ int block_in_row = col >> 8;
 int within_block = col & 255;
 auto block = w + (weight_row * BlocksPerRow + block_in_row) * 110;
 y[out_row * InDim + col] = tensorsharp_dequant_iq3_s(block, within_block);
+";
+
+        // IQ3_XXS decode/short-batch matmul. Same simdgroup reduction shape as
+        // the IQ3_S kernel above; only the 98-byte super-block stride and the
+        // dequant helper differ.
+        private static readonly string Iq3XxsMatmulSource =
+            BuildIQuantMatmulSource("tensorsharp_dot8_iq3_xxs", "tensorsharp_dequant_iq3_xxs", 98);
+
+        private const string Iq3XxsGetRowsSource = @"
+auto col = thread_position_in_grid.x;
+auto out_row = thread_position_in_grid.y;
+if (col >= InDim) {
+    return;
+}
+
+int weight_row = indices[out_row];
+int block_in_row = col >> 8;
+int within_block = col & 255;
+auto block = w + (weight_row * BlocksPerRow + block_in_row) * 98;
+y[out_row * InDim + col] = tensorsharp_dequant_iq3_xxs(block, within_block);
 ";
 
         private const string HeadDim256AttentionSource = @"
@@ -2645,6 +2937,15 @@ if (simd_id == 0) {
         float g = matmul_v;
         float g3 = g * g * g;
         float inner = 0.7978845608f * (g + 0.044715f * g3);
+        // Clamp before tanh. metal::fast::tanh is an exp-ratio approximation, so
+        // once exp(2*inner) overflows (|inner| > ~44, i.e. |g| > ~11) it computes
+        // Inf/Inf and returns NaN instead of saturating to +/-1. That is a real
+        // failure, not a rounding artifact: on gemma-4-E4B this produced ONE NaN
+        // in the 256-element per-layer-embedding gate at layer 4, the following
+        // proj matmul smeared it across all 2560 residual channels, and the model
+        // emitted <pad> for every token after the first. tanh is +/-1 to float
+        // precision well before |x| = 15, so clamping there is exact.
+        inner = metal::clamp(inner, -15.0f, 15.0f);
         float gelu = 0.5f * g * (1.0f + metal::fast::tanh(inner));
         y[out_col] = gelu * gate[out_col];
     }
@@ -4509,6 +4810,130 @@ if (kind == 0) {
             });
         }
 
+        // Fused clamped-SwiGLU (swiglu_oai) + per-expert gate/up bias gather.
+        // gate/up: [rows, dim] f32. gateBias/upBias: [E, dim] f32. experts:
+        // [rows] int32 (expert id of each row). Returns [rows, dim] f32.
+        internal static MlxArray SwigluOaiGatherBias(
+            MlxArray gate,
+            MlxArray up,
+            MlxArray gateBias,
+            MlxArray upBias,
+            MlxArray experts,
+            float alpha,
+            float limit,
+            int rows,
+            int dim)
+        {
+            if (!gate.IsValid || !up.IsValid || !gateBias.IsValid || !upBias.IsValid || !experts.IsValid)
+                throw new ArgumentException("MLX swiglu-oai gather-bias requires valid arrays.");
+            if (rows <= 0 || dim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(rows));
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel = EnsureSwigluOaiGatherBiasKernel();
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default;
+                MlxVectorArray outputs = default;
+                MlxArray alphaArray = default;
+                MlxArray limitArray = default;
+                try
+                {
+                    AddTemplateInt(config, "Rows", rows);
+                    AddTemplateInt(config, "Dim", dim);
+
+                    int[] shape = { rows, dim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring swiglu-oai output");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, dim, rows, 1), "configuring swiglu-oai grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring swiglu-oai threadgroup");
+
+                    alphaArray = mlx_array_new_float32(alpha);
+                    limitArray = mlx_array_new_float32(limit);
+                    inputs = CreateVectorArray(gate, up, gateBias, upBias, experts, alphaArray, limitArray);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running swiglu-oai gather-bias");
+                    if (mlx_vector_array_size(outputs) < 1)
+                        throw new InvalidOperationException("swiglu-oai gather-bias kernel produced no output.");
+
+                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading swiglu-oai output");
+                    return result;
+                }
+                finally
+                {
+                    if (alphaArray.IsValid)
+                        _ = mlx_array_free(alphaArray);
+                    if (limitArray.IsValid)
+                        _ = mlx_array_free(limitArray);
+                    if (inputs.IsValid)
+                        _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid)
+                        _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid)
+                        _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+        }
+
+        // Routing-weighted MoE combine + per-expert down-bias gather + unsort.
+        // downRows: [n*k, dim] f32 in expert-sorted pair order. downBias:
+        // [E, dim] f32 (pass any valid array with hasBias=false to skip).
+        // expertsSorted / invOrder: [n*k] int32. routeWeights: [n*k] f32 in
+        // ORIGINAL (token-major) pair order. Returns [n, dim] f32.
+        internal static MlxArray MoeBiasWeightedSum(
+            MlxArray downRows,
+            MlxArray downBias,
+            bool hasBias,
+            MlxArray expertsSorted,
+            MlxArray invOrder,
+            MlxArray routeWeights,
+            int n,
+            int k,
+            int dim)
+        {
+            if (!downRows.IsValid || !downBias.IsValid || !expertsSorted.IsValid || !invOrder.IsValid || !routeWeights.IsValid)
+                throw new ArgumentException("MLX MoE bias-weighted-sum requires valid arrays.");
+            if (n <= 0 || k <= 0 || dim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(n));
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel = EnsureMoeBiasWeightedSumKernel();
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default;
+                MlxVectorArray outputs = default;
+                try
+                {
+                    AddTemplateInt(config, "Rows", n);
+                    AddTemplateInt(config, "K", k);
+                    AddTemplateInt(config, "Dim", dim);
+                    AddTemplateInt(config, "HasBias", hasBias ? 1 : 0);
+
+                    int[] shape = { n, dim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring MoE bias-weighted-sum output");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, dim, n, 1), "configuring MoE bias-weighted-sum grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring MoE bias-weighted-sum threadgroup");
+
+                    inputs = CreateVectorArray(downRows, downBias, expertsSorted, invOrder, routeWeights);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running MoE bias-weighted-sum");
+                    if (mlx_vector_array_size(outputs) < 1)
+                        throw new InvalidOperationException("MoE bias-weighted-sum kernel produced no output.");
+
+                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading MoE bias-weighted-sum output");
+                    return result;
+                }
+                finally
+                {
+                    if (inputs.IsValid)
+                        _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid)
+                        _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid)
+                        _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+        }
+
         internal static MlxArray FlatToHeadFirst(
             MlxArray input,
             int seqLen,
@@ -5661,6 +6086,26 @@ if (kind == 0) {
         internal static MlxArray Iq3SGetRows(MlxArray rawWeight, MlxArray indices, int rows, int inDim)
         {
             return IQuantGetRows(rawWeight, indices, rows, inDim, EnsureIq3SGetRowsKernel, "IQ3_S");
+        }
+
+        internal static MlxArray Iq3XxsMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
+        {
+            if (rows >= Iq2XxsMatmulSimdgroupMinRows && !Iq2XxsMatmulSimdgroupDisabled)
+            {
+                try { return Iq3XxsMatmulSimdgroup(input, rawWeight, rows, inDim, outDim); }
+                catch (NotSupportedException) { }
+            }
+            return IQuantMatmul(input, rawWeight, rows, inDim, outDim, EnsureIq3XxsMatmulKernel, "IQ3_XXS");
+        }
+
+        internal static MlxArray Iq3XxsMatmulSimdgroup(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
+        {
+            return IQuantMatmulSimdgroup(input, rawWeight, rows, inDim, outDim, EnsureIq3XxsMatmulSimdgroupKernel, "IQ3_XXS");
+        }
+
+        internal static MlxArray Iq3XxsGetRows(MlxArray rawWeight, MlxArray indices, int rows, int inDim)
+        {
+            return IQuantGetRows(rawWeight, indices, rows, inDim, EnsureIq3XxsGetRowsKernel, "IQ3_XXS");
         }
 
         private static MlxArray IQuantMatmul(
@@ -7000,6 +7445,16 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 "tensorsharp_iq3s_matmul_sg", "tensorsharp_dequant_iq3_s", 110,
                 Iq2SIq3SLookupHeader, "IQ3_S");
 
+        // IQ3_XXS shares the 256-element super-block layout of the other
+        // i-quants; only the 98-byte block stride and the dequant helper
+        // differ. Unsloth's UD mixed quants put IQ3_XXS on ffn_down (the
+        // largest matmul in each layer), so it needs the same kernel coverage
+        // as IQ3_S or those tensors fall back to the C# row-dequant path.
+        private static MlxFastMetalKernel EnsureIq3XxsMatmulSimdgroupKernel() =>
+            EnsureSgKernel(ref iq3XxsMatmulSimdgroupKernel, ref iq3XxsMatmulSimdgroupKernelDisabled,
+                "tensorsharp_iq3xxs_matmul_sg", "tensorsharp_dequant_iq3_xxs", 98,
+                Iq3XxsHelpersHeader, "IQ3_XXS");
+
         private static MlxFastMetalKernel EnsureIq4XsMatmulSimdgroupKernel() =>
             EnsureSgKernel(ref iq4XsMatmulSimdgroupKernel, ref iq4XsMatmulSimdgroupKernelDisabled,
                 "tensorsharp_iq4xs_matmul_sg", "tensorsharp_dequant_iq4xs", 136,
@@ -7216,6 +7671,56 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 }
 
                 return iq3SGetRowsKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureIq3XxsMatmulKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (iq3XxsMatmulKernel.IsValid)
+                    return iq3XxsMatmulKernel;
+                if (iq3XxsMatmulKernelDisabled)
+                    throw new NotSupportedException("MLX IQ3_XXS matmul kernel was disabled after initialization failed.");
+
+                iq3XxsMatmulKernel = CreateFastMetalKernel(
+                    "tensorsharp_iq3xxs_matmul",
+                    new[] { "x", "w" },
+                    new[] { "y" },
+                    Iq3XxsMatmulSource,
+                    Iq3XxsHelpersHeader);
+                if (!iq3XxsMatmulKernel.IsValid)
+                {
+                    iq3XxsMatmulKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX IQ3_XXS matmul kernel.");
+                }
+
+                return iq3XxsMatmulKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureIq3XxsGetRowsKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (iq3XxsGetRowsKernel.IsValid)
+                    return iq3XxsGetRowsKernel;
+                if (iq3XxsGetRowsKernelDisabled)
+                    throw new NotSupportedException("MLX IQ3_XXS get_rows kernel was disabled after initialization failed.");
+
+                iq3XxsGetRowsKernel = CreateFastMetalKernel(
+                    "tensorsharp_iq3xxs_get_rows",
+                    new[] { "w", "indices" },
+                    new[] { "y" },
+                    Iq3XxsGetRowsSource,
+                    Iq3XxsHelpersHeader);
+                if (!iq3XxsGetRowsKernel.IsValid)
+                {
+                    iq3XxsGetRowsKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX IQ3_XXS get_rows kernel.");
+                }
+
+                return iq3XxsGetRowsKernel;
             }
         }
 
@@ -8135,6 +8640,56 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 }
 
                 return geluMulSplitKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureSwigluOaiGatherBiasKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (swigluOaiGatherBiasKernel.IsValid)
+                    return swigluOaiGatherBiasKernel;
+                if (swigluOaiGatherBiasKernelDisabled)
+                    throw new NotSupportedException("MLX swiglu-oai gather-bias kernel was disabled after initialization failed.");
+
+                swigluOaiGatherBiasKernel = CreateFastMetalKernel(
+                    "tensorsharp_swiglu_oai_gather_bias",
+                    new[] { "gate_in", "up_in", "gate_bias", "up_bias", "experts", "alpha_v", "limit_v" },
+                    new[] { "out_y" },
+                    SwigluOaiGatherBiasSource,
+                    string.Empty);
+                if (!swigluOaiGatherBiasKernel.IsValid)
+                {
+                    swigluOaiGatherBiasKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX swiglu-oai gather-bias kernel.");
+                }
+
+                return swigluOaiGatherBiasKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureMoeBiasWeightedSumKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (moeBiasWeightedSumKernel.IsValid)
+                    return moeBiasWeightedSumKernel;
+                if (moeBiasWeightedSumKernelDisabled)
+                    throw new NotSupportedException("MLX MoE bias-weighted-sum kernel was disabled after initialization failed.");
+
+                moeBiasWeightedSumKernel = CreateFastMetalKernel(
+                    "tensorsharp_moe_bias_weighted_sum",
+                    new[] { "down_rows", "down_bias", "experts_sorted", "inv_order", "route_weights" },
+                    new[] { "out_y" },
+                    MoeBiasWeightedSumSource,
+                    string.Empty);
+                if (!moeBiasWeightedSumKernel.IsValid)
+                {
+                    moeBiasWeightedSumKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX MoE bias-weighted-sum kernel.");
+                }
+
+                return moeBiasWeightedSumKernel;
             }
         }
 

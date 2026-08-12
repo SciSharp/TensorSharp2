@@ -913,7 +913,15 @@ TSG_EXPORT int TSGgml_GptOssModelDecode(
 
         void* out_data = fold ? logits_data : hidden_data;
         finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
-        if (buffer.value != nullptr || can_persist) host_read_barrier();
+        // ALWAYS drain before returning. `out_data` is the C# caller's pinned
+        // logits/hidden array, which it reads directly (no Storage read barrier),
+        // and on Metal async mode finalize_compute_with_download only QUEUES the
+        // device->host blit. Gating this on `buffer.value != nullptr` left the
+        // common gallocr path (buffer.value == nullptr, can_persist == false on
+        // Metal) reading the PREVIOUS token's logits, so greedy decode re-emitted
+        // the token it had just produced ("We We need need to to ..."). It also
+        // has to happen before BufferHandle frees a per-call fallback buffer.
+        host_read_barrier();
 
         if (can_persist && dcache != nullptr)
         {

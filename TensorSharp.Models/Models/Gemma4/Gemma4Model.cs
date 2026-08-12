@@ -4200,6 +4200,13 @@ namespace TensorSharp.Models
 
         #endregion
 
+        // Escape hatch for the fused Q8 matmul+GeluMul per-layer-embedding gate on
+        // MLX (TS_MLX_FUSED_PLE_GATE=0 falls back to the unfused op chain). Read
+        // once: this sits in the per-layer decode path, so an env lookup here
+        // would run NumLayers times per token.
+        private static readonly bool MlxFusedPleGateEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_FUSED_PLE_GATE"), "0", StringComparison.Ordinal);
+
         private bool HasMoE(int layer)
         {
             if (_numExperts == 0) return false;
@@ -4266,6 +4273,7 @@ namespace TensorSharp.Models
                     hidden.Dispose();
                 }
             }
+
 
             Tensor result;
 
@@ -4401,7 +4409,8 @@ namespace TensorSharp.Models
                     && perLayerInput.ElementCount() == inpGateQw.Ne1)
                 {
                     var fusedGate = new Tensor(_allocator, DType.Float32, 1, (int)inpGateQw.Ne1);
-                    if (MlxQuantizedOps.TryFusedQ8MatmulGeluMul(
+                    if (MlxFusedPleGateEnabled
+                        && MlxQuantizedOps.TryFusedQ8MatmulGeluMul(
                             fusedGate, result, perLayerInput,
                             inpGateQw.EnsureDeviceCacheKey(), inpGateQw.Data,
                             inpGateQw.GgmlType, inpGateQw.Ne0, inpGateQw.Ne1, inpGateQw.RawBytes))

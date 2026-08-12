@@ -78,11 +78,24 @@ public class TcpCommunicatorTests
             t0.Start(); t1.Start();
             t0.Join(30_000); t1.Join(30_000);
 
+            // AllReduce computes i*0.001f + i*0.002f, which is NOT bit-identical
+            // to i*0.003f: each product rounds independently and the sum rounds
+            // again. At i near 1M the value is ~3000, where one fp32 ulp is
+            // ~2.4e-4 — far coarser than the 5-decimal-place (1e-5) bound this
+            // used to assert, so the test failed on the first index whose sum
+            // happened to round the other way (i=12196: 36.5880051 vs
+            // 36.5880013). Assert a relative fp32 tolerance instead: a real
+            // reduce bug (a dropped chunk, a wrong offset, a partial buffer)
+            // moves values by whole percent, not by ulps.
+            const float relTol = 1e-5f;
             for (int i = 0; i < n; i++)
             {
                 float expected = i * 0.003f;
-                Assert.Equal(expected, buf0[i], 5);
-                Assert.Equal(expected, buf1[i], 5);
+                float tol = Math.Max(1e-6f, Math.Abs(expected) * relTol);
+                Assert.True(Math.Abs(expected - buf0[i]) <= tol,
+                    $"rank0[{i}]: expected {expected}, actual {buf0[i]}");
+                Assert.True(Math.Abs(expected - buf1[i]) <= tol,
+                    $"rank1[{i}]: expected {expected}, actual {buf1[i]}");
             }
         }
         finally

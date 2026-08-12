@@ -1151,14 +1151,28 @@ namespace TensorSharp.Models
             var extraEos = gguf.GetInt32Array("tokenizer.ggml.eos_token_ids");
             var eosIds = new List<int>(ResolveEogTokenIds(vocabTokens, eosId, extraEos));
 
-            if (UsesSentencePieceTokenizer(tokenizerModel))
+            // llama.cpp folds the declared end-of-turn control into the EOG set
+            // for EVERY tokenizer type (llama_vocab::impl::load inserts
+            // special_eot_id into special_eog_ids). This used to run only on the
+            // SentencePiece branch, so a BPE model whose turn ends on a token
+            // other than tokenizer.ggml.eos_token_id never stopped: Muse-Glimmer
+            // declares eos_token_id = <|end_of_text|> but ends every assistant
+            // turn with <|eot|> (tokenizer.ggml.eot_token_id = 200008), so it ran
+            // past its answer and re-answered until max_tokens.
+            bool isSentencePiece = UsesSentencePieceTokenizer(tokenizerModel);
+            // 106 (<end_of_turn>) is the SentencePiece/Gemma fallback that
+            // predates the metadata key; BPE vocabularies get no fallback, only
+            // the key when the converter wrote one.
+            if (gguf.Metadata.ContainsKey("tokenizer.ggml.eot_token_id") || isSentencePiece)
+            {
+                int eotId = (int)gguf.GetUint32("tokenizer.ggml.eot_token_id", 106);
+                if (eotId >= 0 && eotId < vocabTokens.Length && !eosIds.Contains(eotId))
+                    eosIds.Add(eotId);
+            }
+
+            if (isSentencePiece)
             {
                 var scores = gguf.GetFloatArray("tokenizer.ggml.scores");
-
-                int eotId = (int)gguf.GetUint32("tokenizer.ggml.eot_token_id", 106);
-                if (!eosIds.Contains(eotId))
-                    eosIds.Add(eotId);
-
                 return new SentencePieceTokenizer(vocabTokens, tokenTypes, scores,
                     bosId, eosIds.ToArray(), addBos, addEos);
             }
@@ -1547,6 +1561,16 @@ namespace TensorSharp.Models
                 if (!qw.HasHostData)
                     continue;
 
+                // Skip weights the model serves device-resident by another route
+                // (e.g. MoE per-expert views covered by a stacked-experts MLX
+                // weight built for mlx_gather_qmm). Preloading them here would
+                // put a second, redundant copy of every expert byte in unified
+                // memory. The host view is left intact so the per-expert
+                // fallback can still lazily upload on first use if the batched
+                // path ever refuses at runtime.
+                if (!ShouldPreloadMlxQuantWeightToDevice(weightName, qw))
+                    continue;
+
                 bool isExpert = offloadEnabled && MoeExpertOffload.IsExpertWeightName(weightName);
                 bool canPreload = MlxQuantizedOps.CanPreloadQuantizedType(qw.GgmlType);
                 bool preloadCopies = canPreload && MlxQuantizedOps.PreloadDuplicatesHostMemory(qw.GgmlType);
@@ -1881,6 +1905,19 @@ namespace TensorSharp.Models
         /// </summary>
         protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
             => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName);
+
+        /// <summary>
+        /// Per-weight veto for the eager MLX quantized preload
+        /// (<see cref="PrepareMlxQuantizedWeightsForInference"/>). Models whose
+        /// MLX forward serves a weight device-resident by another route (e.g.
+        /// routed experts through a stacked-experts <c>mlx_gather_qmm</c>
+        /// weight) override this to return false for those names, avoiding a
+        /// second full copy of the bytes in unified memory. Skipped weights
+        /// keep their host data, so any per-op fallback still lazily uploads
+        /// them on first use.
+        /// </summary>
+        protected virtual bool ShouldPreloadMlxQuantWeightToDevice(string weightName, QuantizedWeight weight)
+            => true;
 
         protected bool CanUseGgmlQuantizedGetRows(int ggmlType)
         {
@@ -3016,6 +3053,67 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Column-parallel shard of a logical fused bias whose SOURCE tensors
+        /// were never fused (e.g. Q/K/V biases next to mixed-quant-type Q/K/V
+        /// weights that declined load-time fusion). Gathers each rank's slice
+        /// of every source bias, in order, into one per-rank tensor registered
+        /// under <paramref name="fusedBiasName"/> — the bias counterpart of
+        /// <see cref="ShardSeparateColumnParallel"/>, producing exactly the
+        /// per-rank [seg0_r | seg1_r | …] layout the forward's fused lookup
+        /// expects. No-op if any source bias is absent.
+        /// </summary>
+        protected void ShardSeparateBiasColumnParallel(string fusedBiasName, string[] sourceNames, int[] segmentDims)
+        {
+            if (!IsTensorParallel) return;
+            if (sourceNames.Length != segmentDims.Length)
+                throw new ArgumentException("sourceNames and segmentDims must have the same length.");
+
+            var sources = new Tensor[sourceNames.Length];
+            for (int s = 0; s < sourceNames.Length; s++)
+            {
+                if (!_weights.TryGetValue(sourceNames[s], out sources[s]))
+                    return; // biases are optional — mirror the fused-bias no-op
+            }
+
+            int tp = TpDegree;
+            int globalTp = GlobalTpDegree;
+            int rankOffset = TpRankOffset;
+
+            int totalLen = 0;
+            foreach (int segDim in segmentDims)
+                totalLen += segDim / globalTp;
+
+            var shards = new Tensor[tp];
+            for (int r = 0; r < tp; r++)
+            {
+                int globalRank = rankOffset + r;
+                var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, totalLen);
+                unsafe
+                {
+                    float* dst = GetFloatPtr(shard);
+                    int dstOff = 0;
+                    for (int s = 0; s < sourceNames.Length; s++)
+                    {
+                        int perRank = segmentDims[s] / globalTp;
+                        float* src = GetFloatPtr(sources[s]);
+                        int start = globalRank * perRank;
+                        for (int i = 0; i < perRank; i++)
+                            dst[dstOff + i] = src[start + i];
+                        dstOff += perRank;
+                    }
+                }
+                shards[r] = shard;
+            }
+
+            _tpWeights[fusedBiasName] = shards;
+            for (int s = 0; s < sourceNames.Length; s++)
+            {
+                _weights.Remove(sourceNames[s]);
+                sources[s].Dispose();
+            }
+        }
+
+        /// <summary>
         /// Column-parallel shard of a fused [gate | up] bias as two equal
         /// segments, deriving the half length from the bias itself.
         /// </summary>
@@ -3462,6 +3560,17 @@ namespace TensorSharp.Models
                     // the flag exists to save.
                     if (!qw.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key))
                         continue;
+
+                    // A zero-sized (or otherwise degenerate) shard is a producer
+                    // bug in the model's TP sharding code. Say WHICH weight it is:
+                    // the native preload can only report "invalid cache key, host
+                    // data, and size", which is undiagnosable across the ~2400
+                    // tensors of a real model.
+                    if (qw.RawBytes <= 0 || qw.Ne0 <= 0 || qw.Ne1 <= 0)
+                        throw new InvalidOperationException(
+                            $"TP shard for weight '{kv.Key}' (rank {r}) is degenerate: " +
+                            $"type={(GgmlTensorType)qw.GgmlType}, ne0={qw.Ne0}, ne1={qw.Ne1}, rawBytes={qw.RawBytes}. " +
+                            "This is a bug in the model's TP weight sharding.");
 
                     IntPtr cacheKey = qw.EnsureDeviceCacheKey();
                     if (!GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))
@@ -5749,6 +5858,55 @@ namespace TensorSharp.Models
                 allocatorDisposable.Dispose();
         }
 
+        /// <summary>
+        /// Native tunables that must be set BEFORE the compute backend spins up,
+        /// because they are read once when the device is probed. Called from
+        /// <see cref="Create"/> with the architecture already known from the GGUF
+        /// header but no backend initialised yet.
+        /// </summary>
+        private static void ApplyArchitectureNativeTunables(string arch, BackendType backend)
+        {
+            if (backend != BackendType.GgmlMetal)
+                return;
+            if (arch is not ("wan" or "wan2.1" or "wan2.2"))
+                return;
+
+            // Wan renders NaN - a uniformly black frame - on Metal whenever ggml
+            // routes mul_mm through the Metal 4 tensor API. An M5 advertises
+            // MTLGPUFamilyMetal4 so ggml enables that path by default, and
+            // TensorSharp's MSL shim (tsg_metal_msl_default.m) is what makes it
+            // reachable from a .NET host at all - worth ~2.6x LLM prefill, which is
+            // why it is not simply turned off globally.
+            //
+            // The corruption is real and shape-dependent, not a rounding
+            // difference: a 32x32 latent (256x256 px) decoded to all-NaN while a
+            // 33x33 latent decoded correctly, on EVERY Wan model including the
+            // quantized ones, with the denoise loop provably innocent (final-latent
+            // cosine 0.993 vs ggml_cpu, no NaN anywhere). It reproduces with both
+            // F16 and F32 im2col GEMMs, so it is the kernel and not the activation
+            // dtype; GGML_METAL_TENSOR_DISABLE=1 fixes it, and so does avoiding
+            // im2col entirely (ggml_conv_2d_direct).
+            //
+            // has_tensor is a device-level property fixed at device init, so it
+            // cannot be scoped to a single op. Turning it off for the process that
+            // is about to generate video keeps LLM inference on the fast path and
+            // gives video correct pixels. TS_WAN_METAL_TENSOR_API=1 opts back in.
+            if (string.Equals(Environment.GetEnvironmentVariable("TS_WAN_METAL_TENSOR_API"), "1", StringComparison.Ordinal))
+                return;
+
+            try
+            {
+                if (TensorSharp.GGML.GgmlBasicOps.SetNativeEnvironmentVariable(
+                        "GGML_METAL_TENSOR_DISABLE", "1", overwrite: false))
+                {
+                    Console.WriteLine("  [wan] Metal 4 tensor API disabled for this process (it returns NaN " +
+                                      "for the VAE's GEMM shapes; TS_WAN_METAL_TENSOR_API=1 overrides).");
+                }
+            }
+            catch (DllNotFoundException) { /* managed-only host; nothing to configure */ }
+            catch (EntryPointNotFoundException) { /* older GgmlOps without the setter */ }
+        }
+
         /// <param name="draftModelPath">Optional speculative-decoding draft
         /// model (DeepSeek V4's DSpark support GGUF); ignored by architectures
         /// that have no drafter.</param>
@@ -5765,9 +5923,16 @@ namespace TensorSharp.Models
             using var probe = new GgufFile(ggufPath);
             string arch = probe.GetString("general.architecture") ?? "qwen3";
 
+            ApplyArchitectureNativeTunables(arch, backend);
+
             return arch switch
             {
-                "qwen3" => new Qwen3Model(ggufPath, backend, tpDegree, tpGroup),
+                // qwen2vl is Qwen2/Qwen2.5-VL. Its language model is Qwen3's block
+                // with a QKV bias and no QK norm, both of which Qwen3Model detects
+                // from the weights. Text-only chat: M-RoPE degenerates to standard
+                // RoPE when the t/h/w position components are equal, which they are
+                // for text tokens, so the vision tower (mmproj) is not required.
+                "qwen3" or "qwen2" or "qwen2vl" or "qwen2_vl" => new Qwen3Model(ggufPath, backend, tpDegree, tpGroup),
                 "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend, tpDegree, tpGroup),
                 "gemma3" => new Gemma3Model(ggufPath, backend, tpDegree, tpGroup),
                 "gemma4" => new Gemma4Model(ggufPath, backend, tpDegree, tpGroup),
@@ -5777,6 +5942,7 @@ namespace TensorSharp.Models
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend, tpDegree, tpGroup),
                 "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend, tpDegree, tpGroup),
                 "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),
+                "muse-glimmer" or "muse_glimmer" => new MuseGlimmerModel(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 "deepseek4" => new DeepSeek4Model(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };

@@ -450,8 +450,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecodeBatched(
                 // ggml_cont here copied the whole padded window per seq/layer EVERY
                 // step (only 1 KV row actually changed), a big redundant memcpy.
                 // ggml_concat already produces a contiguous output for flash.
-                ggml_tensor* k_win = view_kv_cache_window(ctx, k_src, info.hd, info.cacheSize, info.kvHeads, 0, info.win, kv_cache_type);
-                ggml_tensor* v_win = view_kv_cache_window(ctx, v_src, info.hd, info.cacheSize, info.kvHeads, 0, info.win, kv_cache_type);
+                // n_seqs > 1: the window feeds ggml_concat (whose non-contiguous
+                // kernel materialises a dense result), not flash attention
+                // directly, so it needs no defensive copy. n_seqs == 1 hands the
+                // raw view straight to the single-row fattn - the vec-kernel shape.
+                ggml_tensor* k_win = view_kv_cache_window(ctx, k_src, info.hd, info.cacheSize, info.kvHeads, 0, info.win, kv_cache_type, n_seqs == 1 ? 1 : 0);
+                ggml_tensor* v_win = view_kv_cache_window(ctx, v_src, info.hd, info.cacheSize, info.kvHeads, 0, info.win, kv_cache_type, n_seqs == 1 ? 1 : 0);
                 k_cat = (k_cat == nullptr) ? k_win : ggml_concat(ctx, k_cat, k_win, 3);
                 v_cat = (v_cat == nullptr) ? v_win : ggml_concat(ctx, v_cat, v_win, 3);
             }
@@ -636,10 +640,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecodeBatched(
         }
 
         finalize_compute_with_download(logits_out, logits_data, static_cast<std::size_t>(vocab_size) * n_seqs * sizeof(float));
+        // Unconditional: logits_data is the caller's host buffer and on Metal
+        // async mode the download above is only QUEUED.
+        host_read_barrier();
 
         if (can_persist)
         {
-            host_read_barrier();
             G4BatchedDecodeCache& e = g_g4batched_pool.claim(sig_disc, sig_kc, n_seqs);
             e.ctx = ctx; e.buffer = persist_buf; e.graph = graph;
             e.hidden_in = current; e.pos_tensor = pos_tensor; e.logits_out = logits_out;
@@ -893,8 +899,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
                     t.v_cpy[s] = ggml_cpy(ctx, v_write, v_dst);
                     k_src = t.k_cached[s]; v_src = t.v_cached[s];
                 }
-                ggml_tensor* k_win = view_kv_cache_window(ctx, k_src, info.hd, info.cacheSize, info.kvH, 0, info.win, kvType);
-                ggml_tensor* v_win = view_kv_cache_window(ctx, v_src, info.hd, info.cacheSize, info.kvH, 0, info.win, kvType);
+                // Same contract as the dense batched graph above: concat consumes
+                // the strided view for n_seqs > 1; only the n_seqs == 1 single-row
+                // fattn read needs the vec-kernel defensive copy.
+                ggml_tensor* k_win = view_kv_cache_window(ctx, k_src, info.hd, info.cacheSize, info.kvH, 0, info.win, kvType, n_seqs == 1 ? 1 : 0);
+                ggml_tensor* v_win = view_kv_cache_window(ctx, v_src, info.hd, info.cacheSize, info.kvH, 0, info.win, kvType, n_seqs == 1 ? 1 : 0);
                 k_cat = (k_cat == nullptr) ? k_win : ggml_concat(ctx, k_cat, k_win, 3);
                 v_cat = (v_cat == nullptr) ? v_win : ggml_concat(ctx, v_cat, v_win, 3);
             }
@@ -1074,10 +1083,12 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
         { set_last_error("Gemma4 MoE batched decode: graph compute failed."); if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); } return 0; }
 
         finalize_compute_with_download(logits_out, logits_data, static_cast<std::size_t>(vocab_size) * n_seqs * sizeof(float));
+        // Unconditional: logits_data is the caller's host buffer and on Metal
+        // async mode the download above is only QUEUED.
+        host_read_barrier();
 
         if (can_persist)
         {
-            host_read_barrier();
             G4BatchedDecodeCache& e = g_g4moebatched_pool.claim(sig_disc, sig_kc, n_seqs);
             e.ctx = ctx; e.buffer = persist_buf; e.graph = graph;
             e.hidden_in = current; e.pos_tensor = pos_tensor; e.logits_out = logits_out;

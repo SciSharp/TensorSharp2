@@ -40,6 +40,8 @@ namespace TensorSharp.Server.Hosting
             IReadOnlyList<BackendOption> supportedBackends,
             int defaultMaxTokens,
             bool maxTokensPinned,
+            int defaultWanVideoFrames,
+            int defaultWanVideoFps,
             string uploadDirectory,
             string logDirectory,
             bool fileLoggingEnabled,
@@ -56,6 +58,8 @@ namespace TensorSharp.Server.Hosting
                 SupportedBackendValues.Add(SupportedBackends[i].Value);
             DefaultMaxTokens = defaultMaxTokens;
             MaxTokensPinned = maxTokensPinned;
+            DefaultWanVideoFrames = defaultWanVideoFrames;
+            DefaultWanVideoFps = defaultWanVideoFps;
             UploadDirectory = uploadDirectory;
             LogDirectory = logDirectory;
             FileLoggingEnabled = fileLoggingEnabled;
@@ -99,6 +103,20 @@ namespace TensorSharp.Server.Hosting
         /// also caps requests that ask for more (see <see cref="ResolveMaxTokens"/>).
         /// </summary>
         public bool MaxTokensPinned { get; }
+
+        /// <summary>
+        /// Default Wan output frame count used when a video-generation request
+        /// omits <c>frames</c>. Zero delegates to the loaded Wan model's native
+        /// default (33, or 49 for Wan2.2-TI2V).
+        /// </summary>
+        public int DefaultWanVideoFrames { get; }
+
+        /// <summary>
+        /// Default Wan MP4 playback rate used when a video-generation request
+        /// omits <c>fps</c>. Zero delegates to the loaded Wan model's native
+        /// default (16, or 24 for Wan2.2-TI2V).
+        /// </summary>
+        public int DefaultWanVideoFps { get; }
 
         /// <summary>Absolute path to the directory used for user uploads.</summary>
         public string UploadDirectory { get; }

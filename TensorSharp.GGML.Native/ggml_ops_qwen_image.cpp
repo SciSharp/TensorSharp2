@@ -760,11 +760,35 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
         ggml_tensor* outT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq);
         ggml_tensor* winMask = nullptr;
         bool needWinMask = false;
-        for (int l = 0; l < nl; l++) needWinMask |= d->layers[l].mask_kind == 2;
+        bool needCausalMask = false;
+        for (int l = 0; l < nl; l++)
+        {
+            needWinMask |= d->layers[l].mask_kind == 2;
+            needCausalMask |= d->layers[l].mask_kind == 1;
+        }
         if (needWinMask)
         {
             if (d->win_mask == nullptr) { set_last_error("QwenTeTrunk: missing window mask."); return 0; }
             winMask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
+        }
+        // Causal layers used ggml_diag_mask_inf + ggml_soft_max. ggml-metal
+        // implements NEITHER a diag-mask kernel nor a supports_op case for
+        // GGML_OP_DIAG_MASK_INF, so the whole-trunk graph failed its
+        // supports_op sweep on Metal and the Qwen2.5-VL text encoder fell back
+        // to the per-op path for every image edit. An explicit additive mask
+        // fed to ggml_soft_max_ext is the same maths (this is what llama.cpp
+        // does) and is supported on every backend.
+        ggml_tensor* causalMask = nullptr;
+        std::vector<float> causalMaskData;
+        if (needCausalMask)
+        {
+            causalMask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
+            causalMaskData.assign(static_cast<std::size_t>(seq) * seq, 0.0f);
+            const float neg_inf = -std::numeric_limits<float>::infinity();
+            // Row j = query position, column i = key position; mask i > j.
+            for (int j = 0; j < seq; j++)
+                for (int i = j + 1; i < seq; i++)
+                    causalMaskData[static_cast<std::size_t>(j) * seq + i] = neg_inf;
         }
 
         ggml_tensor* h = x;
@@ -793,8 +817,7 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
             ggml_tensor* probs;
             if (lw.mask_kind == 1)
             {
-                kq = ggml_diag_mask_inf(ctx, ggml_scale(ctx, kq, scale), 0);
-                probs = ggml_soft_max(ctx, kq);
+                probs = ggml_soft_max_ext(ctx, kq, causalMask, scale, 0.0f);
             }
             else
             {
@@ -836,6 +859,7 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
 
         ggml_set_input(x); ggml_set_input(cosf); ggml_set_input(sinf);
         if (winMask) ggml_set_input(winMask);
+        if (causalMask) ggml_set_input(causalMask);
 
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
@@ -850,6 +874,7 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
         ggml_backend_tensor_set(cosf, d->cosf, 0, static_cast<std::size_t>(hd) * seq * sizeof(float));
         ggml_backend_tensor_set(sinf, d->sinf, 0, static_cast<std::size_t>(hd) * seq * sizeof(float));
         if (winMask) ggml_backend_tensor_set(winMask, d->win_mask, 0, static_cast<std::size_t>(seq) * seq * sizeof(float));
+        if (causalMask) ggml_backend_tensor_set(causalMask, causalMaskData.data(), 0, causalMaskData.size() * sizeof(float));
 
         if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
         { set_last_error("QwenTeTrunk: graph compute failed."); return 0; }

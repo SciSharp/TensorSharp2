@@ -116,6 +116,73 @@ namespace TensorSharp.Runtime
             return string.Empty;
         }
 
+        /// <summary>
+        /// Marker after which the chat template emits an assistant HEADER that the raw
+        /// generated tokens already carry themselves, or null when the template's
+        /// assistant framing matches what the model actually produced.
+        ///
+        /// Muse-Glimmer's GGUF template is the case that needs this. Its generation
+        /// prompt is bare — <c>&lt;|start|&gt;assistant</c> and nothing else — so the model
+        /// itself emits the routing header and channel framing that follow
+        /// (<c> to=self&lt;|message|&gt;</c> for its reasoning turn, then
+        /// <c>&lt;|eom|&gt;&lt;|start|&gt;assistant to=user&lt;|message|&gt;</c> for the answer).
+        /// Rendering the SAME turn again as history, however, takes the template's
+        /// past-assistant branch, which emits <c>&lt;|start|&gt;assistant to=user&lt;|message|&gt;</c>
+        /// before the content. Splicing the raw tokens after that header prepends three
+        /// tokens the KV cache never saw (` to`, `=user`, `&lt;|message|&gt;`), so the very
+        /// first follow-up turn diverges at the first assistant boundary and EVERY block
+        /// hash misses — prefix reuse was reported as 0% for every multi-turn Muse-Glimmer
+        /// conversation. Dropping the template's header restores the exact cached stream:
+        /// <c>&lt;|start|&gt;assistant</c> + raw tokens.
+        /// </summary>
+        internal static string GetTemplateAssistantHeaderAnchor(string architecture)
+        {
+            if (architecture is "muse-glimmer" or "muse_glimmer")
+                return "<|start|>assistant";
+            return null;
+        }
+
+        /// <summary>
+        /// Delete the text the template emitted between <paramref name="anchor"/> and each
+        /// spliced-raw-token placeholder. The scan stops at the nearest anchor before the
+        /// placeholder and refuses to cross a turn boundary (another <c>&lt;|start|&gt;</c>),
+        /// so a template that legitimately emits no header is left untouched.
+        /// </summary>
+        private static string StripTemplateAssistantHeaders(string text, string anchor)
+        {
+            var sb = new System.Text.StringBuilder(text.Length);
+            int searchPos = 0;
+            while (searchPos < text.Length)
+            {
+                int sentinel = text.IndexOf(PlaceholderSentinel, searchPos);
+                if (sentinel < 0)
+                {
+                    sb.Append(text, searchPos, text.Length - searchPos);
+                    break;
+                }
+
+                int copyEnd = sentinel;
+                int anchorStart = text.LastIndexOf(anchor, sentinel - 1 < 0 ? 0 : sentinel - 1, StringComparison.Ordinal);
+                if (anchorStart >= searchPos)
+                {
+                    int headerStart = anchorStart + anchor.Length;
+                    // Refuse to swallow a whole turn: the header may only be the short
+                    // routing/channel run the template adds right before the content.
+                    if (text.IndexOf("<|start|>", headerStart, sentinel - headerStart, StringComparison.Ordinal) < 0)
+                        copyEnd = headerStart;
+                }
+                sb.Append(text, searchPos, copyEnd - searchPos);
+
+                int sentinelEnd = text.IndexOf(PlaceholderSentinel, sentinel + 1);
+                if (sentinelEnd < 0)
+                    throw new InvalidOperationException(
+                        "Malformed KV-cache placeholder: opening sentinel without matching close.");
+                sb.Append(text, sentinel, sentinelEnd - sentinel + 1);
+                searchPos = sentinelEnd + 1;
+            }
+            return sb.ToString();
+        }
+
         private static bool IsQwen35FamilyArch(string architecture)
         {
             return architecture == "qwen35"
@@ -218,6 +285,13 @@ namespace TensorSharp.Runtime
             string suffix = GetAssistantGenerationSuffix(architecture, enableThinking);
             if (!string.IsNullOrEmpty(suffix))
                 text = InjectSuffixBeforePlaceholders(text, suffix);
+
+            // The mirror image of the suffix injection: some templates emit MORE assistant
+            // framing for a past turn than the generation prompt did, and the raw tokens
+            // already contain their own. See GetTemplateAssistantHeaderAnchor.
+            string headerAnchor = GetTemplateAssistantHeaderAnchor(architecture);
+            if (!string.IsNullOrEmpty(headerAnchor))
+                text = StripTemplateAssistantHeaders(text, headerAnchor);
 
             // Some renderers (those that go through ChatTemplate.RenderFromGgufTemplate's
             // jinja path) apply a final TrimEnd to the whole rendered text. That stripped

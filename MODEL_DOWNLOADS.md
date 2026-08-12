@@ -24,6 +24,7 @@ TensorSharp loads models in GGUF format. Below are verified Hugging Face repos f
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron 3 Nano Omni 30B-A3B (image-capable) | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) — mmproj `mmproj-BF16.gguf` (same repo) is required for image input. Audio is preprocessed only: real audio inference needs a Parakeet audio mmproj these GGUFs do not ship |
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct-2503 | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) — Pixtral mmproj `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` in the same repo |
+| Muse-Glimmer | Muse-Glimmer-30B (dense, image-capable) | `general.architecture` = `muse-glimmer`. Needs the `mmproj-Muse-Glimmer-30B-*.gguf` from the same repo for image input (`--mmproj`). Optional DFlash drafter `dflash-*.gguf` loaded with `--draft-model` for lossless speculative decoding |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731 (284B MoE) | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) — one subdirectory per quant (`UD-Q8_K_XL/`, `UD-IQ4_XS/`, `UD-IQ1_S/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. Text only |
 | DeepSeek V4 | DSpark speculative drafters | see [DSpark drafters](#dspark-drafters) below — a separate GGUF loaded with `--draft-model` for ~1.3-1.4x decode |
 | DiffusionGemma | diffusiongemma-26B-A4B-it | [unsloth/diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) (`general.architecture` = `diffusion-gemma`) |
@@ -58,12 +59,17 @@ shards are downloaded, ~11 GB): see
 [Getting a drafter](docs/models/deepseek4.md#getting-a-drafter) and
 `eng/dsv4-dspark-to-gguf.py`.
 
-**DSpark drafters for other architectures are NOT supported yet.** DeepSeek also released
+**DSpark drafters for Qwen 3 / Gemma 4 are NOT supported yet.** DeepSeek also released
 DSpark drafters for Qwen 3 and Gemma 4, and community GGUF conversions exist, but they are a
 different drafter design — a 5-layer transformer stack with an `fc` fusion over five target
 layers (`general.architecture` = `dspark` or `dflash`, `block_size` 7), not DeepSeek V4's
-three hyper-connection blocks (`mtp.*`). TensorSharp rejects them with a clear message rather
-than mis-loading them. Listed here so you know what exists upstream:
+three hyper-connection blocks (`mtp.*`). TensorSharp rejects them against a DeepSeek V4 target
+with a clear message rather than mis-loading them. Listed here so you know what exists upstream:
+
+> That 5-layer `fc`-fusion design **is** implemented for Muse-Glimmer — see
+> [DFlash speculative decoding](docs/models/muse-glimmer.md#3-dflash-speculative-decoding).
+> The drafters below are not wired up because each one needs its target model to expose the
+> per-layer input residuals its encoder consumes; only `MuseGlimmerModel` does so today.
 
 | Backbone | Official checkpoint (safetensors) | Community GGUF |
 |---|---|---|

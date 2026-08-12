@@ -4,9 +4,9 @@
 > Part of the [TensorSharp](README.md) documentation.
 
 
-- **Multi-architecture support** -- DeepSeek V4 Flash, Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, Qwen-Image-Edit (image editing), and Wan 2.1/2.2 (text- and image-to-video)
+- **Multi-architecture support** -- DeepSeek V4 Flash, Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, Muse-Glimmer, Qwen-Image-Edit (image editing), and Wan 2.1/2.2 (text- and image-to-video)
 - **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni
-- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4)
+- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` / `to=self` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
 - **GPU-accelerated** -- GGML Metal on macOS, GGML CUDA on Windows/Linux with NVIDIA GPUs, GGML Vulkan on Windows/Linux with AMD/Intel/NVIDIA GPUs, a direct CUDA/cuBLAS backend with PTX kernels, and an MLX backend for Apple Silicon (mlx-c / Metal), all with CPU fallbacks for unsupported ops
@@ -14,7 +14,7 @@
 - **Continuous batching & paged KV cache** -- vLLM-style block-paged KV pool with block-hash prefix sharing across requests, iteration-level scheduler that admits / preempts sequences mid-batch, optional SSD-backed tier for very large KV working sets, and a native fused paged-attention kernel (`TSGgml_PagedAttentionForward`) that drives `ggml_flash_attn_ext` on Metal/CUDA/Vulkan. Enabled by default in `TensorSharp.Server`; opt-out with `--no-continuous-batching`. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 - **MTP / NextN speculative decoding** -- multi-token-prediction draft heads accelerate solo (non-concurrent) decode. Qwen 3.6 ships its NextN block fused into the trunk GGUF; Gemma 4 loads a separate EAGLE-style `gemma4-assistant` draft GGUF via `--mtp-draft-model` whose draft layers attend the target's own KV cache. The draft proposes up to `--mtp-draft` tokens per step (kept while draft confidence ≥ `--mtp-pmin`) and the trunk verifies them in a single batched forward; the request's own sampler — penalties included — drives both drafting and verification, so output is identical to standard decode. Opt in with the server's `--mtp-spec` flag (off by default; `TensorSharp.Cli` has no MTP flags — set the `TS_MTP_*` env vars there). On ggml backends fused multi-token-verify / draft-step kernels make it a clear win; the pure-C# `cuda` backend runs a fully GPU-resident per-op verify/draft and is also a win. CPU / MLX stay on standard decode. Env: `TS_MTP_*` (shared) and `TS_GMTP_*` (Gemma 4 tuning).
 - **Batched / parallel inference** -- `IBatchedPagedModel.ForwardBatch` implementations for Mistral 3, Gemma 4, GPT OSS, Qwen 3, Qwen 3.5/3.6-family, and Nemotron-H all run by default and pack N sequences into a single forward pass with paged K/V scatter and per-sequence attention via the native kernel. Gemma 4, Qwen 3.5/3.6, GPT OSS, and Nemotron-H expose a per-family `TS_<FAMILY>_BATCHED=0` escape hatch (`TS_GEMMA4_BATCHED=0`, `TS_QWEN35_BATCHED=0`, `TS_GPTOSS_BATCHED=0`, `TS_NEMOTRON_BATCHED=0`) to fall back to the per-sequence KV-swap path for A/B comparison or regression isolation; Qwen 3 and Mistral 3 have no per-family switch — use the global `TS_SCHED_DISABLE_BATCHED=1`.
-- **Tensor parallelism & distributed inference** -- split a model across multiple GPUs (Megatron-LM column/row-parallel pattern) with `--tp N` on both `TensorSharp.Cli` and `TensorSharp.Server` (or `TENSORSHARP_TP_DEGREE`), and extend across machines with peer-to-peer TCP clustering (`--tp-node-id` / `--tp-peers`). Hierarchical AllReduce minimizes inter-node traffic. Runs on the direct `cuda` backend and on the GGML CUDA / Vulkan backends, where each rank owns a ggml backend, weight shards, and KV cache on its own GPU. Supports all autoregressive architectures (Qwen 3, Mistral 3, Gemma 3/4, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H) with architecture-specific strategies for MoE expert parallelism / expert slicing, GatedDeltaNet per-rank V-head ownership, and Mamba2 replication. Fused per-rank graphs make `--tp 2` decode faster than a single GPU (Gemma 4 E4B 51.7 vs 37.3 tok/s) and run models that do not fit one card. Optional Redis-backed KV cache and Responses API store for shared state. → [Tensor Parallelism](USAGE.md#tensor-parallelism--distributed-inference)
+- **Tensor parallelism & distributed inference** -- split a model across multiple GPUs (Megatron-LM column/row-parallel pattern) with `--tp N` on both `TensorSharp.Cli` and `TensorSharp.Server` (or `TENSORSHARP_TP_DEGREE`), and extend across machines with peer-to-peer TCP clustering (`--tp-node-id` / `--tp-peers`). Hierarchical AllReduce minimizes inter-node traffic. Runs on the direct `cuda` backend and on the GGML CUDA / Vulkan backends, where each rank owns a ggml backend, weight shards, and KV cache on its own GPU. Supports all autoregressive architectures (Qwen 3, Mistral 3, Gemma 3/4, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Muse-Glimmer — `--tp 2` max there, 2 KV heads) with architecture-specific strategies for MoE expert parallelism / expert slicing, GatedDeltaNet per-rank V-head ownership, and Mamba2 replication. Fused per-rank graphs make `--tp 2` decode faster than a single GPU (Gemma 4 E4B 51.7 vs 37.3 tok/s) and run models that do not fit one card. Optional Redis-backed KV cache and Responses API store for shared state. → [Tensor Parallelism](USAGE.md#tensor-parallelism--distributed-inference)
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
 - **Chat templates** -- auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture
@@ -38,7 +38,7 @@
 
 ## Thinking / Reasoning Mode
 
-Models that support thinking mode (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
+Models that support thinking mode (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
 
 - **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H:** uses `<think>...</think>` tags
 - **Gemma 4:** uses `<|channel>thought\n...<channel|>` tags
@@ -175,6 +175,7 @@ Each architecture uses its own wire format for tool calls:
 - **Qwen 3 / Nemotron-H:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
 - **Qwen 3.5/3.6-family:** the same `<tool_call>` block, but with an XML body — `<function=NAME><parameter=key>value</parameter></function>` (the JSON form is still accepted)
 - **Gemma 4:** `<|tool_call>call:function_name{args}<tool_call|>`
+- **Muse-Glimmer:** ATEM XML — `<atem:function_calls><atem:invoke name="NAME"><atem:parameter name="key">value</atem:parameter></atem:invoke></atem:function_calls>`, routed on the assistant's `to=` recipient header
 - **GPT OSS (Harmony):** tools are declared as a TypeScript namespace in the developer message, and calls are emitted on the commentary channel as `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`
 - **DeepSeek V4:** DSML markup — the system prompt teaches the syntax and carries one JSON schema per function, and the model answers with `<｜DSML｜tool_calls><｜DSML｜invoke name="NAME"><｜DSML｜parameter name="key" string="true|false">value</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`. `string="false"` marks a JSON-typed argument
 
@@ -201,6 +202,18 @@ All Qwen 3.5/3.6-family variants (`qwen35`, `qwen35moe`, and `qwen3next`) load t
 ### Mistral 3
 
 Mistral 3 supports image inputs via the Pixtral vision encoder. The example repository uses `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf`; pass it explicitly with `--mmproj`.
+
+- **Images:** PNG, JPEG, HEIC/HEIF
+
+### Muse-Glimmer
+
+Muse-Glimmer-30B supports image inputs through a 50-layer sparse-window ViT with
+2D RoPE and a 2x2 pixel shuffle. Pass the companion projector explicitly with
+`--mmproj` (e.g. `mmproj-Muse-Glimmer-30B-Q8_0.gguf`). The chat template renders
+an image content part as a single `<|patch|>`, which the multimodal injector
+expands to `<|image_start|>` + N merged-patch rows + `<|image_end|>` — up to 4096
+merged tokens per image, chosen by an aspect-preserving stretch (no tiling, no
+padding).
 
 - **Images:** PNG, JPEG, HEIC/HEIF
 

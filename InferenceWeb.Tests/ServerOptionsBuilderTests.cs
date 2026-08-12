@@ -134,6 +134,47 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.NotNull(options.DefaultSamplingConfig);
     }
 
+    // ---- Wan video-generation defaults -------------------------------------
+
+    [Fact]
+    public void Build_NoWanVideoFlags_UsesModelSpecificDefaultsAtGenerationTime()
+    {
+        var options = ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir);
+
+        // Zero is the Wan pipeline's sentinel for choosing the loaded model's
+        // native defaults (33/16 generally, 49/24 for TI2V).
+        Assert.Equal(0, options.DefaultWanVideoFrames);
+        Assert.Equal(0, options.DefaultWanVideoFps);
+    }
+
+    [Fact]
+    public void Build_WanVideoFlags_SetStartupDefaultsAndSupportEqualsForm()
+    {
+        var options = ServerOptionsBuilder.Build(
+            new[] { "--video-frames", "81", "--fps=24", "--video-frames=121" },
+            _baseDir);
+
+        // Scalar options are last-one-wins, which also lets a real command line
+        // override values expanded from --config ahead of it.
+        Assert.Equal(121, options.DefaultWanVideoFrames);
+        Assert.Equal(24, options.DefaultWanVideoFps);
+    }
+
+    [Theory]
+    [InlineData("--video-frames", "0")]
+    [InlineData("--video-frames", "-1")]
+    [InlineData("--video-frames", "abc")]
+    [InlineData("--fps", "0")]
+    [InlineData("--fps", "-1")]
+    [InlineData("--fps", "abc")]
+    public void Build_InvalidWanVideoDefault_ThrowsArgumentException(string flag, string value)
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.Build(new[] { flag, value }, _baseDir));
+
+        Assert.Contains(flag, ex.Message);
+    }
+
     [Fact]
     public void ApplyPagedKvCacheCliFlags_PagedKvFlag_SetsEnabledEnvVar()
     {
@@ -421,6 +462,7 @@ public class ServerOptionsBuilderTests : IDisposable
             "--model", "--mmproj", "--backend", "--gpu-device", "--list-gpus",
             "--tp", "--tp-node-id", "--tp-peers",
             "--max-tokens", "--temperature", "--top-k", "--top-p", "--min-p",
+            "--video-frames", "--fps",
             "--repeat-penalty", "--presence-penalty", "--frequency-penalty",
             "--seed", "--stop", "--kv-cache-dtype",
             "--paged-kv", "--paged-kv-block-size", "--paged-kv-ram-mb",

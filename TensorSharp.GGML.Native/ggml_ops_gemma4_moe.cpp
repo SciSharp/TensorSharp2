@@ -1417,10 +1417,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             }
 
             finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
-            // If we used the per-call fallback buffer (not the persistent gallocr),
-            // drain the queued async download before BufferHandle frees it. No-op on
-            // the common gallocr path (buffer.value == nullptr).
-            if (buffer.value != nullptr || can_persist) host_read_barrier();
+            // Unconditional drain: `out_data` is the caller's host logits/hidden
+            // buffer and on Metal async mode the download above is only QUEUED.
+            // (It also has to happen before BufferHandle frees a per-call
+            // fallback buffer that an in-flight blit is still reading.)
+            host_read_barrier();
         }
 
         if (can_persist && g4moe != nullptr)
@@ -1970,8 +1971,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             const int swaBase = start_pos - prevCount;   // logical position of the prev-window start
             if (swaPrev)
             {
-                ggml_tensor* kpv = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, swaBase, prevCount, kvType);
-                ggml_tensor* vpv = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, swaBase, prevCount, kvType);
+                ggml_tensor* kpv = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, swaBase, prevCount, kvType, /*fattn_query_rows=*/0);
+                ggml_tensor* vpv = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, swaBase, prevCount, kvType, /*fattn_query_rows=*/0);
                 if (kpv == nullptr || vpv == nullptr)
                 {
                     set_last_error("Gemma4 MoE model verify: failed to view prev SWA window.");
@@ -2071,8 +2072,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                 attnKvLen = flash_attn_kv_length(attendLen, cacheSize, hd);
                 maskWindow = 0;                       // window already enforced by the cache view
                 keyBase = 0;
-                k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
-                v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+                k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType, N);
+                v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType, N);
             }
             if (k_full == nullptr || v_full == nullptr)
             {

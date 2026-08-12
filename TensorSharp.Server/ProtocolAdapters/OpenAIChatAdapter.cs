@@ -388,11 +388,11 @@ namespace TensorSharp.Server.ProtocolAdapters
                 && responseFormat.Kind == StructuredOutputKind.JsonObject)
                 ? new StreamingJsonObjectFilter() : null;
 
-            await foreach (var (piece, done, promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs)
-                in _svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens, ctx.RequestAborted, samplingConfig,
-                    openaiTools, openaiThink))
+            await foreach (var update in _svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens,
+                ctx.RequestAborted, samplingConfig, openaiTools, openaiThink))
             {
-                if (!done)
+                string piece = update.Piece;
+                if (!update.Done)
                 {
                     if (bufferForStructured)
                     {
@@ -454,8 +454,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 if (bufferForStructured)
                 {
                     if (!await FlushStructuredCompletionAsync(ctx, requestId, responseFormat,
-                            buffer.ToString(), useStreamParser, openaiThink, openaiTools,
-                            promptTokens, evalTokens, kvReusedTokens))
+                            buffer.ToString(), useStreamParser, openaiThink, openaiTools, update))
                         return;
                     continue;
                 }
@@ -487,15 +486,20 @@ namespace TensorSharp.Server.ProtocolAdapters
                                 ctx.RequestAborted);
                     }
 
-                    string finReason = sawToolCall ? "tool_calls" : "stop";
+                    // The final chunk must carry the same reason the non-streaming
+                    // path would report; clients switch on it identically either way.
+                    string finReason = FinishReasonMapper.ToOpenAIChat(update.FinishReason, sawToolCall);
                     await SseWriter.WriteEventAsync(ctx.Response,
-                        OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName, finReason, promptTokens, evalTokens, kvReusedTokens),
+                        OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName, finReason,
+                            update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens),
                         ctx.RequestAborted);
                 }
                 else
                 {
                     await SseWriter.WriteEventAsync(ctx.Response,
-                        OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName, "stop", promptTokens, evalTokens, kvReusedTokens),
+                        OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName,
+                            FinishReasonMapper.ToOpenAIChat(update.FinishReason, hasToolCalls: false),
+                            update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens),
                         ctx.RequestAborted);
                 }
 
@@ -512,9 +516,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             bool useStreamParser,
             bool openaiThink,
             List<ToolFunction> openaiTools,
-            int promptTokens,
-            int evalTokens,
-            int kvCacheReusedTokens)
+            ChatStreamUpdate update)
         {
             if (useStreamParser)
             {
@@ -546,8 +548,15 @@ namespace TensorSharp.Server.ProtocolAdapters
                 OpenAIResponseFactory.StructuredContentChunk(requestId, _svc.LoadedModelName, normalized.NormalizedContent),
                 ctx.RequestAborted);
 
+            // Structured output never reports tool_calls — response_format and tools
+            // are rejected as a pair upstream. It can still be cut off by the budget
+            // though, and reaching here means the truncated JSON happened to survive
+            // normalization, so "length" is what tells the client to retry with more
+            // room rather than trust a document that stops early.
             await SseWriter.WriteEventAsync(ctx.Response,
-                OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName, "stop", promptTokens, evalTokens, kvCacheReusedTokens),
+                OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName,
+                    FinishReasonMapper.ToOpenAIChat(update.FinishReason, hasToolCalls: false),
+                    update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens),
                 ctx.RequestAborted);
 
             await SseWriter.WriteDoneSentinelAsync(ctx.Response, ctx.RequestAborted);
@@ -583,21 +592,29 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             var sb = new StringBuilder();
             int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
+            string pipelineFinishReason = null;
 
-            await foreach (var (piece, done, pt, et, kr, _, _, _)
-                in _svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens, ctx.RequestAborted, samplingConfig,
-                    openaiTools, openaiThink))
+            await foreach (var update in _svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens,
+                ctx.RequestAborted, samplingConfig, openaiTools, openaiThink))
             {
-                if (!done)
-                    sb.Append(piece);
-                else { promptTokens = pt; evalTokens = et; kvReusedTokens = kr; }
+                if (!update.Done)
+                {
+                    sb.Append(update.Piece);
+                }
+                else
+                {
+                    promptTokens = update.PromptTokens;
+                    evalTokens = update.EvalTokens;
+                    kvReusedTokens = update.KvCacheReusedTokens;
+                    pipelineFinishReason = update.FinishReason;
+                }
             }
 
             string rawOutput = sb.ToString();
             bool useParser = openaiThink || (openaiTools != null && openaiTools.Count > 0)
                 || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
             object responseMessage;
-            string finishReason = "stop";
+            bool sawToolCalls = false;
 
             if (responseFormat != null)
             {
@@ -628,8 +645,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 string thinkingOut = openaiThink && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
                 responseMessage = OpenAIResponseFactory.ParsedAssistantMessage(parsed.Content, thinkingOut, parsed.ToolCalls);
 
-                if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
-                    finishReason = "tool_calls";
+                sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;
             }
             else
             {
@@ -638,7 +654,8 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             await ctx.Response.WriteAsync(JsonSerializer.Serialize(
                 OpenAIResponseFactory.Completion(requestId, _svc.LoadedModelName, responseMessage,
-                    finishReason, promptTokens, evalTokens, kvReusedTokens),
+                    FinishReasonMapper.ToOpenAIChat(pipelineFinishReason, sawToolCalls),
+                    promptTokens, evalTokens, kvReusedTokens),
                 JsonOptions.IgnoreNulls));
         }
     }

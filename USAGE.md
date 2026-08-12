@@ -370,6 +370,11 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf
 # Multimodal models: host an explicit projector too
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
 
+# Wan video generation: use 121 frames at 24 fps (about five seconds) whenever
+# the Web UI or an API request does not supply its own frames / fps value.
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/Wan2.2-TI2V-5B.gguf --backend ggml_cuda \
+    --video-frames 121 --fps 24
+
 # Configure server-wide default sampling parameters
 # (used whenever a request does not override the value itself)
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf --backend ggml_metal \
@@ -416,6 +421,8 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--help` | Print the parameter reference (also shown when the server is started with no arguments) and exit |
 | `--max-tokens <N>` | Maximum tokens to generate: fills in when a request omits its own limit, and caps a request that asks for more. Applies to every endpoint (Web UI, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses`). Default: `20000`, which is a plain default and does not cap. Env: `MAX_TOKENS`. |
+| `--video-frames <N>` | Default output frame count for Wan video generation when a Web UI or API request omits `frames`. The VAE snaps it to `4k+1`; `121` frames at 24 fps is about five seconds. Without this flag, the model default is `33` (`49` for Wan 2.2 TI2V). An explicit request `frames` value overrides this default. |
+| `--fps <N>` | Default playback frame rate for Wan MP4 output when a Web UI or API request omits `fps`. Without this flag, the model default is `16` fps (`24` for Wan 2.2 TI2V). An explicit request `fps` value overrides this default; changing only FPS changes playback speed rather than the generated frame count. |
 | `--temperature <f>` | Sampling temperature (`0` = greedy) |
 | `--top-k <N>` | Top-K filtering (`0` = disabled) |
 | `--top-p <f>` | Nucleus sampling threshold (`1.0` = disabled) |
@@ -466,8 +473,8 @@ did unconditionally.
 |---|---|
 | `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `MAX_TOKENS` | Maximum generation length when `--max-tokens` is not passed: fills in when a request omits its own limit and caps a request that asks for more (default: `20000`, which is a plain default and does not cap) |
-| `VIDEO_SAMPLE_FPS` | Frames sampled per second of video for video prompts; time-based extraction (default: `1`) |
-| `VIDEO_MAX_FRAMES` | Optional upper bound on extracted video frames (evenly down-sampled); unset/`0` means no cap (default: no cap) |
+| `VIDEO_SAMPLE_FPS` | Frames sampled per second from an **input video prompt** for multimodal understanding; time-based extraction (default: `1`). This is unrelated to the Wan output setting `--fps`. |
+| `VIDEO_MAX_FRAMES` | Optional upper bound on frames extracted from an **input video prompt** (evenly down-sampled); unset/`0` means no cap (default: no cap). This is unrelated to Wan output `--video-frames`. |
 | `PORT` / `HOST` | Listen port / bind interface when `--port` / `--host` are not passed (defaults: `5000`, `0.0.0.0`) |
 | `ASPNETCORE_URLS` | Full listen URL(s) when none of `--port`, `--host`, `--urls`, `PORT`, or `HOST` is set |
 | `TENSORSHARP_TEMPERATURE` | Sampling temperature when `--temperature` is not passed. Counts as operator-configured, so it also outranks the request body under the default `--sampling-precedence config` |
@@ -893,6 +900,7 @@ for the combined numbers.
 - `numHeads`, `numKVHeads`, and `intermediateSize` must be divisible by the TP degree.
 - Quantized row-parallel splits require `ne0` divisible by `tp × blockSize`.
 - Batched/continuous-batching forward under TP is implemented for Qwen 3 and Mistral 3; MoE models (Gemma 4, Qwen 3.5/3.6, GPT OSS, Nemotron-H) fall back to per-sequence forward under TP.
+- **Muse-Glimmer** caps at `--tp 2`: it has 2 KV heads, and no model here replicates KV heads when `numKVHeads < tp`. Its DFlash drafter and pooled KV-block snapshots stay single-GPU under TP (multi-turn reuse comes from live-cache continuation instead), and it requires the GGML CUDA/Vulkan backends — the fused per-rank plan needs a device collective that ggml-metal does not provide.
 
 ### Cluster tuning & diagnostics
 

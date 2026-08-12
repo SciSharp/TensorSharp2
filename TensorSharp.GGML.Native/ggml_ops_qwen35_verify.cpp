@@ -863,8 +863,8 @@ namespace
 
                 // Attend over the fixed window [0, window) (now holds the N fresh rows);
                 // the shared causal mask zeroes valid keys and -inf's the rest.
-                ggml_tensor* k_full = view_kv_cache_window(ctx, t.k_cache_base, head_dim, cache_size, num_kv_heads, 0, window, kv_cache_type);
-                ggml_tensor* v_full = view_kv_cache_window(ctx, t.v_cache_base, head_dim, cache_size, num_kv_heads, 0, window, kv_cache_type);
+                ggml_tensor* k_full = view_kv_cache_window(ctx, t.k_cache_base, head_dim, cache_size, num_kv_heads, 0, window, kv_cache_type, N);
+                ggml_tensor* v_full = view_kv_cache_window(ctx, t.v_cache_base, head_dim, cache_size, num_kv_heads, 0, window, kv_cache_type, N);
                 if (k_full == nullptr || v_full == nullptr)
                 {
                     set_last_error("Qwen3.5 model verify: failed to build KV cache views.");

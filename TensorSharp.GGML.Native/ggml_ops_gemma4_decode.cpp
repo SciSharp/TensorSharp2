@@ -1089,7 +1089,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             // Download hidden state (async blit on Metal in async mode), or the
             // folded logits[vocab] when the lm_head was folded into the graph.
             finalize_compute_with_download(hidden_out, g4_out_data, static_cast<std::size_t>(g4_out_count) * sizeof(float));
-            if (can_persist) host_read_barrier();
+            // Unconditional: g4_out_data is the caller's host buffer and on Metal
+            // async mode the download above is only QUEUED, so returning without a
+            // drain hands the caller the previous token's bytes.
+            host_read_barrier();
         }
 
         if (can_persist && g4dc != nullptr)

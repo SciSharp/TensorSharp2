@@ -57,6 +57,16 @@ namespace TensorSharp.Models
         public long VerifySteps => _exec.Stats.VerifySteps;
         public long PlainSteps => _exec.Stats.PlainSteps;
         public long RollbackSteps => _exec.Stats.RollbackSteps;
+        /// <summary>Steps the cost governor forced to plain decoding.</summary>
+        public long ParkedSteps => _exec.Stats.ParkedSteps;
+        public double PlainMsPerToken => _exec.Stats.PlainMsPerToken;
+        public double SpecMsPerToken => _exec.Stats.SpecMsPerToken;
+        /// <summary>Set false to force drafting on regardless of measured cost.</summary>
+        public bool AdaptiveSpeculation
+        {
+            get => _exec.AdaptiveSpeculation;
+            set => _exec.AdaptiveSpeculation = value;
+        }
         public double AcceptanceRate => _exec.Stats.AcceptanceRate;
 
         /// <summary>Wall-clock phase breakdown of the speculative decode loop

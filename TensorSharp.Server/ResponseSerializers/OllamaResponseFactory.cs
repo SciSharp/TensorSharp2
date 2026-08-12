@@ -42,6 +42,7 @@ namespace TensorSharp.Server.ResponseSerializers
 
         public static object GenerateFinalChunk(
             string model,
+            string doneReason,
             int promptTokens,
             int evalTokens,
             int kvCacheReusedTokens,
@@ -53,7 +54,7 @@ namespace TensorSharp.Server.ResponseSerializers
             created_at = TimestampNow(),
             response = "",
             done = true,
-            done_reason = "stop",
+            done_reason = doneReason,
             total_duration = totalNs,
             prompt_eval_count = promptTokens,
             prompt_eval_duration = promptNs,
@@ -76,6 +77,7 @@ namespace TensorSharp.Server.ResponseSerializers
         public static object GenerateNonStreamingResponse(
             string model,
             string content,
+            string doneReason,
             int promptTokens,
             int evalTokens,
             int kvCacheReusedTokens,
@@ -87,7 +89,7 @@ namespace TensorSharp.Server.ResponseSerializers
             created_at = TimestampNow(),
             response = content,
             done = true,
-            done_reason = "stop",
+            done_reason = doneReason,
             total_duration = totalNs,
             prompt_eval_count = promptTokens,
             prompt_eval_duration = promptNs,
@@ -125,6 +127,7 @@ namespace TensorSharp.Server.ResponseSerializers
 
         public static object ChatRawFinalChunk(
             string model,
+            string doneReason,
             int promptTokens,
             int evalTokens,
             int kvCacheReusedTokens,
@@ -136,7 +139,7 @@ namespace TensorSharp.Server.ResponseSerializers
             created_at = TimestampNow(),
             message = new { role = "assistant", content = "" },
             done = true,
-            done_reason = "stop",
+            done_reason = doneReason,
             total_duration = totalNs,
             prompt_eval_count = promptTokens,
             prompt_eval_duration = promptNs,
@@ -148,6 +151,7 @@ namespace TensorSharp.Server.ResponseSerializers
 
         public static object ChatParsedFinalChunk(
             string model,
+            string doneReason,
             IReadOnlyList<ToolCall> collectedToolCalls,
             int promptTokens,
             int evalTokens,
@@ -168,7 +172,7 @@ namespace TensorSharp.Server.ResponseSerializers
                     tool_calls = toolCallsJson,
                 },
                 done = true,
-                done_reason = collectedToolCalls != null ? "tool_calls" : "stop",
+                done_reason = doneReason,
                 total_duration = totalNs,
                 prompt_eval_count = promptTokens,
                 prompt_eval_duration = promptNs,
