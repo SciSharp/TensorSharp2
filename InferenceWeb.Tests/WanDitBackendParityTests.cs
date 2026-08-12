@@ -18,7 +18,9 @@
 // identical prompt/seed/steps — the quantized 5B/14B/A14B DiTs were all fine.
 //
 // Opt in with TS_WAN_PARITY_MODEL=<dit.gguf> TS_WAN_PARITY_OUT=<dump.bin>
-// [TS_WAN_PARITY_BACKEND=metal|cpu|cuda].
+// [TS_WAN_PARITY_BACKEND=metal|cpu|cuda]. The default latent grid is the small
+// T=2, H=8, W=8 fixture; TS_WAN_PARITY_T / _HH / _WW optionally override it
+// for allocation-pressure probes without changing the normal parity workload.
 
 using System;
 using System.IO;
@@ -54,13 +56,24 @@ public class WanDitBackendParityTests
         };
         GgmlBasicOps.EnsureBackendAvailable(backend);
 
-        // Small deterministic problem: 2 latent frames of 8x8 -> 2*4*4 = 32 tokens.
-        const int T = 2, Hh = 8, Ww = 8;
-        int hLen = Hh / 2, wLen = Ww / 2, seq = T * hLen * wLen;
+        // Small default problem: 2 latent frames of 8x8 -> 2*4*4 = 32 tokens.
+        // The optional dimensions let an opt-in run reproduce production graph
+        // allocation pressure with a smaller checkpoint. For example, the
+        // 736x544x245 A14B request maps to T=62, Hh=68, Ww=92 (96,968 tokens).
+        int T = ReadPositiveInt("TS_WAN_PARITY_T", 2);
+        int Hh = ReadPositiveInt("TS_WAN_PARITY_HH", 8);
+        int Ww = ReadPositiveInt("TS_WAN_PARITY_WW", 8);
+        if (Hh % WanDiT.PatchH != 0 || Ww % WanDiT.PatchW != 0)
+            throw new InvalidOperationException(
+                $"TS_WAN_PARITY_HH/WW must be divisible by the Wan patch grid " +
+                $"{WanDiT.PatchH}x{WanDiT.PatchW}; got {Hh}x{Ww}.");
+        int hLen = Hh / WanDiT.PatchH, wLen = Ww / WanDiT.PatchW;
+        int seq = checked(T * hLen * wLen);
 
         using var gguf = new GgufFile(model);
         using var dit = new WanDiT(gguf);
-        _output.WriteLine($"[wan-parity] backend={backend} inDim={dit.InDim} inTok={dit.InTok} outTok={dit.OutTok} seq={seq}");
+        _output.WriteLine($"[wan-parity] backend={backend} inDim={dit.InDim} inTok={dit.InTok} " +
+                          $"outTok={dit.OutTok} latent={T}x{Hh}x{Ww} seq={seq}");
 
         var x = new float[(long)dit.InTok * seq];
         Fill(x, 0x5EEDu);
@@ -93,6 +106,16 @@ public class WanDitBackendParityTests
         Assert.False(anyNonFinite, "DiT velocity contains NaN/Inf");
         Assert.True(sumAbs / v.Length > 1e-8,
             $"DiT velocity is degenerate (meanAbs={sumAbs / v.Length:E6}); the VAE will decode a flat frame");
+    }
+
+    private static int ReadPositiveInt(string name, int fallback)
+    {
+        string raw = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(raw))
+            return fallback;
+        if (!int.TryParse(raw, out int value) || value <= 0)
+            throw new InvalidOperationException($"{name} must be a positive integer; got '{raw}'.");
+        return value;
     }
 
     /// <summary>Deterministic, well-conditioned pseudo-random fill in [-1, 1].</summary>
