@@ -82,6 +82,14 @@ namespace
         int n_tokens = 0;
         bool embed_in_graph = false;
         bool fold_all = false;
+        // Tensor-parallel execution plan for this rank: the SAME graph, cut at the
+        // two row-parallel projections per layer (o_proj and the FFN down) whose
+        // outputs are this rank's partial sums. `tp_planned` is part of the entry's
+        // identity, not just a validity flag: a graph built to be executed here and
+        // one built to be handed to the TP driver differ in what the caller does
+        // with them, so a mode switch must rebuild rather than replay.
+        tsg::TpRankPlan tp_plan;
+        bool tp_planned = false;
 
         void reset()
         {
@@ -95,6 +103,7 @@ namespace
             sig_disc = sig_kcache0 = nullptr;
             num_layers = hidden_size = n_tokens = 0;
             folded = false; out_count = 0; capture_count = 0; embed_in_graph = false; fold_all = false;
+            tp_plan.clear(); tp_planned = false;
         }
     };
 
@@ -148,6 +157,70 @@ namespace
 
     MgDecodeCachePool g_mg_pools[tsg::TSG_MAX_DEVICES];
     inline MgDecodeCachePool& mg_pool() { return g_mg_pools[tsg::g_active_rank]; }
+
+    // Resources a TRANSIENT (prefill) tensor-parallel graph borrows between
+    // "build" and "execute". The persistent decode graph already outlives its
+    // call - it is the whole point of the cache above - but the prefill path
+    // allocates from the context pool and the shared gallocr, so it has nothing
+    // that naturally survives the return. Under TP the driver runs the graph only
+    // after EVERY rank has built one, so each rank parks its context (and any
+    // per-call buffer) here and recycles the slot when it next builds. Mirrors
+    // G4VerifyTpPending in ggml_ops_gemma4_verify.cpp.
+    struct MgTpPending
+    {
+        PooledContextHandle context;
+        BufferHandle buffer{ nullptr };
+        std::vector<BufferHandle> ephemeral;
+        tsg::TpRankPlan plan;
+
+        void reset()
+        {
+            plan.clear();
+            ephemeral.clear();
+            buffer = BufferHandle(nullptr);
+            context = PooledContextHandle();
+        }
+    };
+
+    // Deliberately leaked: freeing a parked context or backend buffer from a
+    // static destructor runs after the CUDA driver has torn down and aborts the
+    // process ("CUDA error: driver shutting down"). The supported release path is
+    // TSGgml_MuseGlimmerReleaseTpGraphs, which the C# side calls on dispose and
+    // on KV reset while the backends are still alive.
+    MgTpPending* const g_mg_tp = new MgTpPending[tsg::TSG_MAX_DEVICES];
+
+    // Point one rank's plan at the caller's host buffers. Only RANK 0 downloads:
+    // every rank ends the graph with the same replicated hidden state (the last
+    // AllReduce made it so) and they all share one host buffer, and the LM head is
+    // folded on rank 0 alone - which is also the only rank the caller hands a
+    // logits buffer. Called on every build AND on every replay, because the host
+    // pointers are per-call while the graph is not.
+    void mg_tp_bind_outputs(tsg::TpRankPlan& plan,
+                            ggml_tensor* out_tensor, void* out_host, std::size_t out_bytes,
+                            const std::vector<ggml_tensor*>& capture_out, float* capture_data,
+                            int hidden_size, int n_tokens)
+    {
+        plan.out_tensor = nullptr;
+        plan.out_host = nullptr;
+        plan.out_bytes = 0;
+        plan.extra_out.clear();
+        if (tsg::g_active_rank != 0)
+            return;
+        if (out_tensor != nullptr && out_host != nullptr && out_bytes != 0)
+        {
+            plan.out_tensor = out_tensor;
+            plan.out_host = out_host;
+            plan.out_bytes = out_bytes;
+        }
+        // DFlash residual capture: extra downloads the driver performs alongside
+        // the result, after every rank has synchronized.
+        if (capture_data == nullptr)
+            return;
+        const std::size_t block = static_cast<std::size_t>(hidden_size) * n_tokens;
+        for (std::size_t c = 0; c < capture_out.size(); c++)
+            if (capture_out[c] != nullptr)
+                plan.extra_out.push_back({ capture_out[c], capture_data + c * block, block * sizeof(float) });
+    }
 
     struct MgLayerTensors
     {
@@ -277,23 +350,50 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
     // Non-zero: run the folded output head on EVERY row, not just the last,
     // writing [vocab, n_tokens] to logits_data. This is what a speculative
     // verify batch needs - it scores every drafted position in one pass.
-    int all_logits_rows)
+    int all_logits_rows,
+    // Tensor parallelism - same contract as TSGgml_Gemma4ModelVerify / ...Decode.
+    // With tp_degree > 1 the caller drives one rank at a time (tsg::g_active_rank,
+    // set through TSGgml_SetActiveDevice): every weight/KV pointer above is THIS
+    // rank's shard, num_heads / num_kv_heads are already this rank's head counts,
+    // and the call BUILDS AND BINDS the graph instead of running it - handing back
+    // a plan (tp_plan_out[0]) cut at the two row-parallel projections per layer.
+    // The caller collects one plan per rank and runs them together through
+    // TSGgml_TensorParallelExecutePlans, so the GPUs overlap and the partial sums
+    // are reduced in VRAM. tp_degree <= 1 (or a null tp_plan_out) is the ordinary
+    // single-device path and ignores both parameters.
+    int tp_degree, void** tp_plan_out)
 {
     try
     {
         if (!ensure_backend())
             return 0;
+
+        const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+        if (tp_mode)
+        {
+            tp_plan_out[0] = nullptr;
+            // Recycle this rank's previously parked transient graph: the driver
+            // has executed it by the time the caller asks for another.
+            g_mg_tp[tsg::g_active_rank].reset();
+        }
+
         if (n_tokens <= 0 || num_layers <= 0 || hidden_size <= 0)
         {
             set_last_error("Muse-Glimmer forward: invalid arguments.");
             return 0;
         }
         // hidden_data may be null only when the graph produces the input itself
-        // (token ids + table) AND folds the head, so nothing is written back to it.
-        if (hidden_data == nullptr && !(tok_embd_data != nullptr && token_ids != nullptr && logits_data != nullptr))
+        // (token ids + table) AND nothing is written back to it - either because
+        // the head is folded here, or because this is a tensor-parallel rank that
+        // does not fold and therefore downloads nothing (only rank 0 does).
         {
-            set_last_error("Muse-Glimmer forward: hidden_data is required unless the input and output stages are both in-graph.");
-            return 0;
+            const bool in_graph_input = tok_embd_data != nullptr && token_ids != nullptr;
+            const bool no_hidden_download = logits_data != nullptr || (tp_mode && tsg::g_active_rank != 0);
+            if (hidden_data == nullptr && !(in_graph_input && no_hidden_download))
+            {
+                set_last_error("Muse-Glimmer forward: hidden_data is required unless the input and output stages are both in-graph.");
+                return 0;
+            }
         }
 
         const int total_seq_len = start_pos + n_tokens;
@@ -348,6 +448,31 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
             return e == nullptr || e[0] != '0';
         }();
 
+        // Diagnostics only (TS_MUSE_GLIMMER_LAYER_TRACE=1): copy the residual
+        // ENTERING every layer, plus the final residual, out of the graph and print a
+        // checksum for the FIRST forward. Diffing that against the per-op loop's
+        // matching trace is what localizes a fused-vs-per-op divergence to a layer.
+        // TS_MUSE_GLIMMER_LAYER_TRACE_POS selects the first forward at or past that
+        // absolute position (which is what skips the startup warmup, whose own
+        // prefill and decode run at unrelated positions), and ..._N how many
+        // consecutive forwards to trace from there.
+        static const bool mg_trace = [] {
+            const char* e = std::getenv("TS_MUSE_GLIMMER_LAYER_TRACE");
+            return e != nullptr && e[0] != '0' && e[0] != '\0';
+        }();
+        static const int mg_trace_pos = [] {
+            const char* e = std::getenv("TS_MUSE_GLIMMER_LAYER_TRACE_POS");
+            return e == nullptr ? 0 : std::atoi(e);
+        }();
+        static const int mg_trace_n = [] {
+            const char* e = std::getenv("TS_MUSE_GLIMMER_LAYER_TRACE_N");
+            const int v = e == nullptr ? 1 : std::atoi(e);
+            return v > 0 ? v : 1;
+        }();
+        static int mg_trace_calls = 0;
+        const bool trace_this_call = mg_trace && mg_trace_calls < mg_trace_n &&
+            start_pos >= mg_trace_pos;
+
         // Only single-row decode gets the persistent capturable graph; a prefill
         // chunk is a different shape every time and is cheap to rebuild relative
         // to the work it does.
@@ -369,7 +494,8 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
             dc->swa_start == swa_start && dc->swa_rows == swa_cache_size &&
             dc->folded == fold && dc->out_count == out_count &&
             dc->capture_count == cap_count && dc->embed_in_graph == embed_in_graph &&
-            dc->fold_all == fold_all && dc->n_tokens == n_tokens)
+            dc->fold_all == fold_all && dc->n_tokens == n_tokens &&
+            dc->tp_planned == tp_mode)
         {
             host_read_barrier();
             if (embed_in_graph)
@@ -406,6 +532,25 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
                 const std::vector<ggml_fp16_t>& md = (cls == 1) ? md_swa : md_full;
                 if (md.empty()) continue;
                 decode_input_set_async(mt, md.data(), md.size() * sizeof(ggml_fp16_t));
+            }
+
+            if (tp_mode)
+            {
+                // Every per-step input is staged on this rank's stream; the driver
+                // runs the segments across all ranks and reduces at the boundaries.
+                if (!dc->tp_plan.valid())
+                {
+                    set_last_error("Muse-Glimmer forward: cached graph has no tensor-parallel plan.");
+                    dc->reset();
+                    return 0;
+                }
+                mg_tp_bind_outputs(dc->tp_plan, dc->hidden_out,
+                    dc->folded ? logits_data : hidden_data,
+                    static_cast<std::size_t>(dc->out_count) * sizeof(float),
+                    dc->capture_out, capture_data, hidden_size, n_tokens);
+                tp_plan_out[0] = &dc->tp_plan;
+                clear_last_error();
+                return 1;
             }
 
             ggml_status st = tsg::graph_compute_profiled(g_backend, dc->graph, "muse-glimmer forward");
@@ -489,6 +634,29 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
 #endif
         std::vector<ggml_tensor*> layer_attn_mask(num_layers, nullptr);
         std::vector<ggml_tensor*> capture_out(cap_count, nullptr);
+        std::vector<ggml_tensor*> trace_out;   // TS_MUSE_GLIMMER_LAYER_TRACE only
+
+        // Tensor-parallel cut points. `tp_partial` is the row-parallel matmul
+        // output the collective reduces; `tp_boundary` is the last graph node that
+        // may run before that reduction. Muse-Glimmer has no reshape or view
+        // between either matmul and the norm that consumes it (unlike Gemma 4's
+        // decode kernel), so the two are the same tensor - but they are recorded
+        // separately because tp_plan_segments resolves the SEGMENT END from the
+        // boundary and reduces the partial.
+        //
+        // The cut has to land on the RAW matmul output, before the post-attention
+        // / post-FFN norms: those norms sit between the row-parallel projection and
+        // the residual add, and RMSNorm is not linear, so norming per-rank partials
+        // and summing afterwards is not the same function as summing then norming.
+        // It produces plausible-looking output, which is exactly what makes it
+        // expensive to find later.
+        std::vector<ggml_tensor*> tp_partial;
+        std::vector<ggml_tensor*> tp_boundary;
+        if (tp_mode)
+        {
+            tp_partial.reserve(static_cast<std::size_t>(num_layers) * 2);
+            tp_boundary.reserve(static_cast<std::size_t>(num_layers) * 2);
+        }
 
         // Input stage: either the caller's hidden rows, or an in-graph
         // get_rows(token_embd, ids) + weightless input RMSNorm.
@@ -560,6 +728,13 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
                 ggml_set_output(capture_out[c]);
             }
 
+            if (trace_this_call && !tp_mode)
+            {
+                ggml_tensor* td = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, n_tokens);
+                trace_out.push_back(ggml_cpy(ctx, hidden, td));
+                ggml_set_output(trace_out.back());
+            }
+
             // 1. pre-attention norm; the same tensor feeds Q/K/V and the output gate
             ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), lt.attn_norm_w);
 
@@ -618,14 +793,27 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
             layer_attn_mask[l] = mask;
             const int layer_rows = (swa_ring && swa) ? swa_cache_size : cache_size;
 
-            ggml_tensor* k_full = view_kv_cache_window(ctx, lt.k_cached_t, head_dim, layer_rows, num_kv_heads, span_start, window, kv_cache_type);
-            ggml_tensor* v_full = view_kv_cache_window(ctx, lt.v_cached_t, head_dim, layer_rows, num_kv_heads, span_start, window, kv_cache_type);
+            ggml_tensor* k_full = view_kv_cache_window(ctx, lt.k_cached_t, head_dim, layer_rows, num_kv_heads, span_start, window, kv_cache_type, n_tokens);
+            ggml_tensor* v_full = view_kv_cache_window(ctx, lt.v_cached_t, head_dim, layer_rows, num_kv_heads, span_start, window, kv_cache_type, n_tokens);
             if (k_full == nullptr || v_full == nullptr)
             {
                 set_last_error("Muse-Glimmer forward: failed to create KV cache views.");
                 if (can_persist) ggml_free(ctx);
                 return 0;
             }
+            // NOTE: the windows above come back MATERIALISED on CUDA for a
+            // SINGLE-ROW decode (n_tokens == 1, passed through as fattn_query_rows)
+            // whenever they are a strict, FATTN_KQ_STRIDE-aligned sub-range of an
+            // F16 cache - which is exactly what a full-attention layer produces
+            // here, reading [0, window_full) rows out of a cache_size-row tensor.
+            // ggml-cuda's flash-attention vec kernel (the single-row decode kernel)
+            // returns wrong results for that strided shape; see
+            // kv_window_needs_cuda_flash_attn_copy in ggml_ops_transformer_common.h
+            // for the measurement and for why the predicate must not be spelled
+            // ggml_is_contiguous. Prefill (n_tokens > 1) lands on the MMA kernels,
+            // which honour the strides (measured bit-identical), so its windows
+            // stay raw views; the sliding-window layers read the WHOLE ring
+            // (window == rows) and are untouched either way.
 
             ggml_tensor* q_attn = ggml_permute(ctx, q_3d, 0, 2, 1, 3);     // [hd, n_tokens, n_heads]
             ggml_tensor* attn_flat;
@@ -649,6 +837,9 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
             // 7. attention output gate, then o_proj
             attn_flat = ggml_mul(ctx, attn_flat, ggml_sigmoid(ctx, gate));
             ggml_tensor* o_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);
+            // TP cut 1/2: o_proj is row-parallel, so o_out is this rank's partial
+            // sum. Reduce it BEFORE the post-attention norm below.
+            if (tp_mode) { tp_partial.push_back(o_out); tp_boundary.push_back(o_out); }
 
             // 8. post-attention norm (its own epsilon) + residual
             ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_out, post_norm_eps), lt.post_attn_norm_w);
@@ -671,10 +862,20 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
             (void) interm;
             ggml_tensor* act = ggml_glu(ctx, gu, GGML_GLU_OP_SWIGLU, /*swapped=*/false);
             ggml_tensor* down = ggml_mul_mat(ctx, lt.down_w, act);
+            // TP cut 2/2: the FFN down projection is row-parallel too. Same rule -
+            // the reduction lands on `down`, ahead of the post-FFN norm.
+            if (tp_mode) { tp_partial.push_back(down); tp_boundary.push_back(down); }
 
             // 10. post-FFN norm (its own epsilon) + residual
             ggml_tensor* post_ffn = ggml_mul(ctx, ggml_rms_norm(ctx, down, post_norm_eps), lt.post_ffn_norm_w);
             hidden = ggml_add(ctx, residual1, post_ffn);
+        }
+
+        if (trace_this_call && !tp_mode)
+        {
+            ggml_tensor* td = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, n_tokens);
+            trace_out.push_back(ggml_cpy(ctx, hidden, td));
+            ggml_set_output(trace_out.back());
         }
 
         // ---------------- output ----------------
@@ -713,7 +914,8 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
         }
         ggml_set_output(out_node);
 
-        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 128 + 512;
+        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 128 + 512
+            + trace_out.size() * 2;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
         for (int l = 0; l < num_layers; l++)
         {
@@ -723,6 +925,8 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
         for (int c = 0; c < cap_count; c++)
             if (capture_out[c] != nullptr)
                 ggml_build_forward_expand(graph, capture_out[c]);
+        for (std::size_t t = 0; t < trace_out.size(); t++)
+            ggml_build_forward_expand(graph, trace_out[t]);
         ggml_build_forward_expand(graph, out_node);
 
         // ---------------- bind ----------------
@@ -894,27 +1098,70 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
         }
 
         // ---------------- run ----------------
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
-        if (status != GGML_STATUS_SUCCESS)
-        {
-            set_last_error("Muse-Glimmer forward: graph execution failed.");
-            if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
-            return 0;
-        }
-
-        for (int c = 0; c < cap_count; c++)
-        {
-            if (capture_out[c] == nullptr) continue;
-            ggml_backend_tensor_get(capture_out[c],
-                capture_data + static_cast<std::size_t>(c) * hidden_size * n_tokens,
-                0, static_cast<std::size_t>(hidden_size) * n_tokens * sizeof(float));
-        }
-
+        // ...except under tensor parallelism, where the graph is only BUILT here:
+        // the driver runs every rank's segments together so the AllReduces at the
+        // boundaries have all the partials to reduce.
         void* out_data = fold ? logits_data : hidden_data;
-        finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
-        // Unconditional: out_data is the caller's host buffer and on Metal async
-        // mode the download above is only QUEUED.
-        host_read_barrier();
+        if (!tp_mode)
+        {
+            ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+            if (status != GGML_STATUS_SUCCESS)
+            {
+                set_last_error("Muse-Glimmer forward: graph execution failed.");
+                if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
+                return 0;
+            }
+
+            for (int c = 0; c < cap_count; c++)
+            {
+                if (capture_out[c] == nullptr) continue;
+                ggml_backend_tensor_get(capture_out[c],
+                    capture_data + static_cast<std::size_t>(c) * hidden_size * n_tokens,
+                    0, static_cast<std::size_t>(hidden_size) * n_tokens * sizeof(float));
+            }
+
+            if (!trace_out.empty())
+            {
+                const int trace_seq = mg_trace_calls++;
+                std::vector<float> tb(static_cast<std::size_t>(hidden_size) * n_tokens);
+                for (std::size_t t = 0; t < trace_out.size(); t++)
+                {
+                    ggml_backend_tensor_get(trace_out[t], tb.data(), 0, tb.size() * sizeof(float));
+                    double sum = 0.0, abs_sum = 0.0;
+                    float mx = -std::numeric_limits<float>::infinity();
+                    int nonfinite = 0;
+                    for (std::size_t j = 0; j < tb.size(); j++)
+                    {
+                        sum += tb[j];
+                        abs_sum += std::fabs(static_cast<double>(tb[j]));
+                        if (tb[j] > mx) mx = tb[j];
+                        if (!std::isfinite(tb[j])) nonfinite++;
+                    }
+                    std::fprintf(stderr,
+                        "[MGTRACE-fused] pos=%d rows=%d layer=%d n=%zu sum=%.4f abs=%.4f max=%.6f nonfinite=%d\n",
+                        start_pos, n_tokens, static_cast<int>(t), tb.size(), sum, abs_sum,
+                        static_cast<double>(mx), nonfinite);
+                    const char* dir = std::getenv("TS_MUSE_GLIMMER_LAYER_TRACE_DIR");
+                    if (dir != nullptr && dir[0] != '\0')
+                    {
+                        char path[1024];
+                        std::snprintf(path, sizeof(path), "%s/fused_S%02d_L%02d.bin", dir,
+                                      trace_seq, static_cast<int>(t));
+                        if (FILE* fp = std::fopen(path, "wb"))
+                        {
+                            std::fwrite(tb.data(), sizeof(float), tb.size(), fp);
+                            std::fclose(fp);
+                        }
+                    }
+                }
+                std::fflush(stderr);
+            }
+
+            finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
+            // Unconditional: out_data is the caller's host buffer and on Metal async
+            // mode the download above is only QUEUED.
+            host_read_barrier();
+        }
 
         if (can_persist && mgdc != nullptr)
         {
@@ -944,7 +1191,51 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
             mgdc->embed_in_graph = embed_in_graph;
             mgdc->fold_all = fold_all;
             mgdc->n_tokens = n_tokens;
+            mgdc->tp_planned = tp_mode;
             mgdc->valid = true;
+        }
+
+        if (tp_mode)
+        {
+            // Whoever owns the context has to outlive this call: the persist cache
+            // slot already does (and keeps the plan alongside the graph it
+            // describes, so a replay hands back the same plan without rebuilding),
+            // while a transient prefill graph parks its pooled context and any
+            // per-call buffer in this rank's pending slot until its next build.
+            tsg::TpRankPlan* plan = nullptr;
+            if (can_persist)
+            {
+                if (mgdc == nullptr)
+                {
+                    set_last_error("Muse-Glimmer forward: tensor-parallel build produced no cache slot.");
+                    ggml_backend_buffer_free(persist_buf);
+                    ggml_free(ctx);
+                    return 0;
+                }
+                plan = &mgdc->tp_plan;
+            }
+            else
+            {
+                auto& pending = g_mg_tp[tsg::g_active_rank];
+                pending.context = std::move(context);
+                pending.buffer = std::move(buffer);
+                pending.ephemeral = std::move(ephemeral_bufs);
+                plan = &pending.plan;
+            }
+
+            plan->clear();
+            plan->graph = graph;
+            plan->ar_tensor = tp_partial;
+            if (!tp_plan_segments(*plan, tp_boundary))
+            {
+                if (can_persist) mgdc->reset();
+                else             g_mg_tp[tsg::g_active_rank].reset();
+                return 0;
+            }
+            mg_tp_bind_outputs(*plan, hidden_out, out_data,
+                static_cast<std::size_t>(out_count) * sizeof(float),
+                capture_out, capture_data, hidden_size, n_tokens);
+            tp_plan_out[0] = plan;
         }
 
         clear_last_error();
@@ -970,4 +1261,21 @@ TSG_EXPORT void TSGgml_MuseGlimmerResetDecodeCache()
 {
     for (auto& pool : g_mg_pools)
         pool.reset_all();
+}
+
+// Release every rank's parked tensor-parallel Muse-Glimmer graph (the transient
+// prefill path's context + per-call buffers). The C# side calls this on model
+// teardown and on KV reset, while the backends are still alive - freeing these
+// from a static destructor would run after the CUDA driver has shut down. The
+// PERSISTENT decode graphs carry their plan inside the decode cache and are
+// dropped by TSGgml_MuseGlimmerResetDecodeCache.
+TSG_EXPORT void TSGgml_MuseGlimmerReleaseTpGraphs()
+{
+    for (int r = 0; r < tsg::TSG_MAX_DEVICES; ++r)
+    {
+        if (g_mg_tp[r].plan.graph == nullptr && g_mg_tp[r].context.value == nullptr)
+            continue;
+        tsg::ScopedRank rank(r);
+        g_mg_tp[r].reset();
+    }
 }

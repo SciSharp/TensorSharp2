@@ -1561,6 +1561,16 @@ namespace TensorSharp.Models
                 if (!qw.HasHostData)
                     continue;
 
+                // Skip weights the model serves device-resident by another route
+                // (e.g. MoE per-expert views covered by a stacked-experts MLX
+                // weight built for mlx_gather_qmm). Preloading them here would
+                // put a second, redundant copy of every expert byte in unified
+                // memory. The host view is left intact so the per-expert
+                // fallback can still lazily upload on first use if the batched
+                // path ever refuses at runtime.
+                if (!ShouldPreloadMlxQuantWeightToDevice(weightName, qw))
+                    continue;
+
                 bool isExpert = offloadEnabled && MoeExpertOffload.IsExpertWeightName(weightName);
                 bool canPreload = MlxQuantizedOps.CanPreloadQuantizedType(qw.GgmlType);
                 bool preloadCopies = canPreload && MlxQuantizedOps.PreloadDuplicatesHostMemory(qw.GgmlType);
@@ -1895,6 +1905,19 @@ namespace TensorSharp.Models
         /// </summary>
         protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
             => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName);
+
+        /// <summary>
+        /// Per-weight veto for the eager MLX quantized preload
+        /// (<see cref="PrepareMlxQuantizedWeightsForInference"/>). Models whose
+        /// MLX forward serves a weight device-resident by another route (e.g.
+        /// routed experts through a stacked-experts <c>mlx_gather_qmm</c>
+        /// weight) override this to return false for those names, avoiding a
+        /// second full copy of the bytes in unified memory. Skipped weights
+        /// keep their host data, so any per-op fallback still lazily uploads
+        /// them on first use.
+        /// </summary>
+        protected virtual bool ShouldPreloadMlxQuantWeightToDevice(string weightName, QuantizedWeight weight)
+            => true;
 
         protected bool CanUseGgmlQuantizedGetRows(int ggmlType)
         {

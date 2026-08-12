@@ -124,7 +124,10 @@ public static class FeatureCatalog
         // (gemma-4-E4B, gpt-oss) spends the whole budget on the preamble and gets
         // cut off before writing a single sentence of the summary. That reads as
         // a correctness failure when the model is fine; give the answer room.
-        MaxTokens = 256,
+        // 512, not 256: gpt-oss reasons ALWAYS, and its MLX greedy chain was
+        // measured spending all 256 tokens in the analysis channel — the parser
+        // correctly hides that channel, so the cell saw 0 output chars.
+        MaxTokens = 512,
         // Summary of a paged-KV-cache report. Any correct summary names
         // either the data structure or the technique.
         ExpectedContains = new[] { "paged" },
@@ -136,8 +139,20 @@ public static class FeatureCatalog
         DisplayName = "Uploaded text file",
         PromptFile = "prompts/upload_text.txt",
         Kind = FeatureKind.UploadedText,
-        // Log analysis; both bullets must surface the ERROR line. We assert
-        // the exact error timestamp from the log.
+        // Same budget argument as LongText: this asks for a two-bullet analysis,
+        // and a model that reasons first (gemma-4-E4B was measured narrating its
+        // plan for the whole 64-token default) never reaches the bullets. The
+        // assertion is about the ANSWER, so the answer needs room. gpt-oss was
+        // still enumerating log lines in its analysis channel at 256.
+        MaxTokens = 512,
+        // Log analysis; bullet (1) asks for the error and its timestamp - asked
+        // FIRST so a budget-bounded reasoner emits it before anything else. The
+        // original bullet order asked "which event repeats most often" first,
+        // and the log had a genuine 9-9 tie between "request" and "generation
+        // done": gpt-oss and Muse-Glimmer both burned their entire budget
+        // agonizing over the tie ("They tie. But maybe...") and never reached
+        // the error bullet. The question now has one unambiguous answer per
+        // bullet (error at 08:01:12; alice with 4 requests).
         ExpectedContains = new[] { "08:01:12" },
     };
 
@@ -151,7 +166,13 @@ public static class FeatureCatalog
         MultiTurnFile: "multi_turn/three_turn.jsonl",
         PrefillTokens: 0,
         DecodeTokens: 0,
-        MaxTokens: DefaultMaxTokens,
+        // Per TURN, and the assertion spans turns 2 and 3, so the default 64 is
+        // the tightest budget in the catalog relative to what it asks for. On
+        // Muse-Glimmer (which opens every turn with a reasoning channel) it
+        // produced the bare fragment "Your favourite colour" and read as a
+        // KV-reuse failure; the reuse was in fact fine (measured 79.3% prefix
+        // reuse on the same backend), the answer simply never arrived.
+        MaxTokens: 192,
         EnableThinking: false,
         RequiresImage: false,
         RequiresAudio: false,
@@ -175,7 +196,10 @@ public static class FeatureCatalog
         MultiTurnFile: null,
         PrefillTokens: 0,
         DecodeTokens: 0,
-        MaxTokens: 128,
+        // gpt-oss deliberates in its analysis channel before emitting the call;
+        // at 128 its MLX chain produced 0 visible chars. The assertion needs the
+        // call itself, so the deliberation must fit too.
+        MaxTokens: 384,
         EnableThinking: false,
         RequiresImage: false,
         RequiresAudio: false,
@@ -197,7 +221,13 @@ public static class FeatureCatalog
         MultiTurnFile: null,
         PrefillTokens: 0,
         DecodeTokens: 0,
-        MaxTokens: 256,
+        // Raised twice, both times from measurement: at 256 gemma-4-E4B was
+        // still laying out the algebra, and at 512 it was one line short —
+        // cut off at "t_meet = 170 km / 150 km/h" with the meeting time never
+        // stated (byte-identical truncation on Metal and MLX, so it is purely
+        // budget). This cell deliberately asks a model to think out loud in
+        // LaTeX; 1024 is what that actually takes.
+        MaxTokens: 1024,
         EnableThinking: true,
         RequiresImage: false,
         RequiresAudio: false,
@@ -217,21 +247,26 @@ public static class FeatureCatalog
         DisplayName: "Image prompt",
         Kind: FeatureKind.Image,
         PromptFile: "prompts/image_question.txt",
-        MediaFile: "media/apple.png",
+        MediaFile: "media/image.png",
         ToolsFile: null,
         MultiTurnFile: null,
         PrefillTokens: 0,
         DecodeTokens: 0,
-        MaxTokens: DefaultMaxTokens,
+        // Media cells get the same headroom as the long-form text cells: the
+        // question is one sentence, but a reasoning model narrates before it
+        // answers and would otherwise be cut off mid-preamble.
+        MaxTokens: 192,
         EnableThinking: false,
         RequiresImage: true,
         RequiresAudio: false,
         RequiresVideo: false,
         RequiresTools: false)
     {
-        // Default media is apple.png. If a runner replaces it with something
-        // else, this spec needs to be overridden — see README.
-        ExpectedContains = new[] { "apple" },
+        // Default media is the TensorSharp banner (eng/make-test-media.sh), whose
+        // rendered title is legible to every VLM in the matrix, so a single
+        // keyword is a sound "did the image reach the model at all" probe. Swap
+        // the file and this expectation together — see README.
+        ExpectedContains = new[] { "tensorsharp" },
     };
 
     public static readonly FeatureSpec Audio = new(
@@ -239,19 +274,25 @@ public static class FeatureCatalog
         DisplayName: "Audio prompt",
         Kind: FeatureKind.Audio,
         PromptFile: "prompts/audio_question.txt",
-        MediaFile: "media/sample.mp3",
+        MediaFile: "media/sample.wav",
         ToolsFile: null,
         MultiTurnFile: null,
         PrefillTokens: 0,
         DecodeTokens: 0,
-        MaxTokens: DefaultMaxTokens,
+        MaxTokens: 192,
         EnableThinking: false,
         RequiresImage: false,
         RequiresAudio: true,
         RequiresVideo: false,
-        RequiresTools: false);
-    // No default ExpectedContains: audio content depends on whatever
-    // sample.mp3 the runner provides. Override per-deployment.
+        RequiresTools: false)
+    {
+        // eng/make-test-media.sh speaks "The quick brown fox jumps over the lazy
+        // dog near the river bank" into sample.wav. One content word is enough to
+        // separate a real transcription from "the audio is silent or
+        // unintelligible", which is what the prompt invites when the clip never
+        // reached the encoder.
+        ExpectedContains = new[] { "fox" },
+    };
 
     public static readonly FeatureSpec Video = new(
         Id: "video",
@@ -263,13 +304,22 @@ public static class FeatureCatalog
         MultiTurnFile: null,
         PrefillTokens: 0,
         DecodeTokens: 0,
-        MaxTokens: DefaultMaxTokens,
+        MaxTokens: 192,
         EnableThinking: false,
         RequiresImage: false,
         RequiresAudio: false,
         RequiresVideo: true,
-        RequiresTools: false);
-    // No default ExpectedContains for video for the same reason as audio.
+        RequiresTools: false)
+    {
+        // eng/make-test-media.sh renders a slow zoom on the repo banner. The
+        // first fixture here was an abstract red square panning across white;
+        // it reached the model correctly (frames extracted, 3 x 48 vision
+        // tokens injected) yet Gemma 4 still answered "no actual video content
+        // has been provided", so the cell measured legibility rather than
+        // plumbing. The banner keys off the same title the image cell does,
+        // which every VLM in the matrix reads.
+        ExpectedContains = new[] { "tensorsharp" },
+    };
 
     public static readonly IReadOnlyList<FeatureSpec> All = new[]
     {

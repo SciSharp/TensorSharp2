@@ -596,8 +596,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 // following shared SWA layer reuses the donor's prev window.
                 if (swaPrev && prevCount > 0)
                 {
-                    ggml_tensor* kpv = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, swaBase, prevCount, kv_cache_type);
-                    ggml_tensor* vpv = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, swaBase, prevCount, kv_cache_type);
+                    ggml_tensor* kpv = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, swaBase, prevCount, kv_cache_type, /*fattn_query_rows=*/0);
+                    ggml_tensor* vpv = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, swaBase, prevCount, kv_cache_type, /*fattn_query_rows=*/0);
                     if (kpv == nullptr || vpv == nullptr)
                     {
                         set_last_error("Gemma4 model verify: failed to view prev SWA window.");
@@ -746,8 +746,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 if (pad_flash_kv)
                     attnKvLen = std::min(info.cacheSize, std::max(attnKvLen, flash_pad_len(attendLen)));
                 maskWindow = 0;                 // window already enforced by the cache view
-                k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type);
-                v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type);
+                k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type, N);
+                v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type, N);
             }
             if (k_full == nullptr || v_full == nullptr)
             {
@@ -1266,8 +1266,8 @@ TSG_EXPORT int TSGgml_Gemma4DraftStep(
             // unwrapped by view_kv_cache_window). Global donor: read [0, fixed_pos).
             const int dAttendLen = (is_local_arr[l] != 0) ? std::min(fixed_pos, d.csize) : fixed_pos;
             const int dActiveStart = (is_local_arr[l] != 0) ? ((fixed_pos - dAttendLen) % d.csize) : 0;
-            ggml_tensor* k_full = view_kv_cache_window(ctx, d.k_cache, d.hd, d.csize, d.kvHeads, dActiveStart, dAttendLen, kv_cache_type);
-            ggml_tensor* v_full = view_kv_cache_window(ctx, d.v_cache, d.hd, d.csize, d.kvHeads, dActiveStart, dAttendLen, kv_cache_type);
+            ggml_tensor* k_full = view_kv_cache_window(ctx, d.k_cache, d.hd, d.csize, d.kvHeads, dActiveStart, dAttendLen, kv_cache_type, /*fattn_query_rows=*/0);
+            ggml_tensor* v_full = view_kv_cache_window(ctx, d.v_cache, d.hd, d.csize, d.kvHeads, dActiveStart, dAttendLen, kv_cache_type, /*fattn_query_rows=*/0);
             if (k_full == nullptr || v_full == nullptr) { set_last_error("draft donor cache view failed"); return 0; }
 
             ggml_tensor* q_t = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));  // [hd,1,num_heads]

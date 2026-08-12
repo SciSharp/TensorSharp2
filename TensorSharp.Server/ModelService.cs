@@ -173,7 +173,7 @@ namespace TensorSharp.Server
         /// <summary>
         /// Stream chat inference tokens with timing metrics. Must be called within the InferenceQueue.
         /// </summary>
-        public IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
+        public IAsyncEnumerable<ChatStreamUpdate>
             ChatStreamWithMetricsAsync(
                 List<ChatMessage> history,
                 int maxTokens,
@@ -189,7 +189,7 @@ namespace TensorSharp.Server
         /// Session-aware overload of
         /// <see cref="ChatStreamWithMetricsAsync(List{ChatMessage}, int, CancellationToken, SamplingConfig, List{ToolFunction}, bool)"/>.
         /// </summary>
-        public IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
+        public IAsyncEnumerable<ChatStreamUpdate>
             ChatStreamWithMetricsAsync(
                 ChatSession session,
                 List<ChatMessage> history,
@@ -222,7 +222,7 @@ namespace TensorSharp.Server
         /// Stream generate tokens. Must be called within the InferenceQueue to prevent concurrent access.
         /// Intended for one-shot completions and does not update session history.
         /// </summary>
-        public IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
+        public IAsyncEnumerable<ChatStreamUpdate>
             GenerateStreamAsync(
                 string prompt,
                 List<string> imagePaths,
@@ -237,7 +237,7 @@ namespace TensorSharp.Server
         /// Session-aware streaming generate. Generate requests are treated as
         /// one-shot prompts and do not update tracked chat history.
         /// </summary>
-        public IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
+        public IAsyncEnumerable<ChatStreamUpdate>
             GenerateStreamAsync(
                 ChatSession session,
                 string prompt,

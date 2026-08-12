@@ -1214,19 +1214,25 @@ namespace TensorSharp.Server.ProtocolAdapters
             // generation finishes.
             int turnPromptTokens = 0;
             int turnKvReusedTokens = 0;
+            // Whether the answer was cut off by the token budget. The UI renders this
+            // as a "response was truncated" hint, so a user staring at a sentence that
+            // stops mid-word knows to raise max tokens rather than blame the model.
+            bool turnTruncated = false;
             try
             {
-                await foreach (var (piece, done, pt, _, kvReused, _, _, _)
+                await foreach (var update
                     in _svc.ChatStreamWithMetricsAsync(chatSession, messages, maxTokens, ctx.RequestAborted, samplingConfig,
                         uiTools, uiThink))
                 {
-                    if (done)
+                    if (update.Done)
                     {
-                        turnPromptTokens = pt;
-                        turnKvReusedTokens = kvReused;
+                        turnPromptTokens = update.PromptTokens;
+                        turnKvReusedTokens = update.KvCacheReusedTokens;
+                        turnTruncated = FinishReasonMapper.IsTruncated(update.FinishReason);
                         continue;
                     }
 
+                    string piece = update.Piece;
                     if (string.IsNullOrEmpty(piece))
                         continue;
 
@@ -1265,7 +1271,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             }
 
             await FinalizeChatStreamAsync(ctx, uiParser, aborted, inferenceError, chatSession, sw, tokenCount,
-                turnPromptTokens, turnKvReusedTokens);
+                turnPromptTokens, turnKvReusedTokens, turnTruncated);
         }
 
         // ---- Chat (SSE) for DiffusionGemma: live denoising preview ------------
@@ -1322,7 +1328,8 @@ namespace TensorSharp.Server.ProtocolAdapters
 
         private static async Task FinalizeChatStreamAsync(
             HttpContext ctx, IOutputParser uiParser, bool aborted, string inferenceError,
-            ChatSession chatSession, Stopwatch sw, int tokenCount, int turnPromptTokens, int turnKvReusedTokens)
+            ChatSession chatSession, Stopwatch sw, int tokenCount, int turnPromptTokens, int turnKvReusedTokens,
+            bool truncated = false)
         {
             try
             {
@@ -1341,7 +1348,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 double tokPerSec = tokenCount > 0 ? tokenCount / sw.Elapsed.TotalSeconds : 0;
                 await SseWriter.WriteEventAsync(ctx.Response,
                     WebUiSseEvents.Done(tokenCount, sw.Elapsed.TotalSeconds, tokPerSec, aborted, inferenceError, chatSession.Id,
-                        turnPromptTokens, turnKvReusedTokens));
+                        turnPromptTokens, turnKvReusedTokens, truncated));
             }
             catch (Exception)
             {

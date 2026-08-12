@@ -106,6 +106,16 @@ namespace TensorSharp.Models
             return 256;
         }
 
+        // MLX batched MoE FFN via mlx_gather_qmm over the stacked experts
+        // (TryMoEMlxGatherQmm): 3 grouped-GEMM dispatches + 2 fused kernels
+        // per layer instead of the per-active-expert ExpertFFN loop (K
+        // experts x {gate_up matmul, host SwiGLU with 2 device->host syncs,
+        // down matmul} per token). TS_GPTOSS_MLX_MOE_GQMM=0 restores the
+        // per-expert path for an A/B (process restart required — stacked
+        // weights and preload decisions are made once at load).
+        private static readonly bool MlxMoeGatherQmmEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_GPTOSS_MLX_MOE_GQMM"), "0", StringComparison.Ordinal);
+
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
         private int _numExperts;
@@ -162,6 +172,14 @@ namespace TensorSharp.Models
         private float[][] _layerDownBiasStacked;    // shape [hidden_dim * num_experts] per layer
         private int _layerStackedReady;             // 1 once InitMoeStackedWeights has run
 
+        // Per-layer MLX-resident stacked expert biases for the batched MLX MoE
+        // path (TryMoEMlxGatherQmm): gate/up [E, n_ff] split out of
+        // _layerGateUpBiasStacked, down [E, hidden] from _layerDownBiasStacked.
+        // Lazily built on first use per layer; reused across decode steps.
+        private Tensor[] _moeGateBiasMlx;
+        private Tensor[] _moeUpBiasMlx;
+        private Tensor[] _moeDownBiasMlx;
+
         public GptOssModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
             : base(ggufPath, backend, tpDegree, tpGroup)
         {
@@ -211,6 +229,7 @@ namespace TensorSharp.Models
             else
             {
                 PrepareCudaQuantizedWeightsForInference();
+                PrepareMlxStackedMoeWeights();
             }
 
             int maxContextLength = ResolveConfiguredContextLength();
@@ -1692,6 +1711,15 @@ namespace TensorSharp.Models
                     return;
             }
 
+            // MLX decode fast path: one gather_qmm grouped GEMM per projection
+            // over the stacked experts instead of K per-expert matmuls with
+            // host-side SwiGLU / bias adds between them.
+            if (_backend == BackendType.Mlx
+                && TryMoEMlxGatherQmm(hiddenState, output, routingWeights, selectedExperts, layer, /*seqLen=*/1, hiddenDim))
+            {
+                return;
+            }
+
             float* outputPtr = _backend == BackendType.Cuda ? null : GetFloatPtr(output);
 
             for (int e = 0; e < _numExpertsUsed; e++)
@@ -1739,6 +1767,15 @@ namespace TensorSharp.Models
             {
                 if (TryMoEPrefillFused(hiddenState, output, routingWeights, selectedExperts, layer, seqLen, hiddenDim))
                     return;
+            }
+
+            // MLX prefill fast path: sort the (token, expert) pairs by expert
+            // and run the whole layer's MoE FFN as 3 grouped-GEMM gather_qmm
+            // dispatches instead of a per-expert loop with host gathers.
+            if (_backend == BackendType.Mlx
+                && TryMoEMlxGatherQmm(hiddenState, output, routingWeights, selectedExperts, layer, seqLen, hiddenDim))
+            {
+                return;
             }
 
             float* inputPtr = GetFloatPtr(hiddenState);
@@ -1894,6 +1931,237 @@ namespace TensorSharp.Models
                 WarnMoEFusedUnavailable(ex.Message);
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Batched MLX MoE FFN via <c>mlx_gather_qmm</c> over the layer's
+        /// stacked experts — the MLX analogue of the GGML
+        /// <c>MoEFFNPrefillSwiGLU</c> path. The (token, expert) pairs are
+        /// sorted by expert on the host so each expert's weight is loaded once
+        /// and serves its consecutive rows as a grouped GEMM
+        /// (<c>sortedIndices: true</c>), then:
+        ///   gate = gather_qmm(x, gate_stack);  up = gather_qmm(x, up_stack)
+        ///   act  = swiglu_oai(gate + gate_bias[e], up + up_bias[e])   (fused kernel)
+        ///   down = gather_qmm(act, down_stack)
+        ///   out[n] = Σ_k w[n,k] * (down[n,k] + down_bias[e])          (fused kernel)
+        /// replacing the per-active-expert ExpertFFN loop (K × {matmul,
+        /// device→host sync, host SwiGLU, matmul, host bias add} per token).
+        /// Numerically it matches the per-expert path: same GGUF expert bytes
+        /// (repacked bit-exactly per EnsureStackedAffine), same clamped-SiLU
+        /// formula as ApplySwiGluOaiInPlace. Returns false (output untouched,
+        /// still zero-filled) to fall back to the per-expert loop.
+        /// </summary>
+        private bool TryMoEMlxGatherQmm(
+            Tensor moeInput,
+            Tensor output,
+            float[] routingWeights,
+            int[] selectedExperts,
+            int layer,
+            int seqLen,
+            int hiddenDim)
+        {
+            if (!MlxMoeGatherQmmEnabled || _layerStackedReady == 0)
+                return false;
+
+            var gateW = _layerStackedGate?[layer];
+            var upW = _layerStackedUp?[layer];
+            var downW = _layerStackedDown?[layer];
+            if (gateW == null || upW == null || downW == null)
+                return false;
+            if (!MlxQuantizedOps.SupportsStackedAffine(gateW.GgmlType)
+                || !MlxQuantizedOps.SupportsStackedAffine(upW.GgmlType)
+                || !MlxQuantizedOps.SupportsStackedAffine(downW.GgmlType))
+                return false;
+            // The fused activation kernel gathers per-expert gate/up bias rows;
+            // every shipping GPT-OSS GGUF has them. (Down bias stays optional.)
+            if (_layerGateUpBiasStacked == null || _layerGateUpBiasStacked[layer] == null)
+                return false;
+            if (MoeCpuOffloadConfig.IsLayerOnCpu(layer))
+                return false;
+
+            int E = _numExperts;
+            int K = _numExpertsUsed;
+            int ff = _expertFfnLength;
+            int NK = seqLen * K;
+            if (E <= 0 || K <= 0 || ff <= 0 || NK <= 0)
+                return false;
+
+            EnsureMoeMlxBiasTensors(layer, E, ff, hiddenDim);
+
+            // Sort the (token, expert) pairs by expert so gather_qmm's
+            // sorted-indices grouped-GEMM mode loads each expert weight once
+            // for all its consecutive rows. Host sort; NK is tiny (K at
+            // decode, seqLen*K <= a few thousand at prefill).
+            int[] order = new int[NK];
+            for (int i = 0; i < NK; i++) order[i] = i;
+            Array.Sort(order, (a, b) => selectedExperts[a].CompareTo(selectedExperts[b]));
+            int[] expertsSorted = new int[NK];   // rhs for all three projections
+            int[] tokenSorted = new int[NK];     // source token per sorted pair (device row gather)
+            int[] invOrder = new int[NK];        // original pair -> sorted row
+            float[] pairWeights = new float[NK]; // routing weight per ORIGINAL pair
+            for (int i = 0; i < NK; i++)
+            {
+                int p = order[i];
+                expertsSorted[i] = selectedExperts[p];
+                tokenSorted[i] = p / K;
+                invOrder[p] = i;
+                pairWeights[i] = routingWeights[i];
+            }
+
+            using var expertsSortedT = CreateIntTensor(expertsSorted, NK);
+            using var tokenSortedT = CreateIntTensor(tokenSorted, NK);
+            using var invOrderT = CreateIntTensor(invOrder, NK);
+            using var pairWeightsT = CreateFloatTensor(pairWeights, NK);
+
+            try
+            {
+                // Pre-gather x's rows into sorted pair order and pass NO
+                // lhs_indices to gather_qmm: MLX only marks the weight side as
+                // sorted (its gate to the batched grouped-GEMM kernel,
+                // gather_qmm_rhs) when lhs_indices are absent — passing the
+                // token map as lhs_indices silently demotes every call to the
+                // per-row gather_qmv kernel.
+                using var xSorted = new Tensor(_allocator, DType.Float32, NK, hiddenDim);
+                if (!MlxFusedOps.TryGatherRows(xSorted, moeInput, tokenSortedT))
+                    return false;
+                using var xSorted3 = xSorted.View(NK, 1, hiddenDim);   // [NK, M=1, D]
+
+                using var gateSorted = new Tensor(_allocator, DType.Float32, NK, ff);
+                if (!MlxQuantizedOps.TryGatherQmm(gateSorted, xSorted3, null, expertsSortedT,
+                        gateW.Data, gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, E, gateW.TotalRawBytes,
+                        sortedIndices: true))
+                    return false;
+
+                using var upSorted = new Tensor(_allocator, DType.Float32, NK, ff);
+                if (!MlxQuantizedOps.TryGatherQmm(upSorted, xSorted3, null, expertsSortedT,
+                        upW.Data, upW.Data, upW.GgmlType, upW.PerExpertNe0, upW.PerExpertNe1, E, upW.TotalRawBytes,
+                        sortedIndices: true))
+                    return false;
+
+                using var actSorted = new Tensor(_allocator, DType.Float32, NK, ff);
+                if (!MlxFusedOps.TrySwiGluOaiGatherBias(actSorted, gateSorted, upSorted,
+                        _moeGateBiasMlx[layer], _moeUpBiasMlx[layer], expertsSortedT, SiluAlpha, SiluLimit))
+                    return false;
+
+                using var act3 = actSorted.View(NK, 1, ff);
+                using var downSorted = new Tensor(_allocator, DType.Float32, NK, hiddenDim);
+                if (!MlxQuantizedOps.TryGatherQmm(downSorted, act3, null, expertsSortedT,
+                        downW.Data, downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, E, downW.TotalRawBytes,
+                        sortedIndices: true))
+                    return false;
+
+                return MlxFusedOps.TryMoeBiasWeightedSum(output, downSorted,
+                    _moeDownBiasMlx != null ? _moeDownBiasMlx[layer] : null,
+                    expertsSortedT, invOrderT, pairWeightsT, K);
+            }
+            catch (Exception)
+            {
+                // e.g. mlx_gather_qmm rejecting the layout/mode at runtime, or
+                // an allocation failure while building the stacked weight. The
+                // output tensor is only written by the final combine (which
+                // catches internally), so it is still zero-filled and the
+                // per-expert fallback below the caller remains correct.
+                WarnMoEFusedUnavailable("MLX gather_qmm MoE path failed");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Eagerly build the stacked [E, out, in] MLX expert weights for every
+        /// layer at model-load time so the first prefill doesn't pay the
+        /// multi-GB MXFP4/Q8_0 repack (the per-layer stacks are cached inside
+        /// MlxQuantizedOps and reused by every TryMoEMlxGatherQmm call).
+        /// No-op off-MLX, under TP, with the kill switch set, or for layers
+        /// the stacked path can't serve (those keep the lazy/fallback flow).
+        /// </summary>
+        private void PrepareMlxStackedMoeWeights()
+        {
+            if (_backend != BackendType.Mlx
+                || !MlxMoeGatherQmmEnabled
+                || IsTensorParallel
+                || _layerStackedReady == 0
+                || _allocator is not MlxAllocator mlxAllocator)
+            {
+                return;
+            }
+
+            var sw = Stopwatch.StartNew();
+            int built = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (MoeCpuOffloadConfig.IsLayerOnCpu(l))
+                    continue;
+                foreach (var w in new[] { _layerStackedGate[l], _layerStackedUp[l], _layerStackedDown[l] })
+                {
+                    if (w == null || !MlxQuantizedOps.SupportsStackedAffine(w.GgmlType))
+                        continue;
+                    if (MlxQuantizedOps.PreloadStackedAffine(
+                            mlxAllocator.DeviceId, w.Data, w.Data, w.GgmlType,
+                            (int)w.PerExpertNe0, (int)w.PerExpertNe1, w.NumExperts, w.TotalRawBytes))
+                        built++;
+                }
+            }
+            if (built > 0)
+            {
+                Console.WriteLine(
+                    $"  MLX batched MoE: stacked expert weights device-resident for {built} projections ({sw.ElapsedMilliseconds} ms)");
+            }
+        }
+
+        /// <summary>
+        /// Build (once per layer) the MLX-resident stacked expert bias tensors
+        /// consumed by the batched MoE kernels: gate/up [E, n_ff] split from
+        /// the fused gate‖up stack, down [E, hidden] when present.
+        /// </summary>
+        private void EnsureMoeMlxBiasTensors(int layer, int E, int ff, int hiddenDim)
+        {
+            if (_moeGateBiasMlx == null)
+            {
+                _moeGateBiasMlx = new Tensor[Config.NumLayers];
+                _moeUpBiasMlx = new Tensor[Config.NumLayers];
+                _moeDownBiasMlx = new Tensor[Config.NumLayers];
+            }
+            if (_moeGateBiasMlx[layer] != null)
+                return;
+
+            float[] fused = _layerGateUpBiasStacked[layer];   // [E * 2ff], gate then up per expert
+            float[] gateBias = new float[(long)E * ff];
+            float[] upBias = new float[(long)E * ff];
+            for (int e = 0; e < E; e++)
+            {
+                Array.Copy(fused, e * 2 * ff, gateBias, (long)e * ff, ff);
+                Array.Copy(fused, e * 2 * ff + ff, upBias, (long)e * ff, ff);
+            }
+            _moeGateBiasMlx[layer] = CreateFloatTensor(gateBias, E, ff);
+            _moeUpBiasMlx[layer] = CreateFloatTensor(upBias, E, ff);
+            if (_layerDownBiasStacked != null && _layerDownBiasStacked[layer] != null)
+                _moeDownBiasMlx[layer] = CreateFloatTensor(_layerDownBiasStacked[layer], E, hiddenDim);
+        }
+
+        /// <summary>
+        /// Per-weight veto for the eager MLX preload: the batched MLX MoE path
+        /// (TryMoEMlxGatherQmm) serves every routed-expert matmul from ONE
+        /// stacked [E, out, in] MLX weight per projection, built directly from
+        /// the GGUF stacked bytes (EnsureStackedAffine). Giving each
+        /// per-expert view (<c>ffn_down_exps.{e}.weight</c>) or per-expert
+        /// fused copy (<c>ffn_gate_up_exps.{e}.weight</c>) its own eager
+        /// device copy on top of that would duplicate every expert byte in
+        /// unified memory (~10 GB on gpt-oss-20b MXFP4). Skipped weights keep
+        /// their host data, so the per-expert fallback still lazily uploads on
+        /// first use if the batched path ever refuses at runtime.
+        /// </summary>
+        protected override bool ShouldPreloadMlxQuantWeightToDevice(string weightName, QuantizedWeight weight)
+        {
+            if (MlxMoeGatherQmmEnabled
+                && !IsTensorParallel
+                && _layerStackedReady != 0
+                && MlxQuantizedOps.SupportsStackedAffine(weight.GgmlType)
+                && (_stackedExpertMemberNames.Contains(weightName)
+                    || weightName.Contains(".ffn_gate_up_exps.", StringComparison.Ordinal)))
+            {
+                return false;
+            }
+            return base.ShouldPreloadMlxQuantWeightToDevice(weightName, weight);
         }
 
         private int _moeFusedWarned;
@@ -2125,6 +2393,12 @@ namespace TensorSharp.Models
             DisposeGptOssTpState();
             if (_layerSinksMlx != null)
                 foreach (var t in _layerSinksMlx) t?.Dispose();
+            if (_moeGateBiasMlx != null)
+                foreach (var t in _moeGateBiasMlx) t?.Dispose();
+            if (_moeUpBiasMlx != null)
+                foreach (var t in _moeUpBiasMlx) t?.Dispose();
+            if (_moeDownBiasMlx != null)
+                foreach (var t in _moeDownBiasMlx) t?.Dispose();
             if (_sinksHandles != null)
                 foreach (var handle in _sinksHandles)
                     if (handle.IsAllocated)

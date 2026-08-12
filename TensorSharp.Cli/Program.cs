@@ -2354,7 +2354,7 @@ namespace TensorSharp.Cli
             bool pipelinedDecodeEnabled =
                 !string.Equals(pipelinedEnv, "0", StringComparison.Ordinal)
                 && !string.Equals(pipelinedEnv, "false", StringComparison.OrdinalIgnoreCase);
-            bool pipelinedGreedy = cfg.IsGreedy
+            bool pipelinedGreedy = IsArgmaxDecode(cfg)
                 && (cfg.StopSequences == null || cfg.StopSequences.Count == 0)
                 && model.SupportsPipelinedGreedy
                 && pipelinedDecodeEnabled;
@@ -2404,10 +2404,17 @@ namespace TensorSharp.Cli
                     if (pending != null)
                     {
                         // Drain the last queued forward; if non-EOS and we still
-                        // have room, emit it as the final token.
+                        // have room, emit it as the final token. "Room" is
+                        // step < maxTokens: on a normal loop exit step ==
+                        // maxTokens and generatedTokens already HOLDS maxTokens
+                        // entries (the bootstrap token plus maxTokens-1 loop
+                        // tokens), so the old `step <= maxTokens` emitted one
+                        // token past the caller's budget — which also made a
+                        // pipelined-vs-legacy output diff look like a decode
+                        // divergence when it was only an extra trailing token.
                         int tok = pending.GetElementsAsInt(1)[0];
                         pending.Dispose();
-                        if (step <= maxTokens && !model.Tokenizer.IsEos(tok))
+                        if (step < maxTokens && !model.Tokenizer.IsEos(tok))
                         {
                             generatedTokens.Add(tok);
                         }
@@ -2688,8 +2695,12 @@ namespace TensorSharp.Cli
         {
             if (prefillTokens < 1)
                 throw new ArgumentOutOfRangeException(nameof(prefillTokens), "Benchmark prefill tokens must be at least 1.");
-            if (decodeTokens < 1)
-                throw new ArgumentOutOfRangeException(nameof(decodeTokens), "Benchmark decode tokens must be at least 1.");
+            // 0 is legal and means "prefill only" — the llama-bench `pp<N>` shape.
+            // TensorSharp.TestMatrix's pp512 / pp2048 cells pass exactly that, and
+            // rejecting it made every prefill-only cell in the shipped default
+            // feature set abort before the first forward.
+            if (decodeTokens < 0)
+                throw new ArgumentOutOfRangeException(nameof(decodeTokens), "Benchmark decode tokens cannot be negative.");
             if (runs < 1)
                 throw new ArgumentOutOfRangeException(nameof(runs), "Benchmark runs must be at least 1.");
 
@@ -2764,7 +2775,7 @@ namespace TensorSharp.Cli
                 double prefillTps = prefillTokens / (prefillMs / 1000.0);
 
                 int next = -1;
-                if (!fixedTokens)
+                if (!fixedTokens && decodeTokens > 0)
                 {
                     // Seed sampling occurs after prefill and before the decode
                     // stopwatch, matching the benchmark's historic behavior.
@@ -2784,7 +2795,15 @@ namespace TensorSharp.Cli
                 bool decodeBreakdownAvailable = fixedTokens || !usePipelinedGreedy;
                 int[] decodeInput = new int[1];
                 var decodeSw = Stopwatch.StartNew();
-                if (fixedTokens)
+                if (decodeTokens == 0)
+                {
+                    // Prefill-only (pp<N>): nothing to decode. Skipping the whole
+                    // block matters beyond saving work — the pipelined branch would
+                    // submit a step for the unsampled `next = -1` and then index
+                    // firstRunDecodeTokens[-1], which is null here because it is
+                    // only allocated when there are tokens to record.
+                }
+                else if (fixedTokens)
                 {
                     for (int i = 0; i < decodeTokens; i++)
                     {
@@ -2835,10 +2854,14 @@ namespace TensorSharp.Cli
                 }
                 decodeSw.Stop();
                 double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
-                double decodeTps = decodeTokens / (decodeMs / 1000.0);
+                // Prefill-only runs report NaN rather than 0 for the decode metrics:
+                // 0 tok/s would read as "measured, and catastrophically slow" in the
+                // report, while NaN is unambiguously "not measured here".
+                double decodeTps = decodeTokens > 0 ? decodeTokens / (decodeMs / 1000.0) : double.NaN;
+                double decodeMsPerTok = decodeTokens > 0 ? decodeMs / decodeTokens : double.NaN;
                 double decodeModelMs = decodeModelTicks * 1000.0 / Stopwatch.Frequency;
                 double decodeSamplingMs = decodeSamplingTicks * 1000.0 / Stopwatch.Frequency;
-                double decodeModelTps = decodeBreakdownAvailable
+                double decodeModelTps = decodeBreakdownAvailable && decodeTokens > 0
                     ? decodeTokens / (decodeModelMs / 1000.0)
                     : double.NaN;
 
@@ -2847,7 +2870,7 @@ namespace TensorSharp.Cli
                     _log.LogInformation(LogEventIds.CliBenchmark,
                         "benchmark run {Run}/{Runs}: prefillMs={PrefillMs:F0} prefillTps={PrefillTps:F1} decodeMs={DecodeMs:F0} decodeTps={DecodeTps:F1} msPerTok={MsPerTok:F1} decodeModelMs={DecodeModelMs:F0} decodeModelTps={DecodeModelTps:F1} greedySampleMs={GreedySampleMs:F1} decodeMode={DecodeMode}",
                         run + 1, runs, prefillMs, prefillTps, decodeMs, decodeTps,
-                        decodeMs / decodeTokens, decodeModelMs, decodeModelTps,
+                        decodeMsPerTok, decodeModelMs, decodeModelTps,
                         decodeSamplingMs, decodeMode);
                 }
                 else
@@ -2855,7 +2878,7 @@ namespace TensorSharp.Cli
                     _log.LogInformation(LogEventIds.CliBenchmark,
                         "benchmark run {Run}/{Runs}: prefillMs={PrefillMs:F0} prefillTps={PrefillTps:F1} decodeMs={DecodeMs:F0} decodeTps={DecodeTps:F1} msPerTok={MsPerTok:F1} decodeBreakdown=pipelined-overlap decodeMode={DecodeMode}",
                         run + 1, runs, prefillMs, prefillTps, decodeMs, decodeTps,
-                        decodeMs / decodeTokens, decodeMode);
+                        decodeMsPerTok, decodeMode);
                 }
 
                 if (prefillMs < bestPrefillMs)
@@ -2890,7 +2913,7 @@ namespace TensorSharp.Cli
                 _log.LogInformation(LogEventIds.CliBenchmark,
                     "benchmark summary: bestPrefillMs={BestPrefillMs:F0} bestPrefillTps={BestPrefillTps:F1} bestDecodeMs={BestDecodeMs:F0} bestDecodeTps={BestDecodeTps:F1} bestDecodeMsPerTok={BestDecodeMsPerTok:F2} bestDecodeModelMs={BestDecodeModelMs:F0} bestDecodeModelTps={BestDecodeModelTps:F1} bestGreedySampleMs={BestGreedySampleMs:F1} avgPrefillTps={AvgPrefillTps:F1} avgDecodeTps={AvgDecodeTps:F1} avgDecodeModelTps={AvgDecodeModelTps:F1} decodeMode={DecodeMode}",
                     bestPrefillMs, bestPrefillTps, bestDecodeMs, bestDecodeTps,
-                    bestDecodeMs / decodeTokens, bestDecodeModelMs, bestDecodeModelTps,
+                    decodeTokens > 0 ? bestDecodeMs / decodeTokens : double.NaN, bestDecodeModelMs, bestDecodeModelTps,
                     bestDecodeSamplingMs, avgPrefillTps, avgDecodeTps,
                     avgDecodeModelTps, decodeMode);
             }
@@ -2899,7 +2922,7 @@ namespace TensorSharp.Cli
                 _log.LogInformation(LogEventIds.CliBenchmark,
                     "benchmark summary: bestPrefillMs={BestPrefillMs:F0} bestPrefillTps={BestPrefillTps:F1} bestDecodeMs={BestDecodeMs:F0} bestDecodeTps={BestDecodeTps:F1} bestDecodeMsPerTok={BestDecodeMsPerTok:F2} avgPrefillTps={AvgPrefillTps:F1} avgDecodeTps={AvgDecodeTps:F1} decodeBreakdown=pipelined-overlap decodeMode={DecodeMode}",
                     bestPrefillMs, bestPrefillTps, bestDecodeMs, bestDecodeTps,
-                    bestDecodeMs / decodeTokens, avgPrefillTps, avgDecodeTps, decodeMode);
+                    decodeTokens > 0 ? bestDecodeMs / decodeTokens : double.NaN, avgPrefillTps, avgDecodeTps, decodeMode);
             }
 
             if (!fixedTokens && firstRunDecodeTokens != null)
@@ -2965,6 +2988,30 @@ namespace TensorSharp.Cli
                 sampledTokens[i] = next;
             }
             return sampledTokens;
+        }
+
+        /// <summary>
+        /// True when <see cref="TokenSampler.Sample"/> will reduce to a plain
+        /// argmax over the raw logits — which is exactly what the model's
+        /// pipelined device argmax computes.
+        ///
+        /// <see cref="SamplingConfig.IsGreedy"/> is not the right test here: it
+        /// also demands topK &lt;= 0 / topP &gt;= 1 / minP &lt;= 0, but the
+        /// sampler never reaches those stages once temperature &lt;= 0, so the
+        /// very common "--top-k 1" spelling of greedy decoding was silently
+        /// falling off the pipelined path. Conversely IsGreedy ignores the
+        /// penalty and grammar knobs, which DO change the greedy branch's
+        /// result (ArgmaxWithPenaltiesInPlace / grammar masking) and therefore
+        /// have to disqualify the device argmax.
+        /// </summary>
+        static bool IsArgmaxDecode(SamplingConfig cfg)
+        {
+            return cfg.Temperature <= 0f
+                && cfg.RepetitionPenalty == 1f
+                && cfg.PresencePenalty == 0f
+                && cfg.FrequencyPenalty == 0f
+                && cfg.Grammar == null
+                && (cfg.FirstTokenAllowList == null || cfg.FirstTokenAllowList.Count == 0);
         }
 
         static int SampleGreedyFromLogits(float[] logits, int vocab)

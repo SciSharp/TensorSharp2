@@ -1,4 +1,4 @@
-The user has uploaded the following plain-text log file. Skim it and answer in two short bullets: (1) what kind of event repeats most often, (2) what error appears, if any, and at what timestamp.
+The user has uploaded the following plain-text log file. Skim it and answer in two short bullets: (1) what error appears, if any, and at what timestamp; (2) which user issues the most requests.
 
 UPLOAD BEGINS
 ================================================================

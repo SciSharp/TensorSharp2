@@ -74,10 +74,116 @@ namespace TensorSharp.Models
         /// caller may hand it token ids instead of a hidden tensor. Only armed when the
         /// table is already device-resident (tied LM head) - see BuildFusedArrays.
         /// </summary>
-        internal bool FusedInGraphEmbedAvailable => GetFusedArrays()?.TokEmbd != IntPtr.Zero;
+        /// <remarks>
+        /// Written the long way on purpose. <c>GetFusedArrays()?.TokEmbd != IntPtr.Zero</c>
+        /// is an <c>IntPtr?</c> comparison, and C#'s lifted <c>!=</c> yields TRUE when one
+        /// side is null - so on a backend with no fused kernel at all (MLX, GgmlCpu) the
+        /// property claimed the in-graph embedding path WAS available.
+        /// </remarks>
+        internal bool FusedInGraphEmbedAvailable
+        {
+            get
+            {
+                var a = GetFusedArrays();
+                return a != null && a.TokEmbd != IntPtr.Zero;
+            }
+        }
 
         private static readonly bool FusedForwardEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_FUSED"), "0", StringComparison.Ordinal);
+
+        // ====================================================================
+        // Layer trace (TS_MUSE_GLIMMER_LAYER_TRACE=1) - diagnostics only.
+        // ====================================================================
+        //
+        // Prints a checksum of the residual ENTERING every layer (and the final
+        // residual) for the FIRST forward of the per-op loop. The fused kernel emits
+        // the identical summary under the same variable, so diffing the two runs is
+        // what localizes a fused-vs-per-op divergence to a layer; without it the only
+        // observable is the sampled text, which says nothing about where they parted.
+        // TS_MUSE_GLIMMER_LAYER_TRACE_POS selects the first forward at or past that
+        // absolute position (which is what skips the startup warmup, whose own prefill
+        // and decode run at unrelated positions), and ..._N how many consecutive
+        // forwards to trace from there.
+        private static readonly bool LayerTraceEnabled =
+            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_LAYER_TRACE")) &&
+            Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_LAYER_TRACE") != "0";
+        private static readonly int LayerTracePos =
+            int.TryParse(Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_LAYER_TRACE_POS"), out int _ltp) ? _ltp : 0;
+        private static readonly int LayerTraceCount =
+            int.TryParse(Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_LAYER_TRACE_N"), out int _ltn) && _ltn > 0 ? _ltn : 1;
+        private int _layerTraceForwards;
+        private int _layerTraceRows;
+        private int _layerTracePos;
+
+        private bool TraceActive =>
+            LayerTraceEnabled && _layerTraceForwards < LayerTraceCount && _layerTracePos >= LayerTracePos;
+
+        internal void TraceLayerResidual(Tensor hidden, int layer)
+        {
+            if (!TraceActive || hidden == null)
+                return;
+            float[] v = TensorToFloatArray(hidden);
+            double sum = 0.0, abs = 0.0;
+            float max = float.NegativeInfinity;
+            int nonFinite = 0;
+            for (int i = 0; i < v.Length; i++)
+            {
+                sum += v[i];
+                abs += Math.Abs((double)v[i]);
+                if (v[i] > max) max = v[i];
+                if (!float.IsFinite(v[i])) nonFinite++;
+            }
+            Console.Error.WriteLine($"[MGTRACE-perop] pos={_layerTracePos} rows={_layerTraceRows} layer={layer} " +
+                $"n={v.Length} sum={sum:F4} abs={abs:F4} max={max:F6} nonfinite={nonFinite}");
+            Console.Error.Flush();
+            string dir = Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_LAYER_TRACE_DIR");
+            if (!string.IsNullOrEmpty(dir))
+            {
+                var bytes = new byte[v.Length * 4];
+                Buffer.BlockCopy(v, 0, bytes, 0, bytes.Length);
+                System.IO.File.WriteAllBytes(
+                    System.IO.Path.Combine(dir, $"perop_S{_layerTraceForwards:D2}_L{layer:D2}.bin"), bytes);
+            }
+        }
+
+        /// <summary>Top-5 of the trace forward's logits, for a fused-vs-per-op A/B.</summary>
+        internal void TraceLogits(float[] logits)
+        {
+            if (!TraceActive || logits == null)
+                return;
+            int n = Math.Min(logits.Length, Config.VocabSize);
+            var best = new int[5];
+            for (int k = 0; k < 5; k++)
+            {
+                int bi = -1;
+                for (int i = 0; i < n; i++)
+                {
+                    bool taken = false;
+                    for (int j = 0; j < k; j++) if (best[j] == i) { taken = true; break; }
+                    if (taken) continue;
+                    if (bi < 0 || logits[i] > logits[bi]) bi = i;
+                }
+                best[k] = bi;
+            }
+            var sb = new System.Text.StringBuilder($"[MGTRACE-logits] pos={_layerTracePos} rows={_layerTraceRows} top5:");
+            for (int k = 0; k < 5; k++)
+                sb.Append($" ({best[k]}, {logits[best[k]]:F6})");
+            Console.Error.WriteLine(sb.ToString());
+            Console.Error.Flush();
+        }
+
+        internal void TraceLayerSetRows(int rows, int startPos)
+        {
+            _layerTraceRows = rows;
+            _layerTracePos = startPos;
+        }
+
+        internal void TraceLayerDone()
+        {
+            if (TraceActive)
+                _layerTraceForwards++;
+        }
 
         /// <summary>
         /// The fused kernel is enabled on the GPU GGML backends only. GgmlCpu is

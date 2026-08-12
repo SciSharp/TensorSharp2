@@ -1543,6 +1543,17 @@ namespace TensorSharp.GGML
         /// persistent CUDA-graph-captured graph; nTokens &gt; 1 is a transient prefill
         /// graph. Returns false when the kernel declines so the caller can fall back
         /// to the per-op path.
+        /// <para>
+        /// Tensor parallelism: with <paramref name="tpDegree"/> &gt; 1 and a non-null
+        /// <paramref name="tpPlanOut"/> every pointer above is the CURRENTLY ACTIVE
+        /// rank's shard (<see cref="SetActiveRank"/>), numHeads / numKvHeads are
+        /// already this rank's head counts, and the kernel builds and binds the graph
+        /// instead of running it - returning a plan in <c>tpPlanOut[0]</c> cut at the
+        /// two row-parallel projections per layer (attention o_proj, FFN down). Drive
+        /// one plan per rank through <see cref="TensorParallelExecutePlans"/>, which
+        /// AllReduces the partials at those boundaries. On a decline the call returns
+        /// false and leaves <c>tpPlanOut[0]</c> at <see cref="IntPtr.Zero"/>.
+        /// </para>
         /// </summary>
         public static bool MuseGlimmerModelForward(
             IntPtr hiddenData, int hiddenSize, int nTokens, int numLayers,
@@ -1572,7 +1583,8 @@ namespace TensorSharp.GGML
             IntPtr finalNormData, float logitScale, float logitSoftcap,
             IntPtr captureData, int[] captureLayers, int captureCount,
             IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
-            int[] tokenIds, int allLogitsRows)
+            int[] tokenIds, int allLogitsRows,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
             return GgmlNative.MuseGlimmerModelForward(
                 hiddenData, hiddenSize, nTokens, numLayers,
@@ -1592,11 +1604,16 @@ namespace TensorSharp.GGML
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNormData, logitScale, logitSoftcap,
                 captureData, captureLayers, captureCount,
-                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, tokenIds, allLogitsRows);
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, tokenIds, allLogitsRows,
+                tpDegree, tpPlanOut);
         }
 
         /// <summary>Drop the persistent Muse-Glimmer decode graphs (see the native comment).</summary>
         public static void MuseGlimmerResetDecodeCache() => GgmlNative.MuseGlimmerResetDecodeCache();
+
+        /// <summary>Release every rank's parked tensor-parallel Muse-Glimmer graph.
+        /// Call on dispose and on KV reset.</summary>
+        public static void MuseGlimmerReleaseTpGraphs() => GgmlNative.MuseGlimmerReleaseTpGraphs();
 
 
         public static void TransformerModelDecode(

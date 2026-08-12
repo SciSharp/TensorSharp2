@@ -399,6 +399,19 @@ output projection.
 | Qwen3.5-35B-A3B IQ4_XS | does not fit | 98.7 / 14.2 | **184 / 18.1** |
 | Gemma-4-26B-A4B IQ4_XS | 1845 / 48.5 | 43.0 / 4.9 | 43.1 / 5.1 (unchanged) |
 
+**Muse-Glimmer-30B (2× RTX PRO 4000 Blackwell 24 GB, PCIe, prefill 512 / decode 64):**
+
+| Model | 1 GPU | TP=2 |
+|---|---|---|
+| 30B-UD-IQ2_XXS (10.2 GB) | 1171 / 40.2 | **1569 / 63.2** |
+| 30B-Q8_0 (28.2 GB) | does not fit on 24 GB | **1691 / 34.3** |
+
+1.34× prefill and 1.57× decode — TP beats one GPU on BOTH phases here, which the
+earlier models did not manage on prefill. Resident: IQ2_XXS 9178 MB on one GPU
+versus 5115 + 4063 MB at tp=2; Q8_0 15474 + 12748 MB, i.e. the only way to run it
+on these cards at all. `--tp 2` output is byte-identical across repeat runs and
+tracks the single-GPU greedy continuation for 468 of 500 characters.
+
 (prefill tok/s / decode tok/s.) Decode is where TP should win and now does —
 1.39× single-GPU on E4B, 1.06× on Qwen3.5-9B — while prefill, which is
 compute-bound and pays the collectives, lands at 0.90× / 0.27× instead of 0.01×
@@ -980,5 +993,6 @@ Stage 3 (RDMA)              ░░░░░░░░░░░░░░░░░�
 | Qwen3.5 | SSM + MoE | ✅ Done | GatedDeltaNet SSM with per-rank V-head ownership, packed GDN kernels on direct CUDA and GGML; expert-parallel MoE + column-parallel LM head on GGML |
 | GptOss | MoE | ✅ Done | Expert slicing with biased projections, attention sinks, YaRN; expert down-bias skipped in TP |
 | Nemotron | SSM + MoE | ✅ Done | Mamba2 replicated on rank 0, attention (no RoPE), MoE expert slicing |
+| Muse-Glimmer | Dense + vision | ✅ Done | Interleaved SWA/NoPE layers, per-head QK norm (replicated), attention output gate (column-parallel by head), segmented fused gate_up; **tp=2 max — 2 KV heads**; vision tower replicated on rank 0; DFlash and pooled KV snapshots stay single-GPU |
 | DiffusionGemma | Diffusion | ❌ N/A | Not autoregressive text generation |
 | QwenImage | Image gen | ❌ N/A | Not autoregressive text generation |

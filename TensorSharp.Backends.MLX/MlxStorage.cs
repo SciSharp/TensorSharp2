@@ -222,12 +222,64 @@ namespace TensorSharp.MLX
             };
         }
 
+        /// <summary>
+        /// Bulk host read. Written as ONE <see cref="EnsureHostReadable"/> plus a
+        /// single typed copy loop rather than <c>length</c> calls to
+        /// <see cref="GetElementAsFloat"/>: every one of those calls re-entered
+        /// <c>ThrowIfDestroyed()</c> + <c>lock (sync)</c>, and the hot caller here is
+        /// ModelBase.TensorToFloatArray on the LM head, i.e. 202,048 locked
+        /// per-element reads for EVERY decoded token of Muse-Glimmer.
+        ///
+        /// Like the per-element path this is a pure read: it must NOT raise
+        /// <c>hostDirty</c> (which is why it uses <c>buffer</c> directly instead of
+        /// <see cref="PtrAtElement"/>, whose checkout implies a pending host write).
+        /// </summary>
         public override float[] GetElementsAsFloat(long index, int length)
         {
             ValidateElementRange(index, length);
             float[] result = new float[length];
-            for (int i = 0; i < length; i++)
-                result[i] = GetElementAsFloat(index + i);
+            if (length == 0)
+                return result;
+
+            EnsureHostReadable();
+            IntPtr src = AddBytes(buffer, checked(index * ElementType.Size()));
+            switch (ElementType)
+            {
+                case DType.Float32:
+                    new ReadOnlySpan<float>((float*)src, length).CopyTo(result);
+                    break;
+                case DType.Float64:
+                {
+                    double* typed = (double*)src;
+                    for (int i = 0; i < length; i++)
+                        result[i] = (float)typed[i];
+                    break;
+                }
+                case DType.Float16:
+                {
+                    half* typed = (half*)src;
+                    for (int i = 0; i < length; i++)
+                        result[i] = typed[i];
+                    break;
+                }
+                case DType.Int32:
+                {
+                    int* typed = (int*)src;
+                    for (int i = 0; i < length; i++)
+                        result[i] = typed[i];
+                    break;
+                }
+                case DType.UInt8:
+                {
+                    byte* typed = (byte*)src;
+                    for (int i = 0; i < length; i++)
+                        result[i] = typed[i];
+                    break;
+                }
+                default:
+                    throw new NotSupportedException("Element type " + ElementType + " not supported");
+            }
+
             return result;
         }
 
@@ -258,13 +310,69 @@ namespace TensorSharp.MLX
             hostDirty = true;
         }
 
+        /// <summary>
+        /// Bulk host write, the mirror image of
+        /// <see cref="GetElementsAsFloat"/>: one <see cref="EnsureHostReadable"/>
+        /// (needed because a partial write must not discard the rest of a
+        /// device-resident buffer) and one typed copy loop. The per-element
+        /// spelling cost one <c>ThrowIfDestroyed()</c> + <c>lock (sync)</c> per
+        /// element, which the Muse-Glimmer mmproj upload path hits ~1.85e9 times
+        /// when its ~1.9B parameters are dequantized to F32.
+        ///
+        /// <c>hostDirty</c> is raised exactly once at the end, matching what the
+        /// per-element path did on every write, so the next
+        /// <see cref="EnsureDeviceCurrent"/> re-uploads.
+        /// </summary>
         public override void SetElementsAsFloat(long index, float[] value)
         {
             if (value == null)
                 throw new ArgumentNullException(nameof(value));
             ValidateElementRange(index, value.Length);
-            for (int i = 0; i < value.Length; i++)
-                SetElementAsFloat(index + i, value[i]);
+            int length = value.Length;
+            if (length == 0)
+                return;
+
+            EnsureHostReadable();
+            IntPtr dst = AddBytes(buffer, checked(index * ElementType.Size()));
+            switch (ElementType)
+            {
+                case DType.Float32:
+                    value.AsSpan().CopyTo(new Span<float>((float*)dst, length));
+                    break;
+                case DType.Float64:
+                {
+                    double* typed = (double*)dst;
+                    for (int i = 0; i < length; i++)
+                        typed[i] = value[i];
+                    break;
+                }
+                case DType.Float16:
+                {
+                    half* typed = (half*)dst;
+                    for (int i = 0; i < length; i++)
+                        typed[i] = value[i];
+                    break;
+                }
+                case DType.Int32:
+                {
+                    int* typed = (int*)dst;
+                    for (int i = 0; i < length; i++)
+                        typed[i] = (int)value[i];
+                    break;
+                }
+                case DType.UInt8:
+                {
+                    byte* typed = (byte*)dst;
+                    for (int i = 0; i < length; i++)
+                        typed[i] = (byte)value[i];
+                    break;
+                }
+                default:
+                    // Thrown before hostDirty is raised, as in the per-element path.
+                    throw new NotSupportedException("Element type " + ElementType + " not supported");
+            }
+
+            hostDirty = true;
         }
 
         public override void SetElementsAsHalf(long index, half[] value)

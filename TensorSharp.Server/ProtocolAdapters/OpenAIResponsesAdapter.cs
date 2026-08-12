@@ -216,14 +216,29 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             var sb = new StringBuilder();
             int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
+            string pipelineFinishReason = null;
 
-            await foreach (var (piece, done, pt, et, kr, _, _, _)
+            await foreach (var update
                 in _svc.ChatStreamWithMetricsAsync(inferenceMessages, maxOutputTokens, ctx.RequestAborted, samplingConfig, tools, enableThinking))
             {
-                if (!done)
-                    sb.Append(piece);
-                else { promptTokens = pt; evalTokens = et; kvReusedTokens = kr; }
+                if (!update.Done)
+                {
+                    sb.Append(update.Piece);
+                }
+                else
+                {
+                    promptTokens = update.PromptTokens;
+                    evalTokens = update.EvalTokens;
+                    kvReusedTokens = update.KvCacheReusedTokens;
+                    pipelineFinishReason = update.FinishReason;
+                }
             }
+
+            // This API has no finish_reason: a response cut short by the output-token
+            // budget is reported as status "incomplete" with incomplete_details.reason
+            // "max_output_tokens".
+            var (status, incompleteReason) = FinishReasonMapper.ToResponsesStatus(pipelineFinishReason);
+            string itemStatus = status == FinishReasonMapper.ResponsesIncomplete ? "incomplete" : "completed";
 
             string rawOutput = sb.ToString();
             bool useParser = enableThinking || (tools != null && tools.Count > 0) || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
@@ -237,7 +252,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                     await WriteErrorAsync(ctx, 422, normalized.ErrorMessage, normalized.Errors, "invalid_response_error");
                     return;
                 }
-                output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), normalized.NormalizedContent));
+                output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), normalized.NormalizedContent, itemStatus));
             }
             else if (useParser)
             {
@@ -246,7 +261,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 var parsed = parser.Add(rawOutput, true);
 
                 if (!string.IsNullOrEmpty(parsed.Content))
-                    output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), parsed.Content));
+                    output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), parsed.Content, itemStatus));
 
                 if (parsed.ToolCalls != null)
                     foreach (var call in parsed.ToolCalls)
@@ -255,12 +270,13 @@ namespace TensorSharp.Server.ProtocolAdapters
             }
             else
             {
-                output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), rawOutput));
+                output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), rawOutput, itemStatus));
             }
 
             var response = OpenAIResponsesFactory.Response(
-                requestId, _svc.LoadedModelName, "completed", instructions, maxOutputTokens, output,
-                store, samplingConfig, promptTokens, evalTokens, kvReusedTokens);
+                requestId, _svc.LoadedModelName, status, instructions, maxOutputTokens, output,
+                store, samplingConfig, promptTokens, evalTokens, kvReusedTokens,
+                incompleteReason: incompleteReason);
 
             string json = JsonSerializer.Serialize(response, JsonOptions.IgnoreNulls);
             if (store)
@@ -317,6 +333,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             var toolCalls = new List<ToolCall>();
             int outputIndex = 0;
             int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
+            string pipelineFinishReason = null;
 
             async Task EmitDeltaAsync(string chunk)
             {
@@ -337,32 +354,41 @@ namespace TensorSharp.Server.ProtocolAdapters
                     OpenAIResponsesFactory.OutputTextDelta(messageItemId, outputIndex, 0, chunk), ctx.RequestAborted);
             }
 
-            await foreach (var (piece, done, pt, et, kr, _, _, _)
+            await foreach (var update
                 in _svc.ChatStreamWithMetricsAsync(inferenceMessages, maxOutputTokens, ctx.RequestAborted, samplingConfig, tools, enableThinking))
             {
-                if (!done)
+                if (!update.Done)
                 {
                     if (bufferForStructured)
                     {
-                        buffer.Append(piece);
+                        buffer.Append(update.Piece);
                         continue;
                     }
 
                     if (parser != null)
                     {
-                        var parsed = parser.Add(piece, false);
+                        var parsed = parser.Add(update.Piece, false);
                         if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
                             toolCalls = parsed.ToolCalls.ToList();
                         await EmitDeltaAsync(parsed.Content);
                         continue;
                     }
 
-                    await EmitDeltaAsync(piece);
+                    await EmitDeltaAsync(update.Piece);
                     continue;
                 }
 
-                promptTokens = pt; evalTokens = et; kvReusedTokens = kr;
+                promptTokens = update.PromptTokens;
+                evalTokens = update.EvalTokens;
+                kvReusedTokens = update.KvCacheReusedTokens;
+                pipelineFinishReason = update.FinishReason;
             }
+
+            // Same status/incomplete_details mapping the non-streaming path uses, so
+            // the response.completed frame's payload matches a buffered GET of the
+            // same response id.
+            var (status, incompleteReason) = FinishReasonMapper.ToResponsesStatus(pipelineFinishReason);
+            string itemStatus = status == FinishReasonMapper.ResponsesIncomplete ? "incomplete" : "completed";
 
             var output = new List<object>();
 
@@ -393,7 +419,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 await SseWriter.WriteNamedEventAsync(ctx.Response, "response.content_part.done",
                     OpenAIResponsesFactory.ContentPartDone(messageItemId, outputIndex, 0, messageText.ToString()), ctx.RequestAborted);
 
-                var finishedItem = OpenAIResponsesFactory.OutputMessageItem(messageItemId, messageText.ToString());
+                var finishedItem = OpenAIResponsesFactory.OutputMessageItem(messageItemId, messageText.ToString(), itemStatus);
                 await SseWriter.WriteNamedEventAsync(ctx.Response, "response.output_item.done",
                     OpenAIResponsesFactory.OutputItemDone(outputIndex, finishedItem), ctx.RequestAborted);
                 output.Add(finishedItem);
@@ -413,8 +439,9 @@ namespace TensorSharp.Server.ProtocolAdapters
             }
 
             var response = OpenAIResponsesFactory.Response(
-                requestId, _svc.LoadedModelName, "completed", instructions, maxOutputTokens, output,
-                store, samplingConfig, promptTokens, evalTokens, kvReusedTokens);
+                requestId, _svc.LoadedModelName, status, instructions, maxOutputTokens, output,
+                store, samplingConfig, promptTokens, evalTokens, kvReusedTokens,
+                incompleteReason: incompleteReason);
 
             if (store)
                 _store.Store(new StoredResponse { Id = requestId, Json = JsonSerializer.Serialize(response, JsonOptions.IgnoreNulls) });

@@ -116,14 +116,29 @@ diffusion regression signal.
 
 ## Media files (image / audio / video)
 
-The Inputs tree ships only the **prompts**, not the media. Drop sample media at:
+The Inputs tree ships only the **prompts**, not the media — the fixtures are
+megabytes of binary that would bloat every clone. Generate them instead:
 
-- `TensorSharp.TestMatrix/Inputs/media/apple.png`
-- `TensorSharp.TestMatrix/Inputs/media/sample.mp3`
-- `TensorSharp.TestMatrix/Inputs/media/sample.mp4`
+```bash
+eng/make-test-media.sh ~/work/models/testmedia
+dotnet run --project TensorSharp.TestMatrix -c Release -- --media-dir ~/work/models/testmedia
+```
 
-…or set `media_dir` in the config to point at a shared assets directory. Cases
-whose media file is missing fail with a clear error; they do not silently skip.
+…or set `media_dir` in the config to point at that directory. The script emits
+exactly the three files the catalog expects, and their content is what the
+default `ExpectedContains` keywords assert:
+
+| File | Content | Asserted keyword |
+|---|---|---|
+| `image.png` | the repo banner (`imgs/banner_1.png`) | `tensorsharp` |
+| `sample.wav` | spoken "The quick brown fox jumps over the lazy dog…", 16 kHz mono | `fox` |
+| `sample.mp4` | a red square panning right past a stationary blue one | `red` |
+
+Video generation needs `ffmpeg` on PATH (the OpenCV build vendored here decodes
+video but cannot encode it); audio needs macOS `say`+`afconvert` or
+`espeak`+`ffmpeg`. Anything missing is reported and skipped by the script, and
+the corresponding matrix cells then fail with a clear "media file not found" —
+they do not silently pass.
 
 ## Output
 

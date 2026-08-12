@@ -14,7 +14,7 @@
 | Thinking mode | Yes (the chat template emits an `assistant to=self` reasoning channel) |
 | Tool calling | Yes (ATEM XML markup in the chat template) |
 | Batched / paged forward | No (legacy per-seq) |
-| Tensor parallelism | Not supported (`--tp 1` only) |
+| Tensor parallelism | Yes — GGML CUDA / Vulkan, `--tp 2` max (the 30B has 2 KV heads) |
 
 ## Quick start
 
@@ -427,7 +427,95 @@ Also applied on the managed side:
 * The per-op decode attention handles F32, F16 and block-quantized KV caches, so
   `ApplyModelAlignedKvCacheDefault`'s F16 choice is honoured.
 
-## 6. Environment variables
+### The padded KV window has to be materialized on CUDA
+
+ggml-cuda's flash-attention **vec** kernel — the one `ggml_cuda_get_best_fattn_kernel`
+selects for a single query row, i.e. every decode step — returns wrong results when
+K/V is a view whose `ne[1]` is a *truncated prefix* of a longer axis. A padded
+attention window over a flat cache is exactly that shape: a full-attention layer
+reads `[0, window_full)` rows out of a `cache_size`-row tensor, so the KV-head
+stride jumps over the unread tail.
+
+The failure is not subtle once you look at the tensor: on the first full-attention
+layer (layer 3), **all 16 query heads sharing a KV head came back with the same
+output vector**, wrong by up to 4.6 absolute. Recomputing the attention on the host
+from the very `q`/`k`/`v`/`mask` tensors the kernel was handed reproduces the
+contiguous result to 2e-6 — the inputs were right and the kernel was not. The error
+then compounded through the remaining 49 layers into a different token stream: the
+model stopped echoing the prompt and started stuttering (`请详细介绍详细介绍最终最终幻想幻想7`).
+
+Three things kept it hidden:
+
+* the **sliding-window layers read the whole ring** (`window == rows`), so their view
+  is already contiguous — only the 13 full layers were affected;
+* **prefill is fine**, because more than one query row selects the MMA kernel, which
+  does honour the strides. The prefill logits matched the per-op path to 4e-4 and
+  picked the same top-1 token, so the divergence only ever showed up from the first
+  decode step onward;
+* **Metal and the per-op path were both correct**, which made the fused CUDA path
+  look like the odd one out for reasons that had nothing to do with this kernel.
+
+`ggml_cont` on the window fixes it. The predicate must be "the window is a
+sub-range of the cache", **not** `ggml_is_contiguous(k_full)`: `ggml_is_contiguous_n`
+skips dimensions whose `ne` is 1, so with a single KV head — which is what every rank
+holds under `--tp 2` — a truncated window reports itself contiguous and the guard
+lets the bad shape straight through. `--tp 2` reproduced the identical wrong token
+stream until the predicate stopped consulting `ggml_is_contiguous`.
+
+Cost is not measurable: decode 40.5 → 40.5 tok/s and prefill 465 → 465 tok/s on a
+50-token prompt, and 1159 → 1197 prefill / 38.2 → 37.7 decode on a 12371-token one
+(2× RTX PRO 4000 Blackwell). The copy is only taken when the window is smaller than
+the cache, which is also when it is cheap.
+
+## 6. Tensor parallelism
+
+`--tp 2` splits the model across two GPUs on the GGML CUDA / Vulkan backends.
+Two is the ceiling for the 30B: it has **2 KV heads**, and no model in this repo
+replicates KV heads when `num_kv_heads < tp`.
+
+| Weight | Split |
+|---|---|
+| `attn_q` / `attn_k` / `attn_v` / `attn_gate` | column-parallel (by head) |
+| `ffn_gate_up` | column-parallel, **per segment** — each half of the fused `[gate\|up]` is split independently |
+| `attn_output` / `ffn_down` | row-parallel → AllReduce |
+| all four per-layer norms, `attn_q_norm`, `attn_k_norm` | replicated (the QK norms are per-head `[headDim]` vectors; the Q norm also carries the folded `qk_scale_factor`) |
+| `output_norm`, `token_embd`, `output` | replicated; the tail runs on rank 0 |
+
+The attention output gate is column-parallel alongside Q and is applied **inside**
+the per-rank region, before the row-parallel `o_proj`. Both AllReduce points land
+on the raw matmul output, **before** the 1e-8 post-norms — RMSNorm is non-linear,
+so reducing after it produces coherent-looking but wrong output. That is 104
+reductions per step across 52 layers.
+
+`TSGgml_MuseGlimmerModelForward` takes a `tp_degree` / `tp_plan_out` pair: in TP
+mode it builds each rank's graph and returns a `TpRankPlan` instead of executing,
+so the driver runs all ranks with the collectives at the segment boundaries. The
+per-op TP path exists as a fallback but is far slower (the plan document measures
+op-at-a-time TP at 0.01–0.04× single-GPU).
+
+DFlash speculative decoding and pooled KV block snapshots follow the single-GPU
+path only; multi-turn reuse under `--tp` comes from live-cache continuation.
+
+### Measured (2× RTX PRO 4000 Blackwell 24 GB, PCIe, `--backend ggml_cuda`)
+
+Prefill 512 / decode 64, best of 3:
+
+| Model | | prefill tok/s | decode tok/s | GPU 0 | GPU 1 |
+|---|---|---|---|---|---|
+| 30B-UD-IQ2_XXS (10.2 GB) | `--tp 1` | 1171 | 40.2 | 9178 MB | — |
+| 30B-UD-IQ2_XXS | `--tp 2` | **1569** (1.34×) | **63.2** (1.57×) | 5115 MB | 4063 MB |
+| 30B-Q8_0 (28.2 GB) | `--tp 2` | 1691 | 34.3 | 15474 MB | 12748 MB |
+
+The Q8_0 has no single-GPU row: 28.2 GB of weights does not fit on one 24 GB
+card, so `--tp 2` is the only way to run it at all.
+
+**Correctness.** `--tp 2` is byte-identical across repeat runs (which rules out a
+race in the rank worker pool), and tracks the `--tp 1` greedy continuation for
+468 of 500 characters before diverging at a paraphrase point with both
+continuations coherent — the expected consequence of summing the row-parallel
+partials in a different order.
+
+## 7. Environment variables
 
 | Variable | Effect |
 |---|---|
@@ -438,6 +526,10 @@ Also applied on the managed side:
 | `TS_MUSE_GLIMMER_VENC_F32` | `1` = dequantize the vision tower to F32 (A/B; ~7.4 GB) |
 | `TS_MUSE_GLIMMER_GELU_TANH` | `1` = use the tanh GELU approximation in the tower instead of exact erf |
 | `TS_MUSE_GLIMMER_VENC_TRACE` | `1` = per-stage checksums of the vision residual stream |
+| `TS_MUSE_GLIMMER_LAYER_TRACE` | `1` = print a checksum of the residual *entering* every layer. Both the fused kernel and the per-op loop emit it, so diffing a fused run against a `TS_MUSE_GLIMMER_FUSED=0` run localizes a divergence to a layer |
+| `TS_MUSE_GLIMMER_LAYER_TRACE_POS` | Trace the first forward at or past this absolute position (skips the startup warmup, whose prefill and decode run at unrelated positions) |
+| `TS_MUSE_GLIMMER_LAYER_TRACE_N` | How many consecutive forwards to trace from there (default 1) |
+| `TS_MUSE_GLIMMER_LAYER_TRACE_DIR` | Also dump each traced residual as raw F32 to `<dir>/{fused,perop}_S<step>_L<layer>.bin`, for an element-wise diff — the checksums alone hide a divergence that is small in aggregate |
 | `TS_MLX_MUSE_GLIMMER_EVAL_EVERY_N_LAYERS` | MLX lazy-graph flush interval (default 4, `0` disables) |
 | `TS_PREFILL_CHUNK` | Prompt chunk size for `ForwardRefill` (default 2048) |
 | `TS_MUSE_GLIMMER_PREFILL_CHUNK` | Tokens per prefill forward (default 2048, `0` disables chunking) |

@@ -934,6 +934,16 @@ namespace TensorSharp.Models
                         queued = true;
                     }
                     break;
+                case MuseGlimmerModel mg:
+                    foreach (var span in bucket)
+                    {
+                        if (span.EndPosition <= reusablePrefixTokenCount)
+                            continue;
+
+                        mg.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
+                        queued = true;
+                    }
+                    break;
             }
 
             return queued;
@@ -1018,6 +1028,17 @@ namespace TensorSharp.Models
                             continue;
 
                         nem.SetVisionEmbeddings(embeddings, insertPosition);
+                        queued = true;
+                    }
+                    break;
+                case MuseGlimmerModel mg:
+                    foreach (var span in bucket)
+                    {
+                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
+                                out Tensor embeddings, out int insertPosition))
+                            continue;
+
+                        mg.SetVisionEmbeddings(embeddings, insertPosition);
                         queued = true;
                     }
                     break;

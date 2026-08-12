@@ -60,13 +60,18 @@ namespace TensorSharp.Server.ResponseSerializers
             string error,
             string sessionId,
             int promptTokens,
-            int kvCacheReusedTokens) => new
+            int kvCacheReusedTokens,
+            bool truncated = false) => new
         {
             done = true,
             tokenCount,
             elapsed = elapsedSeconds,
             tokPerSec,
             aborted,
+            // The answer stops mid-thought because the max-tokens budget ran out,
+            // not because the model was finished. Distinct from `aborted`, which
+            // means the user (or a dropped connection) stopped it.
+            truncated,
             error,
             sessionId,
             promptTokens,

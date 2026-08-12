@@ -1971,8 +1971,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             const int swaBase = start_pos - prevCount;   // logical position of the prev-window start
             if (swaPrev)
             {
-                ggml_tensor* kpv = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, swaBase, prevCount, kvType);
-                ggml_tensor* vpv = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, swaBase, prevCount, kvType);
+                ggml_tensor* kpv = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, swaBase, prevCount, kvType, /*fattn_query_rows=*/0);
+                ggml_tensor* vpv = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, swaBase, prevCount, kvType, /*fattn_query_rows=*/0);
                 if (kpv == nullptr || vpv == nullptr)
                 {
                     set_last_error("Gemma4 MoE model verify: failed to view prev SWA window.");
@@ -2072,8 +2072,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                 attnKvLen = flash_attn_kv_length(attendLen, cacheSize, hd);
                 maskWindow = 0;                       // window already enforced by the cache view
                 keyBase = 0;
-                k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
-                v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+                k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType, N);
+                v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType, N);
             }
             if (k_full == nullptr || v_full == nullptr)
             {

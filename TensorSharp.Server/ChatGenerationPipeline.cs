@@ -32,6 +32,44 @@ namespace TensorSharp.Server
         string Text, bool IsPreview, bool Done, int Step, int TotalSteps,
         int PromptTokens, int EvalTokens, long TotalNs);
 
+    /// <summary>A single streaming update from the autoregressive chat / generate pipeline.
+    /// Ordinary updates carry only <see cref="Piece"/> (the text decoded since the last
+    /// update); the one terminal update (<see cref="Done"/> = <c>true</c>) carries the token
+    /// counts, the timings, and the reason generation stopped.</summary>
+    /// <remarks>
+    /// This was an 8-tuple until <see cref="FinishReason"/> needed a home. A named type earns
+    /// its keep here because most consumers want two or three members out of nine, and a row of
+    /// positional <c>_</c> discards had stopped documenting which ones.
+    /// </remarks>
+    /// <param name="Piece">Text decoded since the previous update; empty on the terminal update.</param>
+    /// <param name="Done">True for the single terminal update that carries the metrics below.</param>
+    /// <param name="PromptTokens">Prompt tokens evaluated. Terminal update only.</param>
+    /// <param name="EvalTokens">Tokens generated. Terminal update only.</param>
+    /// <param name="KvCacheReusedTokens">Prompt tokens served from the prefix cache. Terminal update only.</param>
+    /// <param name="TotalNs">Wall-clock nanoseconds for the whole request. Terminal update only.</param>
+    /// <param name="PromptNs">Nanoseconds spent rendering and preparing the prompt. Terminal update only.</param>
+    /// <param name="EvalNs">Nanoseconds spent decoding. Terminal update only.</param>
+    /// <param name="FinishReason">Why generation stopped — <c>max_tokens</c>, <c>stop_sequence</c>,
+    /// <c>cancelled</c>, or whatever the engine reported (<c>eos</c>, <c>aborted</c>, <c>error</c>).
+    /// Null on non-terminal updates. This is the pipeline's own vocabulary, NOT any protocol's:
+    /// adapters must translate it through
+    /// <see cref="TensorSharp.Server.ProtocolAdapters.FinishReasonMapper"/> rather than putting it
+    /// on the wire raw.</param>
+    public readonly record struct ChatStreamUpdate(
+        string Piece,
+        bool Done,
+        int PromptTokens,
+        int EvalTokens,
+        int KvCacheReusedTokens,
+        long TotalNs,
+        long PromptNs,
+        long EvalNs,
+        string FinishReason)
+    {
+        /// <summary>An ordinary (non-terminal) update carrying just newly decoded text.</summary>
+        public static ChatStreamUpdate Text(string piece) => new(piece, false, 0, 0, 0, 0, 0, 0, null);
+    }
+
     internal sealed class ChatGenerationPipeline : IDisposable
     {
         private readonly ModelLifecycleService _lifecycle;
@@ -80,15 +118,15 @@ namespace TensorSharp.Server
             List<ToolFunction> tools = null,
             bool enableThinking = false)
         {
-            await foreach (var (piece, _, _, _, _, _, _, _) in
+            await foreach (var update in
                 ChatStreamWithMetricsAsync(session, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking))
             {
-                if (!string.IsNullOrEmpty(piece))
-                    yield return piece;
+                if (!string.IsNullOrEmpty(update.Piece))
+                    yield return update.Piece;
             }
         }
 
-        public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
+        public async IAsyncEnumerable<ChatStreamUpdate>
             ChatStreamWithMetricsAsync(
                 ChatSession session,
                 List<ChatMessage> history,
@@ -112,9 +150,18 @@ namespace TensorSharp.Server
                     .ConfigureAwait(false))
                 {
                     if (u.Done)
-                        yield return ("", true, u.PromptTokens, u.EvalTokens, 0, u.TotalNs, 0, u.TotalNs);
+                    {
+                        // Denoising has no token budget to exhaust: the sampler runs its
+                        // planned blocks and stops, so the only two outcomes are a natural
+                        // finish and a client abort.
+                        yield return new ChatStreamUpdate("", true, u.PromptTokens, u.EvalTokens, 0,
+                            u.TotalNs, 0, u.TotalNs,
+                            cancellationToken.IsCancellationRequested ? "cancelled" : "stop");
+                    }
                     else if (!u.IsPreview && u.Text.Length > 0)
-                        yield return (u.Text, false, 0, 0, 0, 0, 0, 0);
+                    {
+                        yield return ChatStreamUpdate.Text(u.Text);
+                    }
                 }
                 yield break;
             }
@@ -301,7 +348,7 @@ namespace TensorSharp.Server
                 }
 
                 if (piece.Length > 0)
-                    yield return (piece, false, 0, 0, 0, 0, 0, 0);
+                    yield return ChatStreamUpdate.Text(piece);
 
                 if (stopRequested)
                 {
@@ -354,8 +401,8 @@ namespace TensorSharp.Server
 
             long evalNs = InferenceTelemetry.ToNanos(evalSw.ElapsedTicks);
             long totalNs = InferenceTelemetry.ToNanos(totalSw.ElapsedTicks);
-            yield return ("", true, promptTokenCount, generatedTokens.Count, kvCacheReusedTokens,
-                          totalNs, promptNs, evalNs);
+            yield return new ChatStreamUpdate("", true, promptTokenCount, generatedTokens.Count,
+                                             kvCacheReusedTokens, totalNs, promptNs, evalNs, finishReason);
             }
             finally
             {
@@ -508,7 +555,7 @@ namespace TensorSharp.Server
             catch { return string.Empty; }
         }
 
-        public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
+        public async IAsyncEnumerable<ChatStreamUpdate>
             GenerateStreamAsync(
                 ChatSession session,
                 string prompt,

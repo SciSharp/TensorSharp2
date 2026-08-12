@@ -2179,6 +2179,228 @@ public class MlxBackendTests
         return raw;
     }
 
+    [Fact]
+    public void MlxGatherQmm_MXFP4StackedExpertsMatchDequantizedReference()
+    {
+        if (!MlxBackend.IsAvailable())
+            return;
+
+        const int numExperts = 4;
+        const int inDim = 64;
+        const int outDim = 6;
+        const int n = 3;   // tokens
+        const int k = 2;   // experts per token
+
+        // Stacked GGUF layout: expert-major [E][outDim][blocksPerRow] blocks.
+        byte[][] expertRows = new byte[numExperts][];
+        for (int e = 0; e < numExperts; e++)
+        {
+            int ee = e;
+            expertRows[e] = CreateMxfp4Rows(
+                outDim,
+                inDim,
+                (r, c) => (byte)(((r + 3 + ee) * (c + 5)) & 0x0F),
+                (r, b) => (byte)(125 + ((r + b + ee) % 5)));
+        }
+        byte[] stacked = new byte[expertRows[0].Length * numExperts];
+        for (int e = 0; e < numExperts; e++)
+            Array.Copy(expertRows[e], 0, stacked, e * expertRows[0].Length, expertRows[e].Length);
+
+        float[,] input = new float[n, inDim];
+        for (int r = 0; r < n; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 3) * 0.019f);
+
+        // (token, expert) pairs sorted by expert — the grouped-GEMM mode's contract.
+        int[] tokenSorted = { 0, 1, 0, 2, 1, 2 };
+        int[] expertsSorted = { 0, 0, 1, 2, 3, 3 };
+        int nk = tokenSorted.Length;
+        Assert.Equal(n * k, nk);
+
+        float[] expected = new float[nk * outDim];
+        float[] dequantRow = new float[inDim];
+        for (int p = 0; p < nk; p++)
+        {
+            for (int o = 0; o < outDim; o++)
+            {
+                DequantizeMxfp4Row(expertRows[expertsSorted[p]], o, inDim, dequantRow, 0);
+                float sum = 0;
+                for (int c = 0; c < inDim; c++)
+                    sum += input[tokenSorted[p], c] * dequantRow[c];
+                expected[p * outDim + o] = sum;
+            }
+        }
+
+        IntPtr host = Marshal.AllocHGlobal(stacked.Length);
+        try
+        {
+            Marshal.Copy(stacked, 0, host, stacked.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var input3 = inputTensor.View(n, 1, inDim);
+            using var lhs = new Tensor(allocator, DType.Int32, nk);
+            lhs.SetElementsAsInt(tokenSorted);
+            using var rhs = new Tensor(allocator, DType.Int32, nk);
+            rhs.SetElementsAsInt(expertsSorted);
+            using var result = new Tensor(allocator, DType.Float32, nk, outDim);
+
+            Assert.True(MlxQuantizedOps.TryGatherQmm(
+                result, input3, lhs, rhs,
+                host, host, (int)GgmlTensorType.MXFP4, inDim, outDim, numExperts, stacked.Length,
+                sortedIndices: true));
+
+            AssertClose(expected, result.GetElementsAsFloat(nk * outDim), 2e-3f);
+
+            // Null-lhs variant (rows pre-gathered into pair order) — the shape
+            // the model's fast path uses so MLX's grouped-GEMM kernel engages.
+            float[,] gathered = new float[nk, inDim];
+            for (int p = 0; p < nk; p++)
+                for (int c = 0; c < inDim; c++)
+                    gathered[p, c] = input[tokenSorted[p], c];
+            using var gatheredTensor = Tensor.FromArray(allocator, gathered);
+            using var gathered3 = gatheredTensor.View(nk, 1, inDim);
+            using var result2 = new Tensor(allocator, DType.Float32, nk, outDim);
+
+            Assert.True(MlxQuantizedOps.TryGatherQmm(
+                result2, gathered3, null, rhs,
+                host, host, (int)GgmlTensorType.MXFP4, inDim, outDim, numExperts, stacked.Length,
+                sortedIndices: true));
+
+            AssertClose(expected, result2.GetElementsAsFloat(nk * outDim), 2e-3f);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Fact]
+    public void MlxSwiGluOaiGatherBias_MatchesCpuReference()
+    {
+        if (!MlxBackend.IsAvailable())
+            return;
+
+        const int rows = 5;
+        const int dim = 33;   // deliberately not a threadgroup-width multiple
+        const int numExperts = 3;
+        const float alpha = 1.702f;
+        const float limit = 7.0f;
+
+        float[,] gate = new float[rows, dim];
+        float[,] up = new float[rows, dim];
+        float[,] gateBias = new float[numExperts, dim];
+        float[,] upBias = new float[numExperts, dim];
+        int[] experts = { 2, 0, 1, 2, 0 };
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < dim; c++)
+            {
+                gate[r, c] = MathF.Sin((r + 1) * (c + 2) * 0.13f) * 9f;   // exercises the limit clamp
+                up[r, c] = MathF.Cos((r + 2) * (c + 1) * 0.11f) * 9f;
+            }
+        for (int e = 0; e < numExperts; e++)
+            for (int c = 0; c < dim; c++)
+            {
+                gateBias[e, c] = 0.05f * (e + 1) * MathF.Sin(c * 0.7f);
+                upBias[e, c] = 0.04f * (e + 1) * MathF.Cos(c * 0.5f);
+            }
+
+        float[] expected = new float[rows * dim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < dim; c++)
+            {
+                float g = gate[r, c] + gateBias[experts[r], c];
+                float u = up[r, c] + upBias[experts[r], c];
+                float x = MathF.Min(g, limit);
+                float y = Math.Clamp(u, -limit, limit);
+                float glu = x / (1.0f + MathF.Exp(-alpha * x));
+                expected[r * dim + c] = glu * (y + 1.0f);
+            }
+
+        using var allocator = new MlxAllocator();
+        using var gateT = Tensor.FromArray(allocator, gate);
+        using var upT = Tensor.FromArray(allocator, up);
+        using var gateBiasT = Tensor.FromArray(allocator, gateBias);
+        using var upBiasT = Tensor.FromArray(allocator, upBias);
+        using var expertsT = new Tensor(allocator, DType.Int32, rows);
+        expertsT.SetElementsAsInt(experts);
+        using var result = new Tensor(allocator, DType.Float32, rows, dim);
+
+        Assert.True(MlxFusedOps.TrySwiGluOaiGatherBias(result, gateT, upT, gateBiasT, upBiasT, expertsT, alpha, limit));
+        AssertClose(expected, result.GetElementsAsFloat(rows * dim), 1e-4f);
+    }
+
+    [Fact]
+    public void MlxMoeBiasWeightedSum_MatchesCpuReference()
+    {
+        if (!MlxBackend.IsAvailable())
+            return;
+
+        const int n = 3;
+        const int k = 2;
+        const int dim = 17;
+        const int numExperts = 4;
+        const int nk = n * k;
+
+        // Pairs in original (token-major) order routed to experts, then sorted by expert.
+        int[] expertsOrig = { 1, 3, 0, 3, 2, 1 };
+        int[] order = Enumerable.Range(0, nk).OrderBy(p => expertsOrig[p]).ToArray();
+        int[] expertsSorted = new int[nk];
+        int[] invOrder = new int[nk];
+        for (int i = 0; i < nk; i++)
+        {
+            expertsSorted[i] = expertsOrig[order[i]];
+            invOrder[order[i]] = i;
+        }
+
+        float[,] downSorted = new float[nk, dim];
+        float[,] downBias = new float[numExperts, dim];
+        float[] weights = new float[nk];
+        for (int i = 0; i < nk; i++)
+        {
+            weights[i] = 0.1f + 0.13f * i;
+            for (int c = 0; c < dim; c++)
+                downSorted[i, c] = MathF.Sin((i + 1) * (c + 2) * 0.21f);
+        }
+        for (int e = 0; e < numExperts; e++)
+            for (int c = 0; c < dim; c++)
+                downBias[e, c] = 0.02f * (e + 1) * MathF.Cos(c * 0.3f);
+
+        float[] expected = new float[n * dim];
+        float[] expectedNoBias = new float[n * dim];
+        for (int t = 0; t < n; t++)
+            for (int c = 0; c < dim; c++)
+            {
+                float acc = 0f, accNb = 0f;
+                for (int kk = 0; kk < k; kk++)
+                {
+                    int p = t * k + kk;
+                    int srow = invOrder[p];
+                    float v = downSorted[srow, c];
+                    accNb += weights[p] * v;
+                    acc += weights[p] * (v + downBias[expertsSorted[srow], c]);
+                }
+                expected[t * dim + c] = acc;
+                expectedNoBias[t * dim + c] = accNb;
+            }
+
+        using var allocator = new MlxAllocator();
+        using var downT = Tensor.FromArray(allocator, downSorted);
+        using var biasT = Tensor.FromArray(allocator, downBias);
+        using var expertsT = new Tensor(allocator, DType.Int32, nk);
+        expertsT.SetElementsAsInt(expertsSorted);
+        using var invOrderT = new Tensor(allocator, DType.Int32, nk);
+        invOrderT.SetElementsAsInt(invOrder);
+        using var weightsT = new Tensor(allocator, DType.Float32, nk);
+        weightsT.SetElementsAsFloat(weights);
+        using var output = new Tensor(allocator, DType.Float32, n, dim);
+
+        Assert.True(MlxFusedOps.TryMoeBiasWeightedSum(output, downT, biasT, expertsT, invOrderT, weightsT, k));
+        AssertClose(expected, output.GetElementsAsFloat(n * dim), 1e-5f);
+
+        Assert.True(MlxFusedOps.TryMoeBiasWeightedSum(output, downT, null, expertsT, invOrderT, weightsT, k));
+        AssertClose(expectedNoBias, output.GetElementsAsFloat(n * dim), 1e-5f);
+    }
+
     private static byte[] CreateMxfp4Rows(int rows, int cols, Func<int, int, byte> value, Func<int, int, byte> scaleByte)
     {
         const int blockSize = 32;

@@ -79,6 +79,22 @@ namespace TensorSharp.Models
         /// </summary>
         private static readonly int MlxEvalEveryNLayers = ResolveMlxEvalEveryNLayers();
 
+        /// <summary>
+        /// On MLX, force the K/V cache into a materialised array every N cache writes.
+        /// Each decode step appends a lazy slice_update node, so without this the chain
+        /// every later attention read has to walk grows linearly in decode-step count.
+        /// </summary>
+        private static readonly int MlxKvMaterializeInterval = ResolveMlxKvMaterializeInterval();
+
+        private static int ResolveMlxKvMaterializeInterval()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_MLX_MUSE_GLIMMER_KV_MATERIALIZE")
+                         ?? Environment.GetEnvironmentVariable("TS_MLX_KV_MATERIALIZE_INTERVAL");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v >= 0)
+                return v;
+            return 16;
+        }
+
         private static int ResolveMlxEvalEveryNLayers()
         {
             string env = Environment.GetEnvironmentVariable("TS_MLX_MUSE_GLIMMER_EVAL_EVERY_N_LAYERS")
@@ -107,9 +123,6 @@ namespace TensorSharp.Models
 
             ResolveSwaPattern(arch);
 
-            if (IsTensorParallel)
-                throw new NotSupportedException("Muse-Glimmer does not support tensor parallelism yet; run with --tp 1.");
-
             int swaCount = 0;
             for (int l = 0; l < Config.NumLayers; l++)
                 if (_isSwaLayer[l]) swaCount++;
@@ -129,7 +142,17 @@ namespace TensorSharp.Models
                 Console.WriteLine("  Output tied to token_embd.weight");
 
             FuseGateUpWeights();
-            PrepareCudaQuantizedWeightsForInference();
+
+            if (IsTensorParallel)
+            {
+                ValidateMuseGlimmerTpConstraints();
+                ShardMuseGlimmerWeightsForTP();
+                PrepareCudaQuantizedWeightsForInferenceTP();
+            }
+            else
+            {
+                PrepareCudaQuantizedWeightsForInference();
+            }
 
             PrecomputeConstants();
 
@@ -137,11 +160,26 @@ namespace TensorSharp.Models
             int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
             if (initialCacheLength < maxContextLength)
                 Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
-            InitKVCache(initialCacheLength, maxContextLength);
+            if (IsTensorParallel)
+            {
+                InitTpKVCache(initialCacheLength, maxContextLength);
+                // Needs the per-rank KV caches and the per-rank device preload,
+                // so it goes last. No-op outside tensor parallelism.
+                BuildMuseGlimmerTpDecodeArrays();
+            }
+            else
+            {
+                InitKVCache(initialCacheLength, maxContextLength);
+            }
 
-            // --draft-model, else TS_MUSE_GLIMMER_DFLASH.
+            // --draft-model, else TS_MUSE_GLIMMER_DFLASH. The drafter's speculative
+            // path runs the SINGLE-GPU fused kernel (for its residual capture) and
+            // grows the single-GPU KV cache through EnsureCacheCapacity; neither
+            // exists under tensor parallelism, so it is not offered there.
             string dflashPath = ResolveDFlashPath(draftModelPath);
-            if (!string.IsNullOrWhiteSpace(dflashPath))
+            if (!string.IsNullOrWhiteSpace(dflashPath) && IsTensorParallel)
+                Console.WriteLine("  DFlash speculative decoding is not supported under tensor parallelism; ignoring the drafter.");
+            else if (!string.IsNullOrWhiteSpace(dflashPath))
                 LoadDFlashDraftWeights(dflashPath);
         }
 
@@ -230,11 +268,23 @@ namespace TensorSharp.Models
             DType kvDtype = _kvCacheDtype.ToDType();
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
-            _kvSwaRows = ResolveSwaRows(initialSeqLen);
+            // Size the ring from the MAX context, never the initial allocation. The ring
+            // size is published through MaxReusablePrefixTokens and KVStateFingerprint,
+            // both of which the scheduler samples ONCE at engine construction. Deriving it
+            // from the initial allocation made it change the first time the cache grew
+            // (2048 tokens initially, so ResolveSwaRows returned 0 and the model advertised
+            // unbounded prefix reuse; after the first grow past 4352 the layers became
+            // rings but the scheduler still believed reuse was unbounded, and would inject
+            // a pooled snapshot the wrapped rows can no longer represent). Fixing it at
+            // construction keeps the advertised cap truthful for the model's whole life,
+            // and is also what arms live-cache continuation for long conversations.
+            _kvSwaRows = ResolveSwaRows(maxSeqLen);
             int swaLayers = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 bool ring = _kvSwaRows > 0 && _isSwaLayer[l];
+                // A ring layer is allocated at its final row count immediately: the ring
+                // never grows, so this is the only allocation it will ever need.
                 int rows = ring ? _kvSwaRows : initialSeqLen;
                 if (ring) swaLayers++;
                 _kvCacheK[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, rows, _headDim);
@@ -289,7 +339,10 @@ namespace TensorSharp.Models
         /// </summary>
         private int ResolveSwaRows(int capacity)
         {
-            if (!SwaRingEnabled || !CanUseFusedForward || _slidingWindow <= 0)
+            // Either fused kernel can read the ring; only the per-op path cannot
+            // (see RequireUniformCache). CanUseTpFusedForward is the TP twin of
+            // CanUseFusedForward, which stays false under --tp on purpose.
+            if (!SwaRingEnabled || !(CanUseFusedForward || CanUseTpFusedForward) || _slidingWindow <= 0)
                 return 0;
             int need = _slidingWindow + Math.Max(PrefillChunkTokens, 1) + 1;
             string raw = Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_SWA_ROWS");
@@ -338,45 +391,31 @@ namespace TensorSharp.Models
                 newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
 
             DType kvDtype = _kvCacheDtype.ToDType();
-            int oldSwaRows = _kvSwaRows;
-            int newSwaRows = ResolveSwaRows(newCapacity);
+            // The ring is sized from the max context at construction and never changes,
+            // so a grow only ever re-allocates the FULL-attention layers, and every row
+            // index it holds keeps its meaning (a full layer addresses linearly). Keeping
+            // the ring size fixed is what makes MaxReusablePrefixTokens and
+            // KVStateFingerprint - both sampled ONCE by the scheduler - stay truthful.
+            int newSwaRows = _kvSwaRows;
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                bool swa = newSwaRows > 0 && _isSwaLayer[l];
-                int rows = swa ? newSwaRows : newCapacity;
-                var newK = new Tensor(_allocator, kvDtype, Config.NumKVHeads, rows, _headDim);
-                var newV = new Tensor(_allocator, kvDtype, Config.NumKVHeads, rows, _headDim);
+                if (newSwaRows > 0 && _isSwaLayer[l])
+                    continue;   // ring layers are already at their final size
+
+                var newK = new Tensor(_allocator, kvDtype, Config.NumKVHeads, newCapacity, _headDim);
+                var newV = new Tensor(_allocator, kvDtype, Config.NumKVHeads, newCapacity, _headDim);
                 ZeroCacheTensor(newK);
                 ZeroCacheTensor(newV);
 
                 if (_cacheSeqLen > 0)
                 {
-                    int oldRows = oldSwaRows > 0 && _isSwaLayer[l] ? oldSwaRows : _kvCacheCapacity;
-                    if (oldRows == rows)
-                    {
-                        using (var srcK = _kvCacheK[l].Narrow(1, 0, rows))
-                        using (var dstK = newK.Narrow(1, 0, rows))
-                            Ops.Copy(dstK, srcK);
-                        using (var srcV = _kvCacheV[l].Narrow(1, 0, rows))
-                        using (var dstV = newV.Narrow(1, 0, rows))
-                            Ops.Copy(dstV, srcV);
-                    }
-                    else if (oldRows > rows || rows > oldRows)
-                    {
-                        // The layout changed (a layer just became a ring, or the ring
-                        // grew), so a row means something different now. Re-place the
-                        // positions that are still reachable.
-                        int keep = Math.Min(_cacheSeqLen, Math.Min(rows, oldRows));
-                        for (int p = _cacheSeqLen - keep; p < _cacheSeqLen; p++)
-                        {
-                            using (var srcK = _kvCacheK[l].Narrow(1, p % oldRows, 1))
-                            using (var dstK = newK.Narrow(1, p % rows, 1))
-                                Ops.Copy(dstK, srcK);
-                            using (var srcV = _kvCacheV[l].Narrow(1, p % oldRows, 1))
-                            using (var dstV = newV.Narrow(1, p % rows, 1))
-                                Ops.Copy(dstV, srcV);
-                        }
-                    }
+                    int keep = Math.Min(_cacheSeqLen, _kvCacheCapacity);
+                    using (var srcK = _kvCacheK[l].Narrow(1, 0, keep))
+                    using (var dstK = newK.Narrow(1, 0, keep))
+                        Ops.Copy(dstK, srcK);
+                    using (var srcV = _kvCacheV[l].Narrow(1, 0, keep))
+                    using (var dstV = newV.Narrow(1, 0, keep))
+                        Ops.Copy(dstV, srcV);
                 }
 
                 _kvCacheK[l].Dispose();
@@ -386,7 +425,6 @@ namespace TensorSharp.Models
             }
 
             _kvCacheCapacity = newCapacity;
-            _kvSwaRows = newSwaRows;
             // The captured decode graph baked the old KV device addresses and cache
             // size; replaying it against the reallocated buffers would hang.
             ResetFusedDecodeCache();
@@ -416,6 +454,7 @@ namespace TensorSharp.Models
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
+            ResetTpKVCache();
             if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -426,9 +465,26 @@ namespace TensorSharp.Models
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
+            // The fused kernel writes K/V on-device and leaves the host mirror stale
+            // (_fusedKvDirty). The invalidation below drops the device copies so the
+            // next forward re-uploads from host - so the device rows MUST come back
+            // to the host first, or the re-upload restores the stale mirror and every
+            // position before the truncation point turns to garbage. Measured exactly
+            // that on ggml_metal: a 3-turn CLI conversation planned
+            // "Partial reuse: keeping 156/173", and the model then confabulated both
+            // recalled facts ("name was..." with no name, colour "#FF0000 red" for
+            // teal) while staying perfectly fluent - the 17 fresh tokens were the
+            // only intact context it had. Gemma 4's TruncateKVCacheCore does the same
+            // host sync first, for the same reason.
+            EnsureFusedKvHostSynchronized();
             base.TruncateKVCacheCore(tokenCount);
             _cachedSWAMaskStartPos = -1;
             ResetFusedDecodeCache();
+            // The parked per-rank graphs bake the start position this rewind just
+            // moved. The per-rank KV buffers themselves are NOT invalidated: the
+            // device copy is authoritative under TP.
+            ResetMuseGlimmerTpGraphs();
+            SyncMuseGlimmerTpKvCacheToHost();
             if (_kvCacheK == null) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -437,7 +493,55 @@ namespace TensorSharp.Models
             }
         }
 
-        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+        public override bool SupportsKVStateSnapshot
+            => IsTensorParallel
+                ? _tpKvCacheK != null && _tpKvCacheV != null
+                : _kvCacheK != null && _kvCacheV != null;
+
+        /// <summary>
+        /// Under tensor parallelism the K/V for one layer is split across ranks, so the
+        /// snapshot walks the per-rank tensors as if they were <c>layers * tp</c> layers,
+        /// LAYER-MAJOR and rank-minor. That works because a pooled block is an opaque
+        /// byte blob: any stable flattening round-trips, and
+        /// <see cref="KvBlockTransfer"/> validates and copies each tensor against its
+        /// OWN row count through that tensor's own host mirror - it never routes through
+        /// an op, so mixing tensors from different rank allocators is safe.
+        ///
+        /// Without this, snapshots would be unavailable under --tp, and because
+        /// Muse-Glimmer is not an <c>IBatchedPagedModel</c> that would make
+        /// <c>InferenceEngineHost.TryGetEngine</c> return null - i.e. the server would
+        /// refuse to serve the model at all under tensor parallelism.
+        /// </summary>
+        private Tensor[] _tpKvFlatK;
+        private Tensor[] _tpKvFlatV;
+
+        private void EnsureTpKvFlatViews()
+        {
+            int tp = TpDegree;
+            int need = Config.NumLayers * tp;
+            if (_tpKvFlatK != null && _tpKvFlatK.Length == need)
+                return;
+            _tpKvFlatK = new Tensor[need];
+            _tpKvFlatV = new Tensor[need];
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                for (int r = 0; r < tp; r++)
+                {
+                    _tpKvFlatK[l * tp + r] = _tpKvCacheK[l][r];
+                    _tpKvFlatV[l * tp + r] = _tpKvCacheV[l][r];
+                }
+            }
+        }
+
+        /// <summary>Cache tensors the snapshot path should address, flattened when
+        /// tensor parallelism splits each layer across ranks.</summary>
+        private (Tensor[] k, Tensor[] v) SnapshotCaches()
+        {
+            if (!IsTensorParallel)
+                return (_kvCacheK, _kvCacheV);
+            EnsureTpKvFlatViews();
+            return (_tpKvFlatK, _tpKvFlatV);
+        }
 
         /// <summary>
         /// The POOLED snapshot path is capped at the sliding-window ring size, for the
@@ -460,18 +564,23 @@ namespace TensorSharp.Models
             $"|hd={_headDim}|swa={_slidingWindow}|rows={_kvSwaRows}|dtype={_kvCacheDtype.ToShortString()}";
 
         public override long ComputeKVBlockByteSize(int tokenCount)
-            => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokenCount);
+        {
+            var (k, v) = SnapshotCaches();
+            return KvBlockTransfer.ComputeBlockByteSize(k, v, tokenCount);
+        }
 
         public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
         {
             if (!SupportsKVStateSnapshot)
                 return false;
-            // The fused kernel writes K/V on-device; the snapshot walks the caches
+            // Either fused kernel writes K/V on-device; the snapshot walks the caches
             // through host pointers, so the device rows have to come back first or we
             // would capture the host mirror's stale (zero-filled) bytes.
             EnsureFusedKvHostSynchronized();
+            SyncMuseGlimmerTpKvCacheToHost();
+            var (k, v) = SnapshotCaches();
             return KvBlockTransfer.Extract(
-                _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                _allocator, k, v, _cacheSeqLen,
                 startToken, tokenCount, destination, _kvSwaRows);
         }
 
@@ -479,9 +588,17 @@ namespace TensorSharp.Models
         {
             if (!SupportsKVStateSnapshot)
                 return false;
-            EnsureCacheCapacity(destToken + tokenCount);
+            // Drop the dirty flag first: the host copy is about to become
+            // authoritative, so a later sync must not overwrite it with device rows.
+            SyncMuseGlimmerTpKvCacheToHost();
+            if (IsTensorParallel)
+                EnsureTpCacheCapacity(destToken + tokenCount);
+            else
+                EnsureCacheCapacity(destToken + tokenCount);
+
+            var (k, v) = SnapshotCaches();
             if (!KvBlockTransfer.Inject(
-                    _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                    _allocator, k, v, _cacheSeqLen,
                     destToken, tokenCount, source, _kvSwaRows))
             {
                 return false;
@@ -494,10 +611,11 @@ namespace TensorSharp.Models
             // Dropping the device copies moves the KV buffers the captured decode
             // graph baked in; replaying that capture would hit freed memory.
             ResetFusedDecodeCache();
-            for (int l = 0; l < Config.NumLayers; l++)
+            ResetMuseGlimmerTpGraphs();
+            for (int i = 0; i < k.Length; i++)
             {
-                InvalidateTensorDeviceCache(_kvCacheK[l]);
-                InvalidateTensorDeviceCache(_kvCacheV[l]);
+                InvalidateTensorDeviceCache(k[i]);
+                InvalidateTensorDeviceCache(v[i]);
             }
             return true;
         }
@@ -536,9 +654,14 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardCore(int[] tokens)
         {
-            // Vision rows are injected at absolute prompt offsets and the pending list
-            // is drained in one go, so a multimodal prompt has to stay whole.
-            if (PrefillChunkTokens > 0 && tokens.Length > PrefillChunkTokens && !HasPendingVisionEmbeddings)
+            if (IsTensorParallel)
+                return ForwardTP(tokens);
+
+            // A multimodal prompt chunks too: ForwardChunked re-slices the pending vision
+            // spans onto each piece. A 4096-token image plus its text would otherwise be
+            // one forward, which the sliding-window ring cannot hold (see the throw below)
+            // and whose activations dwarf the chunked ones.
+            if (PrefillChunkTokens > 0 && tokens.Length > PrefillChunkTokens)
                 return ForwardChunked(tokens, PrefillChunkTokens);
 
             // The SWA ring holds sliding_window + chunk + 1 rows, so a forward wider
@@ -559,6 +682,7 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
             EnsureCacheCapacity(startPos + seqLen);
+            TraceLayerSetRows(seqLen, startPos);
 
             // Text-only fast path: the fused graph does the embedding gather and the
             // weightless input norm itself, so nothing is materialised on the host.
@@ -567,6 +691,8 @@ namespace TensorSharp.Models
                 float[] embedded = TryFusedForward(null, seqLen, startPos, null, null, tokens);
                 if (embedded != null)
                 {
+                    TraceLogits(embedded);
+                    TraceLayerDone();
                     _logitsBuffer = embedded;
                     _cacheSeqLen += seqLen;
                     _forwardCount++;
@@ -591,6 +717,8 @@ namespace TensorSharp.Models
             float[] fused = TryFusedForward(hidden, seqLen, startPos, null, null);
             if (fused != null)
             {
+                TraceLogits(fused);
+                TraceLayerDone();
                 hidden.Dispose();
                 _logitsBuffer = fused;
                 _cacheSeqLen += seqLen;
@@ -602,6 +730,7 @@ namespace TensorSharp.Models
             EnsureFusedKvHostSynchronized();
             for (int l = 0; l < Config.NumLayers; l++)
             {
+                TraceLayerResidual(hidden, l);
                 hidden = TransformerBlock(hidden, l, seqLen, startPos);
                 if (_backend == BackendType.Mlx && (l + 1) % MlxEvalEveryNLayers == 0
                     && l + 1 != Config.NumLayers && hidden != null)
@@ -609,6 +738,7 @@ namespace TensorSharp.Models
                     MlxFusedOps.TryAsyncEvaluate(hidden);
                 }
             }
+            TraceLayerResidual(hidden, Config.NumLayers);
 
             Tensor normed = RMSNormOp(hidden, "output_norm.weight");
             hidden.Dispose();
@@ -636,6 +766,8 @@ namespace TensorSharp.Models
             _logitsBuffer = TensorToFloatArray(logitsTensor);
             _logitsCopyTicks += Stopwatch.GetTimestamp() - t0;
             logitsTensor.Dispose();
+            TraceLogits(_logitsBuffer);
+            TraceLayerDone();
 
             _cacheSeqLen += seqLen;
             _forwardCount++;
@@ -653,6 +785,12 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardRefillCore(int[] tokens)
         {
+            // The chunk loop below runs PrefillWithoutLogits, which is the
+            // single-GPU path and reads the (null) non-TP KV caches. ForwardTP
+            // does its own chunking, so hand it the whole prompt instead.
+            if (IsTensorParallel)
+                return ForwardCore(tokens);
+
             if (tokens == null || tokens.Length <= 1)
                 return ForwardCore(tokens);
 
@@ -661,14 +799,61 @@ namespace TensorSharp.Models
             if (tokens.Length <= chunkSize)
                 return ForwardCore(tokens);
 
-            for (int pos = 0; pos < lastIdx; pos += chunkSize)
+            // The pending vision spans are positioned against THIS token array, so the
+            // chunk loop has to re-slice them exactly as ForwardChunked does. Without
+            // this, chunk 0 would receive a span whose rows run past its end and
+            // InjectVisionEmbeddings' Narrow would throw (or, for a span starting after
+            // the first chunk, the image would be dropped entirely).
+            List<(Tensor embeddings, int position)> spans = null;
+            if (_pendingVisionEmbeddingsList.Count > 0)
             {
-                int chunkLen = Math.Min(chunkSize, lastIdx - pos);
-                var chunk = new int[chunkLen];
-                Array.Copy(tokens, pos, chunk, 0, chunkLen);
-                PrefillWithoutLogits(chunk);
+                spans = new List<(Tensor, int)>(_pendingVisionEmbeddingsList);
+                _pendingVisionEmbeddingsList.Clear();
             }
-            return ForwardCore(new[] { tokens[lastIdx] });
+
+            try
+            {
+                for (int pos = 0; pos < lastIdx; pos += chunkSize)
+                {
+                    int chunkLen = Math.Min(chunkSize, lastIdx - pos);
+                    var chunk = new int[chunkLen];
+                    Array.Copy(tokens, pos, chunk, 0, chunkLen);
+                    RequeueVisionSpansForWindow(spans, pos, chunkLen);
+                    PrefillWithoutLogits(chunk);
+                }
+                RequeueVisionSpansForWindow(spans, lastIdx, 1);
+                return ForwardCore(new[] { tokens[lastIdx] });
+            }
+            finally
+            {
+                if (spans != null)
+                    foreach (var (embeddings, _) in spans)
+                        embeddings?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Push the sub-range of each span in <paramref name="spans"/> that falls inside
+        /// the window [<paramref name="windowStart"/>, +<paramref name="windowLen"/>) onto
+        /// the pending list, re-based to the window's own coordinates. The pushed tensors
+        /// are standalone copies because <see cref="DrainPendingVisionEmbeddings"/> disposes
+        /// whatever it injects.
+        /// </summary>
+        private void RequeueVisionSpansForWindow(
+            List<(Tensor embeddings, int position)> spans, int windowStart, int windowLen)
+        {
+            if (spans == null)
+                return;
+            foreach (var (embeddings, position) in spans)
+            {
+                int rows = (int)embeddings.Sizes[0];
+                int overlapStart = Math.Max(windowStart, position);
+                int overlapEnd = Math.Min(windowStart + windowLen, position + rows);
+                if (overlapStart >= overlapEnd)
+                    continue;
+                using var view = embeddings.Narrow(0, overlapStart - position, overlapEnd - overlapStart);
+                _pendingVisionEmbeddingsList.Add((Ops.NewContiguous(view), overlapStart - windowStart));
+            }
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -731,15 +916,37 @@ namespace TensorSharp.Models
         /// </summary>
         private float[] ForwardChunked(int[] tokens, int chunk)
         {
-            float[] last = null;
-            for (int off = 0; off < tokens.Length; off += chunk)
+            // Take ownership of the pending spans: their positions are relative to THIS
+            // call's token array, so each chunk needs the sub-range that lands inside it,
+            // re-based to the chunk's own coordinates. Handing the whole span to the first
+            // chunk (or dropping it) is what would silently strand image rows.
+            List<(Tensor embeddings, int position)> spans = null;
+            if (_pendingVisionEmbeddingsList.Count > 0)
             {
-                int n = Math.Min(chunk, tokens.Length - off);
-                int[] piece = new int[n];
-                Array.Copy(tokens, off, piece, 0, n);
-                last = ForwardCore(piece);
+                spans = new List<(Tensor, int)>(_pendingVisionEmbeddingsList);
+                _pendingVisionEmbeddingsList.Clear();
             }
-            return last;
+
+            try
+            {
+                float[] last = null;
+                for (int off = 0; off < tokens.Length; off += chunk)
+                {
+                    int n = Math.Min(chunk, tokens.Length - off);
+                    int[] piece = new int[n];
+                    Array.Copy(tokens, off, piece, 0, n);
+
+                    RequeueVisionSpansForWindow(spans, off, n);
+                    last = ForwardCore(piece);
+                }
+                return last;
+            }
+            finally
+            {
+                if (spans != null)
+                    foreach (var (embeddings, _) in spans)
+                        embeddings?.Dispose();
+            }
         }
 
         private void DrainPendingVisionEmbeddings(Tensor hidden, int startPos)
@@ -885,9 +1092,17 @@ namespace TensorSharp.Models
             }
 
             // RoPE (NORM / interleaved pairs) on the sliding-window layers only.
+            //
+            // The single-row host RoPE below is a GGML/CUDA optimisation - it trades a
+            // RoPEEx dispatch for a scalar loop over host memory. On MLX that trade
+            // inverts: Q and K are device-authoritative (they were just produced by a
+            // quantized matmul and an RMSNorm), so GetFloatPtr forces an mlx_eval plus a
+            // device->host copy and marks the storage host-dirty, which makes the very
+            // next device op free and re-upload it. Qwen 3.5 routes MLX and direct CUDA
+            // to the tensor RoPE at seqLen == 1 for exactly this reason.
             if (useRope)
             {
-                if (seqLen == 1)
+                if (seqLen == 1 && _backend != BackendType.Mlx)
                 {
                     ApplyNormRoPEDecode(q, Config.NumHeads, _headDim, startPos, _ropeFreqs);
                     ApplyNormRoPEDecode(k, Config.NumKVHeads, _headDim, startPos, _ropeFreqs);
@@ -911,13 +1126,42 @@ namespace TensorSharp.Models
                 CopyToCacheDecode(_kvCacheK[layer], k, _kvCacheV[layer], v,
                     Config.NumKVHeads, _headDim, startPos);
 
+                // MLX builds one lazy slice_update node per decode step, so an
+                // un-materialised cache makes every later attention read walk a chain
+                // that grows linearly in decode-step count - fine for the first few
+                // hundred tokens, catastrophic past ~500. Gemma 4 breaks the chain on
+                // this same schedule.
+                if (_backend == BackendType.Mlx && MlxKvMaterializeInterval > 0
+                    && ((startPos + 1 + layer) % MlxKvMaterializeInterval) == 0)
+                {
+                    MlxFusedOps.TryMaterialize(_kvCacheK[layer]);
+                    MlxFusedOps.TryMaterialize(_kvCacheV[layer]);
+                }
+
                 int attendLen = _isSwaLayer[layer] ? Math.Min(totalSeqLen, _slidingWindow) : totalSeqLen;
                 int attendStart = totalSeqLen - attendLen;
 
                 attn = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * _headDim);
-                AttentionDecodeWithWindow(q, _kvCacheK[layer], _kvCacheV[layer], attn,
-                    Config.NumHeads, Config.NumKVHeads, _headDim, _headDim,
-                    attendStart, totalSeqLen);
+
+                // On MLX the host loop below is the single most expensive thing in the
+                // token: GetHalfPointer(kCache)/(vCache) each force an mlx_eval plus a
+                // device->host copy of the WHOLE cache and then mark it host-dirty, so
+                // the next write frees and re-uploads it - 104 full-cache transfers each
+                // way per token across 52 layers. TryDecodeAttention keeps all of it on
+                // device. Q was already scaled by 1/sqrt(headDim) above, hence scale: 1f.
+                // RequireUniformCache above guarantees a linear cache here, so the
+                // circular mode is never needed (the ring is only armed for the fused
+                // GGML kernel).
+                bool usedMlx = _backend == BackendType.Mlx &&
+                    MlxFusedOps.TryDecodeAttention(attn, q, _kvCacheK[layer], _kvCacheV[layer],
+                        Config.NumHeads, Config.NumKVHeads, _headDim,
+                        attendStart, attendLen, KvRows(layer), circular: false, scale: 1f);
+                if (!usedMlx)
+                {
+                    AttentionDecodeWithWindow(q, _kvCacheK[layer], _kvCacheV[layer], attn,
+                        Config.NumHeads, Config.NumKVHeads, _headDim, _headDim,
+                        attendStart, totalSeqLen);
+                }
             }
             else
             {
@@ -931,26 +1175,42 @@ namespace TensorSharp.Models
                 kHeads.Dispose();
                 vHeads.Dispose();
 
-                int groupSize = Config.NumHeads / Config.NumKVHeads;
-                Tensor kExpanded = ExpandKVHeads(_kvCacheK[layer], groupSize, totalSeqLen);
-                Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
+                // MLX fast path: SDPA straight off the device-resident cache. It skips
+                // BOTH host round-trips the generic chain below pays per layer - the
+                // 16x GQA broadcast that ExpandKVHeadsF16 rebuilds on the host, and the
+                // sliding-window band that ApplyCausalMask fills on the host (which
+                // drags the whole [32, seqLen, totalSeqLen] score matrix down and back).
+                attn = _backend == BackendType.Mlx
+                    ? TryMlxPrefillAttention(qHeads, layer, seqLen, totalSeqLen)
+                    : null;
 
-                using var kT = kExpanded.Transpose(1, 2);
-                var scores = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, totalSeqLen);
-                Ops.AddmmBatch(scores, 0, scores, 1f, qHeads, kT);
-                qHeads.Dispose();
-                kExpanded.Dispose();
+                if (attn != null)
+                {
+                    qHeads.Dispose();
+                }
+                else
+                {
+                    int groupSize = Config.NumHeads / Config.NumKVHeads;
+                    Tensor kExpanded = ExpandKVHeads(_kvCacheK[layer], groupSize, totalSeqLen);
+                    Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
 
-                ApplyCausalMask(scores, seqLen, totalSeqLen, _isSwaLayer[layer] ? _slidingWindow : 0);
-                Ops.Softmax(scores, scores);
+                    using var kT = kExpanded.Transpose(1, 2);
+                    var scores = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, totalSeqLen);
+                    Ops.AddmmBatch(scores, 0, scores, 1f, qHeads, kT);
+                    qHeads.Dispose();
+                    kExpanded.Dispose();
 
-                var attnHeads = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, _headDim);
-                Ops.AddmmBatch(attnHeads, 0, attnHeads, 1.0f, scores, vExpanded);
-                scores.Dispose();
-                vExpanded.Dispose();
+                    ApplyCausalMask(scores, seqLen, totalSeqLen, _isSwaLayer[layer] ? _slidingWindow : 0);
+                    Ops.Softmax(scores, scores);
 
-                attn = ReshapeFromHeads(attnHeads, Config.NumHeads, seqLen, _headDim);
-                attnHeads.Dispose();
+                    var attnHeads = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, _headDim);
+                    Ops.AddmmBatch(attnHeads, 0, attnHeads, 1.0f, scores, vExpanded);
+                    scores.Dispose();
+                    vExpanded.Dispose();
+
+                    attn = ReshapeFromHeads(attnHeads, Config.NumHeads, seqLen, _headDim);
+                    attnHeads.Dispose();
+                }
             }
 
             q.Dispose();
@@ -967,6 +1227,34 @@ namespace TensorSharp.Models
             {
                 return LinearForward(attn, names[7]);
             }
+        }
+
+        /// <summary>
+        /// Multi-row attention through MLX's fused SDPA, reading the live K/V window
+        /// straight off the device-resident cache. Returns null when MLX declines the
+        /// shape (it currently only accepts the first prefill chunk, where the query
+        /// range covers the whole cache and the causal mask is the standard one), and
+        /// the caller falls back to the generic materialised-score chain.
+        /// </summary>
+        private Tensor TryMlxPrefillAttention(Tensor qHeads, int layer, int seqLen, int totalSeqLen)
+        {
+            var result = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * _headDim);
+            using var kLive = _kvCacheK[layer].Narrow(1, 0, totalSeqLen);
+            using var vLive = _kvCacheV[layer].Narrow(1, 0, totalSeqLen);
+            // Q is pre-scaled by 1/sqrt(headDim), hence scale: 1f.
+            if (MlxFusedOps.TryPrefillAttention(
+                    result, qHeads, kLive, vLive,
+                    Config.NumHeads, Config.NumKVHeads, _headDim,
+                    seqLen, totalSeqLen,
+                    maskStart: totalSeqLen - seqLen,
+                    windowSize: _isSwaLayer[layer] ? _slidingWindow : 0,
+                    scale: 1f))
+            {
+                return result;
+            }
+
+            result.Dispose();
+            return null;
         }
 
         private Tensor ApplyBatchRMSNorm(Tensor data, string weightName, int numHeads, int seqLen, int headDim)
@@ -1175,6 +1463,7 @@ namespace TensorSharp.Models
             _pendingVisionEmbeddingsList.Clear();
             _onesForEmbNorm?.Dispose();
             DisposeDFlash();
+            DisposeMuseGlimmerTpState();
             if (_kvCacheK != null)
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)

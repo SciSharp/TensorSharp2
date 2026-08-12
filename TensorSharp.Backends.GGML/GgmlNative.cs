@@ -1942,16 +1942,28 @@ internal enum GgmlIndexReductionOp
             IntPtr finalNormData, float logitScale, float logitSoftcap,
             IntPtr captureData, int[] captureLayers, int captureCount,
             IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
-            int[] tokenIds, int allLogitsRows);
+            int[] tokenIds, int allLogitsRows,
+            int tpDegree, [In, Out] IntPtr[] tpPlanOut);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_MuseGlimmerResetDecodeCache();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_MuseGlimmerReleaseTpGraphs();
 
         /// <summary>
         /// Whole-model Muse-Glimmer forward in a single GGML graph. nTokens == 1 uses
         /// a persistent, CUDA-graph-capturable graph; nTokens &gt; 1 builds a transient
         /// prefill graph. Returns false (without throwing) when the kernel declines,
         /// so the caller can fall back to the per-op path.
+        /// <para>
+        /// With <paramref name="tpDegree"/> &gt; 1 and a non-null
+        /// <paramref name="tpPlanOut"/> the kernel BUILDS the graph for the currently
+        /// active rank (see <c>SetActiveRank</c>) and returns its execution plan in
+        /// <c>tpPlanOut[0]</c> instead of running it; the caller collects one plan per
+        /// rank and executes them together through <c>TensorParallelExecutePlans</c>,
+        /// which AllReduces the per-layer partial sums at the segment boundaries.
+        /// </para>
         /// </summary>
         public static bool MuseGlimmerModelForward(
             IntPtr hiddenData, int hiddenSize, int nTokens, int numLayers,
@@ -1981,8 +1993,10 @@ internal enum GgmlIndexReductionOp
             IntPtr finalNormData, float logitScale, float logitSoftcap,
             IntPtr captureData, int[] captureLayers, int captureCount,
             IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
-            int[] tokenIds, int allLogitsRows)
+            int[] tokenIds, int allLogitsRows,
+            int tpDegree = 1, IntPtr[] tpPlanOut = null)
         {
+            if (tpPlanOut != null) tpPlanOut[0] = IntPtr.Zero;
             return TSGgml_MuseGlimmerModelForward(
                 hiddenData, hiddenSize, nTokens, numLayers,
                 attnNormArr, qArr, kArr, vArr, gateArr, qNormArr, kNormArr, oArr,
@@ -2001,7 +2015,8 @@ internal enum GgmlIndexReductionOp
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNormData, logitScale, logitSoftcap,
                 captureData, captureLayers, captureCount,
-                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, tokenIds, allLogitsRows) != 0;
+                tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes, tokenIds, allLogitsRows,
+                tpDegree, tpPlanOut) != 0;
         }
 
         /// <summary>
@@ -2010,6 +2025,17 @@ internal enum GgmlIndexReductionOp
         /// which a prefill or a KV reset/grow can move; a stale replay then hangs.
         /// </summary>
         public static void MuseGlimmerResetDecodeCache() => TSGgml_MuseGlimmerResetDecodeCache();
+
+        /// <summary>
+        /// Release every rank's parked tensor-parallel Muse-Glimmer graph (the
+        /// transient prefill path's ggml context and per-call buffers). Call on
+        /// dispose and on KV reset, while the backends are still alive.
+        /// </summary>
+        public static void MuseGlimmerReleaseTpGraphs()
+        {
+            try { TSGgml_MuseGlimmerReleaseTpGraphs(); }
+            catch (EntryPointNotFoundException) { }
+        }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4ModelDecodeBatched(

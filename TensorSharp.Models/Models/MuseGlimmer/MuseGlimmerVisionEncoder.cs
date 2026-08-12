@@ -15,6 +15,7 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 
 namespace TensorSharp.Models
 {
@@ -41,10 +42,12 @@ namespace TensorSharp.Models
     ///   f) un-permute + 2x2 pixel shuffle with CHANNEL-OUTER packing;
     ///   g) adapter mm.0 -> erf-GELU -> mm.1 -> erf-GELU -> mm.2 (no biases).
     ///
-    /// Weight residency: every mmproj tensor is dequantized to F32 at load and the
-    /// 2D matmul weights are stored ALREADY TRANSPOSED ([inDim, outDim]) so only
-    /// one copy of each is resident. This tower is ~1.9B parameters, so the F32
-    /// working set is large; see the note on LoadWeights.
+    /// Weight residency: 2D matmul weights stay in their GGUF quantization on any
+    /// backend whose quantized mul_mat can consume them (GGML, and the MLX subset
+    /// MlxQuantizedOps.CanPreloadQuantizedType admits); everything else is
+    /// dequantized to F32 at load and stored ALREADY TRANSPOSED ([inDim, outDim])
+    /// so only one copy of each is resident. This tower is ~1.9B parameters, so
+    /// the all-F32 working set is ~7.4 GB; see the note on LoadWeights.
     /// </summary>
     public sealed class MuseGlimmerVisionEncoder : IDisposable
     {
@@ -65,9 +68,11 @@ namespace TensorSharp.Models
         private readonly Dictionary<string, Tensor> _weights = new();
 
         /// <summary>
-        /// The tower's 2D matmul weights kept in their GGUF quantization (GGML
-        /// backends only). Consumed directly by GgmlBasicOps.AddmmQuant, which
-        /// keeps them device-resident behind the shared cacheable-buffer cache.
+        /// The tower's 2D matmul weights kept in their GGUF quantization on any
+        /// backend that can multiply against them: GgmlBasicOps.AddmmQuant (GGML,
+        /// which keeps them device-resident behind the shared cacheable-buffer
+        /// cache) or MlxQuantizedOps.TryAddmmQuantizedToFloat32 (MLX, behind its
+        /// own device-weight cache keyed by QuantizedWeight.EnsureDeviceCacheKey).
         /// </summary>
         private readonly Dictionary<string, QuantizedWeight> _quantWeights = new();
         private readonly Dictionary<long, Geometry> _geometryCache = new();
@@ -75,13 +80,22 @@ namespace TensorSharp.Models
 
         private readonly IAllocator _allocator;
         // GGML backend: native flash attention is available through
-        // Ops.ScaledDotProductAttention, and host writes need an explicit
-        // device-cache invalidation.
+        // Ops.ScaledDotProductAttention, GgmlBasicOps.AddmmQuant can multiply
+        // against ANY GGUF quantization (so no per-type capability predicate is
+        // needed on this backend), and host writes need an explicit device-cache
+        // invalidation. Note this flag is a genuine backend-identity test - it
+        // selects ggml entry points - and must not be used as a proxy for
+        // "the device can do X"; see LoadWeights and AttentionSegment.
         private readonly bool _useNativeAttention;
         // Direct-CUDA backend: tensor data lives in device memory, so every raw
         // host pointer checkout forces a synchronous DtoH copy plus a re-upload.
         // Write-only fills stage through pinned host memory instead (HostStaging).
         private readonly bool _cudaDirect;
+        // MLX backend: has both a native flash-attention op and quantized matmuls
+        // (for the subset of GGUF types MlxQuantizedOps.CanPreloadQuantizedType
+        // admits). Host writes need no explicit invalidation - MlxStorage marks
+        // itself host-dirty when a raw pointer is checked out.
+        private readonly bool _mlxDirect;
 
         private ModelBase _hostModel;
 
@@ -128,6 +142,7 @@ namespace TensorSharp.Models
             _allocator = allocator;
             _useNativeAttention = allocator is GgmlAllocator;
             _cudaDirect = allocator is TensorSharp.Cuda.CudaAllocator;
+            _mlxDirect = allocator is MlxAllocator;
 
             var gguf = new GgufFile(mmProjPath);
 
@@ -171,11 +186,12 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Dequantize every mmproj tensor to F32. 2D matmul weights land already
-        /// transposed to [inDim, outDim] so Ops.Addmm can consume them directly and
-        /// only one copy stays resident (the reference encoders keep both the
-        /// original and a lazily built transpose; at 1.9B parameters that would
-        /// double an already large F32 footprint).
+        /// Dequantize to F32 every mmproj tensor the active backend cannot multiply
+        /// against in quantized form. 2D matmul weights land already transposed to
+        /// [inDim, outDim] so Ops.Addmm can consume them directly and only one copy
+        /// stays resident (the reference encoders keep both the original and a
+        /// lazily built transpose; at 1.9B parameters that would double an already
+        /// large F32 footprint).
         ///
         /// v.position_embd.weight is excluded: it is a lookup table, not a linear.
         /// </summary>
@@ -199,13 +215,26 @@ namespace TensorSharp.Models
                 byte[] raw = gguf.ReadTensorData(info);
 
                 // Keep the big 2D matmul weights in their GGUF quantization and let
-                // ggml's quantized mul_mat consume them directly. This tower is
-                // ~1.9B parameters: dequantized to F32 it is ~7.4 GB, which on a
+                // the backend's quantized mul_mat consume them directly. This tower
+                // is ~1.9B parameters: dequantized to F32 it is ~7.4 GB, which on a
                 // 16 GB card evicts the language model's device-resident weights and
                 // collapses decode throughput. The GGUF layout is already
                 // [ne0 = inDim, ne1 = outDim], exactly what AddmmQuant wants, so the
                 // host transpose disappears too.
-                if (!s_forceF32Weights && _useNativeAttention
+                //
+                // Residency is a CAPABILITY question, not an allocator-type one.
+                // Gating this on "allocator is GgmlAllocator" made MLX dequantize
+                // the whole mmproj: on an M5 Pro with the same file, ggml_metal
+                // loaded "303 kept quantized: 1942 MB quantized + 13 MB F32" while
+                // MLX loaded "0 kept quantized: 0 MB quantized + 7327 MB F32" - 7.3
+                // GB taken straight out of the language model's unified-memory
+                // budget. MLX can only multiply against the subset that
+                // CanPreloadQuantizedType admits (the predicate is the authority;
+                // it grows as MLX gains kernels), so ask it per tensor and let the
+                // rest fall through to the dequantized path below.
+                bool keepQuantized = _useNativeAttention
+                    || (_mlxDirect && MlxQuantizedOps.CanPreloadQuantizedType((int)info.Type));
+                if (!s_forceF32Weights && keepQuantized
                     && info.Type != GgmlTensorType.F32
                     && info.Shape.Length == 2
                     && info.Name != PositionEmbedName
@@ -785,7 +814,11 @@ namespace TensorSharp.Models
             using Tensor vSeg = v.Narrow(0, offset, length);
             using Tensor oSeg = attnOut.Narrow(0, offset, length);
 
-            if (_useNativeAttention || _cudaDirect)
+            // MLX registers "scaled_dot_product_attention" too, so it belongs here:
+            // excluding it sent all 50 ViT blocks (one call per window on the 37
+            // sparse layers) down AttentionSegmentFallback's batched-matmul +
+            // materialized-scores path for no reason.
+            if (_useNativeAttention || _cudaDirect || _mlxDirect)
             {
                 try
                 {
@@ -978,9 +1011,9 @@ namespace TensorSharp.Models
             if (_quantWeights.TryGetValue(weightName, out var qw))
             {
                 // GGUF layout is [ne0 = inDim, ne1 = outDim] - the orientation
-                // ggml's quantized mul_mat expects, so no transpose is involved.
+                // the quantized mul_mat kernels expect, so no transpose is involved.
                 result = new Tensor(_allocator, DType.Float32, seqLen, (int)qw.Ne1);
-                GgmlBasicOps.AddmmQuant(result, src, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                AddmmQuant(result, src, qw);
             }
             else
             {
@@ -995,6 +1028,53 @@ namespace TensorSharp.Models
                 Ops.Add(result, result, bias);
 
             return result;
+        }
+
+        /// <summary>
+        /// result = src @ weight for a weight still in its GGUF quantization,
+        /// dispatched on the allocator exactly like ModelBase.AddmmQuantManaged.
+        /// Hard-wiring GgmlBasicOps.AddmmQuant here would have been a silent
+        /// correctness bug the moment LoadWeights started retaining quantized
+        /// weights on MLX, since the ggml entry point knows nothing about MLX
+        /// storages.
+        /// </summary>
+        private unsafe void AddmmQuant(Tensor result, Tensor src, QuantizedWeight qw)
+        {
+            // EnsureDeviceCacheKey, not Data: MLX caches the repacked device-side
+            // weight under that key, so passing the raw host pointer would repack
+            // the weight on every call.
+            if (_mlxDirect && MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                    result, src, qw.EnsureDeviceCacheKey(), qw.Data,
+                    qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))
+            {
+                return;
+            }
+
+            if (_useNativeAttention)
+            {
+                // CacheKey, not Data: the GGML device cache is keyed by it, and
+                // after a preload it is an opaque handle rather than the host
+                // pointer. Passing Data would miss the resident copy and re-upload
+                // the weight on every call.
+                GgmlBasicOps.AddmmQuant(result, src, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                return;
+            }
+
+            // MLX declined (an input shape/layout its validator rejects). There is
+            // no F32 copy of this weight - LoadWeights kept only the quantized
+            // bytes - so dequantize through the managed kernel, the same last
+            // resort ModelBase.AddmmQuantManaged falls back to.
+            ManagedQuantizedOps.AddmmQuantizedToFloat32(
+                qw.GgmlType,
+                qw.Data,
+                qw.Ne0,
+                qw.Ne1,
+                GetFloatPtr(src),
+                (int)qw.Ne0,
+                (int)src.Sizes[0],
+                GetFloatPtr(result),
+                (int)qw.Ne1);
+            InvalidateTensorDeviceCache(result);
         }
 
         /// <summary>LayerNorm with bias (clip.cpp NORM_TYPE_NORMAL).</summary>
@@ -1157,6 +1237,17 @@ namespace TensorSharp.Models
             foreach (var t in _weights.Values)
                 t.Dispose();
             _weights.Clear();
+
+            // Drop the MLX device-side copies BEFORE the host buffers they may wrap
+            // zero-copy go away (same ordering as ModelBase.Dispose).
+            if (_mlxDirect && _allocator is MlxAllocator mlxAllocator)
+            {
+                foreach (var qw in _quantWeights.Values)
+                {
+                    if (qw != null)
+                        MlxQuantizedOps.ReleaseQuantizedWeight(mlxAllocator, qw.CacheKey);
+                }
+            }
 
             foreach (var qw in _quantWeights.Values)
                 qw?.Dispose();

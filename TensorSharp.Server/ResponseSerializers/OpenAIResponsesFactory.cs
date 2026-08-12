@@ -32,11 +32,15 @@ namespace TensorSharp.Server.ResponseSerializers
 
         // ---- Output items -----------------------------------------------------
 
-        public static object OutputMessageItem(string itemId, string text) => new
+        /// <param name="status">Item-level status. Defaults to <c>completed</c>; pass
+        /// <c>incomplete</c> when the message was cut short (e.g. the output-token
+        /// budget ran out), so the item does not claim to be whole while the
+        /// enclosing response says otherwise.</param>
+        public static object OutputMessageItem(string itemId, string text, string status = "completed") => new
         {
             id = itemId,
             type = "message",
-            status = "completed",
+            status,
             role = "assistant",
             content = new[]
             {
@@ -68,14 +72,18 @@ namespace TensorSharp.Server.ResponseSerializers
             int promptTokens,
             int evalTokens,
             int kvCacheReusedTokens,
-            string errorMessage = null) => new
+            string errorMessage = null,
+            string incompleteReason = null) => new
         {
             id = responseId,
             @object = "response",
             created_at = UnixNow(),
             status,
             error = errorMessage != null ? new { message = errorMessage, code = "server_error" } : null,
-            incomplete_details = (object)null,
+            // Populated only for status "incomplete" — this is where the Responses
+            // API puts the fact that generation was cut off ("max_output_tokens"),
+            // the equivalent of chat completions' finish_reason "length".
+            incomplete_details = incompleteReason != null ? new { reason = incompleteReason } : null,
             instructions,
             max_output_tokens = maxOutputTokens,
             model,
@@ -86,7 +94,10 @@ namespace TensorSharp.Server.ResponseSerializers
             temperature = samplingConfig?.Temperature,
             top_p = samplingConfig?.TopP,
             truncation = "disabled",
-            usage = status == "completed" ? BuildUsage(promptTokens, evalTokens, kvCacheReusedTokens) : null,
+            // An "incomplete" response still generated (and billed) tokens — in fact
+            // its usage is the whole point, since output_tokens is what proves the
+            // budget was the thing that stopped it. Only a failed response has none.
+            usage = status != "failed" ? BuildUsage(promptTokens, evalTokens, kvCacheReusedTokens) : null,
             metadata = new Dictionary<string, string>(),
         };
 
