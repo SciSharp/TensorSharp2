@@ -3053,6 +3053,67 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Column-parallel shard of a logical fused bias whose SOURCE tensors
+        /// were never fused (e.g. Q/K/V biases next to mixed-quant-type Q/K/V
+        /// weights that declined load-time fusion). Gathers each rank's slice
+        /// of every source bias, in order, into one per-rank tensor registered
+        /// under <paramref name="fusedBiasName"/> — the bias counterpart of
+        /// <see cref="ShardSeparateColumnParallel"/>, producing exactly the
+        /// per-rank [seg0_r | seg1_r | …] layout the forward's fused lookup
+        /// expects. No-op if any source bias is absent.
+        /// </summary>
+        protected void ShardSeparateBiasColumnParallel(string fusedBiasName, string[] sourceNames, int[] segmentDims)
+        {
+            if (!IsTensorParallel) return;
+            if (sourceNames.Length != segmentDims.Length)
+                throw new ArgumentException("sourceNames and segmentDims must have the same length.");
+
+            var sources = new Tensor[sourceNames.Length];
+            for (int s = 0; s < sourceNames.Length; s++)
+            {
+                if (!_weights.TryGetValue(sourceNames[s], out sources[s]))
+                    return; // biases are optional — mirror the fused-bias no-op
+            }
+
+            int tp = TpDegree;
+            int globalTp = GlobalTpDegree;
+            int rankOffset = TpRankOffset;
+
+            int totalLen = 0;
+            foreach (int segDim in segmentDims)
+                totalLen += segDim / globalTp;
+
+            var shards = new Tensor[tp];
+            for (int r = 0; r < tp; r++)
+            {
+                int globalRank = rankOffset + r;
+                var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, totalLen);
+                unsafe
+                {
+                    float* dst = GetFloatPtr(shard);
+                    int dstOff = 0;
+                    for (int s = 0; s < sourceNames.Length; s++)
+                    {
+                        int perRank = segmentDims[s] / globalTp;
+                        float* src = GetFloatPtr(sources[s]);
+                        int start = globalRank * perRank;
+                        for (int i = 0; i < perRank; i++)
+                            dst[dstOff + i] = src[start + i];
+                        dstOff += perRank;
+                    }
+                }
+                shards[r] = shard;
+            }
+
+            _tpWeights[fusedBiasName] = shards;
+            for (int s = 0; s < sourceNames.Length; s++)
+            {
+                _weights.Remove(sourceNames[s]);
+                sources[s].Dispose();
+            }
+        }
+
+        /// <summary>
         /// Column-parallel shard of a fused [gate | up] bias as two equal
         /// segments, deriving the half length from the bias itself.
         /// </summary>
@@ -3499,6 +3560,17 @@ namespace TensorSharp.Models
                     // the flag exists to save.
                     if (!qw.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key))
                         continue;
+
+                    // A zero-sized (or otherwise degenerate) shard is a producer
+                    // bug in the model's TP sharding code. Say WHICH weight it is:
+                    // the native preload can only report "invalid cache key, host
+                    // data, and size", which is undiagnosable across the ~2400
+                    // tensors of a real model.
+                    if (qw.RawBytes <= 0 || qw.Ne0 <= 0 || qw.Ne1 <= 0)
+                        throw new InvalidOperationException(
+                            $"TP shard for weight '{kv.Key}' (rank {r}) is degenerate: " +
+                            $"type={(GgmlTensorType)qw.GgmlType}, ne0={qw.Ne0}, ne1={qw.Ne1}, rawBytes={qw.RawBytes}. " +
+                            "This is a bug in the model's TP weight sharding.");
 
                     IntPtr cacheKey = qw.EnsureDeviceCacheKey();
                     if (!GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))

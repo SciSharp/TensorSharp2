@@ -2492,6 +2492,163 @@ namespace TensorSharp.MLX
             }
         }
 
+        // ============================================================================
+        //  Sorted-rhs gather_qmm self-check. When gather_qmm is called with NO
+        //  lhs_indices and sortedIndices=true, MLX marks the weight side sorted
+        //  (right_sorted_) and, for pair batches B >= 16 with B/E >= 4, dispatches
+        //  a batched grouped-GEMM kernel (gather_qmm_rhs / gather_qmm_rhs_nax).
+        //  On M5-class devices the _nax (neural-accelerator) variant engages for
+        //  f32 activations whenever MLX_ENABLE_TF32 is on (the default), and in
+        //  the vendored MLX it produces garbage for at least the mxfp4 mode —
+        //  while the per-row gather_qmv path (always taken when lhs_indices are
+        //  provided, or when B < 16) is correct everywhere. Rather than pinning
+        //  behavior to a hardware/env matrix that upstream will change, run the
+        //  fast path ONCE against the always-correct reference path on this
+        //  device and cache the verdict; callers gate their B >= 16 usage on it.
+        //  A wildly-off kernel fails the loose 0.25-abs tolerance immediately,
+        //  while legitimate tf32 truncation (~1e-3 here) passes, so a future
+        //  fixed NAX kernel re-enables the fast path automatically.
+        // ============================================================================
+        private static readonly Dictionary<int, bool> SortedRhsProbeCache = new();
+        private static readonly List<System.Runtime.InteropServices.GCHandle> ProbePins = new();
+
+        /// <summary>True if the sorted-rhs (null lhs_indices) gather_qmm fast path is
+        /// numerically trustworthy on this device for the given ggml type. Memoized per type;
+        /// the first call runs a small on-device probe (a few ms).</summary>
+        public static bool GatherQmmSortedRhsUsable(IAllocator allocator, int ggmlType)
+        {
+            lock (Sync)
+            {
+                if (SortedRhsProbeCache.TryGetValue(ggmlType, out bool cached))
+                    return cached;
+            }
+
+            bool ok;
+            try
+            {
+                ok = RunSortedRhsProbe(allocator, ggmlType);
+            }
+            catch
+            {
+                ok = false;
+            }
+
+            bool report;
+            lock (Sync)
+            {
+                report = !SortedRhsProbeCache.ContainsKey(ggmlType);
+                SortedRhsProbeCache[ggmlType] = ok;
+            }
+            if (report && !ok)
+            {
+                Console.Error.WriteLine(
+                    $"[mlx] gather_qmm sorted-rhs fast path failed its numeric self-check for ggml type {ggmlType} " +
+                    "on this device (known issue: the MLX NAX grouped-GEMM kernel on M5-class GPUs); " +
+                    "batched-MoE prefill uses the fallback path — decode is unaffected.");
+            }
+            return ok;
+        }
+
+        private static bool RunSortedRhsProbe(IAllocator allocator, int ggmlType)
+        {
+            // Shapes chosen to satisfy MLX's fast-path gate (M == 1, B >= 16,
+            // B/E >= 4) AND the NAX kernel's 64-aligned tiles, so the probe
+            // exercises exactly the kernel the model's prefill would use.
+            const int E = 4;
+            const int B = 64;
+            const int outDim = 64;
+            int inDim = ggmlType == (int)GgmlTensorType.Q4_K ? QK_K : 64;
+
+            byte[] stacked = BuildProbeStackedBytes(ggmlType, E, outDim, inDim);
+            if (stacked == null)
+                return false;
+
+            // Pin forever: the pinned address doubles as the StackedCache key,
+            // so it must stay unique and valid for the process lifetime.
+            var pin = System.Runtime.InteropServices.GCHandle.Alloc(stacked, System.Runtime.InteropServices.GCHandleType.Pinned);
+            lock (Sync) ProbePins.Add(pin);
+            IntPtr key = pin.AddrOfPinnedObject();
+
+            int[] experts = new int[B];
+            for (int i = 0; i < B; i++) experts[i] = i / (B / E);   // sorted, 16 rows per expert
+            int[] arange = new int[B];
+            for (int i = 0; i < B; i++) arange[i] = i;
+            var rng = new Random(20250812);
+            float[] x = new float[B * inDim];
+            for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() - 0.5) * 0.2f;
+
+            using var xT = new Tensor(allocator, DType.Float32, B, inDim);
+            xT.SetElementsAsFloat(x);
+            using var x3 = xT.View(B, 1, inDim);
+            using var rhsT = new Tensor(allocator, DType.Int32, B);
+            rhsT.SetElementsAsInt(experts);
+            using var lhsT = new Tensor(allocator, DType.Int32, B);
+            lhsT.SetElementsAsInt(arange);
+            using var fast = new Tensor(allocator, DType.Float32, B, outDim);
+            using var reference = new Tensor(allocator, DType.Float32, B, outDim);
+
+            // Fast path under test: no lhs -> right_sorted -> grouped GEMM.
+            if (!TryGatherQmm(fast, x3, null, rhsT, key, key, ggmlType, inDim, outDim, E, stacked.Length, sortedIndices: true))
+                return false;
+            // Reference: explicit lhs -> per-row gather_qmv path.
+            if (!TryGatherQmm(reference, x3, lhsT, rhsT, key, key, ggmlType, inDim, outDim, E, stacked.Length, sortedIndices: false))
+                return false;
+
+            float[] a = fast.GetElementsAsFloat(B * outDim);
+            float[] b = reference.GetElementsAsFloat(B * outDim);
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (float.IsNaN(a[i]) || float.IsInfinity(a[i]))
+                    return false;
+                if (Math.Abs(a[i] - b[i]) > 0.25f)
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>Deterministic stacked GGUF-layout expert bytes for the probe: random
+        /// quantized values under fixed, sane scales (so both probe paths produce O(1)
+        /// finite outputs).</summary>
+        private static byte[] BuildProbeStackedBytes(int ggmlType, int numExperts, int outDim, int inDim)
+        {
+            var rng = new Random(987654321);
+            if (ggmlType == (int)GgmlTensorType.MXFP4)
+            {
+                int blocksPerRow = inDim / Mxfp4BlockElements;
+                byte[] bytes = new byte[(long)numExperts * outDim * blocksPerRow * Mxfp4BlockBytes];
+                rng.NextBytes(bytes);
+                for (long blk = 0; blk < bytes.Length / Mxfp4BlockBytes; blk++)
+                    bytes[blk * Mxfp4BlockBytes] = 127;   // e8m0 scale = 2^0
+                return bytes;
+            }
+            if (ggmlType == (int)GgmlTensorType.Q8_0)
+            {
+                int blocksPerRow = inDim / Q8_0BlockElements;
+                byte[] bytes = new byte[(long)numExperts * outDim * blocksPerRow * Q8_0BlockBytes];
+                rng.NextBytes(bytes);
+                for (long blk = 0; blk < bytes.Length / Q8_0BlockBytes; blk++)
+                {
+                    bytes[blk * Q8_0BlockBytes] = 0x00;    // f16 scale = 1.0 * 2^-6
+                    bytes[blk * Q8_0BlockBytes + 1] = 0x24;
+                }
+                return bytes;
+            }
+            if (ggmlType == (int)GgmlTensorType.Q4_K)
+            {
+                int superBlocksPerRow = inDim / QK_K;
+                byte[] bytes = new byte[(long)numExperts * outDim * superBlocksPerRow * Q4_KBlockBytes];
+                rng.NextBytes(bytes);
+                for (long blk = 0; blk < bytes.Length / Q4_KBlockBytes; blk++)
+                {
+                    long o = blk * Q4_KBlockBytes;
+                    bytes[o] = 0x00; bytes[o + 1] = 0x2C;      // d    = f16 0.0625
+                    bytes[o + 2] = 0x00; bytes[o + 3] = 0x28;  // dmin = f16 0.03125
+                }
+                return bytes;
+            }
+            return null;
+        }
+
         /// <summary>Eagerly build (and cache) the stacked [E, out, in] MLX weight for a layer's
         /// experts at model-load time, so the first forward pass doesn't pay the multi-GB repack.
         /// Returns false when the type is unsupported or the build fails (callers fall back to

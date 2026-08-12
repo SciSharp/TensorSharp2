@@ -113,8 +113,20 @@ namespace TensorSharp.Models
         // down matmul} per token). TS_GPTOSS_MLX_MOE_GQMM=0 restores the
         // per-expert path for an A/B (process restart required — stacked
         // weights and preload decisions are made once at load).
-        private static readonly bool MlxMoeGatherQmmEnabled =
-            !string.Equals(Environment.GetEnvironmentVariable("TS_GPTOSS_MLX_MOE_GQMM"), "0", StringComparison.Ordinal);
+        // Mode: 1 (default) batched path on; 0 fully off (legacy per-expert
+        // path with eager per-expert preload — the pre-existing behavior);
+        // 2 diagnostic: preload veto + stacked build as in mode 1 but the
+        // batched compute disabled, so the legacy path runs with lazily
+        // converted per-expert weights.
+        private static readonly int MlxMoeGqmmMode = ResolveMlxMoeGqmmMode();
+        private static int ResolveMlxMoeGqmmMode()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_GPTOSS_MLX_MOE_GQMM");
+            if (int.TryParse(env, out int v) && v >= 0 && v <= 2)
+                return v;
+            return 1;
+        }
+        private static readonly bool MlxMoeGatherQmmEnabled = MlxMoeGqmmMode != 0;
 
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
@@ -442,8 +454,66 @@ namespace TensorSharp.Models
                 Console.WriteLine($"  Fused expert Gate+Up projections: {fused}");
         }
 
+        /// <summary>
+        /// Decide whether load-time QKV fusion can run for EVERY layer, so the
+        /// model-wide <c>_isQkvFused</c> flag stays truthful. Community/UD
+        /// requants pick quant types per tensor (unsloth's gpt-oss Q4_K_M keeps
+        /// attn_v at Q8_0 on half the layers while the rest are Q5_0), so a
+        /// per-layer fusion decision produced a model where blk.3 only had
+        /// attn_qkv.weight while the layer-name table — keyed off blk.0, which
+        /// did NOT fuse — asked for blk.3.attn_q.weight: a null projection and
+        /// an abort (exit 134) on the first forward. Fusing all layers or none
+        /// removes that mixed state. Static and type-driven so the policy is
+        /// unit-testable without a model file.
+        /// </summary>
+        internal static bool CanFuseAllQkvLayers(
+            int numLayers,
+            Func<int, (int ggmlType, long ne0)?> quantInfo,   // per (layer, proj 0=q/1=k/2=v)
+            Func<int, bool> floatTripletPresent)
+        {
+            for (int l = 0; l < numLayers; l++)
+            {
+                var q = quantInfo(l * 3 + 0);
+                var k = quantInfo(l * 3 + 1);
+                var v = quantInfo(l * 3 + 2);
+                bool quantFusable = q.HasValue && k.HasValue && v.HasValue &&
+                    q.Value.ggmlType == k.Value.ggmlType && k.Value.ggmlType == v.Value.ggmlType &&
+                    q.Value.ne0 == k.Value.ne0 && k.Value.ne0 == v.Value.ne0;
+                if (!quantFusable && !floatTripletPresent(l))
+                    return false;
+            }
+            return true;
+        }
+
         private unsafe void FuseQKVWeights()
         {
+            // All-or-nothing: see CanFuseAllQkvLayers. Note the bias fusion below
+            // must ride along with the weight fusion — fusing the biases of an
+            // UNfused layer removes attn_q/k/v.bias, and the separate-QKV forward
+            // (which looks the biases up by name and treats "missing" as "none")
+            // then silently drops every attention projection bias. GPT-OSS has a
+            // bias on all projections, so that degenerates the model into
+            // template-token loops on every backend.
+            bool allFusable = CanFuseAllQkvLayers(
+                Config.NumLayers,
+                idx =>
+                {
+                    int l = idx / 3;
+                    string[] names = { $"blk.{l}.attn_q.weight", $"blk.{l}.attn_k.weight", $"blk.{l}.attn_v.weight" };
+                    return _quantWeights.TryGetValue(names[idx % 3], out var w)
+                        ? (w.GgmlType, w.Ne0)
+                        : ((int, long)?)null;
+                },
+                l => _weights.ContainsKey($"blk.{l}.attn_q.weight") &&
+                     _weights.ContainsKey($"blk.{l}.attn_k.weight") &&
+                     _weights.ContainsKey($"blk.{l}.attn_v.weight"));
+            if (!allFusable)
+            {
+                if (_quantWeights.ContainsKey("blk.0.attn_q.weight") || _weights.ContainsKey("blk.0.attn_q.weight"))
+                    Console.WriteLine("  QKV fusion skipped: per-layer quant types differ (community requant); keeping separate Q/K/V projections and biases.");
+                return;
+            }
+
             int fused = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -451,6 +521,7 @@ namespace TensorSharp.Models
                 string kName = $"blk.{l}.attn_k.weight";
                 string vName = $"blk.{l}.attn_v.weight";
                 string qkvName = $"blk.{l}.attn_qkv.weight";
+                bool layerFused = false;
 
                 if (_quantWeights.TryGetValue(qName, out var qw) &&
                     _quantWeights.TryGetValue(kName, out var kw) &&
@@ -466,6 +537,7 @@ namespace TensorSharp.Models
                     _quantWeights.Remove(kName); kw.Dispose();
                     _quantWeights.Remove(vName); vw.Dispose();
                     fused++;
+                    layerFused = true;
                 }
                 else if (_weights.TryGetValue(qName, out var qf) &&
                          _weights.TryGetValue(kName, out var kf) &&
@@ -482,7 +554,14 @@ namespace TensorSharp.Models
                     _weights.Remove(kName); kf.Dispose();
                     _weights.Remove(vName); vf.Dispose();
                     fused++;
+                    layerFused = true;
                 }
+
+                // Fuse the biases ONLY when this layer's weights fused: an
+                // orphaned attn_qkv.bias next to separate attn_q/k/v weights is
+                // invisible to the separate-QKV forward, which drops the biases.
+                if (!layerFused)
+                    continue;
 
                 string qBias = $"blk.{l}.attn_q.bias";
                 string kBias = $"blk.{l}.attn_k.bias";
@@ -1775,9 +1854,204 @@ namespace TensorSharp.Models
             if (_backend == BackendType.Mlx
                 && TryMoEMlxGatherQmm(hiddenState, output, routingWeights, selectedExperts, layer, seqLen, hiddenDim))
             {
+                if (MoeMlxSelfCheck)
+                {
+                    using var check = new Tensor(_allocator, DType.Float32, seqLen, hiddenDim);
+                    Ops.Fill(check, 0f);
+                    MoEForwardBatchedLegacy(hiddenState, check, routingWeights, selectedExperts, layer, seqLen, hiddenDim);
+                    int worstToken = ReportMoeMlxSelfCheck(layer, output, check, seqLen, hiddenDim);
+                    if (layer >= 2 && layer <= 3)
+                        DebugArbitrateMoeToken(layer, hiddenState, output, check, routingWeights, selectedExperts, worstToken, hiddenDim);
+                }
                 return;
             }
 
+            MoEForwardBatchedLegacy(hiddenState, output, routingWeights, selectedExperts, layer, seqLen, hiddenDim);
+        }
+
+        // Diagnostic: TS_GPTOSS_MLX_MOE_SELFCHECK=1 recomputes every batched
+        // MLX MoE layer with the per-expert path and prints the deviation.
+        private static readonly bool MoeMlxSelfCheck =
+            string.Equals(Environment.GetEnvironmentVariable("TS_GPTOSS_MLX_MOE_SELFCHECK"), "1", StringComparison.Ordinal);
+
+        // Stage-level diagnostic for the batched MLX MoE path: recompute the
+        // gate / up matmuls, the clamped-SwiGLU activation and the down matmul
+        // for two sampled sorted pair-rows on the host (via ManagedQuantizedOps
+        // row dequantization) and print the max deviation per stage.
+        private unsafe void DebugCheckMoeStages(
+            int layer, Tensor moeInput, Tensor gateSorted, Tensor upSorted, Tensor actSorted, Tensor downSorted,
+            int[] tokenSorted, int[] expertsSorted,
+            StackedExpertWeights gateW, StackedExpertWeights upW, StackedExpertWeights downW,
+            int NK, int ff, int hiddenDim)
+        {
+            float* xPtr = GetFloatPtr(moeInput);
+            float* gPtr = GetFloatPtr(gateSorted);
+            float* uPtr = GetFloatPtr(upSorted);
+            float* aPtr = GetFloatPtr(actSorted);
+            float* dPtr = GetFloatPtr(downSorted);
+            float[] fusedBias = _layerGateUpBiasStacked[layer];
+            float[] downBias = _layerDownBiasStacked?[layer];
+            float[] wRow = new float[Math.Max(ff, hiddenDim)];
+
+            foreach (int i in new[] { 0, NK - 1 })
+            {
+                int t = tokenSorted[i];
+                int e = expertsSorted[i];
+
+                double gateMax = 0, upMax = 0, actMax = 0, downMax = 0;
+                float[] gRef = new float[ff];
+                float[] uRef = new float[ff];
+                long gRowBytes = gateW.PerExpertRawBytes / gateW.PerExpertNe1;
+                long uRowBytes = upW.PerExpertRawBytes / upW.PerExpertNe1;
+                for (int o = 0; o < ff; o++)
+                {
+                    ManagedQuantizedOps.DequantizeToFloat32(gateW.GgmlType,
+                        gateW.Data + (int)(e * gateW.PerExpertRawBytes + o * gRowBytes), wRow, 0, hiddenDim);
+                    float s = 0;
+                    for (int c = 0; c < hiddenDim; c++) s += xPtr[(long)t * hiddenDim + c] * wRow[c];
+                    gRef[o] = s;
+                    gateMax = Math.Max(gateMax, Math.Abs(s - gPtr[(long)i * ff + o]));
+
+                    ManagedQuantizedOps.DequantizeToFloat32(upW.GgmlType,
+                        upW.Data + (int)(e * upW.PerExpertRawBytes + o * uRowBytes), wRow, 0, hiddenDim);
+                    s = 0;
+                    for (int c = 0; c < hiddenDim; c++) s += xPtr[(long)t * hiddenDim + c] * wRow[c];
+                    uRef[o] = s;
+                    upMax = Math.Max(upMax, Math.Abs(s - uPtr[(long)i * ff + o]));
+                }
+
+                float[] actRef = new float[ff];
+                for (int o = 0; o < ff; o++)
+                {
+                    float g = gPtr[(long)i * ff + o] + fusedBias[e * 2 * ff + o];
+                    float u = uPtr[(long)i * ff + o] + fusedBias[e * 2 * ff + ff + o];
+                    float x = MathF.Min(g, SiluLimit);
+                    float y = Math.Clamp(u, -SiluLimit, SiluLimit);
+                    float glu = x / (1.0f + MathF.Exp(-SiluAlpha * x));
+                    actRef[o] = glu * (y + 1.0f);
+                    actMax = Math.Max(actMax, Math.Abs(actRef[o] - aPtr[(long)i * ff + o]));
+                }
+
+                long dRowBytes = downW.PerExpertRawBytes / downW.PerExpertNe1;
+                for (int o = 0; o < hiddenDim; o += 7)
+                {
+                    ManagedQuantizedOps.DequantizeToFloat32(downW.GgmlType,
+                        downW.Data + (int)(e * downW.PerExpertRawBytes + o * dRowBytes), wRow, 0, ff);
+                    float s = 0;
+                    for (int c = 0; c < ff; c++) s += aPtr[(long)i * ff + c] * wRow[c];
+                    downMax = Math.Max(downMax, Math.Abs(s - dPtr[(long)i * hiddenDim + o]));
+                }
+
+                Console.Error.WriteLine(
+                    $"[gpt-oss moe-stagecheck] layer {layer} pair {i} (token {t}, expert {e}): " +
+                    $"gateMax={gateMax:E3} upMax={upMax:E3} actMax={actMax:E3} downMax={downMax:E3}");
+            }
+        }
+
+        private unsafe int ReportMoeMlxSelfCheck(int layer, Tensor batched, Tensor reference, int seqLen, int hiddenDim)
+        {
+            float* a = GetFloatPtr(batched);
+            float* b = GetFloatPtr(reference);
+            long n = (long)seqLen * hiddenDim;
+            double maxAbs = 0, sumMag = 0;
+            long maxIdx = 0;
+            for (long i = 0; i < n; i++)
+            {
+                double diff = Math.Abs((double)a[i] - b[i]);
+                if (diff > maxAbs) { maxAbs = diff; maxIdx = i; }
+                sumMag += Math.Abs(b[i]);
+            }
+            Console.Error.WriteLine(
+                $"[gpt-oss moe-selfcheck] layer {layer} seq {seqLen}: maxAbsDiff={maxAbs:E3} at {maxIdx} " +
+                $"(batched={a[maxIdx]:F6} ref={b[maxIdx]:F6}), meanRefMag={sumMag / n:E3}");
+            return (int)(maxIdx / hiddenDim);
+        }
+
+        // Arbitration: compute one token's MoE output entirely on the host from
+        // the raw GGUF bytes (dequant matmuls + clamped SwiGLU + biases +
+        // routing-weighted sum) and report how far the batched MLX result and
+        // the per-expert legacy result each are from that ground truth.
+        private unsafe void DebugArbitrateMoeToken(
+            int layer, Tensor hiddenState, Tensor batched, Tensor legacy,
+            float[] routingWeights, int[] selectedExperts, int token, int hiddenDim)
+        {
+            int ff = _expertFfnLength;
+            int K = _numExpertsUsed;
+            var gateW = _layerStackedGate[layer];
+            var upW = _layerStackedUp[layer];
+            var downW = _layerStackedDown[layer];
+            float[] fusedBias = _layerGateUpBiasStacked[layer];
+            float[] downBias = _layerDownBiasStacked?[layer];
+            float* xPtr = GetFloatPtr(hiddenState) + (long)token * hiddenDim;
+
+            float[] outRef = new float[hiddenDim];
+            float[] wRow = new float[Math.Max(ff, hiddenDim)];
+            float[] act = new float[ff];
+            long gRowBytes = gateW.PerExpertRawBytes / gateW.PerExpertNe1;
+            long uRowBytes = upW.PerExpertRawBytes / upW.PerExpertNe1;
+            long dRowBytes = downW.PerExpertRawBytes / downW.PerExpertNe1;
+
+            for (int k = 0; k < K; k++)
+            {
+                int e = selectedExperts[token * K + k];
+                float w = routingWeights[token * K + k];
+                for (int o = 0; o < ff; o++)
+                {
+                    ManagedQuantizedOps.DequantizeToFloat32(gateW.GgmlType,
+                        gateW.Data + (int)(e * gateW.PerExpertRawBytes + o * gRowBytes), wRow, 0, hiddenDim);
+                    float g = 0;
+                    for (int c = 0; c < hiddenDim; c++) g += xPtr[c] * wRow[c];
+                    g += fusedBias[e * 2 * ff + o];
+
+                    ManagedQuantizedOps.DequantizeToFloat32(upW.GgmlType,
+                        upW.Data + (int)(e * upW.PerExpertRawBytes + o * uRowBytes), wRow, 0, hiddenDim);
+                    float u = 0;
+                    for (int c = 0; c < hiddenDim; c++) u += xPtr[c] * wRow[c];
+                    u += fusedBias[e * 2 * ff + ff + o];
+
+                    float x = MathF.Min(g, SiluLimit);
+                    float y = Math.Clamp(u, -SiluLimit, SiluLimit);
+                    act[o] = (x / (1.0f + MathF.Exp(-SiluAlpha * x))) * (y + 1.0f);
+                }
+                for (int o = 0; o < hiddenDim; o++)
+                {
+                    ManagedQuantizedOps.DequantizeToFloat32(downW.GgmlType,
+                        downW.Data + (int)(e * downW.PerExpertRawBytes + o * dRowBytes), wRow, 0, ff);
+                    float s = 0;
+                    for (int c = 0; c < ff; c++) s += act[c] * wRow[c];
+                    if (downBias != null) s += downBias[e * hiddenDim + o];
+                    outRef[o] += w * s;
+                }
+            }
+
+            float* bPtr = GetFloatPtr(batched) + (long)token * hiddenDim;
+            float* lPtr = GetFloatPtr(legacy) + (long)token * hiddenDim;
+            double batchedMax = 0, legacyMax = 0;
+            int batchedIdx = 0, legacyIdx = 0;
+            for (int o = 0; o < hiddenDim; o++)
+            {
+                double db = Math.Abs(bPtr[o] - outRef[o]);
+                double dl = Math.Abs(lPtr[o] - outRef[o]);
+                if (db > batchedMax) { batchedMax = db; batchedIdx = o; }
+                if (dl > legacyMax) { legacyMax = dl; legacyIdx = o; }
+            }
+            var experts = new System.Text.StringBuilder();
+            var weights = new System.Text.StringBuilder();
+            for (int k = 0; k < K; k++)
+            {
+                if (k > 0) { experts.Append(','); weights.Append(','); }
+                experts.Append(selectedExperts[token * K + k]);
+                weights.Append(routingWeights[token * K + k].ToString("F4"));
+            }
+            Console.Error.WriteLine(
+                $"[gpt-oss moe-arbiter] layer {layer} token {token}: batched-vs-cpu max={batchedMax:E3} at {batchedIdx} " +
+                $"(batched={bPtr[batchedIdx]:F6} cpu={outRef[batchedIdx]:F6}); legacy-vs-cpu max={legacyMax:E3} at {legacyIdx} " +
+                $"(legacy={lPtr[legacyIdx]:F6} cpu={outRef[legacyIdx]:F6}); experts=[{experts}] weights=[{weights}]");
+        }
+
+        private unsafe void MoEForwardBatchedLegacy(Tensor hiddenState, Tensor output,
+            float[] routingWeights, int[] selectedExperts, int layer, int seqLen, int hiddenDim)
+        {
             float* inputPtr = GetFloatPtr(hiddenState);
             float* outputPtr = GetFloatPtr(output);
 
@@ -1960,7 +2234,7 @@ namespace TensorSharp.Models
             int seqLen,
             int hiddenDim)
         {
-            if (!MlxMoeGatherQmmEnabled || _layerStackedReady == 0)
+            if (MlxMoeGqmmMode != 1 || _layerStackedReady == 0)
                 return false;
 
             var gateW = _layerStackedGate?[layer];
@@ -1985,6 +2259,21 @@ namespace TensorSharp.Models
             int NK = seqLen * K;
             if (E <= 0 || K <= 0 || ff <= 0 || NK <= 0)
                 return false;
+
+            // Pair batches of >= 16 can hit MLX's sorted-rhs grouped-GEMM
+            // kernel (gather_qmm_rhs / _nax) when called WITHOUT lhs_indices.
+            // That kernel is numerically broken on some device/MLX
+            // combinations (observed: the NAX variant on M5-class GPUs
+            // produces garbage for mxfp4), so gate the no-lhs calling shape
+            // on a one-time on-device self-check. When it fails, keep the
+            // batched path but pass explicit lhs_indices — MLX then dispatches
+            // the per-row gather_qmv kernel, which is correct everywhere
+            // (just without the grouped-GEMM speedup). Decode (NK = K) has
+            // batches far below 16 and never reaches the suspect kernel.
+            bool sortedRhs = NK < 16
+                || (MlxQuantizedOps.GatherQmmSortedRhsUsable(_allocator, gateW.GgmlType)
+                    && MlxQuantizedOps.GatherQmmSortedRhsUsable(_allocator, upW.GgmlType)
+                    && MlxQuantizedOps.GatherQmmSortedRhsUsable(_allocator, downW.GgmlType));
 
             EnsureMoeMlxBiasTensors(layer, E, ff, hiddenDim);
 
@@ -2015,44 +2304,78 @@ namespace TensorSharp.Models
 
             try
             {
-                // Pre-gather x's rows into sorted pair order and pass NO
-                // lhs_indices to gather_qmm: MLX only marks the weight side as
+                // sortedRhs mode: pre-gather x's rows into sorted pair order
+                // and pass NO lhs_indices — MLX only marks the weight side as
                 // sorted (its gate to the batched grouped-GEMM kernel,
-                // gather_qmm_rhs) when lhs_indices are absent — passing the
-                // token map as lhs_indices silently demotes every call to the
-                // per-row gather_qmv kernel.
-                using var xSorted = new Tensor(_allocator, DType.Float32, NK, hiddenDim);
-                if (!MlxFusedOps.TryGatherRows(xSorted, moeInput, tokenSortedT))
-                    return false;
-                using var xSorted3 = xSorted.View(NK, 1, hiddenDim);   // [NK, M=1, D]
+                // gather_qmm_rhs) when lhs_indices are absent. Fallback mode:
+                // pass the token map / arange as explicit lhs_indices, which
+                // pins every call to the always-correct per-row gather_qmv.
+                Tensor xSorted = null;
+                Tensor xSorted3 = null;
+                Tensor arangeT = null;
+                try
+                {
+                    Tensor gateUpInput;
+                    Tensor gateUpLhs;
+                    if (sortedRhs)
+                    {
+                        xSorted = new Tensor(_allocator, DType.Float32, NK, hiddenDim);
+                        if (!MlxFusedOps.TryGatherRows(xSorted, moeInput, tokenSortedT))
+                            return false;
+                        xSorted3 = xSorted.View(NK, 1, hiddenDim);   // [NK, M=1, D]
+                        gateUpInput = xSorted3;
+                        gateUpLhs = null;
+                    }
+                    else
+                    {
+                        xSorted3 = moeInput.View(seqLen, 1, hiddenDim);   // [N, M=1, D]
+                        gateUpInput = xSorted3;
+                        gateUpLhs = tokenSortedT;
+                        int[] arangeNK = new int[NK];
+                        for (int i = 0; i < NK; i++) arangeNK[i] = i;
+                        arangeT = CreateIntTensor(arangeNK, NK);
+                    }
 
-                using var gateSorted = new Tensor(_allocator, DType.Float32, NK, ff);
-                if (!MlxQuantizedOps.TryGatherQmm(gateSorted, xSorted3, null, expertsSortedT,
-                        gateW.Data, gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, E, gateW.TotalRawBytes,
-                        sortedIndices: true))
-                    return false;
+                    using var gateSorted = new Tensor(_allocator, DType.Float32, NK, ff);
+                    if (!MlxQuantizedOps.TryGatherQmm(gateSorted, gateUpInput, gateUpLhs, expertsSortedT,
+                            gateW.Data, gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, E, gateW.TotalRawBytes,
+                            sortedIndices: sortedRhs))
+                        return false;
 
-                using var upSorted = new Tensor(_allocator, DType.Float32, NK, ff);
-                if (!MlxQuantizedOps.TryGatherQmm(upSorted, xSorted3, null, expertsSortedT,
-                        upW.Data, upW.Data, upW.GgmlType, upW.PerExpertNe0, upW.PerExpertNe1, E, upW.TotalRawBytes,
-                        sortedIndices: true))
-                    return false;
+                    using var upSorted = new Tensor(_allocator, DType.Float32, NK, ff);
+                    if (!MlxQuantizedOps.TryGatherQmm(upSorted, gateUpInput, gateUpLhs, expertsSortedT,
+                            upW.Data, upW.Data, upW.GgmlType, upW.PerExpertNe0, upW.PerExpertNe1, E, upW.TotalRawBytes,
+                            sortedIndices: sortedRhs))
+                        return false;
 
-                using var actSorted = new Tensor(_allocator, DType.Float32, NK, ff);
-                if (!MlxFusedOps.TrySwiGluOaiGatherBias(actSorted, gateSorted, upSorted,
-                        _moeGateBiasMlx[layer], _moeUpBiasMlx[layer], expertsSortedT, SiluAlpha, SiluLimit))
-                    return false;
+                    using var actSorted = new Tensor(_allocator, DType.Float32, NK, ff);
+                    if (!MlxFusedOps.TrySwiGluOaiGatherBias(actSorted, gateSorted, upSorted,
+                            _moeGateBiasMlx[layer], _moeUpBiasMlx[layer], expertsSortedT, SiluAlpha, SiluLimit))
+                        return false;
 
-                using var act3 = actSorted.View(NK, 1, ff);
-                using var downSorted = new Tensor(_allocator, DType.Float32, NK, hiddenDim);
-                if (!MlxQuantizedOps.TryGatherQmm(downSorted, act3, null, expertsSortedT,
-                        downW.Data, downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, E, downW.TotalRawBytes,
-                        sortedIndices: true))
-                    return false;
+                    using var act3 = actSorted.View(NK, 1, ff);
+                    using var downSorted = new Tensor(_allocator, DType.Float32, NK, hiddenDim);
+                    if (!MlxQuantizedOps.TryGatherQmm(downSorted, act3, sortedRhs ? null : arangeT, expertsSortedT,
+                            downW.Data, downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, E, downW.TotalRawBytes,
+                            sortedIndices: sortedRhs))
+                        return false;
 
-                return MlxFusedOps.TryMoeBiasWeightedSum(output, downSorted,
-                    _moeDownBiasMlx != null ? _moeDownBiasMlx[layer] : null,
-                    expertsSortedT, invOrderT, pairWeightsT, K);
+                    if (MoeMlxSelfCheck && seqLen > 1 && layer >= 2 && layer <= 3)
+                    {
+                        DebugCheckMoeStages(layer, moeInput, gateSorted, upSorted, actSorted, downSorted,
+                            tokenSorted, expertsSorted, gateW, upW, downW, NK, ff, hiddenDim);
+                    }
+
+                    return MlxFusedOps.TryMoeBiasWeightedSum(output, downSorted,
+                        _moeDownBiasMlx != null ? _moeDownBiasMlx[layer] : null,
+                        expertsSortedT, invOrderT, pairWeightsT, K);
+                }
+                finally
+                {
+                    xSorted3?.Dispose();
+                    xSorted?.Dispose();
+                    arangeT?.Dispose();
+                }
             }
             catch (Exception)
             {

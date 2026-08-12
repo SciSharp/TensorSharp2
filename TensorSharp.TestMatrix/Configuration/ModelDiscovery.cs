@@ -111,16 +111,25 @@ public static class ModelDiscovery
 
     private static string? FindMmproj(string modelDir, string family)
     {
-        // Prefer a same-family mmproj. Family substrings are tested in priority order.
+        // Only a SAME-FAMILY mmproj is acceptable. There used to be a bare
+        // "mmproj" fallback at the end of every needle list, and it did real
+        // damage: a directory holding several models plus one projector paired
+        // that projector with EVERY discovered model. On a VM with only
+        // mmproj-Muse-Glimmer-30B-Q8_0.gguf present, Gemma 4 and Qwen 3.5 were
+        // both handed the Muse-Glimmer ViT and their image/audio cells died
+        // with exit 134 — reading as model crashes when the harness had simply
+        // mis-paired the projector. A missing projector merely skips the media
+        // cells; a wrong one aborts the process, so no match now means none.
         string[] needles = family.ToLowerInvariant() switch
         {
-            "gemma4" => new[] { "gemma-4-mmproj", "gemma4-mmproj", "mmproj" },
-            "gemma3" => new[] { "gemma-3-mmproj", "gemma3-mmproj", "mmproj" },
-            "mistral3" => new[] { "ministral", "mistral", "mmproj" },
-            "qwen35" or "qwen36" => new[] { "qwen", "mmproj" },
-            "nemotron" => new[] { "nemotron", "mmproj" },
-            "muse-glimmer" => new[] { "muse-glimmer", "muse_glimmer", "mmproj" },
-            _ => new[] { "mmproj" },
+            "gemma4" => new[] { "gemma-4", "gemma4" },
+            "gemma3" => new[] { "gemma-3", "gemma3" },
+            "mistral3" => new[] { "ministral", "mistral" },
+            "qwen35" or "qwen36" => new[] { "qwen" },
+            "nemotron" => new[] { "nemotron" },
+            "muse-glimmer" => new[] { "muse-glimmer", "muse_glimmer" },
+            // Unknown or text-only family: never attach a projector on a guess.
+            _ => Array.Empty<string>(),
         };
         foreach (string needle in needles)
         {

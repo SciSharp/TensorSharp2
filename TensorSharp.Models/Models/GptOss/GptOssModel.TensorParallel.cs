@@ -89,12 +89,36 @@ namespace TensorSharp.Models
                 rowParallelPatterns: new[] { "attn_output.weight" });
 
             int headDim = Config.HeadDim;
+            int qDim = Config.NumHeads * headDim;
+            int kDim = Config.NumKVHeads * headDim;
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                ShardConcatenatedColumnParallel($"blk.{l}.attn_qkv.weight",
-                    Config.NumHeads * headDim,     // Q
-                    Config.NumKVHeads * headDim,   // K
-                    Config.NumKVHeads * headDim);  // V
+                string qkvName = $"blk.{l}.attn_qkv.weight";
+                if (_quantWeights.ContainsKey(qkvName) || _weights.ContainsKey(qkvName))
+                {
+                    ShardConcatenatedColumnParallel(qkvName,
+                        qDim,   // Q
+                        kDim,   // K
+                        kDim);  // V
+                }
+                else
+                {
+                    // Community/UD requants quantize Q, K and V with different
+                    // types (unsloth's gpt-oss Q2_K ships IQ4_NL/IQ4_NL/Q5_0),
+                    // which declines load-time QKV fusion — there is no
+                    // attn_qkv tensor to shard, and the forward's fused lookup
+                    // used to die with "TP column-parallel weight
+                    // 'blk.0.attn_q.weight' not found". Mirror Qwen3.5's
+                    // ShardFusedQkvForTP fallback: build each rank's
+                    // [Q_r|K_r|V_r] shard straight from the separate weights
+                    // (dequantised slice by slice) and register it under the
+                    // fused name, so the TP forward keeps its single
+                    // column-parallel QKV projection per layer.
+                    string prefix = $"blk.{l}.";
+                    ShardSeparateColumnParallel(qkvName,
+                        new[] { prefix + "attn_q.weight", prefix + "attn_k.weight", prefix + "attn_v.weight" },
+                        new[] { qDim, kDim, kDim });
+                }
             }
 
             // MoE expert weights: whole-expert partitioning when the batched
@@ -124,11 +148,24 @@ namespace TensorSharp.Models
                 string prefix = $"blk.{l}.";
 
                 // QKV bias: segment-aware column-parallel [Q|K|V] — must match
-                // the attn_qkv weight regrouping.
-                ShardConcatenatedBiasColumnParallel(prefix + "attn_qkv.bias",
-                    Config.NumHeads * headDim,     // Q
-                    Config.NumKVHeads * headDim,   // K
-                    Config.NumKVHeads * headDim);  // V
+                // the attn_qkv weight regrouping. When load-time fusion was
+                // declined (mixed quant types), the biases are still separate
+                // attn_q/k/v.bias tensors: gather each rank's fused bias slice
+                // from them, mirroring the weight fallback above.
+                string qkvBias = prefix + "attn_qkv.bias";
+                if (_weights.ContainsKey(qkvBias))
+                {
+                    ShardConcatenatedBiasColumnParallel(qkvBias,
+                        Config.NumHeads * headDim,     // Q
+                        Config.NumKVHeads * headDim,   // K
+                        Config.NumKVHeads * headDim);  // V
+                }
+                else
+                {
+                    ShardSeparateBiasColumnParallel(qkvBias,
+                        new[] { prefix + "attn_q.bias", prefix + "attn_k.bias", prefix + "attn_v.bias" },
+                        new[] { Config.NumHeads * headDim, Config.NumKVHeads * headDim, Config.NumKVHeads * headDim });
+                }
 
                 // Expert gate_up biases: segment-aware column-parallel [gate|up].
                 // Expert-parallel ranks own whole experts, so they take the

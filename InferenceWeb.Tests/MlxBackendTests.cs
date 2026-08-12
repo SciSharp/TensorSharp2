@@ -2275,6 +2275,216 @@ public class MlxBackendTests
     }
 
     [Fact]
+    public void MlxGatherQmm_SortedRhsProbe_GatesTheFastPath()
+    {
+        if (!MlxBackend.IsAvailable())
+            return;
+
+        using var allocator = new MlxAllocator();
+
+        // The probe must return a stable verdict for the shipping GPT-OSS
+        // expert type. On devices where the sorted-rhs grouped-GEMM kernel is
+        // numerically broken (e.g. the MLX NAX variant on M5-class GPUs) it
+        // must return false so the model's prefill falls back; when it returns
+        // true, the fast path must actually match the per-row reference path
+        // at a fast-path-eligible shape (B=64, B/E=16).
+        bool usable = MlxQuantizedOps.GatherQmmSortedRhsUsable(allocator, (int)GgmlTensorType.MXFP4);
+        Assert.Equal(usable, MlxQuantizedOps.GatherQmmSortedRhsUsable(allocator, (int)GgmlTensorType.MXFP4));
+
+        const int numExperts = 4;
+        const int inDim = 64;
+        const int outDim = 64;
+        const int nk = 64;   // B >= 16 and B/E = 16 >= 4 -> grouped-GEMM eligible
+
+        byte[][] expertRows = new byte[numExperts][];
+        for (int e = 0; e < numExperts; e++)
+        {
+            int ee = e;
+            expertRows[e] = CreateMxfp4Rows(
+                outDim,
+                inDim,
+                (r, c) => (byte)(((r + 3 + ee) * (c + 5)) & 0x0F),
+                (r, b) => (byte)(125 + ((r + b + ee) % 5)));
+        }
+        byte[] stacked = new byte[expertRows[0].Length * numExperts];
+        for (int e = 0; e < numExperts; e++)
+            Array.Copy(expertRows[e], 0, stacked, e * expertRows[0].Length, expertRows[e].Length);
+
+        int[] expertsSorted = new int[nk];
+        int[] arange = new int[nk];
+        for (int i = 0; i < nk; i++)
+        {
+            expertsSorted[i] = i / (nk / numExperts);
+            arange[i] = i;
+        }
+        float[,] x = new float[nk, inDim];
+        for (int r = 0; r < nk; r++)
+            for (int c = 0; c < inDim; c++)
+                x[r, c] = MathF.Sin((r + 1) * (c + 3) * 0.017f) * 0.1f;
+
+        IntPtr host = Marshal.AllocHGlobal(stacked.Length);
+        try
+        {
+            Marshal.Copy(stacked, 0, host, stacked.Length);
+            using var xT = Tensor.FromArray(allocator, x);
+            using var x3 = xT.View(nk, 1, inDim);
+            using var rhs = new Tensor(allocator, DType.Int32, nk);
+            rhs.SetElementsAsInt(expertsSorted);
+            using var lhs = new Tensor(allocator, DType.Int32, nk);
+            lhs.SetElementsAsInt(arange);
+            using var reference = new Tensor(allocator, DType.Float32, nk, outDim);
+
+            // The per-row reference path (explicit lhs) is correct everywhere.
+            Assert.True(MlxQuantizedOps.TryGatherQmm(
+                reference, x3, lhs, rhs,
+                host, host, (int)GgmlTensorType.MXFP4, inDim, outDim, numExperts, stacked.Length,
+                sortedIndices: false));
+            float[] expected = new float[nk * outDim];
+            float[] dequantRow = new float[inDim];
+            for (int p = 0; p < nk; p++)
+            {
+                for (int o = 0; o < outDim; o++)
+                {
+                    DequantizeMxfp4Row(expertRows[expertsSorted[p]], o, inDim, dequantRow, 0);
+                    float sum = 0;
+                    for (int c = 0; c < inDim; c++)
+                        sum += x[p, c] * dequantRow[c];
+                    expected[p * outDim + o] = sum;
+                }
+            }
+            AssertClose(expected, reference.GetElementsAsFloat(nk * outDim), 2e-3f);
+
+            if (usable)
+            {
+                // The probe blessed the fast path: it must agree with the reference.
+                using var fast = new Tensor(allocator, DType.Float32, nk, outDim);
+                Assert.True(MlxQuantizedOps.TryGatherQmm(
+                    fast, x3, null, rhs,
+                    host, host, (int)GgmlTensorType.MXFP4, inDim, outDim, numExperts, stacked.Length,
+                    sortedIndices: true));
+                AssertClose(expected, fast.GetElementsAsFloat(nk * outDim), 2e-2f);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Fact]
+    public void MlxGatherQmm_MXFP4GptOssShapes_NullLhsMatchesProvidedLhs()
+    {
+        if (!MlxBackend.IsAvailable())
+            return;
+
+        // GPT-OSS-20b decode/short-prefill shapes: E=32 experts, 2880x2880
+        // projections, NK=56 pairs (14 tokens x K=4). NK/E < 4 keeps this on
+        // the per-row gather_qmv kernel, matching what decode dispatches.
+        const int numExperts = 32;
+        const int inDim = 2880;
+        const int outDim = 2880;
+        const int n = 14;
+        const int k = 4;
+        const int nk = n * k;
+
+        var rng = new Random(1234);
+        byte[] stacked = new byte[(long)numExperts * outDim * (inDim / 32) * 17];
+        rng.NextBytes(stacked);
+        // Clamp scale bytes to sane e8m0 range so dequant values stay finite.
+        int blocksPerRow = inDim / 32;
+        for (long b = 0; b < (long)numExperts * outDim * blocksPerRow; b++)
+            stacked[b * 17] = (byte)(120 + (stacked[b * 17] % 10));
+
+        float[,] input = new float[n, inDim];
+        for (int r = 0; r < n; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = (float)(rng.NextDouble() * 2 - 1) * 0.05f;
+
+        // Random routing then sort pairs by expert.
+        int[] expertsOrig = new int[nk];
+        for (int p = 0; p < nk; p++) expertsOrig[p] = rng.Next(numExperts);
+        int[] order = Enumerable.Range(0, nk).OrderBy(p => expertsOrig[p]).ToArray();
+        int[] expertsSorted = new int[nk];
+        int[] tokenSorted = new int[nk];
+        for (int i = 0; i < nk; i++)
+        {
+            expertsSorted[i] = expertsOrig[order[i]];
+            tokenSorted[i] = order[i] / k;
+        }
+
+        float[,] gathered = new float[nk, inDim];
+        for (int p = 0; p < nk; p++)
+            for (int c = 0; c < inDim; c++)
+                gathered[p, c] = input[tokenSorted[p], c];
+
+        IntPtr host = Marshal.AllocHGlobal(stacked.Length);
+        try
+        {
+            Marshal.Copy(stacked, 0, host, stacked.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var input3 = inputTensor.View(n, 1, inDim);
+            using var gatheredTensor = Tensor.FromArray(allocator, gathered);
+            using var gathered3 = gatheredTensor.View(nk, 1, inDim);
+            using var lhs = new Tensor(allocator, DType.Int32, nk);
+            lhs.SetElementsAsInt(tokenSorted);
+            using var rhs = new Tensor(allocator, DType.Int32, nk);
+            rhs.SetElementsAsInt(expertsSorted);
+            using var resultLhs = new Tensor(allocator, DType.Float32, nk, outDim);
+            using var resultNull = new Tensor(allocator, DType.Float32, nk, outDim);
+
+            Assert.True(MlxQuantizedOps.TryGatherQmm(
+                resultLhs, input3, lhs, rhs,
+                host, host, (int)GgmlTensorType.MXFP4, inDim, outDim, numExperts, stacked.Length,
+                sortedIndices: true));
+            Assert.True(MlxQuantizedOps.TryGatherQmm(
+                resultNull, gathered3, null, rhs,
+                host, host, (int)GgmlTensorType.MXFP4, inDim, outDim, numExperts, stacked.Length,
+                sortedIndices: true));
+
+            float[] a = resultLhs.GetElementsAsFloat(nk * outDim);
+            float[] b = resultNull.GetElementsAsFloat(nk * outDim);
+            int mismatches = 0;
+            float worst = 0f;
+            for (int i = 0; i < a.Length; i++)
+            {
+                float diff = Math.Abs(a[i] - b[i]);
+                if (diff > 1e-2f) { mismatches++; worst = Math.Max(worst, diff); }
+            }
+            Assert.True(mismatches == 0, $"null-lhs deviates from provided-lhs: {mismatches} elements, worst diff {worst}");
+
+            // Spot-check a few rows against the CPU dequantized reference.
+            float[] dequantRow = new float[inDim];
+            foreach (int p in new[] { 0, 7, nk - 1 })
+            {
+                int e = expertsSorted[p];
+                for (int o = 0; o < outDim; o += 977)
+                {
+                    DequantizeMxfp4RowStacked(stacked, e, o, inDim, outDim, dequantRow);
+                    float sum = 0;
+                    for (int c = 0; c < inDim; c++)
+                        sum += gathered[p, c] * dequantRow[c];
+                    float actual = a[p * outDim + o];
+                    Assert.True(Math.Abs(sum - actual) <= 5e-2f, $"pair {p} out {o}: cpu {sum} vs mlx {actual}");
+                }
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    private static void DequantizeMxfp4RowStacked(byte[] stacked, int expert, int row, int inDim, int outDim, float[] destination)
+    {
+        int blocksPerRow = inDim / 32;
+        long expertBytes = (long)outDim * blocksPerRow * 17;
+        byte[] slice = new byte[outDim * blocksPerRow * 17];
+        Array.Copy(stacked, expert * expertBytes, slice, 0, slice.Length);
+        DequantizeMxfp4Row(slice, row, inDim, destination, 0);
+    }
+
+    [Fact]
     public void MlxSwiGluOaiGatherBias_MatchesCpuReference()
     {
         if (!MlxBackend.IsAvailable())
