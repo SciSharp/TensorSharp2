@@ -1417,10 +1417,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             }
 
             finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
-            // If we used the per-call fallback buffer (not the persistent gallocr),
-            // drain the queued async download before BufferHandle frees it. No-op on
-            // the common gallocr path (buffer.value == nullptr).
-            if (buffer.value != nullptr || can_persist) host_read_barrier();
+            // Unconditional drain: `out_data` is the caller's host logits/hidden
+            // buffer and on Metal async mode the download above is only QUEUED.
+            // (It also has to happen before BufferHandle frees a per-call
+            // fallback buffer that an in-flight blit is still reading.)
+            host_read_barrier();
         }
 
         if (can_persist && g4moe != nullptr)

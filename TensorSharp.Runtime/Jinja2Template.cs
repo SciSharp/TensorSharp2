@@ -768,14 +768,33 @@ namespace TensorSharp.Runtime
                 return Stringify(lhs) + Stringify(rhs);
             }
 
-            // Handle + (string concatenation / addition)
+            // Handle + (list concatenation / string concatenation / addition)
             int plusIdx = FindTopLevelOp(expr, "+");
             if (plusIdx > 0)
             {
                 var lhs = EvalPrimary(expr.Substring(0, plusIdx).Trim(), ctx);
                 var rhs = EvalComparison(expr.Substring(plusIdx + 1).Trim(), ctx);
+                // list + list => concatenation (Python/Jinja2 semantics). Without
+                // this the accumulator idiom every "build a list in a loop"
+                // template uses --
+                //     {%- set ns.items = ns.items + [x] -%}
+                // -- fell through to Stringify() and turned the namespace member
+                // into the literal text "System.Collections.Generic.List`1[
+                // System.Object]", which then leaked into the rendered prompt
+                // (Muse-Glimmer's "# Valid recipients:" system line) and into any
+                // later `| join` on it.
+                if (lhs is IList<object> llist && rhs is IList<object> rlist)
+                {
+                    var sum = new List<object>(llist.Count + rlist.Count);
+                    sum.AddRange(llist);
+                    sum.AddRange(rlist);
+                    return sum;
+                }
                 if (lhs is string ls) return ls + Stringify(rhs);
                 if (lhs is int li && rhs is int ri) return li + ri;
+                // Numeric addition that is not int+int (a float on either side)
+                // must stay numeric rather than degrade to text concatenation.
+                if (IsNumber(lhs) && IsNumber(rhs)) return ToNumber(lhs) + ToNumber(rhs);
                 return Stringify(lhs) + Stringify(rhs);
             }
 
@@ -1112,6 +1131,11 @@ namespace TensorSharp.Runtime
             if (val is IDictionary<string, object> dict) return dict.Count > 0;
             return true;
         }
+
+        /// <summary>True for values `+` / `-` should treat as arithmetic rather
+        /// than text. Deliberately excludes numeric-looking strings: Jinja2's `+`
+        /// on a string is concatenation, not addition.</summary>
+        private static bool IsNumber(object? val) => val is int || val is double || val is long || val is float;
 
         private static double ToNumber(object? val)
         {

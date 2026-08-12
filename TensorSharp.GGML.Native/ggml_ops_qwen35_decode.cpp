@@ -2088,7 +2088,10 @@ namespace
         void* out_data = fold ? logits_data : hidden_data;
         finalize_compute_with_download(hidden_out, out_data,
             static_cast<std::size_t>(out_count) * sizeof(float));
-        if (persist || buffer.value != nullptr) host_read_barrier();
+        // Unconditional: out_data is the caller's host logits/hidden buffer and on
+        // Metal async mode the download above is only QUEUED, so the gallocr path
+        // (persist == false, buffer.value == nullptr) would return stale bytes.
+        host_read_barrier();
 
         if (persist && dcb != nullptr)
         {

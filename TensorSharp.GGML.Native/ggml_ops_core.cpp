@@ -2463,6 +2463,11 @@ extern "C" void TSGgml_Qwen35ResetVerifyCache();
 extern "C" void TSGgml_Gemma4ResetBatchedDecodeCache();
 extern "C" void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
 extern "C" void TSGgml_GptOssResetDecodeCache();
+extern "C" void TSGgml_GptOssInvalidateKvCache(const void* kCacheData, const void* vCacheData);
+extern "C" void TSGgml_MuseGlimmerResetDecodeCache();
+extern "C" void TSGgml_DFlashResetCaches();
+extern "C" void TSGgml_QwenImageResetForwardCache();
+extern "C" void TSGgml_WanResetForwardCache();
 
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
@@ -2571,6 +2576,24 @@ TSG_EXPORT void TSGgml_Shutdown()
     TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
     TSGgml_Gemma4MoEResetDecodeCache();
     TSGgml_Gemma4ResetDecodeCache();
+    TSGgml_Gemma4ResetBatchedDecodeCache();
+    TSGgml_Gemma4ResetMoEBatchedDecodeCache();
+    TSGgml_Qwen35ResetVerifyCache();
+    // GPT-OSS keeps per-layer device-resident K/V windows (tsg_gptoss::kv_*)
+    // alive for the whole session; nothing else drops them, so on Metal their
+    // MTLBuffers were still registered in the device residency set when the
+    // ggml_metal_device static destructor ran, tripping
+    // GGML_ASSERT([rsets->data count] == 0) and aborting the process at exit
+    // (SIGABRT / exit code 134) after a perfectly good generation. Passing
+    // (null, null) drops every window.
+    TSGgml_GptOssResetDecodeCache();
+    TSGgml_GptOssInvalidateKvCache(nullptr, nullptr);
+    // Same contract for the other whole-model graph caches: each parks a ggml
+    // context + backend buffer that must be released before the backend is.
+    TSGgml_MuseGlimmerResetDecodeCache();
+    TSGgml_DFlashResetCaches();
+    TSGgml_QwenImageResetForwardCache();
+    TSGgml_WanResetForwardCache();
     // Release the calling thread's cached prefill-attention sessions while the
     // CUDA driver is still alive; leaving them to thread_local destructors
     // aborts the process on exit ("CUDA error: driver shutting down").

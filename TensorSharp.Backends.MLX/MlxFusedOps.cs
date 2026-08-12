@@ -6,8 +6,23 @@ namespace TensorSharp.MLX
     public static class MlxFusedOps
     {
         private static readonly int Qwen35GdnPackedMinSeqLen = ResolveQwen35GdnPackedMinSeqLen();
+        // Packed multi-row GatedDeltaNet kernel, ON by default (opt out with
+        // TS_MLX_QWEN35_GDN_PACKED_KERNELS=0).
+        //
+        // It has to be the default because the UNPACKED prefill path leaves an
+        // incorrect recurrent state behind on MLX. The giveaway is that prefill
+        // itself looks fine - Qwen3.5-9B's prefill logits match ggml_metal to 4
+        // decimal places - but the FIRST decode token after a >=64-token prompt is
+        // wrong (argmax 8160 vs 248068), because in a GatedDeltaNet the context
+        // lives in the recurrent state rather than a KV cache. Downstream that
+        // reads as "the model answered a question it was never asked".
+        //
+        // Verified with the packed kernel on: Qwen3.5-9B decode0 becomes 248068,
+        // matching ggml_metal exactly, and Qwen3.6-27B / Qwen3.6-35B-A3B are
+        // bit-for-bit unchanged (they were already correct), so this is a strict
+        // improvement rather than a trade between models.
         private static readonly bool Qwen35GdnPackedKernelsEnabled =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QWEN35_GDN_PACKED_KERNELS"), "1", StringComparison.Ordinal);
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QWEN35_GDN_PACKED_KERNELS"), "0", StringComparison.Ordinal);
 
         private static int ResolveQwen35GdnPackedMinSeqLen()
         {
@@ -15,7 +30,15 @@ namespace TensorSharp.MLX
             if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int parsed) && parsed > 0)
                 return parsed;
 
-            return 64;
+            // 1, i.e. the packed kernel handles EVERY prefill length. This used to
+            // be 64 as a perf heuristic, but that made the threshold part of the
+            // bug described on Qwen35GdnPackedKernelsEnabled: below it the broken
+            // unpacked prefill ran, and Qwen3.5-9B produced the exact same decode
+            // trace for two completely different short prompts (271/8160/369/264)
+            // because the recurrent state it carried out of prefill did not depend
+            // on the prompt at all. At 1, short and medium prompts both match
+            // ggml_metal token for token.
+            return 1;
         }
 
         public static bool TryEvaluate(Tensor tensor)

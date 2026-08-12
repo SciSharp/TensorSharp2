@@ -72,6 +72,7 @@ namespace TensorSharp.Models
                 GgmlTensorType.IQ4_NL => true,
                 GgmlTensorType.IQ2_XXS => true,
                 GgmlTensorType.IQ2_S => true,
+                GgmlTensorType.IQ3_XXS => true,
                 GgmlTensorType.IQ3_S => true,
                 GgmlTensorType.MXFP4 => true,
                 _ => false,
@@ -892,6 +893,9 @@ namespace TensorSharp.Models
                 case GgmlTensorType.IQ2_S:
                     DequantizeIq2S(src, dst, numElements);
                     return;
+                case GgmlTensorType.IQ3_XXS:
+                    DequantizeIq3Xxs(src, dst, numElements);
+                    return;
                 case GgmlTensorType.IQ3_S:
                     DequantizeIq3S(src, dst, numElements);
                     return;
@@ -1280,6 +1284,58 @@ namespace TensorSharp.Models
                         shift += 2; m <<= 1;
                     }
                     qq += 32;
+                }
+            }
+        }
+
+        // IQ3_XXS: 3.0625 bpw codebook quant. Ported verbatim from ggml
+        // dequantize_row_iq3_xxs. Block layout: d(fp16) | qs[3*QK_K/8] = 2 + 96 = 98
+        // bytes, where the first QK_K/4 = 64 bytes are grid indices (one byte per
+        // 4 weights) and the trailing 32 bytes are eight uint32 words packing a
+        // 4-bit scale (top nibble) and four 7-bit sign selectors.
+        //
+        // Unsloth's "UD" mixed quants (Muse-Glimmer-30B-UD-IQ2_XXS,
+        // Qwen3.6-27B-UD-IQ2_XXS, Qwen3.6-35B-A3B-UD-IQ2_XXS) put IQ3_XXS on the
+        // sensitive tensors. MLX has no native IQ3_XXS kernel, so those tensors
+        // route to this managed path and every one of those models aborted with
+        // "Pure C# backend does not support GGUF tensor type IQ3_XXS" on the very
+        // first FFN.
+        private static unsafe void DequantizeIq3Xxs(byte* src, float* dst, long numElements)
+        {
+            if (numElements % QK_K != 0)
+                throw new NotSupportedException($"IQ3_XXS requires {QK_K}-element alignment, got {numElements}.");
+
+            int blockBytes = 2 + 3 * QK_K / 8;     // 2 + 96 = 98
+            int nb = (int)(numElements / QK_K);
+            fixed (uint* grid = IQuantGrids.iq3xxs_grid)
+            fixed (byte* ksigns = IQuantGrids.ksigns_iq2xs)
+            fixed (byte* kmask = IQuantGrids.kmask_iq2xs)
+            {
+                for (int i = 0; i < nb; i++)
+                {
+                    byte* block = src + i * blockBytes;
+                    float d = HalfToSingle(ReadUInt16(block));
+                    byte* qs = block + 2;
+                    byte* scalesAndSigns = qs + QK_K / 4;
+                    float* y = dst + i * QK_K;
+                    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32)
+                    {
+                        uint aux32 = ReadUInt32(scalesAndSigns + 4 * ib32);
+                        float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+                        for (int l = 0; l < 4; ++l)
+                        {
+                            byte signs = ksigns[(aux32 >> (7 * l)) & 127];
+                            byte* g1 = (byte*)(grid + qs[2 * l + 0]);
+                            byte* g2 = (byte*)(grid + qs[2 * l + 1]);
+                            for (int j = 0; j < 4; ++j)
+                            {
+                                y[j + 0] = db * g1[j] * ((signs & kmask[j + 0]) != 0 ? -1f : 1f);
+                                y[j + 4] = db * g2[j] * ((signs & kmask[j + 4]) != 0 ? -1f : 1f);
+                            }
+                            y += 8;
+                        }
+                        qs += 8;
+                    }
                 }
             }
         }

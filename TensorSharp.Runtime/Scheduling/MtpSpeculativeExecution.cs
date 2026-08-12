@@ -259,6 +259,13 @@ namespace TensorSharp.Runtime.Scheduling
         public long VerifySteps { get; internal set; }
         public long PlainSteps { get; internal set; }
         public long RollbackSteps { get; internal set; }
+        /// <summary>Decode steps forced to plain because the cost governor measured
+        /// speculation as a net loss on this model/drafter pair.</summary>
+        public long ParkedSteps { get; internal set; }
+        /// <summary>Measured ms per emitted token, plain vs speculative (EMA). Both
+        /// 0 until the governor has enough samples.</summary>
+        public double PlainMsPerToken { get; internal set; }
+        public double SpecMsPerToken { get; internal set; }
         public double AcceptanceRate => TokensDrafted > 0 ? (double)TokensAccepted / TokensDrafted : 0;
 
         // Wall-clock phase breakdown (Stopwatch ticks) so a slow speculative
@@ -284,7 +291,8 @@ namespace TensorSharp.Runtime.Scheduling
 
         public void Reset()
         {
-            TokensDrafted = TokensAccepted = VerifySteps = PlainSteps = RollbackSteps = 0;
+            TokensDrafted = TokensAccepted = VerifySteps = PlainSteps = RollbackSteps = ParkedSteps = 0;
+            PlainMsPerToken = SpecMsPerToken = 0;
             DraftTicks = VerifyTicks = SnapshotTicks = RollbackTicks = CatchUpTicks = PlainTicks = 0;
         }
     }
@@ -400,6 +408,107 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly int[] _blockTokens;
         private readonly float[] _blockConf;
 
+        // ---- Cost governor -------------------------------------------------
+        //
+        // Speculation is only ever a SPEED optimization - the emitted stream is
+        // identical either way - so it must never make decoding slower. Whether it
+        // pays off is a property of the model/drafter PAIR, not of the code: on
+        // Muse-Glimmer-30B (a sparse MoE where a decode step only touches the
+        // active experts) the 1.5 GB dense DFlash drafter costs roughly half a
+        // trunk step per drafted token, and measured end to end at every window
+        // size from 1 to 15 it ran 18-31% SLOWER than plain greedy despite a 70%
+        // acceptance rate. Acceptance rate alone cannot see that: it says nothing
+        // about what a draft costs relative to the trunk.
+        //
+        // So measure both and let the numbers decide. The first few steps run
+        // plain to establish a baseline, then speculation runs and is compared
+        // against it; if it loses, it parks for ParkedProbeInterval steps and
+        // re-probes, so a pair that becomes profitable later (longer context,
+        // different prompt) is picked back up. Overhead when speculation is a
+        // loss is bounded by one probe per ParkedProbeInterval tokens.
+        /// <summary>
+        /// Measure speculation against plain decoding at runtime and skip drafting
+        /// while it is measurably slower. On by default; set false to force the
+        /// drafter on for A/B measurement.
+        /// </summary>
+        public bool AdaptiveSpeculation { get; set; } = true;
+
+        /// <summary>Speculative steps measured per round before judging speculation.</summary>
+        private const int ProbeSpecSteps = 8;
+        /// <summary>Plain steps measured per round, for the baseline to compare against.</summary>
+        private const int CalibrationPlainSteps = 3;
+        /// <summary>Plain steps speculation stays parked for after losing a round.</summary>
+        private const int ParkedProbeInterval = 64;
+        /// <summary>Steps a winning verdict holds for before the next measuring round.</summary>
+        private const int WinRecheckInterval = 512;
+        /// <summary>Speculation must not be more than this much slower to stay on.</summary>
+        private const double SpecWinMargin = 1.02;
+
+        private double _plainMsPerToken, _specMsPerToken;
+        private int _plainSamples, _specSamples;
+        private int _parkedRemaining;
+        private int _recheckRemaining;
+        private bool _specWins = true;
+
+        // A round measures speculation FIRST (so the very first decode step still
+        // speculates, which is also what the unit tests pin), then takes a short
+        // plain baseline, then decides. A win holds for WinRecheckInterval steps
+        // before re-measuring; a loss parks drafting for ParkedProbeInterval steps.
+        private bool GovernorAllowsSpeculation()
+        {
+            if (!AdaptiveSpeculation)
+                return true;
+            if (_parkedRemaining > 0)
+                return false;
+            if (_recheckRemaining > 0)
+                return _specWins;
+            if (_specSamples < ProbeSpecSteps)
+                return true;                        // measuring speculation
+            if (_plainSamples < CalibrationPlainSteps)
+                return false;                       // measuring the plain baseline
+            return _specWins;
+        }
+
+        private void GovernorRecord(bool speculated, int tokensEmitted, long elapsedTicks)
+        {
+            if (!AdaptiveSpeculation || tokensEmitted <= 0)
+                return;
+
+            if (_parkedRemaining > 0)
+            {
+                _parkedRemaining--;
+                return;                             // parked steps are not samples
+            }
+            if (_recheckRemaining > 0)
+            {
+                _recheckRemaining--;
+                return;
+            }
+
+            double ms = elapsedTicks * 1000.0 / Stopwatch.Frequency / tokensEmitted;
+            if (speculated)
+            {
+                _specMsPerToken += (ms - _specMsPerToken) / (_specSamples + 1);
+                _specSamples++;
+                Stats.SpecMsPerToken = _specMsPerToken;
+            }
+            else
+            {
+                _plainMsPerToken += (ms - _plainMsPerToken) / (_plainSamples + 1);
+                _plainSamples++;
+                Stats.PlainMsPerToken = _plainMsPerToken;
+            }
+
+            if (_specSamples < ProbeSpecSteps || _plainSamples < CalibrationPlainSteps)
+                return;
+
+            _specWins = _specMsPerToken <= _plainMsPerToken * SpecWinMargin;
+            _parkedRemaining = _specWins ? 0 : ParkedProbeInterval;
+            _recheckRemaining = _specWins ? WinRecheckInterval : 0;
+            _specSamples = _plainSamples = 0;
+            _specMsPerToken = _plainMsPerToken = 0;
+        }
+
         public MtpSpecStats Stats { get; } = new();
 
         public MtpSpeculativeExecution(IMtpSpeculativeModel model, int maxDraftTokens = 8, IMtpSpecTrunk trunk = null)
@@ -510,6 +619,16 @@ namespace TensorSharp.Runtime.Scheduling
         {
             ArgumentNullException.ThrowIfNull(drawNext);
 
+            long tStep0 = Stopwatch.GetTimestamp();
+            // Governor: a step it declines becomes a plain decode, which is the
+            // same path an all-low-confidence draft window already takes (and so
+            // keeps the drafter's own cache in sync via MtpCatchUp below).
+            if (!GovernorAllowsSpeculation())
+            {
+                kMax = 0;
+                Stats.ParkedSteps++;
+            }
+
             kMax = Math.Min(kMax, MaxDraftTokens);
             // Verify needs position + K + 1 trunk slots; drafting writes MTP
             // rows up to position + K.
@@ -579,6 +698,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                 float[] plainLogits = new float[_vocab];
                 Array.Copy(_stepLogits, plainLogits, _vocab);
+                GovernorRecord(speculated: false, tokensEmitted: 1, elapsedTicks: Stopwatch.GetTimestamp() - tStep0);
                 return new MtpDecodeOutcome
                 {
                     AcceptedCount = 0,
@@ -658,6 +778,8 @@ namespace TensorSharp.Runtime.Scheduling
 
             float[] nextLogits = new float[_vocab];
             Array.Copy(_verifyLogits, (long)m * _vocab, nextLogits, 0, _vocab);
+            // m accepted drafts plus the corrected/bonus token.
+            GovernorRecord(speculated: true, tokensEmitted: m + 1, elapsedTicks: Stopwatch.GetTimestamp() - tStep0);
             return new MtpDecodeOutcome
             {
                 AcceptedCount = m,

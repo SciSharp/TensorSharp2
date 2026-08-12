@@ -2645,6 +2645,15 @@ if (simd_id == 0) {
         float g = matmul_v;
         float g3 = g * g * g;
         float inner = 0.7978845608f * (g + 0.044715f * g3);
+        // Clamp before tanh. metal::fast::tanh is an exp-ratio approximation, so
+        // once exp(2*inner) overflows (|inner| > ~44, i.e. |g| > ~11) it computes
+        // Inf/Inf and returns NaN instead of saturating to +/-1. That is a real
+        // failure, not a rounding artifact: on gemma-4-E4B this produced ONE NaN
+        // in the 256-element per-layer-embedding gate at layer 4, the following
+        // proj matmul smeared it across all 2560 residual channels, and the model
+        // emitted <pad> for every token after the first. tanh is +/-1 to float
+        // precision well before |x| = 15, so clamping there is exact.
+        inner = metal::clamp(inner, -15.0f, 15.0f);
         float gelu = 0.5f * g * (1.0f + metal::fast::tanh(inner));
         y[out_col] = gelu * gate[out_col];
     }

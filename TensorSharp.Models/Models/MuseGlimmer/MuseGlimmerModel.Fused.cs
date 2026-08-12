@@ -86,10 +86,21 @@ namespace TensorSharp.Models
         /// repo, and a 1024-row fused graph faulted the CPU backend during warmup.
         /// The per-op path there is unchanged and already correct, so the safe
         /// behaviour is to leave CPU on it rather than ship a crash.
+        ///
+        /// Metal IS included. It was originally left out because the kernel writes
+        /// the KV cache with ggml_set_rows, which ggml-metal did not implement at
+        /// the time; it does now (GGML_OP_SET_ROWS, F32 -> F16/F32/quant, see
+        /// ggml-metal-device.m). Metal takes the kernel's non-persist branch (no
+        /// graph capture), exactly as the Gemma 4 / GPT-OSS whole-model kernels do
+        /// there. Without this the 52-layer model fell back to the per-op path and
+        /// decoded at 246 ms/token on an M5 Pro (attention + norms alone were 60%
+        /// of the token) versus 26 ms/token fused - a 9.4x regression relative to
+        /// every other architecture on the same machine.
         /// </summary>
         private bool CanUseFusedForward =>
             FusedForwardEnabled && !IsTensorParallel &&
-            (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan);
+            (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan ||
+             _backend == BackendType.GgmlMetal);
 
         /// <summary>
         /// Build (or rebuild) the fused kernel's pointer tables. Every 2D projection

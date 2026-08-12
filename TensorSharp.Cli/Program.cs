@@ -2546,9 +2546,11 @@ namespace TensorSharp.Cli
                     decodeMs > 0 ? generated.Count / (decodeMs / 1000.0) : 0.0);
                 _log.LogInformation(LogEventIds.CliBenchmark,
                     "cli.inference speculative: window={Window} confMin={ConfMin:F2} drafted={Drafted} accepted={Accepted} " +
-                    "acceptanceRate={Rate:F3} verifySteps={Verify} plainSteps={Plain} rollbacks={Rollbacks}",
+                    "acceptanceRate={Rate:F3} verifySteps={Verify} plainSteps={Plain} rollbacks={Rollbacks} " +
+                    "parked={Parked} plainMsPerTok={PlainMs:F1} specMsPerTok={SpecMs:F1}",
                     window, decoder.MinDraftProb, decoder.TokensDrafted, decoder.TokensAccepted,
-                    decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps);
+                    decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps,
+                    decoder.ParkedSteps, decoder.PlainMsPerToken, decoder.SpecMsPerToken);
                 _log.LogInformation(LogEventIds.ChatCompleted,
                     "cli.inference finishReason={FinishReason} tokens={Tokens}",
                     hitEos ? "eos" : "max_tokens", generated.Count);

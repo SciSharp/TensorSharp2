@@ -105,13 +105,20 @@ namespace TensorSharp.Models
             !string.Equals(Environment.GetEnvironmentVariable("TS_DFLASH_FUSED"), "0", StringComparison.Ordinal);
 
         /// <summary>
-        /// Same backend restriction as the trunk kernel: the fused graphs go through
-        /// GGML's gallocr and persistent-buffer paths that are exercised on CUDA and
-        /// Vulkan in this repo. CPU keeps the per-op drafter, which is correct.
+        /// Same backend set as the trunk kernel (see
+        /// <c>MuseGlimmerModel.Fused.CanUseFusedForward</c>): CUDA, Vulkan and
+        /// Metal. CPU keeps the per-op drafter, which is correct.
+        ///
+        /// Metal was excluded with the trunk kernel and is included for the same
+        /// reason - ggml-metal implements every op these graphs use, including
+        /// GGML_OP_SET_ROWS. Leaving it out made speculation a NET LOSS there: the
+        /// per-op drafter cost more per step than it saved, and a 300-token greedy
+        /// generation took 46.7 s with `--draft-model` versus 17.7 s without.
         /// </summary>
         private bool CanUseFusedDFlash =>
             DFlashFusedEnabled && _hasDFlash && !IsTensorParallel &&
-            (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan);
+            (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan ||
+             _backend == BackendType.GgmlMetal);
 
         private unsafe void BuildDFlashArrays()
         {

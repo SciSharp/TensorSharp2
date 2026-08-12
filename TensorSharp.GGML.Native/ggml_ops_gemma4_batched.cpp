@@ -636,10 +636,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecodeBatched(
         }
 
         finalize_compute_with_download(logits_out, logits_data, static_cast<std::size_t>(vocab_size) * n_seqs * sizeof(float));
+        // Unconditional: logits_data is the caller's host buffer and on Metal
+        // async mode the download above is only QUEUED.
+        host_read_barrier();
 
         if (can_persist)
         {
-            host_read_barrier();
             G4BatchedDecodeCache& e = g_g4batched_pool.claim(sig_disc, sig_kc, n_seqs);
             e.ctx = ctx; e.buffer = persist_buf; e.graph = graph;
             e.hidden_in = current; e.pos_tensor = pos_tensor; e.logits_out = logits_out;
@@ -1074,10 +1076,12 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
         { set_last_error("Gemma4 MoE batched decode: graph compute failed."); if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); } return 0; }
 
         finalize_compute_with_download(logits_out, logits_data, static_cast<std::size_t>(vocab_size) * n_seqs * sizeof(float));
+        // Unconditional: logits_data is the caller's host buffer and on Metal
+        // async mode the download above is only QUEUED.
+        host_read_barrier();
 
         if (can_persist)
         {
-            host_read_barrier();
             G4BatchedDecodeCache& e = g_g4moebatched_pool.claim(sig_disc, sig_kc, n_seqs);
             e.ctx = ctx; e.buffer = persist_buf; e.graph = graph;
             e.hidden_in = current; e.pos_tensor = pos_tensor; e.logits_out = logits_out;

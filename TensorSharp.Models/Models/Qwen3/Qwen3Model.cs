@@ -37,6 +37,13 @@ namespace TensorSharp.Models
         private int[] _decodeKPositions;
         private float[] _ropeFreqs;
 
+        // Qwen2 / Qwen2.5-VL ("qwen2vl") share Qwen3's block layout but swap one
+        // detail: they add a bias to the Q/K/V projections and have no per-head
+        // QK RMSNorm. Both are detected from the weights rather than hardcoded per
+        // architecture, so a Qwen2-style GGUF loads through the same fast paths.
+        private bool _hasQkvBias;
+        private bool _hasQkNorm;
+
         private ModelDecodeArrays _modelDecodeArrays;
         private bool _canUseNativeLayerDecode;
         private bool _kvCacheHostDirty;
@@ -57,8 +64,14 @@ namespace TensorSharp.Models
             Console.WriteLine($"RoPE base={Config.RopeBase}, scale={Config.RopeScale}, eps={Config.Eps}");
 
             LoadWeights();
+            _hasQkNorm = _weights.ContainsKey("blk.0.attn_q_norm.weight");
+            _hasQkvBias = _weights.ContainsKey("blk.0.attn_q.bias");
+            if (_hasQkvBias)
+                FuseQKVBiases();
             FuseQKVWeights();
             FuseGateUpWeights();
+            if (!_hasQkNorm || _hasQkvBias)
+                Console.WriteLine($"  Attention variant: qkNorm={_hasQkNorm}, qkvBias={_hasQkvBias}");
 
             if (IsTensorParallel)
             {
@@ -83,6 +96,40 @@ namespace TensorSharp.Models
             PrecomputeConstants();
             BuildModelDecodeArrays();
             DetermineNativeLayerDecodeAvailability();
+        }
+
+        // Concatenate the separate q/k/v bias vectors into one Q|K|V bias that
+        // matches the layout of the fused attn_qkv weight, so the bias is a single
+        // ggml_add on the fused projection output instead of three.
+        private void FuseQKVBiases()
+        {
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                string qName = $"blk.{l}.attn_q.bias";
+                string kName = $"blk.{l}.attn_k.bias";
+                string vName = $"blk.{l}.attn_v.bias";
+
+                if (!_weights.TryGetValue(qName, out var qb) ||
+                    !_weights.TryGetValue(kName, out var kb) ||
+                    !_weights.TryGetValue(vName, out var vb))
+                {
+                    _hasQkvBias = false;
+                    return;
+                }
+
+                int qDim = (int)qb.ElementCount();
+                int kDim = (int)kb.ElementCount();
+                int vDim = (int)vb.ElementCount();
+                var fused = new Tensor(_allocator, DType.Float32, qDim + kDim + vDim);
+                using (var s0 = fused.Narrow(0, 0, qDim)) Ops.Copy(s0, qb.View(qDim));
+                using (var s1 = fused.Narrow(0, qDim, kDim)) Ops.Copy(s1, kb.View(kDim));
+                using (var s2 = fused.Narrow(0, qDim + kDim, vDim)) Ops.Copy(s2, vb.View(vDim));
+
+                _weights[$"blk.{l}.attn_qkv.bias"] = fused;
+                _weights.Remove(qName); qb.Dispose();
+                _weights.Remove(kName); kb.Dispose();
+                _weights.Remove(vName); vb.Dispose();
+            }
         }
 
         private unsafe void FuseQKVWeights()
@@ -150,6 +197,7 @@ namespace TensorSharp.Models
                     p + "ffn_norm.weight",
                     p + "ffn_gate_up.weight",
                     p + "ffn_down.weight",
+                    p + "attn_qkv.bias",
                 };
             }
 
@@ -517,28 +565,14 @@ namespace TensorSharp.Models
             int totalSeqLen = startPos + seqLen;
             float scale = 1.0f / MathF.Sqrt(headDim);
 
-            Tensor qkvFused = LinearForward(input, wn[1]);
-            Tensor qTensor, kTensor, vTensor;
-            if (seqLen == 1)
-            {
-                qTensor = qkvFused.Narrow(1, 0, qDim);
-                kTensor = qkvFused.Narrow(1, qDim, kDim);
-                vTensor = qkvFused.Narrow(1, qDim + kDim, kDim);
-                qkvFused.Dispose();
-            }
-            else
-            {
-                using (var qView = qkvFused.Narrow(1, 0, qDim))
-                    qTensor = Ops.NewContiguous(qView);
-                using (var kView = qkvFused.Narrow(1, qDim, kDim))
-                    kTensor = Ops.NewContiguous(kView);
-                using (var vView = qkvFused.Narrow(1, qDim + kDim, kDim))
-                    vTensor = Ops.NewContiguous(vView);
-                qkvFused.Dispose();
-            }
+            ProjectQkv(input, wn, layer, seqLen, qDim, kDim,
+                out Tensor qTensor, out Tensor kTensor, out Tensor vTensor);
 
-            qTensor = ApplyQKNormInPlace(qTensor, wn[2], numHeads, seqLen);
-            kTensor = ApplyQKNormInPlace(kTensor, wn[3], numKVHeads, seqLen);
+            if (_hasQkNorm)
+            {
+                qTensor = ApplyQKNormInPlace(qTensor, wn[2], numHeads, seqLen);
+                kTensor = ApplyQKNormInPlace(kTensor, wn[3], numKVHeads, seqLen);
+            }
 
             if (seqLen == 1)
             {
@@ -640,6 +674,80 @@ namespace TensorSharp.Models
             return output;
         }
 
+        /// <summary>
+        /// Q/K/V projection, from the fused attn_qkv weight when one exists and
+        /// from the three separate weights when it does not.
+        ///
+        /// The unfused path is not dead code: <see cref="FuseQKVWeights"/> can only
+        /// concatenate q/k/v when all three share a ggml type, and mixed-precision
+        /// GGUFs routinely break that. Qwen2.5-VL-7B Q4_K_M, for instance, stores
+        /// attn_v as Q6_K and attn_q/attn_k as Q4_K on half its layers, so only
+        /// 14 of 28 layers fuse.
+        /// </summary>
+        private void ProjectQkv(Tensor input, string[] wn, int layer, int seqLen, int qDim, int kDim,
+                                out Tensor qTensor, out Tensor kTensor, out Tensor vTensor)
+        {
+            Tensor qkvFused = LinearForward(input, wn[1]);
+            if (qkvFused == null)
+            {
+                string p = $"blk.{layer}.";
+                qTensor = LinearForward(input, p + "attn_q.weight");
+                kTensor = LinearForward(input, p + "attn_k.weight");
+                vTensor = LinearForward(input, p + "attn_v.weight");
+                if (qTensor == null || kTensor == null || vTensor == null)
+                    throw new InvalidOperationException(
+                        $"Layer {layer} has neither a fused attn_qkv weight nor separate attn_q/k/v weights.");
+
+                if (_hasQkvBias && _weights.TryGetValue(wn[8], out var splitBias))
+                {
+                    // The fused bias is laid out Q|K|V, so slice it the same way.
+                    using (var qb = splitBias.Narrow(0, 0, qDim)) AddRowBiasInPlace(qTensor, qb, seqLen);
+                    using (var kb = splitBias.Narrow(0, qDim, kDim)) AddRowBiasInPlace(kTensor, kb, seqLen);
+                    using (var vb = splitBias.Narrow(0, qDim + kDim, kDim)) AddRowBiasInPlace(vTensor, vb, seqLen);
+                }
+                return;
+            }
+
+            if (_hasQkvBias && _weights.TryGetValue(wn[8], out var qkvBias))
+                AddRowBiasInPlace(qkvFused, qkvBias, seqLen);
+
+            if (seqLen == 1)
+            {
+                qTensor = qkvFused.Narrow(1, 0, qDim);
+                kTensor = qkvFused.Narrow(1, qDim, kDim);
+                vTensor = qkvFused.Narrow(1, qDim + kDim, kDim);
+                qkvFused.Dispose();
+                return;
+            }
+
+            using (var qView = qkvFused.Narrow(1, 0, qDim))
+                qTensor = Ops.NewContiguous(qView);
+            using (var kView = qkvFused.Narrow(1, qDim, kDim))
+                kTensor = Ops.NewContiguous(kView);
+            using (var vView = qkvFused.Narrow(1, qDim + kDim, kDim))
+                vTensor = Ops.NewContiguous(vView);
+            qkvFused.Dispose();
+        }
+
+        /// <summary>
+        /// Adds a length-<c>cols</c> bias vector to every row of a [rows, cols]
+        /// activation, in place. Used for the fused Q|K|V bias on Qwen2-style
+        /// architectures, which Qwen3 does not have.
+        /// </summary>
+        private void AddRowBiasInPlace(Tensor data, Tensor bias, int seqLen)
+        {
+            int cols = (int)data.Sizes[data.Sizes.Length - 1];
+            using var biasRow = bias.View(1, cols);
+            if (seqLen == 1)
+            {
+                Ops.Add(data, data, biasRow);
+                return;
+            }
+
+            using var expanded = biasRow.Expand(seqLen, cols);
+            Ops.Add(data, data, expanded);
+        }
+
         private Tensor ApplyQKNormInPlace(Tensor data, string weightName, int numHeads, int seqLen)
         {
             int headDim = Config.HeadDim;
@@ -719,8 +827,8 @@ namespace TensorSharp.Models
 
             var attnNormW = _weights[wn[0]];
             var qkvW = _quantWeights[wn[1]];
-            var qNormW = _weights[wn[2]];
-            var kNormW = _weights[wn[3]];
+            var qNormW = _hasQkNorm ? _weights[wn[2]] : null;
+            var kNormW = _hasQkNorm ? _weights[wn[3]] : null;
             var oW = _quantWeights[wn[4]];
             var ffnNormW = _weights[wn[5]];
             var guW = _quantWeights[wn[6]];
@@ -732,7 +840,11 @@ namespace TensorSharp.Models
                 (IntPtr)hiddenPtr, hiddenSize,
                 (IntPtr)GetFloatPtr(attnNormW),
                 qkvW.CacheKey, qkvW.GgmlType, qkvW.Ne0, qkvW.Ne1, qkvW.RawBytes,
-                (IntPtr)GetFloatPtr(qNormW), (IntPtr)GetFloatPtr(kNormW), Config.HeadDim,
+                _hasQkvBias && _weights.TryGetValue(wn[8], out var qkvBiasW)
+                    ? (IntPtr)GetFloatPtr(qkvBiasW) : IntPtr.Zero,
+                qNormW != null ? (IntPtr)GetFloatPtr(qNormW) : IntPtr.Zero,
+                kNormW != null ? (IntPtr)GetFloatPtr(kNormW) : IntPtr.Zero,
+                Config.HeadDim,
                 oW.CacheKey, oW.GgmlType, oW.Ne0, oW.Ne1, oW.RawBytes,
                 (IntPtr)GetFloatPtr(ffnNormW),
                 guW.CacheKey, guW.GgmlType, guW.Ne0, guW.Ne1, guW.RawBytes,
@@ -749,6 +861,20 @@ namespace TensorSharp.Models
         private class ModelDecodeArrays
         {
             public IntPtr[] AttnNorm, Qkv, QNorm, KNorm, O, FfnNorm, Gu, Down, KCache, VCache;
+            // Null when the architecture has no QKV bias (Qwen3); the native
+            // kernel treats a null array, or a null entry, as "no bias".
+            public IntPtr[] QkvBias;
+            // Per-layer split Q/K/V, used for layers where Qkv[l] is Zero because
+            // the three weights have different ggml types and cannot be
+            // concatenated. SplitType/SplitBytes are flattened [q,k,v] per layer.
+            public IntPtr[] Q, K, V;
+            public int[] SplitType;
+            public long[] SplitBytes;
+            // Per-layer type/size for each weight class. A *_K_M quant mixes types
+            // ACROSS layers (Qwen2.5-VL-7B Q4_K_M: ffn_down is Q6_K on 14 of 28
+            // layers), so one scalar per weight class is not enough.
+            public int[] QkvTypes, OTypes, GuTypes, DownTypes;
+            public long[] QkvBytesPerLayer, OBytesPerLayer, GuBytesPerLayer, DownBytesPerLayer;
             public int QkvType, OType, GuType, DownType;
             public long QkvNe0, QkvNe1, QkvBytes;
             public long ONe0, ONe1, OBytes;
@@ -761,14 +887,31 @@ namespace TensorSharp.Models
             int numLayers = Config.NumLayers;
             if (!IsGgmlBackend) return;
 
+            // A layer contributes either a fused attn_qkv weight or three separate
+            // q/k/v weights; if any layer has neither, the whole-model graph is
+            // not buildable and we fall back to the per-layer path.
+            for (int l = 0; l < numLayers; l++)
+            {
+                string[] wnl = _layerWeightNames[l];
+                if (_quantWeights.ContainsKey(wnl[1])) continue;
+                if (!_quantWeights.ContainsKey($"blk.{l}.attn_q.weight") ||
+                    !_quantWeights.ContainsKey($"blk.{l}.attn_k.weight") ||
+                    !_quantWeights.ContainsKey($"blk.{l}.attn_v.weight"))
+                    return;
+            }
+
             string[] wn0 = _layerWeightNames[0];
-            if (!_quantWeights.ContainsKey(wn0[1])) return;
 
             var arr = new ModelDecodeArrays();
             arr.AttnNorm = new IntPtr[numLayers];
             arr.Qkv = new IntPtr[numLayers];
-            arr.QNorm = new IntPtr[numLayers];
-            arr.KNorm = new IntPtr[numLayers];
+            arr.QNorm = _hasQkNorm ? new IntPtr[numLayers] : null;
+            arr.KNorm = _hasQkNorm ? new IntPtr[numLayers] : null;
+            arr.QkvBias = _hasQkvBias ? new IntPtr[numLayers] : null;
+            arr.QkvTypes = new int[numLayers]; arr.QkvBytesPerLayer = new long[numLayers];
+            arr.OTypes = new int[numLayers]; arr.OBytesPerLayer = new long[numLayers];
+            arr.GuTypes = new int[numLayers]; arr.GuBytesPerLayer = new long[numLayers];
+            arr.DownTypes = new int[numLayers]; arr.DownBytesPerLayer = new long[numLayers];
             arr.O = new IntPtr[numLayers];
             arr.FfnNorm = new IntPtr[numLayers];
             arr.Gu = new IntPtr[numLayers];
@@ -776,8 +919,28 @@ namespace TensorSharp.Models
             arr.KCache = new IntPtr[numLayers];
             arr.VCache = new IntPtr[numLayers];
 
-            var qkv0 = _quantWeights[wn0[1]];
-            arr.QkvType = qkv0.GgmlType; arr.QkvNe0 = qkv0.Ne0; arr.QkvNe1 = qkv0.Ne1; arr.QkvBytes = qkv0.RawBytes;
+            // Shapes are uniform across layers; only the quantization TYPE varies,
+            // and that is carried per layer below. The fused-QKV shape still has to
+            // be read from a layer that actually has a fused weight - layer 0 may
+            // well be split.
+            QuantizedWeight qkvHeader = null;
+            for (int l = 0; l < numLayers && qkvHeader == null; l++)
+                _quantWeights.TryGetValue(_layerWeightNames[l][1], out qkvHeader);
+
+            if (qkvHeader != null)
+            {
+                arr.QkvType = qkvHeader.GgmlType; arr.QkvNe0 = qkvHeader.Ne0;
+                arr.QkvNe1 = qkvHeader.Ne1; arr.QkvBytes = qkvHeader.RawBytes;
+            }
+            else
+            {
+                // Every layer is split. QkvNe0 (the input dimension) is still read
+                // by the native kernel to size the split Q/K/V tensors.
+                arr.QkvType = 0;
+                arr.QkvNe0 = Config.HiddenSize;
+                arr.QkvNe1 = (Config.NumHeads + 2 * Config.NumKVHeads) * (long)Config.HeadDim;
+                arr.QkvBytes = 0;
+            }
             var o0 = _quantWeights[wn0[4]];
             arr.OType = o0.GgmlType; arr.ONe0 = o0.Ne0; arr.ONe1 = o0.Ne1; arr.OBytes = o0.RawBytes;
             var gu0 = _quantWeights[wn0[6]];
@@ -789,16 +952,57 @@ namespace TensorSharp.Models
             {
                 string[] wn = _layerWeightNames[l];
                 arr.AttnNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[0]]);
-                arr.Qkv[l] = _quantWeights[wn[1]].CacheKey;
-                arr.QNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[2]]);
-                arr.KNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[3]]);
-                arr.O[l] = _quantWeights[wn[4]].CacheKey;
+                if (_quantWeights.TryGetValue(wn[1], out var qkvL))
+                {
+                    arr.Qkv[l] = qkvL.CacheKey;
+                    arr.QkvTypes[l] = qkvL.GgmlType;
+                    arr.QkvBytesPerLayer[l] = qkvL.RawBytes;
+                }
+                else
+                {
+                    arr.Q ??= new IntPtr[numLayers];
+                    arr.K ??= new IntPtr[numLayers];
+                    arr.V ??= new IntPtr[numLayers];
+                    arr.SplitType ??= new int[3 * numLayers];
+                    arr.SplitBytes ??= new long[3 * numLayers];
+
+                    var qW = _quantWeights[$"blk.{l}.attn_q.weight"];
+                    var kW = _quantWeights[$"blk.{l}.attn_k.weight"];
+                    var vW = _quantWeights[$"blk.{l}.attn_v.weight"];
+                    arr.Q[l] = qW.CacheKey; arr.K[l] = kW.CacheKey; arr.V[l] = vW.CacheKey;
+                    arr.SplitType[3 * l + 0] = qW.GgmlType;
+                    arr.SplitType[3 * l + 1] = kW.GgmlType;
+                    arr.SplitType[3 * l + 2] = vW.GgmlType;
+                    arr.SplitBytes[3 * l + 0] = qW.RawBytes;
+                    arr.SplitBytes[3 * l + 1] = kW.RawBytes;
+                    arr.SplitBytes[3 * l + 2] = vW.RawBytes;
+                }
+                if (arr.QNorm != null)
+                {
+                    arr.QNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[2]]);
+                    arr.KNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[3]]);
+                }
+                if (arr.QkvBias != null)
+                    arr.QkvBias[l] = (IntPtr)GetFloatPtr(_weights[wn[8]]);
+                var oL = _quantWeights[wn[4]];
+                arr.O[l] = oL.CacheKey;
+                arr.OTypes[l] = oL.GgmlType; arr.OBytesPerLayer[l] = oL.RawBytes;
                 arr.FfnNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[5]]);
-                arr.Gu[l] = _quantWeights[wn[6]].CacheKey;
-                arr.Down[l] = _quantWeights[wn[7]].CacheKey;
+                var guL = _quantWeights[wn[6]];
+                arr.Gu[l] = guL.CacheKey;
+                arr.GuTypes[l] = guL.GgmlType; arr.GuBytesPerLayer[l] = guL.RawBytes;
+                var downL = _quantWeights[wn[7]];
+                arr.Down[l] = downL.CacheKey;
+                arr.DownTypes[l] = downL.GgmlType; arr.DownBytesPerLayer[l] = downL.RawBytes;
                 arr.KCache[l] = TensorComputePrimitives.GetStoragePointer(_kvCacheK[l]);
                 arr.VCache[l] = TensorComputePrimitives.GetStoragePointer(_kvCacheV[l]);
             }
+
+            // Escape hatch: TS_QWEN3_MODEL_DECODE=0 runs the per-layer decode path
+            // instead of the single whole-model graph, for bisecting a suspected
+            // kernel bug against the (slower) per-layer and managed paths.
+            if (string.Equals(Environment.GetEnvironmentVariable("TS_QWEN3_MODEL_DECODE"), "0", StringComparison.Ordinal))
+                return;
 
             _modelDecodeArrays = arr;
         }
@@ -851,6 +1055,12 @@ namespace TensorSharp.Models
                 a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
                 a.O, a.FfnNorm, a.Gu, a.Down,
                 a.KCache, a.VCache,
+                a.QkvBias,
+                a.Q, a.K, a.V, a.SplitType, a.SplitBytes,
+                a.QkvTypes, a.QkvBytesPerLayer,
+                a.OTypes, a.OBytesPerLayer,
+                a.GuTypes, a.GuBytesPerLayer,
+                a.DownTypes, a.DownBytesPerLayer,
                 a.QkvType, a.QkvNe0, a.QkvNe1, a.QkvBytes,
                 a.OType, a.ONe0, a.ONe1, a.OBytes,
                 a.GuType, a.GuNe0, a.GuNe1, a.GuBytes,

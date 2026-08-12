@@ -912,7 +912,9 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
 
         void* out_data = fold ? logits_data : hidden_data;
         finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
-        if (can_persist) host_read_barrier();
+        // Unconditional: out_data is the caller's host buffer and on Metal async
+        // mode the download above is only QUEUED.
+        host_read_barrier();
 
         if (can_persist && mgdc != nullptr)
         {

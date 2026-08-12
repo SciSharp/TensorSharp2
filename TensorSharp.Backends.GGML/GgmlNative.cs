@@ -1405,6 +1405,7 @@ internal enum GgmlIndexReductionOp
             IntPtr hiddenData, int hiddenSize,
             IntPtr attnNormData,
             IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvBiasData,
             IntPtr qNormData, IntPtr kNormData, int headDim,
             IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
             IntPtr ffnNormData,
@@ -1758,6 +1759,13 @@ internal enum GgmlIndexReductionOp
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
             IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
             IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            IntPtr[] qkvBiasArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
+            int[] splitTypeArr, long[] splitBytesArr,
+            int[] qkvTypeArr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oBytesArr,
+            int[] guTypeArr, long[] guBytesArr,
+            int[] downTypeArr, long[] downBytesArr,
             int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
             int oType, long oNe0, long oNe1, long oBytes,
             int guType, long guNe0, long guNe1, long guBytes,
@@ -3970,10 +3978,16 @@ internal enum GgmlIndexReductionOp
                 "rope_ex_ff");
         }
 
+        /// <param name="qkvBiasData">
+        /// Optional fused Q|K|V bias vector (IntPtr.Zero when the architecture has none).
+        /// Qwen2 / Qwen2.5-VL carry a QKV bias and no QK norm; Qwen3 is the reverse.
+        /// <paramref name="qNormData"/>/<paramref name="kNormData"/> may likewise be Zero.
+        /// </param>
         public static void TransformerLayerDecode(
             IntPtr hiddenData, int hiddenSize,
             IntPtr attnNormData,
             IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvBiasData,
             IntPtr qNormData, IntPtr kNormData, int headDim,
             IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
             IntPtr ffnNormData,
@@ -3990,6 +4004,7 @@ internal enum GgmlIndexReductionOp
                 hiddenData, hiddenSize,
                 attnNormData,
                 qkvData, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qkvBiasData,
                 qNormData, kNormData, headDim,
                 oData, oType, oNe0, oNe1, oBytes,
                 ffnNormData,
@@ -4272,6 +4287,13 @@ internal enum GgmlIndexReductionOp
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
             IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
             IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            IntPtr[] qkvBiasArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
+            int[] splitTypeArr, long[] splitBytesArr,
+            int[] qkvTypeArr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oBytesArr,
+            int[] guTypeArr, long[] guBytesArr,
+            int[] downTypeArr, long[] downBytesArr,
             int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
             int oType, long oNe0, long oNe1, long oBytes,
             int guType, long guNe0, long guNe1, long guBytes,
@@ -4287,6 +4309,13 @@ internal enum GgmlIndexReductionOp
                 attnNormArr, qkvArr, qNormArr, kNormArr,
                 oArr, ffnNormArr, guArr, downArr,
                 kCacheArr, vCacheArr,
+                qkvBiasArr,
+                qArr, kArr, vArr,
+                splitTypeArr, splitBytesArr,
+                qkvTypeArr, qkvBytesArr,
+                oTypeArr, oBytesArr,
+                guTypeArr, guBytesArr,
+                downTypeArr, downBytesArr,
                 qkvType, qkvNe0, qkvNe1, qkvBytes,
                 oType, oNe0, oNe1, oBytes,
                 guType, guNe0, guNe1, guBytes,

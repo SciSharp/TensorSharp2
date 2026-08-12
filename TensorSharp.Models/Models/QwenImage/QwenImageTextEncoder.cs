@@ -354,7 +354,11 @@ namespace TensorSharp.Models.QwenImage
             }
             if (!ok)
             {
-                Console.WriteLine("  [te-fused] trunk kernel unavailable; using the per-op path.");
+                // Surface WHY: "op unsupported by backend" (a backend gap worth
+                // fixing) reads very differently from an allocation failure, and
+                // the per-op fallback is several times slower.
+                Console.WriteLine("  [te-fused] trunk kernel unavailable (" +
+                    GgmlBasicOps.LastNativeError("no native error") + "); using the per-op path.");
                 _fusedFailed = true;
                 return false;
             }

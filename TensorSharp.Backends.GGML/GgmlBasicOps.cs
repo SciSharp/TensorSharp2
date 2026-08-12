@@ -1438,6 +1438,15 @@ namespace TensorSharp.GGML
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
         public static void Shutdown() => GgmlNative.Shutdown();
+
+        /// <summary>
+        /// Set an environment variable as the NATIVE library sees it. Managed
+        /// <c>Environment.SetEnvironmentVariable</c> does not reach native getenv on
+        /// every platform, and some ggml tunables are read once at device probe, so
+        /// they have to be set through this before the backend initialises.
+        /// </summary>
+        public static bool SetNativeEnvironmentVariable(string name, string value, bool overwrite)
+            => GgmlNative.SetNativeEnvironmentVariable(name, value, overwrite);
         public static void ReleaseReuseComputeBuffers() => GgmlNative.ReleaseReuseComputeBuffers();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
         public static long DeviceCopyCacheResidentBytes() => GgmlNative.DeviceCopyCacheResidentBytes();
@@ -1595,6 +1604,13 @@ namespace TensorSharp.GGML
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
             IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
             IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            IntPtr[] qkvBiasArr,
+            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
+            int[] splitTypeArr, long[] splitBytesArr,
+            int[] qkvTypeArr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oBytesArr,
+            int[] guTypeArr, long[] guBytesArr,
+            int[] downTypeArr, long[] downBytesArr,
             int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
             int oType, long oNe0, long oNe1, long oBytes,
             int guType, long guNe0, long guNe1, long guBytes,
@@ -1610,6 +1626,13 @@ namespace TensorSharp.GGML
                 attnNormArr, qkvArr, qNormArr, kNormArr,
                 oArr, ffnNormArr, guArr, downArr,
                 kCacheArr, vCacheArr,
+                qkvBiasArr,
+                qArr, kArr, vArr,
+                splitTypeArr, splitBytesArr,
+                qkvTypeArr, qkvBytesArr,
+                oTypeArr, oBytesArr,
+                guTypeArr, guBytesArr,
+                downTypeArr, downBytesArr,
                 qkvType, qkvNe0, qkvNe1, qkvBytes,
                 oType, oNe0, oNe1, oBytes,
                 guType, guNe0, guNe1, guBytes,
@@ -1628,6 +1651,7 @@ namespace TensorSharp.GGML
             IntPtr hiddenData, int hiddenSize,
             IntPtr attnNormData,
             IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvBiasData,
             IntPtr qNormData, IntPtr kNormData, int headDim,
             IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
             IntPtr ffnNormData,
@@ -1644,6 +1668,7 @@ namespace TensorSharp.GGML
                 hiddenData, hiddenSize,
                 attnNormData,
                 qkvData, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qkvBiasData,
                 qNormData, kNormData, headDim,
                 oData, oType, oNe0, oNe1, oBytes,
                 ffnNormData,

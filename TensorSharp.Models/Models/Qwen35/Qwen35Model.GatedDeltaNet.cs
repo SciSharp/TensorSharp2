@@ -2188,7 +2188,12 @@ namespace TensorSharp.Models
                     && _ssmDtBiasW[layer] != null
                     && _ssmAW[layer] != null
                     && _ssmNormW[layer] != null
-                    && (seqLen == 1 || string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QWEN35_GDN_PACKED_KERNELS"), "1", StringComparison.Ordinal)))
+                    // Prefill uses the packed kernel too, not just decode: the
+                    // unpacked path leaves a WRONG recurrent state on MLX, which
+                    // only shows up in the first decode token. See the comment on
+                    // MlxFusedOps.Qwen35GdnPackedKernelsEnabled.
+                    && (seqLen == 1 ||
+                        !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QWEN35_GDN_PACKED_KERNELS"), "0", StringComparison.Ordinal)))
                 {
                     gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
                     ranMlxNativeGdn = _mlxGdnCache[layer].TryRunQwen35Packed(

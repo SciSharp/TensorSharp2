@@ -108,6 +108,53 @@ public class ManagedQuantizedOpsTests
     }
 
     [Fact]
+    public void ManagedIq3Xxs_MatchesNativeGgmlDequantizer()
+    {
+        // IQ3_XXS is what Unsloth's "UD-IQ2_XXS" mixed quants put on the
+        // sensitive tensors. MLX has no native IQ3_XXS kernel, so those tensors
+        // fall through to the managed dequantizer; before it existed,
+        // Muse-Glimmer-30B / Qwen3.6-27B / Qwen3.6-35B-A3B all aborted on their
+        // first FFN with "Pure C# backend does not support GGUF tensor type
+        // IQ3_XXS". Ground truth is ggml's own dequantize_row_iq3_xxs.
+        const int blocks = 7;
+        const int elems = blocks * 256;
+        int blockBytes = (int)GgufFile.GetTypeSize(GgmlTensorType.IQ3_XXS);
+        Assert.Equal(98, blockBytes);
+        Assert.Equal(256, GgufFile.GetBlockSize(GgmlTensorType.IQ3_XXS));
+        Assert.Equal(blocks * blockBytes, NativeDequant.RowSize((int)GgmlTensorType.IQ3_XXS, elems));
+
+        // Deterministic pseudo-random block payloads: every grid index, every
+        // 7-bit sign selector and every 4-bit scale nibble gets exercised.
+        byte[] raw = new byte[blocks * blockBytes];
+        uint state = 0x9E3779B9u;
+        for (int i = 0; i < raw.Length; i++)
+        {
+            state = state * 1664525u + 1013904223u;
+            raw[i] = (byte)(state >> 24);
+        }
+        // Keep the fp16 scale of every block finite and sane.
+        for (int b = 0; b < blocks; b++)
+            WriteHalf(raw, b * blockBytes, 0.25f + 0.125f * b);
+
+        var managed = new float[elems];
+        ManagedQuantizedOps.DequantizeToFloat32((int)GgmlTensorType.IQ3_XXS, raw, 0, managed, 0, elems);
+
+        var native = new float[elems];
+        TensorSharp.GGML.GgmlGgufTensorDequant.DequantizeToFloat32(
+            (int)GgmlTensorType.IQ3_XXS, raw, 0, native, 0, elems);
+
+        Assert.Equal(native.Length, managed.Length);
+        bool anyNonZero = false;
+        for (int i = 0; i < elems; i++)
+        {
+            if (native[i] != 0f) anyNonZero = true;
+            Assert.True(Math.Abs(native[i] - managed[i]) <= 1e-5f * Math.Max(1f, Math.Abs(native[i])),
+                $"element {i}: native {native[i]}, managed {managed[i]}");
+        }
+        Assert.True(anyNonZero, "dequantized block was entirely zero - the fixture is not exercising the codebook");
+    }
+
+    [Fact]
     public void NativeDequant_RowSizeSupportsIq2Xxs()
     {
         Assert.Equal(

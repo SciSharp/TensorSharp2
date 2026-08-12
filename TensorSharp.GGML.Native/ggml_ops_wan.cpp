@@ -978,6 +978,50 @@ ggml_tensor* wan_vae_conv_w(WanVaeBuild& b, void* tap, const TSGWanVaeConv& c)
 // cross-chunk feature caches that filled a 16 GB card into WDDM paging (decode
 // 51 s -> 180 s depending on what else held VRAM). Banding is exact — each band
 // gets its vertical context rows from a single pre-padded copy of the input.
+// ggml_pad_ext with LEADING padding, built so it runs on every backend.
+//
+// ggml-metal implements only trailing padding: ggml_metal_device_supports_op
+// returns false for GGML_OP_PAD whenever any of op_params 0/2/4/6 (the lo pads)
+// is non-zero, and ggml_metal_op_encode_impl then ABORTS THE PROCESS with
+// "unsupported op 'PAD'". The Wan VAE leans on leading pads throughout - the
+// causal 3D convolutions zero-pad the FRONT of the temporal axis, and the banded
+// 2D conv pre-pads the top row band - so every Wan video generation died in
+// TSGgml_WanVaeDecode on Metal (SIGABRT) after a perfectly good denoise loop.
+//
+// Trailing pads still go through ggml_pad_ext. Each leading pad is prepended as a
+// zeroed strip of the tensor itself (view -> cont -> scale 0 -> concat), which
+// uses only ops every backend implements. The strips are 1-2 slices wide, so the
+// extra work is negligible next to the convolutions around them.
+static ggml_tensor* wan_pad_ext_compat(ggml_context* ctx, ggml_tensor* x,
+                                       int lp0, int rp0, int lp1, int rp1,
+                                       int lp2, int rp2, int lp3, int rp3)
+{
+    const int lead[4] = { lp0, lp1, lp2, lp3 };
+    if (lead[0] <= 0 && lead[1] <= 0 && lead[2] <= 0 && lead[3] <= 0)
+        return ggml_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+
+    ggml_tensor* t = (rp0 > 0 || rp1 > 0 || rp2 > 0 || rp3 > 0)
+        ? ggml_pad_ext(ctx, x, 0, rp0, 0, rp1, 0, rp2, 0, rp3)
+        : x;
+
+    for (int d = 0; d < 4; d++)
+    {
+        int remaining = lead[d];
+        while (remaining > 0)
+        {
+            // A prefix along any single axis is a valid strided view of t.
+            const std::int64_t take = std::min<std::int64_t>(remaining, t->ne[d]);
+            std::int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+            ne[d] = take;
+            ggml_tensor* strip = ggml_cont(ctx, ggml_view_4d(ctx, t, ne[0], ne[1], ne[2], ne[3],
+                                                             t->nb[1], t->nb[2], t->nb[3], 0));
+            t = ggml_concat(ctx, ggml_scale(ctx, strip, 0.0f), t, d);
+            remaining -= static_cast<int>(take);
+        }
+    }
+    return t;
+}
+
 ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int pad, int stride = 1)
 {
     const long long gemmMax = b.gemmMax;
@@ -998,7 +1042,7 @@ ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int
     // Banded path: pre-pad vertically once, then convolve horizontal bands whose
     // views carry their own context rows (horizontal padding stays in the conv).
     long long bandRows = std::max<long long>(1, gemmMax / std::max<long long>(1, rowBytes));
-    ggml_tensor* xp = pad > 0 ? ggml_pad_ext(ctx, x, 0, 0, pad, pad, 0, 0, 0, 0) : x;
+    ggml_tensor* xp = pad > 0 ? wan_pad_ext_compat(ctx, x, 0, 0, pad, pad, 0, 0, 0, 0) : x;
     ggml_tensor* out = nullptr;
     for (long long y = 0; y < OH; y += bandRows)
     {
@@ -1034,14 +1078,14 @@ ggml_tensor* wan_vae_causal_conv(WanVaeBuild& b, const TSGWanVaeConv& c, ggml_te
         if (prev == nullptr)
         {
             // first chunk: 2 zero frames in front (causal zero padding)
-            xin = ggml_pad_ext(ctx, x, 0, 0, 0, 0, 0, 0, 2, 0);
+            xin = wan_pad_ext_compat(ctx, x, 0, 0, 0, 0, 0, 0, 2, 0);
         }
         else
         {
             if (prev->ne[3] < 2)
             {
                 // previous chunk had a single frame: zero-pad its front once
-                prev = ggml_pad_ext(ctx, prev, 0, 0, 0, 0, 0, 0, 2 - static_cast<int>(prev->ne[3]), 0);
+                prev = wan_pad_ext_compat(ctx, prev, 0, 0, 0, 0, 0, 0, 2 - static_cast<int>(prev->ne[3]), 0);
             }
             xin = ggml_concat(ctx, prev, x, 3);
         }
@@ -1175,7 +1219,7 @@ ggml_tensor* wan_vae_upsample(WanVaeBuild& b, const TSGWanVaeUpsampleW& u, ggml_
             ggml_tensor* prev = b.cache[idx] != nullptr ? ggml_cast(ctx, b.cache[idx], GGML_TYPE_F32) : nullptr;
             ggml_tensor* xin;
             if (prev == nullptr)
-                xin = ggml_pad_ext(ctx, x, 0, 0, 0, 0, 0, 0, 2, 0);
+                xin = wan_pad_ext_compat(ctx, x, 0, 0, 0, 0, 0, 0, 2, 0);
             else
                 xin = ggml_concat(ctx, prev, x, 3);
             // cache = trailing 2 frames of x (zero-front-padded when T == 1 on the
@@ -1190,7 +1234,7 @@ ggml_tensor* wan_vae_upsample(WanVaeBuild& b, const TSGWanVaeUpsampleW& u, ggml_
                 nc = ggml_concat(ctx, lastPrev, x, 3);
             }
             else
-                nc = ggml_pad_ext(ctx, x, 0, 0, 0, 0, 0, 0, 1, 0);
+                nc = wan_pad_ext_compat(ctx, x, 0, 0, 0, 0, 0, 0, 1, 0);
             b.cache[idx] = ggml_cast(ctx, nc, GGML_TYPE_F16);
 
             // temporal conv (kd=3, 1x1 spatial): per-tap 1x1 conv over the window
@@ -1328,7 +1372,7 @@ ggml_tensor* wan_vae_enc_resample(WanVaeBuild& b, const TSGWanVaeDownW& u, ggml_
 {
     ggml_context* ctx = b.ctx;
 
-    ggml_tensor* xp = ggml_pad_ext(ctx, x, 0, 1, 0, 1, 0, 0, 0, 0);
+    ggml_tensor* xp = wan_pad_ext_compat(ctx, x, 0, 1, 0, 1, 0, 0, 0, 0);
     ggml_tensor* wt = wan_vae_conv_w(b, u.sconv.tap0, u.sconv);
     ggml_tensor* y = wan_vae_conv2d(b, wt, xp, 0, 2);
     if (u.sconv.bias != nullptr)
@@ -1392,7 +1436,7 @@ ggml_tensor* wan_vae_avg_down(WanVaeBuild& b, ggml_tensor* x, int ft, int fs)
     if (ft == 2)
     {
         if (x->ne[3] % 2 == 1)
-            x = ggml_pad_ext(ctx, x, 0, 0, 0, 0, 0, 0, 1, 0);       // front zero frame
+            x = wan_pad_ext_compat(ctx, x, 0, 0, 0, 0, 0, 0, 1, 0);       // front zero frame
         const std::int64_t W = x->ne[0], H = x->ne[1], C = x->ne[2], T = x->ne[3];
         ggml_tensor* r = ggml_reshape_4d(ctx, x, W * H, C, 2, T / 2);
         r = ggml_cont(ctx, ggml_permute(ctx, r, 0, 2, 1, 3));       // [WH, 2, C, T/2]

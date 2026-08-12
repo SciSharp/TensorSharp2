@@ -645,7 +645,9 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         }
         ggml_backend_tensor_get(out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
         finalize_compute_with_download(out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
-        if (can_persist) host_read_barrier();
+        // Unconditional: conf_out is the caller's host confidence array and on
+        // Metal async mode the download above is only QUEUED.
+        host_read_barrier();
 
         if (can_persist && slot != nullptr)
         {
