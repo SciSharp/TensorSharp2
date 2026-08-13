@@ -35,6 +35,7 @@
       <tr><td><strong>Muse-Glimmer</strong></td><td><code>muse-glimmer</code></td><td>Muse-Glimmer-30B (interleaved SWA + NoPE, attention output gate)</td><td>Image</td><td class="yes">Yes</td><td class="yes">Yes (ATEM)</td><td class="yes">Yes (DFlash block drafter, separate GGUF)</td></tr>
       <tr><td><strong>DiffusionGemma</strong></td><td><code>diffusion-gemma</code>, <code>diffusion_gemma</code></td><td>diffusion-gemma text-diffusion GGUFs</td><td>Text only</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen-Image-Edit</strong></td><td><code>qwen_image</code>, <code>qwen-image</code></td><td>qwen-image-edit MMDiT (+ VAE &amp; Qwen2.5-VL companions)</td><td>Image edit (image+text → image)</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
+      <tr><td><strong>Wan video</strong></td><td><code>wan</code></td><td>Wan 2.1 T2V 1.3B/14B, Wan 2.2 TI2V-5B, Wan 2.2 A14B T2V/I2V (two 14B experts) (+ UMT5-XXL &amp; video-VAE companions)</td><td>Video out (text → video, image → video)</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
     </tbody>
   </table>
   </div>
@@ -64,10 +65,15 @@
       <tr><td>Nemotron-H</td><td>Nemotron 3 Nano Omni 30B-A3B (image)</td><td><a href="https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF" target="_blank" rel="noopener">unsloth/NVIDIA-Nemotron-3-Nano-Omni-…</a></td><td>mmproj: <code>mmproj-BF16.gguf</code> (same repo) — required for image input. Audio is not functional: it needs a Parakeet audio mmproj that this distribution does not ship</td></tr>
       <tr><td>Mistral 3</td><td>Mistral-Small-3.1-24B-Instruct</td><td><a href="https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF" target="_blank" rel="noopener">bartowski/mistralai_Mistral-Small-3.1-24B-…</a></td><td>Pixtral mmproj: <code>mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf</code> (same repo)</td></tr>
       <tr><td>DiffusionGemma</td><td>diffusiongemma-26B-A4B-it</td><td><a href="https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF" target="_blank" rel="noopener">unsloth/diffusiongemma-26B-A4B-it-GGUF</a></td><td>—</td></tr>
+      <tr><td>Muse-Glimmer</td><td>Muse-Glimmer-30B</td><td><a href="https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF" target="_blank" rel="noopener">unsloth/Muse-Glimmer-30B-GGUF</a></td><td>mmproj: <code>mmproj-Muse-Glimmer-30B-Q8_0.gguf</code> (same repo) for image input</td></tr>
+      <tr><td>Muse-Glimmer</td><td>DFlash speculative drafter (optional)</td><td><a href="https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF" target="_blank" rel="noopener">unsloth/Muse-Glimmer-30B-GGUF</a></td><td><code>dflash-*.gguf</code> — a 5-layer block drafter loaded with <code>--draft-model</code>. Verification is greedy against the target, so the emitted stream is the plain-greedy stream</td></tr>
       <tr><td>Qwen-Image-Edit</td><td>MMDiT DiT (the <code>--model</code> GGUF)</td><td><a href="https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF" target="_blank" rel="noopener">unsloth/Qwen-Image-Edit-2511-GGUF</a></td><td>e.g. <code>qwen-image-edit-2511-Q4_K_M.gguf</code></td></tr>
       <tr><td>Qwen-Image-Edit</td><td>Qwen-Image VAE (required)</td><td><a href="https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF" target="_blank" rel="noopener">QuantStack/Qwen-Image-Edit-GGUF</a></td><td><code>VAE/Qwen_Image-VAE.safetensors</code> — place next to the DiT or pass <code>--qwen-image-vae</code></td></tr>
       <tr><td>Qwen-Image-Edit</td><td>Qwen2.5-VL-7B text encoder (required)</td><td><a href="https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF" target="_blank" rel="noopener">unsloth/Qwen2.5-VL-7B-Instruct-GGUF</a></td><td>Optional vision mmproj: <code>mmproj-BF16.gguf</code> (same repo) for image-grounded edits</td></tr>
       <tr><td>Qwen-Image-Edit</td><td>Lightning LoRA (optional, 4/8-step)</td><td><a href="https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning" target="_blank" rel="noopener">lightx2v/Qwen-Image-Edit-2511-Lightning</a></td><td><code>Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors</code> via <code>--qwen-image-lora</code></td></tr>
+      <tr><td>Wan video</td><td>Wan DiT (the <code>--model</code> GGUF)</td><td><a href="https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF" target="_blank" rel="noopener">QuantStack/Wan2.2-TI2V-5B-GGUF</a></td><td>Also <a href="https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF" target="_blank" rel="noopener">Wan2.2-I2V-A14B</a> (download <em>both</em> the HighNoise and LowNoise experts) and <a href="https://huggingface.co/city96/Wan2.1-T2V-14B-gguf" target="_blank" rel="noopener">Wan2.1-T2V-14B</a></td></tr>
+      <tr><td>Wan video</td><td>UMT5-XXL text encoder (required)</td><td><a href="https://huggingface.co/city96/umt5-xxl-encoder-gguf" target="_blank" rel="noopener">city96/umt5-xxl-encoder-gguf</a></td><td><code>umt5-xxl-encoder-Q8_0.gguf</code> — place next to the DiT or pass <code>--wan-te</code></td></tr>
+      <tr><td>Wan video</td><td>video VAE (required)</td><td><a href="https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors" target="_blank" rel="noopener">wan_2.1_vae.safetensors</a></td><td>Wan 2.1 and A14B use <code>wan_2.1_vae.safetensors</code>; TI2V-5B uses <code>Wan2.2_VAE.safetensors</code> (bundled in the TI2V-5B repo). Place next to the DiT (a <code>VAE/</code> subfolder works) or pass <code>--wan-vae</code></td></tr>
     </tbody>
   </table>
   </div>
@@ -161,6 +167,20 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/mistralai_Mistral-
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf \
     --mmproj models/mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf --backend ggml_cuda</code></pre>
 
+  <h3 id="muse-glimmer">Muse-Glimmer (text + image, thinking, tools, DFlash drafting)</h3>
+  <pre data-lang="bash"><code>hf download unsloth/Muse-Glimmer-30B-GGUF Muse-Glimmer-30B-UD-IQ2_XXS.gguf --local-dir models
+hf download unsloth/Muse-Glimmer-30B-GGUF mmproj-Muse-Glimmer-30B-Q8_0.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \r
+    --input prompt.txt --max-tokens 256 --backend ggml_cuda
+# image understanding
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \r
+    --mmproj models/mmproj-Muse-Glimmer-30B-Q8_0.gguf --image photo.png --input question.txt \r
+    --max-tokens 300 --backend ggml_cuda
+# DFlash speculative decoding (optional drafter GGUF from the same repo)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \r
+    --draft-model models/dflash-kquant.gguf --spec-draft-n-max 15 --input prompt.txt --backend ggml_cuda</code></pre>
+
   <h3>DiffusionGemma (block text diffusion)</h3>
   <pre data-lang="bash"><code>hf download unsloth/diffusiongemma-26B-A4B-it-GGUF diffusiongemma-26B-A4B-it-Q4_K_M.gguf --local-dir models
 
@@ -189,6 +209,24 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
     --qwen-image-lora models/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
     --backend ggml_cuda</code></pre>
 
+  <h3 id="wan">Wan 2.1 / 2.2 (prompt → video, image → video)</h3>
+  <pre data-lang="bash"><code>hf download QuantStack/Wan2.2-TI2V-5B-GGUF Wan2.2-TI2V-5B-Q8_0.gguf --local-dir models
+hf download QuantStack/Wan2.2-TI2V-5B-GGUF VAE/Wan2.2_VAE.safetensors --local-dir models
+hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
+
+# text → video
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2.2-TI2V-5B-Q8_0.gguf \r
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \r
+    --prompt "A red fox trotting through falling snow, cinematic" \r
+    --video-frames 81 --fps 24 --output out.mp4 --backend ggml_cuda
+# image → video (the image becomes the first frame; Wan 2.2 models only)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2.2-TI2V-5B-Q8_0.gguf \r
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \r
+    --image first_frame.png --prompt "the camera pushes in as the waves rise" \r
+    --output out.mp4 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Wan2.2-TI2V-5B-Q8_0.gguf \r
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors --backend ggml_cuda</code></pre>
+
   <h2 id="multimodal">Multimodal support</h2>
   <div class="table-scroll">
   <table>
@@ -198,6 +236,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
       <tr><td>Gemma 3</td><td>Image</td><td>PNG / JPEG / HEIC. Non-gated 4B projector: <code>mmproj-model-f16.gguf</code>.</td></tr>
       <tr><td>Qwen 3.5 / 3.6</td><td>Image</td><td>Dynamic-resolution vision encoder. The 9B / 3.6 repositories use <code>mmproj-F16.gguf</code>.</td></tr>
       <tr><td>Mistral 3</td><td>Image</td><td>Pixtral vision encoder. Projector: <code>mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf</code>.</td></tr>
+      <tr><td>Muse-Glimmer</td><td>Image</td><td>50-layer sparse-window ViT with 2D RoPE and a 2×2 pixel shuffle; the image is stretched (no padding, no tiling) to a grid chosen the same way llama.cpp chooses it. Projector: <code>mmproj-Muse-Glimmer-30B-Q8_0.gguf</code>.</td></tr>
       <tr><td>Nemotron-H (Omni)</td><td>Image</td><td>RADIO / v2_vl ViT encoder. Pass the matching <code>--mmproj</code>; image tokens expand at <code>&lt;image&gt;</code> placeholders. Audio is preprocessed only — real audio inference needs a Parakeet audio mmproj that the GGUF distribution does not ship.</td></tr>
     </tbody>
   </table>
@@ -214,13 +253,33 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
   <p>An optional <strong>Lightning distillation LoRA</strong> (<code>--qwen-image-lora</code> / <code>TS_QWEN_IMAGE_LORA</code>, <code>.safetensors</code>) is merged into the DiT at load time — it auto-derives the reduced denoise step count (e.g. 4 or 8) and switches CFG to 1.0, skipping the negative pass. The denoise loop is further accelerated by a <strong>whole-step DiT cache</strong> (EasyCache-style; <code>TS_QWEN_DIT_CACHE_MODE</code> = <code>easycache</code> / <code>fbc</code>) that skips DiT steps when the output is predictable from the previous step.</p>
   <p>Run it from the <a href="cli.html#imageedit">CLI</a> (<code>--image</code> + <code>--prompt</code>), the <a href="server.html#webui">Web UI</a> image-edit flow (with live denoising previews), or in-process from <a href="code-api.html#imageedit">C# via <code>QwenImageModel.EditImage()</code></a>. Full details are in the repository's <code>docs/models/qwenimage.md</code> card.</p>
 
+  <h2 id="video">Video generation (Wan 2.1 / 2.2)</h2>
+  <p>Wan turns a <strong>prompt</strong> — and, on the Wan 2.2 checkpoints, an <strong>uploaded first frame</strong> — into an H.264 MP4. The <code>--model</code> GGUF is only the DiT; TensorSharp resolves two companions next to it (a <code>VAE/</code>, <code>HighNoise/</code> or <code>LowNoise/</code> subfolder is fine):</p>
+  <ul>
+    <li><strong>UMT5-XXL text encoder</strong> — prompt → conditioning (<code>--wan-te</code> / <code>TS_WAN_TE</code>). Released from VRAM before the denoise starts.</li>
+    <li><strong>Causal 3D video VAE</strong> — latent ↔ frames (<code>--wan-vae</code> / <code>TS_WAN_VAE</code>). Wan 2.1 and A14B use <code>wan_2.1_vae</code>; TI2V-5B uses <code>Wan2.2_VAE</code>.</li>
+  </ul>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Family</th><th>Latent</th><th>Modes</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Wan 2.1 T2V (1.3B / 14B)</td><td>16 ch, 8×8×4</td><td>text → video</td><td>single DiT</td></tr>
+      <tr><td>Wan 2.2 TI2V-5B</td><td>48 ch, 16×16×4</td><td>text → video, <strong>image → video</strong></td><td>dense 5B, 24 fps, 720p-capable</td></tr>
+      <tr><td>Wan 2.2 A14B (T2V / I2V)</td><td>16 ch (36 ch I2V input)</td><td>text → video, <strong>image → video</strong></td><td>two 14B experts switched at a timestep boundary</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Each denoise step is one resident-weight ggml graph (CUDA-graph-captured, flash attention, per-token-timestep modulation for TI2V image-to-video); the video VAE encode and decode are each a single graph. The stages hand VRAM over in sequence — text encoder, then DiT, then VAE — so peak usage is roughly <code>max(TE, DiT + attention, VAE)</code>: TI2V-5B generates 81-frame 480p image-to-video on a <strong>16 GB</strong> GPU in under 8 minutes, and both A14B experts run sequentially on the same card. Numerics are verified against diffusers (DiT cosine &gt; 0.995, VAE encoders &gt; 0.999, decode 59.9 dB PSNR), and Wan 2.1 runs <strong>6.0×</strong> faster end-to-end than <code>stable-diffusion.cpp</code> on the identical workload.</p>
+  <p>Drive it from the <a href="cli.html">CLI</a> (<code>--prompt</code>, optional <code>--image</code>, <code>--video-frames</code>, <code>--fps</code>, <code>--flow-shift</code>, <code>--sampler</code>, <code>--negative-prompt</code>), the <a href="http-api.html">HTTP API</a> (<code>/v1/videos/generations</code>), or the <a href="server.html#webui">Web UI</a> chat with an image upload. Full details are in the repository's <code>docs/models/wan.md</code> card.</p>
+
   <h2 id="thinking">Thinking / reasoning mode</h2>
-  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
+  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4, Muse-Glimmer) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
   <ul>
     <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags.</li>
     <li><strong>Gemma 4</strong> — <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> tags.</li>
     <li><strong>GPT OSS</strong> — Harmony format: <code>&lt;|channel|&gt;analysis</code> for thinking, <code>&lt;|channel|&gt;final</code> for the answer.</li>
     <li><strong>DeepSeek V4</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags; the chat template closes the block immediately unless thinking is requested, so reasoning is opt-in.</li>
+    <li><strong>Muse-Glimmer</strong> — an <code>assistant to=self</code> reasoning channel emitted by the chat template.</li>
   </ul>
   <p>Enable it via <code>--think</code> (CLI), <code>"think": true</code> (Ollama API / Web UI), or the thinking toggle in the browser. Responses expose the reasoning separately — e.g. <code>message.thinking</code> in the Ollama chat response.</p>
 
@@ -231,6 +290,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
     <li><strong>Qwen 3.5 / 3.6</strong> — the same <code>&lt;tool_call&gt;</code> block with an XML body: <code>&lt;function=NAME&gt;&lt;parameter=key&gt;value&lt;/parameter&gt;&lt;/function&gt;</code> (the JSON form is still accepted).</li>
     <li><strong>Gemma 4</strong> — <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
     <li><strong>GPT OSS (Harmony)</strong> — tools declared as a TypeScript namespace; calls emitted on the commentary channel.</li>
+    <li><strong>Muse-Glimmer</strong> — ATEM XML markup declared by the chat template; the parser lifts the calls into the same structured <code>tool_calls</code> shape.</li>
     <li><strong>DeepSeek V4</strong> — DSML markup: the system prompt teaches the syntax and carries one JSON schema per function, and the model answers with <code>&lt;｜DSML｜tool_calls&gt;&lt;｜DSML｜invoke name="NAME"&gt;&lt;｜DSML｜parameter name="key" string="true|false"&gt;value&lt;/｜DSML｜parameter&gt;…</code>.</li>
   </ul>
   <p>See <a href="http-api.html#tools">Tool calling over HTTP</a> for a complete request/response example and the continuation loop.</p>

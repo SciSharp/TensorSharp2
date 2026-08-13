@@ -129,6 +129,26 @@ NextN 块；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）。投机仅对单�
 | `TS_GMTP_NO_FAST_ROLLBACK` | Gemma 4 | 部分接受时恢复保留前缀回滚，而非稠密快速回滚 | 关闭 | 未注册 | 否 |
 | `TS_GMTP_BATCHED_TRUNK` | Gemma 4 | 验证主干走批量分页路径，而非线性主干 | 关闭 | 未注册 | 否 |
 
+## 矩阵外的 Muse-Glimmer 与 DFlash 开关
+
+Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有一个 A/B 开关，另外还有
+长上下文的尺寸开关。这些都没有注册进 `EnvVarMatrix.All`。完整清单（含逐层追踪开关）见
+[Muse-Glimmer 卡片](models/muse-glimmer_zh-cn.md#7-环境变量)。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描取值 | 默认是否扫描 |
+|---|---|---|---|---|---|
+| `TS_MUSE_GLIMMER_FUSED` | GGML CUDA / Vulkan 上的 Muse-Glimmer | 融合整模型图 vs 逐算子路径 | 开 | 未注册 | 否 |
+| `TS_MUSE_GLIMMER_PERSIST` | Muse-Glimmer（融合） | 持久、可被 CUDA 图捕获的计算图 vs 每次调用重建 | 开 | 未注册 | 否 |
+| `TS_MUSE_GLIMMER_INGRAPH_EMBED` | Muse-Glimmer（融合） | 在图内完成 embedding gather + 无权重输入 norm（LM head 未绑定时是负收益） | 自动（仅绑定时开启） | 未注册 | 否 |
+| `TS_MUSE_GLIMMER_PREFILL_CHUNK` | Muse-Glimmer | 每次 prefill 前向的 token 数；`0` 关闭分块 | `2048` | 未注册 | 否 |
+| `TS_MUSE_GLIMMER_SWA_RING` | Muse-Glimmer（融合） | 把 39 个滑动窗口层按 `pad(n_swa + chunk + 1, 256)` 行做环，而不是所有层都按完整上下文分配 | 开 | 未注册 | 否 |
+| `TS_MUSE_GLIMMER_SWA_ROWS` | Muse-Glimmer（融合） | 覆盖 SWA 环的行数（诊断用） | 自动 | 未注册 | 否 |
+| `TS_MUSE_GLIMMER_VENC_F32` | Muse-Glimmer 视觉塔 | 把塔反量化为 F32（约 7.4 GB），而不是把 GGUF 量化直接喂给 `AddmmQuant` | 关 | 未注册 | 否 |
+| `TS_MUSE_GLIMMER_VENC_FUSED` | CUDA 上的 Muse-Glimmer 视觉塔 | 融合视觉块 / flash-attention 路径 | 开 | 未注册 | 否 |
+| `TS_MUSE_GLIMMER_DFLASH` | Muse-Glimmer | DFlash 草稿模型 GGUF 路径（等同 CLI 的 `--draft-model`） | 无 | 未注册 | 否 |
+| `TS_DFLASH_FUSED` | Muse-Glimmer DFlash | 融合的 `TSGgml_DFlashInject` / `TSGgml_DFlashDraftBlock` 图 vs 逐算子草稿模型 | 开 | 未注册 | 否 |
+| `TS_DFLASH_PERSIST` | Muse-Glimmer DFlash | 重放持久草稿图，而不是每步重建 | 开 | 未注册 | 否 |
+
 ## 矩阵外的张量并行 / 分布式推理变量
 
 这些变量配置张量并行（把单个模型切分到多张 GPU）以及基于点对点 TCP 网格的多节点

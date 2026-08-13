@@ -50,6 +50,22 @@
 
   <div class="callout note"><div class="ic">⚖️</div><p>An honest comparison shows the gaps as well as the wins. These figures are one machine (RTX 3080 Laptop, single-stream); your hardware, model, and quantization will shift them. Run the built-in benchmark and the engine-comparison harness on your own box for the numbers that matter to you.</p></div>
 
+  <h2 id="muse-glimmer">Muse-Glimmer 30B, with and without DFlash</h2>
+  <p>A separate, hand-run comparison on different hardware: <strong>one RTX PRO 6000 Blackwell (96 GB)</strong>, <code>Muse-Glimmer-30B-Q8_0</code>, greedy on both sides, 128 generated tokens, two reps with the engines alternating, and — importantly — <strong>the same token sequence on both sides</strong> (TensorSharp's rendered chat prompt is handed to <code>llama-cli -no-cnv</code>, and <code>llama-tokenize</code> confirms the counts match). llama.cpp is master <code>8e7f22b</code>, within a day of TensorSharp's vendored ggml.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Prompt tokens</th><th>prefill (llama.cpp → TS)</th><th>decode (llama.cpp → TS)</th><th>DFlash decode (llama.cpp → TS)</th></tr></thead>
+    <tbody>
+      <tr><td>60</td><td>362 → <span class="yes">459</span> (1.27×)</td><td>34.7 → 35.0 (1.01×)</td><td>45.5 → <span class="yes">50.9</span> (1.12×)</td></tr>
+      <tr><td>501</td><td>927 → <span class="yes">1135</span> (1.23×)</td><td>36.2 → 34.3 (0.95×)</td><td>117.5 → <span class="yes">164.6</span></td></tr>
+      <tr><td>2050</td><td>1132 → <span class="yes">1317</span> (1.16×)</td><td>35.0 → 33.5 (0.96×)</td><td>24.9 → <span class="yes">43.5</span></td></tr>
+      <tr><td>16126</td><td>1325 → 1249 (0.94×)</td><td>32.2 → 30.9 (0.96×)</td><td>80.2 → 55.8</td></tr>
+      <tr><td>123931</td><td>1166 → 1073 (0.92×)</td><td>30.7 → 26.6 (0.86×)</td><td>69.0 → 42.3</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The pattern: TensorSharp's fused whole-model graph wins prefill below ~2K by 1.16-1.27×, the engines cross somewhere between 2K and 16K, and llama.cpp keeps a 6-8% prefill edge above that; decode is a tie at short context and drifts to 0.86× at 128K. With <strong>DFlash</strong> speculative decoding TensorSharp is ahead at short and mid prompts and behind from 16K up — but that gap is mostly a runtime <em>cost governor</em> that parks the drafter after a mis-measured probe: on the reps where it stays armed, TensorSharp reaches 94% of llama.cpp at 16K and 96% at 64K. The absolute DFlash figures also depend heavily on the corpus (the 501-token prompt hits 100% draft acceptance on <em>both</em> engines). Both engines run the full 128K context on one card. One caveat on the two long rows: they were taken before a line-ending fix landed in the harness, so on those points TensorSharp prefilled the CRLF form of the same document (1.2% more tokens); throughput is a rate so the effect is small, but the generated continuations are not strictly comparable there. Method, per-rep spread, VRAM and the governor analysis are in the <a href="models.html#table">Muse-Glimmer architecture card</a> (<code>docs/models/muse-glimmer.md</code>).</p>
+
   <h2 id="testing">Testing</h2>
   <p>The build and test commands below require the <a href="getting-started.html#install-dotnet">.NET 10 SDK for your platform</a>; verify the installation before running them.</p>
   <h3>Unit tests (xUnit)</h3>

@@ -50,6 +50,22 @@
 
   <div class="callout note"><div class="ic">⚖️</div><p>诚实的对比会同时展示胜势与差距。这些数字来自单台机器（RTX 3080 Laptop、单流）；你的硬件、模型与量化都会改变它们。请在你自己的机器上运行内置基准与引擎对比框架，得到对你而言真正有意义的数字。</p></div>
 
+  <h2 id="muse-glimmer">Muse-Glimmer 30B，带与不带 DFlash</h2>
+  <p>这是在另一套硬件上单独手工执行的对比：<strong>单张 RTX PRO 6000 Blackwell（96 GB）</strong>，<code>Muse-Glimmer-30B-Q8_0</code>，两侧都是贪心，生成 128 token，两次重复且两个引擎交替执行；关键在于<strong>两侧 prefill 的是同一串 token</strong>（把 TensorSharp 渲染后的聊天提示交给 <code>llama-cli -no-cnv</code>，再用 <code>llama-tokenize</code> 确认 token 数一致）。llama.cpp 为 master <code>8e7f22b</code>，与 TensorSharp 内置的 ggml 相差一天以内。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>提示 token 数</th><th>prefill（llama.cpp → TS）</th><th>decode（llama.cpp → TS）</th><th>DFlash decode（llama.cpp → TS）</th></tr></thead>
+    <tbody>
+      <tr><td>60</td><td>362 → <span class="yes">459</span>（1.27×）</td><td>34.7 → 35.0（1.01×）</td><td>45.5 → <span class="yes">50.9</span>（1.12×）</td></tr>
+      <tr><td>501</td><td>927 → <span class="yes">1135</span>（1.23×）</td><td>36.2 → 34.3（0.95×）</td><td>117.5 → <span class="yes">164.6</span></td></tr>
+      <tr><td>2050</td><td>1132 → <span class="yes">1317</span>（1.16×）</td><td>35.0 → 33.5（0.96×）</td><td>24.9 → <span class="yes">43.5</span></td></tr>
+      <tr><td>16126</td><td>1325 → 1249（0.94×）</td><td>32.2 → 30.9（0.96×）</td><td>80.2 → 55.8</td></tr>
+      <tr><td>123931</td><td>1166 → 1073（0.92×）</td><td>30.7 → 26.6（0.86×）</td><td>69.0 → 42.3</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>规律很清楚：TensorSharp 的融合整模型图在约 2K 以下的 prefill 上领先 1.16-1.27×，两个引擎在 2K 到 16K 之间交叉，再往上 llama.cpp 保持 6-8% 的 prefill 优势；decode 在短上下文时打平，到 128K 降到 0.86×。启用 <strong>DFlash</strong> 投机解码后，TensorSharp 在短与中等提示上领先，从 16K 起落后——但这个差距主要来自运行期的<em>成本调控器</em>：一次误判的探测会让它暂停起草；在保持启用的那些重复里，TensorSharp 在 16K 达到 llama.cpp 的 94%、64K 达到 96%。DFlash 的绝对数字还高度依赖语料（501 token 那一点在<em>两个</em>引擎上都是 100% 接受率）。两个引擎都能在单卡上跑满 128K。两行长上下文有一个说明：它们是在换行符归一化修复落地之前测的，因此在这两个点上 TensorSharp prefill 的是同一文档的 CRLF 形式（多 1.2% 的 token）；吞吐是速率，影响很小，但那里两侧生成的续写并不严格可比。方法、逐次重复的离散度、显存与调控器分析见 <a href="models_zh-cn.html#table">Muse-Glimmer 架构卡片</a>（<code>docs/models/muse-glimmer_zh-cn.md</code>）。</p>
+
   <h2 id="testing">测试</h2>
   <p>下方构建与测试命令需要<a href="getting-started_zh-cn.html#install-dotnet">按平台安装的 .NET 10 SDK</a>；运行命令前请先验证安装。</p>
   <h3>单元测试（xUnit）</h3>

@@ -181,7 +181,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 | `--think` | 启用思维链/推理模式 |
 | `--tools <path>` | 包含工具/函数定义的 JSON 文件 |
 | `--draft-model <path>` | 投机解码草稿 GGUF，适用于草稿器以独立文件发布的架构——目前是 DeepSeek V4 的 DSpark 支持模块（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）。它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。在所有单序列路径（`--input`、`--input-jsonl`、`--multi-turn-jsonl`、`--interactive`）上生效，需要 `--backend cuda` 或 `--backend ggml_cuda`，并且必须是纯 argmax 采样：任何 temperature、top-k/p 或重复/存在/频率惩罚都会将其关闭。环境变量：`TS_DSV4_DSPARK`。 |
-| `--spec-draft-n-max <N>` | 每个投机块最多起草的 token 数（默认：草稿器训练时的块大小，DSpark 为 5） |
+| `--spec-draft-n-max <N>` | 每个投机块最多起草的 token 数（默认：草稿器训练时的块大小；DSpark 为 5，Muse-Glimmer 的 DFlash 为 15） |
 | `--spec-draft-conf-min <p>` | 保留某个起草位置所需的最小**累积**接受概率（置信度头各位置估计值的乘积，默认 `0.35`）。调低会起草更远、回滚更多；调高则更早退回普通 decode。 |
 | `--temperature <f>` | 采样温度（0 = 贪心） |
 | `--top-k <N>` | Top-K 过滤（0 = 关闭） |

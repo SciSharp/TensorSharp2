@@ -115,6 +115,21 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --prompt "Make the sky a dramatic sunset." --output edited.png \
     --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0</code></pre>
 
+  <h3 id="video">视频生成（Wan 2.1 / 2.2）</h3>
+  <pre data-lang="bash"><code># 提示词 -> H.264 MP4。UMT5-XXL 文本编码器与视频 VAE 会在 DiT GGUF
+# 旁边自动解析（也可用 --wan-te / --wan-vae 指定）。
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;Wan2.2-TI2V-5B-Q8_0.gguf&gt; \
+    --prompt "A red fox trotting through falling snow, cinematic" \
+    --video-frames 81 --fps 24 --output out.mp4 --backend ggml_cuda
+
+# 图像 -> 视频：图像作为首帧，提示词驱动运动
+# （仅 Wan 2.2 TI2V-5B 与 A14B I2V 支持）。
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;Wan2.2-TI2V-5B-Q8_0.gguf&gt; --image first_frame.png \
+    --prompt "the camera pushes in as the waves rise" \
+    --video-frames 81 --fps 24 --flow-shift 5.0 --output out.mp4 --backend ggml_cuda</code></pre>
+
   <h3 id="diffusion">DiffusionGemma 与检查</h3>
   <pre data-lang="bash"><code># DiffusionGemma 文本扩散生成
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \

@@ -4,16 +4,16 @@
 > [TensorSharp](README_zh-cn.md) 文档的一部分。
 
 
-- **多架构支持** —— DeepSeek V4 Flash、Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3、Qwen-Image-Edit（图像编辑），以及 Wan 2.1/2.2（文生/图生视频）
-- **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni）
-- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4）
+- **多架构支持** —— DeepSeek V4 Flash、Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、Qwen-Image-Edit（图像编辑），以及 Wan 2.1/2.2（文生/图生视频）
+- **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni / Muse-Glimmer）
+- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer、DeepSeek V4）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
 - **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
 - **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）、GGML CUDA（Windows/Linux + NVIDIA）和 GGML Vulkan（Windows/Linux + AMD/Intel/NVIDIA），并提供 Direct CUDA/cuBLAS 后端（含 PTX 内核与未覆盖算子的 CPU 回退），以及面向 Apple Silicon 的 MLX 后端（mlx-c / Metal）
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 块池，跨请求的块级哈希前缀共享，迭代级调度器（可在批内动态加入/抢占序列），可选的 SSD 冷层用于超大 KV 工作集，原生融合分页注意力内核（`TSGgml_PagedAttentionForward`，在 Metal/CUDA/Vulkan 上驱动 `ggml_flash_attn_ext`）。`TensorSharp.Server` 默认启用，可用 `--no-continuous-batching` 关闭。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
 - **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列（无并发）decode。Qwen 3.6 将 NextN 块内嵌在主干 GGUF 中；Gemma 4 通过 `--mtp-draft-model` 加载独立的 EAGLE 风格 `gemma4-assistant` 草稿 GGUF，其草稿层读取目标模型自身的 KV 缓存。草稿头每步最多提议 `--mtp-draft` 个 token（草稿置信度 ≥ `--mtp-pmin` 时保留），主干用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，因此输出与标准 decode 完全一致。服务端通过 `--mtp-spec` 启用（默认关闭）；CLI 没有 MTP 参数，需设置 `TS_MTP_*` 环境变量。ggml 后端有融合的多 token 验证 / 草稿步内核，是明确收益；纯 C# `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿，同样有收益；CPU / MLX 保持标准 decode。环境变量：`TS_MTP_*`（通用）与 `TS_GMTP_*`（Gemma 4 调优）。
-- **张量并行与分布式推理** —— 用 `--tp N`（`TensorSharp.Cli` 与 `TensorSharp.Server` 均支持，也可用 `TENSORSHARP_TP_DEGREE`）把一个模型按 Megatron-LM 列/行并行范式切分到多张 GPU 上，再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。分层 AllReduce 把跨网络流量降到最低。可运行在 Direct `cuda` 后端以及 GGML CUDA / Vulkan 后端上——后者每个 rank 在自己的 GPU 上拥有独立的 ggml 后端、权重分片与 KV 缓存。支持全部自回归架构（Qwen 3、Mistral 3、Gemma 3/4、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H），并针对 MoE 专家并行 / 专家切分、GatedDeltaNet 按 rank V-head 归属、Mamba2 复制等异构层提供各自的策略。融合的按 rank 计算图使 `--tp 2` 的 decode 快于单卡（Gemma 4 E4B 51.7 对 37.3 tok/s），也让单卡装不下的模型得以运行。服务端还可选用 Redis 支撑的共享 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
+- **张量并行与分布式推理** —— 用 `--tp N`（`TensorSharp.Cli` 与 `TensorSharp.Server` 均支持，也可用 `TENSORSHARP_TP_DEGREE`）把一个模型按 Megatron-LM 列/行并行范式切分到多张 GPU 上，再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。分层 AllReduce 把跨网络流量降到最低。可运行在 Direct `cuda` 后端以及 GGML CUDA / Vulkan 后端上——后者每个 rank 在自己的 GPU 上拥有独立的 ggml 后端、权重分片与 KV 缓存。支持全部自回归架构（Qwen 3、Mistral 3、Gemma 3/4、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Muse-Glimmer——因为只有 2 个 KV 头，并行度上限为 `--tp 2`），并针对 MoE 专家并行 / 专家切分、GatedDeltaNet 按 rank V-head 归属、Mamba2 复制等异构层提供各自的策略。融合的按 rank 计算图使 `--tp 2` 的 decode 快于单卡（Gemma 4 E4B 51.7 对 37.3 tok/s），也让单卡装不下的模型得以运行。服务端还可选用 Redis 支撑的共享 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
 - **批处理 / 并行推理** —— 已为 Mistral 3、Gemma 4、GPT OSS、Qwen 3、Qwen 3.5/3.6-family、Nemotron-H 默认启用 `IBatchedPagedModel.ForwardBatch`，能在一次前向传播中打包 N 个序列，使用 `slotMapping` 进行分页 K/V 写入，并通过原生内核做按序列注意力。Gemma 4、Qwen 3.5/3.6、GPT OSS 与 Nemotron-H 提供各自的 `TS_<FAMILY>_BATCHED=0` 兜底开关；Qwen 3 与 Mistral 3 没有家族专属开关，请用全局 `TS_SCHED_DISABLE_BATCHED=1` 强制回到按序列 KV-swap 路径。
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
@@ -49,6 +49,12 @@
 ## DSpark 块级投机解码（DeepSeek V4）
 
 DeepSeek V4 的 checkpoint 中随模型附带一个 **DSpark** 支持模块（"Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation"）：三个 DSV4 块读取主干的 hidden states，每步提议**一整块** token 而不是一个；一个 Markov 头让块内每个位置以其前一个 token 为条件；一个置信度头预测每个位置被接受的概率。TensorSharp 把它作为独立的草稿 GGUF 加载（`--draft-model`，可用 `eng/dsv4-dspark-to-gguf.py` 自行转换），并在两个 GPU 引擎（`--backend cuda` 与 `--backend ggml_cuda`）上为贪心单序列生成启用——在 ggml 上草稿器就是计算图里额外的三层，其 key ring 由主干图自己提交，因此投机不产生任何主机往返；主干用一次批量前向验证整块，只保留它本来也会产生的前缀。在 4×A40 上以默认累积置信度门限测得 **decode 提速 1.3–1.4×**；这个门限很关键，因为验证批中每多一行都要把一整套 MoE 专家重新拉过显存。详见 [DeepSeek V4 卡片](docs/models/deepseek4.md#dspark-speculative-decoding)。
+
+## DFlash 块级投机解码（Muse-Glimmer）
+
+Muse-Glimmer 有自己的块级草稿模型 **DFlash**：一个独立的 5 层 GGUF（`general.architecture = dflash`），一次前向即提出整个投机窗口。它复用主干的 token embedding 与 LM head，维护自己的滑动窗口 KV 环，每步跑三遍——把主干在 `dflash.target_layers` 处的逐层输入残差*编码*成一行宽向量，将该行*注入*为每个草稿层的 K/V，再把 `[anchor, MASK x (block-1)]` 送过 5 个块*起草*，并用主干的 LM head 打分。主干用一次批量前向验证该块，只保留它自己本来也会产生的前缀，因此**输出的 token 流与普通贪心 decode 完全一致**。
+
+两部分都是可被 CUDA 图捕获并重放的融合原生图，草稿块以设备端 `argmax` 收尾，因此 202048 宽的概率块无需经 PCIe 回传。运行期的成本调控器会把投机与普通解码逐 token 计时对比，在投机确实更慢时暂停起草——所以投机只会更快，但需要生成数百个 token 才能稳定。用 `--draft-model`（CLI）或 `TS_MUSE_GLIMMER_DFLASH` 加载，并且**不要传任何采样参数**：`--top-k 1` 不满足 `SamplingConfig.IsGreedy`，会静默关闭整条投机路径。在单张 RTX PRO 6000 Blackwell 上与 llama.cpp 自带的 DFlash 对比（Q8_0、贪心、60 token 提示）：50.9 tok/s，对比 llama.cpp 的 45.5 与普通解码的 35.0。详见 [Muse-Glimmer 卡片](docs/models/muse-glimmer_zh-cn.md)。
 
 ## MTP / NextN 投机解码
 
