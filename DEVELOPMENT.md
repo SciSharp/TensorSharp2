@@ -151,6 +151,24 @@ ggml_metal_device_init: has tensor            = false
 
 ggml's own switches still apply on top: `GGML_METAL_TENSOR_DISABLE=1` turns the tensor API off, and `GGML_METAL_TENSOR_ENABLE=1` bypasses ggml's allowlist that restricts it to M5/M6/A19/A20 devices.
 
+##### Wan video and the tensor API
+
+ggml's tensor-API `mul_mm` intermittently misreads operand columns inside the Wan VAE's conv GEMMs on M5 — first pass over a graph only, buffer-layout dependent (historically the "32×32 latent decodes to a black frame while 33×33 works" bug), immune to every runtime kill switch, while the same GEMMs are bit-correct in isolation and LLM/DiT-style graphs never corrupt. It is an upstream ggml-metal/driver defect, and `has_tensor` is fixed at device init, so the kernel choice cannot be scoped per op.
+
+When the tensor API is on, the VAE stays **correct** by routing its convolutions through `ggml_conv_2d_direct` instead of im2col+`mul_mat` on tensor-API devices (`wan_vae_gemm_budget` in `ggml_ops_wan.cpp`), which decodes within F16 rounding of the CPU backend but slower — a **fixed** per-video cost, while the tensor API's DiT speedup **scales** with step count and model size. Measured at 480×480×9f / 6 steps on an M5 Pro:
+
+| | DiT step (tensor on / off) | VAE enc+dec (direct / GEMM) | break-even |
+|---|---|---|---|
+| A14B I2V Q4_K_M | **17.1s** / 30.2s (1.77×) | 135s / 19s | ~9 steps → the 40-step recipe is **~33% faster** with the tensor API (~13.7 vs ~20.5 min) |
+| TI2V-5B Q8_0 | **1.6s** / 2.9s (1.8×) | 179s / 13s | ~128 steps → never wins |
+
+The default therefore follows the DiT class (`ApplyArchitectureNativeTunables` in ModelBase.cs): tensor API **enabled** for A14B/14B-class models (`patch_embedding` output dim ≥ 5120), **disabled** for smaller ones. When upstream fixes the tensor-API `mul_mm`, enable it everywhere and drop the direct-conv carve-out.
+
+| Environment variable | Effect |
+|---|---|
+| `TS_WAN_METAL_TENSOR_API=1` / `=0` | Force the tensor API on/off for the Wan process, overriding the model-class default |
+| `TS_WAN_VAE_GEMM_MAX_MB=<n>` | Force the im2col+GEMM VAE path with an `n` MB im2col budget (0 forces direct conv) — overrides the automatic choice in both directions |
+
 ### Build the native MLX library (macOS only)
 
 The MLX backend depends on `libmlxc` (the C bindings for [MLX](https://github.com/ml-explore/mlx)). The repository pins a known-good tag of `mlx-c` in `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` and a helper script fetches and builds it:

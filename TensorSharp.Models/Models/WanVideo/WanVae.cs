@@ -10,8 +10,10 @@
 //   - Wan 2.1 (wan_2.1_vae.safetensors): z=16, 8x spatial / 4x temporal.
 //   - Wan 2.2 TI2V (Wan2.2_VAE.safetensors): z=48, 16x spatial (8x conv + 2x2
 //     pixel patchify) / 4x temporal, residual AvgDown/DupUp scale shortcuts.
-// Weights load through the shared WanVaeWeights parser (BF16/F16, upcast once
-// into stable unmanaged F32 buffers); each causal 3D conv is pre-sliced into
+// Weights load through the shared WanVaeWeights parser; conv taps are
+// registered as stable unmanaged F16 buffers (the graphs always convolved in
+// F16 — converting at load removes the per-graph F32->F16 casts) and norms /
+// biases / attention weights as F32. Each causal 3D conv is pre-sliced into
 // its temporal taps so the native graphs (TSGgml_WanVaeDecode /
 // TSGgml_WanVaeEncode) run them as batched 2D convolutions. Decode/encode
 // iterate their temporal chunks with the causal feature caches inside the one
@@ -66,14 +68,20 @@ namespace TensorSharp.Models.WanVideo
             WanVaeConv Conv(WanVaeConvWeights c)
             {
                 if (c == null) return default;
+                // Taps are registered as F16 (TapType = 1). The native graph
+                // always ran these convs with F16 kernels anyway (it cast
+                // F32 -> F16 in-graph); converting at load is numerically
+                // identical, halves the resident weight bytes, and drops one
+                // cast node per conv tap per chunk from every VAE graph.
                 var r = new WanVaeConv
                 {
                     Kd = c.Kd, K = c.K, Ic = c.Ic, Oc = c.Oc,
                     Bias = c.Bias != null ? Reg(c.Bias) : IntPtr.Zero,
+                    TapType = 1,
                 };
                 for (int tap = 0; tap < c.Kd; tap++)
                 {
-                    IntPtr p = Reg(c.Taps[tap]);
+                    IntPtr p = Reg16(c.Taps[tap]);
                     if (tap == 0) r.Tap0 = p; else if (tap == 1) r.Tap1 = p; else r.Tap2 = p;
                 }
                 return r;
@@ -141,6 +149,25 @@ namespace TensorSharp.Models.WanVideo
             IntPtr p = Marshal.AllocHGlobal((IntPtr)bytes);
             _allocs.Add(p);
             Marshal.Copy(data, 0, p, data.Length);
+            return p;
+        }
+
+        /// <summary>Registers a stable unmanaged F16 copy of <paramref name="data"/>.
+        /// (Half) rounds to nearest even — bit-identical to the ggml F32→F16 cast
+        /// these weights previously went through in-graph.</summary>
+        private unsafe IntPtr Reg16(float[] data)
+        {
+            long bytes = data.LongLength * sizeof(ushort);
+            IntPtr p = Marshal.AllocHGlobal((IntPtr)bytes);
+            _allocs.Add(p);
+            System.Threading.Tasks.Parallel.For(0, (int)((data.LongLength + 1048575) / 1048576), block =>
+            {
+                ushort* dst = (ushort*)p;
+                long start = (long)block * 1048576;
+                long end = Math.Min(start + 1048576, data.LongLength);
+                for (long i = start; i < end; i++)
+                    dst[i] = BitConverter.HalfToUInt16Bits((System.Half)data[i]);
+            });
             return p;
         }
 

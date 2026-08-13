@@ -757,9 +757,15 @@ public struct WanDitForwardArgs
 [StructLayout(LayoutKind.Sequential)]
 public struct WanVaeConv
 {
-    public IntPtr Tap0, Tap1, Tap2;  // [k, k, ic, oc] F32 kernels (Tap1/2 zero when Kd == 1)
+    public IntPtr Tap0, Tap1, Tap2;  // [k, k, ic, oc] kernels (Tap1/2 zero when Kd == 1)
     public IntPtr Bias;              // [oc] F32 or zero
     public int Kd, K, Ic, Oc;
+    // 1 = taps are F16 (pre-converted at load with the same round-to-nearest
+    // the graph's F32->F16 cast applied), 0 = legacy F32 taps cast in-graph.
+    // F16 halves the resident weight bytes and removes one cast node per conv
+    // tap per chunk from every VAE graph.
+    public int TapType;
+    public int Reserved2;
 }
 
 [StructLayout(LayoutKind.Sequential)]

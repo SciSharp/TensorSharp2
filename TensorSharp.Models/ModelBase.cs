@@ -5864,43 +5864,65 @@ namespace TensorSharp.Models
         /// <see cref="Create"/> with the architecture already known from the GGUF
         /// header but no backend initialised yet.
         /// </summary>
-        private static void ApplyArchitectureNativeTunables(string arch, BackendType backend)
+        private static void ApplyArchitectureNativeTunables(string arch, BackendType backend, GgufFile probe)
         {
             if (backend != BackendType.GgmlMetal)
                 return;
             if (arch is not ("wan" or "wan2.1" or "wan2.2"))
                 return;
 
-            // Wan renders NaN - a uniformly black frame - on Metal whenever ggml
-            // routes mul_mm through the Metal 4 tensor API. An M5 advertises
-            // MTLGPUFamilyMetal4 so ggml enables that path by default, and
-            // TensorSharp's MSL shim (tsg_metal_msl_default.m) is what makes it
-            // reachable from a .NET host at all - worth ~2.6x LLM prefill, which is
-            // why it is not simply turned off globally.
+            // Wan rendered NaN - a uniformly black frame - on Metal whenever ggml
+            // routed mul_mm through the Metal 4 tensor API. Diagnosis (2026-08-13):
+            // the corruption is confined to the VAE's conv GEMMs. The tensor-API
+            // mul_mm intermittently misreads operand columns there on the FIRST
+            // pass over a graph (M5, macOS 26.6) - buffer-layout dependent (32x32
+            // latents failed while 33x33 packed differently and passed),
+            // first-run-only (recomputes read back the previous pass's bytes and
+            // look clean), and immune to every kill switch (fusion / concurrency /
+            // graph-optimize off, even serialized 64-node slices with full syncs).
+            // The same GEMMs are bit-correct in isolation and LLM/DiT-style GEMMs
+            // never corrupt - an upstream ggml-metal/driver defect, and has_tensor
+            // is a device-level property fixed at init, so the kernel choice
+            // cannot be scoped per-op.
             //
-            // The corruption is real and shape-dependent, not a rounding
-            // difference: a 32x32 latent (256x256 px) decoded to all-NaN while a
-            // 33x33 latent decoded correctly, on EVERY Wan model including the
-            // quantized ones, with the denoise loop provably innocent (final-latent
-            // cosine 0.993 vs ggml_cpu, no NaN anywhere). It reproduces with both
-            // F16 and F32 im2col GEMMs, so it is the kernel and not the activation
-            // dtype; GGML_METAL_TENSOR_DISABLE=1 fixes it, and so does avoiding
-            // im2col entirely (ggml_conv_2d_direct).
-            //
-            // has_tensor is a device-level property fixed at device init, so it
-            // cannot be scoped to a single op. Turning it off for the process that
-            // is about to generate video keeps LLM inference on the fast path and
-            // gives video correct pixels. TS_WAN_METAL_TENSOR_API=1 opts back in.
-            if (string.Equals(Environment.GetEnvironmentVariable("TS_WAN_METAL_TENSOR_API"), "1", StringComparison.Ordinal))
+            // With the tensor API on, the VAE stays CORRECT because
+            // ggml_ops_wan.cpp routes its convs through ggml_conv_2d_direct on
+            // tensor-API devices (wan_vae_gemm_budget) - slower than im2col+GEMM,
+            // but a FIXED per-video cost, while the tensor API's DiT speedup
+            // scales with step count and model size. Measured at 480x480x9f,
+            // 6 steps, M5 Pro:
+            //   A14B I2V: 17.1 vs 30.2 s/step (1.77x); VAE enc+dec 135s vs 19s
+            //             -> break-even ~9 steps; the 40-step recipe is ~33% faster
+            //             with the tensor API (~13.7 vs ~20.5 min).
+            //   TI2V-5B:  1.6 vs 2.9 s/step; VAE decode 179s vs 13s
+            //             -> break-even ~128 steps; never wins.
+            // So the default follows the DiT class: enabled for A14B/14B-class
+            // models (patch_embedding oc >= 5120), disabled for smaller ones.
+            // TS_WAN_METAL_TENSOR_API=1/0 forces either way. When upstream fixes
+            // the tensor-API mul_mm, enable it everywhere and drop the direct-conv
+            // carve-out.
+            long dim = 0;
+            if (probe.Tensors.TryGetValue("patch_embedding.weight", out var patch) && patch.Shape.Length >= 5)
+                dim = (long)patch.Shape[4];
+
+            string env = Environment.GetEnvironmentVariable("TS_WAN_METAL_TENSOR_API");
+            bool enable = string.Equals(env, "1", StringComparison.Ordinal) ||
+                          (!string.Equals(env, "0", StringComparison.Ordinal) && dim >= 5120);
+            if (enable)
+            {
+                Console.WriteLine("  [wan] Metal 4 tensor API enabled (~1.8x faster DiT steps; the VAE runs " +
+                                  "on the slower-but-correct direct-conv path; TS_WAN_METAL_TENSOR_API=0 opts out).");
                 return;
+            }
 
             try
             {
                 if (TensorSharp.GGML.GgmlBasicOps.SetNativeEnvironmentVariable(
                         "GGML_METAL_TENSOR_DISABLE", "1", overwrite: false))
                 {
-                    Console.WriteLine("  [wan] Metal 4 tensor API disabled for this process (it returns NaN " +
-                                      "for the VAE's GEMM shapes; TS_WAN_METAL_TENSOR_API=1 overrides).");
+                    Console.WriteLine("  [wan] Metal 4 tensor API disabled for this process (fastest correct " +
+                                      "config for this model class; TS_WAN_METAL_TENSOR_API=1 opts in: faster " +
+                                      "DiT steps but a slower direct-conv VAE).");
                 }
             }
             catch (DllNotFoundException) { /* managed-only host; nothing to configure */ }
@@ -5923,7 +5945,7 @@ namespace TensorSharp.Models
             using var probe = new GgufFile(ggufPath);
             string arch = probe.GetString("general.architecture") ?? "qwen3";
 
-            ApplyArchitectureNativeTunables(arch, backend);
+            ApplyArchitectureNativeTunables(arch, backend, probe);
 
             return arch switch
             {

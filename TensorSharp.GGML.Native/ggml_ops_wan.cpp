@@ -134,13 +134,19 @@ struct TSGgmlWanDitDesc
 // ---- Wan VAE decoder -------------------------------------------------------
 
 // One causal conv3d, decomposed by the managed side into per-temporal-tap 2D
-// kernels: tap[j] is the [k, k, ic, oc] F32 kernel for temporal offset j
+// kernels: tap[j] is the [k, k, ic, oc] kernel for temporal offset j
 // (0 = oldest frame). kd == 1 uses tap[0] only.
 struct TSGWanVaeConv
 {
     void* tap0; void* tap1; void* tap2;
     void* bias;                 // [oc] F32 or null
     std::int32_t kd, k, ic, oc;
+    // 1 = taps are F16 (pre-converted managed-side; same round-to-nearest the
+    // graph's F32->F16 cast used to apply), 0 = legacy F32 taps that the graph
+    // casts in place. F16 halves the resident weight bytes and removes one
+    // cast node per conv tap per chunk from every VAE graph.
+    std::int32_t tap_type;
+    std::int32_t reserved2;
 };
 
 struct TSGWanVaeNorm { void* gamma; std::int32_t c; std::int32_t pad; };
@@ -898,10 +904,45 @@ struct WanVaeBuild
 // slice of what must stay resident (activation planes, cross-chunk caches,
 // the growing output) — a few bands on 16 GB, unbanded on large cards — and
 // the 384 MB floor preserves the old behavior under memory pressure.
+// True when the process-global GGML backend is ggml-metal ("MTL0", "MTL1", ...).
+static bool wan_backend_is_metal()
+{
+    const char* name = g_backend != nullptr ? ggml_backend_name(g_backend) : nullptr;
+    return name != nullptr && std::strncmp(name, "MTL", 3) == 0;
+}
+
+// Mirrors ggml-metal's has_tensor gating closely enough to predict whether the
+// Metal 4 tensor API is active for this process: an M5/M6/A19/A20-class device
+// name (or GGML_METAL_TENSOR_ENABLE) and no GGML_METAL_TENSOR_DISABLE. Used to
+// decide the VAE conv strategy; a rare false positive only costs speed, never
+// correctness.
+static bool wan_metal_tensor_api_likely()
+{
+    if (!wan_backend_is_metal()) return false;
+    if (std::getenv("GGML_METAL_TENSOR_DISABLE") != nullptr) return false;
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    const char* desc = dev != nullptr ? ggml_backend_dev_description(dev) : nullptr;
+    const bool m5class = desc != nullptr &&
+        (std::strstr(desc, "M5") || std::strstr(desc, "M6") ||
+         std::strstr(desc, "A19") || std::strstr(desc, "A20"));
+    return m5class || std::getenv("GGML_METAL_TENSOR_ENABLE") != nullptr;
+}
+
 static long long wan_vae_gemm_budget()
 {
     const char* e = std::getenv("TS_WAN_VAE_GEMM_MAX_MB");
     if (e != nullptr) return std::strtoll(e, nullptr, 10) * 1024 * 1024;
+
+    // ggml-metal's Metal 4 tensor-API mul_mm intermittently misreads operands
+    // inside the VAE decode graph on M5 (first pass, layout-dependent: the
+    // 32x32-latent all-NaN decode). It is correct in isolation and for every
+    // LLM/DiT-style graph, and has_tensor is fixed at device init, so it
+    // cannot be scoped per-op. When the tensor API is active, route the VAE
+    // convs through ggml_conv_2d_direct (budget 0): slower than im2col+GEMM,
+    // but correct — and it keeps the tensor API's much larger DiT/text-encoder
+    // wins. TS_WAN_VAE_GEMM_MAX_MB overrides in both directions.
+    if (wan_metal_tensor_api_likely())
+        return 0;
     // Non-CUDA device backends (Vulkan) stay at the banded floor: their
     // drivers reject the multi-GB single gallocr arena that an unbanded
     // full-plane im2col produces (Vulkan maxMemoryAllocationSize is commonly
@@ -921,8 +962,9 @@ static long long wan_vae_gemm_budget()
 
 ggml_tensor* wan_vae_conv_w(WanVaeBuild& b, void* tap, const TSGWanVaeConv& c)
 {
-    ggml_tensor* t = ggml_new_tensor_4d(b.ctx, GGML_TYPE_F32, c.k, c.k, c.ic, c.oc);
-    b.wb->bind(t, tap, static_cast<std::size_t>(c.k) * c.k * c.ic * c.oc * sizeof(float));
+    const ggml_type tt = c.tap_type == 1 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    ggml_tensor* t = ggml_new_tensor_4d(b.ctx, tt, c.k, c.k, c.ic, c.oc);
+    b.wb->bind(t, tap, static_cast<std::size_t>(c.k) * c.k * c.ic * c.oc * ggml_type_size(tt));
     return t;
 }
 
@@ -992,6 +1034,13 @@ ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int
     const long long T = x->ne[3];
     const long long rowBytes = KW * KH * IC * OW * T * 2;   // im2col bytes per output row
     ggml_tensor* wf16 = wt->type == GGML_TYPE_F16 ? wt : ggml_cast(ctx, wt, GGML_TYPE_F16);
+    // Defensive on Metal: give a legacy in-graph weight cast a dedicated
+    // (never gallocr-reused) slot. Weights marshalled as F16 (tap_type == 1)
+    // skip the cast entirely, and tensor-API devices take the direct-conv
+    // path (wan_vae_gemm_budget) anyway, so this only matters for F32-tap
+    // callers on the GEMM path.
+    if (wf16 != wt && wan_backend_is_metal())
+        ggml_set_output(wf16);
 
     if (rowBytes * OH <= gemmMax)
         return ggml_conv_2d(ctx, wf16, x, stride, stride, pad, pad, 1, 1);
@@ -1537,6 +1586,100 @@ bool wan_vae_encode(const TSGgmlWanVaeEncodeDesc* d)
     return true;
 }
 
+static bool wan_vae_op_writes(const ggml_tensor* t);
+static bool wan_vae_node_live(ggml_cgraph* g, int i, int upto);
+
+// TS_WAN_VAE_TRACE=<path>: after compute, walk the graph nodes in execution
+// order and report the first ones whose buffer holds NaN/Inf. Only nodes whose
+// slot has not been legally reused by a later writer are scanned (gallocr
+// aliasing makes anything else a dtype-misread ghost).
+void wan_vae_trace_nan(ggml_cgraph* graph)
+{
+    const char* path = std::getenv("TS_WAN_VAE_TRACE");
+    if (path == nullptr) return;
+    std::FILE* out = std::fopen(path, "a");
+    if (out == nullptr) return;
+    const int n = ggml_graph_n_nodes(graph);
+    int printed = 0;
+    for (int i = 0; i < n && printed < 12; i++)
+    {
+        ggml_tensor* t = ggml_graph_node(graph, i);
+        if (t->buffer == nullptr || t->data == nullptr) continue;
+        const std::int64_t nel = ggml_nelements(t);
+        if (nel <= 0) continue;
+        if (!wan_vae_op_writes(t)) continue;          // views mirror their src
+        if (!wan_vae_node_live(graph, i, n)) continue; // slot legally reused
+        std::vector<float> host;
+        if (t->type == GGML_TYPE_F32)
+        {
+            host.resize(static_cast<std::size_t>(nel));
+            ggml_backend_tensor_get(t, host.data(), 0, static_cast<std::size_t>(nel) * sizeof(float));
+        }
+        else if (t->type == GGML_TYPE_F16)
+        {
+            std::vector<ggml_fp16_t> h16(static_cast<std::size_t>(nel));
+            ggml_backend_tensor_get(t, h16.data(), 0, static_cast<std::size_t>(nel) * sizeof(ggml_fp16_t));
+            host.resize(static_cast<std::size_t>(nel));
+            for (std::int64_t j = 0; j < nel; j++) host[j] = ggml_fp16_to_fp32(h16[j]);
+        }
+        else continue;
+        std::int64_t nan = 0;
+        for (std::int64_t j = 0; j < nel; j++)
+            if (std::isnan(host[j]) || std::isinf(host[j])) nan++;
+        if (nan == 0) continue;
+        std::fprintf(out, "[wan-vae-trace] node %d %s '%s' %s ne=[%lld,%lld,%lld,%lld] nan=%lld/%lld\n",
+                     i, ggml_op_name(t->op), t->name, ggml_type_name(t->type),
+                     (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                     (long long)nan, (long long)nel);
+        for (int s = 0; s < 2; s++)
+        {
+            ggml_tensor* src = t->src[s];
+            if (src == nullptr) continue;
+            std::fprintf(out, "[wan-vae-trace]   src%d %s '%s' %s ne=[%lld,%lld,%lld,%lld] buf=%s\n",
+                         s, ggml_op_name(src->op), src->name, ggml_type_name(src->type),
+                         (long long)src->ne[0], (long long)src->ne[1], (long long)src->ne[2], (long long)src->ne[3],
+                         src->buffer ? ggml_backend_buffer_name(src->buffer) : "none");
+        }
+        printed++;
+    }
+    if (printed == 0)
+        std::fprintf(out, "[wan-vae-trace] no NaN in any of %d nodes\n", n);
+    std::fclose(out);
+}
+
+// A node's op writes memory unless it is a pure view. (NONE = leaf.)
+static bool wan_vae_op_writes(const ggml_tensor* t)
+{
+    switch (t->op)
+    {
+        case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+            return false;
+        default:
+            return true;
+    }
+}
+
+// Is node i's output still readable (not legally overwritten) after nodes
+// (i, upto) have run? gallocr reuses freed slots, so a later writer whose dst
+// range overlaps node i's range invalidates it.
+static bool wan_vae_node_live(ggml_cgraph* g, int i, int upto)
+{
+    ggml_tensor* t = ggml_graph_node(g, i);
+    const std::uintptr_t s0 = reinterpret_cast<std::uintptr_t>(t->data);
+    const std::uintptr_t e0 = s0 + ggml_nbytes(t);
+    for (int j = i + 1; j < upto; j++)
+    {
+        ggml_tensor* u = ggml_graph_node(g, j);
+        if (!wan_vae_op_writes(u) || u->data == nullptr) continue;
+        const std::uintptr_t s1 = reinterpret_cast<std::uintptr_t>(u->data);
+        const std::uintptr_t e1 = s1 + ggml_nbytes(u);
+        if (s1 < e0 && s0 < e1) return false;
+    }
+    return true;
+}
+
+
 bool wan_vae_decode(const TSGgmlWanVaeDecodeDesc* d)
 {
     const int zw = d->zw, zh = d->zh, zt = d->zt, zc = d->zc;
@@ -1599,9 +1742,94 @@ bool wan_vae_decode(const TSGgmlWanVaeDecodeDesc* d)
     for (auto& u : wbind.uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
     ggml_backend_tensor_set(zIn, d->z, 0, static_cast<std::size_t>(zw) * zh * zc * zt * sizeof(float));
 
-    if (tsg::graph_compute_profiled(g_backend, graph, "wan vae decode") != GGML_STATUS_SUCCESS)
+    // TS_WAN_VAE_SLICE=<K>[,nosync] (debug): execute the graph as sequential
+    // K-node sub-graphs (buffers stay as the full-graph gallocr assigned them),
+    // synchronizing between slices unless ",nosync". K <= 64 keeps every slice
+    // in a single main-thread command buffer.
+    const char* sliceEnv = std::getenv("TS_WAN_VAE_SLICE");
+    if (sliceEnv != nullptr && std::strtol(sliceEnv, nullptr, 10) > 0)
+    {
+        const int K = static_cast<int>(std::strtol(sliceEnv, nullptr, 10));
+        const bool doSync = std::strstr(sliceEnv, "nosync") == nullptr;
+        const int n = ggml_graph_n_nodes(graph);
+        for (int a = 0; a < n; a += K)
+        {
+            const int e = std::min(n, a + K);
+            const std::size_t smeta = ggml_graph_overhead_custom(static_cast<std::size_t>(K) + 8, false) + (1u << 20);
+            ggml_init_params sip{ smeta, nullptr, true };
+            ggml_context* sctx = ggml_init(sip);
+            ggml_cgraph* sub = ggml_new_graph_custom(sctx, static_cast<std::size_t>(K) + 8, false);
+            for (int i = a; i < e; i++)
+                ggml_graph_add_node(sub, ggml_graph_node(graph, i));
+            const ggml_status st = ggml_backend_graph_compute(g_backend, sub);
+            if (st != GGML_STATUS_SUCCESS)
+            { ggml_free(sctx); set_last_error("WanVaeDecode: sliced graph compute failed."); return false; }
+            if (doSync) ggml_backend_synchronize(g_backend);
+
+            // TS_WAN_VAE_SLICE_SCAN=<path>: immediately after each synced slice,
+            // scan the slice's own outputs (nothing later has run, so only
+            // in-slice reuse can alias) and report the first corrupt node.
+            static const char* scanPath = std::getenv("TS_WAN_VAE_SLICE_SCAN");
+            if (scanPath != nullptr && doSync)
+            {
+                for (int i = 0; i < e - a; i++)
+                {
+                    ggml_tensor* t = ggml_graph_node(sub, i);
+                    if (t->buffer == nullptr || t->data == nullptr) continue;
+                    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) continue;
+                    if (!wan_vae_op_writes(t)) continue;
+                    if (!wan_vae_node_live(sub, i, e - a)) continue;
+                    const std::int64_t nel = ggml_nelements(t);
+                    std::vector<float> host(static_cast<std::size_t>(nel));
+                    if (t->type == GGML_TYPE_F32)
+                        ggml_backend_tensor_get(t, host.data(), 0, static_cast<std::size_t>(nel) * sizeof(float));
+                    else
+                    {
+                        std::vector<ggml_fp16_t> h16(static_cast<std::size_t>(nel));
+                        ggml_backend_tensor_get(t, h16.data(), 0, static_cast<std::size_t>(nel) * sizeof(ggml_fp16_t));
+                        for (std::int64_t j = 0; j < nel; j++) host[j] = ggml_fp16_to_fp32(h16[j]);
+                    }
+                    std::int64_t nan = 0;
+                    for (std::int64_t j = 0; j < nel; j++)
+                        if (std::isnan(host[j]) || std::isinf(host[j])) nan++;
+                    if (nan == 0) continue;
+                    std::FILE* out = std::fopen(scanPath, "a");
+                    if (out != nullptr)
+                    {
+                        ggml_tensor* g = ggml_graph_node(graph, a + i);
+                        std::fprintf(out, "[wan-vae-slice] FIRST corrupt node %d (slice [%d,%d)) %s '%s' %s "
+                                          "ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] data=%p buf=%s nan=%lld/%lld\n",
+                                     a + i, a, e, ggml_op_name(g->op), g->name, ggml_type_name(g->type),
+                                     (long long)g->ne[0], (long long)g->ne[1], (long long)g->ne[2], (long long)g->ne[3],
+                                     g->nb[0], g->nb[1], g->nb[2], g->nb[3], g->data,
+                                     g->buffer ? ggml_backend_buffer_name(g->buffer) : "none",
+                                     (long long)nan, (long long)nel);
+                        for (int s = 0; s < 3; s++)
+                        {
+                            ggml_tensor* src = g->src[s];
+                            if (src == nullptr) continue;
+                            ggml_tensor* vsrc = src->view_src != nullptr ? src->view_src : src;
+                            std::fprintf(out, "[wan-vae-slice]   src%d %s '%s' %s ne=[%lld,%lld,%lld,%lld] "
+                                              "nb=[%zu,%zu,%zu,%zu] data=%p buf=%s (view of %s '%s')\n",
+                                         s, ggml_op_name(src->op), src->name, ggml_type_name(src->type),
+                                         (long long)src->ne[0], (long long)src->ne[1], (long long)src->ne[2], (long long)src->ne[3],
+                                         src->nb[0], src->nb[1], src->nb[2], src->nb[3], src->data,
+                                         src->buffer ? ggml_backend_buffer_name(src->buffer) : "none",
+                                         ggml_op_name(vsrc->op), vsrc->name);
+                        }
+                        std::fclose(out);
+                    }
+                    scanPath = nullptr;   // report only the first
+                    break;
+                }
+            }
+            ggml_free(sctx);
+        }
+    }
+    else if (tsg::graph_compute_profiled(g_backend, graph, "wan vae decode") != GGML_STATUS_SUCCESS)
     { set_last_error("WanVaeDecode: graph compute failed."); return false; }
     ggml_backend_synchronize(g_backend);
+    wan_vae_trace_nan(graph);
     ggml_backend_tensor_get(outT, d->out, 0, static_cast<std::size_t>(d->out_len) * sizeof(float));
     return true;
 }
