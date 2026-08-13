@@ -151,6 +151,24 @@ ggml_metal_device_init: has tensor            = false
 
 ggml 自身的开关依然在此之上生效：`GGML_METAL_TENSOR_DISABLE=1` 关闭 tensor API，`GGML_METAL_TENSOR_ENABLE=1` 则绕过 ggml 将其限制在 M5/M6/A19/A20 设备的白名单。
 
+##### Wan 视频与 tensor API
+
+ggml 的 tensor-API `mul_mm` 在 M5 上会偶发性地误读 Wan VAE 卷积 GEMM 的操作数列——仅计算图首次执行、与缓冲区布局相关（即历史上"32×32 latent 解码为全黑帧而 33×33 正常"的问题），任何运行时开关都无法规避；而同样的 GEMM 在隔离环境下逐位正确，LLM/DiT 类计算图也从未出错。这是上游 ggml-metal/驱动层缺陷，且 `has_tensor` 在设备初始化时固定，无法按算子选择 kernel。
+
+tensor API 开启时 VAE 依然**正确**：在支持 tensor API 的设备上，VAE 卷积改走 `ggml_conv_2d_direct`（`ggml_ops_wan.cpp` 的 `wan_vae_gemm_budget`），解码结果与 CPU 后端仅差 F16 舍入，但更慢——这是**固定的**每视频开销，而 tensor API 的 DiT 加速随步数和模型规模**线性放大**。M5 Pro 480×480×9帧、6 步实测：
+
+| | DiT 每步（tensor 开/关） | VAE 编+解码（直接/GEMM） | 盈亏平衡 |
+|---|---|---|---|
+| A14B I2V Q4_K_M | **17.1s** / 30.2s（1.77×） | 135s / 19s | 约 9 步 → 40 步默认配方下开启 tensor API **快约 33%**（约 13.7 vs 20.5 分钟） |
+| TI2V-5B Q8_0 | **1.6s** / 2.9s（1.8×） | 179s / 13s | 约 128 步 → 永不划算 |
+
+因此默认按 DiT 规模选择（ModelBase.cs 的 `ApplyArchitectureNativeTunables`）：A14B/14B 级模型（`patch_embedding` 输出维度 ≥ 5120）**启用**，更小的模型**禁用**。待上游修复 tensor-API `mul_mm` 后，可全面启用并移除直接卷积隔离方案。
+
+| 环境变量 | 作用 |
+|---|---|
+| `TS_WAN_METAL_TENSOR_API=1` / `=0` | 为 Wan 进程强制开/关 tensor API，覆盖按模型规模的默认值 |
+| `TS_WAN_VAE_GEMM_MAX_MB=<n>` | 强制走 im2col+GEMM VAE 路径并设定 `n` MB 的 im2col 预算（0 强制直接卷积）——双向覆盖自动选择 |
+
 ### 构建原生 MLX 库（仅 macOS）
 
 MLX 后端依赖 `libmlxc`（[MLX](https://github.com/ml-explore/mlx) 的 C 绑定）。仓库在 `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` 中固定了已知可用的 `mlx-c` tag，并提供一个辅助脚本来获取和构建：
