@@ -20,6 +20,10 @@ extern "C" bool tsg_cuda_fill_causal_mask_f16(
 extern "C" bool tsg_cuda_fill_ring_mask_f16(
     void* mask_dev, int ringRows, int N, int startPos, int window);
 extern "C" bool tsg_cuda_sync_stream0(void);
+// Highest visible NVIDIA compute capability, ggml's encoding (8.6 -> 860).
+// Used by kv_window_needs_cuda_flash_attn_copy to mirror ggml-cuda's
+// device-dependent flash-attention kernel choice.
+extern "C" int tsg_cuda_max_compute_capability(void);
 #endif
 
 // ============================================================================
@@ -116,6 +120,22 @@ namespace tsg
             ggml_backend_tensor_set_async(g_backend, tensor, data, 0, bytes);
         else
             ggml_backend_tensor_set(tensor, data, 0, bytes);
+    }
+
+    // Same, for a partial refresh: `offset` bytes into the tensor. Used where the
+    // caller knows only a suffix of an input changed since the last replay (the
+    // causal decode mask grows by one entry per token), so the H2D drops from the
+    // whole buffer to the delta. The tensor's address is fixed by the persistent
+    // graph, so the untouched bytes are exactly what the previous replay wrote.
+    inline void decode_input_set_range_async(ggml_tensor* tensor, const void* data,
+                                             std::size_t offset, std::size_t bytes)
+    {
+        if (tensor == nullptr || data == nullptr || bytes == 0)
+            return;
+        if (g_backend_type == BACKEND_TYPE_CUDA)
+            ggml_backend_tensor_set_async(g_backend, tensor, data, offset, bytes);
+        else
+            ggml_backend_tensor_set(tensor, data, offset, bytes);
     }
 
     // ------------------------------------------------------------------
@@ -248,11 +268,36 @@ namespace tsg
     // identical wrong token stream until this predicate stopped consulting
     // ggml_is_contiguous.
     //
+    //  * `fattn_gqa_ratio` - THE narrowing that matters at long context, and the
+    //    reason this predicate takes a parameter no other caller needs. It is
+    //    n_query_heads / n_kv_heads of the flash-attention op that reads the
+    //    window, or 0 when the caller does not know. ggml-cuda only reaches its
+    //    VEC branch for an unquantized K/V when
+    //        cc >= GGML_CUDA_CC_ADA_LOVELACE (890)
+    //        && Q->ne[1] == 1 && Q->ne[3] == 1
+    //        && !(gqa_ratio > 4 && K->ne[1] >= 8192)
+    //    (fattn.cu, ggml_cuda_get_best_fattn_kernel). The `!gqa_opt_applies`
+    //    escape one line below it cannot fire for a GQA model with a mask and a
+    //    stride-aligned window, so with gqa_ratio >= 2 everything outside that
+    //    condition lands on BEST_FATTN_KERNEL_MMA_F16 - the kernel the prefill
+    //    path already proves stride-correct. Concretely, for Muse-Glimmer
+    //    (gqa_ratio 16) the copy was being taken on EVERY decode step at EVERY
+    //    context length while the kernel it guards against is only selected
+    //    below 8192 KV rows, and never at all on Turing/Ampere. At 124K that is
+    //    26 x 63.6 MB of pure-waste copy per token (3.3 GB of traffic) plus the
+    //    same again pinned in the persistent graph's buffer.
+    //
+    //    CALLER CONTRACT: pass a non-zero ratio only when the flash-attention op
+    //    that reads this window has a MASK and `max_bias == 0`. Both are part of
+    //    `gqa_opt_applies`, and without them ggml can reach the vec kernel through
+    //    the `!gqa_opt_applies && Q->ne[1] == 1` branch even on Turing/Ampere.
+    //    Callers that pass 0 keep the old unconditional behaviour.
+    //
     // Restricted to CUDA: Metal, Vulkan and CPU were never affected and keep
     // their exact graphs.
     inline bool kv_window_needs_cuda_flash_attn_copy(
         int head_dim, int cache_size, int start_idx, int length, int kv_cache_type,
-        int fattn_query_rows)
+        int fattn_query_rows, int fattn_gqa_ratio = 0)
     {
         if (g_backend_type != BACKEND_TYPE_CUDA)
             return false;
@@ -277,6 +322,27 @@ namespace tsg
             return false;                               // F32 is converted with
                                                         // stride-aware kernels;
                                                         // quantized can't be cont'd
+#ifdef TSG_GGML_USE_CUDA
+        // TS_KV_FATTN_COPY=force pins the old unconditional copy, so a field
+        // failure after an ExternalProjects/ggml bump that moves the kernel
+        // selection can be worked around without a rebuild.
+        static const bool copy_forced = [] {
+            const char* e = std::getenv("TS_KV_FATTN_COPY");
+            return e != nullptr && std::strcmp(e, "force") == 0;
+        }();
+        if (!copy_forced && fattn_gqa_ratio >= 2)
+        {
+            // gqa_opt_applies holds (gqa_ratio >= 2, a mask is always present on
+            // these paths, max_bias 0, length % 256 == 0 checked above, and every
+            // nb is 16-aligned because head_dim % 64 == 0 on an F16 cache), so
+            // ggml-cuda's only route to the VEC kernel is the Ada+ branch.
+            const int cc = tsg_cuda_max_compute_capability();
+            if (cc >= 750 && cc < 890)
+                return false;                           // Turing/Ampere -> MMA_F16
+            if (cc >= 890 && fattn_gqa_ratio > 4 && length >= 8192)
+                return false;                           // Ada+ -> MMA_F16 (fattn.cu)
+        }
+#endif
         return true;
     }
 
@@ -295,7 +361,11 @@ namespace tsg
         int start_idx,
         int length,
         int kv_cache_type = GGML_TYPE_F32,
-        int fattn_query_rows = 1)
+        int fattn_query_rows = 1,
+        // n_query_heads / n_kv_heads of the flash-attention op that reads this
+        // window; 0 = unknown, which keeps the conservative always-copy
+        // behaviour. See kv_window_needs_cuda_flash_attn_copy.
+        int fattn_gqa_ratio = 0)
     {
         if (ctx == nullptr || cache == nullptr || head_dim <= 0 || cache_size <= 0 || kv_heads <= 0 || length <= 0)
             return nullptr;
@@ -323,7 +393,7 @@ namespace tsg
                 static_cast<std::size_t>(start_idx) * nb1);
             if (window != nullptr &&
                 kv_window_needs_cuda_flash_attn_copy(head_dim, cache_size, start_idx, length, kv_cache_type,
-                                                     fattn_query_rows))
+                                                     fattn_query_rows, fattn_gqa_ratio))
             {
                 // See kv_window_needs_cuda_flash_attn_copy above. One copy of the
                 // window per affected cache per forward; it only fires when the
