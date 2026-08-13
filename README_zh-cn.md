@@ -6,7 +6,7 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-**面向 GGUF 模型的原生 .NET LLM 推理引擎** —— 覆盖自回归 LLM *与* DiffusionGemma 风格的文本扩散模型，以及 Qwen-Image-Edit 图像编辑。提供控制台应用、浏览器聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API。一个纯 .NET 引擎，在相同 GGUF 文件与相同 GPU 上与手工优化的 C++ `llama.cpp` 互有胜负。
+**面向 GGUF 模型的原生 .NET LLM 推理引擎** —— 覆盖自回归 LLM *与* DiffusionGemma 风格的文本扩散模型，以及 Qwen-Image-Edit 图像编辑、Wan 2.1/2.2 文本与图像生视频。提供控制台应用、浏览器聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API。一个纯 .NET 引擎，在相同 GGUF 文件与相同 GPU 上与手工优化的 C++ `llama.cpp` 互有胜负。
 
 ## 《From Tensors to Tokens》—— TensorSharp 实战书籍
 
@@ -28,6 +28,7 @@ Zhongkai Fu 所著的 **[From Tensors to Tokens: Building a Multimodal LLM Infer
 - **🔮 投机解码——MTP / NextN 与 DSpark。** 多 token 预测草稿头加速单序列 decode：Qwen 3.6（内嵌 NextN 块）与 Gemma 4（独立 `gemma4-assistant` 草稿 GGUF）；DeepSeek V4 则新增 **DSpark** 块级起草（`--draft-model`），每步提议一整块 token，decode 提速 **1.3–1.4×**（多轮对话最高 2.0×）。三者都是草稿提议、主干一次批量前向验证，输出与标准 decode 一致。→ [投机解码](FEATURES_zh-cn.md#mtp--nextn-投机解码)
 - **🔗 张量并行与分布式集群。** 用 `--tp N` 把一个模型切分到多张 GPU 上——Direct `cuda` 后端**以及** GGML CUDA / Vulkan 后端均支持——再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。采用 Megatron-LM 列/行并行范式与分层 AllReduce；GGML 上提供 MoE 专家并行与按 rank 的 GatedDeltaNet 融合内核。融合式按 rank 执行让 Gemma 4 E4B 上 `--tp 2` 的 decode 达到单卡的 **1.39×**、Muse-Glimmer 30B 达到 **1.57×**（其 prefill 同时提升 **1.34×**——是这里唯一在两个阶段都超过单卡的模型），也让单卡装不下的模型（Qwen 3.5-35B-A3B；24 GB 卡上 28.2 GB 的 Muse-Glimmer 30B Q8_0）得以运行。可选 Redis 支撑的 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
 - **🎨 Qwen-Image-Edit 图像编辑。** 提示词 + 输入图像 → 编辑后的图像，驱动 60 块 MMDiT，配以 Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器。CUDA 图捕获的整 DiT、FlowMatch-Euler true-CFG 去噪、Web UI 实时预览，以及 Lightning-LoRA 快速路径。热态 4 步编辑比 `stable-diffusion.cpp` 快 **1.19×**。→ [Qwen-Image-Edit 卡片](docs/models/qwenimage_zh-cn.md)
+- **🎬 Wan 2.1 / 2.2 视频生成（文本→视频、图像→视频）。** 提示词 → H.264 MP4；Wan 2.2（TI2V-5B、I2V-A14B）上上传的图像作为首帧，提示词驱动运动、镜头与场景变化。每个去噪步一张常驻权重的 ggml 图（CUDA 图捕获、flash attention），因果 3D 视频 VAE 编/解码各一张图，A14B 的两个 14B 专家在时间步边界热切换，分阶段显存交接——TI2V-5B 在 16 GB GPU 上 8 分钟内生成 81 帧 480p 图生视频，Wan 2.1 端到端比 `stable-diffusion.cpp` 快 **6.0×**。→ [Wan 卡片](docs/models/wan_zh-cn.md)
 - **🌫️ DiffusionGemma 文本扩散。** 基于 Gemma-4 派生 MoE backbone 的分块 EntropyBound 去噪，提供 CLI 参数与 Web UI 实时去噪预览。→ [DiffusionGemma 卡片](docs/models/diffusiongemma_zh-cn.md)
 - **🖼️ 多模态。** 图像 / 视频 / 音频（Gemma 4）；图像输入（Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni、Muse-Glimmer）；CLI 与 Web UI 支持 PDF。→ [多模态](FEATURES_zh-cn.md#多模态支持)
 - **🛠️ 工具调用与思维链。** Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer（ATEM 标记）、DeepSeek V4（DSML 标记）均支持多轮工具调用与结构化思维链。→ [功能特性](FEATURES_zh-cn.md)
@@ -158,7 +159,9 @@ dotnet run --project TensorSharp.Server -c Release -- --help
 | Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3](docs/models/mistral3_zh-cn.md) |
 | Gemma 3 | [gemma-3-4b-it](https://huggingface.co/ggml-org/gemma-3-4b-it-GGUF) | ✅ / — / — | — | — | [gemma3](docs/models/gemma3_zh-cn.md) |
 | DiffusionGemma | [diffusiongemma-26B-A4B-it](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) | — / — / — | — | — | [diffusiongemma](docs/models/diffusiongemma_zh-cn.md) |
+| Muse-Glimmer | [Muse-Glimmer-30B](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)（+ mmproj） | ✅ / — / — | ✅ | ✅ | [muse-glimmer](docs/models/muse-glimmer_zh-cn.md) |
 | Qwen-Image-Edit | [Qwen-Image-Edit-2511](https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF)（MMDiT + VAE + Qwen2.5-VL） | 🖼️ 图像→图像 | — | — | [qwenimage](docs/models/qwenimage_zh-cn.md) |
+| Wan 2.1 / 2.2 视频 | [Wan2.2-TI2V-5B](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF)（另有 [I2V-A14B](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF)、[Wan2.1-T2V-14B](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf)）+ UMT5-XXL + 视频 VAE | 🎬 文本→视频、图像→视频 | — | — | [wan](docs/models/wan_zh-cn.md) |
 
 ## 支持的模型架构
 
@@ -172,9 +175,10 @@ dotnet run --project TensorSharp.Server -c Release -- --help
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持（始终） | 支持 | — | [gptoss](docs/models/gptoss_zh-cn.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B/47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni | 图像（Omni） | 支持 | 支持 | — | [nemotron](docs/models/nemotron_zh-cn.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 | — | [mistral3](docs/models/mistral3_zh-cn.md) |
-| Muse-Glimmer | `muse-glimmer` | Muse-Glimmer-30B（交错滑动窗口 + NoPE 全注意力层，注意力输出门控） | 图像 | 支持 | 支持（ATEM） | 支持（DFlash 块级草稿，独立 GGUF） | [muse-glimmer](docs/models/muse-glimmer.md) |
+| Muse-Glimmer | `muse-glimmer` | Muse-Glimmer-30B（交错滑动窗口 + NoPE 全注意力层，注意力输出门控） | 图像 | 支持 | 支持（ATEM） | 支持（DFlash 块级草稿，独立 GGUF） | [muse-glimmer](docs/models/muse-glimmer_zh-cn.md) |
 | DiffusionGemma | `diffusion-gemma` | diffusion-gemma 文本扩散 GGUF | 仅文本 | 不支持 | 不支持 | — | [diffusiongemma](docs/models/diffusiongemma_zh-cn.md) |
 | Qwen-Image-Edit | `qwen_image` | qwen-image-edit MMDiT GGUF（+ VAE 与 Qwen2.5-VL） | 图像编辑（图像+文本 → 图像） | 不支持 | 不支持 | — | [qwenimage](docs/models/qwenimage_zh-cn.md) |
+| Wan 视频 | `wan` | Wan 2.1 T2V 1.3B/14B、Wan 2.2 TI2V-5B、Wan 2.2 A14B T2V/I2V（双专家） | 视频输出（文本→视频、图像→视频） | 不支持 | 不支持 | — | [wan](docs/models/wan_zh-cn.md) |
 
 各架构的端到端文档（前向图、组件、参数、prefill/decode 优化）见[按模型架构卡片](docs/models/README_zh-cn.md)。
 
@@ -220,12 +224,12 @@ TensorSharp 在 CUDA 的 prefill / 首 token 延迟上明显领先（多轮 pref
 
 | 范围 | 状态 |
 |---|---|
-| 模型家族 | DeepSeek V4 Flash（`deepseek4`）、Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3。图像编辑通过 Qwen-Image-Edit（`qwen_image` MMDiT）。 |
+| 模型家族 | DeepSeek V4 Flash（`deepseek4`）、Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3、Muse-Glimmer（`muse-glimmer`）。图像编辑通过 Qwen-Image-Edit（`qwen_image` MMDiT）；视频生成通过 Wan 2.1 / 2.2（`wan`）。 |
 | 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA、GGML Vulkan。DeepSeek V4 另有三套专属的整模型执行器——Direct CUDA、原生 ggml 与纯 C# CPU——都会把权重按层切分到所有可见 GPU（`--tp N` / `TS_DSV4_NGPU` 限定卡数）。 |
-| 多模态 | Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni、Muse-Glimmer 图像输入；PDF（CLI `--pdf` + Web UI）。 |
+| 多模态 | Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni、Muse-Glimmer 图像输入；PDF（CLI `--pdf` + Web UI）。媒体*输出*：Qwen-Image-Edit（图像）与 Wan 2.1 / 2.2（H.264 MP4 视频，文本→视频与图像→视频）。 |
 | 连续批处理 | vLLM 风格分页 KV 缓存、基于内容哈希的前缀共享、迭代级调度器（默认启用，`--no-continuous-batching` 关闭）。DeepSeek V4 在同一引擎上通过其原生 per-sequence slot 提供服务。 |
-| 投机解码 | Qwen 3.6（内嵌）与 Gemma 4（独立草稿 GGUF）的 MTP / NextN 草稿头；DeepSeek V4 的 DSpark 块级起草（`--draft-model` 指定独立草稿 GGUF，`cuda` / `ggml_cuda`，decode 提速 1.3–1.4×）。默认关闭；服务端用 `--mtp-spec` 启用，CLI 直接传 `--draft-model` 即可。 |
+| 投机解码 | Qwen 3.6（内嵌）与 Gemma 4（独立草稿 GGUF）的 MTP / NextN 草稿头；DeepSeek V4 的 DSpark 与 Muse-Glimmer 的 DFlash 块级起草（`--draft-model` 指定独立草稿 GGUF，`cuda` / `ggml_cuda`）。验证以贪心方式对齐主干，因此输出与普通贪心 decode 一致。默认关闭；服务端用 `--mtp-spec` 启用，CLI 直接传 `--draft-model` 即可。 |
 | 张量并行 | Direct `cuda` 后端与 GGML CUDA / Vulkan 后端上的 Megatron-LM 列/行并行 TP（`--tp N` / `TENSORSHARP_TP_DEGREE`，CLI 与服务端均支持）；通过点对点 TCP 的多节点分布式 TP（`--tp-node-id` / `--tp-peers`），采用分层 AllReduce，CUDA P2P 不可用时自动回退到主机中转。覆盖全部自回归架构；GGML 上 Gemma 4 与 Qwen 3.5/3.6 使用 MoE 专家并行与融合的按 rank decode/prefill 计算图。可选 Redis 支撑的 KV 缓存与 Responses API 存储。 |
 | 服务端模型范围 | 通过 `--model` 显式托管单个 GGUF；可通过 `--mmproj` 显式指定投影器；不扫描目录。 |
 | 可观测性 | 结构化每轮日志、队列状态，以及 Web UI / Ollama / OpenAI 中的 KV 缓存复用指标。 |

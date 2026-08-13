@@ -166,6 +166,7 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 | Gemma 3 | [gemma-3-4b-it](https://huggingface.co/ggml-org/gemma-3-4b-it-GGUF) | ✅ / — / — | — | — | [gemma3.md](docs/models/gemma3.md) |
 | DiffusionGemma | [diffusiongemma-26B-A4B-it](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) | — / — / — | — | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
 | Qwen-Image-Edit | [Qwen-Image-Edit-2511](https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF) (MMDiT + VAE + Qwen2.5-VL) | 🖼️ image→image | — | — | [qwenimage.md](docs/models/qwenimage.md) |
+| Wan 2.1 / 2.2 video | [Wan2.2-TI2V-5B](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF) (also [I2V-A14B](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF), [Wan2.1-T2V-14B](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf)) + UMT5-XXL + video VAE | 🎬 text→video, image→video | — | — | [wan.md](docs/models/wan.md) |
 
 ## Supported Model Architectures
 
@@ -182,6 +183,7 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 | Muse-Glimmer | `muse-glimmer` | Muse-Glimmer-30B (interleaved SWA + NoPE full layers, attention output gate) | Image | Yes | Yes (ATEM) | Yes (DFlash block drafter, separate GGUF) | [muse-glimmer.md](docs/models/muse-glimmer.md) |
 | DiffusionGemma | `diffusion-gemma` | diffusion-gemma text-diffusion GGUFs | Text only | No | No | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
 | Qwen-Image-Edit | `qwen_image` | qwen-image-edit MMDiT GGUFs (+ VAE & Qwen2.5-VL) | Image edit (image+text → image) | No | No | — | [qwenimage.md](docs/models/qwenimage.md) |
+| Wan video | `wan` | Wan 2.1 T2V 1.3B/14B, Wan 2.2 TI2V-5B, Wan 2.2 A14B T2V/I2V (two experts) | Video out (text→video, image→video) | No | No | — | [wan.md](docs/models/wan.md) |
 
 End-to-end per-model documentation (origin, forward graph, components, parameters, prefill/decode optimizations): [architecture cards](docs/models/README.md).
 
@@ -227,12 +229,12 @@ New here? The sections above are all you need to get running. Everything else is
 
 | Area | Status |
 |---|---|
-| Model families | DeepSeek V4 Flash (`deepseek4`), Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3. Image editing via Qwen-Image-Edit (`qwen_image` MMDiT). |
+| Model families | DeepSeek V4 Flash (`deepseek4`), Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3, Muse-Glimmer (`muse-glimmer`). Image editing via Qwen-Image-Edit (`qwen_image` MMDiT); video generation via Wan 2.1 / 2.2 (`wan`). |
 | Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API. |
 | Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA, GGML Vulkan. DeepSeek V4 additionally has three whole-model executors of its own — direct-CUDA, native ggml, and a pure-C# CPU one — each layer-splitting the weights across every visible GPU (`--tp N` / `TS_DSV4_NGPU` caps the count). |
-| Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, Nemotron-H Omni image input; PDF documents (CLI `--pdf` + Web UI). |
+| Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, Nemotron-H Omni, Muse-Glimmer image input; PDF documents (CLI `--pdf` + Web UI). Media *out*: Qwen-Image-Edit (image) and Wan 2.1 / 2.2 (H.264 MP4 video, text→video and image→video). |
 | Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (default on; opt-out `--no-continuous-batching`). DeepSeek V4 serves through its own native per-sequence slots on the same engine. |
-| Speculative decoding | MTP / NextN draft heads on Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); DSpark block drafting on DeepSeek V4 (separate drafter GGUF via `--draft-model`, `cuda` / `ggml_cuda`, 1.3–1.4× decode). Off by default; opt-in via the server's `--mtp-spec`, or by passing `--draft-model` on the CLI. |
+| Speculative decoding | MTP / NextN draft heads on Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); DSpark block drafting on DeepSeek V4 and DFlash block drafting on Muse-Glimmer (separate drafter GGUF via `--draft-model`, `cuda` / `ggml_cuda`). Verification is greedy against the target, so the emitted stream is the plain-greedy stream. Off by default; opt-in via the server's `--mtp-spec`, or by passing `--draft-model` on the CLI. |
 | Tensor parallelism | Megatron-LM column/row-parallel TP on the direct `cuda` backend and on GGML CUDA / Vulkan (`--tp N` / `TENSORSHARP_TP_DEGREE`, CLI and server); distributed multi-node TP via peer-to-peer TCP (`--tp-node-id` / `--tp-peers`), with hierarchical AllReduce and automatic host-staging fallback when CUDA P2P is unavailable. All autoregressive architectures; MoE expert parallelism and fused per-rank decode/prefill graphs for Gemma 4 and Qwen 3.5/3.6 on GGML. Optional Redis-backed KV cache and Responses API store. |
 | Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning. |
 | Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI shapes. |

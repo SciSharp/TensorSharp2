@@ -133,20 +133,15 @@ The drafter's logits get **neither** the target's `logit_scale` nor its softcap
 both, but the acceptance confidence is not, so the per-position confidences
 handed to the executor are the softmax of the raw drafter logits.
 
-Verification is greedy against the target, so **the emitted token stream is
-identical to plain greedy decoding**. Measured acceptance on this model is
-73-100% per prompt (mean ~84%) with a mean accepted run of ~2 tokens per verify
-step, matching llama.cpp's behaviour on the same GGUFs.
+Verification is greedy against the target, so the emitted token stream is the
+plain-greedy stream (see [Output agreement](#output-agreement) for what
+"lossless" means once floating point is involved).
 
-**It is not a speedup on this model yet** (15.5 tok/s against 19.5 for plain
-decode). The trunk verify now runs on the fused kernel — the kernel emits the
-per-layer input residuals the drafter's encoder needs, and scores every drafted
-row in one pass — but the DRAFTER itself is still per-op: a 33280x6656 `fc`
-GEMM plus five unfused layers per step costs more than the ~2.5 target forwards
-that ~2 accepted tokens per step saves. llama.cpp wins with DFlash (1.3-4.8x on
-these prompts) because its drafter is also a single graph. Fusing the drafter is
-the obvious next step; until then DFlash is correct, lossless, and off by
-default.
+Both the drafter and the trunk verify run as fused, CUDA-graph-captured native
+graphs; that is what turned speculation from a loss into a win on this model.
+The current head-to-head against llama.cpp's own DFlash implementation — where
+TensorSharp wins, where it loses, and why — is in
+[§5 Performance](#5-performance).
 
 ## 4. Parity with llama.cpp
 
@@ -175,55 +170,233 @@ Then `TS_TEST_MODEL_DIR=<model dir> dotnet test --filter MuseGlimmerParityTests`
 
 ## 5. Performance
 
-Measured on an RTX 3080 Laptop (16 GB), `Muse-Glimmer-30B-UD-IQ2_XXS`,
-`ggml_cuda`, 16-token prompt, 128 generated tokens, greedy. llama.cpp is
-`build-ninja-cuda` at the same commit as the vendored ggml, run with
-`llama-cli -st -no-cnv -ngl 99 -c 4096 -n 128 --temp 0`.
+Re-measured 2026-08-13. This section replaces an earlier table taken on a 16 GB
+laptop GPU with a 2-bit quantization; none of those numbers survive here. The
+engineering subsections further down keep their original A/B measurements
+because they document *why* a change was made — each says which machine it was
+taken on.
 
-| Path | Prefill | Decode |
-|---|---|---|
-| llama.cpp, plain | 226.5 tok/s | 21.6 tok/s |
-| llama.cpp + DFlash (`-md`, `--spec-draft-n-max 15`) | 208.6-216.7 tok/s | 20.0-20.2 tok/s |
-| TensorSharp per-op (`TS_MUSE_GLIMMER_FUSED=0`) | 55 tok/s | 4.3 tok/s |
-| TensorSharp fused, plain | 357.9-361.3 tok/s | 19.1-19.9 tok/s |
-| TensorSharp fused + DFlash (per-op drafter) | ~260 tok/s | 15.8-16.4 tok/s |
-| **TensorSharp fused + fused DFlash** | **260-269 tok/s** | **26.0-27.0 tok/s** |
+### Test setup
 
-Decode with DFlash is **~1.25x llama.cpp's best** (21.6 plain) and **~1.3x
-llama.cpp's own DFlash**. Plain decode is ~90% of llama.cpp's; prefill is ~1.6x.
+| | |
+|---|---|
+| GPU | 1x **NVIDIA RTX PRO 6000 Blackwell Server Edition** (97,887 MiB), driver 580.126.20, PCIe 5.0 x16. The host has two; every row except [Two GPUs](#two-gpus) pins `CUDA_VISIBLE_DEVICES=0`. |
+| CPU / RAM | 2x Intel Xeon 6952P (384 threads), 1.5 TiB |
+| Model | `Muse-Glimmer-30B-Q8_0.gguf` (27.6 GiB) |
+| Drafter | `dflash-kquant.gguf` (1.5 GiB) |
+| TensorSharp | commit `5098e3f`, vendored ggml `8846b79` (2026-08-12), `--backend ggml_cuda`, native library built `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120-real` |
+| llama.cpp | master `8e7f22b` (2026-08-13, libggml 0.19.0 — within a day of the vendored ggml), same CUDA arch, `-DGGML_CUDA=ON -DLLAMA_CURL=OFF` |
+| Sampling | greedy on both sides (`--temp 0` for llama.cpp; **no** sampler flags for TensorSharp) |
+| Generation | 128 tokens |
+| Batching | llama.cpp `-b 2048 -ub 2048`, matching TensorSharp's default `TS_MUSE_GLIMMER_PREFILL_CHUNK` of 2048 |
+| Reps | 2 per point, **engines alternating within each context** |
 
-Note that DFlash is a net *loss* for llama.cpp on this GPU (20.0 vs 21.6): its
-drafter is fast in absolute terms but not fast enough to pay for itself when the
-target forward is only ~46 ms. It only pays once the drafter itself is fused.
+**Both engines prefill the same token sequence.** TensorSharp applies the chat
+template and llama.cpp's `-no-cnv -f` does not, so handing both the raw question
+would compare a 60-token prompt against a 21-token one. The rendered prompt is
+dumped once (`TensorSharp.Cli --dump-prompt`) and *that* text is what
+`llama-cli` is given; `llama-tokenize` then confirms the count matches what
+TensorSharp reports (60 / 501 / 2050 / 16126 / 32274 / 64575 / 123931 tokens).
 
-### Long context
+### Plain text generation
 
-Same hardware and model, prompts of 16336 / 32680 / 65373 tokens, 128 generated
-tokens, `MAX_CONTEXT` set to fit each prompt. Two reps per point, **alternating
-engines** — running one engine's three contexts back to back and then the other's
-biases the second engine downward by 10-15% through GPU thermals, which is enough
-to invent or hide a gap this size.
+Mean of two reps, tok/s. The ratio column is TensorSharp / llama.cpp, so above
+1.00x is TensorSharp ahead.
 
-| Context | llama.cpp prefill / decode | TensorSharp prefill / decode |
-|---|---|---|
-| 16K | 589.1, 584.9 / 20.1, 19.9 | 587.4, 580.4 / 18.7, 18.4 |
-| 32K | 555.1, 539.7 / 18.0, 16.4 | 551.8, 529.5 / 17.6, 16.5 |
-| 64K | 480.9, 498.6 / 16.7, 16.8 | 474.6, 488.1 / 14.8, 17.1 |
+| Prompt tokens | llama.cpp prefill | TS prefill | ratio | llama.cpp decode | TS decode | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 60 | 362 | **459** | 1.27x | 34.7 | **35.0** | 1.01x |
+| 501 | 927 | **1135** | 1.23x | **36.2** | 34.3 | 0.95x |
+| 2050 | 1132 | **1317** | 1.16x | **35.0** | 33.5 | 0.96x |
+| 16126 | **1325** | 1249 | 0.94x | **32.2** | 30.9 | 0.96x |
+| 32274 | **1303** | 1211 | 0.93x | **32.1** | 29.9 | 0.93x |
+| 64575 | **1256** | 1150 | 0.92x | **32.4** | 29.1 | 0.90x |
+| 123931 | **1166** | 1073 | 0.92x | **30.7** | 26.6 | 0.86x |
 
-Prefill is **98-99.5% of llama.cpp at every context** (it was 77-83% before the
-work described below). Decode is 93% at 16K, level at 32K, and 88-102% at 64K —
-the 64K decode spread is real run-to-run variance, not a stable number.
+The shape is consistent across the ladder: TensorSharp's fused whole-model graph
+wins short prompts by 1.16-1.27x, the two engines cross somewhere between 2K and
+16K, and llama.cpp keeps a 6-8% prefill edge above that. Decode is a tie at 60
+tokens of context and slides to 0.86x at 128K — the gap grows with KV length,
+which points at the attention path rather than the FFN.
 
-Earlier revisions of this table reported 471.5 / 426.0 / 353.3 prefill; that is
-the pre-mask-sharing code.
+> **Caveat on the four long rows.** The 60 / 501 / 2050 prompts are byte-identical
+> for both engines. The 16126 / 32274 / 64575 / 123931 rows were taken before the
+> CRLF normalization described in [Benchmark method notes](#benchmark-method-notes)
+> landed, so on those four points TensorSharp prefilled the CRLF form of the same
+> document — 1.2% more tokens (16322 / 32666 / 65359 / 125412) for the same text.
+> Throughput is a rate, so the effect on tok/s is small, but the generated
+> continuations are not strictly comparable on those rows. The corrected re-run
+> was queued and the benchmark host went offline before it finished.
+
+Both engines run the full 128K context on one card.
+
+### DFlash speculative decoding
+
+Same runs with `--draft-model dflash-kquant.gguf --spec-draft-n-max 15` against
+llama.cpp's `-md … --spec-type draft-dflash --spec-draft-n-max 15 -ngld 99`.
+Decode tok/s; parentheses give the two-rep range where it is wide.
+
+| Prompt tokens | llama.cpp | TensorSharp | TS, `--spec-draft-conf-min 0` |
+|---|---:|---:|---:|
+| 60 | 45.5 | **50.9** | 43.5 |
+| 501 | 117.5 | 164.6 (150-179) | **180.3** |
+| 2050 | 24.9 | **43.5** (30-57) | 34.7 |
+| 16126 | **80.2** | 55.8 (37-75) | 33.2 |
+| 32274 | **60.7** (43-79) | 33.8 (31-36) | 29.9 |
+| 64575 | **66.1** | 48.7 (34-64) | 49.1 |
+| 123931 | **69.0** | 42.3 (30-55) | 59.8 |
+
+Speculation costs *prefill* on both engines, because the drafter's encoder has
+to run over the prompt too:
+
+| Prompt tokens | llama.cpp plain → DFlash | TensorSharp plain → DFlash |
+|---|---:|---:|
+| 60 | 362 → 203 (0.56x) | 459 → 341 (0.74x) |
+| 501 | 927 → 495 (0.53x) | 1135 → 700 (0.62x) |
+| 2050 | 1132 → 259 (0.23x) | 1317 → 703 (0.53x) |
+| 16126 | 1325 → 988 (0.75x) | 1249 → 826 (0.66x) |
+| 64575 | 1256 → 985 (0.78x) | 1150 → 780 (0.68x) |
+| 123931 | 1166 → 920 (0.79x) | 1073 → 742 (0.69x) |
+
+#### Why the TensorSharp column is a range and llama.cpp's is not
+
+TensorSharp runs an **adaptive cost governor** in front of the drafter
+([`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs),
+`AdaptiveSpeculation`, on by default). Speculation is only ever a speed
+optimization, so the executor measures ms/token with drafting and without it,
+and if drafting loses it **parks** the drafter for `ParkedProbeInterval = 64`
+steps before probing again. llama.cpp has no such governor — it drafts every
+step, unconditionally.
+
+On a 128-token run one bad probe therefore costs half the measurement. The two
+16K reps below are the same prompt, the same binary and the same weights; they
+differ only in the governor's verdict:
+
+| 16K rep | drafted / accepted | verify steps | parked steps | decode |
+|---|---|---:|---:|---:|
+| 1 | 64 / 48 (75%) | 13 | **67** | 36.7 tok/s |
+| 2 | 132 / 103 (78%) | 22 | 3 | **74.8 tok/s** |
+
+Rep 1's *post-park* re-probe measured speculation at **14.0 ms/token against
+37.8 ms/token plain** — 2.7x faster — so the verdict that parked it was wrong.
+The first speculative steps after a prefill pay the one-off graph build for the
+verify batch shape, and that is exactly what the probe samples. The parked reps
+at 32K, 64K and 128K show the same fingerprint (`drafted` stuck at 64-84: one
+probe window, then nothing).
+
+Reading the unparked rep as the steady state, TensorSharp's fused DFlash reaches
+**94% of llama.cpp's at 16K (74.8 vs 79.8) and 96% at 64K (63.6 vs 66.5)** — not
+the 1.6-2.4x deficit an earlier revision of this document reported on other
+hardware. Warming the verify shape before the probe, or dropping the first
+speculative step from the sample, is the obvious fix and is not done yet.
+
+#### The confidence floor
+
+TensorSharp defaults to `confMin = 0.35`; llama.cpp's `p_min` defaults to 0 on
+this path, i.e. it always drafts its full window. `--spec-draft-conf-min 0`
+makes the two policies comparable and is **not** uniformly better: it wins at
+501 and 128K tokens (180 vs 165, 60 vs 42) and loses badly at 16K and 32K
+(33 vs 56, 30 vs 34), where acceptance collapses from ~75% to 24-42% and every
+rejected row still occupies a verify slot. The floor wants to be adaptive, not a
+constant — the same conclusion the earlier laptop run reached.
+
+#### The 2K anomaly belongs to llama.cpp
+
+At a 2050-token prompt llama.cpp's DFlash decode (24.9 tok/s, both reps) falls
+*below* its own plain decode (35.0), and its DFlash prefill collapses to 259
+tok/s from 1132 — a 4.4x penalty against the 0.75-0.79x it pays at 16K and up.
+TensorSharp pays 0.53x on the same point and decodes at 43.5. Nothing about the
+prompt is unusual except that it stops mid-document, so the continuation is less
+predictable than the question-and-answer prompts at the other sizes.
+
+### Peak VRAM
+
+Whole-process peak on one GPU, sampled every 2 s (MiB):
+
+| Prompt tokens | llama.cpp plain | TS plain | llama.cpp DFlash | TS DFlash |
+|---|---:|---:|---:|---:|
+| 501 | 28329 | 29655 | 31881 | 29887 |
+| 16126 | 28585 | 30567 | 32191 | 34089 |
+| 64575 | 29401 | 32003 | 33007 | 35809 |
+| 123931 | 30471 | 33787 | 34641 | 37769 |
+
+TensorSharp carries 1.3-3.3 GB more than llama.cpp on the plain path and about
+3 GB more with the drafter resident. Both fit 128K on a 96 GB card easily; on a
+40 GB card the 128K DFlash configuration is the first one to run out.
+
+### Output agreement
+
+Greedy verification makes DFlash lossless *in exact arithmetic* — the verify
+batch re-scores every drafted row against the target and keeps only the prefix
+the target itself would have emitted. In floating point the verify GEMM has a
+different shape from the 1-row decode GEMM, the logits differ in the last bits,
+and a near-tie can flip. Measured across these runs:
+
+* TensorSharp is **deterministic**: every configuration produced a byte-identical
+  continuation to its own repeat.
+* TensorSharp plain vs TensorSharp DFlash: identical at 60 / 501 / 2050 / 16126
+  prompt tokens, diverged at 32274.
+* llama.cpp plain vs llama.cpp DFlash: identical everywhere except at 2050.
+
+Both engines show the same behaviour on the same corpus, so this is the tie
+flip, not a verification bug. Across engines the two continuations agree for the
+first 127-636 characters and then split — expected from different kernels and
+different reduction orders over the same weights.
+
+### Benchmark method notes
+
+Five things here moved a number by more than the effect being measured, so they
+are recorded rather than rediscovered:
+
+* **Alternate the engines.** Running one engine's whole ladder and then the
+  other's biases the second one down. Every context runs
+  llama.cpp → TensorSharp → llama.cpp DFlash → TensorSharp DFlash.
+* **Give llama.cpp the templated prompt** (above). At the 60-token point the
+  difference is 3x in prompt length.
+* **Normalize line endings first.** The long prompt files were CRLF. Handing
+  llama.cpp an LF copy of the same document made TensorSharp prefill 16322
+  tokens where llama.cpp prefilled 16126 — the same text, 1.2% more tokens, a
+  different continuation. Compare the two engines' reported prompt-token counts
+  before believing any long-context row.
+* **Never pass `--top-k 1` to `TensorSharp.Cli`.** `SamplingConfig.IsGreedy`
+  requires `TopK <= 0`, so `--top-k 1` fails
+  `InteractiveSession.IsArgmaxSampling` and the speculative path silently never
+  arms; the run then reports plain decode under a "dflash" label. The CLI already
+  starts from `SamplingConfig.Greedy`, which is what `--temp 0` means on the
+  llama.cpp side, so pass no sampler flags at all — and assert
+  `cli.inference speculative:` appears in the log.
+* **128 generated tokens is too few for a speculative comparison.** It is
+  shorter than two park intervals, so one governor misfire moves the number by
+  2x (the 16K reps above).
+
+The GPU reports `HW Power Brake Slowdown: Active` for the whole session at
+2280-2347 MHz, 180-270 W of a 450 W cap, 28-42 C — a host-level power brake, not
+thermal throttling, and it applies to both engines equally. Roughly one run in
+twenty comes out ~40% slow on both prefill and decode with no clock or
+temperature signature (llama.cpp's 32K DFlash rep 2 is the clearest: 603 / 42.8
+against 1017 / 78.6 for a byte-identical run). Treat a single-rep delta on this
+host with suspicion.
+
+### The corpus matters more than either engine
+
+The long prompts come from `.parity/gen_long_prompts.py`, which emits a
+synthetic, highly repetitive document ("Chapter *n*. The *n*th study …") and
+asks a question whose answer quotes one chapter almost verbatim. Drafts on that
+text are near-perfect — the 501-token point reaches **100% acceptance on both
+engines**, which is why its DFlash numbers (117-180 tok/s) are 3-5x the plain
+decode and should not be read as a general speculative speedup. Acceptance on
+natural prose is closer to the 55-78% the 16K-128K rows show. Compare engines on
+these rows; do not quote the absolute DFlash figures as what a chat workload
+will see.
 
 ### Why the per-op path was slow
 
 Not arithmetic — dispatch. The per-op forward submits ~600 GGML ops per token
-across 52 layers, and each carries a host-visible round trip. Measured: a 1-row
-forward cost ~262 ms and a 74-row forward ~1332 ms, i.e. ~262 ms of *fixed*
-per-forward cost plus ~14 ms per row. Every model in this repo that reaches
-llama.cpp-class decode throughput does it the same way — one whole-model kernel.
+across 52 layers, and each carries a host-visible round trip. Measured on the
+RTX 3080 Laptop: a 1-row forward cost ~262 ms and a 74-row forward ~1332 ms,
+i.e. ~262 ms of *fixed* per-forward cost plus ~14 ms per row. Every model in
+this repo that reaches llama.cpp-class decode throughput does it the same way —
+one whole-model kernel.
 
 ### The fused kernel
 
@@ -260,25 +433,24 @@ Design points that mattered:
   faulted there, and shipping a graceful fallback beats shipping a crash.
 * **In-graph embedding is opt-in.** The kernel can do the embedding gather and
   the weightless input norm itself, but binding the 202K x 6656 table pins a
-  second ~1.1 GB tensor; on a 16 GB card that evicts layer weights and cost more
+  second ~1.1 GB tensor; on a 16 GB card that evicted layer weights and cost more
   than the two dispatches it saved (18.5 -> 16.1 tok/s). It is therefore enabled
   only when the LM head is tied to the table (so it is resident anyway), or via
   `TS_MUSE_GLIMMER_INGRAPH_EMBED=1`.
 
-
 ### The fused DFlash drafter
 
-The drafter was the reason speculation lost: per speculative step the managed
-drafter issued ~150 GPU dispatches for ~2.5 GB of weight reads -- about a quarter
-of one target forward -- and cost ~100 ms.
+The drafter was the reason speculation used to lose outright: per speculative
+step the managed drafter issued ~150 GPU dispatches for ~2.5 GB of weight reads
+— about a quarter of one target forward — and cost ~100 ms.
 [`ggml_ops_dflash.cpp`](../../TensorSharp.GGML.Native/ggml_ops_dflash.cpp) turns
 it into two graphs:
 
-* `TSGgml_DFlashInject` -- `fc` -> RMSNorm -> per draft layer
+* `TSGgml_DFlashInject` — `fc` -> RMSNorm -> per draft layer
   {k/v projection, per-head k norm, NeoX RoPE, `ggml_set_rows` into the ring}.
   No Q, no attention, no FFN, no LM head. llama.cpp's `build_dflash` early-returns
   at the same point.
-* `TSGgml_DFlashDraftBlock` -- `[anchor, MASK x (b-1)]` through the 5 draft
+* `TSGgml_DFlashDraftBlock` — `[anchor, MASK x (b-1)]` through the 5 draft
   blocks, then the *target's* LM head (borrowed, never duplicated) and a softmax.
 
 Both are persistent and capturable. This is where TensorSharp diverges from
@@ -301,18 +473,18 @@ Two details make the capture possible:
   gets this for free by only ever gathering `[winStart, anchor)`.
 
 **On-device top-1.** llama.cpp pulls the whole `[202048, 16]` probability block
-back to the host every draft step -- 12.9 MB over PCIe plus a 3.2 M-element scan,
+back to the host every draft step — 12.9 MB over PCIe plus a 3.2 M-element scan,
 and `common_sampler` then materializes a 202048-entry array *per block position*.
 The kernel instead finishes with `ggml_argmax` plus a `get_rows` gather of the
 winning probability, returning two 16-element tensors. Argmax is invariant under
 softmax and the winning probability is exactly the confidence the executor
 multiplies cumulatively.
 
-Result on the benchmark above: **15.8-16.4 -> 26.0-27.0 tok/s**, with the draft
-statistics (`drafted=96 accepted=75`, 78.1% acceptance) byte-identical to the
-per-op drafter -- fusing changed the speed, not a single sampled token.
+On the RTX 3080 Laptop where this work was done, fusing the drafter moved decode
+from 15.8-16.4 to 26.0-27.0 tok/s with the draft statistics
+(`drafted=96 accepted=75`, 78.1% acceptance) byte-identical to the per-op
+drafter — fusing changed the speed, not a single sampled token.
 `TS_DFLASH_FUSED=0` forces the per-op drafter for A/B.
-
 
 ### One mask per attention class, not one per layer
 
@@ -338,10 +510,11 @@ llama.cpp never had this: `build_attn_inp_kv_iswa` creates exactly two masks
 per graph (`llama-graph.cpp:3266,3276`) and the per-layer choice is a pointer
 pick (`:3042`).
 
-Sharing them brings 3.90 GB to 273 MB and two uploads per chunk. Measured at 64K:
-**prefill 353 -> 486 tok/s, peak VRAM 16059 -> 12671 MiB.** Sharing is safe
-because nothing writes a mask — `ggml_flash_attn_ext` takes it as `src[3]` and
-`ggml_soft_max_ext` as `src[1]`, and both CUDA kernels bind it `const`.
+Sharing them brings 3.90 GB to 273 MB and two uploads per chunk. Measured at 64K
+on the RTX 3080 Laptop: **prefill 353 -> 486 tok/s, peak VRAM 16059 -> 12671
+MiB.** Sharing is safe because nothing writes a mask — `ggml_flash_attn_ext`
+takes it as `src[3]` and `ggml_soft_max_ext` as `src[1]`, and both CUDA kernels
+bind it `const`.
 
 Three smaller items landed with it:
 
@@ -365,11 +538,12 @@ Three smaller items landed with it:
 Things that were tried and rejected, so they are not re-tried: **shrinking the
 SWA ring by lowering the prefill chunk makes everything worse.** Chunk 2048 (ring
 4352) gives 475.6 prefill / 16.1 decode at 64K; chunk 1024 (ring 3328) gives
-443.2 / 15.7; chunk 512 (ring 2816) gives 421.9 / 15.1. Decode is not KV-bandwidth
-bound here — both engines run at ~35-39% of peak bandwidth because IQ2_XXS matvec
-is ALU-bound — so the smaller ring buys nothing and the smaller chunk costs GEMM
-efficiency. llama.cpp's ring is smaller (2560 rows) only because its default
-`n_ubatch` is 512; that is not an advantage to copy.
+443.2 / 15.7; chunk 512 (ring 2816) gives 421.9 / 15.1 (all RTX 3080 Laptop,
+IQ2_XXS). Decode is not KV-bandwidth bound here — both engines run at ~35-39% of
+peak bandwidth because IQ2_XXS matvec is ALU-bound — so the smaller ring buys
+nothing and the smaller chunk costs GEMM efficiency. llama.cpp's ring is smaller
+(2560 rows) only because its default `n_ubatch` is 512; that is not an advantage
+to copy.
 
 ### Long prompts: chunking and the SWA ring
 
@@ -391,10 +565,10 @@ cache. Uniform F16 KV at 64K is 3.5 GB; llama.cpp allocates 954 MB because
 64K text-only run peaked at **16059 MiB of 16384** and lost throughput to the
 resulting memory pressure.
 
-TensorSharp now allocates the SWA layers `pad(n_swa + chunk + 1, 256)` rows
+TensorSharp allocates the SWA layers `pad(n_swa + chunk + 1, 256)` rows
 (4352 at the default chunk) and indexes them by `position % rows`. At 64K that is
-**1049 MB instead of 3.5 GB (29% of a uniform cache)**, and it bought
-+56% prefill (226 -> 353 tok/s) and +15% decode (13.4 -> 15.4 tok/s) at 64K.
+**1049 MB instead of 3.5 GB (29% of a uniform cache)**, and on the laptop card it
+bought +56% prefill (226 -> 353 tok/s) and +15% decode (13.4 -> 15.4 tok/s) at 64K.
 
 Details worth knowing:
 
@@ -496,9 +670,11 @@ op-at-a-time TP at 0.01–0.04× single-GPU).
 DFlash speculative decoding and pooled KV block snapshots follow the single-GPU
 path only; multi-turn reuse under `--tp` comes from live-cache continuation.
 
-### Measured (2× RTX PRO 4000 Blackwell 24 GB, PCIe, `--backend ggml_cuda`)
+### Two GPUs
 
-Prefill 512 / decode 64, best of 3:
+Measured on **2× RTX PRO 4000 Blackwell 24 GB (PCIe)** — a different machine from
+the single-GPU tables above, and not re-measured in the 2026-08-13 run. Prefill
+512 / decode 64, best of 3:
 
 | Model | | prefill tok/s | decode tok/s | GPU 0 | GPU 1 |
 |---|---|---|---|---|---|
@@ -506,8 +682,8 @@ Prefill 512 / decode 64, best of 3:
 | 30B-UD-IQ2_XXS | `--tp 2` | **1569** (1.34×) | **63.2** (1.57×) | 5115 MB | 4063 MB |
 | 30B-Q8_0 (28.2 GB) | `--tp 2` | 1691 | 34.3 | 15474 MB | 12748 MB |
 
-The Q8_0 has no single-GPU row: 28.2 GB of weights does not fit on one 24 GB
-card, so `--tp 2` is the only way to run it at all.
+The Q8_0 has no single-GPU row on that machine: 28.2 GB of weights does not fit
+on one 24 GB card, so `--tp 2` is the only way to run it at all.
 
 **Correctness.** `--tp 2` is byte-identical across repeat runs (which rules out a
 race in the rank worker pool), and tracks the `--tp 1` greedy continuation for

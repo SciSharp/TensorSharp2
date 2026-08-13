@@ -115,6 +115,21 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --prompt "Make the sky a dramatic sunset." --output edited.png \
     --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0</code></pre>
 
+  <h3 id="video">Video generation (Wan 2.1 / 2.2)</h3>
+  <pre data-lang="bash"><code># Prompt -> H.264 MP4. The UMT5-XXL text encoder and the video VAE are resolved
+# next to the DiT GGUF (or pass --wan-te / --wan-vae).
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;Wan2.2-TI2V-5B-Q8_0.gguf&gt; \
+    --prompt "A red fox trotting through falling snow, cinematic" \
+    --video-frames 81 --fps 24 --output out.mp4 --backend ggml_cuda
+
+# Image -> video: the image becomes the FIRST FRAME and the prompt drives motion
+# (Wan 2.2 TI2V-5B and A14B I2V only).
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;Wan2.2-TI2V-5B-Q8_0.gguf&gt; --image first_frame.png \
+    --prompt "the camera pushes in as the waves rise" \
+    --video-frames 81 --fps 24 --flow-shift 5.0 --output out.mp4 --backend ggml_cuda</code></pre>
+
   <h3 id="diffusion">DiffusionGemma &amp; inspection</h3>
   <pre data-lang="bash"><code># DiffusionGemma text-diffusion generation
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \

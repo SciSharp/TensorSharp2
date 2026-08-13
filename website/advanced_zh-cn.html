@@ -89,6 +89,13 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model DeepSeek-V4-Flash-.
   <p>多轮对话获益最大 —— 延续既有上下文的轮次，正是草稿器最有把握的地方。在同一台机器上的 5 轮交互式会话中，每轮实测 1.50× 到 <strong>2.02×</strong>（接受率 66–87%），prefill 保持持平。在 200 token 与 15K 上下文两次运行中，贪心输出都与非投机基线逐字节一致。</p>
   <p>为什么是 1.3× 而不是更多：主干是 6 选 256 的稀疏结构，验证批中每多一个 token 就要把它自己那套路由专家拉过显存 —— 无论起草多便宜，一行验证都要花掉约四分之一个完整 decode 步。<code>--spec-draft-conf-min</code>（默认 <code>0.35</code>，即保留某个起草位置所需的最小<em>累积</em>接受概率）正是让这笔交易保持正收益的旋钮；<code>--spec-draft-n-max</code> 则限制每块的 token 数。</p>
 
+  <h2 id="dflash">DFlash 块级投机解码（Muse-Glimmer）</h2>
+  <p>Muse-Glimmer 有自己的块级草稿模型 <strong>DFlash</strong>：一个独立的 5 层 GGUF（<code>general.architecture = dflash</code>），一次前向即提出整个投机窗口。它复用主干的 token embedding 与 LM head，维护自己的滑动窗口 KV 环，并按三步驱动——把主干在 <code>dflash.target_layers</code> 处的逐层输入残差<em>编码</em>成一行宽向量，将该行<em>注入</em>为每个草稿层的 K/V，然后把 <code>[anchor, MASK × (block−1)]</code> 送过 5 个块<em>起草</em>，并用主干的 LM head 打分。随后主干用一次批量前向完成验证。</p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
+    --backend ggml_cuda --draft-model dflash-kquant.gguf --spec-draft-n-max 15 \
+    --input prompt.txt --max-tokens 256</code></pre>
+  <p>两部分都是可被 CUDA 图捕获并重放的融合原生图：<code>TSGgml_DFlashInject</code> 与 <code>TSGgml_DFlashDraftBlock</code>，后者以设备端 <code>argmax</code> 收尾，因此 202048 宽的概率块无需经 PCIe 回传主机。验证以贪心方式对齐主干，因此输出与普通贪心 decode 一致。运行期的<strong>成本调控器</strong>会把投机与普通解码逐 token 计时对比，在投机确实更慢时暂停起草——这保证投机只会更快，但也意味着它需要生成数百个 token 才能稳定，因此很短的回答可能看不到收益。CLI 上不要传任何采样参数：<code>--top-k 1</code> 不满足 <code>SamplingConfig.IsGreedy</code>，会静默关闭整条投机路径。在单张 RTX PRO 6000 Blackwell 上与 llama.cpp 自带的 DFlash 实现对比（Q8_0、贪心、60 token 提示）：<strong>50.9 tok/s，对比 llama.cpp 的 45.5 与普通解码的 35.0</strong>。完整的上下文阶梯（包括 llama.cpp 领先的区间）见仓库中的 <code>docs/models/muse-glimmer.md</code> 卡片。</p>
+
   <h2 id="diffusion">DiffusionGemma 文本扩散</h2>
   <p>DiffusionGemma 与自回归模型本质不同：它不逐 token 调用 <code>Forward()</code>。相反，它在 Gemma-4 衍生的 MoE 主干上，对定长画布做块式 <strong>EntropyBound 去噪</strong> —— 整个答案是被迭代精炼，而非从左到右写出。</p>
   <ul>

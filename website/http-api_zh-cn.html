@@ -259,6 +259,9 @@ curl -N -X POST http://localhost:5000/api/chat \
   <h3 id="imageedit-api">图像编辑（<code>/api/image-edit</code> · <code>/api/image-edit/stream</code>）</h3>
   <p>托管模型为 <code>qwen_image</code> DiT 时可用。<code>POST /api/image-edit</code> 执行一次编辑：可提交 multipart（<code>image</code> 文件 + <code>prompt</code>，以及可选 <code>steps</code>、<code>cfg</code>、<code>seed</code>），也可提交 JSON <code>{"imagePath": "...", "prompt": "...", "steps": 0, "cfg": 0, "seed": 0}</code>；其中 <code>imagePath</code> 必须指向上传目录中的文件，<code>steps</code> / <code>cfg</code> 为 <code>0</code> 表示自动。响应为 <code>{ ok, url, width, height, elapsedSeconds }</code>，PNG 从 <code>/uploads/</code> 提供。<code>POST /api/image-edit/stream</code> 接收相同 JSON，但以 SSE 流式返回去噪进度：每步帧为 <code>{"imageEdit": true, "step": i, "total": N, "image": "data:image/png;base64,..."}</code>（最多 8 张均匀预览），最后返回 <code>{"done": true, "url": "...", "width": ..., "height": ..., "elapsedSeconds": ...}</code>。整个进程中的编辑请求串行执行。</p>
 
+  <h3 id="video-api">视频生成（<code>/v1/videos/generations</code> · <code>/api/video-generate</code>）</h3>
+  <p>当托管的模型是 <code>wan</code> DiT 时可用。<code>POST /v1/videos/generations</code> 接收 OpenAI images 风格的请求体——<code>{"prompt": "…", "size": "832x480", "frames": 81, "steps": 0, "cfg": 0, "seed": 0, "fps": 24, "negative_prompt": "…", "response_format": "url"|"b64_json"}</code>——返回 <code>{ created, data: [{ url }] }</code>，MP4 由 <code>/uploads/</code> 提供。Web UI 形态的 <code>POST /api/video-generate</code> 接收 <code>{ prompt, width?, height?, frames?, steps?, cfg?, seed?, fps?, flowShift?, negativePrompt? }</code> 以及可选的首帧图像，返回 <code>{ ok, url, width, height, frames, fps, seed, codec, elapsedSeconds }</code>；<code>POST /api/video-generate/stream</code> 以 SSE 流式返回同一任务的去噪进度。视频生成在进程内串行执行。</p>
+
   <h2 id="sampling">6 · 采样参数</h2>
   <h4>Ollama 风格（在 <code>options</code> 对象内）</h4>
   <p>下表默认值用于请求省略字段时，可通过服务端参数 / <code>TENSORSHARP_*</code> 环境变量配置（见<a href="server_zh-cn.html#options">服务端参数</a>）。</p>

@@ -148,6 +148,27 @@ server CLI flags.
 | `TS_GMTP_NO_FAST_ROLLBACK` | Gemma 4 | Restore kept-prefix rollback instead of dense fast rollback on partial accept | OFF | not registered | no |
 | `TS_GMTP_BATCHED_TRUNK` | Gemma 4 | Run the verify trunk through the batched paged path instead of the linear trunk | OFF | not registered | no |
 
+## Out-of-Matrix Muse-Glimmer & DFlash Knobs
+
+Muse-Glimmer's fused whole-model kernel and its DFlash block drafter each have an
+A/B switch, plus long-context sizing knobs. None are registered in
+`EnvVarMatrix.All`. The full list, including the layer-trace knobs, is in the
+[Muse-Glimmer card](models/muse-glimmer.md#7-environment-variables).
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_MUSE_GLIMMER_FUSED` | Muse-Glimmer on GGML CUDA / Vulkan | Fused whole-model graph vs the per-op path | ON | not registered | no |
+| `TS_MUSE_GLIMMER_PERSIST` | Muse-Glimmer (fused) | Persistent, CUDA-graph-capturable graph vs rebuild per call | ON | not registered | no |
+| `TS_MUSE_GLIMMER_INGRAPH_EMBED` | Muse-Glimmer (fused) | Do the embedding gather + weightless input norm inside the graph (a loss unless the LM head is tied) | auto (on only when tied) | not registered | no |
+| `TS_MUSE_GLIMMER_PREFILL_CHUNK` | Muse-Glimmer | Tokens per prefill forward; `0` disables chunking | `2048` | not registered | no |
+| `TS_MUSE_GLIMMER_SWA_RING` | Muse-Glimmer (fused) | Ring the 39 sliding-window layers at `pad(n_swa + chunk + 1, 256)` rows instead of sizing every layer for the full context | ON | not registered | no |
+| `TS_MUSE_GLIMMER_SWA_ROWS` | Muse-Glimmer (fused) | Override the SWA ring size in rows (diagnostics) | auto | not registered | no |
+| `TS_MUSE_GLIMMER_VENC_F32` | Muse-Glimmer vision tower | Dequantize the tower to F32 (~7.4 GB) instead of feeding the GGUF quantization to `AddmmQuant` | OFF | not registered | no |
+| `TS_MUSE_GLIMMER_VENC_FUSED` | Muse-Glimmer vision tower on CUDA | Fused vision-block / flash-attention path | ON | not registered | no |
+| `TS_MUSE_GLIMMER_DFLASH` | Muse-Glimmer | DFlash drafter GGUF path (same as the CLI's `--draft-model`) | none | not registered | no |
+| `TS_DFLASH_FUSED` | Muse-Glimmer DFlash | Fused `TSGgml_DFlashInject` / `TSGgml_DFlashDraftBlock` graphs vs the per-op drafter | ON | not registered | no |
+| `TS_DFLASH_PERSIST` | Muse-Glimmer DFlash | Replay the persistent draft graphs instead of rebuilding every step | ON | not registered | no |
+
 ## Out-of-Matrix Tensor Parallelism & Distributed Inference Knobs
 
 These variables configure tensor parallelism (splitting a model across multiple
