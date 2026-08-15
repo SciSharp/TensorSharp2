@@ -200,6 +200,7 @@ namespace TensorSharp.Server
 
             var promptSw = Stopwatch.StartNew();
             List<int> inputTokens;
+            int effectiveMaxTokens;
             bool hasMultimodal = RequiresMultimodalPreparation(renderHistory);
             if (hasMultimodal)
             {
@@ -243,8 +244,8 @@ namespace TensorSharp.Server
                     injectorBucketCreated = true;
                     inputTokens = model.MultimodalInjector.ProcessPromptTokens(renderHistory, inputTokens, requestId);
                     inputTokens = TruncatePromptToContext(
-                        session, inputTokens, maxTokens, requestId, preserveAttachedDocuments,
-                        engineContextLimit);
+                        session, inputTokens, maxTokens, out effectiveMaxTokens, requestId,
+                        preserveAttachedDocuments, engineContextLimit);
                 }
             }
             else
@@ -253,7 +254,8 @@ namespace TensorSharp.Server
                     model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
                     addGenerationPrompt: true, tools: tools, enableThinking: enableThinking);
                 inputTokens = TruncatePromptToContext(
-                    session, inputTokens, maxTokens, preserveAllInput: preserveAttachedDocuments,
+                    session, inputTokens, maxTokens, out effectiveMaxTokens,
+                    preserveAllInput: preserveAttachedDocuments,
                     executionContextLimit: engineContextLimit);
             }
 
@@ -271,7 +273,7 @@ namespace TensorSharp.Server
             var seq = new SequenceState(
                 requestId: requestId,
                 promptTokens: inputTokens,
-                maxNewTokens: maxTokens,
+                maxNewTokens: effectiveMaxTokens,
                 blockSize: enginePoolStats.blockSize,
                 samplingConfig: cfg,
                 userTag: session,
@@ -452,7 +454,7 @@ namespace TensorSharp.Server
                 model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
                 addGenerationPrompt: true, tools: null, enableThinking: false);
             inputTokens = TruncatePromptToContext(
-                session, inputTokens, maxTokens, preserveAllInput: preserveAttachedDocuments);
+                session, inputTokens, maxTokens, out _, preserveAllInput: preserveAttachedDocuments);
             int promptTokenCount = inputTokens.Count;
             promptSw.Stop();
 
@@ -590,6 +592,7 @@ namespace TensorSharp.Server
             ChatSession session,
             List<int> inputTokens,
             int maxTokens,
+            out int effectiveMaxTokens,
             string requestId = null,
             bool preserveAllInput = false,
             int executionContextLimit = 0)
@@ -599,11 +602,17 @@ namespace TensorSharp.Server
             if (executionContextLimit > 0 && (maxCtx <= 0 || executionContextLimit < maxCtx))
                 maxCtx = executionContextLimit;
             int inputCount = inputTokens?.Count ?? 0;
-            RejectAttachedDocumentOverflow(inputCount, maxTokens, maxCtx, preserveAllInput);
-            if (maxCtx <= 0 || inputTokens == null || (long)inputCount + maxTokens <= maxCtx)
+
+            // Shrink the reserve to the room the prompt leaves. The clamped
+            // value is what the engine reserves, so it flows back to the caller
+            // for maxNewTokens.
+            effectiveMaxTokens = ClampGenerationReserve(maxTokens, inputCount, maxCtx);
+
+            RejectAttachedDocumentOverflow(inputCount, effectiveMaxTokens, maxCtx, preserveAllInput);
+            if (maxCtx <= 0 || inputTokens == null || (long)inputCount + effectiveMaxTokens <= maxCtx)
                 return inputTokens;
 
-            int available = maxCtx - maxTokens;
+            int available = maxCtx - effectiveMaxTokens;
             if (available < 1)
             {
                 throw new InvalidOperationException(
@@ -623,10 +632,26 @@ namespace TensorSharp.Server
 
             _logger.LogWarning(LogEventIds.PromptTruncated,
                 "prompt.truncated from {OriginalTokens} to {KeptTokens} tokens (contextLimit={ContextLimit}, generationReserve={MaxTokens}, sessionId={SessionId})",
-                inputTokens.Count, kept, maxCtx, maxTokens, session?.Id ?? "(none)");
+                inputTokens.Count, kept, maxCtx, effectiveMaxTokens, session?.Id ?? "(none)");
             model.MultimodalInjector.TrimPreparedPrompt(trimStart, requestId);
             session?.TrackedHistory.Clear();
             return inputTokens.GetRange(trimStart, kept);
+        }
+
+        /// <summary>
+        /// Clamp a generation reserve to the context room the prompt leaves, so
+        /// a large default reserve on a small-context model still admits a short
+        /// prompt. The reserve is only ever shrunk, never below 1, and never
+        /// when the context length is unknown. A prompt that alone overflows the
+        /// context is left for the caller's trim/reject logic.
+        /// </summary>
+        internal static int ClampGenerationReserve(int requestedReserve, int promptTokenCount, int contextLimit)
+        {
+            if (contextLimit <= 0)
+                return requestedReserve;
+
+            int room = Math.Max(1, contextLimit - promptTokenCount);
+            return Math.Min(requestedReserve, room);
         }
 
         internal static void RejectAttachedDocumentOverflow(
