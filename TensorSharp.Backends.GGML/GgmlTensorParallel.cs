@@ -12,47 +12,60 @@
 // rank selection, the cross-GPU AllReduce, and the fused multi-rank matmul that
 // backs column-/row-parallel linear layers.
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace TensorSharp.GGML
 {
     internal static partial class GgmlNative
     {
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_GetGpuDeviceCount(int backendType);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_GetGpuDeviceCount(int backendType);
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_GetGpuDeviceDescription(int backendType, int deviceIndex, byte[] description, int descriptionSize);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_GetGpuDeviceDescription(int backendType, int deviceIndex, byte[] description, int descriptionSize);
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_TensorParallelInit(int backendType, int[] deviceIndices, int count, int concurrentRanks);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_TensorParallelInit(int backendType, int[] deviceIndices, int count, int concurrentRanks);
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_SetActiveDevice(int rank);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_SetActiveDevice(int rank);
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_GetActiveDevice();
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_GetActiveDevice();
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_GetTensorParallelDegree();
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_GetTensorParallelDegree();
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_TensorParallelHasDeviceAllReduce();
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_TensorParallelHasDeviceAllReduce();
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern unsafe int TSGgml_TensorParallelAllReduceHost(float** buffers, int rankCount, long count);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_TensorParallelAllReduceHost(float** buffers, int rankCount, long count);
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern unsafe int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCount, long count);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCount, long count);
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_TensorParallelFusedAvailable(int rankCount);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_TensorParallelFusedAvailable(int rankCount);
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern int TSGgml_TensorParallelExecutePlans(IntPtr[] plans, int rankCount);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_TensorParallelExecutePlans(IntPtr[] plans, int rankCount);
 
-        [DllImport(DllName, CallingConvention = CallingConventionType)]
-        private static extern unsafe int TSGgml_TensorParallelMatmul(
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_TensorParallelMatmul(
             GgmlTensorView2D* results,
             GgmlTensorView2D* inputs,
             IntPtr* weightData,

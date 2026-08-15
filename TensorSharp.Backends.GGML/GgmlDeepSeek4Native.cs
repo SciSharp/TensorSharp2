@@ -10,14 +10,14 @@
 // (split) GGUF itself, places the layers across every visible GPU, owns the
 // DSV4 KV caches, and runs prefill/decode ubatches through ggml_backend_sched.
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace TensorSharp.GGML
 {
-    public static class GgmlDeepSeek4Native
+    public static partial class GgmlDeepSeek4Native
     {
         private const string DllName = "GgmlOps";
-        private const CallingConvention Conv = CallingConvention.Cdecl;
 
         static GgmlDeepSeek4Native()
         {
@@ -26,58 +26,74 @@ namespace TensorSharp.GGML
 
         // Paths must cross as UTF-8: ggml_fopen decodes them as UTF-8 on Windows,
         // while CharSet.Ansi would marshal the active code page.
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern IntPtr TSGgml_Dsv4LoadModel([MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr TSGgml_Dsv4LoadModel(string ggufPath,
             int nGpu, int nCtx, int nUbatch, int nThreads,
-            int nCpuMoe, [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName);
+            int nCpuMoe, string backendName);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern IntPtr TSGgml_Dsv4LoadModelDspark([MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr TSGgml_Dsv4LoadModelDspark(string ggufPath,
             int nGpu, int nCtx, int nUbatch,
-            int nThreads, [MarshalAs(UnmanagedType.LPUTF8Str)] string dsparkPath, int nCpuMoe,
-            [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName);
+            int nThreads, string dsparkPath, int nCpuMoe,
+            string backendName);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern int TSGgml_Dsv4DsparkBlockSize(IntPtr handle);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4DsparkBlockSize(IntPtr handle);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern unsafe int TSGgml_Dsv4ForwardSpec(IntPtr handle, int* tokens, int nTokens, float* logitsOut);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_Dsv4ForwardSpec(IntPtr handle, int* tokens, int nTokens, float* logitsOut);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern unsafe int TSGgml_Dsv4DsparkDraft(IntPtr handle, int anchorToken, int* toksOut, float* confOut);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_Dsv4DsparkDraft(IntPtr handle, int anchorToken, int* toksOut, float* confOut);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern int TSGgml_Dsv4Rewind(IntPtr handle, int nPast);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4Rewind(IntPtr handle, int nPast);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern int TSGgml_Dsv4VocabSize(IntPtr handle);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4VocabSize(IntPtr handle);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern int TSGgml_Dsv4CtxSize(IntPtr handle);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4CtxSize(IntPtr handle);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern int TSGgml_Dsv4NPast(IntPtr handle);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4NPast(IntPtr handle);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern unsafe int TSGgml_Dsv4Forward(IntPtr handle, int* tokens, int nTokens, float* logitsOut);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_Dsv4Forward(IntPtr handle, int* tokens, int nTokens, float* logitsOut);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern void TSGgml_Dsv4Reset(IntPtr handle);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void TSGgml_Dsv4Reset(IntPtr handle);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern void TSGgml_Dsv4Free(IntPtr handle);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void TSGgml_Dsv4Free(IntPtr handle);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern int TSGgml_Dsv4SlotAlloc(IntPtr handle);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4SlotAlloc(IntPtr handle);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern int TSGgml_Dsv4SetActiveSlot(IntPtr handle, int slotId);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4SetActiveSlot(IntPtr handle, int slotId);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern int TSGgml_Dsv4SlotFree(IntPtr handle, int slotId);
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4SlotFree(IntPtr handle, int slotId);
 
-        [DllImport(DllName, CallingConvention = Conv)]
-        private static extern unsafe int TSGgml_Dsv4ForwardBatchedDecode(
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_Dsv4ForwardBatchedDecode(
             IntPtr handle, int n, int* slotIds, int* tokens, int* positions, float* logitsOut);
 
         /// <summary>
