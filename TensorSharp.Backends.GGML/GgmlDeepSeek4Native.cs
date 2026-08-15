@@ -24,13 +24,18 @@ namespace TensorSharp.GGML
             GgmlNative.EnsureImportResolverRegistered();
         }
 
-        [DllImport(DllName, CallingConvention = Conv, CharSet = CharSet.Ansi)]
-        private static extern IntPtr TSGgml_Dsv4LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads,
-            int nCpuMoe, string backendName);
+        // Paths must cross as UTF-8: ggml_fopen decodes them as UTF-8 on Windows,
+        // while CharSet.Ansi would marshal the active code page.
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern IntPtr TSGgml_Dsv4LoadModel([MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
+            int nGpu, int nCtx, int nUbatch, int nThreads,
+            int nCpuMoe, [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName);
 
-        [DllImport(DllName, CallingConvention = Conv, CharSet = CharSet.Ansi)]
-        private static extern IntPtr TSGgml_Dsv4LoadModelDspark(string ggufPath, int nGpu, int nCtx, int nUbatch,
-            int nThreads, string dsparkPath, int nCpuMoe, string backendName);
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern IntPtr TSGgml_Dsv4LoadModelDspark([MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
+            int nGpu, int nCtx, int nUbatch,
+            int nThreads, [MarshalAs(UnmanagedType.LPUTF8Str)] string dsparkPath, int nCpuMoe,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName);
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_Dsv4DsparkBlockSize(IntPtr handle);

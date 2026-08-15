@@ -1070,8 +1070,10 @@ internal enum GgmlIndexReductionOp
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_IsMetalAvailable();
 
-        [DllImport(DllName, CallingConvention = CallingConventionType, CharSet = CharSet.Ansi)]
-        private static extern int TSGgml_SetNativeEnvironmentVariable(string name, string value, int overwrite);
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_SetNativeEnvironmentVariable(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string value, int overwrite);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_CanInitializeBackend(int backendType);
