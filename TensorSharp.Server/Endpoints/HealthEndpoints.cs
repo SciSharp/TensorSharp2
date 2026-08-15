@@ -14,6 +14,9 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using TensorSharp.Runtime.Logging;
 
 namespace TensorSharp.Server.Endpoints
 {
@@ -50,8 +53,16 @@ namespace TensorSharp.Server.Endpoints
             {
                 if (await TrySendIndexAsync(ctx, environment))
                     return;
+                // The resolved web root goes to the server log for the operator
+                // diagnosing a misdeployed wwwroot; the response stays generic so
+                // clients don't learn host filesystem paths.
+                ctx.RequestServices.GetService<ILoggerFactory>()
+                    ?.CreateLogger("TensorSharp.Server.Health")
+                    .LogWarning(LogEventIds.HttpRequestRejected,
+                        "Fallback route hit but index.html is missing. WebRootPath: {WebRootPath}",
+                        environment.WebRootPath ?? "(null)");
                 ctx.Response.StatusCode = 404;
-                await ctx.Response.WriteAsync("index.html not found. WebRootPath: " + (environment.WebRootPath ?? "(null)"));
+                await ctx.Response.WriteAsync("index.html not found.");
             });
 
             return endpoints;
