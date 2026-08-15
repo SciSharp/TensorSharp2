@@ -31,16 +31,18 @@ namespace TensorSharp.Server.Endpoints
     {
         private const string LivenessMessage = "TensorSharp.Server is running";
 
-        public static IEndpointRouteBuilder MapHealthEndpoints(this IEndpointRouteBuilder endpoints, IWebHostEnvironment environment)
+        public static IEndpointRouteBuilder MapHealthEndpoints(
+            this IEndpointRouteBuilder endpoints, IWebHostEnvironment environment, bool webUiEnabled = true)
         {
             // UseDefaultFiles() cannot rewrite "/" to "/index.html" for us:
             // WebApplication runs routing ahead of the static-file middleware,
             // which then bails out because this endpoint is already selected.
             // Sending the file from the endpoint itself is what makes a bare
             // http://host:port/ open the UI instead of the liveness text.
+            // With the Web UI disabled, "/" always answers the liveness text.
             endpoints.MapGet("/", async ctx =>
             {
-                if (await TrySendIndexAsync(ctx, environment))
+                if (webUiEnabled && await TrySendIndexAsync(ctx, environment))
                     return;
                 await Results.Ok(LivenessMessage).ExecuteAsync(ctx);
             });
@@ -51,18 +53,23 @@ namespace TensorSharp.Server.Endpoints
 
             endpoints.MapFallback(async ctx =>
             {
-                if (await TrySendIndexAsync(ctx, environment))
+                if (webUiEnabled && await TrySendIndexAsync(ctx, environment))
                     return;
-                // The resolved web root goes to the server log for the operator
-                // diagnosing a misdeployed wwwroot; the response stays generic so
-                // clients don't learn host filesystem paths.
-                ctx.RequestServices.GetService<ILoggerFactory>()
-                    ?.CreateLogger("TensorSharp.Server.Health")
-                    .LogWarning(LogEventIds.HttpRequestRejected,
-                        "Fallback route hit but index.html is missing. WebRootPath: {WebRootPath}",
-                        environment.WebRootPath ?? "(null)");
+                // With the UI enabled, a fallback hit means index.html is
+                // missing: the resolved web root goes to the server log for the
+                // operator diagnosing a misdeployed wwwroot. The response stays
+                // generic either way so clients don't learn host filesystem
+                // paths.
+                if (webUiEnabled)
+                {
+                    ctx.RequestServices.GetService<ILoggerFactory>()
+                        ?.CreateLogger("TensorSharp.Server.Health")
+                        .LogWarning(LogEventIds.HttpRequestRejected,
+                            "Fallback route hit but index.html is missing. WebRootPath: {WebRootPath}",
+                            environment.WebRootPath ?? "(null)");
+                }
                 ctx.Response.StatusCode = 404;
-                await ctx.Response.WriteAsync("index.html not found.");
+                await ctx.Response.WriteAsync(webUiEnabled ? "index.html not found." : "Not found.");
             });
 
             return endpoints;

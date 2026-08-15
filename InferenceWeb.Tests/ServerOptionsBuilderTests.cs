@@ -1044,4 +1044,44 @@ public class ServerOptionsBuilderTests : IDisposable
         var ex = Assert.Throws<ArgumentException>(() => BuildListenUrls("--prot", "8080"));
         Assert.Contains("--port", ex.Message);
     }
+
+    [Fact]
+    public void Build_Default_WebUiEnabled()
+    {
+        _env.Set("TS_NO_WEBUI", null);
+        var options = ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir);
+        Assert.True(options.WebUiEnabled);
+    }
+
+    [Fact]
+    public void Build_NoWebUiFlag_DisablesWebUi()
+    {
+        _env.Set("TS_NO_WEBUI", null);
+        var options = ServerOptionsBuilder.Build(new[] { "--no-webui" }, _baseDir);
+        Assert.False(options.WebUiEnabled);
+    }
+
+    [Fact]
+    public void Build_NoWebUiEnvVar_DisablesWebUi()
+    {
+        _env.Set("TS_NO_WEBUI", "1");
+        var options = ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir);
+        Assert.False(options.WebUiEnabled);
+    }
+
+    [Fact]
+    public void Build_NoWebUiEnvVarZero_KeepsWebUiEnabled()
+    {
+        _env.Set("TS_NO_WEBUI", "0");
+        var options = ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir);
+        Assert.True(options.WebUiEnabled);
+    }
+
+    [Fact]
+    public void Build_NoWebUiFlag_OverridesEnvVarZero()
+    {
+        _env.Set("TS_NO_WEBUI", "0");
+        var options = ServerOptionsBuilder.Build(new[] { "--no-webui" }, _baseDir);
+        Assert.False(options.WebUiEnabled);
+    }
 }

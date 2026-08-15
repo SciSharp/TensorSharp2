@@ -256,9 +256,19 @@ app.UsePromptOverflowHandling();
 // Serve the bundled static UI. GET / sends index.html too (see
 // HealthEndpoints), so a bare http://host:port/ opens the chat UI; the plain
 // liveness response moved to GET /health and still answers / on headless
-// deployments that ship no wwwroot content.
-app.UseDefaultFiles();
-app.UseStaticFiles();
+// deployments that ship no wwwroot content. --no-webui skips the wwwroot
+// middleware entirely for API-only deployments; /uploads stays served below
+// because the image and video APIs return result URLs under it.
+if (hostingOptions.WebUiEnabled)
+{
+    app.UseDefaultFiles();
+    app.UseStaticFiles();
+}
+else
+{
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Web UI disabled (--no-webui / TS_NO_WEBUI): wwwroot is not served; API endpoints and /uploads remain available");
+}
 // /uploads holds user-supplied files, so its content types come from the
 // UploadContentPolicy allow-list: media keeps real types, text/code always
 // comes back as text/plain (an uploaded .html page must never execute in the
@@ -266,7 +276,7 @@ app.UseStaticFiles();
 // X-Content-Type-Options: nosniff.
 app.UseStaticFiles(UploadContentPolicy.BuildStaticFileOptions(hostingOptions.UploadDirectory));
 
-app.MapHealthEndpoints(app.Environment);
+app.MapHealthEndpoints(app.Environment, hostingOptions.WebUiEnabled);
 app.MapSessionEndpoints();
 app.MapUploadEndpoints();
 app.MapWebUiEndpoints();

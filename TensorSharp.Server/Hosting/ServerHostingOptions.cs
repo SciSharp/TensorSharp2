@@ -46,8 +46,10 @@ namespace TensorSharp.Server.Hosting
             string logDirectory,
             bool fileLoggingEnabled,
             SamplingDefaults samplingDefaults,
-            string listenUrls = DefaultListenUrls)
+            string listenUrls = DefaultListenUrls,
+            bool webUiEnabled = true)
         {
+            WebUiEnabled = webUiEnabled;
             ListenUrls = string.IsNullOrWhiteSpace(listenUrls) ? DefaultListenUrls : listenUrls;
             StartupModelPath = startupModelPath;
             StartupMmProjPath = startupMmProjPath;
@@ -73,6 +75,16 @@ namespace TensorSharp.Server.Hosting
         /// <see cref="DefaultListenUrls"/>. Never null or empty.
         /// </summary>
         public string ListenUrls { get; }
+
+        /// <summary>
+        /// False when the operator passed <c>--no-webui</c> (or set
+        /// <c>TS_NO_WEBUI</c> to anything but <c>0</c>): the bundled wwwroot UI
+        /// is not served and <c>GET /</c> answers with the plain liveness text,
+        /// as on a headless deployment that ships no wwwroot content. Every
+        /// HTTP API endpoint (including <c>/uploads</c>, whose URLs the image
+        /// and video APIs return) stays up.
+        /// </summary>
+        public bool WebUiEnabled { get; }
 
         /// <summary>Absolute path of the model the server was launched with, or null when no model is hosted.</summary>
         public string StartupModelPath { get; }
