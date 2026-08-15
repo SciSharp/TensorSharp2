@@ -966,17 +966,8 @@ internal enum GgmlIndexReductionOp
         {
             try
             {
-                if (!string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_CUDA_GRAPHS"), "0",
-                                   StringComparison.Ordinal))
-                    return;
-
-                string degreeText = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
-                if (!int.TryParse(degreeText, System.Globalization.NumberStyles.Integer,
-                                  System.Globalization.CultureInfo.InvariantCulture, out int degree)
-                    || degree <= 1)
-                    return;
-
-                SetNativeEnvironmentVariable("GGML_CUDA_DISABLE_GRAPHS", "1", overwrite: false);
+                ApplySmallBarVulkanWorkaround();
+                ApplyTensorParallelCudaGraphTunable();
             }
             catch (DllNotFoundException)
             {
@@ -987,6 +978,79 @@ internal enum GgmlIndexReductionOp
             {
                 // Older GgmlOps without the setter; the native-side backstop in
                 // TSGgml_TensorParallelInit still applies where it can.
+            }
+        }
+
+        private static void ApplyTensorParallelCudaGraphTunable()
+        {
+            if (!string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_CUDA_GRAPHS"), "0",
+                               StringComparison.Ordinal))
+                return;
+
+            string degreeText = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
+            if (!int.TryParse(degreeText, System.Globalization.NumberStyles.Integer,
+                              System.Globalization.CultureInfo.InvariantCulture, out int degree)
+                || degree <= 1)
+                return;
+
+            SetNativeEnvironmentVariable("GGML_CUDA_DISABLE_GRAPHS", "1", overwrite: false);
+        }
+
+        /// <summary>
+        /// ggml-vulkan's default device-buffer preference is
+        /// DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT — the Resizable-BAR memory
+        /// type. On a discrete AMD GPU without ReBAR only the 256 MB BAR heap
+        /// carries those flags, and RADV over-commits that heap instead of
+        /// failing the allocation, so the fallback to plain DEVICE_LOCAL never
+        /// fires: every weight buffer is silently backed by GTT and the GPU
+        /// re-reads the whole model across PCIe on every token (measured
+        /// 1.3 → 35.9 tok/s on Qwen3.8-27B Q4_K_XL, RX 7900 XTX, RADV).
+        /// Detect the small-BAR case via amdgpu sysfs and pre-set
+        /// GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM before the Vulkan device is
+        /// created — ggml-vulkan latches the variable at device init, so this
+        /// must run before the first backend call. A user-set value of the
+        /// variable (any value, including empty) is always respected.
+        /// </summary>
+        private static void ApplySmallBarVulkanWorkaround()
+        {
+            if (!OperatingSystem.IsLinux())
+                return;
+            if (Environment.GetEnvironmentVariable("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM") != null)
+                return;
+
+            try
+            {
+                foreach (string dev in System.IO.Directory.GetDirectories("/sys/class/drm"))
+                {
+                    string vramPath = System.IO.Path.Combine(dev, "device", "mem_info_vram_total");
+                    string visPath = System.IO.Path.Combine(dev, "device", "mem_info_vis_vram_total");
+                    if (!System.IO.File.Exists(vramPath) || !System.IO.File.Exists(visPath))
+                        continue;
+                    if (!long.TryParse(System.IO.File.ReadAllText(vramPath).Trim(), out long vramTotal) ||
+                        !long.TryParse(System.IO.File.ReadAllText(visPath).Trim(), out long visTotal))
+                        continue;
+
+                    const long OneGiB = 1L << 30;
+                    if (vramTotal >= 4 * OneGiB && visTotal <= OneGiB && visTotal < vramTotal / 4)
+                    {
+                        if (SetNativeEnvironmentVariable("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", "1", overwrite: false))
+                        {
+                            Console.Error.WriteLine(
+                                $"ggml-vulkan small-BAR workaround: {System.IO.Path.GetFileName(dev)} exposes " +
+                                $"{visTotal >> 20} MB CPU-visible VRAM of {vramTotal >> 30} GB total (Resizable BAR off); " +
+                                "set GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 so model weights stay in VRAM. " +
+                                "Enabling Resizable BAR in the BIOS removes the need for this.");
+                        }
+                        return;
+                    }
+                }
+            }
+            catch (System.IO.IOException)
+            {
+                // sysfs unavailable/odd permissions: leave ggml-vulkan defaults alone.
+            }
+            catch (UnauthorizedAccessException)
+            {
             }
         }
 
@@ -3135,6 +3199,17 @@ internal enum GgmlIndexReductionOp
             IntPtr up, IntPtr down, int rank, float scale, int nThreads);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void ggml_quantize_init(int type);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        private static extern bool ggml_quantize_requires_imatrix(int type);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern UIntPtr ggml_quantize_chunk(int type, IntPtr src, IntPtr dst,
+            long start, long nrows, long nPerRow, IntPtr imatrix);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_QwenVaeRun(in QwenVaeArgs args);
 
         /// <summary>Run a whole VAE encode/decode op-list as ONE device graph (see QwenVaeArgs).
@@ -5080,6 +5155,27 @@ internal enum GgmlIndexReductionOp
             {
                 return TSGgml_ApplyLoraDelta(w, ggmlType, ne0, ne1, (IntPtr)pu, (IntPtr)pd, rank, scale, nThreads);
             }
+        }
+
+        /// <summary>
+        /// Quantize FP32 rows into a GGML quantized row layout via ggml_quantize_chunk.
+        /// Returns bytes written, or 0 when the target type cannot be produced without
+        /// an importance matrix (IQ1/IQ2 families).
+        /// </summary>
+        internal static long QuantizeFloat32RowsOrZero(int ggmlType, IntPtr src, IntPtr dst, long nrows, long nPerRow)
+        {
+            if (src == IntPtr.Zero || dst == IntPtr.Zero || nrows <= 0 || nPerRow <= 0)
+            {
+                throw new ArgumentException("Invalid src/dst pointers or shape for quantization.");
+            }
+
+            if (ggml_quantize_requires_imatrix(ggmlType))
+            {
+                return 0;
+            }
+
+            ggml_quantize_init(ggmlType);
+            return (long)ggml_quantize_chunk(ggmlType, src, dst, 0, nrows, nPerRow, IntPtr.Zero).ToUInt64();
         }
 
         internal static void DequantizeGgufTensorToFloat32Native(int ggmlType, IntPtr src, IntPtr dst, long numElements)

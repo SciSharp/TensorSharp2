@@ -1214,11 +1214,24 @@ namespace TensorSharp.Models
         internal bool TryFullModelDecodeToken(int tokenId, int position, float[] logitsOut)
             => TryFullModelDecodeCore(null, tokenId, position, logitsOut);
 
+        // One-time stderr note for why the fused whole-model decode graph is not
+        // used (the per-op fallback is silent otherwise, and the two paths differ
+        // by an order of magnitude in tokens/sec).
+        private bool FdBail(string reason)
+        {
+            if (!_fdDiagPrinted)
+            {
+                _fdDiagPrinted = true;
+                Console.Error.WriteLine($"[full-decode] not engaged: {reason}; using per-op decode.");
+            }
+            return false;
+        }
+
         private unsafe bool TryFullModelDecodeCore(
             Tensor hidden, int tokenId, int position, float[] logitsOut)
         {
             if (logitsOut == null || logitsOut.Length < Config.VocabSize)
-                return false;
+                return FdBail("logits buffer missing/too small");
             bool tokenInput = tokenId >= 0;
             // Whole-model single-graph paths read the single-device caches
             // (_kvCacheK, _deltaStateTensor) and the unsharded LM head, none of
@@ -1227,19 +1240,21 @@ namespace TensorSharp.Models
                 return false;
             // Fold final-norm + lm_head into the graph requires both present.
             if ((_lmHeadQW == null && _lmHeadF32 == null) || _finalNormW == null)
-                return false;
+                return FdBail("final-norm or lm_head weight missing");
             // All three GGML GPU backends persist and replay the fixed-topology
             // graph. CUDA/Vulkan use dynamic SET_ROWS KV writes; Metal moves CPY
             // destination views before replay, avoiding its problematic SET_ROWS
             // shape. GDN recurrence and MoE top-K routing remain device-resident.
-            if (!_fullDecodeEnabled || _fdUnsupported || _fdSpecSessionActive
+            if (!_fullDecodeEnabled || _fdSpecSessionActive
                 || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal
                     && _backend != BackendType.GgmlVulkan))
+                return false;
+            if (_fdUnsupported)
                 return false;
             if (!tokenInput &&
                 (hidden == null || hidden.DimensionCount != 2 || hidden.Sizes[0] != 1
                     || hidden.ElementType != DType.Float32))
-                return false;
+                return FdBail("hidden tensor shape/dtype not a single f32 row");
 
             // Keep the new token-input contract scoped to Metal for now. CUDA
             // supports only a subset of quantized GET_ROWS types and TP needs the
@@ -1277,11 +1292,11 @@ namespace TensorSharp.Models
             // [S_v, S_v, heads], so asymmetric key/value state widths cannot
             // enter the fused graph (the per-operation path remains available).
             if (_headKDim != _headVDim)
-                return false;
+                return FdBail($"asymmetric GDN state widths (K={_headKDim}, V={_headVDim})");
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             int convDim = _convKernel - 1;
             if (convDim <= 0)
-                return false;
+                return FdBail($"conv kernel too small ({_convKernel})");
 
             // --- one-time gate: every layer must have its required weights/state ---
             if (_fdLayers == null)
@@ -1313,7 +1328,11 @@ namespace TensorSharp.Models
                             && _deltaStateTensor[l] != null && _convState[l] != null;
                     if (!ok)
                     {
-                        _fdUnsupported = true; return false;
+                        _fdUnsupported = true;
+                        return FdBail($"layer {l} ({(_isRecurrent[l] ? "recurrent" : "attention")}, moe={isMoeL}) missing a required weight/state" +
+                            (!_isRecurrent[l] && _kvCacheK[l] != null && !IsFusedGraphKvCacheDType(_kvCacheK[l].ElementType)
+                                ? $" (KV cache dtype {_kvCacheK[l].ElementType} unsupported by fused graph on {_backend})"
+                                : ""));
                     }
                 }
                 int gdnCount = 0;
@@ -1342,7 +1361,7 @@ namespace TensorSharp.Models
                 }
             }
             if (cacheSize <= 0 || position >= cacheSize)
-                return false;
+                return FdBail($"KV cache capacity gate (cacheSize={cacheSize}, position={position})");
 
             int structBytes = Marshal.SizeOf<Qwen35LayerDecodeArgs>();
             int convBlock = convDim * qkvDim;

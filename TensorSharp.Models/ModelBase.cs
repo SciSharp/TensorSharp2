@@ -2036,6 +2036,7 @@ namespace TensorSharp.Models
             if (numLayers <= 0)
                 numLayers = Config.NumLayers;
             int fused = 0;
+            int requantized = 0;
             for (int l = 0; l < numLayers; l++)
             {
                 string gateName = $"blk.{l}.ffn_gate.weight";
@@ -2044,19 +2045,42 @@ namespace TensorSharp.Models
 
                 if (_quantWeights.TryGetValue(gateName, out var gw) &&
                     _quantWeights.TryGetValue(upName, out var uw) &&
-                    gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
+                    gw.Ne0 == uw.Ne0)
                 {
+                    // Mixed-quant "UD"/dynamic GGUFs (e.g. Qwen3.8 UD quants, where
+                    // ffn_gate is IQ4_XS but ffn_up is Q5_K) store gate and up in
+                    // different types, which a single fused tensor can't represent.
+                    // Requantize the lower-fidelity side into the higher-fidelity
+                    // type first, then fuse as usual.
+                    QuantizedWeight gateSrc = gw, upSrc = uw, requant = null;
+                    if (gw.GgmlType != uw.GgmlType)
+                    {
+                        requant = TryRequantizeForFusion(gw, uw, out bool requantIsGate);
+                        if (requant == null)
+                        {
+                            Console.WriteLine(
+                                $"  WARNING: layer {l} ffn_gate ({(Runtime.GgmlTensorType)(uint)gw.GgmlType}) and ffn_up " +
+                                $"({(Runtime.GgmlTensorType)(uint)uw.GgmlType}) quant types differ and requantization is " +
+                                "unavailable; gate/up left unfused.");
+                            continue;
+                        }
+                        if (requantIsGate) gateSrc = requant; else upSrc = requant;
+                        requantized++;
+                    }
+
                     // Gate-up fusion must always succeed: model FFN code expects
                     // a single fused tensor at guName. If MLX view-fusion fails
                     // (gate/up not contiguous in the GGUF file), fall back to a
                     // copy. Cost is bounded — 2 tensors × per-layer, host memory
                     // released after the MLX device upload.
-                    if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, gw, uw))
-                        fusedWeight = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
+                    if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, gateSrc, upSrc))
+                        fusedWeight = QuantizedWeight.ConcatOrCreateCopy(gateSrc, upSrc);
 
                     _quantWeights[guName] = fusedWeight;
                     _quantWeights.Remove(gateName); gw.Dispose();
                     _quantWeights.Remove(upName); uw.Dispose();
+                    if (requant != null && !ReferenceEquals(requant, fusedWeight))
+                        requant.Dispose();
                     fused++;
                 }
                 else if (_weights.TryGetValue(gateName, out var gf) &&
@@ -2074,7 +2098,115 @@ namespace TensorSharp.Models
                 }
             }
             if (fused > 0)
-                Console.WriteLine($"  Fused projections: {fused} Gate+Up");
+                Console.WriteLine(requantized > 0
+                    ? $"  Fused projections: {fused} Gate+Up ({requantized} mixed-quant layers requantized to a common type)"
+                    : $"  Fused projections: {fused} Gate+Up");
+        }
+
+        /// <summary>
+        /// Produce a copy of the lower-fidelity side of a mixed-type gate/up pair,
+        /// requantized to the other side's type so the pair can be fused. Prefers
+        /// upcasting (smaller row size → larger); tries the opposite direction when
+        /// the preferred target can't be produced without an importance matrix.
+        /// Returns null when neither direction is possible.
+        /// </summary>
+        private unsafe QuantizedWeight TryRequantizeForFusion(QuantizedWeight gw, QuantizedWeight uw, out bool requantIsGate)
+        {
+            requantIsGate = false;
+            if (!gw.HasHostData || !uw.HasHostData || gw.Ne0 != uw.Ne0)
+                return null;
+
+            long gRow = NativeDequant.RowSize(gw.GgmlType, gw.Ne0);
+            long uRow = NativeDequant.RowSize(uw.GgmlType, uw.Ne0);
+            QuantizedWeight lower = gRow <= uRow ? gw : uw;
+            QuantizedWeight higher = gRow <= uRow ? uw : gw;
+
+            QuantizedWeight result = TryRequantizeWeight(lower, higher.GgmlType);
+            if (result != null)
+            {
+                requantIsGate = ReferenceEquals(lower, gw);
+                return result;
+            }
+
+            result = TryRequantizeWeight(higher, lower.GgmlType);
+            if (result != null)
+            {
+                requantIsGate = ReferenceEquals(higher, gw);
+                return result;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Dequantize a weight row-chunk-wise to FP32 and requantize it into
+        /// <paramref name="targetType"/>. Returns null when the conversion is not
+        /// possible (imatrix-only target, or no native quantize available).
+        /// </summary>
+        private unsafe QuantizedWeight TryRequantizeWeight(QuantizedWeight src, int targetType)
+        {
+            try
+            {
+                long ne0 = src.Ne0, ne1 = src.Ne1;
+                long srcRow = NativeDequant.RowSize(src.GgmlType, ne0);
+                long dstRow = NativeDequant.RowSize(targetType, ne0);
+                byte[] dstBuf = new byte[checked(dstRow * ne1)];
+                const int ChunkRows = 512;
+                int numChunks = (int)((ne1 + ChunkRows - 1) / ChunkRows);
+                IntPtr srcBase = src.Data;
+                bool failed = false;
+                GCHandle hDst = GCHandle.Alloc(dstBuf, GCHandleType.Pinned);
+                try
+                {
+                    IntPtr dstBase = hDst.AddrOfPinnedObject();
+                    Parallel.For(0, numChunks,
+                        () => new float[(long)ChunkRows * ne0],
+                        (ci, state, f32) =>
+                        {
+                            if (Volatile.Read(ref failed))
+                            {
+                                state.Stop();
+                                return f32;
+                            }
+                            long r = (long)ci * ChunkRows;
+                            long rows = Math.Min(ChunkRows, ne1 - r);
+                            fixed (float* pF32 = f32)
+                            {
+                                NativeDequant.DequantizeToFloat32Native(src.GgmlType,
+                                    (IntPtr)((byte*)srcBase.ToPointer() + r * srcRow), (IntPtr)pF32, rows * ne0);
+                                long written = GgmlGgufTensorDequant.QuantizeFloat32RowsOrZero(targetType,
+                                    (IntPtr)pF32, (IntPtr)((byte*)dstBase.ToPointer() + r * dstRow), rows, ne0);
+                                if (written != rows * dstRow)
+                                {
+                                    Volatile.Write(ref failed, true);
+                                    state.Stop();
+                                }
+                            }
+                            return f32;
+                        },
+                        _ => { });
+                }
+                finally
+                {
+                    hDst.Free();
+                }
+
+                if (failed)
+                    return null;
+
+                return new QuantizedWeight(dstBuf, targetType, ne0, ne1);
+            }
+            catch (Exception ex) when (IsRequantizeUnavailable(ex))
+            {
+                return null;
+            }
+        }
+
+        private static bool IsRequantizeUnavailable(Exception ex)
+        {
+            if (ex is AggregateException agg)
+                return agg.InnerExceptions.Count > 0 && agg.InnerExceptions.All(IsRequantizeUnavailable);
+            return ex is DllNotFoundException or EntryPointNotFoundException or NotSupportedException;
         }
 
         protected Tensor CreateFloatTensor(float[] data, params long[] sizes)
