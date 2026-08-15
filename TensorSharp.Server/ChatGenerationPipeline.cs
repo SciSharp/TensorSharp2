@@ -606,7 +606,7 @@ namespace TensorSharp.Server
             int available = maxCtx - maxTokens;
             if (available < 1)
             {
-                throw new InvalidOperationException(
+                throw new PromptContextOverflowException(
                     $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
                     "Please shorten the input or reduce attached file size.");
             }
@@ -616,7 +616,7 @@ namespace TensorSharp.Server
             int kept = inputTokens.Count - trimStart;
             if (kept < 1)
             {
-                throw new InvalidOperationException(
+                throw new PromptContextOverflowException(
                     $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
                     "Please shorten the input or reduce attached file size.");
             }
@@ -641,7 +641,7 @@ namespace TensorSharp.Server
                 return;
             }
 
-            throw new InvalidOperationException(
+            throw new PromptContextOverflowException(
                 $"The prompt containing the complete attached document requires {promptTokens} prompt " +
                 $"tokens plus a {maxTokens}-token generation reserve, but the current model/engine " +
                 $"configuration allows {modelContextLimit} context tokens. No document content was " +
