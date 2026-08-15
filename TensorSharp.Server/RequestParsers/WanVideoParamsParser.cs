@@ -59,7 +59,7 @@ namespace TensorSharp.Server.RequestParsers
             {
                 string uploadRoot = Path.GetFullPath(options.UploadDirectory);
                 string full = Path.GetFullPath(ip.GetString());
-                if (!full.StartsWith(uploadRoot, StringComparison.OrdinalIgnoreCase) || !File.Exists(full))
+                if (!UploadPathGuard.IsInsideDirectory(uploadRoot, full) || !File.Exists(full))
                 {
                     error = "imagePath must reference a previously uploaded file.";
                     return p;

@@ -586,7 +586,7 @@ namespace TensorSharp.Server.ProtocolAdapters
         /// <c>imagePaths</c> (array, multi-image) or legacy <c>imagePath</c> (single). Every path
         /// must resolve inside the upload directory. Returns an error message, or null on success.
         /// </summary>
-        private async Task<string> ReadUploadedImagesAsync(JsonElement root, List<byte[]> images, CancellationToken ct)
+        internal async Task<string> ReadUploadedImagesAsync(JsonElement root, List<byte[]> images, CancellationToken ct)
         {
             var paths = new List<string>();
             if (root.TryGetProperty("imagePaths", out var ips) && ips.ValueKind == JsonValueKind.Array)
@@ -602,7 +602,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             foreach (var path in paths)
             {
                 string full = path == null ? null : Path.GetFullPath(path);
-                if (full == null || !full.StartsWith(uploadRoot, StringComparison.OrdinalIgnoreCase) || !File.Exists(full))
+                if (full == null || !UploadPathGuard.IsInsideDirectory(uploadRoot, full) || !File.Exists(full))
                     return "imagePath must reference a previously uploaded file.";
                 images.Add(await File.ReadAllBytesAsync(full, ct));
             }
