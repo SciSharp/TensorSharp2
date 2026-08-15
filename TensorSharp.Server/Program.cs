@@ -14,7 +14,6 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
 using TensorSharp.GGML;
 using TensorSharp.Runtime.Logging;
@@ -254,19 +253,12 @@ app.UsePromptOverflowHandling();
 // deployments that ship no wwwroot content.
 app.UseDefaultFiles();
 app.UseStaticFiles();
-// The default content-type provider has no HEIC/HEIF mapping, so uploaded iPhone
-// photos 404'd under /uploads (browsers can't render HEIC in <img> anyway — the
-// Web UI displays the server-generated PNG previewUrl — but the original should
-// at least stay downloadable).
-var uploadContentTypes = new Microsoft.AspNetCore.StaticFiles.FileExtensionContentTypeProvider();
-uploadContentTypes.Mappings[".heic"] = "image/heic";
-uploadContentTypes.Mappings[".heif"] = "image/heif";
-app.UseStaticFiles(new StaticFileOptions
-{
-    FileProvider = new PhysicalFileProvider(hostingOptions.UploadDirectory),
-    RequestPath = "/uploads",
-    ContentTypeProvider = uploadContentTypes,
-});
+// /uploads holds user-supplied files, so its content types come from the
+// UploadContentPolicy allow-list: media keeps real types, text/code always
+// comes back as text/plain (an uploaded .html page must never execute in the
+// server's origin), unlisted extensions 404, and every response carries
+// X-Content-Type-Options: nosniff.
+app.UseStaticFiles(UploadContentPolicy.BuildStaticFileOptions(hostingOptions.UploadDirectory));
 
 app.MapHealthEndpoints(app.Environment);
 app.MapSessionEndpoints();
