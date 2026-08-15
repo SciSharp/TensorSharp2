@@ -11,6 +11,7 @@
 #include "ggml_ops_transformer_common.h"
 #include <cmath>
 #include <cstdio>
+#include <thread>
 
 using namespace tsg;
 
@@ -262,25 +263,70 @@ namespace
     // KV-cache row the attention view begins at. Columns are span_start + ki, so
     // everything outside a query's causal + sliding window -- including the stride
     // padding at either end of the span -- stays -inf.
+    // Runs fn(q0, q1) over [0, n_tokens), fanned out across threads when the
+    // mask is large. A 2048-row prefill chunk at 64K context is a 256 MB fill;
+    // single-threaded that is tens of milliseconds per chunk on the backends
+    // without a device-side fill kernel (Metal, CPU). Decode shapes (1-64 rows,
+    // small rings) stay on the calling thread.
+    template <typename F>
+    void mg_parallel_rows(int n_tokens, std::size_t row_len, F&& fn)
+    {
+        const std::size_t total = row_len * static_cast<std::size_t>(n_tokens);
+        const unsigned hw = std::thread::hardware_concurrency();
+        int nthreads = (total >= (std::size_t(1) << 21) && hw > 1)
+            ? static_cast<int>(std::min(hw, 8u)) : 1;
+        nthreads = std::min(nthreads, n_tokens);
+        if (nthreads <= 1)
+        {
+            fn(0, n_tokens);
+            return;
+        }
+        const int per = (n_tokens + nthreads - 1) / nthreads;
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<std::size_t>(nthreads) - 1);
+        for (int t = 1; t < nthreads; t++)
+        {
+            const int q0 = t * per;
+            const int q1 = std::min(n_tokens, q0 + per);
+            if (q0 >= q1) break;
+            workers.emplace_back([&fn, q0, q1] { fn(q0, q1); });
+        }
+        fn(0, std::min(per, n_tokens));
+        for (auto& w : workers) w.join();
+    }
+
     void fill_mg_mask(std::vector<ggml_fp16_t>& data, int mask_kv_len, int n_tokens,
                       int start_pos, int valid_kv_len, int window, int span_start)
     {
-        data.assign(static_cast<std::size_t>(mask_kv_len) * n_tokens,
-                    ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        data.resize(static_cast<std::size_t>(mask_kv_len) * n_tokens);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
         const ggml_fp16_t zero_val = static_cast<ggml_fp16_t>(0);
-        for (int qi = 0; qi < n_tokens; qi++)
+        ggml_fp16_t* base = data.data();
+        mg_parallel_rows(n_tokens, static_cast<std::size_t>(mask_kv_len),
+            [=](int q_first, int q_last)
         {
-            const int q_pos = start_pos + qi;
-            const int hi = std::min(q_pos, valid_kv_len - 1);                   // causal
-            const int lo = (window > 0) ? std::max(0, q_pos - window + 1) : 0;  // sliding window
-            ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * mask_kv_len];
-            for (int pos = std::max(lo, span_start); pos <= hi; pos++)
+            for (int qi = q_first; qi < q_last; qi++)
             {
-                const int ki = pos - span_start;
-                if (ki >= 0 && ki < mask_kv_len)
-                    row[ki] = zero_val;
+                const int q_pos = start_pos + qi;
+                const int hi = std::min(q_pos, valid_kv_len - 1);                   // causal
+                const int lo = (window > 0) ? std::max(0, q_pos - window + 1) : 0;  // sliding window
+                ggml_fp16_t* row = base + static_cast<std::size_t>(qi) * mask_kv_len;
+                // Visible columns are the single contiguous span
+                // [max(lo, span_start) - span_start, hi - span_start], clamped to
+                // the mask; everything else is -inf. Three block fills replace the
+                // per-element loop of the original.
+                int k_lo = std::max(lo - span_start, 0);
+                int k_hi = std::min(hi - span_start, mask_kv_len - 1);
+                if (k_hi < k_lo)
+                {
+                    std::fill(row, row + mask_kv_len, neg_inf);
+                    continue;
+                }
+                std::fill(row, row + k_lo, neg_inf);
+                std::fill(row + k_lo, row + k_hi + 1, zero_val);
+                std::fill(row + k_hi + 1, row + mask_kv_len, neg_inf);
             }
-        }
+        });
     }
 
     // Mask for a RING cache: slot (pos % ring_rows) holds position pos. The caller
@@ -292,17 +338,30 @@ namespace
     void fill_mg_ring_mask(std::vector<ggml_fp16_t>& data, int ring_rows, int n_tokens,
                            int start_pos, int window)
     {
-        data.assign(static_cast<std::size_t>(ring_rows) * n_tokens,
-                    ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        data.resize(static_cast<std::size_t>(ring_rows) * n_tokens);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
         const ggml_fp16_t zero_val = static_cast<ggml_fp16_t>(0);
-        for (int qi = 0; qi < n_tokens; qi++)
+        ggml_fp16_t* base = data.data();
+        mg_parallel_rows(n_tokens, static_cast<std::size_t>(ring_rows),
+            [=](int q_first, int q_last)
         {
-            const int q_pos = start_pos + qi;
-            const int lo = (window > 0) ? std::max(0, q_pos - window + 1) : 0;
-            ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * ring_rows];
-            for (int pos = lo; pos <= q_pos; pos++)
-                row[pos % ring_rows] = zero_val;
-        }
+            for (int qi = q_first; qi < q_last; qi++)
+            {
+                const int q_pos = start_pos + qi;
+                const int lo = (window > 0) ? std::max(0, q_pos - window + 1) : 0;
+                ggml_fp16_t* row = base + static_cast<std::size_t>(qi) * ring_rows;
+                std::fill(row, row + ring_rows, neg_inf);
+                // The visible positions [lo, q_pos] map to at most two contiguous
+                // slot spans (one wrap): [lo % rows, ...) then [0, remainder).
+                // The caller guarantees rows >= window + n_tokens so live
+                // positions never alias a slot; clamp defensively anyway.
+                const int len = std::min(q_pos - lo + 1, ring_rows);
+                const int s = lo % ring_rows;
+                const int first = std::min(len, ring_rows - s);
+                std::fill(row + s, row + s + first, zero_val);
+                std::fill(row, row + (len - first), zero_val);
+            }
+        });
     }
 }
 
@@ -487,8 +546,17 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
         // Only single-row decode gets the persistent capturable graph; a prefill
         // chunk is a different shape every time and is cheap to rebuild relative
         // to the work it does.
+        //
+        // Metal has no CUDA-graph analog (every submit re-encodes the nodes), but
+        // the persist/replay path still removes the per-token graph metadata
+        // rebuild, ~790 tensor re-binds, the gallocr lifetime re-plan, the 104
+        // small norm re-uploads and the O(context) full-class mask regeneration
+        // (the replay path extends that mask by 2 bytes per token instead).
+        // Measured on an M5 Pro this is what closes the decode gap to llama.cpp,
+        // whose graph-reuse path (llm_graph_result::can_reuse) does the same.
         const bool can_persist = mg_persist && n_tokens <= kMgMaxPersistTokens &&
-            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN ||
+             g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CPU);
 
         const void* mg_sig = attn_norm_arr[0];
         const void* mg_kc0 = k_cache_arr != nullptr ? k_cache_arr[0] : nullptr;
@@ -598,6 +666,10 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
                 dc->reset();
                 return 0;
             }
+            // See the transient path: Metal must drain before a shared-buffer
+            // tensor_get, or the capture rows are read mid-flight.
+            if (dc->capture_count > 0 && g_backend_type == BACKEND_TYPE_METAL)
+                ggml_backend_synchronize(g_backend);
             for (int c = 0; c < dc->capture_count; c++)
             {
                 ggml_backend_tensor_get(dc->capture_out[c],
@@ -1040,6 +1112,20 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
         if (embed_in_graph)
             bind_or_mark(tok_embd_t, const_cast<void*>(tok_embd_data), static_cast<std::size_t>(tok_embd_bytes), true);
 
+        // Metal only: run the backend's graph_optimize hook (alias-aware reorder
+        // that widens the encoder's concurrent sets and groups fusable
+        // norm+mul/add chains). ggml_backend_sched does this for llama.cpp; a
+        // direct ggml_backend_graph_compute call does not. Persist builds only:
+        // there the ~1 ms reorder runs once and every replay benefits, whereas
+        // on the transient path it ran per prefill chunk / per non-persist token
+        // and measured as a net loss (decode 20.6 -> 19.5 tok/s with persist
+        // disabled, 16K prefill -2.7% on the M5 Pro). Must run BEFORE
+        // allocation - reordering after lifetime planning can invalidate the
+        // allocator's alias plan. Skipped under tensor parallelism, whose plan
+        // segments are resolved from node positions.
+        if (!tp_mode && can_persist)
+            optimize_graph_for_metal(graph);
+
         // ---------------- allocate + upload ----------------
         // Decode (1 row) gets its own slot per tensor so the addresses are STABLE
         // and ggml-cuda can capture the graph. A prefill chunk must not do that:
@@ -1155,6 +1241,13 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
                 if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
                 return 0;
             }
+
+            // Metal's graph_compute returns with the GPU still running and a
+            // shared-buffer tensor_get is a raw memcpy (no implicit sync), so
+            // reading the capture/trace outputs below without draining first
+            // returns stale bytes. CUDA/Vulkan get_tensor already synchronize.
+            if ((cap_count > 0 || !trace_out.empty()) && g_backend_type == BACKEND_TYPE_METAL)
+                ggml_backend_synchronize(g_backend);
 
             for (int c = 0; c < cap_count; c++)
             {

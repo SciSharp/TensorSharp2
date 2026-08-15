@@ -211,8 +211,12 @@ TSG_EXPORT int TSGgml_DFlashInject(
 
         const void* sig = k_arr[0];
         const void* sig_ring = ring_k_arr[0];
+        // Metal replays the persistent graph without a capture (every submit
+        // re-encodes) but still skips the per-step metadata rebuild, re-binds
+        // and gallocr re-plan - same rationale as the trunk kernel.
         const bool can_persist = df_persist_enabled() &&
-            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN ||
+             g_backend_type == BACKEND_TYPE_METAL);
 
         DfCache* dc = can_persist ? df_inject_pool().find(sig, sig_ring, n_rows) : nullptr;
         if (dc != nullptr && dc->graph != nullptr)
@@ -311,6 +315,10 @@ TSG_EXPORT int TSGgml_DFlashInject(
             binder.bind(lt.ring_v, ring_v_arr[l], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         }
 
+        // Metal: reorder for encoder concurrency before allocation (no-op on
+        // other backends) - same as the trunk kernel.
+        optimize_graph_for_metal(graph);
+
         ggml_backend_buffer_t persist_buf = nullptr;
         if (can_persist)
         {
@@ -398,8 +406,10 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
 
         const void* sig = attn_norm_arr[0];
         const void* sig_ring = ring_k_arr[0];
+        // Metal is included for the same reason as the inject graph above.
         const bool can_persist = df_persist_enabled() &&
-            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN ||
+             g_backend_type == BACKEND_TYPE_METAL);
 
         // Mask [kv_len, b]: ring slot s holds ring_slot_pos[s] (or -1 = dead);
         // it is visible to block query i (position positions[i]) when the slot is
@@ -443,6 +453,12 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
                 dc->reset();
                 return 0;
             }
+            // Metal's graph_compute is async and a shared-buffer tensor_get is a
+            // raw memcpy, so the draft ids must not be read until the queue
+            // drains - otherwise the executor verifies stale drafts (correct
+            // output, silently collapsed acceptance).
+            if (g_backend_type == BACKEND_TYPE_METAL)
+                ggml_backend_synchronize(g_backend);
             ggml_backend_tensor_get(dc->out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
             finalize_compute_with_download(dc->out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
             host_read_barrier();
@@ -610,6 +626,10 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         binder.bind(tok_t, const_cast<void*>(tok_embd_data), static_cast<std::size_t>(tok_embd_bytes), true);
         binder.bind(lm_head_t, const_cast<void*>(lm_head_data), static_cast<std::size_t>(lm_head_bytes), true);
 
+        // Metal: reorder for encoder concurrency before allocation (no-op on
+        // other backends).
+        optimize_graph_for_metal(graph);
+
         ggml_backend_buffer_t persist_buf = nullptr;
         if (can_persist)
         {
@@ -643,6 +663,9 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
             return 0;
         }
+        // See the replay path above: Metal must drain before reading the ids.
+        if (g_backend_type == BACKEND_TYPE_METAL)
+            ggml_backend_synchronize(g_backend);
         ggml_backend_tensor_get(out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
         finalize_compute_with_download(out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
         // Unconditional: conf_out is the caller's host confidence array and on

@@ -2092,6 +2092,53 @@ namespace TensorSharp.MLX
         }
 
         /// <summary>
+        /// Multi-row prefill attention for ANY chunk of a chunked prefill, not just
+        /// the first: the query block starts at absolute position
+        /// <paramref name="qStart"/>, K/V cover absolute positions
+        /// [<paramref name="kvStart"/>, kvStart + kvLen), and a key is visible iff
+        /// kv &lt;= q (and q - kv &lt; window when window &gt; 0). The band mask is
+        /// built on device (two aranges + compares + where), so unlike the generic
+        /// fallback nothing round-trips through the host - the generic chain pays a
+        /// full cache download, a 16x GQA host broadcast and a host-masked
+        /// [heads, seqLen, kvLen] score tensor per layer per chunk.
+        /// First chunks degrade to the string "causal" mask, which skips the mask
+        /// array entirely. Muse-Glimmer uses this; TryPrefillAttention keeps its
+        /// first-chunk-only contract for the other models until they opt in.
+        /// </summary>
+        public static bool TryPrefillAttentionBanded(
+            Tensor result,
+            Tensor qHeads,
+            Tensor kHeads,
+            Tensor vHeads,
+            int numHeads,
+            int numKVHeads,
+            int headDim,
+            int seqLen,
+            int kvLen,
+            int qStart,
+            int kvStart,
+            int windowSize,
+            float scale)
+        {
+            if (seqLen <= 0 || kvLen <= 0 || qStart < 0 || kvStart < 0)
+                return false;
+
+            if (qStart == 0 && kvStart == 0 && kvLen == seqLen &&
+                (windowSize <= 0 || kvLen <= windowSize))
+            {
+                return TryRunHeadFirstAttention(result, qHeads, kHeads, vHeads,
+                    numHeads, numKVHeads, seqLen, kvLen, headDim,
+                    seqLen == 1 ? string.Empty : "causal",
+                    scale);
+            }
+
+            return TryRunHeadFirstAttention(result, qHeads, kHeads, vHeads,
+                numHeads, numKVHeads, seqLen, kvLen, headDim,
+                "array", scale,
+                bandQStart: qStart, bandKvStart: kvStart, bandWindow: windowSize);
+        }
+
+        /// <summary>
         /// Decode attention with per-head attention sinks (GPT-OSS family).
         /// Replaces the host-CPU <see cref="ModelBase.AttentionDecodePureCS"/>
         /// path for MLX backend so K/V cache stays on device. Sinks must
@@ -2497,7 +2544,14 @@ namespace TensorSharp.MLX
             int kvLen,
             int headDim,
             string maskMode,
-            float scale)
+            float scale,
+            // maskMode == "array" only: the causal(+sliding-window) band is built
+            // ON DEVICE from these - query row qi sits at absolute position
+            // bandQStart + qi, KV column j at bandKvStart + j, and a key is
+            // visible iff kv <= q (and q - kv < bandWindow when bandWindow > 0).
+            int bandQStart = 0,
+            int bandKvStart = 0,
+            int bandWindow = 0)
         {
             if (!CanUseFastAttention(numHeads, numKVHeads, seqLen, kvLen, headDim))
                 return false;
@@ -2527,12 +2581,14 @@ namespace TensorSharp.MLX
             }
 
             return MlxWorker.Shared.Invoke(() => RunHeadFirstAttentionInner(
-                result, qHeads, kHeads, vHeads, numHeads, numKVHeads, seqLen, kvLen, headDim, maskMode, scale));
+                result, qHeads, kHeads, vHeads, numHeads, numKVHeads, seqLen, kvLen, headDim, maskMode, scale,
+                bandQStart, bandKvStart, bandWindow));
         }
 
         private static bool RunHeadFirstAttentionInner(
             Tensor result, Tensor qHeads, Tensor kHeads, Tensor vHeads,
-            int numHeads, int numKVHeads, int seqLen, int kvLen, int headDim, string maskMode, float scale)
+            int numHeads, int numKVHeads, int seqLen, int kvLen, int headDim, string maskMode, float scale,
+            int bandQStart = 0, int bandKvStart = 0, int bandWindow = 0)
         {
             MlxNative.MlxArray qView = default;
             MlxNative.MlxArray kView = default;
@@ -2549,6 +2605,18 @@ namespace TensorSharp.MLX
             MlxNative.MlxArray seqMajor = default;
             MlxNative.MlxArray contiguous = default;
             MlxNative.MlxArray flat = default;
+            MlxNative.MlxArray bandQPos = default;
+            MlxNative.MlxArray bandQCol = default;
+            MlxNative.MlxArray bandKPos = default;
+            MlxNative.MlxArray bandKRow = default;
+            MlxNative.MlxArray bandFuture = default;
+            MlxNative.MlxArray bandNegInf = default;
+            MlxNative.MlxArray bandZero = default;
+            MlxNative.MlxArray bandCausal = default;
+            MlxNative.MlxArray bandDiff = default;
+            MlxNative.MlxArray bandWinLim = default;
+            MlxNative.MlxArray bandOow = default;
+            MlxNative.MlxArray bandMask = default;
 
             try
             {
@@ -2616,13 +2684,42 @@ namespace TensorSharp.MLX
                     vInput = vF32;
                 }
 
+                if (string.Equals(maskMode, "array", StringComparison.Ordinal))
+                {
+                    // Additive causal(+SWA) band, built on device: 0 where the key
+                    // is visible, -inf where it is in the future or has slid out of
+                    // the window. F32 positions are exact for any context ggml can
+                    // hold (2^24), and the rank-2 [seqLen, kvLen] mask broadcasts
+                    // over the [1, heads, ...] attention batch.
+                    bandQPos = MlxNative.Arange(bandQStart, bandQStart + (double)seqLen, 1.0, DType.Float32);
+                    bandQCol = MlxNative.Reshape(bandQPos, new[] { seqLen, 1 });
+                    bandKPos = MlxNative.Arange(bandKvStart, bandKvStart + (double)kvLen, 1.0, DType.Float32);
+                    bandKRow = MlxNative.Reshape(bandKPos, new[] { 1, kvLen });
+                    bandFuture = MlxNative.Greater(bandKRow, bandQCol);
+                    bandNegInf = MlxNative.Full(new[] { 1 }, float.NegativeInfinity, DType.Float32);
+                    bandZero = MlxNative.Full(new[] { 1 }, 0f, DType.Float32);
+                    bandCausal = MlxNative.Where(bandFuture, bandNegInf, bandZero);
+                    if (bandWindow > 0)
+                    {
+                        bandDiff = MlxNative.Binary(MlxNative.MlxBinaryOp.Sub, bandQCol, bandKRow);
+                        bandWinLim = MlxNative.Full(new[] { 1 }, bandWindow - 0.5f, DType.Float32);
+                        bandOow = MlxNative.Greater(bandDiff, bandWinLim);
+                        bandMask = MlxNative.Where(bandOow, bandNegInf, bandCausal);
+                    }
+                    else
+                    {
+                        bandMask = bandCausal;
+                        bandCausal = default;
+                    }
+                }
+
                 attention = MlxNative.FastScaledDotProductAttention(
                     q4,
                     kInput,
                     vInput,
                     scale,
                     maskMode ?? string.Empty,
-                    default);
+                    bandMask);
                 seqMajor = MlxNative.Transpose(attention, new[] { 0, 2, 1, 3 });
                 contiguous = MlxNative.Contiguous(seqMajor);
                 flat = MlxNative.Reshape(contiguous, new[] { seqLen, numHeads * headDim });
@@ -2651,6 +2748,18 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(seqMajor);
                 MlxNative.FreeArray(contiguous);
                 MlxNative.FreeArray(flat);
+                MlxNative.FreeArray(bandQPos);
+                MlxNative.FreeArray(bandQCol);
+                MlxNative.FreeArray(bandKPos);
+                MlxNative.FreeArray(bandKRow);
+                MlxNative.FreeArray(bandFuture);
+                MlxNative.FreeArray(bandNegInf);
+                MlxNative.FreeArray(bandZero);
+                MlxNative.FreeArray(bandCausal);
+                MlxNative.FreeArray(bandDiff);
+                MlxNative.FreeArray(bandWinLim);
+                MlxNative.FreeArray(bandOow);
+                MlxNative.FreeArray(bandMask);
             }
         }
 
