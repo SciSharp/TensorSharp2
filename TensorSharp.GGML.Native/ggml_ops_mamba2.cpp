@@ -596,7 +596,7 @@ TSG_EXPORT int TSGgml_NemotronMamba2PrefillF32(
             ggml_tensor* dt = ggml_add(ctx, dt_raw, dt_bias_t);
             dt = ggml_reshape_3d(ctx, dt, n_head, T, 1);
 
-            ggml_tensor* scan = ggml_ssm_scan(ctx, ssm_state_t, x, dt, a_t, b, c, ids_t);
+            ggml_tensor* scan = ggml_ssm_scan(ctx, ssm_state_t, x, dt, a_t, b, c, ids_t, 1);
 
             ggml_tensor* y = ggml_view_4d(
                 ctx, scan,
@@ -953,7 +953,7 @@ TSG_EXPORT int TSGgml_NemotronMamba2DecodeF32(
             ggml_tensor* dt = ggml_add(ctx, dt_raw, dt_bias_t);
             dt = ggml_reshape_3d(ctx, dt, n_head, T, 1);
 
-            ggml_tensor* scan = ggml_ssm_scan(ctx, ssm_state_t, x, dt, a_t, b, c, ids_t);
+            ggml_tensor* scan = ggml_ssm_scan(ctx, ssm_state_t, x, dt, a_t, b, c, ids_t, 1);
 
             ggml_tensor* y = ggml_view_4d(
                 ctx, scan,
