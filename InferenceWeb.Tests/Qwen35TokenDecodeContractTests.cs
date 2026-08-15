@@ -167,10 +167,12 @@ public class Qwen35TokenDecodeContractTests
             publicMethod.GetParameters().Select(parameter => parameter.ParameterType),
             nativeMethod.GetParameters().Select(parameter => parameter.ParameterType));
 
-        DllImportAttribute import = nativeMethod.GetCustomAttribute<DllImportAttribute>()!;
+        LibraryImportAttribute import = nativeMethod.GetCustomAttribute<LibraryImportAttribute>()!;
         Assert.NotNull(import);
-        Assert.Equal("GgmlOps", import.Value);
-        Assert.Equal(CallingConvention.Cdecl, import.CallingConvention);
+        Assert.Equal("GgmlOps", import.LibraryName);
+        UnmanagedCallConvAttribute callConv = nativeMethod.GetCustomAttribute<UnmanagedCallConvAttribute>()!;
+        Assert.NotNull(callConv);
+        Assert.Contains(typeof(System.Runtime.CompilerServices.CallConvCdecl), callConv.CallConvs!);
         Assert.Equal(nativeMethodName, nativeMethod.Name);
 
         ParameterInfo reseedParameter = nativeMethod.GetParameters()[2];

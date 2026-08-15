@@ -27,7 +27,7 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Cli
 {
-    class Program
+    partial class Program
     {
         private static readonly IPromptRenderer PromptRenderer = new GgufPromptRenderer();
         private static ILogger _log = NullLogger.Instance;
@@ -124,8 +124,8 @@ namespace TensorSharp.Cli
             return backend;
         }
 
-        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "_exit")]
-        private static extern void LibcExit(int status);
+        [System.Runtime.InteropServices.LibraryImport("libc", EntryPoint = "_exit")]
+        private static partial void LibcExit(int status);
 
         static void MainCore(string[] args)
         {
