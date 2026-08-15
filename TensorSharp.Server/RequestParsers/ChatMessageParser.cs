@@ -66,6 +66,56 @@ namespace TensorSharp.Server.RequestParsers
         }
 
         /// <summary>
+        /// Validate that every client-supplied attachment path resolves inside
+        /// the upload directory. Returns an error message, or null when all
+        /// paths are acceptable.
+        /// </summary>
+        public static string ValidateAttachmentPaths(List<ChatMessage> messages, string uploadRoot)
+        {
+            if (messages == null)
+                return null;
+
+            string root = Path.GetFullPath(uploadRoot);
+
+            foreach (var msg in messages)
+            {
+                string error = ValidatePathList(msg?.ImagePaths, root)
+                    ?? ValidatePathList(msg?.AudioPaths, root)
+                    ?? ValidatePathList(msg?.TextFilePaths, root);
+                if (error != null)
+                    return error;
+            }
+            return null;
+        }
+
+        private static string ValidatePathList(List<string> paths, string root)
+        {
+            if (paths == null)
+                return null;
+
+            foreach (var path in paths)
+            {
+                if (string.IsNullOrWhiteSpace(path) || !IsInsideDirectory(root, path))
+                    return "Attachment path must reference a previously uploaded file.";
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// True when <paramref name="path"/> resolves inside <paramref name="root"/>.
+        /// Traversal and a sibling directory that merely shares the root's name
+        /// both resolve outside and are rejected. <paramref name="root"/> must
+        /// already be a full path.
+        /// </summary>
+        private static bool IsInsideDirectory(string root, string path)
+        {
+            string relative = Path.GetRelativePath(root, path);
+            return relative != ".."
+                && !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                && !Path.IsPathRooted(relative);
+        }
+
+        /// <summary>
         /// Parse Ollama's messages array. Ollama embeds images per-message as a
         /// base64 array under <c>"images"</c>; we materialise each one as a PNG
         /// in the upload directory and reference them by absolute path.
