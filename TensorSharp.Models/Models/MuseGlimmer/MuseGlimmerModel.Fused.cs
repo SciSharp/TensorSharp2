@@ -186,27 +186,33 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// The fused kernel is enabled on the GPU GGML backends only. GgmlCpu is
-        /// excluded deliberately: the multi-row prefill graph goes through the shared
-        /// gallocr, which is exercised (and proven) by the CUDA/Vulkan kernels in this
-        /// repo, and a 1024-row fused graph faulted the CPU backend during warmup.
-        /// The per-op path there is unchanged and already correct, so the safe
-        /// behaviour is to leave CPU on it rather than ship a crash.
+        /// The fused kernel is enabled on every GGML backend.
         ///
-        /// Metal IS included. It was originally left out because the kernel writes
-        /// the KV cache with ggml_set_rows, which ggml-metal did not implement at
-        /// the time; it does now (GGML_OP_SET_ROWS, F32 -> F16/F32/quant, see
-        /// ggml-metal-device.m). Metal takes the kernel's non-persist branch (no
-        /// graph capture), exactly as the Gemma 4 / GPT-OSS whole-model kernels do
-        /// there. Without this the 52-layer model fell back to the per-op path and
-        /// decoded at 246 ms/token on an M5 Pro (attention + norms alone were 60%
-        /// of the token) versus 26 ms/token fused - a 9.4x regression relative to
-        /// every other architecture on the same machine.
+        /// Metal was originally left out because the kernel writes the KV cache
+        /// with ggml_set_rows, which ggml-metal did not implement at the time; it
+        /// does now (GGML_OP_SET_ROWS, F32 -> F16/F32/quant, see
+        /// ggml-metal-device.m). Without this the 52-layer model fell back to the
+        /// per-op path and decoded at 246 ms/token on an M5 Pro (attention + norms
+        /// alone were 60% of the token) versus 26 ms/token fused - a 9.4x
+        /// regression relative to every other architecture on the same machine.
+        /// Metal also runs the kernel's persist/replay branch (no CUDA-style
+        /// capture, but the per-token graph rebuild, re-binds, gallocr re-plan and
+        /// mask regeneration are gone).
+        ///
+        /// GgmlCpu is included the same way GPT-OSS and Gemma 4 include it for
+        /// their whole-model kernels: the per-op path is ~940 synchronous ggml
+        /// graph submissions per decoded token, each of which used to spawn a
+        /// disposable 4-thread pool. TS_MUSE_GLIMMER_FUSED_CPU=0 restores the
+        /// per-op CPU path (the historical default) if a regression appears.
         /// </summary>
+        private static readonly bool FusedCpuEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_FUSED_CPU"), "0", StringComparison.Ordinal);
+
         private bool CanUseFusedForward =>
             FusedForwardEnabled && !IsTensorParallel &&
             (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan ||
-             _backend == BackendType.GgmlMetal);
+             _backend == BackendType.GgmlMetal ||
+             (_backend == BackendType.GgmlCpu && FusedCpuEnabled));
 
         /// <summary>
         /// Build (or rebuild) the fused kernel's pointer tables. Every 2D projection
@@ -293,14 +299,18 @@ namespace TensorSharp.Models
                 a.FinalNorm = (IntPtr)GetFloatPtr(fnorm);
             }
 
-            // In-graph embedding only pays when the table is ALREADY device-resident,
-            // i.e. when the LM head is tied to it. Muse-Glimmer 30B ships a separate
-            // output.weight, so binding token_embd as well would pin a second ~1.1 GB
-            // tensor; on a 16 GB card that evicts layer weights and costs more than
-            // the two host dispatches it saves (measured 18.5 -> 16.1 tok/s).
-            // TS_MUSE_GLIMMER_INGRAPH_EMBED=1 forces it on for A/B.
-            bool wantInGraphEmbed = _hasTiedOutput ||
-                string.Equals(Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_INGRAPH_EMBED"), "1", StringComparison.Ordinal);
+            // In-graph embedding only pays when the table costs nothing extra to bind:
+            // when the LM head is tied to it (already device-resident), or on Metal,
+            // where quantized weights are zero-copy host-pointer wraps of the GGUF
+            // mmap - binding token_embd pins no second copy on unified memory. On a
+            // discrete card with a separate output.weight it would pin ~1.1 GB and
+            // evict layer weights (measured 18.5 -> 16.1 tok/s on a 16 GB card).
+            // TS_MUSE_GLIMMER_INGRAPH_EMBED=1 forces it on, =0 forces it off (A/B).
+            string ingraphEnv = Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_INGRAPH_EMBED");
+            bool wantInGraphEmbed = string.Equals(ingraphEnv, "0", StringComparison.Ordinal)
+                ? false
+                : _hasTiedOutput || _backend == BackendType.GgmlMetal || _backend == BackendType.GgmlCpu ||
+                  string.Equals(ingraphEnv, "1", StringComparison.Ordinal);
             if (wantInGraphEmbed && _quantWeights.TryGetValue("token_embd.weight", out var tokEmbd))
             {
                 a.TokEmbd = tokEmbd.CacheKey;

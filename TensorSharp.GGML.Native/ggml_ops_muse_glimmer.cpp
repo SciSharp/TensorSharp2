@@ -11,6 +11,7 @@
 #include "ggml_ops_transformer_common.h"
 #include <cmath>
 #include <cstdio>
+#include <thread>
 
 using namespace tsg;
 
@@ -68,6 +69,15 @@ namespace
         int swa_rows = 0;                                // ring size baked into the graph
         std::vector<ggml_tensor*> attn_mask;             // per-layer alias into class_mask
         ggml_tensor* class_mask[2] = { nullptr, nullptr }; // [0] full, [1] sliding-window
+        // Host staging for the two masks, kept HERE rather than on the stack of
+        // every replay: at 128K the full-class mask is 250 KB, so a per-call
+        // std::vector was a 250 KB malloc/fill/free on the critical path of every
+        // decoded token. `mask_pos` is the start_pos the buffer currently
+        // describes (-1 = not built yet), which is what lets a 1-row decode
+        // extend the causal mask by the single element that changed instead of
+        // regenerating O(window) entries.
+        std::vector<ggml_fp16_t> mask_host[2];
+        int mask_pos[2] = { -1, -1 };
         std::vector<ggml_tensor*> capture_out;           // per captured layer
         int window_swa = 0;                              // padded span length, SWA layers
         int swa_start = 0;                               // padded span start, SWA layers
@@ -99,6 +109,8 @@ namespace
             hidden_in = hidden_out = pos_tensor = kv_index = kv_index_swa = nullptr;
             attn_mask.clear(); capture_out.clear();
             class_mask[0] = class_mask[1] = nullptr;
+            mask_host[0].clear(); mask_host[1].clear();
+            mask_pos[0] = mask_pos[1] = -1;
             window_swa = window_full = swa_start = swa_rows = 0;
             sig_disc = sig_kcache0 = nullptr;
             num_layers = hidden_size = n_tokens = 0;
@@ -251,25 +263,70 @@ namespace
     // KV-cache row the attention view begins at. Columns are span_start + ki, so
     // everything outside a query's causal + sliding window -- including the stride
     // padding at either end of the span -- stays -inf.
+    // Runs fn(q0, q1) over [0, n_tokens), fanned out across threads when the
+    // mask is large. A 2048-row prefill chunk at 64K context is a 256 MB fill;
+    // single-threaded that is tens of milliseconds per chunk on the backends
+    // without a device-side fill kernel (Metal, CPU). Decode shapes (1-64 rows,
+    // small rings) stay on the calling thread.
+    template <typename F>
+    void mg_parallel_rows(int n_tokens, std::size_t row_len, F&& fn)
+    {
+        const std::size_t total = row_len * static_cast<std::size_t>(n_tokens);
+        const unsigned hw = std::thread::hardware_concurrency();
+        int nthreads = (total >= (std::size_t(1) << 21) && hw > 1)
+            ? static_cast<int>(std::min(hw, 8u)) : 1;
+        nthreads = std::min(nthreads, n_tokens);
+        if (nthreads <= 1)
+        {
+            fn(0, n_tokens);
+            return;
+        }
+        const int per = (n_tokens + nthreads - 1) / nthreads;
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<std::size_t>(nthreads) - 1);
+        for (int t = 1; t < nthreads; t++)
+        {
+            const int q0 = t * per;
+            const int q1 = std::min(n_tokens, q0 + per);
+            if (q0 >= q1) break;
+            workers.emplace_back([&fn, q0, q1] { fn(q0, q1); });
+        }
+        fn(0, std::min(per, n_tokens));
+        for (auto& w : workers) w.join();
+    }
+
     void fill_mg_mask(std::vector<ggml_fp16_t>& data, int mask_kv_len, int n_tokens,
                       int start_pos, int valid_kv_len, int window, int span_start)
     {
-        data.assign(static_cast<std::size_t>(mask_kv_len) * n_tokens,
-                    ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        data.resize(static_cast<std::size_t>(mask_kv_len) * n_tokens);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
         const ggml_fp16_t zero_val = static_cast<ggml_fp16_t>(0);
-        for (int qi = 0; qi < n_tokens; qi++)
+        ggml_fp16_t* base = data.data();
+        mg_parallel_rows(n_tokens, static_cast<std::size_t>(mask_kv_len),
+            [=](int q_first, int q_last)
         {
-            const int q_pos = start_pos + qi;
-            const int hi = std::min(q_pos, valid_kv_len - 1);                   // causal
-            const int lo = (window > 0) ? std::max(0, q_pos - window + 1) : 0;  // sliding window
-            ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * mask_kv_len];
-            for (int pos = std::max(lo, span_start); pos <= hi; pos++)
+            for (int qi = q_first; qi < q_last; qi++)
             {
-                const int ki = pos - span_start;
-                if (ki >= 0 && ki < mask_kv_len)
-                    row[ki] = zero_val;
+                const int q_pos = start_pos + qi;
+                const int hi = std::min(q_pos, valid_kv_len - 1);                   // causal
+                const int lo = (window > 0) ? std::max(0, q_pos - window + 1) : 0;  // sliding window
+                ggml_fp16_t* row = base + static_cast<std::size_t>(qi) * mask_kv_len;
+                // Visible columns are the single contiguous span
+                // [max(lo, span_start) - span_start, hi - span_start], clamped to
+                // the mask; everything else is -inf. Three block fills replace the
+                // per-element loop of the original.
+                int k_lo = std::max(lo - span_start, 0);
+                int k_hi = std::min(hi - span_start, mask_kv_len - 1);
+                if (k_hi < k_lo)
+                {
+                    std::fill(row, row + mask_kv_len, neg_inf);
+                    continue;
+                }
+                std::fill(row, row + k_lo, neg_inf);
+                std::fill(row + k_lo, row + k_hi + 1, zero_val);
+                std::fill(row + k_hi + 1, row + mask_kv_len, neg_inf);
             }
-        }
+        });
     }
 
     // Mask for a RING cache: slot (pos % ring_rows) holds position pos. The caller
@@ -281,17 +338,30 @@ namespace
     void fill_mg_ring_mask(std::vector<ggml_fp16_t>& data, int ring_rows, int n_tokens,
                            int start_pos, int window)
     {
-        data.assign(static_cast<std::size_t>(ring_rows) * n_tokens,
-                    ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        data.resize(static_cast<std::size_t>(ring_rows) * n_tokens);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
         const ggml_fp16_t zero_val = static_cast<ggml_fp16_t>(0);
-        for (int qi = 0; qi < n_tokens; qi++)
+        ggml_fp16_t* base = data.data();
+        mg_parallel_rows(n_tokens, static_cast<std::size_t>(ring_rows),
+            [=](int q_first, int q_last)
         {
-            const int q_pos = start_pos + qi;
-            const int lo = (window > 0) ? std::max(0, q_pos - window + 1) : 0;
-            ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * ring_rows];
-            for (int pos = lo; pos <= q_pos; pos++)
-                row[pos % ring_rows] = zero_val;
-        }
+            for (int qi = q_first; qi < q_last; qi++)
+            {
+                const int q_pos = start_pos + qi;
+                const int lo = (window > 0) ? std::max(0, q_pos - window + 1) : 0;
+                ggml_fp16_t* row = base + static_cast<std::size_t>(qi) * ring_rows;
+                std::fill(row, row + ring_rows, neg_inf);
+                // The visible positions [lo, q_pos] map to at most two contiguous
+                // slot spans (one wrap): [lo % rows, ...) then [0, remainder).
+                // The caller guarantees rows >= window + n_tokens so live
+                // positions never alias a slot; clamp defensively anyway.
+                const int len = std::min(q_pos - lo + 1, ring_rows);
+                const int s = lo % ring_rows;
+                const int first = std::min(len, ring_rows - s);
+                std::fill(row + s, row + s + first, zero_val);
+                std::fill(row, row + (len - first), zero_val);
+            }
+        });
     }
 }
 
@@ -476,8 +546,17 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
         // Only single-row decode gets the persistent capturable graph; a prefill
         // chunk is a different shape every time and is cheap to rebuild relative
         // to the work it does.
+        //
+        // Metal has no CUDA-graph analog (every submit re-encodes the nodes), but
+        // the persist/replay path still removes the per-token graph metadata
+        // rebuild, ~790 tensor re-binds, the gallocr lifetime re-plan, the 104
+        // small norm re-uploads and the O(context) full-class mask regeneration
+        // (the replay path extends that mask by 2 bytes per token instead).
+        // Measured on an M5 Pro this is what closes the decode gap to llama.cpp,
+        // whose graph-reuse path (llm_graph_result::can_reuse) does the same.
         const bool can_persist = mg_persist && n_tokens <= kMgMaxPersistTokens &&
-            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN ||
+             g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CPU);
 
         const void* mg_sig = attn_norm_arr[0];
         const void* mg_kc0 = k_cache_arr != nullptr ? k_cache_arr[0] : nullptr;
@@ -517,22 +596,49 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
                 decode_input_set_async(dc->kv_index_swa, ring_vals.data(), ring_vals.size() * sizeof(std::int64_t));
             }
 
-            std::vector<ggml_fp16_t> md_swa, md_full;
+            // The SWA class is small (one ring, 4352 rows) and its liveness is not
+            // monotone in start_pos, so it is regenerated whole. The FULL class is
+            // O(window_full) - 125K entries at 128K - but for a 1-row decode its
+            // content is a pure prefix of zeros that only ever GROWS by one entry
+            // per token, so an in-place extension plus a 2-byte upload replaces a
+            // 250 KB regenerate-and-resend. Any other shape (verify batches, a KV
+            // rollback that moves start_pos backwards, a rebuilt window) falls back
+            // to the full path.
+            std::vector<ggml_fp16_t>& md_swa = dc->mask_host[1];
+            std::vector<ggml_fp16_t>& md_full = dc->mask_host[0];
             if (swa_ring)
                 fill_mg_ring_mask(md_swa, window_swa, n_tokens, start_pos, sliding_window);
             else
                 fill_mg_mask(md_swa, window_swa, n_tokens, start_pos, total_seq_len, sliding_window, swa_start);
-            fill_mg_mask(md_full, window_full, n_tokens, start_pos, total_seq_len, 0, 0);
+            dc->mask_pos[1] = start_pos;
+
+            const std::size_t full_len = static_cast<std::size_t>(window_full) * n_tokens;
+            const int prev_full_pos = dc->mask_pos[0];
+            const bool full_extend = n_tokens == 1 && prev_full_pos >= 0 &&
+                start_pos > prev_full_pos && start_pos < window_full &&
+                md_full.size() == full_len;
+            std::size_t full_off = 0, full_bytes = full_len * sizeof(ggml_fp16_t);
+            if (full_extend)
+            {
+                const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+                for (int k = prev_full_pos + 1; k <= start_pos; k++)
+                    md_full[static_cast<std::size_t>(k)] = zero_val;
+                full_off = static_cast<std::size_t>(prev_full_pos + 1) * sizeof(ggml_fp16_t);
+                full_bytes = static_cast<std::size_t>(start_pos - prev_full_pos) * sizeof(ggml_fp16_t);
+            }
+            else
+            {
+                fill_mg_mask(md_full, window_full, n_tokens, start_pos, total_seq_len, 0, 0);
+            }
+            dc->mask_pos[0] = start_pos;
+
             // Two uploads, not num_layers: every layer of a class points at the same
             // shared tensor, so uploading per layer would re-send the same bytes 39x/13x.
-            for (int cls = 0; cls < 2; cls++)
-            {
-                ggml_tensor* mt = dc->class_mask[cls];
-                if (mt == nullptr) continue;
-                const std::vector<ggml_fp16_t>& md = (cls == 1) ? md_swa : md_full;
-                if (md.empty()) continue;
-                decode_input_set_async(mt, md.data(), md.size() * sizeof(ggml_fp16_t));
-            }
+            if (dc->class_mask[1] != nullptr && !md_swa.empty())
+                decode_input_set_async(dc->class_mask[1], md_swa.data(), md_swa.size() * sizeof(ggml_fp16_t));
+            if (dc->class_mask[0] != nullptr && !md_full.empty())
+                decode_input_set_range_async(dc->class_mask[0],
+                    reinterpret_cast<const char*>(md_full.data()) + full_off, full_off, full_bytes);
 
             if (tp_mode)
             {
@@ -560,6 +666,10 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
                 dc->reset();
                 return 0;
             }
+            // See the transient path: Metal must drain before a shared-buffer
+            // tensor_get, or the capture rows are read mid-flight.
+            if (dc->capture_count > 0 && g_backend_type == BACKEND_TYPE_METAL)
+                ggml_backend_synchronize(g_backend);
             for (int c = 0; c < dc->capture_count; c++)
             {
                 ggml_backend_tensor_get(dc->capture_out[c],
@@ -793,27 +903,33 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
             layer_attn_mask[l] = mask;
             const int layer_rows = (swa_ring && swa) ? swa_cache_size : cache_size;
 
-            ggml_tensor* k_full = view_kv_cache_window(ctx, lt.k_cached_t, head_dim, layer_rows, num_kv_heads, span_start, window, kv_cache_type, n_tokens);
-            ggml_tensor* v_full = view_kv_cache_window(ctx, lt.v_cached_t, head_dim, layer_rows, num_kv_heads, span_start, window, kv_cache_type, n_tokens);
+            // num_heads/num_kv_heads is already this rank's ratio under --tp, and
+            // that is the ratio ggml-cuda sees (16 single-GPU, 16 per rank at
+            // --tp 2 where each rank holds one KV head). It selects the flash-
+            // attention kernel, which is what decides whether the window below
+            // has to be materialised - see kv_window_needs_cuda_flash_attn_copy.
+            const int fattn_gqa_ratio = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
+            ggml_tensor* k_full = view_kv_cache_window(ctx, lt.k_cached_t, head_dim, layer_rows, num_kv_heads, span_start, window, kv_cache_type, n_tokens, fattn_gqa_ratio);
+            ggml_tensor* v_full = view_kv_cache_window(ctx, lt.v_cached_t, head_dim, layer_rows, num_kv_heads, span_start, window, kv_cache_type, n_tokens, fattn_gqa_ratio);
             if (k_full == nullptr || v_full == nullptr)
             {
                 set_last_error("Muse-Glimmer forward: failed to create KV cache views.");
                 if (can_persist) ggml_free(ctx);
                 return 0;
             }
-            // NOTE: the windows above come back MATERIALISED on CUDA for a
-            // SINGLE-ROW decode (n_tokens == 1, passed through as fattn_query_rows)
-            // whenever they are a strict, FATTN_KQ_STRIDE-aligned sub-range of an
-            // F16 cache - which is exactly what a full-attention layer produces
-            // here, reading [0, window_full) rows out of a cache_size-row tensor.
-            // ggml-cuda's flash-attention vec kernel (the single-row decode kernel)
-            // returns wrong results for that strided shape; see
-            // kv_window_needs_cuda_flash_attn_copy in ggml_ops_transformer_common.h
-            // for the measurement and for why the predicate must not be spelled
-            // ggml_is_contiguous. Prefill (n_tokens > 1) lands on the MMA kernels,
-            // which honour the strides (measured bit-identical), so its windows
-            // stay raw views; the sliding-window layers read the WHOLE ring
-            // (window == rows) and are untouched either way.
+            // NOTE: the windows above come back MATERIALISED on CUDA only when
+            // ggml-cuda would actually dispatch this shape to its flash-attention
+            // VEC kernel, which is the one that misreads a truncated-prefix view
+            // (see kv_window_needs_cuda_flash_attn_copy in
+            // ggml_ops_transformer_common.h for the measurement and for why the
+            // predicate must not be spelled ggml_is_contiguous). For this model
+            // that leaves exactly one case: a single-row decode on an Ada-or-newer
+            // card with fewer than 8192 KV rows in the window. Turing/Ampere and
+            // every window >= 8192 rows go to the MMA kernel, which honours the
+            // strides (measured bit-identical, and the prefill path has always
+            // relied on it). Prefill (n_tokens > 1) is on the MMA kernels too, so
+            // its windows stay raw views; the sliding-window layers read the WHOLE
+            // ring (window == rows) and are untouched either way.
 
             ggml_tensor* q_attn = ggml_permute(ctx, q_3d, 0, 2, 1, 3);     // [hd, n_tokens, n_heads]
             ggml_tensor* attn_flat;
@@ -996,6 +1112,20 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
         if (embed_in_graph)
             bind_or_mark(tok_embd_t, const_cast<void*>(tok_embd_data), static_cast<std::size_t>(tok_embd_bytes), true);
 
+        // Metal only: run the backend's graph_optimize hook (alias-aware reorder
+        // that widens the encoder's concurrent sets and groups fusable
+        // norm+mul/add chains). ggml_backend_sched does this for llama.cpp; a
+        // direct ggml_backend_graph_compute call does not. Persist builds only:
+        // there the ~1 ms reorder runs once and every replay benefits, whereas
+        // on the transient path it ran per prefill chunk / per non-persist token
+        // and measured as a net loss (decode 20.6 -> 19.5 tok/s with persist
+        // disabled, 16K prefill -2.7% on the M5 Pro). Must run BEFORE
+        // allocation - reordering after lifetime planning can invalidate the
+        // allocator's alias plan. Skipped under tensor parallelism, whose plan
+        // segments are resolved from node positions.
+        if (!tp_mode && can_persist)
+            optimize_graph_for_metal(graph);
+
         // ---------------- allocate + upload ----------------
         // Decode (1 row) gets its own slot per tensor so the addresses are STABLE
         // and ggml-cuda can capture the graph. A prefill chunk must not do that:
@@ -1112,6 +1242,13 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
                 return 0;
             }
 
+            // Metal's graph_compute returns with the GPU still running and a
+            // shared-buffer tensor_get is a raw memcpy (no implicit sync), so
+            // reading the capture/trace outputs below without draining first
+            // returns stale bytes. CUDA/Vulkan get_tensor already synchronize.
+            if ((cap_count > 0 || !trace_out.empty()) && g_backend_type == BACKEND_TYPE_METAL)
+                ggml_backend_synchronize(g_backend);
+
             for (int c = 0; c < cap_count; c++)
             {
                 if (capture_out[c] == nullptr) continue;
@@ -1177,6 +1314,14 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
             mgdc->attn_mask = layer_attn_mask;
             mgdc->class_mask[0] = class_mask[0];
             mgdc->class_mask[1] = class_mask[1];
+            // Hand the host staging buffers to the cache entry so replays extend
+            // them in place. An empty one (the device-fill path) leaves mask_pos
+            // at -1, which makes the first replay regenerate from scratch.
+            for (int cls = 0; cls < 2; cls++)
+            {
+                mgdc->mask_host[cls] = std::move(class_mask_data[cls]);
+                mgdc->mask_pos[cls] = mgdc->mask_host[cls].empty() ? -1 : start_pos;
+            }
             mgdc->capture_out = capture_out;
             mgdc->window_swa = window_swa;
             mgdc->swa_start = swa_start;

@@ -75,17 +75,48 @@ namespace TensorSharp.Models
         private const int DfFfnDown = 10;
 
         /// <summary>
-        /// Prompt-prefill chunk the speculative executor should use. Deliberately
-        /// small: one captured row is <see cref="DFlashConfig.FeatureSize"/> = 33280
-        /// floats (133 KB), and MtpSpeculativeExecution.PrefillStep keeps TWO
-        /// chunk-sized float[] buffers (_chunkH and _chunkHPairs). 128 tokens is
-        /// 2 x 17 MB of managed arrays; the model's own 2048-token prefill chunk
-        /// would be 2 x 545 MB. Nothing is lost by chunking finer here: the DFlash
-        /// catch-up cost is strictly linear in rows (one fc GEMM plus 5 layers of
-        /// k/v projections), and the trunk's per-chunk fixed overhead is small
-        /// next to a 128-row Muse-Glimmer forward.
+        /// Default prompt-prefill chunk the speculative executor should use, and
+        /// the reason it is not the model's own 2048.
+        ///
+        /// This value drives the TRUNK forward, not only the drafter, so it decides
+        /// how many full 52-layer Muse-Glimmer forwards a prompt costs. It used to
+        /// be 128, chosen purely to bound the host-side capture buffer (one row is
+        /// <see cref="DFlashConfig.FeatureSize"/> = 33280 floats = 130 KB), on the
+        /// assumption that "the trunk's per-chunk fixed overhead is small next to a
+        /// 128-row forward". Measured against llama.cpp it is not: the extra cost
+        /// per chunk is a FLAT ~60 ms from 2K to 128K of context (a 52-layer graph
+        /// rebuild plus a DFlash host round trip), against ~13 ms of useful work in
+        /// a 128-row chunk. At a 124K prompt that is 980 trunk forwards instead of
+        /// 61 - 58 s added to a 112 s prefill, which was the whole of the
+        /// 0.69x-versus-llama.cpp DFlash prefill ratio.
+        ///
+        /// 1024 keeps one 130 MB host buffer (PrefillStep now shifts the pairing in
+        /// place instead of keeping a second one) and removes 87% of the extra
+        /// chunks. It also stays well inside both hard limits: the drafter's ring is
+        /// <see cref="DFlashConfig.RingRows"/> = 2080 rows, and the trunk's SWA ring
+        /// refuses a forward wider than rows - n_swa = 2304.
+        /// Override with TS_DFLASH_PREFILL_CHUNK.
         /// </summary>
-        private const int DFlashPrefillChunk = 128;
+        private const int DFlashPrefillChunkDefault = 1024;
+
+        private int _dflashPrefillChunk;
+
+        private int ResolveDFlashPrefillChunk()
+        {
+            int chunk = DFlashPrefillChunkDefault;
+            string raw = Environment.GetEnvironmentVariable("TS_DFLASH_PREFILL_CHUNK");
+            if (!string.IsNullOrWhiteSpace(raw) && int.TryParse(raw, out int parsed) && parsed > 0)
+                chunk = parsed;
+
+            // Never exceed what either ring can absorb in one forward: the drafter
+            // would alias two live positions onto one ring slot, and the trunk's
+            // ForwardCore throws outright.
+            int draftCap = _dflash != null ? _dflash.RingRows - _dflash.BlockSize - 1 : chunk;
+            int trunkCap = _kvSwaRows > 0 ? _kvSwaRows - _slidingWindow : chunk;
+            chunk = Math.Min(chunk, Math.Max(1, draftCap));
+            chunk = Math.Min(chunk, Math.Max(1, trunkCap));
+            return Math.Max(1, chunk);
+        }
 
         private DFlashConfig _dflash;
         private bool _hasDFlash;
@@ -346,8 +377,21 @@ namespace TensorSharp.Models
         /// discards it (only DSpark consumes it).</summary>
         public int MtpDraftBlockSize => _hasDFlash ? _dflash.MaxDraftTokens : 0;
 
-        /// <summary>See <see cref="DFlashPrefillChunk"/>.</summary>
-        public int MtpPrefillChunkSize => DFlashPrefillChunk;
+        /// <summary>See <see cref="DFlashPrefillChunkDefault"/>.</summary>
+        public int MtpPrefillChunkSize
+        {
+            get
+            {
+                // Resolved lazily and only once the drafter is loaded: the caps
+                // below come off the drafter's ring and the trunk's SWA ring, so
+                // answering before either exists would cache a wrong value.
+                if (_dflash == null)
+                    return 0;
+                if (_dflashPrefillChunk <= 0)
+                    _dflashPrefillChunk = ResolveDFlashPrefillChunk();
+                return _dflashPrefillChunk;
+            }
+        }
 
         /// <summary>The drafter is fed from the host: every prefill chunk hands its
         /// per-row features back so <see cref="MtpCatchUp"/> can fill the ring.</summary>

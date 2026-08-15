@@ -342,7 +342,18 @@ namespace TensorSharp.Models
             // Either fused kernel can read the ring; only the per-op path cannot
             // (see RequireUniformCache). CanUseTpFusedForward is the TP twin of
             // CanUseFusedForward, which stays false under --tp on purpose.
+            //
+            // GgmlCpu keeps uniform caches: a ring is read WHOLE (its slots are
+            // not in position order), and ggml-cpu's flash-attention evaluates
+            // every KV column, masked or not - so 39 of 52 layers would pay the
+            // full 4352 ring rows of attention at ANY depth, where the uniform
+            // moving span costs pad256(window + chunk) only once the context is
+            // actually that long. The GPU backends keep the ring: their fixed
+            // graph shape is what preserves the persistent graph (and the CUDA
+            // capture), and their flash kernels skip fully-masked blocks.
             if (!SwaRingEnabled || !(CanUseFusedForward || CanUseTpFusedForward) || _slidingWindow <= 0)
+                return 0;
+            if (_backend == BackendType.GgmlCpu)
                 return 0;
             int need = _slidingWindow + Math.Max(PrefillChunkTokens, 1) + 1;
             string raw = Environment.GetEnvironmentVariable("TS_MUSE_GLIMMER_SWA_ROWS");
@@ -1231,22 +1242,32 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Multi-row attention through MLX's fused SDPA, reading the live K/V window
-        /// straight off the device-resident cache. Returns null when MLX declines the
-        /// shape (it currently only accepts the first prefill chunk, where the query
-        /// range covers the whole cache and the causal mask is the standard one), and
-        /// the caller falls back to the generic materialised-score chain.
+        /// straight off the device-resident cache. Every prefill chunk stays on
+        /// device: the first chunk uses the plain "causal" string mask, later chunks
+        /// a device-built causal(+SWA) band mask, and sliding-window layers narrow
+        /// the cache read to the window itself so a 16K prefill does not score 39
+        /// layers against out-of-window keys. Returns null when MLX declines the
+        /// shape and the caller falls back to the generic materialised-score chain
+        /// (host GQA expand + host-masked scores).
         /// </summary>
         private Tensor TryMlxPrefillAttention(Tensor qHeads, int layer, int seqLen, int totalSeqLen)
         {
+            int qStart = totalSeqLen - seqLen;
+            // The earliest query (position qStart) still sees keys back to
+            // qStart - window + 1, so the windowed read starts there, never later.
+            int kvStart = _isSwaLayer[layer] && _slidingWindow > 0
+                ? Math.Max(0, qStart - _slidingWindow + 1)
+                : 0;
             var result = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * _headDim);
-            using var kLive = _kvCacheK[layer].Narrow(1, 0, totalSeqLen);
-            using var vLive = _kvCacheV[layer].Narrow(1, 0, totalSeqLen);
+            using var kLive = _kvCacheK[layer].Narrow(1, kvStart, totalSeqLen - kvStart);
+            using var vLive = _kvCacheV[layer].Narrow(1, kvStart, totalSeqLen - kvStart);
             // Q is pre-scaled by 1/sqrt(headDim), hence scale: 1f.
-            if (MlxFusedOps.TryPrefillAttention(
+            if (MlxFusedOps.TryPrefillAttentionBanded(
                     result, qHeads, kLive, vLive,
                     Config.NumHeads, Config.NumKVHeads, _headDim,
-                    seqLen, totalSeqLen,
-                    maskStart: totalSeqLen - seqLen,
+                    seqLen, totalSeqLen - kvStart,
+                    qStart: qStart,
+                    kvStart: kvStart,
                     windowSize: _isSwaLayer[layer] ? _slidingWindow : 0,
                     scale: 1f))
             {

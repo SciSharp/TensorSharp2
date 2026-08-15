@@ -100,3 +100,36 @@ extern "C" bool tsg_cuda_fill_ring_mask_f16(
         (__half*) mask_dev, ringRows, N, startPos, window);
     return cudaGetLastError() == cudaSuccess;
 }
+
+// ---------------------------------------------------------------------------
+// Highest NVIDIA compute capability among the visible devices, encoded exactly
+// the way ggml-cuda encodes it (major*100 + minor*10; 8.6 -> 860, 12.0 -> 1200,
+// GGML_CUDA_CC_ADA_LOVELACE == 890). ggml_cuda_get_best_fattn_kernel's choice
+// between the VEC and the MMA flash-attention kernel is device-dependent, and
+// kv_window_needs_cuda_flash_attn_copy has to mirror that choice to know
+// whether a truncated K/V window must be materialised. ggml-cuda keeps its
+// device table private (common.cuh), so ask the driver directly.
+//
+// The MAXIMUM is deliberate: on a heterogeneous host the copy has to be taken
+// if ANY device could run the VEC kernel, so erring high errs safe.
+extern "C" int tsg_cuda_max_compute_capability(void)
+{
+    static const int cc = [] {
+        int count = 0;
+        if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0)
+            return 0;
+        int best = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int major = 0, minor = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, i) != cudaSuccess)
+                continue;
+            if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, i) != cudaSuccess)
+                continue;
+            const int v = major * 100 + minor * 10;
+            if (v > best) best = v;
+        }
+        return best;
+    }();
+    return cc;
+}

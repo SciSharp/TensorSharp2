@@ -370,8 +370,8 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly float[] _stepLogits;    // [vocab] for plain/re-advance steps
         private readonly float[] _rowLogits;     // [vocab] scratch row handed to drawNext
         private readonly List<int> _draftTokens = new();
-        private float[] _chunkH;                 // [chunk * hidden] prefill h capture
-        private float[] _chunkHPairs;            // [chunk * hidden] (token k, h of token k-1) pairs
+        private float[] _chunkH;                 // [chunk * hidden] prefill h capture, shifted in place into (token k, h of k-1) pairs
+        private float[] _lastRowH;               // [hidden] the row the in-place shift would otherwise overwrite
 
         /// <summary>Maximum tokens drafted per speculative step (llama.cpp n_max).</summary>
         public int MaxDraftTokens { get; }
@@ -437,23 +437,62 @@ namespace TensorSharp.Runtime.Scheduling
         private const int ProbeSpecSteps = 8;
         /// <summary>Plain steps measured per round, for the baseline to compare against.</summary>
         private const int CalibrationPlainSteps = 3;
-        /// <summary>Plain steps speculation stays parked for after losing a round.</summary>
+        /// <summary>Longest a losing verdict may park drafting for.</summary>
         private const int ParkedProbeInterval = 64;
+        /// <summary>
+        /// Park length after the FIRST losing verdict. A verdict formed right after
+        /// a prefill is the least trustworthy one the governor ever makes, so the
+        /// penalty for getting it wrong is capped low and only backs off toward
+        /// <see cref="ParkedProbeInterval"/> if speculation keeps losing.
+        /// </summary>
+        private const int FirstParkInterval = 16;
         /// <summary>Steps a winning verdict holds for before the next measuring round.</summary>
         private const int WinRecheckInterval = 512;
-        /// <summary>Speculation must not be more than this much slower to stay on.</summary>
-        private const double SpecWinMargin = 1.02;
+        /// <summary>
+        /// Speculation must not be more than this much slower to stay on. This is a
+        /// tolerance on a NOISY estimator, not a precision knob: the sample is 8
+        /// steps taken at the least predictable point of a response, so a few
+        /// percent either way carries no information. It was 1.02, which let
+        /// ordinary sampling noise park a drafter that was measurably 2.7x faster
+        /// on the very next probe.
+        /// </summary>
+        private const double SpecWinMargin = 1.15;
 
-        private double _plainMsPerToken, _specMsPerToken;
+        // Ratio of SUMS, not a mean of per-step rates. A speculative step emits
+        // between 1 and MaxDraftTokens+1 tokens; normalising each step to ms/token
+        // BEFORE averaging weights a fully-rejected step (1 token, full step cost)
+        // exactly as heavily as a fully-accepted one (16 tokens, barely more cost),
+        // which over-states speculation's cost and only speculation's - plain steps
+        // always emit one token, so their mean of rates already equals their
+        // aggregate. On a realistic 8-step probe (4 steps x 16 tokens, 4 steps x 1)
+        // the old estimator read 29.4 ms/token where the true figure was 6.8.
+        private long _plainTicks, _specTicks;
+        private long _plainTokens, _specTokens;
         private int _plainSamples, _specSamples;
+        // The single most expensive speculative sample of the round (by ms/token),
+        // kept as its raw (ticks, tokens) so the verdict can drop the WHOLE step.
+        // The verify graph is rebuilt whenever the batch shape or the padded KV
+        // window changes, and both happen DURING a probe (k varies per step, and 8
+        // speculative steps can advance the position across a window boundary), so
+        // one sample in a round routinely carries a graph build that never recurs.
+        private long _specWorstTicks;
+        private int _specWorstTokens;
+        // Whether the first sample of each side has already been discarded this
+        // round. The first speculative step after a prefill pays four one-off graph
+        // builds (trunk verify shape, drafter inject at n_rows=1, the draft block,
+        // and possibly a KV-capacity grow that drops every persistent graph); the
+        // first plain step after a run of verify batches finds the 1-row trunk
+        // graph cold for the same reason.
+        private bool _specFirstSkipped, _plainFirstSkipped;
         private int _parkedRemaining;
         private int _recheckRemaining;
+        private int _consecutiveLosses;
         private bool _specWins = true;
 
         // A round measures speculation FIRST (so the very first decode step still
         // speculates, which is also what the unit tests pin), then takes a short
         // plain baseline, then decides. A win holds for WinRecheckInterval steps
-        // before re-measuring; a loss parks drafting for ParkedProbeInterval steps.
+        // before re-measuring; a loss parks drafting for a backed-off interval.
         private bool GovernorAllowsSpeculation()
         {
             if (!AdaptiveSpeculation)
@@ -468,6 +507,9 @@ namespace TensorSharp.Runtime.Scheduling
                 return false;                       // measuring the plain baseline
             return _specWins;
         }
+
+        private static double MsPerToken(long ticks, long tokens) =>
+            tokens > 0 ? ticks * 1000.0 / Stopwatch.Frequency / tokens : 0.0;
 
         private void GovernorRecord(bool speculated, int tokensEmitted, long elapsedTicks)
         {
@@ -485,28 +527,74 @@ namespace TensorSharp.Runtime.Scheduling
                 return;
             }
 
-            double ms = elapsedTicks * 1000.0 / Stopwatch.Frequency / tokensEmitted;
             if (speculated)
             {
-                _specMsPerToken += (ms - _specMsPerToken) / (_specSamples + 1);
+                if (!_specFirstSkipped) { _specFirstSkipped = true; return; }
+                _specTicks += elapsedTicks;
+                _specTokens += tokensEmitted;
                 _specSamples++;
-                Stats.SpecMsPerToken = _specMsPerToken;
+                if (_specWorstTokens == 0 ||
+                    MsPerToken(elapsedTicks, tokensEmitted) > MsPerToken(_specWorstTicks, _specWorstTokens))
+                {
+                    _specWorstTicks = elapsedTicks;
+                    _specWorstTokens = tokensEmitted;
+                }
+                Stats.SpecMsPerToken = MsPerToken(_specTicks, _specTokens);
             }
             else
             {
-                _plainMsPerToken += (ms - _plainMsPerToken) / (_plainSamples + 1);
+                if (!_plainFirstSkipped) { _plainFirstSkipped = true; return; }
+                _plainTicks += elapsedTicks;
+                _plainTokens += tokensEmitted;
                 _plainSamples++;
-                Stats.PlainMsPerToken = _plainMsPerToken;
+                Stats.PlainMsPerToken = MsPerToken(_plainTicks, _plainTokens);
             }
 
             if (_specSamples < ProbeSpecSteps || _plainSamples < CalibrationPlainSteps)
                 return;
 
-            _specWins = _specMsPerToken <= _plainMsPerToken * SpecWinMargin;
-            _parkedRemaining = _specWins ? 0 : ParkedProbeInterval;
+            // Trim the worst speculative sample (a graph rebuild that will not
+            // recur) before comparing. Only when it leaves something to compare.
+            double specMs = MsPerToken(_specTicks, _specTokens);
+            if (_specSamples > 1)
+            {
+                long keptTicks = _specTicks - _specWorstTicks;
+                long keptTokens = _specTokens - _specWorstTokens;
+                if (keptTicks > 0 && keptTokens > 0)
+                    specMs = Math.Min(specMs, MsPerToken(keptTicks, keptTokens));
+            }
+
+            _specWins = specMs <= MsPerToken(_plainTicks, _plainTokens) * SpecWinMargin;
+            _consecutiveLosses = _specWins ? 0 : _consecutiveLosses + 1;
+            _parkedRemaining = _specWins
+                ? 0
+                : Math.Min(ParkedProbeInterval, FirstParkInterval << Math.Min(_consecutiveLosses - 1, 4));
             _recheckRemaining = _specWins ? WinRecheckInterval : 0;
+            GovernorResetRound();
+        }
+
+        private void GovernorResetRound()
+        {
             _specSamples = _plainSamples = 0;
-            _specMsPerToken = _plainMsPerToken = 0;
+            _specTicks = _plainTicks = 0;
+            _specTokens = _plainTokens = 0;
+            _specWorstTicks = 0;
+            _specWorstTokens = 0;
+            _specFirstSkipped = _plainFirstSkipped = false;
+        }
+
+        /// <summary>
+        /// Drop every governor verdict and start measuring from scratch. Called from
+        /// <see cref="Reset"/>: a park decided on one turn describes that turn's
+        /// context length and prompt, and carrying it into the next request means a
+        /// fresh generation can start with drafting disabled for no reason.
+        /// </summary>
+        private void GovernorReset()
+        {
+            GovernorResetRound();
+            _parkedRemaining = _recheckRemaining = 0;
+            _consecutiveLosses = 0;
+            _specWins = true;
         }
 
         public MtpSpecStats Stats { get; } = new();
@@ -551,6 +639,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             Array.Clear(_pendingH);
             Stats.Reset();
+            GovernorReset();
         }
 
         /// <summary>
@@ -580,13 +669,21 @@ namespace TensorSharp.Runtime.Scheduling
 
                 _trunk.Forward(chunk, _chunkH, _stepLogits, allLogitsRows: false);
 
-                // Pair token k with the hidden state of the token before it.
-                Array.Copy(_pendingH, 0, _chunkHPairs, 0, _hidden);
+                // Pair token k with the hidden state of the token before it. Done
+                // IN PLACE: the only row still needed after the shift is the last
+                // one (it becomes the next chunk's carry-in), so save that, slide
+                // the block down a row and prepend the carried-in row. A second
+                // chunk-sized buffer used to hold the result, which for a DFlash
+                // feature row (33280 floats, 130 KB) is 130 MB at a 1024-row chunk
+                // - and doubling the prefill chunk is worth far more than the
+                // buffer it costs. Array.Copy is memmove-safe on overlap.
+                Array.Copy(_chunkH, (long)(n - 1) * _hidden, _lastRowH, 0, _hidden);
                 if (n > 1)
-                    Array.Copy(_chunkH, 0, _chunkHPairs, _hidden, (long)(n - 1) * _hidden);
-                _model.MtpCatchUp(chunk, _chunkHPairs, startPos);
+                    Array.Copy(_chunkH, 0, _chunkH, _hidden, (long)(n - 1) * _hidden);
+                Array.Copy(_pendingH, 0, _chunkH, 0, _hidden);
+                _model.MtpCatchUp(chunk, _chunkH, startPos);
 
-                Array.Copy(_chunkH, (long)(n - 1) * _hidden, _pendingH, 0, _hidden);
+                Array.Copy(_lastRowH, 0, _pendingH, 0, _hidden);
             }
 
             float[] logits = new float[_vocab];
@@ -626,7 +723,12 @@ namespace TensorSharp.Runtime.Scheduling
             if (!GovernorAllowsSpeculation())
             {
                 kMax = 0;
-                Stats.ParkedSteps++;
+                // Only a genuine park counts. The CalibrationPlainSteps that a
+                // round takes to establish its baseline also come through here, and
+                // counting them made a perfectly healthy run report "parked 3",
+                // which is indistinguishable from a short real park in a log.
+                if (_parkedRemaining > 0)
+                    Stats.ParkedSteps++;
             }
 
             kMax = Math.Min(kMax, MaxDraftTokens);
@@ -793,10 +895,8 @@ namespace TensorSharp.Runtime.Scheduling
         {
             long need = (long)chunkLen * _hidden;
             if (_chunkH == null || _chunkH.Length < need)
-            {
                 _chunkH = new float[need];
-                _chunkHPairs = new float[need];
-            }
+            _lastRowH ??= new float[_hidden];
         }
 
         /// <summary>
