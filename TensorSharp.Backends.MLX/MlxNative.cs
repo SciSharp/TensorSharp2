@@ -9349,7 +9349,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         private static extern nuint mlx_array_size_native(MlxArray array);
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "_mlx_array_is_row_contiguous")]
-        private static extern int mlx_array_is_row_contiguous_native(out bool result, MlxArray array);
+        private static extern int mlx_array_is_row_contiguous_native([MarshalAs(UnmanagedType.I1)] out bool result, MlxArray array);
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_astype")]
         private static extern int mlx_astype(out MlxArray result, MlxArray array, int dtype, MlxStream stream);
