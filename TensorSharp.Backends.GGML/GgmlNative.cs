@@ -3135,6 +3135,17 @@ internal enum GgmlIndexReductionOp
             IntPtr up, IntPtr down, int rank, float scale, int nThreads);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void ggml_quantize_init(int type);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        private static extern bool ggml_quantize_requires_imatrix(int type);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern UIntPtr ggml_quantize_chunk(int type, IntPtr src, IntPtr dst,
+            long start, long nrows, long nPerRow, IntPtr imatrix);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_QwenVaeRun(in QwenVaeArgs args);
 
         /// <summary>Run a whole VAE encode/decode op-list as ONE device graph (see QwenVaeArgs).
@@ -5080,6 +5091,27 @@ internal enum GgmlIndexReductionOp
             {
                 return TSGgml_ApplyLoraDelta(w, ggmlType, ne0, ne1, (IntPtr)pu, (IntPtr)pd, rank, scale, nThreads);
             }
+        }
+
+        /// <summary>
+        /// Quantize FP32 rows into a GGML quantized row layout via ggml_quantize_chunk.
+        /// Returns bytes written, or 0 when the target type cannot be produced without
+        /// an importance matrix (IQ1/IQ2 families).
+        /// </summary>
+        internal static long QuantizeFloat32RowsOrZero(int ggmlType, IntPtr src, IntPtr dst, long nrows, long nPerRow)
+        {
+            if (src == IntPtr.Zero || dst == IntPtr.Zero || nrows <= 0 || nPerRow <= 0)
+            {
+                throw new ArgumentException("Invalid src/dst pointers or shape for quantization.");
+            }
+
+            if (ggml_quantize_requires_imatrix(ggmlType))
+            {
+                return 0;
+            }
+
+            ggml_quantize_init(ggmlType);
+            return (long)ggml_quantize_chunk(ggmlType, src, dst, 0, nrows, nPerRow, IntPtr.Zero).ToUInt64();
         }
 
         internal static void DequantizeGgufTensorToFloat32Native(int ggmlType, IntPtr src, IntPtr dst, long numElements)

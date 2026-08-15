@@ -88,4 +88,14 @@ public static class GgmlGgufTensorDequant
     {
         GgmlNative.DequantizeGgufTensorToFloat32Native(ggmlType, src, dst, numElements);
     }
+
+    /// <summary>
+    /// Quantizes FP32 rows in unmanaged memory into a GGML quantized row layout.
+    /// Returns bytes written, or 0 when the target type needs an importance matrix
+    /// (IQ1/IQ2 families cannot be produced without one).
+    /// </summary>
+    public static long QuantizeFloat32RowsOrZero(int ggmlType, IntPtr src, IntPtr dst, long nrows, long nPerRow)
+    {
+        return GgmlNative.QuantizeFloat32RowsOrZero(ggmlType, src, dst, nrows, nPerRow);
+    }
 }
