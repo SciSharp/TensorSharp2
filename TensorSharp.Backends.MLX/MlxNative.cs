@@ -2,11 +2,17 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+
+// Structs with bool fields (MlxOptional*) cross by value; with runtime
+// marshalling disabled they pass with their managed layout, which matches
+// the mlx-c definitions (1-byte bool).
+[assembly: DisableRuntimeMarshalling]
 
 namespace TensorSharp.MLX
 {
-    internal static class MlxNative
+    internal static partial class MlxNative
     {
         private const string LibraryName = "mlxc";
         private const int MlxGpu = 1;
@@ -9282,275 +9288,365 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             Maximum,
         }
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_metal_is_available")]
-        private static extern int mlx_metal_is_available([MarshalAs(UnmanagedType.I1)] out bool res);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_set_error_handler")]
-        private static extern void mlx_set_error_handler(MlxErrorHandler handler, IntPtr data, IntPtr destructor);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_device_new_type")]
-        private static extern MlxDevice mlx_device_new_type(int type, int index);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_device_free")]
-        private static extern int mlx_device_free(MlxDevice dev);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_device_is_available")]
-        private static extern int mlx_device_is_available([MarshalAs(UnmanagedType.I1)] out bool avail, MlxDevice dev);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_set_default_device")]
-        private static extern int mlx_set_default_device(MlxDevice dev);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_clear_cache")]
-        private static extern int mlx_clear_cache();
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_get_active_memory")]
-        private static extern int mlx_get_active_memory(ref nuint res);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_get_cache_memory")]
-        private static extern int mlx_get_cache_memory(ref nuint res);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_get_peak_memory")]
-        private static extern int mlx_get_peak_memory(ref nuint res);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_reset_peak_memory")]
-        private static extern int mlx_reset_peak_memory();
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_set_cache_limit")]
-        private static extern int mlx_set_cache_limit(ref nuint previous, nuint limit);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_set_wired_limit")]
-        private static extern int mlx_set_wired_limit(ref nuint previous, nuint limit);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_set_memory_limit")]
-        private static extern int mlx_set_memory_limit(ref nuint previous, nuint limit);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_get_default_stream")]
-        private static extern int mlx_get_default_stream(out MlxStream stream, MlxDevice dev);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_stream_free")]
-        private static extern int mlx_stream_free(MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_new_data")]
-        private static extern MlxArray mlx_array_new_data(IntPtr data, int[] shape, int dim, int dtype);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_new_data_managed")]
-        private static extern MlxArray mlx_array_new_data_managed(IntPtr data, int[] shape, int dim, int dtype, IntPtr dtor);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_new_float32")]
-        private static extern MlxArray mlx_array_new_float32(float value);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_new_int")]
-        private static extern MlxArray mlx_array_new_int(int value);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_free")]
-        private static extern int mlx_array_free(MlxArray array);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_size")]
-        private static extern nuint mlx_array_size_native(MlxArray array);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "_mlx_array_is_row_contiguous")]
-        private static extern int mlx_array_is_row_contiguous_native([MarshalAs(UnmanagedType.I1)] out bool result, MlxArray array);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_astype")]
-        private static extern int mlx_astype(out MlxArray result, MlxArray array, int dtype, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_data_float32")]
-        private static extern IntPtr mlx_array_data_float32(MlxArray array);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_data_float64")]
-        private static extern IntPtr mlx_array_data_float64(MlxArray array);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_data_float16")]
-        private static extern IntPtr mlx_array_data_float16(MlxArray array);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_data_int32")]
-        private static extern IntPtr mlx_array_data_int32(MlxArray array);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_data_uint8")]
-        private static extern IntPtr mlx_array_data_uint8(MlxArray array);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_array_new")]
-        private static extern MlxVectorArray mlx_vector_array_new();
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_array_new_data")]
-        private static extern MlxVectorArray mlx_vector_array_new_data(IntPtr values, nuint size);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_array_free")]
-        private static extern int mlx_vector_array_free(MlxVectorArray vector);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_array_append_value")]
-        private static extern int mlx_vector_array_append_value(MlxVectorArray vector, MlxArray value);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_array_size")]
-        private static extern nuint mlx_vector_array_size(MlxVectorArray vector);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_array_get")]
-        private static extern int mlx_vector_array_get(out MlxArray result, MlxVectorArray vector, nuint index);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_string_new")]
-        private static extern MlxVectorString mlx_vector_string_new();
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_string_free")]
-        private static extern int mlx_vector_string_free(MlxVectorString vector);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_string_append_value")]
-        private static extern int mlx_vector_string_append_value(MlxVectorString vector, IntPtr value);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_eval")]
-        private static extern int mlx_eval(MlxVectorArray outputs);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_async_eval")]
-        private static extern int mlx_async_eval(MlxVectorArray outputs);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_as_strided")]
-        private static extern int mlx_as_strided(out MlxArray result, MlxArray array, int[] shape, nuint shapeCount, long[] strides, nuint stridesCount, nuint offset, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_reshape")]
-        private static extern int mlx_reshape(out MlxArray result, MlxArray array, int[] shape, nuint shapeCount, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_contiguous")]
-        private static extern int mlx_contiguous(out MlxArray result, MlxArray array, [MarshalAs(UnmanagedType.I1)] bool allowColMajor, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_concatenate_axis")]
-        private static extern int mlx_concatenate_axis(out MlxArray result, MlxVectorArray arrays, int axis, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_full")]
-        private static extern int mlx_full(out MlxArray result, int[] shape, nuint shapeCount, MlxArray values, int dtype, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_arange")]
-        private static extern int mlx_arange(out MlxArray result, double start, double stop, double step, int dtype, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_transpose_axes")]
-        private static extern int mlx_transpose_axes(out MlxArray result, MlxArray array, int[] axes, nuint axesCount, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_abs")]
-        private static extern int mlx_abs(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_negative")]
-        private static extern int mlx_negative(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_sqrt")]
-        private static extern int mlx_sqrt(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_rsqrt")]
-        private static extern int mlx_rsqrt(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_exp")]
-        private static extern int mlx_exp(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_log")]
-        private static extern int mlx_log(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_log1p")]
-        private static extern int mlx_log1p(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_floor")]
-        private static extern int mlx_floor(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_ceil")]
-        private static extern int mlx_ceil(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_sin")]
-        private static extern int mlx_sin(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_cos")]
-        private static extern int mlx_cos(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_tanh")]
-        private static extern int mlx_tanh(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_sigmoid")]
-        private static extern int mlx_sigmoid(out MlxArray result, MlxArray input, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_add")]
-        private static extern int mlx_add(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_subtract")]
-        private static extern int mlx_subtract(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_multiply")]
-        private static extern int mlx_multiply(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_divide")]
-        private static extern int mlx_divide(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_maximum")]
-        private static extern int mlx_maximum(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_remainder")]
-        private static extern int mlx_remainder(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_greater")]
-        private static extern int mlx_greater(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_where")]
-        private static extern int mlx_where(out MlxArray result, MlxArray condition, MlxArray whenTrue, MlxArray whenFalse, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_addmm")]
-        private static extern int mlx_addmm(out MlxArray result, MlxArray src, MlxArray m1, MlxArray m2, float alpha, float beta, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_softmax_axis")]
-        private static extern int mlx_softmax_axis(out MlxArray result, MlxArray input, int axis, [MarshalAs(UnmanagedType.I1)] bool precise, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_repeat_axis")]
-        private static extern int mlx_repeat_axis(out MlxArray result, MlxArray input, int repeats, int axis, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_layer_norm")]
-        private static extern int mlx_fast_layer_norm(out MlxArray result, MlxArray input, MlxArray weight, MlxArray bias, float eps, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_rms_norm")]
-        private static extern int mlx_fast_rms_norm(out MlxArray result, MlxArray input, MlxArray weight, float eps, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_scaled_dot_product_attention")]
-        private static extern int mlx_fast_scaled_dot_product_attention(out MlxArray result, MlxArray query, MlxArray key, MlxArray value, float scale, IntPtr maskMode, MlxArray mask, MlxArray sinks, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_rope_dynamic")]
-        private static extern int mlx_fast_rope_dynamic(out MlxArray result, MlxArray input, int dims, [MarshalAs(UnmanagedType.I1)] bool traditional, MlxOptionalFloat baseValue, float scale, MlxArray offsets, MlxArray freqs, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_take_axis")]
-        private static extern int mlx_take_axis(out MlxArray result, MlxArray input, MlxArray indices, int axis, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_take_along_axis")]
-        private static extern int mlx_take_along_axis(out MlxArray result, MlxArray input, MlxArray indices, int axis, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_argmax_axis")]
-        private static extern int mlx_argmax_axis(out MlxArray result, MlxArray input, int axis, [MarshalAs(UnmanagedType.I1)] bool keepdims, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_argpartition_axis")]
-        private static extern int mlx_argpartition_axis(out MlxArray result, MlxArray input, int kth, int axis, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_slice_update")]
-        private static extern int mlx_slice_update(out MlxArray result, MlxArray input, MlxArray update, int[] starts, nuint startCount, int[] stops, nuint stopCount, int[] strides, nuint strideCount, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_slice")]
-        private static extern int mlx_slice(out MlxArray result, MlxArray input, int[] starts, nuint startCount, int[] stops, nuint stopCount, int[] strides, nuint strideCount, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_quantized_matmul")]
-        private static extern int mlx_quantized_matmul(out MlxArray result, MlxArray input, MlxArray weight, MlxArray scales, MlxArray biases, [MarshalAs(UnmanagedType.I1)] bool transpose, MlxOptionalInt groupSize, MlxOptionalInt bits, IntPtr mode, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_dequantize")]
-        private static extern int mlx_dequantize(out MlxArray result, MlxArray weight, MlxArray scales, MlxArray biases, MlxOptionalInt groupSize, MlxOptionalInt bits, IntPtr mode, MlxArray globalScale, MlxOptionalDType dtype, MlxStream stream);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_metal_kernel_config_new")]
-        private static extern MlxFastMetalKernelConfig mlx_fast_metal_kernel_config_new();
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_metal_kernel_config_free")]
-        private static extern int mlx_fast_metal_kernel_config_free(MlxFastMetalKernelConfig config);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_metal_kernel_config_add_output_arg")]
-        private static extern int mlx_fast_metal_kernel_config_add_output_arg(MlxFastMetalKernelConfig config, int[] shape, nuint size, int dtype);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_metal_kernel_config_set_grid")]
-        private static extern int mlx_fast_metal_kernel_config_set_grid(MlxFastMetalKernelConfig config, int grid1, int grid2, int grid3);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_metal_kernel_config_set_thread_group")]
-        private static extern int mlx_fast_metal_kernel_config_set_thread_group(MlxFastMetalKernelConfig config, int thread1, int thread2, int thread3);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_metal_kernel_config_add_template_arg_int")]
-        private static extern int mlx_fast_metal_kernel_config_add_template_arg_int(MlxFastMetalKernelConfig config, IntPtr name, int value);
-
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_metal_kernel_new")]
-        private static extern MlxFastMetalKernel mlx_fast_metal_kernel_new(
+        [LibraryImport(LibraryName, EntryPoint = "mlx_metal_is_available")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_metal_is_available([MarshalAs(UnmanagedType.I1)] out bool res);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_set_error_handler")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void mlx_set_error_handler(MlxErrorHandler handler, IntPtr data, IntPtr destructor);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_device_new_type")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxDevice mlx_device_new_type(int type, int index);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_device_free")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_device_free(MlxDevice dev);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_device_is_available")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_device_is_available([MarshalAs(UnmanagedType.I1)] out bool avail, MlxDevice dev);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_set_default_device")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_set_default_device(MlxDevice dev);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_clear_cache")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_clear_cache();
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_get_active_memory")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_get_active_memory(ref nuint res);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_get_cache_memory")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_get_cache_memory(ref nuint res);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_get_peak_memory")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_get_peak_memory(ref nuint res);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_reset_peak_memory")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_reset_peak_memory();
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_set_cache_limit")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_set_cache_limit(ref nuint previous, nuint limit);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_set_wired_limit")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_set_wired_limit(ref nuint previous, nuint limit);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_set_memory_limit")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_set_memory_limit(ref nuint previous, nuint limit);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_get_default_stream")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_get_default_stream(out MlxStream stream, MlxDevice dev);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_stream_free")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_stream_free(MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_new_data")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxArray mlx_array_new_data(IntPtr data, int[] shape, int dim, int dtype);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_new_data_managed")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxArray mlx_array_new_data_managed(IntPtr data, int[] shape, int dim, int dtype, IntPtr dtor);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_new_float32")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxArray mlx_array_new_float32(float value);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_new_int")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxArray mlx_array_new_int(int value);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_free")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_array_free(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_size")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial nuint mlx_array_size_native(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "_mlx_array_is_row_contiguous")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_array_is_row_contiguous_native([MarshalAs(UnmanagedType.I1)] out bool result, MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_astype")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_astype(out MlxArray result, MlxArray array, int dtype, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_data_float32")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr mlx_array_data_float32(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_data_float64")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr mlx_array_data_float64(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_data_float16")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr mlx_array_data_float16(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_data_int32")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr mlx_array_data_int32(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_data_uint8")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr mlx_array_data_uint8(MlxArray array);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_array_new")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxVectorArray mlx_vector_array_new();
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_array_new_data")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxVectorArray mlx_vector_array_new_data(IntPtr values, nuint size);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_array_free")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_vector_array_free(MlxVectorArray vector);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_array_append_value")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_vector_array_append_value(MlxVectorArray vector, MlxArray value);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_array_size")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial nuint mlx_vector_array_size(MlxVectorArray vector);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_array_get")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_vector_array_get(out MlxArray result, MlxVectorArray vector, nuint index);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_string_new")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxVectorString mlx_vector_string_new();
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_string_free")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_vector_string_free(MlxVectorString vector);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_string_append_value")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_vector_string_append_value(MlxVectorString vector, IntPtr value);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_eval")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_eval(MlxVectorArray outputs);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_async_eval")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_async_eval(MlxVectorArray outputs);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_as_strided")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_as_strided(out MlxArray result, MlxArray array, int[] shape, nuint shapeCount, long[] strides, nuint stridesCount, nuint offset, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_reshape")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_reshape(out MlxArray result, MlxArray array, int[] shape, nuint shapeCount, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_contiguous")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_contiguous(out MlxArray result, MlxArray array, [MarshalAs(UnmanagedType.I1)] bool allowColMajor, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_concatenate_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_concatenate_axis(out MlxArray result, MlxVectorArray arrays, int axis, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_full")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_full(out MlxArray result, int[] shape, nuint shapeCount, MlxArray values, int dtype, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_arange")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_arange(out MlxArray result, double start, double stop, double step, int dtype, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_transpose_axes")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_transpose_axes(out MlxArray result, MlxArray array, int[] axes, nuint axesCount, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_abs")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_abs(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_negative")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_negative(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_sqrt")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_sqrt(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_rsqrt")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_rsqrt(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_exp")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_exp(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_log")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_log(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_log1p")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_log1p(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_floor")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_floor(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_ceil")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_ceil(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_sin")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_sin(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_cos")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_cos(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_tanh")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_tanh(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_sigmoid")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_sigmoid(out MlxArray result, MlxArray input, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_add")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_add(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_subtract")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_subtract(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_multiply")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_multiply(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_divide")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_divide(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_maximum")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_maximum(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_remainder")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_remainder(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_greater")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_greater(out MlxArray result, MlxArray lhs, MlxArray rhs, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_where")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_where(out MlxArray result, MlxArray condition, MlxArray whenTrue, MlxArray whenFalse, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_addmm")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_addmm(out MlxArray result, MlxArray src, MlxArray m1, MlxArray m2, float alpha, float beta, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_softmax_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_softmax_axis(out MlxArray result, MlxArray input, int axis, [MarshalAs(UnmanagedType.I1)] bool precise, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_repeat_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_repeat_axis(out MlxArray result, MlxArray input, int repeats, int axis, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_layer_norm")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_layer_norm(out MlxArray result, MlxArray input, MlxArray weight, MlxArray bias, float eps, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_rms_norm")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_rms_norm(out MlxArray result, MlxArray input, MlxArray weight, float eps, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_scaled_dot_product_attention")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_scaled_dot_product_attention(out MlxArray result, MlxArray query, MlxArray key, MlxArray value, float scale, IntPtr maskMode, MlxArray mask, MlxArray sinks, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_rope_dynamic")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_rope_dynamic(out MlxArray result, MlxArray input, int dims, [MarshalAs(UnmanagedType.I1)] bool traditional, MlxOptionalFloat baseValue, float scale, MlxArray offsets, MlxArray freqs, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_take_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_take_axis(out MlxArray result, MlxArray input, MlxArray indices, int axis, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_take_along_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_take_along_axis(out MlxArray result, MlxArray input, MlxArray indices, int axis, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_argmax_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_argmax_axis(out MlxArray result, MlxArray input, int axis, [MarshalAs(UnmanagedType.I1)] bool keepdims, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_argpartition_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_argpartition_axis(out MlxArray result, MlxArray input, int kth, int axis, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_slice_update")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_slice_update(out MlxArray result, MlxArray input, MlxArray update, int[] starts, nuint startCount, int[] stops, nuint stopCount, int[] strides, nuint strideCount, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_slice")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_slice(out MlxArray result, MlxArray input, int[] starts, nuint startCount, int[] stops, nuint stopCount, int[] strides, nuint strideCount, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_quantized_matmul")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_quantized_matmul(out MlxArray result, MlxArray input, MlxArray weight, MlxArray scales, MlxArray biases, [MarshalAs(UnmanagedType.I1)] bool transpose, MlxOptionalInt groupSize, MlxOptionalInt bits, IntPtr mode, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_dequantize")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_dequantize(out MlxArray result, MlxArray weight, MlxArray scales, MlxArray biases, MlxOptionalInt groupSize, MlxOptionalInt bits, IntPtr mode, MlxArray globalScale, MlxOptionalDType dtype, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_metal_kernel_config_new")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxFastMetalKernelConfig mlx_fast_metal_kernel_config_new();
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_metal_kernel_config_free")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_metal_kernel_config_free(MlxFastMetalKernelConfig config);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_metal_kernel_config_add_output_arg")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_metal_kernel_config_add_output_arg(MlxFastMetalKernelConfig config, int[] shape, nuint size, int dtype);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_metal_kernel_config_set_grid")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_metal_kernel_config_set_grid(MlxFastMetalKernelConfig config, int grid1, int grid2, int grid3);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_metal_kernel_config_set_thread_group")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_metal_kernel_config_set_thread_group(MlxFastMetalKernelConfig config, int thread1, int thread2, int thread3);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_metal_kernel_config_add_template_arg_int")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_metal_kernel_config_add_template_arg_int(MlxFastMetalKernelConfig config, IntPtr name, int value);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_metal_kernel_new")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxFastMetalKernel mlx_fast_metal_kernel_new(
             IntPtr name,
             MlxVectorString inputNames,
             MlxVectorString outputNames,
@@ -9559,47 +9655,60 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             [MarshalAs(UnmanagedType.I1)] bool ensureRowContiguous,
             [MarshalAs(UnmanagedType.I1)] bool atomicOutputs);
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_fast_metal_kernel_apply")]
-        private static extern int mlx_fast_metal_kernel_apply(ref MlxVectorArray outputs, MlxFastMetalKernel kernel, MlxVectorArray inputs, MlxFastMetalKernelConfig config, MlxStream stream);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_fast_metal_kernel_apply")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_fast_metal_kernel_apply(ref MlxVectorArray outputs, MlxFastMetalKernel kernel, MlxVectorArray inputs, MlxFastMetalKernelConfig config, MlxStream stream);
 
         // ----- mlx_compile / mlx_closure_* (graph compilation) -----
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_compile")]
-        private static extern int mlx_compile(out MlxClosure result, MlxClosure fun, [MarshalAs(UnmanagedType.I1)] bool shapeless);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_compile")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_compile(out MlxClosure result, MlxClosure fun, [MarshalAs(UnmanagedType.I1)] bool shapeless);
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_enable_compile")]
-        private static extern int mlx_enable_compile();
+        [LibraryImport(LibraryName, EntryPoint = "mlx_enable_compile")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_enable_compile();
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_disable_compile")]
-        private static extern int mlx_disable_compile();
+        [LibraryImport(LibraryName, EntryPoint = "mlx_disable_compile")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_disable_compile();
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_set_compile_mode")]
-        private static extern int mlx_set_compile_mode(int mode);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_set_compile_mode")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_set_compile_mode(int mode);
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_closure_new")]
-        private static extern MlxClosure mlx_closure_new();
+        [LibraryImport(LibraryName, EntryPoint = "mlx_closure_new")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxClosure mlx_closure_new();
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_closure_free")]
-        private static extern int mlx_closure_free(MlxClosure closure);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_closure_free")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_closure_free(MlxClosure closure);
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_closure_new_func_payload")]
-        private static extern MlxClosure mlx_closure_new_func_payload(IntPtr fun, IntPtr payload, IntPtr destructor);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_closure_new_func_payload")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxClosure mlx_closure_new_func_payload(IntPtr fun, IntPtr payload, IntPtr destructor);
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_closure_apply")]
-        private static extern int mlx_closure_apply(ref MlxVectorArray result, MlxClosure closure, MlxVectorArray input);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_closure_apply")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_closure_apply(ref MlxVectorArray result, MlxClosure closure, MlxVectorArray input);
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_vector_array_set_data")]
-        private static extern int mlx_vector_array_set_data(ref MlxVectorArray vec, IntPtr data, nuint size);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_vector_array_set_data")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_vector_array_set_data(ref MlxVectorArray vec, IntPtr data, nuint size);
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_array_dtype")]
-        private static extern int mlx_array_dtype(out int dtype, MlxArray array);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_dtype")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_array_dtype(out int dtype, MlxArray array);
 
         // ----- mlx_gather_mm / mlx_gather_qmm (MoE-friendly batched matmul) -----
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_gather_mm")]
-        private static extern int mlx_gather_mm(out MlxArray result, MlxArray a, MlxArray b, MlxArray lhsIndices, MlxArray rhsIndices, [MarshalAs(UnmanagedType.I1)] bool sortedIndices, MlxStream stream);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_gather_mm")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_gather_mm(out MlxArray result, MlxArray a, MlxArray b, MlxArray lhsIndices, MlxArray rhsIndices, [MarshalAs(UnmanagedType.I1)] bool sortedIndices, MlxStream stream);
 
-        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_gather_qmm")]
-        private static extern int mlx_gather_qmm(out MlxArray result, MlxArray x, MlxArray w, MlxArray scales, MlxArray biases, MlxArray lhsIndices, MlxArray rhsIndices, [MarshalAs(UnmanagedType.I1)] bool transpose, MlxOptionalInt groupSize, MlxOptionalInt bits, IntPtr mode, [MarshalAs(UnmanagedType.I1)] bool sortedIndices, MlxStream stream);
+        [LibraryImport(LibraryName, EntryPoint = "mlx_gather_qmm")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_gather_qmm(out MlxArray result, MlxArray x, MlxArray w, MlxArray scales, MlxArray biases, MlxArray lhsIndices, MlxArray rhsIndices, [MarshalAs(UnmanagedType.I1)] bool transpose, MlxOptionalInt groupSize, MlxOptionalInt bits, IntPtr mode, [MarshalAs(UnmanagedType.I1)] bool sortedIndices, MlxStream stream);
     }
 }

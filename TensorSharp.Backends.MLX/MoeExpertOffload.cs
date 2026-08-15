@@ -31,7 +31,7 @@ namespace TensorSharp.MLX
     /// are small in aggregate, hot on every forward, and remain permanently
     /// device-resident under the existing preload path.
     /// </summary>
-    public static class MoeExpertOffload
+    public static partial class MoeExpertOffload
     {
         private const string EnvVarMb = "TS_MLX_EXPERT_OFFLOAD_MB";
         private static readonly long _maxCacheBytes = ParseLimit();
@@ -138,8 +138,8 @@ namespace TensorSharp.MLX
 
         private const int MadvDontNeed = 4;
 
-        [DllImport("libc", SetLastError = true, EntryPoint = "madvise")]
-        private static extern unsafe int madvise(void* addr, nuint len, int advice);
+        [LibraryImport("libc", EntryPoint = "madvise", SetLastError = true)]
+        private static unsafe partial int madvise(void* addr, nuint len, int advice);
 
         private static long ParseLimit()
         {
