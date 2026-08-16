@@ -78,3 +78,5 @@ launchSettings.json
 # Benchmark tooling artifacts
 benchmarks/engine_comparison/__pycache__/
 benchmarks/engine_comparison/results/
+/.vs
+/TensorSharp.Server/Properties/launchSettings.json
