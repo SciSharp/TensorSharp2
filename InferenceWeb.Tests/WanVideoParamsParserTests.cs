@@ -85,6 +85,33 @@ public class WanVideoParamsParserTests : IDisposable
         Assert.Equal(0, parsed.Fps);
     }
 
+    [Fact]
+    public void Parse_ImagePathAsBareFileName_ResolvesUnderUploadDirectory()
+    {
+        var options = BuildOptions(81, 16);
+        File.WriteAllBytes(Path.Combine(options.UploadDirectory, "cond.png"), new byte[] { 1, 2, 3 });
+        using var doc = JsonDocument.Parse("""{"imagePath":"cond.png"}""");
+
+        var parsed = WanVideoParamsParser.Parse(doc.RootElement, options, out string error);
+
+        Assert.Null(error);
+        Assert.Equal(new byte[] { 1, 2, 3 }, parsed.ImageBytes);
+    }
+
+    [Fact]
+    public void Parse_ImagePathOutsideUploadDirectory_IsRejected()
+    {
+        var options = BuildOptions(81, 16);
+        string outside = Path.Combine(_baseDir, "outside.png");
+        File.WriteAllBytes(outside, new byte[] { 1 });
+        using var doc = JsonDocument.Parse($$"""{"imagePath":{{JsonSerializer.Serialize(outside)}}}""");
+
+        var parsed = WanVideoParamsParser.Parse(doc.RootElement, options, out string error);
+
+        Assert.NotNull(error);
+        Assert.Null(parsed.ImageBytes);
+    }
+
     private ServerHostingOptions BuildOptions(int frames, int fps)
     {
         return ServerOptionsBuilder.Build(

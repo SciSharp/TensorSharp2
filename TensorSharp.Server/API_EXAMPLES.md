@@ -755,9 +755,10 @@ the prior turn's KV cache) for the corresponding session.
 curl -X POST http://localhost:5000/api/upload -F "file=@report.pdf"
 ```
 
-Every response carries `ok, path, url, mediaType, fileName`; the media type is
-classified by file extension (image / video / audio / pdf / text). The client
-then references the stored server `path` in the next `/api/chat` request —
+Every response carries `ok, file, url, mediaType, fileName`; the media type is
+classified by file extension (image / video / audio / pdf / text). `file` is
+the server-assigned filename inside the upload directory. The client then
+references that `file` name in the next `/api/chat` request —
 images via `imagePaths`, extracted video frames via `isVideo: true` +
 `imagePaths`, audio via `audioPaths`, and text content by inlining the returned
 `textContent` into the message.
@@ -780,7 +781,7 @@ curl -N -X POST http://localhost:5000/api/chat \
     "messages": [{
       "role": "user",
       "content": "[File: report.pdf]\n<textContent from the upload response>\n[End of file]\nPlease analyze the attached PDF document and summarize its content.",
-      "textFilePaths": ["<path from the upload response>"]
+      "textFilePaths": ["<file from the upload response>"]
     }],
     "maxTokens": 500
   }'
@@ -789,8 +790,8 @@ curl -N -X POST http://localhost:5000/api/chat \
 - **Scanned / image-only PDF**: if a vision-capable model is loaded (`--mmproj`
   present or the model has a built-in vision encoder), pages are rendered to
   images and returned like video frames (`renderedAsImages: true`, `frames[]`,
-  `frameUrls[]`, `framePaths[]`); pass the `framePaths` as `imagePaths` on the
-  next `/api/chat` request. Without a vision model the response instead carries
+  `frameUrls[]`); pass the `frames` names as `imagePaths` on the next
+  `/api/chat` request. Without a vision model the response instead carries
   `needsVision: true` plus a `warning` asking for a restart with a
   vision-capable model.
 
@@ -818,15 +819,16 @@ Response:
 {"ok": true, "url": "/uploads/edit-<guid>.png", "width": 1184, "height": 544, "elapsedSeconds": 40.4}
 ```
 
-A JSON body `{ "imagePath": "<server path from /api/upload>", "prompt": "...",
-"steps": 0, "cfg": 0, "seed": 42 }` is also accepted (`imagePath` must
-reference a previously uploaded file inside the upload directory). The
+A JSON body `{ "imagePath": "<file from /api/upload>", "prompt": "...",
+"steps": 0, "cfg": 0, "seed": 42 }` is also accepted (`imagePath` is the
+server filename of a previously uploaded file; absolute paths inside the
+upload directory are still accepted for older clients). The
 streaming variant emits SSE progress with live denoising previews:
 
 ```bash
 curl -N -X POST http://localhost:5000/api/image-edit/stream \
   -H "Content-Type: application/json" \
-  -d '{"imagePath": "<path from /api/upload>", "prompt": "Replace the background with a sunny beach", "seed": 42}'
+  -d '{"imagePath": "<file from /api/upload>", "prompt": "Replace the background with a sunny beach", "seed": 42}'
 ```
 
 Per-step events look like

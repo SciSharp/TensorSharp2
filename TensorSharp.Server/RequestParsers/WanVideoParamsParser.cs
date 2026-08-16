@@ -55,14 +55,14 @@ namespace TensorSharp.Server.RequestParsers
                 p.CfgCacheStride = ccv;
 
             // Conditioning image for Wan 2.2 image-to-video: either a previously uploaded
-            // file ("imagePath", Web UI flow) or inline base64 ("image", API flow; a
-            // data:...;base64, prefix is accepted).
+            // file ("imagePath" — the bare server filename from /api/upload, or a legacy
+            // absolute path inside the upload directory) or inline base64 ("image", API
+            // flow; a data:...;base64, prefix is accepted).
             if (root.TryGetProperty("imagePath", out var ip) && ip.ValueKind == JsonValueKind.String
                 && !string.IsNullOrWhiteSpace(ip.GetString()))
             {
-                string uploadRoot = Path.GetFullPath(options.UploadDirectory);
-                string full = Path.GetFullPath(ip.GetString());
-                if (!UploadPathGuard.IsInsideDirectory(uploadRoot, full) || !File.Exists(full))
+                if (!UploadFileReference.TryResolve(options.UploadDirectory, ip.GetString(), out string full)
+                    || !File.Exists(full))
                 {
                     error = "imagePath must reference a previously uploaded file.";
                     return p;

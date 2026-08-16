@@ -1153,26 +1153,26 @@ async function sendMessage() {
 
   attachmentsCopy.forEach(att => {
     if (att.mediaType === 'image') {
-      imagePaths.push(att.path);
+      imagePaths.push(att.file);
     } else if (att.mediaType === 'video') {
       isVideo = true;
-      if (att.framePaths) att.framePaths.forEach(f => imagePaths.push(f));
+      if (att.frames) att.frames.forEach(f => imagePaths.push(f));
     } else if (att.mediaType === 'audio') {
-      audioPaths.push(att.path);
+      audioPaths.push(att.file);
     } else if (att.mediaType === 'text' && att.textContent) {
       textParts.push(`[File: ${att.fileName}]\n${att.textContent}\n[End of file]`);
-      if (att.path) textFilePaths.push(att.path);
+      if (att.file) textFilePaths.push(att.file);
     } else if (att.mediaType === 'pdf') {
       if (att.textContent) {
         // Born-digital PDF: inline the extracted text.
         textParts.push(`[File: ${att.fileName}]\n${att.textContent}\n[End of file]`);
-        if (att.path) textFilePaths.push(att.path);
-      } else if (att.framePaths && att.framePaths.length) {
+        if (att.file) textFilePaths.push(att.file);
+      } else if (att.frames && att.frames.length) {
         // Scanned / image-only PDF: send its page images to the vision model.
-        // Keep the original PDF path as document provenance too, so the server
+        // Keep the original PDF file as document provenance too, so the server
         // never silently trims pages if the expanded vision prompt is too large.
-        if (att.path) textFilePaths.push(att.path);
-        att.framePaths.forEach(f => imagePaths.push(f));
+        if (att.file) textFilePaths.push(att.file);
+        att.frames.forEach(f => imagePaths.push(f));
       }
     }
   });
@@ -1781,7 +1781,7 @@ function uploadUrlForAttachment(att) {
   // Formats the browser can't render (HEIC/HEIF) get a server-generated PNG preview.
   if (att && att.previewUrl) return att.previewUrl;
   if (att && att.url) return att.url;
-  const raw = String((att && (att.path || att.fileName)) || '');
+  const raw = String((att && (att.file || att.fileName)) || '');
   if (!raw) return '';
   const normalized = raw.replace(/\\/g, '/');
   const fileName = normalized.split('/').filter(Boolean).pop() || raw;
