@@ -282,6 +282,17 @@ namespace TensorSharp.Runtime
             // Content field. To work around this AND to keep the renderer template-agnostic,
             // we inject the architecture-specific generation suffix as POST-render text
             // patching: walk the rendered text and prepend the suffix before each placeholder.
+            // Templates that carry a thinking channel emit an EMPTY `<think></think>`
+            // block ahead of a past assistant turn, to tell the model that turn's
+            // reasoning was dropped. The KV cache has no such block: turn N forwarded
+            // `<think>` + the model's real reasoning tokens. Left in place, that empty
+            // block inserts four tokens (`<think>`, `\n\n`, `</think>`, `\n\n`) right
+            // at the first assistant boundary, so the re-rendered prefix diverges there
+            // and every multi-turn request re-prefills the whole conversation. Drop it
+            // before injecting the suffix that reproduces what the cache actually saw.
+            if (enableThinking)
+                text = StripEmptyThinkBlockBeforePlaceholders(text);
+
             string suffix = GetAssistantGenerationSuffix(architecture, enableThinking);
             if (!string.IsNullOrEmpty(suffix))
                 text = InjectSuffixBeforePlaceholders(text, suffix);
@@ -311,6 +322,66 @@ namespace TensorSharp.Runtime
                 text = TrimWhitespaceBeforeEachPlaceholder(text);
 
             return TokenizeAndReplacePlaceholderSpans(tokenizer, text, rawTokensByPlaceholderIndex!);
+        }
+
+        /// <summary>
+        /// Remove an EMPTY thinking block (<c>&lt;think&gt;</c>, only whitespace,
+        /// <c>&lt;/think&gt;</c>, then whitespace) that the chat template emitted
+        /// immediately before a spliced assistant turn.
+        ///
+        /// Only an empty block is removed. A block with real reasoning text in it was
+        /// not produced by this mechanism and is left alone, so a client that replays
+        /// prior reasoning verbatim still renders it.
+        /// </summary>
+        internal static string StripEmptyThinkBlockBeforePlaceholders(string text)
+        {
+            const string open = "<think>";
+            const string close = "</think>";
+            if (text.IndexOf(PlaceholderSentinel) < 0 || text.IndexOf(open, StringComparison.Ordinal) < 0)
+                return text;
+
+            var sb = new System.Text.StringBuilder(text.Length);
+            int searchPos = 0;
+            while (searchPos < text.Length)
+            {
+                int sentinel = text.IndexOf(PlaceholderSentinel, searchPos);
+                if (sentinel < 0)
+                {
+                    sb.Append(text, searchPos, text.Length - searchPos);
+                    break;
+                }
+
+                // Walk back over trailing whitespace, then require "</think>".
+                int cursor = sentinel;
+                while (cursor > searchPos && char.IsWhiteSpace(text[cursor - 1]))
+                    cursor--;
+                if (cursor - searchPos >= close.Length
+                    && string.CompareOrdinal(text, cursor - close.Length, close, 0, close.Length) == 0)
+                {
+                    cursor -= close.Length;
+                    // Walking back over whitespace has to land exactly on the end of
+                    // "<think>" - anything else means the block held real reasoning.
+                    while (cursor > searchPos && char.IsWhiteSpace(text[cursor - 1]))
+                        cursor--;
+                    if (cursor - searchPos >= open.Length
+                        && string.CompareOrdinal(text, cursor - open.Length, open, 0, open.Length) == 0)
+                    {
+                        // Copy up to the "<think>" and drop the whole empty block,
+                        // INCLUDING the whitespace the template put after "</think>".
+                        // Keeping that whitespace would leave `assistant\n` + `\n\n`
+                        // where the cache has `assistant\n` + `<think>\n`, which just
+                        // moves the divergence rather than removing it.
+                        sb.Append(text, searchPos, (cursor - open.Length) - searchPos);
+                        sb.Append(text[sentinel]);
+                        searchPos = sentinel + 1;
+                        continue;
+                    }
+                }
+
+                sb.Append(text, searchPos, sentinel - searchPos + 1);
+                searchPos = sentinel + 1;
+            }
+            return sb.ToString();
         }
 
         private static string TrimWhitespaceBeforeEachPlaceholder(string text)

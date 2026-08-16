@@ -139,27 +139,36 @@ namespace TensorSharp.Cli
                     "ID; every node passes the identical list. Requires --tp-node-id. Default: none.",
                     "--tp-peers 192.168.1.10:9500,192.168.1.11:9500"),
             }),
-            ("Sampling (defaults are greedy/deterministic)", new[]
+            ("Sampling (batch runs are greedy; interactive chat samples - see below)", new[]
             {
                 new OptionHelp("--temperature <f>",
                     "Sampling temperature: 0 = greedy (always the most probable token), higher = more random. " +
-                    "Typical range: 0.0-2.0. Default: 0.",
+                    "Typical range: 0.0-2.0. Default: 0 for one-shot/batch runs, 0.8 for --interactive " +
+                    "(overridden by the model's own general.sampling.temp when the GGUF ships one). " +
+                    "Greedy chat degenerates into endless repetition on long answers, which is why " +
+                    "--interactive does not default to it.",
                     "--temperature 0.7"),
                 new OptionHelp("--top-k <N>",
-                    "Keep only the K most probable tokens; 0 disables the filter. Typical range: 20-100. Default: 0.",
+                    "Keep only the K most probable tokens; 0 disables the filter. Typical range: 20-100. " +
+                    "Default: 0 for one-shot/batch runs, 40 for --interactive (or the GGUF's general.sampling.top_k).",
                     "--top-k 40"),
                 new OptionHelp("--top-p <f>",
                     "Nucleus sampling: keep the smallest token set whose cumulative probability exceeds P; 1.0 " +
-                    "disables. Range: 0.0-1.0. Default: 1.0.",
+                    "disables. Range: 0.0-1.0. Default: 1.0 for one-shot/batch runs, 0.95 for --interactive " +
+                    "(or the GGUF's general.sampling.top_p).",
                     "--top-p 0.9"),
                 new OptionHelp("--min-p <f>",
                     "Drop tokens whose probability is below min-p x the top token's probability; 0 disables. " +
-                    "Range: 0.0-1.0. Default: 0.",
+                    "Range: 0.0-1.0. Default: 0 for one-shot/batch runs, 0.05 for --interactive.",
                     "--min-p 0.05"),
                 new OptionHelp("--repeat-penalty <f>",
                     "Multiplicative penalty on recently generated tokens; 1.0 = none, > 1.0 discourages " +
                     "repetition. Typical range: 1.0-1.5. Default: 1.0.",
                     "--repeat-penalty 1.1"),
+                new OptionHelp("--penalty-last-n <N>",
+                    "How many of the most recent tokens the repeat/presence/frequency penalties consider; " +
+                    "0 disables history penalties, -1 uses the whole history. Default: 64.",
+                    "--penalty-last-n 128"),
                 new OptionHelp("--presence-penalty <f>",
                     "Additive penalty on any token that has already appeared; 0 disables. Typical range: 0.0-2.0. " +
                     "Default: 0.",

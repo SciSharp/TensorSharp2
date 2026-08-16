@@ -22,6 +22,10 @@ namespace TensorSharp.Runtime
         private readonly Random _rng;
         private float[]? _scoreBuffer;
         private int[]? _indexBuffer;
+        // Reused top-k heap. Sized k (typically 20-40), so this is only about
+        // dropping one small allocation per sampled token, but the sampler runs
+        // once per token for the life of the process.
+        private int[]? _heapBuffer;
         private readonly Dictionary<int, int> _penaltyCounts = new();
         private int[]? _penaltyTokenBuffer;
         private float[]? _penaltyOriginalBuffer;
@@ -104,7 +108,7 @@ namespace TensorSharp.Runtime
             int[] candidates = ApplyTopK(scores);
             candidates = ApplyTopP(scores, candidates);
             candidates = ApplyMinP(scores, candidates);
-            ApplyTemperature(scores, _config.Temperature);
+            ApplyTemperature(scores, candidates, _config.Temperature);
 
             return SampleFromCandidates(scores, candidates);
         }
@@ -303,11 +307,21 @@ namespace TensorSharp.Runtime
 
         #region Temperature
 
-        private static void ApplyTemperature(float[] scores, float temperature)
+        /// <summary>
+        /// Scale the surviving candidates by 1/temperature.
+        /// <para>
+        /// Only <paramref name="candidates"/> are touched. Nothing reads
+        /// <paramref name="scores"/> outside that set afterwards
+        /// (<see cref="SampleFromCandidates"/> indexes exclusively through the
+        /// candidate list), so this is identical to scaling the whole vocabulary —
+        /// it just drops a 248K-element pass per generated token.
+        /// </para>
+        /// </summary>
+        private static void ApplyTemperature(float[] scores, int[] candidates, float temperature)
         {
             float invT = 1.0f / temperature;
-            for (int i = 0; i < scores.Length; i++)
-                scores[i] *= invT;
+            for (int i = 0; i < candidates.Length; i++)
+                scores[candidates[i]] *= invT;
         }
 
         #endregion
@@ -342,20 +356,25 @@ namespace TensorSharp.Runtime
             int n = scores.Length;
             int k = _config.TopK > 0 ? Math.Min(_config.TopK, n) : n;
 
-            int[] indices = _indexBuffer != null && _indexBuffer.Length == n
-                ? _indexBuffer
-                : (_indexBuffer = new int[n]);
-            for (int i = 0; i < n; i++) indices[i] = i;
-
             if (k >= n)
             {
+                // Only the no-top-k branch needs the identity permutation. Filling it
+                // unconditionally wrote a vocab-sized array (248k ints on Qwen3.x) on
+                // every sampled token and then discarded it whenever top_k was set,
+                // which is the common case (the model's own recommendation is 20).
+                int[] indices = _indexBuffer != null && _indexBuffer.Length == n
+                    ? _indexBuffer
+                    : (_indexBuffer = new int[n]);
+                for (int i = 0; i < n; i++) indices[i] = i;
                 Array.Sort(indices, new ScoreComparer(scores));
                 return indices;
             }
 
             // heap[0..k) is a min-heap on (score, -id): its root is the weakest
             // member of the running top-k, so one comparison rejects most tokens.
-            var heap = new int[k];
+            int[] heap = _heapBuffer != null && _heapBuffer.Length == k
+                ? _heapBuffer
+                : (_heapBuffer = new int[k]);
             int count = 0;
             for (int i = 0; i < n; i++)
             {

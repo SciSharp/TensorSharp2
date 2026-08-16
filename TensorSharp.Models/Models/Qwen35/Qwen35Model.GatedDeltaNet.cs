@@ -1743,7 +1743,22 @@ namespace TensorSharp.Models
                             && _ssmConv1dW[l] != null && _ssmDtBiasW[l] != null && _ssmAW[l] != null
                             && _ssmNormW[l] != null && HasW(_ssmOutQW[l], _ssmOutF32[l])
                             && _deltaStateTensor[l] != null && _convState[l] != null;
-                    if (!ok) { _fvUnsupported = true; return false; }
+                    if (!ok)
+                    {
+                        // Latched for the process lifetime, so this must say why:
+                        // every subsequent prefill silently drops to the op-by-op
+                        // loop. The KV-cache dtype is by far the most common cause
+                        // (a block-quantized cache is only fused-graph-capable on
+                        // ggml_cuda), and it used to be invisible.
+                        _fvUnsupported = true;
+                        return FvBail(
+                            $"layer {l} ({(_isRecurrent[l] ? "recurrent" : "attention")}, moe={isMoeL}) " +
+                            "is missing a required weight/state" +
+                            (!_isRecurrent[l] && _kvCacheK[l] != null
+                                && !IsFusedGraphKvCacheDType(_kvCacheK[l].ElementType)
+                                ? $" (KV cache dtype {_kvCacheK[l].ElementType} is unsupported by the fused prefill graph on {_backend})"
+                                : ""));
+                    }
                     _fvGdnSlot[l] = _isRecurrent[l] ? gdnCount++ : -1;
                 }
                 _fvConvIn = Marshal.AllocHGlobal(Math.Max(1, gdnCount) * convBlock * sizeof(float));
