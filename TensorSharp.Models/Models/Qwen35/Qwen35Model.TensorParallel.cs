@@ -1226,14 +1226,27 @@ namespace TensorSharp.Models
             while (newCapacity < requiredSeqLen)
                 newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
 
+            // Ops.Copy below is a HOST-side copy, but the fused TP paths (both the
+            // per-rank attention block and the whole-model decode) leave K/V
+            // device-resident and only mark _tpAttnKvDeviceOnly. Without this drain
+            // the copy reads a host mirror that is stale by however many tokens have
+            // been decoded since the last sync, and every attention layer silently
+            // inherits garbage history from the grow onward — fluent output that
+            // degenerates into repetition, on tp>=2 only, once the prompt+generation
+            // crosses the initial capacity. The non-TP EnsureCacheCapacity has done
+            // this from the start; the TP twin never did.
+            SyncQwen35TpAttentionKvToHost();
             // The persistent TP decode graphs bake the old cache tensors'
             // device buffers; drop them before those tensors are disposed.
+            // (SyncQwen35TpAttentionKvToHost also drops them, but only when it had
+            // something to drain.)
             DropTpFusedDecodeGraphs();
 
             int tp = TpDegree;
             int numKVHeadsPerGpu = Config.NumKVHeads / GlobalTpDegree;
             int headDim = Config.HeadDim;
             DType kvDtype = _kvCacheDtype.ToDType();
+            int previousRank = IsGgmlBackend ? GgmlBasicOps.GetActiveRank() : 0;
 
             for (int l = 0; l < TotalLayerCount; l++)
             {
@@ -1259,12 +1272,27 @@ namespace TensorSharp.Models
                         Ops.Copy(dstV, srcV);
                     }
 
+                    // Evict the device-copy entries keyed by the OLD host pointers
+                    // while those pointers are still valid: the allocator may hand
+                    // the same address back for a later tensor, which would then
+                    // bind a stale device buffer. The cache is per rank, hence the
+                    // rank switch (same pattern as ResetTpKVCache).
+                    if (IsGgmlBackend)
+                    {
+                        GgmlBasicOps.SetActiveRank(r);
+                        InvalidateTensorDeviceCache(_tpKvCacheK[l][r]);
+                        InvalidateTensorDeviceCache(_tpKvCacheV[l][r]);
+                    }
+
                     _tpKvCacheK[l][r].Dispose();
                     _tpKvCacheV[l][r].Dispose();
                     _tpKvCacheK[l][r] = newK;
                     _tpKvCacheV[l][r] = newV;
                 }
             }
+
+            if (IsGgmlBackend)
+                GgmlBasicOps.SetActiveRank(previousRank);
 
             _tpKvCacheCapacity = newCapacity;
             Console.WriteLine($"Expanded Qwen3.5 TP attention cache to {newCapacity} tokens ({tp} GPUs).");

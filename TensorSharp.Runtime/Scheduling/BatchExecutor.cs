@@ -1348,22 +1348,15 @@ namespace TensorSharp.Runtime.Scheduling
 
             int liveLen = Math.Min(_liveCacheLen, _liveCacheSeq.NumTotalTokens);
 
-            // The live cache holds every token the model was FORWARDED, and a
-            // finished turn's last forward is the sampled EOS - the engine never
-            // publishes it (InferenceEngine stops on EOS without emitting), so the
-            // next turn's prompt re-derives that boundary from the chat template
-            // instead of from the previous turn's raw output tokens. Whether the
-            // two agree depends on the template and on how the tokenizer treats the
-            // literal end-of-turn marker, and because the check below is
-            // all-or-nothing, a single disagreement at that one position drops
-            // reuse from ~100% to exactly 0. Ignore the trailing EOS: the prefix
-            // before it is what actually has to match, and stopping one token
-            // short costs a single re-forwarded token.
-            if (liveLen > 0 && _model.Tokenizer != null
-                && _model.Tokenizer.IsEos(_liveCacheSeq.TokenAt(liveLen - 1)))
-            {
-                liveLen--;
-            }
+            // NOTE: do NOT shorten liveLen here. The adopted length becomes the
+            // sequence's NumComputedTokens, and EnsureOwnership only keeps the live
+            // cache when `_liveCacheLen == seq.NumComputedTokens` exactly - the model
+            // has no way to drop a token off the end of its cache (Qwen3.x cannot
+            // truncate its recurrent state at all). Returning liveLen-1 gets the
+            // continuation planned and then silently discarded one step later, which
+            // is worse than not planning it: an EOS-terminated turn reported 0% reuse
+            // while a max_tokens-terminated turn of the same conversation reported
+            // ~95%.
 
             if (liveLen <= cap)
                 return LiveContinuationDeclined(seq,
@@ -1379,8 +1372,20 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 if (seq.PromptTokens[i] != _liveCacheSeq.TokenAt(i))
                 {
+                    // A mismatch at the very last cached position is its own story:
+                    // that token is the sampled EOS, which the engine stops on and
+                    // never publishes, so turn N+1 re-derives the boundary from the
+                    // chat template rather than from the previous turn's raw output
+                    // tokens. Nothing can be salvaged (the model cannot drop the
+                    // trailing token), but it is worth naming so it is not confused
+                    // with a template/tokenizer divergence earlier in the prompt.
+                    bool trailingEos = i == liveLen - 1
+                        && _model.Tokenizer != null
+                        && _model.Tokenizer.IsEos(_liveCacheSeq.TokenAt(i));
                     return LiveContinuationDeclined(seq,
-                        $"prompt diverges from the live cache at token {i} of {liveLen} " +
+                        (trailingEos
+                            ? $"prompt does not reproduce the cached trailing EOS at token {i} of {liveLen} "
+                            : $"prompt diverges from the live cache at token {i} of {liveLen} ") +
                         $"(prompt={seq.PromptTokens[i]}, cached={_liveCacheSeq.TokenAt(i)}); " +
                         $"context prompt=[{DescribeTokenWindow(k => seq.PromptTokens[k], seq.PromptTokens.Count, i)}] " +
                         $"cached=[{DescribeTokenWindow(k => _liveCacheSeq.TokenAt(k), liveLen, i)}]");
@@ -1432,12 +1437,24 @@ namespace TensorSharp.Runtime.Scheduling
         public bool TryAdoptLiveCache(SequenceState seq, int lcp)
         {
             if (seq == null || lcp <= 0) return false;
-            if (seq.BlockTable.NumBlocks != 0) return false;
+            if (seq.BlockTable.NumBlocks != 0)
+            {
+                LiveContinuationDeclined(seq,
+                    $"blocks already reserved ({seq.BlockTable.NumBlocks}) before adoption");
+                return false;
+            }
 
             int neededBlocks = (lcp + _blockSize - 1) / _blockSize;
             var blocks = _pool.AllocateNew(neededBlocks);
             if (blocks == null)
-                return false; // pool pressure -> let the caller use the capped pool path
+            {
+                // Pool pressure -> the caller falls back to the capped pool path.
+                // Silent before: a planned continuation that failed HERE looked
+                // exactly like one that was never planned.
+                LiveContinuationDeclined(seq,
+                    $"block pool could not reserve {neededBlocks} block(s) for the {lcp}-token prefix");
+                return false;
+            }
 
             for (int i = 0; i < blocks.Length; i++)
                 seq.BlockTable.AppendBlock(blocks[i]);
