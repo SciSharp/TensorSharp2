@@ -1134,6 +1134,16 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             var messages = ChatMessageParser.ParseWebUi(messagesEl);
 
+            string attachmentError = ChatMessageParser.ValidateAttachmentPaths(messages, _options.UploadDirectory);
+            if (attachmentError != null)
+            {
+                webUiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                    "/api/chat rejected: attachment path outside upload directory");
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsJsonAsync(new { error = attachmentError });
+                return;
+            }
+
             SseWriter.ApplyHeaders(ctx.Response);
 
             using var ticket = _queue.Enqueue(ctx.RequestAborted);
