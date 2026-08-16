@@ -41,17 +41,20 @@ namespace TensorSharp.Server.ProtocolAdapters
         private readonly ModelService _svc;
         private readonly InferenceQueue _queue;
         private readonly ServerHostingOptions _options;
+        private readonly UploadStoragePolicy _uploads;
         private readonly ILoggerFactory _loggerFactory;
 
         public OllamaAdapter(
             ModelService svc,
             InferenceQueue queue,
             ServerHostingOptions options,
+            UploadStoragePolicy uploads,
             ILoggerFactory loggerFactory)
         {
             _svc = svc ?? throw new ArgumentNullException(nameof(svc));
             _queue = queue ?? throw new ArgumentNullException(nameof(queue));
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            _uploads = uploads ?? throw new ArgumentNullException(nameof(uploads));
             _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         }
 
@@ -142,7 +145,19 @@ namespace TensorSharp.Server.ProtocolAdapters
                     ? SamplingConfigParser.ReadRequestedMaxTokens(opts, "num_predict")
                     : null);
 
-            var imagePaths = ChatMessageParser.DecodeBase64Images(body, _options.UploadDirectory);
+            List<string> imagePaths;
+            try
+            {
+                imagePaths = ChatMessageParser.DecodeBase64Images(body, _uploads);
+            }
+            catch (UploadLimitExceededException ex)
+            {
+                generateLogger.LogWarning(LogEventIds.UploadRejected,
+                    "/api/generate attachment rejected: {Reason}", ex.Message);
+                ctx.Response.StatusCode = ex.StatusCode;
+                await ctx.Response.WriteAsJsonAsync(new { error = ex.Message });
+                return;
+            }
 
             generateLogger.LogInformation(LogEventIds.ChatStarted,
                 "/api/generate request: model={Model} stream={Stream} maxTokens={MaxTokens} images={ImageCount} promptChars={PromptLength} prompt=\"{Prompt}\"",
@@ -286,7 +301,19 @@ namespace TensorSharp.Server.ProtocolAdapters
                     ? SamplingConfigParser.ReadRequestedMaxTokens(opts, "num_predict")
                     : null);
 
-            var messages = ChatMessageParser.ParseOllama(messagesEl, _options.UploadDirectory);
+            List<ChatMessage> messages;
+            try
+            {
+                messages = ChatMessageParser.ParseOllama(messagesEl, _uploads);
+            }
+            catch (UploadLimitExceededException ex)
+            {
+                ollamaLogger.LogWarning(LogEventIds.UploadRejected,
+                    "/api/chat/ollama attachment rejected: {Reason}", ex.Message);
+                ctx.Response.StatusCode = ex.StatusCode;
+                await ctx.Response.WriteAsJsonAsync(new { error = ex.Message });
+                return;
+            }
             var ollamaTools = ToolFunctionParser.ParseOllama(body);
             bool ollamaThink = body.TryGetProperty("think", out var thinkProp) && thinkProp.GetBoolean();
 

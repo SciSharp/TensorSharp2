@@ -39,6 +39,7 @@ namespace TensorSharp.Server.ProtocolAdapters
         private readonly ModelService _svc;
         private readonly InferenceQueue _queue;
         private readonly ServerHostingOptions _options;
+        private readonly UploadStoragePolicy _uploads;
         private readonly ILoggerFactory _loggerFactory;
         private readonly IResponsesStore _store;
 
@@ -46,12 +47,14 @@ namespace TensorSharp.Server.ProtocolAdapters
             ModelService svc,
             InferenceQueue queue,
             ServerHostingOptions options,
+            UploadStoragePolicy uploads,
             ILoggerFactory loggerFactory,
             IResponsesStore store)
         {
             _svc = svc ?? throw new ArgumentNullException(nameof(svc));
             _queue = queue ?? throw new ArgumentNullException(nameof(queue));
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            _uploads = uploads ?? throw new ArgumentNullException(nameof(uploads));
             _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
             _store = store ?? throw new ArgumentNullException(nameof(store));
         }
@@ -110,7 +113,18 @@ namespace TensorSharp.Server.ProtocolAdapters
             int maxOutputTokens = _options.ResolveMaxTokens(requestedOutputTokens);
 
             var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
-            var messages = ChatMessageParser.ParseResponsesInput(inputEl, instructions, _options.UploadDirectory);
+            List<ChatMessage> messages;
+            try
+            {
+                messages = ChatMessageParser.ParseResponsesInput(inputEl, instructions, _uploads);
+            }
+            catch (UploadLimitExceededException ex)
+            {
+                logger.LogWarning(LogEventIds.UploadRejected,
+                    "/v1/responses attachment rejected: {Reason}", ex.Message);
+                await WriteErrorAsync(ctx, ex.StatusCode, ex.Message);
+                return;
+            }
             var tools = ToolFunctionParser.ParseOpenAIResponses(body);
             bool enableThinking = body.TryGetProperty("reasoning", out var reasoningEl) && reasoningEl.ValueKind == JsonValueKind.Object;
 

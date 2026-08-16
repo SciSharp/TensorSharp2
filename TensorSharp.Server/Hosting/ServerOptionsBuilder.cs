@@ -42,6 +42,7 @@ namespace TensorSharp.Server.Hosting
                 out SamplingOverrides configuredSampling,
                 out SamplingPrecedence? configuredPrecedence,
                 out ListenOverrides configuredListen,
+                out UploadLimitOverrides configuredUploads,
                 out bool configuredNoWebUi);
 
             if (!string.IsNullOrWhiteSpace(configuredMmProj) && string.IsNullOrWhiteSpace(configuredModel))
@@ -88,6 +89,12 @@ namespace TensorSharp.Server.Hosting
 
             string listenUrls = ResolveListenUrls(configuredListen);
 
+            long uploadMaxFileBytes = ResolveUploadMb(
+                configuredUploads.MaxFileMb, "TS_UPLOAD_MAX_MB", UploadStoragePolicy.DefaultMaxFileBytes);
+            long uploadQuotaBytes = ResolveUploadMb(
+                configuredUploads.QuotaMb, "TS_UPLOAD_QUOTA_MB", 0);
+            TimeSpan? uploadTtl = ResolveUploadTtl(configuredUploads.TtlHours, "TS_UPLOAD_TTL_HOURS");
+
             // TS_NO_WEBUI follows the TENSORSHARP_LOG_FILE convention: set to
             // anything but "0" counts as on.
             string noWebUiEnv = Environment.GetEnvironmentVariable("TS_NO_WEBUI");
@@ -108,14 +115,49 @@ namespace TensorSharp.Server.Hosting
                 fileLoggingEnabled,
                 defaultSampling,
                 listenUrls,
+                uploadMaxFileBytes,
+                uploadQuotaBytes,
+                uploadTtl,
                 webUiEnabled);
         }
 
         /// <summary>Backend originally requested via <c>--backend</c> / <c>BACKEND</c> (without the OS-default fallback).</summary>
         public static string ReadConfiguredBackendInput(string[] args)
         {
-            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _, out _, out _, out _);
+            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _, out _, out _, out _, out _);
             return configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
+        }
+
+        /// <summary>Upload storage-limit overrides captured from the CLI (see <see cref="UploadStoragePolicy"/>).</summary>
+        private struct UploadLimitOverrides
+        {
+            public int? MaxFileMb;
+            public int? QuotaMb;
+            public double? TtlHours;
+        }
+
+        /// <summary>Resolve one MB-denominated upload limit: CLI flag, then env var, then <paramref name="fallbackBytes"/>.</summary>
+        private static long ResolveUploadMb(int? cliMb, string envVar, long fallbackBytes)
+        {
+            if (cliMb.HasValue)
+                return cliMb.Value * 1024L * 1024L;
+            if (TryReadEnvInt(envVar, out int envMb) && envMb > 0)
+                return envMb * 1024L * 1024L;
+            return fallbackBytes;
+        }
+
+        private static TimeSpan? ResolveUploadTtl(double? cliHours, string envVar)
+        {
+            if (cliHours.HasValue)
+                return TimeSpan.FromHours(cliHours.Value);
+            string raw = Environment.GetEnvironmentVariable(envVar);
+            if (!string.IsNullOrWhiteSpace(raw)
+                && double.TryParse(raw.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double hours)
+                && hours > 0)
+            {
+                return TimeSpan.FromHours(hours);
+            }
+            return null;
         }
 
         /// <summary>Listen address overrides captured from the CLI.</summary>
@@ -806,6 +848,7 @@ namespace TensorSharp.Server.Hosting
             out SamplingOverrides configuredSampling,
             out SamplingPrecedence? configuredPrecedence,
             out ListenOverrides configuredListen,
+            out UploadLimitOverrides configuredUploads,
             out bool configuredNoWebUi)
         {
             configuredModel = null;
@@ -817,6 +860,7 @@ namespace TensorSharp.Server.Hosting
             configuredSampling = default;
             configuredPrecedence = null;
             configuredListen = default;
+            configuredUploads = default;
             configuredNoWebUi = false;
 
             for (int i = 0; i < args.Length; i++)
@@ -959,9 +1003,39 @@ namespace TensorSharp.Server.Hosting
                     continue;
                 }
 
+                if (TryReadOption(args, ref i, "--upload-max-mb", out string uploadMaxOption))
+                {
+                    if (!TryParsePositiveInt(uploadMaxOption, out int parsedUploadMax))
+                        throw new ArgumentException(
+                            $"Invalid value for --upload-max-mb: '{uploadMaxOption}'. Expected a positive number of megabytes.");
+                    configuredUploads.MaxFileMb = parsedUploadMax;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--upload-quota-mb", out string uploadQuotaOption))
+                {
+                    if (!TryParsePositiveInt(uploadQuotaOption, out int parsedUploadQuota))
+                        throw new ArgumentException(
+                            $"Invalid value for --upload-quota-mb: '{uploadQuotaOption}'. Expected a positive number of megabytes.");
+                    configuredUploads.QuotaMb = parsedUploadQuota;
+                    continue;
+                }
+
                 if (string.Equals(args[i], "--no-webui", StringComparison.OrdinalIgnoreCase))
                 {
                     configuredNoWebUi = true;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--upload-ttl-hours", out string uploadTtlOption))
+                {
+                    if (!double.TryParse(uploadTtlOption, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsedTtlHours)
+                        || parsedTtlHours <= 0)
+                    {
+                        throw new ArgumentException(
+                            $"Invalid value for --upload-ttl-hours: '{uploadTtlOption}'. Expected a positive number of hours.");
+                    }
+                    configuredUploads.TtlHours = parsedTtlHours;
                     continue;
                 }
 
@@ -1137,6 +1211,7 @@ namespace TensorSharp.Server.Hosting
                 "--offload-cpu",
                 "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",
                 "--tp", "--tp-node-id", "--tp-peers",
+                "--upload-max-mb", "--upload-quota-mb", "--upload-ttl-hours",
                 "--config",
             };
             string best = null;

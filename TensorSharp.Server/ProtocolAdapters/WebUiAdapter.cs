@@ -50,6 +50,7 @@ namespace TensorSharp.Server.ProtocolAdapters
         private readonly InferenceQueue _queue;
         private readonly SessionManager _sessions;
         private readonly ServerHostingOptions _options;
+        private readonly UploadStoragePolicy _uploads;
         private readonly ILoggerFactory _loggerFactory;
 
         public WebUiAdapter(
@@ -57,12 +58,14 @@ namespace TensorSharp.Server.ProtocolAdapters
             InferenceQueue queue,
             SessionManager sessions,
             ServerHostingOptions options,
+            UploadStoragePolicy uploads,
             ILoggerFactory loggerFactory)
         {
             _svc = svc ?? throw new ArgumentNullException(nameof(svc));
             _queue = queue ?? throw new ArgumentNullException(nameof(queue));
             _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            _uploads = uploads ?? throw new ArgumentNullException(nameof(uploads));
             _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         }
 
@@ -238,6 +241,13 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return Results.BadRequest(new { error = "No file uploaded" });
             }
 
+            if (!_uploads.TryReserveClientWrite(file.Length, out string limitError, out int limitStatus))
+            {
+                uploadLogger.LogWarning(LogEventIds.UploadRejected,
+                    "Upload rejected: {Reason} (name={FileName} bytes={Length})", limitError, file.FileName, file.Length);
+                return Results.Json(new { error = limitError }, statusCode: limitStatus);
+            }
+
             string ext = Path.GetExtension(file.FileName).ToLowerInvariant();
             // Classify before anything touches disk: an upload with an extension
             // outside the allow-list is rejected without ever being written, so
@@ -260,8 +270,17 @@ namespace TensorSharp.Server.ProtocolAdapters
             string savePath = Path.Combine(_options.UploadDirectory, safeFileName);
             string uploadUrl = BuildUploadUrl(safeFileName);
 
-            using (var stream = File.Create(savePath))
-                await file.CopyToAsync(stream);
+            try
+            {
+                using (var stream = File.Create(savePath))
+                    await file.CopyToAsync(stream);
+            }
+            catch
+            {
+                _uploads.Release(file.Length);
+                try { File.Delete(savePath); } catch { /* best effort */ }
+                throw;
+            }
 
             // Include the full saved path and the classified media type so this entry
             // is self-sufficient for tracing back from the per-turn chat log
@@ -273,6 +292,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             if (mediaType == "video")
             {
                 var frames = MediaHelper.ExtractVideoFrames(savePath);
+                _uploads.RecordFiles(frames);
                 return Results.Json(new
                 {
                     ok = true,
@@ -409,6 +429,8 @@ namespace TensorSharp.Server.ProtocolAdapters
                     return Results.BadRequest(new { ok = false, error = "Could not read the PDF: " + ex.Message });
                 }
 
+                _uploads.RecordFiles(pdfImages.ImagePaths);
+
                 if (pdfImages.ImagePaths.Count == 0)
                 {
                     uploadLogger.LogWarning(LogEventIds.UploadReceived,
@@ -485,6 +507,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                             img = TensorSharp.Models.QwenImage.ImageIO.ResizeToArea(img, previewArea, multiple: 1);
                         TensorSharp.Models.QwenImage.ImageIO.SavePng(previewPath, img);
                     });
+                    _uploads.RecordFile(previewPath);
                     return Results.Json(new
                     {
                         ok = true,
@@ -522,6 +545,14 @@ namespace TensorSharp.Server.ProtocolAdapters
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.ImageEdit");
             if (_svc.Model is not TensorSharp.Models.QwenImage.QwenImageModel editModel)
                 return Results.BadRequest(new { error = "The loaded model is not a Qwen-Image-Edit model." });
+
+            // Fail before the (slow) diffusion runs, not after: the result PNG
+            // has nowhere to go once the upload quota is exhausted.
+            if (!_uploads.HasQuotaHeadroom(out string editQuotaError))
+            {
+                logger.LogWarning(LogEventIds.UploadRejected, "Image edit rejected: {Reason}", editQuotaError);
+                return Results.Json(new { error = editQuotaError }, statusCode: 507);
+            }
 
             string prompt; int steps; float cfg; long seed; long targetArea = 0;
             var imageBytesList = new List<byte[]>();
@@ -585,6 +616,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 }
             });
             sw.Stop();
+            _uploads.RecordFile(outPath);
 
             string url = BuildUploadUrl(outName);
             logger.LogInformation(LogEventIds.UploadReceived,
@@ -666,6 +698,12 @@ namespace TensorSharp.Server.ProtocolAdapters
             if (imgError != null)
                 return Results.BadRequest(new { error = imgError });
 
+            if (!_uploads.HasQuotaHeadroom(out string videoQuotaError))
+            {
+                logger.LogWarning(LogEventIds.UploadRejected, "Video generate rejected: {Reason}", videoQuotaError);
+                return Results.Json(new { error = videoQuotaError }, statusCode: 507);
+            }
+
             string outName = $"video-{Guid.NewGuid():N}.mp4";
             string outPath = Path.Combine(_options.UploadDirectory, outName);
             logger.LogInformation(LogEventIds.UploadReceived,
@@ -683,6 +721,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 }
             });
             sw.Stop();
+            _uploads.RecordFile(outPath);
 
             string url = BuildUploadUrl(outName);
             logger.LogInformation(LogEventIds.UploadReceived,
@@ -718,6 +757,13 @@ namespace TensorSharp.Server.ProtocolAdapters
             var p = ParseVideoParams(root, out string imgError);
             if (imgError != null)
                 return Results.BadRequest(new { error = new { message = imgError, type = "invalid_request_error" } });
+
+            if (!_uploads.HasQuotaHeadroom(out string oaiVideoQuotaError))
+            {
+                logger.LogWarning(LogEventIds.UploadRejected, "OpenAI video generation rejected: {Reason}", oaiVideoQuotaError);
+                return Results.Json(new { error = new { message = oaiVideoQuotaError, type = "server_error" } }, statusCode: 507);
+            }
+
             if (root.TryGetProperty("size", out var sz) && sz.ValueKind == JsonValueKind.String)
             {
                 var parts = (sz.GetString() ?? "").Split('x');
@@ -745,6 +791,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 }
             });
             sw.Stop();
+            _uploads.RecordFile(outPath);
 
             string url = BuildUploadUrl(outName);
             logger.LogInformation(LogEventIds.UploadReceived,
@@ -808,6 +855,13 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return;
             }
 
+            if (!_uploads.HasQuotaHeadroom(out string videoStreamQuotaError))
+            {
+                logger.LogWarning(LogEventIds.UploadRejected, "Video generate (stream) rejected: {Reason}", videoStreamQuotaError);
+                await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = videoStreamQuotaError }, ct);
+                return;
+            }
+
             string outName = $"video-{Guid.NewGuid():N}.mp4";
             string outPath = Path.Combine(_options.UploadDirectory, outName);
             logger.LogInformation(LogEventIds.UploadReceived,
@@ -840,6 +894,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                         });
                         var video = videoModel.GenerateVideo(prompt, p);
                         string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outPath, video.Frames, video.Fps);
+                        _uploads.RecordFile(outPath);
                         channel.Writer.TryWrite(new VideoFrame
                         {
                             Final = true, Url = BuildUploadUrl(outName),
@@ -926,6 +981,13 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return;
             }
 
+            if (!_uploads.HasQuotaHeadroom(out string editStreamQuotaError))
+            {
+                logger.LogWarning(LogEventIds.UploadRejected, "Image edit (stream) rejected: {Reason}", editStreamQuotaError);
+                await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = editStreamQuotaError }, ct);
+                return;
+            }
+
             // Parse the Web UI JSON body (mirrors the JSON branch of ImageEditAsync).
             string prompt; int steps; float cfg; long seed; long targetArea = 0;
             var imageBytesList = new List<byte[]>();
@@ -1004,6 +1066,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                         if (targetArea > 0) p.TargetArea = targetArea;
                         var output = editModel.EditImage(prompt, inputs, p);
                         TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
+                        _uploads.RecordFile(outPath);
                         channel.Writer.TryWrite(new EditFrame
                         {
                             Final = true, Url = BuildUploadUrl(outName),
