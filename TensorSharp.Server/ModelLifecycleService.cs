@@ -18,6 +18,7 @@ namespace TensorSharp.Server
     internal sealed class ModelLifecycleService : IDisposable
     {
         private readonly ILogger _logger;
+        private readonly Func<string, BackendType, ITensorParallelGroup, string, ModelBase> _createModel;
 
         private ModelBase _model;
         private string _loadedModelPath;
@@ -25,8 +26,17 @@ namespace TensorSharp.Server
         private BackendType _backend;
 
         public ModelLifecycleService(ILogger logger)
+            : this(logger, static (path, backend, tpGroup, draftPath) =>
+                ModelBase.Create(path, backend, tpGroup: tpGroup, draftModelPath: draftPath))
+        {
+        }
+
+        /// <summary>Test seam: <paramref name="createModel"/> stands in for
+        /// <see cref="ModelBase.Create(string, BackendType, int, ITensorParallelGroup, string)"/>.</summary>
+        internal ModelLifecycleService(ILogger logger, Func<string, BackendType, ITensorParallelGroup, string, ModelBase> createModel)
         {
             _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+            _createModel = createModel;
         }
 
         public bool IsLoaded => _model != null;
@@ -66,6 +76,73 @@ namespace TensorSharp.Server
                 Path.GetFileName(modelPath), Path.GetFileName(mmProjPath ?? string.Empty),
                 backendStr ?? "(default)", modelPath, mmProjPath ?? "(none)");
 
+            try
+            {
+                ValidateModelFiles(modelPath, mmProjPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(LogEventIds.ModelLoadFailed, ex,
+                    "Rejected model load {ModelFile}: file validation failed; current model {CurrentModel} stays loaded",
+                    Path.GetFileName(modelPath), LoadedModelName ?? "(none)");
+                throw;
+            }
+
+            string previousModelPath = _loadedModelPath;
+            string previousMmProjPath = _loadedMmProjPath;
+            string previousBackendValue = LoadedBackend;
+
+            UnloadCurrentModel();
+
+            try
+            {
+                LoadModelCore(modelPath, mmProjPath, backendStr);
+            }
+            catch
+            {
+                // Best-effort rollback so a failed reload doesn't leave the
+                // server with no model. The original exception still reaches
+                // the caller; the rollback outcome is only logged.
+                if (previousModelPath != null)
+                {
+                    try
+                    {
+                        LoadModelCore(previousModelPath, previousMmProjPath, previousBackendValue);
+                        _logger.LogWarning("Restored previous model {PreviousModel} after failed load of {ModelFile}",
+                            Path.GetFileName(previousModelPath), Path.GetFileName(modelPath));
+                    }
+                    catch (Exception rollbackEx)
+                    {
+                        _logger.LogError(LogEventIds.ModelLoadFailed, rollbackEx,
+                            "Could not restore previous model {PreviousModel} after failed load of {ModelFile}; no model is loaded",
+                            Path.GetFileName(previousModelPath), Path.GetFileName(modelPath));
+                    }
+                }
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Header-only validation of the files a load is about to commit to,
+        /// run BEFORE the current model is disposed: a missing, non-GGUF, or
+        /// truncated file is rejected while there is still a working model.
+        /// </summary>
+        private static void ValidateModelFiles(string modelPath, string mmProjPath)
+        {
+            using (var gguf = new GgufFile(modelPath))
+                gguf.ThrowIfTruncated();
+
+            // A missing projector file is skipped by the load itself, but one
+            // that exists must parse.
+            if (!string.IsNullOrEmpty(mmProjPath) && File.Exists(mmProjPath))
+            {
+                using var mmProj = new GgufFile(mmProjPath);
+                mmProj.ThrowIfTruncated();
+            }
+        }
+
+        private void UnloadCurrentModel()
+        {
             string previousModel = LoadedModelName;
             _model?.Dispose();
             _model = null;
@@ -78,7 +155,10 @@ namespace TensorSharp.Server
                 _logger.LogInformation(LogEventIds.ModelUnloaded,
                     "Unloaded previous model {PreviousModel}", previousModel);
             }
+        }
 
+        private void LoadModelCore(string modelPath, string mmProjPath, string backendStr)
+        {
             _backend = ResolveBackend(backendStr);
 
             var loadSw = Stopwatch.StartNew();
@@ -107,7 +187,7 @@ namespace TensorSharp.Server
                 // drafter's weights have to be counted by the layer split and
                 // uploaded with the trunk.
                 string blockDraftPath = Environment.GetEnvironmentVariable("TS_DSV4_DSPARK");
-                _model = ModelBase.Create(modelPath, _backend, tpGroup: tpGroup, draftModelPath: blockDraftPath);
+                _model = _createModel(modelPath, _backend, tpGroup, blockDraftPath);
 
                 // Say so when a drafter was named but the loaded model has no
                 // block-draft head to put it in, instead of leaving the operator
@@ -147,7 +227,7 @@ namespace TensorSharp.Server
                 // (gemma4-assistant). Load it onto the target so HasMtp turns on
                 // and --mtp-spec engages. (Qwen3.6 embeds its NextN block in the
                 // trunk and needs no separate file.) MtpDraftActivationError was
-                // already cleared above before the model was (re)created.
+                // cleared when the previous model was unloaded.
                 string mtpDraftPath = Environment.GetEnvironmentVariable("TS_MTP_DRAFT_MODEL");
                 if (!string.IsNullOrEmpty(mtpDraftPath))
                 {
@@ -210,6 +290,13 @@ namespace TensorSharp.Server
                 _logger.LogError(LogEventIds.ModelLoadFailed, ex,
                     "Failed to load model {ModelFile} on backend {Backend} after {ElapsedMs:F1} ms",
                     Path.GetFileName(modelPath), backendStr ?? "(default)", loadSw.Elapsed.TotalMilliseconds);
+                // Drop any partially initialized model so the service holds
+                // either a fully loaded model or none at all.
+                _model?.Dispose();
+                _model = null;
+                _loadedModelPath = null;
+                _loadedMmProjPath = null;
+                MtpDraftActivationError = null;
                 throw;
             }
         }
