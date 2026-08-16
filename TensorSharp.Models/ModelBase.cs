@@ -674,6 +674,12 @@ namespace TensorSharp.Models
             Config.KeyLength = (int)_gguf.GetUint32($"{arch}.attention.key_length", 0);
             Config.ValueLength = (int)_gguf.GetUint32($"{arch}.attention.value_length", 0);
             Config.IntermediateSize = (int)_gguf.GetUint32($"{arch}.feed_forward_length", 0);
+
+            // Sampling parameters the model author shipped in the file. llama.cpp
+            // layers these over its own defaults for every field the operator did
+            // not pin; TensorSharp read none of them, so a GGUF that says
+            // "sample me with top_k=20, top_p=0.95" was ignored.
+            Config.RecommendedSampling = RecommendedSampling.FromGgufMetadata(_gguf.Metadata);
         }
 
         protected int ResolveConfiguredContextLength(int fallback = 4096)
@@ -3032,8 +3038,10 @@ namespace TensorSharp.Models
         /// <see cref="ShardConcatenatedColumnParallel"/>). Each source is
         /// dequantized (if quantized) and sliced per-rank on the fly, so no
         /// full-model F32 intermediate is ever materialised. The per-rank
-        /// results are stored under <paramref name="fusedName"/> in
-        /// <see cref="_tpWeights"/>; source weights are removed and disposed.
+        /// results are stored under <paramref name="fusedName"/> - as Q8_0 in
+        /// <see cref="_tpQuantWeights"/> when the input dim allows it, otherwise
+        /// as F32 in <see cref="_tpWeights"/>; source weights are removed and
+        /// disposed.
         /// </summary>
         protected void ShardSeparateColumnParallel(string fusedName, string[] sourceNames, int[] segmentDims)
         {
@@ -3067,7 +3075,23 @@ namespace TensorSharp.Models
                 }
             }
 
-            var shards = new Tensor[tp];
+            // This path exists because the sources had MIXED quant types, so they
+            // could not be packed in place. Materializing the shard in F32 as well
+            // costs ~8x the source bytes AND drops the layer off the cached
+            // quantized matmul onto the generic Ops.Addmm path, which re-uploads
+            // the whole weight per call - on a mixed-quant Qwen3.8-27B that alone
+            // was several GB per rank and erased the throughput tensor parallelism
+            // was supposed to buy. Re-encode each gathered row as Q8_0 instead: the
+            // gather is row-wise, so a row's values are untouched, and an 8-bit
+            // round-trip of an already <=6-bit source is lossless in practice. Q8_0
+            // blocks are 32 elements along the INPUT dim, so this needs inDim % 32.
+            const int q8Type = (int)GgmlTensorType.Q8_0;
+            bool requantize = (inDim % 32) == 0;
+
+            var shards = requantize ? null : new Tensor[tp];
+            var quantShards = requantize ? new QuantizedWeight[tp] : null;
+            long q8RowBytes = requantize ? NativeDequant.RowSize(q8Type, inDim) : 0;
+
             for (int r = 0; r < tp; r++)
             {
                 int globalRank = rankOffset + r;
@@ -3075,47 +3099,77 @@ namespace TensorSharp.Models
                 foreach (int segDim in segmentDims)
                     totalRows += segDim / globalTp;
 
-                var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, totalRows, inDim);
+                Tensor shard = requantize
+                    ? null
+                    : new Tensor(_tpGroup.GetAllocator(r), DType.Float32, totalRows, inDim);
+                IntPtr quantPtr = requantize
+                    ? QuantizedWeight.AllocateBuffer((long)totalRows * q8RowBytes)
+                    : IntPtr.Zero;
+                // One reusable row buffer when re-quantizing: the shard is written
+                // row at a time, so no full-size F32 intermediate is ever allocated.
+                float[] rowScratch = requantize ? new float[inDim] : null;
 
                 unsafe
                 {
-                    float* dstBase = GetFloatPtr(shard);
+                    float* dstBase = requantize ? null : GetFloatPtr(shard);
+                    byte* quantBase = requantize ? (byte*)quantPtr.ToPointer() : null;
                     long dstRow = 0;
 
-                    for (int s = 0; s < sourceNames.Length; s++)
+                    fixed (float* scratch = rowScratch)
                     {
-                        int perRank = segmentDims[s] / globalTp;
-                        int srcStart = globalRank * perRank;
+                        for (int s = 0; s < sourceNames.Length; s++)
+                        {
+                            int perRank = segmentDims[s] / globalTp;
+                            int srcStart = globalRank * perRank;
 
-                        if (quants[s] != null)
-                        {
-                            var qw = quants[s];
-                            long rowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
-                            byte* srcBase = (byte*)qw.Data.ToPointer();
                             for (int row = 0; row < perRank; row++)
-                                NativeDequant.DequantizeToFloat32Native(
-                                    qw.GgmlType,
-                                    (IntPtr)(srcBase + (long)(srcStart + row) * rowBytes),
-                                    (IntPtr)(dstBase + (dstRow + row) * inDim),
-                                    inDim);
+                            {
+                                float* dstRowPtr = requantize
+                                    ? scratch
+                                    : dstBase + (dstRow + row) * inDim;
+
+                                if (quants[s] != null)
+                                {
+                                    var qw = quants[s];
+                                    long rowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                                    byte* srcBase = (byte*)qw.Data.ToPointer();
+                                    NativeDequant.DequantizeToFloat32Native(
+                                        qw.GgmlType,
+                                        (IntPtr)(srcBase + (long)(srcStart + row) * rowBytes),
+                                        (IntPtr)dstRowPtr,
+                                        inDim);
+                                }
+                                else
+                                {
+                                    float* srcPtr = GetFloatPtr(tensors[s]);
+                                    long bytes = (long)inDim * sizeof(float);
+                                    Buffer.MemoryCopy(
+                                        srcPtr + (long)(srcStart + row) * inDim,
+                                        dstRowPtr, bytes, bytes);
+                                }
+
+                                if (requantize)
+                                    ManagedQuantizedOps.QuantizeRowFromFloat32(
+                                        q8Type, dstRowPtr,
+                                        (IntPtr)(quantBase + (dstRow + row) * q8RowBytes),
+                                        inDim);
+                            }
+                            dstRow += perRank;
                         }
-                        else
-                        {
-                            float* srcPtr = GetFloatPtr(tensors[s]);
-                            long bytes = (long)perRank * inDim * sizeof(float);
-                            Buffer.MemoryCopy(
-                                srcPtr + (long)srcStart * inDim,
-                                dstBase + dstRow * inDim,
-                                bytes, bytes);
-                        }
-                        dstRow += perRank;
                     }
                 }
 
-                shards[r] = shard;
+                if (requantize)
+                    quantShards[r] = new QuantizedWeight(quantPtr, (long)totalRows * q8RowBytes,
+                        q8Type, inDim, totalRows);
+                else
+                    shards[r] = shard;
             }
 
-            _tpWeights[fusedName] = shards;
+            if (requantize)
+                _tpQuantWeights[fusedName] = quantShards;
+            else
+                _tpWeights[fusedName] = shards;
 
             for (int s = 0; s < sourceNames.Length; s++)
             {
@@ -3727,6 +3781,13 @@ namespace TensorSharp.Models
                     QuantizedWeight qw = kv.Value;
                     if (!qw.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key))
                         continue;
+                    // A source weight that was folded into a TP shard has no reader
+                    // left under tensor parallelism, but it is still sitting in
+                    // _quantWeights. Uploading it puts a full unsharded copy of that
+                    // tensor on rank 0 on top of the shards - which is exactly the
+                    // "TP still loads the whole model on each GPU" complaint.
+                    if (IsSupersededByTpShard(kv.Key))
+                        continue;
                     if (string.Equals(kv.Key, "token_embd.weight", StringComparison.Ordinal)
                         && !CanUseGgmlQuantizedGetRows(qw.GgmlType)
                         && (_quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")))
@@ -3757,6 +3818,58 @@ namespace TensorSharp.Models
             if (tooLarge > 0)
                 Console.WriteLine($"  {tooLarge} weight(s) exceeded the device single-buffer limit and stream from host memory.");
 
+            // The banner above counts only quantized shards. Two other categories
+            // decide whether tensor parallelism actually shrank per-GPU memory, and
+            // neither was ever reported -- so "each GPU still loads the whole model"
+            // could not be confirmed or refuted from a normal load log:
+            //   * _tpWeights: shards that had to be DEQUANTIZED to F32 (mixed-quant
+            //     Q/K/V, the packed GDN in-projection). These are ~8x the quantized
+            //     bytes AND are served by the uncached generic matmul.
+            //   * _quantWeights: whatever was never sharded at all, which stays
+            //     replicated on rank 0 on top of its shards.
+            long tpF32Bytes = 0;
+            int tpF32Count = 0;
+            foreach (var kv in _tpWeights)
+            {
+                var shards = kv.Value;
+                if (shards == null) continue;
+                tpF32Count++;
+                foreach (var t in shards)
+                    if (t != null) tpF32Bytes += t.ElementCount() * t.ElementType.Size();
+            }
+            if (tpF32Count > 0)
+            {
+                Console.WriteLine($"  TP F32 shards: {tpF32Count} weight(s), {tpF32Bytes / 1024 / 1024} MB across all ranks " +
+                    "(dequantized because the source could not be split in its quant type; " +
+                    "these also bypass the cached quantized matmul).");
+            }
+            long replicatedBytes = 0, supersededBytes = 0;
+            int replicatedCount = 0, supersededCount = 0;
+            foreach (var kv in _quantWeights)
+            {
+                if (kv.Value == null) continue;
+                if (IsSupersededByTpShard(kv.Key))
+                {
+                    supersededCount++;
+                    supersededBytes += kv.Value.RawBytes;
+                }
+                else
+                {
+                    replicatedCount++;
+                    replicatedBytes += kv.Value.RawBytes;
+                }
+            }
+            if (replicatedCount > 0)
+            {
+                Console.WriteLine($"  TP replicated on rank 0: {replicatedCount} unsharded quantized weight(s), " +
+                    $"{replicatedBytes / 1024 / 1024} MB.");
+            }
+            if (supersededCount > 0)
+            {
+                Console.WriteLine($"  TP not resident: {supersededCount} fusion-source weight(s), " +
+                    $"{supersededBytes / 1024 / 1024} MB (superseded by a shard; host mapping kept).");
+            }
+
             GgmlBasicOps.SetActiveRank(0);
             _cudaQuantWeightsPrepared = true;
         }
@@ -3772,6 +3885,16 @@ namespace TensorSharp.Models
         /// slot in the running totals so the load report stays accurate.
         /// </summary>
         protected virtual void PreloadGgmlTpAuxiliaryWeightsForRank(int rank, long[] bytesPerRank, int[] countPerRank) { }
+
+        /// <summary>
+        /// True when <paramref name="weightName"/> is still present in
+        /// <see cref="_quantWeights"/> only because a fusion kept its sources alive,
+        /// and tensor parallelism reads the fused/sharded tensor instead. Such a
+        /// weight must not be uploaded to rank 0: it would duplicate, unsharded, a
+        /// tensor the TP path already holds in shards. The host mapping stays, so a
+        /// rare non-TP reader can still stream it.
+        /// </summary>
+        protected virtual bool IsSupersededByTpShard(string weightName) => false;
 
         /// <summary>
         /// True when the MoE layers under TP fall back to the per-token,

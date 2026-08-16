@@ -338,6 +338,19 @@ namespace TensorSharp.Models
         // 3-dispatch path: FusedRmsNormMatMul + SiLUMul + FusedMatMulQuantAdd).
         private static readonly bool _useFusedFfnPrefill =
             !string.Equals(Environment.GetEnvironmentVariable("QWEN35_DISABLE_FUSED_FFN"), "1", StringComparison.Ordinal);
+
+        // Latched so a VRAM-starved prefill reports the degrade once instead of
+        // once per layer per chunk.
+        private bool _fusedFfnDeclineLogged;
+
+        private void WarnFusedFfnDeclinedOnce(string reason)
+        {
+            if (_fusedFfnDeclineLogged) return;
+            _fusedFfnDeclineLogged = true;
+            Console.Error.WriteLine(
+                $"[qwen35] fused dense FFN declined, falling back to the unfused chain: {reason}");
+        }
+
         private long _mlxEvalBoundaryTicks;
         private long _mlxCacheEvalTicks;
 
@@ -1141,6 +1154,50 @@ namespace TensorSharp.Models
             => !_stackedExpertMemberNames.Contains(weightName)
                && base.ShouldPreloadCudaQuantWeightToDevice(weightName);
 
+        /// <summary>
+        /// Under tensor parallelism a recurrent layer's GatedDeltaNet input is read
+        /// exclusively through the sharded <c>ssm_in_proj.weight</c> pack. Its four
+        /// sources (<c>attn_qkv</c>, <c>attn_gate</c>, <c>ssm_beta</c>,
+        /// <c>ssm_alpha</c>) are deliberately kept alive by the fusion
+        /// (<c>keepSources: true</c>, and the F32 fallback leaves them in place), so
+        /// they were still in <c>_quantWeights</c> at preload time and rank 0 ended up
+        /// holding a complete unsharded copy of the whole GDN trunk on top of its
+        /// shards — 4 tensors x 48 recurrent layers on Qwen3.8-27B.
+        ///
+        /// Skipping the PRELOAD only drops a device-side cache entry: the host mapping
+        /// is untouched, so any path that still reads a source streams it on demand
+        /// exactly as an MoE-offloaded expert does. Numerics are unaffected.
+        /// </summary>
+        private HashSet<string> _tpSupersededSources;
+
+        protected override bool IsSupersededByTpShard(string weightName)
+        {
+            if (!IsTensorParallel || _isRecurrent == null || _ssmInProjKey == null)
+                return false;
+
+            if (_tpSupersededSources == null)
+            {
+                var set = new HashSet<string>(StringComparer.Ordinal);
+                for (int l = 0; l < TotalLayerCount; l++)
+                {
+                    if (!_isRecurrent[l] || _ssmInProjKey[l] == null)
+                        continue;
+                    if (!_tpQuantWeights.ContainsKey(_ssmInProjKey[l])
+                        && !_tpWeights.ContainsKey(_ssmInProjKey[l]))
+                        continue;
+                    set.Add(_attnQkvRecKey[l]);
+                    set.Add(_attnGateRecKey[l]);
+                    set.Add(_ssmBetaKey[l]);
+                    set.Add(_ssmAlphaKey[l]);
+                }
+                _tpSupersededSources = set;
+                if (set.Count > 0)
+                    Console.WriteLine($"  TP: {set.Count} GDN source weight(s) superseded by the sharded " +
+                        "ssm_in_proj pack; not preloaded to rank 0.");
+            }
+            return _tpSupersededSources.Contains(weightName);
+        }
+
         protected override void ResetKVCacheCore()
         {
             if (IsTensorParallel)
@@ -1505,18 +1562,65 @@ namespace TensorSharp.Models
         /// </summary>
         private bool CanUsePrefillVerify(int startPos, int seqLen)
         {
-            if (!_prefillVerifyEnabled || _fvUnsupported) return false;
+            if (!_prefillVerifyEnabled) return false;
+            if (_fvUnsupported) return false;
             // All GGML GPU backends run the whole-model prefill graph. CUDA and
             // Vulkan use dynamic set_rows writes; Metal uses contiguous cpy views
             // whose offset is baked into this one-shot prefill graph. The latter
             // mirrors llama.cpp's linear KV-store path without relying on Metal's
             // problematic multi-dimensional set_rows shape.
-            if ((_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan
-                    && _backend != BackendType.GgmlMetal) || seqLen <= 1)
-                return false;
-            if (_visionEmbeddingsList.Count > 0 || _pendingMRoPEPositions != null) return false;
-            if (_headKDim != _headVDim) return false;
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan
+                    && _backend != BackendType.GgmlMetal)
+                return FvBail($"backend {_backend} has no whole-model prefill graph");
+            if (seqLen <= 1) return false;   // decode; TryFullModelDecode's job
+            // Vision embeddings must already be spliced into `hidden` before the
+            // graph runs; ForwardCore injects them, so a non-empty queue here means
+            // this call is upstream of that.
+            if (_visionEmbeddingsList.Count > 0)
+                return FvBail("vision embeddings are still queued for injection");
+            // NOTE: pending MRoPE positions used to bail here too, which sent every
+            // image-bearing prompt down the op-by-op layer loop for the whole
+            // prompt. The native graph implements MRoPE end to end (ggml_rope_multi
+            // with GGML_ROPE_TYPE_IMROPE for both Q and K) and TryFullModelVerify
+            // already packs `_pendingMRoPEPositions`/`_mropeSections` into its
+            // mropePos/mropeSecs arguments, so the guard was blocking a finished
+            // path. TS_QWEN35_MROPE_VERIFY=0 restores the old behaviour.
+            if (_pendingMRoPEPositions != null)
+            {
+                if (!_mropeVerifyEnabled)
+                    return FvBail("multimodal prompt (disabled via TS_QWEN35_MROPE_VERIFY=0)");
+                if (_mropeSections == null || _mropeSections.Length < 4)
+                    return FvBail("multimodal prompt without MRoPE section metadata");
+            }
+            if (_headKDim != _headVDim)
+                return FvBail($"asymmetric GDN state widths (headKDim={_headKDim}, headVDim={_headVDim})");
             return true;
+        }
+
+        /// <summary>Set TS_QWEN35_MROPE_VERIFY=0 to keep image prompts on the
+        /// op-by-op prefill loop (A/B against the fused graph).</summary>
+        private static readonly bool _mropeVerifyEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_MROPE_VERIFY") != "0";
+
+        /// <summary>
+        /// Report, once, why the whole-model fused PREFILL graph declined. Its
+        /// absence costs an order of magnitude (the op-by-op fallback re-allocates,
+        /// uploads and synchronises per operation, ~15 ops x 65 layers per chunk),
+        /// and every one of these returns used to be silent — the decode path got
+        /// this diagnostic; prefill never did.
+        /// </summary>
+        private bool _fvDeclineLogged;
+
+        private bool FvBail(string reason)
+        {
+            if (!_fvDeclineLogged)
+            {
+                _fvDeclineLogged = true;
+                Console.Error.WriteLine(
+                    $"[qwen35] fused whole-model prefill NOT engaged ({reason}); " +
+                    "falling back to the per-op prefill loop.");
+            }
+            return false;
         }
 
         // Cached CUDA graphs of the per-op prefill layer loop (direct cuda backend
@@ -2028,9 +2132,11 @@ namespace TensorSharp.Models
             // MoE + final-norm + last-token lm_head) for all N prompt tokens as ONE
             // fused GGML graph (TSGgml_Qwen35ModelVerify with nLogitRows=1), writing
             // KV + GDN state on-device. This replaces the per-layer dispatch loop
-            // whose host round-trip per op keeps the GPU mostly idle ÔÇö the dominant
+            // whose host round-trip per op keeps the GPU mostly idle - the dominant
             // CUDA prefill cost. Mirrors Gemma4's whole-model prefill-verify routing.
-            // Text-only (no multimodal MRoPE); long prompts chunk via ForwardRefill.
+            // Image prompts take this path too: the graph applies MRoPE itself
+            // (ggml_rope_multi / IMROPE) from the mropePos+mropeSecs arguments
+            // TryFullModelVerify packs. Long prompts chunk via ForwardRefill.
             if (seqLen > 1 && CanUsePrefillVerify(startPos, seqLen)
                 && TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1))
             {
@@ -3273,14 +3379,28 @@ namespace TensorSharp.Models
                     && _ffnDownQW[layer].Ne1 == residual.Sizes[1])
                 {
                     long t0 = Stopwatch.GetTimestamp();
-                    GgmlBasicOps.FusedFFNSwiGLUQuant(residual, residual, postNormW, Config.Eps,
-                        _ffnGateUpQW[layer].CacheKey, _ffnGateUpQW[layer].GgmlType,
-                        _ffnGateUpQW[layer].Ne0, _ffnGateUpQW[layer].Ne1, _ffnGateUpQW[layer].RawBytes,
-                        _ffnDownQW[layer].CacheKey, _ffnDownQW[layer].GgmlType,
-                        _ffnDownQW[layer].Ne0, _ffnDownQW[layer].Ne1, _ffnDownQW[layer].RawBytes,
-                        halfDimFused);
-                    _linearTicks += Stopwatch.GetTimestamp() - t0;
-                    return null;
+                    try
+                    {
+                        GgmlBasicOps.FusedFFNSwiGLUQuant(residual, residual, postNormW, Config.Eps,
+                            _ffnGateUpQW[layer].CacheKey, _ffnGateUpQW[layer].GgmlType,
+                            _ffnGateUpQW[layer].Ne0, _ffnGateUpQW[layer].Ne1, _ffnGateUpQW[layer].RawBytes,
+                            _ffnDownQW[layer].CacheKey, _ffnDownQW[layer].GgmlType,
+                            _ffnDownQW[layer].Ne0, _ffnDownQW[layer].Ne1, _ffnDownQW[layer].RawBytes,
+                            halfDimFused);
+                        _linearTicks += Stopwatch.GetTimestamp() - t0;
+                        return null;
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        // The native op already row-slabs and retries on device OOM, so a
+                        // throw here means even a single row would not fit. Degrade to the
+                        // unfused chain below (three smaller dispatches, ~2.5x lower peak)
+                        // instead of killing the turn - the sibling FusedOutProjFFN call in
+                        // RecurrentBlock has always had this guard, and its absence here is
+                        // what turned a tight-VRAM multimodal prefill into a failed request.
+                        _linearTicks += Stopwatch.GetTimestamp() - t0;
+                        WarnFusedFfnDeclinedOnce(ex.Message);
+                    }
                 }
             }
 

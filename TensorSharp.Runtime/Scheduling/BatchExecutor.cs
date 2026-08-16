@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
@@ -1331,8 +1332,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public int ComputeLiveContinuationLcp(SequenceState seq)
         {
-            if (seq == null || !_liveCacheValid || _liveCacheSeq == null || _liveCacheLen <= 0)
+            if (seq == null)
                 return 0;
+            if (!_liveCacheValid || _liveCacheSeq == null || _liveCacheLen <= 0)
+                return LiveContinuationDeclined(seq, "no live cache resident (reset, batched step, or first request)");
             // Only worth it when the pooled path cannot already reuse the full
             // prefix. Models that opt out of cross-sequence snapshots have an
             // effective pooled cap of zero, but continuing their still-live
@@ -1341,23 +1344,88 @@ namespace TensorSharp.Runtime.Scheduling
                 ? _model.MaxReusablePrefixTokens
                 : 0;
             if (cap == int.MaxValue)
-                return 0;
+                return 0; // pooled reuse is uncapped; it already covers this
 
             int liveLen = Math.Min(_liveCacheLen, _liveCacheSeq.NumTotalTokens);
-            if (liveLen <= cap)
-                return 0; // pooled reuse already covers this prefix correctly
-            if (seq.PromptTokens.Count <= liveLen)
-                return 0; // no new suffix to forward (or prompt shorter than cache)
 
-            // Require the entire live sequence to be an exact prefix of the new
-            // prompt. This is the common multi-turn append ("Þ»Àþ╗ºþ╗¡") case and avoids
+            // NOTE: do NOT shorten liveLen here. The adopted length becomes the
+            // sequence's NumComputedTokens, and EnsureOwnership only keeps the live
+            // cache when `_liveCacheLen == seq.NumComputedTokens` exactly - the model
+            // has no way to drop a token off the end of its cache (Qwen3.x cannot
+            // truncate its recurrent state at all). Returning liveLen-1 gets the
+            // continuation planned and then silently discarded one step later, which
+            // is worse than not planning it: an EOS-terminated turn reported 0% reuse
+            // while a max_tokens-terminated turn of the same conversation reported
+            // ~95%.
+
+            if (liveLen <= cap)
+                return LiveContinuationDeclined(seq,
+                    $"live prefix {liveLen} within the pooled reuse cap {cap}");
+            if (seq.PromptTokens.Count <= liveLen)
+                return LiveContinuationDeclined(seq,
+                    $"prompt ({seq.PromptTokens.Count} tokens) has no new suffix past the live prefix ({liveLen})");
+
+            // Require the live sequence to be an exact prefix of the new prompt.
+            // This is the common multi-turn append ("continue") case and avoids
             // truncating the circular cache (which would reintroduce the wrap issue).
             for (int i = 0; i < liveLen; i++)
             {
                 if (seq.PromptTokens[i] != _liveCacheSeq.TokenAt(i))
-                    return 0;
+                {
+                    // A mismatch at the very last cached position is its own story:
+                    // that token is the sampled EOS, which the engine stops on and
+                    // never publishes, so turn N+1 re-derives the boundary from the
+                    // chat template rather than from the previous turn's raw output
+                    // tokens. Nothing can be salvaged (the model cannot drop the
+                    // trailing token), but it is worth naming so it is not confused
+                    // with a template/tokenizer divergence earlier in the prompt.
+                    bool trailingEos = i == liveLen - 1
+                        && _model.Tokenizer != null
+                        && _model.Tokenizer.IsEos(_liveCacheSeq.TokenAt(i));
+                    return LiveContinuationDeclined(seq,
+                        (trailingEos
+                            ? $"prompt does not reproduce the cached trailing EOS at token {i} of {liveLen} "
+                            : $"prompt diverges from the live cache at token {i} of {liveLen} ") +
+                        $"(prompt={seq.PromptTokens[i]}, cached={_liveCacheSeq.TokenAt(i)}); " +
+                        $"context prompt=[{DescribeTokenWindow(k => seq.PromptTokens[k], seq.PromptTokens.Count, i)}] " +
+                        $"cached=[{DescribeTokenWindow(k => _liveCacheSeq.TokenAt(k), liveLen, i)}]");
+                }
             }
             return liveLen;
+        }
+
+        /// <summary>Log why live-cache continuation was refused and return 0. The
+        /// path had five distinct bare `return 0`s, which is why a report of "KV
+        /// reuse is 0" carried no way to tell which one fired.</summary>
+        private int LiveContinuationDeclined(SequenceState seq, string reason)
+        {
+            _logger.LogDebug(
+                "Live-cache continuation declined for {RequestId}: {Reason}.",
+                seq.RequestId, reason);
+            return 0;
+        }
+
+        /// <summary>Render the few tokens either side of <paramref name="center"/> as
+        /// "id:piece" so a prefix divergence names the actual text that differs.
+        /// Without this a mismatch report is a pair of bare integers.</summary>
+        private string DescribeTokenWindow(Func<int, int> tokenAt, int count, int center, int radius = 3)
+        {
+            var sb = new StringBuilder();
+            int from = Math.Max(0, center - radius);
+            int to = Math.Min(count - 1, center + radius);
+            for (int k = from; k <= to; k++)
+            {
+                if (sb.Length > 0) sb.Append(' ');
+                int id = tokenAt(k);
+                if (k == center) sb.Append('*');
+                sb.Append(id);
+                string piece = null;
+                try { piece = _model.Tokenizer?.Decode(new List<int> { id }); }
+                catch (Exception) { /* a lone special/partial token may not decode */ }
+                if (!string.IsNullOrEmpty(piece))
+                    sb.Append(':').Append(piece.Replace("\n", "\\n").Replace("\r", "\\r"));
+            }
+            return sb.ToString();
         }
 
         /// <summary>Set <paramref name="seq"/> up to continue from the model's live
@@ -1369,12 +1437,24 @@ namespace TensorSharp.Runtime.Scheduling
         public bool TryAdoptLiveCache(SequenceState seq, int lcp)
         {
             if (seq == null || lcp <= 0) return false;
-            if (seq.BlockTable.NumBlocks != 0) return false;
+            if (seq.BlockTable.NumBlocks != 0)
+            {
+                LiveContinuationDeclined(seq,
+                    $"blocks already reserved ({seq.BlockTable.NumBlocks}) before adoption");
+                return false;
+            }
 
             int neededBlocks = (lcp + _blockSize - 1) / _blockSize;
             var blocks = _pool.AllocateNew(neededBlocks);
             if (blocks == null)
-                return false; // pool pressure -> let the caller use the capped pool path
+            {
+                // Pool pressure -> the caller falls back to the capped pool path.
+                // Silent before: a planned continuation that failed HERE looked
+                // exactly like one that was never planned.
+                LiveContinuationDeclined(seq,
+                    $"block pool could not reserve {neededBlocks} block(s) for the {lcp}-token prefix");
+                return false;
+            }
 
             for (int i = 0; i < blocks.Length; i++)
                 seq.BlockTable.AppendBlock(blocks[i]);

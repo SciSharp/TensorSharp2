@@ -57,6 +57,28 @@ namespace TensorSharp.Models
         private static readonly bool _tpFdEnabled =
             Environment.GetEnvironmentVariable("TS_QWEN35_TP_FUSED_DECODE") != "0";
 
+        /// <summary>
+        /// Report, once, why the whole-model fused tensor-parallel decode declined.
+        /// Declining latches this path off for the process and falls back to the
+        /// per-op TP loop, which is roughly an order of magnitude slower — that is
+        /// the mechanism behind "tp=2 decodes no faster than tp=1", and it used to
+        /// leave no trace at all. Mirrors the non-TP FdBail added for the same
+        /// failure mode on the single-GPU path.
+        /// </summary>
+        private bool _tpFdDeclineLogged;
+
+        private bool TpFdBail(string reason)
+        {
+            if (!_tpFdDeclineLogged)
+            {
+                _tpFdDeclineLogged = true;
+                Console.Error.WriteLine(
+                    $"[qwen35-tp] fused whole-model decode NOT engaged ({reason}); " +
+                    "falling back to the per-op tensor-parallel decode.");
+            }
+            return false;
+        }
+
         private bool TpFusedModelDecodeAvailable()
         {
             if (_tpFdFailed)
@@ -77,6 +99,16 @@ namespace TensorSharp.Models
                 && GgmlBasicOps.TensorParallelFusedAvailable(TpDegree);
             if (_tpFdReady)
                 _tpFdPlans = new IntPtr[TpDegree];
+            else if (IsTensorParallel)
+                TpFdBail(
+                    !_tpFdEnabled ? "disabled via TS_QWEN35_TP_FUSED_DECODE=0"
+                    : !IsGgmlBackend ? $"backend {_backend} has no fused TP decode kernel"
+                    : GlobalTpDegree != TpDegree ? $"multi-node TP (global={GlobalTpDegree}, local={TpDegree})"
+                    : _tpLmHeadKey == null ? "the LM head was not sharded column-parallel (tied embeddings, a vocab that does not divide by the TP degree, or a non-GGML backend)"
+                    : !_tpQuantWeights.ContainsKey(_tpLmHeadKey) ? $"no quantized TP shard for the LM head ({_tpLmHeadKey})"
+                    : !_weights.ContainsKey("output_norm.weight") ? "output_norm.weight is missing"
+                    : (_numExperts > 0 && !UsesExpertParallelMoE) ? "MoE is not expert-parallel sharded"
+                    : $"the native bridge reports no fused TP support for tp={TpDegree}");
             return _tpFdReady;
         }
 
@@ -172,14 +204,25 @@ namespace TensorSharp.Models
                         a.DownExps = sd.Data; a.DownExpsType = sd.GgmlType; a.DownExpsBytes = sd.TotalRawBytes;
 
                         string prefix = $"blk.{l}.";
-                        if (!TryTpFdShard(prefix + "ffn_gate_shexp.weight", r, out var shg)) return false;
-                        if (!TryTpFdShard(prefix + "ffn_up_shexp.weight", r, out var shu)) return false;
-                        if (!TryTpFdShard(prefix + "ffn_down_shexp.weight", r, out var shd)) return false;
+                        // The native decode graph builds the gated shared-expert branch
+                        // unconditionally for a MoE layer, so this path genuinely
+                        // requires the shexp weights - a variant without them has to
+                        // decline rather than leave the descriptor zeroed. Say so out
+                        // loud: declining latches the fused TP decode off for the whole
+                        // process, and it used to do that in silence.
+                        if (_hasSharedExperts == null || !_hasSharedExperts[l])
+                            return TpFdBail($"layer {l} is MoE without shared experts, which the fused TP decode graph requires");
+                        if (!TryTpFdShard(prefix + "ffn_gate_shexp.weight", r, out var shg))
+                            return TpFdBail($"layer {l} rank {r}: no TP shard for {prefix}ffn_gate_shexp.weight");
+                        if (!TryTpFdShard(prefix + "ffn_up_shexp.weight", r, out var shu))
+                            return TpFdBail($"layer {l} rank {r}: no TP shard for {prefix}ffn_up_shexp.weight");
+                        if (!TryTpFdShard(prefix + "ffn_down_shexp.weight", r, out var shd))
+                            return TpFdBail($"layer {l} rank {r}: no TP shard for {prefix}ffn_down_shexp.weight");
                         a.ShexpGateW = shg.ptr; a.ShexpGateType = shg.type; a.ShexpGateNe0 = shg.ne0; a.ShexpGateNe1 = shg.ne1; a.ShexpGateBytes = shg.bytes;
                         a.ShexpUpW = shu.ptr; a.ShexpUpType = shu.type; a.ShexpUpNe0 = shu.ne0; a.ShexpUpNe1 = shu.ne1; a.ShexpUpBytes = shu.bytes;
                         a.ShexpDownW = shd.ptr; a.ShexpDownType = shd.type; a.ShexpDownNe0 = shd.ne0; a.ShexpDownNe1 = shd.ne1; a.ShexpDownBytes = shd.bytes;
                         if (_ffnGateInpShexpVec?[l] == null)
-                            return false;
+                            return TpFdBail($"layer {l}: shared experts present but ffn_gate_inp_shexp is missing");
                         a.ShexpGateInpW = (IntPtr)GetFloatPtr(_ffnGateInpShexpVec[l]);
                     }
 
@@ -188,8 +231,13 @@ namespace TensorSharp.Models
                         a.IsRecurrent = 0;
                         // The regrouped fused QKV shard ([Q_r|K_r|V_r]); missing
                         // means mixed quant types prevented it — keep per-op.
-                        if (!TryTpFdShard(_attnQkvKey[l], r, out var qkv)) return false;
-                        if (!TryTpFdShard(_attnOutputKey[l], r, out var o)) return false;
+                        if (!TryTpFdShard(_attnQkvKey[l], r, out var qkv))
+                            return TpFdBail($"layer {l} rank {r}: no TP shard for {_attnQkvKey[l]}" +
+                                (_tpWeights.ContainsKey(_attnQkvKey[l])
+                                    ? " (an F32 shard exists; mixed-quant Q/K/V forced the dequantized path)"
+                                    : " (mixed quant types prevented the fused QKV shard)"));
+                        if (!TryTpFdShard(_attnOutputKey[l], r, out var o))
+                            return TpFdBail($"layer {l} rank {r}: no TP shard for {_attnOutputKey[l]}");
                         a.QkvW = qkv.ptr; a.QkvType = qkv.type; a.QkvNe0 = qkv.ne0; a.QkvNe1 = qkv.ne1; a.QkvBytes = qkv.bytes;
                         a.SeparateQkv = 0;
                         a.OW = o.ptr; a.OType = o.type; a.ONe0 = o.ne0; a.ONe1 = o.ne1; a.OBytes = o.bytes;
@@ -282,9 +330,12 @@ namespace TensorSharp.Models
                 DropTpFusedDecodeGraphs();
                 bool built;
                 try { built = TryBuildTpFdLayerDescs(); }
-                catch (KeyNotFoundException) { built = false; }
+                catch (KeyNotFoundException e) { built = TpFdBail($"missing weight {e.Message}"); }
                 if (!built)
                 {
+                    // Latched for the process: report it if TryBuildTpFdLayerDescs
+                    // returned false through a path that had nothing to say.
+                    TpFdBail("a per-layer descriptor could not be built");
                     _tpFdFailed = true;
                     return false;
                 }

@@ -3841,12 +3841,26 @@ namespace TensorSharp.GGML
                 return;
             }
 
-            // Float32 keeps the historical element-level iteration: callers
-            // build ad-hoc strided F32 tensors where strides aren't guaranteed
-            // to align to anything coarser than one float, so we walk element
-            // by element via TensorIterState's float* cursor.
+            // Float32: prefer the per-outer-index memcpy whenever the innermost
+            // run is contiguous on BOTH sides. The common shapes here are exactly
+            // that — a Narrow on an outer dim (the prefill QKV split slices the
+            // fused [seq, q|k|v] projection, so each row's segment is contiguous)
+            // and a KV-cache resize. Walking those element by element cost
+            // ~16.8M single-float copies for Q alone at 2048 tokens, per attention
+            // layer, per chunk, single-threaded.
+            //
+            // Genuinely element-strided F32 views (innermost stride != 1 on either
+            // side, e.g. a bare transpose) keep the element loop: callers build
+            // ad-hoc strided F32 tensors whose strides align to nothing coarser
+            // than one float.
             if (dtype == DType.Float32)
             {
+                if (InnerContiguousExtent(result, src) > 1)
+                {
+                    CopyStridedBytes(result, src, resultBuffer, srcBuffer, dtype);
+                    return;
+                }
+
                 TensorIterState resultIter = new TensorIterState((float*)resultBuffer, result.DimensionCount, result.SizesMemory, result.StridesMemory);
                 TensorIterState srcIter = new TensorIterState((float*)srcBuffer, src.DimensionCount, src.SizesMemory, src.StridesMemory);
 
@@ -3868,6 +3882,30 @@ namespace TensorSharp.GGML
             // For Q8_0 the inner extent must align to the 32-element block
             // boundary so byte offsets stay block-aligned.
             CopyStridedBytes(result, src, resultBuffer, srcBuffer, dtype);
+        }
+
+        /// <summary>
+        /// Number of trailing elements that are contiguous in BOTH tensors — the
+        /// size of the largest run <see cref="CopyStridedBytes"/> can memcpy in one
+        /// shot. Returns 1 when the innermost dimension is itself strided (nothing
+        /// coarser than a single element can be copied) and the full element count
+        /// when both tensors are fully contiguous.
+        /// </summary>
+        private static long InnerContiguousExtent(Tensor result, Tensor src)
+        {
+            int dimCount = result.DimensionCount;
+            ReadOnlySpan<long> sizes = result.Sizes;
+            ReadOnlySpan<long> resultStrides = result.Strides;
+            ReadOnlySpan<long> srcStrides = src.Strides;
+
+            long innerElems = 1;
+            for (int d = dimCount - 1; d >= 0; d--)
+            {
+                if (resultStrides[d] != innerElems || srcStrides[d] != innerElems)
+                    break;
+                innerElems *= sizes[d];
+            }
+            return innerElems;
         }
 
         private static unsafe void CopyStridedBytes(Tensor result, Tensor src, byte* resultBuffer, byte* srcBuffer, DType dtype)

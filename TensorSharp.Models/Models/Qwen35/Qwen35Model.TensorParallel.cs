@@ -303,6 +303,10 @@ namespace TensorSharp.Models
         /// </summary>
         private void ShardLmHeadForTP()
         {
+            // Every early return here also disables the whole-model fused TP decode
+            // (which folds the column-parallel head into its graph), so each one says
+            // why. Silence here read as "TP just isn't any faster".
+            //
             // Direct CUDA keeps its replicated head: its TP forward reads the
             // logits through the CUDA-resident weight path, not by name.
             if (!IsGgmlBackend)
@@ -311,13 +315,25 @@ namespace TensorSharp.Models
             // which Embedding() gathers rows from on rank 0. Sharding it would
             // leave half the table missing there.
             if (!_quantWeights.TryGetValue("output.weight", out var qw) || qw == null)
+            {
+                Console.WriteLine("  Qwen3.5 LM head: kept replicated on rank 0 " +
+                    "(no separate output.weight - tied embeddings).");
                 return;
+            }
             if (qw.Ne1 % GlobalTpDegree != 0 || qw.Ne1 != Config.VocabSize)
+            {
+                Console.WriteLine($"  Qwen3.5 LM head: kept replicated on rank 0 " +
+                    $"(vocab rows {qw.Ne1} vs config vocab {Config.VocabSize}, TP degree {GlobalTpDegree}).");
                 return;
+            }
 
             ShardExpertColumnParallel("output.weight");
             if (!_tpQuantWeights.ContainsKey("output.weight"))
+            {
+                Console.WriteLine("  Qwen3.5 LM head: kept replicated on rank 0 " +
+                    "(column-parallel split declined).");
                 return;
+            }
 
             _tpLmHeadKey = "output.weight";
             Console.WriteLine($"  Qwen3.5 LM head: column-parallel across {GlobalTpDegree} GPU(s), " +
@@ -471,29 +487,79 @@ namespace TensorSharp.Models
             }
             else if (_weights.TryGetValue(weightName, out var w))
             {
-                // F32 path
-                var shards = new Tensor[tp];
-                for (int r = 0; r < tp; r++)
+                // The source pack is F32 because the four GDN input weights had
+                // mismatched quant types (every importance-matrix "UD" build does
+                // this), so TryFuseWeights fell back to TryFuseWeightsToFloat32.
+                //
+                // Keeping the SHARD in F32 as well was the single biggest cost of
+                // tensor parallelism on such a model: on Qwen3.8-27B it is 337 MB
+                // per recurrent layer x 48 layers = 16 GB of F32 shards, i.e. MORE
+                // device memory than the whole quantized model, and _tpWeights is
+                // served by the generic Ops.Addmm path which has no weight cache and
+                // re-uploads the entire weight on every layer, every token, every
+                // rank. That is why tp=2 measured no faster than tp=1.
+                //
+                // Re-encode each rank's gathered rows as Q8_0 instead. The gather is
+                // along ROWS, so a row's contents are untouched and the only loss is
+                // one 8-bit round-trip of a weight that was already <=5-bit at the
+                // source - the same argument ShardSsmOutWeightRequantized makes.
+                // Q8_0's 32-element blocks divide the input dim (a power of two), so
+                // the shard stays on the cached quantized matmul.
+                const int q8Type = (int)GgmlTensorType.Q8_0;
+                bool canRequant = (hiddenSize % 32) == 0;
+                if (canRequant)
                 {
-                    int globalRank = rankOffset + r;
-                    int[] rowIndices = BuildSsmInProjRowIndices(globalRank, globalTp, qkDim, vDim, qkvDim, packedDim);
-                    var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, rowIndices.Length, hiddenSize);
-                    unsafe
+                    var qShards = new QuantizedWeight[tp];
+                    long dstRowBytes = NativeDequant.RowSize(q8Type, hiddenSize);
+                    for (int r = 0; r < tp; r++)
                     {
-                        float* srcPtr = GetFloatPtr(w);
-                        float* dstPtr = GetFloatPtr(shard);
-                        for (int row = 0; row < rowIndices.Length; row++)
+                        int globalRank = rankOffset + r;
+                        int[] rowIndices = BuildSsmInProjRowIndices(globalRank, globalTp, qkDim, vDim, qkvDim, packedDim);
+                        long totalBytes = (long)rowIndices.Length * dstRowBytes;
+                        IntPtr shardPtr = QuantizedWeight.AllocateBuffer(totalBytes);
+                        unsafe
                         {
-                            Buffer.MemoryCopy(
-                                srcPtr + (long)rowIndices[row] * hiddenSize,
-                                dstPtr + (long)row * hiddenSize,
-                                hiddenSize * 4, hiddenSize * 4);
+                            float* srcPtr = GetFloatPtr(w);
+                            byte* dst = (byte*)shardPtr.ToPointer();
+                            for (int row = 0; row < rowIndices.Length; row++)
+                            {
+                                ManagedQuantizedOps.QuantizeRowFromFloat32(
+                                    q8Type,
+                                    srcPtr + (long)rowIndices[row] * hiddenSize,
+                                    (IntPtr)(dst + (long)row * dstRowBytes),
+                                    hiddenSize);
+                            }
                         }
+                        qShards[r] = new QuantizedWeight(shardPtr, totalBytes,
+                            q8Type, hiddenSize, rowIndices.Length);
                     }
-                    shards[r] = shard;
+                    _tpQuantWeights[weightName] = qShards;
+                }
+                else
+                {
+                    var shards = new Tensor[tp];
+                    for (int r = 0; r < tp; r++)
+                    {
+                        int globalRank = rankOffset + r;
+                        int[] rowIndices = BuildSsmInProjRowIndices(globalRank, globalTp, qkDim, vDim, qkvDim, packedDim);
+                        var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, rowIndices.Length, hiddenSize);
+                        unsafe
+                        {
+                            float* srcPtr = GetFloatPtr(w);
+                            float* dstPtr = GetFloatPtr(shard);
+                            for (int row = 0; row < rowIndices.Length; row++)
+                            {
+                                Buffer.MemoryCopy(
+                                    srcPtr + (long)rowIndices[row] * hiddenSize,
+                                    dstPtr + (long)row * hiddenSize,
+                                    hiddenSize * 4, hiddenSize * 4);
+                            }
+                        }
+                        shards[r] = shard;
+                    }
+                    _tpWeights[weightName] = shards;
                 }
 
-                _tpWeights[weightName] = shards;
                 _weights.Remove(weightName);
                 w.Dispose();
             }
@@ -954,7 +1020,12 @@ namespace TensorSharp.Models
                 for (int r = 0; r < tp; r++)
                 {
                     int globalRank = rankOffset + r;
-                    IntPtr shardPtr = IntPtr.Add(qw.Data, (int)(globalRank * bytesPerShard));
+                    // 64-bit offset arithmetic: `globalRank * bytesPerShard` is a long,
+                    // and a per-rank shard of the LM head or a shared expert can exceed
+                    // 2 GiB. The old (int) cast wrapped silently there, handing out a
+                    // wrong (possibly negative) base pointer with no error. Matches the
+                    // long-safe form the generic sharder already uses in ModelBase.
+                    IntPtr shardPtr = new IntPtr((long)qw.Data + globalRank * bytesPerShard);
                     shards[r] = QuantizedWeight.CreateExternalView(
                         shardPtr, bytesPerShard, qw.GgmlType, qw.Ne0, rowsPerShard, qw);
                 }
@@ -1155,14 +1226,27 @@ namespace TensorSharp.Models
             while (newCapacity < requiredSeqLen)
                 newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
 
+            // Ops.Copy below is a HOST-side copy, but the fused TP paths (both the
+            // per-rank attention block and the whole-model decode) leave K/V
+            // device-resident and only mark _tpAttnKvDeviceOnly. Without this drain
+            // the copy reads a host mirror that is stale by however many tokens have
+            // been decoded since the last sync, and every attention layer silently
+            // inherits garbage history from the grow onward — fluent output that
+            // degenerates into repetition, on tp>=2 only, once the prompt+generation
+            // crosses the initial capacity. The non-TP EnsureCacheCapacity has done
+            // this from the start; the TP twin never did.
+            SyncQwen35TpAttentionKvToHost();
             // The persistent TP decode graphs bake the old cache tensors'
             // device buffers; drop them before those tensors are disposed.
+            // (SyncQwen35TpAttentionKvToHost also drops them, but only when it had
+            // something to drain.)
             DropTpFusedDecodeGraphs();
 
             int tp = TpDegree;
             int numKVHeadsPerGpu = Config.NumKVHeads / GlobalTpDegree;
             int headDim = Config.HeadDim;
             DType kvDtype = _kvCacheDtype.ToDType();
+            int previousRank = IsGgmlBackend ? GgmlBasicOps.GetActiveRank() : 0;
 
             for (int l = 0; l < TotalLayerCount; l++)
             {
@@ -1188,12 +1272,27 @@ namespace TensorSharp.Models
                         Ops.Copy(dstV, srcV);
                     }
 
+                    // Evict the device-copy entries keyed by the OLD host pointers
+                    // while those pointers are still valid: the allocator may hand
+                    // the same address back for a later tensor, which would then
+                    // bind a stale device buffer. The cache is per rank, hence the
+                    // rank switch (same pattern as ResetTpKVCache).
+                    if (IsGgmlBackend)
+                    {
+                        GgmlBasicOps.SetActiveRank(r);
+                        InvalidateTensorDeviceCache(_tpKvCacheK[l][r]);
+                        InvalidateTensorDeviceCache(_tpKvCacheV[l][r]);
+                    }
+
                     _tpKvCacheK[l][r].Dispose();
                     _tpKvCacheV[l][r].Dispose();
                     _tpKvCacheK[l][r] = newK;
                     _tpKvCacheV[l][r] = newV;
                 }
             }
+
+            if (IsGgmlBackend)
+                GgmlBasicOps.SetActiveRank(previousRank);
 
             _tpKvCacheCapacity = newCapacity;
             Console.WriteLine($"Expanded Qwen3.5 TP attention cache to {newCapacity} tokens ({tp} GPUs).");

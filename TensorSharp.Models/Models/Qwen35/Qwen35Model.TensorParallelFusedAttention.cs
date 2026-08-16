@@ -195,6 +195,28 @@ namespace TensorSharp.Models
         private static readonly bool _tpFusedBlocksEnabled =
             Environment.GetEnvironmentVariable("TS_QWEN35_TP_FUSED") != "0";
 
+        /// <summary>
+        /// Report the first reason the fused per-rank attention block declined, once,
+        /// and return false. Without this the fallback to the per-op TP chain — which
+        /// the header above measures at 13.0 s of a 13.4 s forward — is completely
+        /// silent, so a run where tensor parallelism buys nothing looks identical to
+        /// one where it works. (The non-TP whole-model decode already reports its
+        /// decline this way; this is the TP twin.)
+        /// </summary>
+        private bool _tpFusedAttnDeclineLogged;
+
+        private bool TpAttnBail(string reason)
+        {
+            if (!_tpFusedAttnDeclineLogged)
+            {
+                _tpFusedAttnDeclineLogged = true;
+                Console.Error.WriteLine(
+                    $"[qwen35-tp] fused attention block NOT engaged ({reason}); " +
+                    "falling back to the per-op tensor-parallel chain for every full-attention layer.");
+            }
+            return false;
+        }
+
         private bool TpFusedAttentionAvailable()
         {
             if (_tpFusedAttnChecked)
@@ -212,6 +234,12 @@ namespace TensorSharp.Models
 
             if (_tpFusedAttnReady)
                 _tpAttnPlans = new IntPtr[TpDegree];
+            else if (IsTensorParallel)
+                TpAttnBail(
+                    !_tpFusedBlocksEnabled ? "disabled via TS_QWEN35_TP_FUSED=0"
+                    : !IsGgmlBackend ? $"backend {_backend} has no fused TP attention kernel"
+                    : GlobalTpDegree != TpDegree ? $"multi-node TP (global={GlobalTpDegree}, local={TpDegree})"
+                    : $"the native bridge reports no fused TP support for tp={TpDegree}");
             return _tpFusedAttnReady;
         }
 
@@ -235,16 +263,27 @@ namespace TensorSharp.Models
             Tensor qNorm = _attnQNormW[layer];
             Tensor kNorm = _attnKNormW[layer];
             if (attnNorm == null || qNorm == null || kNorm == null)
-                return false;
+                return TpAttnBail($"layer {layer} is missing attn/q/k norm weights");
             if (!_tpQuantWeights.TryGetValue(_attnQkvKey[layer], out var qkvShards) ||
                 !_tpQuantWeights.TryGetValue(_attnOutputKey[layer], out var oShards))
-                return false;
+            {
+                // The usual cause is a mixed-quant GGUF (UD / imatrix builds pick
+                // different types for Q, K and V), where the QKV fusion declines and
+                // the TP shard is built as a dequantized F32 tensor in _tpWeights
+                // instead. Every full-attention layer then silently drops to the
+                // per-op TP chain, which is where "tp=2 is no faster than tp=1"
+                // comes from.
+                return TpAttnBail(
+                    $"layer {layer}: no quantized TP shard for " +
+                    $"{(_tpQuantWeights.ContainsKey(_attnQkvKey[layer]) ? _attnOutputKey[layer] : _attnQkvKey[layer])}" +
+                    (_tpWeights.ContainsKey(_attnQkvKey[layer]) ? " (an F32 shard exists; mixed-quant Q/K/V forced the dequantized path)" : ""));
+            }
             if (_tpKvCacheK == null || _tpKvCacheK[layer] == null)
-                return false;
+                return TpAttnBail($"layer {layer} has no per-rank TP KV cache");
 
             Tensor kCache0 = _tpKvCacheK[layer][0];
             if (kCache0.ElementType != DType.Float32 && kCache0.ElementType != DType.Float16)
-                return false;
+                return TpAttnBail($"KV cache dtype {kCache0.ElementType} is unsupported by the fused TP attention graph");
 
             int headDim = Config.HeadDim;
             int numHeadsPerGpu = Config.NumHeads / tp;

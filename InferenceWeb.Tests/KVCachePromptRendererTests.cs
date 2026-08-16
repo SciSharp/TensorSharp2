@@ -518,6 +518,74 @@ public class KVCachePromptRendererTests
         Assert.Equal(string.Empty, KVCachePromptRenderer.GetAssistantGenerationSuffix(null, false));
     }
 
+    // ---- Empty <think> stripping (multi-turn prefix reuse) -------------------
+    //
+    // Repro: TensorSharp.Server + Qwen3.8-27B on ggml_metal, two turns, thinking on.
+    // Turn 2 reported kvReusePercent=0. The live cache held
+    //   ... `assistant` `\n` `<think>` `\n` <generated>
+    // but the re-render produced
+    //   ... `assistant` `\n` `<think>` `\n\n` `</think>` `\n\n` `<think>` `\n` <generated>
+    // because the chat template emits an EMPTY think block for a PAST assistant turn
+    // on top of the `<think>\n` this renderer injects. Four extra tokens at the first
+    // assistant boundary zeroed an all-or-nothing prefix match.
+
+    private static string P(int i) => MakePlaceholder(i);
+
+    [Fact]
+    public void StripEmptyThinkBlock_RemovesTemplateEmptyBlockAndItsTrailingWhitespace()
+    {
+        string rendered = "<|im_start|>assistant\n<think>\n\n</think>\n\n" + P(0) + "<|im_end|>\n";
+        string stripped = KVCachePromptRenderer.StripEmptyThinkBlockBeforePlaceholders(rendered);
+
+        // What remains must be exactly the framing the cache saw, so that the
+        // subsequent "<think>\n" injection reproduces it byte for byte.
+        Assert.Equal("<|im_start|>assistant\n" + P(0) + "<|im_end|>\n", stripped);
+    }
+
+    [Fact]
+    public void StripEmptyThinkBlock_LeavesNonEmptyThinkBlockAlone()
+    {
+        // A client that replays real prior reasoning must keep it.
+        string rendered = "<|im_start|>assistant\n<think>\nprior reasoning\n</think>\n\n" + P(0) + "<|im_end|>\n";
+        Assert.Equal(rendered, KVCachePromptRenderer.StripEmptyThinkBlockBeforePlaceholders(rendered));
+    }
+
+    [Fact]
+    public void StripEmptyThinkBlock_OnlyTouchesBlocksAdjacentToAPlaceholder()
+    {
+        // An empty block that is NOT immediately before a spliced turn (e.g. the
+        // generation prompt for the CURRENT turn) is part of what the model will be
+        // fed and must survive.
+        string rendered = "<|im_start|>assistant\n" + P(0) + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        Assert.Equal(rendered, KVCachePromptRenderer.StripEmptyThinkBlockBeforePlaceholders(rendered));
+    }
+
+    [Fact]
+    public void StripEmptyThinkBlock_HandlesEveryPlaceholderInAMultiTurnRender()
+    {
+        string rendered =
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n" + P(0) + "<|im_end|>\n" +
+            "<|im_start|>user\nagain<|im_end|>\n" +
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n" + P(1) + "<|im_end|>\n";
+        string stripped = KVCachePromptRenderer.StripEmptyThinkBlockBeforePlaceholders(rendered);
+
+        Assert.Equal(
+            "<|im_start|>assistant\n" + P(0) + "<|im_end|>\n" +
+            "<|im_start|>user\nagain<|im_end|>\n" +
+            "<|im_start|>assistant\n" + P(1) + "<|im_end|>\n",
+            stripped);
+    }
+
+    [Fact]
+    public void StripEmptyThinkBlock_NoPlaceholdersOrNoThinkTags_IsIdentity()
+    {
+        Assert.Equal("plain text", KVCachePromptRenderer.StripEmptyThinkBlockBeforePlaceholders("plain text"));
+        Assert.Equal("<think>\n\n</think>\n\nno placeholder",
+            KVCachePromptRenderer.StripEmptyThinkBlockBeforePlaceholders("<think>\n\n</think>\n\nno placeholder"));
+        string noThink = "<|im_start|>assistant\n" + P(0) + "<|im_end|>";
+        Assert.Equal(noThink, KVCachePromptRenderer.StripEmptyThinkBlockBeforePlaceholders(noThink));
+    }
+
     private static string MakePlaceholder(int index)
     {
         // Mirrors KVCachePromptRenderer.MakePlaceholder so we don't have to expose it

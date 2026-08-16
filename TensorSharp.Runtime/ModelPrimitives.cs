@@ -42,6 +42,17 @@ namespace TensorSharp.Runtime
         public bool UsesCircularKvCache { get; set; }
         public int OriginalContextLength { get; set; }
 
+        /// <summary>
+        /// Sampling parameters the model author shipped inside the GGUF under the
+        /// <c>general.sampling.*</c> keys, or null when the file carries none.
+        /// Only the fields actually present are set; the rest stay at their
+        /// <see cref="SamplingConfig"/> defaults. llama.cpp applies these over its
+        /// own defaults for every field the operator did not pin
+        /// (common/common.cpp), and Qwen3.x GGUFs ship them — for example
+        /// Qwen3.8-27B carries top_k=20, top_p=0.95, temp=1.0.
+        /// </summary>
+        public RecommendedSampling RecommendedSampling { get; set; }
+
         public int HeadDim => KeyLength > 0 ? KeyLength : (ValueLength > 0 ? ValueLength : HiddenSize / NumHeads);
     }
 }

@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
 
 namespace TensorSharp.Runtime.Scheduling
@@ -69,6 +70,7 @@ namespace TensorSharp.Runtime.Scheduling
         // Running set: keyed by request id, ordered by sn for fairness.
         private readonly Dictionary<string, SequenceState> _running = new();
         private readonly List<SequenceState> _runningOrder = new();
+        private readonly ILogger _logger;
 
         public ContinuousBatchScheduler(
             SchedulerConfig cfg,
@@ -81,6 +83,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
+            _logger = logger ?? NullLogger.Instance;
             _fingerprint = modelFingerprint ?? string.Empty;
             _crossSeqKvReuse = supportsCrossSequenceKvReuse;
             _maxReusablePrefixTokens = maxReusablePrefixTokens <= 0 ? int.MaxValue : maxReusablePrefixTokens;
@@ -299,6 +302,15 @@ namespace TensorSharp.Runtime.Scheduling
                         int lcp = _liveContinuationLcp(seq);
                         if (lcp > 0 && _liveContinuationAdopt(seq, lcp))
                             plannedLiveContinuation = true;
+                    }
+                    else if (_liveContinuationLcp != null)
+                    {
+                        // Not even attempted. The sole-sequence gate is the usual
+                        // reason and it is invisible from the request's telemetry,
+                        // which just reports 0% reuse.
+                        _logger.LogDebug(
+                            "Live-cache continuation not attempted for {RequestId}: running={Running} scheduledThisStep={Scheduled}.",
+                            seq.RequestId, _running.Count, output.ScheduledWork.Count);
                     }
 
                     // Retained fused-cache continuation: a finished concurrent

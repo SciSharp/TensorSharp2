@@ -446,6 +446,44 @@ TSG_EXPORT void TSGgml_ReleaseFusedMatmulAddTpGraphs()
     }
 }
 
+namespace
+{
+    // Byte ceiling for the activation set of ONE fused FFN graph. The op is
+    // row-splittable, so a prompt whose single-shot graph would exceed this is
+    // walked in slabs instead of demanding one enormous device buffer -- the
+    // 27B/1073-token multimodal prefill that motivated this asked for 645 MiB
+    // in a single cudaMalloc and died. Override with TS_GGML_FFN_GRAPH_BUDGET_MB
+    // (0 disables slabbing entirely).
+    std::size_t ffn_graph_budget_bytes()
+    {
+        static const std::size_t s_budget = []() -> std::size_t {
+            const char* e = std::getenv("TS_GGML_FFN_GRAPH_BUDGET_MB");
+            if (e != nullptr && e[0] != '\0')
+            {
+                char* end = nullptr;
+                const long long mb = std::strtoll(e, &end, 10);
+                if (end != e && mb >= 0)
+                    return static_cast<std::size_t>(mb) * 1024ull * 1024ull;
+            }
+            return 512ull * 1024ull * 1024ull;
+        }();
+        return s_budget;
+    }
+
+    // Largest row slab whose graph activations fit the budget, clamped to
+    // [1, rows]. `bytes_per_row` is the caller's per-row activation footprint.
+    int ffn_rows_per_slab(int rows, std::size_t bytes_per_row)
+    {
+        const std::size_t budget = ffn_graph_budget_bytes();
+        if (budget == 0 || bytes_per_row == 0)
+            return rows;
+        const std::size_t fit = budget / bytes_per_row;
+        if (fit == 0)
+            return 1;
+        return fit >= static_cast<std::size_t>(rows) ? rows : static_cast<int>(fit);
+    }
+}
+
 // ============================================================================
 // Fully fused dense SwiGLU FFN with residual add: single GGML graph dispatch.
 //
@@ -460,7 +498,7 @@ TSG_EXPORT void TSGgml_ReleaseFusedMatmulAddTpGraphs()
 // 2 host<->backend syncs per FFN per layer per forward call. On Metal this
 // dramatically lowers Metal command-buffer overhead which dominates FFN time
 // for moderate sequence lengths.
-int fused_ffn_swiglu_quant_f32_impl(
+static int fused_ffn_swiglu_quant_f32_slab(
     const TensorView2DDesc& residual_desc,
     const TensorView2DDesc& input_desc,
     void* norm_weight_data,
@@ -470,8 +508,11 @@ int fused_ffn_swiglu_quant_f32_impl(
     const QuantizedWeightDesc& down_quant,
     int half_dim,
     int tp_degree,
-    void** tp_plan_out)
+    void** tp_plan_out,
+    int* alloc_failed_out)
 {
+    if (alloc_failed_out != nullptr)
+        *alloc_failed_out = 0;
     if (!ensure_backend())
         return 0;
 
@@ -666,11 +707,14 @@ int fused_ffn_swiglu_quant_f32_impl(
     ggml_tensor* up_view = ggml_view_2d(context.value, gate_up_mm,
         half_dim, rows, gu_row_bytes, half_bytes);
 
-    ggml_tensor* gate_cont = ggml_cont(context.value, gate_view);
-    ggml_tensor* up_cont = ggml_cont(context.value, up_view);
-
-    ggml_tensor* silu_gate = ggml_silu(context.value, gate_cont);
-    ggml_tensor* swiglu = ggml_mul(context.value, silu_gate, up_cont);
+    // silu(gate) * up in ONE node straight off the strided halves. The GLU op
+    // only needs ggml_is_contiguous_1 (rows contiguous, arbitrary row stride),
+    // which a [half_dim, rows] view of the packed gate_up output satisfies on
+    // every backend (CPU ops.cpp, ggml-cuda/unary.cu, ggml-metal, ggml-vulkan
+    // all read src->nb[1]). The previous cont/cont/silu/mul chain materialized
+    // FOUR extra [rows, half_dim] F32 tensors -- at 1073 rows x 17408 that is
+    // 285 MiB of activations and 3 extra kernel launches per layer.
+    ggml_tensor* swiglu = ggml_swiglu_split(context.value, gate_view, up_view);
 
     ggml_tensor* swiglu_2d = (rows == 1)
         ? ggml_reshape_2d(context.value, swiglu, half_dim, 1)
@@ -690,6 +734,12 @@ int fused_ffn_swiglu_quant_f32_impl(
     }
 
     ggml_set_output(output_tensor);
+    // The residual base is both a graph input (its cont feeds the add) and the
+    // destination of the terminal cpy. Marking it OUTPUT keeps ggml_gallocr from
+    // recycling its memory for a later intermediate (ggml-alloc.c
+    // ggml_gallocr_free_node skips OUTPUT tensors) and from picking it as an
+    // in-place target.
+    ggml_set_output(residual_binding.storage);
 
     ggml_cgraph* graph = ggml_new_graph(context.value);
     if (graph == nullptr)
@@ -699,12 +749,32 @@ int fused_ffn_swiglu_quant_f32_impl(
     }
     ggml_build_forward_expand(graph, output_tensor);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
-    if (buffer.value == nullptr)
+    // Allocate the activations out of the persistent, liveness-planning gallocr
+    // instead of one fresh device buffer per call. ggml_backend_alloc_ctx_tensors
+    // has no notion of liveness: it sums EVERY tensor in the context, so a
+    // 1073-row FFN asked for 595 MiB in a single cudaMalloc, per layer, per
+    // forward -- both the OOM in the multimodal prefill and a per-layer
+    // alloc/free that fragments VRAM and stalls the driver. gallocr reuses one
+    // grown-once buffer across every call and only holds the live set (~2.4x
+    // less here). TP build mode parks the graph for deferred execution, so it
+    // keeps its own buffer -- a shared allocator would be re-planned out from
+    // under the parked graph.
+    BufferHandle buffer(nullptr);
+    if (tp_mode || !alloc_graph_reuse_gallocr(graph))
     {
-        set_last_error("fused_ffn_swiglu: failed to allocate backend buffer.");
-        return 0;
+        buffer.value = ggml_backend_alloc_ctx_tensors(context.value, g_backend);
+        if (buffer.value == nullptr)
+        {
+            if (alloc_failed_out != nullptr)
+                *alloc_failed_out = 1;
+            set_last_error("fused_ffn_swiglu: failed to allocate backend buffer.");
+            return 0;
+        }
     }
+
+    // Drain the previous call's GPU work before overwriting the shared buffer
+    // (no-op on the eager-sync path and on the per-call fallback).
+    host_read_barrier();
 
     if (!use_zero_copy)
     {
@@ -760,7 +830,70 @@ int fused_ffn_swiglu_quant_f32_impl(
         return 0;
     }
     finalize_compute(use_zero_copy, residual_binding.storage, residual_desc.data, residual_binding.raw_bytes);
+    // Drain the queued async download before the per-call fallback buffer frees
+    // (no-op on the reuse-gallocr path, where buffer.value == nullptr).
+    if (buffer.value != nullptr) host_read_barrier();
 
+    clear_last_error();
+    return 1;
+}
+
+// Row-slabbed driver for the fused SwiGLU FFN. Every row is independent, so a
+// prompt whose single-shot activation set would exceed the graph budget (or
+// whose allocation fails outright on a loaded GPU) is walked in slabs instead of
+// failing the turn. TP build mode parks one graph per call and is never slabbed.
+int fused_ffn_swiglu_quant_f32_impl(
+    const TensorView2DDesc& residual_desc,
+    const TensorView2DDesc& input_desc,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps,
+    const QuantizedWeightDesc& gate_up_quant,
+    const QuantizedWeightDesc& down_quant,
+    int half_dim,
+    int tp_degree,
+    void** tp_plan_out)
+{
+    const bool tp_mode = tp_degree > 1 && tp_plan_out != nullptr;
+    const int rows = input_desc.dim0;
+    if (tp_mode || rows <= 1 || half_dim <= 0 || input_desc.dim1 <= 0)
+    {
+        return fused_ffn_swiglu_quant_f32_slab(residual_desc, input_desc, norm_weight_data,
+            norm_weight_count, eps, gate_up_quant, down_quant, half_dim, tp_degree, tp_plan_out, nullptr);
+    }
+
+    // Live activation set per row under gallocr: the residual base and its cont
+    // stay live across the whole graph, the norm chain reuses one hidden-sized
+    // slot, and the peak adds gate_up (2*half) + swiglu (half). Budget against
+    // that rather than the un-reused sum so a comfortably-fitting prompt is
+    // still done in one dispatch.
+    const std::size_t bytes_per_row = sizeof(float) * (
+        3ull * static_cast<std::size_t>(input_desc.dim1) +
+        3ull * static_cast<std::size_t>(half_dim));
+
+    int slab = ffn_rows_per_slab(rows, bytes_per_row);
+    int start = 0;
+    while (start < rows)
+    {
+        const int count = std::min(slab, rows - start);
+        int alloc_failed = 0;
+        if (fused_ffn_swiglu_quant_f32_slab(
+                slice_rows_2d(residual_desc, start, count),
+                slice_rows_2d(input_desc, start, count),
+                norm_weight_data, norm_weight_count, eps,
+                gate_up_quant, down_quant, half_dim, 1, nullptr, &alloc_failed) != 0)
+        {
+            start += count;
+            continue;
+        }
+        // Only an ALLOCATION failure is retryable: the slab died before its
+        // graph ran, so its rows of `residual` are untouched and narrowing is
+        // exact. A compute failure may have partially written them, and
+        // re-running would add the FFN output twice -- fail the call instead.
+        if (alloc_failed == 0 || slab <= 1)
+            return 0;
+        slab = std::max(1, slab / 2);
+    }
     clear_last_error();
     return 1;
 }
@@ -982,13 +1115,12 @@ int fused_ffn_act_project_quant_f32_impl(
     ggml_tensor* gate_view = ggml_view_2d(context.value, gate_up_mm, half_dim, rows, gu_row_bytes, 0);
     ggml_tensor* up_view = ggml_view_2d(context.value, gate_up_mm, half_dim, rows, gu_row_bytes, half_bytes);
 
-    ggml_tensor* gate_cont = ggml_cont(context.value, gate_view);
-    ggml_tensor* up_cont = ggml_cont(context.value, up_view);
-
-    ggml_tensor* act_gate = (act_type == 1)
-        ? ggml_gelu(context.value, gate_cont)
-        : ggml_silu(context.value, gate_cont);
-    ggml_tensor* glu = ggml_mul(context.value, act_gate, up_cont);
+    // act(gate) * up as one GLU node off the strided halves (see the note in
+    // fused_ffn_swiglu_quant_f32_slab): three fewer [rows, half_dim] F32
+    // intermediates and three fewer kernel launches.
+    ggml_tensor* glu = (act_type == 1)
+        ? ggml_geglu_split(context.value, gate_view, up_view)
+        : ggml_swiglu_split(context.value, gate_view, up_view);
 
     ggml_tensor* glu_2d = (rows == 1)
         ? ggml_reshape_2d(context.value, glu, half_dim, 1)
@@ -1004,6 +1136,9 @@ int fused_ffn_act_project_quant_f32_impl(
         return 0;
     }
     ggml_set_output(output_node);
+    // The output base is written by the terminal cpy and read back afterwards;
+    // keep gallocr from recycling it (see fused_ffn_swiglu_quant_f32_slab).
+    ggml_set_output(output_binding.storage);
 
     ggml_cgraph* graph = ggml_new_graph(context.value);
     if (graph == nullptr)
@@ -1013,12 +1148,20 @@ int fused_ffn_act_project_quant_f32_impl(
     }
     ggml_build_forward_expand(graph, output_node);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
-    if (buffer.value == nullptr)
+    // Persistent, liveness-planning allocator instead of a fresh per-call device
+    // buffer (see fused_ffn_swiglu_quant_f32_slab).
+    BufferHandle buffer(nullptr);
+    if (!alloc_graph_reuse_gallocr(graph))
     {
-        set_last_error("fused_ffn_act: failed to allocate backend buffer.");
-        return 0;
+        buffer.value = ggml_backend_alloc_ctx_tensors(context.value, g_backend);
+        if (buffer.value == nullptr)
+        {
+            set_last_error("fused_ffn_act: failed to allocate backend buffer.");
+            return 0;
+        }
     }
+
+    host_read_barrier();
 
     // Output is write-only; never upload it. Upload input + weights as needed.
     if (!use_zero_copy)
@@ -1045,6 +1188,7 @@ int fused_ffn_act_project_quant_f32_impl(
         return 0;
     }
     finalize_compute(use_zero_copy, output_binding.storage, output_desc.data, output_binding.raw_bytes);
+    if (buffer.value != nullptr) host_read_barrier();
 
     clear_last_error();
     return 1;
@@ -1889,10 +2033,12 @@ int fused_outproj_ffn_quant_f32_impl(
     ggml_tensor* gu_mm = ggml_mul_mat(ctx, gu_w, scaled_2d);
     std::size_t gu_row_bytes = static_cast<std::size_t>(gate_up_out) * sizeof(float);
     std::size_t half_bytes = static_cast<std::size_t>(half_dim) * sizeof(float);
-    ggml_tensor* gate_v = ggml_cont(ctx, ggml_view_2d(ctx, gu_mm, half_dim, rows, gu_row_bytes, 0));
-    ggml_tensor* up_v   = ggml_cont(ctx, ggml_view_2d(ctx, gu_mm, half_dim, rows, gu_row_bytes, half_bytes));
-    ggml_tensor* silu_gate = ggml_silu(ctx, gate_v);
-    ggml_tensor* swiglu = ggml_mul(ctx, silu_gate, up_v);
+    // One GLU node straight off the strided halves (see the note in
+    // fused_ffn_swiglu_quant_f32_slab): saves three [rows, half_dim] F32
+    // intermediates and three kernel launches per layer.
+    ggml_tensor* gate_v = ggml_view_2d(ctx, gu_mm, half_dim, rows, gu_row_bytes, 0);
+    ggml_tensor* up_v   = ggml_view_2d(ctx, gu_mm, half_dim, rows, gu_row_bytes, half_bytes);
+    ggml_tensor* swiglu = ggml_swiglu_split(ctx, gate_v, up_v);
     ggml_tensor* swiglu_2d = (rows == 1) ? ggml_reshape_2d(ctx, swiglu, half_dim, 1) : swiglu;
     ggml_tensor* dn_mm = ggml_mul_mat(ctx, dn_w, swiglu_2d);
 
@@ -1903,13 +2049,26 @@ int fused_outproj_ffn_quant_f32_impl(
     ggml_tensor* output = ggml_cpy(ctx, final_res, residual_binding.tensor);
     if (!output) { set_last_error("fused_outproj_ffn: output cpy failed."); return 0; }
     ggml_set_output(output);
+    // Keep gallocr from recycling the residual base: it is read at the start and
+    // written by the terminal cpy (see fused_ffn_swiglu_quant_f32_slab).
+    ggml_set_output(residual_binding.storage);
 
     ggml_cgraph* graph = ggml_new_graph(ctx);
     if (!graph) { set_last_error("fused_outproj_ffn: graph failed."); return 0; }
     ggml_build_forward_expand(graph, output);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
-    if (!buffer.value) { set_last_error("fused_outproj_ffn: buffer alloc failed."); return 0; }
+    // Persistent, liveness-planning allocator instead of a fresh per-call device
+    // buffer (see fused_ffn_swiglu_quant_f32_slab). This graph is the larger of
+    // the two: it also carries the GDN value-dim input, which is what asked for
+    // 645 MiB in a single cudaMalloc on the 1073-token multimodal prefill.
+    BufferHandle buffer(nullptr);
+    if (!alloc_graph_reuse_gallocr(graph))
+    {
+        buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+        if (!buffer.value) { set_last_error("fused_outproj_ffn: buffer alloc failed."); return 0; }
+    }
+
+    host_read_barrier();
 
     if (!use_zero_copy) {
         upload_binding(residual_binding, residual_desc.data, residual_binding.raw_bytes);
@@ -1925,6 +2084,7 @@ int fused_outproj_ffn_quant_f32_impl(
     ggml_status status = ggml_backend_graph_compute(g_backend, graph);
     if (status != GGML_STATUS_SUCCESS) { set_last_error("fused_outproj_ffn: compute failed."); return 0; }
     finalize_compute(use_zero_copy, residual_binding.storage, residual_desc.data, residual_binding.raw_bytes);
+    if (buffer.value != nullptr) host_read_barrier();
 
     clear_last_error();
     return 1;

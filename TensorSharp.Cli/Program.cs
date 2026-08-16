@@ -222,6 +222,9 @@ namespace TensorSharp.Cli
             float specDraftConfMin = -1f;
 
             var samplingConfig = SamplingConfig.Greedy;
+            // Which sampling knobs the operator set explicitly. Model- and
+            // mode-derived defaults must never overwrite these.
+            var pinnedSampling = SamplingFields.None;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -379,13 +382,14 @@ namespace TensorSharp.Cli
                             systemPrompt = File.ReadAllText(spPath);
                         }
                         break;
-                    case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); break;
-                    case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--min-p": samplingConfig.MinP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--repeat-penalty": samplingConfig.RepetitionPenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--presence-penalty": samplingConfig.PresencePenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--frequency-penalty": samplingConfig.FrequencyPenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.Temperature; break;
+                    case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); pinnedSampling |= SamplingFields.TopK; break;
+                    case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.TopP; break;
+                    case "--min-p": samplingConfig.MinP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.MinP; break;
+                    case "--repeat-penalty": samplingConfig.RepetitionPenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.RepetitionPenalty; break;
+                    case "--penalty-last-n": samplingConfig.PenaltyLastN = int.Parse(args[++i]); pinnedSampling |= SamplingFields.PenaltyLastN; break;
+                    case "--presence-penalty": samplingConfig.PresencePenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.PresencePenalty; break;
+                    case "--frequency-penalty": samplingConfig.FrequencyPenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.FrequencyPenalty; break;
                     case "--seed": samplingConfig.Seed = int.Parse(args[++i]); break;
                     case "--stop":
                         samplingConfig.StopSequences ??= new List<string>();
@@ -733,6 +737,15 @@ namespace TensorSharp.Cli
                 _log.LogInformation(LogEventIds.CliStarted,
                     "Entering interactive chat mode (model={Model}, backend={Backend}, thinking={Thinking})",
                     Path.GetFileName(modelPath), backend, enableThinking);
+
+                // Interactive chat must not decode greedily. An unpenalised argmax
+                // over thousands of steps is the textbook neural-text-degeneration
+                // setting: locally fluent for a few hundred tokens, then the argmax
+                // map reaches a fixed cycle and repeats the same phrase forever.
+                // (The 512-token default budget used to hide it; --max-tokens 20000
+                // removes that backstop.) Batch / benchmark entry points below keep
+                // SamplingConfig.Greedy so they stay bit-reproducible.
+                ResolveChatSamplingDefaults(samplingConfig, ref pinnedSampling, model);
 
                 // Apply --system / --system-file by prepending it to the running
                 // history before the loop starts; the user can still override
@@ -1492,6 +1505,50 @@ namespace TensorSharp.Cli
             if (!string.IsNullOrWhiteSpace(raw) && int.TryParse(raw, out int v) && v > 0)
                 return v;
             return 0;
+        }
+
+        /// <summary>
+        /// Resolve the sampling chain an interactive chat turn should use, in the
+        /// same precedence order llama.cpp uses (common/common.cpp): built-in chat
+        /// defaults, then the model's own <c>general.sampling.*</c> recommendations
+        /// from the GGUF, then whatever the operator pinned on the command line.
+        ///
+        /// The CLI previously handed <see cref="SamplingConfig.Greedy"/> straight to
+        /// the chat loop. Greedy decoding with every penalty disabled is why long
+        /// answers degenerated into an endless repetition of the same phrase: the
+        /// argmax map has fixed cycles, and nothing in the decode loop can leave one.
+        /// Passing <c>--temperature 0</c> restores the old behaviour (and with it the
+        /// argmax-keyed fast paths: pipelined greedy decode and MTP block-speculative
+        /// decoding, both of which require a pure-argmax sampler).
+        /// </summary>
+        internal static void ResolveChatSamplingDefaults(
+            SamplingConfig cfg, ref SamplingFields pinned, IModelArchitecture model)
+        {
+            if (cfg == null) return;
+
+            // 1. Chat defaults for everything the operator did not pin. These match
+            //    llama.cpp's default sampler chain (common/common.h) rather than the
+            //    CLI's historical greedy config.
+            if (!pinned.HasFlag(SamplingFields.Temperature)) cfg.Temperature = 0.8f;
+            if (!pinned.HasFlag(SamplingFields.TopK)) cfg.TopK = 40;
+            if (!pinned.HasFlag(SamplingFields.TopP)) cfg.TopP = 0.95f;
+            if (!pinned.HasFlag(SamplingFields.MinP)) cfg.MinP = 0.05f;
+            if (!pinned.HasFlag(SamplingFields.PenaltyLastN)) cfg.PenaltyLastN = 64;
+
+            // 2. The model's own recommendation wins over our generic defaults.
+            string fromModel = model?.Config?.RecommendedSampling?.ApplyTo(cfg, pinned) ?? string.Empty;
+
+            string summary =
+                $"temp={cfg.Temperature.ToString("0.###", CultureInfo.InvariantCulture)} " +
+                $"top_k={cfg.TopK} " +
+                $"top_p={cfg.TopP.ToString("0.###", CultureInfo.InvariantCulture)} " +
+                $"min_p={cfg.MinP.ToString("0.###", CultureInfo.InvariantCulture)} " +
+                $"repeat_penalty={cfg.RepetitionPenalty.ToString("0.###", CultureInfo.InvariantCulture)}";
+            Console.WriteLine(fromModel.Length > 0
+                ? $"  Chat sampling: {summary} (GGUF general.sampling.*: {fromModel})"
+                : $"  Chat sampling: {summary}");
+            if (cfg.IsGreedy)
+                Console.WriteLine("  NOTE: sampling resolved to greedy; long answers can repeat endlessly.");
         }
 
         static SamplingConfig ParseSamplingFromJson(JsonElement root, SamplingConfig fallback)
