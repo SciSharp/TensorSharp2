@@ -15,7 +15,7 @@ public class ChatGenerationPipelineDocumentTests
     [Fact]
     public void RejectAttachedDocumentOverflow_RejectsInsteadOfSilentlyTruncating()
     {
-        var ex = Assert.Throws<InvalidOperationException>(() =>
+        var ex = Assert.Throws<PromptContextOverflowException>(() =>
             ChatGenerationPipeline.RejectAttachedDocumentOverflow(
                 promptTokens: 130_000,
                 maxTokens: 4_096,

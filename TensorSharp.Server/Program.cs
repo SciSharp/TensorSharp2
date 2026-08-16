@@ -244,6 +244,10 @@ if (qwenImageFlagsApplied)
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);
 
 app.UseTensorSharpRequestLogging();
+// Convert a prompt-doesn't-fit-context failure into a 400. After request
+// logging so the rejection is still traced; before the endpoints so it covers
+// every protocol surface.
+app.UsePromptOverflowHandling();
 // Serve the bundled static UI. GET / sends index.html too (see
 // HealthEndpoints), so a bare http://host:port/ opens the chat UI; the plain
 // liveness response moved to GET /health and still answers / on headless
