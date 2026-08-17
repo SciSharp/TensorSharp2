@@ -241,14 +241,29 @@ namespace TensorSharp.Server.ProtocolAdapters
             }
 
             string ext = Path.GetExtension(file.FileName).ToLowerInvariant();
+            // Classify before anything touches disk: an upload with an extension
+            // outside the allow-list is rejected without ever being written, so
+            // /uploads can only ever hold files the serve-side policy covers.
+            string mediaType = UploadContentPolicy.Classify(ext);
+            if (mediaType == "unknown")
+            {
+                uploadLogger.LogWarning(LogEventIds.UploadRejected,
+                    "Upload rejected: unsupported extension {Extension} (name={FileName})",
+                    ext.Length == 0 ? "(none)" : ext, file.FileName);
+                return Results.BadRequest(new
+                {
+                    error = ext.Length == 0
+                        ? "Files without an extension are not supported. Upload an image, video, audio, PDF, or plain-text/code file."
+                        : $"Unsupported file type '{ext}'. Upload an image, video, audio, PDF, or plain-text/code file.",
+                });
+            }
+
             string safeFileName = $"{Guid.NewGuid():N}{ext}";
             string savePath = Path.Combine(_options.UploadDirectory, safeFileName);
             string uploadUrl = BuildUploadUrl(safeFileName);
 
             using (var stream = File.Create(savePath))
                 await file.CopyToAsync(stream);
-
-            string mediaType = ClassifyExtension(ext);
 
             // Include the full saved path and the classified media type so this entry
             // is self-sufficient for tracing back from the per-turn chat log
@@ -1052,21 +1067,6 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return v;
             return 0;
         }
-
-        private static string ClassifyExtension(string ext) => ext switch
-        {
-            ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp" or ".bmp"
-                or ".heic" or ".heif" => "image",
-            ".mp4" or ".mov" or ".avi" or ".mkv" or ".webm" => "video",
-            ".mp3" or ".wav" or ".ogg" or ".flac" or ".m4a" => "audio",
-            ".pdf" => "pdf",
-            ".txt" or ".csv" or ".json" or ".xml" or ".md" or ".log"
-                or ".py" or ".js" or ".ts" or ".cs" or ".java" or ".cpp" or ".c" or ".h"
-                or ".html" or ".css" or ".yaml" or ".yml" or ".toml" or ".ini" or ".cfg"
-                or ".sh" or ".bat" or ".ps1" or ".rb" or ".go" or ".rs" or ".swift"
-                or ".kt" or ".sql" or ".r" or ".m" or ".tex" or ".rtf" => "text",
-            _ => "unknown",
-        };
 
         // ---- Chat (SSE) -------------------------------------------------------
 
