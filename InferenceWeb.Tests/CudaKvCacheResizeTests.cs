@@ -17,6 +17,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Cuda")]
 public class CudaKvCacheResizeTests
 {
     private readonly ITestOutputHelper _output;

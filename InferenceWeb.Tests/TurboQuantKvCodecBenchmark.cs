@@ -25,6 +25,7 @@ namespace InferenceWeb.Tests;
 /// the timings are roughly representative of a production paged tier rather
 /// than the toy sizes used by the correctness tests.
 /// </summary>
+[Trait("Category", "Bench")]
 public class TurboQuantKvCodecBenchmark
 {
     // 16 layers × 8 KV heads × 256 tokens × 128 headDim × 2 (K+V) = 8,388,608 elements

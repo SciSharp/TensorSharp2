@@ -27,6 +27,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Mlx")]
 public class MlxIq3XxsKernelTests
 {
     private const int QK_K = 256;

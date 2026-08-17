@@ -132,6 +132,7 @@ public class WanDirectOpsTests
     // kernel without an additive mask: a non-aligned KV length and a
     // non-aligned bidirectional self-attention length. Wan's DiT attention is
     // unmasked, and neither length is a multiple of its 32/256-wide tiling.
+    [Trait("Requires", "Cuda")]
     [Theory]
     [InlineData(37, 257)]
     [InlineData(513, 513)]
@@ -222,6 +223,8 @@ public class WanDirectOpsTests
 
     // Manual perf probe (TS_WAN_ATTN_BENCH=1): raw streaming-attention kernel
     // throughput at the 832x480x33f DiT shape, printed as GFLOPS.
+    [Trait("Category", "Bench")]
+    [Trait("Requires", "Cuda")]
     [Fact]
     public void WanAttentionThroughput()
     {
@@ -249,6 +252,7 @@ public class WanDirectOpsTests
         ctx.Dispose();
     }
 
+    [Trait("Requires", "Cuda")]
     [Fact]
     public void CudaWanKernels_MatchCpu()
     {

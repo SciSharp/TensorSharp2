@@ -31,6 +31,8 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Category", "Bench")]
+[Trait("Requires", "Models")]
 public class Gemma4BatchedPerfBench
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";

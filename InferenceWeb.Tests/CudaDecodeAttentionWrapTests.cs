@@ -18,6 +18,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Cuda")]
 public class CudaDecodeAttentionWrapTests
 {
     private readonly ITestOutputHelper _output;

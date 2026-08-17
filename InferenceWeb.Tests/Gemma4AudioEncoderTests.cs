@@ -24,6 +24,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Models")]
 public class Gemma4AudioEncoderTests
 {
     private readonly ITestOutputHelper _output;

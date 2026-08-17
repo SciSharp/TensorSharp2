@@ -36,6 +36,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Models")]
 public class Gemma4MtpTests
 {
     private readonly ITestOutputHelper _output;

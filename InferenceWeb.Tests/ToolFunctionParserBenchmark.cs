@@ -40,6 +40,7 @@ namespace InferenceWeb.Tests;
 /// <see cref="JsonValueKind"/> before each access costs nothing.
 /// </para>
 /// </summary>
+[Trait("Category", "Bench")]
 public class ToolFunctionParserBenchmark
 {
     // A tool catalogue the size of a working agent harness: 12 tools x 6

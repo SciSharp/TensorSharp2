@@ -20,6 +20,8 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Category", "Bench")]
+[Trait("Requires", "Cuda")]
 public class CudaGraphPocTests
 {
     private readonly ITestOutputHelper _output;

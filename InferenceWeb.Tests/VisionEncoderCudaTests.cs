@@ -10,6 +10,7 @@ namespace InferenceWeb.Tests;
 /// defects these guard against were all silent: the encoder produced plausible
 /// but wrong embeddings rather than throwing.
 /// </summary>
+[Trait("Requires", "Cuda")]
 public class VisionEncoderCudaTests
 {
     // Ops.Add(x[rows, cols], bias[cols]) is how every linear layer in the vision

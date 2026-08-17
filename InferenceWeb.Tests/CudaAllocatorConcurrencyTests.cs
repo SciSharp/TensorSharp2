@@ -28,6 +28,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Cuda")]
 public class CudaAllocatorConcurrencyTests
 {
     private readonly ITestOutputHelper _output;
