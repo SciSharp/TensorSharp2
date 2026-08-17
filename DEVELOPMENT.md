@@ -440,6 +440,24 @@ the fused path engages.
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 ```
 
+#### Test lanes
+
+Tests are tagged with xUnit traits on two axes (declared in `InferenceWeb.Tests/TestAssemblyConfig.cs`): `Category=Bench` marks the timing/throughput benchmark classes, and `Requires=Cuda|Mlx|Models` marks what a test needs from the environment (`Models` = real GGUF weights via the test model directory). Untagged tests are self-contained correctness tests that run anywhere. An unfiltered `dotnet test` runs everything, exactly as before; `--filter` selects a lane:
+
+```bash
+# Inner loop while editing: environment-independent correctness tests, runs anywhere in seconds.
+# This is also the lane PR CI runs (.github/workflows/pr-unit-tests.yml).
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category!=Bench&Requires!=Cuda&Requires!=Mlx&Requires!=Models"
+
+# Full correctness (pre-push on a box with a GPU and model files): everything except benchmarks.
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category!=Bench"
+
+# Benchmarks only, run deliberately on quiet hardware — their assertions are timing-sensitive.
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category=Bench"
+```
+
+Note that CUDA-, MLX-, and model-gated tests currently pass silently when their prerequisite is missing, so excluding them from a lane changes what is exercised, not what a green run looks like.
+
 ### Server integration tests
 
 Integration tests for TensorSharp.Server are in `TensorSharp.Server/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue-status compatibility, concurrent requests, and abort support. Architecture-specific features (thinking, tool calling) are auto-detected and skipped when the active model does not support them.
