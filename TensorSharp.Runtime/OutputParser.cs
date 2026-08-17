@@ -120,14 +120,20 @@ namespace TensorSharp.Runtime
                     continue;   // a schema keyword sitting next to "properties" ("type", "$schema", ...)
                 var param = new ToolParameter
                 {
-                    Type = GetString(prop.Value, "type") ?? string.Empty,
+                    Type = ReadSchemaType(prop.Value) ?? string.Empty,
                     Description = GetString(prop.Value, "description") ?? string.Empty,
                 };
                 if (prop.Value.TryGetProperty("enum", out JsonElement enumValues)
                     && enumValues.ValueKind == JsonValueKind.Array)
                 {
+                    // A string member is stored unquoted, because the renderers
+                    // add the quotes themselves; anything else keeps its raw JSON
+                    // text. GetRawText rather than ToString: ToString renders a
+                    // boolean in .NET's casing ("True", which is not JSON) and
+                    // renders null as an empty string, which reaches the model as
+                    // a meaningless empty choice in the enum.
                     foreach (JsonElement v in enumValues.EnumerateArray())
-                        param.Enum.Add(v.ValueKind == JsonValueKind.String ? v.GetString() : v.ToString());
+                        param.Enum.Add(v.ValueKind == JsonValueKind.String ? v.GetString() : v.GetRawText());
                 }
                 fn.Parameters[prop.Name] = param;
             }
@@ -142,6 +148,37 @@ namespace TensorSharp.Runtime
             => obj.TryGetProperty(name, out JsonElement v) && v.ValueKind == JsonValueKind.String
                 ? v.GetString()
                 : null;
+
+        /// <summary>
+        /// Read a property schema's <c>type</c>. JSON Schema allows a union, and
+        /// <c>"type": ["string", "null"]</c> is how every schema generator spells
+        /// a nullable field, while <see cref="ToolParameter.Type"/> holds a single
+        /// name that the renderers switch on — an unrecognised one degrades the
+        /// parameter to <c>any</c> and drops its enum. Keep the first real type
+        /// and drop the <c>"null"</c> member, whose meaning <c>required</c>
+        /// already carries.
+        /// </summary>
+        private static string ReadSchemaType(JsonElement schema)
+        {
+            if (!schema.TryGetProperty("type", out JsonElement type))
+                return null;
+            if (type.ValueKind == JsonValueKind.String)
+                return type.GetString();
+            if (type.ValueKind != JsonValueKind.Array)
+                return null;
+
+            string first = null;
+            foreach (JsonElement v in type.EnumerateArray())
+            {
+                if (v.ValueKind != JsonValueKind.String)
+                    continue;
+                string name = v.GetString();
+                first ??= name;
+                if (name != "null")
+                    return name;
+            }
+            return first;
+        }
 
         private static void CollectRequired(JsonElement obj, List<string> into)
         {

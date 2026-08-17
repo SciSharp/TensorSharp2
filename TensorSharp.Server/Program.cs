@@ -242,6 +242,12 @@ if (qwenImageFlagsApplied)
 
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);
 
+// Outermost application middleware, so it handles an escaping exception before
+// the framework's Developer Exception Page can answer with the throwing source
+// file. Request logging sits just inside it and has already recorded the
+// failure in full by the time it rethrows here, so every API surface fails as
+// JSON without losing a single log line.
+app.UseApiExceptionHandling();
 app.UseTensorSharpRequestLogging();
 // Convert a prompt-doesn't-fit-context failure into a 400. After request
 // logging so the rejection is still traced; before the endpoints so it covers
