@@ -123,6 +123,39 @@ public class ToolFunctionParseTests
     }
 
     /// <summary>
+    /// A tool's <c>parameters</c> is a JSON Schema document, so <c>enum</c> may
+    /// hold values of any type and <c>type</c> may be a union. Both reach the
+    /// model as prompt text, so the spelling matters: a boolean has to arrive as
+    /// JSON's <c>true</c> rather than .NET's <c>True</c>, and a nullable field
+    /// has to keep a type name the renderers recognise instead of degrading to
+    /// <c>any</c>. Same rule as the server's tool parser (issue #142).
+    /// </summary>
+    [Fact]
+    public void JsonSchemaValuesThatAreNotStringsKeepTheirJsonSpelling()
+    {
+        var tools = ToolFunction.ParseList("""
+        [{
+          "name": "configure",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "level":   { "type": "integer", "enum": [0, 1, 2] },
+              "persist": { "type": "boolean", "enum": [true, false] },
+              "scope":   { "type": ["string", "null"] },
+              "choice":  { "type": "string", "enum": ["a", null] }
+            }
+          }
+        }]
+        """);
+
+        var fn = Assert.Single(tools);
+        Assert.Equal(new[] { "0", "1", "2" }, fn.Parameters["level"].Enum);
+        Assert.Equal(new[] { "true", "false" }, fn.Parameters["persist"].Enum);
+        Assert.Equal("string", fn.Parameters["scope"].Type);
+        Assert.Equal(new[] { "a", "null" }, fn.Parameters["choice"].Enum);
+    }
+
+    /// <summary>
     /// Every failure mode has to surface as a <see cref="JsonException"/> (or a
     /// subclass of it, e.g. JsonReaderException) so the CLI's single catch turns
     /// a bad file into a one-line error instead of an unhandled crash.
