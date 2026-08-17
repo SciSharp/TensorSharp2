@@ -83,16 +83,48 @@ namespace TensorSharp.Models.WanVideo
 
         public abstract void Dispose();
 
+        /// <summary>Latent rows blended between adjacent decode bands.</summary>
+        internal const int OverlapLat = 8;
+
+        /// <summary>
+        /// Horizontal band layout for a <paramref name="lh"/>-row latent plane that is
+        /// <paramref name="W"/> px wide: the band starts, and the band height in
+        /// <paramref name="bandLat"/>. Returns null when the plane fits the budget whole.
+        /// <para>Every overlapped row is decoded twice, so the layout — not just the
+        /// per-band budget — decides how much redundant work tiling costs. Choosing the
+        /// band COUNT from the budget first and then splitting the plane evenly across it
+        /// beats walking a fixed band height and letting the last band land wherever the
+        /// stride puts it: 52 rows with a 24-row band gave starts 0/16/28 and decoded 72
+        /// rows to produce 52, where two 30-row bands cover it in 60 with one seam
+        /// instead of two — and 30 rows still fit the same per-band budget.</para>
+        /// </summary>
+        internal static System.Collections.Generic.List<int> PlanBands(
+            int lh, int W, int spatialScale, long tilePixelThreshold, out int bandLat)
+        {
+            int maxBandLat = Math.Max(16, (int)(tilePixelThreshold / ((double)W * spatialScale)));
+            if (lh <= maxBandLat) { bandLat = lh; return null; }
+            int bands = Math.Max(2, (int)Math.Ceiling((lh - OverlapLat) / (double)(maxBandLat - OverlapLat)));
+            // n*bandLat >= lh + (n-1)*overlap keeps every seam at least OverlapLat wide.
+            bandLat = (int)Math.Ceiling((lh + (bands - 1) * (double)OverlapLat) / bands);
+            var starts = new System.Collections.Generic.List<int>(bands);
+            for (int b = 0; b < bands; b++)
+                starts.Add((int)((long)b * (lh - bandLat) / (bands - 1)));
+            return starts;
+        }
+
         /// <summary>
         /// Decode diffusion latents [ZDim, t, lh, lw] (planar c,t,h,w) into RGB frames.
-        /// Above ~0.5 MP the decode is spatially tiled into full-width horizontal bands
-        /// (each ~0.4 MP, the scale the whole-graph kernel is fast at) blended over an
-        /// 8-latent-row overlap — the diffusers AutoencoderKLWan enable_tiling approach.
+        /// Above the per-band pixel budget the decode is spatially tiled into full-width
+        /// horizontal bands (see <see cref="PlanBands"/>) blended over an 8-latent-row
+        /// overlap — the diffusers AutoencoderKLWan enable_tiling approach.
         /// A 720p plane's activation planes + cross-chunk causal caches otherwise hold
         /// ~12 GB device-resident, which pushes 16 GB WDDM cards into shared-memory
         /// paging (~20x slower). TS_WAN_VAE_TILE=0 disables tiling.
         /// </summary>
-        public RgbImage[] Decode(float[] latent, int t, int lh, int lw)
+        /// <param name="onBand">Optional band progress: (bandsDone, bandCount). A
+        /// full-resolution decode is minutes of work in a handful of native calls,
+        /// so the caller needs something to report while it runs.</param>
+        public RgbImage[] Decode(float[] latent, int t, int lh, int lw, Action<int, int> onBand = null)
         {
             int outT = 1 + (t - 1) * TemporalScale;
             int W = lw * SpatialScale, H = lh * SpatialScale;
@@ -111,29 +143,22 @@ namespace TensorSharp.Models.WanVideo
                 }
             }
 
-            const int OverlapLat = 8;   // latent rows blended between bands
-            // Band height targets ~2/3 of the tile threshold per band (so a plane
-            // just over the threshold still splits into at least two bands).
-            int bandLat = Math.Max(16, (int)Math.Round(TilePixelThreshold * 0.66 / ((double)W * SpatialScale)));
-            bool tile = Environment.GetEnvironmentVariable("TS_WAN_VAE_TILE") != "0"
-                        && (long)W * H > TilePixelThreshold && lh > bandLat;
+            bool tile = Environment.GetEnvironmentVariable("TS_WAN_VAE_TILE") != "0";
+            var starts = PlanBands(lh, W, SpatialScale, TilePixelThreshold, out int bandLat);
+            tile &= starts != null;
 
             var pixels = new float[(long)W * H * 3 * outT];
             if (!tile)
             {
+                onBand?.Invoke(0, 1);
                 DecodeNative(z, t, lh, lw, pixels);
+                onBand?.Invoke(1, 1);
             }
             else
             {
-                // Band starts: stride bandLat - OverlapLat, last band pinned to the end.
-                var starts = new System.Collections.Generic.List<int>();
-                for (int y = 0; ; y += bandLat - OverlapLat)
-                {
-                    if (y + bandLat >= lh) { starts.Add(Math.Max(0, lh - bandLat)); break; }
-                    starts.Add(y);
-                }
                 Console.WriteLine($"  [wan] VAE decode tiled into {starts.Count} horizontal bands " +
-                                  $"({W}x{bandLat * SpatialScale} px, {OverlapLat * SpatialScale} px blend)");
+                                  $"({W}x{bandLat * SpatialScale} px, " +
+                                  $"{(bandLat - (starts[1] - starts[0])) * SpatialScale} px blend)");
                 var band = new float[(long)lw * bandLat * ZDim * t];
                 var bandPx = new float[(long)W * (bandLat * SpatialScale) * 3 * outT];
                 for (int bi = 0; bi < starts.Count; bi++)
@@ -145,6 +170,7 @@ namespace TensorSharp.Models.WanVideo
                             Array.Copy(z, (((long)tt * ZDim + c) * lh + y0) * lw,
                                        band, ((long)tt * ZDim + c) * bandLat * lw,
                                        (long)bandLat * lw);
+                    onBand?.Invoke(bi, starts.Count);
                     DecodeNative(band, t, bandLat, lw, bandPx);
                     // blend the band into the canvas: cross-fade the overlap rows
                     int py0 = y0 * SpatialScale;
@@ -173,6 +199,7 @@ namespace TensorSharp.Models.WanVideo
                             }
                         }
                     });
+                    onBand?.Invoke(bi + 1, starts.Count);
                 }
             }
 

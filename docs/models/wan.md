@@ -100,6 +100,13 @@ TensorSharp.Cli --model HighNoise/Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf \
   cfg 3.5 (both experts), shift 5.0, 40 steps; A14B T2V cfg 4.0/3.0, shift
   12.0; Wan 2.1 cfg 6.0, shift 8.0 (1.3B video) or 3.0/5.0, 30 steps, 16 fps.
 - `--negative-prompt` defaults to the official Wan negative prompt.
+- `--cfg-cache-stride N` (default off) — approximate speedup. A guided step
+  is `v = v_cond + (cfg-1)·d` with `d = v_cond - v_uncond`; the guidance
+  direction `d` changes much more slowly across the schedule than `v` does, so
+  the unconditional pass can run on one step in `N` and the cached `d` cover the
+  rest. At 50 steps, `2` runs 77 of the 100 passes (1.30× faster) and `3` runs
+  70 (1.43×). The first three steps and the last always recompute `d`. Leave it
+  off when matching a reference sample matters. Server: `"cfgCacheStride": 2`.
 - MP4 writing prefers `ffmpeg` on `PATH` (or `TS_FFMPEG=<path>`, or an
   `ffmpeg` folder next to the executable) — near-lossless CRF 17 H.264.
   Without it the OS codec via OpenCV is used at its default bitrate, which
@@ -207,10 +214,13 @@ encoders match `AutoencoderKLWan` at cosine > 0.999, the Wan 2.2 VAE decode at
 HuggingFace T5 ids exactly on English and CJK prompts.
 
 Environment knobs: `TS_WAN_DIT_CAPTURE=0` (disable the persistent captured DiT
-graph), `TS_WAN_DIT_FLASH=0` (materialized attention), `TS_WAN_VAE_GEMM_MAX_MB`
-(im2col budget), `TS_WAN_VAE`/`TS_WAN_TE`/`TS_WAN_DIT2` (companion paths),
-`TS_FFMPEG` (ffmpeg path for MP4 export), `TS_WAN_DIT_TRACE=<file>`
-(per-stage activation stats for debugging).
+graph), `TS_WAN_DIT_FLASH=0` (materialized attention), `TS_WAN_DIT_KV_F16=0`
+(F32 attention keys/values — the old, ~2x slower default), `TS_WAN_HEARTBEAT_S`
+(progress tick interval, default 30; `0` silences the ticks),
+`TS_WAN_VAE_GEMM_MAX_MB` (im2col budget),
+`TS_WAN_VAE`/`TS_WAN_TE`/`TS_WAN_DIT2` (companion paths), `TS_FFMPEG` (ffmpeg
+path for MP4 export), `TS_WAN_DIT_TRACE=<file>` (per-stage activation stats for
+debugging).
 
 ## Performance
 
@@ -226,6 +236,111 @@ RTX 3080 Laptop 16 GB (Windows/WDDM), ggml_cuda:
 The TI2V-5B model's 16×16 spatial compression gives it ~2.7× fewer DiT tokens
 than Wan 2.1 at the same resolution — it is both the fastest and the
 highest-quality option for consumer GPUs, and the only 720p-24fps one.
+
+### Long sequences: cost is quadratic in the token count
+
+Token count is `latent_frames × (h/2) × (w/2)`, and DiT self-attention costs
+`O(tokens²)`. Past a few thousand tokens attention — not the weight matmuls —
+is where the time goes, so the frame count and the frame area both matter far
+more than the step count:
+
+| Request (TI2V-5B) | Tokens | Attention work |
+|---|---|---|
+| 640×384×25f | 1 200 | 1× |
+| 832×480×81f | 8 190 | 47× |
+| 1088×832×121f (5 s at 24 fps, 720p class) | 27 404 | 520× |
+
+The full 5-second 720p recipe is a genuinely large job: 50 steps × 2 CFG passes
+= 100 DiT passes over 27 k tokens. The pipeline prints the token count, a
+per-pass timing and a running ETA, and heartbeats every 30 s while a pass is in
+flight, so a long run is visibly progressing rather than apparently hung:
+
+```
+Wan 2.2-TI2V I2V: 1088x832x121f (31x26x34 = 27404 tokens), 50 steps, unipc, cfg 5, shift 5, seed ...
+  [wan] large request: 100 DiT passes over 27404 tokens. Self-attention costs O(tokens^2) ...
+  step 1/50 t=999.0 (249.0s: cond 124.6s + uncond 124.4s) — ~3h 24m left
+  [wan] …denoise step 2/50 (cond pass) 60s in this pass, 315s total, ~3h 24m left
+```
+
+To make such a request cheaper, in order of effect:
+
+1. **Fewer frames.** 121 → 61 frames roughly quarters the attention work; the
+   video is 2.5 s instead of 5 s at 24 fps.
+2. **Smaller frame area**, but not below Wan's training resolutions — under
+   ~0.3 MP the model is out of distribution and the result gets *worse*, not
+   just cheaper. `--width 480 --height 704` is a good portrait target.
+3. **Fewer steps.** 50 is the official TI2V recipe; 30 is visibly close and
+   1.7× cheaper.
+4. **`--cfg-cache-stride 2` or `3`** — 1.30× / 1.43× by reusing the guidance
+   direction between steps (approximate; see the CLI section).
+
+M5 Pro (20-core GPU, 48 GB unified), `ggml_metal`, Wan2.2-TI2V-5B Q8_0,
+1088×832×121f = 27 404 tokens, image-to-video, the official 50-step recipe:
+
+| Stage | Before | Now |
+|---|---|---|
+| text encode (UMT5-XXL, both prompts) | 1.9 s | 1.9 s |
+| image encode (VAE) | 5.2 s | 5.2 s |
+| denoise, per step (2 CFG passes) | 412.3 s | **249.0 s** |
+| VAE decode, 121 frames | 863 s (3 bands × 24 latent rows) | **734 s** (2 × 30) |
+| **50-step total** | ≈ 5 h 58 m | **≈ 3 h 40 m** (1.63×) |
+| 50-step total, `--cfg-cache-stride 3` | — | ≈ 2 h 38 m (2.27×) |
+
+Two changes account for that.
+
+**F16 attention keys and values.** Every backend's flash-attention kernel is
+built around an F16 KV cache: ggml-metal instantiates the F32 variant with
+`simdgroup_float8x8` accumulators where the F16 one uses `simdgroup_half8x8`,
+and the F32 tiles also cost twice the bandwidth in a kernel that re-streams K
+and V once per 8-query threadgroup. The permute into flash-attention layout and
+the narrowing happen in one `ggml_cpy`, so the F16 path also writes half the
+bytes the old `ggml_cont` did. `TS_WAN_DIT_KV_F16=0` restores F32.
+
+**VAE decode band layout.** Tiling picks the band *count* from the memory budget
+and then splits the plane evenly, instead of walking a fixed band height and
+letting the last band land wherever the stride puts it. At 52 latent rows that
+was three 24-row bands — 72 rows decoded to produce 52 — and is now two 30-row
+bands (60 rows, one seam instead of two) within the same per-band budget:
+863 s → 734 s, the ratio the row counts predict.
+
+#### Alternatives measured and rejected
+
+One self-attention at this shape (seq 27 404, 24 heads, head dim 128), same run:
+
+| KV type | time | vs F32 |
+|---|---|---|
+| F32 (before) | 4993 ms | 1.00× |
+| **F16 (now)** | **2467 ms** | **2.02×** |
+| Q8_0 | 2652 ms | 1.88× |
+| Q4_0 | 2395 ms | 2.08× |
+
+Q8_0 keys/values are *slower* than F16 — the dequantization outweighs the
+bandwidth saved — and Q4_0 buys 3% for a real precision cost, so F16 is the
+sweet spot rather than a compromise. Materialized chunked attention
+(`mul_mat` + `soft_max_ext`, which unlike flash attention *can* use the Metal 4
+tensor API) came in at 1.08×: at this size attention is bound by score traffic,
+not by the GEMM rate. Dequantizing the DiT weights from Q8_0 to F16 moved the
+matmuls by <5% (25.2 → 26.4 ms for an attention projection). The Metal 4 tensor
+API stays off for TI2V-5B: it makes the weight matmuls 2.9× faster (~22 s per
+pass) but forces the VAE onto the direct-conv path, which at 121 frames costs
+hours — see `ApplyArchitectureNativeTunables`.
+
+#### Quality
+
+F16 keys and values change the DiT's output by less than the sampler's own
+sensitivity to floating-point reassociation:
+
+- One DiT forward against the diffusers `WanTransformer3DModel` reference
+  (`WanVideoOracleTests`): cosine **0.999964** with F16 K/V and **0.999964**
+  with F32 K/V — the per-pass accuracy is unchanged.
+- Full 25-frame generations from an identical seed: F16 vs F32 K/V differ by
+  39.08 dB mean PSNR. The control — F32 K/V with flash attention *off*, i.e. the
+  same arithmetic in a different summation order — differs by 39.40 dB. The two
+  are the same magnitude, so the pixel difference is an 8-step diffusion
+  trajectory diverging from a rounding difference, not a loss of accuracy.
+
+The speedup only appears where attention dominates: at 2 310 tokens
+(480×704×25f) F16 and F32 K/V both run 5.0 s per pass.
 
 Wan 2.1 vs stable-diffusion.cpp (master-769, identical GGUFs/settings,
 33-frame 480p): sampling is near parity (281 s vs 258 s) but sd.cpp's VAE

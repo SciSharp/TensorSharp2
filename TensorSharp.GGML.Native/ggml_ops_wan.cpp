@@ -337,6 +337,25 @@ inline bool wan_flash_enabled()
     return on;
 }
 
+// Keys/values are handed to attention as F16. Every backend's flash-attention
+// kernel is built around an F16 KV cache: ggml-metal instantiates the F32-KV
+// kernel with simdgroup_float8x8 accumulators (FA_TYPES_F32) where the F16 one
+// uses simdgroup_half8x8, and the F32 tiles also cost twice the bandwidth in a
+// kernel that re-streams K and V once per 8-query threadgroup. Measured on an
+// M5 Pro at the Wan 2.2 TI2V 720p/121-frame shape (seq 27404, 24 heads, head
+// dim 128), one self-attention: 4872 ms F32 KV vs 2439 ms F16 KV — 2.0x, and
+// 30 blocks of it is the bulk of a denoising step. Q stays F32 (the Metal
+// kernel asserts it), and F16 K/V is what every reference implementation feeds
+// its attention (PyTorch/diffusers run the whole DiT in bf16/fp16;
+// stable-diffusion.cpp casts K/V to F16 before ggml_flash_attn_ext), so this
+// costs no accuracy the reference pipelines do not already spend.
+// TS_WAN_DIT_KV_F16=0 restores F32 keys/values.
+inline bool wan_kv_f16_enabled()
+{
+    static const bool on = []{ const char* e = std::getenv("TS_WAN_DIT_KV_F16"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+
 // Attention over q [hd, n_q, heads], k/v [hd, n_kv, heads]. Wan DiT
 // self-attention is fully bidirectional, so its flash path must be unmasked.
 // ggml-cuda handles a non-aligned KV tail directly; padding it to 256 used to
@@ -357,6 +376,8 @@ ggml_tensor* wan_attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, gg
     // Materialized reference path (backends without flash support; O(n_kv * n_q)
     // scores). The caller's k/v are already padded when a mask is given, and
     // soft_max_ext folds the scale and the (F16) additive mask in one op.
+    // k/v arrive F16 here (wan_heads_seq_kv); ggml_mul_mat takes an F16 src0
+    // against an F32 src1, so this path needs no change for that.
     ggml_tensor* kq = ggml_mul_mat(ctx, k, q);                       // [n_kv, n_q, heads]
     ggml_tensor* m = mask != nullptr
         ? ggml_view_2d(ctx, mask, k->ne[1], n_q, mask->nb[1], 0)
@@ -372,6 +393,22 @@ ggml_tensor* wan_attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, gg
 ggml_tensor* wan_heads_seq(ggml_context* ctx, ggml_tensor* x)
 {
     return ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+}
+
+// Same reshape for a key/value projection, landing in F16 when the KV cast is
+// enabled. ggml_cpy into a pre-typed destination does the permute and the
+// narrowing in ONE pass, so the F16 path also writes half the bytes the plain
+// ggml_cont did — it is strictly cheaper than the F32 layout change it replaces.
+ggml_tensor* wan_heads_seq_kv(ggml_context* ctx, ggml_tensor* x)
+{
+    if (!wan_kv_f16_enabled()) return wan_heads_seq(ctx, x);
+    ggml_tensor* p = ggml_permute(ctx, x, 0, 2, 1, 3);            // [hd, seq, heads]
+    ggml_tensor* dst = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, p->ne[0], p->ne[1], p->ne[2]);
+    ggml_tensor* cast = ggml_cpy(ctx, p, dst);
+    // A strided F32 -> F16 copy is supported on ggml-cpu / -metal / -cuda; keep the
+    // F32 layout change for any backend whose dup kernel rejects this combination
+    // rather than failing the whole graph.
+    return backend_supports_op(cast) ? cast : wan_heads_seq(ctx, x);
 }
 
 // ---------------------------------------------------------------------------
@@ -651,8 +688,8 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
         k3 = wan_rope(ctx, k3, g.cosIn, g.sinIn, hd, heads, seq);
 
         ggml_tensor* qa = wan_heads_seq(ctx, q3);                    // [hd, seq, heads]
-        ggml_tensor* ka = wan_heads_seq(ctx, k3);
-        ggml_tensor* va = wan_heads_seq(ctx, ggml_reshape_3d(ctx, v, hd, heads, seq));
+        ggml_tensor* ka = wan_heads_seq_kv(ctx, k3);                 // F16 (see wan_kv_f16_enabled)
+        ggml_tensor* va = wan_heads_seq_kv(ctx, ggml_reshape_3d(ctx, v, hd, heads, seq));
         ggml_tensor* attn = wan_attention(ctx, qa, ka, va, nullptr, dim, seq, scale);
         attn = wan_lin(ctx, b.sow, attn, b.sob);
         x = ggml_add(ctx, x, segGate(attn, eGateA, eGateAB));
@@ -664,8 +701,8 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
         ggml_tensor* xk = wan_rms(ctx, wan_lin(ctx, b.xkw, txt, b.xkb), b.xnk, eps);
         ggml_tensor* xv = wan_lin(ctx, b.xvw, txt, b.xvb);
         ggml_tensor* xqa = wan_heads_seq(ctx, ggml_reshape_3d(ctx, xq, hd, heads, seq));
-        ggml_tensor* xka = wan_heads_seq(ctx, ggml_reshape_3d(ctx, xk, hd, heads, cl));
-        ggml_tensor* xva = wan_heads_seq(ctx, ggml_reshape_3d(ctx, xv, hd, heads, cl));
+        ggml_tensor* xka = wan_heads_seq_kv(ctx, ggml_reshape_3d(ctx, xk, hd, heads, cl));
+        ggml_tensor* xva = wan_heads_seq_kv(ctx, ggml_reshape_3d(ctx, xv, hd, heads, cl));
         // ctx_len is a multiple of the KV stride (512), so flash needs no mask here.
         ggml_tensor* xattn = wan_attention(ctx, xqa, xka, xva, nullptr, dim, seq, scale);
         x = ggml_add(ctx, x, wan_lin(ctx, b.xow, xattn, b.xob));

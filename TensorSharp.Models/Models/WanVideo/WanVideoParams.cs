@@ -9,6 +9,26 @@ using TensorSharp.Models.QwenImage;
 
 namespace TensorSharp.Models.WanVideo
 {
+    /// <summary>A progress report from a running Wan generation.</summary>
+    public sealed class WanProgress
+    {
+        /// <summary>"text-encode", "image-encode", "denoise", "vae-decode" or "done".</summary>
+        public string Phase { get; init; }
+        /// <summary>Completed denoising steps (0-based count of finished steps).</summary>
+        public int Step { get; init; }
+        /// <summary>Total denoising steps for this request.</summary>
+        public int TotalSteps { get; init; }
+        /// <summary>Human-readable detail, e.g. "cond pass" or "band 3/7".</summary>
+        public string Detail { get; init; }
+        /// <summary>Seconds since generation started.</summary>
+        public double ElapsedSeconds { get; init; }
+        /// <summary>Estimated seconds still to run, or -1 before the first pass finishes.</summary>
+        public double EtaSeconds { get; init; } = -1;
+        /// <summary>True when this report is a periodic "still working" tick rather
+        /// than a phase transition.</summary>
+        public bool Heartbeat { get; init; }
+    }
+
     /// <summary>Sampling parameters for Wan video generation (text-to-video, or
     /// image-to-video on the Wan 2.2 models when a conditioning image is supplied).</summary>
     public sealed class WanVideoParams
@@ -69,8 +89,30 @@ namespace TensorSharp.Models.WanVideo
         /// 1000-step timestep range. 0 = model default (0.9 for I2V, 0.875 for T2V).</summary>
         public float BoundaryRatio { get; set; }
 
+        /// <summary>
+        /// Classifier-free guidance cache stride. Every step normally costs TWO DiT
+        /// passes (conditional + unconditional). Writing the update as
+        /// <c>v = v_cond + (cfg-1) * d</c> with <c>d = v_cond - v_uncond</c> isolates
+        /// the guidance direction <c>d</c>, which changes far more slowly across the
+        /// schedule than <c>v</c> itself. With a stride of N the unconditional pass
+        /// runs on one step in N (plus a warm-up and the final step) and the cached
+        /// <c>d</c> covers the rest. At the 50-step TI2V recipe, stride 2 runs 77 of
+        /// the 100 passes (1.30x faster) and stride 3 runs 70 (1.43x).
+        /// <para>0 or 1 = off (default): every step runs both passes exactly as the
+        /// reference pipelines do. This is an approximation — leave it off when
+        /// matching a reference sample matters.</para>
+        /// </summary>
+        public int CfgCacheStride { get; set; }
+
         /// <summary>Per-step progress callback: (stepIndex, totalSteps).</summary>
         public Action<int, int> OnStep { get; set; }
+
+        /// <summary>
+        /// Fine-grained progress. Fires on every phase transition AND on a periodic
+        /// heartbeat while a single DiT pass is running, so a caller can show that
+        /// work is advancing during the minutes one 720p/121-frame pass takes.
+        /// </summary>
+        public Action<WanProgress> OnProgress { get; set; }
 
         /// <summary>Resolve the conditioning image from whichever input was supplied.</summary>
         internal RgbImage ResolveImage()

@@ -125,6 +125,11 @@ namespace TensorSharp.Models.WanVideo
             var phase = Stopwatch.StartNew();
             void Phase(string n) { Console.WriteLine($"  [wan-timing] {n}: {phase.Elapsed.TotalMilliseconds:F0}ms"); phase.Restart(); }
 
+            // One DiT pass over a 720p/121-frame latent is minutes of uninterrupted
+            // GPU work inside a single native call. Without a heartbeat the console
+            // and the Web UI go silent for that whole time, which reads as a hang.
+            using var beat = new WanHeartbeat(p, total);
+
             WanVariant variant = _model.Variant;
             bool ti2v = variant == WanVariant.TI2V;
             bool a14b = variant == WanVariant.A14B;
@@ -207,12 +212,27 @@ namespace TensorSharp.Models.WanVideo
                                   $"(480p: 832x480, 720p: 1280x704{(ti2v ? ", the TI2V-5B native recipe" : "")}); " +
                                   "expect soft, distorted results. Prefer generating at a supported resolution " +
                                   "(e.g. --width 480 --height 704 for portrait) and downscaling afterwards.");
+            // Guidance-delta cache (opt-in; see WanVideoParams.CfgCacheStride).
+            int cfgStride = useCfg ? Math.Max(0, p.CfgCacheStride) : 0;
+            int passes = steps;
+            if (useCfg)
+                for (int i = 0; i < steps; i++)
+                    if (UsesUncondPass(i, steps, cfgStride)) passes++;
             Console.WriteLine($"Wan {family} {(i2v ? "I2V" : "T2V")}: {width}x{height}x{frames}f " +
                               $"({lt}x{hLen}x{wLen} = {seq} tokens), {steps} steps, " +
                               $"{(useEuler ? "euler" : "unipc")}, cfg {cfg}{(dualExpert ? $"/{cfg2}" : "")}, " +
                               $"shift {shift}, seed {seed}");
+            // Past a few thousand tokens the quadratic self-attention term dominates a
+            // pass, and a pass becomes minutes long — say so up front, because the
+            // request that produced it looks identical to a cheap one.
+            if (seq > 8000)
+                Console.WriteLine($"  [wan] large request: {passes} DiT passes over {seq} tokens. Self-attention " +
+                                  $"costs O(tokens^2) and dominates at this size, so halving the frame count or " +
+                                  $"the frame area makes it ~4x cheaper. A per-pass timing and an ETA follow the " +
+                                  $"first pass; progress ticks every 30s (TS_WAN_HEARTBEAT_S).");
 
             // ---- 1. text conditioning (both prompts), then free the TE's VRAM ----
+            beat.Set("text-encode", 0, steps, "UMT5-XXL");
             float[] ctxCond = Te.Encode(prompt);
             float[] ctxNeg = useCfg ? Te.Encode(negPrompt) : null;
             // The UMT5 weights (several GB resident) are not needed again this
@@ -228,6 +248,7 @@ namespace TensorSharp.Models.WanVideo
             int inTok = ti2v || !i2v ? zTok : (zc + 4 + zc) * WanDiT.PatchH * WanDiT.PatchW;
             if (i2v)
             {
+                beat.Set("image-encode", 0, steps, "VAE encode");
                 var resized = ImageIO.Resize(image, width, height);
                 if (ti2v)
                 {
@@ -299,6 +320,12 @@ namespace TensorSharp.Models.WanVideo
             }
 
             bool usedLowExpert = false;
+            int passCount = 0, cfgCacheHits = 0;
+            double passSeconds = 0;
+            float[] dCache = cfgStride > 1 ? new float[(long)zTok * seq] : null;
+            if (dCache != null)
+                Console.WriteLine($"  [wan] guidance cache: unconditional pass every {cfgStride} steps " +
+                                  $"after a {CfgCacheWarmup}-step warm-up (approximate; cfgCacheStride=1 disables)");
             for (int i = 0; i < steps; i++)
             {
                 float t = timesteps[i];
@@ -337,26 +364,64 @@ namespace TensorSharp.Models.WanVideo
                     xIn = xFull;
                 }
 
+                var pass = Stopwatch.StartNew();
+                beat.Set("denoise", i + 1, steps, "cond pass");
                 float[] vCond = cur.Predict(xIn, ctxCond, t, rope, seq, seq0);
+                double condS = pass.Elapsed.TotalSeconds;
+                passCount++;
+                passSeconds += condS;
                 if (i == 0 && !string.IsNullOrEmpty(dumpDir))
                 {
                     DumpF32(System.IO.Path.Combine(dumpDir, "v0_cond.bin"), vCond);
                     Console.WriteLine($"  [wan-debug] ctx {Stat(ctxCond)} | x {Stat(xIn)} | v {Stat(vCond)}");
                 }
                 float[] v = vCond;
+                double negS = 0;
                 if (useCfg)
                 {
-                    float[] vNeg = cur.Predict(xIn, ctxNeg, t, rope, seq, seq0);
-                    for (long j = 0; j < v.LongLength; j++)
-                        v[j] = vNeg[j] + curCfg * (vCond[j] - vNeg[j]);
+                    // v = v_cond + (cfg-1) * d, d = v_cond - v_uncond. With the guidance
+                    // cache on, d is only recomputed every cfgStride steps (always over
+                    // the warm-up and on the final step, where the result is most
+                    // sensitive); in between the cached d is reused and the unconditional
+                    // pass is skipped entirely.
+                    bool computeNeg = dCache == null || UsesUncondPass(i, steps, cfgStride);
+                    if (computeNeg)
+                    {
+                        pass.Restart();
+                        beat.Set("denoise", i + 1, steps, "uncond pass");
+                        float[] vNeg = cur.Predict(xIn, ctxNeg, t, rope, seq, seq0);
+                        negS = pass.Elapsed.TotalSeconds;
+                        passCount++;
+                        passSeconds += negS;
+                        if (dCache != null)
+                            for (long j = 0; j < v.LongLength; j++) dCache[j] = vCond[j] - vNeg[j];
+                        for (long j = 0; j < v.LongLength; j++)
+                            v[j] = vNeg[j] + curCfg * (vCond[j] - vNeg[j]);
+                    }
+                    else
+                    {
+                        cfgCacheHits++;
+                        for (long j = 0; j < v.LongLength; j++)
+                            v[j] = vCond[j] + (curCfg - 1f) * dCache[j];
+                    }
                 }
                 if (euler != null) euler.Step(x, v, i);
                 else x = unipc.Step(x, v);
                 p.OnStep?.Invoke(i + 1, steps);
-                Console.WriteLine($"  step {i + 1}/{steps} t={t:F1} ({phase.Elapsed.TotalSeconds:F1}s)");
+
+                // ETA from the mean pass so far. The first pass carries the one-time
+                // weight upload and graph build, so it over-estimates slightly; the
+                // running mean corrects itself from step 2 on.
+                double eta = passCount > 0 ? passSeconds / passCount * (passes - passCount) : -1;
+                Console.WriteLine($"  step {i + 1}/{steps} t={t:F1} ({phase.Elapsed.TotalSeconds:F1}s" +
+                                  (useCfg ? $": cond {condS:F1}s + uncond {negS:F1}s" : "") +
+                                  $") — {FormatEta(eta)} left");
+                beat.Report("denoise", i + 1, steps, "step done", eta, heartbeat: false);
                 phase.Restart();
             }
             Phase("denoise-last-step");
+            Console.WriteLine($"  [wan] denoise: {passCount} DiT passes, {passSeconds / Math.Max(1, passCount):F1}s mean" +
+                              (cfgCacheHits > 0 ? $" ({cfgCacheHits} unconditional passes served from the guidance cache)" : ""));
 
             // TI2V I2V: pin the conditioning frame into the final latent.
             if (ti2v && i2v)
@@ -371,8 +436,12 @@ namespace TensorSharp.Models.WanVideo
                 DumpF32(System.IO.Path.Combine(dumpDir, "latent_final.bin"), latent);
                 Console.WriteLine($"  [wan-debug] final latent {Stat(latent)}");
             }
-            RgbImage[] framesOut = Vae.Decode(latent, lt, lh, lw);
+            beat.Set("vae-decode", steps, steps, $"{frames} frames at {width}x{height}");
+            RgbImage[] framesOut = Vae.Decode(latent, lt, lh, lw, (done, bands) =>
+                beat.Set("vae-decode", steps, steps,
+                         $"{frames} frames at {width}x{height}, band {Math.Min(done + 1, bands)}/{bands}"));
             Phase("vae-decode");
+            beat.Report("done", steps, steps, "complete", 0, heartbeat: false);
 
             Console.WriteLine($"  [wan-timing] total: {total.Elapsed.TotalSeconds:F1}s");
             return new GeneratedVideo { Frames = framesOut, Fps = fps, Seed = seed };
@@ -405,6 +474,29 @@ namespace TensorSharp.Models.WanVideo
             var bytes = new byte[data.LongLength * 4];
             Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
             System.IO.File.WriteAllBytes(path, bytes);
+        }
+
+        /// <summary>Steps whose guidance delta is recomputed rather than reused: the
+        /// first <see cref="CfgCacheWarmup"/> steps (where the frame's structure is
+        /// decided), the last step, and every <paramref name="stride"/>-th step in
+        /// between. A stride of 0/1 means "every step" — the cache is off.</summary>
+        internal static bool UsesUncondPass(int step, int steps, int stride)
+        {
+            if (stride <= 1) return true;
+            if (step < CfgCacheWarmup || step == steps - 1) return true;
+            return (step - CfgCacheWarmup) % stride == 0;
+        }
+
+        /// <summary>Leading steps that always run both passes when the guidance cache is on.</summary>
+        internal const int CfgCacheWarmup = 3;
+
+        /// <summary>"1h 04m" / "7m 12s" / "43s"; "?" before the first pass finishes.</summary>
+        internal static string FormatEta(double seconds)
+        {
+            if (seconds < 0) return "ETA unknown";
+            if (seconds >= 3600) return $"~{(int)(seconds / 3600)}h {(int)(seconds % 3600 / 60):00}m";
+            if (seconds >= 60) return $"~{(int)(seconds / 60)}m {(int)(seconds % 60):00}s";
+            return $"~{seconds:F0}s";
         }
 
         private static string Stat(float[] a)
@@ -486,6 +578,75 @@ namespace TensorSharp.Models.WanVideo
             _vae?.Dispose();
             _dctx?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Periodic "still working" ticks for the phases that spend minutes inside one
+    /// blocking native call (a DiT pass, a VAE band). Ticks go to the console and,
+    /// when the caller supplied one, to <see cref="WanVideoParams.OnProgress"/> —
+    /// the Web UI turns them into a live status line. TS_WAN_HEARTBEAT_S=0 silences
+    /// the ticks (the phase-transition reports still fire).
+    /// </summary>
+    internal sealed class WanHeartbeat : IDisposable
+    {
+        private readonly WanVideoParams _p;
+        private readonly Stopwatch _total;
+        private readonly System.Threading.Timer _timer;
+        private readonly object _lock = new();
+        private string _phase = "starting", _detail = "";
+        private int _step, _totalSteps;
+        private double _eta = -1;
+        private Stopwatch _since = Stopwatch.StartNew();
+
+        public WanHeartbeat(WanVideoParams p, Stopwatch total)
+        {
+            _p = p;
+            _total = total;
+            int seconds = 30;
+            string env = Environment.GetEnvironmentVariable("TS_WAN_HEARTBEAT_S");
+            if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v)) seconds = v;
+            if (seconds <= 0) return;
+            var period = TimeSpan.FromSeconds(seconds);
+            _timer = new System.Threading.Timer(_ => Tick(), null, period, period);
+        }
+
+        /// <summary>Enter a phase; the next ticks describe it.</summary>
+        public void Set(string phase, int step, int totalSteps, string detail)
+        {
+            lock (_lock)
+            {
+                _phase = phase; _step = step; _totalSteps = totalSteps; _detail = detail;
+                _since = Stopwatch.StartNew();
+            }
+        }
+
+        public void Report(string phase, int step, int totalSteps, string detail, double eta, bool heartbeat)
+        {
+            lock (_lock) { _eta = eta; }
+            _p?.OnProgress?.Invoke(new WanProgress
+            {
+                Phase = phase, Step = step, TotalSteps = totalSteps, Detail = detail,
+                ElapsedSeconds = _total.Elapsed.TotalSeconds, EtaSeconds = eta, Heartbeat = heartbeat,
+            });
+        }
+
+        private void Tick()
+        {
+            string phase, detail; int step, totalSteps; double inPhase, eta;
+            lock (_lock)
+            {
+                phase = _phase; detail = _detail; step = _step; totalSteps = _totalSteps;
+                inPhase = _since.Elapsed.TotalSeconds; eta = _eta;
+            }
+            Console.WriteLine($"  [wan] …{phase}" +
+                              (totalSteps > 0 && phase == "denoise" ? $" step {step}/{totalSteps}" : "") +
+                              $" ({detail}) {inPhase:F0}s in this pass, " +
+                              $"{_total.Elapsed.TotalSeconds:F0}s total" +
+                              (eta > 0 ? $", {WanVideoPipeline.FormatEta(eta)} left" : ""));
+            Report(phase, step, totalSteps, detail, eta, heartbeat: true);
+        }
+
+        public void Dispose() => _timer?.Dispose();
     }
 
     /// <summary>Seeded standard-normal sampler (xoshiro-seeded Box-Muller).</summary>

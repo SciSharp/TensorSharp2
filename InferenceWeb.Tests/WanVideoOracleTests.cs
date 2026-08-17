@@ -17,15 +17,25 @@ using TensorSharp.GGML;
 using TensorSharp.Models.WanVideo;
 using TensorSharp.Runtime;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests
 {
     public class WanVideoOracleTests
     {
-        private const string FixtureDir = @"C:\Works\models\wan\fixtures";
-        private const string Vae22Path = @"C:\Works\models\wan\VAE\Wan2.2_VAE.safetensors";
-        private const string Vae21Path = @"C:\Works\models\wan\wan_2.1_vae.safetensors";
-        private const string Ti2vGguf = @"C:\Works\models\wan\Wan2.2-TI2V-5B-Q8_0.gguf";
+        private readonly ITestOutputHelper _output;
+        public WanVideoOracleTests(ITestOutputHelper output) { _output = output; }
+
+        // TS_WAN_MODEL_DIR points the whole oracle suite at a local Wan checkout
+        // (the fixtures live in <dir>/fixtures); without it the historical Windows
+        // paths apply, so an existing checkout keeps running unchanged and the
+        // tests still no-op wherever the files are absent.
+        private static readonly string ModelDir =
+            Environment.GetEnvironmentVariable("TS_WAN_MODEL_DIR") ?? @"C:\Works\models\wan";
+        private static readonly string FixtureDir = Path.Combine(ModelDir, "fixtures");
+        private static readonly string Vae22Path = Path.Combine(ModelDir, "VAE", "Wan2.2_VAE.safetensors");
+        private static readonly string Vae21Path = Path.Combine(ModelDir, "wan_2.1_vae.safetensors");
+        private static readonly string Ti2vGguf = Path.Combine(ModelDir, "Wan2.2-TI2V-5B-Q8_0.gguf");
 
         private static float[] ReadF32(string name)
         {
@@ -229,6 +239,7 @@ namespace InferenceWeb.Tests
             var vmLat = new float[xLat.Length];
             WanVideoPipeline.Unpatchify(vm, vmLat, T, Hh, Ww, 48, dit.OutTok);
             double cosM = Cosine(vmLat, ReadF32("dit_v_masked.bin"));
+            _output.WriteLine($"[wan-oracle] TI2V-5B DiT cosine vs diffusers: uniform={cosU:F6} masked={cosM:F6}");
             Assert.True(cosM > 0.995, $"TI2V-5B DiT (masked t) cosine vs diffusers = {cosM:F6} (want > 0.995)");
         }
     }

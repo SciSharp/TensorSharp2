@@ -275,6 +275,7 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--flow-shift <F>` | Wan FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1). |
 | `--sampler <name>` | Wan sampler: `unipc` (official Wan sampler, default) or `euler`. |
 | `--negative-prompt <text>` | Wan negative prompt (default: the official Wan negative prompt). |
+| `--cfg-cache-stride <N>` | Wan guidance cache: run the unconditional CFG pass on one step in `N` and reuse the cached guidance direction in between (default off — every step runs both passes). `2` ≈ 1.30x faster, `3` ≈ 1.43x; approximate, so leave it off when matching a reference sample matters. |
 | `--wan-vae <path>` | Override the resolved Wan video VAE (`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`). Env: `TS_WAN_VAE`. |
 | `--wan-te <path>` | Override the resolved UMT5-XXL text-encoder GGUF. Env: `TS_WAN_TE`. Wan 2.2 A14B additionally resolves the second high/low-noise expert automatically (env: `TS_WAN_DIT2`). |
 | `--tp <N>` | Tensor parallelism degree — split the model across N GPUs in a single process (default: `1`). Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
@@ -374,6 +375,11 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf
 # the Web UI or an API request does not supply its own frames / fps value.
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/Wan2.2-TI2V-5B.gguf --backend ggml_cuda \
     --video-frames 121 --fps 24
+
+# 121 frames at the TI2V-5B native area is 27k DiT tokens, and self-attention is
+# quadratic in that, so a full 50-step run is hours on a laptop-class GPU. The
+# server logs a per-pass timing plus a running ETA and heartbeats every 30 s, and
+# the Web UI shows both; see docs/models/wan.md for the cost table and the knobs.
 
 # Configure server-wide default sampling parameters
 # (used whenever a request does not override the value itself)
