@@ -158,8 +158,6 @@ namespace TensorSharp.Server.ProtocolAdapters
                 defaultBackend = _options.DefaultBackend,
                 supportedBackends = _options.SupportedBackends,
                 architecture = _svc.Architecture,
-                hostedModelPath = _options.StartupModelPath,
-                hostedMmProjPath = _options.StartupMmProjPath,
                 defaultMaxTokens = _options.DefaultMaxTokens,
             });
         }
