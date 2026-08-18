@@ -102,6 +102,7 @@ namespace InferenceWeb.Tests
 
         // ---- parity against the converted GGUF (the trusted existing path) -----------------------
 
+        [Trait("Requires", "Models")]
         [Fact]
         public void Vae_Safetensors_BitIdentical_To_Gguf()
         {
@@ -139,6 +140,7 @@ namespace InferenceWeb.Tests
             Assert.Equal(194, compared);
         }
 
+        [Trait("Requires", "Models")]
         [Fact]
         public void Vae_Header_Shapes_AreCorrect()
         {

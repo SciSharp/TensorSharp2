@@ -23,6 +23,7 @@ using Xunit;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Mlx")]
 public class MuseGlimmerMlxDecodeTests
 {
     // The pipelined step computes argmax and the next embedding ON DEVICE with

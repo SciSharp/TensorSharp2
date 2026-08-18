@@ -30,6 +30,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Models")]
 public class DecodeBackendParityTests
 {
     private readonly ITestOutputHelper _output;

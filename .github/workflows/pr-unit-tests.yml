@@ -1,0 +1,45 @@
+name: PR Unit Tests
+
+# Deterministic correctness signal for every PR on a stock GitHub-hosted
+# runner: builds the solution (including the CPU-only native GGML library,
+# which the TensorSharp.Backends.GGML build triggers automatically) and runs
+# the environment-independent test lane — no GPU, no model downloads, no
+# secrets. Lane taxonomy: InferenceWeb.Tests/TestAssemblyConfig.cs and
+# DEVELOPMENT.md "Test lanes". The engine-comparison benchmark workflow
+# (test-matrix.yml) on the self-hosted CUDA runner is unaffected.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Tests run on the GGML CPU backend (TS_TEST_GGML_BACKEND default), so skip
+  # the Vulkan native build the script would otherwise auto-enable if the
+  # runner image ships a Vulkan loader.
+  TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN: "OFF"
+  DOTNET_NOLOGO: "true"
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Run environment-independent tests
+        run: >
+          dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
+          --filter "Category!=Bench&Requires!=Cuda&Requires!=Mlx&Requires!=Models"

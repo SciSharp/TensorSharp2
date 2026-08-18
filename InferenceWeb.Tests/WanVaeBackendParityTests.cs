@@ -33,6 +33,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Models")]
 public class WanVaeBackendParityTests
 {
     private readonly ITestOutputHelper _output;

@@ -35,6 +35,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Models")]
 public class MuseGlimmerKvSnapshotTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";

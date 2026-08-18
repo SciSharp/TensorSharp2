@@ -421,6 +421,24 @@ TensorSharp 采用分层系统结构：
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 ```
 
+#### 测试分组（Test lanes）
+
+测试通过 xUnit trait 按两个维度打标（声明见 `InferenceWeb.Tests/TestAssemblyConfig.cs`）：`Category=Bench` 标记含时延/吞吐断言的基准测试类；`Requires=Cuda|Mlx|Models` 标记测试对环境的依赖（`Models` = 需要测试模型目录下的真实 GGUF 权重）。未打标的测试是自包含的正确性测试，可在任何环境运行。不带过滤器的 `dotnet test` 行为与之前完全一致；用 `--filter` 选择分组：
+
+```bash
+# 内循环（边改边测）：与环境无关的正确性测试，任何机器上数秒内跑完。
+# PR CI 也运行这一分组（.github/workflows/pr-unit-tests.yml）。
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category!=Bench&Requires!=Cuda&Requires!=Mlx&Requires!=Models"
+
+# 完整正确性（推送前，在有 GPU 和模型文件的机器上）：除基准外的全部测试。
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category!=Bench"
+
+# 仅基准测试：其断言对时序敏感，应在空闲机器上有意运行。
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category=Bench"
+```
+
+注意：CUDA、MLX 和模型相关的测试在前提条件缺失时目前会静默通过，因此从分组中排除它们改变的是实际执行的内容，而不是绿色结果的样子。
+
 ### 服务端集成测试
 
 TensorSharp.Server 的集成测试位于 `TensorSharp.Server/testdata/`。测试覆盖所有三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思维链模式、工具调用、结构化输出、队列状态兼容、并发请求和中断支持。架构特定能力（思维链、工具调用）会自动检测，当前模型不支持时会自动跳过。

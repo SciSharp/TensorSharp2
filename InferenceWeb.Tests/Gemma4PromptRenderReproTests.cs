@@ -192,6 +192,7 @@ public class Gemma4PromptRenderReproTests
         return candidates.FirstOrDefault(p => !string.IsNullOrEmpty(p) && File.Exists(p));
     }
 
+    [Trait("Requires", "Models")]
     [Fact]
     public void RealGemma4BpeTokenizer_MatchesLlamaCppOracle()
     {
@@ -244,6 +245,7 @@ public class Gemma4PromptRenderReproTests
             tokenizer.Decode(new List<int> { 9259, 236888, 2088, 740, 564, 1601, 611, 3124, 236881 }));
     }
 
+    [Trait("Requires", "Models")]
     [Fact]
     public void RealTemplate_RendersUserText_AndSingleBos()
     {
@@ -267,6 +269,7 @@ public class Gemma4PromptRenderReproTests
         Assert.Equal(1, CountLeading(tokens, bosId)); // exactly one BOS
     }
 
+    [Trait("Requires", "Models")]
     [Fact]
     public async Task Generate_FinalFantasyPrompt_ProducesRelevantOutput()
     {
@@ -319,6 +322,7 @@ public class Gemma4PromptRenderReproTests
         }
     }
 
+    [Trait("Requires", "Models")]
     [Fact]
     public async Task Generate_ThreeDistinctPromptsInParallel_EachStaysOnTopic()
     {
@@ -378,6 +382,7 @@ public class Gemma4PromptRenderReproTests
     // producing coherent-but-off-topic output. The multi-token prefill must yield
     // the SAME next-token as feeding the prompt one token at a time (decode path),
     // and must be deterministic across repeats.
+    [Trait("Requires", "Models")]
     [Fact]
     public void PrefillNextToken_MatchesIncrementalDecode_AndIsDeterministic()
     {

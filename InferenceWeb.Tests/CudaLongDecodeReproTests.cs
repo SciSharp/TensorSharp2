@@ -24,6 +24,8 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Cuda")]
+[Trait("Requires", "Models")]
 public class CudaLongDecodeReproTests
 {
     private readonly ITestOutputHelper _output;

@@ -25,6 +25,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Models")]
 public class GptOssBatchedCorrectnessTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";

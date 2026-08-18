@@ -5,6 +5,7 @@ using TensorSharp.Runtime;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Mlx")]
 public class MlxBackendTests
 {
     [Fact]

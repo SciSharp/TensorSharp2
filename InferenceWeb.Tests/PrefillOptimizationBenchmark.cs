@@ -10,6 +10,7 @@ using TensorSharp.GGML;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Category", "Bench")]
 public class PrefillOptimizationBenchmark
 {
     private readonly IAllocator _alloc = new CpuAllocator(BlasEnum.DotNet);

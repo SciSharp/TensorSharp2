@@ -6,6 +6,7 @@ using System.Threading;
 
 namespace InferenceWeb.Tests;
 
+[Trait("Requires", "Cuda")]
 public class CudaBackendTests
 {
     [Fact]

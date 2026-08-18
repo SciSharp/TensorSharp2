@@ -16,6 +16,7 @@ namespace InferenceWeb.Tests;
 /// contract: identical values to the per-element path, and unchanged
 /// host/device dirty semantics.
 /// </summary>
+[Trait("Requires", "Mlx")]
 public class MlxStorageBulkElementIoTests
 {
     [Fact]
