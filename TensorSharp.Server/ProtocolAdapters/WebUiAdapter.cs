@@ -636,6 +636,11 @@ namespace TensorSharp.Server.ProtocolAdapters
             public string Codec;
             public double Seconds;
             public string Error;
+            // Live progress detail (see WanProgress): which phase is running, how long
+            // it has been running and the projected time left. A 720p/121-frame pass
+            // is minutes long, so without these the UI has nothing to show between steps.
+            public string Phase, Detail;
+            public double Elapsed, Eta = -1;
         }
 
         private TensorSharp.Models.WanVideo.WanVideoParams ParseVideoParams(JsonElement root, out string error)
@@ -810,7 +815,10 @@ namespace TensorSharp.Server.ProtocolAdapters
             logger.LogInformation(LogEventIds.UploadReceived,
                 "Video generate (stream): prompt='{Prompt}' {W}x{H}x{F}", prompt, p.Width, p.Height, p.Frames);
 
-            var channel = Channel.CreateUnbounded<VideoFrame>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+            // SingleWriter is false: the heartbeat below fires OnProgress from a timer
+            // thread while the generation thread is blocked inside a DiT pass, so two
+            // threads publish into this channel.
+            var channel = Channel.CreateUnbounded<VideoFrame>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
 
             var genTask = Task.Run(() =>
             {
@@ -824,6 +832,14 @@ namespace TensorSharp.Server.ProtocolAdapters
                             if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
                             channel.Writer.TryWrite(new VideoFrame { Step = step, Total = total });
                         };
+                        // Heartbeats and phase transitions. These arrive from a timer
+                        // thread mid-pass, so cancellation is only observed here — the
+                        // OnStep hook above still owns aborting between steps.
+                        p.OnProgress = prog => channel.Writer.TryWrite(new VideoFrame
+                        {
+                            Step = prog.Step, Total = prog.TotalSteps, Phase = prog.Phase,
+                            Detail = prog.Detail, Elapsed = prog.ElapsedSeconds, Eta = prog.EtaSeconds,
+                        });
                         var video = videoModel.GenerateVideo(prompt, p);
                         string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outPath, video.Frames, video.Fps);
                         channel.Writer.TryWrite(new VideoFrame
@@ -868,8 +884,12 @@ namespace TensorSharp.Server.ProtocolAdapters
                     }
                     else
                     {
-                        await SseWriter.WriteEventAsync(ctx.Response,
-                            new { videoGen = true, step = f.Step, total = f.Total }, ct);
+                        await SseWriter.WriteEventAsync(ctx.Response, new
+                        {
+                            videoGen = true, step = f.Step, total = f.Total,
+                            phase = f.Phase, detail = f.Detail,
+                            elapsedSeconds = f.Elapsed, etaSeconds = f.Eta,
+                        }, ct);
                     }
                 }
             }

@@ -39,6 +39,7 @@
 // (patch embedding as a matmul, causal conv3d as per-temporal-tap 2D kernels).
 // ============================================================================
 #include "ggml_ops_internal.h"
+#include "ggml-impl.h"   // ggml_graph_view, for the segmented MPS conv runner
 #include "ggml-alloc.h"
 
 #include <cmath>
@@ -337,6 +338,25 @@ inline bool wan_flash_enabled()
     return on;
 }
 
+// Keys/values are handed to attention as F16. Every backend's flash-attention
+// kernel is built around an F16 KV cache: ggml-metal instantiates the F32-KV
+// kernel with simdgroup_float8x8 accumulators (FA_TYPES_F32) where the F16 one
+// uses simdgroup_half8x8, and the F32 tiles also cost twice the bandwidth in a
+// kernel that re-streams K and V once per 8-query threadgroup. Measured on an
+// M5 Pro at the Wan 2.2 TI2V 720p/121-frame shape (seq 27404, 24 heads, head
+// dim 128), one self-attention: 4872 ms F32 KV vs 2439 ms F16 KV — 2.0x, and
+// 30 blocks of it is the bulk of a denoising step. Q stays F32 (the Metal
+// kernel asserts it), and F16 K/V is what every reference implementation feeds
+// its attention (PyTorch/diffusers run the whole DiT in bf16/fp16;
+// stable-diffusion.cpp casts K/V to F16 before ggml_flash_attn_ext), so this
+// costs no accuracy the reference pipelines do not already spend.
+// TS_WAN_DIT_KV_F16=0 restores F32 keys/values.
+inline bool wan_kv_f16_enabled()
+{
+    static const bool on = []{ const char* e = std::getenv("TS_WAN_DIT_KV_F16"); return e == nullptr || e[0] != '0'; }();
+    return on;
+}
+
 // Attention over q [hd, n_q, heads], k/v [hd, n_kv, heads]. Wan DiT
 // self-attention is fully bidirectional, so its flash path must be unmasked.
 // ggml-cuda handles a non-aligned KV tail directly; padding it to 256 used to
@@ -357,6 +377,8 @@ ggml_tensor* wan_attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, gg
     // Materialized reference path (backends without flash support; O(n_kv * n_q)
     // scores). The caller's k/v are already padded when a mask is given, and
     // soft_max_ext folds the scale and the (F16) additive mask in one op.
+    // k/v arrive F16 here (wan_heads_seq_kv); ggml_mul_mat takes an F16 src0
+    // against an F32 src1, so this path needs no change for that.
     ggml_tensor* kq = ggml_mul_mat(ctx, k, q);                       // [n_kv, n_q, heads]
     ggml_tensor* m = mask != nullptr
         ? ggml_view_2d(ctx, mask, k->ne[1], n_q, mask->nb[1], 0)
@@ -372,6 +394,22 @@ ggml_tensor* wan_attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, gg
 ggml_tensor* wan_heads_seq(ggml_context* ctx, ggml_tensor* x)
 {
     return ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+}
+
+// Same reshape for a key/value projection, landing in F16 when the KV cast is
+// enabled. ggml_cpy into a pre-typed destination does the permute and the
+// narrowing in ONE pass, so the F16 path also writes half the bytes the plain
+// ggml_cont did — it is strictly cheaper than the F32 layout change it replaces.
+ggml_tensor* wan_heads_seq_kv(ggml_context* ctx, ggml_tensor* x)
+{
+    if (!wan_kv_f16_enabled()) return wan_heads_seq(ctx, x);
+    ggml_tensor* p = ggml_permute(ctx, x, 0, 2, 1, 3);            // [hd, seq, heads]
+    ggml_tensor* dst = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, p->ne[0], p->ne[1], p->ne[2]);
+    ggml_tensor* cast = ggml_cpy(ctx, p, dst);
+    // A strided F32 -> F16 copy is supported on ggml-cpu / -metal / -cuda; keep the
+    // F32 layout change for any backend whose dup kernel rejects this combination
+    // rather than failing the whole graph.
+    return backend_supports_op(cast) ? cast : wan_heads_seq(ctx, x);
 }
 
 // ---------------------------------------------------------------------------
@@ -651,8 +689,8 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
         k3 = wan_rope(ctx, k3, g.cosIn, g.sinIn, hd, heads, seq);
 
         ggml_tensor* qa = wan_heads_seq(ctx, q3);                    // [hd, seq, heads]
-        ggml_tensor* ka = wan_heads_seq(ctx, k3);
-        ggml_tensor* va = wan_heads_seq(ctx, ggml_reshape_3d(ctx, v, hd, heads, seq));
+        ggml_tensor* ka = wan_heads_seq_kv(ctx, k3);                 // F16 (see wan_kv_f16_enabled)
+        ggml_tensor* va = wan_heads_seq_kv(ctx, ggml_reshape_3d(ctx, v, hd, heads, seq));
         ggml_tensor* attn = wan_attention(ctx, qa, ka, va, nullptr, dim, seq, scale);
         attn = wan_lin(ctx, b.sow, attn, b.sob);
         x = ggml_add(ctx, x, segGate(attn, eGateA, eGateAB));
@@ -664,8 +702,8 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
         ggml_tensor* xk = wan_rms(ctx, wan_lin(ctx, b.xkw, txt, b.xkb), b.xnk, eps);
         ggml_tensor* xv = wan_lin(ctx, b.xvw, txt, b.xvb);
         ggml_tensor* xqa = wan_heads_seq(ctx, ggml_reshape_3d(ctx, xq, hd, heads, seq));
-        ggml_tensor* xka = wan_heads_seq(ctx, ggml_reshape_3d(ctx, xk, hd, heads, cl));
-        ggml_tensor* xva = wan_heads_seq(ctx, ggml_reshape_3d(ctx, xv, hd, heads, cl));
+        ggml_tensor* xka = wan_heads_seq_kv(ctx, ggml_reshape_3d(ctx, xk, hd, heads, cl));
+        ggml_tensor* xva = wan_heads_seq_kv(ctx, ggml_reshape_3d(ctx, xv, hd, heads, cl));
         // ctx_len is a multiple of the KV stride (512), so flash needs no mask here.
         ggml_tensor* xattn = wan_attention(ctx, xqa, xka, xva, nullptr, dim, seq, scale);
         x = ggml_add(ctx, x, wan_lin(ctx, b.xow, xattn, b.xob));
@@ -933,22 +971,30 @@ static long long wan_vae_gemm_budget()
     const char* e = std::getenv("TS_WAN_VAE_GEMM_MAX_MB");
     if (e != nullptr) return std::strtoll(e, nullptr, 10) * 1024 * 1024;
 
-    // ggml-metal's Metal 4 tensor-API mul_mm intermittently misreads operands
-    // inside the VAE decode graph on M5 (first pass, layout-dependent: the
-    // 32x32-latent all-NaN decode). It is correct in isolation and for every
-    // LLM/DiT-style graph, and has_tensor is fixed at device init, so it
-    // cannot be scoped per-op. When the tensor API is active, route the VAE
-    // convs through ggml_conv_2d_direct (budget 0): slower than im2col+GEMM,
-    // but correct — and it keeps the tensor API's much larger DiT/text-encoder
-    // wins. TS_WAN_VAE_GEMM_MAX_MB overrides in both directions.
+    // ggml-metal's Metal 4 tensor-API mul_mm misreads operands inside the VAE
+    // decode graph on M5 (first pass, buffer-layout dependent). When the tensor
+    // API is active, route the VAE convs through ggml_conv_2d_direct (budget 0):
+    // slower than im2col+GEMM, but correct.
+    //
+    // Do NOT "verify this is fixed" with an isolated decode. Tried 2026-08-17:
+    // WanVideoBench decoded synthetic latents at five shapes — including the
+    // 32x32 layout recorded as the original all-NaN repro — and tensor-API vs
+    // non-tensor output agreed to 91-93 dB PSNR with no NaN anywhere. It looked
+    // conclusively fixed. The very next full 1088x832x121f generation, with the
+    // DiT loaded and released before the decode, rendered 121 uniformly BLACK
+    // frames. The defect follows the allocation history, so only an end-to-end
+    // video is evidence.
     if (wan_metal_tensor_api_likely())
         return 0;
-    // Non-CUDA device backends (Vulkan) stay at the banded floor: their
-    // drivers reject the multi-GB single gallocr arena that an unbanded
-    // full-plane im2col produces (Vulkan maxMemoryAllocationSize is commonly
-    // 4 GB or less), and the CPU backend gains nothing from bigger scratch.
+    // Vulkan stays at the banded floor: its drivers reject the multi-GB single
+    // gallocr arena an unbanded full-plane im2col produces (maxMemoryAllocationSize
+    // is commonly 4 GB or less). Metal and CUDA size the budget from free device
+    // memory — on Metal that measured 56.4s -> 49.7s for a 1088x832x9f decode,
+    // because it turns many small banded GEMMs into few large ones.
     const char* name = g_backend != nullptr ? ggml_backend_name(g_backend) : nullptr;
-    if (name == nullptr || std::strncmp(name, "CUDA", 4) != 0)
+    const bool sizedFromMemory = name != nullptr &&
+        (std::strncmp(name, "CUDA", 4) == 0 || std::strncmp(name, "MTL", 3) == 0);
+    if (!sizedFromMemory)
         return 384LL << 20;
     std::size_t freeB = 0, totalB = 0;
     ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -1025,6 +1071,10 @@ ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int
 {
     const long long gemmMax = b.gemmMax;
     ggml_context* ctx = b.ctx;
+    // MPS executes the convolution whole, so emit the un-lowered node: this also
+    // skips the horizontal banding and its leading-pad shim entirely.
+    if (tsg::fast_conv_enabled())
+        return ggml_conv_2d_direct(ctx, wt, x, stride, stride, pad, pad, 1, 1);
     if (gemmMax <= 0)
         return ggml_conv_2d_direct(ctx, wt, x, stride, stride, pad, pad, 1, 1);
 
@@ -1579,7 +1629,12 @@ bool wan_vae_encode(const TSGgmlWanVaeEncodeDesc* d)
     for (auto& u : wbind.uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
     ggml_backend_tensor_set(xIn, d->x, 0, static_cast<std::size_t>(pw) * ph * pc * pt * sizeof(float));
 
-    if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
+    // The encoder shares wan_vae_conv2d, so on the MPS path its graph also holds
+    // un-lowered CONV_2D nodes and needs the same segmented runner.
+    const ggml_status encSt = tsg::fast_conv_enabled()
+        ? tsg::graph_compute_fast_conv(graph, "wan vae")
+        : ggml_backend_graph_compute(g_backend, graph);
+    if (encSt != GGML_STATUS_SUCCESS)
     { set_last_error("WanVaeEncode: graph compute failed."); return false; }
     ggml_backend_synchronize(g_backend);
     ggml_backend_tensor_get(outT, d->out, 0, static_cast<std::size_t>(d->out_len) * sizeof(float));
@@ -1825,6 +1880,11 @@ bool wan_vae_decode(const TSGgmlWanVaeDecodeDesc* d)
             }
             ggml_free(sctx);
         }
+    }
+    else if (tsg::fast_conv_enabled())
+    {
+        if (tsg::graph_compute_fast_conv(graph, "wan vae") != GGML_STATUS_SUCCESS)
+        { set_last_error("WanVaeDecode: graph compute failed (MPS conv path)."); return false; }
     }
     else if (tsg::graph_compute_profiled(g_backend, graph, "wan vae decode") != GGML_STATUS_SUCCESS)
     { set_last_error("WanVaeDecode: graph compute failed."); return false; }

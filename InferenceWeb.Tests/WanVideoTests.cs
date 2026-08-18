@@ -150,6 +150,177 @@ namespace InferenceWeb.Tests
         public void SnapFramesRoundsToVaeTemporalGrid(int input, int expected)
             => Assert.Equal(expected, WanVideoPipeline.SnapFrames(input));
 
+        // ---- degenerate-decode guard ------------------------------------------
+
+        private static TensorSharp.Models.QwenImage.RgbImage MakeFrame(int w, int h, Func<int, float> pixel)
+        {
+            var chw = new float[3 * w * h];
+            for (int i = 0; i < chw.Length; i++) chw[i] = pixel(i);
+            return TensorSharp.Models.QwenImage.RgbImage.FromPlanarChw(w, h, chw);
+        }
+
+        [Fact]
+        public void FlatDecodeIsRejected()
+        {
+            // Every frame a single colour = the Metal tensor-API VAE corruption.
+            var frames = new[] { MakeFrame(8, 8, _ => 0f), MakeFrame(8, 8, _ => 0f), MakeFrame(8, 8, _ => 0f) };
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => WanVideoPipeline.AssertFramesAreNotDegenerate(frames));
+            Assert.Contains("TS_WAN_METAL_TENSOR_API=0", ex.Message);
+        }
+
+        [Fact]
+        public void NaNDecodeIsRejected()
+        {
+            var frames = new[] { MakeFrame(8, 8, _ => float.NaN), MakeFrame(8, 8, _ => float.NaN) };
+            Assert.Throws<InvalidOperationException>(
+                () => WanVideoPipeline.AssertFramesAreNotDegenerate(frames));
+        }
+
+        [Fact]
+        public void RealDecodeIsAccepted()
+        {
+            var frames = new[] { MakeFrame(8, 8, i => (i % 97) / 97f), MakeFrame(8, 8, i => (i % 53) / 53f) };
+            WanVideoPipeline.AssertFramesAreNotDegenerate(frames);   // must not throw
+        }
+
+        [Fact]
+        public void ASingleFlatFrameIsNotEnoughToReject()
+        {
+            // A legitimately flat frame (a fade to black at the end) must not fail
+            // the whole video — the guard only fires when every sampled frame is flat.
+            var frames = new[]
+            {
+                MakeFrame(8, 8, i => (i % 97) / 97f), MakeFrame(8, 8, i => (i % 53) / 53f),
+                MakeFrame(8, 8, i => (i % 31) / 31f), MakeFrame(8, 8, _ => 0f),
+            };
+            WanVideoPipeline.AssertFramesAreNotDegenerate(frames);
+        }
+
+        // ---- step-distilled checkpoint detection -------------------------------
+
+        [Theory]
+        // Published distilled Wan checkpoints / LoRAs.
+        [InlineData("Wan2_2-TI2V-5B-Turbo-Q8_0.gguf", 4)]
+        [InlineData("Wan22_TI2V_5B_Turbo_lora_rank_64_fp16.safetensors", 4)]
+        [InlineData("Wan2_2_5B_FastWanFullAttn_lora_rank_128_bf16.safetensors", 4)]
+        [InlineData("Wan2.2-I2V-A14B-HighNoise-Lightning-4steps-Q4_K_M.gguf", 4)]
+        [InlineData("wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step.safetensors", 4)]
+        [InlineData("Wan2.1-T2V-14B-StepDistill-CfgDistill-Lightx2v-8steps.gguf", 8)]
+        // Ordinary checkpoints must NOT be mistaken for distilled ones.
+        [InlineData("Wan2.2-TI2V-5B-Q8_0.gguf", 0)]
+        [InlineData("wan2.1-t2v-14b-Q4_K_M.gguf", 0)]
+        [InlineData("Wan2.1-T2V-1.3B-F16.gguf", 0)]
+        [InlineData("", 0)]
+        public void DistilledStepsParsedFromCheckpointName(string fileName, int expected)
+            => Assert.Equal(expected, WanVideoModel.ParseDistilledSteps(fileName));
+
+        [Fact]
+        public void DistilledStepCountIsBoundedToASaneRange()
+        {
+            // A "1.3B" or a Q4_K_M shard index must not be read as a step count, and
+            // an absurd count falls back to the marker default rather than trusting it.
+            Assert.Equal(0, WanVideoModel.ParseDistilledSteps("Wan2.1-T2V-1.3B-F16.gguf"));
+            Assert.Equal(4, WanVideoModel.ParseDistilledSteps("wan-turbo-9999steps.gguf"));
+        }
+
+        // ---- VAE decode band layout -------------------------------------------
+
+        [Theory]
+        // (latent rows, plane width px, spatial scale) — TI2V-5B (16x) and Wan 2.1 (8x)
+        [InlineData(52, 1088, 16)]   // 1088x832, the 121-frame 720p-class I2V shape
+        [InlineData(44, 1280, 16)]   // 1280x704, the official TI2V 720p recipe
+        [InlineData(80, 1920, 16)]
+        [InlineData(120, 1664, 8)]
+        public void VaeBandsCoverThePlaneWithinTheMemoryBudget(int lh, int w, int scale)
+        {
+            const long threshold = 640_000;
+            var starts = WanVaeBase.PlanBands(lh, w, scale, threshold, out int bandLat);
+            Assert.NotNull(starts);
+            Assert.True(starts.Count >= 2);
+
+            // every band fits the per-band pixel budget
+            Assert.True((long)w * bandLat * scale <= threshold,
+                $"band {w}x{bandLat * scale} exceeds the {threshold} px budget");
+            // the plane is fully covered, first band at the top, last flush with lh
+            Assert.Equal(0, starts[0]);
+            Assert.Equal(lh - bandLat, starts[^1]);
+            for (int i = 1; i < starts.Count; i++)
+            {
+                Assert.True(starts[i] > starts[i - 1], "band starts must advance");
+                int overlap = starts[i - 1] + bandLat - starts[i];
+                Assert.True(overlap >= WanVaeBase.OverlapLat,
+                    $"seam {i} overlaps {overlap} rows, want >= {WanVaeBase.OverlapLat}");
+            }
+        }
+
+        [Fact]
+        public void VaeBandsDecodeFewerRowsThanTheFixedHeightWalk()
+        {
+            // 1088x832 (lh 52): the old fixed-height walk used a 24-row band at
+            // starts 0/16/28 — 72 rows of work for 52 rows of output.
+            const long threshold = 640_000;
+            var starts = WanVaeBase.PlanBands(52, 1088, 16, threshold, out int bandLat);
+            Assert.Equal(2, starts.Count);
+            Assert.Equal(30, bandLat);
+            Assert.Equal(60, starts.Count * bandLat);   // was 72
+        }
+
+        [Fact]
+        public void VaeSkipsTilingWhenThePlaneFitsWhole()
+        {
+            // 832x480 on the TI2V VAE is 30 latent rows — under the budget, one graph.
+            Assert.Null(WanVaeBase.PlanBands(30, 832, 16, 640_000, out int bandLat));
+            Assert.Equal(30, bandLat);
+        }
+
+        // ---- guidance cache ---------------------------------------------------
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(1)]
+        public void GuidanceCacheOffRunsBothPassesEveryStep(int stride)
+        {
+            for (int i = 0; i < 50; i++)
+                Assert.True(WanVideoPipeline.UsesUncondPass(i, 50, stride));
+        }
+
+        [Theory]
+        [InlineData(2, 50, 27)]   // 3 warm-up + every 2nd of steps 3..49 (which includes the last)
+        [InlineData(3, 50, 20)]   // 3 warm-up + 16 strided + the last
+        [InlineData(4, 50, 16)]
+        public void GuidanceCacheStrideSkipsTheExpectedUncondPasses(int stride, int steps, int expected)
+        {
+            int uncond = 0;
+            for (int i = 0; i < steps; i++)
+                if (WanVideoPipeline.UsesUncondPass(i, steps, stride)) uncond++;
+            Assert.Equal(expected, uncond);
+        }
+
+        [Fact]
+        public void GuidanceCacheAlwaysRecomputesWarmupAndFinalStep()
+        {
+            const int steps = 50, stride = 4;
+            // The steps that decide structure (the first few) and the one that
+            // produces the final latent must never run on a stale guidance delta.
+            for (int i = 0; i < WanVideoPipeline.CfgCacheWarmup; i++)
+                Assert.True(WanVideoPipeline.UsesUncondPass(i, steps, stride));
+            Assert.True(WanVideoPipeline.UsesUncondPass(steps - 1, steps, stride));
+            // ... and something in the middle must actually be skipped, or the
+            // cache would be a no-op.
+            Assert.False(WanVideoPipeline.UsesUncondPass(WanVideoPipeline.CfgCacheWarmup + 1, steps, stride));
+        }
+
+        // ---- progress / ETA formatting ----------------------------------------
+
+        [Theory]
+        [InlineData(-1, "ETA unknown")]
+        [InlineData(43, "~43s")]
+        [InlineData(432, "~7m 12s")]
+        [InlineData(3840, "~1h 04m")]
+        public void FormatEtaIsHumanReadable(double seconds, string expected)
+            => Assert.Equal(expected, WanVideoPipeline.FormatEta(seconds));
+
         // ---- RoPE -------------------------------------------------------------
 
         [Fact]

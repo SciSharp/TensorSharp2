@@ -66,6 +66,61 @@
   </div>
   <p>The pattern: TensorSharp's fused whole-model graph wins prefill below ~2K by 1.16-1.27×, the engines cross somewhere between 2K and 16K, and llama.cpp keeps a 6-8% prefill edge above that; decode is a tie at short context and drifts to 0.86× at 128K. With <strong>DFlash</strong> speculative decoding TensorSharp is ahead at short and mid prompts and behind from 16K up — but that gap is mostly a runtime <em>cost governor</em> that parks the drafter after a mis-measured probe: on the reps where it stays armed, TensorSharp reaches 94% of llama.cpp at 16K and 96% at 64K. The absolute DFlash figures also depend heavily on the corpus (the 501-token prompt hits 100% draft acceptance on <em>both</em> engines). Both engines run the full 128K context on one card. One caveat on the two long rows: they were taken before a line-ending fix landed in the harness, so on those points TensorSharp prefilled the CRLF form of the same document (1.2% more tokens); throughput is a rate so the effect is small, but the generated continuations are not strictly comparable there. Method, per-rep spread, VRAM and the governor analysis are in the <a href="models.html#table">Muse-Glimmer architecture card</a> (<code>docs/models/muse-glimmer.md</code>).</p>
 
+  <h2 id="wan">Wan video: two independent speed levers</h2>
+  <p>Video is the one workload where the wrong choice costs <em>hours</em> rather than seconds, so it is worth seeing the levers apart. Every row below is the <strong>same request</strong> — Apple <strong>M5 Pro (20-core GPU, 48 GB unified)</strong>, <code>ggml_metal</code>, <code>Wan2.2-TI2V-5B</code> Q8_0, image-to-video at <strong>1088×832 × 121 frames = 27,404 DiT tokens</strong> — and the rows differ only in the engine version and in which checkpoint <code>--model</code> pointed at.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Configuration</th><th>DiT passes</th><th>s / pass</th><th>Denoise</th><th>VAE decode</th><th>End to end</th></tr></thead>
+    <tbody>
+      <tr><td>Base checkpoint, before this optimization pass</td><td>100</td><td>206.2 s</td><td>20,615 s</td><td>863 s</td><td>≈5 h 58 m</td></tr>
+      <tr><td>Base checkpoint, current engine</td><td>100</td><td>120.2 s</td><td>12,020 s</td><td>563 s</td><td>≈3 h 30 m</td></tr>
+      <tr><td><strong>Step-distilled (Turbo, 4-step) checkpoint</strong></td><td>4</td><td>120.2 s</td><td>481 s</td><td>563 s</td><td><span class="yes">17 m 30 s</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The total decomposes into two multipliers that stack: <strong>~1.7× per pass</strong> from engine work (F16 attention K/V plus the VAE convolution path) and <strong>25× fewer passes</strong> from step distillation. The official Wan2.2-TI2V-5B recipe is 50 steps × 2 classifier-free-guidance passes = <strong>100 DiT passes</strong>; a step-distilled checkpoint is trained guidance-free and costs <strong>4</strong>. That is not a flag — it is a different <code>--model</code> file. TensorSharp detects it from the DiT file name (<code>turbo</code>, <code>distill</code>, <code>lightning</code>, <code>lightx2v</code>, <code>fastwan</code>, <code>-dmd</code>, or an explicit <code>…-4steps-…</code>), prints <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off</code> on load, and drops guidance automatically; <code>--diffusion-steps</code> / <code>--cfg</code> still override. → <a href="models-video.html#wan">Wan downloads</a></p>
+  <div class="callout tip"><div class="ic">⚡</div><p>Once the checkpoint is distilled the <strong>VAE decode becomes the bottleneck</strong> — 563 s of the 1,050 s run, about 55%. Optimizing the DiT further past this point buys much less than trimming frames or frame area.</p></div>
+
+  <h3>Resolution and frame count vs. time</h3>
+  <p>Same M5 Pro, same <code>ggml_metal</code> build, same Turbo checkpoint and the same source image. DiT self-attention costs O(tokens²) and the token count is <code>latent_frames × (h/2) × (w/2)</code>, so frame area and frame count dominate everything else:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Request</th><th>DiT tokens</th><th>Denoise</th><th>VAE decode</th><th>Total</th></tr></thead>
+    <tbody>
+      <tr><td>736×544 × 81f (3.4 s, 480p class)</td><td>8,211</td><td>84 s</td><td>159 s</td><td><span class="yes">4 m 09 s</span></td></tr>
+      <tr><td>736×544 × 121f (5 s, 480p class)</td><td>12,121</td><td>137 s</td><td>237 s</td><td>6 m 19 s</td></tr>
+      <tr><td>1088×832 × 121f (5 s, 720p class)</td><td>27,404</td><td>481 s</td><td>563 s</td><td>17 m 30 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>480p (≈0.4 MP) is a resolution Wan is <em>trained</em> at, so the 736×544 rows are in-distribution output rather than a degraded mode — that is the setting to reach for when a few minutes matters. Quality does fall off below ~0.3 MP, and the pipeline warns when width × height drops under 300,000 px.</p>
+
+  <h3>Where the per-pass 1.7× comes from</h3>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Change</th><th>Measurement</th><th>Before → after</th><th>Numerics</th></tr></thead>
+    <tbody>
+      <tr><td>F16 attention K/V in the DiT flash path</td><td>one self-attention, seq 27,404 / 24 heads / head dim 128, M5 Pro</td><td>4,993 → 2,467 ms (<span class="yes">2.02×</span>)</td><td>cosine 0.999964 vs the diffusers reference with either dtype</td></tr>
+      <tr><td>Wan VAE convolutions on MPSGraph (Metal)</td><td>VAE decode, 736×544 × 81f</td><td>159 → 80 s (<span class="yes">1.99×</span>)</td><td>93.9 dB PSNR, max Δ 0.128 of 255</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>A Wan VAE decode profile puts 44.4% of the graph in <code>MUL_MAT</code> and another 30.2% in <code>IM2COL</code> — 74.6% inside the convolution — which is why routing those convs through MPSGraph pays: per shape it reaches 6.2× (512→512 k3 at 320×240 t9), 8.6× (256→256 k3 at 640×480 t9), 10.4× (160→160 k3) and 13.9× (512→512 k1), because MPS reaches ~30 TFLOP/s where ggml's Metal GEMM gets ~4.9. Both knobs have an opt-out for A/B work: <code>TS_WAN_DIT_KV_F16=0</code> and <code>TS_WAN_VAE_MPS_CONV=0</code>. Q8_0 attention K/V was measured <em>slower</em> than F16 (2,652 ms) and dequantizing the DiT from Q8_0 to F16 moved the matmuls by under 5%, so a higher-precision Wan quant buys essentially no speed.</p>
+
+  <h3>Wan backends and the sd.cpp comparison</h3>
+  <p>Reference timings on an <strong>RTX 2000 Ada (16 GB)</strong> with <code>Wan2.1-1.3B</code> F16 at 832×480, 33 frames, 30 UniPC steps — the official 480p recipe:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Backend</th><th>s / step</th><th>Total</th></tr></thead>
+    <tbody>
+      <tr><td><code>ggml_cuda</code></td><td><span class="yes">12.0 s</span></td><td><span class="yes">445 s</span></td></tr>
+      <tr><td><code>ggml_vulkan</code></td><td>17.2 s</td><td>625 s</td></tr>
+      <tr><td><code>cuda</code> (direct driver API)</td><td>19.3 s</td><td>700 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><code>ggml_cuda</code> is the backend to pick for Wan on NVIDIA; <code>cpu</code> / <code>ggml_cpu</code> run correctly but a 480p multi-second video takes tens of minutes there, and <code>mlx</code> is not a supported Wan backend at all. Against <strong><code>stable-diffusion.cpp</code></strong> (master-769, identical GGUFs and settings, 33-frame 480p) sampling is near parity — 281 s vs 258 s — but sd.cpp's VAE decode materializes ≈8 GB of 3D im2col and oversubscribes a 16 GB card into WDDM paging: <strong>51 s vs 1,762 s</strong>, which makes TensorSharp <strong>6.0× faster end to end</strong> on that run.</p>
+
   <h2 id="testing">Testing</h2>
   <p>The build and test commands below require the <a href="getting-started.html#install-dotnet">.NET 10 SDK for your platform</a>; verify the installation before running them.</p>
   <h3>Unit tests (xUnit)</h3>

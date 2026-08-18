@@ -143,6 +143,34 @@ namespace TensorSharp.Models.WanVideo
             }
         }
 
+        /// <summary>
+        /// Band tiling exists to keep a full-resolution decode inside a small card's
+        /// VRAM, and it is not free: the bands overlap, so the decoder runs more
+        /// latent rows than the plane has, plus a band buffer alongside the canvas.
+        /// Measured at 1088x832x121f on an M5 Pro, decoding the plane whole is both
+        /// FASTER and LIGHTER than two bands — 565 s vs 655 s, peak RSS 4.85 vs
+        /// 5.37 GB. So scale the threshold with the memory actually available
+        /// instead of pinning it at a 16 GB card's budget; the constant is anchored
+        /// so that ~16 GB free reproduces the historical 640 kpx.
+        /// </summary>
+        protected override long TilePixelThreshold => _tileThreshold ??= ResolveTileThreshold();
+
+        private long? _tileThreshold;
+
+        private static long ResolveTileThreshold()
+        {
+            const long Anchor = 640_000;                 // px, the previous fixed value
+            const long AnchorFreeBytes = 16L << 30;      // the card size it was chosen for
+            try
+            {
+                if (GgmlBasicOps.TryGetDeviceMemoryInfo(out long freeBytes, out _) && freeBytes > 0)
+                    return Math.Max(Anchor / 4, (long)((double)freeBytes / AnchorFreeBytes * Anchor));
+            }
+            catch (DllNotFoundException) { /* managed-only host */ }
+            catch (EntryPointNotFoundException) { /* older GgmlOps */ }
+            return Anchor;
+        }
+
         private IntPtr Reg(float[] data)
         {
             long bytes = data.LongLength * sizeof(float);

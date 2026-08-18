@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>视频生成 — TensorSharp 维基</title>
+  <meta name="description" content="Wan 2.1 / 2.2 文生视频与图生视频：下载、运行示例，以及决定一段视频是几分钟还是几小时的检查点选择。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="models-video">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › <a href="models_zh-cn.html">支持的模型</a> › 视频生成（Wan 2.1 / 2.2）</div>
+  <h1>视频生成（Wan 2.1 / 2.2）</h1>
+  <p class="lede">Wan 把提示词——在 Wan 2.2 检查点上还可以加一张首帧图像——变成 H.264 MP4。本页包含下载、运行示例，以及决定端到端耗时的设置。</p>
+  <div class="callout note"><div class="ic">💡</div><p>这些命令遵循与文本模型示例相同的约定：Hugging Face CLI、从仓库根目录源码构建，并把 <code>--backend</code> 换成与你硬件匹配的值。参见<a href="models-text_zh-cn.html#download-run">按家族下载与运行</a>。</p></div>
+
+  <h2 id="wan">Wan 2.1 / 2.2（提示词 → 视频、图像 → 视频）</h2>
+  <p><strong>请下载 Turbo 版 DiT，而不是基础版。</strong>基础的 <code>Wan2.2-TI2V-5B</code> 走官方的 50 步 × CFG 配方，也就是每段视频 100 次 DiT 前向；同一模型的步数蒸馏 Turbo 版本经过训练可在无引导的 4 步内完成，TensorSharp 会从文件名识别出来，于是同一条请求<strong>从数小时变成数分钟</strong>。Turbo 仓库只提供 DiT，VAE 与文本编码器仍从基础仓库获取：</p>
+  <pre data-lang="bash"><code># 快车道：DiT 前向 4 次而不是 100 次。注意 “Wan2_2” 用的是下划线。
+hf download hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --local-dir models
+hf download QuantStack/Wan2.2-TI2V-5B-GGUF VAE/Wan2.2_VAE.safetensors --local-dir models
+hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
+
+# 文本 → 视频
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --prompt "A red fox trotting through falling snow, cinematic" \
+    --video-frames 81 --fps 24 --output out.mp4 --backend ggml_cuda
+# 图像 → 视频（上传的图像作为首帧；仅 Wan 2.2 模型支持）
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --image first_frame.png --prompt "the camera pushes in as the waves rise" \
+    --output out.mp4 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --backend ggml_cuda --video-frames 121 --fps 24</code></pre>
+  <p>加载时控制台会打印 <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off (--diffusion-steps / --cfg override)</code> 确认识别成功。在 M5 Pro 上用 <code>ggml_metal</code> 实测：一条 1088×832、121 帧（5 秒，720p 级）的图生视频请求，基础检查点需要 100 次 DiT 前向、约 <strong>3 小时 30 分</strong>，Turbo 检查点只需 4 次、<strong>17 分 30 秒</strong>——参数相同、分辨率相同，只有 <code>--model</code> 路径不同。若改到 480p（736×544、121 帧），Turbo 检查点 <strong>6 分 19 秒</strong>即可完成。</p>
+  <p>若要复现基础配方——例如生成参考样本，或使用没有蒸馏版本的 Wan 2.1 检查点——只需替换第一条下载命令与 <code>--model</code> 路径：</p>
+  <pre data-lang="bash"><code>hf download QuantStack/Wan2.2-TI2V-5B-GGUF Wan2.2-TI2V-5B-Q8_0.gguf --local-dir models
+
+# 50 步 x 2 次 CFG 前向；--cfg-cache-stride 以少量精度换取 1.30x / 1.43x
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2.2-TI2V-5B-Q8_0.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --prompt "A red fox trotting through falling snow, cinematic" \
+    --video-frames 81 --fps 24 --cfg-cache-stride 2 --output out.mp4 --backend ggml_cuda</code></pre>
+  <p>Wan 2.2 A14B 图生视频请把<em>两个</em>蒸馏专家下载到同一个 <code>--local-dir</code>——加载器会依据高噪专家的文件名找到对应的低噪专家，因此只需传一个 <code>--model</code> 路径。A14B 使用 Wan 2.1 的 VAE：</p>
+  <pre data-lang="bash"><code>hf download jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF \
+    high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf --local-dir models
+hf download jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF \
+    low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf --local-dir models
+hf download QuantStack/Wan2.2-I2V-A14B-GGUF VAE/Wan2.1_VAE.safetensors --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.1_VAE.safetensors \
+    --image first_frame.png --prompt "the camera pushes in as the waves rise" \
+    --output out.mp4 --backend ggml_cuda</code></pre>
+  <div class="callout tip"><div class="ic">⚡</div><p><strong>请在 Wan 训练过的分辨率上生成。</strong>Wan 的训练分辨率是 480p（832×480）与 720p（1280×704），TI2V-5B 原生就是 720p 模型。低于约 0.3 MP 时 DiT 已经超出分布，无论花多少步，画面都会发糊、不稳定并出现偏色——低于该阈值时流水线会给出警告。请先在受支持的分辨率上生成，再缩小，而不是直接生成小尺寸。</p></div>
+
+  <h2 id="video">视频生成（Wan 2.1 / 2.2）</h2>
+  <p>Wan 把<strong>提示词</strong>——在 Wan 2.2 检查点上还可以加一张<strong>上传的首帧图像</strong>——变成 H.264 MP4。<code>--model</code> 指定的 GGUF 只是 DiT，TensorSharp 会在其旁边解析两个伴随文件（放在 <code>VAE/</code>、<code>HighNoise/</code> 或 <code>LowNoise/</code> 子目录中同样可以）：</p>
+  <ul>
+    <li><strong>UMT5-XXL 文本编码器</strong> —— 提示词 → 条件向量（<code>--wan-te</code> / <code>TS_WAN_TE</code>）。去噪开始前即从显存释放。</li>
+    <li><strong>因果 3D 视频 VAE</strong> —— 潜变量 ↔ 帧（<code>--wan-vae</code> / <code>TS_WAN_VAE</code>）。需要哪一个由 DiT 自身读出，不用你指定：Wan 2.1 与 A14B 使用 <code>wan_2.1_vae</code>，TI2V-5B 使用 <code>Wan2.2_VAE</code>。</li>
+    <li><strong>A14B 的第二个专家</strong> —— 两个 14B 专家必须同时存在。把它们放在同一目录，或放进 <code>HighNoise/</code> 与 <code>LowNoise/</code> 子目录，加载器会依据文件名配对（<code>TS_WAN_DIT2</code> 可覆盖；没有对应的 CLI 参数）。</li>
+  </ul>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>系列</th><th>潜空间</th><th>模式</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>Wan 2.1 T2V（1.3B / 14B）</td><td>16 通道，8×8×4</td><td>文本 → 视频</td><td>单个 DiT</td></tr>
+      <tr><td>Wan 2.2 TI2V-5B</td><td>48 通道，16×16×4</td><td>文本 → 视频、<strong>图像 → 视频</strong></td><td>稠密 5B，24 fps，可出 720p</td></tr>
+      <tr><td>Wan 2.2 A14B（T2V / I2V）</td><td>16 通道（I2V 输入 36 通道）</td><td>文本 → 视频、<strong>图像 → 视频</strong></td><td>两个 14B 专家在时间步边界切换</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>每个去噪步是一张常驻权重的 ggml 图（CUDA 图捕获、flash attention；TI2V 图生视频还带 per-token 时间步调制），视频 VAE 的编码与解码各是一张图。各阶段按顺序交接显存——先文本编码器，再 DiT，最后 VAE——因此峰值约为 <code>max(TE, DiT + attention, VAE)</code>：TI2V-5B 在 <strong>16 GB</strong> GPU 上 8 分钟内生成 81 帧 480p 图生视频，A14B 的两个专家也能在同一张卡上顺序执行。数值上与 diffusers 对齐（DiT 余弦相似度 &gt; 0.995，VAE 编码器 &gt; 0.999，解码 59.9 dB PSNR），同等负载下 Wan 2.1 端到端比 <code>stable-diffusion.cpp</code> 快 <strong>6.0×</strong>。</p>
+
+  <h3 id="video-fast">检查点决定端到端耗时</h3>
+  <p>Wan 的 DiT token 数为 <code>latent_frames × (h/2) × (w/2)</code>，自注意力开销为 <code>O(tokens²)</code>，因此 5 秒 720p 视频确实是个大活：1088×832、121 帧就是 27 404 个 token，而 TI2V-5B 的官方配方要在其上跑 50 步 × 2 次无分类器引导前向 = <strong>100 次 DiT 前向</strong>。<strong>步数蒸馏检查点</strong>经过训练可在无引导的 4 步内完成，因此同一段视频只需 <strong>4 次前向</strong>——去噪工作量只有 1/25。TensorSharp 会从 DiT 文件名识别（<code>turbo</code>、<code>distill</code>、<code>lightning</code>、<code>lightx2v</code>、<code>fastwan</code>、<code>-dmd</code>，或显式的 <code>…-4steps-…</code>，步数取 1–16），在加载时打印 <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off</code> 并自动套用该配方；<code>--diffusion-steps</code> 与 <code>--cfg</code> 仍可覆盖。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>M5 Pro、<code>ggml_metal</code>、TI2V-5B Q8_0、1088×832×121 帧（27 404 token，图 → 视频）</th><th>基础版，优化前</th><th>基础版，现在</th><th>Turbo，现在</th></tr></thead>
+    <tbody>
+      <tr><td>DiT 前向次数</td><td>100（50 步 × CFG）</td><td>100</td><td><strong>4</strong>（无引导）</td></tr>
+      <tr><td>单次前向</td><td>206.2 s</td><td><strong>120.2 s</strong></td><td>120.2 s</td></tr>
+      <tr><td>去噪总耗时</td><td>20 615 s</td><td>12 020 s</td><td><strong>481 s</strong></td></tr>
+      <tr><td>VAE 解码 121 帧</td><td>863 s</td><td><strong>563 s</strong></td><td>563 s</td></tr>
+      <tr><td><strong>端到端</strong></td><td><strong>约 5 小时 58 分</strong></td><td>约 3 小时 30 分</td><td><strong>17 分 30 秒</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>两条加速路径互相独立：单次前向约 1.7× 来自把 DiT flash 注意力的 K/V 保持为 F16（单次 27k token 自注意力实测 2.02×，与 diffusers 参考实现的余弦相似度 0.999964——<code>TS_WAN_DIT_KV_F16=0</code> 可恢复 F32），以及在 Metal 上把 Wan VAE 卷积改走 MPSGraph 而非 ggml 的 im2col+GEMM 降级路径（736×544×81 帧下 VAE 解码 159 s → 80 s，数值不变，93.9 dB PSNR——<code>TS_WAN_VAE_MPS_CONV=0</code> 可回退）；另一条是蒸馏检查点带来的前向次数减少 25×。一旦用上蒸馏检查点，瓶颈就变成 <strong>VAE 解码</strong>（约占整轮的 55%），而不再是 DiT。</p>
+
+  <h3 id="video-resolution">帧数与分辨率决定其余部分</h3>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>输出（M5 Pro，同一 Turbo 检查点与图像）</th><th>Token</th><th>去噪</th><th>VAE 解码</th><th>总计</th></tr></thead>
+    <tbody>
+      <tr><td>736×544 × 81 帧（3.4 秒，480p 级）</td><td>8 211</td><td>84 s</td><td>159 s</td><td><strong>4 分 09 秒</strong></td></tr>
+      <tr><td>736×544 × 121 帧（5 秒，480p 级）</td><td>12 121</td><td>137 s</td><td>237 s</td><td><strong>6 分 19 秒</strong></td></tr>
+      <tr><td>1088×832 × 121 帧（5 秒，720p 级）</td><td>27 404</td><td>481 s</td><td>563 s</td><td><strong>17 分 30 秒</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>480p（约 0.4 MP）本身就是 Wan <em>训练过</em>的分辨率，因此前两行属于分布内的正常档位，而不是降级模式——想在几分钟内出片就该选它。质量真正开始下滑是在约 0.3 MP 以下：那里 DiT 已超出分布，无论花多少步，画面都会发糊、不稳定并偏色，流水线也会给出警告。请在受支持的分辨率上生成后再缩小（用 <code>--width 480 --height 704</code> 而不是 320×480）。</p>
+  <p>要让一次大请求更便宜，按效果排序：<strong>(1)</strong> 换成步数蒸馏检查点——100 次前向变 4 次，压倒其他一切；<strong>(2)</strong> 减少帧数——121 → 61 大致把注意力工作量降到四分之一，VAE 解码减半；<strong>(3)</strong> 减小画面面积，但不要低于约 0.3 MP；<strong>(4)</strong> 减少步数，仅限基础检查点——30 步与 50 步观感接近，成本低 1.7×；<strong>(5)</strong> <code>--cfg-cache-stride 2</code> 或 <code>3</code>，即每 N 步才跑一次无条件前向、其余步复用缓存的引导方向——50 步下 100 次前向只跑 77 次（1.30×）或 70 次（1.43×）。它是近似方法，需要对齐参考样本时请关掉；在本就无引导的蒸馏检查点上也没有作用。</p>
+  <p>在 NVIDIA 上 <code>ggml_cuda</code> 是最快的 Wan 后端：RTX 2000 Ada 16 GB 跑官方 480p Wan2.1-1.3B 配方时为 12.0 s/步，<code>ggml_vulkan</code> 为 17.2，直连 <code>cuda</code> 后端为 19.3。Wan 完全不支持 <code>mlx</code>；<code>cpu</code> / <code>ggml_cpu</code> 后端只用于功能性验证。</p>
+
+  <p>可通过 <a href="cli_zh-cn.html">CLI</a>（<code>--prompt</code>、可选 <code>--image</code>、<code>--video-frames</code>、<code>--fps</code>、<code>--flow-shift</code>、<code>--sampler</code>、<code>--negative-prompt</code>）、<a href="http-api_zh-cn.html">HTTP API</a>（<code>/v1/videos/generations</code>）或 <a href="server_zh-cn.html#webui">Web UI</a> 聊天上传图像来驱动。在服务端，<code>--video-frames</code> 与 <code>--fps</code> 设定的是默认值而非上限——请求自带 <code>frames</code> 或 <code>fps</code> 时各自覆盖；两者都不给时套用模型自身的配方（Wan2.2-TI2V 为 49 帧 24 fps，其余为 33 帧 16 fps）。帧数会对齐到 VAE 的时间网格（4k+1）。完整说明见仓库中的 <code>docs/models/wan_zh-cn.md</code> 卡片。</p>
+  <div class="content-footer">
+    <a href="models-image_zh-cn.html">← 图像生成</a>
+    <a href="cli_zh-cn.html">下一篇：命令行 →</a>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>模型下载 — TensorSharp 维基</title>
+  <meta name="description" content="所有受支持架构的 GGUF 下载，以及每个家族所需的投影器、VAE、文本编码器与草稿模型等配套文件。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="models-downloads">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › <a href="models_zh-cn.html">支持的模型</a> › 模型下载（GGUF）</div>
+  <h1>模型下载（GGUF）</h1>
+  <p class="lede">每个构件一行：模型本体，以及各家族需要与之搭配的配套文件——投影器、VAE、文本编码器、第二专家、推测解码草稿模型。</p>
+
+  <h2 id="downloads">模型下载（GGUF）</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>架构</th><th>模型</th><th>下载</th></tr></thead>
+    <tbody>
+      <tr><td>DeepSeek V4</td><td>DeepSeek-V4-Flash-0731（284B MoE）</td><td><a href="https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF" target="_blank" rel="noopener">unsloth/DeepSeek-V4-Flash-0731-GGUF</a>；每个量化档一个子目录（<code>UD-Q8_K_XL/</code>、<code>UD-IQ4_XS/</code>、<code>UD-IQ1_S/</code> …），均为多分片——<code>--model</code> 指向 <code>-00001-of-</code> 那一片。仅文本；权重按层切分到所有可见 GPU</td></tr>
+      <tr><td>DeepSeek V4</td><td>DSpark 投机草稿器（可选）</td><td><a href="https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF" target="_blank" rel="noopener">bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF</a> 的 <code>DSpark-drafter-Q2K-Q8-0731.gguf</code>（7.0 GB，对应 0731 版本），用 <code>--draft-model</code> 加载可获得约 1.3–1.4× 的 decode 提速。另有两家发布的构建（5.6 GB / 10.9 GB）也可直接加载，见 <code>MODEL_DOWNLOADS_zh-cn.md</code>。其他架构的草稿器属于不同设计，<strong>暂不支持</strong></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-E4B-it</td><td><a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a>；已验证 E4B Q8_0 原生 GGML 规格推荐使用公开文件 <code>gemma-4-E4B-it-Q8_0.gguf</code>；多模态投影器为同仓库的 <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-12B-it（QAT）</td><td><a href="https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF" target="_blank" rel="noopener">unsloth/gemma-4-12B-it-qat-GGUF</a>；同仓库 <code>mmproj-BF16.gguf</code> 与 <code>mtp-gemma-4-12B-it.gguf</code></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-31B-it</td><td><a href="https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-31B-it-GGUF</a></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-26B-A4B-it (MoE)</td><td><a href="https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-26B-A4B-it-GGUF</a></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-26B-A4B-it（MoE，QAT）</td><td><a href="https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF" target="_blank" rel="noopener">unsloth/gemma-4-26B-A4B-it-qat-GGUF</a>；同仓库 <code>mmproj-BF16.gguf</code> 与 MTP draft；另有 <a href="https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF" target="_blank" rel="noopener">AtomicChat assistant</a></td></tr>
+      <tr><td>Gemma 3</td><td>gemma-3-4b-it</td><td><a href="https://huggingface.co/ggml-org/gemma-3-4b-it-GGUF" target="_blank" rel="noopener">非 gated ggml-org 仓库</a>；<code>Q4_K_M</code> 约 2.32 GiB，mmproj 为 <code>mmproj-model-f16.gguf</code>。<a href="https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf" target="_blank" rel="noopener">Google QAT 仓库</a>需要登录并接受许可证</td></tr>
+      <tr><td>Gemma 3</td><td>gemma-3-4b-it（官方 QAT）</td><td><a href="https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf" target="_blank" rel="noopener">google/gemma-3-4b-it-qat-q4_0-gguf</a>；<code>mmproj-model-f16-4B.gguf</code>；⚠️ 需要 Hugging Face 登录并接受 Google Gemma 许可证</td></tr>
+      <tr><td>Qwen 3</td><td>Qwen3-4B</td><td><a href="https://huggingface.co/Qwen/Qwen3-4B-GGUF" target="_blank" rel="noopener">Qwen/Qwen3-4B-GGUF</a>；<code>Qwen3-4B-Q4_K_M.gguf</code> 约 2.33 GiB</td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>Qwen3.5-9B</td><td><a href="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF" target="_blank" rel="noopener">unsloth/Qwen3.5-9B-GGUF</a></td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>Qwen3.5-35B-A3B (MoE)</td><td><a href="https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF" target="_blank" rel="noopener">ggml-org/Qwen3.5-35B-A3B-GGUF</a></td></tr>
+      <tr><td>Qwen 3.6</td><td>Qwen3.6-35B-A3B NextN MTP</td><td><a href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF" target="_blank" rel="noopener">unsloth/Qwen3.6-35B-A3B-MTP-GGUF</a>；<code>UD-Q4_K_M</code> 约 21.11 GiB。基础仓库 GGUF 会剥离 NextN 块</td></tr>
+      <tr><td>GPT OSS</td><td>gpt-oss-20b (MoE)</td><td><a href="https://huggingface.co/ggml-org/gpt-oss-20b-GGUF" target="_blank" rel="noopener">ggml-org/gpt-oss-20b-GGUF</a></td></tr>
+      <tr><td>Nemotron-H</td><td>Nemotron-H-8B-Reasoning-128K</td><td><a href="https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF" target="_blank" rel="noopener">bartowski/nvidia_Nemotron-H-8B-…</a></td></tr>
+      <tr><td>Nemotron-H</td><td>Nemotron-H-47B-Reasoning-128K</td><td><a href="https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF" target="_blank" rel="noopener">bartowski/nvidia_Nemotron-H-47B-…</a></td></tr>
+      <tr><td>Nemotron-H</td><td>Nemotron 3 Nano Omni 30B-A3B（图像）</td><td><a href="https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF" target="_blank" rel="noopener">unsloth/NVIDIA-Nemotron-3-Nano-Omni-…</a>；图像输入需要同仓库 <code>mmproj-BF16.gguf</code>；未附真实音频推理所需的 Parakeet mmproj</td></tr>
+      <tr><td>Mistral 3</td><td>Mistral-Small-3.1-24B-Instruct</td><td><a href="https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF" target="_blank" rel="noopener">bartowski/mistralai_Mistral-Small-3.1-24B-…</a>；Q4_K_M 约 13.35 GiB；同仓库 Pixtral mmproj</td></tr>
+      <tr><td>DiffusionGemma</td><td>diffusiongemma-26B-A4B-it</td><td><a href="https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF" target="_blank" rel="noopener">unsloth/diffusiongemma-26B-A4B-it-GGUF</a>；Q4_K_M 约 15.65 GiB</td></tr>
+      <tr><td>Muse-Glimmer</td><td>Muse-Glimmer-30B</td><td><a href="https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF" target="_blank" rel="noopener">unsloth/Muse-Glimmer-30B-GGUF</a>；图像输入需要同仓库的 mmproj：<code>mmproj-Muse-Glimmer-30B-Q8_0.gguf</code></td></tr>
+      <tr><td>Muse-Glimmer</td><td>DFlash 投机草稿模型（可选）</td><td><a href="https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF" target="_blank" rel="noopener">unsloth/Muse-Glimmer-30B-GGUF</a> 中的 <code>dflash-*.gguf</code> —— 5 层块级草稿模型，用 <code>--draft-model</code> 加载。验证以贪心方式对齐主干，因此输出与普通贪心 decode 一致</td></tr>
+      <tr><td>Qwen-Image-Edit</td><td>2511 MMDiT（<code>--model</code>）</td><td><a href="https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF" target="_blank" rel="noopener">unsloth/Qwen-Image-Edit-2511-GGUF</a>；<code>qwen-image-edit-2511-Q4_K_M.gguf</code> 约 12.34 GiB</td></tr>
+      <tr><td>Qwen-Image-Edit</td><td>Qwen-Image VAE（必需）</td><td><a href="https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF" target="_blank" rel="noopener">QuantStack/Qwen-Image-Edit-GGUF</a> 中的 <code>VAE/Qwen_Image-VAE.safetensors</code>；通过 <code>--qwen-image-vae</code> 指定</td></tr>
+      <tr><td>Qwen-Image-Edit</td><td>Qwen2.5-VL-7B 文本编码器（必需）</td><td><a href="https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF" target="_blank" rel="noopener">unsloth/Qwen2.5-VL-7B-Instruct-GGUF</a>；可选视觉投影器为同仓库 <code>mmproj-BF16.gguf</code></td></tr>
+      <tr><td>Qwen-Image-Edit</td><td>Lightning LoRA（可选，4/8 步）</td><td><a href="https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning" target="_blank" rel="noopener">lightx2v/Qwen-Image-Edit-2511-Lightning</a>；如 <code>Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors</code></td></tr>
+      <tr><td>Wan 视频</td><td><strong>步数蒸馏 Wan DiT —— 快车道（推荐）</strong></td><td><a href="https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF" target="_blank" rel="noopener">hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF</a> 中的 <code>Wan2_2-TI2V-5B-Turbo-Q8_0.gguf</code>（5.40 GB）—— 注意 <code>Wan2_2</code> 用的是<em>下划线</em>；最小到 <code>Q2_K</code>（1.86 GB）。从文件名自动识别，无需改任何参数：DiT 前向由 100 次降到 4 次，并关闭引导。A14B 图生视频用 <a href="https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF" target="_blank" rel="noopener">jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF</a>，<em>两个</em>专家（<code>high_noise/</code> 与 <code>low_noise/</code>）都要下载。这两个仓库都不含 VAE 和文本编码器——请从下面两行取</td></tr>
+      <tr><td>Wan 视频</td><td>基础 Wan DiT（完整步数配方）</td><td><a href="https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF" target="_blank" rel="noopener">QuantStack/Wan2.2-TI2V-5B-GGUF</a> 中的 <code>Wan2.2-TI2V-5B-Q8_0.gguf</code>（5.40 GB），同仓库已附带 <code>VAE/Wan2.2_VAE.safetensors</code>。另有 <a href="https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF" target="_blank" rel="noopener">Wan2.2-I2V-A14B</a> 与 <a href="https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF" target="_blank" rel="noopener">Wan2.2-T2V-A14B</a>（需同时下载 HighNoise 与 LowNoise 两个专家；两个仓库均附带 Wan 2.1 VAE）、<a href="https://huggingface.co/city96/Wan2.1-T2V-14B-gguf" target="_blank" rel="noopener">Wan2.1-T2V-14B</a> 与 <a href="https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF" target="_blank" rel="noopener">Wan2.1-T2V-1.3B</a></td></tr>
+      <tr><td>Wan 视频</td><td>UMT5-XXL 文本编码器（必需）</td><td><a href="https://huggingface.co/city96/umt5-xxl-encoder-gguf" target="_blank" rel="noopener">city96/umt5-xxl-encoder-gguf</a> 中的 <code>umt5-xxl-encoder-Q8_0.gguf</code>（6.04 GB；内存紧张可用 <code>Q5_K_M</code> 4.15 GB 或 <code>Q4_K_M</code> 3.66 GB）—— 放在 DiT 旁边，或用 <code>--wan-te</code> 指定</td></tr>
+      <tr><td>Wan 视频</td><td>视频 VAE（必需）</td><td><a href="https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors" target="_blank" rel="noopener">wan_2.1_vae.safetensors</a>；需要哪一个由 DiT 自己决定，不用你选：Wan 2.1 与 A14B 用 <code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>。QuantStack 的两个 A14B 仓库与 TI2V-5B 仓库都已在 <code>VAE/</code> 下附带，因此只有 Wan 2.1 检查点和蒸馏仓库才需要单独下载。放在 DiT 旁边（<code>VAE/</code> 子目录亦可）或用 <code>--wan-vae</code> 指定</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout note"><div class="ic">🧩</div><p>多模态模型需要<strong>投影器（mmproj）</strong>文件。请下载匹配文件并显式传入 <code>--mmproj</code>；服务端不会自动检测，CLI 也只识别少数旧文件名。</p></div>
+  <div class="content-footer">
+    <a href="models_zh-cn.html">← 支持的模型</a>
+    <a href="models-text_zh-cn.html">下一篇：文本与 LLM 模型 →</a>
+  </div>
+</main>
+</body>
+</html>

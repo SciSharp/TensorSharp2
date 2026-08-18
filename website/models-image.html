@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Image Generation &amp; Editing — TensorSharp Wiki</title>
+  <meta name="description" content="Qwen-Image-Edit: download and run the MMDiT image editor, and the Lightning LoRA and DiT cache that make it fast.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="models-image">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › <a href="models.html">Supported Models</a> › Image Generation &amp; Editing</div>
+  <h1>Image Generation &amp; Editing</h1>
+  <p class="lede">Qwen-Image-Edit takes a prompt plus an input image and returns an edited image. This page covers the download, the run recipe, and the two levers that decide how long an edit takes.</p>
+  <div class="callout note"><div class="ic">💡</div><p>These commands follow the same conventions as the text-model recipes — the Hugging Face CLI, a source build from the repository root, and <code>--backend</code> swapped to match your hardware. See <a href="models-text.html#download-run">Download &amp; run, per family</a>.</p></div>
+
+  <h2 id="qwen-image-edit">Qwen-Image-Edit (image + prompt → edited image)</h2>
+  <pre data-lang="bash"><code>hf download unsloth/Qwen-Image-Edit-2511-GGUF qwen-image-edit-2511-Q4_K_M.gguf --local-dir models
+hf download QuantStack/Qwen-Image-Edit-GGUF VAE/Qwen_Image-VAE.safetensors --local-dir models
+hf download unsloth/Qwen2.5-VL-7B-Instruct-GGUF Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf --local-dir models
+hf download unsloth/Qwen2.5-VL-7B-Instruct-GGUF mmproj-BF16.gguf --local-dir models
+hf download lightx2v/Qwen-Image-Edit-2511-Lightning Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/qwen-image-edit-2511-Q4_K_M.gguf --image input.png \
+    --prompt "Make the sky a dramatic sunset." --output edited.png \
+    --qwen-image-vae models/VAE/Qwen_Image-VAE.safetensors \
+    --qwen-image-vl models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
+    --qwen-image-mmproj models/mmproj-BF16.gguf \
+    --qwen-image-lora models/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
+    --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-edit-2511-Q4_K_M.gguf \
+    --qwen-image-vae models/VAE/Qwen_Image-VAE.safetensors \
+    --qwen-image-vl models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
+    --qwen-image-mmproj models/mmproj-BF16.gguf \
+    --qwen-image-lora models/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
+    --backend ggml_cuda</code></pre>
+
+  <h2 id="imageedit">Image editing (Qwen-Image-Edit)</h2>
+  <p>Qwen-Image-Edit takes a <strong>prompt + an input image</strong> and returns an edited image — a different output modality from the text LLMs above. The loaded <code>qwen_image</code> GGUF is only the MMDiT (multimodal diffusion transformer); TensorSharp resolves two companion GGUFs alongside it:</p>
+  <ul>
+    <li><strong>Qwen-Image VAE</strong> — image ↔ 16-channel latent (the original <code>.safetensors</code> works too).</li>
+    <li><strong>Qwen2.5-VL-7B text encoder</strong> — prompt → 3584-dim conditioning, with an optional <code>mmproj</code> vision tower for image-grounded edits.</li>
+  </ul>
+  <p>Place the companions next to the DiT GGUF, or point at them with <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> (CLI: <code>--qwen-image-vae</code> / <code>--qwen-image-vl</code> / <code>--qwen-image-mmproj</code>). The pipeline VAE-encodes the reference, builds the conditioning, runs a FlowMatch-Euler true-CFG denoise loop (reference-latent concatenation), then VAE-decodes back to pixels. The whole 60-block DiT forward is CUDA-graph-captured and flash attention is on by default; the target area auto-clamps to the device VRAM budget unless you pin a width/height.</p>
+  <p><strong>The speed lever is the Lightning distillation LoRA</strong> (<code>--qwen-image-lora</code> / <code>TS_QWEN_IMAGE_LORA</code>, a <code>.safetensors</code> file). TensorSharp parses the trained step count out of its file name (<code>…-4steps-…</code> / <code>…8step…</code>, 1–16 accepted) and switches the sampling defaults to that step count at cfg 1.0 with a fixed timestep shift of 3 — one DiT forward per step, no negative pass. Without it the base recipe is 30 steps at cfg 2.5, so the default <strong>60 DiT forwards drop to 4–8</strong>. On the project's CUDA <code>image_edit</code> scenario (Q2_K DiT + 4-step Lightning LoRA, 544×1184, identical inputs and seed) a warm edit completes in <strong>40.44 s</strong> against <code>stable-diffusion.cpp</code>'s 48.16 s.</p>
+  <p>The LoRA is applied as a runtime F32 side-path next to each targeted projection (<code>y = W·x + b + (alpha/rank)·up·(down·x)</code>) with the quantized base weights untouched — it is <em>not</em> merged into them, because the Lightning deltas are far below a low-bit quantization step and a merge would be pure requantization noise. That side-path exists only on the whole-model and fused per-block CUDA forwards, so a Lightning LoRA on a fallback path (<code>TS_QWEN_DIT_FUSED_BLOCK=0</code>, <code>TS_QWEN_DIT_NATIVE=0</code>, or a non-CUDA backend) fails loudly rather than emitting noise. Stacking it on a base DiT that is <em>already</em> few-step (a file name containing <code>rapid</code>, <code>turbo</code>, <code>hyper</code>, <code>lightning</code>, <code>lcm</code>, <code>nitro</code> or <code>step</code>) is detected and warned about — such a checkpoint needs no LoRA.</p>
+  <p>Three fused graphs carry the rest, all on by default: the CUDA-graph-captured whole-DiT forward cut the per-forward cost ~2.9× and an 8-step denoise from ~153 s to ~63 s (<code>TS_QWEN_DIT_WHOLE_CAPTURE=0</code> to disable); the fused conditioning-encoder trunks took text conditioning from 11.2 s to 2.5 s (<code>TS_QWEN_TE_FUSED=0</code>); and the fused whole-VAE graph took a 928×688 encode from 19.5 s to 0.95 s and the decode from 22.8 s to 1.35 s (<code>TS_QWEN_VAE_FUSED=0</code>). A <strong>whole-step DiT cache</strong> (<code>TS_QWEN_DIT_CACHE_MODE</code> = <code>easycache</code> / <code>fbc</code> / <code>both</code>) can skip 40–55% of the remaining steps, but it is <strong>off by default</strong>: on edit workloads it measurably softens fine detail such as faces, so quality comes first and you opt in.</p>
+  <p>Because the text and vision encoders are freed before the denoise loop starts, a larger text-encoder quantization costs nothing at denoise time while driving the whole edit's fidelity — <code>Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf</code> (4.683 GB) is the recommended choice even on low-VRAM cards; the ~2-bit <code>UD-IQ2_XXS</code> build markedly softens faces.</p>
+  <p>Run it from the <a href="cli.html#imageedit">CLI</a> (<code>--image</code> + <code>--prompt</code>), the <a href="server.html#webui">Web UI</a> image-edit flow (with live denoising previews), or in-process from <a href="code-api.html#imageedit">C# via <code>QwenImageModel.EditImage()</code></a>. Full details are in the repository's <code>docs/models/qwenimage.md</code> card.</p>
+  <div class="content-footer">
+    <a href="models-text.html">← Text &amp; LLM Models</a>
+    <a href="models-video.html">Next: Video Generation →</a>
+  </div>
+</main>
+</body>
+</html>

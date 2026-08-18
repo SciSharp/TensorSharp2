@@ -43,6 +43,24 @@ has_cuda_toolkit() {
 # libvulkan.so over the runtime soname libvulkan.so.1 — CMake accepts a full
 # path in Vulkan_LIBRARY either way). Fails when no loader is installed, which
 # is the "this machine does not support Vulkan" signal for auto-detection.
+# Is a Vulkan BUILD toolchain already present? A loader (libvulkan.so) only says
+# the machine can RUN Vulkan -- every NVIDIA driver install ships one -- so it is
+# the wrong signal for auto-enabling the backend: on a CUDA-only box it sent the
+# build off to download and compile shaderc/SPIRV-Headers before it ever reached
+# ggml-cuda. Auto-enable only when the pieces needed to compile the shaders are
+# already installed; `--vulkan` still opts in explicitly and will provision them.
+have_vulkan_build_toolchain() {
+    if [[ -n "${VULKAN_SDK:-}" && -f "${VULKAN_SDK}/include/vulkan/vulkan.h" && -x "${VULKAN_SDK}/bin/glslc" ]]; then
+        return 0
+    fi
+    command -v glslc >/dev/null 2>&1 || return 1
+    local dir
+    for dir in /usr/include /usr/local/include; do
+        [[ -f "${dir}/vulkan/vulkan.h" ]] && return 0
+    done
+    return 1
+}
+
 find_vulkan_loader_library() {
     local candidates=()
     if command -v ldconfig >/dev/null 2>&1; then
@@ -268,10 +286,14 @@ elif [[ "$(read_cached_backend_setting TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT)"
     fi
 fi
 if [[ -z "${ENABLE_VULKAN}" ]]; then
-    if [[ -n "${VULKAN_SDK:-}" ]] || find_vulkan_loader_library >/dev/null; then
+    if have_vulkan_build_toolchain; then
         ENABLE_VULKAN=ON
     else
         ENABLE_VULKAN=OFF
+        if find_vulkan_loader_library >/dev/null; then
+            echo "note: a Vulkan loader is present but no build toolchain (glslc + vulkan headers);" >&2
+            echo "      building without ggml-vulkan. Pass --vulkan to provision the toolchain and include it." >&2
+        fi
     fi
 fi
 if [[ "${ENABLE_VULKAN}" == "ON" ]] && ! prepare_vulkan_toolchain; then

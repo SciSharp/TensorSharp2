@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video Generation — TensorSharp Wiki</title>
+  <meta name="description" content="Wan 2.1 / 2.2 text-to-video and image-to-video: downloads, run recipes, and the checkpoint choice that decides whether a clip takes minutes or hours.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="models-video">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › <a href="models.html">Supported Models</a> › Video Generation (Wan 2.1 / 2.2)</div>
+  <h1>Video Generation (Wan 2.1 / 2.2)</h1>
+  <p class="lede">Wan turns a prompt — and, on the Wan 2.2 checkpoints, an uploaded first frame — into an H.264 MP4. This page covers the downloads, the run recipes, and the settings that decide the wall clock.</p>
+  <div class="callout note"><div class="ic">💡</div><p>These commands follow the same conventions as the text-model recipes — the Hugging Face CLI, a source build from the repository root, and <code>--backend</code> swapped to match your hardware. See <a href="models-text.html#download-run">Download &amp; run, per family</a>.</p></div>
+
+  <h2 id="wan">Wan 2.1 / 2.2 (prompt → video, image → video)</h2>
+  <p><strong>Download the Turbo DiT, not the base one.</strong> The base <code>Wan2.2-TI2V-5B</code> follows the official 50-step × CFG recipe — 100 DiT passes per video. The step-distilled Turbo build of the same model is trained to run guidance-free in 4 steps, TensorSharp recognizes it from the file name, and the identical request comes back <strong>in minutes instead of hours</strong>. The Turbo repository ships only the DiT, so the VAE and the text encoder still come from the base repositories:</p>
+  <pre data-lang="bash"><code># The fast lane: 4 DiT passes instead of 100. Note the underscore in "Wan2_2".
+hf download hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --local-dir models
+hf download QuantStack/Wan2.2-TI2V-5B-GGUF VAE/Wan2.2_VAE.safetensors --local-dir models
+hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
+
+# text → video
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --prompt "A red fox trotting through falling snow, cinematic" \
+    --video-frames 81 --fps 24 --output out.mp4 --backend ggml_cuda
+# image → video (the image becomes the first frame; Wan 2.2 models only)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --image first_frame.png --prompt "the camera pushes in as the waves rise" \
+    --output out.mp4 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --backend ggml_cuda --video-frames 121 --fps 24</code></pre>
+  <p>At load the console confirms the detection with <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off (--diffusion-steps / --cfg override)</code>. Measured on an M5 Pro with <code>ggml_metal</code>, a 1088×832 × 121-frame (5 s, 720p-class) image-to-video request costs 100 DiT passes ≈ <strong>3 h 30 m</strong> on the base checkpoint and 4 passes = <strong>17 m 30 s</strong> on the Turbo one — the same flags, the same resolution, only the <code>--model</code> path differs. At 480p (736×544 × 121f) the Turbo checkpoint finishes in <strong>6 m 19 s</strong>.</p>
+  <p>To reproduce the base recipe instead — for a reference sample, or on a Wan 2.1 checkpoint that has no distilled build — swap the first download and the <code>--model</code> paths:</p>
+  <pre data-lang="bash"><code>hf download QuantStack/Wan2.2-TI2V-5B-GGUF Wan2.2-TI2V-5B-Q8_0.gguf --local-dir models
+
+# 50 steps x 2 CFG passes; --cfg-cache-stride trades a little accuracy for 1.30x / 1.43x
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2.2-TI2V-5B-Q8_0.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --prompt "A red fox trotting through falling snow, cinematic" \
+    --video-frames 81 --fps 24 --cfg-cache-stride 2 --output out.mp4 --backend ggml_cuda</code></pre>
+  <p>For Wan 2.2 A14B image-to-video, download <em>both</em> distilled experts under one <code>--local-dir</code> — the loader finds the low-noise partner from the high-noise file name, so only one <code>--model</code> path is passed. A14B uses the Wan 2.1 VAE:</p>
+  <pre data-lang="bash"><code>hf download jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF \
+    high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf --local-dir models
+hf download jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF \
+    low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf --local-dir models
+hf download QuantStack/Wan2.2-I2V-A14B-GGUF VAE/Wan2.1_VAE.safetensors --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.1_VAE.safetensors \
+    --image first_frame.png --prompt "the camera pushes in as the waves rise" \
+    --output out.mp4 --backend ggml_cuda</code></pre>
+  <div class="callout tip"><div class="ic">⚡</div><p><strong>Generate at a resolution Wan was trained at.</strong> Wan is trained at 480p (832×480) and 720p (1280×704), and TI2V-5B is natively a 720p model. Below ~0.3 MP the DiT is out of distribution and the video gets soft, unstable and color-drifting no matter how many steps you spend — the pipeline warns when you cross that line. Generate at 480p and downscale afterwards rather than generating small.</p></div>
+
+  <h2 id="video">Video generation (Wan 2.1 / 2.2)</h2>
+  <p>Wan turns a <strong>prompt</strong> — and, on the Wan 2.2 checkpoints, an <strong>uploaded first frame</strong> — into an H.264 MP4. The <code>--model</code> GGUF is only the DiT; TensorSharp resolves two companions next to it (a <code>VAE/</code>, <code>HighNoise/</code> or <code>LowNoise/</code> subfolder is fine):</p>
+  <ul>
+    <li><strong>UMT5-XXL text encoder</strong> — prompt → conditioning (<code>--wan-te</code> / <code>TS_WAN_TE</code>). Released from VRAM before the denoise starts.</li>
+    <li><strong>Causal 3D video VAE</strong> — latent ↔ frames (<code>--wan-vae</code> / <code>TS_WAN_VAE</code>). Which one is required is read off the DiT itself, not chosen by you: Wan 2.1 and A14B use <code>wan_2.1_vae</code>; TI2V-5B uses <code>Wan2.2_VAE</code>.</li>
+    <li><strong>The A14B second expert</strong> — the two 14B experts must both be present. Put them in one directory, or in <code>HighNoise/</code> + <code>LowNoise/</code> subdirectories, and the loader pairs them from the file names (<code>TS_WAN_DIT2</code> overrides; there is no CLI flag).</li>
+  </ul>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Family</th><th>Latent</th><th>Modes</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Wan 2.1 T2V (1.3B / 14B)</td><td>16 ch, 8×8×4</td><td>text → video</td><td>single DiT</td></tr>
+      <tr><td>Wan 2.2 TI2V-5B</td><td>48 ch, 16×16×4</td><td>text → video, <strong>image → video</strong></td><td>dense 5B, 24 fps, 720p-capable</td></tr>
+      <tr><td>Wan 2.2 A14B (T2V / I2V)</td><td>16 ch (36 ch I2V input)</td><td>text → video, <strong>image → video</strong></td><td>two 14B experts switched at a timestep boundary</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Each denoise step is one resident-weight ggml graph (CUDA-graph-captured, flash attention, per-token-timestep modulation for TI2V image-to-video); the video VAE encode and decode are each a single graph. The stages hand VRAM over in sequence — text encoder, then DiT, then VAE — so peak usage is roughly <code>max(TE, DiT + attention, VAE)</code>: TI2V-5B generates 81-frame 480p image-to-video on a <strong>16 GB</strong> GPU in under 8 minutes, and both A14B experts run sequentially on the same card. Numerics are verified against diffusers (DiT cosine &gt; 0.995, VAE encoders &gt; 0.999, decode 59.9 dB PSNR), and Wan 2.1 runs <strong>6.0×</strong> faster end-to-end than <code>stable-diffusion.cpp</code> on the identical workload.</p>
+
+  <h3 id="video-fast">The checkpoint decides the wall clock</h3>
+  <p>Wan's DiT token count is <code>latent_frames × (h/2) × (w/2)</code> and self-attention costs <code>O(tokens²)</code>, so a 5-second 720p video is a genuinely large job: 1088×832 × 121 frames is 27 404 tokens, and the official TI2V-5B recipe spends 50 steps × 2 classifier-free-guidance passes = <strong>100 DiT passes</strong> on it. A <strong>step-distilled checkpoint</strong> is trained to run guidance-free in 4 steps, so the same video costs <strong>4 passes</strong> — 1/25th of the denoising work. TensorSharp detects one from the DiT file name (<code>turbo</code>, <code>distill</code>, <code>lightning</code>, <code>lightx2v</code>, <code>fastwan</code>, <code>-dmd</code>, or an explicit <code>…-4steps-…</code> for 1–16 steps), prints <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off</code> at load, and applies the recipe itself; <code>--diffusion-steps</code> and <code>--cfg</code> still override.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>M5 Pro, <code>ggml_metal</code>, TI2V-5B Q8_0, 1088×832 × 121f (27 404 tokens, image → video)</th><th>Base, before</th><th>Base, now</th><th>Turbo, now</th></tr></thead>
+    <tbody>
+      <tr><td>DiT passes</td><td>100 (50 steps × CFG)</td><td>100</td><td><strong>4</strong> (guidance-free)</td></tr>
+      <tr><td>per pass</td><td>206.2 s</td><td><strong>120.2 s</strong></td><td>120.2 s</td></tr>
+      <tr><td>denoise total</td><td>20 615 s</td><td>12 020 s</td><td><strong>481 s</strong></td></tr>
+      <tr><td>VAE decode, 121 frames</td><td>863 s</td><td><strong>563 s</strong></td><td>563 s</td></tr>
+      <tr><td><strong>end to end</strong></td><td><strong>≈ 5 h 58 m</strong></td><td>≈ 3 h 30 m</td><td><strong>17 m 30 s</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The two levers are independent: ~1.7× per pass from keeping the DiT's flash-attention keys and values in F16 (2.02× on a single 27 k-token self-attention, at cosine 0.999964 against the diffusers reference — <code>TS_WAN_DIT_KV_F16=0</code> restores F32) and from running the Metal VAE convolutions through MPSGraph instead of ggml's im2col+GEMM lowering (VAE decode 159 s → 80 s at 736×544 × 81f, numerics unchanged at 93.9 dB PSNR — <code>TS_WAN_VAE_MPS_CONV=0</code> reverts), and 25× fewer passes from the distilled checkpoint. Once distilled, the <strong>VAE decode is the bottleneck</strong> at ~55% of the run, not the DiT.</p>
+
+  <h3 id="video-resolution">Frames and resolution set the rest</h3>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Output (M5 Pro, same Turbo checkpoint and image)</th><th>Tokens</th><th>Denoise</th><th>VAE decode</th><th>Total</th></tr></thead>
+    <tbody>
+      <tr><td>736×544 × 81f (3.4 s, 480p class)</td><td>8 211</td><td>84 s</td><td>159 s</td><td><strong>4 m 09 s</strong></td></tr>
+      <tr><td>736×544 × 121f (5 s, 480p class)</td><td>12 121</td><td>137 s</td><td>237 s</td><td><strong>6 m 19 s</strong></td></tr>
+      <tr><td>1088×832 × 121f (5 s, 720p class)</td><td>27 404</td><td>481 s</td><td>563 s</td><td><strong>17 m 30 s</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>480p (≈0.4 MP) is a resolution Wan is <em>trained</em> at, so the first two rows are in-distribution rather than a degraded mode — that is the setting to reach for when a few minutes matters. Quality falls off below ~0.3 MP, where the DiT is out of distribution and the video turns soft, unstable and color-drifting however many steps you spend; the pipeline prints a warning when you cross that line. Generate at a supported resolution and downscale afterwards (<code>--width 480 --height 704</code> rather than 320×480).</p>
+  <p>To make a large request cheaper, in order of effect: <strong>(1)</strong> use a step-distilled checkpoint — 100 passes become 4, dwarfing everything else; <strong>(2)</strong> fewer frames — 121 → 61 roughly quarters the attention work and halves the VAE decode; <strong>(3)</strong> a smaller frame area, but not below ~0.3 MP; <strong>(4)</strong> fewer steps, on base checkpoints only — 30 instead of 50 is visibly close and 1.7× cheaper; <strong>(5)</strong> <code>--cfg-cache-stride 2</code> or <code>3</code>, which runs the unconditional pass on one step in N and reuses the cached guidance direction between — 77 of the 100 passes (1.30×) or 70 (1.43×) at 50 steps. It is an approximation, so leave it off when matching a reference sample matters, and it does nothing on a distilled checkpoint, which is already guidance-free.</p>
+  <p>On NVIDIA, <code>ggml_cuda</code> is the fastest Wan backend: on an RTX 2000 Ada 16 GB running the official 480p Wan2.1-1.3B recipe it takes 12.0 s/step against <code>ggml_vulkan</code>'s 17.2 and the direct <code>cuda</code> backend's 19.3. Wan does not run on <code>mlx</code> at all, and the <code>cpu</code> / <code>ggml_cpu</code> backends are for functional use only.</p>
+
+  <p>Drive it from the <a href="cli.html">CLI</a> (<code>--prompt</code>, optional <code>--image</code>, <code>--video-frames</code>, <code>--fps</code>, <code>--flow-shift</code>, <code>--sampler</code>, <code>--negative-prompt</code>), the <a href="http-api.html">HTTP API</a> (<code>/v1/videos/generations</code>), or the <a href="server.html#webui">Web UI</a> chat with an image upload. On the server, <code>--video-frames</code> and <code>--fps</code> set defaults rather than caps — a request carrying its own <code>frames</code> or <code>fps</code> overrides them independently, and with both omitted the model's own recipe applies (49 frames at 24 fps for Wan2.2-TI2V, 33 at 16 fps otherwise). Frame counts snap to the VAE's temporal grid (4k+1). Full details are in the repository's <code>docs/models/wan.md</code> card.</p>
+  <div class="content-footer">
+    <a href="models-image.html">← Image Generation</a>
+    <a href="cli.html">Next: Command Line →</a>
+  </div>
+</main>
+</body>
+</html>

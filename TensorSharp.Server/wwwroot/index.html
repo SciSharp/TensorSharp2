@@ -1281,6 +1281,14 @@ async function runImageEdit(userMsg, bubbleText, statsDiv, queueDiv) {
   }
 }
 
+// "1h 04m" / "7m 12s" / "43s"; '' when the value is missing or not yet known.
+function fmtDuration(s) {
+  if (typeof s !== 'number' || !(s > 0)) return '';
+  if (s >= 3600) return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, '0')}s`;
+  return `${Math.round(s)}s`;
+}
+
 async function runVideoGenerate(userMsg, bubbleText, statsDiv, queueDiv) {
   if (queueDiv) queueDiv.style.display = 'none';
   bubbleText.textContent = 'Starting video generation… (this takes a few minutes)';
@@ -1320,9 +1328,24 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, queueDiv) {
         try { data = JSON.parse(line.slice(6)); } catch { continue; }
 
         if (data.videoGen) {
-          if (data.total > 0) {
-            statsDiv.textContent = `Denoising… step ${data.step}/${data.total}`;
-            bubbleText.textContent = `Generating video… step ${data.step} of ${data.total} (then decoding frames)`;
+          // A single denoising pass at 720p/121 frames runs for minutes, so the
+          // server also sends heartbeats carrying the phase and a running ETA.
+          // Show those, otherwise the UI looks frozen between steps.
+          const eta = fmtDuration(data.etaSeconds);
+          const el = fmtDuration(data.elapsedSeconds);
+          if (data.phase && data.phase !== 'denoise') {
+            const label = data.phase === 'text-encode' ? 'Encoding prompt'
+                        : data.phase === 'image-encode' ? 'Encoding the input image'
+                        : data.phase === 'vae-decode' ? 'Decoding frames'
+                        : data.phase === 'done' ? 'Finishing' : data.phase;
+            statsDiv.textContent = `${label}… ${el}`;
+            bubbleText.textContent = `${label}${data.detail ? ' (' + data.detail + ')' : ''}…`;
+          } else if (data.total > 0) {
+            statsDiv.textContent = `Denoising… step ${data.step}/${data.total}` + (eta ? ` · ${eta} left` : '');
+            bubbleText.textContent = `Generating video… step ${data.step} of ${data.total}`
+              + (data.detail ? ` — ${data.detail}` : '')
+              + (eta ? ` · about ${eta} left` : '')
+              + (el ? ` · ${el} elapsed` : '');
           }
         } else if (data.done) {
           if (data.error) {

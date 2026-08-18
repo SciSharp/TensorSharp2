@@ -12,18 +12,18 @@
   // --cfg, --diffusion-seed, --width, --height. With the Lightning LoRA merged
   // the sampler auto-selects its fast few-step schedule.
   "variables": {
-    "modelRoot": "C:/Works/models"
+    "modelRoot": "/Users/zhongkaifu/work/models/Qwen"
   },
 
-  "backend": "ggml_cuda",
+  "backend": "ggml_metal",
   // Stream DiT weights from RAM so native-resolution edits fit on VRAM-limited
   // cards. Drop this if you have plenty of VRAM and want maximum speed.
-  "offload-cpu": true,
+  "offload-cpu": false,
 
-  "model": "${modelRoot}/qwen-image-edit-2511-Q4_K_M.gguf",
+  "model": "${modelRoot}/Qwen-image-edit-2511-Q4_K_M.gguf",
   "qwen-image-vae": "${modelRoot}/Qwen_Image-VAE.safetensors",
-  "qwen-image-vl": "${modelRoot}/qwen-image-te-Qwen2.5-VL-7B-Q4_K_M.gguf",
-  "qwen-image-mmproj": "${modelRoot}/Qwen2.5-VL-7B-mmproj-BF16.gguf",
+  "qwen-image-vl": "${modelRoot}/Qwen2.5-VL-7B-Instruct-abliterated.Q4_K_M.gguf",
+  "qwen-image-mmproj": "${modelRoot}/Qwen2.5-VL-7B-Instruct-abliterated.mmproj-Q8_0.gguf",
 
   // Lightning step-distillation LoRA (8 steps). Swap in the 4steps file for an
   // even faster, slightly lower-quality edit.

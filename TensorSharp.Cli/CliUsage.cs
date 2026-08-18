@@ -415,6 +415,12 @@ namespace TensorSharp.Cli
                     "Wan video generation: negative prompt for classifier-free guidance. Default: the official " +
                     "Wan negative prompt.",
                     "--negative-prompt \"static, blurry\""),
+                new OptionHelp("--cfg-cache-stride <N>",
+                    "Wan guidance cache: run the unconditional CFG pass on one step in N and reuse the cached " +
+                    "guidance direction in between (the first three steps and the last always recompute it). " +
+                    "At 50 steps, 2 runs 77 of the 100 passes (1.30x faster) and 3 runs 70 (1.43x). This is an " +
+                    "approximation — leave it off when matching a reference sample matters. Default: 0 (off).",
+                    "--cfg-cache-stride 2"),
                 new OptionHelp("--wan-vae <path>",
                     "Wan video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B). Default: " +
                     "same-directory scan next to the DiT model, VAE/ subfolders included (TS_WAN_VAE env var " +

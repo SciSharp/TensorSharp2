@@ -214,6 +214,7 @@ namespace TensorSharp.Cli
             int videoFps = 0;          // 0 = model default (16)
             float flowShift = 0f;      // 0 = auto (8.0 for 1.3B video; 3.0/5.0 otherwise)
             string videoSampler = null;   // null = unipc (the official Wan sampler)
+            int cfgCacheStride = 0;       // 0/1 = off: every step runs both CFG passes
             string negativePrompt = null;
             string wanVaePath = null;
             string wanTePath = null;
@@ -246,6 +247,7 @@ namespace TensorSharp.Cli
                     case "--fps": videoFps = int.Parse(args[++i]); break;
                     case "--flow-shift": flowShift = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
                     case "--sampler": videoSampler = args[++i]; break;
+                    case "--cfg-cache-stride": cfgCacheStride = int.Parse(args[++i]); break;
                     case "--negative-prompt": negativePrompt = args[++i]; break;
                     case "--wan-vae": wanVaePath = args[++i]; break;
                     case "--wan-te": wanTePath = args[++i]; break;
@@ -578,14 +580,14 @@ namespace TensorSharp.Cli
                     Console.Error.WriteLine("Wan video generation requires --prompt \"<description>\" (or --input prompt.txt). " +
                         "Optionally --image first_frame.png (Wan 2.2 image-to-video), --output out.mp4, --width, " +
                         "--height, --video-frames, --fps, --diffusion-steps, --cfg, --flow-shift, " +
-                        "--negative-prompt, --diffusion-seed.");
+                        "--negative-prompt, --diffusion-seed, --cfg-cache-stride.");
                     return;
                 }
                 RunVideoGeneration(wanModel, prompt, outputFile ?? "wan_video.mp4",
                     imageWidth, imageHeight, videoFrames,
                     diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f,
                     diffusionSeedSet ? diffusionSeed : -1, flowShift, videoFps, negativePrompt,
-                    videoSampler, imagePath);
+                    videoSampler, imagePath, cfgCacheStride);
                 return;
             }
 
@@ -1626,7 +1628,7 @@ namespace TensorSharp.Cli
         static void RunVideoGeneration(TensorSharp.Models.WanVideo.WanVideoModel model,
             string prompt, string outputPath, int width, int height, int frames,
             int steps, float cfgScale, int seed, float flowShift, int fps, string negativePrompt,
-            string sampler = null, string imagePath = null)
+            string sampler = null, string imagePath = null, int cfgCacheStride = 0)
         {
             Console.WriteLine(imagePath != null ? "=== Wan Image-to-Video ===" : "=== Wan Text-to-Video ===");
             Console.WriteLine($"  prompt : {prompt}");
@@ -1654,6 +1656,7 @@ namespace TensorSharp.Cli
                 NegativePrompt = negativePrompt,
                 Sampler = sampler,
                 ImagePath = imagePath,
+                CfgCacheStride = cfgCacheStride,
             };
             var sw = Stopwatch.StartNew();
             var video = model.GenerateVideo(prompt, p);

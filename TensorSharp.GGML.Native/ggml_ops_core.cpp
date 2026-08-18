@@ -2267,6 +2267,174 @@ namespace tsg
         }
     }
 
+
+    // True when the process-global GGML backend is ggml-metal ("MTL0", "MTL1", ...).
+    static bool backend_is_metal()
+    {
+        const char* name = g_backend != nullptr ? ggml_backend_name(g_backend) : nullptr;
+        return name != nullptr && std::strncmp(name, "MTL", 3) == 0;
+    }
+
+    // Wan VAE convolutions on MPSGraph (tsg_metal_mps_conv.mm). ggml lowers conv2d
+    // to im2col + mul_mat, which is 74.6% of a VAE decode and moves 9x the input
+    // before the GEMM starts; Apple's tuned convolution runs the same shapes 6-14x
+    // faster and reaches the matrix units WITHOUT ggml's mul_mm kernel, whose Metal 4
+    // tensor path corrupts this graph. TS_VAE_MPS_CONV=0 opts out.
+    #if defined(__APPLE__)
+    extern "C" bool tsg_mps_conv2d_available(void);
+    extern "C" bool tsg_mps_conv2d(const void* w, int wIsF16, int kw, int kh, int ic, int oc,
+                                   const float* x, int W, int H, int T,
+                                   int stride, int pad,
+                                   float* dst, int OW, int OH);
+    extern "C" void tsg_mps_conv2d_release(void);
+    #endif
+
+    #if defined(TSG_HAVE_CUDNN)
+    // The CUDA twin (tsg_cuda_cudnn_conv.cu). On an L4 the im2col lowering is 46% of
+    // a VAE decode against only 24.5% for the GEMM, so cuBLAS speed does not help --
+    // the materialisation itself is the cost. TS_VAE_CUDNN_CONV=0 opts out.
+    extern "C" bool tsg_cudnn_conv2d_available(void);
+    extern "C" bool tsg_cudnn_conv2d(const void* w, int wIsF16, int kw, int kh, int ic, int oc,
+                                     const void* x, int W, int H, int T,
+                                     int stride, int pad,
+                                     void* dst, int OW, int OH);
+    extern "C" void tsg_cudnn_conv2d_release(void);
+    #endif
+
+    // True when the process-global GGML backend is ggml-cuda.
+    static bool backend_is_cuda()
+    {
+        const char* name = g_backend != nullptr ? ggml_backend_name(g_backend) : nullptr;
+        return name != nullptr && std::strncmp(name, "CUDA", 4) == 0;
+    }
+
+    // True when a VAE should emit single CONV_2D nodes for a vendor
+    // convolution library to execute instead of ggml's im2col + mul_mat lowering.
+    bool fast_conv_enabled()
+    {
+    #if defined(__APPLE__)
+        if (backend_is_metal())
+        {
+            static const bool on = []{
+                const char* e = std::getenv("TS_VAE_MPS_CONV");
+                if (e != nullptr && e[0] == '0') return false;
+                return tsg_mps_conv2d_available();
+            }();
+            return on;
+        }
+    #endif
+    #if defined(TSG_HAVE_CUDNN)
+        if (backend_is_cuda())
+        {
+            static const bool on = []{
+                const char* e = std::getenv("TS_VAE_CUDNN_CONV");
+                if (e != nullptr && e[0] == '0') return false;
+                return tsg_cudnn_conv2d_available();
+            }();
+            return on;
+        }
+    #endif
+        return false;
+    }
+
+
+    // Run one CONV_2D node through the backend's convolution library (MPSGraph on
+    // Metal, cuDNN on CUDA). ggml's kernel is [KW,KH,IC,OC] F16 and
+    // the activation [W,H,IC,T] F32, which are MPS OIHW / NCHW byte for byte, so the
+    // operands go across as they lie. Returns false for anything unsupported, and
+    // the caller then lets ggml execute the node normally.
+    static bool run_conv_fast(ggml_tensor* node)
+    {
+        ggml_tensor* kern = node->src[0];
+        ggml_tensor* act  = node->src[1];
+        if (kern == nullptr || act == nullptr) return false;
+        const bool kernF16 = kern->type == GGML_TYPE_F16;
+        if ((!kernF16 && kern->type != GGML_TYPE_F32) || act->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32)
+            return false;
+        if (!ggml_is_contiguous(kern) || !ggml_is_contiguous(act) || !ggml_is_contiguous(node))
+            return false;
+
+        const int32_t* op = (const int32_t*) node->op_params;
+        const int s0 = op[0], s1 = op[1], p0 = op[2], p1 = op[3], d0 = op[4], d1 = op[5];
+        if (s0 != s1 || p0 != p1 || d0 != 1 || d1 != 1) return false;   // square stride/pad only
+
+        const int kw = (int) kern->ne[0], kh = (int) kern->ne[1];
+        const int ic = (int) kern->ne[2], oc = (int) kern->ne[3];
+        const int W  = (int) act->ne[0],  H  = (int) act->ne[1], T = (int) act->ne[3];
+        const int OW = (int) node->ne[0], OH = (int) node->ne[1];
+        if ((int) act->ne[2] != ic || (int) node->ne[2] != oc || (int) node->ne[3] != T) return false;
+
+    #if defined(TSG_HAVE_CUDNN)
+        if (backend_is_cuda())
+        {
+            // ggml tensor data is already a device pointer here, so cuDNN reads and
+            // writes ggml's own buffers -- no staging, no copies.
+            return tsg_cudnn_conv2d(kern->data, kernF16 ? 1 : 0, kw, kh, ic, oc,
+                                    act->data, W, H, T, s0, p0,
+                                    node->data, OW, OH);
+        }
+    #endif
+    #if defined(__APPLE__)
+        if (backend_is_metal())
+        {
+            std::vector<std::uint8_t> kbuf((std::size_t) ggml_nbytes(kern));
+            std::vector<float> ah((std::size_t) ggml_nelements(act));
+            std::vector<float> oh((std::size_t) ggml_nelements(node));
+            ggml_backend_tensor_get(kern, kbuf.data(), 0, kbuf.size());
+            ggml_backend_tensor_get(act,  ah.data(), 0, ah.size() * sizeof(float));
+            if (!tsg_mps_conv2d(kbuf.data(), kernF16 ? 1 : 0, kw, kh, ic, oc,
+                                ah.data(), W, H, T, s0, p0,
+                                oh.data(), OW, OH))
+                return false;
+            ggml_backend_tensor_set(node, oh.data(), 0, oh.size() * sizeof(float));
+            return true;
+        }
+    #endif
+        (void) kw; (void) kh; (void) ic; (void) oc; (void) W; (void) H; (void) T; (void) OW; (void) OH;
+        return false;
+    }
+
+
+    // Execute a graph with every CONV_2D node handed to the platform convolution
+    // library (MPSGraph on Metal, cuDNN on CUDA) and the stretches between them
+    // left to ggml. Running node ranges through ggml_graph_view is the same
+    // mechanism graph_compute_profiled uses, so it is safe against gallocr's
+    // buffer reuse.
+    ggml_status graph_compute_fast_conv(ggml_cgraph* graph, const char* tag)
+    {
+        (void) tag;
+        const int n = ggml_graph_n_nodes(graph);
+        int from = 0;
+        for (int i = 0; i < n; i++)
+        {
+            ggml_tensor* node = ggml_graph_node(graph, i);
+            if (node->op != GGML_OP_CONV_2D) continue;
+
+            if (i > from)
+            {
+                ggml_cgraph view = ggml_graph_view(graph, from, i);
+                const ggml_status st = ggml_backend_graph_compute(g_backend, &view);
+                if (st != GGML_STATUS_SUCCESS) return st;
+            }
+            ggml_backend_synchronize(g_backend);
+            if (!run_conv_fast(node))
+            {
+                // Unsupported shape: let ggml run just this node.
+                ggml_cgraph one = ggml_graph_view(graph, i, i + 1);
+                const ggml_status st = ggml_backend_graph_compute(g_backend, &one);
+                if (st != GGML_STATUS_SUCCESS) return st;
+            }
+            from = i + 1;
+        }
+        if (from < n)
+        {
+            ggml_cgraph view = ggml_graph_view(graph, from, n);
+            const ggml_status st = ggml_backend_graph_compute(g_backend, &view);
+            if (st != GGML_STATUS_SUCCESS) return st;
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
     ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag)
     {
         if (!graph_node_profile_enabled())

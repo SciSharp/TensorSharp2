@@ -50,6 +50,9 @@ namespace TensorSharp.Server.RequestParsers
                 p.NegativePrompt = np.GetString();
             if (root.TryGetProperty("sampler", out var sm) && sm.ValueKind == JsonValueKind.String)
                 p.Sampler = sm.GetString();
+            // Opt-in guidance cache: run the unconditional pass on one step in N.
+            if (root.TryGetProperty("cfgCacheStride", out var cc) && cc.TryGetInt32(out int ccv))
+                p.CfgCacheStride = ccv;
 
             // Conditioning image for Wan 2.2 image-to-video: either a previously uploaded
             // file ("imagePath", Web UI flow) or inline base64 ("image", API flow; a
