@@ -100,6 +100,10 @@ TensorSharp.Cli --model HighNoise/Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf \
   cfg 3.5 (both experts), shift 5.0, 40 steps; A14B T2V cfg 4.0/3.0, shift
   12.0; Wan 2.1 cfg 6.0, shift 8.0 (1.3B video) or 3.0/5.0, 30 steps, 16 fps.
 - `--negative-prompt` defaults to the official Wan negative prompt.
+- **Step-distilled checkpoints are auto-detected** and are by far the biggest
+  speed lever — 100 DiT passes become 4, for the same video. No flag: it is an
+  ordinary `--model` GGUF. See [the fast lane](#the-fast-lane-step-distilled-checkpoints)
+  below.
 - `--cfg-cache-stride N` (default off) — approximate speedup. A guided step
   is `v = v_cond + (cfg-1)·d` with `d = v_cond - v_uncond`; the guidance
   direction `d` changes much more slowly across the schedule than `v` does, so
@@ -111,6 +115,58 @@ TensorSharp.Cli --model HighNoise/Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf \
   `ffmpeg` folder next to the executable) — near-lossless CRF 17 H.264.
   Without it the OS codec via OpenCV is used at its default bitrate, which
   is visibly worse; the CLI warns when that happens.
+
+### The fast lane: step-distilled checkpoints
+
+This is the difference between a 5-second 720p video costing three and a half
+hours and costing seventeen minutes, and it is a one-word change to a file path.
+
+TensorSharp reads the DiT GGUF's **file name**. A name carrying `Turbo` /
+`distill` / `Lightning` / `lightx2v` / `FastWan` / `-dmd`, or an explicit step
+count (`…-4steps-…`, `…8step…`, accepted for 1–16), switches the sampling
+defaults to that step count with **guidance off** — which is what those
+checkpoints are trained for. On load the console confirms it:
+
+```
+step-distilled checkpoint detected -> 4 steps, guidance off (--diffusion-steps / --cfg override)
+```
+
+The official 50-step + CFG recipe costs 50 × 2 = 100 DiT passes; a 4-step
+guidance-free checkpoint costs **4** — 1/25th of the denoising work. Everything
+else (companion files, flags, endpoints, the Web UI) is unchanged, and
+`--diffusion-steps` / `--cfg` still override the detected values.
+
+Drop-in GGUFs. The distilled repos ship the DiT only, so the VAE and the text
+encoder still come from the base repos:
+
+```bash
+# TI2V-5B, 4 steps — note the Wan2_2 underscore in the file name
+hf download hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --local-dir models
+hf download QuantStack/Wan2.2-TI2V-5B-GGUF VAE/Wan2.2_VAE.safetensors --local-dir models
+hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
+
+TensorSharp.Cli --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_metal \
+  --prompt "the cat runs toward the camera, cinematic" --image first_frame.png \
+  --output cat.mp4 --video-frames 121
+```
+
+```bash
+# I2V-A14B, 4 steps — both experts; --model either one, the sibling is found by name
+hf download jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf --local-dir models
+hf download jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf --local-dir models
+hf download QuantStack/Wan2.2-I2V-A14B-GGUF VAE/Wan2.1_VAE.safetensors --local-dir models
+```
+
+[hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF)
+also offers Q6_K (4.22 GB) through Q2_K (1.86 GB);
+[jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF](https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF)
+carries the Lightning distillation already merged into both experts, Q8_0
+(15.4 GB/expert) through Q2_K (5.31 GB).
+[Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF](https://huggingface.co/Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF)
+is a second TI2V-5B option. Note that
+[lightx2v/Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning)
+publishes LoRA `.safetensors` only, and TensorSharp has no Wan LoRA option — use
+the pre-merged GGUFs above.
 
 ### Getting good quality
 
@@ -143,6 +199,25 @@ fields are both omitted, the model recipes apply: 49 frames at 24 fps for
 TI2V-5B, and 33 frames at 16 fps otherwise. Frame counts are snapped to `4k+1`.
 Keep the model's native FPS and adjust the frame count when changing duration;
 changing only FPS changes playback speed.
+
+The step-distilled fast lane is a property of the `--model` GGUF, not of the
+request, so it applies to the Web UI and to every endpoint with no client-side
+change at all — point `--model` at a Turbo/Lightning checkpoint and nothing else
+moves:
+
+```bash
+TensorSharp.Server --model Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_metal \
+  --video-frames 121 --fps 24
+```
+
+This matters most from the browser, where the request is a prompt and an image
+and the cost is invisible until the ETA appears. The same Web UI request —
+a 1024×768 first frame, 121 frames at 24 fps, which resolves to 1088×832 and
+27 404 tokens — takes **≈ 3 h 30 m** on the base `Wan2.2-TI2V-5B-Q8_0.gguf` and
+**17 m 30 s** on `Wan2_2-TI2V-5B-Turbo-Q8_0.gguf` (M5 Pro, `ggml_metal`; see
+[Performance](#performance)). If a run's ETA looks impossible, check the startup
+log for the `step-distilled checkpoint detected` line before changing anything
+else.
 
 - **Web UI** (`http://localhost:5000`): type a prompt in the chat — attach an
   image to get image-to-video (the image becomes the first frame); the reply is
@@ -217,12 +292,20 @@ Environment knobs: `TS_WAN_DIT_CAPTURE=0` (disable the persistent captured DiT
 graph), `TS_WAN_DIT_FLASH=0` (materialized attention), `TS_WAN_DIT_KV_F16=0`
 (F32 attention keys/values — the old, ~2x slower default), `TS_WAN_HEARTBEAT_S`
 (progress tick interval, default 30; `0` silences the ticks),
-`TS_WAN_VAE_GEMM_MAX_MB` (im2col budget),
+`TS_WAN_VAE_GEMM_MAX_MB` (im2col budget), `TS_WAN_VAE_MPS_CONV=0`
+(ggml conv lowering instead of MPSGraph on Metal),
 `TS_WAN_VAE`/`TS_WAN_TE`/`TS_WAN_DIT2` (companion paths), `TS_FFMPEG` (ffmpeg
 path for MP4 export), `TS_WAN_DIT_TRACE=<file>` (per-stage activation stats for
 debugging).
 
 ## Performance
+
+**The headline: use a step-distilled checkpoint.** Every other lever on this
+page is worth tens of percent; that one is worth 25×. The same 5-second 720p
+image-to-video request runs in **3 h 30 m** on a base checkpoint and
+**17 m 30 s** on a Turbo one, on the same machine, with the same flags — see
+[the fast lane](#the-fast-lane-step-distilled-checkpoints) for where to get one
+and the M5 Pro table below for the breakdown.
 
 RTX 3080 Laptop 16 GB (Windows/WDDM), ggml_cuda:
 
@@ -264,29 +347,51 @@ Wan 2.2-TI2V I2V: 1088x832x121f (31x26x34 = 27404 tokens), 50 steps, unipc, cfg 
 
 To make such a request cheaper, in order of effect:
 
-1. **Fewer frames.** 121 → 61 frames roughly quarters the attention work; the
-   video is 2.5 s instead of 5 s at 24 fps.
-2. **Smaller frame area**, but not below Wan's training resolutions — under
+1. **Use a step-distilled checkpoint.** This dwarfs everything else: 100 DiT
+   passes become 4. See [the fast lane](#the-fast-lane-step-distilled-checkpoints)
+   — TensorSharp detects them by name and switches the recipe automatically.
+2. **Fewer frames.** 121 → 61 frames roughly quarters the attention work and
+   halves the VAE decode; the video is 2.5 s instead of 5 s at 24 fps.
+3. **Smaller frame area**, but not below Wan's training resolutions — under
    ~0.3 MP the model is out of distribution and the result gets *worse*, not
    just cheaper. `--width 480 --height 704` is a good portrait target.
-3. **Fewer steps.** 50 is the official TI2V recipe; 30 is visibly close and
-   1.7× cheaper.
-4. **`--cfg-cache-stride 2` or `3`** — 1.30× / 1.43× by reusing the guidance
-   direction between steps (approximate; see the CLI section).
+4. **Fewer steps** (base checkpoints only). 50 is the official TI2V recipe;
+   30 is visibly close and 1.7× cheaper.
+5. **`--cfg-cache-stride 2` or `3`** — 1.30× / 1.43× by reusing the guidance
+   direction between steps (approximate; see the CLI section). Pointless on a
+   distilled checkpoint, which already runs guidance-free.
 
 M5 Pro (20-core GPU, 48 GB unified), `ggml_metal`, Wan2.2-TI2V-5B Q8_0,
-1088×832×121f = 27 404 tokens, image-to-video, the official 50-step recipe:
+1088×832×121f = 27 404 tokens, image-to-video — the request this was all
+measured against (5 s at 24 fps, 720p class):
 
-| Stage | Before | Now |
-|---|---|---|
-| text encode (UMT5-XXL, both prompts) | 1.9 s | 1.9 s |
-| image encode (VAE) | 5.2 s | 5.2 s |
-| denoise, per step (2 CFG passes) | 412.3 s | **249.0 s** |
-| VAE decode, 121 frames | 863 s (3 bands × 24 latent rows) | **734 s** (2 × 30) |
-| **50-step total** | ≈ 5 h 58 m | **≈ 3 h 40 m** (1.63×) |
-| 50-step total, `--cfg-cache-stride 3` | — | ≈ 2 h 38 m (2.27×) |
+| | Base checkpoint, before | Base checkpoint, now | **Turbo checkpoint, now** |
+|---|---|---|---|
+| DiT passes | 100 (50 steps × CFG) | 100 | **4** (4 steps, guidance-free) |
+| per pass | 206.2 s | **120.2 s** | **120.2 s** |
+| denoise total | 20 615 s | 12 020 s | **481 s** |
+| VAE decode, 121 frames | 863 s | **563 s** | **563 s** |
+| **end to end** | **≈ 5 h 58 m** | ≈ 3 h 30 m | **17 m 30 s** |
 
-Two changes account for that.
+The two levers are independent: ~1.7× per pass from the attention and VAE work
+below, and 25× fewer passes from running a step-distilled checkpoint. Once
+distilled, the **VAE decode is the bottleneck** (~55% of the run), not the DiT.
+
+Frame count and frame area then set the rest, and the VAE scales linearly with
+output pixels while attention scales with the square of the token count. All
+measured on the same machine with the same Turbo checkpoint and image:
+
+| Output | Tokens | Denoise | VAE decode | **Total** |
+|---|---|---|---|---|
+| 736×544 × 81f (3.4 s, 480p class) | 8 211 | 84 s | 159 s | **4 m 09 s** |
+| 736×544 × 121f (5 s, 480p class) | 12 121 | 137 s | 237 s | **6 m 19 s** |
+| 1088×832 × 121f (5 s, 720p class) | 27 404 | 481 s | 563 s | **17 m 30 s** |
+
+480p (≈0.4 MP) is a resolution Wan is *trained* at, so the middle rows are
+in-distribution, not a degraded mode — that is the setting to reach for when a
+few minutes matters. Going below ~0.3 MP is where quality actually falls off.
+
+Three changes account for the per-pass part.
 
 **F16 attention keys and values.** Every backend's flash-attention kernel is
 built around an F16 KV cache: ggml-metal instantiates the F32 variant with
@@ -300,8 +405,46 @@ bytes the old `ggml_cont` did. `TS_WAN_DIT_KV_F16=0` restores F32.
 and then splits the plane evenly, instead of walking a fixed band height and
 letting the last band land wherever the stride puts it. At 52 latent rows that
 was three 24-row bands — 72 rows decoded to produce 52 — and is now two 30-row
-bands (60 rows, one seam instead of two) within the same per-band budget:
-863 s → 734 s, the ratio the row counts predict.
+bands (60 rows, one seam instead of two) within the same per-band budget.
+
+**VAE convolutions on MPSGraph (Metal).** ggml lowers `conv2d` to im2col +
+`mul_mat`, and a decode profile (`WanVideoBench`, 640×480×9f) puts **44.4% of
+the graph in MUL_MAT and a further 30.2% in IM2COL** — 74.6% in the convolution,
+with im2col moving 865 MB per node at ~57 GB/s. The lowering is pure overhead: a
+3×3 conv materialises 9× its input before the GEMM starts. Apple's tuned
+convolution runs the same shapes far faster:
+
+| conv shape | ggml im2col+GEMM | MPSGraph | |
+|---|---|---|---|
+| 512→512 k3 320×240 t9 | 666 ms | 108 ms | 6.2× |
+| 256→256 k3 640×480 t9 | 947 ms | 110 ms | 8.6× |
+| 160→160 k3 640×480 t9 | 491 ms | 47 ms | 10.4× |
+| 512→512 k1 320×240 t9 | 184 ms | 14 ms | 13.9× |
+
+MPS reaches ~30 TFLOP/s where ggml's Metal GEMM gets ~4.9 — and it does so
+*without* ggml's `mul_mm`, the kernel whose Metal 4 tensor path corrupts this
+exact graph. It buys matrix-unit throughput while stepping around that defect.
+
+Layout costs nothing: ggml's activation `[W,H,C,T]` and kernel `[KW,KH,IC,OC]`
+are byte-for-byte MPS NCHW and OIHW, and NCHW measured as fast as NHWC here, so
+no transpose is inserted. On this path the VAE emits un-lowered `CONV_2D` nodes,
+which also skips the horizontal banding and its leading-pad shim entirely; the
+decode graph is then run in segments with each `CONV_2D` handed to MPSGraph
+(`ggml_graph_view`, the same mechanism the node profiler uses, so it is safe
+against gallocr reuse). Measured end to end: **VAE decode 159 s → 80 s (1.99×)**
+at 736×544×81f. Numerics are unchanged — ggml already convolves in F16 with F32
+accumulation and so does this, agreeing to **93.9 dB PSNR / max Δ 0.128 of 255**
+over a whole decode. `TS_WAN_VAE_MPS_CONV=0` restores the ggml lowering.
+
+**VAE conv im2col budget, and the tiling threshold itself, sized from device
+memory.** Both were pinned at a 16 GB card's budget on every non-CUDA backend.
+Metal now derives them from free device memory like CUDA does (Vulkan keeps the
+floor — its drivers reject multi-GB arenas). A bigger im2col budget turns many
+small banded GEMMs into few large ones: 56.4 s → 49.7 s for a 1088×832×9f
+decode. And tiling is not free — the bands overlap, so the decoder runs more
+latent rows than the plane has, and the band buffer lives alongside the canvas.
+Decoding 1088×832×121f **whole** measured both faster *and* lighter than two
+bands: **565 s vs 655 s, peak RSS 4.85 vs 5.37 GB**. Small cards still tile.
 
 #### Alternatives measured and rejected
 
@@ -320,10 +463,36 @@ sweet spot rather than a compromise. Materialized chunked attention
 (`mul_mat` + `soft_max_ext`, which unlike flash attention *can* use the Metal 4
 tensor API) came in at 1.08×: at this size attention is bound by score traffic,
 not by the GEMM rate. Dequantizing the DiT weights from Q8_0 to F16 moved the
-matmuls by <5% (25.2 → 26.4 ms for an attention projection). The Metal 4 tensor
-API stays off for TI2V-5B: it makes the weight matmuls 2.9× faster (~22 s per
-pass) but forces the VAE onto the direct-conv path, which at 121 frames costs
-hours — see `ApplyArchitectureNativeTunables`.
+matmuls by <5% (25.2 → 26.4 ms for an attention projection).
+
+#### The Metal 4 tensor API, and how not to test it
+
+The most tempting knob here, and it stays **off** for TI2V-5B. It measures 1.20×
+on the DiT (121.4 → 100.8 s/pass) and 1.66× on the VAE decode, because it routes
+`mul_mm` through Metal 4 tensor operations — but on M5 / macOS 26.6 it also
+miscomputes the VAE's conv GEMMs and the video comes out uniformly **black**.
+
+The trap is that this does not reproduce in isolation. `WanVideoBench
+vae-decode` was run at five latent shapes, including the 32×32 layout recorded
+as the original all-NaN repro, dumping raw pixels with the tensor API on and
+off: they agreed to **91–93 dB PSNR, max delta 0.18/255, zero NaN**. On that
+evidence the workaround was removed — and the very next full 1088×832×121f
+generation produced 121 black frames. The defect follows the process's
+allocation history (the DiT is loaded and released before the decode), so a
+fresh-process decode probe reproduces the wrong buffer layout.
+
+It was then re-tested a second time with a *much* more faithful harness —
+`WanVideoBench pipeline`, which runs VAE-encode → DiT forward → release → VAE
+decode in one process at the exact production shapes, including the full
+121-frame decode. That came back clean too, and 1.50× faster (374 s vs 563 s).
+The real generation still produced flat frames. The only remaining difference is
+the UMT5-XXL text encoder that loads and releases before everything else, which
+is the largest allocation in the pipeline.
+
+So: re-enabling it requires a full end-to-end video, and nothing less has ever
+been sufficient. The pipeline now refuses to return a uniformly flat video and
+names this cause (`AssertFramesAreNotDegenerate`), which is what caught the
+second attempt automatically instead of costing another eyeballed PNG.
 
 #### Quality
 

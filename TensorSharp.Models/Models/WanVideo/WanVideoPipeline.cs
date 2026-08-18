@@ -170,12 +170,21 @@ namespace TensorSharp.Models.WanVideo
                 height = SnapDim(p.Height > 0 ? p.Height : defH, grid);
             }
             int frames = p.Frames > 0 ? SnapFrames(p.Frames) : (ti2v ? 49 : 33);
-            int steps = p.Steps > 0 ? p.Steps : ti2v ? 50 : a14b ? 40 : 30;
+            // A step-distilled checkpoint replaces the whole sampling recipe: it is
+            // trained to land in a handful of steps AND without classifier-free
+            // guidance, so it costs one pass per step instead of two. Applying the
+            // base recipe to one wastes 25x the work and looks worse.
+            int distilled = _model.DistilledSteps;
+            int steps = p.Steps > 0 ? p.Steps
+                : distilled > 0 ? distilled
+                : ti2v ? 50 : a14b ? 40 : 30;
             float cfg = p.CfgScale > 0 ? p.CfgScale
+                : distilled > 0 ? 1.0f
                 : ti2v ? 5.0f
                 : a14b ? (i2v ? 3.5f : 4.0f)
                 : 6.0f;
             float cfg2 = p.CfgScale2 > 0 ? p.CfgScale2
+                : distilled > 0 ? 1.0f
                 : a14b ? (i2v ? 3.5f : 3.0f)
                 : cfg;
             // FlowMatch shift. Wan 2.2 recipes: 5.0 (12.0 for A14B T2V). Wan 2.1: 8.0
@@ -441,6 +450,7 @@ namespace TensorSharp.Models.WanVideo
                 beat.Set("vae-decode", steps, steps,
                          $"{frames} frames at {width}x{height}, band {Math.Min(done + 1, bands)}/{bands}"));
             Phase("vae-decode");
+            AssertFramesAreNotDegenerate(framesOut);
             beat.Report("done", steps, steps, "complete", 0, heartbeat: false);
 
             Console.WriteLine($"  [wan-timing] total: {total.Elapsed.TotalSeconds:F1}s");
@@ -474,6 +484,41 @@ namespace TensorSharp.Models.WanVideo
             var bytes = new byte[data.LongLength * 4];
             Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
             System.IO.File.WriteAllBytes(path, bytes);
+        }
+
+        /// <summary>
+        /// Fail loudly when the decode produced a uniformly flat (usually black)
+        /// video. A backend that miscomputes the VAE's conv GEMMs — the Metal 4
+        /// tensor-API mul_mm defect is the known one — yields exactly this, and it
+        /// is otherwise silent: the request "succeeds" after however many minutes
+        /// the generation took and writes an unusable MP4. Two frames are enough to
+        /// catch it and the scan is microseconds next to the decode.
+        /// </summary>
+        internal static void AssertFramesAreNotDegenerate(RgbImage[] frames)
+        {
+            if (frames == null || frames.Length == 0) return;
+            // Spread the samples: a legitimately flat frame (a fade to or from black)
+            // must not condemn the video, while the corruption flattens all of them.
+            int n = frames.Length;
+            foreach (int idx in new[] { 0, n / 3, 2 * n / 3, n - 1 })
+            {
+                var px = frames[idx].Pixels;
+                float min = float.MaxValue, max = float.MinValue;
+                long bad = 0;
+                foreach (float v in px)
+                {
+                    if (float.IsNaN(v) || float.IsInfinity(v)) { bad++; continue; }
+                    if (v < min) min = v;
+                    if (v > max) max = v;
+                }
+                if (bad == 0 && max - min > 1e-3f) return;   // a real picture; done
+            }
+            throw new InvalidOperationException(
+                "The Wan VAE decoded a uniformly flat video (every sampled frame is a single " +
+                "colour, usually black). That is a backend numerics failure, not a sampling " +
+                "problem. On Metal the known cause is the Metal 4 tensor-API mul_mm defect in " +
+                "the VAE's conv GEMMs: run with TS_WAN_METAL_TENSOR_API=0 (or check that " +
+                "GGML_METAL_TENSOR_DISABLE is not being overridden).");
         }
 
         /// <summary>Steps whose guidance delta is recomputed rather than reused: the

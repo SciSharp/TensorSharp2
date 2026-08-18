@@ -117,6 +117,21 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <qwen-image-edit-DiT.gguf
     --prompt "Make the sky a dramatic sunset." --output edited.png \
     --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0
 
+# Wan 视频生成（提示词 -> H.264 MP4）。UMT5-XXL 文本编码器 GGUF 与视频 VAE
+# 伴随文件会在 DiT GGUF 旁解析（或用 --wan-te / --wan-vae 指定）。
+# Wan 2.1 T2V、Wan 2.2 TI2V-5B 与 Wan 2.2 A14B（两个专家）都会自动识别；
+# 步数蒸馏（Turbo / Lightning / FastWan）检查点同样自动识别——同一段视频只需
+# 4 次 DiT 前向而不是 100 次。详见下文“视频生成（Wan）”与 docs/models/wan_zh-cn.md。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <Wan2.2-TI2V-5B.gguf> \
+    --prompt "a lovely cat walking through a garden" --output cat.mp4 \
+    --width 832 --height 480 --video-frames 49 --backend ggml_cuda \
+    --diffusion-seed 7
+# Wan 2.2 图生视频：--image 提供首帧，提示词控制运动、镜头与场景变化
+# （TI2V-5B 或 I2V-A14B 检查点）。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <Wan2.2-TI2V-5B.gguf> \
+    --prompt "the cat runs toward the camera, cinematic tracking shot" \
+    --image first_frame.png --output cat_run.mp4 --backend ggml_cuda
+
 # 思维链 / 推理模式
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --backend ggml_metal --think
 
@@ -214,7 +229,17 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 | `--qwen-image-vae <path>` | 覆盖解析到的 Qwen-Image VAE 伴随文件（`.gguf` 或 `.safetensors`）。 |
 | `--qwen-image-vl <path>` | 覆盖解析到的 Qwen2.5-VL-7B 文本编码器 GGUF。 |
 | `--qwen-image-mmproj <path>` | 覆盖解析到的 Qwen2.5-VL mmproj（视觉接地）GGUF。 |
-| `--qwen-image-lora <path>` | Qwen-Image-Edit 的 Lightning 蒸馏 LoRA（`.safetensors`），在加载时合并进 DiT。自动推导步数（例如 4 或 8）并把 CFG 切换为 1.0。环境变量：`TS_QWEN_IMAGE_LORA`。 |
+| `--qwen-image-lora <path>` | Qwen-Image-Edit 的 Lightning 蒸馏 LoRA（`.safetensors`）。它以运行期 F32 旁路的形式接在每个目标投影旁（`y = W_quant·x + b + (alpha/rank)·up·(down·x)`），量化基权重原样保留——**不会**被合并进权重。步数从文件名自动推导（例如 4 或 8），并把 CFG 切换为 1.0、时间步 shift 固定为 3，于是默认的 30 步 × 2 次 CFG 前向（60 次 DiT 前向）变成 4–8 次。它需要整模型或融合逐块的 CUDA 前向路径；在没有该旁路的路径上会直接报错而不是输出噪声。环境变量：`TS_QWEN_IMAGE_LORA`。 |
+| `--width <px>` / `--height <px>` | Qwen-Image-Edit 与 Wan 视频的输出尺寸。默认 `0` —— 自动（Qwen-Image-Edit：源图尺寸，按 VRAM 钳制；Wan：按输入图的宽高比取模型原生面积，TI2V-5B 为 1280×704，其余为 832×480）。 |
+| `--video-frames <N>` | Wan 视频帧数，会对齐到 `4k+1`（默认：33；Wan2.2-TI2V 为 49）。`1` 生成一张静态图（配合 `--output out.png`）。 |
+| `--fps <N>` | 保存的 Wan MP4 的播放帧率（默认：16；Wan2.2-TI2V 为 24）。 |
+| `--flow-shift <F>` | Wan FlowMatch 时间步 shift（默认：模型官方配方 —— Wan 2.2 为 5.0，A14B T2V 为 12.0，Wan 2.1 为 8.0/3.0/5.0）。 |
+| `--sampler <name>` | Wan 采样器：`unipc`（官方采样器，默认）或 `euler`。 |
+| `--negative-prompt <text>` | Wan 负向提示词（默认：官方 Wan 负向提示词）。 |
+| _（步数蒸馏检查点）_ | 按 DiT 文件名自动识别（`Turbo`、`distill`、`Lightning`、`lightx2v`、`FastWan`、`-dmd`，或显式的 `…-4steps-…` / `…8step…`，N 取 1–16）：管线切换到该步数并关闭引导，把官方 50 步 × CFG 配方的 100 次 DiT 前向变成 4 次。这是 Wan 最大的提速手段——详见下文 **[视频生成（Wan）](#视频生成wan)**。`--diffusion-steps` / `--cfg` 可覆盖它。 |
+| `--cfg-cache-stride <N>` | Wan 引导缓存：每 `N` 步只跑一次无条件 CFG 前向，其余步复用缓存的引导方向（默认关闭——每步都跑两次前向）。`2` 约快 1.30×，`3` 约快 1.43×；属于近似，需要严格对齐参考样本时请关闭。 |
+| `--wan-vae <path>` | 覆盖解析到的 Wan 视频 VAE（`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`）。环境变量：`TS_WAN_VAE`。 |
+| `--wan-te <path>` | 覆盖解析到的 UMT5-XXL 文本编码器 GGUF。环境变量：`TS_WAN_TE`。Wan 2.2 A14B 还会自动解析第二个 high/low-noise 专家（环境变量 `TS_WAN_DIT2`）。 |
 | `--test` | 运行内置的分词器、Qwen3 聊天模板与 ollama 对比测试 |
 | `--test-templates <dir>` | 对 `<dir>` 下的每个 *.gguf 校验硬编码模板与 GGUF Jinja2 模板的一致性 |
 | `--config <path>` | 从 JSON 配置文件读取参数（命令行参数会覆盖它）。支持 `${变量}` 与通过 `{ "path": ..., "urls": [...] }` 自动下载模型。可重复。见[配置文件](#配置文件cli--server)。 |
@@ -309,6 +334,12 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf
 # 默认以 24 fps 生成 121 帧（约五秒）。
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/Wan2.2-TI2V-5B.gguf --backend ggml_cuda \
     --video-frames 121 --fps 24
+# TI2V-5B 原生面积下的 121 帧是 27k 个 DiT token，而自注意力对 token 数是平方级，
+# 因此在**基础**检查点上跑完 50 步在笔记本级 GPU 上需要数小时（实测 M5 Pro 约 3 小时
+# 30 分）。把 --model 换成步数蒸馏检查点后，同一个请求只需 17 分 30 秒——其他参数
+# 一律不变。详见下文“视频生成（Wan）”。
+# 服务端会打印每次前向的耗时与滚动 ETA，并每 30 秒发一次心跳，Web UI 两者都会显示；
+# 完整成本表见 docs/models/wan_zh-cn.md。
 
 # 配置服务端默认采样参数（仅在请求未自行覆盖时生效）
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf --backend ggml_metal \
@@ -370,10 +401,10 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `--kv-cache-dtype <type>` | 托管模型的 KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（量化缓存以微小数值漂移换取内存节省；各档位的取舍见上文 CLI 参数表）。默认：自动 —— 由后端 / 模型决定。环境变量：`KV_CACHE_DTYPE`。 |
 | `--continuous-batching` / `--no-continuous-batching` | 启用（默认）或关闭迭代级分页批处理。启用时服务会在批内动态加入 / 抢占序列，并在实现了 `IBatchedPagedModel` 的模型上将多个序列打包到一次前向中执行。`--no-continuous-batching` 会让所有模型回退到按序列 KV 交换。别名：`--paged-batching` / `--no-paged-batching`。 |
 | `--prefill-chunk-size <N>` | 存在竞争时的分块 prefill 粒度 —— 有其他请求同时运行时，每个调度步最多处理的 prefill token 数；块越小，并行 decode 请求越容易频繁轮到 GPU（默认：`1024`）。环境变量：`TS_SCHED_PREFILL_CHUNK`。 |
-| `--mtp-spec` / `--no-mtp-spec` | 在带有多 token 预测草稿头的模型上启用 NextN/MTP 投机解码（默认关闭）。草稿头可以是 Qwen 3.6 内嵌的 NextN 块，或通过 `--mtp-draft-model` 加载的 Gemma 4 `gemma4-assistant` 草稿。仅对单序列（无并发）请求生效：草稿头每步最多提议 `--mtp-draft` 个 token，主干网络用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，输出与标准 decode 一致。仅在有收益处自动启用（ggml 后端与纯 C# `cuda` 后端）；CPU / MLX 走标准 decode。环境变量：`TS_MTP_SPEC`。 |
+| `--mtp-spec` / `--no-mtp-spec` | 在带有多 token 预测草稿头的模型上启用 NextN/MTP 投机解码（默认关闭）。草稿头可以是 Qwen 3.6 内嵌的 NextN 块，或通过 `--mtp-draft-model` 加载的 Gemma 4 `gemma4-assistant` 草稿。仅对单序列（无并发）请求生效：草稿头每步最多提议 `--mtp-draft` 个 token，主干网络用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，输出与标准 decode 一致。仅在有收益处自动启用：Qwen 3.6 的内嵌 NextN 块在所有后端上都被认为有收益，而 Gemma 4 的独立草稿头只在各 ggml 后端与 Direct `cuda` 后端上启用；CPU / GGML CPU / MLX 走标准 decode。环境变量：`TS_MTP_SPEC`。 |
 | `--mtp-draft <N>` | 每个投机步最多起草的 token 数（默认 `8`）。环境变量：`TS_MTP_DRAFT`。 |
 | `--mtp-pmin <f>` | 草稿 token 被保留所需的最低置信度，取值 `(0, 1]`；遇到第一个低置信 token 即停止起草。默认值按草稿器类型选择：逐 token 草稿头为 `0.75`（其 top-10 logits 上的 top-1 概率），块级草稿器为 `0.35`——后者的门限是**累积**前缀概率，因此同一个数字要严格得多。环境变量：`TS_MTP_PMIN`。 |
-| `--draft-model <path>` | 草稿器以独立文件发布的架构所用的投机解码草稿模型，即 DeepSeek V4 的 DSpark 支持 GGUF（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）：它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。需要与 `--mtp-spec` 一起使用，在 `cuda` 与 `ggml_cuda` 后端上对单序列请求生效。与 CLI 不同，服务端的每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。环境变量：`TS_DSV4_DSPARK`。 |
+| `--draft-model <path>` | 草稿器以独立文件发布的架构所用的投机解码草稿模型：DeepSeek V4 的 DSpark 支持 GGUF（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）与 Muse-Glimmer 的 DFlash 草稿器（见 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md)，环境变量 `TS_MUSE_GLIMMER_DFLASH`）。两者都每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。需要与 `--mtp-spec` 一起使用，在 `cuda` 与 `ggml_cuda` 后端上对单序列请求生效。与 CLI 不同，服务端的每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。环境变量：`TS_DSV4_DSPARK`。 |
 | `--spec-draft-n-max <N>` | 每个投机块最多起草的 token 数（默认：草稿器训练时的块大小）。 |
 | `--spec-draft-conf-min <p>` | 保留某个起草位置所需的最小累积接受概率（置信度头各位置估计值的乘积，默认 `0.35`）。 |
 | `--mtp-draft-model <path>` | 对于草稿头作为独立文件发布的架构（Gemma 4 的 `gemma4-assistant`），指定其草稿 GGUF 路径。草稿的隐藏维度必须与目标一致（例如 12B 目标配 12B 草稿，而非 26B-A4B 草稿）；草稿不匹配或不完整会在启动时立即失败并给出修复提示。Qwen 3.6 将 NextN 块内嵌在主干 GGUF 中，此参数对其无效。环境变量：`TS_MTP_DRAFT_MODEL`。 |
@@ -504,6 +535,142 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 使用 `--sampling-precedence request` 时，第 1~3 步互换：请求中出现的参数优先
 于服务端参数与环境变量，其余参数仍由服务端填充。无论哪种模式，服务端 `--stop`
 在 `config` 下始终生效（与请求的列表合并），在 `request` 下则被请求替换。
+
+## 视频生成（Wan）
+
+一个 `wan` GGUF 可以把提示词——Wan 2.2 模型还可再加一张首帧图片——变成 H.264 MP4，
+`TensorSharp.Cli`、服务端的三个视频端点以及 Web UI 聊天都能驱动。完整的架构细节见
+[Wan 卡片](docs/models/wan_zh-cn.md)；本节是运维视角：该下载哪个检查点，以及哪些开关
+真正影响墙钟时间。
+
+### 选哪个检查点
+
+| 家族 | 潜空间 | 模式 | 说明 |
+|---|---|---|---|
+| Wan 2.2 TI2V-5B | 48 通道、16×16×4（`Wan2.2_VAE.safetensors`） | 文生视频 + 图生视频 | 稠密 5B、24 fps、原生 720p；同分辨率下 DiT token 数约为 Wan 2.1 的 1/2.7，因此在消费级 GPU 上既最快也质量最好 |
+| Wan 2.2 A14B（T2V / I2V） | 16 通道（I2V 输入 36 通道），`wan_2.1_vae.safetensors` | 文生视频 + 图生视频 | 两个 14B 专家在时间步边界切换；**两个**专家 GGUF 都必须就位（同一目录，或 `HighNoise/` + `LowNoise/`） |
+| Wan 2.1 T2V（1.3B / 14B） | 16 通道，`wan_2.1_vae.safetensors` | 文生视频 | 单个 DiT |
+
+每个家族都还需要 UMT5-XXL 文本编码器（`umt5-xxl-encoder-Q8_0.gguf`）和匹配的视频 VAE。
+这三个伴随文件都会从 DiT 自身所在目录解析，包括 `VAE/`、`HighNoise/`、`LowNoise/` 这类
+子目录，因此一个 `--local-dir` 就够了；`--wan-vae` / `--wan-te`（以及第二个 A14B 专家的
+`TS_WAN_DIT2`）可以覆盖搜索结果。
+
+Wan 是唯一会直接拒绝某个后端的家族：它可以运行在 `ggml_cuda`、`ggml_vulkan`、
+`ggml_metal`、`ggml_cpu`、`cuda` 与 `cpu` 上，**不支持** `--backend mlx`。`ggml_cuda`
+最快（RTX 2000 Ada、Wan2.1-1.3B F16、832×480×33f、30 步：`ggml_cuda` 12.0 秒/步，
+`ggml_vulkan` 17.2 秒/步，Direct `cuda` 19.3 秒/步）；`cpu` / `ggml_cpu` 仅供功能性使用。
+
+### 提速主路径：步数蒸馏检查点
+
+**这是 Wan 最大的提速手段，代价只是换一个下载。** Wan2.2-TI2V-5B 的官方配方是
+50 步 × 2 次无分类器引导前向 = **100 次 DiT 前向**。步数蒸馏检查点（Turbo / Lightning /
+FastWan / DMD）本身就是按无引导、少步数训练的，因此同一段视频只需 **4 次 DiT 前向**，
+去噪工作量降到 1/25。
+
+TensorSharp 从 DiT 的**文件名**识别它：不区分大小写地匹配 `turbo`、`distill`、
+`lightning`、`lightx2v`、`fastwan`、`-dmd`，或显式的 `<N>steps` / `<N>_steps`（1 ≤ N ≤ 16，
+显式步数优先于标记）。只有标记而没有步数时默认为 4 步。加载时控制台会打印
+
+```
+step-distilled checkpoint detected -> 4 steps, guidance off (--diffusion-steps / --cfg override)
+```
+
+因此可以从日志确认识别是否生效。这里没有任何参数——蒸馏 GGUF 就当作普通的 `--model` 传入。
+
+在 M5 Pro（20 核 GPU、48 GB 统一内存）、`ggml_metal`、Wan2.2-TI2V-5B Q8_0、
+1088×832×121f = 27 404 token、图生视频（即完整的五秒 720p 级请求）上实测：
+
+| | 基础检查点 | **Turbo 检查点** |
+|---|---|---|
+| DiT 前向次数 | 100（50 步 × CFG） | **4**（4 步，无引导） |
+| 每次前向 | 120.2 秒 | 120.2 秒 |
+| 去噪合计 | 12 020 秒 | **481 秒** |
+| VAE 解码 121 帧 | 563 秒 | 563 秒 |
+| **端到端** | **约 3 小时 30 分** | **17 分 30 秒** |
+
+这两列之间只有 `--model` 路径不同。一旦用上蒸馏检查点，瓶颈就变成 VAE 解码（约占整段
+运行的 55%），而不再是 DiT。
+
+下载方式（TI2V-5B —— 注意文件名里的版本号用的是**下划线** `Wan2_2`，与基础仓库不同）：
+
+```bash
+pip install -U huggingface_hub
+hf download hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --local-dir models
+# Turbo 仓库不含 VAE 与文本编码器——从基础仓库取
+hf download QuantStack/Wan2.2-TI2V-5B-GGUF VAE/Wan2.2_VAE.safetensors --local-dir models
+hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --backend ggml_metal --image first_frame.png --output out.mp4 \
+    --prompt "the cat runs toward the camera, cinematic tracking shot" \
+    --video-frames 121 --fps 24
+
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --backend ggml_metal --video-frames 121 --fps 24
+```
+
+Wan 2.2 I2V-A14B 的即插即用蒸馏 GGUF 是
+[jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF](https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF)，
+它已经把蒸馏合并进两个专家，分别放在 `high_noise/` 与 `low_noise/` 下；两个都下载，
+`--model` 指向其中任意一个即可。该仓库同样不含 VAE 与文本编码器，因此
+`VAE/Wan2.1_VAE.safetensors` 取自
+[QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF)，
+UMT5-XXL 编码器同上。
+
+> [lightx2v/Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning)
+> 只发布 LoRA `.safetensors`，而 TensorSharp 没有任何 Wan LoRA 参数——请选择已经把
+> 蒸馏烘焙进 GGUF 的仓库。
+
+### `--cfg-cache-stride`（仅基础检查点）
+
+一次带引导的去噪步是 `v = v_cond + (cfg-1)·d`，其中 `d = v_cond - v_uncond`。引导方向 `d`
+在整个调度上的变化远比 `v` 缓慢，因此 `--cfg-cache-stride N` 让无条件前向每 `N` 步只跑
+一次，中间各步复用缓存的 `d`。在 50 步下，`2` 只跑 100 次前向中的 77 次（**1.30×**），
+`3` 跑 70 次（**1.43×**）。前三步与最后一步始终重新计算 `d`。服务端 JSON 字段：
+`"cfgCacheStride": 2`。
+
+这是一种近似——需要严格对齐参考样本时请关闭；在步数蒸馏检查点上也没有意义，因为它们本来
+就无引导运行（cfg ≤ 1.0 时缓存会被自动禁用）。
+
+### 让一个大请求变便宜，按收益排序
+
+1. **换用步数蒸馏检查点。** 100 次 DiT 前向变成 4 次，收益远超其他所有手段。
+2. **减少帧数。** 121 → 61 大约把注意力工作量降到 1/4（token 数是
+   `latent_frames × (h/2) × (w/2)`，自注意力是 `O(tokens²)`），VAE 解码减半。
+3. **减小画面面积**——但不要低于 Wan 的训练分辨率。低于约 0.3 MP 后模型进入分布外，
+   视频会变*差*而不只是变便宜，管线也会给出警告。Wan 在 480p（832×480）与
+   720p（1280×704）上训练，所以请在受支持的尺寸上生成，再事后缩小。
+4. **减少步数**，仅限基础检查点——30 步相对官方 50 步在观感上很接近，成本降到 1/1.7。
+5. **`--cfg-cache-stride 2` 或 `3`**——1.30× / 1.43×，仅限基础检查点。
+
+同一台 M5 Pro、同一个 Turbo 检查点与输入图，分辨率与墙钟时间的关系：
+
+| 输出 | Token 数 | 去噪 | VAE 解码 | **合计** |
+|---|---|---|---|---|
+| 736×544 × 81f（3.4 秒，480p 级） | 8 211 | 84 秒 | 159 秒 | **4 分 09 秒** |
+| 736×544 × 121f（5 秒，480p 级） | 12 121 | 137 秒 | 237 秒 | **6 分 19 秒** |
+| 1088×832 × 121f（5 秒，720p 级） | 27 404 | 481 秒 | 563 秒 | **17 分 30 秒** |
+
+480p（约 0.4 MP）是 Wan *训练过*的分辨率，因此前两行属于分布内，而不是降级模式——当你
+只能接受几分钟时，就该选它。
+
+### 服务端默认值
+
+`--video-frames N` 与 `--fps N` 为 Web UI 和三个视频端点设置服务端级**默认值**，不是上限；
+请求中提供的 `frames` 或 `fps` 会各自独立覆盖。两者都不提供时使用模型配方：Wan2.2-TI2V
+为 49 帧 / 24 fps，其余为 33 帧 / 16 fps。帧数会对齐到 VAE 的 `4k+1` 时序网格。改变时长
+时请保持模型原生 FPS 而调整帧数——只改 FPS 只会改变播放速度。
+
+### 其他 Wan 开关
+
+这些开关用于 A/B 与调试，除注明外都会让速度变慢。`TS_WAN_DIT_KV_F16=0` 恢复 F32 的注意力
+键值（F16 是默认值，在 27k token 下快 2.02×，且没有可测的精度损失）；
+`TS_WAN_VAE_MPS_CONV=0` 在 Metal 上恢复 ggml 的 im2col+GEMM 卷积下降路径（MPSGraph 是默认
+值，把 736×544×81f 的 VAE 解码从 159 秒降到 80 秒）；`TS_WAN_VAE_GEMM_MAX_MB` 设置 im2col
+预算，`TS_WAN_VAE_TILE=0` 关闭分块；`TS_WAN_DIT_CAPTURE=0` 关闭常驻的 CUDA 图捕获 DiT 图；
+`TS_WAN_DIT_FLASH=0` 强制走物化注意力；`TS_WAN_HEARTBEAT_S` 设置进度心跳间隔（默认 30 秒，
+`0` 静默）；`TS_FFMPEG` 指定用于近无损 CRF 17 H.264 导出的 `ffmpeg`。
 
 ## 张量并行与分布式推理
 

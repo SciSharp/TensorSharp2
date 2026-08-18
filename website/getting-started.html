@@ -37,7 +37,7 @@
   <h3>Other prerequisites</h3>
   <ul>
     <li><strong><code>git</code>, <code>curl</code>, and network access</strong> — used to clone TensorSharp and download a model. A full native build also clones <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> into <code>ExternalProjects/ggml/</code>; set <code>TENSORSHARP_GGML_NO_UPDATE=1</code> to skip later network updates.</li>
-    <li><strong>A GGUF model file</strong> — e.g. from <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>. See <a href="models.html#downloads">Model downloads</a>.</li>
+    <li><strong>A GGUF model file</strong> — e.g. from <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>. See <a href="models-downloads.html#downloads">Model downloads</a>.</li>
   </ul>
   <h4>Per-platform toolchains (only for GPU acceleration)</h4>
   <div class="table-scroll">
@@ -72,9 +72,15 @@ dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre
   <div class="callout warn"><div class="ic">📦</div><p><strong>Current release status:</strong> <a href="https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.0.5.0" target="_blank" rel="noopener">v3.0.5.0</a> has no uploaded CLI/server archives, so build from source today. The repository contains a Release Binaries workflow, but do not invent an archive URL—use one only when it is visibly listed on the <a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">Releases page</a>.</p></div>
 
   <h2 id="download">3 · Download a model</h2>
-  <p>For the quick start, download the recommended benchmark-verified <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q8_0.gguf file (7.48 GiB)</a> from the public <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a> repository. The lower-memory <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_K_M.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q4_K_M.gguf</a> lives in the same repository, and the <a href="models.html#downloads">Models</a> page lists other options.</p>
+  <p>For the quick start, download the recommended benchmark-verified <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q8_0.gguf file (7.48 GiB)</a> from the public <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a> repository. The lower-memory <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_K_M.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q4_K_M.gguf</a> lives in the same repository, and the <a href="models-downloads.html#downloads">Models</a> page lists other options.</p>
   <pre data-lang="bash"><code>curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf</code></pre>
   <div class="callout note"><div class="ic">🧩</div><p>For multimodal models, download the matching <strong>projector</strong> (mmproj) and pass its exact path with <code>--mmproj</code>. The server does not auto-detect a projector, and CLI auto-detection recognizes only a few legacy filenames; explicit paths are reliable.</p></div>
+  <div class="callout tip"><div class="ic">⚡</div><p><strong>Generating images or video? Pick the fast checkpoint on the way in.</strong> Both families ship in a <em>base</em> and a <em>step-distilled</em> form, and the difference is not subtle:</p>
+  <ul>
+    <li><strong>Wan video</strong> — a base <code>Wan2.2-TI2V-5B</code> follows the official 50-step × 2-CFG recipe = 100 DiT passes; a <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> checkpoint is trained guidance-free and costs 4. TensorSharp detects it from the DiT file name and needs no extra flag. On an M5 Pro a 1088×832 × 121-frame image-to-video takes ≈3 h 30 m on the base checkpoint and <strong>17 m 30 s</strong> on Turbo — the same command, a different <code>--model</code> path.</li>
+    <li><strong>Qwen-Image-Edit</strong> — adding the Lightning distillation LoRA with <code>--qwen-image-lora</code> drops the default 30 steps at CFG 2.5 (60 DiT forwards) to a 4- or 8-step run.</li>
+  </ul>
+  <p>→ <a href="models-downloads.html#downloads">Model downloads</a> for the exact repos and files · <a href="benchmarks.html#wan">the measurements behind these numbers</a></p></div>
 
   <h3 id="e4b-fast-lane">Gemma 4 E4B backend and platform notes</h3>
   <p>The first-run commands below are for Linux + NVIDIA. On Windows + NVIDIA, set <code>$env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'</code> in PowerShell, then run the same commands without the Bash assignment prefix. On Apple Silicon, omit the CUDA environment assignment and use <code>ggml_metal</code>. For Vulkan on Windows/Linux, set <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> (PowerShell: <code>$env:TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN='ON'</code>) and use <code>ggml_vulkan</code>. Without a GPU, use <code>ggml_cpu</code> (native CPU kernels). Text needs no projector. For image, video, or audio, download <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code> from the same repository and add <code>--mmproj models/mmproj-gemma-4-E4B-it-Q8_0.gguf</code>.</p>
@@ -103,6 +109,7 @@ TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Cli -c R
     <a class="card" href="cli.html"><div class="ic">⌨️</div><h3>CLI reference</h3><p>All flags, the REPL, and batch workflows.</p></a>
     <a class="card" href="http-api.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>Call the server from curl, Python, or SDKs.</p></a>
     <a class="card" href="models.html"><div class="ic">🧠</div><h3>Models</h3><p>What's supported and where to download.</p></a>
+    <a class="card" href="benchmarks.html"><div class="ic">📊</div><h3>Benchmarks</h3><p>Measured speed per model, and the levers that move it.</p></a>
   </div>
 
   <div class="content-footer">

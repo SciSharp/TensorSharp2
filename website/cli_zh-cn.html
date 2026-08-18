@@ -128,7 +128,15 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;Wan2.2-TI2V-5B-Q8_0.gguf&gt; --image first_frame.png \
     --prompt "the camera pushes in as the waves rise" \
-    --video-frames 81 --fps 24 --flow-shift 5.0 --output out.mp4 --backend ggml_cuda</code></pre>
+    --video-frames 81 --fps 24 --flow-shift 5.0 --output out.mp4 --backend ggml_cuda
+
+# 快车道：把 --model 指向一个步数蒸馏权重。命令的其他部分完全不变；
+# 仅凭文件名，这次运行就会切换为 4 次无引导前向。
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;Wan2_2-TI2V-5B-Turbo-Q8_0.gguf&gt; --image first_frame.png \
+    --prompt "the camera pushes in as the waves rise" \
+    --video-frames 121 --fps 24 --output out.mp4 --backend ggml_metal</code></pre>
+  <div class="callout tip"><div class="ic">⚡</div><p><strong>步数蒸馏是最大的一个提速杠杆，而且它不是一个开关。</strong>基础的 Wan2.2-TI2V-5B 走官方配方 50 步 × 2 次 CFG = <strong>100 次 DiT 前向</strong>；蒸馏后的 <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重在训练时就不使用引导，只需 <strong>4</strong> 次。TensorSharp 会从 DiT 文件名识别它（<code>turbo</code>、<code>distill</code>、<code>lightning</code>、<code>lightx2v</code>、<code>fastwan</code>、<code>-dmd</code>，或显式的 <code>…-4steps-…</code> / <code>…8step…</code>，取值 1–16），并在加载时打印 <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off</code>。在 M5 Pro 上、1088×832 × 121 帧的同一个请求，<strong>基础权重约需 3 h 30 m，Turbo 只需 17 m 30 s</strong>。<code>--diffusion-steps</code> / <code>--cfg</code> 可覆盖识别到的取值。→ <a href="models-video_zh-cn.html#wan">去哪里下载</a> · <a href="benchmarks_zh-cn.html#wan">实测数据</a></p></div>
 
   <h3 id="diffusion">DiffusionGemma 与检查</h3>
   <pre data-lang="bash"><code># DiffusionGemma 文本扩散生成
@@ -208,6 +216,9 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--list-gpus</code></td><td>列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
       <tr><td><code>--help</code></td><td>打印完整参数参考（逐项列出说明、默认值、取值范围与示例）后退出；不带任何参数启动 CLI 时也会显示。</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>（默认：自动，由后端/模型选择；覆盖 <code>KV_CACHE_DTYPE</code> 环境变量）。块量化档位需要原生 GGML flash-attention 路径；<code>q4_0</code>（约为 f32 占用的 1/7）面向 128K–256K 的超长上下文。</td></tr>
+      <tr><td><code>--n-cpu-moe &lt;N&gt;</code> / <code>-ncmoe &lt;N&gt;</code></td><td>把前 N 层的路由 MoE 专家权重留在系统内存中并在 CPU 上做乘法；注意力、归一化、路由器与共享专家仍留在加速器上。传 <code>all</code> 表示所有层。默认 <code>0</code> —— 但 GPU 后端上的 DeepSeek V4 例外，它会自动卸载“刚好能放进可见显存”的最少层数。环境变量：<code>TS_N_CPU_MOE</code>。</td></tr>
+      <tr><td><code>--cpu-moe</code> / <code>-cmoe</code></td><td><code>--n-cpu-moe all</code> 的简写（环境变量 <code>TS_CPU_MOE</code>）。</td></tr>
+      <tr><td><code>--cpu-moe-threads &lt;N&gt;</code></td><td>主机侧专家矩阵乘的工作线程数（默认为本进程实际可用并行度减一）。不要超过 cgroup 的 CPU 配额 —— ggml 的线程池在栅栏处自旋，超订会让吞吐直接崩塌。环境变量：<code>TS_CPU_MOE_THREADS</code>。</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>启动交互式 REPL（见下文）。</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>从文本或文件设定会话的系统提示。仅交互式 REPL 与 DiffusionGemma 扩散模式使用它；普通单次文本模式会忽略系统提示。</td></tr>
       <tr><td><code>--think</code></td><td>启用思考 / 推理模式（思维链）。</td></tr>
@@ -234,6 +245,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--top-p &lt;f&gt;</code></td><td>核采样阈值（默认 1.0 = 禁用）。</td></tr>
       <tr><td><code>--min-p &lt;f&gt;</code></td><td>最小概率过滤（默认 0 = 禁用）。</td></tr>
       <tr><td><code>--repeat-penalty &lt;f&gt;</code></td><td>重复惩罚（默认 1.0 = 无）。</td></tr>
+      <tr><td><code>--penalty-last-n &lt;N&gt;</code></td><td>重复 / 存在 / 频率惩罚考虑最近多少个 token（默认 64；<code>0</code> 关闭历史惩罚，<code>-1</code> 使用全部历史）。</td></tr>
       <tr><td><code>--presence-penalty &lt;f&gt;</code> / <code>--frequency-penalty &lt;f&gt;</code></td><td>存在 / 频率惩罚（默认 0 = 禁用）。</td></tr>
       <tr><td><code>--seed &lt;N&gt;</code></td><td>随机种子（默认 -1 = 非确定性）。</td></tr>
       <tr><td><code>--stop &lt;string&gt;</code></td><td>停止序列（可重复）。</td></tr>
@@ -251,7 +263,9 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--image &lt;path&gt;</code> / <code>--prompt &lt;text&gt;</code> / <code>--output &lt;path&gt;</code></td><td>Qwen-Image-Edit：输入图像、编辑指令与输出 PNG（默认 <code>edited.png</code>）。复用 <code>--diffusion-steps</code> / <code>--diffusion-seed</code>。</td></tr>
       <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG 引导尺度（省略则自动取值：2.5，加载 Lightning LoRA 时为 1.0；<code>&lt;= 1</code> 关闭负向分支）。</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-Edit 伴随 GGUF（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
-      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning 蒸馏 LoRA（<code>.safetensors</code>），在加载时合并进 DiT；自动推导去噪步数（如 4 或 8），并将 CFG 切换为 1.0（无负向分支）。</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning 蒸馏 LoRA（<code>.safetensors</code>）。它作为运行期 F32 旁路挂在每个目标投影旁边 —— 量化后的基础权重原封不动，<strong>不会</strong>被合并 —— 并从文件名自动推导去噪步数（<code>…-4steps-…</code> / <code>…8step…</code>，取值 1–16），同时把 CFG 切换为 1.0 并固定 timestep shift 为 3。这会把默认的 30 步 / CFG 2.5（60 次 DiT 前向）降到 4–8 次。它要求整模或融合分块的 CUDA 前向路径：在没有旁路的路径上模型会直接抛错，而不是输出噪声。环境变量：<code>TS_QWEN_IMAGE_LORA</code>。</td></tr>
+      <tr><td><code>--width &lt;px&gt;</code> / <code>--height &lt;px&gt;</code></td><td>Qwen-Image-Edit 的固定输出尺寸（默认 <code>0</code> = 自动：源图尺寸，并按显存上限收敛）。</td></tr>
+      <tr><td><code>--offload-cpu</code></td><td>把 Qwen-Image-Edit 的 DiT 权重从内存流式读取，而不是常驻显存：每步更慢，但小显存卡也能做原生约 1 MP 的编辑。默认自动 —— 仅当目标分辨率放不下常驻权重时才启用。</td></tr>
       <tr><td><code>--benchmark</code></td><td>运行合成的 prefill/decode 吞吐基准。</td></tr>
       <tr><td><code>--bench-prefill / --bench-decode / --bench-runs &lt;N&gt;</code></td><td>合成的 prefill 长度、decode 长度与运行次数。</td></tr>
       <tr><td><code>--bench-kvcache</code> / <code>--bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准（带缓存 vs 强制重置）。</td></tr>
@@ -261,6 +275,25 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     </tbody>
   </table>
   </div>
+  <h4>视频生成（Wan 2.1 / 2.2）</h4>
+  <p>以下参数在 <code>--model</code> 为 <code>wan</code> DiT GGUF 时生效。<code>--prompt</code> 提供文本，<code>--image</code> 提供图生视频的首帧，<code>--output</code> 指定 MP4 文件名。除非用 <code>--diffusion-steps</code> / <code>--cfg</code> 覆盖，去噪步数与引导强度都来自模型自身的配方。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>选项</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--video-frames &lt;N&gt;</code></td><td>输出帧数，会对齐到 <code>4k+1</code>（VAE 的时间网格）；<code>1</code> 表示只出一张静态图。默认 33，Wan2.2-TI2V 为 49。帧数同时决定注意力开销与 VAE 解码耗时，是仅次于权重选择的第二大杠杆。</td></tr>
+      <tr><td><code>--fps &lt;N&gt;</code></td><td>保存的 MP4 的播放帧率（默认 16，Wan2.2-TI2V 为 24 —— 即模型的训练帧率）。它只改变播放速度，不改变计算量。</td></tr>
+      <tr><td><code>--flow-shift &lt;F&gt;</code></td><td>FlowMatch timestep shift（默认 <code>0</code> = 模型官方配方：Wan 2.2 为 5.0，A14B T2V 为 12.0；Wan 2.1 中 1.3B 模型的视频运行为 8.0，其余 ≤ 480p 为 3.0、更高为 5.0）。</td></tr>
+      <tr><td><code>--sampler &lt;name&gt;</code></td><td><code>unipc</code>（默认 —— Wan 官方采样器；多步预测-校正，在相同步数下质量更好）或 <code>euler</code>。</td></tr>
+      <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>无分类器引导使用的负向提示词（默认为 Wan 官方负向提示词）。对步数蒸馏权重无效，因为它本身就不使用引导。</td></tr>
+      <tr><td><code>--cfg-cache-stride &lt;N&gt;</code></td><td>引导缓存：每 N 步才跑一次无条件 CFG 分支，其余步复用缓存的引导方向（前三步与最后一步始终重算）。50 步时，<code>2</code> 只跑 100 次前向中的 77 次（快 1.30×），<code>3</code> 跑 70 次（1.43×）。默认 <code>0</code> = 关闭。它是一种近似 —— 需要对齐参考样本时请保持关闭；另外它在蒸馏权重上没有意义（根本没有无条件分支可缓存）。</td></tr>
+      <tr><td><code>--diffusion-steps &lt;N&gt;</code> / <code>--cfg &lt;F&gt;</code></td><td>覆盖配方或自动识别到的蒸馏取值。基础权重上用 30 步替代 50 步，观感非常接近而开销少 1.7×。</td></tr>
+      <tr><td><code>--wan-vae &lt;path&gt;</code></td><td>视频 VAE（<code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>）。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_WAN_VAE</code>。需要哪个 VAE 由 DiT 自己决定，而不是由你指定。</td></tr>
+      <tr><td><code>--wan-te &lt;path&gt;</code></td><td>UMT5-XXL 文本编码器 GGUF。默认在同目录扫描。环境变量：<code>TS_WAN_TE</code>。Wan 2.2 A14B 还会按文件名自动解析第二个 high/low noise 专家 GGUF（用 <code>TS_WAN_DIT2</code> 覆盖；它没有对应的命令行参数）。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Wan 可运行于 <code>ggml_cuda</code>、<code>ggml_vulkan</code>、<code>ggml_metal</code>、<code>ggml_cpu</code>、<code>cuda</code> 与 <code>cpu</code> —— 它是唯一会直接拒绝 <code>--backend mlx</code> 的模型族 —— 并且不支持 <code>--tp</code>。→ <a href="benchmarks_zh-cn.html#wan">Wan 后端耗时与成本模型</a></p>
   <p class="page-foot-note">完整参考（含 <code>--test</code>、<code>--test-templates</code> 与分块 prefill 正确性检查）见 <a href="api-reference_zh-cn.html#cli-flags">API 参考</a> 页。</p>
 
   <h2 id="repl">交互式 REPL 命令</h2>

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>图像生成与编辑 — TensorSharp 维基</title>
+  <meta name="description" content="Qwen-Image-Edit：下载并运行 MMDiT 图像编辑器，以及让它变快的 Lightning LoRA 与 DiT 缓存。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="models-image">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › <a href="models_zh-cn.html">支持的模型</a> › 图像生成与编辑</div>
+  <h1>图像生成与编辑</h1>
+  <p class="lede">Qwen-Image-Edit 接受提示词加一张输入图像，返回编辑后的图像。本页包含下载、运行示例，以及决定单次编辑耗时的两个关键选项。</p>
+  <div class="callout note"><div class="ic">💡</div><p>这些命令遵循与文本模型示例相同的约定：Hugging Face CLI、从仓库根目录源码构建，并把 <code>--backend</code> 换成与你硬件匹配的值。参见<a href="models-text_zh-cn.html#download-run">按家族下载与运行</a>。</p></div>
+
+  <h2 id="qwen-image-edit">Qwen-Image-Edit（图像 + 提示词 → 编辑后的图像）</h2>
+  <pre data-lang="bash"><code>hf download unsloth/Qwen-Image-Edit-2511-GGUF qwen-image-edit-2511-Q4_K_M.gguf --local-dir models
+hf download QuantStack/Qwen-Image-Edit-GGUF VAE/Qwen_Image-VAE.safetensors --local-dir models
+hf download unsloth/Qwen2.5-VL-7B-Instruct-GGUF Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf --local-dir models
+hf download unsloth/Qwen2.5-VL-7B-Instruct-GGUF mmproj-BF16.gguf --local-dir models
+hf download lightx2v/Qwen-Image-Edit-2511-Lightning Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/qwen-image-edit-2511-Q4_K_M.gguf --image input.png \
+    --prompt "把天空改成壮丽的日落。" --output edited.png \
+    --qwen-image-vae models/VAE/Qwen_Image-VAE.safetensors \
+    --qwen-image-vl models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
+    --qwen-image-mmproj models/mmproj-BF16.gguf \
+    --qwen-image-lora models/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
+    --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-edit-2511-Q4_K_M.gguf \
+    --qwen-image-vae models/VAE/Qwen_Image-VAE.safetensors \
+    --qwen-image-vl models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
+    --qwen-image-mmproj models/mmproj-BF16.gguf \
+    --qwen-image-lora models/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
+    --backend ggml_cuda</code></pre>
+
+  <h2 id="imageedit">图像编辑（Qwen-Image-Edit）</h2>
+  <p>Qwen-Image-Edit 接收<strong>提示词 + 一张输入图像</strong>并返回编辑后的图像——这是与上面文本 LLM 不同的输出模态。所加载的 <code>qwen_image</code> GGUF 仅是 MMDiT（多模态扩散 Transformer）；TensorSharp 会在其旁解析两个伴随 GGUF：</p>
+  <ul>
+    <li><strong>Qwen-Image VAE</strong> —— 图像 ↔ 16 通道潜变量（原始 <code>.safetensors</code> 也可用）。</li>
+    <li><strong>Qwen2.5-VL-7B 文本编码器</strong> —— 提示词 → 3584 维条件，外加可选的 <code>mmproj</code> 视觉塔以实现图像接地编辑。</li>
+  </ul>
+  <p>将伴随文件放在 DiT GGUF 旁，或用 <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> 指定（CLI：<code>--qwen-image-vae</code> / <code>--qwen-image-vl</code> / <code>--qwen-image-mmproj</code>）。流水线对参考图做 VAE 编码、构建条件、运行带参考潜变量拼接的 FlowMatch-Euler true-CFG 去噪循环，再 VAE 解码回像素。整个 60 块 DiT 前向被 CUDA 图捕获，flash 注意力默认开启；除非固定宽/高，否则目标面积按设备 VRAM 预算自动钳制。</p>
+  <p><strong>提速的关键是 Lightning 蒸馏 LoRA</strong>（<code>--qwen-image-lora</code> / <code>TS_QWEN_IMAGE_LORA</code>，一个 <code>.safetensors</code> 文件）。TensorSharp 从文件名解析出训练时的步数（<code>…-4steps-…</code> / <code>…8step…</code>，接受 1–16），并把采样默认值切换为该步数、cfg 1.0、时间步 shift 固定为 3——每步一次 DiT 前向，没有负向分支。不加 LoRA 时基础配方是 30 步、cfg 2.5，因此默认的 <strong>60 次 DiT 前向降到 4–8 次</strong>。在本项目的 CUDA <code>image_edit</code> 场景下（Q2_K DiT + 4 步 Lightning LoRA，544×1184，输入与种子完全一致），一次热态编辑耗时 <strong>40.44 s</strong>，而 <code>stable-diffusion.cpp</code> 为 48.16 s。</p>
+  <p>该 LoRA 以运行时 F32 旁路的方式作用在每个目标投影旁（<code>y = W·x + b + (alpha/rank)·up·(down·x)</code>），量化后的基础权重保持不变——它<em>不会</em>被合并进权重，因为 Lightning 的增量远小于低比特量化的一个台阶，合并的结果只是重量化噪声。这条旁路只存在于整模型前向与融合逐块 CUDA 前向上，因此在回退路径上（<code>TS_QWEN_DIT_FUSED_BLOCK=0</code>、<code>TS_QWEN_DIT_NATIVE=0</code> 或非 CUDA 后端）使用 Lightning LoRA 会直接报错，而不是输出噪声。若基础 DiT 本身<em>已经</em>是少步模型（文件名含 <code>rapid</code>、<code>turbo</code>、<code>hyper</code>、<code>lightning</code>、<code>lcm</code>、<code>nitro</code> 或 <code>step</code>），叠加 LoRA 会被检测并告警——这类检查点无需再加 LoRA。</p>
+  <p>其余提速来自三张默认开启的融合图：CUDA 图捕获的整 DiT 前向把单次前向成本降到约 1/2.9，8 步去噪从约 153 s 降到约 63 s（<code>TS_QWEN_DIT_WHOLE_CAPTURE=0</code> 可关闭）；融合的条件编码器主干把文本条件阶段从 11.2 s 降到 2.5 s（<code>TS_QWEN_TE_FUSED=0</code>）；融合的整 VAE 图把 928×688 的编码从 19.5 s 降到 0.95 s、解码从 22.8 s 降到 1.35 s（<code>TS_QWEN_VAE_FUSED=0</code>）。<strong>整步 DiT 缓存</strong>（<code>TS_QWEN_DIT_CACHE_MODE</code> = <code>easycache</code> / <code>fbc</code> / <code>both</code>）还能跳过其余步数的 40–55%，但它<strong>默认关闭</strong>：在编辑类负载上它会可测地弱化人脸等细节，因此以质量优先，需要时再自行开启。</p>
+  <p>由于文本与视觉编码器在去噪循环开始前就已释放，更大的文本编码器量化档在去噪阶段不增加任何成本，却决定整次编辑的保真度——即便显存有限也推荐 <code>Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf</code>（4.683 GB）；约 2 比特的 <code>UD-IQ2_XXS</code> 会明显弱化人脸。</p>
+  <p>可从 <a href="cli_zh-cn.html#imageedit">CLI</a>（<code>--image</code> + <code>--prompt</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 图像编辑流程（含实时去噪预览），或在进程内从 <a href="code-api_zh-cn.html#imageedit">C# 通过 <code>QwenImageModel.EditImage()</code></a> 运行。完整细节见仓库的 <code>docs/models/qwenimage_zh-cn.md</code> 卡片。</p>
+  <div class="content-footer">
+    <a href="models-text_zh-cn.html">← 文本与 LLM 模型</a>
+    <a href="models-video_zh-cn.html">下一篇：视频生成 →</a>
+  </div>
+</main>
+</body>
+</html>

@@ -39,6 +39,7 @@
 // (patch embedding as a matmul, causal conv3d as per-temporal-tap 2D kernels).
 // ============================================================================
 #include "ggml_ops_internal.h"
+#include "ggml-impl.h"   // ggml_graph_view, for the segmented MPS conv runner
 #include "ggml-alloc.h"
 
 #include <cmath>
@@ -970,22 +971,30 @@ static long long wan_vae_gemm_budget()
     const char* e = std::getenv("TS_WAN_VAE_GEMM_MAX_MB");
     if (e != nullptr) return std::strtoll(e, nullptr, 10) * 1024 * 1024;
 
-    // ggml-metal's Metal 4 tensor-API mul_mm intermittently misreads operands
-    // inside the VAE decode graph on M5 (first pass, layout-dependent: the
-    // 32x32-latent all-NaN decode). It is correct in isolation and for every
-    // LLM/DiT-style graph, and has_tensor is fixed at device init, so it
-    // cannot be scoped per-op. When the tensor API is active, route the VAE
-    // convs through ggml_conv_2d_direct (budget 0): slower than im2col+GEMM,
-    // but correct — and it keeps the tensor API's much larger DiT/text-encoder
-    // wins. TS_WAN_VAE_GEMM_MAX_MB overrides in both directions.
+    // ggml-metal's Metal 4 tensor-API mul_mm misreads operands inside the VAE
+    // decode graph on M5 (first pass, buffer-layout dependent). When the tensor
+    // API is active, route the VAE convs through ggml_conv_2d_direct (budget 0):
+    // slower than im2col+GEMM, but correct.
+    //
+    // Do NOT "verify this is fixed" with an isolated decode. Tried 2026-08-17:
+    // WanVideoBench decoded synthetic latents at five shapes — including the
+    // 32x32 layout recorded as the original all-NaN repro — and tensor-API vs
+    // non-tensor output agreed to 91-93 dB PSNR with no NaN anywhere. It looked
+    // conclusively fixed. The very next full 1088x832x121f generation, with the
+    // DiT loaded and released before the decode, rendered 121 uniformly BLACK
+    // frames. The defect follows the allocation history, so only an end-to-end
+    // video is evidence.
     if (wan_metal_tensor_api_likely())
         return 0;
-    // Non-CUDA device backends (Vulkan) stay at the banded floor: their
-    // drivers reject the multi-GB single gallocr arena that an unbanded
-    // full-plane im2col produces (Vulkan maxMemoryAllocationSize is commonly
-    // 4 GB or less), and the CPU backend gains nothing from bigger scratch.
+    // Vulkan stays at the banded floor: its drivers reject the multi-GB single
+    // gallocr arena an unbanded full-plane im2col produces (maxMemoryAllocationSize
+    // is commonly 4 GB or less). Metal and CUDA size the budget from free device
+    // memory — on Metal that measured 56.4s -> 49.7s for a 1088x832x9f decode,
+    // because it turns many small banded GEMMs into few large ones.
     const char* name = g_backend != nullptr ? ggml_backend_name(g_backend) : nullptr;
-    if (name == nullptr || std::strncmp(name, "CUDA", 4) != 0)
+    const bool sizedFromMemory = name != nullptr &&
+        (std::strncmp(name, "CUDA", 4) == 0 || std::strncmp(name, "MTL", 3) == 0);
+    if (!sizedFromMemory)
         return 384LL << 20;
     std::size_t freeB = 0, totalB = 0;
     ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -1062,6 +1071,10 @@ ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int
 {
     const long long gemmMax = b.gemmMax;
     ggml_context* ctx = b.ctx;
+    // MPS executes the convolution whole, so emit the un-lowered node: this also
+    // skips the horizontal banding and its leading-pad shim entirely.
+    if (tsg::fast_conv_enabled())
+        return ggml_conv_2d_direct(ctx, wt, x, stride, stride, pad, pad, 1, 1);
     if (gemmMax <= 0)
         return ggml_conv_2d_direct(ctx, wt, x, stride, stride, pad, pad, 1, 1);
 
@@ -1616,7 +1629,12 @@ bool wan_vae_encode(const TSGgmlWanVaeEncodeDesc* d)
     for (auto& u : wbind.uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
     ggml_backend_tensor_set(xIn, d->x, 0, static_cast<std::size_t>(pw) * ph * pc * pt * sizeof(float));
 
-    if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
+    // The encoder shares wan_vae_conv2d, so on the MPS path its graph also holds
+    // un-lowered CONV_2D nodes and needs the same segmented runner.
+    const ggml_status encSt = tsg::fast_conv_enabled()
+        ? tsg::graph_compute_fast_conv(graph, "wan vae")
+        : ggml_backend_graph_compute(g_backend, graph);
+    if (encSt != GGML_STATUS_SUCCESS)
     { set_last_error("WanVaeEncode: graph compute failed."); return false; }
     ggml_backend_synchronize(g_backend);
     ggml_backend_tensor_get(outT, d->out, 0, static_cast<std::size_t>(d->out_len) * sizeof(float));
@@ -1862,6 +1880,11 @@ bool wan_vae_decode(const TSGgmlWanVaeDecodeDesc* d)
             }
             ggml_free(sctx);
         }
+    }
+    else if (tsg::fast_conv_enabled())
+    {
+        if (tsg::graph_compute_fast_conv(graph, "wan vae") != GGML_STATUS_SUCCESS)
+        { set_last_error("WanVaeDecode: graph compute failed (MPS conv path)."); return false; }
     }
     else if (tsg::graph_compute_profiled(g_backend, graph, "wan vae decode") != GGML_STATUS_SUCCESS)
     { set_last_error("WanVaeDecode: graph compute failed."); return false; }

@@ -135,6 +135,11 @@ kbd {
 }
 .sidebar a:hover { background: var(--bg-soft); color: var(--text); text-decoration: none; }
 .sidebar a.active { background: var(--accent-soft); color: var(--link); font-weight: 600; }
+.sidebar a.sub {
+  margin-left: 10px; padding-left: 12px; font-size: .86rem;
+  border-left: 2px solid var(--border); border-radius: 0 7px 7px 0;
+}
+.sidebar a.sub.active { border-left-color: var(--accent); }
 
 .content {
   min-width: 0; padding: 36px 48px 96px;

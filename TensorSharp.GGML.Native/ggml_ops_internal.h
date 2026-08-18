@@ -936,6 +936,14 @@ namespace tsg
     bool graph_node_profile_enabled();
     ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag);
 
+    // Platform convolution offload for the VAEs (MPSGraph on Metal, cuDNN on
+    // CUDA). ggml lowers conv2d to im2col + mul_mat, which dominates a VAE graph
+    // and materialises 9x the input for a 3x3 kernel; the vendor libraries
+    // convolve directly. fast_conv_enabled() says whether to emit un-lowered
+    // CONV_2D nodes, and graph_compute_fast_conv() executes such a graph.
+    bool fast_conv_enabled();
+    ggml_status graph_compute_fast_conv(ggml_cgraph* graph, const char* tag);
+
     // ------------------------------------------------------------------
     // Whole-model kernel phase timer (TS_GGML_PHASE_TIMING)
     // ------------------------------------------------------------------

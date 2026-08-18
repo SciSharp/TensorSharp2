@@ -133,7 +133,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <qwen-image-edit-DiT.gguf
 # Wan video generation (prompt -> H.264 MP4). The UMT5-XXL text-encoder GGUF and
 # video-VAE companions are resolved next to the DiT GGUF (or set --wan-te /
 # --wan-vae). Wan 2.1 T2V, Wan 2.2 TI2V-5B, and Wan 2.2 A14B (both experts)
-# are auto-detected. See docs/models/wan.md.
+# are auto-detected, and so are step-distilled (Turbo / Lightning / FastWan)
+# checkpoints -- 4 DiT passes instead of 100 for the same video. See the
+# "Video generation (Wan)" section below and docs/models/wan.md.
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <Wan2.2-TI2V-5B.gguf> \
     --prompt "a lovely cat walking through a garden" --output cat.mp4 \
     --width 832 --height 480 --video-frames 49 --backend ggml_cuda \
@@ -269,12 +271,14 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--qwen-image-vae <path>` | Override the resolved Qwen-Image VAE companion (`.gguf` or `.safetensors`). |
 | `--qwen-image-vl <path>` | Override the resolved Qwen2.5-VL-7B text-encoder GGUF. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen2.5-VL mmproj (vision grounding) GGUF. |
-| `--qwen-image-lora <path>` | Qwen-Image-Edit Lightning distillation LoRA (`.safetensors`), merged into the DiT at load time. Auto-derives the step count (e.g. 4 or 8) and switches CFG to 1.0. Env: `TS_QWEN_IMAGE_LORA`. |
+| `--qwen-image-lora <path>` | Qwen-Image-Edit Lightning distillation LoRA (`.safetensors`). Applied as a runtime F32 side-path next to each targeted projection (`y = W_quant·x + b + (alpha/rank)·up·(down·x)`) with the quantized base weights left untouched — **not** merged into them. Auto-derives the step count from the file name (e.g. 4 or 8), switches CFG to 1.0 and pins the timestep shift to 3, so the default 30 steps × 2 CFG passes (60 DiT forwards) become 4–8. Needs the whole-model or fused per-block CUDA forward — on a path without the side-path it throws rather than emitting noise. Env: `TS_QWEN_IMAGE_LORA`. |
+| `--width <px>` / `--height <px>` | Output size for Qwen-Image-Edit and Wan video. Default: `0` — auto (Qwen-Image-Edit: the source size, VRAM-clamped; Wan: the model's native area at the input image's aspect ratio, 1280×704 for TI2V-5B and 832×480 otherwise). |
 | `--video-frames <N>` | Wan video frame count, snapped to `4k+1` (default: 33; 49 for Wan2.2-TI2V). `1` generates a still image (use `--output out.png`). |
 | `--fps <N>` | Wan video playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). |
 | `--flow-shift <F>` | Wan FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1). |
 | `--sampler <name>` | Wan sampler: `unipc` (official Wan sampler, default) or `euler`. |
 | `--negative-prompt <text>` | Wan negative prompt (default: the official Wan negative prompt). |
+| _(step-distilled checkpoints)_ | Auto-detected from the DiT file name (`Turbo`, `distill`, `Lightning`, `lightx2v`, `FastWan`, `-dmd`, or an explicit `…-4steps-…` / `…8step…` for 1–16): the pipeline switches to that step count with guidance off, turning the official 50-step × CFG recipe's 100 DiT passes into 4. This is the single biggest speed lever for Wan — see **[Video generation (Wan)](#video-generation-wan)** below. `--diffusion-steps` / `--cfg` override it. |
 | `--cfg-cache-stride <N>` | Wan guidance cache: run the unconditional CFG pass on one step in `N` and reuse the cached guidance direction in between (default off — every step runs both passes). `2` ≈ 1.30x faster, `3` ≈ 1.43x; approximate, so leave it off when matching a reference sample matters. |
 | `--wan-vae <path>` | Override the resolved Wan video VAE (`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`). Env: `TS_WAN_VAE`. |
 | `--wan-te <path>` | Override the resolved UMT5-XXL text-encoder GGUF. Env: `TS_WAN_TE`. Wan 2.2 A14B additionally resolves the second high/low-noise expert automatically (env: `TS_WAN_DIT2`). |
@@ -377,9 +381,12 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/Wan2.2-TI2
     --video-frames 121 --fps 24
 
 # 121 frames at the TI2V-5B native area is 27k DiT tokens, and self-attention is
-# quadratic in that, so a full 50-step run is hours on a laptop-class GPU. The
-# server logs a per-pass timing plus a running ETA and heartbeats every 30 s, and
-# the Web UI shows both; see docs/models/wan.md for the cost table and the knobs.
+# quadratic in that, so a full 50-step run on the BASE checkpoint is hours on a
+# laptop-class GPU (measured: ~3 h 30 m on an M5 Pro). Point --model at a
+# step-distilled checkpoint instead and the identical request takes 17 m 30 s --
+# nothing else changes. See "Video generation (Wan)" below.
+# The server logs a per-pass timing plus a running ETA and heartbeats every 30 s,
+# and the Web UI shows both; docs/models/wan.md has the full cost table.
 
 # Configure server-wide default sampling parameters
 # (used whenever a request does not override the value itself)
@@ -445,7 +452,7 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
 | `--prefill-chunk-size <N>` | Chunked-prefill granularity under contention — the maximum prefill tokens scheduled per step while other requests are running, so parallel decodes get frequent turns at the GPU (default: `1024`). Env: `TS_SCHED_PREFILL_CHUNK`. |
-| `--mtp-spec` / `--no-mtp-spec` | Enable NextN/MTP speculative decoding (default off) on models that ship a multi-token-prediction draft head (Qwen 3.6's embedded NextN block, or a Gemma 4 `gemma4-assistant` draft loaded via `--mtp-draft-model`). Engages for solo (non-concurrent) sequences: the draft head proposes up to `--mtp-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode. Engaged automatically only where profitable (ggml backends and the pure-C# `cuda` backend); CPU / MLX serve standard decode. Env: `TS_MTP_SPEC`. |
+| `--mtp-spec` / `--no-mtp-spec` | Enable NextN/MTP speculative decoding (default off) on models that ship a multi-token-prediction draft head (Qwen 3.6's embedded NextN block, or a Gemma 4 `gemma4-assistant` draft loaded via `--mtp-draft-model`). Engages for solo (non-concurrent) sequences: the draft head proposes up to `--mtp-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode. Engaged automatically only where profitable: Qwen 3.6 reports its embedded NextN block profitable on every backend, while Gemma 4's separate draft head engages on the ggml backends and on the direct `cuda` backend only. CPU / GGML CPU / MLX serve standard decode. Env: `TS_MTP_SPEC`. |
 | `--mtp-draft <N>` | Maximum tokens drafted per speculative step (default `8`). Env: `TS_MTP_DRAFT`. |
 | `--mtp-pmin <f>` | Minimum draft confidence in `(0, 1]` for a drafted token to be kept; drafting stops at the first low-confidence token. Default: chosen per drafter kind — `0.75` for a per-token draft head (top-1 probability over its top-10 logits), `0.35` for a block drafter, where the gate is the CUMULATIVE prefix probability and so the same number means something far stricter. Env: `TS_MTP_PMIN`. |
 | `--draft-model <path>` | Speculative-decoding draft model for architectures whose drafter ships as its own file: DeepSeek V4's DSpark support GGUF (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)) and Muse-Glimmer's DFlash drafter (see [Muse-Glimmer](docs/models/muse-glimmer.md#3-dflash-speculative-decoding), env `TS_MUSE_GLIMMER_DFLASH`). Either one drafts a whole block per step and the trunk verifies it in one batched forward, so greedy output is unchanged. Engages on every single-sequence CLI path — `--input`, `--multi-turn-jsonl` and `--interactive` — with `--backend cuda` or `--backend ggml_cuda`. On the CLI it needs a pure-argmax sampler (any temperature, top-k/p or repetition penalty turns it off, because the standalone decoder verifies with argmax). `TensorSharp.Server` accepts the same flag alongside `--mtp-spec`, where verification runs the request's own sampler and so composes with any sampling settings. Env: `TS_DSV4_DSPARK`. |
@@ -588,6 +595,166 @@ server-wide flags and env vars for parameters it sends, and they still fill in
 the rest. Either way `--stop` sequences pinned on the server stay in force under
 `config` (merged with the request's) and are replaced by the request under
 `request`.
+
+## Video generation (Wan)
+
+A `wan` GGUF turns a prompt — plus an optional first-frame image on the Wan 2.2
+models — into an H.264 MP4, from `TensorSharp.Cli`, the server's three video
+endpoints, and the Web UI chat. Full architecture detail is in the
+[Wan card](docs/models/wan.md); this section is the operator's view: which
+checkpoint to download, and which knobs actually change the wall clock.
+
+### Which checkpoint
+
+| Family | Latent | Modes | Notes |
+|---|---|---|---|
+| Wan 2.2 TI2V-5B | 48 ch, 16×16×4 (`Wan2.2_VAE.safetensors`) | T2V + I2V | dense 5B, 24 fps, natively 720p; ~2.7× fewer DiT tokens than Wan 2.1 at the same resolution, so it is both the fastest and the highest-quality option on consumer GPUs |
+| Wan 2.2 A14B (T2V / I2V) | 16 ch (36 ch I2V input), `wan_2.1_vae.safetensors` | T2V + I2V | two 14B experts switched at a timestep boundary; **both** expert GGUFs must be present (same folder, or `HighNoise/` + `LowNoise/`) |
+| Wan 2.1 T2V (1.3B / 14B) | 16 ch, `wan_2.1_vae.safetensors` | T2V | single DiT |
+
+Every family also needs the UMT5-XXL text encoder
+(`umt5-xxl-encoder-Q8_0.gguf`) and the matching video VAE. All three companions
+are resolved from the DiT's own directory, subfolders such as `VAE/`,
+`HighNoise/` and `LowNoise/` included, so one `--local-dir` is enough;
+`--wan-vae` / `--wan-te` (and `TS_WAN_DIT2` for the second A14B expert)
+override the search.
+
+Wan is the one family that rejects a backend outright: it runs on `ggml_cuda`,
+`ggml_vulkan`, `ggml_metal`, `ggml_cpu`, `cuda` and `cpu`, and **not** on
+`--backend mlx`. `ggml_cuda` is the fastest (RTX 2000 Ada, Wan2.1-1.3B F16,
+832×480×33f, 30 steps: `ggml_cuda` 12.0 s/step vs `ggml_vulkan` 17.2 and direct
+`cuda` 19.3); `cpu` / `ggml_cpu` are for functional use only.
+
+### The fast lane: step-distilled checkpoints
+
+**This is the single biggest speed lever in Wan, and it costs nothing but a
+different download.** The official Wan2.2-TI2V-5B recipe is 50 steps × 2
+classifier-free-guidance passes = **100 DiT passes**. A step-distilled
+checkpoint (Turbo / Lightning / FastWan / DMD) is trained to run guidance-free
+in a handful of steps, so the same video costs **4 DiT passes** — 1/25th of the
+denoising work.
+
+TensorSharp detects one from the DiT **file name**: any of `turbo`, `distill`,
+`lightning`, `lightx2v`, `fastwan`, `-dmd` (case-insensitive), or an explicit
+`<N>steps` / `<N>_steps` token for 1 ≤ N ≤ 16, which wins over the markers. A
+marker with no step count means 4. On load the console prints
+
+```
+step-distilled checkpoint detected -> 4 steps, guidance off (--diffusion-steps / --cfg override)
+```
+
+so you can confirm from the log that it fired. No flag is involved — a distilled
+GGUF is passed as an ordinary `--model`.
+
+Measured on an M5 Pro (20-core GPU, 48 GB unified), `ggml_metal`,
+Wan2.2-TI2V-5B Q8_0, 1088×832×121f = 27 404 tokens, image-to-video — i.e. the
+full five-second 720p-class request:
+
+| | Base checkpoint | **Turbo checkpoint** |
+|---|---|---|
+| DiT passes | 100 (50 steps × CFG) | **4** (4 steps, guidance-free) |
+| per pass | 120.2 s | 120.2 s |
+| denoise total | 12 020 s | **481 s** |
+| VAE decode, 121 frames | 563 s | 563 s |
+| **end to end** | **≈ 3 h 30 m** | **17 m 30 s** |
+
+Only the `--model` path changes between those two columns. Once distilled, the
+VAE decode is the bottleneck (~55% of the run), not the DiT.
+
+Getting one (TI2V-5B — note the file names spell the version with an
+**underscore**, `Wan2_2`, unlike the base repo):
+
+```bash
+pip install -U huggingface_hub
+hf download hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --local-dir models
+# the Turbo repo ships no VAE and no text encoder — take them from the base repos
+hf download QuantStack/Wan2.2-TI2V-5B-GGUF VAE/Wan2.2_VAE.safetensors --local-dir models
+hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --backend ggml_metal --image first_frame.png --output out.mp4 \
+    --prompt "the cat runs toward the camera, cinematic tracking shot" \
+    --video-frames 121 --fps 24
+
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
+    --backend ggml_metal --video-frames 121 --fps 24
+```
+
+For Wan 2.2 I2V-A14B the drop-in distilled GGUFs are
+[jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF](https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF),
+which ships the distillation already merged into both experts under `high_noise/`
+and `low_noise/`; download both and point `--model` at either one. It ships no
+VAE and no text encoder, so take `VAE/Wan2.1_VAE.safetensors` from
+[QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF)
+and the UMT5-XXL encoder as above.
+
+> [lightx2v/Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning)
+> publishes LoRA `.safetensors` only, and TensorSharp has no Wan LoRA option —
+> use a repo that ships the distillation already baked into the GGUF.
+
+### `--cfg-cache-stride` (base checkpoints only)
+
+A guided step is `v = v_cond + (cfg-1)·d` with `d = v_cond - v_uncond`. The
+guidance direction `d` changes far more slowly across the schedule than `v`
+does, so `--cfg-cache-stride N` runs the unconditional pass on one step in `N`
+and reuses the cached `d` in between. At 50 steps, `2` runs 77 of the 100 passes
+(**1.30×**) and `3` runs 70 (**1.43×**). The first three steps and the last
+always recompute `d`. Server JSON field: `"cfgCacheStride": 2`.
+
+It is an approximation — leave it off when matching a reference sample matters —
+and it is pointless on a step-distilled checkpoint, which already runs
+guidance-free (the cache is disabled whenever cfg ≤ 1.0).
+
+### Making a large request cheaper, in order of effect
+
+1. **Use a step-distilled checkpoint.** 100 DiT passes become 4; this dwarfs
+   everything else.
+2. **Fewer frames.** 121 → 61 roughly quarters the attention work (token count
+   is `latent_frames × (h/2) × (w/2)` and self-attention is `O(tokens²)`) and
+   halves the VAE decode.
+3. **Smaller frame area** — but not below Wan's training resolutions. Under
+   ~0.3 MP the model is out of distribution and the video gets *worse*, not just
+   cheaper; the pipeline warns below that. Wan is trained at 480p (832×480) and
+   720p (1280×704), so generate at a supported size and downscale afterwards.
+4. **Fewer steps**, base checkpoints only — 30 instead of the official 50 is
+   visibly close and 1.7× cheaper.
+5. **`--cfg-cache-stride 2` or `3`** — 1.30× / 1.43×, base checkpoints only.
+
+Resolution against wall clock on the same M5 Pro, same Turbo checkpoint and
+image:
+
+| Output | Tokens | Denoise | VAE decode | **Total** |
+|---|---|---|---|---|
+| 736×544 × 81f (3.4 s, 480p class) | 8 211 | 84 s | 159 s | **4 m 09 s** |
+| 736×544 × 121f (5 s, 480p class) | 12 121 | 137 s | 237 s | **6 m 19 s** |
+| 1088×832 × 121f (5 s, 720p class) | 27 404 | 481 s | 563 s | **17 m 30 s** |
+
+480p (≈0.4 MP) is a resolution Wan is *trained* at, so the first two rows are
+in-distribution rather than a degraded mode — that is the setting to reach for
+when a few minutes matters.
+
+### Server defaults
+
+`--video-frames N` and `--fps N` set server-wide **defaults**, not caps, for the
+Web UI and all three video endpoints; a request that supplies `frames` or `fps`
+overrides each independently. With both omitted the model recipe applies: 49
+frames at 24 fps for Wan2.2-TI2V, 33 at 16 fps otherwise. Frame counts are
+snapped to the VAE's `4k+1` temporal grid. Keep the model's native FPS and change
+the frame count to change duration — changing only FPS changes playback speed.
+
+### Other Wan knobs
+
+These exist for A/B and debugging; all of them make things slower except where
+noted. `TS_WAN_DIT_KV_F16=0` restores F32 attention keys/values (F16 is the
+default and is 2.02× faster at 27 k tokens, with no measurable accuracy cost);
+`TS_WAN_VAE_MPS_CONV=0` restores ggml's im2col+GEMM conv lowering on Metal
+(MPSGraph is the default and took a 736×544×81f VAE decode from 159 s to 80 s);
+`TS_WAN_VAE_GEMM_MAX_MB` sets the im2col budget and `TS_WAN_VAE_TILE=0` disables
+tiling; `TS_WAN_DIT_CAPTURE=0` disables the persistent CUDA-graph-captured DiT
+graph; `TS_WAN_DIT_FLASH=0` forces materialized attention;
+`TS_WAN_HEARTBEAT_S` sets the progress tick interval (default 30 s, `0`
+silences it); `TS_FFMPEG` points at the `ffmpeg` used for near-lossless CRF 17
+H.264 export.
 
 ## Mixture-of-Experts CPU offload (`--n-cpu-moe`)
 

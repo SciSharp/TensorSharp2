@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文本与 LLM 模型 — TensorSharp 维基</title>
+  <meta name="description" content="十种文本架构的下载与运行示例，以及多模态输入、思考模式与工具调用。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="models-text">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › <a href="models_zh-cn.html">支持的模型</a> › 文本与 LLM 模型</div>
+  <h1>文本与 LLM 模型</h1>
+  <p class="lede">每种文本架构的下载与运行命令，随后是它们共享的能力：图像、音频与 PDF 输入，思考模式，以及工具调用。</p>
+
+  <h2 id="download-run">下载并运行</h2>
+  <p>运行构建命令前，请先<a href="getting-started_zh-cn.html#install-dotnet">按平台安装并验证 .NET 10 SDK</a>。第一个代码块是已验证的 Gemma 4 E4B 快速上手。所有代码块都使用 Hugging Face CLI（<code>pip install -U huggingface_hub</code>）；其后的各家族代码块假定已完成完整源码构建。从仓库根目录运行；先把问题写入 <code>prompt.txt</code>，并按硬件把 <code>ggml_cuda</code> 换成 <code>ggml_metal</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>。</p>
+
+  <h3 id="gemma4-fast-lane">约 30 秒快速上手：Gemma 4 E4B Q8_0（原生 GGML）</h3>
+  <p>复制并运行这些命令约需 30 秒；7.48 GiB 的模型下载与首次 restore/构建耗时更长，取决于网络与机器。仓库基准已经验证 TensorSharp 的 E4B Q8_0 家族与执行路径；链接的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org 仓库</a>是推荐下载源。下面的代码块面向 Linux + NVIDIA：</p>
+  <pre data-lang="bash"><code>hf download ggml-org/gemma-4-E4B-it-GGUF gemma-4-E4B-it-Q8_0.gguf --local-dir models
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
+echo "请说明本地推理的价值。" &gt; prompt.txt
+
+# 纯文本不需要 mmproj。
+dotnet run --project TensorSharp.Cli -c Release --no-build -- --model models/gemma-4-E4B-it-Q8_0.gguf \
+    --input prompt.txt --max-tokens 300 --backend ggml_cuda
+dotnet run --project TensorSharp.Server -c Release --no-build -- --model models/gemma-4-E4B-it-Q8_0.gguf \
+    --backend ggml_cuda</code></pre>
+  <p>Apple Silicon 请省略 CUDA 环境变量并使用 <code>ggml_metal</code>；受支持的 Windows/Linux Vulkan GPU 请改为请求 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> 并使用 <code>ggml_vulkan</code>。图像、视频或音频输入还需运行 <code>hf download ggml-org/gemma-4-E4B-it-GGUF mmproj-gemma-4-E4B-it-Q8_0.gguf --local-dir models</code>，并传入 <code>--mmproj models/mmproj-gemma-4-E4B-it-Q8_0.gguf</code>。服务端的浏览器界面位于 <code>http://localhost:5000/index.html</code>。Windows PowerShell 与完整平台语法见<a href="getting-started_zh-cn.html#e4b-fast-lane">快速开始</a>。</p>
+
+  <h3 id="deepseek4">DeepSeek V4 Flash（284B MoE，文本、思考、工具、DSpark）</h3>
+  <p>一个 284B 的专家混合模型，配备 128 token 的原始滑动窗口加块压缩注意力（官方宣称 1M 上下文）。它<em>不</em>走通用的逐算子前向：TensorSharp 通过三套专属的整模型执行器之一运行它 —— <code>--backend cuda</code>（Direct CUDA，不依赖 ggml）、<code>--backend ggml_cuda</code> / <code>ggml_vulkan</code>（原生 ggml），以及 <code>--backend cpu</code>（100% 纯 C#，零原生依赖）。三者都会把权重按层切分到所有可见 GPU，因此远大于单卡显存的模型依然跑得起来；<code>--tp N</code>（或 <code>TS_DSV4_NGPU</code>）用来限制使用几张卡。</p>
+  <pre data-lang="bash"><code># Q8 档位约需 160 GB 权重 —— 显存不足时改用更小的量化子目录
+hf download unsloth/DeepSeek-V4-Flash-0731-GGUF --include "UD-Q8_K_XL/*" --local-dir models
+hf download bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF DSpark-drafter-Q2K-Q8-0731.gguf --local-dir models
+
+# 普通 decode —— --model 指向第一个分片
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    --backend ggml_cuda --input prompt.txt --max-tokens 200
+
+# DSpark 块级投机解码（decode 约 1.3-1.4×；需要贪心采样）
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    --backend ggml_cuda --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf \
+    --input prompt.txt --max-tokens 200 --temperature 0
+
+# 通过 HTTP 服务，4 张 GPU，开启投机
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
+    --backend ggml_cuda --tp 4 --mtp-spec --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf</code></pre>
+  <p>DSpark 每步起草一整<em>块</em> token，主干用一次批量前向验证整块，因此贪心输出保持不变。在 CLI 上它需要纯 argmax 采样（任何 temperature、top-k/p 或惩罚项都会将其关闭）；在服务端每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。详见 <a href="advanced_zh-cn.html#dspark">DSpark 投机解码</a>。</p>
+
+  <h3 id="gemma3">Gemma 3（文本 + 图像）</h3>
+  <pre data-lang="bash"><code>hf download ggml-org/gemma-3-4b-it-GGUF gemma-3-4b-it-Q4_K_M.gguf --local-dir models
+hf download ggml-org/gemma-3-4b-it-GGUF mmproj-model-f16.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/gemma-3-4b-it-Q4_K_M.gguf --mmproj models/mmproj-model-f16.gguf --input prompt.txt --max-tokens 300 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/gemma-3-4b-it-Q4_K_M.gguf --mmproj models/mmproj-model-f16.gguf --backend ggml_cuda</code></pre>
+
+  <h3 id="qwen3">Qwen 3（文本、思维链、工具）</h3>
+  <pre data-lang="bash"><code>hf download Qwen/Qwen3-4B-GGUF Qwen3-4B-Q4_K_M.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Qwen3-4B-Q4_K_M.gguf --input prompt.txt --think --max-tokens 400 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Qwen3-4B-Q4_K_M.gguf --backend ggml_cuda</code></pre>
+
+  <h3 id="qwen35">Qwen 3.5 / 3.6（文本 + 图像、思维链、工具；3.6 支持 NextN MTP）</h3>
+  <pre data-lang="bash"><code>hf download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-UD-Q4_K_XL.gguf --local-dir models
+hf download unsloth/Qwen3.5-9B-GGUF mmproj-F16.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Qwen3.5-9B-UD-Q4_K_XL.gguf --mmproj models/mmproj-F16.gguf \
+    --image photo.png --max-tokens 300 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Qwen3.5-9B-UD-Q4_K_XL.gguf --mmproj models/mmproj-F16.gguf --backend ggml_cuda</code></pre>
+  <p>Qwen 3.6 NextN 必须从保留该块的 <code>-MTP-</code> 仓库下载，并在<em>服务端</em>加入 <code>--mtp-spec</code>；基础仓库 GGUF 会剥离 NextN 块并回退到标准解码：</p>
+  <pre data-lang="bash"><code>hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --local-dir models
+
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --mtp-spec</code></pre>
+
+  <h3 id="gptoss">GPT OSS（文本、始终思考、工具）</h3>
+  <pre data-lang="bash"><code>hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/gpt-oss-20b-MXFP4.gguf --input prompt.txt --max-tokens 400 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/gpt-oss-20b-MXFP4.gguf --backend ggml_cuda</code></pre>
+
+  <h3 id="nemotron">Nemotron-H（文本；Omni 分发支持图像）</h3>
+  <pre data-lang="bash"><code>hf download bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf --input prompt.txt \
+    --think --max-tokens 400 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf --backend ggml_cuda</code></pre>
+  <p>图像输入请改用上表 Nemotron 3 Nano Omni GGUF 与 <code>mmproj-BF16.gguf</code>。当前 GGUF 分发未附真实音频推理所需的 Parakeet audio mmproj。</p>
+
+  <h3 id="mistral3">Mistral 3（文本 + 图像）</h3>
+  <pre data-lang="bash"><code>hf download bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf --local-dir models
+hf download bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf \
+    --mmproj models/mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf \
+    --image photo.png --max-tokens 300 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf \
+    --mmproj models/mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf --backend ggml_cuda</code></pre>
+
+  <h3 id="muse-glimmer">Muse-Glimmer（文本 + 图像、思维链、工具、DFlash 起草）</h3>
+  <pre data-lang="bash"><code>hf download unsloth/Muse-Glimmer-30B-GGUF Muse-Glimmer-30B-UD-IQ2_XXS.gguf --local-dir models
+hf download unsloth/Muse-Glimmer-30B-GGUF mmproj-Muse-Glimmer-30B-Q8_0.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
+    --input prompt.txt --max-tokens 256 --backend ggml_cuda
+# 图像理解
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
+    --mmproj models/mmproj-Muse-Glimmer-30B-Q8_0.gguf --image photo.png --input question.txt \
+    --max-tokens 300 --backend ggml_cuda
+# DFlash 投机解码（草稿 GGUF 可从同仓库下载）
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
+    --draft-model models/dflash-kquant.gguf --spec-draft-n-max 15 --input prompt.txt --backend ggml_cuda</code></pre>
+
+  <h3 id="diffusiongemma">DiffusionGemma（分块文本扩散）</h3>
+  <pre data-lang="bash"><code>hf download unsloth/diffusiongemma-26B-A4B-it-GGUF diffusiongemma-26B-A4B-it-Q4_K_M.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --input prompt.txt \
+    --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_cuda</code></pre>
+
+  <h2 id="multimodal">多模态支持</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>家族</th><th>输入</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>Gemma 4</td><td>图像 · 视频 · 音频</td><td>图像 PNG/JPEG/HEIC；视频 MP4（经 OpenCV 以 1 fps 采样）；音频 WAV 16 kHz 单声道 / MP3 / OGG。E4B 投影器：<code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code>。</td></tr>
+      <tr><td>Gemma 3</td><td>图像</td><td>PNG / JPEG / HEIC。非 gated 4B 投影器：<code>mmproj-model-f16.gguf</code>。</td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>图像</td><td>动态分辨率视觉编码器；9B / 3.6 仓库使用 <code>mmproj-F16.gguf</code>。</td></tr>
+      <tr><td>Mistral 3</td><td>图像</td><td>Pixtral 视觉编码器。投影器：<code>mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf</code>。</td></tr>
+      <tr><td>Muse-Glimmer</td><td>图像</td><td>50 层稀疏窗口 ViT，采用 2D RoPE 与 2×2 像素混洗；图像按 llama.cpp 相同的方式选定网格后直接拉伸（不填充、不切块）。投影器：<code>mmproj-Muse-Glimmer-30B-Q8_0.gguf</code>。</td></tr>
+      <tr><td>Nemotron-H (Omni)</td><td>图像</td><td>RADIO / v2_vl ViT 编码器。传入匹配的 <code>--mmproj</code>；图像 token 在 <code>&lt;image&gt;</code> 占位处展开。当前 GGUF 分发未附真实音频推理需要的 Parakeet mmproj。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>通过 <a href="cli_zh-cn.html#examples">CLI</a>（<code>--image</code>、<code>--video</code>、<code>--audio</code>、<code>--pdf</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 上传，或 <a href="http-api_zh-cn.html">HTTP API</a>（Ollama 用 base64 <code>images</code> 数组，OpenAI 用 <code>image_url</code> data URI）发送文件。数字版 PDF 会提取文本；扫描版 PDF 会转换为页面图像并需要视觉模型。</p>
+
+  <h2 id="thinking">思考 / 推理模式</h2>
+  <p>具备思考能力的模型（Qwen 3、Qwen 3.5/3.6、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、Muse-Glimmer）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
+  <ul>
+    <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签。</li>
+    <li><strong>Gemma 4</strong> —— <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> 标签。</li>
+    <li><strong>GPT OSS</strong> —— Harmony 格式：<code>&lt;|channel|&gt;analysis</code> 用于思考，<code>&lt;|channel|&gt;final</code> 用于答案。</li>
+    <li><strong>DeepSeek V4</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签；不显式开启思考时聊天模板会立即闭合该块，因此推理是按需启用的。</li>
+    <li><strong>Muse-Glimmer</strong> —— 聊天模板输出的 <code>assistant to=self</code> 推理通道。</li>
+  </ul>
+  <p>通过 <code>--think</code>（CLI）、<code>"think": true</code>（Ollama API / Web UI）或浏览器中的思考开关启用。响应会单独暴露推理 —— 例如 Ollama 聊天响应中的 <code>message.thinking</code>。</p>
+
+  <h2 id="toolcalling">工具调用 / 函数调用</h2>
+  <p>模型可以调用用户自定义工具，并参与多轮工具调用对话。将工具定义为 JSON，通过 <code>--tools</code>（CLI）或 <code>tools</code> 参数（API）传入。每个架构使用各自的线格式，但输出解析器都会将调用提取为结构化 <code>tool_calls</code>：</p>
+  <ul>
+    <li><strong>Qwen 3 / Nemotron-H</strong> —— <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Qwen 3.5 / 3.6</strong> —— 同样是 <code>&lt;tool_call&gt;</code> 块，但内容为 XML：<code>&lt;function=NAME&gt;&lt;parameter=key&gt;value&lt;/parameter&gt;&lt;/function&gt;</code>（JSON 形式仍被接受）。</li>
+    <li><strong>Gemma 4</strong> —— <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
+    <li><strong>GPT OSS (Harmony)</strong> —— 工具以 TypeScript 命名空间声明；调用在 commentary 通道发出。</li>
+    <li><strong>DeepSeek V4</strong> —— DSML 标记：系统提示词负责讲解语法并携带每个函数的 JSON schema，模型以 <code>&lt;｜DSML｜tool_calls&gt;&lt;｜DSML｜invoke name="NAME"&gt;&lt;｜DSML｜parameter name="key" string="true|false"&gt;value&lt;/｜DSML｜parameter&gt;…</code> 作答。</li>
+    <li><strong>Muse-Glimmer</strong> —— 聊天模板声明的 ATEM XML 标记；解析器会把调用提取成同样的结构化 <code>tool_calls</code>。</li>
+  </ul>
+  <p>完整的请求/响应示例与续接循环见 <a href="http-api_zh-cn.html#tools">通过 HTTP 进行工具调用</a>。</p>
+
+  <div class="content-footer">
+    <a href="models-downloads_zh-cn.html">← 模型下载</a>
+    <a href="models-image_zh-cn.html">下一篇：图像生成 →</a>
+  </div>
+</main>
+</body>
+</html>

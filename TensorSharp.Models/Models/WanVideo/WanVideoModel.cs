@@ -78,6 +78,34 @@ namespace TensorSharp.Models.WanVideo
         internal GgufFile HighNoiseGguf { get; }
         internal GgufFile LowNoiseGguf { get; }
 
+        /// <summary>
+        /// Denoising steps a step-distilled checkpoint was trained for; 0 for an
+        /// ordinary one. Step distillation (Wan2.2-TI2V-5B-Turbo, Wan2.2-Lightning,
+        /// lightx2v, FastWan/DMD) is the difference between a 5-second 720p video
+        /// costing 100 DiT passes and costing 4, so the pipeline has to notice — run
+        /// a distilled checkpoint on the 50-step CFG recipe and it is 25x slower for
+        /// a worse picture, since these models are also trained to run WITHOUT
+        /// classifier-free guidance.
+        /// </summary>
+        public int DistilledSteps { get; }
+
+        /// <summary>
+        /// Steps a distilled Wan checkpoint/LoRA advertises in its file name.
+        /// "…-4steps-…" / "…8step…" wins; otherwise a distillation marker implies the
+        /// 4 steps every published Wan 2.2 distillation recommends.
+        /// </summary>
+        internal static int ParseDistilledSteps(string fileName)
+        {
+            if (string.IsNullOrEmpty(fileName)) return 0;
+            string n = Path.GetFileNameWithoutExtension(fileName).ToLowerInvariant();
+            bool marker = n.Contains("turbo") || n.Contains("distill") || n.Contains("lightning")
+                          || n.Contains("lightx2v") || n.Contains("fastwan") || n.Contains("-dmd");
+            var m = System.Text.RegularExpressions.Regex.Match(n, @"(\d+)\s*_?steps?\b");
+            if (m.Success && int.TryParse(m.Groups[1].Value, out int s) && s > 0 && s <= 16)
+                return s;
+            return marker ? 4 : 0;
+        }
+
         public WanVideoModel(string ggufPath, BackendType backend) : base(ggufPath, backend)
         {
             if (backend is not (BackendType.GgmlCuda or BackendType.GgmlCpu or BackendType.GgmlMetal
@@ -147,7 +175,12 @@ namespace TensorSharp.Models.WanVideo
                 new[] { "umt5-xxl-encoder-Q8_0.gguf" },
                 n => (n.Contains("umt5") || n.Contains("t5xxl") || n.Contains("t5-xxl")) && n.EndsWith(".gguf"));
 
+            DistilledSteps = ParseDistilledSteps(Path.GetFileName(ggufPath));
+
             Console.WriteLine($"Wan video ({Variant}): DiT={Path.GetFileName(ggufPath)}");
+            if (DistilledSteps > 0)
+                Console.WriteLine($"  step-distilled checkpoint detected -> {DistilledSteps} steps, guidance off " +
+                                  $"(--diffusion-steps / --cfg override)");
             if (_dit2Path != null)
                 Console.WriteLine($"  expert #2    = {_dit2Path}");
             Console.WriteLine($"  VAE          = {_vaePath ?? "<missing>"}");

@@ -6126,8 +6126,8 @@ namespace TensorSharp.Models
             if (arch is not ("wan" or "wan2.1" or "wan2.2"))
                 return;
 
-            // Wan rendered NaN - a uniformly black frame - on Metal whenever ggml
-            // routed mul_mm through the Metal 4 tensor API. Diagnosis (2026-08-13):
+            // Wan renders NaN - uniformly black frames - on Metal whenever ggml
+            // routes mul_mm through the Metal 4 tensor API. Diagnosis (2026-08-13):
             // the corruption is confined to the VAE's conv GEMMs. The tensor-API
             // mul_mm intermittently misreads operand columns there on the FIRST
             // pass over a graph (M5, macOS 26.6) - buffer-layout dependent (32x32
@@ -6139,6 +6139,13 @@ namespace TensorSharp.Models
             // never corrupt - an upstream ggml-metal/driver defect, and has_tensor
             // is a device-level property fixed at init, so the kernel choice
             // cannot be scoped per-op.
+            //
+            // Re-verified 2026-08-17 that this is NOT yet fixed, and how easy it is
+            // to conclude otherwise: an isolated WanVideoBench decode of synthetic
+            // latents at five shapes - including the 32x32 all-NaN repro - matched
+            // the non-tensor decode to 91-93 dB PSNR with no NaN. The next full
+            // 1088x832x121f generation with the tensor API on produced 121 BLACK
+            // frames. Only an end-to-end video decides this.
             //
             // With the tensor API on, the VAE stays CORRECT because
             // ggml_ops_wan.cpp routes its convs through ggml_conv_2d_direct on
@@ -6155,7 +6162,7 @@ namespace TensorSharp.Models
             // models (patch_embedding oc >= 5120), disabled for smaller ones.
             // TS_WAN_METAL_TENSOR_API=1/0 forces either way. When upstream fixes
             // the tensor-API mul_mm, enable it everywhere and drop the direct-conv
-            // carve-out.
+            // carve-out - and confirm with a full video, not a decode probe.
             long dim = 0;
             if (probe.Tensors.TryGetValue("patch_embedding.weight", out var patch) && patch.Shape.Length >= 5)
                 dim = (long)patch.Shape[4];

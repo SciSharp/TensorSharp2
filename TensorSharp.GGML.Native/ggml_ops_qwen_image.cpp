@@ -257,9 +257,13 @@ TSG_EXPORT int TSGgml_QwenVaeRun(const TSGgmlQwenVaeDesc* d)
                     const long long oh = (x->ne[1] + 2LL * p1 - op.kh) / op.sh + 1;
                     const long long ow = (x->ne[0] + 2LL * p0 - op.kw) / op.sw + 1;
                     const long long im2col = static_cast<long long>(op.ic) * op.kh * op.kw * oh * ow * 2;
-                    ggml_tensor* y = im2col <= kIm2colBudget
-                        ? ggml_conv_2d(ctx, ker, x, op.sw, op.sh, p0, p1, 1, 1)
-                        : ggml_conv_2d_direct(ctx, ker, x, op.sw, op.sh, p0, p1, 1, 1);
+                    // With MPSGraph/cuDNN available the convolution is executed
+                    // whole, so emit the un-lowered node and skip im2col entirely.
+                    ggml_tensor* y = tsg::fast_conv_enabled()
+                        ? ggml_conv_2d_direct(ctx, ker, x, op.sw, op.sh, p0, p1, 1, 1)
+                        : (im2col <= kIm2colBudget
+                            ? ggml_conv_2d(ctx, ker, x, op.sw, op.sh, p0, p1, 1, 1)
+                            : ggml_conv_2d_direct(ctx, ker, x, op.sw, op.sh, p0, p1, 1, 1));
                     if (op.b >= 0)
                     {
                         ggml_tensor* bt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, op.oc);
@@ -355,7 +359,10 @@ TSG_EXPORT int TSGgml_QwenVaeRun(const TSGgmlQwenVaeDesc* d)
         ggml_backend_tensor_set(input, d->input,
             0, static_cast<std::size_t>(d->in_w) * d->in_h * d->in_c * sizeof(float));
 
-        if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
+        const ggml_status vaeSt = tsg::fast_conv_enabled()
+            ? tsg::graph_compute_fast_conv(graph, "qwen-image vae")
+            : ggml_backend_graph_compute(g_backend, graph);
+        if (vaeSt != GGML_STATUS_SUCCESS)
         { set_last_error("QwenVaeRun: graph compute failed."); return 0; }
         ggml_backend_synchronize(g_backend);
         ggml_backend_tensor_get(out, d->output, 0, static_cast<std::size_t>(d->out_len) * sizeof(float));

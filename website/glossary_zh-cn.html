@@ -34,9 +34,9 @@
       <tr><td><strong>TTFT</strong></td><td>“首 token 时间” —— 答案开始流式输出前需多久。KV 缓存复用会在后续轮次降低它。</td></tr>
       <tr><td><strong>后端（Backend）</strong></td><td>运行数学运算的硬件路径：CPU、NVIDIA GPU（CUDA）、任何 Vulkan GPU（AMD/Intel/NVIDIA）或 Apple Silicon GPU（Metal/MLX）。→ <a href="backends_zh-cn.html">后端</a></td></tr>
       <tr><td><strong>MoE</strong>（专家混合）</td><td>一种把每个 token 路由到少数几个专门子网络（“专家”）而非整张网络的模型，以更低的每 token 计算获得更大容量。</td></tr>
-      <tr><td><strong>多模态（Multimodal）</strong></td><td>能接收文本以外的输入 —— 图像、音频或视频。→ <a href="models_zh-cn.html#multimodal">多模态</a></td></tr>
-      <tr><td><strong>思考 / 推理</strong></td><td>模型在最终答案前产生隐藏的逐步推理；TensorSharp 将两者分离。→ <a href="models_zh-cn.html#thinking">思考模式</a></td></tr>
-      <tr><td><strong>工具 / 函数调用</strong></td><td>模型可请求你的应用运行一个函数（如 “get_weather”）并使用结果。→ <a href="models_zh-cn.html#toolcalling">工具调用</a></td></tr>
+      <tr><td><strong>多模态（Multimodal）</strong></td><td>能接收文本以外的输入 —— 图像、音频或视频。→ <a href="models-text_zh-cn.html#multimodal">多模态</a></td></tr>
+      <tr><td><strong>思考 / 推理</strong></td><td>模型在最终答案前产生隐藏的逐步推理；TensorSharp 将两者分离。→ <a href="models-text_zh-cn.html#thinking">思考模式</a></td></tr>
+      <tr><td><strong>工具 / 函数调用</strong></td><td>模型可请求你的应用运行一个函数（如 “get_weather”）并使用结果。→ <a href="models-text_zh-cn.html#toolcalling">工具调用</a></td></tr>
       <tr><td><strong>连续批处理</strong></td><td>在单个托管模型上交错运行多个用户的请求，从而同时服务多人，而非一次一个。→ <a href="advanced_zh-cn.html#continuous-batching">深入了解</a></td></tr>
       <tr><td><strong>推测解码</strong></td><td>一个小“草稿”头猜测若干 token；主模型一次性验证它们 —— 输出更快、结果一致。→ <a href="advanced_zh-cn.html#mtp">MTP</a></td></tr>
       <tr><td><strong>块级草稿器 / DSpark</strong></td><td>一次提议一整<em>块</em> token 而非逐个的投机草稿器，由置信度头决定起草多远。DeepSeek V4 以独立 GGUF 的形式提供了一个。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
@@ -55,7 +55,7 @@
   <p>不需要。TensorSharp 可在普通 CPU 上运行（<code>--backend cpu</code> 或更快的 <code>ggml_cpu</code>）。GPU —— NVIDIA（CUDA）、任何支持 Vulkan 的 AMD/Intel/NVIDIA GPU，或 Apple Silicon（Metal/MLX）—— 会让生成显著更快，尤其是更大的模型。见<a href="backends_zh-cn.html">后端</a>。</p>
 
   <h3>我该从哪个模型开始？</h3>
-  <p>建议从 <strong>Gemma 4 E4B Q8_0</strong>（推荐公开文件为 7.48 GiB）开始 —— 它是 TensorSharp 原生 GGML 快路径上经过验证的快速上手模型，支持思维链、工具调用，以及需要可选投影器的图像/视频/音频输入。内存占用更低的小型入门模型是 <strong>Qwen3-4B Q4_K_M</strong>（2.33 GiB）。见 <a href="getting-started_zh-cn.html#e4b-fast-lane">E4B 快路径</a>或<a href="models_zh-cn.html#downloads">模型下载</a>。</p>
+  <p>建议从 <strong>Gemma 4 E4B Q8_0</strong>（推荐公开文件为 7.48 GiB）开始 —— 它是 TensorSharp 原生 GGML 快路径上经过验证的快速上手模型，支持思维链、工具调用，以及需要可选投影器的图像/视频/音频输入。内存占用更低的小型入门模型是 <strong>Qwen3-4B Q4_K_M</strong>（2.33 GiB）。见 <a href="getting-started_zh-cn.html#e4b-fast-lane">E4B 快路径</a>或<a href="models-downloads_zh-cn.html#downloads">模型下载</a>。</p>
 
   <h3>我的数据私密吗？</h3>
   <p>是的 —— 推理完全在你的机器上进行。提示词、文档与图像不会发送到任何外部服务。这正是各组织选择本地推理的主要原因。见<a href="overview_zh-cn.html#business">商业价值</a>。</p>

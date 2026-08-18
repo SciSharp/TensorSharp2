@@ -150,6 +150,80 @@ namespace InferenceWeb.Tests
         public void SnapFramesRoundsToVaeTemporalGrid(int input, int expected)
             => Assert.Equal(expected, WanVideoPipeline.SnapFrames(input));
 
+        // ---- degenerate-decode guard ------------------------------------------
+
+        private static TensorSharp.Models.QwenImage.RgbImage MakeFrame(int w, int h, Func<int, float> pixel)
+        {
+            var chw = new float[3 * w * h];
+            for (int i = 0; i < chw.Length; i++) chw[i] = pixel(i);
+            return TensorSharp.Models.QwenImage.RgbImage.FromPlanarChw(w, h, chw);
+        }
+
+        [Fact]
+        public void FlatDecodeIsRejected()
+        {
+            // Every frame a single colour = the Metal tensor-API VAE corruption.
+            var frames = new[] { MakeFrame(8, 8, _ => 0f), MakeFrame(8, 8, _ => 0f), MakeFrame(8, 8, _ => 0f) };
+            var ex = Assert.Throws<InvalidOperationException>(
+                () => WanVideoPipeline.AssertFramesAreNotDegenerate(frames));
+            Assert.Contains("TS_WAN_METAL_TENSOR_API=0", ex.Message);
+        }
+
+        [Fact]
+        public void NaNDecodeIsRejected()
+        {
+            var frames = new[] { MakeFrame(8, 8, _ => float.NaN), MakeFrame(8, 8, _ => float.NaN) };
+            Assert.Throws<InvalidOperationException>(
+                () => WanVideoPipeline.AssertFramesAreNotDegenerate(frames));
+        }
+
+        [Fact]
+        public void RealDecodeIsAccepted()
+        {
+            var frames = new[] { MakeFrame(8, 8, i => (i % 97) / 97f), MakeFrame(8, 8, i => (i % 53) / 53f) };
+            WanVideoPipeline.AssertFramesAreNotDegenerate(frames);   // must not throw
+        }
+
+        [Fact]
+        public void ASingleFlatFrameIsNotEnoughToReject()
+        {
+            // A legitimately flat frame (a fade to black at the end) must not fail
+            // the whole video — the guard only fires when every sampled frame is flat.
+            var frames = new[]
+            {
+                MakeFrame(8, 8, i => (i % 97) / 97f), MakeFrame(8, 8, i => (i % 53) / 53f),
+                MakeFrame(8, 8, i => (i % 31) / 31f), MakeFrame(8, 8, _ => 0f),
+            };
+            WanVideoPipeline.AssertFramesAreNotDegenerate(frames);
+        }
+
+        // ---- step-distilled checkpoint detection -------------------------------
+
+        [Theory]
+        // Published distilled Wan checkpoints / LoRAs.
+        [InlineData("Wan2_2-TI2V-5B-Turbo-Q8_0.gguf", 4)]
+        [InlineData("Wan22_TI2V_5B_Turbo_lora_rank_64_fp16.safetensors", 4)]
+        [InlineData("Wan2_2_5B_FastWanFullAttn_lora_rank_128_bf16.safetensors", 4)]
+        [InlineData("Wan2.2-I2V-A14B-HighNoise-Lightning-4steps-Q4_K_M.gguf", 4)]
+        [InlineData("wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step.safetensors", 4)]
+        [InlineData("Wan2.1-T2V-14B-StepDistill-CfgDistill-Lightx2v-8steps.gguf", 8)]
+        // Ordinary checkpoints must NOT be mistaken for distilled ones.
+        [InlineData("Wan2.2-TI2V-5B-Q8_0.gguf", 0)]
+        [InlineData("wan2.1-t2v-14b-Q4_K_M.gguf", 0)]
+        [InlineData("Wan2.1-T2V-1.3B-F16.gguf", 0)]
+        [InlineData("", 0)]
+        public void DistilledStepsParsedFromCheckpointName(string fileName, int expected)
+            => Assert.Equal(expected, WanVideoModel.ParseDistilledSteps(fileName));
+
+        [Fact]
+        public void DistilledStepCountIsBoundedToASaneRange()
+        {
+            // A "1.3B" or a Q4_K_M shard index must not be read as a step count, and
+            // an absurd count falls back to the marker default rather than trusting it.
+            Assert.Equal(0, WanVideoModel.ParseDistilledSteps("Wan2.1-T2V-1.3B-F16.gguf"));
+            Assert.Equal(4, WanVideoModel.ParseDistilledSteps("wan-turbo-9999steps.gguf"));
+        }
+
         // ---- VAE decode band layout -------------------------------------------
 
         [Theory]

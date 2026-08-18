@@ -34,9 +34,9 @@
       <tr><td><strong>TTFT</strong></td><td>"Time to first token" — how long before the answer starts streaming. KV-cache reuse reduces it on follow-up turns.</td></tr>
       <tr><td><strong>Backend</strong></td><td>The hardware path that runs the math: CPU, NVIDIA GPU (CUDA), any Vulkan GPU (AMD/Intel/NVIDIA), or Apple Silicon GPU (Metal/MLX). → <a href="backends.html">Backends</a></td></tr>
       <tr><td><strong>MoE</strong> (Mixture of Experts)</td><td>A model that routes each token to a few specialized sub-networks ("experts") instead of the whole network, giving large capacity at lower compute per token.</td></tr>
-      <tr><td><strong>Multimodal</strong></td><td>Able to take more than text — images, audio, or video — as input. → <a href="models.html#multimodal">Multimodal</a></td></tr>
-      <tr><td><strong>Thinking / reasoning</strong></td><td>The model produces hidden step-by-step reasoning before its final answer; TensorSharp separates the two. → <a href="models.html#thinking">Thinking mode</a></td></tr>
-      <tr><td><strong>Tool / function calling</strong></td><td>The model can ask your application to run a function (e.g. "get_weather") and use the result. → <a href="models.html#toolcalling">Tool calling</a></td></tr>
+      <tr><td><strong>Multimodal</strong></td><td>Able to take more than text — images, audio, or video — as input. → <a href="models-text.html#multimodal">Multimodal</a></td></tr>
+      <tr><td><strong>Thinking / reasoning</strong></td><td>The model produces hidden step-by-step reasoning before its final answer; TensorSharp separates the two. → <a href="models-text.html#thinking">Thinking mode</a></td></tr>
+      <tr><td><strong>Tool / function calling</strong></td><td>The model can ask your application to run a function (e.g. "get_weather") and use the result. → <a href="models-text.html#toolcalling">Tool calling</a></td></tr>
       <tr><td><strong>Continuous batching</strong></td><td>Serving many users at once by interleaving their requests on a single hosted model, instead of one at a time. → <a href="advanced.html#continuous-batching">Deep dive</a></td></tr>
       <tr><td><strong>Speculative decoding</strong></td><td>A small "draft" head guesses several tokens; the main model verifies them in one pass — faster output, identical result. → <a href="advanced.html#mtp">MTP</a></td></tr>
       <tr><td><strong>Block drafter / DSpark</strong></td><td>A speculative drafter that proposes a whole <em>block</em> of tokens at once rather than one at a time, with a confidence head deciding how far to draft. DeepSeek V4 ships one as a separate GGUF. → <a href="advanced.html#dspark">DSpark</a></td></tr>
@@ -55,7 +55,7 @@
   <p>No. TensorSharp runs on plain CPU (<code>--backend cpu</code> or the faster <code>ggml_cpu</code>). A GPU — NVIDIA (CUDA), any Vulkan-capable AMD/Intel/NVIDIA GPU, or Apple Silicon (Metal/MLX) — makes generation substantially faster, especially for larger models. See <a href="backends.html">Backends</a>.</p>
 
   <h3>Which model should I start with?</h3>
-  <p>Start with <strong>Gemma 4 E4B Q8_0</strong> (recommended public file: 7.48 GiB) — the verified quick-start model on TensorSharp's native-GGML fast path, with thinking, tools, and optional-projector image/video/audio input. A lower-memory small starter is <strong>Qwen3-4B Q4_K_M</strong> (2.33 GiB). See <a href="getting-started.html#e4b-fast-lane">the E4B fast lane</a> or <a href="models.html#downloads">model downloads</a>.</p>
+  <p>Start with <strong>Gemma 4 E4B Q8_0</strong> (recommended public file: 7.48 GiB) — the verified quick-start model on TensorSharp's native-GGML fast path, with thinking, tools, and optional-projector image/video/audio input. A lower-memory small starter is <strong>Qwen3-4B Q4_K_M</strong> (2.33 GiB). See <a href="getting-started.html#e4b-fast-lane">the E4B fast lane</a> or <a href="models-downloads.html#downloads">model downloads</a>.</p>
 
   <h3>Is my data private?</h3>
   <p>Yes — inference happens entirely on your machine. Prompts, documents, and images are not sent to any external service. That is the main reason organizations choose local inference. See <a href="overview.html#business">Business value</a>.</p>

@@ -13,7 +13,12 @@
     { group: { en: "Get started", zh: "快速上手" }, items: [
       { page: "getting-started", label: { en: "Getting Started", zh: "快速开始" } },
       { page: "backends", label: { en: "Compute Backends", zh: "计算后端" } },
-      { page: "models",   label: { en: "Supported Models", zh: "支持的模型" } },
+      { page: "models",   label: { en: "Supported Models", zh: "支持的模型" }, children: [
+        { page: "models-downloads", label: { en: "Model Downloads", zh: "模型下载" } },
+        { page: "models-text",      label: { en: "Text & LLM Models", zh: "文本与 LLM 模型" } },
+        { page: "models-image",     label: { en: "Image Generation", zh: "图像生成" } },
+        { page: "models-video",     label: { en: "Video Generation", zh: "视频生成" } },
+      ]},
     ]},
     { group: { en: "Run it", zh: "运行" }, items: [
       { page: "cli",    label: { en: "Command Line (CLI)", zh: "命令行 (CLI)" } },
@@ -159,6 +164,12 @@
         var a = el("a", { href: hrefFor(it.page, lang) }, it.label[lang]);
         if (it.page === cur) a.className = "active";
         grp.appendChild(a);
+        // Optional second level (e.g. the model reference sub-pages).
+        (it.children || []).forEach(function (ch) {
+          var c = el("a", { href: hrefFor(ch.page, lang) }, ch.label[lang]);
+          c.className = ch.page === cur ? "sub active" : "sub";
+          grp.appendChild(c);
+        });
       });
       sidebar.appendChild(grp);
     });

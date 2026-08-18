@@ -19,17 +19,20 @@
 纯文本不需要 `mmproj`；图像、视频或音频输入需要匹配的 `mmproj`。这里不声称基准输入
 对应某个公开文件的特定校验和。
 
-| 架构 | 中文卡片 | English card |
-|---|---|---|
-| Gemma 3 | [models/gemma3_zh-cn.md](models/gemma3_zh-cn.md) | [models/gemma3.md](models/gemma3.md) |
-| Gemma 4 | [models/gemma4_zh-cn.md](models/gemma4_zh-cn.md) | [models/gemma4.md](models/gemma4.md) |
-| DiffusionGemma | [models/diffusiongemma_zh-cn.md](models/diffusiongemma_zh-cn.md) | [models/diffusiongemma.md](models/diffusiongemma.md) |
-| Qwen 3 | [models/qwen3_zh-cn.md](models/qwen3_zh-cn.md) | [models/qwen3.md](models/qwen3.md) |
-| Qwen 3.5 / 3.6 family | [models/qwen35_zh-cn.md](models/qwen35_zh-cn.md) | [models/qwen35.md](models/qwen35.md) |
-| GPT OSS | [models/gptoss_zh-cn.md](models/gptoss_zh-cn.md) | [models/gptoss.md](models/gptoss.md) |
-| Nemotron-H | [models/nemotron_zh-cn.md](models/nemotron_zh-cn.md) | [models/nemotron.md](models/nemotron.md) |
-| Mistral 3 | [models/mistral3_zh-cn.md](models/mistral3_zh-cn.md) | [models/mistral3.md](models/mistral3.md) |
-| Qwen-Image-Edit | [models/qwenimage_zh-cn.md](models/qwenimage_zh-cn.md) | [models/qwenimage.md](models/qwenimage.md) |
+| 架构 | GGUF 架构标识 | 功能 | 中文卡片 | English card |
+|---|---|---|---|---|
+| DeepSeek V4 Flash | `deepseek4` | 带压缩注意力的稀疏 MoE 文本模型；通过独立 `--draft-model` GGUF 支持 DSpark 块级投机解码 | [models/deepseek4_zh-cn.md](models/deepseek4_zh-cn.md) | [models/deepseek4.md](models/deepseek4.md) |
+| Gemma 3 | `gemma3` | 稠密文本 + 图像对话 | [models/gemma3_zh-cn.md](models/gemma3_zh-cn.md) | [models/gemma3.md](models/gemma3.md) |
+| Gemma 4 | `gemma4` | 稠密与 MoE 的文本 + 图像 + 视频 + 音频对话，支持思维链与工具调用；通过独立 `gemma4-assistant` 草稿 GGUF 支持 MTP 投机解码 | [models/gemma4_zh-cn.md](models/gemma4_zh-cn.md) | [models/gemma4.md](models/gemma4.md) |
+| DiffusionGemma | `diffusion-gemma`、`diffusion_gemma` | 文本**扩散**生成——用 EntropyBound 去噪采样器取代自回归 decode | [models/diffusiongemma_zh-cn.md](models/diffusiongemma_zh-cn.md) | [models/diffusiongemma.md](models/diffusiongemma.md) |
+| Qwen 3 | `qwen3`、`qwen2`、`qwen2vl`、`qwen2_vl` | 稠密文本对话，支持思维链与工具调用（Qwen2 / Qwen2.5-VL 检查点按纯文本对话加载） | [models/qwen3_zh-cn.md](models/qwen3_zh-cn.md) | [models/qwen3.md](models/qwen3.md) |
+| Qwen 3.5 / 3.6 family | `qwen35`、`qwen35moe`、`qwen3next` | 全注意力 + GatedDeltaNet 混合的文本 + 图像对话，稠密或 MoE；Qwen 3.6 内嵌 NextN 草稿块用于投机解码 | [models/qwen35_zh-cn.md](models/qwen35_zh-cn.md) | [models/qwen35.md](models/qwen35.md) |
+| GPT OSS | `gptoss`、`gpt-oss` | 带 attention sinks 的 MXFP4 MoE 文本模型，使用 Harmony 思维链 / 工具格式 | [models/gptoss_zh-cn.md](models/gptoss_zh-cn.md) | [models/gptoss.md](models/gptoss.md) |
+| Nemotron-H | `nemotron_h`、`nemotron_h_moe` | Mamba2 SSM + 注意力 +（MoE）FFN 混合文本模型；Omni 版本增加图像输入 | [models/nemotron_zh-cn.md](models/nemotron_zh-cn.md) | [models/nemotron.md](models/nemotron.md) |
+| Mistral 3 | `mistral3` | 稠密文本 + 图像对话，YaRN 校正 RoPE 与 Pixtral 视觉编码器 | [models/mistral3_zh-cn.md](models/mistral3_zh-cn.md) | [models/mistral3.md](models/mistral3.md) |
+| Muse-Glimmer | `muse-glimmer`、`muse_glimmer` | 交错滑动窗口的文本 + 图像对话，支持思维链与 ATEM 工具调用；通过独立 `--draft-model` GGUF 支持 DFlash 块级投机解码 | [models/muse-glimmer_zh-cn.md](models/muse-glimmer_zh-cn.md) | [models/muse-glimmer.md](models/muse-glimmer.md) |
+| Qwen-Image-Edit | `qwen_image`、`qwen-image` | **图像编辑**——提示词 + 输入图像 → 编辑后的图像，走 60 块 MMDiT 扩散循环；Lightning LoRA 可把 60 次 DiT 前向降到 4–8 次 | [models/qwenimage_zh-cn.md](models/qwenimage_zh-cn.md) | [models/qwenimage.md](models/qwenimage.md) |
+| Wan 视频 | `wan`、`wan2.1`、`wan2.2` | **视频生成**——提示词（可选首帧图）→ H.264 MP4，涵盖 Wan 2.1 T2V 与 Wan 2.2 TI2V-5B / A14B；换用步数蒸馏检查点可把 100 次 DiT 前向的官方配方降到 4 次 | [models/wan_zh-cn.md](models/wan_zh-cn.md) | [models/wan.md](models/wan.md) |
 
 每张卡片会把工程师或研究员从“从未听说过这个模型”带到“可以解释它的前向计算图，
 并能在 TensorSharp 中复现推理路径”，统一覆盖：

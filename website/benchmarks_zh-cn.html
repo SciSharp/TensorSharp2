@@ -66,6 +66,61 @@
   </div>
   <p>规律很清楚：TensorSharp 的融合整模型图在约 2K 以下的 prefill 上领先 1.16-1.27×，两个引擎在 2K 到 16K 之间交叉，再往上 llama.cpp 保持 6-8% 的 prefill 优势；decode 在短上下文时打平，到 128K 降到 0.86×。启用 <strong>DFlash</strong> 投机解码后，TensorSharp 在短与中等提示上领先，从 16K 起落后——但这个差距主要来自运行期的<em>成本调控器</em>：一次误判的探测会让它暂停起草；在保持启用的那些重复里，TensorSharp 在 16K 达到 llama.cpp 的 94%、64K 达到 96%。DFlash 的绝对数字还高度依赖语料（501 token 那一点在<em>两个</em>引擎上都是 100% 接受率）。两个引擎都能在单卡上跑满 128K。两行长上下文有一个说明：它们是在换行符归一化修复落地之前测的，因此在这两个点上 TensorSharp prefill 的是同一文档的 CRLF 形式（多 1.2% 的 token）；吞吐是速率，影响很小，但那里两侧生成的续写并不严格可比。方法、逐次重复的离散度、显存与调控器分析见 <a href="models_zh-cn.html#table">Muse-Glimmer 架构卡片</a>（<code>docs/models/muse-glimmer_zh-cn.md</code>）。</p>
 
+  <h2 id="wan">Wan 视频：两个彼此独立的提速杠杆</h2>
+  <p>视频是唯一一种选错会浪费<em>数小时</em>而非数秒的工作负载，因此值得把两个杠杆分开来看。下表三行是<strong>同一个请求</strong> —— Apple <strong>M5 Pro（20 核 GPU、48 GB 统一内存）</strong>、<code>ggml_metal</code>、<code>Wan2.2-TI2V-5B</code> Q8_0，图生视频，<strong>1088×832 × 121 帧 = 27,404 个 DiT token</strong> —— 各行之间只有引擎版本与 <code>--model</code> 指向哪个权重的区别。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>配置</th><th>DiT 前向次数</th><th>秒 / 次</th><th>去噪</th><th>VAE 解码</th><th>端到端</th></tr></thead>
+    <tbody>
+      <tr><td>基础权重，本轮优化之前</td><td>100</td><td>206.2 s</td><td>20,615 s</td><td>863 s</td><td>≈5 h 58 m</td></tr>
+      <tr><td>基础权重，当前引擎</td><td>100</td><td>120.2 s</td><td>12,020 s</td><td>563 s</td><td>≈3 h 30 m</td></tr>
+      <tr><td><strong>步数蒸馏（Turbo，4 步）权重</strong></td><td>4</td><td>120.2 s</td><td>481 s</td><td>563 s</td><td><span class="yes">17 m 30 s</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>总收益可以拆成两个相乘的因子：引擎侧带来的<strong>每次前向约 1.7×</strong>（F16 注意力 K/V 加上 VAE 卷积路径），以及步数蒸馏带来的<strong>前向次数少 25×</strong>。Wan2.2-TI2V-5B 的官方配方是 50 步 × 2 次无分类器引导（CFG）分支 = <strong>100 次 DiT 前向</strong>；步数蒸馏权重在训练时就不使用引导，只需 <strong>4</strong> 次。这不是一个开关，而是换一个 <code>--model</code> 文件。TensorSharp 会从 DiT 文件名识别它（<code>turbo</code>、<code>distill</code>、<code>lightning</code>、<code>lightx2v</code>、<code>fastwan</code>、<code>-dmd</code>，或显式的 <code>…-4steps-…</code>），加载时打印 <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off</code> 并自动关闭引导；<code>--diffusion-steps</code> / <code>--cfg</code> 仍可覆盖。→ <a href="models-video_zh-cn.html#wan">Wan 下载</a></p>
+  <div class="callout tip"><div class="ic">⚡</div><p>一旦换成蒸馏权重，<strong>VAE 解码就成了瓶颈</strong> —— 1,050 s 的总耗时里占 563 s，约 55%。再往下优化 DiT 的收益，远不如减少帧数或帧面积。</p></div>
+
+  <h3>分辨率与帧数对耗时的影响</h3>
+  <p>同一台 M5 Pro、同一份 <code>ggml_metal</code> 构建、同一个 Turbo 权重与同一张源图。DiT 自注意力的开销是 O(token²)，而 token 数为 <code>latent_frames × (h/2) × (w/2)</code>，因此帧面积与帧数的影响远超其他因素：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>请求</th><th>DiT token 数</th><th>去噪</th><th>VAE 解码</th><th>总计</th></tr></thead>
+    <tbody>
+      <tr><td>736×544 × 81 帧（3.4 s，480p 档）</td><td>8,211</td><td>84 s</td><td>159 s</td><td><span class="yes">4 m 09 s</span></td></tr>
+      <tr><td>736×544 × 121 帧（5 s，480p 档）</td><td>12,121</td><td>137 s</td><td>237 s</td><td>6 m 19 s</td></tr>
+      <tr><td>1088×832 × 121 帧（5 s，720p 档）</td><td>27,404</td><td>481 s</td><td>563 s</td><td>17 m 30 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>480p（约 0.4 MP）是 Wan <em>训练过</em>的分辨率，因此 736×544 这两行是分布内的正常输出，而不是降级模式 —— 当你只想等几分钟时，就应该选它。低于约 0.3 MP 后画质确实会下滑，宽 × 高小于 300,000 px 时管线会给出告警。</p>
+
+  <h3>每次前向的 1.7× 来自哪里</h3>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>改动</th><th>测量对象</th><th>前 → 后</th><th>数值一致性</th></tr></thead>
+    <tbody>
+      <tr><td>DiT flash 路径中的 F16 注意力 K/V</td><td>单次自注意力，seq 27,404 / 24 头 / head dim 128，M5 Pro</td><td>4,993 → 2,467 ms（<span class="yes">2.02×</span>）</td><td>对 diffusers 参考实现，两种 dtype 的余弦相似度均为 0.999964</td></tr>
+      <tr><td>Wan VAE 卷积走 MPSGraph（Metal）</td><td>VAE 解码，736×544 × 81 帧</td><td>159 → 80 s（<span class="yes">1.99×</span>）</td><td>93.9 dB PSNR，最大 Δ 为 255 中的 0.128</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Wan VAE 解码的性能剖析显示：<code>MUL_MAT</code> 占整图 44.4%，<code>IM2COL</code> 再占 30.2% —— 合计 74.6% 都在卷积里，这正是把这些卷积交给 MPSGraph 会有回报的原因：按形状分别达到 6.2×（512→512 k3，320×240 t9）、8.6×（256→256 k3，640×480 t9）、10.4×（160→160 k3）与 13.9×（512→512 k1），因为 MPS 能跑到约 30 TFLOP/s，而 ggml 的 Metal GEMM 只有约 4.9。两处都留了 A/B 用的开关：<code>TS_WAN_DIT_KV_F16=0</code> 与 <code>TS_WAN_VAE_MPS_CONV=0</code>。实测 Q8_0 的注意力 K/V 反而<em>比</em> F16 慢（2,652 ms），把 DiT 从 Q8_0 反量化到 F16 也只让矩阵乘变化不到 5%，因此更高精度的 Wan 量化基本换不来速度。</p>
+
+  <h3>Wan 的后端选择与 sd.cpp 对比</h3>
+  <p><strong>RTX 2000 Ada（16 GB）</strong>上的参考耗时，<code>Wan2.1-1.3B</code> F16、832×480、33 帧、30 步 UniPC —— 即官方 480p 配方：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>后端</th><th>秒 / 步</th><th>总计</th></tr></thead>
+    <tbody>
+      <tr><td><code>ggml_cuda</code></td><td><span class="yes">12.0 s</span></td><td><span class="yes">445 s</span></td></tr>
+      <tr><td><code>ggml_vulkan</code></td><td>17.2 s</td><td>625 s</td></tr>
+      <tr><td><code>cuda</code>（直连驱动 API）</td><td>19.3 s</td><td>700 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>在 NVIDIA 上跑 Wan 应当选 <code>ggml_cuda</code>；<code>cpu</code> / <code>ggml_cpu</code> 能正确出片，但一段 480p 的数秒视频要几十分钟，而 <code>mlx</code> 根本不是 Wan 支持的后端。与 <strong><code>stable-diffusion.cpp</code></strong>（master-769，相同 GGUF 与设置，33 帧 480p）相比，采样阶段接近持平 —— 281 s vs 258 s —— 但 sd.cpp 的 VAE 解码会实体化约 8 GB 的 3D im2col，把 16 GB 显卡压进 WDDM 换页：<strong>51 s vs 1,762 s</strong>，因此该次运行中 TensorSharp <strong>端到端快 6.0×</strong>。</p>
+
   <h2 id="testing">测试</h2>
   <p>下方构建与测试命令需要<a href="getting-started_zh-cn.html#install-dotnet">按平台安装的 .NET 10 SDK</a>；运行命令前请先验证安装。</p>
   <h3>单元测试（xUnit）</h3>

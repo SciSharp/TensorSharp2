@@ -4,7 +4,7 @@
 > Part of the [TensorSharp](README.md) documentation. See also the [per-model architecture cards](docs/models/README.md).
 
 
-TensorSharp loads models in GGUF format. Below are verified Hugging Face repos for every supported architecture, including the multimodal-projector (mmproj) and MTP-draft companion files each family uses. Pick a quantization that fits your hardware (Q4_K_M / UD-Q4_K_XL for low memory, Q8_0 for higher quality, etc.).
+TensorSharp loads models in GGUF format. Below are verified Hugging Face repos for every supported architecture, including the multimodal-projector (mmproj) and MTP-draft companion files each family uses. Pick a quantization that fits your hardware (Q4_K_M / UD-Q4_K_XL for low memory, Q8_0 for higher quality, etc.). Rows marked *optional* are the speed artifacts — step-distilled checkpoints, distillation LoRAs and speculative-decoding drafters. Nothing breaks without them, but they are usually the difference between minutes and hours, so skim them before you start a long download.
 
 | Architecture | Model | GGUF Download |
 |---|---|---|
@@ -13,29 +13,30 @@ TensorSharp loads models in GGUF format. Below are verified Hugging Face repos f
 | Gemma 4 | gemma-4-26B-A4B-it (MoE, QAT) | [unsloth/gemma-4-26B-A4B-it-qat-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF) — mmproj `mmproj-BF16.gguf` and MTP draft `mtp-gemma-4-26B-A4B-it.gguf` in the same repo |
 | Gemma 4 | gemma-4-26B-A4B-it (MoE) | [ggml-org/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF) — mmproj files in the same repo |
 | Gemma 4 | gemma-4-31B-it | [ggml-org/gemma-4-31B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF) — mmproj files in the same repo |
-| Gemma 4 | `gemma4-assistant` MTP drafts | [AtomicChat/gemma-4-E4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF) (E4B) and [AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF) (26B-A4B) — load via the server's `--mtp-spec --mtp-draft-model`; pair each draft with its matching target size |
+| Gemma 4 | `gemma4-assistant` MTP drafts (optional — speculative decoding) | [AtomicChat/gemma-4-E4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF) (E4B) and [AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF) (26B-A4B) — load via the server's `--mtp-spec --mtp-draft-model`; pair each draft with its matching target size |
 | Gemma 3 | gemma-3-4b-it | [ggml-org/gemma-3-4b-it-GGUF](https://huggingface.co/ggml-org/gemma-3-4b-it-GGUF) — mmproj `mmproj-model-f16.gguf` in the same repo. The official QAT repo [google/gemma-3-4b-it-qat-q4_0-gguf](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) is gated (requires HF login + accepting Google's Gemma license) |
 | Qwen 3 | Qwen3-4B | [Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF) (text only — no companion files) |
 | Qwen 3.5 / 3.6 family | Qwen3.5-9B | [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) — mmproj `mmproj-F16.gguf` in the same repo |
 | Qwen 3.5 / 3.6 family | Qwen3.5-35B-A3B (MoE) | [ggml-org/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF) — mmproj `mmproj-Qwen3.5-35B-A3B-Q8_0.gguf` in the same repo |
 | Qwen 3.5 / 3.6 family | Qwen3.6-35B-A3B (MoE, embedded NextN MTP) | [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) — these GGUFs retain the NextN block for the server's `--mtp-spec`; mmproj `mmproj-F16.gguf` in the same repo. The base repo [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) ships the same file names with NextN stripped — those load fine but silently fall back to standard decode |
-| GPT OSS | gpt-oss-20b (MoE) | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) (`gpt-oss-20b-mxfp4.gguf`, text only) |
+| GPT OSS | gpt-oss-20b (MoE) | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) — `gpt-oss-20b-MXFP4.gguf` (note the uppercase `MXFP4`), text only, no companion files |
 | Nemotron-H | Nemotron-H-8B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron 3 Nano Omni 30B-A3B (image-capable) | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) — mmproj `mmproj-BF16.gguf` (same repo) is required for image input. Audio is preprocessed only: real audio inference needs a Parakeet audio mmproj these GGUFs do not ship |
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct-2503 | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) — Pixtral mmproj `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` in the same repo |
-| Muse-Glimmer | Muse-Glimmer-30B (dense, image-capable) | `general.architecture` = `muse-glimmer`. Needs the `mmproj-Muse-Glimmer-30B-*.gguf` from the same repo for image input (`--mmproj`). Optional DFlash drafter `dflash-*.gguf` loaded with `--draft-model` for lossless speculative decoding |
+| Muse-Glimmer | Muse-Glimmer-30B (dense, image-capable) | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF) — e.g. `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` or `Muse-Glimmer-30B-Q8_0.gguf`; `general.architecture` = `muse-glimmer` / `muse_glimmer`. Image input requires `mmproj-Muse-Glimmer-30B-Q8_0.gguf` (same repo) passed **explicitly** with `--mmproj` — this is the one family with no mmproj auto-detection. Optional speed artifact: the DFlash block drafter `dflash-kquant.gguf` (same repo) loaded with `--draft-model` for lossless speculative decoding — pass no sampler flags, it needs plain greedy |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731 (284B MoE) | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) — one subdirectory per quant (`UD-Q8_K_XL/`, `UD-IQ4_XS/`, `UD-IQ1_S/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. Text only |
-| DeepSeek V4 | DSpark speculative drafters | see [DSpark drafters](#dspark-drafters) below — a separate GGUF loaded with `--draft-model` for ~1.3-1.4x decode |
+| DeepSeek V4 | DSpark speculative drafters (optional — speed only) | see [DSpark drafters](#dspark-drafters) below — a separate GGUF loaded with `--draft-model` for ~1.3-1.4x decode |
 | DiffusionGemma | diffusiongemma-26B-A4B-it | [unsloth/diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) (`general.architecture` = `diffusion-gemma`) |
 | Qwen-Image-Edit | MMDiT DiT (the `--model` GGUF) | [unsloth/Qwen-Image-Edit-2511-GGUF](https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF) (e.g. `qwen-image-edit-2511-Q4_K_M.gguf`; `general.architecture` = `qwen_image`) |
 | Qwen-Image-Edit | Qwen-Image VAE (required) | `VAE/Qwen_Image-VAE.safetensors` from [QuantStack/Qwen-Image-Edit-GGUF](https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF) — place next to the DiT or point `--qwen-image-vae` / `TS_QWEN_IMAGE_VAE` at it (the `.safetensors` VAE loads directly) |
 | Qwen-Image-Edit | Qwen2.5-VL-7B text encoder (required) | [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) — place next to the DiT or set `--qwen-image-vl` / `TS_QWEN_IMAGE_TE` |
 | Qwen-Image-Edit | Vision mmproj (optional) | `mmproj-BF16.gguf` from [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) — image-grounded conditioning via `--qwen-image-mmproj` / `TS_QWEN_IMAGE_MMPROJ` |
 | Qwen-Image-Edit | Lightning LoRA (optional, 4/8-step) | [lightx2v/Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) (`Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`) — `--qwen-image-lora` / `TS_QWEN_IMAGE_LORA`; auto-switches to the LoRA's step count and CFG 1.0 |
-| Wan video generation | Wan DiT (the `--model` GGUF) | Wan 2.2 text/image-to-video: [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF) (e.g. `Wan2.2-TI2V-5B-Q8_0.gguf`) or [QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF) (both HighNoise + LowNoise experts); Wan 2.1 text-to-video: [samuelchristlie/Wan2.1-T2V-1.3B-GGUF](https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF) or [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf); `general.architecture` = `wan`. See [docs/models/wan.md](docs/models/wan.md) |
-| Wan video generation | UMT5-XXL text encoder (required) | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) (`umt5-xxl-encoder-Q8_0.gguf`) — place next to the DiT or set `--wan-te` / `TS_WAN_TE` |
-| Wan video generation | video VAE (required) | Wan 2.1 + A14B: [`wan_2.1_vae.safetensors`](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors); TI2V-5B: [`Wan2.2_VAE.safetensors`](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE) — place next to the DiT (a `VAE/` subfolder works) or set `--wan-vae` / `TS_WAN_VAE` |
+| Wan video generation | **Step-distilled DiT (start here)** | **The single biggest speed lever — pick this unless you are reproducing a reference sample.** A distilled checkpoint runs 4 denoise passes instead of the official recipe's 100 for the same video: measured on M5 Pro / `ggml_metal` at 1088×832×121 frames, **17 m 30 s** end to end versus **3 h 30 m** on the base checkpoint, same request, no other flag changed. TI2V-5B: [hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF) — `Wan2_2-TI2V-5B-Turbo-Q8_0.gguf` (5.40 GB), also Q6_K (4.22 GB), Q5_K_M (3.82 GB), Q4_K_M (3.44 GB), down to Q2_K (1.86 GB). **Mind the `Wan2_2` underscore** — copying the base repo's `Wan2.2` spelling into `hf download` 404s. I2V-A14B: [jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF](https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF) — Lightning already merged into both experts; download `high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf` **and** `low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf` (9.66 GB each; Q8_0 15.42 GB, Q2_K 5.31 GB) under one `--local-dir` and point `--model` at either — the sibling expert is found automatically. Secondary: [Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF](https://huggingface.co/Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF) (`FastWan2.2-TI2V-5B-q8_0.gguf`, 5.41 GB). **No flag is needed**: TensorSharp reads the DiT file name for `turbo` / `distill` / `lightning` / `lightx2v` / `fastwan` / `-dmd` or an explicit `<N>steps` (1-16), switches to that step count with guidance off, and prints `step-distilled checkpoint detected -> N steps, guidance off` on load; `--diffusion-steps` / `--cfg` override it. The Turbo and A14B distilled repos ship no VAE and no text encoder — take those from the two rows below |
+| Wan video generation | Base DiT (the `--model` GGUF) | The full official recipe (50 steps × 2 CFG passes = 100 DiT passes) — use it when you need to match a reference sample; otherwise prefer the distilled row above. Wan 2.2 text/image-to-video: [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF) (`Wan2.2-TI2V-5B-Q8_0.gguf` 5.40 GB or `Wan2.2-TI2V-5B-Q4_K_M.gguf` 3.43 GB; bundles `VAE/Wan2.2_VAE.safetensors`), [QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF) or [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF) (both `HighNoise/` **and** `LowNoise/` experts are required; each repo bundles `VAE/Wan2.1_VAE.safetensors`); Wan 2.1 text-to-video: [samuelchristlie/Wan2.1-T2V-1.3B-GGUF](https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF) (`Wan2.1-T2V-1.3B-Q8_0.gguf` / `-F16.gguf`) or [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf) (lowercase names, e.g. `wan2.1-t2v-14b-Q8_0.gguf`) — neither 2.1 repo ships a VAE or encoder. `general.architecture` = `wan` / `wan2.1` / `wan2.2`. See [docs/models/wan.md](docs/models/wan.md) |
+| Wan video generation | UMT5-XXL text encoder (required, every Wan checkpoint) | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) — `umt5-xxl-encoder-Q8_0.gguf` (6.04 GB), or `umt5-xxl-encoder-Q5_K_M.gguf` (4.15 GB) / `umt5-xxl-encoder-Q4_K_M.gguf` (3.66 GB) for tighter memory. Turns the prompt into conditioning and is freed before the denoise starts. Place next to the DiT or set `--wan-te` / `TS_WAN_TE` |
+| Wan video generation | video VAE (required) | Decodes latents to frames — **which one is decided by the DiT**, not by you: TI2V-5B needs [`Wan2.2_VAE.safetensors`](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE) (bundled in the TI2V-5B repo), Wan 2.1 and A14B need `Wan2.1_VAE.safetensors` — bundled as `VAE/Wan2.1_VAE.safetensors` in both QuantStack A14B repos, or standalone as [`wan_2.1_vae.safetensors`](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors). The distilled repos above ship no VAE, so pair them with the matching file from here. Place next to the DiT (a `VAE/` subfolder works) or set `--wan-vae` / `TS_WAN_VAE` |
 
 ### DSpark drafters
 
@@ -88,7 +89,7 @@ block. Those are different drafters from DSpark.
 
 These commands run from the repository root. First install the [.NET 10 SDK](DEVELOPMENT.md#install-the-net-10-sdk) for your platform and run `dotnet build TensorSharp.slnx -c Release`; a runtime-only installation cannot build the binaries used below.
 
-The `hf download` commands need the Hugging Face CLI (`pip install -U huggingface_hub`) and drop every file into `./models`. Reminders that apply to all blocks: the CLI reads its one-shot prompt from a **file** via `--input` (`--prompt` is exclusively the Qwen-Image-Edit edit instruction), samples **greedily** by default, and generates only 100 tokens unless you raise `--max-tokens`; the server always listens on **http://localhost:5000**. Swap `--backend ggml_cuda` for the backend that fits your hardware (see [Pick a Backend](README.md#pick-a-backend)). Create a prompt file first:
+The `hf download` commands need the Hugging Face CLI (`pip install -U huggingface_hub`) and drop every file into `./models`. Reminders that apply to all blocks: the CLI reads its one-shot prompt from a **file** via `--input` (`--prompt` is the Qwen-Image-Edit edit instruction and the Wan video prompt), samples **greedily** by default, and generates only 100 tokens unless you raise `--max-tokens`; the server always listens on **http://localhost:5000**. Swap `--backend ggml_cuda` for the backend that fits your hardware (see [Pick a Backend](README.md#pick-a-backend)). Create a prompt file first:
 
 ```bash
 echo "Give me three facts about the Moon." > prompt.txt
@@ -163,10 +164,10 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Qwen3.6-35B-
 **GPT OSS** — text, thinking (always on), tools ([ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF))
 
 ```bash
-hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-mxfp4.gguf --local-dir models
+hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --local-dir models
 
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/gpt-oss-20b-mxfp4.gguf --input prompt.txt --max-tokens 300 --backend ggml_cuda
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/gpt-oss-20b-mxfp4.gguf --backend ggml_cuda
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/gpt-oss-20b-MXFP4.gguf --input prompt.txt --max-tokens 300 --backend ggml_cuda
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/gpt-oss-20b-MXFP4.gguf --backend ggml_cuda
 ```
 
 **Nemotron-H** — text, thinking, tools; image on the Omni distribution ([bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF))
@@ -214,4 +215,49 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
 ```
 
 (In the Web UI, attach an image and type the edit instruction. The Lightning LoRA download and `--qwen-image-lora` flag are optional — they cut the denoise to 4 steps at CFG 1.0.)
+
+**Wan video generation** — prompt (+ optional first-frame image) → H.264 MP4; needs the DiT + video VAE + UMT5-XXL text encoder ([hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF))
+
+```bash
+# The step-distilled Turbo DiT: 4 denoise passes instead of 100, detected from the file name.
+# Note the Wan2_2 underscore in the Turbo file name; the VAE and encoder come from the base repos.
+hf download hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --local-dir models
+hf download QuantStack/Wan2.2-TI2V-5B-GGUF VAE/Wan2.2_VAE.safetensors --local-dir models
+hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_cuda \
+    --wan-vae models/VAE/Wan2.2_VAE.safetensors --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --prompt "a cute fluffy orange cat walking through a sunny garden with flowers" \
+    --output cat.mp4 --width 832 --height 480 --video-frames 81
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_cuda \
+    --wan-vae models/VAE/Wan2.2_VAE.safetensors --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --video-frames 121 --fps 24
+```
+
+The console prints `step-distilled checkpoint detected -> 4 steps, guidance off` on load — that
+line is how you confirm you are on the fast path. Swapping only the `--model` path for the base
+`Wan2.2-TI2V-5B-Q8_0.gguf` runs the official 50-step + CFG recipe instead: the same 1088×832×121-frame
+request measured 3 h 30 m there against 17 m 30 s here (M5 Pro, `ggml_metal`). Add `--image first_frame.png`
+for image-to-video, or attach an image in the Web UI (it becomes the first frame); on the server
+`--video-frames` / `--fps` are defaults that a request can override. Wan is the one family that does
+not run on `--backend mlx`; use `ggml_cuda`, `ggml_metal`, `ggml_vulkan`, `ggml_cpu`, `cuda` or `cpu`.
+
+If all three files sit in one folder (a `VAE/` subfolder counts) the `--wan-vae` / `--wan-te` flags
+can be dropped — they are resolved automatically. For the two-expert A14B models download **both**
+experts under the same `--local-dir` and point `--model` at either one:
+
+```bash
+hf download jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf --local-dir models
+hf download jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf --local-dir models
+hf download QuantStack/Wan2.2-I2V-A14B-GGUF VAE/Wan2.1_VAE.safetensors --local-dir models
+hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf \
+    --backend ggml_cuda --wan-vae models/VAE/Wan2.1_VAE.safetensors \
+    --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --prompt "the ship sails into the storm, waves crashing" --image ship.jpg --output ship.mp4
+```
 

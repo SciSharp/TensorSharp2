@@ -231,6 +231,8 @@ if (APPLE)
     # Raises the process-wide default MSL version so ggml's Metal 4 tensor-API probe can compile
     # under the .NET apphost's stale recorded SDK. See the file header for the full story.
     list(APPEND TSG_GGMLOPS_SOURCES tsg_metal_msl_default.m)
+    # Wan VAE convolutions on MPSGraph (see tsg_metal_mps_conv.mm).
+    list(APPEND TSG_GGMLOPS_SOURCES tsg_metal_mps_conv.mm)
 endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
@@ -238,6 +240,19 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_dsv4_fused.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
+    # Wan VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu). Optional: the
+    # VAE falls back to ggml's im2col+GEMM when cuDNN is not present.
+    find_path(TSG_CUDNN_INCLUDE_DIR cudnn.h
+              HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/local/cuda/include)
+    find_library(TSG_CUDNN_LIBRARY NAMES cudnn
+                 HINTS /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64)
+    if (TSG_CUDNN_INCLUDE_DIR AND TSG_CUDNN_LIBRARY)
+        message(STATUS "TensorSharp: cuDNN found (${TSG_CUDNN_LIBRARY}); Wan VAE convolutions will use it")
+        list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_cudnn_conv.cu)
+        set(TSG_HAVE_CUDNN ON)
+    else()
+        message(STATUS "TensorSharp: cuDNN not found; Wan VAE convolutions stay on ggml im2col+GEMM")
+    endif()
 endif()
 
 add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})
@@ -280,6 +295,11 @@ endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)
+    if (TSG_HAVE_CUDNN)
+        target_include_directories(GgmlOps PRIVATE ${TSG_CUDNN_INCLUDE_DIR})
+        target_link_libraries(GgmlOps PRIVATE ${TSG_CUDNN_LIBRARY})
+        target_compile_definitions(GgmlOps PRIVATE TSG_HAVE_CUDNN=1)
+    endif()
     # Fast intrinsic transcendentals (tanhf/expf) for the diffusion sampler kernel — the accurate
     # library tanhf is ~100x slower on-device and the sampler only needs FP-reduction-level accuracy.
     target_compile_options(GgmlOps PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
@@ -296,7 +316,10 @@ if (APPLE)
     # tsg_metal_msl_default.m talks to Metal and the Objective-C runtime directly.
     find_library(TSG_FOUNDATION_LIBRARY Foundation REQUIRED)
     find_library(TSG_METAL_FRAMEWORK    Metal      REQUIRED)
-    target_link_libraries(GgmlOps PRIVATE ${TSG_FOUNDATION_LIBRARY} ${TSG_METAL_FRAMEWORK})
+    find_library(TSG_MPSGRAPH_FRAMEWORK MetalPerformanceShadersGraph REQUIRED)
+    find_library(TSG_MPS_FRAMEWORK      MetalPerformanceShaders      REQUIRED)
+    target_link_libraries(GgmlOps PRIVATE ${TSG_FOUNDATION_LIBRARY} ${TSG_METAL_FRAMEWORK}
+                                          ${TSG_MPSGRAPH_FRAMEWORK} ${TSG_MPS_FRAMEWORK})
 endif()
 
 set_target_properties(GgmlOps PROPERTIES

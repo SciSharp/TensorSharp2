@@ -37,7 +37,7 @@
   <h3>其他前置要求</h3>
   <ul>
     <li><strong><code>git</code>、<code>curl</code> 与网络访问</strong> —— 用于克隆 TensorSharp 与下载模型。完整原生构建还会把 <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> 克隆到 <code>ExternalProjects/ggml/</code>；之后可设置 <code>TENSORSHARP_GGML_NO_UPDATE=1</code> 跳过网络更新。</li>
-    <li><strong>一个 GGUF 模型文件</strong> —— 例如来自 <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>。见<a href="models_zh-cn.html#downloads">模型下载</a>。</li>
+    <li><strong>一个 GGUF 模型文件</strong> —— 例如来自 <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>。见<a href="models-downloads_zh-cn.html#downloads">模型下载</a>。</li>
   </ul>
   <h4>各平台工具链（仅 GPU 加速需要）</h4>
   <div class="table-scroll">
@@ -72,9 +72,15 @@ dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre
   <div class="callout warn"><div class="ic">📦</div><p><strong>当前发行状态：</strong><a href="https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.0.5.0" target="_blank" rel="noopener">v3.0.5.0</a> 没有上传 CLI/server 应用归档，因此现在请从源码构建。仓库中虽有 Release Binaries 工作流，但不要自行拼接归档 URL；只有在 <a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">Releases 页面</a>明确列出后才使用。</p></div>
 
   <h2 id="download">3 · 下载模型</h2>
-  <p>快速上手请从公开的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a> 仓库下载推荐的、经基准验证的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q8_0.gguf（7.48 GiB）</a>。同一仓库还提供更省内存的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_K_M.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q4_K_M.gguf</a>，更多选项见<a href="models_zh-cn.html#downloads">模型</a>页。</p>
+  <p>快速上手请从公开的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a> 仓库下载推荐的、经基准验证的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q8_0.gguf（7.48 GiB）</a>。同一仓库还提供更省内存的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_K_M.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q4_K_M.gguf</a>，更多选项见<a href="models-downloads_zh-cn.html#downloads">模型</a>页。</p>
   <pre data-lang="bash"><code>curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf</code></pre>
   <div class="callout note"><div class="ic">🧩</div><p>多模态模型还需下载匹配的<strong>投影器</strong>（mmproj），并用 <code>--mmproj</code> 传入精确路径。服务端不会自动检测投影器，CLI 也只识别少数旧文件名；显式路径最可靠。</p></div>
+  <div class="callout tip"><div class="ic">⚡</div><p><strong>要生成图像或视频？在下载阶段就选好快的那一版权重。</strong>这两个模型族都同时提供<em>基础版</em>与<em>步数蒸馏版</em>，差距非常大：</p>
+  <ul>
+    <li><strong>Wan 视频</strong> —— 基础的 <code>Wan2.2-TI2V-5B</code> 走官方配方 50 步 × 2 次 CFG = 100 次 DiT 前向；<em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重在训练时就不使用引导，只需 4 次。TensorSharp 会从 DiT 文件名自动识别，不需要额外参数。在 M5 Pro 上，一段 1088×832 × 121 帧的图生视频，基础权重约需 3 h 30 m，Turbo 只需 <strong>17 m 30 s</strong> —— 命令完全相同，只是 <code>--model</code> 指向了不同的文件。</li>
+    <li><strong>Qwen-Image-Edit</strong> —— 用 <code>--qwen-image-lora</code> 加载 Lightning 蒸馏 LoRA，可把默认的 30 步 / CFG 2.5（60 次 DiT 前向）降到 4 步或 8 步。</li>
+  </ul>
+  <p>→ <a href="models-downloads_zh-cn.html#downloads">模型下载</a>（具体仓库与文件名）· <a href="benchmarks_zh-cn.html#wan">这些数字背后的实测</a></p></div>
 
   <h3 id="e4b-fast-lane">Gemma 4 E4B 后端与平台说明</h3>
   <p>下一节的首次运行命令面向 Linux + NVIDIA。Windows + NVIDIA 请先在 PowerShell 中设置 <code>$env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'</code>，再运行不带 Bash 赋值前缀的相同命令。Apple Silicon 请省略 CUDA 环境变量并改用 <code>ggml_metal</code>。Windows/Linux 上使用 Vulkan 时，请设置 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code>（PowerShell：<code>$env:TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN='ON'</code>）并使用 <code>ggml_vulkan</code>。没有 GPU 时使用 <code>ggml_cpu</code>（原生 CPU 内核）。纯文本不需要投影器；图像、视频或音频输入需从同一仓库下载 <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code>，并添加 <code>--mmproj models/mmproj-gemma-4-E4B-it-Q8_0.gguf</code>。</p>
@@ -103,6 +109,7 @@ TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Cli -c R
     <a class="card" href="cli_zh-cn.html"><div class="ic">⌨️</div><h3>CLI 参考</h3><p>所有参数、REPL 与批处理工作流。</p></a>
     <a class="card" href="http-api_zh-cn.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>用 curl、Python 或 SDK 调用服务器。</p></a>
     <a class="card" href="models_zh-cn.html"><div class="ic">🧠</div><h3>模型</h3><p>支持哪些模型，以及在哪里下载。</p></a>
+    <a class="card" href="benchmarks_zh-cn.html"><div class="ic">📊</div><h3>基准测试</h3><p>各模型的实测速度，以及影响速度的杠杆。</p></a>
   </div>
 
   <div class="content-footer">
