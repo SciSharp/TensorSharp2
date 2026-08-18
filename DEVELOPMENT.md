@@ -442,7 +442,7 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 
 #### Test lanes
 
-Tests are tagged with xUnit traits on two axes (declared in `InferenceWeb.Tests/TestAssemblyConfig.cs`): `Category=Bench` marks the timing/throughput benchmark classes, and `Requires=Cuda|Mlx|Models` marks what a test needs from the environment (`Models` = real GGUF weights via the test model directory). Untagged tests are self-contained correctness tests that run anywhere. An unfiltered `dotnet test` runs everything, exactly as before; `--filter` selects a lane:
+Tests are tagged on two axes (declared in `InferenceWeb.Tests/TestAssemblyConfig.cs`): `Category=Bench` marks the timing/throughput benchmark classes with a plain `[Trait]`, and `Requires=Cuda|Mlx|Models` marks what a test needs from the environment (`Models` = real GGUF weights via the test model directory). Environment-gated tests are written with the gated attributes from `InferenceWeb.Tests/GatedFacts.cs` — `[CudaFact]`/`[CudaTheory]`, `[MlxFact]`/`[MlxTheory]`, `[ModelFact("ENV_VAR", "gguf-substring")]`/`[ModelTheory(...)]` — which apply the matching `Requires` trait automatically and skip visibly when the prerequisite is missing. Calling `CudaBackend.IsAvailable()`/`MlxBackend.IsAvailable()` directly from a test is a build error (`BannedSymbols.txt`): use the attribute instead. Untagged `[Fact]`/`[Theory]` tests are self-contained correctness tests that run anywhere. An unfiltered `dotnet test` runs everything; `--filter` selects a lane:
 
 ```bash
 # Inner loop while editing: environment-independent correctness tests, runs anywhere in seconds.
@@ -456,7 +456,7 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category!=Ben
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category=Bench"
 ```
 
-Note that CUDA-, MLX-, and model-gated tests currently pass silently when their prerequisite is missing, so excluding them from a lane changes what is exercised, not what a green run looks like.
+Gated tests report as **Skipped** when their prerequisite is missing (a skipped `[Theory]` counts once, not per data row), so a green run on a bare box reads "N passed, M skipped" rather than silently passing tests that never executed. A few classes with compound prerequisites (multiple env vars, per-method model choice) still gate inside the test body and keep explicit `[Trait("Requires", ...)]` lines.
 
 ### Server integration tests
 

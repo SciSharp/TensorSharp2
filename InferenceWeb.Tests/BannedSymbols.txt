@@ -1,0 +1,2 @@
+M:TensorSharp.Cuda.CudaBackend.IsAvailable;Gate the test with [CudaFact]/[CudaTheory] instead of a silent in-test availability check
+M:TensorSharp.MLX.MlxBackend.IsAvailable;Gate the test with [MlxFact]/[MlxTheory] instead of a silent in-test availability check
