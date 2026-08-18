@@ -32,7 +32,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class MuseGlimmerParityTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -50,7 +49,7 @@ public class MuseGlimmerParityTests
         public string Content { get; set; }
     }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "muse-glimmer")]
     public void MuseGlimmer_GreedyContinuationMatchesLlamaCpp()
     {
         var records = TryLoadReference();
@@ -105,7 +104,7 @@ public class MuseGlimmerParityTests
     /// The forward pass is compared on recorded token ids, so the tokenizer needs
     /// its own check: our BPE must reproduce llama.cpp's prompt tokenization.
     /// </summary>
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "muse-glimmer")]
     public void MuseGlimmer_TokenizerMatchesLlamaCpp()
     {
         var records = TryLoadReference();
@@ -165,7 +164,7 @@ public class MuseGlimmerParityTests
     /// runs a ~4790-token prompt against a llama.cpp golden captured the same way.
     /// Generate it with .parity/gen_ref_long.py (needs a llama-server with -c 8192).
     /// </summary>
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "muse-glimmer")]
     public void MuseGlimmer_LongContextMatchesLlamaCpp()
     {
         var records = TryLoadReference(LocateReference("ref_text_long.json"), "TS_MUSE_GLIMMER_REF_LONG");
@@ -199,7 +198,7 @@ public class MuseGlimmerParityTests
     /// prompts reproduces its baseline token-for-token at 1.33x-4.77x, so anything
     /// other than an exact match here is a bug, not sampling noise.
     /// </summary>
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "muse-glimmer")]
     public void MuseGlimmer_DFlashDraftingIsLossless()
     {
         var records = TryLoadReference();

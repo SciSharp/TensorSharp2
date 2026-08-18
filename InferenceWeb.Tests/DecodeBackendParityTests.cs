@@ -30,13 +30,12 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class DecodeBackendParityTests
 {
     private readonly ITestOutputHelper _output;
     public DecodeBackendParityTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_PARITY_MODEL")]
     public void DumpGreedyDecodeTrace()
     {
         string modelPath = Environment.GetEnvironmentVariable("TS_PARITY_MODEL");

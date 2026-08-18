@@ -14,7 +14,7 @@
 // The microbenchmark uses a fake (free) backing allocator so it isolates the
 // managed pool's synchronization cost — exactly the hot spot the change
 // targets — and therefore runs without a GPU. The real-device correctness and
-// throughput tests are gated on CudaBackend.IsAvailable().
+// throughput tests are gated with [CudaFact].
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -28,7 +28,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Cuda")]
 public class CudaAllocatorConcurrencyTests
 {
     private readonly ITestOutputHelper _output;
@@ -41,15 +40,9 @@ public class CudaAllocatorConcurrencyTests
     // must reuse pooled blocks (high hit ratio), and must keep cachedBytes /
     // metric accounting consistent (no negative or leaked accounting).
     // ---------------------------------------------------------------------
-    [Fact]
+    [CudaFact]
     public void RealDevice_ConcurrentAllocateDispose_IsRaceFreeAndPools()
     {
-        if (!CudaBackend.IsAvailable())
-        {
-            _output.WriteLine("[cuda-alloc] CUDA unavailable; skipping real-device test.");
-            return;
-        }
-
         using var allocator = new CudaAllocator();
 
         const int threads = 16;
@@ -103,15 +96,9 @@ public class CudaAllocatorConcurrencyTests
     // ---------------------------------------------------------------------
     // Deterministic single-threaded metric accounting.
     // ---------------------------------------------------------------------
-    [Fact]
+    [CudaFact]
     public void RealDevice_Metrics_CountHitsMissesAndDriverAllocs()
     {
-        if (!CudaBackend.IsAvailable())
-        {
-            _output.WriteLine("[cuda-alloc] CUDA unavailable; skipping metrics test.");
-            return;
-        }
-
         using var allocator = new CudaAllocator();
         CudaAllocatorStats start = allocator.GetStats();
 
@@ -139,15 +126,9 @@ public class CudaAllocatorConcurrencyTests
     // Real-device throughput (informational): aggregate alloc/free ops/sec
     // across thread counts. Never fails on throughput; just prints.
     // ---------------------------------------------------------------------
-    [Fact]
+    [CudaFact]
     public void RealDevice_AllocationThroughput_ScalesWithThreads()
     {
-        if (!CudaBackend.IsAvailable())
-        {
-            _output.WriteLine("[cuda-alloc] CUDA unavailable; skipping throughput test.");
-            return;
-        }
-
         using var allocator = new CudaAllocator();
         long[] elementCounts = { 256, 1024, 4096 };
         const int opsPerThread = 3000;

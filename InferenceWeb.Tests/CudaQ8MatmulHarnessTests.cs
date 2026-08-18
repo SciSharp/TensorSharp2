@@ -27,15 +27,16 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Category", "Bench")]
-[Trait("Requires", "Cuda")]
 public class CudaQ8MatmulHarnessTests
 {
     private readonly ITestOutputHelper _output;
     public CudaQ8MatmulHarnessTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [CudaFact]
     public void Cuda_Q8Mma_CorrectnessVsDp4aAndReference()
     {
+        // CudaFact covers availability; TS_CUDA_Q8_HARNESS stays an opt-in gate
+        // so this benchmark never runs in the normal suite.
         if (Environment.GetEnvironmentVariable("TS_CUDA_Q8_HARNESS") != "1")
         { _output.WriteLine("[q8-mma] set TS_CUDA_Q8_HARNESS=1 to run; skipping"); return; }
 
@@ -119,9 +120,11 @@ public class CudaQ8MatmulHarnessTests
         _output.WriteLine("[q8-mma] CORRECTNESS PASS — tensor-core MMA matches dp4a + f32 reference.");
     }
 
-    [Fact]
+    [CudaFact]
     public void Cuda_Q8Matmul_ScalingProfile_GoNoGo()
     {
+        // CudaFact covers availability; TS_CUDA_Q8_HARNESS stays an opt-in gate
+        // so this benchmark never runs in the normal suite.
         if (Environment.GetEnvironmentVariable("TS_CUDA_Q8_HARNESS") != "1")
         { _output.WriteLine("[q8-harness] set TS_CUDA_Q8_HARNESS=1 to run; skipping"); return; }
 

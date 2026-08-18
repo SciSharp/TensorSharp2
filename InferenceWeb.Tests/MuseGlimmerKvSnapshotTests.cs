@@ -35,7 +35,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class MuseGlimmerKvSnapshotTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -52,7 +51,7 @@ public class MuseGlimmerKvSnapshotTests
     /// the batch executor does. Before the fix this faulted the process the first
     /// time a block started at or beyond _kvSwaRows.
     /// </summary>
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "muse-glimmer")]
     public void MuseGlimmer_CapturingBlocksPastTheSwaRing_DoesNotFault()
     {
         string modelPath = TryFindModel();
@@ -125,7 +124,7 @@ public class MuseGlimmerKvSnapshotTests
     /// pick up exactly where it left off. Bit-identical logits are the bar: the
     /// restore writes the same rows the prefill did, so nothing should shift.
     /// </summary>
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "muse-glimmer")]
     public void MuseGlimmer_RestoringACapturedPrefix_ReproducesTheLivePrefillLogits()
     {
         string modelPath = TryFindModel();

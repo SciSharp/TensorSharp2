@@ -32,7 +32,6 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Category", "Bench")]
-[Trait("Requires", "Models")]
 public class Gemma4BatchedPerfBench
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -44,7 +43,7 @@ public class Gemma4BatchedPerfBench
     // Five short prompts in parallel - representative of a typical chat
     // workload where each request is a few hundred tokens of prompt and
     // we want low p50 latency.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "gemma-4-e4b")]
     public Task Gemma4_ShortPromptsParallel_BatchedVsLegacy() =>
         RunComparison(
             label: "short-parallel",
@@ -56,7 +55,7 @@ public class Gemma4BatchedPerfBench
     // batched paged kernel was expected to show its biggest win over the
     // per-seq KV-swap path (gather + GPU launch overhead amortised across
     // the longer attention compute).
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "gemma-4-e4b")]
     public Task Gemma4_LongPromptsParallel_BatchedVsLegacy() =>
         RunComparison(
             label: "long-parallel",
@@ -67,7 +66,7 @@ public class Gemma4BatchedPerfBench
     // Single sequence - sanity check that batched isn't WORSE than legacy
     // on the degenerate batch=1 case. The fixed per-call overheads
     // (graph build, gather) shouldn't drown out the layer compute.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "gemma-4-e4b")]
     public Task Gemma4_SingleSequence_BatchedVsLegacy() =>
         RunComparison(
             label: "single-seq",
@@ -79,7 +78,7 @@ public class Gemma4BatchedPerfBench
     // paged-attention amortisation should be most visible. Need
     // SchedulerConfig.MaxNumRunningSequences >= 8 (already set in
     // BenchContext).
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "gemma-4-e4b")]
     public Task Gemma4_EightPromptsParallel_BatchedVsLegacy() =>
         RunComparison(
             label: "batch8-parallel",

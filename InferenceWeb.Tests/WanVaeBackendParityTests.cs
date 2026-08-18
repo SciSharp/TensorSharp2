@@ -33,13 +33,12 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class WanVaeBackendParityTests
 {
     private readonly ITestOutputHelper _output;
     public WanVaeBackendParityTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_WAN_VAE_PARITY_VAE")]
     public void DumpVaeDecodeForBackendParity()
     {
         string vaePath = Environment.GetEnvironmentVariable("TS_WAN_VAE_PARITY_VAE");

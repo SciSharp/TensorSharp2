@@ -12,10 +12,13 @@ using Xunit;
 // Trait taxonomy, selectable with dotnet test --filter:
 //   Category=Bench    timing/throughput assertions — a failure means the perf
 //                     regressed or the box was busy, never that code is wrong
-//   Requires=Cuda     needs a CUDA device (otherwise the tests no-op)
+//   Requires=Cuda     needs a CUDA device
 //   Requires=Mlx      needs the MLX native backend (macOS)
 //   Requires=Models   needs real GGUF weights (TS_TEST_MODEL_DIR and friends)
-// Untagged tests are self-contained correctness tests that run anywhere.
+// Requires traits come from the gated attributes in GatedFacts.cs
+// ([CudaFact], [MlxFact], [ModelFact], ...), which also skip visibly when the
+// prerequisite is missing. Untagged tests are self-contained correctness
+// tests that run anywhere.
 // Common lanes:
 //   --filter "Category!=Bench&Requires!=Models&Requires!=Cuda&Requires!=Mlx"   fast inner loop
 //   --filter "Category!=Bench"                                                 full correctness

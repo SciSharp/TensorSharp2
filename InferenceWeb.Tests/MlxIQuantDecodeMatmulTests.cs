@@ -32,7 +32,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Mlx")]
 public class MlxIQuantDecodeMatmulTests
 {
     private const int QK_K = 256;
@@ -50,7 +49,7 @@ public class MlxIQuantDecodeMatmulTests
     // tolerance is loose enough for the block-scale factoring the amortized
     // form does (sum(d*g*x) -> d*sum(g*x)) but far tighter than any indexing
     // mistake could survive.
-    [Theory]
+    [MlxTheory]
     [InlineData((int)GgmlTensorType.IQ2_XXS, 1)]
     [InlineData((int)GgmlTensorType.IQ2_XXS, 3)]
     [InlineData((int)GgmlTensorType.IQ2_S, 1)]
@@ -59,9 +58,6 @@ public class MlxIQuantDecodeMatmulTests
     [InlineData((int)GgmlTensorType.IQ3_S, 3)]
     public void DecodeMatmul_MatchesManagedDequantReference(int ggmlType, int rows)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 512;   // 2 super-blocks per row
         const int outDim = 6;
         byte[] weights = CreateRows(ggmlType, outDim, inDim, seed: 0x2C51 + ggmlType);
@@ -102,15 +98,12 @@ public class MlxIQuantDecodeMatmulTests
     // which still uses the per-ELEMENT dequant helper - so this pins that the
     // rewrite left the scalar path intact and the two agree element for
     // element.
-    [Theory]
+    [MlxTheory]
     [InlineData((int)GgmlTensorType.IQ2_XXS)]
     [InlineData((int)GgmlTensorType.IQ2_S)]
     [InlineData((int)GgmlTensorType.IQ3_S)]
     public void GetRows_MatchesManagedDequantReference(int ggmlType)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 512;
         const int outDim = 6;
         int[] rowIds = { 4, 0, 2, 2 };

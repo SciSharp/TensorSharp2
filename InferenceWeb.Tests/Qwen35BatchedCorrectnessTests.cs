@@ -32,7 +32,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class Qwen35BatchedCorrectnessTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -47,7 +46,7 @@ public class Qwen35BatchedCorrectnessTests
     // accumulated enough to flip the argmax). We assert at least 4 of the
     // first 8 tokens match — relaxes for accumulating FP drift while still
     // catching structural divergence (which would diverge at token 0).
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "27b")]
     public async Task Qwen35_Greedy_LegacyAndBatchedAgree()
     {
         var modelPath = FindQwen35();

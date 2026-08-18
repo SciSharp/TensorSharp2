@@ -6,7 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
 // Correctness + performance tests for the DiffusionGemma block-diffusion MoE model
-// (architecture key "diffusion-gemma") against a real GGUF. Opt-in via TS_TEST_MODEL_DIR.
+// (architecture key "diffusion-gemma|gemma-diffusion") against a real GGUF. Opt-in via TS_TEST_MODEL_DIR.
 //
 // These tests exercise the full denoising pipeline (DiffusionGemmaModel.ForwardCanvas +
 // DiffusionGemmaSampler EntropyBound sampler). They are skipped cleanly when the model file
@@ -26,7 +26,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class DiffusionGemmaTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -90,7 +89,7 @@ public class DiffusionGemmaTests
         return model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
     }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void ForwardCanvas_ProducesFiniteLogits_AndArgmaxIsValid()
     {
         using var model = TryLoad();
@@ -125,7 +124,7 @@ public class DiffusionGemmaTests
         _output.WriteLine("[diffusion-gemma] ForwardCanvas produced finite, valid logits.");
     }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void CapitalOfFrance_Generates_Paris()
     {
         using var model = TryLoad();
@@ -149,7 +148,7 @@ public class DiffusionGemmaTests
         Assert.Contains("Paris", text, StringComparison.OrdinalIgnoreCase);
     }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void Benchmark_StepThroughput()
     {
         using var model = TryLoad();
@@ -173,7 +172,7 @@ public class DiffusionGemmaTests
         Assert.True(msPerStep > 0);
     }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void PromptKvCache_LogitsMatchUnified()
     {
         using var model = TryLoad();
@@ -221,7 +220,7 @@ public class DiffusionGemmaTests
         Assert.True(cosine >= 0.99, $"PKV logits diverged from unified (cosine {cosine:F6}) — likely a bug");
     }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void Benchmark_PromptKvCache_SpeedupOnLongPrompt()
     {
         using var model = TryLoad();
@@ -292,7 +291,7 @@ public class DiffusionGemmaTests
     // because the host softcap/readback raced the in-flight device->host logits blit. A healthy answer is
     // substantial and token-diverse. Exercises the default (fused decode + fused lm_head + PKV) path on the
     // GPU backend. Skipped without TS_TEST_MODEL_DIR.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void Generate_LongAnswer_IsCoherent_NotDegenerate()
     {
         using var model = TryLoad();
@@ -332,7 +331,7 @@ public class DiffusionGemmaTests
     // (kIOGPUCommandBufferCallbackErrorOutOfMemory). The fix (ReleasePromptKvTensor) frees the cached
     // device copy before disposing each K/V tensor. This test reallocates the prompt K/V many times and
     // asserts the resident device-copy bytes stay bounded (≈ one prefill's K/V), not growing per prefill.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void PromptKvCache_DeviceCopiesDoNotLeakAcrossPrefills()
     {
         using var model = TryLoad();
@@ -380,7 +379,7 @@ public class DiffusionGemmaTests
     // every block of every turn leaked its prompt K/V device copies. Asserts generation keeps succeeding
     // and resident device memory stays bounded across turns. Uses a fixed prompt so the per-turn resident
     // footprint is constant (isolates the leak from the natural growth of an accumulating chat history).
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void MultiTurn_Generation_DoesNotLeakDeviceMemory()
     {
         using var model = TryLoad();
@@ -423,7 +422,7 @@ public class DiffusionGemmaTests
     // whether it is decoded alone or batched with another sequence (each canvas row's attention/FFN/lm_head
     // depends only on that row + its own prompt K/V, so batching must not perturb it). Uses fixed mask-token
     // canvases with self-conditioning off so the forward is deterministic. Skipped without a GPU/PKV backend.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void BatchedDecode_LogitsMatchSolo()
     {
         using var model = TryLoad();
@@ -493,7 +492,7 @@ public class DiffusionGemmaTests
     // End-to-end mirror of the reported bug: two prompts generated together in ONE batched run must BOTH
     // produce a correct, non-empty answer (pre-fix, a second parallel request produced nothing). Drives the
     // batched sampler the way the server scheduler does — one block at a time over the active set.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void BatchedGeneration_TwoPrompts_BothProduceOutput()
     {
         using var model = TryLoad();
@@ -527,7 +526,7 @@ public class DiffusionGemmaTests
     // TrimCanvas, a single request driven through RunBlockBatched must produce TOKEN-IDENTICAL output
     // to the single-request Generate() path — on every backend. Runs a few fixed steps so it is cheap
     // enough for the CPU backends.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void BatchedScheduler_SingleRequest_MatchesGenerate_AllBackends()
     {
         using var model = TryLoad();
@@ -591,7 +590,7 @@ public class DiffusionGemmaTests
     // throughput; worse, the per-op batched forward is markedly slower per canvas than the fused kernel, so
     // the fused time-slice wins. This benchmark proves that ordering (so the scheduler default is correct)
     // and reports the numbers. Skipped without a GPU/PKV backend.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
     public void Benchmark_BatchedDecodeThroughput()
     {
         using var model = TryLoad();

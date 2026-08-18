@@ -24,16 +24,17 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Cuda")]
-[Trait("Requires", "Models")]
 public class CudaLongDecodeReproTests
 {
     private readonly ITestOutputHelper _output;
     public CudaLongDecodeReproTests(ITestOutputHelper output) => _output = output;
 
-    [Fact]
+    [CudaFact("TS_REPRO_MODEL")]
     public async Task GreedyDecode_RealPrompt_RecordText()
     {
+        // CudaFact covers Cuda + Models availability; TS_REPRO_BACKEND stays a
+        // separate opt-in gate (it also selects a non-CUDA backend) so this
+        // never runs in the normal suite.
         string backendStr = Environment.GetEnvironmentVariable("TS_REPRO_BACKEND");
         if (string.IsNullOrWhiteSpace(backendStr))
         {

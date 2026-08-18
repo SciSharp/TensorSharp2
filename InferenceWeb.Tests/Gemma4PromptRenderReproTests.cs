@@ -192,8 +192,7 @@ public class Gemma4PromptRenderReproTests
         return candidates.FirstOrDefault(p => !string.IsNullOrEmpty(p) && File.Exists(p));
     }
 
-    [Trait("Requires", "Models")]
-    [Fact]
+    [ModelFact("TS_GEMMA4_BPE_MODEL")]
     public void RealGemma4BpeTokenizer_MatchesLlamaCppOracle()
     {
         string? modelPath = FindBpeModel();
@@ -245,8 +244,7 @@ public class Gemma4PromptRenderReproTests
             tokenizer.Decode(new List<int> { 9259, 236888, 2088, 740, 564, 1601, 611, 3124, 236881 }));
     }
 
-    [Trait("Requires", "Models")]
-    [Fact]
+    [ModelFact("TS_GEMMA4_12B")]
     public void RealTemplate_RendersUserText_AndSingleBos()
     {
         string? modelPath = FindModel();
@@ -269,8 +267,7 @@ public class Gemma4PromptRenderReproTests
         Assert.Equal(1, CountLeading(tokens, bosId)); // exactly one BOS
     }
 
-    [Trait("Requires", "Models")]
-    [Fact]
+    [ModelFact("TS_GEMMA4_12B")]
     public async Task Generate_FinalFantasyPrompt_ProducesRelevantOutput()
     {
         string? modelPath = FindModel();
@@ -322,8 +319,7 @@ public class Gemma4PromptRenderReproTests
         }
     }
 
-    [Trait("Requires", "Models")]
-    [Fact]
+    [ModelFact("TS_GEMMA4_12B")]
     public async Task Generate_ThreeDistinctPromptsInParallel_EachStaysOnTopic()
     {
         string? modelPath = FindModel();
@@ -382,8 +378,7 @@ public class Gemma4PromptRenderReproTests
     // producing coherent-but-off-topic output. The multi-token prefill must yield
     // the SAME next-token as feeding the prompt one token at a time (decode path),
     // and must be deterministic across repeats.
-    [Trait("Requires", "Models")]
-    [Fact]
+    [ModelFact("TS_GEMMA4_12B")]
     public void PrefillNextToken_MatchesIncrementalDecode_AndIsDeterministic()
     {
         string? modelPath = FindModel();

@@ -27,7 +27,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class NemotronBatchedCorrectnessTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -36,7 +35,7 @@ public class NemotronBatchedCorrectnessTests
     private readonly ITestOutputHelper _output;
     public NemotronBatchedCorrectnessTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "nemotron")]
     public async Task Nemotron_Greedy_LegacyAndBatchedAgree()
     {
         var modelPath = FindNemotron();

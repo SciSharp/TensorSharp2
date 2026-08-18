@@ -25,7 +25,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class GptOssBatchedCorrectnessTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -34,7 +33,7 @@ public class GptOssBatchedCorrectnessTests
     private readonly ITestOutputHelper _output;
     public GptOssBatchedCorrectnessTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "gpt-oss|gpt_oss|gptoss")]
     public async Task GptOss_Greedy_LegacyAndBatchedAgree()
     {
         var modelPath = FindGptOss();
@@ -125,7 +124,7 @@ public class GptOssBatchedCorrectnessTests
         return Directory.GetFiles(dir, "*.gguf").Where(p =>
         {
             var n = Path.GetFileName(p).ToLowerInvariant();
-            return (n.Contains("gpt-oss") || n.Contains("gpt_oss") || n.Contains("gptoss"))
+            return (n.Contains("gpt-oss|gpt_oss|gptoss") || n.Contains("gpt_oss") || n.Contains("gptoss"))
                 && !n.Contains("mmproj");
         }).OrderBy(p => Path.GetFileName(p)).FirstOrDefault();
     }
