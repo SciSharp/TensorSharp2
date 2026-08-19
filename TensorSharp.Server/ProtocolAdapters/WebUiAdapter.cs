@@ -276,13 +276,12 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return Results.Json(new
                 {
                     ok = true,
-                    path = savePath,
+                    file = safeFileName,
                     url = uploadUrl,
                     mediaType,
                     fileName = file.FileName,
                     frames = frames.Select(f => Path.GetFileName(f)).ToList(),
                     frameUrls = frames.Select(f => BuildUploadUrl(Path.GetFileName(f))).ToList(),
-                    framePaths = frames,
                 });
             }
 
@@ -294,7 +293,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return Results.Json(new
                 {
                     ok = true,
-                    path = savePath,
+                    file = safeFileName,
                     url = uploadUrl,
                     mediaType,
                     fileName = file.FileName,
@@ -351,7 +350,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                     return Results.Json(new
                     {
                         ok = true,
-                        path = savePath,
+                        file = safeFileName,
                         url = uploadUrl,
                         mediaType,
                         fileName = file.FileName,
@@ -382,7 +381,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                     return Results.Json(new
                     {
                         ok = true,
-                        path = savePath,
+                        file = safeFileName,
                         url = uploadUrl,
                         mediaType,
                         fileName = file.FileName,
@@ -417,7 +416,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                     return Results.Json(new
                     {
                         ok = true,
-                        path = savePath,
+                        file = safeFileName,
                         url = uploadUrl,
                         mediaType,
                         fileName = file.FileName,
@@ -451,7 +450,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return Results.Json(new
                 {
                     ok = true,
-                    path = savePath,
+                    file = safeFileName,
                     url = uploadUrl,
                     mediaType,
                     fileName = file.FileName,
@@ -462,7 +461,6 @@ namespace TensorSharp.Server.ProtocolAdapters
                     warning = incompleteWarning,
                     frames = frameNames,
                     frameUrls,
-                    framePaths,
                     note = $"This PDF has no selectable text; {framePaths.Count} page image(s) were attached for the vision model to read.",
                 });
             }
@@ -490,7 +488,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                     return Results.Json(new
                     {
                         ok = true,
-                        path = savePath,
+                        file = safeFileName,
                         url = uploadUrl,
                         previewUrl = BuildUploadUrl(previewName),
                         mediaType,
@@ -505,7 +503,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 }
             }
 
-            return Results.Json(new { ok = true, path = savePath, url = uploadUrl, mediaType, fileName = file.FileName });
+            return Results.Json(new { ok = true, file = safeFileName, url = uploadUrl, mediaType, fileName = file.FileName });
         }
 
         // ---- Image editing (Qwen-Image-Edit) ---------------------------------
@@ -596,8 +594,10 @@ namespace TensorSharp.Server.ProtocolAdapters
 
         /// <summary>
         /// Read the referenced upload(s) from a JSON edit request into <paramref name="images"/>:
-        /// <c>imagePaths</c> (array, multi-image) or legacy <c>imagePath</c> (single). Every path
-        /// must resolve inside the upload directory. Returns an error message, or null on success.
+        /// <c>imagePaths</c> (array, multi-image) or legacy <c>imagePath</c> (single). References
+        /// are the bare server filenames returned by <c>/api/upload</c>; absolute paths from older
+        /// clients are accepted when they resolve inside the upload directory. Returns an error
+        /// message, or null on success.
         /// </summary>
         internal async Task<string> ReadUploadedImagesAsync(JsonElement root, List<byte[]> images, CancellationToken ct)
         {
@@ -611,11 +611,9 @@ namespace TensorSharp.Server.ProtocolAdapters
             if (paths.Count == 0)
                 return "imagePath (or imagePaths) must reference a previously uploaded file.";
 
-            string uploadRoot = Path.GetFullPath(_options.UploadDirectory);
             foreach (var path in paths)
             {
-                string full = path == null ? null : Path.GetFullPath(path);
-                if (full == null || !UploadPathGuard.IsInsideDirectory(uploadRoot, full) || !File.Exists(full))
+                if (!UploadFileReference.TryResolve(_options.UploadDirectory, path, out string full) || !File.Exists(full))
                     return "imagePath must reference a previously uploaded file.";
                 images.Add(await File.ReadAllBytesAsync(full, ct));
             }
@@ -1152,7 +1150,7 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             var messages = ChatMessageParser.ParseWebUi(messagesEl);
 
-            string attachmentError = ChatMessageParser.ValidateAttachmentPaths(messages, _options.UploadDirectory);
+            string attachmentError = ChatMessageParser.ResolveAttachmentPaths(messages, _options.UploadDirectory);
             if (attachmentError != null)
             {
                 webUiLogger.LogWarning(LogEventIds.HttpRequestRejected,

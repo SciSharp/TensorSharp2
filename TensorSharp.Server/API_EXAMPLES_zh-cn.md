@@ -742,9 +742,9 @@ OpenAI 的 `usage.prompt_tokens_details.cached_tokens` 含义一致 —— 都�
 curl -X POST http://localhost:5000/api/upload -F "file=@report.pdf"
 ```
 
-每个响应都携带 `ok, path, url, mediaType, fileName`；媒体类型按文件扩展名分类
+每个响应都携带 `ok, file, url, mediaType, fileName`；媒体类型按文件扩展名分类
 （image / video / audio / pdf / text）。客户端随后在下一次 `/api/chat` 请求中
-引用服务端存储的 `path` —— 图像通过 `imagePaths`，抽取出的视频帧通过
+引用服务端返回的 `file` 文件名 —— 图像通过 `imagePaths`，抽取出的视频帧通过
 `isVideo: true` + `imagePaths`，音频通过 `audioPaths`，文本内容则把返回的
 `textContent` 内联进消息。
 
@@ -763,7 +763,7 @@ curl -N -X POST http://localhost:5000/api/chat \
     "messages": [{
       "role": "user",
       "content": "[File: report.pdf]\n<textContent from the upload response>\n[End of file]\nPlease analyze the attached PDF document and summarize its content.",
-      "textFilePaths": ["<上传响应中的 path>"]
+      "textFilePaths": ["<上传响应中的 file>"]
     }],
     "maxTokens": 500
   }'
@@ -771,8 +771,8 @@ curl -N -X POST http://localhost:5000/api/chat \
 
 - **扫描版 / 纯图像 PDF**：如果加载了具备视觉能力的模型（存在 `--mmproj` 或模
   型内置视觉编码器），页面会被渲染为图像并按视频帧的形式返回
-  （`renderedAsImages: true`、`frames[]`、`frameUrls[]`、`framePaths[]`）；在下
-  一次 `/api/chat` 请求中把 `framePaths` 作为 `imagePaths` 传入。没有视觉模型
+  （`renderedAsImages: true`、`frames[]`、`frameUrls[]`）；在下
+  一次 `/api/chat` 请求中把 `frames` 文件名作为 `imagePaths` 传入。没有视觉模型
   时，响应会携带 `needsVision: true` 和一条 `warning`，提示需用具备视觉能力的
   模型重启服务。
 
@@ -798,14 +798,14 @@ curl -X POST http://localhost:5000/api/image-edit \
 {"ok": true, "url": "/uploads/edit-<guid>.png", "width": 1184, "height": 544, "elapsedSeconds": 40.4}
 ```
 
-也接受 JSON body `{ "imagePath": "<server path from /api/upload>", "prompt": "...",
-"steps": 0, "cfg": 0, "seed": 42 }`（`imagePath` 必须引用上传目录内先前上传过的
+也接受 JSON body `{ "imagePath": "<file from /api/upload>", "prompt": "...",
+"steps": 0, "cfg": 0, "seed": 42 }`（`imagePath` 为先前上传文件的服务端文件名；为兼容旧客户端也接受上传目录内的
 文件）。流式变体通过 SSE 发送进度事件与实时去噪预览：
 
 ```bash
 curl -N -X POST http://localhost:5000/api/image-edit/stream \
   -H "Content-Type: application/json" \
-  -d '{"imagePath": "<path from /api/upload>", "prompt": "Replace the background with a sunny beach", "seed": 42}'
+  -d '{"imagePath": "<file from /api/upload>", "prompt": "Replace the background with a sunny beach", "seed": 42}'
 ```
 
 每步事件形如

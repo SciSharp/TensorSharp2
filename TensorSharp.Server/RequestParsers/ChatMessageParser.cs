@@ -66,53 +66,42 @@ namespace TensorSharp.Server.RequestParsers
         }
 
         /// <summary>
-        /// Validate that every client-supplied attachment path resolves inside
-        /// the upload directory. Returns an error message, or null when all
-        /// paths are acceptable.
+        /// Resolve every client-supplied attachment reference (imagePaths /
+        /// audioPaths / textFilePaths) to a full path inside the upload
+        /// directory, rewriting the lists in place. The Web UI sends the bare
+        /// server filenames returned by <c>/api/upload</c>; absolute paths from
+        /// older clients are still accepted when they resolve inside the upload
+        /// directory. Returns an error message, or null when everything
+        /// resolved.
         /// </summary>
-        public static string ValidateAttachmentPaths(List<ChatMessage> messages, string uploadRoot)
+        public static string ResolveAttachmentPaths(List<ChatMessage> messages, string uploadRoot)
         {
             if (messages == null)
                 return null;
 
-            string root = Path.GetFullPath(uploadRoot);
-
             foreach (var msg in messages)
             {
-                string error = ValidatePathList(msg?.ImagePaths, root)
-                    ?? ValidatePathList(msg?.AudioPaths, root)
-                    ?? ValidatePathList(msg?.TextFilePaths, root);
+                string error = ResolvePathList(msg?.ImagePaths, uploadRoot)
+                    ?? ResolvePathList(msg?.AudioPaths, uploadRoot)
+                    ?? ResolvePathList(msg?.TextFilePaths, uploadRoot);
                 if (error != null)
                     return error;
             }
             return null;
         }
 
-        private static string ValidatePathList(List<string> paths, string root)
+        private static string ResolvePathList(List<string> paths, string uploadRoot)
         {
             if (paths == null)
                 return null;
 
-            foreach (var path in paths)
+            for (int i = 0; i < paths.Count; i++)
             {
-                if (string.IsNullOrWhiteSpace(path) || !IsInsideDirectory(root, path))
+                if (!UploadFileReference.TryResolve(uploadRoot, paths[i], out string full))
                     return "Attachment path must reference a previously uploaded file.";
+                paths[i] = full;
             }
             return null;
-        }
-
-        /// <summary>
-        /// True when <paramref name="path"/> resolves inside <paramref name="root"/>.
-        /// Traversal and a sibling directory that merely shares the root's name
-        /// both resolve outside and are rejected. <paramref name="root"/> must
-        /// already be a full path.
-        /// </summary>
-        private static bool IsInsideDirectory(string root, string path)
-        {
-            string relative = Path.GetRelativePath(root, path);
-            return relative != ".."
-                && !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-                && !Path.IsPathRooted(relative);
         }
 
         /// <summary>

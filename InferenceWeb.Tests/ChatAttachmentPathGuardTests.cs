@@ -4,11 +4,12 @@ using TensorSharp.Server.RequestParsers;
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Web UI /api/chat attachment paths (imagePaths/audioPaths/textFilePaths)
-/// arrive as client-supplied absolute paths that the multimodal injector later
-/// opens, so every one must resolve inside the upload directory. These check
-/// that paths outside it — including a sibling directory that shares the root's
-/// name — are rejected.
+/// Web UI /api/chat attachment references (imagePaths/audioPaths/textFilePaths)
+/// are resolved by <see cref="ChatMessageParser.ResolveAttachmentPaths"/>: the
+/// canonical form is the bare server filename from /api/upload, while legacy
+/// absolute paths are accepted only when they resolve inside the upload
+/// directory. These check both forms, and that paths outside the root —
+/// including a sibling directory sharing the root's name — are rejected.
 /// </summary>
 public class ChatAttachmentPathGuardTests : IDisposable
 {
@@ -31,10 +32,22 @@ public class ChatAttachmentPathGuardTests : IDisposable
         new() { new ChatMessage { Role = "user", Content = "hi", ImagePaths = new List<string> { path } } };
 
     [Fact]
+    public void BareFileName_ResolvesUnderUploadRoot()
+    {
+        var messages = MessageWithImage("img.png");
+
+        Assert.Null(ChatMessageParser.ResolveAttachmentPaths(messages, _uploadRoot));
+        Assert.Equal(Path.Combine(Path.GetFullPath(_uploadRoot), "img.png"), messages[0].ImagePaths[0]);
+    }
+
+    [Fact]
     public void PathInsideUploadRoot_IsAccepted()
     {
         string inside = Path.Combine(_uploadRoot, "img.png");
-        Assert.Null(ChatMessageParser.ValidateAttachmentPaths(MessageWithImage(inside), _uploadRoot));
+        var messages = MessageWithImage(inside);
+
+        Assert.Null(ChatMessageParser.ResolveAttachmentPaths(messages, _uploadRoot));
+        Assert.Equal(Path.GetFullPath(inside), messages[0].ImagePaths[0]);
     }
 
     [Fact]
@@ -43,14 +56,21 @@ public class ChatAttachmentPathGuardTests : IDisposable
         string secret = Path.Combine(_baseDir, "secret.png");
         File.WriteAllText(secret, "top secret");
 
-        Assert.NotNull(ChatMessageParser.ValidateAttachmentPaths(MessageWithImage(secret), _uploadRoot));
+        Assert.NotNull(ChatMessageParser.ResolveAttachmentPaths(MessageWithImage(secret), _uploadRoot));
     }
 
     [Fact]
     public void TraversalOutOfUploadRoot_IsRejected()
     {
         string traversal = Path.Combine(_uploadRoot, "..", "secret.png");
-        Assert.NotNull(ChatMessageParser.ValidateAttachmentPaths(MessageWithImage(traversal), _uploadRoot));
+        Assert.NotNull(ChatMessageParser.ResolveAttachmentPaths(MessageWithImage(traversal), _uploadRoot));
+    }
+
+    [Fact]
+    public void DotDotFileName_IsRejected()
+    {
+        Assert.NotNull(ChatMessageParser.ResolveAttachmentPaths(MessageWithImage(".."), _uploadRoot));
+        Assert.NotNull(ChatMessageParser.ResolveAttachmentPaths(MessageWithImage("."), _uploadRoot));
     }
 
     [Fact]
@@ -60,11 +80,11 @@ public class ChatAttachmentPathGuardTests : IDisposable
         Directory.CreateDirectory(sibling);
         string path = Path.Combine(sibling, "img.png");
 
-        Assert.NotNull(ChatMessageParser.ValidateAttachmentPaths(MessageWithImage(path), _uploadRoot));
+        Assert.NotNull(ChatMessageParser.ResolveAttachmentPaths(MessageWithImage(path), _uploadRoot));
     }
 
     [Fact]
-    public void AudioAndTextFilePaths_AreValidatedToo()
+    public void AudioAndTextFileReferences_AreResolvedToo()
     {
         string outside = Path.Combine(_baseDir, "outside.wav");
         var audio = new List<ChatMessage>
@@ -73,25 +93,26 @@ public class ChatAttachmentPathGuardTests : IDisposable
         };
         var text = new List<ChatMessage>
         {
-            new ChatMessage { Role = "user", Content = "hi", TextFilePaths = new List<string> { outside } }
+            new ChatMessage { Role = "user", Content = "hi", TextFilePaths = new List<string> { "doc.txt" } }
         };
 
-        Assert.NotNull(ChatMessageParser.ValidateAttachmentPaths(audio, _uploadRoot));
-        Assert.NotNull(ChatMessageParser.ValidateAttachmentPaths(text, _uploadRoot));
+        Assert.NotNull(ChatMessageParser.ResolveAttachmentPaths(audio, _uploadRoot));
+        Assert.Null(ChatMessageParser.ResolveAttachmentPaths(text, _uploadRoot));
+        Assert.Equal(Path.Combine(Path.GetFullPath(_uploadRoot), "doc.txt"), text[0].TextFilePaths[0]);
     }
 
     [Fact]
     public void NullOrEmptyPathEntry_IsRejected()
     {
-        Assert.NotNull(ChatMessageParser.ValidateAttachmentPaths(MessageWithImage(null), _uploadRoot));
-        Assert.NotNull(ChatMessageParser.ValidateAttachmentPaths(MessageWithImage("  "), _uploadRoot));
+        Assert.NotNull(ChatMessageParser.ResolveAttachmentPaths(MessageWithImage(null), _uploadRoot));
+        Assert.NotNull(ChatMessageParser.ResolveAttachmentPaths(MessageWithImage("  "), _uploadRoot));
     }
 
     [Fact]
     public void MessagesWithoutAttachments_AreAccepted()
     {
         var plain = new List<ChatMessage> { new ChatMessage { Role = "user", Content = "hi" } };
-        Assert.Null(ChatMessageParser.ValidateAttachmentPaths(plain, _uploadRoot));
-        Assert.Null(ChatMessageParser.ValidateAttachmentPaths(null, _uploadRoot));
+        Assert.Null(ChatMessageParser.ResolveAttachmentPaths(plain, _uploadRoot));
+        Assert.Null(ChatMessageParser.ResolveAttachmentPaths(null, _uploadRoot));
     }
 }
