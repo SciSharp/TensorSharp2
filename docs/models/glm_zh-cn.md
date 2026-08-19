@@ -199,6 +199,22 @@ offload 与张量并行可以叠加：`--n-cpu-moe 30 --tp 2` 能正常加载，
 映射就地提供——那会把一个映射文件变成 200 GiB 的私有副本），于是这些层由 rank 0 计算，
 而留在 GPU 上的层照常切分。单独用 `--n-cpu-moe 30` 时与 llama.cpp 3/3 一致。
 
+### 上下文长度
+
+GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里每个 token 的 576 宽 MLA
+行加上 indexer 的那一行约 93 KiB，1M 上下文就是约 98 GiB 的 KV——比权重还多，而且还没
+算计算图。所以宣称的数字被当作**上限**而不是请求：加载器会用权重落盘后设备上真正剩下
+的显存（再扣掉一张 `n_ubatch` 计算图里 DSA 掩码与 LM head 所需的部分）来定上下文，并把
+选中的数字打出来。
+
+```
+[glm] context 91136 tokens (the GGUF advertises 1048576): 18.3 GiB free per rank
+      after the weights, and the caches and graphs have to live in it.
+```
+
+`MAX_CONTEXT` 则反过来：你指定的上下文是硬性要求，放得下就照办，放不下就带着数字拒绝，
+而不会在你背后悄悄缩小。
+
 ### 环境变量
 
 | 变量 | 默认值 | 含义 |

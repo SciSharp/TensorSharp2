@@ -208,8 +208,9 @@ in the last bits, and — exactly as for batched decode above — 75 layers of
 top-8-of-256 routing amplify that into a different continuation on a 2-bit
 checkpoint. Against the recorded llama.cpp goldens the layer split reproduces
 5/6 short prompts and `--tp 3` reproduces 3/6; the tokens that differ are the
-near-tied ones. The second is speed, and the reason is the interconnect. Each layer needs two all-reduces of the
-`[6144, n_tokens]` hidden state, and these cards are PCIe-attached with no
+near-tied ones. The second is speed, and the reason is the interconnect. Each
+layer needs two all-reduces of the `[6144, n_tokens]` hidden state, and these
+cards are PCIe-attached with no
 NVLink: a 1024-token prefill chunk moves ~25 MB per crossing, 78 layers x 2
 reductions deep, which is more time on the bus than the split saves in
 arithmetic. Layer splitting moves the hidden state exactly twice per token, so
@@ -241,6 +242,25 @@ RAM and no host time, and a strided strip cannot be served in place from the GGU
 mapping — it would turn a mapped file into a 200 GiB private copy), so rank 0
 evaluates those layers while the GPU-resident ones stay split. `--n-cpu-moe 30`
 on its own reproduces llama.cpp 3/3.
+
+### Context length
+
+The GGUF advertises 1,048,576 tokens. That is not a promise the caches fit: at
+78 layers a 576-wide MLA row plus the indexer's is ~93 KiB per token, so a 1M
+context is ~98 GiB of KV — more than the weights — before the graphs are
+counted. So the advertised number is treated as a **ceiling**, not a request:
+the loader sizes the context from the VRAM actually left after the weights land
+(minus what the DSA masks and the LM head need for one `n_ubatch` graph) and
+says what it picked.
+
+```
+[glm] context 91136 tokens (the GGUF advertises 1048576): 18.3 GiB free per rank
+      after the weights, and the caches and graphs have to live in it.
+```
+
+`MAX_CONTEXT` turns that around: a context you name is a requirement, honoured
+if it fits and refused with the numbers if it does not, rather than quietly
+shrunk under you.
 
 ### Environment knobs
 

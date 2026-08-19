@@ -35,7 +35,7 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern IntPtr TSGgml_GlmLoadModel([MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
             int nGpu, int nCtx, int nUbatch, int nThreads, int nCpuMoe,
-            [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName, int tp);
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName, int tp, int ctxIsHardLimit);
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmVocabSize(IntPtr handle);
@@ -80,9 +80,14 @@ namespace TensorSharp.GGML
         /// model across the visible GPUs; &gt;1 runs EVERY layer on every rank with
         /// the attention heads and the routed experts sharded, so all the GPUs work
         /// on each token instead of one at a time.</param>
+        /// <param name="ctxIsHardLimit">True when <paramref name="nCtx"/> came from
+        /// the caller (MAX_CONTEXT) and must be honoured or refused; false when it
+        /// is only what the GGUF advertises, which the loader may cap to whatever
+        /// the devices can actually hold beside the weights.</param>
         public static IntPtr LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads,
-            int nCpuMoe = CpuMoeNone, string backendName = null, int tp = 1)
-            => TSGgml_GlmLoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads, nCpuMoe, backendName ?? string.Empty, tp);
+            int nCpuMoe = CpuMoeNone, string backendName = null, int tp = 1, bool ctxIsHardLimit = false)
+            => TSGgml_GlmLoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads, nCpuMoe, backendName ?? string.Empty, tp,
+                                   ctxIsHardLimit ? 1 : 0);
 
         public static int VocabSize(IntPtr handle) => TSGgml_GlmVocabSize(handle);
         public static int CtxSize(IntPtr handle) => TSGgml_GlmCtxSize(handle);

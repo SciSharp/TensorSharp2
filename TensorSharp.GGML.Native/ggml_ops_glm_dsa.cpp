@@ -206,6 +206,22 @@ static int shard_first(int total, int n, int r)
     return r * base + std::min(r, rem);
 }
 
+/// Same contiguous tiling, but the remainder is handed out starting at rank
+/// `rot` instead of always at rank 0. The routed experts are split in whole
+/// quantization blocks, and GLM-5.2 has only eight of them per expert row: at
+/// tp=3 a fixed split gives 3/3/2, so one rank carries a third less weight and
+/// does a third less work in every one of the 78 layers. Rotating by layer
+/// index evens the totals out without breaking contiguity.
+static int shard_first_rot(int total, int n, int r, int rot)
+{
+    const int base = total / n;
+    const int rem = total % n;
+    int first = base * r;
+    for (int k = 0; k < r; k++)
+        if (((k - rot) % n + n) % n < rem) first++;
+    return first;
+}
+
 // Per-sequence caches. One row per token per layer; the indexer cache exists
 // only on layers that compute a fresh top-k.
 struct glm_slot
@@ -983,8 +999,14 @@ static void slot_free(glm_model & m, int slot_id)
 // load
 // ---------------------------------------------------------------------------
 
+/// `ctx_is_hard_limit` distinguishes "the user asked for this context" from
+/// "this is what the GGUF advertises". The first is honoured or refused; the
+/// second is a ceiling the loader may cap to whatever the VRAM actually holds,
+/// because a 1M-token advertisement is not a promise that 1M tokens of KV fit
+/// beside the weights.
 static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch,
-                            int n_threads, int n_cpu_moe_req, const char * backend_name, int tp_req)
+                            int n_threads, int n_cpu_moe_req, const char * backend_name, int tp_req,
+                            bool ctx_is_hard_limit)
 {
     auto t_start = std::chrono::steady_clock::now();
     std::unique_ptr<glm_model> m(new glm_model());
@@ -1198,6 +1220,9 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     const size_t head_bytes = root_bytes > embd_bytes ? root_bytes - embd_bytes : 0;
 
     m->n_ctx = n_ctx > 0 ? n_ctx : 8192;
+    // What the caller asked for, kept so a later measurement can hand slack back
+    // without ever exceeding the request.
+    const int ctx_requested = m->n_ctx;
     m->n_ubatch = n_ubatch > 0 ? n_ubatch : 512;
     m->layers.resize((size_t) hp.n_layer);
     for (int il = 0; il < hp.n_layer; il++)
@@ -1235,15 +1260,120 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     size_t total_bytes = root_bytes;
     for (auto b : layer_bytes) total_bytes += b;
 
+    // KV bytes one token costs, summed over every layer. GLM-5.2 advertises a
+    // 1M context, which at 78 layers is ~98 GiB of cache — more than the weights
+    // — so the advertised number is a ceiling to fit under, not a promise.
+    size_t kv_bytes_per_token = 0;
+    for (int il = 0; il < hp.n_layer; il++)
+    {
+        kv_bytes_per_token += (size_t) hp.n_kv_row * 2;
+        if (hp.indexer_full[il]) kv_bytes_per_token += (size_t) hp.indexer_head_size * 2;
+    }
+
+    // What a graph needs on top of the caches. Two things scale with the
+    // context: the DSA top-k masks, which are [n_kv, n_ubatch] F16 and live for
+    // the whole graph on every full-indexer layer, and nothing else. The rest is
+    // fixed per ubatch and dominated by the LM head's [n_vocab, n_ubatch] output.
+    // Counted twice over because the graph cache keeps several built graphs
+    // alive, each holding its own allocation.
+    const int n_full_indexer = (int) std::count(hp.indexer_full.begin(), hp.indexer_full.end(), (uint8_t) 1);
+    const size_t graph_bytes_per_token = 2 * (size_t) n_full_indexer * (size_t) m->n_ubatch * 2;
+    const size_t graph_bytes_fixed =
+        2 * (size_t) m->n_ubatch * ((size_t) hp.n_vocab + 16 * (size_t) hp.n_embd) * 4;
+
+    /// Largest context whose caches AND graphs still fit in `avail`, in whole
+    /// 256-token steps because that is the granularity the graphs are keyed on.
+    auto ctx_that_fits = [&](size_t avail) -> int
+    {
+        const size_t per_token = kv_bytes_per_token + graph_bytes_per_token;
+        if (per_token == 0 || avail <= graph_bytes_fixed) return 0;
+        size_t tokens = (avail - graph_bytes_fixed) / per_token;
+        tokens -= tokens % 256;
+        if (tokens > (size_t) ctx_requested) tokens = (size_t) ctx_requested;
+        return (int) tokens;
+    };
+
+    /// Everything a rank must hold at `n_ctx` besides its weights.
+    auto runtime_bytes = [&](int n_ctx_want) -> size_t
+    {
+        return (size_t) n_ctx_want * (kv_bytes_per_token + graph_bytes_per_token) + graph_bytes_fixed;
+    };
+
+    // The pre-load estimate only has to be conservative enough to refuse the
+    // hopeless cases; when the devices can be asked directly after the weights
+    // land, that measurement decides the context and the estimate stays quiet.
+    const bool remeasure_ctx = !ctx_is_hard_limit && n_gpu > 0;
+
     int n_cpu_moe = 0;
     if (m->tp > 1)
     {
-        // Every rank runs every layer; `device` stays 0 and is unused.
-        n_cpu_moe = std::min(std::max(n_cpu_moe_req, 0), hp.n_layer);
+        // Every rank runs every layer, so the budget is per rank: the routed
+        // experts are the only weights that shrink with `tp`, and the MLA and
+        // indexer caches do not shrink at all — they are rank-independent, so
+        // every rank keeps its own full-length copy. Without this the load only
+        // discovered it did not fit when the first sequence slot failed to
+        // allocate, which is minutes of weight reads after the point of no
+        // return.
+        auto rank_weight_bytes = [&](int n_cpu) -> size_t
+        {
+            size_t b = embd_bytes + head_bytes;              // replicated on rank 0's device
+            for (int il = 0; il < hp.n_layer; il++)
+            {
+                const size_t e = layer_exps_bytes[il];
+                b += layer_bytes[il] - e;                    // dense half: replicated (upper bound)
+                if (il >= n_cpu) b += e / (size_t) m->tp;    // this rank's expert rows
+            }
+            return b;
+        };
+        // Only meaningful with one rank per GPU: a host-only run has no device
+        // budget to measure, and TS_GLM_TP_OVERSUBSCRIBE deliberately stacks
+        // several ranks on one card, where a per-rank budget says nothing.
+        const bool budgeted = n_gpu > 0 && m->tp <= n_gpu;
+
+        const size_t kv_bytes = runtime_bytes(m->n_ctx);
+
+        size_t budget = 0;
+        if (budgeted)
+        {
+            budget = SIZE_MAX;
+            for (int r = 0; r < m->tp; r++) budget = std::min(budget, dev_budget[(size_t) m->rank_device(r)]);
+        }
+
+        int need_cpu_moe = 0;
+        if (budgeted)
+            while (need_cpu_moe <= hp.n_layer && rank_weight_bytes(need_cpu_moe) + kv_bytes > budget) need_cpu_moe++;
+
+        n_cpu_moe = n_cpu_moe_req < 0 ? std::min(need_cpu_moe, hp.n_layer)
+                                      : std::min(std::max(n_cpu_moe_req, 0), hp.n_layer);
+
+        // Experts can only free so much; past that the context is what does not
+        // fit, and shrinking it is the only remedy that keeps the model resident.
+        const size_t w = rank_weight_bytes(n_cpu_moe);
+        if (budgeted && w + kv_bytes > budget)
+        {
+            const int fit = w < budget ? ctx_that_fits(budget - w) : 0;
+            if (fit < 256 || ctx_is_hard_limit)
+            {
+                fprintf(stderr,
+                        "[glm] not enough VRAM for --tp %d: %.1f GiB per rank of weights plus %.1f GiB of KV and "
+                        "graphs for an %d-token context, against %.1f GiB usable on the smallest rank. Lower "
+                        "MAX_CONTEXT (%d tokens would fit) or add --n-cpu-moe N.\n",
+                        m->tp, w / 1073741824.0, kv_bytes / 1073741824.0, m->n_ctx,
+                        budget / 1073741824.0, fit);
+                return nullptr;
+            }
+            if (!remeasure_ctx)
+                fprintf(stderr, "[glm] context capped to %d tokens (the GGUF advertises %d): %.1f GiB per rank of "
+                        "weights leaves %.1f GiB for the caches and graphs. Set MAX_CONTEXT to ask for a "
+                        "different one.\n",
+                        fit, m->n_ctx, w / 1073741824.0, (budget - w) / 1073741824.0);
+            m->n_ctx = fit;
+        }
+
         for (int il = 0; il < n_cpu_moe && il < hp.n_layer; il++) m->layers[il].cpu_moe = true;
         if (n_cpu_moe > 0)
-            fprintf(stderr, "[glm] MoE CPU offload: this rank's experts for layers 0..%d stay in system RAM\n",
-                    n_cpu_moe - 1);
+            fprintf(stderr, "[glm] MoE CPU offload: this rank's experts for layers 0..%d stay in system RAM%s\n",
+                    n_cpu_moe - 1, n_cpu_moe_req < 0 ? " (auto: they do not fit alongside the caches otherwise)" : "");
     }
     else if (n_gpu == 0)
     {
@@ -1283,6 +1413,34 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             }
             return true;
         };
+
+        // An advertised context that does not fit is capped, not refused — the
+        // same ceiling rule the tensor-parallel path uses. Only when MAX_CONTEXT
+        // named the number is it treated as a requirement.
+        if (!ctx_is_hard_limit)
+        {
+            const int want_cpu = n_cpu_moe_req < 0 ? 0 : std::min(n_cpu_moe_req, hp.n_layer);
+            if (!pack(1.0, want_cpu, nullptr))
+            {
+                size_t weights = root_bytes;
+                for (int il = 0; il < hp.n_layer; il++)
+                {
+                    weights += layer_bytes[il];
+                    if (il < want_cpu) weights -= layer_exps_bytes[il];
+                }
+                size_t budget_total = 0;
+                for (int d = 0; d < n_gpu; d++) budget_total += dev_budget[d];
+                const int fit = weights < budget_total ? ctx_that_fits(budget_total - weights) : 0;
+                if (fit >= 256 && fit < m->n_ctx)
+                {
+                    if (!remeasure_ctx)
+                        fprintf(stderr, "[glm] context capped to %d tokens (the GGUF advertises %d) so the weights "
+                                "and their caches fit the %d visible GPU(s). Set MAX_CONTEXT to ask for a "
+                                "different one.\n", fit, m->n_ctx, n_gpu);
+                    m->n_ctx = fit;
+                }
+            }
+        }
 
         int need_cpu_moe = 0;
         while (need_cpu_moe <= hp.n_layer && !pack(1.0, need_cpu_moe, nullptr)) need_cpu_moe++;
@@ -1411,7 +1569,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             const bool sh = n_rank > 1 && m->tp_heads();
             const bool se = n_rank > 1 && m->tp_experts();
             L.head_first[r] = sh ? shard_first(hp.n_head, n_rank, r) : (r == 0 ? 0 : hp.n_head);
-            L.moe_ff_first[r] = se ? shard_first(hp.n_ff_exp / moe_ff_blck, n_rank, r) * moe_ff_blck
+            L.moe_ff_first[r] = se ? shard_first_rot(hp.n_ff_exp / moe_ff_blck, n_rank, r, il) * moe_ff_blck
                                    : (r == 0 ? 0 : hp.n_ff_exp);
         }
 
@@ -1754,6 +1912,37 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     m->op_offload = (n_cpu_moe == 0);
     if (const char * e = getenv("TS_GLM_OP_OFFLOAD")) m->op_offload = atoi(e) != 0;
 
+    // The weights are resident now, so stop estimating: ask the devices how much
+    // they actually have left and size the caches to that. The pre-load estimate
+    // above only has to be conservative enough to refuse the hopeless cases; this
+    // is what decides the context the session really gets.
+    if (!ctx_is_hard_limit && n_gpu > 0 && (m->tp <= 1 || m->tp <= n_gpu))
+    {
+        size_t free_min = SIZE_MAX;
+        const int n_rank = m->tp > 1 ? m->tp : n_gpu;
+        for (int r = 0; r < n_rank; r++)
+        {
+            const int d = m->tp > 1 ? m->rank_device(r) : r;
+            size_t free_b = 0, total_b = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(m->backends[d]), &free_b, &total_b);
+            // Under a layer split the caches are spread over the devices, so each
+            // one only carries its own layers' share; with tensor parallelism
+            // every rank carries the lot.
+            const size_t share = m->tp > 1 ? free_b : free_b * (size_t) n_gpu;
+            free_min = std::min(free_min, share);
+        }
+        const size_t reserve = (size_t) 1024 * 1024 * 1024;   // leave the driver room to breathe
+        const int fit = free_min > reserve ? ctx_that_fits(free_min - reserve) : 0;
+        if (fit >= 256 && fit != m->n_ctx)
+        {
+            if (fit < ctx_requested)
+                fprintf(stderr, "[glm] context %d tokens (the GGUF advertises %d): %.1f GiB free per rank after the "
+                        "weights, and the caches and graphs have to live in it. Set MAX_CONTEXT to ask for a "
+                        "different one.\n", fit, ctx_requested, free_min / 1073741824.0);
+            m->n_ctx = fit;
+        }
+    }
+
     m->active_slot = slot_alloc(*m);
     if (!m->active_slot) { fprintf(stderr, "[glm] primary slot allocation failed\n"); return nullptr; }
 
@@ -1775,10 +1964,16 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 m->n_ctx, m->n_ubatch, m->flash_attn ? "on" : "off", m->fused_lid ? "on" : "off");
         if (m->tp > 1)
         {
+            // The expert rows are split in whole quantization blocks and the
+            // remainder rotates by layer, so quote the per-rank average rather
+            // than one layer's slice.
+            int rows0 = 0;
+            for (int il = 0; il < hp.n_layer; il++)
+                if (m->layers[il].is_moe) rows0 += m->layers[il].moe_ff_first[1];
+            const int moe_layers = std::max(1, hp.n_layer - hp.n_dense_lead);
             fprintf(stderr, "[glm] tensor parallel across %d rank(s): every layer on every rank, "
-                    "heads %d/%d and expert rows %d/%d per rank, 2 reductions per layer\n",
-                    m->tp, m->layers[0].head_first[1], hp.n_head,
-                    m->layers[hp.n_layer - 1].moe_ff_first[1], hp.n_ff_exp);
+                    "heads %d/%d and ~%d/%d expert rows per rank, 2 reductions per layer\n",
+                    m->tp, m->layers[0].head_first[1], hp.n_head, rows0 / moe_layers, hp.n_ff_exp);
         }
         for (int d = 0; d < n_gpu; d++)
         {
@@ -3061,11 +3256,13 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
 using namespace tsg_glm;
 
 TSG_EXPORT void * TSGgml_GlmLoadModel(const char * gguf_path, int n_gpu, int n_ctx, int n_ubatch,
-                                      int n_threads, int n_cpu_moe, const char * backend_name, int tp)
+                                      int n_threads, int n_cpu_moe, const char * backend_name, int tp,
+                                      int ctx_is_hard_limit)
 {
     try
     {
-        return glm_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend_name, tp);
+        return glm_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend_name, tp,
+                        ctx_is_hard_limit != 0);
     }
     catch (const std::exception & e)
     {

@@ -100,8 +100,16 @@ namespace TensorSharp.Models
             int nUbatch = ParseEnvInt("TS_GLM_UBATCH", 1024);
             int nThreads = ParseEnvInt("TS_GLM_THREADS", Math.Min(Environment.ProcessorCount, 32));
 
+            // GLM-5.2 advertises a 1M-token context, which is ~98 GiB of KV cache
+            // across 78 layers — more than the weights. Unless MAX_CONTEXT named
+            // the number, the loader treats it as a ceiling and caps it to what
+            // the devices hold, rather than loading 200 GiB and only then failing
+            // to allocate the first sequence slot.
+            bool ctxIsHardLimit = !string.IsNullOrWhiteSpace(
+                Environment.GetEnvironmentVariable("MAX_CONTEXT"));
+
             _native = GgmlGlmNative.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
-                ResolveCpuMoeLayers(), BackendRegistryName(backend), tp);
+                ResolveCpuMoeLayers(), BackendRegistryName(backend), tp, ctxIsHardLimit);
             if (_native == IntPtr.Zero)
                 throw new InvalidOperationException(
                     $"Failed to load the glm-dsa model from {ggufPath} with the native executor (see stderr). " +
