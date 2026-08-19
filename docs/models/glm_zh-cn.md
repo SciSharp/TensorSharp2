@@ -194,6 +194,11 @@ dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --cpu-mo
 dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --n-cpu-moe 30
 ```
 
+offload 是让放不下的 checkpoint 能跑起来的手段，不是提速开关——模型本来就放得下时，
+把专家挪到主机只会多出总线往返。同样 3 张卡、同一轮：默认按层切分 pp2048 **915.9** /
+tg64 **43.9** tok/s，`--n-cpu-moe 30` 为 **94.7** / **16.4**，`--tp 3` 为 **505.6** /
+**17.6**。只有在"otherwise 根本跑不起来"时才该用 `--n-cpu-moe`。
+
 offload 与张量并行可以叠加：`--n-cpu-moe 30 --tp 2` 能正常加载，主机常驻的那些层会
 保持专家完整（切开它们既省不了主机内存也省不了主机时间，而且跨步切片没法直接由 GGUF
 映射就地提供——那会把一个映射文件变成 200 GiB 的私有副本），于是这些层由 rank 0 计算，

@@ -236,6 +236,12 @@ dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --cpu-mo
 dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --n-cpu-moe 30
 ```
 
+Offload is a way to fit a checkpoint that does not fit, not a speed knob — when
+the model already fits, moving experts to the host only adds bus round trips.
+Same 3 GPUs, same run: default layer split pp2048 **915.9** / tg64 **43.9** tok/s,
+`--n-cpu-moe 30` **94.7** / **16.4**, `--tp 3` **505.6** / **17.6**. Reach for
+`--n-cpu-moe` when the alternative is not running at all.
+
 Offload composes with tensor parallelism: `--n-cpu-moe 30 --tp 2` loads, and the
 host-resident layers keep their experts whole (splitting them would save no host
 RAM and no host time, and a strided strip cannot be served in place from the GGUF
