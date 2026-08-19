@@ -1764,6 +1764,295 @@ namespace TensorSharp.Runtime
     }
 
     // ========================================================================
+    // GLM-5.x (glm-dsa): <think>...</think> reasoning, then content, with tool
+    // calls as <tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
+    // ========================================================================
+
+    /// <summary>
+    /// Parser for the GLM-5.x reply format.
+    ///
+    /// <para>The generation prompt already emits the opening <c>&lt;think&gt;</c>
+    /// (or an immediately-closed pair when thinking is off), so the model's own
+    /// output starts INSIDE the reasoning block and closes it with
+    /// <c>&lt;/think&gt;</c>. Everything after that is the answer, except for
+    /// <c>&lt;tool_call&gt;</c> blocks, which carry the function name as bare
+    /// text followed by alternating key/value tags.</para>
+    ///
+    /// <para>Unlike Qwen's JSON-bodied tool calls, GLM's arguments arrive as one
+    /// XML element per argument, so a value is taken verbatim unless it parses as
+    /// JSON — that is what the model emits for numbers, booleans, arrays and
+    /// objects (the template renders them with <c>tojson</c>).</para>
+    /// </summary>
+    public class GlmDsaOutputParser : IOutputParser
+    {
+        private enum State { Thinking, Content, ToolCall }
+
+        private const string ThinkOpen = "<think>";
+        private const string ThinkClose = "</think>";
+        private const string CallOpen = "<tool_call>";
+        private const string CallClose = "</tool_call>";
+
+        private State _state;
+        private readonly StringBuilder _buffer = new();
+        private bool _thinkingEnabled;
+        private int _callIndex;
+
+        public bool HasThinkingSupport => true;
+        public bool HasToolSupport => true;
+        public bool AlwaysRequired => true;
+
+        public void Init(bool enableThinking, List<ToolFunction> tools)
+        {
+            _buffer.Clear();
+            _thinkingEnabled = enableThinking;
+            _callIndex = 0;
+            _state = enableThinking ? State.Thinking : State.Content;
+        }
+
+        public ParsedOutput Add(string text, bool done)
+        {
+            _buffer.Append(text);
+            var result = new ParsedOutput();
+            var contentSb = new StringBuilder();
+            var thinkingSb = new StringBuilder();
+            var toolCalls = new List<ToolCall>();
+
+            bool keepParsing = true;
+            while (keepParsing)
+            {
+                keepParsing = false;
+                string buf = _buffer.ToString();
+                if (buf.Length == 0)
+                    break;
+
+                switch (_state)
+                {
+                    case State.Thinking:
+                    {
+                        int closeIdx = buf.IndexOf(ThinkClose, StringComparison.Ordinal);
+                        if (closeIdx >= 0)
+                        {
+                            thinkingSb.Append(buf, 0, closeIdx);
+                            string after = buf.Substring(closeIdx + ThinkClose.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = State.Content;
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (done)
+                        {
+                            thinkingSb.Append(buf);
+                            _buffer.Clear();
+                        }
+                        else
+                        {
+                            int hold = HoldBackForPartialTag(buf, ThinkClose);
+                            if (hold < buf.Length)
+                            {
+                                thinkingSb.Append(buf, 0, buf.Length - hold);
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                        }
+                        break;
+                    }
+
+                    case State.Content:
+                    {
+                        int callIdx = buf.IndexOf(CallOpen, StringComparison.Ordinal);
+                        if (callIdx >= 0)
+                        {
+                            contentSb.Append(buf, 0, callIdx);
+                            string after = buf.Substring(callIdx + CallOpen.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = State.ToolCall;
+                            keepParsing = true;
+                            break;
+                        }
+                        // A late <think> can still open: the model may reason again
+                        // between answers even though the prompt closed the block.
+                        int thinkIdx = _thinkingEnabled ? buf.IndexOf(ThinkOpen, StringComparison.Ordinal) : -1;
+                        if (thinkIdx >= 0)
+                        {
+                            contentSb.Append(buf, 0, thinkIdx);
+                            string after = buf.Substring(thinkIdx + ThinkOpen.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = State.Thinking;
+                            keepParsing = after.Length > 0;
+                            break;
+                        }
+                        if (done)
+                        {
+                            contentSb.Append(buf);
+                            _buffer.Clear();
+                        }
+                        else
+                        {
+                            int hold = HoldBackForPartialTag(buf, CallOpen, ThinkOpen);
+                            if (hold < buf.Length)
+                            {
+                                contentSb.Append(buf, 0, buf.Length - hold);
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                        }
+                        break;
+                    }
+
+                    case State.ToolCall:
+                    {
+                        int endIdx = buf.IndexOf(CallClose, StringComparison.Ordinal);
+                        if (endIdx >= 0)
+                        {
+                            ParseGlmToolCall(buf.Substring(0, endIdx), toolCalls);
+                            string after = buf.Substring(endIdx + CallClose.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = State.Content;
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (done)
+                        {
+                            // Generation stopped inside the block (token budget, or
+                            // EOS right after the last argument): surface whatever
+                            // completed rather than dropping the call.
+                            ParseGlmToolCall(buf, toolCalls);
+                            _buffer.Clear();
+                            _state = State.Content;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            result.Content = contentSb.ToString();
+            result.Thinking = thinkingSb.ToString();
+            result.ToolCalls = toolCalls.Count > 0 ? toolCalls : null;
+            return result;
+        }
+
+        /// <summary>
+        /// Body of one &lt;tool_call&gt; block: the function name, then alternating
+        /// &lt;arg_key&gt;/&lt;arg_value&gt; pairs.
+        /// </summary>
+        private void ParseGlmToolCall(string body, List<ToolCall> toolCalls)
+        {
+            const string keyOpen = "<arg_key>";
+            const string keyClose = "</arg_key>";
+            const string valOpen = "<arg_value>";
+            const string valClose = "</arg_value>";
+
+            int firstKey = body.IndexOf(keyOpen, StringComparison.Ordinal);
+            string name = (firstKey >= 0 ? body.Substring(0, firstKey) : body).Trim();
+            if (name.Length == 0)
+                return;
+
+            var args = new Dictionary<string, object>();
+            int pos = firstKey < 0 ? body.Length : firstKey;
+            while (pos < body.Length)
+            {
+                int ks = body.IndexOf(keyOpen, pos, StringComparison.Ordinal);
+                if (ks < 0) break;
+                int ke = body.IndexOf(keyClose, ks + keyOpen.Length, StringComparison.Ordinal);
+                if (ke < 0) break;
+                string key = body.Substring(ks + keyOpen.Length, ke - ks - keyOpen.Length).Trim();
+
+                int vs = body.IndexOf(valOpen, ke + keyClose.Length, StringComparison.Ordinal);
+                if (vs < 0) break;
+                int ve = body.IndexOf(valClose, vs + valOpen.Length, StringComparison.Ordinal);
+                string raw = ve < 0
+                    ? body.Substring(vs + valOpen.Length)
+                    : body.Substring(vs + valOpen.Length, ve - vs - valOpen.Length);
+
+                if (key.Length > 0)
+                    args[key] = ParseJsonValue(raw.Trim());
+
+                if (ve < 0) break;
+                pos = ve + valClose.Length;
+            }
+
+            toolCalls.Add(new ToolCall { Name = name, Arguments = args, Index = _callIndex++ });
+        }
+
+        /// <summary>
+        /// A GLM argument is a JSON scalar / array / object when the template
+        /// rendered it with <c>tojson</c>, and bare text otherwise. Numbers,
+        /// booleans, null and bracketed values are parsed; everything else stays
+        /// the literal string the model wrote.
+        /// </summary>
+        private static object ParseJsonValue(string value)
+        {
+            if (value.Length == 0)
+                return string.Empty;
+
+            char c = value[0];
+            bool looksJson = c == '{' || c == '[' || c == '"' || c == '-' || char.IsDigit(c) ||
+                             value == "true" || value == "false" || value == "null";
+            if (!looksJson)
+                return value;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(value);
+                return JsonElementToObject(doc.RootElement);
+            }
+            catch (JsonException)
+            {
+                return value;
+            }
+        }
+
+        private static object JsonElementToObject(JsonElement e)
+        {
+            switch (e.ValueKind)
+            {
+                case JsonValueKind.String: return e.GetString() ?? string.Empty;
+                // Boxed separately: a `? long : double` ternary would widen every
+                // integer to double, so a tool argument of 3 would arrive as 3.0.
+                case JsonValueKind.Number:
+                    if (e.TryGetInt64(out long l)) return l;
+                    return e.GetDouble();
+                case JsonValueKind.True: return true;
+                case JsonValueKind.False: return false;
+                case JsonValueKind.Null: return null;
+                case JsonValueKind.Array:
+                {
+                    var list = new List<object>();
+                    foreach (var item in e.EnumerateArray()) list.Add(JsonElementToObject(item));
+                    return list;
+                }
+                case JsonValueKind.Object:
+                {
+                    var map = new Dictionary<string, object>();
+                    foreach (var prop in e.EnumerateObject()) map[prop.Name] = JsonElementToObject(prop.Value);
+                    return map;
+                }
+                default: return e.ToString();
+            }
+        }
+
+        private static int HoldBackForPartialTag(string buf, params string[] tags)
+        {
+            int hold = 0;
+            foreach (string tag in tags)
+            {
+                int max = Math.Min(tag.Length - 1, buf.Length);
+                for (int len = max; len > 0; len--)
+                {
+                    if (string.CompareOrdinal(buf, buf.Length - len, tag, 0, len) == 0)
+                    {
+                        if (len > hold) hold = len;
+                        break;
+                    }
+                }
+            }
+            return hold;
+        }
+    }
+
+    // ========================================================================
     // Factory
     // ========================================================================
 
@@ -1779,6 +2068,7 @@ namespace TensorSharp.Runtime
                 "gptoss" or "gpt-oss" => new HarmonyOutputParser(),
                 "muse-glimmer" => new MuseGlimmerOutputParser(),
                 "deepseek4" => new DeepSeek4OutputParser(),
+                "glm-dsa" or "glm_dsa" => new GlmDsaOutputParser(),
                 "nemotron_h" or "nemotron_h_moe" => new Qwen3OutputParser(),
                 _ => new PassthroughOutputParser()
             };
@@ -1809,7 +2099,8 @@ namespace TensorSharp.Runtime
             // <|start|>...<|message|>...<|eom|>/<|eot|> framing and its reasoning
             // arrives on the "to=self" channel, so an unparsed stream shows the
             // raw tags and the whole chain of thought as if it were the answer.
-            return architecture is "gptoss" or "gpt-oss" or "gemma4" or "deepseek4" or "muse-glimmer";
+            return architecture is "gptoss" or "gpt-oss" or "gemma4" or "deepseek4" or "muse-glimmer"
+                                or "glm-dsa" or "glm_dsa";
         }
     }
 }

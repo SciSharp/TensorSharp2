@@ -212,6 +212,7 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 | Qwen 3.5 / 3.6 family | 默认批处理路径。支持 FullAttention 层、通过每槽位状态池处理 GatedDeltaNet 递归层、MoE 变体、视觉注入与多模态 RoPE 表。Qwen 3.6 还通过其内嵌 NextN 块支持 MTP 投机解码（GDN 递归状态快照 / 回滚）。 | `TS_QWEN35_BATCHED=0`；`TS_QWEN35_BATCHED_GDN_NATIVE=1` 启用原生批处理 GDN 内核；服务端 `--mtp-spec` 在 Qwen 3.6 上启用投机。 |
 | GPT OSS | 默认批处理路径。支持 Q/K/V/O bias、YaRN RoPE、滑窗层、attention sinks、MXFP4 MoE expert 与原生 sinks 注意力。已与旧路径做贪心正确性验证；性能仍主要受逐层图构建限制。 | `TS_GPTOSS_BATCHED=0`；`TS_GPTOSS_PAGED_ATTN_MANAGED=1`。 |
 | Nemotron-H | 默认批处理路径。Attention 层使用分页 K/V；Mamba2 层使用每槽位 conv/SSM 状态池；MoE 层使用批处理 expert 内核；准备好的图像 / 音频 embedding 可注入到批处理 hidden state。 | `TS_NEMOTRON_BATCHED=0`；`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 step。 |
+| GLM 5.x | 没有 `ForwardBatch`：MLA 每个 token 只存一行压缩表示，DSA indexer 又要对同一段连续历史打分，没有分页 KV 布局可批。并发改由原生**序列 slot** 承担（`TSGgml_GlmSlotAlloc` / `SetActiveSlot` / `SlotFree`）——绑定请求只是切换活动 slot，不搬运 KV 字节，每个 slot 的计算图独立缓存与捕获。在此之上实现了批量融合 decode（一张图、每序列一个 token，整批只读一遍权重）：4 个并发请求时合计 decode 提速 1.81×；默认需显式开启，因为批处理改变 GEMM 形状，而 2 bit MoE 会把这点差别放大成不同的专家选择。 | `TS_BATCHED_FUSED_DECODE=1` 开启批量 decode；`TS_GLM_BATCHED_DECODE=0` 让原生侧拒绝它。 |
 | Gemma 3 | 尚无真正 `ForwardBatch` 移植；通过引擎的按序列回退执行。 | 仅全局回退。 |
 | DiffusionGemma | 独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求，并可选择批处理活跃 canvas。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`、`DIFFUSION_BATCHED_FORWARD`；`DIFFUSION_NO_FUSED_DECODE=1` 关闭 GGML 融合整模型 diffusion decode。 |
 

@@ -36,11 +36,13 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 
 ## 后端
 
-视频生成在 TensorSharp 的每个后端上都可运行：
+除 MLX 外，视频生成在 TensorSharp 的每个后端上都可运行（`--backend mlx` 会在
+加载时被拒绝）：
 
 | `--backend` | 路径 | 说明 |
 |---|---|---|
 | `ggml_cuda` | GGML 整图内核 | 最快；常驻 DiT 图 + CUDA graph 捕获 |
+| `ggml_metal` | GGML 整图内核 | Apple Silicon；VAE 卷积走 MPSGraph |
 | `ggml_vulkan` | GGML 整图内核 | 通过 Vulkan 支持 AMD/Intel/NVIDIA；VAE 保持分带卷积路径（Vulkan 驱动拒绝多 GB 显存竞技场） |
 | `ggml_cpu` | GGML 整图内核 | 纯 CPU 机器；慢但精确 |
 | `cuda` | 直连 CUDA（`WanDirect*`） | 不依赖 ggml：量化权重常驻，走 TensorSharp 自有的 MMQ/dp4a/cuBLAS 路由、流式 online-softmax 注意力内核、channels-last im2col VAE |
@@ -64,7 +66,7 @@ cuBLAS GEMM+softmax（`TS_WAN_DIRECT_FUSED_ATTN=0` 可强制全程使用）。
 
 ```bash
 TensorSharp.Cli --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
-  --prompt "一只可爱的毛茸茸的橘猫走过开满鲜花的阳光花园" \
+  --prompt "a cute fluffy orange cat walking through a sunny garden with flowers" \
   --output cat.mp4 --width 832 --height 480 --video-frames 49 --diffusion-seed 7
 ```
 
@@ -72,14 +74,14 @@ TensorSharp.Cli --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
 
 ```bash
 TensorSharp.Cli --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
-  --prompt "猫向镜头跑来，动感追踪镜头，黄金时刻光线" \
+  --prompt "the cat runs toward the camera, dynamic tracking shot, golden hour" \
   --image first_frame.png --output cat_run.mp4 --video-frames 81
 ```
 
 ```bash
 # A14B：--model 指向任一专家即可，另一专家自动配对
 TensorSharp.Cli --model HighNoise/Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf \
-  --backend ggml_cuda --prompt "帆船驶入风暴，巨浪拍打" \
+  --backend ggml_cuda --prompt "the ship sails into the storm, waves crashing" \
   --image ship.jpg --output ship.mp4
 ```
 
@@ -135,7 +137,7 @@ hf download QuantStack/Wan2.2-TI2V-5B-GGUF VAE/Wan2.2_VAE.safetensors --local-di
 hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir models
 
 TensorSharp.Cli --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_metal \
-  --prompt "猫向镜头跑来，电影感" --image first_frame.png \
+  --prompt "the cat runs toward the camera, cinematic" --image first_frame.png \
   --output cat.mp4 --video-frames 121
 ```
 

@@ -746,7 +746,8 @@ the frame count to change duration — changing only FPS changes playback speed.
 
 These exist for A/B and debugging; all of them make things slower except where
 noted. `TS_WAN_DIT_KV_F16=0` restores F32 attention keys/values (F16 is the
-default and is 2.02× faster at 27 k tokens, with no measurable accuracy cost);
+default and is 2.02× faster on a single 27 k-token self-attention, with no
+measurable accuracy cost);
 `TS_WAN_VAE_MPS_CONV=0` restores ggml's im2col+GEMM conv lowering on Metal
 (MPSGraph is the default and took a 736×544×81f VAE decode from 159 s to 80 s);
 `TS_WAN_VAE_GEMM_MAX_MB` sets the im2col budget and `TS_WAN_VAE_TILE=0` disables

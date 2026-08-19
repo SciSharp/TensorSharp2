@@ -106,6 +106,12 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --video clip
 # 音频推理（Gemma 4）
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --audio speech.wav --backend ggml_metal
 
+# PDF 文档输入：文字型 PDF 会提取文本层并内联进提示词；扫描型 PDF 会转成页面
+# 图像，需要视觉模型（--mmproj 或内置视觉编码器）。--input 提供针对文档的指令。
+echo "Summarize the key findings of this paper." > question.txt
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --pdf paper.pdf --input question.txt \
+    --max-tokens 300 --backend ggml_metal
+
 # DiffusionGemma 文本扩散生成
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <diffusion-gemma.gguf> --input prompt.txt --backend ggml_metal \
     --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0
@@ -166,6 +172,18 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prom
 # 对目录下每个 *.gguf 文件，对比硬编码回退模板与 GGUF 内置 Jinja2 模板
 # （在适配新架构时尤其有用）
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
+
+# 张量并行：在单个进程内把模型切分到 2 张 GPU 上
+# （--backend cuda、ggml_cuda 或 ggml_vulkan）
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --backend cuda --tp 2
+
+# 分布式张量并行：2 节点 × 每节点 2 GPU（共 4 GPU）
+# 节点 0：
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
+    --tp-node-id 0 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
+# 节点 1：
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cuda --tp 2 \
+    --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 ```
 
 **命令行参数：**
@@ -186,6 +204,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 | `--backend <type>` | 计算后端：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan` |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里并在 CPU 上做乘法；注意力、norm、路由器与始终活跃的共享专家仍留在加速器上（等价于 llama.cpp 的 `--n-cpu-moe`）。正是它让 35B-A3B 这类 MoE 能与长上下文 KV 缓存一起塞进 12–16 GB 的显卡。传 `all` 表示所有层。默认：所有架构（含 DeepSeek V4）都是 0 —— 装不下的模型会在加载时被拒绝并告知需要卸载多少层，而不会被悄悄卸载（环境变量 `TS_N_CPU_MOE`）。详见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。 |
+| `--cpu-moe` / `-cmoe` | `--n-cpu-moe all` 的简写。默认：关闭（环境变量 `TS_CPU_MOE`）。 |
+| `--cpu-moe-threads <N>` | 主机侧专家矩阵乘的工作线程数。默认：在核数多于 8 的主机上取本进程实际可用 CPU 并行度（`hardware_concurrency`，再受调度亲和性掩码与 cgroup CPU 配额约束）的**一半**，低于 8 时取「全部减一」。另一半并非浪费——加速器提交线程，以及 `TensorSharp.Server` 里的 Kestrel 与调度器，同样需要可被调度，而 .NET 自己的线程池是按机器 CPU 数而不是 cgroup 配额来定的。把它设到接近配额是悬崖而不是缓坡：在 95 CPU 配额下，托管的 26B MoE 在 64 线程时实测 20.7 tok/s，71 线程时只剩 8.2。独占机器上可以调高（环境变量 `TS_CPU_MOE_THREADS`）。 |
 | `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16`、`q8_0` 或 `q4_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径。 |
 | `--tp <N>` | 张量并行度 —— 在单个进程内把模型切分到 N 张 GPU 上（默认：`1`）。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
 | `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |
@@ -195,7 +216,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --test-templates ~/models
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
 | `--think` | 启用思维链/推理模式 |
 | `--tools <path>` | 包含工具/函数定义的 JSON 文件 |
-| `--draft-model <path>` | 投机解码草稿 GGUF，适用于草稿器以独立文件发布的架构——目前是 DeepSeek V4 的 DSpark 支持模块（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）。它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。在所有单序列路径（`--input`、`--input-jsonl`、`--multi-turn-jsonl`、`--interactive`）上生效，需要 `--backend cuda` 或 `--backend ggml_cuda`，并且必须是纯 argmax 采样：任何 temperature、top-k/p 或重复/存在/频率惩罚都会将其关闭。环境变量：`TS_DSV4_DSPARK`。 |
+| `--draft-model <path>` | 投机解码草稿 GGUF，适用于草稿器以独立文件发布的架构——DeepSeek V4 的 DSpark 支持模块（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）与 Muse-Glimmer 的 DFlash 块级草稿器（见 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md#3-dflash-投机解码)，环境变量 `TS_MUSE_GLIMMER_DFLASH`）。它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。在所有单序列路径（`--input`、`--input-jsonl`、`--multi-turn-jsonl`、`--interactive`）上生效，需要 `--backend cuda` 或 `--backend ggml_cuda`，并且必须是纯 argmax 采样：任何 temperature、top-k/p 或重复/存在/频率惩罚都会将其关闭。环境变量：`TS_DSV4_DSPARK`。 |
 | `--spec-draft-n-max <N>` | 每个投机块最多起草的 token 数（默认：草稿器训练时的块大小；DSpark 为 5，Muse-Glimmer 的 DFlash 为 15） |
 | `--spec-draft-conf-min <p>` | 保留某个起草位置所需的最小**累积**接受概率（置信度头各位置估计值的乘积，默认 `0.35`）。调低会起草更远、回滚更多；调高则更早退回普通 decode。 |
 | `--temperature <f>` | 采样温度（0 = 贪心） |
@@ -384,6 +405,9 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `--tp-peers <list>` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，按节点 ID 排序，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `--tp-node-id` 一起使用。环境变量：`TENSORSHARP_TP_PEERS`。 |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里、在 CPU 上运行其 FFN（见上文**混合专家 CPU 卸载**）。`all` 表示卸载所有层。默认：所有架构（含 DeepSeek V4）都是 0；装不下的模型会在加载时被拒绝并告知需要卸载多少层。环境变量：`TS_N_CPU_MOE`。 |
+| `--cpu-moe` / `-cmoe` | `--n-cpu-moe all` 的简写。默认：关闭。环境变量：`TS_CPU_MOE`。 |
+| `--cpu-moe-threads <N>` | 主机侧专家矩阵乘的工作线程数。默认：在核数多于 8 的主机上取可用 CPU 并行度（`hardware_concurrency`，再受亲和性掩码与 cgroup CPU 配额约束）的一半。服务端还需要另一半来跑 Kestrel、调度器与加速器提交线程；把它设到接近配额会让吞吐直接崩塌而不是缓慢下降（95 CPU 配额下 64 线程 20.7 tok/s，71 线程只剩 8.2）。环境变量：`TS_CPU_MOE_THREADS`。 |
 | `--help` | 打印参数说明后退出（不带任何参数启动服务时也会显示） |
 | `--max-tokens <N>` | 最大生成 token 数：请求未携带上限时用它填充，请求要求更多时按它截断。对所有端点生效（Web UI、`/api/chat`、`/api/generate`、`/v1/chat/completions`、`/v1/responses`）。默认：`20000`，此默认值只用于填充、不做截断。环境变量：`MAX_TOKENS`。 |
 | `--video-frames <N>` | Web UI 或 API 请求未提供 `frames` 时，Wan 视频生成使用的默认输出帧数。VAE 会将其对齐到 `4k+1`；以 24 fps 生成 `121` 帧约为五秒。未指定此参数时沿用模型回退值：通常为 `33`，Wan 2.2 TI2V-5B 为 `49`。请求中显式提供的 `frames` 会覆盖此默认值。 |
@@ -665,12 +689,149 @@ UMT5-XXL 编码器同上。
 ### 其他 Wan 开关
 
 这些开关用于 A/B 与调试，除注明外都会让速度变慢。`TS_WAN_DIT_KV_F16=0` 恢复 F32 的注意力
-键值（F16 是默认值，在 27k token 下快 2.02×，且没有可测的精度损失）；
+键值（F16 是默认值，单次 27k token 自注意力快 2.02×，且没有可测的精度损失）；
 `TS_WAN_VAE_MPS_CONV=0` 在 Metal 上恢复 ggml 的 im2col+GEMM 卷积下降路径（MPSGraph 是默认
 值，把 736×544×81f 的 VAE 解码从 159 秒降到 80 秒）；`TS_WAN_VAE_GEMM_MAX_MB` 设置 im2col
 预算，`TS_WAN_VAE_TILE=0` 关闭分块；`TS_WAN_DIT_CAPTURE=0` 关闭常驻的 CUDA 图捕获 DiT 图；
 `TS_WAN_DIT_FLASH=0` 强制走物化注意力；`TS_WAN_HEARTBEAT_S` 设置进度心跳间隔（默认 30 秒，
 `0` 静默）；`TS_FFMPEG` 指定用于近无损 CRF 17 H.264 导出的 `ffmpeg`。
+
+## 混合专家 CPU 卸载（`--n-cpu-moe`）
+
+大型 MoE 模型几乎所有权重都花在路由专家上，而每个 token 只激活其中很小一部分
+——Qwen3.6-35B-A3B 有约 11 GB 权重，活跃参数却只有约 3B。`--n-cpu-moe N` 把前 N
+层的路由专家留在系统内存里，注意力、各个 norm、路由器以及始终活跃的共享专家仍留
+在加速器上。因此 `--n-cpu-moe` 的含义是「这些专家不驻留显存」，而不是「这些专家在
+CPU 上做矩阵乘」。它们究竟在哪里被相乘，取决于批大小：
+
+* **Decode（单 token，或任何小于 `TS_HOST_MOE_DEVICE_MIN_BATCH` 的批，默认 128）。**
+  由主机做乘法，直接从 GGUF 的 mmap 零拷贝读取量化块。一个 token 只会碰到
+  `n_expert_used` 个专家，因此每层只有几 MB 的内存流量，而一次上传要花掉几百 MB。
+* **Prefill（真正成批时）。** 专家会为这一张图**流式**送到加速器上并在那里相乘，
+  随后暂存内存被下一层复用——它们始终不会常驻。512 token 的批会把这次上传摊薄到
+  批内每个 token 上，而算术正是 GPU 的用武之地。llama.cpp 的调度器也是同样的判断
+  （`ggml_backend_sched` 会把权重位于主机缓冲区的算子在超过
+  `op_offload_min_batch_size` 时送回 GPU）。
+
+有三点让流式这一侧变得很快，这也是 TensorSharp 的卸载 prefill 在相同文件上比
+llama.cpp 快数倍的原因：
+
+1. **主机页被锁定。** 从可分页的 mmap 里做拷贝无法 DMA——驱动会通过一小块固定内存
+   中转。对专家区间调用 `cudaHostRegister` 一次性花费约 65 ms/GiB，却把 PCIe 5.0
+   x16 上的传输从 9.3 GB/s 提升到 55.6 GB/s。用 `TS_HOST_MOE_PIN=0` 关闭，用
+   `TS_HOST_MOE_PIN_MAX_MB` 设上限（默认为 cgroup/主机内存上限的 60%）。
+2. **只发送这一批实际路由到的专家**，并按连续区段分组——和 llama.cpp 调度器用
+   已用专家位图玩的是同一个把戏。512 token 时较大的专家池只会被部分覆盖，而在投机
+   验证与轻负载服务产生的小批下，这项节省相当可观。`TS_HOST_MOE_EXPERT_FILTER=0`
+   恢复整栈上传。
+3. **拷贝是异步下发的**，走后端自己的 stream，并且随图一次同步，而不是每层同步三次。
+
+被卸载的层仍然留在整模型融合图里：加速器在每个卸载层的路由器之后暂停，专家被相乘
+（在主机上，或用流式送达的权重在加速器上），结果再交回，之后下一段才继续运行。token
+里的其他一切——注意力、共享或稠密 FFN、LM head——仍然是一次图提交。这对
+Qwen3.5/3.6、Gemma 4 MoE、GPT-OSS 与 DiffusionGemma 都成立；Gemma 4 MoE 的 prefill
+图也按同样方式分段，而 DiffusionGemma 的块级 decode 会一次性把整块画布位置交给主机，
+因此它卸载出去的是 GEMM 而不是 matvec。Qwen3.5/3.6 的 prefill 图同样分段，并且它和
+Gemma 4 MoE 在张量并行下也保留融合图（见下文 `--tp` 说明）。GPT-OSS 现在同样有整模型
+融合 prefill 图，因此它的卸载 prefill 也是分段而非逐层派发。仍然没有融合图的架构
+（Nemotron-H）通过各自的逐层 MoE 算子进入流式路径，且只在单设备上；在 `--tp N` 下
+它们保持在主机侧，以免 N 个 rank 各自流式传输同一份未切分的专家。
+
+在 2 × Xeon 6952P + RTX PRO 6000 Blackwell（PCIe 5.0 x16）上实测，**pp8192 /
+tg128**，显存为每进程峰值。与 llama.cpp 的完整对比——两种提示长度、每个模型五个卸载
+深度，含跨两张 GPU 的 DeepSeek V4 Flash——见
+[docs/moe_cpu_offload_benchmark.md](docs/moe_cpu_offload_benchmark.md)：
+
+| 模型 | 设置 | 峰值显存 | Prefill | Decode |
+| --- | --- | --- | --- | --- |
+| gemma-4-26B-A4B (UD-IQ4_XS) | 默认 | 16.4 GiB | 11,274 tok/s | 161 tok/s |
+| | `--n-cpu-moe 8` | 15.4 GiB | 6,500 tok/s | 80 tok/s |
+| | `--n-cpu-moe 16` | 13.8 GiB | 4,888 tok/s | 55 tok/s |
+| | `--cpu-moe`（30 层） | 10.8 GiB | 3,072 tok/s | 40 tok/s |
+| Qwen3.5-35B-A3B (UD-IQ4_XS) | 默认 | 19.4 GiB | 9,405 tok/s | 160 tok/s |
+| | `--n-cpu-moe 24` | 15.1 GiB | 5,259 tok/s | 52 tok/s |
+| | `--cpu-moe`（48 层） | 11.3 GiB | 3,709 tok/s | 39 tok/s |
+| gpt-oss-20b (Q8_0/MXFP4) | 默认 | 12.9 GiB | 12,925 tok/s | 213 tok/s |
+| | `--n-cpu-moe 12` | 9.2 GiB | 6,394 tok/s | 52 tok/s |
+| | `--cpu-moe`（24 层） | 4.7 GiB | 3,798 tok/s | 28 tok/s |
+| DeepSeek-V4-Flash (UD-Q8_K_XL，2 张 GPU) | 默认 | 165.2 GiB | 4,387 tok/s | 51 tok/s |
+| | `--n-cpu-moe 12` | 128.7 GiB | 428 tok/s | 10 tok/s |
+| | `--n-cpu-moe 24` | 77.9 GiB | 236 tok/s | 5.3 tok/s |
+
+在三个对照模型上，每一个卸载深度的 prefill 都是 llama.cpp 的 **4.5–10.9×**，decode
+是 **2.5–4.5×**。峰值显存高于 llama.cpp（常驻时 1.1×，完全卸载时最高 3.5×）——详见
+报告中的显存说明。
+
+在 gemma-4-26B-A4B 上，任何卸载深度下的贪心输出都是 **token 一致**的。
+
+同一功能在笔记本上的小机器画面（RTX 3080 Laptop 16 GB / i7-11800H，生成 96 个
+token）——注意卸载配置离这张卡的 16 GB 有多远，以及 GPT-OSS 与 DiffusionGemma 的基线
+本来就越过了 WDDM 的溢出阈值，这正是卸载在那里既能减小占用又能**提速**的原因：
+
+| 模型 | 设置 | 峰值显存 | Prefill | Decode |
+| --- | --- | --- | --- | --- |
+| gemma-4-26B-A4B (Q4_K_XL) | 默认 | 16.1 GB | 190 tok/s | 39.7 tok/s |
+| | `--n-cpu-moe 8` | 13.1 GB | 52 tok/s | 38.6 tok/s |
+| | `--n-cpu-moe 16` | 10.2 GB | 24 tok/s | 21.6 tok/s |
+| | `--cpu-moe`（30 层） | 4.8 GB | 15 tok/s | 17.7 tok/s |
+| gpt-oss-20b (Q8_0) | 默认 | 16.2 GB | 2.7 tok/s | 0.3 tok/s |
+| | `--n-cpu-moe 12` | 14.0 GB | 58 tok/s | 25.4 tok/s |
+| | `--cpu-moe`（24 层） | 2.9 GB | 29 tok/s | 12.1 tok/s |
+| diffusiongemma-26B-A4B (Q4_K_M) | 默认 | 16.0 GB | — | 1709 ms/步 |
+| | `--n-cpu-moe 16` | 9.8 GB | — | 2287 ms/步 |
+| | `--cpu-moe`（30 层） | 3.0 GB | — | 4697 ms/步 |
+
+（上面这些笔记本 prefill 数字早于流式专家路径；同样的配置现在要快好几倍。）
+
+注意事项：
+
+* **选能装下的最小 N。** 每卸载一层都要付出 decode 吞吐的代价，因此只卸载刚好够
+  腾出 KV 缓存所需显存的层数。
+* **按比例算，decode 付出的代价最大。** 提示处理会把专家流式送到加速器上，与常驻
+  运行相差不大；decode 则受限于主机每层从内存里读取 `n_expert_used` 个专家的速度，
+  吞吐就消耗在这里。
+* **工作线程数上限是 64。** decode 侧的矩阵乘只有一个 token 宽——是内存受限、每个
+  算子后都有一次栅栏的工作——因此超过几十个线程之后，每多一个 worker 只是多一个栅栏
+  参与者，在双路主机上还会增加跨 socket 流量。在 2× Xeon 6952P（192 核 / 384 线程）
+  上用 gemma-4-26B `--cpu-moe` 实测，30 个卸载层的主机矩阵乘耗时（毫秒）：8 线程 45、
+  16 线程 35、32 线程 17.6、64 线程 17.3、96 线程 26、192 线程 120。可用
+  `--cpu-moe-threads N` 覆盖。
+* **路由仍在加速器上**，因此专家的选择与权重与完全常驻路径挑出来的完全一致。
+* **整模型融合图会被保留。** Qwen3.5/3.6、Gemma 4 MoE、GPT-OSS 与 DiffusionGemma
+  各自把一整个 token（DiffusionGemma 是一整块画布）作为**单张**加速器图运行，卸载不会
+  放弃这一点。每个卸载层的专家矩阵乘被从图里切出去；其余的一切——注意力、norm、路由器、
+  共享/稠密 FFN 与 LM head——依然融合运行，加速器只在把该层的路由专家工作交给主机时暂停。
+  Gemma 4 MoE 的 **prefill** 图也按同样方式分段，因此一个提示分块仍然是一次派发，
+  而主机对块内每个 token 做的是真正的 GEMM。
+* Nemotron-H 没有可保留的整模型融合图——它混合 Mamba2/注意力/MoE 的 decode 本来就是
+  逐层派发——因此在它上面卸载只是把每层 MoE 走主机路径。
+* **可与张量并行组合。** 在 `--tp N` 下，卸载层的接缝被并入各 rank 已有的 AllReduce
+  分段调度中，因此多 rank 融合图得以保留——Qwen3.5/3.6 与 Gemma 4 MoE 的 decode 与
+  prefill 都保持融合。每个卸载层只在主机上、对未切分的专家栈**求值一次**：主机专家后端
+  是单一线程池，把那次矩阵乘按 rank 拆开只会在它上面串行，还要各自多付一次下载。随后
+  这唯一的结果会被放置到使图自身的归约落在单 GPU 数值上的位置（该层输出会喂给后续
+  AllReduce 时只放 rank 0，否则每个 rank 都放）。在 2× L4 24 GB 上实测（短提示，
+  prefill 512 / decode 64）：
+
+  | 模型 | 设置 | 常驻权重（GPU0 + GPU1） | Prefill | Decode |
+  | --- | --- | --- | --- | --- |
+  | Qwen3.5-35B-A3B (UD-IQ4_XS) | `--tp 2` | 9397 + 8032 MB | 1942 tok/s | 76.5 tok/s |
+  | | `--tp 2 --cpu-moe` | 2277 + 912 MB | 66 tok/s | 17.8 tok/s |
+  | gemma-4-26B-A4B (UD-IQ4_XS) | `--tp 2` | 6835 + 6087 MB | 3062 tok/s | 59.7 tok/s |
+  | | `--tp 2 --n-cpu-moe 8` | 5459 + 4711 MB | 217 tok/s | 36.5 tok/s |
+  | | `--tp 2 --cpu-moe` | 1588 + 840 MB | 60 tok/s | 13.2 tok/s |
+
+  在 Gemma 4 上，贪心输出在大多数提示下与不带卸载的同一次 `--tp N` 运行逐字节一致，
+  其余提示下也能一致数百个字符，之后走向一个等价的结尾；Qwen3.5 同样能跟随常驻运行
+  到一个改写点。两者都是确定性的——差异来自主机专家矩阵乘的激活量化，也就是
+  `TS_HOST_MOE_VERIFY=1` 在单 GPU 上报告的那约 1–5% 的相对差异。纯 C# 的 `cuda`
+  后端没有主机 MoE 接缝，因此在那里使用 `--tp N --cpu-moe` 会打印
+  `[moe-offload] WARNING` 并让专家保持常驻。
+* `TS_HOST_MOE_VERIFY=1` 会在主机链路旁同时构建 GPU 上的专家链路，并报告二者的逐层
+  偏差——用于在同样能塞进显存的模型上验证接缝的诊断手段。`TS_HOST_MOE_DEBUG=1` 打印
+  分段计划（节点切点）与每个接缝的激活范数。`TS_HOST_MOE_TIMING=1` 报告卸载侧的墙钟
+  时间，拆分为每次调用的准备开销与主机矩阵乘——这能告诉你一次慢运行到底慢在专家 GEMM
+  还是它周围的脚手架上。
 
 ## 张量并行与分布式推理
 

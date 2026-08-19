@@ -59,11 +59,13 @@ window.SEARCH_INDEX_ZH = [
   { t: "批处理（JSONL）", p: "CLI", u: "cli.html#jsonl", s: "用 --input-jsonl 从 JSONL 文件运行大量提示词。", k: "batch 批处理 jsonl 多轮" },
   { t: "DiffusionGemma 生成", p: "CLI", u: "cli.html#diffusion", s: "--diffusion-steps、--diffusion-seed、--diffusion-blocks 文本扩散。", k: "diffusion 扩散 去噪 entropybound" },
   { t: "图像编辑（CLI）", p: "CLI", u: "cli.html#imageedit", s: "Qwen-Image-Edit：--image、--prompt、--output、--cfg、--diffusion-steps；伴随文件覆盖 --qwen-image-vae/-vl/-mmproj。", k: "qwen 图像 编辑 cli 命令 图片 照片 cfg lora qwen-image-lora lightning" },
+  { t: "视频生成（Wan 2.1 / 2.2）", p: "CLI", u: "cli.html#video", s: "文生视频与图生视频的 CLI 参数，以及决定端到端耗时的步数蒸馏自动识别。", k: "cli 视频 wan turbo 蒸馏 diffusion-steps cfg cfg-cache-stride video-frames fps flow-shift negative-prompt wan-vae wan-te mp4" },
 
   { t: "启动服务器", p: "服务器", u: "server.html#start", s: "源码 quickstart 必须传 --model；API 位于 localhost:5000，浏览器 UI 位于 /index.html。", k: "dotnet run TensorSharp.Server web 服务器 托管 运行 端口" },
   { t: "约 30 秒快速开始（Gemma 4 E4B）", p: "服务器", u: "server.html#e4b-fast-lane", s: "克隆、下载 E4B Q8_0，并用 GGML CUDA、Metal、Vulkan 或 ggml_cpu 承载；仅多模态需要 mmproj。", k: "gemma4 e4b 服务器 快速开始 30 秒 原生 ggml 快路径 api" },
   { t: "服务器选项", p: "服务器", u: "server.html#options", s: "--model、--mmproj、--backend、--max-tokens、默认采样、批处理参数。", k: "flags 参数 选项 prefill-chunk-size kv-cache-dtype q4_0 qwen-image-lora lora" },
   { t: "Web UI 功能", p: "服务器", u: "server.html#webui", s: "浏览器聊天：多轮、图像/视频/音频/PDF/文本上传、思考、工具、流式、消息编辑与图像编辑预览。", k: "browser 浏览器 聊天机器人 ui 前端 pdf 图像 编辑" },
+  { t: "视频生成（Wan）：网页界面能设什么，什么只能靠 API", p: "服务器", u: "server.html#video", s: "--video-frames / --fps 设定网页界面用的服务端默认值；frames、fps、steps、cfg、cfgCacheStride 与 sampler 是逐请求的 API 字段。", k: "服务器 视频 wan 帧数 fps video-generate videos generations 网页界面 默认值 cfgCacheStride sampler" },
   { t: "服务器环境变量", p: "服务器", u: "server.html#env", s: "BACKEND、MAX_TOKENS、调度器与 MLX 调参；PORT/ASPNETCORE_URLS 会被固定端口 5000 覆盖。", k: "env 环境变量 配置 TS_SCHED port 忽略" },
   { t: "连续批处理调参", p: "服务器", u: "server.html#tunables", s: "用于分页 KV 块、运行序列、prefill 分块的 TS_SCHED_* 旋钮。", k: "scheduler 调度器 分页 kv 调优 solo prefill chunk 独占 decode quantum TS_SCHED_SOLO_PREFILL_CHUNK" },
 
@@ -104,6 +106,8 @@ window.SEARCH_INDEX_ZH = [
 
   { t: "同台对比 vs llama.cpp", p: "基准测试", u: "benchmarks.html#head-to-head", s: "纯 .NET 的 TensorSharp 在相同 GGUF + GPU 下、CUDA 与 Vulkan 两个后端上与 llama.cpp 互有胜负：E4B 与 2-bit Qwen 3.6 35B-A3B MoE 在 CUDA 上 prefill 1.28× / TTFT 1.27×（多轮最高 1.49×）；12B 在 Vulkan 上 decode 1.21×；四个模型中有三个的 CUDA decode 持平或更快。", k: "llama.cpp 对比 更快 加速 几何平均 moe prefill ttft 多轮 decode 持平 cuda vulkan vs versus" },
   { t: "基准测试", p: "基准测试", u: "benchmarks.html#head-to-head", s: "在相同 GGUF 文件与硬件上对比 llama.cpp 的同台评测。", k: "performance 性能 数字 吞吐 每秒 token" },
+  { t: "Muse-Glimmer 30B，带与不带 DFlash", p: "基准测试", u: "benchmarks.html#muse-glimmer", s: "在单张 RTX PRO 6000 Blackwell 上，DFlash 块级草稿器的 decode 与 llama.cpp 对比，提示长度从 60 到 124K token。", k: "muse glimmer dflash draft-model 投机 decode 贪心 基准 rtx pro 6000 blackwell" },
+  { t: "Wan 视频：两个彼此独立的提速杠杆", p: "基准测试", u: "benchmarks.html#wan", s: "M5 Pro 实测：F16 注意力 KV 与 MPSGraph VAE 让每次 DiT 前向约快 1.7×，步数蒸馏则让前向次数少 25×。", k: "wan 基准 视频 turbo 蒸馏 f16 kv mpsgraph vae metal sd.cpp stable-diffusion.cpp m5 pro 分辨率" },
   { t: "测试", p: "基准测试", u: "benchmarks.html#testing", s: "xUnit 单元测试与服务器集成测试。", k: "tests 测试 xunit 集成 ci" },
 
   { t: "CLI 参数参考", p: "API 参考", u: "api-reference.html#cli-flags", s: "TensorSharp.Cli 命令行选项完整表。", k: "reference 参考 参数 cli 选项 表 qwen-image-lora lora q4_0 kv 缓存 精度 paged-kv-quant-bits" },

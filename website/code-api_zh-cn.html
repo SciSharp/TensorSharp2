@@ -119,7 +119,7 @@ List&lt;int&gt; generated = sampler.Generate(promptTokens, p,
 Console.WriteLine();
 Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
   <p><code>DiffusionEbParams</code> 的关键参数：<code>MaxDenoisingSteps</code>（48）、<code>TMin</code>/<code>TMax</code> 温度调度（0.4 / 0.8）、<code>EntropyBound</code>（0.1）、<code>StabilityThreshold</code> / <code>ConfidenceThreshold</code> 早停、<code>Seed</code> 与 <code>MaxBlocks</code>。<code>model.CanvasLength</code> 给出每块的 canvas 大小。</p>
-  <div class="callout note"><div class="ic">🌫️</div><p>在 GPU 后端上，prompt 的 K/V 每块缓存一次并在各去噪步间复用；GGML 后端默认使用融合的整模型解码加融合 lm-head 尾。调优开关（<code>DIFFUSION_STEPS</code>、<code>DIFFUSION_NO_SC</code> 等）见<a href="advanced.html">高级</a>页。</p></div>
+  <div class="callout note"><div class="ic">🌫️</div><p>在 GPU 后端上，prompt 的 K/V 每块缓存一次并在各去噪步间复用；GGML 后端默认使用融合的整模型解码加融合 lm-head 尾。调优开关（<code>DIFFUSION_STEPS</code>、<code>DIFFUSION_NO_SC</code> 等）见<a href="advanced_zh-cn.html">高级</a>页。</p></div>
 
   <h2 id="imageedit">Qwen-Image-Edit — 图像编辑</h2>
   <p>Qwen-Image-Edit 接收<strong>提示词 + 一张输入图像</strong>并返回编辑后的图像。所加载的 <code>qwen_image</code> GGUF 仅是 MMDiT 扩散 Transformer；模型还会拉入两个伴随 GGUF（在 DiT 文件同目录解析，或通过 <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> 环境变量指定）：Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器。与 DiffusionGemma 一样，它<em>不是</em>自回归文本模型——自回归入口会抛异常，编辑通过 <code>EditImage()</code> 驱动。</p>

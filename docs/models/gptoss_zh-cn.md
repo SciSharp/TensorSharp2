@@ -20,27 +20,27 @@
 
 | 模型 | HF 仓库 | 推荐文件 | 说明 |
 |---|---|---|---|
-| gpt-oss-20b（MoE） | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) | `gpt-oss-20b-mxfp4.gguf`（12.110 GB） | 原生 MXFP4 expert 量化；仅文本。思维链始终开启（Harmony analysis channel），支持工具调用。官方上游：[openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b)（Apache-2.0）。 |
+| gpt-oss-20b（MoE） | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) | `gpt-oss-20b-MXFP4.gguf`（12.110 GB） | 原生 MXFP4 expert 量化；仅文本。思维链始终开启（Harmony analysis channel），支持工具调用。官方上游：[openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b)（Apache-2.0）。 |
 
 命令行下载（每个文件一行；需要先 `pip install -U huggingface_hub`）：
 
 ```bash
 python -m pip install -U huggingface_hub
-hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-mxfp4.gguf --local-dir models
+hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --local-dir models
 ```
 
 CLI 单次推理（文本提示词通过 `--input` 从文件读取；CLI 采样默认为 greedy，
 `--max-tokens` 默认为 100）：
 
 ```bash
-dotnet run --project TensorSharp.Cli -c Release -- --model models/gpt-oss-20b-mxfp4.gguf \
+dotnet run --project TensorSharp.Cli -c Release -- --model models/gpt-oss-20b-MXFP4.gguf \
   --input prompt.txt --max-tokens 512 --backend ggml_cuda
 ```
 
 服务端（聊天 Web UI 以及 OpenAI/Ollama 兼容 API，位于 `http://localhost:5000`）：
 
 ```bash
-dotnet run --project TensorSharp.Server -c Release -- --model models/gpt-oss-20b-mxfp4.gguf \
+dotnet run --project TensorSharp.Server -c Release -- --model models/gpt-oss-20b-MXFP4.gguf \
   --backend ggml_cuda --max-tokens 4096
 ```
 
@@ -249,7 +249,7 @@ blk.{L}.ffn_down_exps.{E}.bias                     # expert down bias
 - **Sinks softmax** 跑在 CPU（标量 + 可选 SIMD 求 exp-sum）。GPU 融合 sinks kernel 在「优化机会」清单上 —— 当前 sinks softmax 是 Metal / CUDA 上的慢路径。
 - **MXFP4 expert 权重** 量化保留在 `_quantWeights`，matmul 由后端的量化 matmul 派发。
 
-GPT OSS 当前**没有 whole-model 原生 decode 路径**（不像 Qwen 3），所以 decode 仍然 per-op 派发。这是最大的待优化项。
+GPT OSS 已经把**整个 decode token 作为一次 GGML 图派发**执行 —— 每一层、MoE 路由与专家、最后的 norm 与 LM head 全部在 `GptOssModel.FusedModelDecode.cs` 的同一张图里，这也是 ggml-cuda 能把它整体捕获成 CUDA graph 的原因。A40 实测：decode 从 24 → 154 tok/s，并且随上下文长度基本持平（16K 时仍有 133 tok/s），而逐层路径在同样长度下已经掉到 2.3。设 `TS_GPTOSS_MODEL_DECODE=0` 可退回 per-op 派发。
 
 ## 10. 内存与 KV cache 策略
 
@@ -322,9 +322,9 @@ GPT OSS 实现了 `IBatchedPagedModel.ForwardBatch`
   化点。
 - **任何发布版都用融合 QKV** —— 当 GGUF 拆分 Q / K / V 时，每次单独 matmul
   后还是要单独 bias add。`FusedQKVWithBias` 图能把 3 次派发合 1。
-- **原生 whole-model decode（旧路径）** —— 类似 Qwen 3 的
-  `TransformerModelDecode`，加上 attention sinks 与 bias 支持，能消除单序
-  列路径上的大部分托管开销。
+- **把整模型 decode 铺到旧的单序列路径** —— 融合的整模型 decode 图
+  （`GptOssModel.FusedModelDecode.cs`）目前覆盖的是批处理路径；把同样的
+  单次派发做法延伸到旧的单序列路径，能消除它剩下的大部分托管开销。
 - **旧路径上的 GPU 融合 sinks softmax** —— 旧的 CPU sinks softmax 是批处理
   路径下原生 `*_WithSinks` 内核的单序列对照。给旧路径写一份自定义 Metal /
   CUDA 融合内核能缩小这段差距，让单序列路径在 single-sequence 工作负载下

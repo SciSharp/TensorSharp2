@@ -6228,6 +6228,8 @@ namespace TensorSharp.Models
                 "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),
                 "muse-glimmer" or "muse_glimmer" => new MuseGlimmerModel(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 "deepseek4" => new DeepSeek4Model(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
+                // GLM-5.x with DeepSeek Sparse Attention (MLA + lightning indexer + sigmoid MoE).
+                "glm-dsa" or "glm_dsa" => new GlmDsaModel(ggufPath, backend, tpDegree, tpGroup),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };
         }

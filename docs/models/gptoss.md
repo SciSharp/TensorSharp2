@@ -20,27 +20,27 @@ Verified GGUF pointer:
 
 | Model | HF repo | Recommended file | Notes |
 |---|---|---|---|
-| gpt-oss-20b (MoE) | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) | `gpt-oss-20b-mxfp4.gguf` (12.110 GB) | Native MXFP4 expert quantization; text only. Thinking is always on (Harmony analysis channel) and tool calling is supported. Official upstream: [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) (Apache-2.0). |
+| gpt-oss-20b (MoE) | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) | `gpt-oss-20b-MXFP4.gguf` (12.110 GB) | Native MXFP4 expert quantization; text only. Thinking is always on (Harmony analysis channel) and tool calling is supported. Official upstream: [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) (Apache-2.0). |
 
 Command-line download (one line per file; requires `pip install -U huggingface_hub`):
 
 ```bash
 python -m pip install -U huggingface_hub
-hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-mxfp4.gguf --local-dir models
+hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --local-dir models
 ```
 
 CLI one-shot (the text prompt comes from a file via `--input`; CLI sampling
 defaults to greedy and `--max-tokens` defaults to 100):
 
 ```bash
-dotnet run --project TensorSharp.Cli -c Release -- --model models/gpt-oss-20b-mxfp4.gguf \
+dotnet run --project TensorSharp.Cli -c Release -- --model models/gpt-oss-20b-MXFP4.gguf \
   --input prompt.txt --max-tokens 512 --backend ggml_cuda
 ```
 
 Server (Web UI + OpenAI/Ollama-compatible APIs on `http://localhost:5000`):
 
 ```bash
-dotnet run --project TensorSharp.Server -c Release -- --model models/gpt-oss-20b-mxfp4.gguf \
+dotnet run --project TensorSharp.Server -c Release -- --model models/gpt-oss-20b-MXFP4.gguf \
   --backend ggml_cuda --max-tokens 4096
 ```
 
@@ -318,9 +318,12 @@ Constructor (`GptOssModel(string ggufPath, BackendType backend)`):
 - **MXFP4 expert weights** stay quantized in `_quantWeights`; matmul is
   dispatched through the backend's quantized matmul.
 
-There is **no whole-model native decode path** for GPT OSS (unlike Qwen 3),
-so decode dispatches are still per-op. This is the largest open optimization
-target.
+GPT OSS runs an **entire decode token as one GGML graph dispatch** — every
+layer, the MoE router and experts, the final norm and the LM head — in
+`GptOssModel.FusedModelDecode.cs`, which is what lets ggml-cuda capture it as
+a CUDA graph. Measured on an A40: decode 24 → 154 tok/s, and flat in context
+length (133 tok/s at 16K) where the per-layer path collapsed to 2.3. Set
+`TS_GPTOSS_MODEL_DECODE=0` to fall back to the per-op dispatch.
 
 ## 10. Memory and KV cache strategy
 
@@ -437,9 +440,11 @@ alternating SWA** — inside the paged scheduling stack:
 - **Fused QKV in every release** — when the GGUF ships split Q / K / V the
   per-projection bias add still happens after each separate matmul. A
   `FusedQKVWithBias` graph would cut 3 dispatches into 1.
-- **Native whole-model decode** (legacy) — like Qwen 3's
-  `TransformerModelDecode`, with attention sinks and bias support, would
-  remove most managed overhead on the per-seq path.
+- **Whole-model decode on the legacy per-seq path** — the fused
+  whole-model decode graph (`GptOssModel.FusedModelDecode.cs`) already
+  covers the batched path; extending the same single-dispatch treatment to
+  the legacy per-sequence path would remove most of its remaining managed
+  overhead.
 - **GPU-fused sinks softmax (legacy)** — the legacy CPU sinks softmax is
   the per-seq counterpart to the batched native `*_WithSinks` kernel. A
   custom Metal / CUDA fused kernel for the legacy path would close that

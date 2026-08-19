@@ -36,11 +36,13 @@ Q4_K_M experts run sequentially on the same card.
 
 ## Backends
 
-Video generation runs on every TensorSharp backend:
+Video generation runs on every TensorSharp backend except MLX (`--backend mlx`
+is rejected at load):
 
 | `--backend` | Path | Notes |
 |---|---|---|
 | `ggml_cuda` | GGML whole-graph kernels | fastest; persistent DiT graph + CUDA-graph capture |
+| `ggml_metal` | GGML whole-graph kernels | Apple Silicon; the VAE convolutions go through MPSGraph |
 | `ggml_vulkan` | GGML whole-graph kernels | AMD/Intel/NVIDIA via Vulkan; the VAE stays on the banded conv path (Vulkan drivers reject multi-GB arenas) |
 | `ggml_cpu` | GGML whole-graph kernels | CPU-only machines; slow but exact |
 | `cuda` | direct CUDA (`WanDirect*`) | ggml-independent: quantized weights resident via TensorSharp's own MMQ/dp4a/cuBLAS routing, streaming online-softmax attention kernels, channels-last im2col VAE |
