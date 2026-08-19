@@ -110,6 +110,10 @@ namespace TensorSharp.Server.Hosting
                     "binding several endpoints at once). Overridden by --port/--host when both are given; falls back " +
                     "to the ASPNETCORE_URLS env var.",
                     "--urls \"http://0.0.0.0:8080;https://0.0.0.0:8443\""),
+                new OptionHelp("--no-webui",
+                    "Do not serve the bundled web UI; GET / answers the plain liveness text instead. All HTTP API " +
+                    "endpoints (including /uploads) stay up. Default: UI on (TS_NO_WEBUI env var overrides).",
+                    "--no-webui"),
             }),
             ("Compute backend", new[]
             {

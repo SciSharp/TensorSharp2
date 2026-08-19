@@ -41,7 +41,8 @@ namespace TensorSharp.Server.Hosting
                 out int? configuredWanVideoFps,
                 out SamplingOverrides configuredSampling,
                 out SamplingPrecedence? configuredPrecedence,
-                out ListenOverrides configuredListen);
+                out ListenOverrides configuredListen,
+                out bool configuredNoWebUi);
 
             if (!string.IsNullOrWhiteSpace(configuredMmProj) && string.IsNullOrWhiteSpace(configuredModel))
                 throw new ArgumentException("--mmproj requires --model.");
@@ -87,6 +88,12 @@ namespace TensorSharp.Server.Hosting
 
             string listenUrls = ResolveListenUrls(configuredListen);
 
+            // TS_NO_WEBUI follows the TENSORSHARP_LOG_FILE convention: set to
+            // anything but "0" counts as on.
+            string noWebUiEnv = Environment.GetEnvironmentVariable("TS_NO_WEBUI");
+            bool webUiEnabled = !configuredNoWebUi
+                && (string.IsNullOrWhiteSpace(noWebUiEnv) || string.Equals(noWebUiEnv.Trim(), "0", StringComparison.Ordinal));
+
             return new ServerHostingOptions(
                 startupModelPath,
                 startupMmProjPath,
@@ -100,13 +107,14 @@ namespace TensorSharp.Server.Hosting
                 logDirectory,
                 fileLoggingEnabled,
                 defaultSampling,
-                listenUrls);
+                listenUrls,
+                webUiEnabled);
         }
 
         /// <summary>Backend originally requested via <c>--backend</c> / <c>BACKEND</c> (without the OS-default fallback).</summary>
         public static string ReadConfiguredBackendInput(string[] args)
         {
-            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _, out _, out _);
+            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _, out _, out _, out _);
             return configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
         }
 
@@ -797,7 +805,8 @@ namespace TensorSharp.Server.Hosting
             out int? configuredWanVideoFps,
             out SamplingOverrides configuredSampling,
             out SamplingPrecedence? configuredPrecedence,
-            out ListenOverrides configuredListen)
+            out ListenOverrides configuredListen,
+            out bool configuredNoWebUi)
         {
             configuredModel = null;
             configuredMmProj = null;
@@ -808,6 +817,7 @@ namespace TensorSharp.Server.Hosting
             configuredSampling = default;
             configuredPrecedence = null;
             configuredListen = default;
+            configuredNoWebUi = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -946,6 +956,12 @@ namespace TensorSharp.Server.Hosting
                 if (TryReadOption(args, ref i, "--sampling-precedence", out string precedenceOption))
                 {
                     configuredPrecedence = ParseSamplingPrecedence("--sampling-precedence", precedenceOption);
+                    continue;
+                }
+
+                if (string.Equals(args[i], "--no-webui", StringComparison.OrdinalIgnoreCase))
+                {
+                    configuredNoWebUi = true;
                     continue;
                 }
 
@@ -1106,7 +1122,7 @@ namespace TensorSharp.Server.Hosting
             string[] knownFlags = new[]
             {
                 "--model", "--mmproj", "--backend", "--max-tokens", "--video-frames", "--fps",
-                "--port", "--host", "--urls",
+                "--port", "--host", "--urls", "--no-webui",
                 "--temperature", "--top-k", "--top-p", "--min-p",
                 "--repeat-penalty", "--repeat-last-n", "--presence-penalty", "--frequency-penalty",
                 "--seed", "--stop", "--sampling-precedence",
