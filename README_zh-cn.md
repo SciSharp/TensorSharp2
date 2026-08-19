@@ -25,6 +25,7 @@ Zhongkai Fu 所著的 **[From Tensors to Tokens: Building a Multimodal LLM Infer
 - **⚡ 与 llama.cpp 互有胜负——用纯 .NET 做到。** 在相同 GGUF 文件、相同 GPU 上，TensorSharp 在关键负载上追平乃至超越 `llama.cpp`：Gemma 4 E4B 与 2-bit 量化的 Qwen 3.6 35B-A3B MoE 在 CUDA 上 prefill 快 **1.28×**、首 token 早 **1.27×**（多轮最高 **1.49×**）；Gemma 4 12B 在 Vulkan 上 decode 快 **1.21×**（长上下文最高 **1.32×**）。→ [性能数据](#性能数据)
 - **🚀 连续批处理 & 分页 KV 缓存。** vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
 - **🧬 DeepSeek V4 Flash（284B MoE），三套整模型执行器。** 这套压缩稀疏注意力、1M 上下文的架构可运行在 Direct CUDA 引擎（`--backend cuda`）、原生 ggml 执行器（`--backend ggml_cuda` / `ggml_vulkan`），以及 **100% 纯 C# 的 CPU 执行器**（`--backend cpu`，零原生依赖）上。权重会自动按层切分到所有可见 GPU，因此远大于单卡显存的模型依然跑得起来；服务端以原生 per-sequence slot + 连续批处理托管它。→ [DeepSeek V4 卡片](docs/models/deepseek4.md)
+- **🧠 GLM-5.2（744B-A40B MoE），支持张量并行与 CPU MoE offload。** Multi-head Latent Attention，外加一个 DeepSeek 稀疏注意力的 "lightning indexer"，由它挑出每个 query 可以看的那 2048 个已缓存 token。`--tp N` 让每一层都跑在每张 GPU 上（head 按列/行并行，每个专家按行切开），`--cpu-moe` 则把路由专家——占 checkpoint 的 92%——留在系统内存里。默认的按层切分与 `--cpu-moe` 在同后端下与 llama.cpp 逐 token 一致；`--tp` 是把各 rank 的局部和相加，在 2 bit MoE 上这点最后一位的差别会传到 top-8 路由，几乎并列的 token 可能不同。3× RTX PRO 6000 上的正面对比：**pp2048 918.9，llama.cpp 为 763.1 tok/s**；tg64 43.7 对 42.2。自报的 1M 上下文（约 93 GiB 的 KV）是上限而非承诺——权重落盘之后，加载器会按实际空闲的显存来定上下文并打印它的选择（按层切分 342,272 token，`--n-cpu-moe 30` 为 646,400）；设 `MAX_CONTEXT` 则把某个长度变成硬性要求。→ [GLM 卡片](docs/models/glm_zh-cn.md)
 - **🔮 投机解码——MTP / NextN 与 DSpark。** 多 token 预测草稿头加速单序列 decode：Qwen 3.6（NextN 块内嵌于主干——需使用保留该块的 GGUF，例如 [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)；基础仓库的同名文件已剥离该块）与 Gemma 4（独立 `gemma4-assistant` 草稿 GGUF，`--mtp-draft-model`）；DeepSeek V4 则新增 **DSpark** 块级起草（`--draft-model`），每步提议一整块 token，decode 提速 **1.3–1.4×**（多轮对话最高 2.0×）。三者都是草稿提议、主干一次批量前向验证，输出与标准 decode 一致。→ [投机解码](FEATURES_zh-cn.md#mtp--nextn-投机解码)
 - **🔗 张量并行与分布式集群。** 用 `--tp N` 把一个模型切分到多张 GPU 上——Direct `cuda` 后端**以及** GGML CUDA / Vulkan 后端均支持——再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。采用 Megatron-LM 列/行并行范式与分层 AllReduce；GGML 上提供 MoE 专家并行与按 rank 的 GatedDeltaNet 融合内核。融合式按 rank 执行让 Gemma 4 E4B 上 `--tp 2` 的 decode 达到单卡的 **1.39×**、Muse-Glimmer 30B 达到 **1.57×**（其 prefill 同时提升 **1.34×**——是这里唯一在两个阶段都超过单卡的模型），也让单卡装不下的模型（Qwen 3.5-35B-A3B；24 GB 卡上 28.2 GB 的 Muse-Glimmer 30B Q8_0）得以运行。可选 Redis 支撑的 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
 - **🎨 Qwen-Image-Edit 图像编辑。** 提示词 + 输入图像 → 编辑后的图像，驱动 60 块 MMDiT，配以 Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器。CUDA 图捕获的整 DiT、FlowMatch-Euler true-CFG 去噪、Web UI 实时预览，以及 [Lightning 蒸馏 LoRA](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) 快速路径（`--qwen-image-lora`，以运行期旁路的形式挂在原封不动的量化权重旁），把默认的 30 步 × CFG——即 60 次 DiT 前向——降到 **4** 次。热态 4 步编辑比 `stable-diffusion.cpp` 快 **1.19×**。→ [Qwen-Image-Edit 卡片](docs/models/qwenimage_zh-cn.md)
@@ -151,6 +152,7 @@ dotnet run --project TensorSharp.Server -c Release -- --help
 | 家族 | 示例模型（GGUF） | 图像 / 视频 / 音频 | 思维链 | 工具 | 卡片 |
 |---|---|---|---|---|---|
 | DeepSeek V4 Flash | [DeepSeek-V4-Flash-0731](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)（284B MoE，分片 GGUF） | — / — / — | ✅ | ✅ | [deepseek4](docs/models/deepseek4_zh-cn.md) |
+| GLM 5.x | [GLM-5.2](https://huggingface.co/unsloth/GLM-5.2-GGUF)（744B-A40B MoE，分片 GGUF） | — / — / — | ✅ | ✅ | [glm](docs/models/glm_zh-cn.md) |
 | Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)（另有 31B、26B-A4B MoE） | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4](docs/models/gemma4_zh-cn.md) |
 | Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（另有 35B-A3B MoE） | ✅ / — / — | ✅ | ✅ | [qwen35](docs/models/qwen35_zh-cn.md) |
 | Qwen 3 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B-GGUF) | — / — / — | ✅ | ✅ | [qwen3](docs/models/qwen3_zh-cn.md) |
@@ -189,6 +191,7 @@ dotnet run --project TensorSharp.Server -c Release -- --help
 | 架构 | GGUF 架构标识 | 示例模型 | 多模态 | 思维链 | 工具调用 | MTP 投机 | 卡片 |
 |---|---|---|---|---|---|---|---|
 | DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash（284B MoE，256 专家，压缩稀疏注意力，1M 上下文） | 仅文本 | 支持 | 支持（DSML） | 支持（DSpark 块级草稿，独立 GGUF） | [deepseek4](docs/models/deepseek4_zh-cn.md) |
+| GLM 5.x | `glm-dsa` | GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文） | 仅文本 | 支持 | 支持（XML 工具调用） | — | [glm](docs/models/glm_zh-cn.md) |
 | Gemma 4 | `gemma4` | gemma-4-E4B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 | 支持（独立草稿 GGUF） | [gemma4](docs/models/gemma4_zh-cn.md) |
 | Gemma 3 | `gemma3` | gemma-3-4b | 图像 | 不支持 | 不支持 | — | [gemma3](docs/models/gemma3_zh-cn.md) |
 | Qwen 3 | `qwen3`、`qwen2`、`qwen2vl`、`qwen2_vl` | Qwen3-4B（Qwen2 / Qwen2.5-VL 的 GGUF 也能加载，按纯文本对话运行） | 仅文本 | 支持 | 支持 | — | [qwen3](docs/models/qwen3_zh-cn.md) |
@@ -222,6 +225,8 @@ dotnet run --project TensorSharp.Server -c Release -- --help
 
 TensorSharp 在 CUDA 的 prefill / 首 token 延迟上明显领先（多轮 prefill **每个模型**都获胜，最高 **1.49×**），CUDA decode 保持持平或更快，Vulkan 上 dense 12B 的 decode 明显胜出（长上下文最高 **1.32×**）——即便在 2-bit IQ2_XXS 量化下亦然。剩余低于 1.0× 的项仍是正在优化的目标。该框架还提供工具调用、结构化输出、图像编辑（对比 `stable-diffusion.cpp`）、MTP 开/关与并发场景，可通过 [`benchmarks/engine_comparison`](benchmarks/engine_comparison) 在你自己的硬件上运行。完整报告见 [此处](docs/engine_comparison_report.md)。
 
+放不进这台 16 GB 机器的模型，会在各自的卡片里给出同样方式测得的正面对比（两个引擎、同一份 GGUF、同一台机器、背靠背）：[GLM-5.2 744B-A40B，3× RTX PRO 6000](docs/models/glm_zh-cn.md#性能) —— 从约 1k prompt token 起 TensorSharp 的 prefill 领先（pp2048 **1.20×**、pp4096 **1.21×**），decode 领先 1.04×，短 prefill 上则是 llama.cpp 快几个百分点。
+
 ## 文档
 
 初次使用？上面几节足以让你跑起来。其余均为详细参考：
@@ -245,11 +250,11 @@ TensorSharp 在 CUDA 的 prefill / 首 token 延迟上明显领先（多轮 pref
 
 | 范围 | 状态 |
 |---|---|
-| 模型家族 | DeepSeek V4 Flash（`deepseek4`）、Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3、Muse-Glimmer（`muse-glimmer`、`muse_glimmer`）。图像编辑通过 Qwen-Image-Edit（`qwen_image`、`qwen-image` MMDiT）；视频生成通过 Wan 2.1 / 2.2（`wan`、`wan2.1`、`wan2.2`）。 |
+| 模型家族 | DeepSeek V4 Flash（`deepseek4`）、GLM 5.x（`glm-dsa`）、Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3、Muse-Glimmer（`muse-glimmer`、`muse_glimmer`）。图像编辑通过 Qwen-Image-Edit（`qwen_image`、`qwen-image` MMDiT）；视频生成通过 Wan 2.1 / 2.2（`wan`、`wan2.1`、`wan2.2`）。 |
 | 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA、GGML Vulkan。DeepSeek V4 另有三套专属的整模型执行器——Direct CUDA、原生 ggml 与纯 C# CPU——都会把权重按层切分到所有可见 GPU（`--tp N` / `TS_DSV4_NGPU` 限定卡数）。Wan 是唯一对后端有限制的家族：它可运行于各 GGML 后端以及 Direct `cuda` / 纯 C# `cpu` 后端，但不支持 MLX。 |
 | 多模态 | Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni、Muse-Glimmer 图像输入；PDF（CLI `--pdf` + Web UI）。媒体*输出*：Qwen-Image-Edit（图像）与 Wan 2.1 / 2.2（H.264 MP4 视频，文本→视频与图像→视频）。 |
-| 连续批处理 | vLLM 风格分页 KV 缓存、基于内容哈希的前缀共享、迭代级调度器（默认启用，`--no-continuous-batching` 关闭）。DeepSeek V4 在同一引擎上通过其原生 per-sequence slot 提供服务。 |
+| 连续批处理 | vLLM 风格分页 KV 缓存、基于内容哈希的前缀共享、迭代级调度器（默认启用，`--no-continuous-batching` 关闭）。DeepSeek V4 与 GLM 5.x 在同一引擎上通过各自原生的 per-sequence slot 提供服务——压缩后的 MLA 每 token 只有一行缓存，没有可分页的布局——GLM 还提供可选的批处理融合解码（`TS_BATCHED_FUSED_DECODE=1`，4 路并发下总吞吐 1.81 倍）。 |
 | 投机解码 | Qwen 3.6（内嵌）与 Gemma 4（独立草稿 GGUF）的 MTP / NextN 草稿头；DeepSeek V4 的 DSpark 块级起草（仅 `cuda` / `ggml_cuda`）与 Muse-Glimmer 的 DFlash 块级起草，两者都通过 `--draft-model` 加载独立的草稿 GGUF。验证以贪心方式对齐主干，因此输出与普通贪心 decode 一致。默认关闭；服务端用 `--mtp-spec` 启用，CLI 直接传 `--draft-model` 即可。 |
 | 张量并行 | Direct `cuda` 后端与 GGML CUDA / Vulkan 后端上的 Megatron-LM 列/行并行 TP（`--tp N` / `TENSORSHARP_TP_DEGREE`，CLI 与服务端均支持）；通过点对点 TCP 的多节点分布式 TP（`--tp-node-id` / `--tp-peers`），采用分层 AllReduce，CUDA P2P 不可用时自动回退到主机中转。覆盖全部自回归架构；GGML 上 Gemma 4 与 Qwen 3.5/3.6 使用 MoE 专家并行与融合的按 rank decode/prefill 计算图。可选 Redis 支撑的 KV 缓存与 Responses API 存储。 |
 | 服务端模型范围 | 通过 `--model` 显式托管单个 GGUF；可通过 `--mmproj` 显式指定投影器；不扫描目录。 |

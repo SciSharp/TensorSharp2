@@ -42,8 +42,8 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_GEMMA4_BATCHED` | Gemma 4 | 批处理分页前向 vs 按序列回退 | 启用 | `0`, `1` | 是 |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | 原生批处理 Mamba2 step | 关闭 | `0`, `1` | 否 |
 | `TS_BATCHED_N1_FAST_PATH` | 全部 | solo 序列走融合 N=1 快速路径 decode；`0` 强制这些步骤走完全批处理路径 | 启用 | `0`, `1` | 是 |
-| `TS_PER_SEQ_FUSED` | fused 能力模型（Gemma 4、Qwen 3.5/3.6） | 并发（N>=2）序列走 per-request 融合 Forward；`0` 强制逐算子批处理分页路径 | 启用 | `0`, `1` | 否 |
-| `TS_BATCHED_FUSED_DECODE` | fused 能力模型 | per-seq fused 路径内的真正 token 批量融合 decode（一张图跑全部 N 个序列） | 关闭 | `0`, `1` | 否 |
+| `TS_PER_SEQ_FUSED` | fused 能力模型（Gemma 4、Qwen 3.5/3.6、DeepSeek V4、GLM 5.x） | 并发（N>=2）序列走 per-request 融合 Forward；`0` 强制逐算子批处理分页路径 | 启用 | `0`, `1` | 否 |
+| `TS_BATCHED_FUSED_DECODE` | fused 能力模型 | per-seq fused 路径内的真正 token 批量融合 decode（一张图跑全部 N 个序列）。在 GLM 5.x 上 4 个并发请求可得合计 1.81× decode，但批处理会改变 GEMM 形状，2 bit MoE 会把这点差别放大成不同的专家选择，因此默认需显式开启 | 关闭 | `0`, `1` | 否 |
 | `TS_RETAINED_FUSED_CACHE` | fused 能力的滑窗模型（Gemma 4） | 保留已完成 fused KV holder 用于跨请求前缀复用 | 启用 | `0`, `1` | 否 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | fused 能力的滑窗模型 | 保留 fused holder 的 LRU 预算（限 VRAM） | `4` | 不适用 | 否 |
 | `TS_SCHED_DISABLE_BATCHED` | 全部 | 全局按序列 KV-swap 回退 | 关闭 | `0`, `1` | 是 |
@@ -58,8 +58,8 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
 | `KV_CACHE_DTYPE` | 全部 | KV cache 元素类型 | 自动（随模型对齐：模型权重低于 F32 时为 `f16`，否则为 `f32`） | `f32`, `f16`, `q8_0`（运行时还接受 `q4_0`，不参与 sweep） | 是 |
-| `TS_KV_PAGED_QUANT_BITS` | 全部 | TurboQuant 分页 KV 块编解码器 | 关闭（`0`） | `0`, `4`, `8` | 是 |
-| `MAX_CONTEXT` | 长文本 / 上传文本 | 硬上下文上限 | 模型默认值 | `4096`, `8192`, `16384` | 是 |
+| `TS_KV_PAGED_QUANT_BITS` | 全部分页 KV 模型（不含 `glm-dsa`：MLA 每个 token 只存一行 576 宽的压缩行，DSA 索引器打分的也是这段连续历史，没有可供量化的分页块布局） | TurboQuant 分页 KV 块编解码器 | 关闭（`0`） | `0`, `4`, `8` | 是 |
+| `MAX_CONTEXT` | 长文本 / 上传文本 | 硬上下文上限。设置了就是硬性要求：缓存放得下就照办，放不下就带着数字拒绝。不设置时，GGUF 宣称的长度只是上限，加载器会按设备真正装得下的量来定——GLM-5.2 宣称 1M token，那是约 93 GiB 的 KV | 模型默认值（是上限而非承诺） | `4096`, `8192`, `16384` | 是 |
 
 ## Prefill / Decode 调优
 
@@ -149,6 +149,34 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_DFLASH_FUSED` | Muse-Glimmer DFlash | 融合的 `TSGgml_DFlashInject` / `TSGgml_DFlashDraftBlock` 图 vs 逐算子草稿模型 | 开 | 未注册 | 否 |
 | `TS_DFLASH_PERSIST` | Muse-Glimmer DFlash | 重放持久草稿图，而不是每步重建 | 开 | 未注册 | 否 |
 
+## 矩阵外的 GLM 5.x（`glm-dsa`）开关
+
+这些变量配置 GLM 5.x（`glm-dsa`）执行器——`ggml_cuda` / `ggml_vulkan` /
+`ggml_cpu` / `ggml_metal` 使用的原生整模型 ggml 路径，以及 `cpu` 与 `cuda` 使用的
+托管逐算子路径。它们都未注册在 `EnvVarMatrix.All` 中，默认的 TestMatrix 扫描不会
+覆盖；完整清单与背景见 [GLM 卡片](models/glm_zh-cn.md#环境变量)。张量并行相关的两个
+开关（`TS_GLM_TP_SHARD`、`TS_GLM_TP_OVERSUBSCRIBE`）列在下面的 TP 表里。
+
+| 变量 | 适用范围 | 作用 | 基线 | 扫描取值 | 在矩阵中 |
+|---|---|---|---|---|---|
+| `TS_GLM_NATIVE` | GLM 5.x | `0` 在 GGML 后端上改走托管逐算子路径而非原生整模型图——正是用来对照两条路径是否一致的 A/B | `1`（原生） | `0`, `1` | 否 |
+| `TS_GLM_NGPU` | GGML 上的 GLM 5.x | 按层切分把 78 层摊到多少张 GPU 上 | `0`（全部可见 GPU） | `1`, `2`, `3` | 否 |
+| `TS_GLM_UBATCH` | GLM 5.x | Prefill 微批。显存允许时 `2048` 在长提示上更快：3x RTX PRO 6000 上 pp2048 为 1145.8，对比 918.9 t/s | `1024` | `512`, `1024`, `2048` | 否 |
+| `TS_GLM_THREADS` | `ggml_cpu` 上的 GLM 5.x | CPU 后端线程数（路由专家的 matmul 另用 `--cpu-moe-threads`） | min(核数, 32) | — | 否 |
+| `TS_GLM_FA` | GLM 5.x | `0` 关闭 flash attention，退回显式的 `soft_max` 链路 | `1`（flash） | `0`, `1` | 否 |
+| `TS_GLM_FUSED_LID` | GLM 5.x | `0` 用基本算子拼出 DSA lightning indexer，而不是用融合的 `ggml_lightning_indexer` | `1`（融合） | `0`, `1` | 否 |
+| `TS_GLM_TOPK` | GLM 5.x | `0` 越过索引器 top-k 做稠密注意力——用于对照稀疏选择本身，不是生产设置 | `1`（稀疏） | `0`, `1` | 否 |
+| `TS_GLM_OP_OFFLOAD` | GGML 上的 GLM 5.x | 调度器的 op-offload；一旦有任何层的专家驻留主机就会自动关闭 | 自动 | `0`, `1` | 否 |
+| `TS_GLM_VRAM_RESERVE_MB` | GGML 上的 GLM 5.x | 按层切分在开始放层之前，为计算缓冲在每张卡上预留的余量 | `3072` | — | 否 |
+| `TS_GLM_GRAPH_CACHE` | GGML 上的 GLM 5.x | 缓存多少张已构建且已分配的计算图，使相同形状可以直接重放而不必重建 | `8` | — | 否 |
+| `TS_GLM_NODES_PER_LAYER` | GGML 上的 GLM 5.x | 每 rank 每层的计算图节点预算 | `256` | — | 否 |
+| `TS_GLM_MOE_MMAP` | 带 `--n-cpu-moe` 的 GLM 5.x | `0` 把驻留主机的专家拷进私有缓冲，而不是在 GGUF 映射上就地做乘法 | `1`（映射） | `0`, `1` | 否 |
+| `TS_GLM_BATCHED_DECODE` | GLM 5.x | `0` 让原生侧拒绝一切批处理解码，即便设了 `TS_BATCHED_FUSED_DECODE=1` 也强制走按序列的槽位路径 | `1`（接受） | `0`, `1` | 否 |
+| `TS_GLM_LOAD_THREADS` / `TS_GLM_LOAD_CHUNK_MB` | GLM 5.x | 权重加载的并行度与分块大小——16 个读线程跨 6 个分片，在页缓存预热的情况下约 37 秒读入 218 GiB（5.9 GiB/s） | `16` / `64` | — | 否 |
+| `TS_GLM_TRACE` | GLM 5.x（诊断） | 指定层列表（或 `all`）按 `llama-eval-callback` 的排版打印逐层激活和，用于与 llama.cpp 对拍 | 未设置 | — | 否 |
+| `TS_GLM_BD_DEBUG` | GLM 5.x（诊断） | `1` 逐步叙述每次批处理解码：参与的是哪些槽位、计算图是复用还是重建、跑到了哪一步 | `0` | `0`, `1` | 否 |
+| `TS_GLM_DEBUG` / `TS_GLM_DEBUG_LAYERS` | 托管逐算子路径上的 GLM 5.x（`cpu` / `cuda` / `TS_GLM_NATIVE=0`，诊断） | 逐层激活追踪：打印每个具名中间张量的形状、求和与前几个值，标签与 `llama-eval-callback` 对齐，便于逐标签对拍。`TS_GLM_DEBUG=1` 只追踪第 0 层，`TS_GLM_DEBUG_LAYERS` 接受层列表。原生执行器请改用 `TS_GLM_TRACE` | 未设置 | — | 否 |
+
 ## 矩阵外的张量并行 / 分布式推理变量
 
 这些变量配置张量并行（把单个模型切分到多张 GPU）以及基于点对点 TCP 网格的多节点
@@ -174,6 +202,8 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 本地 TP，GGML 后端 | 超过该元素数量时 AllReduce 走设备集合通信，否则在主机内存中归约 | `262144` | 未注册 | 否 |
 | `TS_GGML_F32_RESIDENT` | GGML 后端 | `0` 表示每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） | 开启（常驻设备） | 未注册 | 否 |
 | `TS_GEMMA4_TP_FUSED_MOE` | GGML 上 TP 下的 Gemma 4 MoE | `0` 表示从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径 | 开启（融合主干） | 未注册 | 否 |
+| `TS_GLM_TP_SHARD` | GGML 上 TP 下的 GLM 5.x | 切分哪一半：`1` 注意力头，`2` 路由专家，`3` 两者都切。路由专家是在每个专家内部按行切分，而不是按专家 id 分配，因为 `ggml_mul_mat_id` 要求同一 token 选中的专家 id 互不相同 | `3`（两者） | `1`, `2`, `3` | 否 |
+| `TS_GLM_TP_OVERSUBSCRIBE` | GGML 上 TP 下的 GLM 5.x | `1` 允许多个 rank 共享一张 GPU，用于在单卡机器上验证切分的正确性 | `0`（一 rank 一卡） | `0`, `1` | 否 |
 | `GGML_CUDA_ALLREDUCE` | 本地 TP，`ggml_cuda` | `nccl` / `internal` / `none` —— 直接透传给 ggml 的集合通信选择；显式设置同时会跳过启动前探测 | 自动（构建时能找到 NCCL 且通过探测就用 NCCL） | 未注册 | 否 |
 | `TS_GGML_TP_AR_PROBE` | 本地 TP，`ggml_cuda` | `0` 跳过 NCCL 启动前探测；`force` 忽略缓存的判定（`~/.cache/tensorsharp/tp-collective-probe`）重新探测。探测在模型加载前端到端跑一次小型 AllReduce —— 一些云主机声称支持 P2P 但数据永远送不到，NCCL 的第一次集合通信会让两块 GPU 永远空转 | 探测开启，判定按 驱动/NCCL/GPU 组合缓存 | 未注册 | 否 |
 | `TS_GGML_TP_AR_PROBE_MS` | 本地 TP，`ggml_cuda` | 探测 AllReduce 的完成期限；超时即判定集合通信不可用并改走钉页主机内存的 `internal` 管线；`0` 关闭探测 | `10000` 毫秒 | 未注册 | 否 |

@@ -66,6 +66,23 @@
   </div>
   <p>规律很清楚：TensorSharp 的融合整模型图在约 2K 以下的 prefill 上领先 1.16-1.27×，两个引擎在 2K 到 16K 之间交叉，再往上 llama.cpp 保持 6-8% 的 prefill 优势；decode 在短上下文时打平，到 128K 降到 0.86×。启用 <strong>DFlash</strong> 投机解码后，TensorSharp 在短与中等提示上领先，从 16K 起落后——但这个差距主要来自运行期的<em>成本调控器</em>：一次误判的探测会让它暂停起草；在保持启用的那些重复里，TensorSharp 在 16K 达到 llama.cpp 的 94%、64K 达到 96%。DFlash 的绝对数字还高度依赖语料（501 token 那一点在<em>两个</em>引擎上都是 100% 接受率）。两个引擎都能在单卡上跑满 128K。两行长上下文有一个说明：它们是在换行符归一化修复落地之前测的，因此在这两个点上 TensorSharp prefill 的是同一文档的 CRLF 形式（多 1.2% 的 token）；吞吐是速率，影响很小，但那里两侧生成的续写并不严格可比。方法、逐次重复的离散度、显存与调控器分析见 <a href="models_zh-cn.html#table">Muse-Glimmer 架构卡片</a>（<code>docs/models/muse-glimmer_zh-cn.md</code>）。</p>
 
+  <h2 id="glm">GLM-5.2 744B：规模的另一端</h2>
+  <p>第二组手工对比，这次跑的是单卡装不下的模型：<strong>3× RTX PRO 6000 Blackwell（各 97 GiB，PCIe，无 NVLink）</strong>，<code>GLM-5.2-UD-IQ2_XXS</code>（744B-A40B MoE，MLA + DeepSeek 稀疏注意力，218 GiB 权重按层切分到三张卡上），两个引擎在同一次会话里背靠背测量——llama.cpp 用 <code>llama-bench</code>，TensorSharp 用对拍工具的 <code>--bench</code>，同样取两次重复中的较好值。这些数字的重复间波动约 4%。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>测试项</th><th>llama.cpp</th><th>TensorSharp（默认 <code>n_ubatch</code> 1024）</th><th>TensorSharp（<code>TS_GLM_UBATCH=2048</code>）</th></tr></thead>
+    <tbody>
+      <tr><td>pp128</td><td><strong>276.5</strong></td><td>254.8</td><td>264.4</td></tr>
+      <tr><td>pp512</td><td><strong>695.4</strong></td><td>666.9</td><td>659.6</td></tr>
+      <tr><td>pp2048</td><td>763.1</td><td><span class="yes">918.9</span></td><td><span class="yes"><strong>1145.8</strong></span></td></tr>
+      <tr><td>pp4096</td><td>715.8</td><td><span class="yes">864.7</span></td><td><span class="yes"><strong>1048.7</strong></span></td></tr>
+      <tr><td>tg64</td><td>42.2</td><td><span class="yes">43.7</span></td><td><span class="yes"><strong>43.9</strong></span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>交叉点大约落在一千个提示 token 上，原因就是微批：256 个专家 top-8 的情况下，一个 512 token 的分块平均只给每个专家路由约 16 行，于是每个专家 GEMM 的 tile 大部分都是填充，把分块调大比图上任何其他改动都更管用。再往下，一整次 prefill 就是一张小图，每次调用的固定开销——托管层的一跳、输入上传、154,880 宽的 logits 回拷——占比明显，llama.cpp 那几个百分点就来自这里。Decode 受访存约束，两边都是各领先几个百分点。除了计时也校验输出：在同一后端上，TensorSharp 与 llama.cpp 逐 token 一致——<code>ggml_cuda</code> 上 6/6 条录制提示，<code>ggml_cpu</code> 上 3/3，100% 托管的 <code>cpu</code> 后端上 1/1。</p>
+  <p>有两件事在这台机器上<em>不会</em>让它变快。<code>--tp 3</code> 把 pp2048 / tg64 从 915.9 / 43.9 拉到 505.6 / 17.6——78 层里每层都要两次 <code>[6144, n_tokens]</code> 隐状态的 all-reduce，没有 NVLink 的 PCIe 付不起这笔账。<code>--n-cpu-moe 30</code> 则拉到 94.7 / 16.4。它们存在的意义是让原本装不下的权重能跑起来：卸载把加载器能定下的上下文从 342,272 抬到 646,400 token。参见 <a href="models-text_zh-cn.html#glm">GLM 5.x</a>。</p>
+
   <h2 id="wan">Wan 视频：两个彼此独立的提速杠杆</h2>
   <p>视频是唯一一种选错会浪费<em>数小时</em>而非数秒的工作负载，因此值得把两个杠杆分开来看。下表三行是<strong>同一个请求</strong> —— Apple <strong>M5 Pro（20 核 GPU、48 GB 统一内存）</strong>、<code>ggml_metal</code>、<code>Wan2.2-TI2V-5B</code> Q8_0，图生视频，<strong>1088×832 × 121 帧 = 27,404 个 DiT token</strong> —— 各行之间只有引擎版本与 <code>--model</code> 指向哪个权重的区别。</p>
   <div class="table-scroll">

@@ -542,6 +542,14 @@ namespace TensorSharp.Runtime
             if (architecture == "gptoss" || architecture == "gpt-oss")
                 return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
 
+            // GLM-5.x: the shipped template is built out of macros, namespaces,
+            // `tojson`, and a `visible_text` walker over structured content — the
+            // exact feature set the lightweight Jinja engine renders inconsistently.
+            // The format itself is a handful of sentinel tokens, so use the
+            // purpose-built renderer and keep tool framing correct.
+            if (IsGlmDsa(architecture))
+                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+
             if (!string.IsNullOrWhiteSpace(template))
             {
                 try
@@ -659,7 +667,105 @@ namespace TensorSharp.Runtime
             if (architecture == "deepseek4")
                 return RenderDeepSeek4(messages, addGenerationPrompt, enableThinking, tools);
 
+            if (IsGlmDsa(architecture))
+                return RenderGlmDsa(messages, addGenerationPrompt, enableThinking, tools);
+
             return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
+        }
+
+        internal static bool IsGlmDsa(string? architecture)
+            => architecture == "glm-dsa" || architecture == "glm_dsa";
+
+        private const string GlmToolsHeader =
+            "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" +
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n";
+
+        private const string GlmToolsFooter =
+            "</tools>\n\nFor each function call, output the function name and arguments within the following " +
+            "XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}" +
+            "</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>";
+
+        /// <summary>
+        /// GLM-5.x (glm-dsa) chat format, mirroring the template shipped in the
+        /// GGUF:
+        /// <code>
+        /// [gMASK]&lt;sop&gt;[&lt;|system|&gt;Reasoning Effort: Max][tools block]
+        /// &lt;|user|&gt;...&lt;|assistant|&gt;&lt;think&gt;...&lt;/think&gt;...
+        /// &lt;|observation|&gt;&lt;tool_response&gt;...&lt;/tool_response&gt;
+        /// </code>
+        /// <para>The reasoning-effort system line is what turns thinking ON for this
+        /// family: the template emits it whenever thinking is not explicitly
+        /// disabled, and the generation prompt then opens a <c>&lt;think&gt;</c>
+        /// block the model is expected to close itself. With thinking off the
+        /// prompt closes the block immediately (<c>&lt;think&gt;&lt;/think&gt;</c>)
+        /// so the model answers directly.</para>
+        /// <para>Past-turn reasoning is dropped, matching the template's default
+        /// (<c>clear_thinking</c>): only the turn currently being generated keeps
+        /// its reasoning.</para>
+        /// </summary>
+        public static string RenderGlmDsa(List<ChatMessage> messages, bool addGenerationPrompt = true,
+            bool enableThinking = false, List<ToolFunction>? tools = null)
+        {
+            var sb = new StringBuilder();
+            sb.Append("[gMASK]<sop>");
+
+            if (enableThinking)
+                sb.Append("<|system|>Reasoning Effort: Max");
+
+            if (tools != null && tools.Count > 0)
+            {
+                sb.Append(GlmToolsHeader);
+                foreach (var tool in tools)
+                    sb.Append(ToolFunctionToJson(tool)).Append('\n');
+                sb.Append(GlmToolsFooter);
+            }
+
+            bool prevWasTool = false;
+            foreach (var m in messages)
+            {
+                switch (m.Role)
+                {
+                    case "system":
+                        sb.Append("<|system|>").Append(m.Content ?? "");
+                        prevWasTool = false;
+                        break;
+                    case "user":
+                    case "developer":
+                        sb.Append("<|user|>").Append(m.Content ?? "");
+                        prevWasTool = false;
+                        break;
+                    case "tool":
+                        // One <|observation|> opens a RUN of tool results.
+                        if (!prevWasTool)
+                            sb.Append("<|observation|>");
+                        sb.Append("<tool_response>").Append(m.Content ?? "").Append("</tool_response>");
+                        prevWasTool = true;
+                        break;
+                    case "assistant":
+                    {
+                        sb.Append("<|assistant|>\n");
+                        string content = m.Content ?? string.Empty;
+                        int close = content.IndexOf("</think>", StringComparison.Ordinal);
+                        if (close >= 0)
+                        {
+                            // Historical reasoning is dropped; the empty block is
+                            // still emitted because the model was trained on it.
+                            content = content.Substring(close + "</think>".Length);
+                        }
+                        sb.Append("<think></think>");
+                        content = content.Trim();
+                        if (content.Length > 0)
+                            sb.Append(content);
+                        prevWasTool = false;
+                        break;
+                    }
+                }
+            }
+
+            if (addGenerationPrompt)
+                sb.Append("<|assistant|>").Append(enableThinking ? "<think>" : "<think></think>");
+
+            return sb.ToString();
         }
 
         /// <summary>

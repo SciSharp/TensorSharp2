@@ -753,6 +753,14 @@ static ggml_backend_buffer_t dsv4_mmap_shard(dsv4_model & m, const shard_files &
         munmap(addr, (size_t) st.st_size);
         return nullptr;
     }
+    // WEIGHTS, not the default ANY: ggml_backend_sched only pins a node to the
+    // backend that owns an input when that input's buffer is marked as weights
+    // (ggml-backend.cpp, "assign nodes that use weights to the backend of the
+    // weights"). Left at ANY, an offloaded layer's mul_mat_id is assigned to the
+    // accelerator instead, and the scheduler copies the whole 2.9 GiB expert
+    // block over the bus once per token — measured 33 s/token against 0.19 s
+    // with the flag set.
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     m.mmap_addrs[si] = addr;
     m.mmap_sizes[si] = (size_t) st.st_size;
     m.mmap_bufs[si] = buf;

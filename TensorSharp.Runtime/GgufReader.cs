@@ -72,12 +72,103 @@ namespace TensorSharp.Runtime
         private unsafe byte* _lockedBase;
         private ulong _lockedLength;
 
-        public GgufFile(string path)
+        /// <summary>
+        /// Sibling shards of a split GGUF (<c>NAME-00001-of-000NN.gguf</c>), in split
+        /// order and excluding this one. Empty for a single-file model.
+        /// </summary>
+        private readonly List<GgufFile> _shards = new();
+
+        /// <summary>
+        /// Owning shard of every tensor that lives in a sibling file. Tensors absent
+        /// from this map are stored in this file, so the single-file read path is
+        /// unchanged (the map stays empty).
+        /// </summary>
+        private readonly Dictionary<string, GgufFile> _tensorOwner = new(StringComparer.Ordinal);
+
+        public GgufFile(string path) : this(path, isShard: false) { }
+
+        private GgufFile(string path, bool isShard)
         {
             _path = path;
             _stream = File.OpenRead(path);
             Parse();
+            if (!isShard)
+                OpenSiblingShards();
         }
+
+        /// <summary>Every file this model is stored in, starting with this one.</summary>
+        public IReadOnlyList<string> FilePaths
+        {
+            get
+            {
+                var paths = new List<string>(_shards.Count + 1) { _path };
+                foreach (var s in _shards)
+                    paths.Add(s._path);
+                return paths;
+            }
+        }
+
+        /// <summary>True when the model is stored across more than one GGUF file.</summary>
+        public bool IsSplit => _shards.Count > 0;
+
+        /// <summary>
+        /// Open the remaining files of a split GGUF and merge their tensor tables into
+        /// this one, so callers see a single flat <see cref="Tensors"/> table and read
+        /// through the same API however the checkpoint was sharded.
+        ///
+        /// <para>Split checkpoints (llama.cpp's <c>gguf-split</c> layout, which every
+        /// very large release ships in — GLM-5.2 is six files) put all metadata in the
+        /// first shard and zero tensors in it; the weights live in the siblings.
+        /// Without this, opening the first shard yields a model with no weights.</para>
+        ///
+        /// <para>A missing sibling is a hard error: a partially loaded model would
+        /// otherwise fail much later as a missing-tensor exception inside a model
+        /// constructor, which reads as an unsupported architecture rather than as an
+        /// incomplete download.</para>
+        /// </summary>
+        private void OpenSiblingShards()
+        {
+            int splitCount = (int)GetUint32("split.count", 0);
+            if (splitCount <= 1)
+                return;
+
+            // gguf-split names shards "<prefix>-%05d-of-%05d.gguf". Derive the prefix
+            // from this file's own name rather than from metadata, so a renamed set
+            // still resolves as long as the shards were renamed together.
+            string dir = Path.GetDirectoryName(Path.GetFullPath(_path)) ?? ".";
+            string name = Path.GetFileName(_path);
+            var m = System.Text.RegularExpressions.Regex.Match(
+                name, @"^(?<prefix>.*)-(?<no>\d{5})-of-(?<count>\d{5})\.gguf$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!m.Success)
+                return;
+
+            string prefix = m.Groups["prefix"].Value;
+            int selfNo = int.Parse(m.Groups["no"].Value);
+
+            for (int i = 1; i <= splitCount; i++)
+            {
+                if (i == selfNo)
+                    continue;
+                string shardPath = Path.Combine(dir, $"{prefix}-{i:D5}-of-{splitCount:D5}.gguf");
+                if (!File.Exists(shardPath))
+                    throw new FileNotFoundException(
+                        $"{_path} is shard {selfNo} of {splitCount}, but {Path.GetFileName(shardPath)} is missing. " +
+                        "Every shard of a split GGUF must sit in the same directory.", shardPath);
+
+                var shard = new GgufFile(shardPath, isShard: true);
+                _shards.Add(shard);
+                foreach (var kv in shard.Tensors)
+                {
+                    Tensors[kv.Key] = kv.Value;
+                    _tensorOwner[kv.Key] = shard;
+                }
+            }
+        }
+
+        /// <summary>The file a tensor's bytes live in: a sibling shard, or this file.</summary>
+        private GgufFile OwnerOf(GgufTensorInfo tensorInfo) =>
+            tensorInfo != null && _tensorOwner.TryGetValue(tensorInfo.Name, out var owner) ? owner : this;
 
         /// <summary>
         /// Pins the GGUF mmap region in physical RAM via mlock(2). This
@@ -92,6 +183,8 @@ namespace TensorSharp.Runtime
         {
             if (_lockedBase != null)
                 return true;
+            foreach (var shard in _shards)
+                shard.TryLockMappedRegion();
             EnsureMappedView();
             if (_mappedBase == null)
                 return false;
@@ -171,6 +264,10 @@ namespace TensorSharp.Runtime
 
             if (Environment.GetEnvironmentVariable("TS_GGUF_PREFAULT") == "0")
                 return;
+
+            // Split GGUF: warm every shard, not just the (tensor-less) first one.
+            foreach (var shard in _shards)
+                shard.PrefaultFileCache();
 
             long length;
             try { length = _stream.Length; }
@@ -296,6 +393,10 @@ namespace TensorSharp.Runtime
             lastTensorName = null;
             foreach (var t in Tensors.Values)
             {
+                // Merged-in shard tensors are sized against their own file.
+                if (_tensorOwner.ContainsKey(t.Name))
+                    continue;
+
                 long bytes;
                 try { bytes = GetTensorByteCount(t); }
                 catch (NotSupportedException) { continue; }
@@ -320,6 +421,9 @@ namespace TensorSharp.Runtime
         /// </summary>
         public void ThrowIfTruncated()
         {
+            foreach (var shard in _shards)
+                shard.ThrowIfTruncated();
+
             long required = GetRequiredLength(out string? lastTensorName);
             long actual = _stream.Length;
             if (actual >= required)
@@ -407,6 +511,10 @@ namespace TensorSharp.Runtime
 
         public byte[] ReadTensorData(GgufTensorInfo tensorInfo)
         {
+            var owner = OwnerOf(tensorInfo);
+            if (!ReferenceEquals(owner, this))
+                return owner.ReadTensorData(tensorInfo);
+
             long byteCount = GetTensorByteCount(tensorInfo);
             byte[] data = new byte[byteCount];
             _stream.Seek(DataOffset + (long)tensorInfo.Offset, SeekOrigin.Begin);
@@ -419,6 +527,13 @@ namespace TensorSharp.Runtime
         /// </summary>
         public unsafe void ReadTensorDataToFloat32(GgufTensorInfo tensorInfo, float[] dest, long numElements)
         {
+            var owner = OwnerOf(tensorInfo);
+            if (!ReferenceEquals(owner, this))
+            {
+                owner.ReadTensorDataToFloat32(tensorInfo, dest, numElements);
+                return;
+            }
+
             long totalBytes = numElements * 4;
             _stream.Seek(DataOffset + (long)tensorInfo.Offset, SeekOrigin.Begin);
             const int chunkBytes = 16 * 1024 * 1024;
@@ -446,6 +561,13 @@ namespace TensorSharp.Runtime
         /// </summary>
         public unsafe void ReadTensorDataToFloat32Native(GgufTensorInfo tensorInfo, IntPtr dest, long numElements)
         {
+            var owner = OwnerOf(tensorInfo);
+            if (!ReferenceEquals(owner, this))
+            {
+                owner.ReadTensorDataToFloat32Native(tensorInfo, dest, numElements);
+                return;
+            }
+
             long totalBytes = numElements * 4;
             _stream.Seek(DataOffset + (long)tensorInfo.Offset, SeekOrigin.Begin);
             const int chunkBytes = 16 * 1024 * 1024;
@@ -467,6 +589,13 @@ namespace TensorSharp.Runtime
         /// </summary>
         public unsafe void ReadTensorDataToNative(GgufTensorInfo tensorInfo, IntPtr dest, long byteCount)
         {
+            var owner = OwnerOf(tensorInfo);
+            if (!ReferenceEquals(owner, this))
+            {
+                owner.ReadTensorDataToNative(tensorInfo, dest, byteCount);
+                return;
+            }
+
             _stream.Seek(DataOffset + (long)tensorInfo.Offset, SeekOrigin.Begin);
             byte[] buffer = new byte[Math.Min(byteCount, 8 * 1024 * 1024)];
             long remaining = byteCount;
@@ -483,6 +612,10 @@ namespace TensorSharp.Runtime
 
         public unsafe bool TryGetTensorDataPointer(GgufTensorInfo tensorInfo, out IntPtr dataPtr)
         {
+            var owner = OwnerOf(tensorInfo);
+            if (!ReferenceEquals(owner, this))
+                return owner.TryGetTensorDataPointer(tensorInfo, out dataPtr);
+
             dataPtr = IntPtr.Zero;
             if (tensorInfo == null)
                 return false;
@@ -696,6 +829,11 @@ namespace TensorSharp.Runtime
 
         public unsafe void Dispose()
         {
+            foreach (var shard in _shards)
+                shard.Dispose();
+            _shards.Clear();
+            _tensorOwner.Clear();
+
             if (_lockedBase != null)
             {
                 try { _ = munlock(_lockedBase, (nuint)_lockedLength); } catch { }

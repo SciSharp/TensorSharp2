@@ -170,6 +170,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
     <tbody>
       <tr><td><code>BACKEND</code></td><td>Default backend when <code>--backend</code> is not passed (default: <code>ggml_metal</code> on macOS, <code>ggml_cpu</code> elsewhere).</td></tr>
       <tr><td><code>MAX_TOKENS</code></td><td>Default max generation length (default: <code>20000</code>).</td></tr>
+      <tr><td><code>MAX_CONTEXT</code></td><td>Hard context limit. Left unset, an advertised context is a <em>ceiling</em>: after the weights load the engine asks the devices how much VRAM is actually free and sizes the context to fit the caches plus one full <code>n_ubatch</code> graph, logging its pick (GLM-5.2 on 3× RTX PRO 6000: 342,272 tokens on the layer split, 91,136 with <code>--tp 3</code>, 646,400 with <code>--n-cpu-moe 30</code>). Set it and the value is honoured if it fits and refused with the numbers if it does not, rather than quietly shrunk.</td></tr>
       <tr><td><code>TS_PDF_MAX_PAGES</code></td><td>Cap on PDF pages read during upload — text extraction and page-image rendering (default: <code>0</code> = all pages; also honored by the CLI's <code>--pdf</code>).</td></tr>
       <tr><td><code>VIDEO_SAMPLE_FPS</code> / <code>VIDEO_MAX_FRAMES</code></td><td>Frames sampled per second of video / optional upper bound on extracted frames.</td></tr>
       <tr><td><code>TS_FUSED_QKNORM_ROPE</code></td><td>Fused QK-Norm + RoPE CUDA kernel for Qwen 3.5/3.6 text prefill on the direct <code>cuda</code> backend (default on; <code>0</code> disables).</td></tr>
@@ -201,6 +202,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
       <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>Decode tokens before a sequence switch (default <code>256</code> = block size).</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>Physical blocks in the engine pool (default <code>256</code>) / tokens per block (default <code>256</code>).</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> disables block-hash prefix sharing across requests.</td></tr>
+      <tr><td><code>TS_BATCHED_FUSED_DECODE</code></td><td><code>1</code> enables the batched fused decode used by the native slot path (DeepSeek V4, GLM 5.x): one graph, one token per sequence, weights read once for the whole batch — 1.81× aggregate decode at 4 concurrent requests on GLM-5.2. Off by default because batching changes GEMM shapes and a 2-bit MoE amplifies that into different expert picks; <code>TS_GLM_BATCHED_DECODE=0</code> makes the native side decline it.</td></tr>
       <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED=0</code></td><td>Per-model escape hatch (e.g. <code>TS_GEMMA4_BATCHED=0</code>) to fall back to per-sequence KV-swap.</td></tr>
     </tbody>
   </table>

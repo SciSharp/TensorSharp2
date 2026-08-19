@@ -170,6 +170,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
     <tbody>
       <tr><td><code>BACKEND</code></td><td>未传 <code>--backend</code> 时的默认后端（默认：macOS 上为 <code>ggml_metal</code>，其他平台为 <code>ggml_cpu</code>）。</td></tr>
       <tr><td><code>MAX_TOKENS</code></td><td>默认最大生成长度（默认：<code>20000</code>）。</td></tr>
+      <tr><td><code>MAX_CONTEXT</code></td><td>硬性的上下文上限。不设时，自报的上下文只是<em>上界</em>：权重加载完之后引擎会去问各设备实际还剩多少显存，按「缓存加一整个 <code>n_ubatch</code> 计算图」能装下的大小定上下文，并打印它的选择（GLM-5.2 在 3× RTX PRO 6000 上：按层切分 342,272 token，<code>--tp 3</code> 91,136，<code>--n-cpu-moe 30</code> 646,400）。设了它，放得下就照办，放不下会带着数字直接报错，而不会被悄悄缩小。</td></tr>
       <tr><td><code>TS_PDF_MAX_PAGES</code></td><td>上传 PDF 时读取的页数上限，文本提取与页面图像渲染均遵循（默认：<code>0</code> = 全部页面；CLI <code>--pdf</code> 同样遵循）。</td></tr>
       <tr><td><code>VIDEO_SAMPLE_FPS</code> / <code>VIDEO_MAX_FRAMES</code></td><td>每秒视频采样的帧数 / 可选的抽帧上限。</td></tr>
       <tr><td><code>TS_FUSED_QKNORM_ROPE</code></td><td>Direct <code>cuda</code> 后端上 Qwen 3.5/3.6 文本 prefill 的融合 QK-Norm + RoPE CUDA 内核（默认开启；<code>0</code> 关闭）。</td></tr>
@@ -201,6 +202,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
       <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>切换序列前的 decode token 数（默认 <code>256</code> = 块大小）。</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>引擎池中的物理块数（默认 <code>256</code>） / 每块 token 数（默认 <code>256</code>）。</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> 禁用跨请求的块哈希前缀共享。</td></tr>
+      <tr><td><code>TS_BATCHED_FUSED_DECODE</code></td><td><code>1</code> 启用原生槽位路径（DeepSeek V4、GLM 5.x）上的批处理融合解码：一张图、每个序列一个 token，整批只读一次权重——GLM-5.2 在 4 路并发下总解码吞吐 1.81 倍。默认关闭，因为批处理会改变 GEMM 形状，而 2-bit MoE 会把这点差异放大成不同的专家选择；<code>TS_GLM_BATCHED_DECODE=0</code> 让原生侧直接拒绝它。</td></tr>
       <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED=0</code></td><td>逐模型的逃生口（如 <code>TS_GEMMA4_BATCHED=0</code>），回退到逐序列 KV 交换。</td></tr>
     </tbody>
   </table>

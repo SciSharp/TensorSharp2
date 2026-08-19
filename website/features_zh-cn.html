@@ -20,7 +20,7 @@
 
   <h2 id="catalog">亮点</h2>
   <div class="card-grid">
-    <div class="card"><div class="ic">🧠</div><h3>多架构</h3><p>DeepSeek V4 Flash、Gemma 4 / 3、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、DiffusionGemma、Qwen-Image-Edit、Wan 视频。</p></div>
+    <div class="card"><div class="ic">🧠</div><h3>多架构</h3><p>DeepSeek V4 Flash、GLM 5.2、Gemma 4 / 3、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、DiffusionGemma、Qwen-Image-Edit、Wan 视频。</p></div>
     <div class="card"><div class="ic">🖼️</div><h3>多模态</h3><p>图像、视频与音频输入（Gemma 4）；多个其他模型支持图像输入。</p></div>
     <div class="card"><div class="ic">📄</div><h3>PDF 文档</h3><p>在 Web UI 上传 PDF，或在 CLI 传 <code>--pdf</code> —— 文本型 PDF 直接内联，扫描页则交给视觉模型。</p></div>
     <div class="card"><div class="ic">🎨</div><h3>图像编辑</h3><p>Qwen-Image-Edit 将提示词 + 输入图像转为编辑后的图像（MMDiT 扩散）。</p></div>
@@ -36,11 +36,12 @@
 
   <h2 id="models-features">模型与模态</h2>
   <ul>
-    <li><strong>多架构支持</strong> —— DeepSeek V4 Flash、Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、Qwen-Image-Edit、Wan 2.1 / 2.2 视频。→ <a href="models_zh-cn.html#table">支持的模型</a></li>
+    <li><strong>多架构支持</strong> —— DeepSeek V4 Flash、GLM 5.2、Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、Qwen-Image-Edit、Wan 2.1 / 2.2 视频。→ <a href="models_zh-cn.html#table">支持的模型</a></li>
     <li><strong>DeepSeek V4 Flash（284B MoE）</strong> —— 一套压缩稀疏注意力、1M 上下文的架构，配有三套专属的整模型执行器：Direct CUDA 引擎（<code>--backend cuda</code>）、原生 ggml 执行器（<code>ggml_cuda</code> / <code>ggml_vulkan</code>），以及 100% 纯 C# 的 CPU 执行器（<code>--backend cpu</code>，零原生依赖）。权重自动按层切分到所有可见 GPU，服务端以原生 per-sequence slot 与连续批处理托管它。→ <a href="models-text_zh-cn.html#deepseek4">DeepSeek V4</a></li>
+    <li><strong>GLM 5.2（744B-A40B MoE）</strong> —— 带权重吸收的多头潜在注意力（MLA）加上 DeepSeek 稀疏注意力的 lightning indexer，256 个路由专家 top-8 加一个共享专家，自报 1M 上下文，直接从 6 分片的 split GGUF 加载。两套实现：一个原生整模型 ggml 执行器（<code>ggml_cuda</code> / <code>ggml_vulkan</code> / <code>ggml_cpu</code> / <code>ggml_metal</code>，把 226 GiB 按层切分到所有可见 GPU），以及 <code>--backend cpu</code>（100% 纯 C#、零原生依赖）与 <code>--backend cuda</code> 使用的托管逐算子路径。→ <a href="models-text_zh-cn.html#glm">GLM 5.x</a></li>
     <li><strong>多模态推理</strong> —— Gemma 4 支持图像、视频与音频输入；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 与 Muse-Glimmer 支持图像。→ <a href="models-text_zh-cn.html#multimodal">多模态</a></li>
     <li><strong>PDF 文档输入</strong> —— 原生数字（born-digital）PDF 会完整提取文本层并内联进提示词；扫描版 PDF 则回退为页面图像，交给具备视觉能力的模型。可通过 Web UI 上传使用，也可用 CLI 一次性生成的 <code>--pdf</code> 参数；用 <code>TS_PDF_MAX_PAGES</code> 限制读取的页数（默认：全部）。→ <a href="server_zh-cn.html#webui">Web UI</a></li>
-    <li><strong>专家混合（MoE）</strong> —— Gemma 4 MoE（如 26B-A4B）、GPT OSS MoE（gpt-oss-20b）、Qwen 3.5/3.6 MoE（35B-A3B）以及 Nemotron-H MoE FFN 层，配以融合的批量 GPU MoE 调度。</li>
+    <li><strong>专家混合（MoE）</strong> —— Gemma 4 MoE（如 26B-A4B）、GPT OSS MoE（gpt-oss-20b）、Qwen 3.5/3.6 MoE（35B-A3B）、Nemotron-H MoE FFN 层，以及 GLM 5.2（744B-A40B：256 个路由专家 top-8 加 1 个共享专家，sigmoid 门控路由带一个只影响选择的 bias 与 x2.5 的路由缩放），配以融合的批量 GPU MoE 调度。</li>
     <li><strong>混合 SSM-Transformer</strong> —— Nemotron-H 在一个模型中混合 Mamba2 SSM 层、注意力层与 MoE FFN。</li>
     <li><strong>混合注意力-循环</strong> —— Qwen 3.5/3.6-family 将全注意力层与 GatedDeltaNet 循环层混合。</li>
     <li><strong>视频生成</strong> —— Wan 2.1（文本 → 视频）与 Wan 2.2 TI2V-5B / A14B（文本 → 视频，以及图像 → 视频，上传的图像作为首帧）可从 CLI、<code>/v1/videos/generations</code> 或 Web UI 输出 H.264 MP4。把 <code>--model</code> 指向<em>步数蒸馏</em>权重（Turbo / Lightning / FastWan），管线会自动识别，把去噪循环从 100 次 DiT 前向降到 4 次。→ <a href="models-video_zh-cn.html#video">视频生成</a></li>
@@ -50,8 +51,8 @@
 
   <h2 id="generation">生成与控制</h2>
   <ul>
-    <li><strong>思考 / 推理模式</strong> —— 带 <code>&lt;think&gt;</code> / <code>&lt;|channel&gt;</code> 标签的结构化思维链（Qwen 3、Qwen 3.5/3.6、Gemma 4、GPT OSS、Nemotron-H）。→ <a href="models-text_zh-cn.html#thinking">思考模式</a></li>
-    <li><strong>工具调用 / 函数调用</strong> —— 与架构无关的输出解析，无论模型输出的是 JSON（Qwen 3、Nemotron-H）、<code>&lt;tool_call&gt;</code> 块内的 XML（Qwen 3.5/3.6）、Harmony commentary（GPT OSS）还是 DSML 标记（DeepSeek V4），都会转成结构化 <code>tool_calls</code>。→ <a href="models-text_zh-cn.html#toolcalling">工具调用</a></li>
+    <li><strong>思考 / 推理模式</strong> —— 带 <code>&lt;think&gt;</code> / <code>&lt;|channel&gt;</code> 标签的结构化思维链（Qwen 3、Qwen 3.5/3.6、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、GLM 5.x）。→ <a href="models-text_zh-cn.html#thinking">思考模式</a></li>
+    <li><strong>工具调用 / 函数调用</strong> —— 与架构无关的输出解析，无论模型输出的是 JSON（Qwen 3、Nemotron-H）、<code>&lt;tool_call&gt;</code> 块内的 XML（Qwen 3.5/3.6）、GLM 5.x 的 <code>&lt;arg_key&gt;</code> / <code>&lt;arg_value&gt;</code> 成对标签、Harmony commentary（GPT OSS）还是 DSML 标记（DeepSeek V4），都会转成结构化 <code>tool_calls</code>。→ <a href="models-text_zh-cn.html#toolcalling">工具调用</a></li>
     <li><strong>可配置采样</strong> —— 温度、top-k、top-p、min-p、重复 / 存在 / 频率惩罚、随机种子与停止序列。→ <a href="http-api_zh-cn.html#sampling">采样</a></li>
     <li><strong>结构化输出</strong> —— OpenAI <code>response_format</code> 支持 <code>text</code>、<code>json_object</code> 与经过校验的 <code>json_schema</code>。→ <a href="http-api_zh-cn.html#structured">结构化输出</a></li>
     <li><strong>聊天模板</strong> —— 从 GGUF 元数据自动加载（Jinja2），并按架构提供硬编码回退。</li>
@@ -64,7 +65,8 @@
     <li><strong>GPU 加速</strong> —— GGML Metal（macOS）、GGML CUDA（Windows/Linux + NVIDIA）、GGML Vulkan（Windows/Linux + AMD/Intel/NVIDIA）、直接 CUDA/cuBLAS 后端，以及面向 Apple Silicon 的 MLX 后端 —— 均带 CPU 回退。→ <a href="backends_zh-cn.html">后端</a></li>
     <li><strong>连续批处理与分页 KV 缓存</strong> —— 块分页 KV 池、块哈希前缀共享、可在批中接纳 / 抢占序列的迭代级调度器、可选 SSD 后备层，以及原生融合分页注意力内核。→ <a href="advanced_zh-cn.html#continuous-batching">深入了解</a></li>
     <li><strong>批量 / 并行推理</strong> —— 将 N 个序列打包进一次前向，配以分页 K/V 散写（Mistral 3、Gemma 4、GPT OSS、Qwen 3 / 3.5 / 3.6、Nemotron-H）。</li>
-    <li><strong>张量并行与分布式推理</strong> —— 用 <code>--tp N</code>（CLI 与服务端均支持）把一个模型切分到 N 张 GPU 上（Megatron-LM 列/行并行，归一化层 / 词嵌入 / LM head 复制），Direct <code>cuda</code> 后端与 GGML CUDA / Vulkan 后端都可运行，并通过点对点 TCP 网格（<code>--tp-node-id</code> / <code>--tp-peers</code>）把并行组扩展到多台机器。分层 AllReduce 让每次集合通信只有 <code>1/tp_local</code> 的数据上网；MoE 专家切分与专家并行、GatedDeltaNet 按 rank 的 V-head 归属与 Mamba2 复制覆盖了各类异构层。融合的按 rank block 计算图让 Gemma 4 上 <code>--tp 2</code> 的 decode 超过单卡（51.7 对 37.3 tok/s），也让单卡装不下的模型得以运行。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></li>
+    <li><strong>张量并行与分布式推理</strong> —— 用 <code>--tp N</code>（CLI 与服务端均支持）把一个模型切分到 N 张 GPU 上（Megatron-LM 列/行并行，归一化层 / 词嵌入 / LM head 复制），Direct <code>cuda</code> 后端与 GGML CUDA / Vulkan 后端都可运行，并通过点对点 TCP 网格（<code>--tp-node-id</code> / <code>--tp-peers</code>）把并行组扩展到多台机器。分层 AllReduce 让每次集合通信只有 <code>1/tp_local</code> 的数据上网；MoE 专家切分与专家并行、GatedDeltaNet 按 rank 的 V-head 归属与 Mamba2 复制覆盖了各类异构层。融合的按 rank block 计算图让 Gemma 4 上 <code>--tp 2</code> 的 decode 超过单卡（51.7 对 37.3 tok/s），也让单卡装不下的模型得以运行。不过 TP 并不是模型用上多张 GPU 的唯一途径：DeepSeek V4 与 GLM 5.x <strong>不加任何开关就会按层切分到所有可见 GPU</strong>，<code>--tp</code> 在 GLM 5.x 上会把这种切分换成层内部的 Megatron 切分，在 DeepSeek V4 上则只是限制按层切分使用几张卡（等同 <code>TS_DSV4_NGPU</code>）；其他所有架构在不加 <code>--tp</code> 时只用一张 GPU（见<a href="distributed_zh-cn.html#vs-layer-split">TP 与按层切分</a>）。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></li>
+    <li><strong>MoE CPU 卸载</strong> —— <code>--cpu-moe</code> / <code>--n-cpu-moe N</code> 把前 N 层的路由专家留在系统内存里，直接从 GGUF 映射取用、不做私有拷贝，并且能与 <code>--tp</code> 组合。它是让装不下的权重能跑起来的手段，而不是提速开关：GLM 5.2 在 <code>--n-cpu-moe 30</code> 下实测 pp2048 94.7 / tg64 16.4，全部常驻时为 915.9 / 43.9，但腾出的显存把能定下的上下文从 342,272 抬到 646,400 token。→ <a href="advanced_zh-cn.html#memory">内存</a></li>
     <li><strong>MTP / NextN 推测解码</strong> —— 多 token 预测草稿头加速单序列解码；因请求自身的采样器同时驱动草稿与验证，故无损。→ <a href="advanced_zh-cn.html#mtp">推测解码</a></li>
     <li><strong>DSpark 块级投机解码</strong> —— DeepSeek V4 的草稿器每步提议一整<em>块</em> token（Markov 头让块内每个位置以前一个 token 为条件，置信度头决定起草多远），主干用一次批量前向验证整块。以独立 GGUF 通过 <code>--draft-model</code> 加载；4×A40 实测 decode 提速 1.3–1.4×，多轮对话最高 2.0×，贪心输出与基线逐字节一致。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></li>
     <li><strong>整模型融合 decode 计算图</strong> —— Gemma 4、Qwen 3.5/3.6 与 GPT OSS 把一个 decode token 作为一次 GGML 计算图提交，而不是每层一次，GPU 因此不会在层间空等主机。GPT OSS decode 在 A40 上从 24 → 154 tok/s，且随上下文长度基本持平。→ <a href="advanced_zh-cn.html#perf">性能优化</a></li>

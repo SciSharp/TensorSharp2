@@ -220,6 +220,7 @@ Three things had to change:
 | `TensorSharp.Core/OpRegistry.cs` | `PreInvokeHook` so a multi-device backend can route an op to its result's device |
 | `TensorSharp.Distributed/DistributedTensorParallelGroup.cs` | Takes any local group, so multi-node works over GGML too |
 | `TensorSharp.Models/ModelBase.cs` | GGML TP context/group construction, `TENSORSHARP_TP_DEVICES`, per-rank weight preload, GGML branch in `AddmmQuantManaged`, fused TP linear path |
+| `TensorSharp.GGML.Native/ggml_ops_glm_dsa.cpp` | **New.** GLM 5.x runs TP inside its own whole-model executor rather than through the shared group: the graph builder emits every rank's slice into one `ggml_backend_sched` graph and reduces the partials with plain `ggml_add`, so the scheduler owns the cross-device copies. Heads split column/row-parallel; the routed experts split **row-wise inside each expert** (`slice_mid` / `slice_lo`), because `ggml_mul_mat_id` needs a token's selected expert ids to stay distinct and an id-space split cannot provide that. See [glm.md](docs/models/glm.md#tensor-parallelism) for the measured cost of the two all-reduces per layer on a PCIe-only host. |
 
 ### How an op finds its GPU
 

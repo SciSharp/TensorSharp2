@@ -51,7 +51,10 @@ The native whole-model executor
 
 - Loads the (split) GGUF directly and **layer-splits the weights across every
   visible CUDA GPU** — a model larger than one GPU's VRAM is hosted across all
-  of them (the 128 GiB IQ4_XS build needs 2×80GB).
+  of them (the 128 GiB IQ4_XS build needs 2×80GB). This happens **by default,
+  with no flag**: `--tp` is not what puts DSV4 on several cards, it switches the
+  split from whole layers to Megatron column/row sharding within each layer.
+  `TS_DSV4_NGPU` caps how many devices the layer split uses.
 - Owns all DSV4 KV state on-device: raw SWA ring, CSA/HCA compressed-K caches,
   lightning-indexer cache, and the compressor state rings.
 - Executes prefill/decode ubatches as single ggml graphs via

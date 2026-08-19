@@ -65,7 +65,12 @@
       <tr><td><code>--prompt &lt;text&gt;</code></td><td>Qwen-Image-Edit 编辑指令（与 <code>--image</code> 一起；编辑后的 PNG 写入 <code>--output</code>）。</td></tr>
       <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG 引导尺度（自动：2.5，使用 Lightning LoRA 时为 1.0；<code>&lt;= 1</code> 关闭负向分支）。</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-Edit 伴随 GGUF（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
-      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>合并进 DiT 的 Lightning 蒸馏 LoRA（<code>.safetensors</code>）；自动推导步数（如 4 或 8），并将 CFG 切换为 1.0。</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Lightning 蒸馏 LoRA（<code>.safetensors</code>），以运行期 F32 旁路的形式挂在原封不动的量化基础权重旁边（<strong>不</strong>合并）；从文件名自动推导步数（如 4 或 8），并将 CFG 切换为 1.0。</td></tr>
+      <tr><td><code>--video-frames &lt;N&gt;</code> / <code>--fps &lt;N&gt;</code></td><td>Wan 输出帧数（对齐到 <code>4k+1</code>；默认 33，Wan2.2-TI2V 为 49）与 MP4 播放帧率（默认 16，Wan2.2-TI2V 为 24）。</td></tr>
+      <tr><td><code>--flow-shift &lt;F&gt;</code> / <code>--sampler &lt;name&gt;</code></td><td>Wan 的 FlowMatch 时间步偏移（<code>0</code> = 使用模型官方配方）与采样器：<code>unipc</code>（默认）或 <code>euler</code>。</td></tr>
+      <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>Wan 无分类器引导的负向提示词（默认为 Wan 官方负向提示词）。在本就无引导的步数蒸馏检查点上不起作用。</td></tr>
+      <tr><td><code>--cfg-cache-stride &lt;N&gt;</code></td><td>Wan 引导缓存：每 N 步只跑一次无条件 CFG 分支，其间复用缓存的引导方向（默认 <code>0</code> = 关闭）。50 步下 <code>2</code> 为 1.30×、<code>3</code> 为 1.43×。属于近似方法；在蒸馏检查点上无效。</td></tr>
+      <tr><td><code>--wan-vae / --wan-te &lt;path&gt;</code></td><td>覆盖解析到的 Wan 伴随文件——因果 3D 视频 VAE 与 UMT5-XXL 文本编码器。环境变量 <code>TS_WAN_VAE</code> / <code>TS_WAN_TE</code>；A14B 的第二个专家用 <code>TS_WAN_DIT2</code>（仅环境变量）。</td></tr>
       <tr><td><code>--paged-kv-quant-bits &lt;0|2|4|8&gt;</code></td><td>TurboQuant 分页 KV 块压缩（0 = 关闭）。</td></tr>
       <tr><td><code>--benchmark / --bench-prefill / --bench-decode / --bench-runs</code></td><td>合成吞吐基准。</td></tr>
       <tr><td><code>--bench-kvcache / --bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准。</td></tr>
@@ -103,7 +108,7 @@
       <tr><td><code>--prefill-chunk-size &lt;N&gt;</code></td><td>每个调度步的最大 prefill token 数（设置 <code>TS_SCHED_PREFILL_CHUNK</code>）。</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>、<code>f16</code>、<code>q8_0</code>、<code>q4_0</code>（默认按后端/模型自动选择；环境变量 <code>KV_CACHE_DTYPE</code>）。</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-Edit 伴随 GGUF。</td></tr>
-      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>合并进 DiT 的 Qwen-Image-Edit Lightning LoRA（更少去噪步数，CFG 1.0）。</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning LoRA，以运行期旁路形式挂在原封不动的量化权重旁边（<strong>不</strong>合并）；去噪步数更少，CFG 1.0。</td></tr>
       <tr><td><code>--paged-kv* / --paged-kv-quant-bits</code></td><td>遗留的独立分页 KV 参数（KV 状态现由引擎管理）。</td></tr>
     </tbody>
   </table>
@@ -137,8 +142,16 @@
       <tr><td><code>TS_DSV4_DSPARK / TS_DSV4_NGPU / TS_DSV4_UBATCH / TS_DSV4_PERF</code></td><td>DeepSeek V4：DSpark 草稿器路径（对应 <code>--draft-model</code>）、层切分使用的 GPU 数、prefill 微批大小，以及吞吐 / 分阶段日志。</td></tr>
       <tr><td><code>TS_GMTP_NO_FUSED / TS_GMTP_NO_FAST_ROLLBACK / TS_GMTP_BATCHED_TRUNK</code></td><td>Gemma 4 MTP 草稿路径 A/B 开关。</td></tr>
       <tr><td><code>TS_QWEN_IMAGE_VAE / TS_QWEN_IMAGE_TE / TS_QWEN_IMAGE_MMPROJ</code></td><td>Qwen-Image-Edit 伴随文件路径（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
-      <tr><td><code>TS_QWEN_IMAGE_LORA / TS_QWEN_IMAGE_LORA_SCALE</code></td><td>合并进 DiT 的 Lightning LoRA <code>.safetensors</code> / 缩放覆盖。</td></tr>
+      <tr><td><code>TS_QWEN_IMAGE_LORA / TS_QWEN_IMAGE_LORA_SCALE</code></td><td>以运行期旁路形式挂在原封不动的量化权重旁边（<strong>不</strong>合并）的 Lightning LoRA <code>.safetensors</code> / 缩放覆盖。</td></tr>
       <tr><td><code>TS_QWEN_DIT_CACHE / TS_QWEN_DIT_CACHE_MODE</code></td><td>整步 DiT 缓存：<code>0</code> 禁用 / 模式 <code>easycache</code>、<code>fbc</code>、<code>both</code>、<code>off</code>。</td></tr>
+      <tr><td><code>TS_WAN_VAE / TS_WAN_TE / TS_WAN_DIT2</code></td><td>Wan 伴随文件路径：因果 3D 视频 VAE、UMT5-XXL 文本编码器，以及 A14B 的第二个高/低噪专家 GGUF（仅环境变量，无对应 CLI 参数）。</td></tr>
+      <tr><td><code>TS_WAN_DIT_KV_F16</code></td><td><code>0</code> 恢复 Wan DiT 中 F32 的注意力键值。默认使用 F16：单次 27k token 自注意力快 2.02×，DiT 余弦同为 0.999964。</td></tr>
+      <tr><td><code>TS_WAN_VAE_MPS_CONV</code></td><td>仅 Metal：<code>0</code> 恢复 Wan VAE 卷积的 ggml im2col+GEMM 下降路径。默认走 MPSGraph（736x544x81f 的一次解码从 159 秒降到 80 秒，数值不变）。</td></tr>
+      <tr><td><code>TS_WAN_VAE_GEMM_MAX_MB / TS_WAN_VAE_TILE</code></td><td>Wan VAE im2col GEMM 预算（MB，默认按设备可用显存推导），以及用 <code>0</code> 关闭 ~0.5 MP 以上使用的水平分带切块。</td></tr>
+      <tr><td><code>TS_WAN_METAL_TENSOR_API</code></td><td>为 Wan DiT 强制开启（<code>1</code>）或关闭（<code>0</code>）Metal 4 tensor API。默认：A14B/14B 级 DiT 开启，TI2V-5B 等较小模型关闭。</td></tr>
+      <tr><td><code>TS_WAN_DIT_CAPTURE / TS_WAN_DIT_FLASH</code></td><td><code>0</code> 分别关闭常驻的 CUDA graph 捕获 Wan DiT 图 / 强制使用物化注意力。两者都更慢，仅用于 A/B 与调试。</td></tr>
+      <tr><td><code>TS_WAN_HEARTBEAT_S</code></td><td>Wan 进度心跳间隔（秒，默认 30；<code>0</code> 表示不打印）。</td></tr>
+      <tr><td><code>TS_FFMPEG</code></td><td>用于写出近无损 MP4 的 <code>ffmpeg</code> 路径（默认使用 <code>PATH</code> 上的 <code>ffmpeg</code>）。</td></tr>
       <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td>本地张量并行度 —— 模型切分到多少张 GPU（= CLI 与服务端的 <code>--tp</code>）。</td></tr>
       <tr><td><code>TENSORSHARP_TP_DEVICES</code></td><td>各 TP rank 使用的 GPU 序号，例如 <code>0,2</code>（默认 <code>0..tp-1</code>）。用于 GGML 后端。</td></tr>
       <tr><td><code>TENSORSHARP_TP_NODE_ID / TENSORSHARP_TP_PEERS</code></td><td>多节点分布式 TP：0 起始的节点编号与所有节点共用的 <code>host:port</code> 列表（= <code>--tp-node-id</code> / <code>--tp-peers</code>）。</td></tr>
