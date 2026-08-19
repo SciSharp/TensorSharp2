@@ -21,15 +21,16 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Category", "Bench")]
-[Trait("Requires", "Cuda")]
 public class CudaGraphPocTests
 {
     private readonly ITestOutputHelper _output;
     public CudaGraphPocTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [CudaFact]
     public void CudaGraph_LaunchOverhead_GoNoGo()
     {
+        // CudaFact covers availability; TS_CUDA_GRAPH_POC stays an opt-in gate
+        // so this benchmark never runs in the normal suite.
         if (Environment.GetEnvironmentVariable("TS_CUDA_GRAPH_POC") != "1")
         { _output.WriteLine("[graph-poc] set TS_CUDA_GRAPH_POC=1 to run; skipping"); return; }
 

@@ -23,7 +23,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class Mistral3BatchedForwardTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -31,11 +30,11 @@ public class Mistral3BatchedForwardTests
     private readonly ITestOutputHelper _output;
     public Mistral3BatchedForwardTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "ministral|mistral")]
     public Task Mistral3_BatchSize1_ForwardBatchMatchesLegacyTop1()
         => RunCorrectnessTest();
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "ministral|mistral")]
     public Task Mistral3_BatchSize2_DistinctSequencesProduceDistinctLogits()
         => RunDistinctTest();
 
@@ -191,7 +190,7 @@ public class Mistral3BatchedForwardTests
             .FirstOrDefault(p =>
             {
                 var n = Path.GetFileName(p).ToLowerInvariant();
-                return (n.Contains("ministral") || n.Contains("mistral"))
+                return (n.Contains("ministral|mistral") || n.Contains("mistral"))
                     && !n.Contains("mmproj");
             });
         if (modelPath == null)

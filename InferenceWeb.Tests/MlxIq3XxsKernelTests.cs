@@ -27,7 +27,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Mlx")]
 public class MlxIq3XxsKernelTests
 {
     private const int QK_K = 256;
@@ -58,14 +57,11 @@ public class MlxIq3XxsKernelTests
     // weights and the activations as `half` before simdgroup_multiply_accumulate
     // — hence the looser fp16-scale tolerance there (same template all the other
     // i-quants use; not IQ3_XXS-specific).
-    [Theory]
+    [MlxTheory]
     [InlineData(3, 1e-4f)]
     [InlineData(8, 1e-2f)]
     public void MlxQuantizedMatmul_Iq3XxsMatchesManagedDequantReference(int rows, float tolerance)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 512;
         const int outDim = 6;
         byte[] weights = CreateIq3XxsRows(outDim, inDim, seed: 0x51F3);
@@ -111,12 +107,9 @@ public class MlxIq3XxsKernelTests
     // get_rows shares tensorsharp_dequant_iq3_xxs with the matmul kernel but
     // reaches every element individually, so it pins the full 256-element decode
     // (not just its dot product).
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedRows_Iq3XxsMatchesManagedDequantReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 512;
         const int outDim = 6;
         int[] rows = { 5, 0, 3, 3 };

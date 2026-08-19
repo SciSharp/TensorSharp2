@@ -27,7 +27,6 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Category", "Bench")]
-[Trait("Requires", "Models")]
 public class NemotronBatchedPerfBench
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -36,7 +35,7 @@ public class NemotronBatchedPerfBench
     private readonly ITestOutputHelper _output;
     public NemotronBatchedPerfBench(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "nemotron")]
     public Task Nemotron_BatchedVsLegacy()
         => RunScenarios(new[]
         {

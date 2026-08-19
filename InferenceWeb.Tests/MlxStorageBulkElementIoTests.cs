@@ -16,24 +16,17 @@ namespace InferenceWeb.Tests;
 /// contract: identical values to the per-element path, and unchanged
 /// host/device dirty semantics.
 /// </summary>
-[Trait("Requires", "Mlx")]
 public class MlxStorageBulkElementIoTests
 {
-    [Fact]
+    [MlxFact]
     public void MlxBulkFloat32Io_MatchesPerElementPath()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         AssertBulkMatchesPerElement(DType.Float32, tolerance: 0f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxBulkFloat16Io_MatchesPerElementPath()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         // F16 loses precision on the way in; the bulk path must lose EXACTLY the
         // same precision as the per-element path (asserted bit-for-bit below),
         // and the round trip must still land within half's ~2^-11 relative step
@@ -45,12 +38,9 @@ public class MlxStorageBulkElementIoTests
     /// A bulk WRITE must mark the storage host-dirty, exactly as the per-element
     /// path did, or the next kernel silently reads the stale device array.
     /// </summary>
-    [Fact]
+    [MlxFact]
     public void MlxBulkSetElementsAsFloat_IsVisibleToTheNextDeviceOp()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var source = new Tensor(allocator, DType.Float32, 2, 3);
 
@@ -71,12 +61,9 @@ public class MlxStorageBulkElementIoTests
     /// A bulk READ must first pull the device array back to the host, and must
     /// keep doing so after each subsequent device op.
     /// </summary>
-    [Fact]
+    [MlxFact]
     public void MlxBulkGetElementsAsFloat_SeesDeviceComputedValues()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var tensor = new Tensor(allocator, DType.Float32, 2, 3);
 

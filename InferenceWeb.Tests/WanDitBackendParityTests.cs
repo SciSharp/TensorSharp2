@@ -32,13 +32,12 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class WanDitBackendParityTests
 {
     private readonly ITestOutputHelper _output;
     public WanDitBackendParityTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_WAN_PARITY_MODEL")]
     public void DumpDitForwardForBackendParity()
     {
         string model = Environment.GetEnvironmentVariable("TS_WAN_PARITY_MODEL");

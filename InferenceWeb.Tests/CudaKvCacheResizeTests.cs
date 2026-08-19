@@ -17,23 +17,16 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Cuda")]
 public class CudaKvCacheResizeTests
 {
     private readonly ITestOutputHelper _output;
     public CudaKvCacheResizeTests(ITestOutputHelper output) => _output = output;
 
-    [Theory]
+    [CudaTheory]
     [InlineData(8, 2048, 4096, 32, 2000)]   // the real first-grow shape (cross 2048)
     [InlineData(4, 64, 128, 16, 50)]        // tiny
     public void ResizeCopy_PreservesStridedHistory(int heads, int oldCap, int newCap, int headDim, int seqLen)
     {
-        if (!CudaBackend.IsAvailable())
-        {
-            _output.WriteLine("[resize] CUDA unavailable; skipping.");
-            return;
-        }
-
         using var allocator = new CudaAllocator();
 
         static float KVal(int pos, int h, int d) => MathF.Sin(0.0021f * pos + 0.31f * h + 0.07f * d);

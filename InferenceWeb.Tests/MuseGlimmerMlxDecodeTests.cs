@@ -23,7 +23,6 @@ using Xunit;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Mlx")]
 public class MuseGlimmerMlxDecodeTests
 {
     // The pipelined step computes argmax and the next embedding ON DEVICE with
@@ -89,12 +88,9 @@ public class MuseGlimmerMlxDecodeTests
     // to a direct call (MlxWorker.IsOnWorkerThread) for the ~1150 nested MLX
     // calls a 52-layer decode step issues.
 
-    [Fact]
+    [MlxFact]
     public void RunDecodeGraphBatched_RunsCallbackOnTheMlxWorkerThread()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         Assert.False(MlxFusedOps.IsBuildingBatchedGraph);
 
         int callerThread = Thread.CurrentThread.ManagedThreadId;
@@ -108,12 +104,9 @@ public class MuseGlimmerMlxDecodeTests
 
     // Nesting has to be free AND ordered: a decode layer calls straight back
     // into MlxFusedOps / MlxQuantizedOps entry points that Invoke on their own.
-    [Fact]
+    [MlxFact]
     public void RunDecodeGraphBatched_NestedInvokesRunInlineOnTheSameThread()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         var (outer, inner) = MlxFusedOps.RunDecodeGraphBatched(() =>
         {
             int outerThread = Thread.CurrentThread.ManagedThreadId;
@@ -127,12 +120,9 @@ public class MuseGlimmerMlxDecodeTests
     // A failure inside the graph build must surface at the call site rather
     // than being swallowed on the worker (which would leave the caller holding
     // a half-built step and no error).
-    [Fact]
+    [MlxFact]
     public void RunDecodeGraphBatched_PropagatesExceptions()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         var ex = Assert.Throws<InvalidOperationException>(
             () => MlxFusedOps.RunDecodeGraphBatched<int>(() => throw new InvalidOperationException("boom")));
         Assert.Equal("boom", ex.Message);

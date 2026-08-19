@@ -10,7 +10,6 @@ namespace InferenceWeb.Tests;
 /// defects these guard against were all silent: the encoder produced plausible
 /// but wrong embeddings rather than throwing.
 /// </summary>
-[Trait("Requires", "Cuda")]
 public class VisionEncoderCudaTests
 {
     // Ops.Add(x[rows, cols], bias[cols]) is how every linear layer in the vision
@@ -18,16 +17,13 @@ public class VisionEncoderCudaTests
     // shapes, so this used to fall through to the CUDA CPU fallback, whose
     // Apply3 advances all three iterators together and stops at the shortest
     // operand's last block — biasing row 0 and leaving every other row untouched.
-    [Theory]
+    [CudaTheory]
     [InlineData(1, 8)]
     [InlineData(7, 3)]
     [InlineData(64, 1152)]
     [InlineData(257, 4304)]
     public void CudaAdd_RowBroadcastBias_AppliesToEveryRow(int rows, int cols)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         float[] baseValues = MakePattern(rows * cols, 0.7f, 0.1f);
         float[] biasValues = MakePattern(cols, 1.3f, -0.4f);
@@ -52,7 +48,7 @@ public class VisionEncoderCudaTests
     // vision projector standardises its pooled patches with Sub-then-Mul against
     // a [cols] vector, so on this backend exactly one of 130 patches was being
     // standardised and the model hallucinated the image contents.
-    [Theory]
+    [CudaTheory]
     [InlineData("sub", 130, 1152)]
     [InlineData("mul", 130, 1152)]
     [InlineData("div", 33, 129)]
@@ -60,9 +56,6 @@ public class VisionEncoderCudaTests
     [InlineData("mul", 7, 3)]
     public void CudaBinary_RowBroadcast_AppliesToEveryRow(string op, int rows, int cols)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         float[] baseValues = MakePattern(rows * cols, 0.7f, 0.1f);
         // Offset away from zero so the division case stays well conditioned.
@@ -122,12 +115,9 @@ public class VisionEncoderCudaTests
 
     // A same-shape add must keep using the elementwise kernel; the broadcast
     // detection above must not capture it.
-    [Fact]
+    [CudaFact]
     public void CudaAdd_SameShape_StillElementwise()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         const int rows = 5, cols = 9;
         float[] a = MakePattern(rows * cols, 0.9f, 0.2f);
@@ -149,12 +139,9 @@ public class VisionEncoderCudaTests
     }
 
     // A [cols]-sized 2D tensor is a single row, not a broadcast source.
-    [Fact]
+    [CudaFact]
     public void CudaAdd_SingleRowSameShape_IsNotTreatedAsBroadcast()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var a = new Tensor(allocator, DType.Float32, 1, 6);
         a.SetElementsAsFloat(new[] { 1f, 2f, 3f, 4f, 5f, 6f });
@@ -167,16 +154,13 @@ public class VisionEncoderCudaTests
         AssertClose(new[] { 11f, 22f, 33f, 44f, 55f, 66f }, result.GetElementsAsFloat(6));
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(4, 16, true)]
     [InlineData(64, 1152, true)]
     [InlineData(31, 1153, true)]
     [InlineData(8, 512, false)]
     public void CudaLayerNorm_MatchesHostReference(int rows, int cols, bool withBias)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         const float eps = 1e-6f;
         float[] input = MakePattern(rows * cols, 2.5f, 0.3f);
@@ -228,7 +212,7 @@ public class VisionEncoderCudaTests
     // The bidirectional flash-shaped kernel used for vision attention. Checked
     // against a direct softmax(QK^T/sqrt(d))V reference, including the
     // seq % 128 != 0 tail and a sequence long enough to span many K tiles.
-    [Theory]
+    [CudaTheory]
     [InlineData(1, 1, 72)]
     [InlineData(37, 2, 72)]
     [InlineData(128, 4, 64)]
@@ -236,9 +220,6 @@ public class VisionEncoderCudaTests
     [InlineData(521, 16, 72)]
     public void CudaVisionAttention_MatchesHostReference(int seq, int heads, int headDim)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         int count = seq * heads * headDim;
         float[] q = MakePattern(count, 0.8f, 0.05f);
@@ -262,12 +243,9 @@ public class VisionEncoderCudaTests
 
     // The kernel and the generic SDPA path must agree; the encoder falls back to
     // SDPA for head dims without a specialized instantiation.
-    [Fact]
+    [CudaFact]
     public void CudaVisionAttention_MatchesScaledDotProductAttention()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int seq = 200, heads = 4, headDim = 72;
         using var allocator = new CudaAllocator();
         int count = seq * heads * headDim;
@@ -297,14 +275,11 @@ public class VisionEncoderCudaTests
     // Vision RoPE: NeoX rotation over [seq, heads, headDim] with per-position
     // cos/sin tables. Guards the layout the encoder relies on (tables indexed by
     // position, shared across heads; the rotated pair is (d, d + half)).
-    [Theory]
+    [CudaTheory]
     [InlineData(5, 3, 72)]
     [InlineData(256, 16, 72)]
     public void CudaNeoxRopeFlat_MatchesHostReference(int seq, int heads, int headDim)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         int half = headDim / 2;
         using var allocator = new CudaAllocator();
         int count = seq * heads * headDim;

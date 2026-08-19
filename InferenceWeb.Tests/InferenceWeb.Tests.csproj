@@ -5,9 +5,17 @@
     <IsPackable>false</IsPackable>
     <Nullable>annotations</Nullable>
     <Description>xUnit test suite for TensorSharp runtime, model, backend, and server behavior.</Description>
+    <!-- RS0030: backend availability probes are banned in test code
+         (BannedSymbols.txt) — gate with [CudaFact]/[MlxFact] instead, so a
+         missing backend counts as Skipped rather than silently Passed. -->
+    <WarningsAsErrors>$(WarningsAsErrors);RS0030</WarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
+    <AdditionalFiles Include="BannedSymbols.txt" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="3.3.4" PrivateAssets="all" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="PdfPig" Version="0.1.8" />
     <PackageReference Include="xunit" Version="2.9.3" />

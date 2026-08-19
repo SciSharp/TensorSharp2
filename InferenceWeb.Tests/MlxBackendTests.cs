@@ -5,9 +5,11 @@ using TensorSharp.Runtime;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Mlx")]
 public class MlxBackendTests
 {
+    // These two test the availability probe itself, so they are the exemption
+    // from the RS0030 ban on calling it directly (see BannedSymbols.txt).
+#pragma warning disable RS0030
     [Fact]
     public void MlxAvailabilityProbe_DoesNotThrow()
     {
@@ -24,13 +26,11 @@ public class MlxBackendTests
 
         Assert.True(MlxBackend.IsAvailable());
     }
+#pragma warning restore RS0030
 
-    [Fact]
+    [MlxFact]
     public void MlxAddmm_MatchesCpuForContiguousRhs()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var a = Tensor.FromArray(allocator, new float[,] { { 1, 2, 3 }, { 4, 5, 6 } });
         using var b = Tensor.FromArray(allocator, new float[,] { { 7, 8 }, { 9, 10 }, { 11, 12 } });
@@ -41,12 +41,9 @@ public class MlxBackendTests
         AssertClose(new[] { 58f, 64f, 139f, 154f }, c.GetElementsAsFloat(4));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxSoftmax_MatchesExpectedRows()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var logits = Tensor.FromArray(allocator, new float[,] { { 1, 2, 3 }, { -2, 0, 2 } });
         using var probs = new Tensor(allocator, DType.Float32, 2, 3);
@@ -60,12 +57,9 @@ public class MlxBackendTests
         }, probs.GetElementsAsFloat(6), 1e-5f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxMul_BroadcastsColumnVector()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var values = Tensor.FromArray(allocator, new float[,]
         {
@@ -84,12 +78,9 @@ public class MlxBackendTests
         AssertClose(new[] { 2f, 4f, 6f, -4f, -5f, -6f }, output.GetElementsAsFloat(6));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxHostWriteAfterDeviceOp_PreservesTensorData()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var tensor = Tensor.FromArray(allocator, new float[,] { { 1, 2 }, { 3, 4 } });
         Ops.Mul(tensor, tensor, 2f);
@@ -99,12 +90,9 @@ public class MlxBackendTests
         AssertClose(new[] { 2f, 100f, 6f, 8f }, tensor.GetElementsAsFloat(4));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxCopyIntoNarrowView_UpdatesDeviceStorage()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var tensor = Tensor.FromArray(allocator, new float[,]
         {
@@ -126,12 +114,9 @@ public class MlxBackendTests
         }, tensor.GetElementsAsFloat(12));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFill_WritesDeviceResidentTensor()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var tensor = new Tensor(allocator, DType.Float32, 2, 3);
 
@@ -140,12 +125,9 @@ public class MlxBackendTests
         AssertClose(new[] { 1.25f, 1.25f, 1.25f, 1.25f, 1.25f, 1.25f }, tensor.GetElementsAsFloat(6));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxRmsNorm_MatchesExpectedRows()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var input = Tensor.FromArray(allocator, new float[,] { { 3, 4 }, { 5, 12 } });
         using var weight = Tensor.FromArray(allocator, new float[] { 1f, 0.5f });
@@ -160,12 +142,9 @@ public class MlxBackendTests
         }, output.GetElementsAsFloat(4), 1e-4f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxLayerNorm_MatchesExpectedRows()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var input = Tensor.FromArray(allocator, new float[,] { { 1, 2, 3 }, { -1, 1, 3 } });
         using var weight = Tensor.FromArray(allocator, new float[] { 1f, 2f, 0.5f });
@@ -181,12 +160,9 @@ public class MlxBackendTests
         }, output.GetElementsAsFloat(6), 1e-4f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxGeluAndGeluMul_MatchCpuFormula()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         float[,] gate =
         {
             { -2.0f, -0.5f, 0.0f },
@@ -219,12 +195,9 @@ public class MlxBackendTests
         AssertClose(expectedMul, mulTensor.GetElementsAsFloat(expectedMul.Length), 1e-5f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxSiLUMulSplit_MatchesSplitReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         float[,] gateUp =
         {
             { -2.0f, -0.5f, 0.0f, 1.5f, -2.0f, 0.25f },
@@ -243,12 +216,9 @@ public class MlxBackendTests
         AssertClose(expected, actualTensor.GetElementsAsFloat(expected.Length), 1e-5f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxScaledDotProductAttention_MatchesReferenceWithoutMask()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int batch = 1;
         const int seqQ = 3;
         const int seqK = 4;
@@ -278,12 +248,9 @@ public class MlxBackendTests
         AssertClose(ScaledDotProductAttentionReference(q, k, v, null, scale), actualTensor.GetElementsAsFloat((int)actualTensor.ElementCount()), 1e-3f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxScaledDotProductAttention_MatchesReferenceWithMask()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int batch = 1;
         const int seqQ = 3;
         const int seqK = 4;
@@ -313,12 +280,9 @@ public class MlxBackendTests
         AssertClose(ScaledDotProductAttentionReference(q, k, v, mask, scale), actualTensor.GetElementsAsFloat((int)actualTensor.ElementCount()), 1e-3f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxCopy_CastsFloat32ToFloat16OnDevice()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var src = Tensor.FromArray(allocator, new float[] { -1.25f, -0.5f, 0f, 0.75f, 1.5f, 3.25f });
         using var dst = new Tensor(allocator, DType.Float16, 6);
@@ -328,12 +292,9 @@ public class MlxBackendTests
         AssertClose(src.GetElementsAsFloat(6), dst.GetElementsAsFloat(6), 1e-3f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedPrefillAttention_GqaMatchesReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int heads = 4;
         const int kvHeads = 2;
         const int seq = 3;
@@ -367,12 +328,9 @@ public class MlxBackendTests
         AssertClose(HeadFirstAttentionReference(q, k, v, scale, causal: true), actualTensor.GetElementsAsFloat((int)actualTensor.ElementCount()), 1e-4f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedPrefillAttention_HeadDim256UsesChunkedVectorPath()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int heads = 24;
         const int kvHeads = 4;
         const int seq = 11;
@@ -415,12 +373,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedDecodeAttention_ReadsFloat16KvCache()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int heads = 4;
         const int kvHeads = 2;
         const int seq = 5;
@@ -459,12 +414,9 @@ public class MlxBackendTests
         AssertClose(HeadFirstAttentionReference(qHeads, k, v, scale, causal: false), actualTensor.GetElementsAsFloat((int)actualTensor.ElementCount()), 2e-3f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedCircularDecodeAttention_ReadsWrappedFloat16KvCache()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int heads = 4;
         const int kvHeads = 2;
         const int cacheLen = 5;
@@ -521,12 +473,9 @@ public class MlxBackendTests
             2e-3f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxIndexSelect_GathersRowsOnDevice()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var src = Tensor.FromArray(allocator, new float[,]
         {
@@ -541,12 +490,9 @@ public class MlxBackendTests
         AssertClose(new[] { 7f, 8f, 9f, 1f, 2f, 3f, 10f, 11f, 12f }, selected.GetElementsAsFloat(9));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedGatherRows_GathersRowsOnDevice()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var src = Tensor.FromArray(allocator, new float[,]
         {
@@ -563,12 +509,9 @@ public class MlxBackendTests
         AssertClose(new[] { 7f, 8f, 9f, 1f, 2f, 3f, 10f, 11f, 12f }, gathered.GetElementsAsFloat(9));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedScatterAddWeightedRows_AccumulatesRowsOnDevice()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var output = Tensor.FromArray(allocator, new float[,]
         {
@@ -597,12 +540,9 @@ public class MlxBackendTests
         }, output.GetElementsAsFloat(12));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedRmsNormAddInPlace_MatchesCpu()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var residual = Tensor.FromArray(allocator, new float[,]
         {
@@ -642,12 +582,9 @@ public class MlxBackendTests
         AssertClose(expected, residual.GetElementsAsFloat(8), tolerance: 1e-5f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedGeluMulSplit_MatchesCpu()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var gateUp = Tensor.FromArray(allocator, new float[,]
         {
@@ -678,12 +615,9 @@ public class MlxBackendTests
         AssertClose(expected, result.GetElementsAsFloat(6), tolerance: 1e-5f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedFlatToHeadFirst_MatchesReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var input = Tensor.FromArray(allocator, new float[,]
         {
@@ -702,12 +636,9 @@ public class MlxBackendTests
         }, result.GetElementsAsFloat(12), tolerance: 1e-5f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxFusedNeoXRoPEFlatAndHeadFirst_MatchReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int heads = 2;
         const int seq = 2;
         const int dim = 4;
@@ -752,12 +683,9 @@ public class MlxBackendTests
         AssertClose(expectedHeadFirst, headFirstTensor.GetElementsAsFloat(expectedHeadFirst.Length), tolerance: 1e-5f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQwen35PackedGdnDecode_MatchesSeparateProjectionPath()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         string previousNative = Environment.GetEnvironmentVariable("TS_MLX_GDN_NATIVE");
         Environment.SetEnvironmentVariable("TS_MLX_GDN_NATIVE", null);
         try
@@ -838,12 +766,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxRepeatInterleave_RepeatsAlongAxis()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var src = Tensor.FromArray(allocator, new float[,]
         {
@@ -855,12 +780,9 @@ public class MlxBackendTests
         AssertClose(new[] { 1f, 2f, 1f, 2f, 3f, 4f, 3f, 4f }, repeated.GetElementsAsFloat(8));
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxAddCausalMask_MasksFuturePositionsOnDevice()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
         using var scores = Tensor.FromArray(allocator, new float[,]
         {
@@ -882,12 +804,9 @@ public class MlxBackendTests
         }, actual);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxRoPEEx_NeoXDynamicPositions_MatchesReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int batch = 1;
         const int seq = 3;
         const int heads = 2;
@@ -908,12 +827,9 @@ public class MlxBackendTests
         AssertClose(expected, actualTensor.GetElementsAsFloat((int)actualTensor.ElementCount()), 1e-4f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxRoPEEx_InPlaceTraditional_MatchesReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int batch = 1;
         const int seq = 2;
         const int heads = 3;
@@ -935,12 +851,9 @@ public class MlxBackendTests
         AssertClose(expected, input.GetElementsAsFloat((int)input.ElementCount()), 1e-4f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_Q80MatchesDequantizedReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 3;
         const int inDim = 64;
         const int outDim = 4;
@@ -977,14 +890,11 @@ public class MlxBackendTests
         }
     }
 
-    [Theory]
+    [MlxTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void MlxQuantizedMatmul_Q4MatchesDequantizedReference(bool hasExplicitBias)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 2;
         const int inDim = 64;
         const int outDim = 3;
@@ -1027,14 +937,11 @@ public class MlxBackendTests
         }
     }
 
-    [Theory]
+    [MlxTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void MlxQuantizedMatmul_Q5MatchesDequantizedReference(bool hasExplicitBias)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 2;
         const int inDim = 64;
         const int outDim = 3;
@@ -1077,15 +984,12 @@ public class MlxBackendTests
         }
     }
 
-    [Theory]
+    [MlxTheory]
     [InlineData((int)GgmlTensorType.Q4_K)]
     [InlineData((int)GgmlTensorType.Q5_K)]
     [InlineData((int)GgmlTensorType.Q6_K)]
     public void MlxQuantizedMatmul_KQuantsMatchDequantizedReference(int ggmlType)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 2;
         const int inDim = 256;
         const int outDim = 2;
@@ -1134,12 +1038,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_Q6KSingleRowMatchesDequantizedReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 1;
         const int inDim = 256;
         const int outDim = 5;
@@ -1178,12 +1079,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_Q5KSingleRow4ColumnMatchesDequantizedReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 1;
         const int inDim = 256;
         const int outDim = 5;
@@ -1222,12 +1120,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_RmsNormFusedMatchesReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 2;
         const int inDim = 256;
         const int outDim = 3;
@@ -1282,12 +1177,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_AddIntoFusedMatchesReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 2;
         const int inDim = 256;
         const int outDim = 4;
@@ -1333,12 +1225,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_MXFP4MatchesDequantizedReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 3;
         const int inDim = 64;
         const int outDim = 4;
@@ -1379,12 +1268,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_IQ4XSMatchesDequantizedReferenceAfterHostRelease()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 3;
         const int inDim = 512;
         const int outDim = 3;
@@ -1426,12 +1312,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_IQ2XXSMatchesNativeDequantizedReferenceAfterHostRelease()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 3;
         const int inDim = 512;
         const int outDim = 4;
@@ -1470,14 +1353,11 @@ public class MlxBackendTests
         }
     }
 
-    [Theory]
+    [MlxTheory]
     [InlineData((int)GgmlTensorType.IQ2_S)]
     [InlineData((int)GgmlTensorType.IQ3_S)]
     public void MlxQuantizedMatmul_IQ2SAndIQ3SMatchNativeDequantizedReferenceAfterHostRelease(int ggmlType)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 3;
         const int inDim = 512;
         const int outDim = 4;
@@ -1517,12 +1397,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedRows_Q80MatchDequantizedReferenceAfterHostRelease()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 64;
         const int outDim = 5;
         int[] rows = { 4, 1, 3 };
@@ -1559,15 +1436,12 @@ public class MlxBackendTests
         }
     }
 
-    [Theory]
+    [MlxTheory]
     [InlineData((int)GgmlTensorType.Q4_K)]
     [InlineData((int)GgmlTensorType.Q5_K)]
     [InlineData((int)GgmlTensorType.Q6_K)]
     public void MlxQuantizedRows_KQuantsMatchDequantizedReferenceAfterHostRelease(int ggmlType)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 256;
         const int outDim = 5;
         int[] rows = { 4, 1, 3 };
@@ -1623,12 +1497,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedMatmul_IQ4XSDecode4ColumnMatchesDequantizedReferenceAfterHostRelease()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 1;
         const int inDim = 512;
         const int outDim = 5;
@@ -1670,12 +1541,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedRows_IQ4XSMatchDequantizedReferenceAfterHostRelease()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 512;
         const int outDim = 5;
         int[] rows = { 4, 1, 3 };
@@ -1712,12 +1580,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedRows_IQ2XXSMatchNativeDequantizedReferenceAfterHostRelease()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 512;
         const int outDim = 5;
         int[] rows = { 4, 1, 3 };
@@ -1755,14 +1620,11 @@ public class MlxBackendTests
         }
     }
 
-    [Theory]
+    [MlxTheory]
     [InlineData((int)GgmlTensorType.IQ2_S)]
     [InlineData((int)GgmlTensorType.IQ3_S)]
     public void MlxQuantizedRows_IQ2SAndIQ3SMatchNativeDequantizedReferenceAfterHostRelease(int ggmlType)
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 512;
         const int outDim = 5;
         int[] rows = { 4, 1, 3 };
@@ -1801,12 +1663,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxQuantizedRows_MXFP4MatchDequantizedReferenceAfterHostRelease()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int inDim = 64;
         const int outDim = 5;
         int[] rows = { 4, 1, 3 };
@@ -2180,12 +2039,9 @@ public class MlxBackendTests
         return raw;
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxGatherQmm_MXFP4StackedExpertsMatchDequantizedReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int numExperts = 4;
         const int inDim = 64;
         const int outDim = 6;
@@ -2275,12 +2131,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxGatherQmm_SortedRhsProbe_GatesTheFastPath()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         using var allocator = new MlxAllocator();
 
         // The probe must return a stable verdict for the shipping GPT-OSS
@@ -2372,12 +2225,9 @@ public class MlxBackendTests
         }
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxGatherQmm_MXFP4GptOssShapes_NullLhsMatchesProvidedLhs()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         // GPT-OSS-20b decode/short-prefill shapes: E=32 experts, 2880x2880
         // projections, NK=56 pairs (14 tokens x K=4). NK/E < 4 keeps this on
         // the per-row gather_qmv kernel, matching what decode dispatches.
@@ -2485,12 +2335,9 @@ public class MlxBackendTests
         DequantizeMxfp4Row(slice, row, inDim, destination, 0);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxSwiGluOaiGatherBias_MatchesCpuReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int rows = 5;
         const int dim = 33;   // deliberately not a threadgroup-width multiple
         const int numExperts = 3;
@@ -2540,12 +2387,9 @@ public class MlxBackendTests
         AssertClose(expected, result.GetElementsAsFloat(rows * dim), 1e-4f);
     }
 
-    [Fact]
+    [MlxFact]
     public void MlxMoeBiasWeightedSum_MatchesCpuReference()
     {
-        if (!MlxBackend.IsAvailable())
-            return;
-
         const int n = 3;
         const int k = 2;
         const int dim = 17;

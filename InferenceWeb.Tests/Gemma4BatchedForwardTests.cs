@@ -31,7 +31,6 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Models")]
 public class Gemma4BatchedForwardTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -39,7 +38,7 @@ public class Gemma4BatchedForwardTests
     private readonly ITestOutputHelper _output;
     public Gemma4BatchedForwardTests(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "gemma-4-e4b")]
     public Task Gemma4_BatchSize1_ForwardBatchEitherMatchesLegacyOrThrows()
         => RunCorrectnessTest();
 

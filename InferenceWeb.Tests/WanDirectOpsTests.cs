@@ -132,15 +132,11 @@ public class WanDirectOpsTests
     // kernel without an additive mask: a non-aligned KV length and a
     // non-aligned bidirectional self-attention length. Wan's DiT attention is
     // unmasked, and neither length is a multiple of its 32/256-wide tiling.
-    [Trait("Requires", "Cuda")]
-    [Theory]
+    [CudaTheory]
     [InlineData(37, 257)]
     [InlineData(513, 513)]
     public void CudaWanAttention_UnmaskedNonAlignedLengths_MatchesNaive(int sq, int sk)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int heads = 1, hd = 64;
         float[] q = Rand(sq * heads * hd, 14);
         float[] k = Rand(sk * heads * hd, 15);
@@ -224,11 +220,12 @@ public class WanDirectOpsTests
     // Manual perf probe (TS_WAN_ATTN_BENCH=1): raw streaming-attention kernel
     // throughput at the 832x480x33f DiT shape, printed as GFLOPS.
     [Trait("Category", "Bench")]
-    [Trait("Requires", "Cuda")]
-    [Fact]
+    [CudaFact]
     public void WanAttentionThroughput()
     {
-        if (Environment.GetEnvironmentVariable("TS_WAN_ATTN_BENCH") != "1" || !CudaBackend.IsAvailable())
+        // CudaFact covers availability; TS_WAN_ATTN_BENCH stays an opt-in gate
+        // so this benchmark never runs in the normal suite.
+        if (Environment.GetEnvironmentVariable("TS_WAN_ATTN_BENCH") != "1")
             return;
         const int seq = 14040, heads = 12, hd = 128;
         using var alloc = new CudaAllocator();
@@ -252,13 +249,9 @@ public class WanDirectOpsTests
         ctx.Dispose();
     }
 
-    [Trait("Requires", "Cuda")]
-    [Fact]
+    [CudaFact]
     public void CudaWanKernels_MatchCpu()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int heads = 2, hd = 128, sq = 300, sk = 70;
         var cpuAlloc = new CpuAllocator(BlasEnum.DotNet);
         using var cudaAlloc = new CudaAllocator();

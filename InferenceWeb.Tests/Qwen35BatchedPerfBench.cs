@@ -34,7 +34,6 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Category", "Bench")]
-[Trait("Requires", "Models")]
 public class Qwen35BatchedPerfBench
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -46,7 +45,7 @@ public class Qwen35BatchedPerfBench
     // Run a few text-only scenarios back-to-back inside a single model
     // load, since each Qwen3.6-27B load takes ~30s. Each scenario runs
     // legacy first, then batched, so the numbers are directly comparable.
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "27b")]
     public Task Qwen35_BatchedVsLegacy()
         => RunScenarios(new[]
         {

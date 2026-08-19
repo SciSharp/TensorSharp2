@@ -18,26 +18,19 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Cuda")]
 public class CudaDecodeAttentionWrapTests
 {
     private readonly ITestOutputHelper _output;
 
     public CudaDecodeAttentionWrapTests(ITestOutputHelper output) => _output = output;
 
-    [Theory]
+    [CudaTheory]
     [InlineData(4, 2, 8, 16)]    // small, exercises wrap quickly
     [InlineData(8, 1, 16, 64)]   // MQA-ish
     [InlineData(8, 4, 32, 128)]  // closer to a real local layer shape
     public void CircularDecodeAttention_MatchesCpuAcrossWrapBoundary(
         int numQHeads, int numKVHeads, int headDim, int cacheSize)
     {
-        if (!CudaBackend.IsAvailable())
-        {
-            _output.WriteLine("[wrap] CUDA unavailable; skipping.");
-            return;
-        }
-
         using var allocator = new CudaAllocator();
 
         int window = cacheSize;                  // local layer attends the whole window
@@ -139,18 +132,12 @@ public class CudaDecodeAttentionWrapTests
     // and is populated through the real CUDA write kernel (TryCopyHeadFirstToCache),
     // exactly as Gemma4Model.CopyToCacheDecode does. This exercises the F16 write
     // and F16 read kernels together across the wrap boundary.
-    [Theory]
+    [CudaTheory]
     [InlineData(4, 2, 8, 16)]
     [InlineData(8, 4, 32, 128)]
     public void CircularDecodeAttentionF16_MatchesCpuAcrossWrapBoundary(
         int numQHeads, int numKVHeads, int headDim, int cacheSize)
     {
-        if (!CudaBackend.IsAvailable())
-        {
-            _output.WriteLine("[wrap-f16] CUDA unavailable; skipping.");
-            return;
-        }
-
         using var allocator = new CudaAllocator();
         int window = cacheSize;
         float scale = 1.0f / MathF.Sqrt(headDim);
@@ -248,17 +235,11 @@ public class CudaDecodeAttentionWrapTests
     // the case that crosses blockDim (256 -> multiple score elements per thread)
     // and the partitioned-attention threshold (2048). Sweeps attendLen across all
     // those boundaries and compares CUDA against a CPU reference.
-    [Theory]
+    [CudaTheory]
     [InlineData(false)]
     [InlineData(true)]   // true => Float16 cache (the q4_0 model default)
     public void GlobalDecodeAttention_MatchesCpuAsSequenceGrows(bool halfCache)
     {
-        if (!CudaBackend.IsAvailable())
-        {
-            _output.WriteLine("[global] CUDA unavailable; skipping.");
-            return;
-        }
-
         using var allocator = new CudaAllocator();
         int numQHeads = 8, numKVHeads = 2, headDim = 32;
         int cacheSize = 4096;                 // big enough to hold every position

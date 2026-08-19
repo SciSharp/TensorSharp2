@@ -26,7 +26,6 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Category", "Bench")]
-[Trait("Requires", "Models")]
 public class GptOssBatchedPerfBench
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -35,7 +34,7 @@ public class GptOssBatchedPerfBench
     private readonly ITestOutputHelper _output;
     public GptOssBatchedPerfBench(ITestOutputHelper output) { _output = output; }
 
-    [Fact]
+    [ModelFact("TS_TEST_MODEL_DIR", "gpt-oss|gpt_oss|gptoss")]
     public Task GptOss_BatchedVsLegacy()
         => RunScenarios(new[]
         {
@@ -196,7 +195,7 @@ public class GptOssBatchedPerfBench
         return Directory.GetFiles(dir, "*.gguf").Where(p =>
         {
             var n = Path.GetFileName(p).ToLowerInvariant();
-            return (n.Contains("gpt-oss") || n.Contains("gpt_oss") || n.Contains("gptoss"))
+            return (n.Contains("gpt-oss|gpt_oss|gptoss") || n.Contains("gpt_oss") || n.Contains("gptoss"))
                 && !n.Contains("mmproj");
         }).OrderBy(p => Path.GetFileName(p)).FirstOrDefault();
     }

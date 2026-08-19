@@ -423,7 +423,7 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 
 #### 测试分组（Test lanes）
 
-测试通过 xUnit trait 按两个维度打标（声明见 `InferenceWeb.Tests/TestAssemblyConfig.cs`）：`Category=Bench` 标记含时延/吞吐断言的基准测试类；`Requires=Cuda|Mlx|Models` 标记测试对环境的依赖（`Models` = 需要测试模型目录下的真实 GGUF 权重）。未打标的测试是自包含的正确性测试，可在任何环境运行。不带过滤器的 `dotnet test` 行为与之前完全一致；用 `--filter` 选择分组：
+测试按两个维度打标（声明见 `InferenceWeb.Tests/TestAssemblyConfig.cs`）：`Category=Bench` 用普通 `[Trait]` 标记含时延/吞吐断言的基准测试类；`Requires=Cuda|Mlx|Models` 标记测试对环境的依赖（`Models` = 需要测试模型目录下的真实 GGUF 权重）。依赖环境的测试使用 `InferenceWeb.Tests/GatedFacts.cs` 中的门控特性编写 —— `[CudaFact]`/`[CudaTheory]`、`[MlxFact]`/`[MlxTheory]`、`[ModelFact("ENV_VAR", "gguf-substring")]`/`[ModelTheory(...)]` —— 它们会自动附加对应的 `Requires` trait，并在前提条件缺失时显式跳过。在测试中直接调用 `CudaBackend.IsAvailable()`/`MlxBackend.IsAvailable()` 会产生编译错误（`BannedSymbols.txt`）：请改用门控特性。未打标的 `[Fact]`/`[Theory]` 是自包含的正确性测试，可在任何环境运行。不带过滤器的 `dotnet test` 运行全部测试；用 `--filter` 选择分组：
 
 ```bash
 # 内循环（边改边测）：与环境无关的正确性测试，任何机器上数秒内跑完。
@@ -437,7 +437,7 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category!=Ben
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category=Bench"
 ```
 
-注意：CUDA、MLX 和模型相关的测试在前提条件缺失时目前会静默通过，因此从分组中排除它们改变的是实际执行的内容，而不是绿色结果的样子。
+门控测试在前提条件缺失时会报告为**已跳过**（被跳过的 `[Theory]` 只计一次，不按数据行展开），因此在没有相应硬件/权重的机器上，绿色结果会显示为"N 通过，M 跳过"，而不是静默通过从未执行的测试。少数前提条件复杂的测试类（多个环境变量、按方法选择模型）仍在测试体内做门控，并保留显式的 `[Trait("Requires", ...)]` 标注。
 
 ### 服务端集成测试
 

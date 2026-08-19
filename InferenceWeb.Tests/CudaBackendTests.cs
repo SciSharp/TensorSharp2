@@ -6,15 +6,11 @@ using System.Threading;
 
 namespace InferenceWeb.Tests;
 
-[Trait("Requires", "Cuda")]
 public class CudaBackendTests
 {
-    [Fact]
+    [CudaFact]
     public void CudaAddmm_MatchesCpuForContiguousRhs()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var a = Tensor.FromArray(allocator, new float[,] { { 1, 2, 3 }, { 4, 5, 6 } });
         using var b = Tensor.FromArray(allocator, new float[,] { { 7, 8 }, { 9, 10 }, { 11, 12 } });
@@ -25,12 +21,9 @@ public class CudaBackendTests
         AssertClose(new[] { 58f, 64f, 139f, 154f }, c.GetElementsAsFloat(4));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaStagedHostEmbeddingCopy_PreservesDeviceResidentTensorData()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var tensor = new Tensor(allocator, DType.Float32, 4, 4);
         FillSequential(tensor, scale: 1f, offset: 0f);
@@ -50,7 +43,7 @@ public class CudaBackendTests
         }, tensor.GetElementsAsFloat(16));
     }
 
-    [Theory]
+    [CudaTheory]
     // (rows, wide, narrow) — narrow < wide forces a strided source row pitch, so
     // NewContiguous hits the 2D strided-copy kernel (ts_copy2d_bytes) rather than
     // a single dense DtoD. Covers the exact prefill shape ([seqLen, 8192] out of a
@@ -61,9 +54,6 @@ public class CudaBackendTests
     [InlineData(1, 512, 200)]
     public void CudaStridedNewContiguous_MatchesHostReference(int rows, int wide, int narrow)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var wideT = new Tensor(allocator, DType.Float32, rows, wide);
         FillSequential(wideT, scale: 0.5f, offset: -3f);
@@ -82,12 +72,9 @@ public class CudaBackendTests
         AssertClose(expected, dense.GetElementsAsFloat(rows * narrow));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaStridedNewContiguous_3D_OuterGroupLoop_MatchesHostReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // A [d0, d1, d2] tensor narrowed on the last axis exercises the kernel's
         // per-outer-group launch loop (groupDims == 1, rows == d1) rather than a
         // single launch, verifying the multi-dimensional counter arithmetic.
@@ -110,12 +97,9 @@ public class CudaBackendTests
         AssertClose(expected, dense.GetElementsAsFloat(d0 * d1 * narrow));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaAddmm_MatchesCpuForTransposedWeightView()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var input = Tensor.FromArray(allocator, new float[,] { { 1, 2, 3 }, { 4, 5, 6 } });
         using var weights = Tensor.FromArray(allocator, new float[,] { { 7, 9, 11 }, { 8, 10, 12 } });
@@ -127,12 +111,9 @@ public class CudaBackendTests
         AssertClose(new[] { 58f, 64f, 139f, 154f }, output.GetElementsAsFloat(4));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaAddmmBatch_MatchesCpuForTransposedRightOperand()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int batch = 3;
         const int rows = 5;
         const int shared = 7;
@@ -174,12 +155,9 @@ public class CudaBackendTests
         AssertClose(expected, actual, 1e-4f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaAddmmBatch_LargeAttentionShape_MatchesCpuForTransposedRightOperand()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int batch = 2;
         const int rows = 257;
         const int shared = 64;
@@ -219,12 +197,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaSoftmax_WithNegativeInfinityMask_MatchesExpected()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var logits = Tensor.FromArray(allocator, new float[,]
         {
@@ -241,12 +216,9 @@ public class CudaBackendTests
             actual[4..], 1e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaSoftmax_LargeRows_MatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int rows = 3;
         const int cols = 2304;
         float[,] values = new float[rows, cols];
@@ -275,12 +247,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaFallbackOps_PreserveTensorSemantics()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var x = Tensor.FromArray(allocator, new float[,] { { 1, 2, 3 }, { 4, 5, 6 } });
         using var y = new Tensor(allocator, DType.Float32, 2, 3);
@@ -297,12 +266,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaElementwiseAndScalarOps_MatchExpected()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var x = Tensor.FromArray(allocator, new float[,] { { 1, -2, 3 }, { -4, 5, -6 } });
         using var y = Tensor.FromArray(allocator, new float[,] { { 0.5f, 2, -1 }, { 4, -0.25f, 3 } });
@@ -337,12 +303,9 @@ public class CudaBackendTests
         AssertClose(new[] { -1.5f, -4.75f, -2f, -16.75f, -7.25f, -26f }, mulMulAdd.GetElementsAsFloat(6), 1e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaRmsNormSoftmaxAndIndexSelect_MatchExpected()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var x = Tensor.FromArray(allocator, new float[,] { { 1, 2, 3, 4 }, { -1, -2, -3, -4 } });
         using var alpha = Tensor.FromArray(allocator, new float[] { 1, 0.5f, 2, -1 });
@@ -363,12 +326,9 @@ public class CudaBackendTests
         AssertClose(new[] { -1f, -2f, -3f, -4f, 1f, 2f, 3f, 4f }, selected.GetElementsAsFloat(8));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaMoEGroupedScatterAdd_MatchesHostReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var output = new Tensor(allocator, DType.Float32, 3, 4);
         Ops.Fill(output, 0f);
@@ -401,12 +361,9 @@ public class CudaBackendTests
         }, output.GetElementsAsFloat(12));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaMoEGroupedScatterAdd_HonorsContiguousViewOffsets()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var outputBacking = new Tensor(allocator, DType.Float32, 3, 4);
         Ops.Fill(outputBacking, 9f);
@@ -440,12 +397,9 @@ public class CudaBackendTests
         }, outputBacking.GetElementsAsFloat(12));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQwen35GatedDeltaNetPacked_MatchesCpuReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int seqLen = 4;
         const int numKHeads = 2;
         const int numVHeads = 4;
@@ -572,12 +526,9 @@ public class CudaBackendTests
         AssertClose(expectedConv, convTensor.GetElementsAsFloat(expectedConv.Length), 1e-6f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQwen35GatedDeltaNetPacked_ProductionHeadDims_MatchesCpuReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // Production-shaped geometry (Qwen3.5-9B: headKDim = headVDim = 128).
         // headVDim > the kernel's warp count used to route through a multi-block-
         // per-head layout whose whole-state decay raced between blocks; this test
@@ -648,12 +599,9 @@ public class CudaBackendTests
         AssertClose(expectedConv, convTensor.GetElementsAsFloat(expectedConv.Length), 1e-6f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaFusedQKNormRopeNeox_PartialRopeDims_MatchesNormThenRopeReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // Qwen3.5 attention geometry: headDim 256, partial RoPE (ropeDim 64 < headDim),
         // large base. The fused kernel used to derive frequencies from headDim instead
         // of ropeDim, mis-rotating every position on partial-RoPE models.
@@ -722,12 +670,9 @@ public class CudaBackendTests
         AssertClose(expected, dataTensor.GetElementsAsFloat(rows * headDim), 2e-4f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaPrefillGraphCache_CaptureReplayAndAbort_BehaveCorrectly()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var cache = new CudaPrefillGraphCache(allocator);
         if (!cache.IsUsable)
@@ -833,12 +778,9 @@ public class CudaBackendTests
     /// slot. Also checks the MaxAttendLen entry expiry used by the single-block
     /// attention route.
     /// </summary>
-    [Fact]
+    [CudaFact]
     public void CudaDecodeDynParams_GraphReplay_ReadsFreshValues()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var cache = new CudaPrefillGraphCache(allocator);
         if (!cache.IsUsable)
@@ -928,12 +870,9 @@ public class CudaBackendTests
         Assert.True(cache.ShouldCapture(key));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaDecodeDynParams_AmbientStateIsThreadLocalAndAllocatorScoped()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocatorA = new CudaAllocator();
         using var allocatorB = new CudaAllocator();
         using var dynA = new CudaDecodeDynParams(allocatorA);
@@ -1025,12 +964,9 @@ public class CudaBackendTests
         AssertClose(new float[headDim], Slot(otherThread, 7), 0f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaNeoXRopeDynamicTables_GraphReplayUsesFreshPosition()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var cache = new CudaPrefillGraphCache(allocator);
         if (!cache.IsUsable)
@@ -1148,12 +1084,9 @@ public class CudaBackendTests
         AssertPosition(11);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaDecodeGraph_CircularDynamicWriteAndAttentionCrossWrap()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var cache = new CudaPrefillGraphCache(allocator);
         if (!cache.IsUsable)
@@ -1315,7 +1248,7 @@ public class CudaBackendTests
     /// empty partitions). Results must be bit-identical to a plain launch with
     /// the same effective length.
     /// </summary>
-    [Fact]
+    [CudaFact]
     public void CudaGqaDecodeAttention_DynAttendLen_MatchesPlainLaunch()
     {
         // Gemma E4B's d=512 GQA switches launch topology above the tuned
@@ -1330,9 +1263,6 @@ public class CudaBackendTests
             keyIsHalf: true, circular: false,
             numQHeads: 8, numKVHeads: 2, headDim: 512,
             attendLen: 513, cacheSize: 8192));
-
-        if (!CudaBackend.IsAvailable())
-            return;
 
         using var allocator = new CudaAllocator();
         using var dyn = new CudaDecodeDynParams(allocator);
@@ -1395,12 +1325,9 @@ public class CudaBackendTests
         RunCase(cacheSize: 6144, scalarLen: 3000, dynLen: 2500);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaRoPE_MatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var x = Tensor.FromArray(allocator, new float[,] { { 1, 2, 3, 4 }, { 5, 6, 7, 8 } });
         using var rope = Ops.RoPE(null, x, seqLen: 2, rowOffset: 1);
@@ -1425,7 +1352,7 @@ public class CudaBackendTests
         AssertClose(expected, rope.GetElementsAsFloat(8), 1e-4f);
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(256, 8, true)]
     [InlineData(32, 32, true)]
     [InlineData(32, 0, false)]
@@ -1439,15 +1366,12 @@ public class CudaBackendTests
             CudaFusedOps.IsMoERouterConfigurationSupported(numExperts, nUsed));
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(32, 0)]
     [InlineData(0, 1)]
     public void CudaMoEExpertFFNDecode_RejectsInvalidRouterBeforeLaunch(
         int numExperts, int nUsed)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var logits = new Tensor(allocator, DType.Float32, 1, 1);
         using var moeInput = new Tensor(allocator, DType.Float32, 1, 32);
@@ -1467,12 +1391,9 @@ public class CudaBackendTests
             gateUpQuantType: 2, downQuantType: 2, numExperts, nUsed, hiddenDim: 32, nFf: 32));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaMoEWrappers_RejectInvalidTensorContractsBeforeLaunch()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numExperts = 2;
         const int nUsed = 1;
         const int hiddenDim = 32;
@@ -1548,7 +1469,7 @@ public class CudaBackendTests
             scatterOutput, sharedDown, nonContiguousExpert));
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(2, 32, true)]
     [InlineData(2, 288, true)]
     [InlineData(2, 704, true)]
@@ -1569,7 +1490,7 @@ public class CudaBackendTests
             CudaFusedOps.IsMoeDp4aDimensionSupported(ggmlType, inDim));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaMoEDp4aEnablement_IsIndependentForEachQuantType()
     {
         bool savedQ40 = CudaQuantizedOps.Q40Dp4aEnabled;
@@ -1598,12 +1519,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmulAndRows_Q8_0MatchExpected()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         byte[] weights = CreateQ8_0Rows(new[]
         {
             Enumerable.Range(1, 32).Select(i => (sbyte)i).ToArray(),
@@ -1645,12 +1563,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedWeight_CanRunAfterHostCopyReleased()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         byte[] weights = CreateQ8_0Rows(new[]
         {
             Enumerable.Range(1, 32).Select(i => (sbyte)i).ToArray(),
@@ -1681,12 +1596,9 @@ public class CudaBackendTests
         CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedWeightArena_IsOwnedByAllocator()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         byte[] weights = CreateQ8_0Rows(new[]
         {
             Enumerable.Range(1, 32).Select(i => (sbyte)i).ToArray(),
@@ -1728,12 +1640,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmul_Q8_0WithMultipleBlocksAndScales_MatchesDequantizedReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 64;
         const int outDim = 5;
         const int rows = 3;
@@ -1764,14 +1673,11 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(1)] // warp-per-column dp4a matvec (decode)
     [InlineData(3)] // block-tile dp4a GEMM (verify window)
     public void CudaQuantizedMatmul_Q8_0Dp4aMatchesDequantizedReference(int rows)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 96;
         const int outDim = 9;
         byte[] weights = CreateQ8_0Rows(outDim, inDim, (r, c) => (sbyte)(((r + 2) * (c - 11)) % 63), r => 0.125f + r * 0.0625f);
@@ -1809,15 +1715,12 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(8, 1)] // Q8_0 decode matvec
     [InlineData(8, 3)] // Q8_0 small-batch dp4a
     [InlineData(2, 1)] // Q4_0 also consumes q8_1.s
     public void CudaQ81WarpQuantizer_BitMatchesLegacyMatmul(int ggmlType, int rows)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // Nine q8_1 blocks leave one live warp in the final 8-warp CTA, covering
         // both the cooperative reduction and its grid tail.
         const int inDim = 288;
@@ -1879,12 +1782,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmul_GraphReplaySurvivesQ81ScratchGrowth()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 288;
         const int outDim = 13;
         const int growthRows = 256;
@@ -1982,14 +1882,11 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(64, 32)] // exactly one 2048-value staging chunk
     [InlineData(96, 7)]  // 672 values: partial chunk and odd 34-byte-block count
     public void CudaQ80F16Dequantizer_BitMatchesLegacyGemm(int inDim, int outDim)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // rows >= 32 selects RunF16Gemm when MMQ is disabled. Comparing its final
         // F32 output exercises the specialized dequantizer through the same
         // cuBLAS consumer used by real large-prefill projections.
@@ -2045,12 +1942,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmul_Q8_0MmqPrefillRows_MatchesDequantizedReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // rows >= 32 auto-routes to the int8 tensor-core MMQ GEMM (mma.m16n8k32).
         // Odd sizes exercise the M/N tail handling; K = 96 exercises the k-step tail.
         const int inDim = 96;
@@ -2098,10 +1992,12 @@ public class CudaBackendTests
     /// the Gemma4 --tp 2 direct-CUDA prefill runs; a divergence here is the
     /// repeated-token garbage seen at prompt lengths >= 32 tokens.
     /// </summary>
-    [Fact]
+    [CudaFact]
     public void CudaF16GemmColumnShards_TwoRanksConcurrent_MatchSingleAllocator()
     {
-        if (!CudaBackend.IsAvailable() || CudaDevice.GetDeviceCount() < 2)
+        // CudaFact covers availability; the two-device requirement stays a
+        // silent gate (no lane filters on device count).
+        if (CudaDevice.GetDeviceCount() < 2)
             return;
 
         const int inDim = 2048;
@@ -2214,12 +2110,9 @@ public class CudaBackendTests
     /// accumulation order - only the staging differs. Odd out_dim/rows cover
     /// the N/M tails (including unstaged garbage rows zeroed by their scales).
     /// </summary>
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmul_Q8_0Mmq2CpAsync_BitMatchesBaseMmq()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 512;
         const int outDim = 70;
         const int rows = 41;
@@ -2268,12 +2161,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmul_Q4_0WithMultipleOutputColumns_MatchesDequantizedReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 64;
         const int outDim = 7;
         const int rows = 3;
@@ -2309,16 +2199,13 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmul_Q4_0BatchedSpansMultipleRowTilesAndColumnEdge_MatchesReference()
     {
         // Exercises the row-tiled batched Q4_0 kernel (ts_quant_matmul_q4_0_batched_f32)
         // used for the speculative-MTP verify window: rows=20 spans more than one
         // TS_Q40_ROW_TILE (12) tile, and outDim=5 leaves the last TS_Q40_COLS (2)
         // column block with a single live column — both edges of the kernel.
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 128;
         const int outDim = 5;
         const int rows = 20;
@@ -2352,7 +2239,7 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(1)]    // single-token decode
     [InlineData(5)]    // mid speculative-verify window
     [InlineData(9)]    // full draft window (n_max + 1)
@@ -2363,9 +2250,6 @@ public class CudaBackendTests
         // so it matches the FP32 dequant reference only to int8 precision (same as
         // ggml's mul_mat_q). A wider inDim keeps the relative quantization error well
         // bounded; the tolerance is scaled to the accumulated dot-product magnitude.
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 256;
         const int outDim = 6;
         byte[] weights = CreateQ4_0Rows(outDim, inDim, (r, c) => (sbyte)(((r * 7 + c * 3) % 16) - 8), r => 0.0625f + r * 0.0078125f);
@@ -2405,15 +2289,12 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData((int)GgmlTensorType.Q4_K)]
     [InlineData((int)GgmlTensorType.Q5_K)]
     [InlineData((int)GgmlTensorType.Q6_K)]
     public void CudaQuantizedMatmul_KQuantsMatchDequantizedReferenceAfterHostRelease(int ggmlType)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int rows = 3;
         const int inDim = 256;
         const int outDim = 5;
@@ -2451,14 +2332,11 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData((int)GgmlTensorType.Q5_K)]
     [InlineData((int)GgmlTensorType.Q6_K)]
     public void CudaQuantizedMatmul_KQuantDecodeDp4aMatchesQ8ActivationReference(int ggmlType)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 512; // two super-blocks exercises row/block addressing
         const int outDim = 7;  // non-power-of-two grid edge
         byte[] weights = CreateKQuantRows(ggmlType, outDim, inDim);
@@ -2519,15 +2397,12 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData((int)GgmlTensorType.Q4_K)]
     [InlineData((int)GgmlTensorType.Q5_K)]
     [InlineData((int)GgmlTensorType.Q6_K)]
     public void CudaQuantizedRows_KQuantsMatchDequantizedReferenceAfterHostRelease(int ggmlType)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 256;
         const int outDim = 5;
         int[] rows = { 4, 1, 3 };
@@ -2572,12 +2447,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmulAndRows_IQ2XXSMatchQ8ActivationReferenceAfterHostRelease()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int rows = 3;
         const int inDim = 512;
         const int outDim = 5;
@@ -2639,14 +2511,11 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData((int)GgmlTensorType.IQ2_XXS)]
     [InlineData((int)GgmlTensorType.IQ2_S)]
     public void CudaQuantizedMatmul_IQ2DecodeGlobalQ81MatchesNativeReference(int ggmlType)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int inDim = 512;
         const int outDim = 5;
         byte[] weights = ggmlType == (int)GgmlTensorType.IQ2_XXS
@@ -2698,12 +2567,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaMoEDecode_MixedIq2StagesMatchQuantizedCpuReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int hiddenDim = 256;
         const int nFf = 256;
         const int numExperts = 2;
@@ -2850,12 +2716,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmulAndRows_IQ4XSMatchNativeReferenceAfterHostRelease()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // IQ4_XS (ggml type 23) is a mixed-quant staple (e.g. Qwen3.5-9B-IQ4_XS).
         // Before device residency was wired in, its weights stayed host-backed and
         // the matmul dequantized on the CPU. This exercises the device-resident
@@ -2934,12 +2797,9 @@ public class CudaBackendTests
 
     // Builds a byte-valid IQ4_XS weight buffer (any bit pattern is a legal block).
     // block_iq4_xs = d(half) @0, scales_h(uint16) @2, scales_l[4] @4, qs[128] @8 => 136 bytes / 256 elems.
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmul_IQ4NLMatchesNativeReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // IQ4_NL (ggml type 20) shares IQ4_XS's non-linear codebook but uses a flat
         // 18-byte / 32-element block with a single scale and no sub-block scales.
         // "Unsloth dynamic" quants mix it with other types per projection (the
@@ -2988,12 +2848,9 @@ public class CudaBackendTests
         }
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaQuantizedMatmul_MXFP4MatchesNativeReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // MXFP4 (ggml type 39) is the expert format of gpt-oss. Without device
         // support its ffn_*_exps tensors stayed host-backed and every MoE matmul
         // dequantized on the CPU (gpt-oss-20b decode measured 3.3 tok/s vs 150 on
@@ -3112,12 +2969,9 @@ public class CudaBackendTests
         return raw;
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaScaledDotProductAttention_WithMaskMatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int batch = 2;
         const int seqQ = 3;
         const int seqK = 4;
@@ -3167,12 +3021,9 @@ public class CudaBackendTests
         AssertClose(expected, actual, 1e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaGqaPrefillAttention_WithWindowMatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 4;
         const int numKVHeads = 2;
         const int seqLen = 3;
@@ -3219,12 +3070,9 @@ public class CudaBackendTests
         AssertClose(expected, actualTensor.GetElementsAsFloat(seqLen * numQHeads * headDim), 1e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaGqaPrefillAttention_ReadsFloat16KvCache()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 4;
         const int numKVHeads = 2;
         const int seqLen = 3;
@@ -3275,14 +3123,11 @@ public class CudaBackendTests
         AssertClose(expected, actualTensor.GetElementsAsFloat(seqLen * numQHeads * headDim), 2e-3f);
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void CudaExpandKvHeads_ConvertsActiveStridedCacheAndRepeatsHeads(bool halfCache)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int kvHeads = 2;
         const int groupSize = 3;
         const int seqLen = 3;
@@ -3324,12 +3169,9 @@ public class CudaBackendTests
             halfCache ? 1e-3f : 1e-6f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaRepeatInterleave_StaysOnDeviceAndMatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var source = Tensor.FromArray(
             allocator,
@@ -3343,14 +3185,11 @@ public class CudaBackendTests
             0f);
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void CudaGqaPrefillAttention_Group4D256StridedWindowMatchesReference(bool halfCache)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // This is the bounded Gemma 4 local-attention specialization:
         // GQA ratio 4, d=256, seq >= 32, a sliding window, and a live-cache
         // stride larger than the logical prefix.
@@ -3416,14 +3255,11 @@ public class CudaBackendTests
             tolerance);
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void CudaGqaPrefillAttention_Group4D512GlobalMatchesReference(bool halfCache)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 8;
         const int numKVHeads = 2;
         const int seqLen = 128;
@@ -3482,12 +3318,9 @@ public class CudaBackendTests
             halfCache ? 3e-3f : 5e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaGqaPrefillAttention_Group4OnlineD512LongCacheMatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 4;
         const int numKVHeads = 1;
         const int seqLen = 3;
@@ -3550,16 +3383,13 @@ public class CudaBackendTests
         }
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(256, false)]
     [InlineData(256, true)]
     [InlineData(512, false)]
     [InlineData(512, true)]
     public void CudaGqaPrefillAttention_Flash2MultiChunkMatchesReference(int headDim, bool halfCache)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         // seqLen/kvLen well past the flash2 K-chunk width (64) so the online
         // softmax crosses several chunks and the multi-slot Phase B reduction is
         // exercised, for both a windowed (SWA) and a full-causal (window 0) mask.
@@ -3611,12 +3441,9 @@ public class CudaBackendTests
             halfCache ? 4e-3f : 7e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaGqaPrefillAttentionWithSinks_ReadsStridedKvCache()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 4;
         const int numKVHeads = 2;
         const int seqLen = 3;
@@ -3688,12 +3515,9 @@ public class CudaBackendTests
         AssertClose(expected, actualF16.GetElementsAsFloat(seqLen * numQHeads * headDim), 2e-3f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaFusedLayoutOps_MatchReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var qkv = new Tensor(allocator, DType.Float32, 3, 10);
         FillSequential(qkv, scale: 1f, offset: 0f);
@@ -3716,12 +3540,9 @@ public class CudaBackendTests
             heads.GetElementsAsFloat(18));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaGqaDecodeAttention_CircularMatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 4;
         const int numKVHeads = 2;
         const int headDim = 3;
@@ -3750,12 +3571,9 @@ public class CudaBackendTests
         AssertClose(expected, actual.GetElementsAsFloat(numQHeads * headDim), 1e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaGqaDecodeAttention_ReadsFloat16KvCache()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 4;
         const int numKVHeads = 2;
         const int headDim = 3;
@@ -3789,7 +3607,7 @@ public class CudaBackendTests
         AssertClose(expected, actual.GetElementsAsFloat(numQHeads * headDim), 2e-3f);
     }
 
-    [Theory]
+    [CudaTheory]
     [InlineData(256, 64, 23, 0, true, false)]
     [InlineData(256, 64, 23, 0, true, true)]
     [InlineData(256, 64, 64, 17, true, false)]
@@ -3804,9 +3622,6 @@ public class CudaBackendTests
         bool circular,
         bool dynamicLength)
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 8;
         const int numKVHeads = 2;
         float scale = 1.0f / MathF.Sqrt(headDim);
@@ -3864,12 +3679,9 @@ public class CudaBackendTests
             3e-3f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaGqaDecodeAttentionWithSinks_ReadsFloat16KvCache()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 4;
         const int numKVHeads = 2;
         const int headDim = 3;
@@ -3907,12 +3719,9 @@ public class CudaBackendTests
         AssertClose(expected, actual.GetElementsAsFloat(numQHeads * headDim), 2e-3f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaGqaDecodeAttentionWithSinks_PartitionedMatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int numQHeads = 4;
         const int numKVHeads = 2;
         const int headDim = 16;
@@ -3956,12 +3765,9 @@ public class CudaBackendTests
         AssertClose(expected, actualF16.GetElementsAsFloat(numQHeads * headDim), 2e-3f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaFusedCacheOps_MatchReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var src = new Tensor(allocator, DType.Float32, 2, 4, 3);
         FillSequential(src, scale: 1f, offset: 1f);
@@ -3986,12 +3792,9 @@ public class CudaBackendTests
         }, concat.GetElementsAsFloat(30));
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaFusedFloat16CacheOps_MatchReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var filled = new Tensor(allocator, DType.Float16, 1, 4, 2);
         Ops.Fill(filled, 1.5f);
@@ -4010,12 +3813,9 @@ public class CudaBackendTests
         AssertClose(src.GetElementsAsFloat(24), gathered.GetElementsAsFloat(24), 1e-3f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaCopy_Float16NarrowedKvCacheLayout_StaysOnDevice()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int heads = 3;
         const int oldCapacity = 8;
         const int newCapacity = 16;
@@ -4048,12 +3848,9 @@ public class CudaBackendTests
             tail.GetElementsAsFloat(heads * (newCapacity - cacheSeqLen) * headDim), 1e-3f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaFusedGeluAndNeoXRope_MatchReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var gateUp = new Tensor(allocator, DType.Float32, 2, 6);
         gateUp.SetElementsAsFloat(new[] { -1f, 0.5f, 2f, 3f, -4f, 0.25f, 1.25f, -0.75f, 0.1f, 2f, 3f, -5f });
@@ -4094,12 +3891,9 @@ public class CudaBackendTests
         AssertClose(expectedRope, data.GetElementsAsFloat(16), 1e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaFusedBiasAndOaiSwiGlu_MatchReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         using var allocator = new CudaAllocator();
         using var matrix = Tensor.FromArray(allocator, new float[,]
         {
@@ -4140,12 +3934,9 @@ public class CudaBackendTests
         AssertClose(expected, activated.GetElementsAsFloat(6), 1e-5f);
     }
 
-    [Fact]
+    [CudaFact]
     public void CudaAttentionSoftmaxWithSinksAndWindow_MatchesReference()
     {
-        if (!CudaBackend.IsAvailable())
-            return;
-
         const int heads = 2;
         const int seqLen = 3;
         const int kvLen = 6;

@@ -1,0 +1,171 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Xunit;
+using Xunit.Abstractions;
+using Xunit.Sdk;
+
+namespace InferenceWeb.Tests
+{
+    /// <summary>
+    /// Environment probes shared by the gated fact attributes below. Probe
+    /// results are cached: attributes run at discovery time for every test.
+    /// </summary>
+    internal static class TestGates
+    {
+        // The probes are banned from test code (BannedSymbols.txt) so gating
+        // can't silently regress to in-test checks; this is the one caller.
+#pragma warning disable RS0030
+        private static readonly Lazy<bool> CudaAvailable = new(() =>
+        {
+            try { return TensorSharp.Cuda.CudaBackend.IsAvailable(); }
+            catch { return false; }
+        });
+
+        private static readonly Lazy<bool> MlxAvailable = new(() =>
+        {
+            try { return TensorSharp.MLX.MlxBackend.IsAvailable(); }
+            catch { return false; }
+        });
+#pragma warning restore RS0030
+
+        public static string CudaSkip =>
+            CudaAvailable.Value ? null : "Requires a CUDA device.";
+
+        public static string MlxSkip =>
+            MlxAvailable.Value ? null : "Requires the MLX native backend.";
+
+        /// <summary>
+        /// Skip reason for weight-gated tests, or null to run. The env var may
+        /// name a file or a directory; with <paramref name="ggufContains"/> the
+        /// directory must hold a matching GGUF (see <see cref="FindGguf"/>).
+        /// </summary>
+        public static string ModelSkip(string envVar, string ggufContains = null)
+        {
+            string value = Environment.GetEnvironmentVariable(envVar);
+            if (string.IsNullOrEmpty(value))
+                return $"Requires model weights ({envVar} not set).";
+            if (File.Exists(value))
+                return null;
+            if (!Directory.Exists(value))
+                return $"Requires model weights ({envVar} points to a missing path).";
+            if (ggufContains != null && FindGguf(value, ggufContains) == null)
+                return $"Requires model weights (no '*{ggufContains}*' GGUF under {envVar}).";
+            return null;
+        }
+
+        /// <summary>
+        /// First GGUF in <paramref name="dir"/> whose name contains
+        /// <paramref name="contains"/> (case-insensitive; '|' separates
+        /// accepted alternatives, e.g. "gpt-oss|gpt_oss"), skipping companion
+        /// files (mmproj / assistant drafts). Shared by the attributes and the
+        /// per-class loaders so the skip decision and the load pick the same file.
+        /// </summary>
+        public static string FindGguf(string dir, string contains)
+        {
+            string[] alternatives = contains.ToLowerInvariant().Split('|');
+            return Directory.GetFiles(dir, "*.gguf").FirstOrDefault(p =>
+            {
+                string n = Path.GetFileName(p).ToLowerInvariant();
+                return alternatives.Any(n.Contains)
+                    && !n.Contains("mmproj") && !n.Contains("assistant");
+            });
+        }
+    }
+
+    /// <summary>
+    /// Emits the Requires trait(s) declared by a gated fact attribute, so
+    /// --filter "Requires!=..." lanes work without a separate [Trait] line.
+    /// </summary>
+    public sealed class RequiresTraitDiscoverer : ITraitDiscoverer
+    {
+        public IEnumerable<KeyValuePair<string, string>> GetTraits(IAttributeInfo traitAttribute)
+        {
+            foreach (string value in traitAttribute.GetNamedArgument<string>("RequiresValue").Split(','))
+                yield return new KeyValuePair<string, string>("Requires", value);
+        }
+    }
+
+    /// <summary>
+    /// [Fact] that needs a CUDA device: skips visibly when none is present and
+    /// carries Requires=Cuda. Passing a model env var adds the Requires=Models
+    /// gate on the same test.
+    /// </summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class CudaFactAttribute : FactAttribute, ITraitAttribute
+    {
+        public string RequiresValue { get; }
+
+        public CudaFactAttribute(string modelEnvVar = null, string ggufContains = null)
+        {
+            RequiresValue = modelEnvVar == null ? "Cuda" : "Cuda,Models";
+            Skip = TestGates.CudaSkip
+                ?? (modelEnvVar == null ? null : TestGates.ModelSkip(modelEnvVar, ggufContains));
+        }
+    }
+
+    /// <summary>[Theory] variant of <see cref="CudaFactAttribute"/>.</summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class CudaTheoryAttribute : TheoryAttribute, ITraitAttribute
+    {
+        public string RequiresValue { get; }
+
+        public CudaTheoryAttribute(string modelEnvVar = null, string ggufContains = null)
+        {
+            RequiresValue = modelEnvVar == null ? "Cuda" : "Cuda,Models";
+            Skip = TestGates.CudaSkip
+                ?? (modelEnvVar == null ? null : TestGates.ModelSkip(modelEnvVar, ggufContains));
+        }
+    }
+
+    /// <summary>
+    /// [Fact] that needs the MLX native backend: skips visibly when it is
+    /// absent and carries Requires=Mlx.
+    /// </summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class MlxFactAttribute : FactAttribute, ITraitAttribute
+    {
+        public string RequiresValue => "Mlx";
+
+        public MlxFactAttribute() => Skip = TestGates.MlxSkip;
+    }
+
+    /// <summary>[Theory] variant of <see cref="MlxFactAttribute"/>.</summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class MlxTheoryAttribute : TheoryAttribute, ITraitAttribute
+    {
+        public string RequiresValue => "Mlx";
+
+        public MlxTheoryAttribute() => Skip = TestGates.MlxSkip;
+    }
+
+    /// <summary>
+    /// [Fact] that needs real GGUF weights: skips visibly when the env var is
+    /// unset or the weights are absent, and carries Requires=Models.
+    /// </summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class ModelFactAttribute : FactAttribute, ITraitAttribute
+    {
+        public string RequiresValue => "Models";
+
+        public ModelFactAttribute(string envVar, string ggufContains = null)
+            => Skip = TestGates.ModelSkip(envVar, ggufContains);
+    }
+
+    /// <summary>[Theory] variant of <see cref="ModelFactAttribute"/>.</summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class ModelTheoryAttribute : TheoryAttribute, ITraitAttribute
+    {
+        public string RequiresValue => "Models";
+
+        public ModelTheoryAttribute(string envVar, string ggufContains = null)
+            => Skip = TestGates.ModelSkip(envVar, ggufContains);
+    }
+}
