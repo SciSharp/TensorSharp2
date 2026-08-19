@@ -28,6 +28,16 @@
   </ul>
   <p>在 GGML 后端上，融合的按 rank block 计算图让 <code>--tp 2</code> 在本来就装得下单卡的模型上也能<strong>快于</strong>单 GPU —— Gemma 4 E4B Q8_0 上 51.7 对 37.3 tok/s（2× RTX 2000 Ada）。如果你要的是更高的<em>并发吞吐</em>而非更低的单流延迟，请先看 <a href="advanced_zh-cn.html#continuous-batching">连续批处理</a>——它默认开启，零成本即可尝试。</p>
 
+  <h2 id="vs-layer-split">TP 与按层切分 —— 多卡机器上到底发生了什么</h2>
+  <p>模型占用多张 GPU 有两种完全不同的方式，其中只有一种是 <code>--tp</code>。</p>
+  <ul>
+    <li><strong>张量并行（<code>--tp N</code>）</strong>把<em>每一层</em>都放到<em>每个 rank</em> 上，切分的是层<em>内部</em>的权重，于是一次 decode 每张卡只读 <code>1/N</code> 的字节，各 rank 在每个层边界做 all-reduce。下表里的所有架构都支持它，而且它是<strong>按需开启</strong>的 —— 不主动要求，就不会有任何张量被切开。</li>
+    <li><strong>按层切分</strong>则是把<em>整层</em>放到不同设备上顺序执行：设备 0 算第 0..k 层，把隐状态交给设备 1，依此类推。切点并不是简单的 <code>n_layer/N</code> —— 加载器会测量每张卡的空闲显存，再做装箱以均衡「占用预算的最大比例」，因此配置不一致的一组卡也能被均匀填满。没有集合通信、层内也不切分，因此在慢速互连上不花额外代价，但同一时刻只有一张卡在忙。</li>
+  </ul>
+  <p>按层切分只适用于<strong>两个架构 —— DeepSeek V4 Flash（<code>deepseek4</code>）与 GLM 5.x（<code>glm-dsa</code>）</strong>，也就是走各自整模型执行器的那两个；而且这是它们<strong>不加任何参数时的默认行为</strong>：它们会摊到所有可见 GPU 上，因为两者都装不进单卡。<code>TS_DSV4_NGPU</code> 与 <code>TS_GLM_NGPU</code> 用来限制使用几张卡。</p>
+  <p>在<strong>其他所有架构</strong>上，不加 <code>--tp</code> 就是<strong>只用一张 GPU</strong>。通用的逐算子路径与融合图路径都没有自动按层切分 —— 装不下单卡的模型会在加载时失败，而不会被悄悄摊开（那条带具体 <code>--n-cpu-moe N</code> 建议的拒绝信息，只有 DeepSeek V4 与 GLM 5.x 的整模型加载器会打印）。</p>
+  <p>所以在一台 3 卡机器上：只写 <code>--backend ggml_cuda</code>，GLM 5.x 与 DeepSeek V4 会用满三张卡（按层切分），Gemma 4 只用一张；再加上 <code>--tp 3</code>，GLM 5.x 切换成张量并行，DeepSeek V4 只是把按层切分限制在这 3 张卡上（那里的 <code>--tp N</code> 仅仅是个设备数，等同 <code>TS_DSV4_NGPU</code>），Gemma 4 则用上三张卡。在 GLM 5.x 上这个切换只会更慢，换来的仅仅是容量 —— 见<a href="#performance">实测结果</a>。</p>
+
   <h2 id="how">张量并行的工作原理</h2>
   <p>每个 transformer block 被改写为一对互补的切分方式，因此每半个 block 只需要一次集合通信：</p>
   <ol class="steps">
@@ -99,12 +109,13 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td>GPT OSS</td><td class="yes">✅</td><td>MoE 专家切分、attention sink、YaRN。GGML 后端同样可运行，但 GGML 上的 MoE 路径目前仍按 token 逐个遍历专家，尚未使用专家并行。</td></tr>
       <tr><td>Nemotron-H</td><td class="yes">✅</td><td>MoE 专家切分；Mamba2 SSM 层在 rank 0 上计算后广播。GGML 上的 MoE 限制与 GPT OSS 相同。</td></tr>
       <tr><td>DeepSeek V4 Flash</td><td class="yes">✅（按层切分）</td><td>机制不同：DSV4 的整模型执行器是把模型<em>按层</em>切分到各 GPU，而不是切分每个权重，因此没有逐层 AllReduce。<code>--tp N</code> 只是限制切分使用几张 GPU（等同 <code>TS_DSV4_NGPU</code>）；不传参数时使用全部可见设备。切分以单卡最大负载为优化目标，并按各设备固定常驻项的实际落点计入——embedding 表在第一张卡，输出头与整个 DSpark 草稿器在最后一张卡。</td></tr>
+      <tr><td>GLM 5.x</td><td class="yes">✅</td><td>MLA 的头列并行（<code>attn_q_b</code> / <code>attn_k_b</code> / <code>attn_v_b</code>）配行并行 <code>attn_output</code>；256 个路由专家不是按专家 id 划分，而是在<em>每个专家内部</em>按 Megatron 切分（gate/up 列并行、down 行并行），因为 <code>ggml_mul_mat_id</code> 要求同一 token 选中的专家 id 互不相同。router、各处 norm、lightning indexer、共享专家与 3 个稠密层均为复制——每层两次 all-reduce。仅限 GGML 后端；<code>TS_GLM_TP_SHARD</code> 选择切哪一半（1 头、2 专家、3 两者都切），<code>TS_GLM_TP_OVERSUBSCRIBE=1</code> 可把多个 rank 挤在一张卡上做测试。不加 <code>--tp</code> 时，GLM 像 DeepSeek V4 一样按层切分到所有可见 GPU。</td></tr>
       <tr><td>DiffusionGemma</td><td class="no">—</td><td>不适用（文本扩散采样器，非自回归 decode）。</td></tr>
       <tr><td>Qwen-Image-Edit</td><td class="no">—</td><td>不适用（MMDiT 图像生成）。</td></tr>
     </tbody>
   </table>
   </div>
-  <p>MoE 有两种切分方式。<strong>专家切分</strong>（Direct CUDA，以及各后端上的 GPT OSS / Nemotron-H）让每张 GPU 持有<em>每一个</em>专家权重的 <code>1/tp</code>，router 复制——因此无论 token 选中哪些专家，负载都保持均衡。<strong>专家并行</strong>（GGML 上的 Qwen 3.5/3.6）则划分整个专家，使每个 rank 每个投影仍然只需一次批量 <code>ggml_mul_mat_id</code> 调度，而不是按 (token, 专家) 循环。</p>
+  <p>MoE 有两种切分方式。<strong>专家切分</strong>（Direct CUDA，以及各后端上的 GPT OSS / Nemotron-H）让每张 GPU 持有<em>每一个</em>专家权重的 <code>1/tp</code>，router 复制——因此无论 token 选中哪些专家，负载都保持均衡。<strong>专家并行</strong>（GGML 上的 Qwen 3.5/3.6）则划分整个专家，使每个 rank 每个投影仍然只需一次批量 <code>ggml_mul_mat_id</code> 调度，而不是按 (token, 专家) 循环。GGML 上的 Gemma 4 与 GLM 5.x 用的是第三种：Megatron 切分发生在<em>每个专家内部</em>（gate/up 列并行、down 行并行），于是每个 rank 仍然看得到完整的专家表，一个 token 选中的 id 在全局范围内依旧有效——这正是 <code>ggml_mul_mat_id</code> 的要求，因为它不接受同一 token 的选择里出现重复的专家 id。</p>
 
   <h2 id="constraints">要求与约束</h2>
   <ul>
@@ -129,6 +140,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   </table>
   </div>
   <p>Decode —— TP 本该受益的访存瓶颈部分 —— 在 Gemma 4 E4B 上达到单卡的 1.39×，在 Qwen 3.5-9B 上为 1.06×，且两个 Gemma 4 模型的输出与单卡运行<strong>逐字节一致</strong>。Prefill 受计算约束且要承担集合通信开销，因此在单卡装得下的模型上持平或略低于单卡。Qwen 3.5-35B-A3B 在 16 GB 卡上根本装不下 —— 只有 TP 能跑，两张卡上的显存占用为 9.4 + 8.0 GB。</p>
+
+  <p>但这并不普适。在 3× RTX PRO 6000（PCIe，无 NVLink）上，GLM-5.2 UD-IQ2_XXS 以 prefill 2048 / decode 64 测得：按层切分 <strong>915.9 / 43.9</strong> tok/s，而 <code>--tp 3</code> 只有 <strong>505.6 / 17.6</strong>——78 层里每层都要对 <code>[6144, n_tokens]</code> 的隐状态做两次 all-reduce，在 PCIe 主机上这笔开销超过了拆分省下的算力。TP 还要求每个 rank 各自持有一份全长缓存，能装下的上下文因此从 342,272 掉到 91,136 token；它也改变了归约顺序——对着录制的 llama.cpp 金标准，2-bit MoE 在 <code>--tp 3</code> 下复现 3/6 条提示，而按层切分复现 5/6。那里的 TP 是容量特性而非延迟特性。TP 能带来多少，取决于互连带宽以及一层里究竟有多少能拆。</p>
 
   <h3 id="perf-graphs">TP 下的 CUDA 图捕获</h3>
   <p>一个张量并行 token 是几十次按 rank 的小提交，重放它们值约 <strong>45% 的 decode 吞吐</strong> —— 因此 TP 下图捕获保持<em>开启</em>（用 <code>TS_GGML_TP_CUDA_GRAPHS=0</code> 关闭）。4×A40 实测：</p>
@@ -193,7 +206,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model model.gguf --backen
       <tr><td>某个维度无法被 TP 度整除</td><td>选择能整除 <code>numHeads</code>、<code>numKVHeads</code> 与 <code>intermediateSize</code> 的并行度，通常取 2 的幂。</td></tr>
       <tr><td>节点一直等待 peer</td><td>各节点的 peer 列表、顺序或端口不一致，或者防火墙拦截了该端口。若只是节点启动间隔较久，调大 <code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS</code>。</td></tr>
       <tr><td>只有多 GPU 时输出乱码</td><td>怀疑 P2P DMA 路径。先用 <code>TENSORSHARP_TP_HOST_ALLREDUCE=1</code> 重跑，再试 <code>TENSORSHARP_TP_DISABLE_P2P=1</code>；如果输出恢复正常，问题出在该拓扑的 peer DMA 上。</td></tr>
-      <tr><td>多 GPU 比单 GPU 更慢</td><td>Prefill 受计算约束且要承担集合通信开销，在本来就装得下单卡的模型上可能落后于单卡。GGML 后端上的 decode 应当更快 —— 如果不是，请确认融合路径处于开启状态（未设置 <code>TS_GEMMA4_TP_FUSED_MOE</code> 与 <code>TS_GGML_TP_FUSED_MATMUL</code>），并确认是单进程运行，因为多节点会回退到逐算子前向。</td></tr>
+      <tr><td>多 GPU 比单 GPU 更慢</td><td>Prefill 受计算约束且要承担集合通信开销，在本来就装得下单卡的模型上可能落后于单卡。GGML 后端上的 decode 应当更快 —— 如果不是，请确认融合路径处于开启状态（未设置 <code>TS_GEMMA4_TP_FUSED_MOE</code> 与 <code>TS_GGML_TP_FUSED_MATMUL</code>），并确认是单进程运行，因为多节点会回退到逐算子前向。另外，在没有 NVLink 的 PCIe 主机上，层本身就不好拆的模型无论怎么调都可能更慢——GLM 5.x 每层需要两次 all-reduce，<code>--tp 3</code> 实测就是比按层切分慢；那里请把 TP 当作容量手段而不是提速手段。</td></tr>
     </tbody>
   </table>
   </div>

@@ -70,7 +70,14 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
 # the split GGUF, --draft-model the separate DSpark drafter. Needs greedy sampling.
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;DeepSeek-V4-Flash-...-00001-of-00005.gguf&gt; --backend ggml_cuda \
-    --draft-model &lt;DSpark-drafter.gguf&gt; --input prompt.txt --max-tokens 200 --temperature 0</code></pre>
+    --draft-model &lt;DSpark-drafter.gguf&gt; --input prompt.txt --max-tokens 200 --temperature 0
+
+# GLM 5.x: --model is the FIRST shard; GgufFile finds the remaining five itself.
+# The weights layer-split across every visible GPU, and the advertised 1M context
+# is sized down to whatever VRAM is left once they land.
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf&gt; --backend ggml_cuda \
+    --input prompt.txt --max-tokens 200 --think</code></pre>
 
   <h3>Multimodal</h3>
   <pre data-lang="bash"><code># Image inference (Gemma 3/4, Qwen 3.5-family)
@@ -216,7 +223,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--list-gpus</code></td><td>List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit.</td></tr>
       <tr><td><code>--help</code></td><td>Print the full parameter reference (description, default, range, and an example per option) and exit; also shown when the CLI is started with no arguments.</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code>, <code>f16</code>, <code>q8_0</code>, or <code>q4_0</code> (default: auto — the backend/model pick; overrides the <code>KV_CACHE_DTYPE</code> env var). The block-quantized tiers require the native GGML flash-attention path; <code>q4_0</code> (~1/7 the f32 footprint) targets very long 128K–256K contexts.</td></tr>
-      <tr><td><code>--n-cpu-moe &lt;N&gt;</code> / <code>-ncmoe &lt;N&gt;</code></td><td>Keep the routed MoE expert weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the shared expert stay on the accelerator. Pass <code>all</code> for every layer. Default: <code>0</code> — except DeepSeek V4 on the GPU backends, which auto-offloads the fewest layers that fit the visible VRAM. Env: <code>TS_N_CPU_MOE</code>.</td></tr>
+      <tr><td><code>--n-cpu-moe &lt;N&gt;</code> / <code>-ncmoe &lt;N&gt;</code></td><td>Keep the routed MoE expert weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the shared expert stay on the accelerator. Pass <code>all</code> for every layer. Default: <code>0</code> — except DeepSeek V4 on the GPU backends, which auto-offloads the fewest layers that fit the visible VRAM. On GLM 5.x the host-resident experts are served straight from the GGUF mapping with no private copy (<code>TS_GLM_MOE_MMAP=0</code> copies instead), and the flag composes with <code>--tp</code> — host-resident layers keep their experts whole and rank 0 evaluates them. It is a way to fit a checkpoint that would not otherwise load, not a speed knob: on GLM-5.2 <code>--n-cpu-moe 30</code> takes pp2048 from 915.9 to 94.7 t/s, but raises the context the loader can size from 342,272 to 646,400 tokens. Env: <code>TS_N_CPU_MOE</code>.</td></tr>
       <tr><td><code>--cpu-moe</code> / <code>-cmoe</code></td><td>Shorthand for <code>--n-cpu-moe all</code> (env <code>TS_CPU_MOE</code>).</td></tr>
       <tr><td><code>--cpu-moe-threads &lt;N&gt;</code></td><td>Worker threads for the host-side expert matmul (default: one less than the parallelism this process can actually use). Do not exceed the cgroup CPU quota — ggml's pool spins at its barriers, so oversubscription collapses throughput. Env: <code>TS_CPU_MOE_THREADS</code>.</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>Start the interactive REPL (see below).</td></tr>

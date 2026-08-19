@@ -17,6 +17,8 @@
 
 **DeepSeek V4 Flash is the exception to the table above.** Its 284B compressed-sparse-attention MoE stack runs through one of three dedicated whole-model executors rather than the generic per-op path: a direct-CUDA engine (`--backend cuda`), the native ggml executor (`--backend ggml_cuda` / `ggml_vulkan`), and a 100% pure-C# CPU executor (`--backend cpu`) that serves quantized weights straight from the memory-mapped GGUF shards. All three layer-split the weights across every visible GPU (or, on CPU, stream them from the mapped shards), so a model far larger than one card still runs. See the [DeepSeek V4 card](docs/models/deepseek4.md).
 
+**GLM 5.x (`glm-dsa`) is the other exception.** Its 744B-A40B MLA + sparse-attention MoE runs through a native whole-model ggml executor on `--backend ggml_cuda` / `ggml_vulkan` / `ggml_cpu` / `ggml_metal`, and through a managed per-op path on `--backend cpu` (100% managed, no native dependencies) and `--backend cuda`; `TS_GLM_NATIVE=0` selects the managed path on a GGML backend for an A/B. The 6-shard split GGUF is handled by `GgufFile` itself — point `--model` at the `-00001-of-00006` shard. MLX does not run it. See the [GLM card](docs/models/glm.md).
+
 ## Configuration file (CLI + Server)
 
 Both `TensorSharp.Cli` and `TensorSharp.Server` can read their options from a JSON
@@ -219,7 +221,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0 on every architecture, DeepSeek V4 included — a model that does not fit is refused at load with the number of layers that would make it fit, rather than silently offloaded (env `TS_N_CPU_MOE`). |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0 on every architecture, DeepSeek V4 and GLM 5.x included — a model that does not fit is refused at load with the number of layers that would make it fit, rather than silently offloaded (env `TS_N_CPU_MOE`). |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off (env `TS_CPU_MOE`). |
 | `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: **half** the CPU parallelism this process can actually use (`hardware_concurrency` clamped by the scheduler affinity mask and the cgroup CPU quota) on hosts with more than 8, all but one below that. The other half is not waste — the accelerator submission threads, and in `TensorSharp.Server` Kestrel and the scheduler, have to be schedulable too, and .NET sizes its own pool from the machine's CPU count rather than the cgroup quota. Sizing this near the quota is a cliff, not a slope: on a 95-CPU quota the hosted 26B MoE measured 20.7 tok/s at 64 threads and 8.2 at 71. Raise it on a dedicated box (env `TS_CPU_MOE_THREADS`). |
 
@@ -235,8 +237,8 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
-| `--think` | Enable thinking/reasoning mode (chain-of-thought) |
-| `--tools <path>` | JSON file with tool/function definitions |
+| `--think` | Enable thinking/reasoning mode (chain-of-thought). Opt-in on every family, GLM 5.x included: without it the GLM template closes the reasoning block immediately (`<think></think>`) so the model answers directly, and with it the prompt carries `Reasoning Effort: Max` and leaves the block open for the model to close. `/think on\|off` toggles it inside the REPL. |
+| `--tools <path>` | JSON file with tool/function definitions. Wire formats differ by family and the parser is picked from the architecture — GLM 5.x emits XML (`<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`, one element per argument, values `tojson`-encoded when they are not plain strings) rather than a JSON body, and the server parses that back into the usual OpenAI tool-call fields so clients see the standard shape. |
 | `--draft-model <path>` | Speculative-decoding drafter GGUF for architectures whose drafter ships as its own file — DeepSeek V4's DSpark support module (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)) and Muse-Glimmer's DFlash block drafter (see [Muse-Glimmer](docs/models/muse-glimmer.md#3-dflash-speculative-decoding); env `TS_MUSE_GLIMMER_DFLASH`). It drafts a whole block per step and the trunk verifies it in one batched forward, so greedy output is unchanged. Engages on every single-sequence path (`--input`, `--input-jsonl`, `--multi-turn-jsonl`, `--interactive`) with `--backend cuda` or `--backend ggml_cuda`, and requires a pure-argmax sampler: any temperature, top-k/p, or repetition/presence/frequency penalty turns it off. Env: `TS_DSV4_DSPARK`. |
 | `--spec-draft-n-max <N>` | Cap on tokens drafted per speculative block (default: the drafter's trained block size — 5 for DSpark, 15 for Muse-Glimmer's DFlash) |
 | `--spec-draft-conf-min <p>` | Minimum cumulative acceptance probability — the product of the confidence head's per-position estimates — for a drafted position to be kept (default: `0.35`). Lower drafts further and rolls back more; higher falls back to plain decode more often. |
@@ -446,7 +448,7 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--seed <N>` | Random seed (`-1` = non-deterministic) |
 | `--stop <string>` | Stop sequence (can be repeated). Under `--sampling-precedence config` a per-request `stop`/`stop_sequences` list is merged with these; under `request` it replaces them. |
 | `--sampling-precedence <config\|request>` | Who wins when a request also carries a sampling parameter you set above. `config` (default) keeps your value — clients such as VS Code Copilot Chat hardcode `temperature`/`top_p` into every request and would otherwise silently override your configuration; parameters you did **not** set still come from the request. `request` restores client-always-wins. Env: `TENSORSHARP_SAMPLING_PRECEDENCE`. |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0 on every architecture, DeepSeek V4 included; a model that does not fit is refused at load with the number of layers that would make it fit. Env: `TS_N_CPU_MOE`. |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0 on every architecture, DeepSeek V4 and GLM 5.x included; a model that does not fit is refused at load with the number of layers that would make it fit. Env: `TS_N_CPU_MOE`. |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off. Env: `TS_CPU_MOE`. |
 | `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: half the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota) on hosts with more than 8 cores. The server needs the other half for Kestrel, the scheduler and the accelerator submission threads; sizing this near the quota collapses throughput rather than degrading (20.7 tok/s at 64 threads vs 8.2 at 71 on a 95-CPU quota). Env: `TS_CPU_MOE_THREADS`. |
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
@@ -486,6 +488,7 @@ did unconditionally.
 |---|---|
 | `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `MAX_TOKENS` | Maximum generation length when `--max-tokens` is not passed: fills in when a request omits its own limit and caps a request that asks for more (default: `20000`, which is a plain default and does not cap) |
+| `MAX_CONTEXT` | Context window to allocate, overriding the length the GGUF advertises. Set, it is a **hard limit**: honoured when the caches plus one full `n_ubatch` graph fit, refused with the numbers when they do not. Left unset, the advertised length is a **ceiling** — after the weights load, the runtime asks the devices how much VRAM is actually free, sizes the context to fit, and logs what it picked. GLM-5.2 advertises 1,048,576 tokens (~93 GiB of KV); on 3x RTX PRO 6000 the pick is 342,272 on the layer split, 91,136 with `--tp 3`, and 646,400 with `--n-cpu-moe 30` |
 | `VIDEO_SAMPLE_FPS` | Frames sampled per second from an **input video prompt** for multimodal understanding; time-based extraction (default: `1`). This is unrelated to the Wan output setting `--fps`. |
 | `VIDEO_MAX_FRAMES` | Optional upper bound on frames extracted from an **input video prompt** (evenly down-sampled); unset/`0` means no cap (default: no cap). This is unrelated to Wan output `--video-frames`. |
 | `PORT` / `HOST` | Listen port / bind interface when `--port` / `--host` are not passed (defaults: `5000`, `0.0.0.0`) |
@@ -918,6 +921,16 @@ Notes:
   difference `TS_HOST_MOE_VERIFY=1` reports on a single GPU. The pure-C# `cuda`
   backend has no host-MoE seam, so `--tp N --cpu-moe` there prints the
   `[moe-offload] WARNING` and keeps the experts resident.
+* **GLM 5.x serves its offloaded experts straight from the mapping.** The native
+  glm-dsa executor keeps host-resident routed experts in the GGUF mmap and
+  multiplies them in place instead of copying them into a private buffer
+  (`TS_GLM_MOE_MMAP=0` copies instead), which is what makes offloading 30 of a
+  744B model's layers a load-time no-op rather than a 100 GB memcpy. It composes
+  with `--tp`: offloaded layers keep their experts whole and rank 0 evaluates
+  them. Measured on 3x RTX PRO 6000, GLM-5.2 UD-IQ2_XXS, prefill 2048 /
+  decode 64: `--n-cpu-moe 30` is 94.7 / 16.4 tok/s against 915.9 / 43.9 fully
+  resident. Offload buys the fit here, not the speed — it frees enough VRAM to
+  raise the sized context from 342,272 to 646,400 tokens.
 * `TS_HOST_MOE_VERIFY=1` builds the on-GPU expert chain alongside the host one
   and reports their per-layer divergence — a diagnostic for validating the seam
   on a model that also fits in VRAM. `TS_HOST_MOE_DEBUG=1` prints the segment
@@ -932,6 +945,44 @@ TensorSharp supports **tensor parallelism (TP)** — splitting a single model ac
 multiple GPUs using the Megatron-LM column/row-parallel pattern — and
 **distributed (multi-node) tensor parallelism**, where TP spans multiple
 machines connected over a TCP peer-to-peer network.
+
+### TP vs. the layer split — what happens on a multi-GPU box
+
+There are two different ways a model can occupy more than one GPU, and only one
+of them is `--tp`.
+
+**Tensor parallelism (`--tp N`)** puts *every* layer on *every* rank and splits
+the weights *within* each layer, so a decode step reads `1/N` of the bytes per
+device and the ranks all-reduce at each layer boundary. Every architecture in the
+table below marked ✅ supports it, and it is **opt-in** — nothing splits a tensor unless
+you ask.
+
+**The layer split** puts *whole layers* on different devices and runs them in
+sequence — device 0 evaluates layers 0..k, hands the hidden state to device 1,
+and so on. The cut points are not a naive `n_layer/N`: the loader measures each
+device's free VRAM and bin-packs the layers to balance the largest
+fraction-of-budget used, so an uneven set of cards still fills up evenly. There
+are no collectives and no per-layer split, so it costs nothing on a slow
+interconnect, but only one GPU is busy at a time. This applies to
+exactly **two architectures — DeepSeek V4 Flash (`deepseek4`) and GLM 5.x
+(`glm-dsa`)** — because they are the two that run through their own whole-model
+executors, and it is what they do **by default, with no flag at all**: they spread
+across every visible GPU because neither fits on one card. `TS_DSV4_NGPU` and
+`TS_GLM_NGPU` cap how many devices they use.
+
+On **every other architecture**, running without `--tp` uses a **single GPU**.
+There is no automatic layer split on the generic per-op or fused-graph paths — a
+model that does not fit one card fails at load rather than being spread silently.
+(The refusal that names the exact `--n-cpu-moe N` you would need comes from the
+DeepSeek V4 and GLM 5.x whole-model loaders.)
+
+So on a 3-GPU box, `--backend ggml_cuda` alone gives you all three GPUs on GLM 5.x
+and DeepSeek V4 (layer split) and one GPU on Gemma 4; adding `--tp 3` switches the
+GLM 5.x to tensor parallelism, caps DeepSeek V4's layer split at three devices
+(there `--tp N` is only a device count — the same thing `TS_DSV4_NGPU` sets), and
+gives Gemma 4 all three GPUs. On GLM 5.x that
+switch is a downgrade in speed and buys only capacity — see the **What to
+expect** measurements below.
 
 ### Local tensor parallelism (single process, multiple GPUs)
 
@@ -1003,6 +1054,7 @@ must be reachable between all nodes.
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership; expert-parallel MoE on GGML (whole experts per rank, Megatron-split shared expert), expert slicing on direct CUDA. Runs on both `cuda` and `ggml_cuda` / `ggml_vulkan` — the GGML path uses the packed per-rank GDN kernel (`TSGgml_Qwen35GdnLayerTP`) with device-resident recurrent state |
 | GPT OSS | ✅ | Attention sinks, YaRN. Runs on `cuda` and the GGML backends; the GGML path is expert-parallel (whole experts per rank, one batched `ggml_mul_mat_id` dispatch per projection per layer) and falls back to per-expert slicing only when the expert count does not divide the TP degree |
 | Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing. Still walks experts per token per rank on GGML (no expert parallelism yet) |
+| GLM 5.x | ✅ | MLA heads column-parallel (`attn_q_b` / `attn_k_b` / `attn_v_b`) with row-parallel `attn_output`; the 256 routed experts are split **row-wise inside every expert** (column-parallel gate/up, row-parallel down) rather than by expert id, because `ggml_mul_mat_id` needs a token's selected expert ids to stay distinct. Router, norms, the DSA indexer, the shared expert and the 3 dense layers are replicated; two all-reduces per layer. `TS_GLM_TP_SHARD` picks the halves (1 heads, 2 experts, 3 both), `TS_GLM_TP_OVERSUBSCRIBE=1` packs several ranks on one GPU for testing. GGML backends only |
 | DiffusionGemma | — | Not applicable (diffusion model) |
 | Qwen-Image-Edit | — | Not applicable (image generation) |
 
@@ -1051,6 +1103,17 @@ collectives, so it lands at or below the single-GPU figure on models that fit on
 one card. Qwen 3.5-35B does not fit a 16 GB card at all, so TP is the only way
 to run it. See `TENSOR_PARALLELISM_PLAN.md` (Stages 1b and 1c) for the full
 measurements and what is left to fuse.
+
+How much TP buys depends on the interconnect and on how much of the layer it can
+actually split. On GLM-5.2 (3x RTX PRO 6000, PCIe, no NVLink) it buys nothing:
+`--tp 3` measures pp2048 505.6 / tg64 17.6 against 915.9 / 43.9 on the plain
+layer split, because each of the 78 layers needs two all-reduces of a
+`[6144, n_tokens]` hidden state and that costs more bus time than the split saves
+in arithmetic. It also holds a full-length cache on *every* rank, which drops the
+fitted context from 342,272 to 91,136 tokens, and it changes the reduction order,
+so against the recorded llama.cpp goldens a 2-bit MoE reproduces 3 of 6 prompts
+under `--tp 3` where the layer split reproduces 5 of 6.
+Reach for it there on an NVLink host, or when a model fits no other way.
 
 TP composes with MoE CPU offload: `--tp N --n-cpu-moe M` keeps the fused
 multi-rank graph and drops the offloaded layers' expert bytes from every rank's
@@ -1138,6 +1201,7 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Qwen 3.5 / 3.6 family | ON | `TS_QWEN35_BATCHED=0` to force legacy per-seq (or `--no-continuous-batching`) | `TS_QWEN35_BATCHED_GDN_NATIVE=1` enables native batched GDN kernel; `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` overrides fused-attention engage threshold (default 4096) |
 | GPT OSS | ON | `TS_GPTOSS_BATCHED=0` to force legacy per-seq | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` forces the managed (C#) sinks softmax instead of the native paged-attention-with-sinks kernel |
 | Nemotron-H | ON | `TS_NEMOTRON_BATCHED=0` to force legacy per-seq | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step (NEON SIMD + GCD parallelism) |
+| GLM 5.x | not implemented — concurrency runs on native per-sequence **slots** instead (each request owns its MLA and indexer caches and its own `n_past`; binding a request switches the active slot without moving KV bytes). MLA keeps one 576-wide row per token and the DSA indexer scores that same contiguous history, so there is no paged-KV layout to batch over | — | `TS_BATCHED_FUSED_DECODE=1` enables a batched fused decode over those slots (one graph, one token per sequence, weights read once): 1.81x aggregate decode at 4 concurrent requests. Off by default because batching changes GEMM shapes and a 2-bit MoE amplifies that into different expert picks; `TS_GLM_BATCHED_DECODE=0` makes the native side decline it |
 | Gemma 3 | not implemented (per-seq fallback) | — | — |
 | DiffusionGemma | Separate diffusion scheduler in the Web UI path; not an `IBatchedPagedModel` autoregressive path | `DIFFUSION_MAX_BATCH`, `DIFFUSION_STEPS` | `DIFFUSION_BATCHED_FORWARD=1` enables true batched canvas decode; fused GGML decode is on by default unless disabled with `DIFFUSION_NO_FUSED_DECODE=1` |
 
@@ -1154,6 +1218,25 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Gemma 4 fused verify / draft kernels (ggml) | ON | `TS_GMTP_NO_FUSED=1` falls back to per-op | — |
 | Gemma 4 dense fast rollback on partial accept | ON | `TS_GMTP_NO_FAST_ROLLBACK=1` restores kept-prefix rollback | — |
 | Gemma 4 verify trunk path | linear (solo) | `TS_GMTP_BATCHED_TRUNK=1` runs the batched paged trunk | — |
+
+#### GLM 5.x (`glm-dsa`)
+
+The full list, including the debug and A/B knobs, is in the
+[GLM card](docs/models/glm.md#environment-knobs).
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Executor | native whole-model ggml graph | `TS_GLM_NATIVE=0` runs the managed per-op path on a GGML backend | `--backend cpu` / `cuda` are managed regardless |
+| Prefill micro-batch | `1024` | `TS_GLM_UBATCH=N` — `2048` measures pp2048 1145.8 vs 918.9 when VRAM allows | — |
+| GPUs the layer split spreads over | all visible | `TS_GLM_NGPU=N` | — |
+| Per-device headroom left for compute buffers | `3072` MB | `TS_GLM_VRAM_RESERVE_MB=N` | — |
+| Context window | advertised length as a **ceiling**, refitted to free VRAM after load | `MAX_CONTEXT=N` makes it a hard limit instead | — (env only) |
+| Tensor-parallel split halves | `3` (heads + routed experts) | `TS_GLM_TP_SHARD` (1 heads, 2 experts, 3 both), `TS_GLM_TP_OVERSUBSCRIBE=1` packs ranks onto one GPU for testing | `--tp N` |
+| Host-resident experts read from the GGUF mmap | ON | `TS_GLM_MOE_MMAP=0` copies into a private buffer instead | `--n-cpu-moe N` selects the layers |
+| Batched fused decode across sequences | OFF | **`TS_BATCHED_FUSED_DECODE=1`**; `TS_GLM_BATCHED_DECODE=0` makes the native side decline it | — |
+| Flash attention / fused lightning indexer | ON | `TS_GLM_FA=0`, `TS_GLM_FUSED_LID=0` fall back to primitives | — |
+| Cached built+allocated graphs | `8` | `TS_GLM_GRAPH_CACHE=N` | — |
+| Weight-load parallelism | `16` threads / `64` MB chunks | `TS_GLM_LOAD_THREADS`, `TS_GLM_LOAD_CHUNK_MB` | — |
 
 #### Tensor parallelism & distributed inference
 

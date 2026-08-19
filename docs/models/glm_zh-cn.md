@@ -43,16 +43,22 @@ head 尺寸，而不是 576 宽的缓存行。
 
 ### 张量并行
 
-`--tp N`（或 `TENSORSHARP_TP_DEGREE`）让**每一层都跑在每一张 GPU 上**，而不是把层
-分给不同的卡，于是 decode 时每张卡只需要读 1/N 的权重，而不是依次走完全部。切分方式
-沿用仓库其它模型一致的 Megatron column/row 模式：
+**不加 `--tp` 时，多卡机器本来就会用满每一张卡**：加载器会测量每张卡的空闲显存，
+把 78 层装箱摊到它们上面，于是设备 0 跑第 0..k 层、把隐状态交给下一张，依此类推。
+这是默认行为，没有对应的开关——226 GiB 的权重也没有别的办法装下。`TS_GLM_NGPU`
+用来限制使用几张卡；即便用满所有卡也装不下时，加载会被拒绝，并给出正好能装下的
+`--n-cpu-moe N`。
+
+`--tp N`（或 `TENSORSHARP_TP_DEGREE`）是另一种模式：让**每一层都跑在每一张 GPU 上**，
+切分的是层*内部*的权重，于是 decode 时每张卡只需要读 1/N 的权重，而不是依次走完全部。
+切分方式沿用仓库其它模型一致的 Megatron column/row 模式：
 
 | 部件 | 切法 | 集合通信 |
 |---|---|---|
 | 注意力 head | `attn_q_b` / `attn_k_b` / `attn_v_b` 按列并行，`attn_output` 按行并行 | 每层一次 all-reduce |
 | 路由专家 | `ffn_gate_exps` / `ffn_up_exps` 按列并行，`ffn_down_exps` 按行并行 —— **每个专家都按行切开，专家本身不在 rank 之间分配** | 每层一次 all-reduce |
 | 路由器、norm、indexer、共享专家、dense 层 | 复制 | 无 |
-| MLA 与 indexer 缓存 | 每个 rank 只存自己那部分 head | 无 |
+| MLA 与 indexer 缓存 | **复制——每个 rank 各保留一份完整长度的副本。** 576 宽的 MLA 行由所有 head 共享，没有可按 head 切分的部分；这正是 `--tp N` 会把 KV 占用放大 N 倍、并把能装下的上下文压小的原因 | 无 |
 
 切专家的**隐藏维**而不是切专家的 **id**，是这件事能成立的关键：`ggml_mul_mat_id`
 要求同一个 token 选中的专家 id 互不相同，而按 id 切分就必须给"本 rank 没有的专家"
@@ -108,7 +114,7 @@ head 时 logits 已经差到 O(1)——在 2 bit 权重上这就是肉眼可见�
 
 ## 数值一致性
 
-在同一台机器上，用 GLM-5.2-UD-IQ2_XXS（222 GiB）对比 `llama.cpp b200-9731ad3`，
+在同一台机器上，用 GLM-5.2-UD-IQ2_XXS（226 GiB）对比 `llama.cpp b200-9731ad3`，
 输入**记录下来的** prompt token id，从而把前向过程与分词过程隔离开
 （`.parity/gen_ref_glm.py`、`InferenceWeb.Tests/GlmDsaParityTests.cs`）：
 
@@ -148,7 +154,7 @@ golden 校验贪心续写。
 动手之前有两点要清楚。第一是精确性：切开注意力会把一次 GEMM 变成各 rank 局部和的
 加总，残差因此在最后几位上不同——和上面的批量 decode 完全一样，75 层 256 选 8 的路由
 会把这点差别放大成 2 bit 权重上另一段续写。对着记录下来的 llama.cpp 金标准，按层切分
-复现 5/6 个短 prompt，`--tp 3` 复现 3/6；不同的那些 token 都是几乎并列的那种。第二
+复现 6 条记录中的 5 条，`--tp 3` 复现 6 条中的 3 条；不同的那些 token 都是几乎并列的那种。第二
 是速度，原因在互连：每层需要两次
 对 `[6144, n_tokens]` 隐状态的 all-reduce，而这些卡是 PCIe 直连、没有 NVLink——一个
 1024 token 的 prefill 分块每次跨越要搬约 25 MB，78 层 × 2 次归约下来，花在总线上的
@@ -197,7 +203,7 @@ dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --n-cpu-
 offload 是让放不下的 checkpoint 能跑起来的手段，不是提速开关——模型本来就放得下时，
 把专家挪到主机只会多出总线往返。同样 3 张卡、同一轮：默认按层切分 pp2048 **915.9** /
 tg64 **43.9** tok/s，`--n-cpu-moe 30` 为 **94.7** / **16.4**，`--tp 3` 为 **505.6** /
-**17.6**。只有在"otherwise 根本跑不起来"时才该用 `--n-cpu-moe`。
+**17.6**。只有在"否则根本跑不起来"时才该用 `--n-cpu-moe`。
 
 offload 与张量并行可以叠加：`--n-cpu-moe 30 --tp 2` 能正常加载，主机常驻的那些层会
 保持专家完整（切开它们既省不了主机内存也省不了主机时间，而且跨步切片没法直接由 GGUF
@@ -207,10 +213,10 @@ offload 与张量并行可以叠加：`--n-cpu-moe 30 --tp 2` 能正常加载，
 ### 上下文长度
 
 GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里每个 token 的 576 宽 MLA
-行加上 indexer 的那一行约 93 KiB，1M 上下文就是约 98 GiB 的 KV——比权重还多，而且还没
+行加上 indexer 的那一行约 93 KiB，1M 上下文就是约 93 GiB 的 KV——相当于在权重之外再多占一整张卡，而且还没
 算计算图。所以宣称的数字被当作**上限**而不是请求：加载器会用权重落盘后设备上真正剩下
 的显存（再扣掉一张 `n_ubatch` 计算图里 DSA 掩码与 LM head 所需的部分）来定上下文，并把
-选中的数字打出来。
+选中的数字打出来。在上面那三张卡上按默认的层切分，选出的是 342,272 token，`--n-cpu-moe 30` 则抬到 646,400。下面这行来自 `--tp 3` 的运行——那时每个 rank 都持有一份完整长度的缓存，所以选出的值会低得多：
 
 ```
 [glm] context 91136 tokens (the GGUF advertises 1048576): 18.3 GiB free per rank
@@ -249,8 +255,10 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 [gMASK]<sop>[<|system|>Reasoning Effort: Max][tools]<|user|>...<|assistant|><think>
 ```
 
-这一系列默认**开启**思考：正是那行 reasoning-effort 系统提示打开了它，而生成提示
-会先写下一个 `<think>`，由模型自己闭合。关闭思考时提示里写的是 `<think></think>`，
-模型于是直接作答。工具调用回来的形式是
+思考是**按需开启**的（`--think`、REPL 里的 `/think on`、API 请求里的
+`"think": true`），与这里其他系列一致。开启后提示会多出
+`<|system|>Reasoning Effort: Max` 这一行，并在生成提示里留下一个未闭合的
+`<think>`，由模型自己闭合；不开启时提示里写的是 `<think></think>`，模型于是直接
+作答。历史轮次的思考内容始终不会带进提示，与模板 `clear_thinking` 的默认行为一致。工具调用回来的形式是
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`，
 每个参数一个 XML 元素（用 `tojson` 渲染的值会被解析回数字 / 数组 / 对象）。

@@ -30,6 +30,8 @@
 
   <h3 id="paged-kv">原生分页注意力</h3>
   <p>原生内核 <code>TSGgml_PagedAttentionForward</code>（以及面向 GPT OSS 的 <code>WithSinks</code> 变体）在 C++ 中从分页缓冲收集 K/V，为每个序列构建一个小的 GGML 图，并分派 <code>ggml_flash_attn_ext</code> —— 与单序列路径所用相同的融合 Metal/CUDA 闪存注意力内核。在长上下文 Ministral-3-14B 负载（4×约 800 token）上，它比 legacy 逐序列 GGML 路径快约 21%。</p>
+  <p>MLA / 稀疏注意力架构（DeepSeek V4、GLM 5.x）走的是第三条路。每个 token 只有一行压缩缓存，没有可分页的布局，因此原生执行器给每个请求分配一个<strong>槽位</strong>——一整套逐层的 MLA 与索引器缓存，外加它自己的 <code>n_past</code>——绑定请求只是切换活跃槽位，不搬运任何 KV 字节。GLM 还提供可选的<strong>批处理融合解码</strong>（<code>TS_BATCHED_FUSED_DECODE=1</code>）：一张图、N 个序列各出一个 token，权重在它们之间只读一次——4 路并发下总解码吞吐 1.81 倍。默认关闭，因为批处理会改变每一个 GEMM 的形状，而 78 层里有 75 层是 top-8-of-256 路由，会把最低位的差异放大成 2-bit 权重上不同的专家选择。</p>
+
   <p>批量前向（Mistral 3、Gemma 4、GPT OSS、带 GatedDeltaNet 循环状态池的 Qwen 3.5/3.6，以及带 Mamba2 循环状态池的 Nemotron-H）把 N 个序列打包进一次 <code>ForwardBatch</code> 调用，每层一次批量线性投影 matmul，并配以分页 K/V 散写。Gemma 4 达到约 1.5–1.6× legacy 吞吐；Nemotron-H Mamba2 批量在 Apple M4 Pro 上 batch=3 时达到约 3.95×。</p>
   <div class="callout note"><div class="ic">📖</div><p>完整深入解析：仓库中的 <code>docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md</code>。</p></div>
 
@@ -111,6 +113,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model DeepSeek-V4-Flash-.
     <li><strong>单图 GPU decode</strong>（Gemma 4 dense，包括 E4B）—— 所有 transformer 层在一次 GGML 图分派中完成，把每 token 的 CPU↔GPU 往返从数百次降到一次（相对逐 op 分派约 2.6×）。</li>
     <li><strong>整模型融合 decode 计算图</strong>（Gemma 4 dense + MoE、Qwen 3.5/3.6、GPT OSS）—— 一个 decode token 的全部计算（含 MoE 路由与专家、最终 norm 与 LM head）作为<em>一次</em> GGML 计算图提交。在 CUDA/Vulkan 上该图只构建一次、张量地址保持稳定后反复重放，这正是 ggml-cuda 能把它捕获成 CUDA 图的前提。GPT OSS decode 在 A40 上从 24 → 154 tok/s，且随上下文长度基本持平（16K 时 133 tok/s，而逐层路径已跌到 2.3）。按模型的关闭开关：<code>TS_GPTOSS_MODEL_DECODE=0</code>、<code>TS_GEMMA4_FD_PERSIST=0</code>、<code>TS_QWEN35_FD_PERSIST=0</code>。</li>
     <li><strong>DeepSeek V4 整模型执行器</strong> —— <code>deepseek4</code> 完全绕开通用的逐算子前向。每套执行器自行加载分片 GGUF，把权重按层切分到所有可见 GPU，在设备上持有全部 DSV4 KV 状态（原始 SWA 环、CSA/HCA 压缩 K 缓存、lightning indexer 缓存），并把每个 prefill/decode 微批作为一张计算图执行，配合按形状签名的缓存，使稳态 decode 直接重放已捕获的 CUDA 图。decode 注意力通过融合的 index-gather 取出紧凑的 <code>[ring | top-512]</code> K，而不是扫描整个上下文。</li>
+    <li><strong>GLM 5.x 整模型执行器</strong> —— <code>glm-dsa</code> 的做法相同：原生执行器自行加载 6 分片的 split GGUF，把权重按层切分到所有可见 GPU，在设备上持有 MLA 与 lightning indexer 的缓存，并通过按形状键控的 LRU 缓存把每个 prefill/decode 微批作为一张计算图提交，使稳态 decode 重放同一张已分配（在 CUDA 上还已捕获）的图。提示长度不到索引器 top-k 时会跳过稀疏选择直接走稠密注意力，因此短提示不为 DSA 付出任何代价；显存允许时 <code>TS_GLM_UBATCH=2048</code> 可以调大 prefill 微批（3× RTX PRO 6000 上 pp2048 从 918.9 提到 1145.8 tok/s）。</li>
     <li><strong>Nemotron-H 设备侧 decode 注意力</strong> —— 在 GGML 后端上，注意力层直接用 flash-attention 内核对常驻 KV 缓存做 decode（<code>TS_NEMOTRON_FLASH_DECODE=0</code> 恢复主机路径），decode 速度不再随上下文长度衰减。</li>
     <li><strong>保留 E4B 语义的融合 prefill / verify</strong> —— 原生整模型路径会在 E4B prefill/verify 中携带逐层嵌入（PLE）与共享 KV donor 映射，而不会回退到数百次逐 op 提交。</li>
     <li><strong>调度器自动 N=1 快路径</strong> —— 只有一个序列被调度时，服务器会自动使用 Gemma 4 的融合逐序列 forward，避免完全批处理路径的固定开销。</li>
@@ -129,6 +132,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model DeepSeek-V4-Flash-.
     <li><strong>最佳匹配内存池</strong>，带有界保留（块上限 64 MB，池上限 32 块），让长时间运行中工作集保持紧凑。</li>
     <li><strong>带可选 SSD 溢出的分页 KV 块池</strong> —— RAM 上限、LRU 淘汰，并跨会话做内容哈希前缀复用。</li>
     <li><strong>KV 块编解码器</strong> —— 通过 <code>--paged-kv-quant-bits</code> 用 <code>TurboQuantKvCodec</code>（Q2 / Q4 / Q8）做可选的原地压缩，以很小的精度代价换取每块占用减半 / 减至四分之一。</li>
+    <li><strong>上下文按实际空闲的显存来定</strong> —— 自报的上下文是上限而不是请求。GLM-5.2 的 GGUF 宣称 1,048,576 token，那是约 93 GiB 的 KV，所以权重落盘之后，加载器会去问每张卡还剩多少，按「缓存加一整个 prefill 计算图」能装下的大小定上下文，并打印它的选择：3 卡按层切分 342,272 token，<code>--n-cpu-moe 30</code> 646,400，<code>--tp 3</code> 91,136。设 <code>MAX_CONTEXT</code> 则把某个长度变成硬性要求——放得下就照办，放不下会带着数字直接报错。</li>
   </ul>
 
   <div class="content-footer">

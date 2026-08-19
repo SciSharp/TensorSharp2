@@ -17,6 +17,8 @@
 
 **DeepSeek V4 Flash 是上表的例外。** 它那套 284B 的压缩稀疏注意力 MoE 结构不走通用的逐算子路径，而是使用三套专属的整模型执行器之一：Direct CUDA 引擎（`--backend cuda`）、原生 ggml 执行器（`--backend ggml_cuda` / `ggml_vulkan`），以及 100% 纯 C# 的 CPU 执行器（`--backend cpu`，直接从内存映射的 GGUF 分片提供量化权重）。三者都会把权重按层切分到所有可见 GPU（CPU 路径则从映射分片流式读取），因此远大于单卡显存的模型依然跑得起来。详见 [DeepSeek V4 卡片](docs/models/deepseek4_zh-cn.md)。
 
+**GLM 5.x（`glm-dsa`）是另一个例外。** 它那套 744B-A40B 的 MLA + 稀疏注意力 MoE 在 `--backend ggml_cuda` / `ggml_vulkan` / `ggml_cpu` / `ggml_metal` 上走原生整模型 ggml 执行器，在 `--backend cpu`（100% 托管，无原生依赖）与 `--backend cuda` 上走托管逐算子路径；在 GGML 后端上设 `TS_GLM_NATIVE=0` 可切到托管路径做 A/B 对照。那份 6 分片的 GGUF 由 `GgufFile` 自己处理——`--model` 指向 `-00001-of-00006` 那一片即可。MLX 跑不了它。详见 [GLM 卡片](docs/models/glm_zh-cn.md)。
+
 
 
 ## 配置文件（CLI + Server）
@@ -204,7 +206,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--backend <type>` | 计算后端：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan` |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里并在 CPU 上做乘法；注意力、norm、路由器与始终活跃的共享专家仍留在加速器上（等价于 llama.cpp 的 `--n-cpu-moe`）。正是它让 35B-A3B 这类 MoE 能与长上下文 KV 缓存一起塞进 12–16 GB 的显卡。传 `all` 表示所有层。默认：所有架构（含 DeepSeek V4）都是 0 —— 装不下的模型会在加载时被拒绝并告知需要卸载多少层，而不会被悄悄卸载（环境变量 `TS_N_CPU_MOE`）。详见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。 |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里并在 CPU 上做乘法；注意力、norm、路由器与始终活跃的共享专家仍留在加速器上（等价于 llama.cpp 的 `--n-cpu-moe`）。正是它让 35B-A3B 这类 MoE 能与长上下文 KV 缓存一起塞进 12–16 GB 的显卡。传 `all` 表示所有层。默认：所有架构（含 DeepSeek V4 与 GLM 5.x）都是 0 —— 装不下的模型会在加载时被拒绝并告知需要卸载多少层，而不会被悄悄卸载（环境变量 `TS_N_CPU_MOE`）。详见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。 |
 | `--cpu-moe` / `-cmoe` | `--n-cpu-moe all` 的简写。默认：关闭（环境变量 `TS_CPU_MOE`）。 |
 | `--cpu-moe-threads <N>` | 主机侧专家矩阵乘的工作线程数。默认：在核数多于 8 的主机上取本进程实际可用 CPU 并行度（`hardware_concurrency`，再受调度亲和性掩码与 cgroup CPU 配额约束）的**一半**，低于 8 时取「全部减一」。另一半并非浪费——加速器提交线程，以及 `TensorSharp.Server` 里的 Kestrel 与调度器，同样需要可被调度，而 .NET 自己的线程池是按机器 CPU 数而不是 cgroup 配额来定的。把它设到接近配额是悬崖而不是缓坡：在 95 CPU 配额下，托管的 26B MoE 在 64 线程时实测 20.7 tok/s，71 线程时只剩 8.2。独占机器上可以调高（环境变量 `TS_CPU_MOE_THREADS`）。 |
 | `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16`、`q8_0` 或 `q4_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径。 |
@@ -214,8 +216,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
 | `--system <text>` | 用于初始化交互式会话的系统提示词（在 REPL 中可用 `/system` 覆盖） |
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
-| `--think` | 启用思维链/推理模式 |
-| `--tools <path>` | 包含工具/函数定义的 JSON 文件 |
+| `--think` | 启用思维链/推理模式。所有系列（含 GLM 5.x）都是按需开启：不加时 GLM 的模板会把推理块立刻闭合（`<think></think>`），模型直接作答；加上后提示里会带上 `Reasoning Effort: Max`，并留下一个未闭合的 `<think>` 交给模型自己收尾。REPL 里用 `/think on\|off` 切换。 |
+| `--tools <path>` | 包含工具/函数定义的 JSON 文件。线格式因系列而异，解析器按架构选取——GLM 5.x 发出的是 XML（`<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`，每个参数一个元素，非纯字符串的值以 `tojson` 编码）而不是 JSON 主体，服务端会把它解析回常规的 OpenAI 工具调用字段，因此客户端看到的仍是标准形状。 |
 | `--draft-model <path>` | 投机解码草稿 GGUF，适用于草稿器以独立文件发布的架构——DeepSeek V4 的 DSpark 支持模块（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）与 Muse-Glimmer 的 DFlash 块级草稿器（见 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md#3-dflash-投机解码)，环境变量 `TS_MUSE_GLIMMER_DFLASH`）。它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。在所有单序列路径（`--input`、`--input-jsonl`、`--multi-turn-jsonl`、`--interactive`）上生效，需要 `--backend cuda` 或 `--backend ggml_cuda`，并且必须是纯 argmax 采样：任何 temperature、top-k/p 或重复/存在/频率惩罚都会将其关闭。环境变量：`TS_DSV4_DSPARK`。 |
 | `--spec-draft-n-max <N>` | 每个投机块最多起草的 token 数（默认：草稿器训练时的块大小；DSpark 为 5，Muse-Glimmer 的 DFlash 为 15） |
 | `--spec-draft-conf-min <p>` | 保留某个起草位置所需的最小**累积**接受概率（置信度头各位置估计值的乘积，默认 `0.35`）。调低会起草更远、回滚更多；调高则更早退回普通 decode。 |
@@ -405,7 +407,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `--tp-peers <list>` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，按节点 ID 排序，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `--tp-node-id` 一起使用。环境变量：`TENSORSHARP_TP_PEERS`。 |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里、在 CPU 上运行其 FFN（见上文**混合专家 CPU 卸载**）。`all` 表示卸载所有层。默认：所有架构（含 DeepSeek V4）都是 0；装不下的模型会在加载时被拒绝并告知需要卸载多少层。环境变量：`TS_N_CPU_MOE`。 |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里、在 CPU 上运行其 FFN（见上文**混合专家 CPU 卸载**）。`all` 表示卸载所有层。默认：所有架构（含 DeepSeek V4 与 GLM 5.x）都是 0；装不下的模型会在加载时被拒绝并告知需要卸载多少层。环境变量：`TS_N_CPU_MOE`。 |
 | `--cpu-moe` / `-cmoe` | `--n-cpu-moe all` 的简写。默认：关闭。环境变量：`TS_CPU_MOE`。 |
 | `--cpu-moe-threads <N>` | 主机侧专家矩阵乘的工作线程数。默认：在核数多于 8 的主机上取可用 CPU 并行度（`hardware_concurrency`，再受亲和性掩码与 cgroup CPU 配额约束）的一半。服务端还需要另一半来跑 Kestrel、调度器与加速器提交线程；把它设到接近配额会让吞吐直接崩塌而不是缓慢下降（95 CPU 配额下 64 线程 20.7 tok/s，71 线程只剩 8.2）。环境变量：`TS_CPU_MOE_THREADS`。 |
 | `--help` | 打印参数说明后退出（不带任何参数启动服务时也会显示） |
@@ -454,6 +456,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 |---|---|
 | `BACKEND` | 未传 `--backend` 时使用的默认计算后端（`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan`；默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `MAX_TOKENS` | 未传 `--max-tokens` 时的最大生成长度：请求未携带上限时用它填充，请求要求更多时按它截断（默认：`20000`，该默认值只填充、不截断） |
+| `MAX_CONTEXT` | 要分配的上下文窗口，覆盖 GGUF 自报的长度。设了它就是**硬上限**：缓存加一整个 `n_ubatch` 的计算图装得下就照办，装不下就带着具体数字拒绝加载。不设时，自报长度只是**上界**——权重加载完之后运行时会去问各设备实际还剩多少显存，按能装下的大小定上下文，并把选中的值打印出来。GLM-5.2 自报 1,048,576 token（约 93 GiB 的 KV）；在 3x RTX PRO 6000 上按层切分选到 342,272，`--tp 3` 选到 91,136，`--n-cpu-moe 30` 选到 646,400 |
 | `VIDEO_SAMPLE_FPS` | 输入视频作为多模态提示词时每秒抽取的帧数；基于时间的抽帧（默认：`1`）。它与 Wan 生成视频的输出 `--fps` 无关 |
 | `VIDEO_MAX_FRAMES` | 输入视频作为多模态提示词时抽取帧数的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制）。它与 Wan 生成视频的输出 `--video-frames` 无关 |
 | `PORT` / `HOST` | 未传 `--port` / `--host` 时的监听端口与绑定网卡（默认：`5000`、`0.0.0.0`） |
@@ -827,6 +830,14 @@ token）——注意卸载配置离这张卡的 16 GB 有多远，以及 GPT-OSS
   `TS_HOST_MOE_VERIFY=1` 在单 GPU 上报告的那约 1–5% 的相对差异。纯 C# 的 `cuda`
   后端没有主机 MoE 接缝，因此在那里使用 `--tp N --cpu-moe` 会打印
   `[moe-offload] WARNING` 并让专家保持常驻。
+* **GLM 5.x 的卸载专家直接从映射里取。** 原生 glm-dsa 执行器把留在主机上的路由专家
+  保持在 GGUF 的 mmap 里就地做乘法，而不是先拷进一块私有缓冲
+  （`TS_GLM_MOE_MMAP=0` 则改为拷贝），正是这一点让「卸载一个 744B 模型的 30 层」
+  在加载时几乎不花时间，而不是一次 100 GB 的 memcpy。它也能与 `--tp` 叠加：被卸载
+  的层保持专家完整，由 rank 0 求值。在 3x RTX PRO 6000、GLM-5.2 UD-IQ2_XXS、
+  prefill 2048 / decode 64 上实测：`--n-cpu-moe 30` 为 94.7 / 16.4 tok/s，全部常驻
+  时为 915.9 / 43.9。这里卸载买到的是「装得下」而不是速度——它腾出的显存把可用
+  上下文从 342,272 抬到了 646,400 token。
 * `TS_HOST_MOE_VERIFY=1` 会在主机链路旁同时构建 GPU 上的专家链路，并报告二者的逐层
   偏差——用于在同样能塞进显存的模型上验证接缝的诊断手段。`TS_HOST_MOE_DEBUG=1` 打印
   分段计划（节点切点）与每个接缝的激活范数。`TS_HOST_MOE_TIMING=1` 报告卸载侧的墙钟
@@ -838,6 +849,32 @@ token）——注意卸载配置离这张卡的 16 GB 有多远，以及 GPT-OSS
 TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范式把单个模型切分
 到多张 GPU 上——以及**分布式（多节点）张量并行**，让 TP 跨越多台通过 TCP 点对点
 网络互联的机器。
+
+### TP 与按层切分——在多卡机器上到底发生了什么
+
+模型占用多张 GPU 有两种完全不同的方式，其中只有一种是 `--tp`。
+
+**张量并行（`--tp N`）**把*每一层*都放到*每个 rank* 上，切分的是层*内部*的权重，
+于是一次 decode 每张卡只读 `1/N` 的字节，各 rank 在每个层边界做 all-reduce。下表
+里的所有架构都支持它，而且它是**按需开启**的——不主动要求，就不会有任何张量被切开。
+
+**按层切分**则是把*整层*放到不同设备上并顺序执行——设备 0 算第 0..k 层，把隐状态
+交给设备 1，依此类推。切点并不是简单的 `n_layer/N`：加载器会测量每张卡的空闲显存，
+再做装箱以均衡「占用预算的最大比例」，因此配置不一致的一组卡也能被均匀填满。没有
+集合通信、层内也不切分，因此在慢速互连上不花额外代价，但同一时刻只有一张卡在忙。这只适用于**两个架构——DeepSeek V4 Flash（`deepseek4`）
+与 GLM 5.x（`glm-dsa`）**，因为只有它们走各自的整模型执行器；而且这是它们**不加任何
+参数时的默认行为**：它们会摊到所有可见 GPU 上，因为两者都装不进单卡。`TS_DSV4_NGPU`
+与 `TS_GLM_NGPU` 用来限制使用几张卡。
+
+在**其他所有架构**上，不加 `--tp` 就是**只用一张 GPU**。通用的逐算子路径与融合图
+路径都没有自动按层切分——装不下单卡的模型会在加载时失败，而不会被悄悄摊开。（那条
+会告诉你正好需要多少 `--n-cpu-moe N` 的拒绝信息，来自 DeepSeek V4 与 GLM 5.x 的
+整模型加载器。）
+
+所以在一台 3 卡机器上：只写 `--backend ggml_cuda`，GLM 5.x 与 DeepSeek V4 会用满三张卡
+（按层切分），Gemma 4 只用一张；再加上 `--tp 3`，GLM 5.x 切换成张量并行，DeepSeek V4 只是把按层切分限制在这 3 张卡上
+（那里的 `--tp N` 仅仅是个设备数，与 `TS_DSV4_NGPU` 等价），Gemma 4 则用上三张卡。
+在 GLM 5.x 上这个切换只会更慢，换来的仅仅是容量——见下文的**预期效果**实测数据。
 
 ### 本地张量并行（单进程，多 GPU）
 
@@ -906,6 +943,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属；GGML 上为专家并行 MoE（每个 rank 持有整个专家，shared expert 仍按 Megatron 切分）与列并行 LM head，Direct CUDA 上为专家切分。`cuda` 与 `ggml_cuda` / `ggml_vulkan` 均可运行——GGML 路径使用打包的按 rank GDN 内核（`TSGgml_Qwen35GdnLayerTP`）并把循环状态常驻设备 |
 | GPT OSS | ✅ | MoE 专家切分，attention sink，YaRN。`cuda` 与 GGML 后端均可运行；GGML 路径目前仍按 token 逐个遍历专家（尚未使用专家并行） |
 | Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算，MoE 专家切分。GGML 上的限制与 GPT OSS 相同 |
+| GLM 5.x | ✅ | MLA 的头按列并行（`attn_q_b` / `attn_k_b` / `attn_v_b`）、`attn_output` 按行并行；256 个路由专家是**在每个专家内部按行切**（gate/up 列并行、down 行并行）而不是按专家 id 切，因为 `ggml_mul_mat_id` 要求一个 token 选中的专家 id 互不相同。路由器、norm、DSA 索引器、共享专家与前 3 个稠密层都是复制的；每层两次 all-reduce。`TS_GLM_TP_SHARD` 选择切哪一半（1 头、2 专家、3 两者都切），`TS_GLM_TP_OVERSUBSCRIBE=1` 允许多个 rank 挤在同一张卡上做正确性测试。仅限 GGML 后端 |
 | DiffusionGemma | — | 不适用（扩散模型） |
 | Qwen-Image-Edit | — | 不适用（图像生成） |
 
@@ -948,6 +986,15 @@ Qwen 3.5-9B 上为 1.06×；两个 Gemma 4 模型的输出与单卡逐字节一�
 约束且要承担集合通信开销，因此在单卡装得下的模型上持平或略低于单卡。
 Qwen 3.5-35B 在 16 GB 卡上根本装不下，只能靠 TP 运行。完整测量数据与尚待融合的
 部分见 `TENSOR_PARALLELISM_PLAN.md`（Stage 1b 与 1c）。
+
+TP 能带来多少，取决于互连带宽以及一层里究竟有多少能拆。在 GLM-5.2 上（3x
+RTX PRO 6000，PCIe，无 NVLink）它什么也带不来：`--tp 3` 实测 pp2048 505.6 /
+tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6144, n_tokens]`
+的隐状态做两次 all-reduce，占用的总线时间比拆分省下的算力还多。而且每个 rank 都
+要各自持有一份全长缓存，能装下的上下文因此从 342,272 token 掉到 91,136；它还改变
+了归约顺序，所以在 2-bit MoE 上，对着录制的 llama.cpp 金标准，按层切分复现 5/6 条
+提示，而 `--tp 3` 只复现 3/6。
+只在带 NVLink 的机器上、或者模型没有别的办法装下时才用它。
 
 | 变量 | 作用 |
 |---|---|
@@ -1027,6 +1074,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 | Qwen 3.5 / 3.6 系列 | 启用 | `TS_QWEN35_BATCHED=0` 强制走旧的按序列路径（或 `--no-continuous-batching`） | `TS_QWEN35_BATCHED_GDN_NATIVE=1` 启用原生批处理 GDN 内核；`FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` 覆盖融合注意力启用阈值（默认 4096） |
 | GPT OSS | 启用 | `TS_GPTOSS_BATCHED=0` 强制走旧的按序列路径 | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制使用托管 (C#) sinks softmax，而非原生带 sinks 的分页注意力内核 |
 | Nemotron-H | 启用 | `TS_NEMOTRON_BATCHED=0` 强制走旧的按序列路径 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 步（NEON SIMD + GCD 并行） |
+| GLM 5.x | 未实现——并发走的是原生的按序列**槽位**（每个请求拥有自己的 MLA 与索引器缓存以及自己的 `n_past`；绑定请求只是切换活跃槽位，不搬运任何 KV 字节）。MLA 每个 token 只存一行 576 宽的数据，DSA 索引器打分的也正是这段连续历史，所以这里没有可供批处理的分页 KV 布局 | — | `TS_BATCHED_FUSED_DECODE=1` 启用跨槽位的批处理融合解码（一张图、每个序列一个 token、权重只读一次）：4 路并发下总解码吞吐 1.81 倍。默认关闭，因为批处理会改变 GEMM 形状，而 2-bit MoE 会把这点差异放大成不同的专家选择；`TS_GLM_BATCHED_DECODE=0` 让原生侧直接拒绝它 |
 | Gemma 3 | 未实现（走按序列回退） | — | — |
 | DiffusionGemma | Web UI 路径使用独立 diffusion 调度器；不是 `IBatchedPagedModel` 自回归路径 | `DIFFUSION_MAX_BATCH`、`DIFFUSION_STEPS` | `DIFFUSION_BATCHED_FORWARD=1` 启用真正的批处理 canvas decode；GGML 融合 decode 默认开启，可用 `DIFFUSION_NO_FUSED_DECODE=1` 关闭 |
 
@@ -1041,6 +1089,24 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 | Gemma 4 融合验证 / 草稿内核（ggml） | 开启 | `TS_GMTP_NO_FUSED=1` 回退到逐算子 | — |
 | Gemma 4 部分接受时的稠密快速回滚 | 开启 | `TS_GMTP_NO_FAST_ROLLBACK=1` 恢复保留前缀回滚 | — |
 | Gemma 4 验证主干路径 | 线性（单序列） | `TS_GMTP_BATCHED_TRUNK=1` 走批量分页主干 | — |
+
+#### GLM 5.x（`glm-dsa`）
+
+完整列表（含调试与 A/B 开关）见 [GLM 卡片](docs/models/glm_zh-cn.md#环境变量)。
+
+| 特性 | 默认 | 环境变量 | 对应 CLI |
+|---|---|---|---|
+| 执行器 | 原生整模型 ggml 计算图 | `TS_GLM_NATIVE=0` 在 GGML 后端上改走托管逐算子路径 | `--backend cpu` / `cuda` 本来就是托管路径 |
+| Prefill 微批 | `1024` | `TS_GLM_UBATCH=N`——显存允许时 `2048` 实测 pp2048 1145.8，对比 918.9 | — |
+| 按层切分使用的 GPU 数 | 全部可见 GPU | `TS_GLM_NGPU=N` | — |
+| 每张卡为计算缓冲预留的余量 | `3072` MB | `TS_GLM_VRAM_RESERVE_MB=N` | — |
+| 上下文窗口 | 自报长度只作**上界**，加载后按实际空闲显存重新定档 | `MAX_CONTEXT=N` 把它变成硬上限 | —（仅环境变量） |
+| 张量并行切哪一半 | `3`（头 + 路由专家） | `TS_GLM_TP_SHARD`（1 头、2 专家、3 两者都切）、`TS_GLM_TP_OVERSUBSCRIBE=1` 允许多个 rank 挤在一张卡上做测试 | `--tp N` |
+| 主机端专家从 GGUF 映射直接读取 | 开启 | `TS_GLM_MOE_MMAP=0` 改为拷进私有缓冲 | 由 `--n-cpu-moe N` 决定哪些层 |
+| 跨序列的批处理融合解码 | 关闭 | **`TS_BATCHED_FUSED_DECODE=1`**；`TS_GLM_BATCHED_DECODE=0` 让原生侧拒绝它 | — |
+| Flash attention / 融合 lightning 索引器 | 开启 | `TS_GLM_FA=0`、`TS_GLM_FUSED_LID=0` 退回到基本算子拼装 | — |
+| 缓存的已构建+已分配计算图数量 | `8` | `TS_GLM_GRAPH_CACHE=N` | — |
+| 权重加载并行度 | `16` 线程 / `64` MB 分块 | `TS_GLM_LOAD_THREADS`、`TS_GLM_LOAD_CHUNK_MB` | — |
 
 #### 张量并行与分布式推理
 

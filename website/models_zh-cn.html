@@ -23,7 +23,7 @@
   <p>完整参考分为四个页面。如果你已经确定要用哪个模型，从"模型下载"开始；如果还在挑选，从对应的分类页面开始。</p>
   <div class="card-grid">
     <a class="card" href="models-downloads_zh-cn.html"><div class="ic">⬇️</div><h3>模型下载</h3><p>所有 GGUF，以及各家族所需的投影器、VAE、编码器与草稿模型。</p></a>
-    <a class="card" href="models-text_zh-cn.html"><div class="ic">🧠</div><h3>文本与 LLM 模型</h3><p>十种架构及其运行示例，加上多模态输入、思考模式与工具调用。</p></a>
+    <a class="card" href="models-text_zh-cn.html"><div class="ic">🧠</div><h3>文本与 LLM 模型</h3><p>十一种架构及其运行示例，加上多模态输入、思考模式与工具调用。</p></a>
     <a class="card" href="models-image_zh-cn.html"><div class="ic">🖼️</div><h3>图像生成</h3><p>Qwen-Image-Edit、Lightning LoRA，以及 DiT 步缓存。</p></a>
     <a class="card" href="models-video_zh-cn.html"><div class="ic">🎬</div><h3>视频生成</h3><p>Wan 2.1 / 2.2，以及把数小时变成几分钟的蒸馏检查点。</p></a>
   </div>
@@ -65,7 +65,8 @@
       <tr><td>Qwen 3.6 / Gemma 4</td><td>在 <code>TensorSharp.Server</code> 上加 <code>--mtp-spec</code>——Qwen 3.6 用 <code>-MTP-</code> GGUF 内嵌的 NextN 块，Gemma 4 用独立的 <code>--mtp-draft-model</code> 草稿</td><td>仅在单独（无并发）序列上启用，并且只在有收益处启用：Qwen 3.6 的内嵌 NextN 块在所有后端上都被认为有收益，而 Gemma 4 的独立草稿头只在各 ggml 后端与直连 <code>cuda</code> 后端上启用；CPU / GGML CPU / MLX 走标准 decode。可用 <code>--mtp-draft</code>（默认 8）与 <code>--mtp-pmin</code>（默认 0.75）调节</td></tr>
       <tr><td>所有文本家族</td><td>选对 <code>--backend</code>：NVIDIA 用 <code>ggml_cuda</code>，Apple Silicon 用 <code>ggml_metal</code>，CPU 用 <code>ggml_cpu</code>（而非 <code>cpu</code>）</td><td>RTX 3080 Laptop、gemma-4-26B-A4B QAT：<code>ggml_cuda</code> decode 78.7 tok/s，直连 <code>cuda</code> 后端 35.3；prefill 1832 对 128。Apple Silicon、Muse-Glimmer-30B：<code>ggml_metal</code> prefill 413.6，<code>mlx</code> 仅 29.0</td></tr>
       <tr><td>装不下的 MoE</td><td><code>--n-cpu-moe N</code> / <code>--cpu-moe</code>——把前 N 层的路由专家权重留在系统内存</td><td>以 decode 换显存；但只要能避免显存溢出就是净赚：gpt-oss-20b 在 16 GB 卡上 16.2 → 2.9 GB，<code>--n-cpu-moe 12</code> 把 WDDM 换页导致的 0.3 tok/s 变成 25.4</td></tr>
-      <tr><td>多 GPU</td><td>在直连 <code>cuda</code> 与 GGML CUDA / Vulkan 上使用 <code>--tp N</code>（环境变量 <code>TENSORSHARP_TP_DEGREE</code>）</td><td>Muse-Glimmer-30B UD-IQ2_XXS、2× RTX PRO 4000：prefill 1171 → 1569（1.34×），decode 40.2 → 63.2 tok/s（1.57×）。它还能跑单卡完全装不下的模型</td></tr>
+      <tr><td>GLM 5.x</td><td><code>TS_GLM_UBATCH=2048</code> —— 显存允许时把 prefill 微批调大</td><td>3× RTX PRO 6000、GLM-5.2 UD-IQ2_XXS：pp2048 从 918.9 到 1145.8 t/s，pp4096 从 864.7 到 1048.7 t/s；decode 受访存约束，仍是约 43.9 tok/s。256 个专家 top-8 的情况下，分块太小会让每个专家 GEMM 的 tile 大半是填充</td></tr>
+      <tr><td>多 GPU</td><td>在直连 <code>cuda</code> 与 GGML CUDA / Vulkan 上使用 <code>--tp N</code>（环境变量 <code>TENSORSHARP_TP_DEGREE</code>）</td><td>Muse-Glimmer-30B UD-IQ2_XXS、2× RTX PRO 4000：prefill 1171 → 1569（1.34×），decode 40.2 → 63.2 tok/s（1.57×）。它还能跑单卡完全装不下的模型——但前提是互连付得起这笔账：在没有 NVLink 的 PCIe 主机上，逐层的 all-reduce 可能比拆分省下的还贵，GLM-5.2 在 3× RTX PRO 6000 上就从 pp2048 915.9 / tg64 43.9 掉到 <code>--tp 3</code> 的 505.6 / 17.6</td></tr>
     </tbody>
   </table>
   </div>

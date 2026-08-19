@@ -66,6 +66,23 @@
   </div>
   <p>The pattern: TensorSharp's fused whole-model graph wins prefill below ~2K by 1.16-1.27×, the engines cross somewhere between 2K and 16K, and llama.cpp keeps a 6-8% prefill edge above that; decode is a tie at short context and drifts to 0.86× at 128K. With <strong>DFlash</strong> speculative decoding TensorSharp is ahead at short and mid prompts and behind from 16K up — but that gap is mostly a runtime <em>cost governor</em> that parks the drafter after a mis-measured probe: on the reps where it stays armed, TensorSharp reaches 94% of llama.cpp at 16K and 96% at 64K. The absolute DFlash figures also depend heavily on the corpus (the 501-token prompt hits 100% draft acceptance on <em>both</em> engines). Both engines run the full 128K context on one card. One caveat on the two long rows: they were taken before a line-ending fix landed in the harness, so on those points TensorSharp prefilled the CRLF form of the same document (1.2% more tokens); throughput is a rate so the effect is small, but the generated continuations are not strictly comparable there. Method, per-rep spread, VRAM and the governor analysis are in the <a href="models.html#table">Muse-Glimmer architecture card</a> (<code>docs/models/muse-glimmer.md</code>).</p>
 
+  <h2 id="glm">GLM-5.2 744B: the other end of the size range</h2>
+  <p>A second hand-run comparison, this one on a model no single card holds: <strong>3× RTX PRO 6000 Blackwell (97 GiB each, PCIe, no NVLink)</strong>, <code>GLM-5.2-UD-IQ2_XXS</code> (744B-A40B MoE, MLA + DeepSeek Sparse Attention, 218 GiB of weights layer-split across the three cards), both engines measured back to back in one session — <code>llama-bench</code> for llama.cpp, and the parity harness's <code>--bench</code>, which reports the best of two repetitions the same way. Run-to-run spread is about 4%.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Test</th><th>llama.cpp</th><th>TensorSharp (default <code>n_ubatch</code> 1024)</th><th>TensorSharp (<code>TS_GLM_UBATCH=2048</code>)</th></tr></thead>
+    <tbody>
+      <tr><td>pp128</td><td><strong>276.5</strong></td><td>254.8</td><td>264.4</td></tr>
+      <tr><td>pp512</td><td><strong>695.4</strong></td><td>666.9</td><td>659.6</td></tr>
+      <tr><td>pp2048</td><td>763.1</td><td><span class="yes">918.9</span></td><td><span class="yes"><strong>1145.8</strong></span></td></tr>
+      <tr><td>pp4096</td><td>715.8</td><td><span class="yes">864.7</span></td><td><span class="yes"><strong>1048.7</strong></span></td></tr>
+      <tr><td>tg64</td><td>42.2</td><td><span class="yes">43.7</span></td><td><span class="yes"><strong>43.9</strong></span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The crossover sits around a thousand prompt tokens, and the micro-batch is why: with 256 experts at top-8, a 512-token chunk routes only ~16 rows to each expert, so most of every expert-GEMM tile is padding and a bigger chunk buys more than anything else on the graph. Below that a whole prefill is one small graph, and the fixed cost per call — the managed hop, the input uploads, the 154,880-wide logits copy back — is a visible fraction of it, which is where llama.cpp's few percent come from. Decode is memory-bound and lands a few percent ahead either way. Output is checked as well as timed: on the same backend TensorSharp reproduces llama.cpp token-for-token on 6/6 recorded prompts on <code>ggml_cuda</code>, 3/3 on <code>ggml_cpu</code>, and 1/1 on the 100% managed <code>cpu</code> backend.</p>
+  <p>Two things do <em>not</em> speed this model up on this host. <code>--tp 3</code> takes pp2048 / tg64 from 915.9 / 43.9 to 505.6 / 17.6 — each of the 78 layers needs two all-reduces of a <code>[6144, n_tokens]</code> hidden state, and PCIe with no NVLink cannot pay for that. <code>--n-cpu-moe 30</code> takes it to 94.7 / 16.4. Both are there so a checkpoint that would not otherwise fit runs at all: offload raises the context the loader can size from 342,272 to 646,400 tokens. See <a href="models-text.html#glm">GLM 5.x</a>.</p>
+
   <h2 id="wan">Wan video: two independent speed levers</h2>
   <p>Video is the one workload where the wrong choice costs <em>hours</em> rather than seconds, so it is worth seeing the levers apart. Every row below is the <strong>same request</strong> — Apple <strong>M5 Pro (20-core GPU, 48 GB unified)</strong>, <code>ggml_metal</code>, <code>Wan2.2-TI2V-5B</code> Q8_0, image-to-video at <strong>1088×832 × 121 frames = 27,404 DiT tokens</strong> — and the rows differ only in the engine version and in which checkpoint <code>--model</code> pointed at.</p>
   <div class="table-scroll">

@@ -47,9 +47,16 @@ so every model in the repo can now be stored across several files.
 
 ### Tensor parallelism
 
-`--tp N` (or `TENSORSHARP_TP_DEGREE`) runs every layer on every one of N GPUs
-instead of splitting the layers between them, so decode reads 1/N of the weights
-per device instead of walking all of them in sequence. The split follows the
+**Without `--tp`, a multi-GPU box already uses every card**: the loader measures
+each device's free VRAM and bin-packs the 78 layers across them, so device 0 runs
+layers 0..k, hands the hidden state on, and so on. That is the default and there
+is no flag for it — a 226 GiB checkpoint fits no other way. `TS_GLM_NGPU` caps how
+many devices it uses, and if even the full set is not enough the load is refused
+with the exact `--n-cpu-moe N` that would make it fit.
+
+`--tp N` (or `TENSORSHARP_TP_DEGREE`) is the other mode: it runs every layer on
+every one of N GPUs and splits the weights *inside* each layer, so decode reads
+1/N of the weights per device instead of walking all of them in sequence. The split follows the
 Megatron column/row pattern used by the rest of the repo:
 
 | Piece | Split | Collective |
@@ -57,7 +64,7 @@ Megatron column/row pattern used by the rest of the repo:
 | Attention heads | column-parallel `attn_q_b` / `attn_k_b` / `attn_v_b`, row-parallel `attn_output` | one all-reduce per layer |
 | Routed experts | column-parallel `ffn_gate_exps` / `ffn_up_exps`, row-parallel `ffn_down_exps` — **every expert is split row-wise, the experts are not divided between ranks** | one all-reduce per layer |
 | Router, norms, indexer, shared expert, dense layers | replicated | none |
-| MLA + indexer caches | per rank, for that rank's heads | none |
+| MLA + indexer caches | **replicated — every rank keeps its own full-length copy.** The 576-wide MLA row is shared by all heads, so there is nothing head-shaped to shard; this is why `--tp N` multiplies the KV footprint by N and drops the fitted context | none |
 
 Splitting the expert *hidden* dimension rather than the expert *ids* is what
 makes this work at all: `ggml_mul_mat_id` needs a token's selected expert ids to
@@ -132,7 +139,7 @@ llama.cpp; reproducing it restored 6/6.
 
 ## Numerical parity
 
-Measured on GLM-5.2-UD-IQ2_XXS (222 GiB) against `llama.cpp b200-9731ad3` on the
+Measured on GLM-5.2-UD-IQ2_XXS (226 GiB) against `llama.cpp b200-9731ad3` on the
 same machine, feeding the RECORDED prompt token ids so the comparison isolates
 the forward pass from tokenization (`.parity/gen_ref_glm.py`,
 `InferenceWeb.Tests/GlmDsaParityTests.cs`):
@@ -207,7 +214,7 @@ attention turns one GEMM into a sum of per-rank partials, so the residual differ
 in the last bits, and — exactly as for batched decode above — 75 layers of
 top-8-of-256 routing amplify that into a different continuation on a 2-bit
 checkpoint. Against the recorded llama.cpp goldens the layer split reproduces
-5/6 short prompts and `--tp 3` reproduces 3/6; the tokens that differ are the
+5 of the 6 recorded prompts and `--tp 3` reproduces 3 of 6; the tokens that differ are the
 near-tied ones. The second is speed, and the reason is the interconnect. Each
 layer needs two all-reduces of the `[6144, n_tokens]` hidden state, and these
 cards are PCIe-attached with no
@@ -253,11 +260,14 @@ on its own reproduces llama.cpp 3/3.
 
 The GGUF advertises 1,048,576 tokens. That is not a promise the caches fit: at
 78 layers a 576-wide MLA row plus the indexer's is ~93 KiB per token, so a 1M
-context is ~98 GiB of KV — more than the weights — before the graphs are
+context is ~93 GiB of KV — a whole card's worth on top of the weights — before the graphs are
 counted. So the advertised number is treated as a **ceiling**, not a request:
 the loader sizes the context from the VRAM actually left after the weights land
 (minus what the DSA masks and the LM head need for one `n_ubatch` graph) and
-says what it picked.
+says what it picked. On the default layer split across the three cards above that
+pick is 342,272 tokens, and `--n-cpu-moe 30` raises it to 646,400. The line below
+comes from a `--tp 3` run, where every rank holds a full-length cache and the
+pick therefore drops much further:
 
 ```
 [glm] context 91136 tokens (the GGUF advertises 1048576): 18.3 GiB free per rank
@@ -297,10 +307,12 @@ shrunk under you.
 [gMASK]<sop>[<|system|>Reasoning Effort: Max][tools]<|user|>...<|assistant|><think>
 ```
 
-Thinking is ON by default for this family: the reasoning-effort system line is
-what enables it, and the generation prompt opens a `<think>` block the model
-closes itself. With thinking off the prompt emits `<think></think>` so the model
-answers directly. Tool calls come back as
+Thinking is opt-in (`--think`, `/think on` in the REPL, `"think": true` in an API
+request), as on every other family here. Turning it on adds the
+`<|system|>Reasoning Effort: Max` line and leaves the generation prompt's
+`<think>` block open for the model to close; left off, the prompt emits
+`<think></think>` so the model answers directly. Past turns' reasoning is always
+dropped from the prompt, matching the template's `clear_thinking` default. Tool calls come back as
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`,
 one XML element per argument (values that were rendered with `tojson` are parsed
 back into numbers / arrays / objects).

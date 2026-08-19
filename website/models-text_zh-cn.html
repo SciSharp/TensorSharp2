@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>文本与 LLM 模型 — TensorSharp 维基</title>
-  <meta name="description" content="十种文本架构的下载与运行示例，以及多模态输入、思考模式与工具调用。">
+  <meta name="description" content="十一种文本架构的下载与运行示例，以及多模态输入、思考模式与工具调用。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -56,6 +56,33 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
     --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --backend ggml_cuda --tp 4 --mtp-spec --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf</code></pre>
   <p>DSpark 每步起草一整<em>块</em> token，主干用一次批量前向验证整块，因此贪心输出保持不变。在 CLI 上它需要纯 argmax 采样（任何 temperature、top-k/p 或惩罚项都会将其关闭）；在服务端每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。详见 <a href="advanced_zh-cn.html#dspark">DSpark 投机解码</a>。</p>
+
+  <h3 id="glm">GLM 5.x（744B-A40B MoE，文本、思考、工具）</h3>
+  <p>一个 744B 的混合专家模型——256 个路由专家 top-8 加一个共享专家——建立在 <strong>DeepSeek 稀疏注意力</strong>之上：带权重吸收的多头潜在注意力（MLA），使得缓存每 token 每层只占一行 576 宽的数据，再加上一个"lightning indexer"决定每个 query 可以看到哪些历史 token（自报 1M 上下文）。与 DeepSeek V4 一样，它不走通用的逐算子前向：<code>--backend ggml_cuda</code> / <code>ggml_vulkan</code> / <code>ggml_cpu</code> / <code>ggml_metal</code> 走原生整模型 ggml 执行器，把 226 GiB 权重按层切分到所有可见 GPU 上；而 <code>--backend cpu</code>（100% 纯 C#、无原生依赖）与 <code>--backend cuda</code> 走托管逐算子路径。MLX 跑不了它。多分片 GGUF 由 <code>GgufFile</code> 自己读取，所以 <code>--model</code> 指向第一片即可。</p>
+  <pre data-lang="bash"><code># UD-IQ2_XXS 这一档约 226 GiB（6 个分片）——想要更大或更小可换一个量化目录
+hf download unsloth/GLM-5.2-GGUF --include "UD-IQ2_XXS/*" --local-dir models
+
+# 按层切分到所有可见 GPU —— --model 指向第一个分片
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --input prompt.txt --max-tokens 200
+
+# 交互式 + 思考模式
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --interactive --think
+
+# 显存不够？把前 N 层的路由专家留在系统内存里
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --n-cpu-moe 30 --input prompt.txt --max-tokens 200
+
+# 以 HTTP 服务方式运行
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda</code></pre>
+  <p>自报的 1M 上下文是<em>上限</em>而非承诺：1M token 的 MLA 缓存约 93 GiB，所以权重落盘之后加载器会去问各设备实际还剩多少显存，按「缓存加一整个 prefill 计算图」能装下的大小定上下文，并把选中的值打印出来。在 3× RTX PRO 6000 上，按层切分是 342,272 token，<code>--n-cpu-moe 30</code> 是 646,400，<code>--tp 3</code> 是 91,136（每个 rank 都要各自持有一份全长缓存）。想把某个长度变成硬性要求，就设 <code>MAX_CONTEXT</code>——放得下就照办，放不下会带着数字直接报错。</p>
+  <p><code>--tp N</code> 这里也能用，但在 PCIe 互连的卡上它是容量特性而非速度特性：78 层里每层都要两次 all-reduce，占用的总线时间比拆分省下的算力还多，所以 <code>--tp 3</code> 实测 pp2048 505.6 / tg64 17.6 tok/s，而按层切分是 915.9 / 43.9。并发靠原生的按序列槽位承载（每个请求拥有自己的 MLA 与索引器缓存），<code>TS_BATCHED_FUSED_DECODE=1</code> 可以开启批处理融合解码，4 路并发下总吞吐 1.81 倍。参见<a href="distributed_zh-cn.html#architectures">张量并行</a>与<a href="advanced_zh-cn.html#continuous-batching">连续批处理</a>。</p>
 
   <h3 id="gemma3">Gemma 3（文本 + 图像）</h3>
   <pre data-lang="bash"><code>hf download ggml-org/gemma-3-4b-it-GGUF gemma-3-4b-it-Q4_K_M.gguf --local-dir models
@@ -144,12 +171,13 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongem
   <p>通过 <a href="cli_zh-cn.html#examples">CLI</a>（<code>--image</code>、<code>--video</code>、<code>--audio</code>、<code>--pdf</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 上传，或 <a href="http-api_zh-cn.html">HTTP API</a>（Ollama 用 base64 <code>images</code> 数组，OpenAI 用 <code>image_url</code> data URI）发送文件。数字版 PDF 会提取文本；扫描版 PDF 会转换为页面图像并需要视觉模型。</p>
 
   <h2 id="thinking">思考 / 推理模式</h2>
-  <p>具备思考能力的模型（Qwen 3、Qwen 3.5/3.6、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、Muse-Glimmer）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
+  <p>具备思考能力的模型（Qwen 3、Qwen 3.5/3.6、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、GLM 5.x、Muse-Glimmer）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
   <ul>
     <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签。</li>
     <li><strong>Gemma 4</strong> —— <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> 标签。</li>
     <li><strong>GPT OSS</strong> —— Harmony 格式：<code>&lt;|channel|&gt;analysis</code> 用于思考，<code>&lt;|channel|&gt;final</code> 用于答案。</li>
     <li><strong>DeepSeek V4</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签；不显式开启思考时聊天模板会立即闭合该块，因此推理是按需启用的。</li>
+    <li><strong>GLM 5.x</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，也是按需开启：加 <code>--think</code> 会补上 <code>Reasoning Effort: Max</code> 系统行并留下一个未闭合的块由模型自己收尾，不加时提示里写的是空的 <code>&lt;think&gt;&lt;/think&gt;</code>。历史轮次的思考内容始终不会带进提示。</li>
     <li><strong>Muse-Glimmer</strong> —— 聊天模板输出的 <code>assistant to=self</code> 推理通道。</li>
   </ul>
   <p>通过 <code>--think</code>（CLI）、<code>"think": true</code>（Ollama API / Web UI）或浏览器中的思考开关启用。响应会单独暴露推理 —— 例如 Ollama 聊天响应中的 <code>message.thinking</code>。</p>
@@ -162,6 +190,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongem
     <li><strong>Gemma 4</strong> —— <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
     <li><strong>GPT OSS (Harmony)</strong> —— 工具以 TypeScript 命名空间声明；调用在 commentary 通道发出。</li>
     <li><strong>DeepSeek V4</strong> —— DSML 标记：系统提示词负责讲解语法并携带每个函数的 JSON schema，模型以 <code>&lt;｜DSML｜tool_calls&gt;&lt;｜DSML｜invoke name="NAME"&gt;&lt;｜DSML｜parameter name="key" string="true|false"&gt;value&lt;/｜DSML｜parameter&gt;…</code> 作答。</li>
+    <li><strong>GLM 5.x</strong> —— 逐参数标签的 XML：<code>&lt;tool_call&gt;NAME&lt;arg_key&gt;k&lt;/arg_key&gt;&lt;arg_value&gt;v&lt;/arg_value&gt;…&lt;/tool_call&gt;</code>。函数名以裸文本紧跟在开标签之后，每个参数自成一组键值对；模板里用 <code>tojson</code> 渲染过的值会被解析回数字、数组与对象。</li>
     <li><strong>Muse-Glimmer</strong> —— 聊天模板声明的 ATEM XML 标记；解析器会把调用提取成同样的结构化 <code>tool_calls</code>。</li>
   </ul>
   <p>完整的请求/响应示例与续接循环见 <a href="http-api_zh-cn.html#tools">通过 HTTP 进行工具调用</a>。</p>

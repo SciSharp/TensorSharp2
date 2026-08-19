@@ -35,13 +35,14 @@ window.SEARCH_INDEX_ZH = [
   { t: "构建原生 GGML / MLX 库", p: "后端", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh、CUDA 架构检测，以及自动启用的 Vulkan（用 --no-vulkan 退出；Windows 便携 Vulkan 工具链）。", k: "compile 编译 native cmake cuda arch vulkan glslc no-vulkan TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN" },
   { t: "当前二进制发行状态", p: "后端", u: "backends.html#binaries", s: "最新 v3.0.5.0 只有源码下载，没有上传 CLI/server 应用归档；Release 出现资产前请从源码构建。", k: "release 下载 归档 二进制 预构建 source v3.0.5.0" },
 
-  { t: "支持的模型", p: "模型", u: "models.html#table", s: "DeepSeek V4 Flash、Gemma 3/4、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、DiffusionGemma、Muse-Glimmer、Qwen-Image-Edit、Wan 视频。", k: "architectures 架构 家族 deepseek gemma qwen gptoss nemotron mistral 图像 编辑 wan 视频" },
+  { t: "支持的模型", p: "模型", u: "models.html#table", s: "DeepSeek V4 Flash、GLM 5.x、Gemma 3/4、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、DiffusionGemma、Muse-Glimmer、Qwen-Image-Edit、Wan 视频。", k: "architectures 架构 家族 deepseek glm glm-dsa glm5 gemma qwen gptoss nemotron mistral 图像 编辑 wan 视频" },
   { t: "哪个更快——每个家族最关键的那一项设置", p: "模型", u: "models.html#fast-lane", s: "每个家族中真正决定端到端耗时的那一个检查点、LoRA 或参数。", k: "fast 快 更快 加速 蒸馏 turbo lightning lora draft 推测解码 性能 哪个" },
   { t: "浏览模型参考", p: "模型", u: "models.html#browse", s: "模型参考分为四个页面：模型下载、文本与 LLM 模型、图像生成、视频生成。", k: "索引 浏览 目录 页面 导航" },
   { t: "模型下载（GGUF）", p: "模型下载", u: "models-downloads.html#downloads", s: "各受支持架构的 Hugging Face 链接、精确文件名，以及 mmproj、VAE、文本编码器与 MTP 草稿等伴随文件。", k: "huggingface 权重 下载 mmproj mtp draft lora vae turbo 蒸馏" },
   { t: "下载并运行", p: "文本与 LLM 模型", u: "models-text.html#download-run", s: "每个文本模型家族的 hf download 与 CLI / Server 可复制命令。", k: "hf download huggingface_hub cli server 快速 命令 家族" },
   { t: "约 30 秒快速上手：Gemma 4 E4B Q8_0（原生 GGML）", p: "文本与 LLM 模型", u: "models-text.html#gemma4-fast-lane", s: "推荐公开 E4B Q8_0 文件、原生构建、CLI/Server 命令、后端选择与可选 mmproj。", k: "gemma4 e4b q8 快速上手 30 秒 快路径 原生 ggml cuda metal vulkan mmproj" },
   { t: "DeepSeek V4 Flash（284B MoE）", p: "文本与 LLM 模型", u: "models-text.html#deepseek4", s: "压缩稀疏注意力的 284B MoE，三种整模型执行器（直连 CUDA、原生 ggml、纯 C# CPU），跨 GPU 自动切分，并支持 DSpark 推测解码。", k: "deepseek deepseek4 v4 flash 284b moe dspark draft-model 切分 gguf 分片 1m 上下文" },
+  { t: "GLM 5.x（744B-A40B MoE）", p: "文本与 LLM 模型", u: "models-text.html#glm", s: "带权重吸收的 MLA 加 DeepSeek 稀疏注意力的 lightning indexer，256 个路由专家 top-8，6 分片的 split GGUF，一个原生 ggml 整模型执行器与一条 100% 托管的逐算子路径，上下文按加载后实际空闲的显存来定。", k: "glm glm-dsa glm5 glm 5.2 744b a40b moe mla 潜在注意力 dsa 稀疏 lightning indexer 分片 gguf 1m 上下文 n-cpu-moe tp 槽位 批处理 融合 解码 MAX_CONTEXT" },
   { t: "多模态：图像、视频、音频、PDF", p: "文本与 LLM 模型", u: "models-text.html#multimodal", s: "Gemma 4 支持图像/视频/音频；其他视觉家族支持图像；CLI/Web UI 支持 PDF 文本提取或页面图像。", k: "vision 视觉 图像 音频 视频 mmproj 投影器 pdf 文档" },
   { t: "思考 / 推理模式", p: "文本与 LLM 模型", u: "models-text.html#thinking", s: "Qwen、Gemma 4、GPT OSS、Nemotron-H 带 think 标签的结构化思维链。", k: "reasoning 推理 思维链 think cot" },
   { t: "工具调用 / 函数调用", p: "文本与 LLM 模型", u: "models-text.html#toolcalling", s: "模型调用用户自定义工具；跨三种 API 风格的多轮。", k: "functions 函数 工具 agent 智能体" },
@@ -107,6 +108,7 @@ window.SEARCH_INDEX_ZH = [
   { t: "同台对比 vs llama.cpp", p: "基准测试", u: "benchmarks.html#head-to-head", s: "纯 .NET 的 TensorSharp 在相同 GGUF + GPU 下、CUDA 与 Vulkan 两个后端上与 llama.cpp 互有胜负：E4B 与 2-bit Qwen 3.6 35B-A3B MoE 在 CUDA 上 prefill 1.28× / TTFT 1.27×（多轮最高 1.49×）；12B 在 Vulkan 上 decode 1.21×；四个模型中有三个的 CUDA decode 持平或更快。", k: "llama.cpp 对比 更快 加速 几何平均 moe prefill ttft 多轮 decode 持平 cuda vulkan vs versus" },
   { t: "基准测试", p: "基准测试", u: "benchmarks.html#head-to-head", s: "在相同 GGUF 文件与硬件上对比 llama.cpp 的同台评测。", k: "performance 性能 数字 吞吐 每秒 token" },
   { t: "Muse-Glimmer 30B，带与不带 DFlash", p: "基准测试", u: "benchmarks.html#muse-glimmer", s: "在单张 RTX PRO 6000 Blackwell 上，DFlash 块级草稿器的 decode 与 llama.cpp 对比，提示长度从 60 到 124K token。", k: "muse glimmer dflash draft-model 投机 decode 贪心 基准 rtx pro 6000 blackwell" },
+  { t: "GLM-5.2 744B：规模的另一端", p: "基准测试", u: "benchmarks.html#glm", s: "3x RTX PRO 6000 上，GLM-5.2-UD-IQ2_XXS 与 llama.cpp 背靠背对比：pp2048 从 763.1 到 918.9 t/s（TS_GLM_UBATCH=2048 时 1145.8），tg64 从 42.2 到 43.7，且在同一后端上逐 token 一致。", k: "glm 5.2 基准 llama.cpp pp2048 pp4096 tg64 ubatch 张量并行 n-cpu-moe 744b" },
   { t: "Wan 视频：两个彼此独立的提速杠杆", p: "基准测试", u: "benchmarks.html#wan", s: "M5 Pro 实测：F16 注意力 KV 与 MPSGraph VAE 让每次 DiT 前向约快 1.7×，步数蒸馏则让前向次数少 25×。", k: "wan 基准 视频 turbo 蒸馏 f16 kv mpsgraph vae metal sd.cpp stable-diffusion.cpp m5 pro 分辨率" },
   { t: "测试", p: "基准测试", u: "benchmarks.html#testing", s: "xUnit 单元测试与服务器集成测试。", k: "tests 测试 xunit 集成 ci" },
 

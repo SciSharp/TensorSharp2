@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Text &amp; LLM Models — TensorSharp Wiki</title>
-  <meta name="description" content="Download-and-run recipes for all ten text architectures, plus multimodal input, thinking mode and tool calling.">
+  <meta name="description" content="Download-and-run recipes for all eleven text architectures, plus multimodal input, thinking mode and tool calling.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -56,6 +56,33 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
     --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --backend ggml_cuda --tp 4 --mtp-spec --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf</code></pre>
   <p>DSpark drafts a whole <em>block</em> of tokens per step and the trunk verifies the block in one batched forward, so greedy output is unchanged. On the CLI it needs a pure-argmax sampler (any temperature, top-k/p, or penalty turns it off); on the server every verify row is drawn with the request's own sampler, so it composes with any sampling settings. See <a href="advanced.html#dspark">DSpark speculative decoding</a>.</p>
+
+  <h3 id="glm">GLM 5.x (744B-A40B MoE, text, thinking, tools)</h3>
+  <p>A 744B mixture-of-experts model — 256 routed experts at top-8 plus one shared expert — built on <strong>DeepSeek Sparse Attention</strong>: Multi-head Latent Attention with weight absorption, so the cache is one 576-wide row per token per layer, plus a "lightning indexer" that decides which cached tokens each query may attend to (1M advertised context). Like DeepSeek V4 it skips the generic per-op forward: <code>--backend ggml_cuda</code> / <code>ggml_vulkan</code> / <code>ggml_cpu</code> / <code>ggml_metal</code> run a native whole-model ggml executor that layer-splits 226 GiB of weights across every visible GPU, while <code>--backend cpu</code> (100% pure C#, no native dependencies) and <code>--backend cuda</code> run the managed per-op path. MLX does not run it. The multi-shard GGUF is read by <code>GgufFile</code> itself, so <code>--model</code> points at the first shard.</p>
+  <pre data-lang="bash"><code># ~226 GiB for the UD-IQ2_XXS tier (6 shards) — pick a different quant directory for more or less
+hf download unsloth/GLM-5.2-GGUF --include "UD-IQ2_XXS/*" --local-dir models
+
+# Layer split across every visible GPU — point --model at the FIRST shard
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --input prompt.txt --max-tokens 200
+
+# Thinking mode, interactive
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --interactive --think
+
+# Not enough VRAM? Keep the routed experts of the first N layers in system RAM
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --n-cpu-moe 30 --input prompt.txt --max-tokens 200
+
+# Served over HTTP
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda</code></pre>
+  <p>The advertised 1M-token context is a <em>ceiling</em>, not a promise: 1M tokens of MLA cache is about 93 GiB, so once the weights land the loader asks the devices how much VRAM is actually free, sizes the context to what fits alongside one full prefill graph, and logs what it picked. On 3× RTX PRO 6000 that is 342,272 tokens on the plain layer split, 646,400 with <code>--n-cpu-moe 30</code>, and 91,136 under <code>--tp 3</code> (every rank holds a full-length cache). Set <code>MAX_CONTEXT</code> to make a specific length a hard requirement instead — it is honoured if it fits and refused with the numbers if it does not.</p>
+  <p><code>--tp N</code> works here too, but on PCIe-attached cards it is a capacity feature rather than a speed one: the two all-reduces every one of the 78 layers needs cost more bus time than the split saves, so <code>--tp 3</code> measures pp2048 505.6 / tg64 17.6 tok/s against 915.9 / 43.9 on the layer split. Concurrency is served by native per-sequence slots (each request owns its MLA and indexer caches), and <code>TS_BATCHED_FUSED_DECODE=1</code> opts into a batched fused decode worth 1.81× aggregate at 4 concurrent requests. See <a href="distributed.html#architectures">Tensor parallelism</a> and <a href="advanced.html#continuous-batching">Continuous batching</a>.</p>
 
   <h3 id="gemma3">Gemma 3 (text + image)</h3>
   <pre data-lang="bash"><code>hf download ggml-org/gemma-3-4b-it-GGUF gemma-3-4b-it-Q4_K_M.gguf --local-dir models
@@ -144,12 +171,13 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongem
   <p>Send images/audio/video via the <a href="cli.html#examples">CLI</a> (<code>--image</code>, <code>--video</code>, <code>--audio</code>), the <a href="server.html#webui">Web UI</a> uploads, or the <a href="http-api.html">HTTP API</a> (base64 <code>images</code> array for Ollama, <code>image_url</code> data URI for OpenAI). <strong>PDF documents</strong> are supported too — born-digital PDFs have their complete text layer extracted and inlined into the prompt; scanned PDFs fall back to page images for vision-capable models — via the CLI's <code>--pdf</code> flag (one-shot mode) or the Web UI upload (<code>TS_PDF_MAX_PAGES</code> caps the page count; default: all pages).</p>
 
   <h2 id="thinking">Thinking / reasoning mode</h2>
-  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4, Muse-Glimmer) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
+  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4, GLM 5.x, Muse-Glimmer) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
   <ul>
     <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags.</li>
     <li><strong>Gemma 4</strong> — <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> tags.</li>
     <li><strong>GPT OSS</strong> — Harmony format: <code>&lt;|channel|&gt;analysis</code> for thinking, <code>&lt;|channel|&gt;final</code> for the answer.</li>
     <li><strong>DeepSeek V4</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags; the chat template closes the block immediately unless thinking is requested, so reasoning is opt-in.</li>
+    <li><strong>GLM 5.x</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags, also opt-in: <code>--think</code> adds a <code>Reasoning Effort: Max</code> system line and leaves the block open for the model to close, and without it the prompt emits an empty <code>&lt;think&gt;&lt;/think&gt;</code>. Earlier turns' reasoning is always dropped from the prompt.</li>
     <li><strong>Muse-Glimmer</strong> — an <code>assistant to=self</code> reasoning channel emitted by the chat template.</li>
   </ul>
   <p>Enable it via <code>--think</code> (CLI), <code>"think": true</code> (Ollama API / Web UI), or the thinking toggle in the browser. Responses expose the reasoning separately — e.g. <code>message.thinking</code> in the Ollama chat response.</p>
@@ -163,6 +191,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongem
     <li><strong>GPT OSS (Harmony)</strong> — tools declared as a TypeScript namespace; calls emitted on the commentary channel.</li>
     <li><strong>Muse-Glimmer</strong> — ATEM XML markup declared by the chat template; the parser lifts the calls into the same structured <code>tool_calls</code> shape.</li>
     <li><strong>DeepSeek V4</strong> — DSML markup: the system prompt teaches the syntax and carries one JSON schema per function, and the model answers with <code>&lt;｜DSML｜tool_calls&gt;&lt;｜DSML｜invoke name="NAME"&gt;&lt;｜DSML｜parameter name="key" string="true|false"&gt;value&lt;/｜DSML｜parameter&gt;…</code>.</li>
+    <li><strong>GLM 5.x</strong> — XML with per-argument tags: <code>&lt;tool_call&gt;NAME&lt;arg_key&gt;k&lt;/arg_key&gt;&lt;arg_value&gt;v&lt;/arg_value&gt;…&lt;/tool_call&gt;</code>. The function name follows the opening tag as bare text and every argument is its own key/value pair; values the template rendered with <code>tojson</code> are parsed back into numbers, arrays and objects.</li>
   </ul>
   <p>See <a href="http-api.html#tools">Tool calling over HTTP</a> for a complete request/response example and the continuation loop.</p>
 

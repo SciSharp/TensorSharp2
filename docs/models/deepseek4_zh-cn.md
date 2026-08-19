@@ -37,7 +37,10 @@ MoE 内核——才留在 DeepSeek V4 的文件里。
 原生整模型执行器（`TensorSharp.GGML.Native/ggml_ops_deepseek4.cpp`）：
 
 - 直接加载（分片的）GGUF，并把权重**按层切分到所有可见 CUDA GPU** 上——大于
-  单卡显存的模型由所有卡共同承载（128 GiB 的 IQ4_XS 构建需要 2×80GB）。
+  单卡显存的模型由所有卡共同承载（128 GiB 的 IQ4_XS 构建需要 2×80GB）。这是
+  **默认行为，不需要任何开关**：把 DSV4 放到多张卡上的并不是 `--tp`，`--tp` 只是
+  把「整层切分」换成层内部的 Megatron 列/行切分。`TS_DSV4_NGPU` 用来限制按层
+  切分使用几张卡。
 - 在设备上持有全部 DSV4 KV 状态：原始 SWA 环、CSA/HCA 压缩 K 缓存、lightning
   indexer 缓存，以及压缩器状态环。
 - 通过 `ggml_backend_sched` 把 prefill/decode 的每个 ubatch 作为单张 ggml 计算图

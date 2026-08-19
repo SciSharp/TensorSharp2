@@ -1261,8 +1261,9 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     for (auto b : layer_bytes) total_bytes += b;
 
     // KV bytes one token costs, summed over every layer. GLM-5.2 advertises a
-    // 1M context, which at 78 layers is ~98 GiB of cache — more than the weights
-    // — so the advertised number is a ceiling to fit under, not a promise.
+    // 1M context, which at 78 layers is ~93 GiB of cache — a whole card's worth
+    // on top of the weights — so the advertised number is a ceiling to fit
+    // under, not a promise.
     size_t kv_bytes_per_token = 0;
     for (int il = 0; il < hp.n_layer; il++)
     {
