@@ -14,6 +14,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using TensorSharp.Models;
+using TensorSharp.Server.Hosting;
 
 namespace TensorSharp.Server.RequestParsers
 {
@@ -109,7 +110,7 @@ namespace TensorSharp.Server.RequestParsers
         /// base64 array under <c>"images"</c>; we materialise each one as a PNG
         /// in the upload directory and reference them by absolute path.
         /// </summary>
-        public static List<ChatMessage> ParseOllama(JsonElement messagesEl, string uploadDir)
+        public static List<ChatMessage> ParseOllama(JsonElement messagesEl, UploadStoragePolicy uploads)
         {
             var messages = new List<ChatMessage>();
             foreach (var msgEl in messagesEl.EnumerateArray())
@@ -129,7 +130,7 @@ namespace TensorSharp.Server.RequestParsers
                         if (string.IsNullOrEmpty(b64))
                             continue;
 
-                        string path = WriteBase64Image(b64, uploadDir);
+                        string path = WriteBase64Image(b64, uploads);
                         msg.ImagePaths.Add(path);
                     }
                 }
@@ -144,7 +145,7 @@ namespace TensorSharp.Server.RequestParsers
         /// either a plain string content, or an array of parts where each part
         /// is either text or an image (data URL or external URL).
         /// </summary>
-        public static List<ChatMessage> ParseOpenAI(JsonElement messagesEl, string uploadDir)
+        public static List<ChatMessage> ParseOpenAI(JsonElement messagesEl, UploadStoragePolicy uploads)
         {
             var messages = new List<ChatMessage>();
             foreach (var msgEl in messagesEl.EnumerateArray())
@@ -182,7 +183,7 @@ namespace TensorSharp.Server.RequestParsers
                                     if (commaIdx > 0)
                                     {
                                         string b64 = url.Substring(commaIdx + 1);
-                                        string path = WriteBase64Image(b64, uploadDir);
+                                        string path = WriteBase64Image(b64, uploads);
                                         msg.ImagePaths.Add(path);
                                     }
                                 }
@@ -193,7 +194,7 @@ namespace TensorSharp.Server.RequestParsers
                                 string path = WriteBase64Audio(
                                     audioEl.TryGetProperty("data", out var aData) ? aData.GetString() : null,
                                     audioEl.TryGetProperty("format", out var aFmt) ? aFmt.GetString() : null,
-                                    uploadDir);
+                                    uploads);
                                 if (path != null)
                                     msg.AudioPaths.Add(path);
                             }
@@ -203,7 +204,7 @@ namespace TensorSharp.Server.RequestParsers
                                 string url = audioUrl.ValueKind == JsonValueKind.String
                                     ? audioUrl.GetString()
                                     : (audioUrl.TryGetProperty("url", out var au) ? au.GetString() : null);
-                                string path = WriteBase64AudioDataUri(url, uploadDir);
+                                string path = WriteBase64AudioDataUri(url, uploads);
                                 if (path != null)
                                     msg.AudioPaths.Add(path);
                             }
@@ -217,7 +218,7 @@ namespace TensorSharp.Server.RequestParsers
 
                 // Message-level base64 audio array (the same shorthand Ollama uses
                 // for images), accepted alongside the OpenAI content-part form.
-                AppendMessageLevelAudios(msgEl, msg, uploadDir);
+                AppendMessageLevelAudios(msgEl, msg, uploads);
 
                 messages.Add(msg);
             }
@@ -232,7 +233,7 @@ namespace TensorSharp.Server.RequestParsers
         /// string is prepended as a system message, matching how the real API
         /// folds it into the model's system prompt.
         /// </summary>
-        public static List<ChatMessage> ParseResponsesInput(JsonElement inputEl, string instructions, string uploadDir)
+        public static List<ChatMessage> ParseResponsesInput(JsonElement inputEl, string instructions, UploadStoragePolicy uploads)
         {
             var messages = new List<ChatMessage>();
 
@@ -294,7 +295,7 @@ namespace TensorSharp.Server.RequestParsers
                             string audioPath = WriteBase64Audio(
                                 audioEl.TryGetProperty("data", out var aData) ? aData.GetString() : null,
                                 audioEl.TryGetProperty("format", out var aFmt) ? aFmt.GetString() : null,
-                                uploadDir);
+                                uploads);
                             if (audioPath != null)
                                 msg.AudioPaths.Add(audioPath);
                         }
@@ -309,7 +310,7 @@ namespace TensorSharp.Server.RequestParsers
                                 if (commaIdx > 0)
                                 {
                                     string b64 = url.Substring(commaIdx + 1);
-                                    msg.ImagePaths.Add(WriteBase64Image(b64, uploadDir));
+                                    msg.ImagePaths.Add(WriteBase64Image(b64, uploads));
                                 }
                             }
                         }
@@ -331,7 +332,7 @@ namespace TensorSharp.Server.RequestParsers
         /// <c>/api/generate</c>. Returns null when no images are present so the
         /// downstream code path can short-circuit cleanly.
         /// </summary>
-        public static List<string> DecodeBase64Images(JsonElement body, string uploadDir)
+        public static List<string> DecodeBase64Images(JsonElement body, UploadStoragePolicy uploads)
         {
             if (!body.TryGetProperty("images", out var imgs) || imgs.ValueKind != JsonValueKind.Array)
                 return null;
@@ -343,16 +344,25 @@ namespace TensorSharp.Server.RequestParsers
                 if (string.IsNullOrEmpty(b64))
                     continue;
 
-                paths.Add(WriteBase64Image(b64, uploadDir));
+                paths.Add(WriteBase64Image(b64, uploads));
             }
             return paths.Count > 0 ? paths : null;
         }
 
-        private static string WriteBase64Image(string base64, string uploadDir)
+        private static string WriteBase64Image(string base64, UploadStoragePolicy uploads)
         {
             byte[] imgData = Convert.FromBase64String(base64);
-            string path = Path.Combine(uploadDir, $"{Guid.NewGuid():N}.png");
-            File.WriteAllBytes(path, imgData);
+            uploads.ReserveClientWriteOrThrow(imgData.Length);
+            string path = Path.Combine(uploads.DirectoryPath, $"{Guid.NewGuid():N}.png");
+            try
+            {
+                File.WriteAllBytes(path, imgData);
+            }
+            catch
+            {
+                uploads.Release(imgData.Length);
+                throw;
+            }
             return path;
         }
 
@@ -363,7 +373,7 @@ namespace TensorSharp.Server.RequestParsers
         /// mapped to one — falling back to sniffing the container header when it
         /// is missing or unrecognised. Returns null for empty/invalid content.
         /// </summary>
-        private static string WriteBase64Audio(string base64, string format, string uploadDir)
+        private static string WriteBase64Audio(string base64, string format, UploadStoragePolicy uploads)
         {
             if (string.IsNullOrWhiteSpace(base64))
                 return null;
@@ -389,16 +399,25 @@ namespace TensorSharp.Server.RequestParsers
             if (data.Length == 0)
                 return null;
 
-            string path = Path.Combine(uploadDir, $"{Guid.NewGuid():N}{AudioExtension(format, data)}");
-            File.WriteAllBytes(path, data);
+            uploads.ReserveClientWriteOrThrow(data.Length);
+            string path = Path.Combine(uploads.DirectoryPath, $"{Guid.NewGuid():N}{AudioExtension(format, data)}");
+            try
+            {
+                File.WriteAllBytes(path, data);
+            }
+            catch
+            {
+                uploads.Release(data.Length);
+                throw;
+            }
             return path;
         }
 
-        private static string WriteBase64AudioDataUri(string url, string uploadDir)
+        private static string WriteBase64AudioDataUri(string url, UploadStoragePolicy uploads)
         {
             if (string.IsNullOrEmpty(url) || !url.StartsWith("data:"))
                 return null;
-            return WriteBase64Audio(url, null, uploadDir);
+            return WriteBase64Audio(url, null, uploads);
         }
 
         private static string MimeToAudioFormat(string mimeAndParams)
@@ -440,7 +459,7 @@ namespace TensorSharp.Server.RequestParsers
         /// Read a message-level <c>"audios"</c> array of base64 clips (optionally
         /// data URIs) and append them to the message's audio attachments.
         /// </summary>
-        private static void AppendMessageLevelAudios(JsonElement msgEl, ChatMessage msg, string uploadDir)
+        private static void AppendMessageLevelAudios(JsonElement msgEl, ChatMessage msg, UploadStoragePolicy uploads)
         {
             if (!msgEl.TryGetProperty("audios", out var auds) || auds.ValueKind != JsonValueKind.Array)
                 return;
@@ -452,7 +471,7 @@ namespace TensorSharp.Server.RequestParsers
                     : (audEl.TryGetProperty("data", out var d) ? d.GetString() : null);
                 string format = audEl.ValueKind == JsonValueKind.Object &&
                                 audEl.TryGetProperty("format", out var f) ? f.GetString() : null;
-                string path = WriteBase64Audio(b64, format, uploadDir);
+                string path = WriteBase64Audio(b64, format, uploads);
                 if (path == null)
                     continue;
                 (msg.AudioPaths ??= new List<string>()).Add(path);

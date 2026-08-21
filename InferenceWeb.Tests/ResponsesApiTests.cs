@@ -7,6 +7,7 @@ using TensorSharp.Models;
 using TensorSharp.Runtime;
 using TensorSharp.Server.RequestParsers;
 using TensorSharp.Server.ResponseSerializers;
+using TensorSharp.Server.Hosting;
 using TensorSharp.Server.Responses;
 
 namespace InferenceWeb.Tests;
@@ -19,7 +20,7 @@ public class ResponsesApiTests
     public void ParseResponsesInput_StringInput_BecomesSingleUserMessage()
     {
         using var doc = JsonDocument.Parse("\"hello there\"");
-        var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, null, Path.GetTempPath());
+        var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, null, new UploadStoragePolicy(Path.GetTempPath()));
 
         var msg = Assert.Single(messages);
         Assert.Equal("user", msg.Role);
@@ -30,7 +31,7 @@ public class ResponsesApiTests
     public void ParseResponsesInput_Instructions_PrependsSystemMessage()
     {
         using var doc = JsonDocument.Parse("\"hi\"");
-        var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, "be nice", Path.GetTempPath());
+        var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, "be nice", new UploadStoragePolicy(Path.GetTempPath()));
 
         Assert.Equal(2, messages.Count);
         Assert.Equal("system", messages[0].Role);
@@ -49,7 +50,7 @@ public class ResponsesApiTests
         ]
         """;
         using var doc = JsonDocument.Parse(body);
-        var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, null, Path.GetTempPath());
+        var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, null, new UploadStoragePolicy(Path.GetTempPath()));
 
         Assert.Equal(3, messages.Count);
         Assert.Equal(["user", "assistant", "user"], messages.ConvertAll(m => m.Role));
@@ -74,7 +75,7 @@ public class ResponsesApiTests
             ]
             """;
             using var doc = JsonDocument.Parse(body);
-            var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, null, tempDir);
+            var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, null, new UploadStoragePolicy(tempDir));
 
             var msg = Assert.Single(messages);
             Assert.Equal("what is this", msg.Content);
@@ -98,7 +99,7 @@ public class ResponsesApiTests
         ]
         """;
         using var doc = JsonDocument.Parse(body);
-        var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, null, Path.GetTempPath());
+        var messages = ChatMessageParser.ParseResponsesInput(doc.RootElement, null, new UploadStoragePolicy(Path.GetTempPath()));
 
         var msg = Assert.Single(messages);
         Assert.Equal("user", msg.Role);

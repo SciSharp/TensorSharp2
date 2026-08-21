@@ -328,6 +328,24 @@ namespace TensorSharp.Server.Hosting
                     "also auto-resolves the second high/low-noise expert GGUF by name (TS_WAN_DIT2).",
                     "--wan-te umt5-xxl-encoder-Q8_0.gguf"),
             }),
+            ("Upload storage (the uploads/ directory next to the server binary)", new[]
+            {
+                new OptionHelp("--upload-max-mb <N>",
+                    "Per-file cap in MB on client-originated writes: multipart /api/upload files and base64 " +
+                    "attachments decoded out of chat requests. Default: 500, the request-body limit " +
+                    "(TS_UPLOAD_MAX_MB env var overrides).",
+                    "--upload-max-mb 25"),
+                new OptionHelp("--upload-quota-mb <N>",
+                    "Total budget in MB for the upload directory, counting client uploads, decoded attachments, " +
+                    "and generated outputs (edited images, videos). Requests that would exceed it are rejected " +
+                    "up front — before any model work runs. Default: off (TS_UPLOAD_QUOTA_MB env var overrides).",
+                    "--upload-quota-mb 2048"),
+                new OptionHelp("--upload-ttl-hours <N>",
+                    "Delete upload-directory files older than this many hours (fractions allowed). Default: off, " +
+                    "because chat sessions reference attachments by path and may reuse them later; enable it when " +
+                    "the server is reachable by untrusted clients (TS_UPLOAD_TTL_HOURS env var overrides).",
+                    "--upload-ttl-hours 24"),
+            }),
             ("Configuration file", new[]
             {
                 new OptionHelp("--config <path>",

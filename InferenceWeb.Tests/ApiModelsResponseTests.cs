@@ -48,6 +48,7 @@ public class ApiModelsResponseTests : IDisposable
                 logDirectory: Path.Combine(_baseDir, "logs"),
                 fileLoggingEnabled: false,
                 samplingDefaults: null),
+            new UploadStoragePolicy(_baseDir),
             NullLoggerFactory.Instance);
 
         var result = adapter.GetModels();

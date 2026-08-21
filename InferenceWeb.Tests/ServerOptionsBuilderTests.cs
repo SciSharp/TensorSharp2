@@ -1045,6 +1045,59 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.Contains("--port", ex.Message);
     }
 
+    // ---- Upload storage limits -------------------------------------------
+
+    [Fact]
+    public void Build_NoUploadFlags_KeepsPermissiveDefaults()
+    {
+        var options = ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir);
+
+        Assert.Equal(500L * 1024 * 1024, options.UploadMaxFileBytes);
+        Assert.Equal(0, options.UploadQuotaBytes);
+        Assert.Null(options.UploadTtl);
+    }
+
+    [Fact]
+    public void Build_UploadFlags_ResolveToBytesAndTimeSpan()
+    {
+        var options = ServerOptionsBuilder.Build(
+            new[] { "--upload-max-mb", "25", "--upload-quota-mb", "2048", "--upload-ttl-hours", "1.5" },
+            _baseDir);
+
+        Assert.Equal(25L * 1024 * 1024, options.UploadMaxFileBytes);
+        Assert.Equal(2048L * 1024 * 1024, options.UploadQuotaBytes);
+        Assert.Equal(TimeSpan.FromMinutes(90), options.UploadTtl);
+    }
+
+    [Fact]
+    public void Build_UploadEnvVars_LayerUnderCliOverrides()
+    {
+        _env.Set("TS_UPLOAD_MAX_MB", "10");
+        _env.Set("TS_UPLOAD_QUOTA_MB", "512");
+        _env.Set("TS_UPLOAD_TTL_HOURS", "24");
+
+        var options = ServerOptionsBuilder.Build(new[] { "--upload-max-mb", "50" }, _baseDir);
+
+        // CLI wins over env for the per-file cap.
+        Assert.Equal(50L * 1024 * 1024, options.UploadMaxFileBytes);
+        // No CLI for the others -> env values applied.
+        Assert.Equal(512L * 1024 * 1024, options.UploadQuotaBytes);
+        Assert.Equal(TimeSpan.FromHours(24), options.UploadTtl);
+    }
+
+    [Theory]
+    [InlineData("--upload-max-mb", "0")]
+    [InlineData("--upload-max-mb", "abc")]
+    [InlineData("--upload-quota-mb", "-5")]
+    [InlineData("--upload-ttl-hours", "0")]
+    [InlineData("--upload-ttl-hours", "soon")]
+    public void Build_InvalidUploadValues_ThrowArgumentException(string flag, string value)
+    {
+        var ex = Assert.Throws<ArgumentException>(
+            () => ServerOptionsBuilder.Build(new[] { flag, value }, _baseDir));
+        Assert.Contains(flag, ex.Message);
+    }
+
     [Fact]
     public void Build_Default_WebUiEnabled()
     {

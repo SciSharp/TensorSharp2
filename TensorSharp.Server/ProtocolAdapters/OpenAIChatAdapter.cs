@@ -42,17 +42,20 @@ namespace TensorSharp.Server.ProtocolAdapters
         private readonly ModelService _svc;
         private readonly InferenceQueue _queue;
         private readonly ServerHostingOptions _options;
+        private readonly UploadStoragePolicy _uploads;
         private readonly ILoggerFactory _loggerFactory;
 
         public OpenAIChatAdapter(
             ModelService svc,
             InferenceQueue queue,
             ServerHostingOptions options,
+            UploadStoragePolicy uploads,
             ILoggerFactory loggerFactory)
         {
             _svc = svc ?? throw new ArgumentNullException(nameof(svc));
             _queue = queue ?? throw new ArgumentNullException(nameof(queue));
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            _uploads = uploads ?? throw new ArgumentNullException(nameof(uploads));
             _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         }
 
@@ -104,7 +107,27 @@ namespace TensorSharp.Server.ProtocolAdapters
             int maxTokens = _options.ResolveMaxTokens(
                 SamplingConfigParser.ReadRequestedMaxTokens(body, "max_tokens", "max_completion_tokens"));
             var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
-            var messages = ChatMessageParser.ParseOpenAI(messagesEl, _options.UploadDirectory);
+            List<ChatMessage> messages;
+            try
+            {
+                messages = ChatMessageParser.ParseOpenAI(messagesEl, _uploads);
+            }
+            catch (UploadLimitExceededException ex)
+            {
+                openaiLogger.LogWarning(LogEventIds.UploadRejected,
+                    "/v1/chat/completions attachment rejected: {Reason}", ex.Message);
+                ctx.Response.StatusCode = ex.StatusCode;
+                await ctx.Response.WriteAsJsonAsync(new
+                {
+                    error = new
+                    {
+                        message = ex.Message,
+                        // 413 (file over the cap) is the client's doing; 507 (quota) is server state.
+                        type = ex.StatusCode == 413 ? "invalid_request_error" : "server_error",
+                    },
+                });
+                return;
+            }
             string requestId = OpenAIResponseFactory.NewRequestId();
 
             var openaiTools = ToolFunctionParser.ParseOpenAI(body);

@@ -123,6 +123,16 @@ builder.Services.Configure<FormOptions>(options =>
 });
 
 builder.Services.AddSingleton(hostingOptions);
+// Constructed eagerly: the constructor scans the upload directory once so the
+// quota tally starts from what is already on disk.
+var uploadPolicy = new UploadStoragePolicy(
+    hostingOptions.UploadDirectory,
+    hostingOptions.UploadMaxFileBytes,
+    hostingOptions.UploadQuotaBytes,
+    hostingOptions.UploadTtl);
+builder.Services.AddSingleton(uploadPolicy);
+if (hostingOptions.UploadTtl.HasValue)
+    builder.Services.AddHostedService<UploadCleanupService>();
 builder.Services.AddSingleton<ModelService>();
 builder.Services.AddSingleton<InferenceQueue>();
 builder.Services.AddSingleton<SessionManager>();
@@ -238,6 +248,18 @@ if (qwenImageFlagsApplied)
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_VAE") ?? "(scan)",
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_TE") ?? "(scan)",
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_MMPROJ") ?? "(scan)");
+}
+
+if (hostingOptions.UploadMaxFileBytes != UploadStoragePolicy.DefaultMaxFileBytes
+    || uploadPolicy.QuotaEnabled
+    || hostingOptions.UploadTtl.HasValue)
+{
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Upload storage limits: maxFileMB={MaxFileMB} quotaMB={QuotaMB} ttlHours={TtlHours} usedMB={UsedMB}",
+        hostingOptions.UploadMaxFileBytes / (1024 * 1024),
+        uploadPolicy.QuotaEnabled ? (hostingOptions.UploadQuotaBytes / (1024 * 1024)).ToString() : "(off)",
+        hostingOptions.UploadTtl.HasValue ? hostingOptions.UploadTtl.Value.TotalHours.ToString("0.##") : "(off)",
+        uploadPolicy.UsedBytes / (1024 * 1024));
 }
 
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);

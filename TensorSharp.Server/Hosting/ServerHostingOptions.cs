@@ -47,6 +47,9 @@ namespace TensorSharp.Server.Hosting
             bool fileLoggingEnabled,
             SamplingDefaults samplingDefaults,
             string listenUrls = DefaultListenUrls,
+            long uploadMaxFileBytes = UploadStoragePolicy.DefaultMaxFileBytes,
+            long uploadQuotaBytes = 0,
+            TimeSpan? uploadTtl = null,
             bool webUiEnabled = true)
         {
             WebUiEnabled = webUiEnabled;
@@ -66,6 +69,9 @@ namespace TensorSharp.Server.Hosting
             LogDirectory = logDirectory;
             FileLoggingEnabled = fileLoggingEnabled;
             SamplingDefaults = samplingDefaults ?? new SamplingDefaults(new SamplingConfig());
+            UploadMaxFileBytes = uploadMaxFileBytes;
+            UploadQuotaBytes = uploadQuotaBytes;
+            UploadTtl = uploadTtl;
         }
 
         /// <summary>
@@ -132,6 +138,27 @@ namespace TensorSharp.Server.Hosting
 
         /// <summary>Absolute path to the directory used for user uploads.</summary>
         public string UploadDirectory { get; }
+
+        /// <summary>
+        /// Per-file cap in bytes on client-originated upload-directory writes,
+        /// from <c>--upload-max-mb</c> / <c>TS_UPLOAD_MAX_MB</c>. Defaults to
+        /// the 500 MB request-body limit, i.e. no additional restriction.
+        /// </summary>
+        public long UploadMaxFileBytes { get; }
+
+        /// <summary>
+        /// Total upload-directory budget in bytes, from <c>--upload-quota-mb</c>
+        /// / <c>TS_UPLOAD_QUOTA_MB</c>. 0 (the default) disables the quota.
+        /// </summary>
+        public long UploadQuotaBytes { get; }
+
+        /// <summary>
+        /// Age after which upload-directory files are deleted, from
+        /// <c>--upload-ttl-hours</c> / <c>TS_UPLOAD_TTL_HOURS</c>. Null (the
+        /// default) disables cleanup: chat sessions reference attachments by
+        /// path and may legitimately reuse them much later.
+        /// </summary>
+        public TimeSpan? UploadTtl { get; }
 
         /// <summary>Resolved log directory (used by the file logger when it is enabled).</summary>
         public string LogDirectory { get; }

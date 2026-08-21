@@ -86,6 +86,7 @@ namespace TensorSharp.Runtime.Logging
         // Uploads / media --------------------------------------------------
         public static readonly EventId UploadReceived = new(1600, nameof(UploadReceived));
         public static readonly EventId UploadRejected = new(1601, nameof(UploadRejected));
+        public static readonly EventId UploadCleanup = new(1602, nameof(UploadCleanup));
 
         // CLI --------------------------------------------------------------
         public static readonly EventId CliStarted = new(1700, nameof(CliStarted));
