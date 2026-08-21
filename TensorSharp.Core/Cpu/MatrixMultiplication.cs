@@ -75,7 +75,7 @@ namespace TensorSharp.Cpu
         ConjTrans = 113
     }
 
-    unsafe public static class MatrixMultiplication
+    unsafe public static partial class MatrixMultiplication
     {
         const string mklDllName = "mkl_rt.2.dll";
         internal const string mklDllNameLinux = "mkl_rt";
@@ -1374,8 +1374,8 @@ namespace TensorSharp.Cpu
             }
         }
 
-        [DllImport(mklDllName)]
-        public static extern unsafe void cblas_sgemm(Order order, byte transa, byte transb, int m, int n, int k, float alpha, float* a, int lda, float* b, int ldb, float beta, float* c, int ldc);
+        [LibraryImport(mklDllName)]
+        public static unsafe partial void cblas_sgemm(Order order, byte transa, byte transb, int m, int n, int k, float alpha, float* a, int lda, float* b, int ldb, float beta, float* c, int ldc);
 
         private static void GemmOp(BlasOp transA, BlasOp transB, float alpha, Tensor a, Tensor b, float beta, Tensor c)
         {
@@ -1450,8 +1450,8 @@ namespace TensorSharp.Cpu
             }
         }
 
-        [DllImport(mklDllName)]
-        public static extern unsafe void cblas_sgemm_batch_strided(Order order, byte transa, byte transb, int m, int n, int k, float alpha, float* a, int lda, int stra, float* b, int ldb, int strb, float beta, float* c, int ldc, int stridec, int batch_size);
+        [LibraryImport(mklDllName)]
+        public static unsafe partial void cblas_sgemm_batch_strided(Order order, byte transa, byte transb, int m, int n, int k, float alpha, float* a, int lda, int stra, float* b, int ldb, int strb, float beta, float* c, int ldc, int stridec, int batch_size);
 
         private static void GemmOpBatch(BlasOp transA, BlasOp transB, float alpha, Tensor a, Tensor b, float beta, Tensor c)
         {

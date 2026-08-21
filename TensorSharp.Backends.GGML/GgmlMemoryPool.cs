@@ -19,7 +19,7 @@ namespace TensorSharp.GGML
     /// GGML host-ptr buffers require aligned addresses, so use aligned allocations on every
     /// platform: 16KB on macOS for Metal shared memory, 32 bytes elsewhere for GGML CPU.
     /// </summary>
-    internal sealed class GgmlMemoryPool
+    internal sealed partial class GgmlMemoryPool
     {
         /// <summary>16KB - Apple Silicon page size; required for Metal newBufferWithBytesNoCopy.</summary>
         private const int MetalPageSize = 16 * 1024;
@@ -247,17 +247,17 @@ namespace TensorSharp.GGML
         private const uint WindowsMemRelease = 0x8000;
         private const uint WindowsPageReadWrite = 0x04;
 
-        [DllImport("kernel32.dll", EntryPoint = "VirtualAlloc", ExactSpelling = true, SetLastError = true)]
-        private static extern IntPtr WindowsVirtualAlloc(IntPtr lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
+        [LibraryImport("kernel32.dll", EntryPoint = "VirtualAlloc", SetLastError = true)]
+        private static partial IntPtr WindowsVirtualAlloc(IntPtr lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
 
-        [DllImport("kernel32.dll", EntryPoint = "VirtualFree", ExactSpelling = true, SetLastError = true)]
+        [LibraryImport("kernel32.dll", EntryPoint = "VirtualFree", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool WindowsVirtualFree(IntPtr lpAddress, UIntPtr dwSize, uint dwFreeType);
+        private static partial bool WindowsVirtualFree(IntPtr lpAddress, UIntPtr dwSize, uint dwFreeType);
 
-        [DllImport("libc", EntryPoint = "mmap", SetLastError = true)]
-        private static extern IntPtr UnixMmap(IntPtr addr, nuint length, int prot, int flags, int fd, IntPtr offset);
+        [LibraryImport("libc", EntryPoint = "mmap", SetLastError = true)]
+        private static partial IntPtr UnixMmap(IntPtr addr, nuint length, int prot, int flags, int fd, IntPtr offset);
 
-        [DllImport("libc", EntryPoint = "munmap", SetLastError = true)]
-        private static extern int UnixMunmap(IntPtr addr, nuint length);
+        [LibraryImport("libc", EntryPoint = "munmap", SetLastError = true)]
+        private static partial int UnixMunmap(IntPtr addr, nuint length);
     }
 }

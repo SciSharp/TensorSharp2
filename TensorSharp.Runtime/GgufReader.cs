@@ -56,7 +56,7 @@ namespace TensorSharp.Runtime
         }
     }
 
-    public class GgufFile : IDisposable
+    public partial class GgufFile : IDisposable
     {
         public uint Version { get; private set; }
         public Dictionary<string, object> Metadata { get; } = new();
@@ -331,11 +331,11 @@ namespace TensorSharp.Runtime
             }
         }
 
-        [DllImport("libc", SetLastError = true, EntryPoint = "mlock")]
-        private static extern unsafe int mlock(void* addr, nuint len);
+        [LibraryImport("libc", EntryPoint = "mlock", SetLastError = true)]
+        private static unsafe partial int mlock(void* addr, nuint len);
 
-        [DllImport("libc", SetLastError = true, EntryPoint = "munlock")]
-        private static extern unsafe int munlock(void* addr, nuint len);
+        [LibraryImport("libc", EntryPoint = "munlock", SetLastError = true)]
+        private static unsafe partial int munlock(void* addr, nuint len);
 
         private void Parse()
         {

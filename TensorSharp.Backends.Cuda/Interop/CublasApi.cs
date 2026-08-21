@@ -3,24 +3,24 @@ using System.Runtime.InteropServices;
 
 namespace TensorSharp.Cuda.Interop
 {
-    internal static class CublasApi
+    internal static partial class CublasApi
     {
         private const string LibName = "cublas";
 
-        [DllImport(LibName, EntryPoint = "cublasCreate_v2")]
-        public static extern int cublasCreate(out IntPtr handle);
+        [LibraryImport(LibName, EntryPoint = "cublasCreate_v2")]
+        public static partial int cublasCreate(out IntPtr handle);
 
-        [DllImport(LibName, EntryPoint = "cublasDestroy_v2")]
-        public static extern int cublasDestroy(IntPtr handle);
+        [LibraryImport(LibName, EntryPoint = "cublasDestroy_v2")]
+        public static partial int cublasDestroy(IntPtr handle);
 
-        [DllImport(LibName, EntryPoint = "cublasSetStream_v2")]
-        public static extern int cublasSetStream(IntPtr handle, IntPtr stream);
+        [LibraryImport(LibName, EntryPoint = "cublasSetStream_v2")]
+        public static partial int cublasSetStream(IntPtr handle, IntPtr stream);
 
-        [DllImport(LibName)]
-        public static extern int cublasSetMathMode(IntPtr handle, int mode);
+        [LibraryImport(LibName)]
+        public static partial int cublasSetMathMode(IntPtr handle, int mode);
 
-        [DllImport(LibName, EntryPoint = "cublasSgemm_v2")]
-        public static extern int cublasSgemm(
+        [LibraryImport(LibName, EntryPoint = "cublasSgemm_v2")]
+        public static partial int cublasSgemm(
             IntPtr handle,
             int transa,
             int transb,
@@ -36,8 +36,8 @@ namespace TensorSharp.Cuda.Interop
             IntPtr c,
             int ldc);
 
-        [DllImport(LibName)]
-        public static extern int cublasSgemmStridedBatched(
+        [LibraryImport(LibName)]
+        public static partial int cublasSgemmStridedBatched(
             IntPtr handle,
             int transa,
             int transb,
@@ -57,8 +57,8 @@ namespace TensorSharp.Cuda.Interop
             long strideC,
             int batchCount);
 
-        [DllImport(LibName)]
-        public static extern int cublasGemmEx(
+        [LibraryImport(LibName)]
+        public static partial int cublasGemmEx(
             IntPtr handle,
             int transa,
             int transb,

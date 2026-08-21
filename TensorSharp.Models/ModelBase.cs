@@ -25,7 +25,7 @@ using TensorSharp.MLX;
 
 namespace TensorSharp.Models
 {
-    public class QuantizedWeight : IDisposable
+    public partial class QuantizedWeight : IDisposable
     {
         private IntPtr _data;
         private GCHandle _cacheKeyHandle;
@@ -307,8 +307,8 @@ namespace TensorSharp.Models
 
         private const int MadvDontNeed = 4;
 
-        [DllImport("libc", SetLastError = true, EntryPoint = "madvise")]
-        private static extern unsafe int madvise(void* addr, nuint len, int advice);
+        [LibraryImport("libc", EntryPoint = "madvise", SetLastError = true)]
+        private static unsafe partial int madvise(void* addr, nuint len, int advice);
     }
 
     /// <summary>
