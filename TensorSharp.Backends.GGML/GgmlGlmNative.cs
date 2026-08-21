@@ -35,7 +35,7 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern IntPtr TSGgml_GlmLoadModel([MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
             int nGpu, int nCtx, int nUbatch, int nThreads, int nCpuMoe,
-            [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName, int tp, int ctxIsHardLimit);
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName, int tp, int ctxIsHardLimit, int loadMtp);
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmVocabSize(IntPtr handle);
@@ -71,6 +71,26 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern void TSGgml_GlmFree(IntPtr handle);
 
+        // ---- NextN/MTP speculative decoding -------------------------------
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmHasMtp(IntPtr handle);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmHiddenSize(IntPtr handle);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_GlmSpecForward(IntPtr handle, int* tokens, int nTokens,
+            float* hOut, float* logitsOut, int allLogitsRows);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_GlmMtpDraftStep(IntPtr handle, int token, float* hPrev, int pos,
+            float* logitsOut, float* hOut);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_GlmMtpCatchUp(IntPtr handle, int* tokens, int nTokens,
+            float* hRows, int startPos);
+
         /// <param name="nGpu">GPUs to spread the layers over; 0 = every visible device.</param>
         /// <param name="nCpuMoe">Leading layers whose routed experts stay in system RAM;
         /// <see cref="CpuMoeAuto"/> offloads the fewest that make the model fit.</param>
@@ -84,10 +104,14 @@ namespace TensorSharp.GGML
         /// the caller (MAX_CONTEXT) and must be honoured or refused; false when it
         /// is only what the GGUF advertises, which the loader may cap to whatever
         /// the devices can actually hold beside the weights.</param>
+        /// <param name="loadMtp">Load the trailing NextN/MTP draft block. It is a
+        /// whole extra decoder layer (~3 GiB of GLM-5.2 at IQ2_XXS), so it stays
+        /// unloaded unless speculation was actually requested.</param>
         public static IntPtr LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads,
-            int nCpuMoe = CpuMoeNone, string backendName = null, int tp = 1, bool ctxIsHardLimit = false)
+            int nCpuMoe = CpuMoeNone, string backendName = null, int tp = 1, bool ctxIsHardLimit = false,
+            bool loadMtp = false)
             => TSGgml_GlmLoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads, nCpuMoe, backendName ?? string.Empty, tp,
-                                   ctxIsHardLimit ? 1 : 0);
+                                   ctxIsHardLimit ? 1 : 0, loadMtp ? 1 : 0);
 
         public static int VocabSize(IntPtr handle) => TSGgml_GlmVocabSize(handle);
         public static int CtxSize(IntPtr handle) => TSGgml_GlmCtxSize(handle);
@@ -130,5 +154,52 @@ namespace TensorSharp.GGML
         public static bool SlotFree(IntPtr handle, int slotId) => TSGgml_GlmSlotFree(handle, slotId) != 0;
 
         public static void Free(IntPtr handle) => TSGgml_GlmFree(handle);
+
+        // ---- NextN/MTP speculative decoding -------------------------------
+
+        /// <summary>True when the trailing NextN/MTP block was loaded and is usable.</summary>
+        public static bool HasMtp(IntPtr handle) => TSGgml_GlmHasMtp(handle) != 0;
+
+        /// <summary>Hidden size (n_embd) — the width of one h_nextn row.</summary>
+        public static int HiddenSize(IntPtr handle) => TSGgml_GlmHiddenSize(handle);
+
+        /// <summary>Trunk forward that also captures the post-output_norm hidden
+        /// state of every row into <paramref name="hOut"/>. With
+        /// <paramref name="allLogitsRows"/> the LM head runs on every row
+        /// (n*vocab floats out); otherwise only the last row's logits are written.</summary>
+        public static unsafe bool SpecForward(IntPtr handle, int[] tokens, float[] hOut,
+                                              float[] logitsOut, bool allLogitsRows)
+        {
+            fixed (int* t = tokens)
+            fixed (float* h = hOut)
+            fixed (float* l = logitsOut)
+            {
+                return TSGgml_GlmSpecForward(handle, t, tokens.Length, h, l, allLogitsRows ? 1 : 0) != 0;
+            }
+        }
+
+        /// <summary>One NextN draft step at <paramref name="pos"/>.</summary>
+        public static unsafe bool MtpDraftStep(IntPtr handle, int token, float[] hPrev, int pos,
+                                               float[] logitsOut, float[] hOut)
+        {
+            fixed (float* hp = hPrev)
+            fixed (float* l = logitsOut)
+            fixed (float* h = hOut)
+            {
+                return TSGgml_GlmMtpDraftStep(handle, token, hp, pos, l, h) != 0;
+            }
+        }
+
+        /// <summary>Replay verified tokens through the NextN block so its KV cache
+        /// tracks the trunk. Row k of <paramref name="hRows"/> is the trunk hidden
+        /// state of the token preceding <c>tokens[k]</c>.</summary>
+        public static unsafe bool MtpCatchUp(IntPtr handle, int[] tokens, float[] hRows, int startPos)
+        {
+            fixed (int* t = tokens)
+            fixed (float* h = hRows)
+            {
+                return TSGgml_GlmMtpCatchUp(handle, t, tokens.Length, h, startPos) != 0;
+            }
+        }
     }
 }

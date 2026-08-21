@@ -18,7 +18,7 @@ id is `glm-dsa`.
 | Indexer layers | 21 of 78 | layers 0,1,2 then every 4th from 6; the layers in between reuse the last full layer's selection |
 | MoE | 256 experts, top-8, `n_ff_exp` 2048 | sigmoid gating, a routing bias for SELECTION only, weight renormalisation, x2.5 routed scale |
 | Dense layers | first 3 | plain SwiGLU with `feed_forward_length` 12288 |
-| NextN / MTP | 1 trailing block | `block_count` includes it; the trunk graph runs `block_count - nextn_predict_layers` layers |
+| NextN / MTP | 1 trailing block | `block_count` includes it; the trunk graph runs `block_count - nextn_predict_layers` layers. Drives [speculative decoding](#nextn--mtp-speculative-decoding) under `--mtp-spec`; unloaded otherwise |
 | RoPE | NORM, base 8e6, no YaRN | applied to the 64-wide rope slice of Q and to the single K rope tail |
 
 Attention softmax scale is `1/sqrt(n_embd_head_k_mla)` = 1/16 — the *decompressed*
@@ -136,6 +136,131 @@ cancels — but the indexer key cache is F16, and rotating before rounding sprea
 the error evenly across the 128 dimensions. Skipping it changed which tokens the
 top-k picked on a 2741-token prompt and broke token-for-token parity with
 llama.cpp; reproducing it restored 6/6.
+
+## NextN / MTP speculative decoding
+
+GLM-5.2 ships a **NextN block** in the stock checkpoint — `block_count` is 79
+and `nextn_predict_layers` is 1, so `blk.78` is a complete glm-dsa decoder block
+(MLA attention, the 256-expert sigmoid-gated MoE with its shared expert) wrapped
+in the deepseek-family NextN wiring:
+
+```
+h_mtp  = shared_head_norm( block( eh_proj( [ enorm(embed(t)) ; hnorm(h) ] ) ) )
+logits = lm_head(h_mtp)
+```
+
+where `h` is the trunk's **post-`output_norm`** hidden state of the token before
+`t`. The block predicts token *t+1* from token *t*, so chaining it drafts a
+window that the trunk then verifies in a single batched forward. Enable it with
+the server's `--mtp-spec`; there is nothing to download.
+
+```bash
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --n-cpu-moe 20 --mtp-spec
+```
+
+Three details are worth stating, because getting any of them wrong is silent:
+
+- **The draft block attends densely.** It ships lightning-indexer weights
+  (`blk.78.indexer.*`), but llama.cpp's `graph_mtp` builds the plain MLA
+  attention input and never reads them — and the block has no indexer key cache
+  to score against anyway. Running the indexer there would be a different model,
+  not a faster one.
+- **It borrows the trunk's embedding table and LM head.** GLM-5.2 ships neither
+  `nextn.embed_tokens` nor `nextn.shared_head_head`. Both are optional in
+  llama.cpp too, and both are honoured when present. The borrowed head is why
+  drafting is refused under `--tp N > 1`: the trunk head is column-parallel
+  there, so the draft would read one rank's strip of the vocabulary.
+- **The draft block's KV cache never needs a rollback.** A catch-up always
+  rewrites from the verified position forward, so rejected speculative rows are
+  overwritten before anything reads them. And because glm-dsa has no recurrent
+  state, a partially-rejected verify keeps the accepted prefix's KV in the trunk
+  and only rewinds the position — no kept-prefix re-forward, which is the
+  dominant rollback cost on a long context.
+
+**Opt-in for a reason.** The block is a whole extra decoder layer — ~3 GiB at
+IQ2_XXS — competing for the VRAM the loader sizes the context against, so the
+native loader only pages it in when `--mtp-spec` (`TS_MTP_SPEC`) was set before
+the model loaded. `TS_GLM_MTP=1` / `0` overrides either way for an A/B.
+
+### Measured
+
+2× RTX PRO 6000 Blackwell (97 GiB each), GLM-5.2-UD-IQ2_XXS, `--n-cpu-moe 20`,
+21-token prompt, 160 tokens generated, greedy
+(`InferenceWeb.Tests/GlmDsaMtpModelTests.cs`). Each run takes the plain baseline
+as the median of three, because the host-side expert matmul is the noisy half of
+the comparison — and the whole benchmark was then repeated five times, because
+one round is not enough to tell a 5% tuning effect from that noise.
+
+| Configuration | Decode (5 runs) | vs plain | Draft acceptance | Drafted per verify |
+|---|---|---|---|---|
+| plain greedy | 17.96 / 18.33 / 20.42 / 20.37 / 18.56 tok/s | 1.00x | — | — |
+| `--mtp-spec` (the defaults: k=8, pMin 0.75) | 20.50 / 25.68 / 25.83 / 25.85 / 23.52 tok/s | 1.14 / 1.40 / 1.27 / 1.27 / 1.27x — **median 1.27x** | 93.8% | 1.59 |
+| `--mtp-spec --mtp-draft 4 --mtp-pmin 0.55` | 22.35 / 26.99 / 25.86 / 26.81 / 25.89 tok/s | 1.24 / 1.47 / 1.27 / 1.32 / 1.39x — median 1.32x | 75.0% | 2.04 |
+
+**On tuning.** A narrower window with a lower gate was best or tied-best in
+every run (and in a `--n-cpu-moe 34` variant), by ~4% on average — but never by
+enough, and never consistently enough, to be worth hard-coding as a per-model
+default: sweeping the gate alone at k=8 won three runs and lost three. The two
+knobs interact, so sweep them together rather than one at a time. The runtime
+cost governor in `MtpSpeculativeExecution` measures the model/drafter pair
+either way and parks drafting if it stops paying.
+
+Why a narrower window helps at all: a verify amortizes unusually well here — the
+trunk reads its routed experts once for the whole window —
+
+| Verify rows | Cost | vs a 1-row decode | Per token |
+|---|---|---|---|
+| 1 | 95.6 ms | 1.00x | 1.00x |
+| 2 | 121.4 ms | 1.27x | 0.64x |
+| 3 | 147.5 ms | 1.54x | 0.51x |
+| 5 | 190.8 ms | 2.00x | 0.40x |
+| 9 | 285.2 ms | 2.98x | 0.33x |
+
+so an extra speculative row costs about a quarter of a decode step and is worth
+taking well below 50% expected acceptance. What the 0.75 gate does instead is
+cut the chain after one token (1.59 drafted per verify); lowering it lengthens
+the chain, and capping the window bounds what a chain that then gets rejected
+costs. Neither alone is reliably better than the defaults — together they are.
+
+The break-even also moves with how much of the MoE is offloaded, so it is worth
+knowing which side of it your host is on. At `--n-cpu-moe 34` (84.4 GiB of
+experts on the host):
+
+| Configuration | Decode | vs plain |
+|---|---|---|
+| plain greedy | 12.57 tok/s | 1.00x |
+| the defaults | 14.57 tok/s | 1.16x |
+| `--mtp-draft 4 --mtp-pmin 0.55` | 14.78 tok/s | 1.18x |
+
+Heavier offload slows the 1-row baseline more than it slows a wide verify, so
+the curve flattens (a 2-row verify is 1.16x a 1-row decode there, not 1.27x) and
+the configurations converge.
+
+### Greedy output and floating point
+
+Every emitted token is drawn from a **trunk** row, so speculation cannot change
+which distribution a token comes from — only how many forward passes it took to
+get there. It does change the *arithmetic*: a K+1-row verify runs the trunk's
+matmuls at a different batch size than a 1-row decode, which selects different
+kernels and reduction orders.
+
+On GLM-5.2 that is not invisible. At 2-bit with 256 experts at top-8, a last-bit
+difference in a router logit changes *which experts run*, and 78 layers amplify
+it. Measured over 140 verify rows against per-token decode: the top token
+differs on **2.9%** of rows (max |Δlogit| 2.6), so a long greedy run eventually
+takes a different — equally valid — branch. This is the same effect the
+[tensor-parallelism section](#tensor-parallelism) describes for `--tp`, and the
+tests pin down where it does *not* come from:
+
+- capturing the hidden state is free: an h-capturing forward at one token is
+  **bit-identical** to a plain forward (max |Δ| exactly 0);
+- driving the whole speculative loop with drafting suppressed — same cache
+  bookkeeping, same catch-up calls, same rewinds — reproduces greedy **exactly**.
+
+So the effect is the batch size, not the speculation. If you need a run to match
+non-speculative greedy token for token, leave `--mtp-spec` off.
 
 ## Numerical parity
 
