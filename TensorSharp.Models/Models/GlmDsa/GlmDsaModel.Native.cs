@@ -110,13 +110,20 @@ namespace TensorSharp.Models
                 Environment.GetEnvironmentVariable("MAX_CONTEXT"));
 
             _native = GgmlGlmNative.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
-                ResolveCpuMoeLayers(), BackendRegistryName(backend), tp, ctxIsHardLimit);
+                ResolveCpuMoeLayers(), BackendRegistryName(backend), tp, ctxIsHardLimit,
+                NativeMtpRequested());
             if (_native == IntPtr.Zero)
                 throw new InvalidOperationException(
                     $"Failed to load the glm-dsa model from {ggufPath} with the native executor (see stderr). " +
                     "TS_GLM_NATIVE=0 falls back to the per-op path.");
 
             _maxContextLength = GgmlGlmNative.CtxSize(_native);
+            // The native loader is the authority on whether the draft block
+            // actually made it in: a trunk-only checkpoint, or a device that had
+            // no room for the extra layer, both come back without one.
+            HasMtp = GgmlGlmNative.HasMtp(_native);
+            if (HasMtp)
+                _mtpLayer = _numTrunkLayers;
             int vocab = GgmlGlmNative.VocabSize(_native);
             if (vocab > 0)
                 Config.VocabSize = vocab;

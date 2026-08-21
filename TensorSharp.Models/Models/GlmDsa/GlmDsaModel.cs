@@ -47,6 +47,15 @@ namespace TensorSharp.Models
         private int _numAllLayers;
         /// <summary>NextN/MTP blocks at the end of the file (1 for GLM-5.2, 0 when absent).</summary>
         private int _numNextnLayers;
+        /// <summary>
+        /// Index of the NextN/MTP draft block, or -1 when the checkpoint declares
+        /// <c>nextn_predict_layers</c> but ships no MTP tensors (a trunk-only
+        /// re-quantization, which llama.cpp also accepts and runs without a draft
+        /// head). Set by <see cref="ResolveMtpLayer"/> once the weights are in.
+        /// </summary>
+        private int _mtpLayer = -1;
+        /// <summary>Layers that own an MLA cache: the trunk, plus the MTP block when it loaded.</summary>
+        private int NumCacheLayers => _mtpLayer >= 0 ? _numTrunkLayers + 1 : _numTrunkLayers;
         /// <summary>Leading dense (non-MoE) blocks.</summary>
         private int _numDenseLead;
 
@@ -137,7 +146,15 @@ namespace TensorSharp.Models
         private const int WN_IDX_K_NORM_W = 18;
         private const int WN_IDX_K_NORM_B = 19;
         private const int WN_IDX_PROJ = 20;
-        private const int WN_COUNT = 21;
+        // NextN/MTP wiring. Only the trailing MTP block(s) carry these; on a
+        // trunk layer every one of them resolves to a missing tensor.
+        private const int WN_NEXTN_EH_PROJ = 21;
+        private const int WN_NEXTN_ENORM = 22;
+        private const int WN_NEXTN_HNORM = 23;
+        private const int WN_NEXTN_SHARED_HEAD_NORM = 24;
+        private const int WN_NEXTN_EMBED_TOKENS = 25;
+        private const int WN_NEXTN_SHARED_HEAD_HEAD = 26;
+        private const int WN_COUNT = 27;
 
         public GlmDsaModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
             : base(ggufPath, NormalizeBackend(backend), tpDegree, tpGroup)
@@ -148,7 +165,9 @@ namespace TensorSharp.Models
             ParseGlmDsaConfig(arch);
             ParseTokenizer();
 
-            Console.WriteLine($"Model: {arch}, Layers={_numTrunkLayers}(+{_numNextnLayers} MTP), Hidden={Config.HiddenSize}, " +
+            Console.WriteLine($"Model: {arch}, Layers={_numTrunkLayers}" +
+                (_numNextnLayers > 0 ? $" (+{_numNextnLayers} NextN/MTP block in the file)" : "") +
+                $", Hidden={Config.HiddenSize}, " +
                 $"Heads={Config.NumHeads}, MLA(q_lora={_qLoraRank}, kv_lora={_kvLoraRank}, head_k={_headDimK}, head_v={_headDimV}, rope={_ropeDim}), " +
                 $"Vocab={Config.VocabSize}");
             Console.WriteLine($"  MoE: {_numExperts} experts, top-{_numExpertsUsed}, ffn={_expertFfnLength}, shared={_numSharedExperts}, " +
@@ -170,6 +189,7 @@ namespace TensorSharp.Models
             LoadWeights();
             BuildLayerNames();
             CacheMoeWeightHandles();
+            ResolveMtpLayer();
 
             if (IsTensorParallel)
             {
@@ -353,6 +373,12 @@ namespace TensorSharp.Models
                 n[WN_IDX_K_NORM_W] = p + "indexer.k_norm.weight";
                 n[WN_IDX_K_NORM_B] = p + "indexer.k_norm.bias";
                 n[WN_IDX_PROJ] = p + "indexer.proj.weight";
+                n[WN_NEXTN_EH_PROJ] = p + "nextn.eh_proj.weight";
+                n[WN_NEXTN_ENORM] = p + "nextn.enorm.weight";
+                n[WN_NEXTN_HNORM] = p + "nextn.hnorm.weight";
+                n[WN_NEXTN_SHARED_HEAD_NORM] = p + "nextn.shared_head_norm.weight";
+                n[WN_NEXTN_EMBED_TOKENS] = p + "nextn.embed_tokens.weight";
+                n[WN_NEXTN_SHARED_HEAD_HEAD] = p + "nextn.shared_head_head.weight";
                 _layerNames[l] = n;
             }
 
@@ -427,16 +453,20 @@ namespace TensorSharp.Models
         {
             _maxContextLength = maxSeqLen;
             _kvCacheCapacity = initialSeqLen;
-            _kvCache = new Tensor[_numTrunkLayers];
-            _kPeCache = new Tensor[_numTrunkLayers];
-            _indexerCache = new Tensor[_numTrunkLayers];
-            for (int l = 0; l < _numTrunkLayers; l++)
+            // The MTP block owns one more MLA cache. It needs no indexer cache:
+            // the draft head runs DENSE attention (llama.cpp's graph_mtp does the
+            // same), so its lightning-indexer weights are never read.
+            int nCache = NumCacheLayers;
+            _kvCache = new Tensor[nCache];
+            _kPeCache = new Tensor[nCache];
+            _indexerCache = new Tensor[nCache];
+            for (int l = 0; l < nCache; l++)
             {
                 _kvCache[l] = new Tensor(_allocator, DType.Float32, initialSeqLen, _kvLoraRank);
                 InitializeCacheTensor(_kvCache[l]);
                 _kPeCache[l] = new Tensor(_allocator, DType.Float32, initialSeqLen, _ropeDim);
                 InitializeCacheTensor(_kPeCache[l]);
-                if (_indexerFull[l])
+                if (l < _numTrunkLayers && _indexerFull[l])
                 {
                     _indexerCache[l] = new Tensor(_allocator, DType.Float32, initialSeqLen, _indexerHeadDim);
                     InitializeCacheTensor(_indexerCache[l]);
@@ -457,7 +487,7 @@ namespace TensorSharp.Models
             while (newCapacity < requiredSeqLen)
                 newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
 
-            for (int l = 0; l < _numTrunkLayers; l++)
+            for (int l = 0; l < NumCacheLayers; l++)
             {
                 GrowCache(ref _kvCache[l], newCapacity, _kvLoraRank);
                 GrowCache(ref _kPeCache[l], newCapacity, _ropeDim);
@@ -519,8 +549,9 @@ namespace TensorSharp.Models
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
+            _mtpCacheSeqLen = 0;
             if (_kvCache == null) return;
-            for (int l = 0; l < _numTrunkLayers; l++)
+            for (int l = 0; l < NumCacheLayers; l++)
             {
                 ResetCacheTensor(_kvCache[l]);
                 ResetCacheTensor(_kPeCache[l]);

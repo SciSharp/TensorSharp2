@@ -174,6 +174,17 @@ struct glm_layer_weights
     ggml_tensor * idx_k_norm_w = nullptr;
     ggml_tensor * idx_k_norm_b = nullptr;
     ggml_tensor * idx_proj = nullptr;
+
+    // NextN/MTP wiring. Only the trailing draft block carries these; the eh_proj
+    // is replicated on every rank (it runs before the head split) and the two
+    // optional tensors are absent from GLM-5.2, which shares the trunk's
+    // embedding table and LM head.
+    ggml_tensor * nextn_eh_proj = nullptr;
+    ggml_tensor * nextn_enorm = nullptr;
+    ggml_tensor * nextn_hnorm = nullptr;
+    ggml_tensor * nextn_head_norm = nullptr;
+    ggml_tensor * nextn_embd = nullptr;
+    ggml_tensor * nextn_head = nullptr;
 };
 
 struct glm_layer
@@ -257,6 +268,9 @@ struct graph_inputs
     ggml_tensor * lid_mask[MAX_GPUS + 1] = {}; // F16 [n_kv, nt] (sparse layers only)
     ggml_tensor * kv_idxs[MAX_GPUS + 1] = {};  // I64 [nt] destination cache rows
     ggml_tensor * out_ids = nullptr;           // I32 [n_out]
+    /// NextN/MTP only: the trunk hidden state of the token preceding each row,
+    /// F32 [n_embd, nt]. Lives on the embedding device like inp.tokens.
+    ggml_tensor * h_in[MAX_GPUS + 1] = {};
 };
 
 /// Named intermediates kept as graph outputs when TS_GLM_TRACE names layers,
@@ -292,11 +306,19 @@ struct graph_build_result
     ggml_backend_sched_t sched = nullptr;
     graph_inputs inp;
     ggml_tensor * logits = nullptr;
+    /// Post-final-norm hidden state, one row per token, when want_h. This is
+    /// llama.cpp's `h_nextn`: what the trunk hands the draft head, and what the
+    /// draft head hands its own next step.
+    ggml_tensor * h_nextn = nullptr;
     int64_t nt = 0;
     int64_t n_kv = 0;
     int64_t n_out = 0;
     bool sparse = false;
     bool want_logits = true;
+    bool want_h = false;
+    /// 0 = trunk, 1 = the NextN/MTP draft block. Part of the cache key: the two
+    /// graphs have different shapes at the same (nt, n_kv).
+    int kind = 0;
     int slot_id = 0;
     /// Non-empty when this is a batched-decode graph; one entry per token.
     std::vector<bd_token> bd;
@@ -337,6 +359,17 @@ struct glm_model
     ggml_tensor * output = nullptr;
 
     std::vector<glm_layer> layers;
+
+    /// The trailing NextN/MTP draft block, when it was requested AND the
+    /// checkpoint ships it. `mtp_layer` indexes `layers` (== hp.n_layer); the
+    /// trunk graph still runs exactly hp.n_layer blocks, so every loop that
+    /// walks the trunk is unaffected by its presence.
+    bool has_mtp = false;
+    int  mtp_layer = -1;
+    /// Tokens the draft block has written into its own MLA cache, per slot, is
+    /// tracked by the caller through the positions it passes; this is only the
+    /// high-water mark used to validate a draft that would read unwritten rows.
+    bool mtp_dense_attn = true;
 
     int32_t n_ctx = 0;
     int32_t n_ubatch = 0;
@@ -909,10 +942,14 @@ static glm_slot * slot_alloc(glm_model & m)
 {
     auto slot = std::unique_ptr<glm_slot>(new glm_slot());
     slot->id = m.next_slot_id++;
+    // One extra MLA row set for the draft block. It needs no indexer cache: the
+    // draft runs dense attention (llama.cpp's graph_mtp does the same), so its
+    // lightning-indexer weights are never read.
+    const int n_cache_layers = m.hp.n_layer + (m.has_mtp ? 1 : 0);
     for (int r = 0; r < m.tp; r++)
     {
-        slot->kv_k[r].assign((size_t) m.hp.n_layer, nullptr);
-        slot->idx_k[r].assign((size_t) m.hp.n_layer, nullptr);
+        slot->kv_k[r].assign((size_t) n_cache_layers, nullptr);
+        slot->idx_k[r].assign((size_t) n_cache_layers, nullptr);
     }
 
     // Cache tensors live on the device that reads them, so attention never
@@ -920,18 +957,18 @@ static glm_slot * slot_alloc(glm_model & m)
     std::vector<ggml_context *> ctxs((size_t) m.n_gpu + 1, nullptr);
     for (int d = 0; d <= m.n_gpu; d++)
     {
-        ggml_init_params p = { (size_t) (4 * m.tp * m.hp.n_layer + 16) * ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params p = { (size_t) (4 * m.tp * n_cache_layers + 16) * ggml_tensor_overhead(), nullptr, true };
         ctxs[d] = ggml_init(p);
     }
 
-    for (int il = 0; il < m.hp.n_layer; il++)
+    for (int il = 0; il < n_cache_layers; il++)
     {
         for (int r = 0; r < m.tp; r++)
         {
             const int d = m.tp > 1 ? m.rank_device(r) : m.layers[il].device;
             slot->kv_k[r][il] = ggml_new_tensor_2d(ctxs[d], GGML_TYPE_F16, m.hp.n_kv_row, m.n_ctx);
             ggml_format_name(slot->kv_k[r][il], "slot%d_kv.%d.%d", slot->id, r, il);
-            if (m.layers[il].indexer_full)
+            if (il < m.hp.n_layer && m.layers[il].indexer_full)
             {
                 slot->idx_k[r][il] = ggml_new_tensor_2d(ctxs[d], GGML_TYPE_F16, m.hp.indexer_head_size, m.n_ctx);
                 ggml_format_name(slot->idx_k[r][il], "slot%d_idx.%d.%d", slot->id, r, il);
@@ -1006,7 +1043,7 @@ static void slot_free(glm_model & m, int slot_id)
 /// beside the weights.
 static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch,
                             int n_threads, int n_cpu_moe_req, const char * backend_name, int tp_req,
-                            bool ctx_is_hard_limit)
+                            bool ctx_is_hard_limit, bool load_mtp)
 {
     auto t_start = std::chrono::steady_clock::now();
     std::unique_ptr<glm_model> m(new glm_model());
@@ -1091,6 +1128,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
 
         if (const char * e = getenv("TS_GLM_GRAPH_CACHE")) { int v = atoi(e); if (v > 0) m->graph_cache_cap = v; }
     }
+    const bool graph_cache_cap_explicit = getenv("TS_GLM_GRAPH_CACHE") != nullptr;
 
     // --- metadata ---------------------------------------------------------
     ggml_context * meta0 = nullptr;
@@ -1170,6 +1208,12 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     std::vector<size_t> layer_bytes((size_t) hp.n_layer, 0);
     std::vector<size_t> layer_exps_bytes((size_t) hp.n_layer, 0);
     size_t root_bytes = 0;
+    // The trailing NextN/MTP block. Counted apart from the trunk so the layer
+    // split prices it onto the device that will actually host it instead of
+    // discovering it after the pack.
+    size_t mtp_bytes = 0;
+    size_t mtp_exps_bytes = 0;
+    bool   mtp_present = false;
 
     for (size_t si = 0; si < shards.paths.size(); si++)
     {
@@ -1204,7 +1248,14 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             {
                 root_bytes += src.size;   // token_embd / output / output_norm
             }
-            // NextN block tensors are not loaded by the trunk graph.
+            else if (bid == hp.n_layer && hp.n_layer_nextn == 1)
+            {
+                // The NextN/MTP block. The trunk graph never runs it; the draft
+                // head does, and only when speculation was requested.
+                mtp_bytes += src.size;
+                if (strstr(name, "_exps.") != nullptr) mtp_exps_bytes += src.size;
+                if (strstr(name, "nextn.eh_proj") != nullptr) mtp_present = true;
+            }
         }
         gguf_free(g);
         ggml_free(meta);
@@ -1217,18 +1268,83 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         hp.n_vocab = (int32_t) it->second.ne[1];
         embd_bytes = it->second.size;
     }
-    const size_t head_bytes = root_bytes > embd_bytes ? root_bytes - embd_bytes : 0;
+    size_t head_bytes = root_bytes > embd_bytes ? root_bytes - embd_bytes : 0;
+
+    // --- NextN/MTP draft block -------------------------------------------
+    // Loading it costs a whole extra decoder layer (~3 GiB of GLM-5.2 at
+    // IQ2_XXS) that also competes with the KV cache for the VRAM the context is
+    // sized against, so it is opt-in: the server sets TS_MTP_SPEC from
+    // --mtp-spec before the model loads, and the managed side forwards that as
+    // `load_mtp`. A checkpoint that declares nextn_predict_layers but ships no
+    // MTP tensors (a trunk-only re-quantization) loads normally without one.
+    if (load_mtp)
+    {
+        auto has_src = [&](const char * suffix) {
+            char nm[256];
+            snprintf(nm, sizeof(nm), "blk.%d.%s", hp.n_layer, suffix);
+            return sources.find(nm) != sources.end();
+        };
+        // Everything is decided BEFORE a byte is placed: a decision made later
+        // would already have priced (and, worse, uploaded) 3 GiB of a block
+        // that then turns out to be unusable.
+        const bool wiring = mtp_present && has_src("nextn.enorm.weight") && has_src("nextn.hnorm.weight");
+        // A draft block with no head of its own borrows the trunk's, which is
+        // column-parallel under tensor parallelism — the draft would read one
+        // rank's strip of the vocabulary and produce nonsense.
+        const bool borrows_split_head = !has_src("nextn.shared_head_head.weight") && m->tp > 1;
+
+        if (hp.n_layer_nextn > 1)
+            fprintf(stderr, "[glm] %d NextN blocks declared; only 1 is supported. Serving standard decode\n",
+                    hp.n_layer_nextn);
+        else if (hp.n_layer_nextn < 1)
+            fprintf(stderr, "[glm] speculation requested but this checkpoint declares no NextN block; "
+                            "serving standard decode\n");
+        else if (!wiring)
+            fprintf(stderr, "[glm] speculation requested but this checkpoint's NextN block is missing its wiring "
+                            "(a trunk-only requantization); serving standard decode\n");
+        else if (borrows_split_head)
+            fprintf(stderr, "[glm] the NextN block has no LM head of its own and the trunk head is column-parallel "
+                            "under --tp %d; serving standard decode\n", m->tp);
+        else
+        {
+            m->has_mtp = true;
+            m->mtp_layer = hp.n_layer;
+        }
+    }
+    if (!m->has_mtp) { mtp_bytes = 0; mtp_exps_bytes = 0; }
+    else if (!graph_cache_cap_explicit)
+    {
+        // Speculation multiplies the number of live graph SHAPES: the trunk
+        // verify is rebuilt for every window length the drafter produces
+        // (2..K+1 rows), the draft block adds its own 1-row and catch-up
+        // shapes, and both still key on the padded KV window. At the default
+        // cap of 8 that thrashes — every step would rebuild and re-allocate a
+        // graph it had a moment ago. These graphs are all tiny next to the
+        // 1024-row prefill graph the cache already holds.
+        int max_draft = 8;
+        if (const char * e = getenv("TS_MTP_DRAFT")) { int v = atoi(e); if (v > 0 && v <= 64) max_draft = v; }
+        m->graph_cache_cap = std::min(64, 8 + 2 * (max_draft + 1));
+    }
+    // The draft block lands beside the LM head (it reads the trunk's post-norm
+    // hidden state and writes through the same head), so it is priced with it.
+    head_bytes += mtp_bytes;
 
     m->n_ctx = n_ctx > 0 ? n_ctx : 8192;
     // What the caller asked for, kept so a later measurement can hand slack back
     // without ever exceeding the request.
     const int ctx_requested = m->n_ctx;
     m->n_ubatch = n_ubatch > 0 ? n_ubatch : 512;
-    m->layers.resize((size_t) hp.n_layer);
+    m->layers.resize((size_t) (hp.n_layer + (m->has_mtp ? 1 : 0)));
     for (int il = 0; il < hp.n_layer; il++)
     {
         m->layers[il].indexer_full = hp.indexer_full[il] != 0;
         m->layers[il].is_moe = il >= hp.n_dense_lead;
+    }
+    if (m->has_mtp)
+    {
+        glm_layer & M = m->layers[(size_t) m->mtp_layer];
+        M.indexer_full = false;             // the draft block attends densely
+        M.is_moe = m->mtp_layer >= hp.n_dense_lead;
     }
 
     // What one layer's caches cost the device that hosts it. Priced into the
@@ -1387,6 +1503,9 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         std::vector<size_t> fixed_bytes((size_t) n_gpu, 0);
         fixed_bytes[0] += embd_bytes;
         fixed_bytes[(size_t) n_gpu - 1] += head_bytes;
+        // The draft block's own MLA cache (no indexer cache — it attends densely).
+        if (m->has_mtp)
+            fixed_bytes[(size_t) n_gpu - 1] += (size_t) hp.n_kv_row * m->n_ctx * 2 + 1024;
 
         auto layer_cost = [&](int il, int n_cpu) -> size_t
         {
@@ -1507,13 +1626,25 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         }
     }
 
+    // The draft block lives with the LM head: it consumes the trunk's post-norm
+    // hidden state and writes through the same head, so putting it anywhere else
+    // would add two cross-device copies per draft step. Under tensor parallelism
+    // `.device` is unused (each rank runs on its own), and its routed experts
+    // follow the trunk's offload policy so `--cpu-moe` still fits the model.
+    if (m->has_mtp)
+    {
+        glm_layer & M = m->layers[(size_t) m->mtp_layer];
+        M.device = n_gpu > 0 ? m->layers[(size_t) hp.n_layer - 1].device : 0;
+        M.cpu_moe = n_gpu == 0 || m->mtp_layer < n_cpu_moe;
+    }
+
     // --- weight tensors ---------------------------------------------------
     for (int d = 0; d <= n_gpu; d++)
     {
         // ~28 tensors per layer per rank that lands on this device. Sized for the
         // worst case (every rank on one device, which TS_GLM_TP_OVERSUBSCRIBE
         // allows) rather than the expected one-rank-per-GPU.
-        const size_t per_dev = (size_t) (32 * hp.n_layer * std::max(1, m->tp) + 64);
+        const size_t per_dev = (size_t) (32 * (hp.n_layer + (m->has_mtp ? 1 : 0)) * std::max(1, m->tp) + 64);
         ggml_init_params wp = { per_dev * ggml_tensor_overhead(), nullptr, true };
         m->w_ctx[d] = ggml_init(wp);
         ggml_init_params cp = { (size_t) 64 * ggml_tensor_overhead(), nullptr, true };
@@ -1561,7 +1692,12 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         }
     }
 
-    for (int il = 0; il < hp.n_layer; il++)
+    // The draft block is an ordinary glm-dsa decoder block, so it loads through
+    // exactly the same code — head sharding, expert sharding and CPU offload
+    // included. The only differences are that its indexer weights are skipped
+    // (it attends densely) and that it additionally carries the NextN wiring.
+    const int n_load_layers = hp.n_layer + (m->has_mtp ? 1 : 0);
+    for (int il = 0; il < n_load_layers; il++)
     {
         glm_layer & L = m->layers[il];
 
@@ -1672,6 +1808,28 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                     W.ffn_gate_shexp = WL.full(d, true, "blk.%d.ffn_gate_shexp.weight", il);
                     W.ffn_up_shexp   = WL.full(d, true, "blk.%d.ffn_up_shexp.weight", il);
                     W.ffn_down_shexp = WL.full(d, true, "blk.%d.ffn_down_shexp.weight", il);
+                }
+            }
+
+            if (il == m->mtp_layer)
+            {
+                // NextN wiring. eh_proj runs before any split, so it is
+                // replicated; embed_tokens and shared_head_head are optional and
+                // absent from GLM-5.2, which shares the trunk's table and head.
+                W.nextn_eh_proj   = WL.full(d, true,  "blk.%d.nextn.eh_proj.weight", il);
+                W.nextn_enorm     = WL.full(d, true,  "blk.%d.nextn.enorm.weight", il);
+                W.nextn_hnorm     = WL.full(d, true,  "blk.%d.nextn.hnorm.weight", il);
+                W.nextn_head_norm = WL.full(d, false, "blk.%d.nextn.shared_head_norm.weight", il);
+                W.nextn_embd      = WL.full(d, false, "blk.%d.nextn.embed_tokens.weight", il);
+                W.nextn_head      = WL.full(d, false, "blk.%d.nextn.shared_head_head.weight", il);
+
+                // The viability decision was made before placement (see above);
+                // this only catches a source table that disagreed with it.
+                if (!W.nextn_eh_proj || !W.nextn_enorm || !W.nextn_hnorm)
+                {
+                    fprintf(stderr, "[glm] the NextN/MTP block is missing its wiring; serving standard decode\n");
+                    m->has_mtp = false;
+                    m->mtp_layer = -1;
                 }
             }
 
@@ -1951,10 +2109,17 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
 
     {
         double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-        fprintf(stderr, "[glm] glm-dsa: %d trunk layers (+%d MTP), n_embd=%d, %d heads, MLA(q_lora=%d, kv_lora=%d, "
+        // Say whether the NextN block was actually LOADED, not just that the
+        // metadata declares one: the two differ whenever speculation was not
+        // requested, and "(+1 MTP)" on a run with no draft head is exactly the
+        // kind of log line that costs an hour.
+        const char * mtp_state = m->has_mtp ? " +1 NextN/MTP draft block"
+                               : (hp.n_layer_nextn > 0 ? " (NextN block present but not loaded; --mtp-spec loads it)"
+                                                       : "");
+        fprintf(stderr, "[glm] glm-dsa: %d trunk layers%s, n_embd=%d, %d heads, MLA(q_lora=%d, kv_lora=%d, "
                 "head_k=%d, head_v=%d, rope=%d), %d experts top-%d (ff=%d), dense_lead=%d, indexer %dx%d top-%d on "
                 "%d/%d layers, vocab=%d\n",
-                hp.n_layer, hp.n_layer_nextn, hp.n_embd, hp.n_head, hp.q_lora_rank, hp.kv_lora_rank,
+                hp.n_layer, mtp_state, hp.n_embd, hp.n_head, hp.q_lora_rank, hp.kv_lora_rank,
                 hp.n_embd_head_k, hp.n_embd_head_v, hp.n_rot, hp.n_expert, hp.n_expert_used, hp.n_ff_exp,
                 hp.n_dense_lead, hp.indexer_n_head, hp.indexer_head_size, hp.indexer_top_k,
                 (int) std::count(hp.indexer_full.begin(), hp.indexer_full.end(), (uint8_t) 1), hp.n_layer, hp.n_vocab);
@@ -2833,7 +2998,7 @@ struct graph_builder
             trace("l_out", il, 0, inpL);
         }
 
-        if (!res.want_logits)
+        if (!res.want_logits && !res.want_h)
         {
             // A non-final prefill chunk only has to leave its KV behind. Running
             // the 154880-row LM head anyway would re-read the whole output matrix
@@ -2842,13 +3007,153 @@ struct graph_builder
             return;
         }
 
-        ggml_tensor * cur = ggml_get_rows(ctx, inpL, inp.out_ids);
-        cur = rms(cur, m.output_norm);
+        if (!res.want_logits)
+        {
+            // A speculative prefill chunk: no logits, but the draft head still
+            // needs this chunk's hidden states, so the final norm runs and the
+            // LM head does not. (Without this branch the early return above
+            // would hand back a graph with no h_nextn at all.)
+            ggml_tensor * hn_only = rms(inpL, m.output_norm);
+            ggml_set_output(hn_only);
+            ggml_set_name(hn_only, "h_nextn");
+            res.h_nextn = hn_only;
+            ggml_build_forward_expand(gf, hn_only);
+            return;
+        }
+
+        if (!res.want_h)
+        {
+            ggml_tensor * cur = ggml_get_rows(ctx, inpL, inp.out_ids);
+            cur = rms(cur, m.output_norm);
+            cur = ggml_mul_mat(ctx, m.output, cur);
+            ggml_set_output(cur);
+            ggml_set_name(cur, "logits");
+            res.logits = cur;
+            ggml_build_forward_expand(gf, cur);
+            return;
+        }
+
+        // Speculation needs one hidden state per token, so the final norm runs
+        // over every row and the LM head selects from the NORMED rows instead of
+        // the other way round. RMS norm is row-wise, so the rows the head reads
+        // are bit-identical to the branch above — only the rows nobody reads are
+        // extra, and at a speculative window that is a handful.
+        ggml_tensor * hn = rms(inpL, m.output_norm);
+        ggml_set_output(hn);
+        ggml_set_name(hn, "h_nextn");
+        res.h_nextn = hn;
+        ggml_build_forward_expand(gf, hn);
+
+        ggml_tensor * cur = ggml_get_rows(ctx, hn, inp.out_ids);
         cur = ggml_mul_mat(ctx, m.output, cur);
         ggml_set_output(cur);
         ggml_set_name(cur, "logits");
         res.logits = cur;
         ggml_build_forward_expand(gf, cur);
+    }
+
+    // ---- NextN/MTP draft block ------------------------------------------
+    //
+    //   h_mtp = shared_head_norm( block( eh_proj([enorm(embed(t)) ; hnorm(h)]) ) )
+    //
+    // `block` is an ordinary glm-dsa decoder block reusing the trunk builders,
+    // with one deliberate difference: the attention is DENSE. The block ships
+    // lightning-indexer weights, but llama.cpp's graph_mtp builds the plain MLA
+    // attention input and never reads them, and it has no indexer key cache to
+    // score against — so running the indexer here would be a different model,
+    // not a faster one.
+    void build_mtp()
+    {
+        graph_inputs & inp = res.inp;
+        const int il = m.mtp_layer;
+        const glm_layer & L = m.layers[il];
+        const glm_layer_weights & W0 = L.w[0];
+        const ggml_type mask_type = m.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+        std::vector<uint8_t> used_dev((size_t) m.n_gpu + 1, 0);
+        if (m.tp > 1) { for (int r = 0; r < m.tp; r++) used_dev[(size_t) m.rank_device(r)] = 1; }
+        else used_dev[(size_t) L.device] = 1;
+
+        for (int d = 0; d <= m.n_gpu; d++)
+        {
+            if (!used_dev[(size_t) d]) continue;
+            char nb[64];
+            snprintf(nb, sizeof(nb), "mtp_pos.%d", d);
+            inp.pos[d] = new_input(GGML_TYPE_I32, nt, 0, nb, d);
+            snprintf(nb, sizeof(nb), "mtp_kq_mask.%d", d);
+            inp.kq_mask[d] = new_input(mask_type, n_kv, nt, nb, d);
+            snprintf(nb, sizeof(nb), "mtp_kv_idxs.%d", d);
+            inp.kv_idxs[d] = new_input(GGML_TYPE_I64, nt, 0, nb, d);
+        }
+
+        const int dev0 = m.tp > 1 ? 0 : L.device;
+        inp.tokens[dev0] = new_input(GGML_TYPE_I32, nt, 0, "mtp_tokens", dev0);
+        inp.h_in[dev0] = new_input(GGML_TYPE_F32, hp.n_embd, nt, "mtp_h_in", dev0);
+        if (res.want_logits)
+            inp.out_ids = new_input(GGML_TYPE_I32, res.n_out, 0, "mtp_out_ids", dev0);
+
+        // The NextN wiring is replicated on every rank, so rank 0's result IS
+        // the result and the block's input is computed once (like inpL).
+        ggml_tensor * embd_w = W0.nextn_embd ? W0.nextn_embd : m.tok_embd;
+        ggml_tensor * tok = ggml_get_rows(ctx, embd_w, inp.tokens[dev0]);
+        ggml_tensor * e_norm = rms(tok, W0.nextn_enorm);
+        ggml_tensor * h_norm = rms(inp.h_in[dev0], W0.nextn_hnorm);
+        ggml_tensor * cat = ggml_concat(ctx, e_norm, h_norm, 0);        // [2*n_embd, nt]
+        ggml_tensor * inpSA = ggml_mul_mat(ctx, W0.nextn_eh_proj, cat); // [n_embd, nt]
+
+        // ---- attention: every rank runs its own heads ---------------------
+        ggml_tensor * part[MAX_GPUS] = {};
+        const int n_attn = (m.tp > 1 && m.tp_heads()) ? m.tp : 1;
+        for (int r = 0; r < n_attn; r++)
+        {
+            const int dev = device_of(il, r);
+            ggml_tensor * cur = rms(inpSA, L.w[r].attn_norm);
+            ggml_tensor * qr = rms(ggml_mul_mat(ctx, L.w[r].wq_a, cur), L.w[r].q_a_norm);
+            part[r] = build_attention(il, r, cur, qr, inp.pos[dev], inp.kq_mask[dev], inp.kv_idxs[dev]);
+        }
+        ggml_tensor * ffn_inp = ggml_add(ctx, inpSA, reduce_ranks(part, n_attn));
+
+        // ---- FFN ----------------------------------------------------------
+        ggml_tensor * out = nullptr;
+        if (!L.is_moe)
+        {
+            ggml_tensor * cur = rms(ffn_inp, L.w[0].ffn_norm);
+            out = ggml_add(ctx, ffn_inp, build_dense_ffn(il, 0, cur));
+        }
+        else
+        {
+            ggml_tensor * mpart[MAX_GPUS] = {};
+            ggml_tensor * shexp0 = nullptr;
+            const int n_moe_l = L.cpu_moe ? 1 : ((m.tp > 1 && m.tp_experts()) ? m.tp : 1);
+            for (int r = 0; r < n_moe_l; r++)
+            {
+                ggml_tensor * cur = rms(ffn_inp, L.w[r].ffn_norm);
+                mpart[r] = build_moe(il, r, cur);
+                if (r == 0) shexp0 = build_shexp(il, 0, cur);
+            }
+            ggml_tensor * ffn = reduce_ranks(mpart, n_moe_l);
+            if (shexp0) ffn = ggml_add(ctx, ffn, shexp0);
+            out = ggml_add(ctx, ffn_inp, ffn);
+        }
+
+        // shared_head_norm both seeds the next draft step and feeds the LM head.
+        ggml_tensor * head_norm_w = W0.nextn_head_norm ? W0.nextn_head_norm : m.output_norm;
+        ggml_tensor * hn = rms(out, head_norm_w);
+        ggml_set_output(hn);
+        ggml_set_name(hn, "mtp_h_nextn");
+        res.h_nextn = hn;
+        ggml_build_forward_expand(gf, hn);
+
+        if (res.want_logits)
+        {
+            ggml_tensor * head_w = W0.nextn_head ? W0.nextn_head : m.output;
+            ggml_tensor * sel = ggml_get_rows(ctx, hn, inp.out_ids);
+            ggml_tensor * logits = ggml_mul_mat(ctx, head_w, sel);
+            ggml_set_output(logits);
+            ggml_set_name(logits, "logits");
+            res.logits = logits;
+            ggml_build_forward_expand(gf, logits);
+        }
     }
 };
 
@@ -3090,17 +3395,20 @@ static bool forward_batched_decode(glm_model & m, int n, const int32_t * slot_id
 }
 
 static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_t nt, int64_t p0,
-                                          int64_t n_out, bool want_logits, bool * out_reused)
+                                          int64_t n_out, bool want_logits, bool * out_reused,
+                                          bool want_h = false, int kind = 0)
 {
     const int64_t n_kv = plan_n_kv(m, p0 + nt);
     static const bool topk_enabled = []() { const char * e = getenv("TS_GLM_TOPK"); return !(e && atoi(e) == 0); }();
-    const bool sparse = topk_enabled && (p0 + nt) > m.hp.indexer_top_k;
+    // The draft block attends densely, so the indexer's sparsity never applies
+    // to it and must not enter its cache key.
+    const bool sparse = kind == 0 && topk_enabled && (p0 + nt) > m.hp.indexer_top_k;
 
     for (auto it = m.graph_cache.begin(); it != m.graph_cache.end(); ++it)
     {
         graph_build_result * e = it->get();
         if (e->nt == nt && e->n_kv == n_kv && e->n_out == n_out && e->want_logits == want_logits &&
-            e->sparse == sparse && e->slot_id == slot.id)
+            e->sparse == sparse && e->slot_id == slot.id && e->want_h == want_h && e->kind == kind)
         {
             auto entry = std::move(*it);
             m.graph_cache.erase(it);
@@ -3117,6 +3425,8 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
     entry->n_out = n_out;
     entry->sparse = sparse;
     entry->want_logits = want_logits;
+    entry->want_h = want_h;
+    entry->kind = kind;
     entry->slot_id = slot.id;
 
     // Node budget. A GLM layer costs ~110 nodes per rank (MoE alone is ~40, the
@@ -3125,7 +3435,10 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
     // pointlessly large.
     size_t nodes_per_layer = 256;
     if (const char * e = getenv("TS_GLM_NODES_PER_LAYER")) { int v = atoi(e); if (v > 0) nodes_per_layer = (size_t) v; }
-    const size_t n_nodes = (size_t) m.hp.n_layer * nodes_per_layer * (size_t) std::max(1, m.tp) + 1024;
+    // The draft block is one layer; give it the same per-layer budget plus the
+    // fixed 1024 so its (much smaller) graph never has to share the trunk's.
+    const size_t graph_layers = kind == 0 ? (size_t) m.hp.n_layer : 1;
+    const size_t n_nodes = graph_layers * nodes_per_layer * (size_t) std::max(1, m.tp) + 1024;
     ggml_init_params gp = { ggml_tensor_overhead() * n_nodes + ggml_graph_overhead_custom(n_nodes, false),
                             nullptr, true };
     entry->ctx = ggml_init(gp);
@@ -3137,7 +3450,8 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
     if (!entry->sched) return nullptr;
 
     graph_builder gb(m, *entry, slot, nt, p0, n_kv, sparse);
-    gb.build();
+    if (kind == 0) gb.build();
+    else           gb.build_mtp();
 
     // Allocate once, here, and never reset: the allocation (and, on CUDA, the
     // captured graph) is what makes a cached entry worth keeping. Note this
@@ -3156,7 +3470,15 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
     return raw;
 }
 
-static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bool want_logits, float * logits_out)
+/// One trunk ubatch.
+///
+/// `h_out`, when non-null, additionally receives the post-final-norm hidden
+/// state of EVERY row (nt * n_embd floats) — llama.cpp's `h_nextn`, the input
+/// the NextN draft head consumes. `all_logits_rows` runs the LM head on every
+/// row instead of only the last, which is what makes one verify pass over a
+/// speculative window cost one trunk forward instead of K+1 of them.
+static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bool want_logits, float * logits_out,
+                           float * h_out = nullptr, bool all_logits_rows = false)
 {
     glm_slot & slot = *m.active_slot;
     const int64_t p0 = slot.n_past;
@@ -3166,9 +3488,10 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
         return false;
     }
 
-    const int64_t n_out = 1;   // only the last row's logits are ever needed
+    const bool want_h = h_out != nullptr;
+    const int64_t n_out = (want_logits && all_logits_rows) ? nt : 1;
     bool reused = false;
-    graph_build_result * gr = acquire_graph(m, slot, nt, p0, n_out, want_logits, &reused);
+    graph_build_result * gr = acquire_graph(m, slot, nt, p0, n_out, want_logits, &reused, want_h, /*kind=*/0);
     if (!gr) return false;
 
     const int64_t n_kv = gr->n_kv;
@@ -3181,7 +3504,9 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
         m.h_pos[(size_t) i] = (int32_t) (p0 + i);
         m.h_kv_idxs[(size_t) i] = p0 + i;
     }
-    m.h_out_ids.assign(1, (int32_t) (nt - 1));
+    m.h_out_ids.resize((size_t) n_out);
+    for (int64_t i = 0; i < n_out; i++)
+        m.h_out_ids[(size_t) i] = (int32_t) (n_out == 1 ? nt - 1 : i);
 
     // Causal mask over the padded cache window.
     const bool f16_mask = m.flash_attn;
@@ -3226,7 +3551,7 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
                 ggml_backend_tensor_set(gr->inp.lid_mask[d], m.h_mask_f16.data(), 0, m.h_mask_f16.size() * 2);
         }
     }
-    set_input_i32(gr->inp.out_ids, m.h_out_ids.data(), 1);
+    set_input_i32(gr->inp.out_ids, m.h_out_ids.data(), (size_t) n_out);
 
 
     // _async, not the synchronous entry point: the graph is already allocated
@@ -3244,7 +3569,97 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     slot.n_past += nt;
 
     if (want_logits && logits_out && gr->logits)
+        ggml_backend_tensor_get(gr->logits, logits_out, 0, (size_t) n_out * m.hp.n_vocab * sizeof(float));
+    if (h_out && gr->h_nextn)
+        ggml_backend_tensor_get(gr->h_nextn, h_out, 0, (size_t) nt * m.hp.n_embd * sizeof(float));
+    return true;
+}
+
+/// One NextN/MTP draft-block pass over `nt` tokens at `start_pos`.
+///
+/// `h_in` is nt rows of n_embd: row k is the hidden state of the token PRECEDING
+/// tokens[k] — the trunk's for a catch-up replay, the draft block's own for a
+/// chained draft step. Writes this window's MLA rows into the draft block's own
+/// cache (never the trunk's), fills `h_out` with one row per token, and, when
+/// `want_logits`, the LAST row's logits.
+///
+/// The draft block's cache needs no rollback: a catch-up always rewrites from
+/// the verified position forward, so speculative rows are overwritten before
+/// anything reads them.
+static bool mtp_forward(glm_model & m, const int32_t * tokens, int64_t nt, const float * h_in,
+                        int64_t start_pos, bool want_logits, float * logits_out, float * h_out)
+{
+    if (!m.has_mtp)
+    {
+        fprintf(stderr, "[glm] MTP draft step requested but no NextN block is loaded\n");
+        return false;
+    }
+    glm_slot & slot = *m.active_slot;
+    if (start_pos < 0 || start_pos + nt > m.n_ctx)
+    {
+        fprintf(stderr, "[glm] MTP window [%" PRId64 ", %" PRId64 ") is outside the context (%d)\n",
+                start_pos, start_pos + nt, m.n_ctx);
+        return false;
+    }
+
+    bool reused = false;
+    graph_build_result * gr = acquire_graph(m, slot, nt, start_pos, /*n_out=*/1, want_logits, &reused,
+                                            /*want_h=*/true, /*kind=*/1);
+    if (!gr) return false;
+
+    const int64_t n_kv = gr->n_kv;
+
+    m.h_tokens.assign(tokens, tokens + nt);
+    m.h_pos.resize((size_t) nt);
+    m.h_kv_idxs.resize((size_t) nt);
+    for (int64_t i = 0; i < nt; i++)
+    {
+        m.h_pos[(size_t) i] = (int32_t) (start_pos + i);
+        m.h_kv_idxs[(size_t) i] = start_pos + i;
+    }
+    m.h_out_ids.assign(1, (int32_t) (nt - 1));
+
+    const bool f16_mask = m.flash_attn;
+    if (f16_mask) m.h_mask_f16.assign((size_t) (n_kv * nt), 0);
+    else          m.h_mask_f32.assign((size_t) (n_kv * nt), 0.0f);
+    for (int64_t t = 0; t < nt; t++)
+    {
+        const int64_t last = start_pos + t;
+        for (int64_t j = 0; j < n_kv; j++)
+        {
+            const bool visible = j <= last;
+            if (f16_mask) m.h_mask_f16[(size_t) (t * n_kv + j)] = visible ? 0 : 0xFC00 /* -inf */;
+            else          m.h_mask_f32[(size_t) (t * n_kv + j)] = visible ? 0.0f : -INFINITY;
+        }
+    }
+
+    for (int d = 0; d <= m.n_gpu; d++)
+    {
+        if (live(gr->inp.tokens[d])) set_input_i32(gr->inp.tokens[d], m.h_tokens.data(), (size_t) nt);
+        if (live(gr->inp.pos[d])) set_input_i32(gr->inp.pos[d], m.h_pos.data(), (size_t) nt);
+        if (live(gr->inp.kv_idxs[d]))
+            ggml_backend_tensor_set(gr->inp.kv_idxs[d], m.h_kv_idxs.data(), 0, (size_t) nt * sizeof(int64_t));
+        if (live(gr->inp.kq_mask[d]))
+        {
+            if (f16_mask) ggml_backend_tensor_set(gr->inp.kq_mask[d], m.h_mask_f16.data(), 0, m.h_mask_f16.size() * 2);
+            else          ggml_backend_tensor_set(gr->inp.kq_mask[d], m.h_mask_f32.data(), 0, m.h_mask_f32.size() * 4);
+        }
+        if (live(gr->inp.h_in[d]))
+            ggml_backend_tensor_set(gr->inp.h_in[d], h_in, 0, (size_t) nt * m.hp.n_embd * sizeof(float));
+    }
+    if (want_logits) set_input_i32(gr->inp.out_ids, m.h_out_ids.data(), 1);
+
+    if (ggml_backend_sched_graph_compute_async(gr->sched, gr->gf) != GGML_STATUS_SUCCESS)
+    {
+        fprintf(stderr, "[glm] MTP graph compute failed\n");
+        return false;
+    }
+    ggml_backend_sched_synchronize(gr->sched);
+
+    if (want_logits && logits_out && gr->logits)
         ggml_backend_tensor_get(gr->logits, logits_out, 0, (size_t) m.hp.n_vocab * sizeof(float));
+    if (h_out && gr->h_nextn)
+        ggml_backend_tensor_get(gr->h_nextn, h_out, 0, (size_t) nt * m.hp.n_embd * sizeof(float));
     return true;
 }
 
@@ -3258,12 +3673,12 @@ using namespace tsg_glm;
 
 TSG_EXPORT void * TSGgml_GlmLoadModel(const char * gguf_path, int n_gpu, int n_ctx, int n_ubatch,
                                       int n_threads, int n_cpu_moe, const char * backend_name, int tp,
-                                      int ctx_is_hard_limit)
+                                      int ctx_is_hard_limit, int load_mtp)
 {
     try
     {
         return glm_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend_name, tp,
-                        ctx_is_hard_limit != 0);
+                        ctx_is_hard_limit != 0, load_mtp != 0);
     }
     catch (const std::exception & e)
     {
@@ -3382,6 +3797,94 @@ TSG_EXPORT int TSGgml_GlmSlotFree(void * handle, int slot_id)
     slot_free(*m, slot_id);
     if (!m->active_slot && !m->slots.empty())
         m->active_slot = m->slots.begin()->second.get();
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// NextN/MTP speculative decoding
+// ---------------------------------------------------------------------------
+
+TSG_EXPORT int TSGgml_GlmHasMtp(void * handle)
+{
+    glm_model * m = (glm_model *) handle;
+    return (m && m->has_mtp) ? 1 : 0;
+}
+
+TSG_EXPORT int TSGgml_GlmHiddenSize(void * handle)
+{
+    glm_model * m = (glm_model *) handle;
+    return m ? m->hp.n_embd : 0;
+}
+
+/// Trunk forward that also reads back the post-final-norm hidden state of every
+/// row (`h_out`, n_tokens * n_embd floats). With `all_logits_rows` the LM head
+/// runs on every row and `logits_out` receives n_tokens * n_vocab floats —
+/// that is the speculative VERIFY pass, one trunk forward for a whole window.
+///
+/// A prompt longer than one ubatch is chunked exactly as TSGgml_GlmForward
+/// chunks it, and each chunk's hidden states land at their own offset in
+/// `h_out`, so the caller always gets one contiguous row per token.
+TSG_EXPORT int TSGgml_GlmSpecForward(void * handle, const int32_t * tokens, int n_tokens,
+                                     float * h_out, float * logits_out, int all_logits_rows)
+{
+    glm_model * m = (glm_model *) handle;
+    if (!m || !m->active_slot || n_tokens <= 0) return 0;
+
+    const int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
+    const int64_t n_embd = m->hp.n_embd;
+    const int64_t n_vocab = m->hp.n_vocab;
+    int done = 0;
+    while (done < n_tokens)
+    {
+        const int take = std::min(ub, n_tokens - done);
+        const bool last = (done + take) == n_tokens;
+        // Only the final chunk needs logits when the caller wants one row; with
+        // all-rows logits every chunk contributes its own block.
+        const bool want_logits = logits_out != nullptr && (all_logits_rows != 0 || last);
+        float * h_chunk = h_out ? h_out + (int64_t) done * n_embd : nullptr;
+        float * l_chunk = (want_logits && all_logits_rows != 0) ? logits_out + (int64_t) done * n_vocab
+                                                                : logits_out;
+        if (!forward_ubatch(*m, tokens + done, take, want_logits, l_chunk, h_chunk, all_logits_rows != 0))
+            return 0;
+        done += take;
+    }
+    return 1;
+}
+
+/// One NextN draft step: consume `token` at `pos` together with the hidden state
+/// of the token before it, and predict the token after it. `h_out` receives the
+/// draft block's own hidden state so the next step in the window chains from it.
+TSG_EXPORT int TSGgml_GlmMtpDraftStep(void * handle, int token, const float * h_prev, int pos,
+                                      float * logits_out, float * h_out)
+{
+    glm_model * m = (glm_model *) handle;
+    if (!m || !m->active_slot || !h_prev || pos < 0) return 0;
+    const int32_t tok = token;
+    return mtp_forward(*m, &tok, 1, h_prev, pos, /*want_logits=*/true, logits_out, h_out) ? 1 : 0;
+}
+
+/// Replay verified trunk tokens through the draft block so its KV cache tracks
+/// the real context. No logits: the drafts for this window are already drawn.
+TSG_EXPORT int TSGgml_GlmMtpCatchUp(void * handle, const int32_t * tokens, int n_tokens,
+                                    const float * h_rows, int start_pos)
+{
+    glm_model * m = (glm_model *) handle;
+    if (!m || !m->active_slot || !tokens || !h_rows || n_tokens <= 0 || start_pos < 0) return 0;
+
+    // A prompt-sized catch-up is chunked like any other pass; the draft block is
+    // one layer, but a 1M-token prompt would still build a graph over the whole
+    // window otherwise.
+    const int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
+    const int64_t n_embd = m->hp.n_embd;
+    int done = 0;
+    while (done < n_tokens)
+    {
+        const int take = std::min(ub, n_tokens - done);
+        if (!mtp_forward(*m, tokens + done, take, h_rows + (int64_t) done * n_embd, start_pos + done,
+                         /*want_logits=*/false, nullptr, nullptr))
+            return 0;
+        done += take;
+    }
     return 1;
 }
 

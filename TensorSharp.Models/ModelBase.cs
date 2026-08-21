@@ -95,6 +95,36 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// True when this view's bytes live in a FILE mapping rather than in
+        /// heap memory.
+        ///
+        /// <para>The distinction matters because releasing a view calls
+        /// <c>madvise(MADV_DONTNEED)</c> on it. On a file mapping that drops
+        /// clean page-cache pages, which is the whole point — the bytes come
+        /// back from the file if anything touches them again. On PRIVATE ANONYMOUS
+        /// memory the same call is destructive: the kernel discards the pages and
+        /// zero-fills them on next touch. A view is an interior pointer into a
+        /// larger buffer and the advised range is rounded outward to page
+        /// boundaries, so on a small allocation that zero-fill lands on the
+        /// allocator's metadata for NEIGHBOURING chunks and the next unrelated
+        /// free() aborts the process. That is not hypothetical: it is what a
+        /// quantized model whose expert tensors could not be mmapped did, every
+        /// time, on glibc.</para>
+        ///
+        /// <para>Owners are recursive — a tensor-parallel shard is a view of a
+        /// parent view — so the question is answered by walking to the root.</para>
+        /// </summary>
+        private bool ViewIsFileBacked => _ownsBuffer
+            ? false
+            : _ownerToken switch
+            {
+                GgufFile => true,
+                StackedExpertWeights stacked => stacked.IsExternalView,
+                QuantizedWeight parent => parent.ViewIsFileBacked,
+                _ => false,
+            };
+
         public static QuantizedWeight CreateExternalView(IntPtr data, long rawBytes, int ggmlType, long ne0, long ne1, object ownerToken)
         {
             if (data == IntPtr.Zero)
@@ -216,10 +246,9 @@ namespace TensorSharp.Models
                 return;
 
             IntPtr currentData = _data;
-            bool wasExternalView = !_ownsBuffer && _ownerToken != null;
             if (_ownsBuffer)
                 FreeBuffer(currentData);
-            else if (wasExternalView)
+            else if (ViewIsFileBacked)
                 AdviseExternalViewCanBePagedOut(currentData, RawBytes);
 
             if (CacheKey == currentData)
@@ -244,6 +273,11 @@ namespace TensorSharp.Models
                 NativeMemory.AlignedFree(ptr.ToPointer());
         }
 
+        /// <summary>
+        /// Hint that a released FILE-MAPPED view's pages can go. Callers must
+        /// have established that (see <see cref="ViewIsFileBacked"/>) — on
+        /// anonymous memory this call destroys data rather than freeing it.
+        /// </summary>
         private static unsafe void AdviseExternalViewCanBePagedOut(IntPtr data, long byteCount)
         {
             if (data == IntPtr.Zero || byteCount <= 0)

@@ -67,7 +67,15 @@ namespace TensorSharp.Models
             return slot;
         }
 
-        private Tensor Attention(Tensor input, int layer, string[] wn, int seqLen, int startPos)
+        /// <param name="dense">
+        /// Skip the DSA lightning indexer and attend over the whole causal window.
+        /// The NextN/MTP draft block runs this way: llama.cpp's <c>graph_mtp</c>
+        /// builds it with the plain MLA attention input and never touches the
+        /// indexer, even though the block ships indexer weights. Passing the
+        /// trunk's selection in instead would be a DIFFERENT model, and the block
+        /// has no indexer key cache to score against anyway.
+        /// </param>
+        private Tensor Attention(Tensor input, int layer, string[] wn, int seqLen, int startPos, bool dense = false)
         {
             int nHead = Config.NumHeads;
             int hidden = Config.HiddenSize;
@@ -82,7 +90,7 @@ namespace TensorSharp.Models
             // ---- DSA lightning indexer --------------------------------------
             int[] topK = null;
             int topKPerToken = 0;
-            if (SparseAttentionActive(kvLen))
+            if (!dense && SparseAttentionActive(kvLen))
             {
                 // Only "full" layers score the cache; the rest inherit the most
                 // recent full layer's selection, which is what makes GLM-5.2's
@@ -95,7 +103,7 @@ namespace TensorSharp.Models
                     topKPerToken = _sharedTopKCount;
                 }
             }
-            else if (_indexerFull[layer])
+            else if (!dense && _indexerFull[layer])
             {
                 // Still append this token's indexer key so a later, longer step can
                 // score it. Cheap: one [T, 128] projection per full layer.
