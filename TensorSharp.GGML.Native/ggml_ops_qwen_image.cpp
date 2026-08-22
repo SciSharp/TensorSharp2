@@ -2549,13 +2549,24 @@ bool qi_fwd_build_graph(ggml_context* ctx, const TSGgmlQwenImageForwardDesc* d, 
 
     // Bind weights resident (cached by stable GGUF ptr); fall back to gallocr input slot.
     ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    bool barriered = false;
     auto bind = [&](ggml_tensor* tt, void* dd, std::size_t bytes) {
         if (!tt || !dd) return;
         if (bytes >= 4096) {
             ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs = false;
             if (try_get_cacheable_tensor_buffer(g_backend, dev, tt, dd, bytes, buf, addr, needs)
                 && ggml_backend_tensor_alloc(buf, tt, addr) == GGML_STATUS_SUCCESS) {
-                if (needs) g.uploads.push_back({tt, dd, bytes});
+                // Fill a cache MISS here, not in the caller's one-time upload loop:
+                // qi_fwd_build_persist abandons this graph (and that loop) when its
+                // spill guard trips or gallocr fails, while the resident-cache entry
+                // created above survives process-wide. The next build would then hit
+                // it with needs == false and compute against never-written VRAM.
+                // See the matching note in WanBind::bind (ggml_ops_wan.cpp), where
+                // exactly that produced a whole denoise of zero weights.
+                if (needs) {
+                    if (!barriered) { host_read_barrier(); barriered = true; }
+                    ggml_backend_tensor_set(tt, dd, 0, bytes);
+                }
                 return;
             }
             invalidate_cached_buffer(dd);

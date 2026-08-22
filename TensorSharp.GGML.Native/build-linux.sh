@@ -340,6 +340,13 @@ echo "Configuring TensorSharp.GGML.Native (CUDA=${ENABLE_CUDA}, CUDA_ARCHITECTUR
 # Ensure the ggml sources are present (cloned from ggml-org/ggml at build time).
 bash "${SCRIPT_DIR}/../eng/fetch-ggml.sh"
 
+# cuDNN for the VAE convolutions. Optional and best-effort: fetch-cudnn.sh always
+# exits 0, and CMake keeps ggml's im2col+GEMM lowering when the headers are absent.
+# TENSORSHARP_CUDNN=OFF skips it entirely.
+if [ "${ENABLE_CUDA}" = "ON" ]; then
+    bash "${SCRIPT_DIR}/../eng/fetch-cudnn.sh"
+fi
+
 CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE=Release
     -DTENSORSHARP_GGML_NATIVE_ENABLE_CUDA="${ENABLE_CUDA}"

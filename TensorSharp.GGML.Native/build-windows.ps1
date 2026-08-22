@@ -480,6 +480,14 @@ if ($EnableCuda -eq "ON" -and -not [string]::IsNullOrWhiteSpace($CudaArchitectur
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "..\eng\fetch-ggml.ps1")
 if ($LASTEXITCODE -ne 0) { throw "fetch-ggml.ps1 failed with exit code $LASTEXITCODE" }
 
+# cuDNN for the VAE convolutions on the CUDA backends. Optional and best-effort:
+# fetch-cudnn.ps1 never fails the build (it exits 0 even when it cannot download),
+# and CMake keeps ggml's im2col+GEMM lowering when the headers are absent.
+# TENSORSHARP_CUDNN=OFF skips it entirely.
+if ($EnableCuda -eq "ON") {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "..\eng\fetch-cudnn.ps1")
+}
+
 cmake -S $ScriptDir -B $BuildDir @GeneratorArgs @GeneratorCMakeArgs @CMakeArgs @ExtraCMakeArgs
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
 

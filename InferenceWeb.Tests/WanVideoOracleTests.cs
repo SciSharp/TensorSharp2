@@ -166,6 +166,10 @@ namespace InferenceWeb.Tests
                 Array.Copy(reference, (long)f * 3 * hw, rf, 0, 3 * hw);
                 perFrame.Append($" f{f}={Psnr01(mf, rf):F1}");
             }
+            // Printed on success too (as the DiT test prints its cosine): the decode's
+            // banded im2col lowering is tuned for speed, so the margin over the 35 dB
+            // bar is the number that says whether a tuning change cost accuracy.
+            _output.WriteLine($"[wan-oracle] Wan2.2 VAE decode PSNR vs diffusers: {psnr:F1} dB; per-frame:{perFrame}");
             Assert.True(psnr > 35.0, $"Wan2.2 VAE decode PSNR vs diffusers = {psnr:F1} dB (want > 35); per-frame:{perFrame}");
         }
 

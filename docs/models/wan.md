@@ -258,8 +258,13 @@ The networks each run as ONE resident-weight ggml graph per invocation
 - `TSGgml_WanVaeDecode` — the causal 3D video VAE decoder (both generations),
   iterating temporal chunks in-graph with the causal feature cache carried
   between chunks; convs run as banded im2col+GEMM under a scratch budget so
-  peak VRAM stays bounded (`TS_WAN_VAE_GEMM_MAX_MB`; the default adapts to
-  free device memory, floor 384 MB; `0` forces direct convolution), with the
+  peak VRAM stays bounded (`TS_WAN_VAE_GEMM_MAX_MB`; 384 MB on CUDA — sizing it
+  from free memory measured **2.2x slower**, because the scratch then eats the
+  headroom the rest of the graph needs and WDDM pages the overflow — and free/8
+  capped at 8 GB on Metal, which has no PCIe cliff; `0` forces direct
+  convolution). The kd temporal taps of a causal conv share ONE im2col instead
+  of lowering the same pixels once each, and bands are split evenly rather than
+  walked at a fixed height; both are bit-identical. With the
   cross-chunk feature caches stored F16. The Wan 2.2 decoder adds the
   weight-free DupUp3D residual shortcuts and the final 2×2 pixel unpatchify.
   Above ~0.5 MP the decode is additionally tiled into full-width horizontal
@@ -294,7 +299,15 @@ Environment knobs: `TS_WAN_DIT_CAPTURE=0` (disable the persistent captured DiT
 graph), `TS_WAN_DIT_FLASH=0` (materialized attention), `TS_WAN_DIT_KV_F16=0`
 (F32 attention keys/values — the old, ~2x slower default), `TS_WAN_HEARTBEAT_S`
 (progress tick interval, default 30; `0` silences the ticks),
-`TS_WAN_VAE_GEMM_MAX_MB` (im2col budget), `TS_WAN_VAE_MPS_CONV=0`
+`TS_WAN_VAE_GEMM_MAX_MB` (im2col budget), `TS_WAN_DIT_FFN_CHUNK_MB` (DiT
+feed-forward token-chunk budget, default 256 MB; `0` disables chunking),
+`TS_WAN_VAE_TAP_SHARE=0` (one im2col per temporal tap instead of one shared
+across them — A/B only; the shared lowering is bit-identical),
+`TS_VAE_CUDNN_CONV=1` (opt in to cuDNN for the VAE convolutions on CUDA; OFF by
+default because it wins ~1.2x on a short clip and loses ~4.5x on a 121-frame one
+-- each convolution runs outside the graph, so the host round trips scale with
+the temporal chunk count), `TS_CUDNN_DIR` (cuDNN install to use),
+`TS_WAN_VAE_MPS_CONV=0`
 (ggml conv lowering instead of MPSGraph on Metal),
 `TS_WAN_VAE`/`TS_WAN_TE`/`TS_WAN_DIT2` (companion paths), `TS_FFMPEG` (ffmpeg
 path for MP4 export), `TS_WAN_DIT_TRACE=<file>` (per-stage activation stats for
@@ -313,10 +326,20 @@ RTX 3080 Laptop 16 GB (Windows/WDDM), ggml_cuda:
 
 | Model / workload | Text enc | Image enc | Denoise | VAE decode | Total |
 |---|---|---|---|---|---|
+| **Wan2_2-TI2V-5B-Turbo Q4_0** I2V 1088×832×121f, 4 steps (720p, 5 s) | 5.9 s | 6.1 s | 27.8 s/pass (27 404 tokens) | 305 s | **429 s** |
 | **Wan2.2-TI2V-5B Q8_0** I2V 832×480×81f, 30 steps | 3.5 s | 8.5 s | 11.5 s/step (CFG ×2, 8190 tokens) | 103 s | 464 s |
 | Wan2.2-TI2V-5B Q8_0 T2V 640×384×25f, 20 steps | 3.7 s | — | 1.5 s/step | 23 s | 65 s |
 | Wan2.2-I2V-A14B Q4_K_M 480×480×9f, 6 steps (smoke) | 3.4 s | 5 s | 7–8 s/step + 2 expert loads | 7.4 s | 89 s |
 | Wan2.1-T2V-1.3B F16 832×480×33f, 30 steps | 3.1 s | — | 9.4 s/step (CFG ×2) | 51 s | 337 s |
+
+That 720p/121-frame row was **1 143 s** before the 2026-08 pass: the DiT graph
+needed 11.4 GiB at 27 404 tokens and the card has 16 GB, so the whole denoise ran
+against a working set that did not fit. Chunking the feed-forward over tokens
+(`TS_WAN_DIT_FFN_CHUNK_MB`) took the 1.5 GiB intermediate out of the peak and the
+per-pass time went 110.4 s -> 26.1 s; capping the VAE im2col scratch and sharing
+one lowering across the causal taps took the decode 712 s -> 305 s. Both are
+exact: the DiT still matches diffusers at cosine 0.99997 and the decode at
+80.2 dB PSNR, unchanged from before.
 
 The TI2V-5B model's 16×16 spatial compression gives it ~2.7× fewer DiT tokens
 than Wan 2.1 at the same resolution — it is both the fastest and the

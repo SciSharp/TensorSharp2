@@ -241,18 +241,32 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_dsv4_fused.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
-    # Wan VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu). Optional: the
-    # VAE falls back to ggml's im2col+GEMM when cuDNN is not present.
+    # Wan / Qwen-Image VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu).
+    # Optional: the VAE falls back to ggml's im2col+GEMM when cuDNN is absent.
+    #
+    # Only the HEADERS are needed to build. The library itself is resolved with
+    # LoadLibrary/dlopen at run time, so nothing is linked and nothing is copied
+    # next to the output (the Windows redistributable is ~1 GB of DLLs). That also
+    # means a binary built here still loads on a machine with no cuDNN at all.
+    #
+    # eng/fetch-cudnn.{ps1,sh} provisions ExternalProjects/cudnn from NVIDIA's public
+    # redist channel; a system install, CUDA_PATH or TS_CUDNN_DIR is used ahead of it.
+    set(TSG_CUDNN_PROVISIONED "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/cudnn")
     find_path(TSG_CUDNN_INCLUDE_DIR cudnn.h
-              HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/local/cuda/include)
-    find_library(TSG_CUDNN_LIBRARY NAMES cudnn
-                 HINTS /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64)
-    if (TSG_CUDNN_INCLUDE_DIR AND TSG_CUDNN_LIBRARY)
-        message(STATUS "TensorSharp: cuDNN found (${TSG_CUDNN_LIBRARY}); Wan VAE convolutions will use it")
+              HINTS "$ENV{TS_CUDNN_DIR}/include" "$ENV{CUDNN_DIR}/include"
+                    "${TSG_CUDNN_PROVISIONED}/include"
+                    ${CUDAToolkit_INCLUDE_DIRS} /usr/include /usr/local/cuda/include)
+    if (TSG_CUDNN_INCLUDE_DIR)
+        message(STATUS "TensorSharp: cuDNN headers at ${TSG_CUDNN_INCLUDE_DIR}; VAE convolutions will use cuDNN when its runtime is present")
         list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_cudnn_conv.cu)
         set(TSG_HAVE_CUDNN ON)
+        # Where the runtime should look first. Points at the provisioned copy when
+        # that is what supplied the headers; TS_CUDNN_DIR still overrides at run time.
+        get_filename_component(TSG_CUDNN_ROOT "${TSG_CUDNN_INCLUDE_DIR}" DIRECTORY)
+        set(TSG_CUDNN_RUNTIME_HINT "${TSG_CUDNN_ROOT}")
     else()
-        message(STATUS "TensorSharp: cuDNN not found; Wan VAE convolutions stay on ggml im2col+GEMM")
+        message(STATUS "TensorSharp: cuDNN headers not found; VAE convolutions stay on ggml im2col+GEMM "
+                       "(run eng/fetch-cudnn to provision, or set TENSORSHARP_CUDNN=OFF to stop looking)")
     endif()
 endif()
 
@@ -298,8 +312,12 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)
     if (TSG_HAVE_CUDNN)
         target_include_directories(GgmlOps PRIVATE ${TSG_CUDNN_INCLUDE_DIR})
-        target_link_libraries(GgmlOps PRIVATE ${TSG_CUDNN_LIBRARY})
+        # Deliberately NOT linked -- resolved with LoadLibrary/dlopen at run time.
         target_compile_definitions(GgmlOps PRIVATE TSG_HAVE_CUDNN=1)
+        if (TSG_CUDNN_RUNTIME_HINT)
+            target_compile_definitions(GgmlOps PRIVATE
+                "TSG_CUDNN_RUNTIME_DIR=\"${TSG_CUDNN_RUNTIME_HINT}\"")
+        endif()
     endif()
     # Fast intrinsic transcendentals (tanhf/expf) for the diffusion sampler kernel — the accurate
     # library tanhf is ~100x slower on-device and the sampler only needs FP-reduction-level accuracy.
@@ -339,4 +357,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     )
     target_link_libraries(GgmlOpsAddmmVectorTest PRIVATE GgmlOps)
+
+    add_executable(GgmlOpsWanDitResidentCacheTest tests/wan_dit_resident_cache_test.cpp)
+    target_include_directories(GgmlOpsWanDitResidentCacheTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+    )
+    target_link_libraries(GgmlOpsWanDitResidentCacheTest PRIVATE GgmlOps)
 endif()
