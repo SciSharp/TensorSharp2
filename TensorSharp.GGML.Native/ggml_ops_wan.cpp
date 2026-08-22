@@ -232,27 +232,47 @@ namespace {
 
 struct WanUpload { ggml_tensor* t; void* d; std::size_t b; };
 
-// Collects the weight-leaf bindings for one graph build: tensors that hit the
-// resident cache upload once (on a cache miss); everything else becomes a
-// gallocr input slot uploaded per call.
+// Collects the weight-leaf bindings for one graph build: a resident-cache MISS
+// is filled immediately (see bind); everything else becomes a gallocr input slot
+// uploaded per call from `uploads`.
 struct WanBind
 {
     ggml_context* ctx = nullptr;
     ggml_backend_dev_t dev = nullptr;
     std::vector<WanUpload> uploads;
+    bool barriered = false;
 
     void bind(ggml_tensor* tt, void* dd, std::size_t bytes)
     {
         if (tt == nullptr || dd == nullptr) return;
-        static const bool noResident = []{
-            const char* e = std::getenv("TS_WAN_NO_RESIDENT"); return e != nullptr && e[0] == '1'; }();
+        // Read per call, not cached in a static: wan_dit_resident_cache_test
+        // toggles this between its reference and its poisoning phase, and a
+        // getenv per weight bind is nothing next to the device allocation it guards.
+        const char* noResidentEnv = std::getenv("TS_WAN_NO_RESIDENT");
+        const bool noResident = noResidentEnv != nullptr && noResidentEnv[0] == '1';
         if (bytes >= 4096 && !noResident)
         {
             ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs = false;
             if (try_get_cacheable_tensor_buffer(g_backend, dev, tt, dd, bytes, buf, addr, needs)
                 && ggml_backend_tensor_alloc(buf, tt, addr) == GGML_STATUS_SUCCESS)
             {
-                if (needs) uploads.push_back({tt, dd, bytes});
+                // A cache MISS just allocated a device buffer that nothing else will
+                // ever fill, and the entry is already published in the process-wide
+                // resident cache. Fill it HERE rather than deferring to the caller's
+                // upload loop: every path that abandons a built graph before reaching
+                // that loop — wan_dit_build_persist's VRAM spill guard, a gallocr
+                // failure, ggml_new_graph_custom returning null — would otherwise
+                // leave the cache holding uninitialised device memory, and the NEXT
+                // build would hit that entry with needs == false and silently compute
+                // with whatever the driver handed back. Freshly mapped VRAM reads as
+                // zeros, so the symptom is a whole model of zero weights: a finite,
+                // NaN-free, token-CONSTANT output that no assert catches. This cost
+                // the 1088x832x121f Wan request its entire video.
+                if (needs)
+                {
+                    if (!barriered) { host_read_barrier(); barriered = true; }
+                    ggml_backend_tensor_set(tt, dd, 0, bytes);
+                }
                 return;
             }
             invalidate_cached_buffer(dd);
@@ -305,6 +325,121 @@ ggml_tensor* wan_lin(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, ggml_ten
 {
     ggml_tensor* o = wan_mm(ctx, w, x, prescale);
     return b != nullptr ? ggml_add(ctx, o, b) : o;
+}
+
+// Concatenate `parts` along `dim` as a BALANCED tree instead of the obvious
+// left-leaning chain.
+//
+// `acc = ggml_concat(acc, next, dim)` re-copies everything accumulated so far on
+// every step, so joining B pieces of total size N moves O(N*B) bytes. Pairwise
+// merging moves O(N*log2(B)). Concatenation is associative and the pairing keeps
+// the pieces in order, so the result is bit-identical — this is pure data movement,
+// no arithmetic. It matters here because a full-resolution VAE decode joins ~11
+// conv bands per convolution and 31 temporal chunks per band, and the decode is
+// bandwidth-bound on exactly this kind of generic strided copy (the profile that
+// motivated the band budget above put CONT+CONCAT+PAD at ~72% of decode time).
+// 31 chunks: 31x the output copied, down to ~5x.
+ggml_tensor* wan_concat_all(ggml_context* ctx, std::vector<ggml_tensor*>& parts, int dim)
+{
+    if (parts.empty()) return nullptr;
+    std::vector<ggml_tensor*> next;
+    while (parts.size() > 1)
+    {
+        next.clear();
+        next.reserve((parts.size() + 1) / 2);
+        std::size_t i = 0;
+        for (; i + 1 < parts.size(); i += 2)
+            next.push_back(ggml_concat(ctx, parts[i], parts[i + 1], dim));
+        if (i < parts.size()) next.push_back(parts[i]);
+        parts.swap(next);
+    }
+    return parts[0];
+}
+
+// Token budget for one FFN chunk (see wan_ffn). TS_WAN_DIT_FFN_CHUNK_MB pins the
+// intermediate's size; 0 disables chunking.
+inline long long wan_ffn_chunk_bytes()
+{
+    static const long long mb = []() -> long long {
+        const char* e = std::getenv("TS_WAN_DIT_FFN_CHUNK_MB");
+        return e != nullptr ? std::strtoll(e, nullptr, 10) : 256;
+    }();
+    return mb << 20;
+}
+
+// Rows of `x` one FFN chunk covers; `seq` (i.e. unchunked) when chunking is off or
+// the whole intermediate already fits. wan_ffn and the graph's node budget must
+// agree on this, so both go through here.
+inline long long wan_ffn_chunk_rows(int ff, int seq)
+{
+    const long long budget = wan_ffn_chunk_bytes();
+    if (budget <= 0) return seq;
+    const long long perTok = static_cast<long long>(ff) * static_cast<long long>(sizeof(float));
+    const long long rows = budget / std::max<long long>(1, perTok);
+    return (rows <= 0 || rows >= seq) ? seq : rows;
+}
+
+inline int wan_ffn_chunk_count(int ff, int seq)
+{
+    const long long rows = wan_ffn_chunk_rows(ff, seq);
+    return rows >= seq ? 1 : static_cast<int>((seq + rows - 1) / rows);
+}
+
+// Nodes one DiT block costs, including the extra matmul/gelu/join nodes chunking
+// adds. A block is ~130 nodes with the TI2V two-segment modulation active; each
+// extra FFN chunk adds 5 compute nodes plus one tree-join node. ggml ASSERTS on
+// graph overflow (ggml.c:7175), so this is sized generously — the only cost of
+// slack is graph metadata, a few hundred KB.
+inline std::size_t wan_dit_nodes(int num_layers, int ff, int seq)
+{
+    const std::size_t perChunk = 8;
+    const std::size_t perBlock = 160 + perChunk * static_cast<std::size_t>(wan_ffn_chunk_count(ff, seq));
+    return static_cast<std::size_t>(num_layers) * perBlock + 2048;
+}
+
+// The DiT feed-forward, evaluated in TOKEN CHUNKS.
+//
+// The intermediate is [ff, seq] — at Wan 2.2 TI2V's ff = 14336 and the 121-frame
+// seq = 27404 that is 1.5 GiB in one tensor, the single largest allocation in the
+// graph. It has no cross-token dependencies (both linears and the GELU are
+// per-token), so slicing the tokens and joining the results is EXACT: each chunk
+// runs the identical arithmetic on a contiguous row range, and a row range of a
+// contiguous [dim, seq] tensor is itself contiguous, so the matmuls see exactly
+// the operands they saw before.
+//
+// This is the memory-for-nothing trade diffusers exposes as enable_forward_chunking
+// (src/diffusers/models/attention.py _chunked_feed_forward) and FastVideo as
+// _chunked_feed_forward. It matters here because the whole 27404-token graph
+// measured 11.4 GiB on a 16 GB card, leaving 359 MiB free — under the spill guard,
+// so the persistent/CUDA-graph path stayed off and every pass ran against a
+// device whose working set did not fit.
+ggml_tensor* wan_ffn(ggml_context* ctx, ggml_tensor* w0, ggml_tensor* b0,
+                     ggml_tensor* w2, ggml_tensor* b2, ggml_tensor* x,
+                     int dim, int ff, int seq)
+{
+    auto once = [&](ggml_tensor* xs) {
+        return wan_lin(ctx, w2, ggml_gelu(ctx, wan_lin(ctx, w0, xs, b0)), b2);
+    };
+
+    // Rows per chunk that keep the intermediate under the budget. ggml_gelu can be
+    // aliased onto its parent by gallocr, so the intermediate counts once.
+    const long long chunk = wan_ffn_chunk_rows(ff, seq);
+    if (chunk >= seq || !ggml_is_contiguous(x))
+        return once(x);
+
+    // Keep the chunk count modest: each chunk adds two matmul launches per block,
+    // and the join costs one copy of the [dim, seq] result per tree level.
+    const int nChunks = static_cast<int>((seq + chunk - 1) / chunk);
+    std::vector<ggml_tensor*> parts;
+    parts.reserve(static_cast<std::size_t>(nChunks));
+    for (long long t0 = 0; t0 < seq; t0 += chunk)
+    {
+        const long long rows = std::min<long long>(chunk, seq - t0);
+        ggml_tensor* xs = ggml_view_2d(ctx, x, dim, rows, x->nb[1],
+                                       static_cast<std::size_t>(t0) * x->nb[1]);
+        parts.push_back(once(xs));
+    }
+    return wan_concat_all(ctx, parts, 1);
 }
 
 // RMS norm over ne0 then * gain.
@@ -711,8 +846,7 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
         // --- FFN sub-layer ---
         ggml_tensor* n2 = ggml_norm(ctx, x, eps);
         ggml_tensor* ym = segModulate(n2, eShiftM, eScaleM, eShiftMB, eScaleMB);
-        ggml_tensor* hM = ggml_gelu(ctx, wan_lin(ctx, b.f0w, ym, b.f0b));
-        ggml_tensor* mlp = wan_lin(ctx, b.f2w, hM, b.f2b);
+        ggml_tensor* mlp = wan_ffn(ctx, b.f0w, b.f0b, b.f2w, b.f2b, ym, dim, d->ff, seq);
         x = ggml_add(ctx, x, segGate(mlp, eGateM, eGateMB));
         if (l == 0 || l == nl - 1)
         {
@@ -740,7 +874,7 @@ bool wan_dit_build_graph(ggml_context* ctx, const TSGgmlWanDitDesc* d, WanDitGra
     ggml_tensor* outc = ggml_cpy(ctx, outv, g.outT);
     ggml_set_output(outc);
 
-    const std::size_t nodes = static_cast<std::size_t>(nl) * 128 + 1024;
+    const std::size_t nodes = wan_dit_nodes(nl, d->ff, d->seq);
     g.graph = ggml_new_graph_custom(ctx, nodes, false);
     if (g.graph == nullptr) return false;
     ggml_build_forward_expand(g.graph, outc);
@@ -784,12 +918,35 @@ constexpr int kWanDitCacheMax = 2;
 WanDitPersist g_wanDit[kWanDitCacheMax];
 int g_wanDitRR = 0;
 
+// Shapes whose persistent graph does not fit in device memory. Building one costs
+// a full 30-block graph construction plus a multi-GB gallocr allocation that is
+// then thrown away; without this memo a 121-frame request pays that on EVERY
+// denoise pass and reprints the fallback notice each time. Mirrors
+// qi_fwd_mark_too_big in ggml_ops_qwen_image.cpp.
+struct WanDitTooBig { int seq, cl, nl, seq0; const void* wkey; };
+std::vector<WanDitTooBig> g_wanDitTooBig;
+
+bool wan_dit_too_big(const TSGgmlWanDitDesc* d)
+{
+    for (const auto& t : g_wanDitTooBig)
+        if (t.seq == d->seq && t.cl == d->ctx_len && t.nl == d->num_layers
+            && t.seq0 == d->seq0 && t.wkey == d->blocks[0].sq.w)
+            return true;
+    return false;
+}
+
+void wan_dit_mark_too_big(const TSGgmlWanDitDesc* d)
+{
+    if (!wan_dit_too_big(d))
+        g_wanDitTooBig.push_back({ d->seq, d->ctx_len, d->num_layers, d->seq0, d->blocks[0].sq.w });
+}
+
 bool wan_dit_capture_enabled()
 {
-    static const int s = []() {
-        const char* e = std::getenv("TS_WAN_DIT_CAPTURE");
-        return (e && e[0] == '0') ? 0 : 1;
-    }();
+    // Read per call (once per forward): wan_dit_resident_cache_test needs to
+    // disable and re-enable the persistent builder inside one process.
+    const char* e = std::getenv("TS_WAN_DIT_CAPTURE");
+    const int s = (e && e[0] == '0') ? 0 : 1;
     if (s == 0 || g_backend == nullptr) return false;
     const char* name = ggml_backend_name(g_backend);
     return name != nullptr && std::strncmp(name, "CUDA", 4) == 0;
@@ -872,7 +1029,7 @@ int wan_dit_run_persist(WanDitPersist* e, const TSGgmlWanDitDesc* d)
 WanDitPersist* wan_dit_build_persist(const TSGgmlWanDitDesc* d)
 {
     const int nl = d->num_layers;
-    const std::size_t nodes = static_cast<std::size_t>(nl) * 128 + 1024;
+    const std::size_t nodes = wan_dit_nodes(nl, d->ff, d->seq);
     const std::size_t meta = ggml_tensor_overhead() * (nodes + 1024)
                              + ggml_graph_overhead_custom(nodes, false) + (8u << 20);
     ggml_init_params ip{ meta, nullptr, true };
@@ -881,6 +1038,17 @@ WanDitPersist* wan_dit_build_persist(const TSGgmlWanDitDesc* d)
 
     WanDitGraph g;
     if (!wan_dit_build_graph(ctx, d, g)) { ggml_free(ctx); return nullptr; }
+
+    // TS_WAN_DIT_CAPTURE=abandon: fault injection for wan_dit_resident_cache_test.
+    // Drops the graph at the same point the VRAM spill guard below does — after
+    // every weight has been bound (and, since the fix, filled) — so the test can
+    // reproduce the 16 GB/27404-token path deterministically without needing a
+    // card that is actually out of memory. Read per call, not cached in a static,
+    // so a test can toggle it between phases.
+    {
+        const char* e = std::getenv("TS_WAN_DIT_CAPTURE");
+        if (e != nullptr && std::strcmp(e, "abandon") == 0) { ggml_free(ctx); return nullptr; }
+    }
 
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
     if (galloc == nullptr) { ggml_free(ctx); return nullptr; }
@@ -893,7 +1061,11 @@ WanDitPersist* wan_dit_build_persist(const TSGgmlWanDitDesc* d)
         if (mdev) ggml_backend_dev_memory(mdev, &freeb, &totalb);
         if (totalb > 0 && freeb < static_cast<std::size_t>(384) * 1024 * 1024)
         {
-            std::fprintf(stderr, "[wan] dit capture: free VRAM %zu MiB after alloc -> non-persistent fallback\n", freeb >> 20);
+            std::fprintf(stderr,
+                "[wan] dit capture: free VRAM %zu MiB after alloc -> non-persistent fallback for %d tokens "
+                "(this shape won't be retried; fewer frames or a smaller frame area keeps the graph resident)\n",
+                freeb >> 20, d->seq);
+            wan_dit_mark_too_big(d);   // skip the (multi-GB, discarded) capture attempt from now on
             ggml_gallocr_free(galloc); ggml_free(ctx); return nullptr;
         }
     }
@@ -992,17 +1164,43 @@ static long long wan_vae_gemm_budget()
     // memory — on Metal that measured 56.4s -> 49.7s for a 1088x832x9f decode,
     // because it turns many small banded GEMMs into few large ones.
     const char* name = g_backend != nullptr ? ggml_backend_name(g_backend) : nullptr;
-    const bool sizedFromMemory = name != nullptr &&
-        (std::strncmp(name, "CUDA", 4) == 0 || std::strncmp(name, "MTL", 3) == 0);
-    if (!sizedFromMemory)
+    const bool isCuda = name != nullptr && std::strncmp(name, "CUDA", 4) == 0;
+    const bool isMetal = name != nullptr && std::strncmp(name, "MTL", 3) == 0;
+    if (!isCuda && !isMetal)
         return 384LL << 20;
+
     std::size_t freeB = 0, totalB = 0;
     ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
     if (dev != nullptr) ggml_backend_dev_memory(dev, &freeB, &totalB);
     long long budget = static_cast<long long>(freeB / 8);
-    const long long lo = 384LL << 20, hi = 8LL << 30;
-    if (budget < lo) budget = lo;
+    const long long lo = 384LL << 20;
+    long long hi = 8LL << 30;
+
+    // CUDA: growing the scratch past ~384 MB is a LOSS, not a win, and a large one.
+    // The im2col scratch is only one term in the graph's peak; the activation planes,
+    // the cross-chunk causal caches and the accumulating output are the rest, and on
+    // a discrete card the whole thing has to sit in real VRAM. Sizing the scratch
+    // from free memory just spends the headroom the rest of the graph needs, and on
+    // WDDM the overflow becomes host paging at PCIe speed.
+    //
+    // Measured on an RTX 3080 Laptop (16 GB), 1088x832x17f isolated decode
+    // (benchmarks/WanVideoBench vae-decode 5 52 68 cuda), at the original code:
+    //     free/8 (~1.9 GB) 122.3 s | 1536 MB 91.5 s | 768 MB 89.3 s
+    //     384 MB  55.4 s  <-- optimum | 256 MB 61.2 s | 128 MB 73.9 s | 64 MB 79.3 s
+    // i.e. the old free/8 sizing cost 2.2x. The curve rises on BOTH sides: below
+    // ~256 MB the band count grows and the per-band CONT + join starts to dominate.
+    // With the shared-im2col taps path and even banding the plateau is flatter and
+    // lower — 384 MB 38.1 s | 448 MB 38.6 s | 512 MB 40.2 s | 640 MB 51.7 s — so
+    // 384 MB stays the pick, now with the cliff a comfortable distance away.
+    //
+    // Metal keeps the free-memory sizing: it is unified memory with no PCIe cliff,
+    // and it measured 56.4 s -> 49.7 s for a 1088x832x9f decode by turning many
+    // small banded GEMMs into few large ones.
+    if (isCuda)
+        hi = 384LL << 20;
+
     if (budget > hi) budget = hi;
+    if (budget < lo) budget = lo;
     return budget;
 }
 
@@ -1097,9 +1295,13 @@ ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int
 
     // Banded path: pre-pad vertically once, then convolve horizontal bands whose
     // views carry their own context rows (horizontal padding stays in the conv).
-    long long bandRows = std::max<long long>(1, gemmMax / std::max<long long>(1, rowBytes));
+    // Even bands (see wan_vae_conv2d_taps).
+    const long long fitRows = std::max<long long>(1, gemmMax / std::max<long long>(1, rowBytes));
+    const long long nBands = (OH + fitRows - 1) / fitRows;
+    const long long bandRows = (OH + nBands - 1) / nBands;
     ggml_tensor* xp = pad > 0 ? wan_pad_ext_compat(ctx, x, 0, 0, pad, pad, 0, 0, 0, 0) : x;
-    ggml_tensor* out = nullptr;
+    std::vector<ggml_tensor*> bands;
+    bands.reserve(static_cast<std::size_t>((OH + bandRows - 1) / bandRows));
     for (long long y = 0; y < OH; y += bandRows)
     {
         const long long rows = std::min(bandRows, OH - y);
@@ -1108,10 +1310,109 @@ ggml_tensor* wan_vae_conv2d(WanVaeBuild& b, ggml_tensor* wt, ggml_tensor* x, int
                                          xp->nb[1], xp->nb[2], xp->nb[3], y * stride * xp->nb[1]);
         // CUDA CONV_2D requires contiguous input; the row-band view is strided.
         band = ggml_cont(ctx, band);
-        ggml_tensor* yb = ggml_conv_2d(ctx, wf16, band, stride, stride, pad, 0, 1, 1);
-        out = out == nullptr ? yb : ggml_concat(ctx, out, yb, 1);
+        bands.push_back(ggml_conv_2d(ctx, wf16, band, stride, stride, pad, 0, 1, 1));
     }
-    return out;
+    return wan_concat_all(ctx, bands, 1);
+}
+
+// The kd temporal taps of one causal conv, sharing ONE im2col per spatial band.
+//
+// A causal conv3d is a sum of kd 2D convolutions, tap j reading input frames
+// [j, j+T) of the front-padded input. Run tap-by-tap through ggml_conv_2d — as this
+// did before — each tap re-lowers its own overlapping frame window, so the same
+// pixels are expanded into an im2col matrix kd times over. im2col is 44% of a
+// full-resolution decode (the single biggest cost in the graph, KW*KH = 9x the
+// input), so that repetition is worth removing: ONE im2col over all T+kd-1 frames
+// serves every tap, because frames are im2col's batch axis (ne[3]) and a frame
+// range of the result is a plain contiguous view. 3 taps over T=4 frames — the
+// widest, most expensive scales — go from 12 frame-lowerings to 6.
+//
+// Two smaller savings ride along: the per-band ggml_cont of the strided row view
+// happens once instead of kd times, and ggml_conv_2d's trailing
+// cont(permute [OW,OH,N,OC] -> [OW,OH,OC,N]) — another full copy of the output —
+// is deferred until after the taps are summed, so it runs once rather than kd
+// times. Everything here is data movement; the GEMMs and their accumulation order
+// are unchanged, so the result is bit-identical.
+ggml_tensor* wan_vae_conv2d_taps(WanVaeBuild& b, ggml_tensor** wts, int nTaps,
+                                 ggml_tensor* xin, std::int64_t T, int pad)
+{
+    ggml_context* ctx = b.ctx;
+    ggml_tensor* w0 = wts[0];
+    const std::int64_t KW = w0->ne[0], KH = w0->ne[1], IC = w0->ne[2], OC = w0->ne[3];
+    const std::int64_t OW = xin->ne[0] + 2 * pad - KW + 1;
+    const std::int64_t OH = xin->ne[1] + 2 * pad - KH + 1;
+    const std::int64_t NT = xin->ne[3];               // T + nTaps - 1
+
+    std::vector<ggml_tensor*> wf16(static_cast<std::size_t>(nTaps));
+    for (int j = 0; j < nTaps; j++)
+        wf16[static_cast<std::size_t>(j)] =
+            wts[j]->type == GGML_TYPE_F16 ? wts[j] : ggml_cast(ctx, wts[j], GGML_TYPE_F16);
+
+    // One band's shared lowering + one GEMM per tap, returned in ggml_conv_2d's
+    // [OW, rows, OC, T] layout.
+    //
+    // The permute+cont stays PER BAND on purpose. Deferring it to the joined
+    // full-height tensor would run it once instead of once per band, but it then
+    // needs the pre-permute and post-permute full-resolution tensors alive at the
+    // same time — a whole extra copy of the widest activation (~2 GB at 1088x832).
+    // Measured: that version cut profiled per-node time 17% and still ran 82 s vs
+    // 49 s wall, because the extra residency pushed the decode into WDDM paging.
+    // Per band it is still kd times fewer permutes than the old tap-by-tap loop.
+    auto band_taps = [&](ggml_tensor* src, std::int64_t rows, int padV) -> ggml_tensor*
+    {
+        ggml_tensor* im = ggml_im2col(ctx, wf16[0], src, 1, 1, pad, padV, 1, 1, true, GGML_TYPE_F16);
+        ggml_tensor* acc = nullptr;
+        for (int j = 0; j < nTaps; j++)
+        {
+            // Frames [j, j+T) of [IC*KH*KW, OW, rows, NT]. ne[0..2] are unchanged,
+            // so the view keeps the parent's strides and is itself contiguous.
+            ggml_tensor* imv = (nTaps == 1)
+                ? im
+                : ggml_view_4d(ctx, im, im->ne[0], im->ne[1], im->ne[2], T,
+                               im->nb[1], im->nb[2], im->nb[3],
+                               static_cast<std::size_t>(j) * im->nb[3]);
+            ggml_tensor* r = ggml_mul_mat(
+                ctx,
+                ggml_reshape_2d(ctx, imv, imv->ne[0], imv->ne[1] * imv->ne[2] * imv->ne[3]),
+                ggml_reshape_2d(ctx, wf16[static_cast<std::size_t>(j)], KW * KH * IC, OC));
+            r = ggml_reshape_4d(ctx, r, OW, rows, T, OC);
+            acc = acc == nullptr ? r : ggml_add(ctx, acc, r);
+        }
+        return ggml_cont(ctx, ggml_permute(ctx, acc, 0, 1, 3, 2));   // -> [OW, rows, OC, T]
+    };
+
+    const long long rowBytes = KW * KH * IC * OW * NT * 2;   // shared im2col bytes per output row
+    ggml_tensor* joined = nullptr;
+    if (rowBytes * OH <= b.gemmMax)
+    {
+        joined = band_taps(xin, OH, pad);
+    }
+    else
+    {
+        // Even bands, not a fixed walk with a runt at the end: every band re-copies
+        // KH-1 context rows, so the waste scales with the band COUNT, and an uneven
+        // split pays for a band that does almost no useful work. Picking the count
+        // from the budget and then dividing OH evenly also makes the cost a smooth
+        // function of the budget instead of a sawtooth (measured 36 s at 448 MB vs
+        // 51 s at 576 MB on the same decode, purely from where the split landed).
+        // Same idea as WanVaeBase.PlanBands for the outer spatial tiling.
+        const long long fit = std::max<long long>(1, b.gemmMax / std::max<long long>(1, rowBytes));
+        const long long nBands = (OH + fit - 1) / fit;
+        const long long bandRows = (OH + nBands - 1) / nBands;
+        ggml_tensor* xp = pad > 0 ? wan_pad_ext_compat(ctx, xin, 0, 0, pad, pad, 0, 0, 0, 0) : xin;
+        std::vector<ggml_tensor*> bands;
+        bands.reserve(static_cast<std::size_t>((OH + bandRows - 1) / bandRows));
+        for (std::int64_t y = 0; y < OH; y += bandRows)
+        {
+            const std::int64_t rows = std::min<std::int64_t>(bandRows, OH - y);
+            ggml_tensor* band = ggml_view_4d(ctx, xp, xp->ne[0], rows + KH - 1, xp->ne[2], xp->ne[3],
+                                             xp->nb[1], xp->nb[2], xp->nb[3],
+                                             static_cast<std::size_t>(y) * xp->nb[1]);
+            bands.push_back(band_taps(ggml_cont(ctx, band), rows, 0));
+        }
+        joined = wan_concat_all(ctx, bands, 1);
+    }
+    return joined;   // already [OW, OH, OC, T]
 }
 
 // Causal conv3d over x [W,H,IC,T] -> [W,H,OC,T]. Temporal context comes from the
@@ -1168,6 +1469,20 @@ ggml_tensor* wan_vae_causal_conv(WanVaeBuild& b, const TSGWanVaeConv& c, ggml_te
     // t .. t+kd-1 of the assembled (front-padded) input.
     void* taps[3] = { c.tap0, c.tap1, c.tap2 };
     ggml_tensor* acc = nullptr;
+    // The shared-im2col path needs ggml's im2col lowering; the MPS/direct-conv
+    // routes emit an un-lowered CONV_2D node instead, so they keep the tap loop.
+    // TS_WAN_VAE_TAP_SHARE=0 forces the tap loop for A/B testing: with a budget
+    // large enough that neither path bands, the two are bit-identical (the sharing
+    // only removes duplicate lowering; the GEMMs and their order are unchanged).
+    static const bool tapShare = []{
+        const char* e = std::getenv("TS_WAN_VAE_TAP_SHARE"); return e == nullptr || e[0] != '0'; }();
+    if (tapShare && c.kd > 1 && b.gemmMax > 0 && !tsg::fast_conv_enabled())
+    {
+        ggml_tensor* wt[3] = { nullptr, nullptr, nullptr };
+        for (int j = 0; j < c.kd; j++) wt[j] = wan_vae_conv_w(b, taps[j], c);
+        acc = wan_vae_conv2d_taps(b, wt, c.kd, xin, T, pad);
+    }
+    else
     for (int j = 0; j < c.kd; j++)
     {
         ggml_tensor* wt = wan_vae_conv_w(b, taps[j], c);
@@ -1760,14 +2075,19 @@ bool wan_vae_decode(const TSGgmlWanVaeDecodeDesc* d)
     // post-quant conv (1x1x1) over the whole latent
     ggml_tensor* z2 = wan_vae_causal_conv(b, d->conv2, zIn);
 
-    ggml_tensor* out = nullptr;
+    // Chunks must be BUILT in order (each one advances the causal feature caches),
+    // but they are JOINED as a balanced tree — see wan_concat_all. The old
+    // left-leaning chain re-copied the whole accumulated video once per chunk, which
+    // at 121 frames is ~31x the output through ggml's generic concat kernel.
+    std::vector<ggml_tensor*> chunks;
+    chunks.reserve(static_cast<std::size_t>(zt));
     for (int i = 0; i < zt; i++)
     {
         b.chunk = i;
         ggml_tensor* z1 = ggml_view_4d(ctx, z2, zw, zh, zc, 1, z2->nb[1], z2->nb[2], z2->nb[3], i * z2->nb[3]);
-        ggml_tensor* frames = wan_vae_decode_chunk(b, d, z1);
-        out = out == nullptr ? frames : ggml_concat(ctx, out, frames, 3);
+        chunks.push_back(wan_vae_decode_chunk(b, d, z1));
     }
+    ggml_tensor* out = wan_concat_all(ctx, chunks, 3);
 
     ggml_tensor* outT = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, out->ne[0], out->ne[1], out->ne[2], out->ne[3]);
     ggml_tensor* outc = ggml_cpy(ctx, out, outT);
@@ -1906,6 +2226,10 @@ TSG_EXPORT void TSGgml_WanResetForwardCache()
 {
     for (auto& e : g_wanDit) e.reset();
     g_wanDitRR = 0;
+    // The "too big to keep resident" verdicts were measured against the VRAM the
+    // previous stage had committed. A reset means that residency is being handed
+    // back (stage boundary, model reload), so re-probe rather than inherit them.
+    g_wanDitTooBig.clear();
 }
 
 TSG_EXPORT int TSGgml_WanT5Encode(const TSGgmlWanT5Desc* d)
@@ -1935,12 +2259,12 @@ TSG_EXPORT int TSGgml_WanDitForward(const TSGgmlWanDitDesc* d)
         {
             WanDitPersist* e = nullptr;
             for (auto& c : g_wanDit) if (c.matches(d)) { e = &c; break; }
-            if (e == nullptr) e = wan_dit_build_persist(d);
+            if (e == nullptr && !wan_dit_too_big(d)) e = wan_dit_build_persist(d);
             if (e != nullptr) return wan_dit_run_persist(e, d);
             // build failed (VRAM?): fall through to the rebuild-per-forward path
         }
 
-        const std::size_t nodes = static_cast<std::size_t>(d->num_layers) * 128 + 1024;
+        const std::size_t nodes = wan_dit_nodes(d->num_layers, d->ff, d->seq);
         const std::size_t meta = ggml_tensor_overhead() * (nodes + 1024)
                                  + ggml_graph_overhead_custom(nodes, false) + (8u << 20);
         ggml_init_params ip{ meta, nullptr, true };

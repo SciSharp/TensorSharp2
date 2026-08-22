@@ -40,6 +40,8 @@ ExternalProjects/ggml/
 # Portable Vulkan build toolchain (headers, loader import lib, glslc), provisioned
 # at build time by eng/fetch-vulkan-toolchain.ps1 when no Vulkan SDK is installed.
 ExternalProjects/vulkan-toolchain/
+# cuDNN redistributable provisioned by eng/fetch-cudnn (~1.1 GB, headers + DLLs).
+ExternalProjects/cudnn/
 
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt

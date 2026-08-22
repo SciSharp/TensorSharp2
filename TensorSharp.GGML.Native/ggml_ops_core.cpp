@@ -1220,6 +1220,19 @@ namespace tsg
                 }
             }
 
+            // CONTRACT: out_needs_upload == true means "this buffer has never been
+            // written". The entry is published in g_host_buffer_cache below BEFORE
+            // any bytes reach the device, and CachedHostBuffer carries no "was
+            // filled" bit — a later cache HIT therefore reports needs_upload ==
+            // false unconditionally. So a caller that takes this branch MUST upload
+            // before it can abandon the graph it is building: bailing out in between
+            // (a VRAM guard, a gallocr failure) leaves a hot entry backing
+            // uninitialised device memory that every later graph accepts as valid,
+            // and reads of it are silent — freshly mapped VRAM is zeros, so the model
+            // computes to a plausible finite answer that is simply wrong. Bind sites
+            // that can abandon a built graph (WanBind::bind in ggml_ops_wan.cpp,
+            // qi_fwd_build_graph's bind in ggml_ops_qwen_image.cpp) therefore fill
+            // the tensor inline here rather than queueing it for a later loop.
             out_buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
             if (out_buffer == nullptr)
                 return false;
@@ -2326,9 +2339,31 @@ namespace tsg
     #if defined(TSG_HAVE_CUDNN)
         if (backend_is_cuda())
         {
+            // OPT-IN on CUDA (TS_VAE_CUDNN_CONV=1), unlike the Metal/MPS route above.
+            //
+            // cuDNN convolves directly and so removes ggml's im2col lowering AND the
+            // band tiling that exists to bound its scratch. That is a win on a short
+            // clip and a large loss on a long one, because this route executes each
+            // convolution OUTSIDE the graph: run_conv_fast is bracketed by a
+            // ggml_backend_synchronize and a stream sync, so the cost is
+            // (convolutions x host round trip), and the convolution count scales with
+            // the temporal chunk count while the graph submission does not.
+            //
+            // Measured, RTX 3080 Laptop 16 GB, 1088x832 isolated decode
+            // (benchmarks/WanVideoBench vae-decode ... cuda):
+            //     17 frames  (5 chunks):   33.8 s cuDNN  vs  39.8 s ggml   (1.18x WIN)
+            //     121 frames (31 chunks): 1327.9 s cuDNN vs 294.4 s ggml   (4.51x LOSS)
+            // Outputs agree (mean 0.435643 vs 0.435646; the diffusers oracle passes at
+            // 80.2 dB either way) -- this is purely a scheduling cost. ggml's path
+            // scales linearly with frames; this one does not, because ~197
+            // convolutions per temporal chunk become ~12 200 host synchronisations at
+            // 121 frames, on a device that is already paging at that size.
+            //
+            // Turn it on for short clips, for the Qwen-Image VAE (single frame), or on
+            // a card with enough headroom that the decode is not memory bound.
             static const bool on = []{
                 const char* e = std::getenv("TS_VAE_CUDNN_CONV");
-                if (e != nullptr && e[0] == '0') return false;
+                if (e == nullptr || e[0] == '0') return false;
                 return tsg_cudnn_conv2d_available();
             }();
             return on;
@@ -2402,8 +2437,18 @@ namespace tsg
     // buffer reuse.
     ggml_status graph_compute_fast_conv(ggml_cgraph* graph, const char* tag)
     {
-        (void) tag;
         const int n = ggml_graph_n_nodes(graph);
+        // TS_GGML_NODE_PROFILE also covers this path: it does not go through
+        // graph_compute_profiled (the convolutions are executed outside the graph),
+        // so without this the vendor-conv route is the one shape that cannot be
+        // profiled — exactly the one whose split between library and graph time
+        // decides whether the vendor library is worth it.
+        const bool prof = graph_node_profile_enabled();
+        double convUs = 0.0, graphUs = 0.0;
+        int convs = 0, fallbacks = 0;
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        const auto tAll = now();
+
         int from = 0;
         for (int i = 0; i < n; i++)
         {
@@ -2413,24 +2458,42 @@ namespace tsg
             if (i > from)
             {
                 ggml_cgraph view = ggml_graph_view(graph, from, i);
+                const auto t0 = now();
                 const ggml_status st = ggml_backend_graph_compute(g_backend, &view);
                 if (st != GGML_STATUS_SUCCESS) return st;
+                if (prof) { ggml_backend_synchronize(g_backend); graphUs += std::chrono::duration<double, std::micro>(now() - t0).count(); }
             }
             ggml_backend_synchronize(g_backend);
+            const auto t1 = now();
             if (!run_conv_fast(node))
             {
                 // Unsupported shape: let ggml run just this node.
                 ggml_cgraph one = ggml_graph_view(graph, i, i + 1);
                 const ggml_status st = ggml_backend_graph_compute(g_backend, &one);
                 if (st != GGML_STATUS_SUCCESS) return st;
+                if (prof) { ggml_backend_synchronize(g_backend); fallbacks++; }
             }
+            if (prof) { convUs += std::chrono::duration<double, std::micro>(now() - t1).count(); convs++; }
             from = i + 1;
         }
         if (from < n)
         {
             ggml_cgraph view = ggml_graph_view(graph, from, n);
+            const auto t0 = now();
             const ggml_status st = ggml_backend_graph_compute(g_backend, &view);
             if (st != GGML_STATUS_SUCCESS) return st;
+            if (prof) { ggml_backend_synchronize(g_backend); graphUs += std::chrono::duration<double, std::micro>(now() - t0).count(); }
+        }
+        if (prof)
+        {
+            const double totalUs = std::chrono::duration<double, std::micro>(now() - tAll).count();
+            std::printf("[fast-conv] %s: %d nodes, %d convolutions (%d fell back to ggml) | "
+                        "vendor conv %.0f ms (%.1f%%) | rest of graph %.0f ms (%.1f%%) | total %.0f ms\n",
+                        tag != nullptr ? tag : "graph", n, convs, fallbacks,
+                        convUs / 1000.0, 100.0 * convUs / totalUs,
+                        graphUs / 1000.0, 100.0 * graphUs / totalUs,
+                        totalUs / 1000.0);
+            std::fflush(stdout);
         }
         return GGML_STATUS_SUCCESS;
     }
@@ -2692,6 +2755,12 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     TSGgml_Qwen35ReleaseVerifyTpGraphs();
     TSGgml_Qwen35ReleaseAttentionTpGraphs();
     TSGgml_Qwen35GdnDropTpGraphs();
+    // The vendor convolution library holds a handle, its engine tables and a
+    // workspace on the device. The VAE ENCODER runs before the DiT, so leaving them
+    // resident charges the whole denoise for memory only the decode needs.
+#if defined(TSG_HAVE_CUDNN)
+    tsg_cudnn_conv2d_release();
+#endif
     forget_cache_keys();
 
     // Every rank owns its own device copies; clear all of them.
