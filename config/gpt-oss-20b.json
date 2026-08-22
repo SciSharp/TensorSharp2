@@ -4,7 +4,7 @@
   //   TensorSharp.Cli    --config config/gpt-oss-20b.json --input prompt.txt
   //   TensorSharp.Server --config config/gpt-oss-20b.json
   "variables": {
-    "modelRoot": "C:/Works/models"
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },
 
   "backend": "ggml_cuda",

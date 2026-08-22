@@ -39,15 +39,36 @@ already accepts (listed in `--help`), with or without the leading `--`. Comments
 Define shared values once under `"variables"` and reference them with `${name}`
 in any string value. A `${name}` that is not defined there falls back to an
 environment variable of the same name, and variables may reference other
-variables. See [`variables.json`](variables.json).
+variables. `${name:-fallback}` supplies a value for when the name is defined
+nowhere. See [`variables.json`](variables.json).
 
 ```json
 {
-  "variables": { "modelRoot": "C:/models" },
+  "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
   "model": "${modelRoot}/gemma-4-E4B-it-Q8_0.gguf",
   "mmproj": "${modelRoot}/mmproj-gemma-4-E4B-it-Q8_0.gguf"
 }
 ```
+
+### Where the models go (and why no config here has a drive letter)
+
+Every config in this folder resolves its model root the same way:
+
+```json
+"modelRoot": "${TENSORSHARP_MODELS:-../models}"
+```
+
+- Set **`TENSORSHARP_MODELS`** to keep your models wherever you like — a Windows
+  path, `/mnt/data/models`, `~/models`. One variable covers every config here.
+- Leave it unset and the models land in a `models/` folder next to the repository
+  (a relative `path` is resolved against the **config file**, not the working
+  directory).
+
+This is not a style preference. A hard-coded `"C:/models/x.gguf"` is **not an
+absolute path on Linux or macOS** — .NET's `Path.IsPathRooted` knows nothing about
+drive letters there — so it would be treated as *relative* and silently glued onto
+the config's own directory. Written the way above, one file works unmodified on
+Windows, Linux and macOS.
 
 You can declare **as many variables (and root paths) as you need** — models that
 live in different folders each get their own root:
@@ -55,8 +76,8 @@ live in different folders each get their own root:
 ```json
 {
   "variables": {
-    "ditRoot": "C:/models/qwen-image-edit",
-    "companionRoot": "C:/Works/models"
+    "ditRoot": "${TENSORSHARP_MODELS:-../models}/qwen-image-edit",
+    "companionRoot": "${TENSORSHARP_MODELS:-../models}"
   },
   "model": { "path": "${ditRoot}/qwen-image-edit-2511-Q4_K_M.gguf", "urls": ["..."] },
   "qwen-image-vae": "${companionRoot}/Qwen_Image-VAE.safetensors"
@@ -107,11 +128,14 @@ are reused afterward. If you already have a file at that `path`, it is used as-i
 | [`variables.json`](variables.json) | Gemma-4 26B-A4B: model + mmproj + MTP draft | One shared root/repo reused across three related files |
 | [`auto-download.json`](auto-download.json) | Qwen3-0.6B (~640 MB) | Small, fast download demo with mirror fallback |
 | [`qwen-image-edit.json`](qwen-image-edit.json) | Qwen-Image-Edit 2511: DiT + VAE + text encoder + mmproj + Lightning LoRA | Multi-file image pipeline, all auto-downloaded |
+| [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~9.5 GB) | **Video generation**, 4-step distilled, text- **and** image-to-video |
+| [`wan-video-ti2v-5b.json`](wan-video-ti2v-5b.json) | Wan 2.2 TI2V-5B: DiT + video VAE + UMT5 (~11.4 GB) | Video generation, undistilled 50-step reference recipe |
+| [`wan-video-i2v-a14b.json`](wan-video-i2v-a14b.json) | Wan 2.2 I2V-A14B: **two** expert DiTs + Wan 2.1 VAE + UMT5 (~24 GB) | Image-to-video, two-expert schedule |
 
 `server-basic.json` uses the standard `gemma-4-E4B-it` build — point its `path` at
 your own file to host a different variant.
 
-## Ready-made configs for the local models in `C:/Works/models`
+## Ready-made configs, one per runnable model
 
 One config per runnable model, with its companions (vision projector, image-edit
 VAE / text encoder, MTP draft head, LoRA) already wired in. Each points at the
@@ -153,3 +177,47 @@ Notes:
 - To make any of these auto-download on another machine, turn a `"model": "…path…"`
   string into an object: `{ "path": "…", "urls": ["https://…"] }` (see the examples
   above).
+
+## Video generation (Wan)
+
+Video is the one pipeline that needs **several cooperating networks**, so a config
+file is the easiest way to run it — it names them all and downloads whatever is
+missing:
+
+```bash
+# Text-to-video and image-to-video, 4-step distilled. Start here.
+TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+
+TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
+  --prompt "a red fox trotting through falling snow" --output fox.mp4
+
+# Image-to-video: the image becomes frame 0 and the prompt drives the motion.
+TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
+  --image first_frame.png --prompt "she turns and smiles" --output clip.mp4
+```
+
+| Config | DiT | VAE | Text encoder | Modes |
+|---|---|---|---|---|
+| [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | TI2V-5B Turbo (4-step) | Wan 2.2 | UMT5-XXL | T2V + I2V |
+| [`wan-video-ti2v-5b.json`](wan-video-ti2v-5b.json) | TI2V-5B (50-step) | Wan 2.2 | UMT5-XXL | T2V + I2V |
+| [`wan-video-i2v-a14b.json`](wan-video-i2v-a14b.json) | A14B high **+** low noise | Wan 2.1 | UMT5-XXL | I2V only |
+
+Notes:
+
+- **The VAEs are not interchangeable.** TI2V-5B uses the Wan **2.2** VAE (48-channel
+  latent, 16×16×4 compression); A14B and the Wan 2.1 models use the Wan **2.1** VAE
+  (16-channel, 8×8×4). Each config names the right one.
+- **UMT5-XXL is shared** by every Wan model, so the ~6 GB encoder downloads once and
+  the other Wan configs reuse it from `${modelRoot}`.
+- **A14B needs both experts.** They are auto-paired by their `high_noise`/`low_noise`
+  names when they sit in the same folder; `wan-dit2` in the config is what lets the
+  second one auto-download.
+- **Turbo/Lightning/distilled checkpoints are detected from the file name** and
+  switch to 4 steps with guidance off — around 25× fewer DiT passes. The startup log
+  prints `step-distilled checkpoint detected`; `--diffusion-steps` / `--cfg` override
+  it.
+- Each network is loaded and released in turn, so peak VRAM is
+  `max(text encoder, DiT, VAE)` rather than their sum.
+- `video-frames` is snapped to `4k+1`. Halving it is the cheapest quality-neutral
+  saving: self-attention is O(tokens²), so 121 → 61 frames is roughly 4× less
+  attention work and half the VAE decode.

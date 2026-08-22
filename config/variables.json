@@ -9,7 +9,7 @@
   // and its MTP speculative-decoding draft head — three related files that each
   // auto-download into ${modelRoot} on the first run and are reused afterward.
   "variables": {
-    "modelRoot": "C:/Works/models",
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "gemmaBase": "${modelRoot}/gemma-4-26B-A4B",
     "repo": "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/resolve/main"
   },

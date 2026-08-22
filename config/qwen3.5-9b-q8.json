@@ -5,7 +5,7 @@
   //   TensorSharp.Server --config config/qwen3.5-9b-q8.json
   // Command-line options override anything here (e.g. --backend ggml_vulkan).
   "variables": {
-    "modelRoot": "C:/Works/models"
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },
 
   "backend": "ggml_cuda",

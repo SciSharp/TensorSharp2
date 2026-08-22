@@ -37,7 +37,12 @@ namespace TensorSharp.Runtime
     /// names that any string value can reference with <c>${name}</c> — so a
     /// shared model root is written once. A reference not found among the
     /// variables falls back to an environment variable of the same name;
-    /// variables may reference other variables.</item>
+    /// variables may reference other variables. <c>${name:-fallback}</c> supplies
+    /// a value for when the name is defined nowhere, which is how the shipped
+    /// configs stay portable: they resolve a model root from
+    /// <c>TENSORSHARP_MODELS</c> when it is set and from a path relative to the
+    /// config file otherwise, instead of hard-coding a drive letter that means
+    /// nothing on Linux or macOS.</item>
     /// <item><b>Auto-download.</b> A file option may be an object
     /// <c>{ "path": "...", "urls": ["...", "..."] }</c>. If <c>path</c> is missing
     /// on disk it is downloaded from the first working URL and saved there, so the
@@ -81,7 +86,14 @@ namespace TensorSharp.Runtime
             CommentHandling = JsonCommentHandling.Skip,
         };
 
-        private static readonly Regex VariablePattern = new(@"\$\{([A-Za-z0-9_.\-]+)\}", RegexOptions.Compiled);
+        // ${name} and ${name:-fallback}. The fallback (shell syntax) is what lets a
+        // shipped config name an environment variable that most users will not have
+        // set and still work unmodified — see the portability note on Substitute.
+        // The fallback alternation lets a default contain its own ${...} reference
+        // (one level), so "${missing:-${base}/models}" parses as name=missing with
+        // default "${base}/models" rather than stopping at the inner brace.
+        private static readonly Regex VariablePattern =
+            new(@"\$\{([A-Za-z0-9_.\-]+)(?::-((?:[^{}]|\$\{[^{}]*\})*))?\}", RegexOptions.Compiled);
 
         /// <summary>
         /// Expand every <c>--config &lt;path&gt;</c> flag in <paramref name="args"/>
@@ -403,15 +415,42 @@ namespace TensorSharp.Runtime
                 return Substitute(input, new HashSet<string>(StringComparer.Ordinal));
             }
 
+            /// <summary>
+            /// Replace every <c>${name}</c> / <c>${name:-fallback}</c> in
+            /// <paramref name="input"/>.
+            ///
+            /// The fallback form exists for portability. A config that hard-codes a
+            /// model root cannot be shipped: <c>C:/models/x.gguf</c> is not rooted on
+            /// Linux or macOS (<see cref="Path.IsPathRooted"/> knows nothing about
+            /// drive letters there), so it is treated as RELATIVE and silently glued
+            /// onto the config's directory. Writing
+            /// <c>${TENSORSHARP_MODELS:-../models}</c> instead gives one file that
+            /// works unmodified everywhere: a path relative to the config by default,
+            /// overridden by one environment variable when the models live elsewhere.
+            /// </summary>
             private string Substitute(string input, HashSet<string> visiting)
             {
-                return VariablePattern.Replace(input, match => Resolve(match.Groups[1].Value, visiting));
+                return VariablePattern.Replace(input, match =>
+                {
+                    string name = match.Groups[1].Value;
+                    if (TryResolve(name, visiting, out string? value))
+                        return value!;
+                    if (match.Groups[2].Success)
+                        return Substitute(match.Groups[2].Value, visiting);
+                    throw new ArgumentException(
+                        $"Configuration file '{_configPath}' references undefined variable '${{{name}}}' " +
+                        "(not found among \"variables\" or environment variables). Give it a default with " +
+                        $"'${{{name}:-some/value}}' if it should be optional.");
+                });
             }
 
-            private string Resolve(string name, HashSet<string> visiting)
+            private bool TryResolve(string name, HashSet<string> visiting, out string? value)
             {
                 if (_resolved.TryGetValue(name, out string? cached))
-                    return cached;
+                {
+                    value = cached;
+                    return true;
+                }
 
                 if (_raw.TryGetValue(name, out string? rawValue))
                 {
@@ -420,19 +459,22 @@ namespace TensorSharp.Runtime
                     string result = Substitute(rawValue, visiting);
                     visiting.Remove(name);
                     _resolved[name] = result;
-                    return result;
+                    value = result;
+                    return true;
                 }
 
+                // An environment variable that exists but is empty counts as unset, so
+                // `set TENSORSHARP_MODELS=` falls back rather than resolving to "".
                 string? env = Environment.GetEnvironmentVariable(name);
-                if (env != null)
+                if (!string.IsNullOrEmpty(env))
                 {
                     _resolved[name] = env;
-                    return env;
+                    value = env;
+                    return true;
                 }
 
-                throw new ArgumentException(
-                    $"Configuration file '{_configPath}' references undefined variable '${{{name}}}' " +
-                    "(not found among \"variables\" or environment variables).");
+                value = null;
+                return false;
             }
 
             private static bool TryGetReserved(JsonElement root, string name, out JsonElement value)

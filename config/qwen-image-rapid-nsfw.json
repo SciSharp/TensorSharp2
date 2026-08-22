@@ -10,8 +10,8 @@
   // This is a "rapid" (few-step) build, so it needs no Lightning LoRA. Tune
   // steps/cfg per run on the CLI: --diffusion-steps N --cfg F --diffusion-seed N.
   "variables": {
-    "modelRoot": "C:/Works/models",
-    "imgedit": "C:/Works/models/imgedit"
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "imgedit": "${TENSORSHARP_MODELS:-../models}/imgedit"
   },
 
   "backend": "ggml_cuda",

@@ -8,7 +8,7 @@
   // server-safe); tune them per run, e.g.:
   //   --diffusion-steps 48 --diffusion-seed 0 --max-tokens 256
   "variables": {
-    "modelRoot": "C:/Works/models"
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },
 
   "backend": "ggml_cuda",

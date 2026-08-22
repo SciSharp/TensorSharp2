@@ -6,8 +6,8 @@
   //   TensorSharp.Cli    --config config/qwen3.6-27b.json --image photo.png
   //   TensorSharp.Server --config config/qwen3.6-27b.json
   "variables": {
-    "modelRoot": "C:/Works/models",
-    "root": "C:/Works/models/mtp"
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${TENSORSHARP_MODELS:-../models}/mtp"
   },
 
   "backend": "ggml_cuda",

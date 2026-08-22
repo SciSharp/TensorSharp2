@@ -308,6 +308,78 @@ public class ConfigFileArgsTests : IDisposable
         Assert.Contains("nope", ex.Message);
     }
 
+    // ${name:-fallback}. This is what lets the shipped configs name a model root
+    // without hard-coding a drive letter: a Windows path like "C:/models/x.gguf"
+    // is NOT rooted on Linux/macOS, so it would be treated as relative and glued
+    // onto the config's own directory rather than failing loudly.
+
+    [Fact]
+    public void Expand_VariableDefault_UsedWhenNameIsUndefined()
+    {
+        string cfg = WriteConfig("""
+        { "model": "${TS_CFG_NO_SUCH_VAR_12345:-../models}/a.gguf" }
+        """);
+        var result = ConfigFileArgs.Expand(new[] { "--config", cfg });
+        Assert.Equal(new[] { "--model", "../models/a.gguf" }, result);
+    }
+
+    [Fact]
+    public void Expand_VariableDefault_LosesToAnEnvironmentVariable()
+    {
+        string name = "TS_CFG_TEST_ROOT_" + Guid.NewGuid().ToString("N");
+        Environment.SetEnvironmentVariable(name, "D:/envmodels");
+        try
+        {
+            string cfg = WriteConfig("{ \"model\": \"${" + name + ":-../models}/a.gguf\" }");
+            var result = ConfigFileArgs.Expand(new[] { "--config", cfg });
+            Assert.Equal(new[] { "--model", "D:/envmodels/a.gguf" }, result);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+
+    [Fact]
+    public void Expand_VariableDefault_LosesToADeclaredVariable()
+    {
+        string cfg = WriteConfig("""
+        { "variables": { "root": "/declared" }, "model": "${root:-../models}/a.gguf" }
+        """);
+        var result = ConfigFileArgs.Expand(new[] { "--config", cfg });
+        Assert.Equal(new[] { "--model", "/declared/a.gguf" }, result);
+    }
+
+    [Fact]
+    public void Expand_VariableDefault_UsedWhenEnvironmentVariableIsEmpty()
+    {
+        // `set VAR=` on Windows leaves an empty value rather than removing it;
+        // treating that as "set" would resolve the root to "" and silently build
+        // a path off the filesystem root.
+        string name = "TS_CFG_TEST_EMPTY_" + Guid.NewGuid().ToString("N");
+        Environment.SetEnvironmentVariable(name, "");
+        try
+        {
+            string cfg = WriteConfig("{ \"model\": \"${" + name + ":-../models}/a.gguf\" }");
+            var result = ConfigFileArgs.Expand(new[] { "--config", cfg });
+            Assert.Equal(new[] { "--model", "../models/a.gguf" }, result);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
+    }
+
+    [Fact]
+    public void Expand_VariableDefault_MayItselfReferenceAVariable()
+    {
+        string cfg = WriteConfig("""
+        { "variables": { "base": "/base" }, "model": "${missing:-${base}/models}/a.gguf" }
+        """);
+        var result = ConfigFileArgs.Expand(new[] { "--config", cfg });
+        Assert.Equal(new[] { "--model", "/base/models/a.gguf" }, result);
+    }
+
     [Fact]
     public void Expand_CyclicVariable_ThrowsArgumentException()
     {

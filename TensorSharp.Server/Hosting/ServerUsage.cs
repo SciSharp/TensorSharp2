@@ -324,9 +324,13 @@ namespace TensorSharp.Server.Hosting
                     "(TS_WAN_VAE).",
                     "--wan-vae Wan2.2_VAE.safetensors"),
                 new OptionHelp("--wan-te <path>",
-                    "UMT5-XXL text-encoder GGUF. Default: same-directory scan (TS_WAN_TE). Wan 2.2 A14B " +
-                    "also auto-resolves the second high/low-noise expert GGUF by name (TS_WAN_DIT2).",
+                    "UMT5-XXL text-encoder GGUF. Default: same-directory scan (TS_WAN_TE).",
                     "--wan-te umt5-xxl-encoder-Q8_0.gguf"),
+                new OptionHelp("--wan-dit2 <path>",
+                    "Wan 2.2 A14B second expert GGUF (the high/low-noise partner of --model). Default: " +
+                    "auto-resolved by name from the same or a sibling folder (TS_WAN_DIT2); needed only " +
+                    "when the pair is not co-located, or to name it in a --config file.",
+                    "--wan-dit2 wan2.2_i2v_A14b_low_noise-Q4_K_M.gguf"),
             }),
             ("Upload storage (the uploads/ directory next to the server binary)", new[]
             {

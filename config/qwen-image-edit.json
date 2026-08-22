@@ -6,10 +6,11 @@
   //
   // These files are co-located, so a single ${root} suffices. If your models
   // live in different folders, declare one variable per folder — e.g.
-  //   "variables": { "ditRoot": "C:/models/qwen-image-edit", "companionRoot": "C:/Works/models" }
+  //   "variables": { "ditRoot": "${TENSORSHARP_MODELS:-../models}/qwen-image-edit",
+  //                  "companionRoot": "${TENSORSHARP_MODELS:-../models}" }
   // — and reference each below (see the multiple-roots note in README.md).
   "variables": {
-    "root": "C:/Works/models"
+    "root": "${TENSORSHARP_MODELS:-../models}"
   },
 
   "backend": "ggml_cuda",

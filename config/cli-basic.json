@@ -7,7 +7,7 @@
   // The model auto-downloads into ${modelRoot} on the first run (real, ungated
   // GGUF, ~8.9 GB) and is reused on every later run.
   "variables": {
-    "modelRoot": "C:/Works/models",
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "hf": "https://huggingface.co"
   },
 
