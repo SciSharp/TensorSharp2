@@ -214,11 +214,14 @@ TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --interactive --think --tp 4 --max-tokens 20000
 ```
 
-On the CLI, speculation needs a pure argmax sampler: the standalone decoder
-verifies each row with argmax, so anything that rewrites those logits — a
-non-zero temperature, top-k/top-p, or a repetition/presence/frequency penalty
-(`/temp`, `/top-k`, … in the REPL) — turns it off from the next turn onward. It
-also stays off for a turn carrying an image or audio attachment.
+On the CLI, verification draws each row with whatever sampler the run
+configured — argmax under `--temperature 0`, the chat sampler otherwise — so
+speculation composes with `/temp`, `/top-k`, … in the REPL. One caveat under a
+penalized sampler: DSpark proposes a whole block in one pass, so the
+repetition/presence/frequency penalties verification applies are not applied to
+the proposal, and acceptance falls as the penalized history grows. Speculation
+stays off entirely for a turn carrying an image or audio attachment, whose
+embeddings only the plain prefill can inject.
 
 ### On TensorSharp.Server
 

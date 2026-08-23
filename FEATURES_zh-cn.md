@@ -12,7 +12,7 @@
 - **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）、GGML CUDA（Windows/Linux + NVIDIA）和 GGML Vulkan（Windows/Linux + AMD/Intel/NVIDIA），并提供 Direct CUDA/cuBLAS 后端（含 PTX 内核与未覆盖算子的 CPU 回退），以及面向 Apple Silicon 的 MLX 后端（mlx-c / Metal）
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 块池，跨请求的块级哈希前缀共享，迭代级调度器（可在批内动态加入/抢占序列），可选的 SSD 冷层用于超大 KV 工作集，原生融合分页注意力内核（`TSGgml_PagedAttentionForward`，在 Metal/CUDA/Vulkan 上驱动 `ggml_flash_attn_ext`）。`TensorSharp.Server` 默认启用，可用 `--no-continuous-batching` 关闭。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。GLM 5.x 是个例外：带权重吸收的 MLA（每层每 token 只占一行 576 宽的缓存）与 DSA lightning indexer 没有分页布局，因此那里的并发靠原生的按序列**槽位**来承载——每个请求拥有自己的 MLA 与索引器缓存以及自己的 `n_past`，绑定请求只是切换活跃槽位，不搬运任何 KV 字节。
-- **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列（无并发）decode。Qwen 3.6 与 GLM 5.2 将 NextN 块内嵌在主干 GGUF 中；Gemma 4 通过 `--mtp-draft-model` 加载独立的 EAGLE 风格 `gemma4-assistant` 草稿 GGUF，其草稿层读取目标模型自身的 KV 缓存。草稿头每步最多提议 `--mtp-draft` 个 token（草稿置信度 ≥ `--mtp-pmin` 时保留），主干用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，因此输出与标准 decode 完全一致。服务端通过 `--mtp-spec` 启用（默认关闭）；CLI 没有 MTP 参数，需设置 `TS_MTP_*` 环境变量。ggml 后端有融合的多 token 验证 / 草稿步内核，是明确收益；Direct `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿，同样有收益；CPU / GGML CPU / MLX 保持标准 decode。环境变量：`TS_MTP_*`（通用）与 `TS_GMTP_*`（Gemma 4 调优）。
+- **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列（无并发）decode。Qwen 3.6 与 GLM 5.2 将 NextN 块内嵌在主干 GGUF 中；Gemma 4 通过 `--mtp-draft-model` 加载独立的 EAGLE 风格 `gemma4-assistant` 草稿 GGUF，其草稿层读取目标模型自身的 KV 缓存。草稿头每步最多提议 `--mtp-draft` 个 token（草稿置信度 ≥ `--mtp-pmin` 时保留），主干用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，因此输出与标准 decode 完全一致。CLI 与服务端均通过 `--mtp-spec` 启用（默认关闭）。在 `TensorSharp.Cli` 上，它在所有单序列路径上生效——`--input`、`--multi-turn-jsonl` 与 `--interactive`。ggml 后端有融合的多 token 验证 / 草稿步内核，是明确收益；Direct `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿，同样有收益；CPU / GGML CPU / MLX 保持标准 decode。环境变量：`TS_MTP_*`（通用）与 `TS_GMTP_*`（Gemma 4 调优）。
 - **张量并行与分布式推理** —— 用 `--tp N`（`TensorSharp.Cli` 与 `TensorSharp.Server` 均支持，也可用 `TENSORSHARP_TP_DEGREE`）把一个模型按 Megatron-LM 列/行并行范式切分到多张 GPU 上，再用点对点 TCP 集群（`--tp-node-id` / `--tp-peers`）扩展到多台机器。分层 AllReduce 把跨网络流量降到最低。可运行在 Direct `cuda` 后端以及 GGML CUDA / Vulkan 后端上——后者每个 rank 在自己的 GPU 上拥有独立的 ggml 后端、权重分片与 KV 缓存。支持全部自回归架构（Qwen 3、Mistral 3、Gemma 3/4、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、GLM 5.x、Muse-Glimmer——因为只有 2 个 KV 头，并行度上限为 `--tp 2`），并针对 MoE 专家并行 / 专家切分、GatedDeltaNet 按 rank V-head 归属、Mamba2 复制等异构层提供各自的策略。融合的按 rank 计算图使 `--tp 2` 的 decode 快于单卡（Gemma 4 E4B 51.7 对 37.3 tok/s），也让单卡装不下的模型得以运行。注意 TP 并不是模型用上多张 GPU 的唯一途径：DeepSeek V4 与 GLM 5.x **不加任何开关就会按层切分到所有可见 GPU**（它们的整模型执行器会按每张卡的空闲显存对整层做装箱），`--tp` 在 GLM 5.x 上会把这种切分换成层内部的 Megatron 切分，在 DeepSeek V4 上则只是限制按层切分使用几张卡（等同 `TS_DSV4_NGPU`）；其他所有架构在不加 `--tp` 时只用一张 GPU。服务端还可选用 Redis 支撑的共享 KV 缓存与 Responses API 存储。→ [张量并行](USAGE_zh-cn.md#张量并行与分布式推理)
 - **批处理 / 并行推理** —— 已为 Mistral 3、Gemma 4、GPT OSS、Qwen 3、Qwen 3.5/3.6-family、Nemotron-H 默认启用 `IBatchedPagedModel.ForwardBatch`，能在一次前向传播中打包 N 个序列，使用 `slotMapping` 进行分页 K/V 写入，并通过原生内核做按序列注意力。Gemma 4、Qwen 3.5/3.6、GPT OSS 与 Nemotron-H 提供各自的 `TS_<FAMILY>_BATCHED=0` 兜底开关；Qwen 3 与 Mistral 3 没有家族专属开关，请用全局 `TS_SCHED_DISABLE_BATCHED=1` 强制回到按序列 KV-swap 路径。GLM 5.x 没有分页版 `ForwardBatch`；取而代之的是一条可选的批处理融合解码（`TS_BATCHED_FUSED_DECODE=1`）：一张图、每个序列一个 token，权重只读一次——4 路并发下总解码吞吐 1.81 倍。默认关闭，因为批处理会改变 GEMM 形状，而 2-bit MoE 会把这点差异放大成不同的专家选择。
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
@@ -58,13 +58,13 @@ DeepSeek V4 的 checkpoint 中随模型附带一个 **DSpark** 支持模块（"C
 
 Muse-Glimmer 有自己的块级草稿模型 **DFlash**：一个独立的 5 层 GGUF（`general.architecture = dflash`），一次前向即提出整个投机窗口。它复用主干的 token embedding 与 LM head，维护自己的滑动窗口 KV 环，每步跑三遍——把主干在 `dflash.target_layers` 处的逐层输入残差*编码*成一行宽向量，将该行*注入*为每个草稿层的 K/V，再把 `[anchor, MASK x (block-1)]` 送过 5 个块*起草*，并用主干的 LM head 打分。主干用一次批量前向验证该块，只保留它自己本来也会产生的前缀，因此**输出的 token 流与普通贪心 decode 完全一致**。
 
-两部分都是可被 CUDA 图捕获并重放的融合原生图，草稿块以设备端 `argmax` 收尾，因此 202048 宽的概率块无需经 PCIe 回传。运行期的成本调控器会把投机与普通解码逐 token 计时对比，在投机确实更慢时暂停起草——所以投机只会更快，但需要生成数百个 token 才能稳定。用 `--draft-model`（CLI）或 `TS_MUSE_GLIMMER_DFLASH` 加载，并且**不要传任何采样参数**：`--top-k 1` 不满足 `SamplingConfig.IsGreedy`，会静默关闭整条投机路径。在单张 RTX PRO 6000 Blackwell 上与 llama.cpp 自带的 DFlash 对比（Q8_0、贪心、60 token 提示）：50.9 tok/s，对比 llama.cpp 的 45.5 与普通解码的 35.0。详见 [Muse-Glimmer 卡片](docs/models/muse-glimmer_zh-cn.md)。
+两部分都是可被 CUDA 图捕获并重放的融合原生图，草稿块以设备端 `argmax` 收尾，因此 202048 宽的概率块无需经 PCIe 回传。运行期的成本调控器会把投机与普通解码逐 token 计时对比，在投机确实更慢时暂停起草——所以投机只会更快，但需要生成数百个 token 才能稳定。用 `--draft-model`（CLI）或 `TS_MUSE_GLIMMER_DFLASH` 加载。采样是可组合的——验证会用本次运行自己的采样器从主干的某一行抽取每个 token——但要注意块级草稿器一次提出整块草稿，惩罚项并不会施加到该提案上，接受率会随带惩罚的历史增长而下降。在单张 RTX PRO 6000 Blackwell 上与 llama.cpp 自带的 DFlash 对比（Q8_0、贪心、60 token 提示）：50.9 tok/s，对比 llama.cpp 的 45.5 与普通解码的 35.0。详见 [Muse-Glimmer 卡片](docs/models/muse-glimmer_zh-cn.md)。
 
 ## MTP / NextN 投机解码
 
 部分架构自带**多 token 预测（MTP / NextN）草稿头**，让 `TensorSharp.Server` 能为单序列（无并发）请求运行无损投机解码。草稿头廉价地提议若干未来 token，主干用一次批量前向验证全部 token，被接受的 token 一步提交。由于起草与验证都由该请求自己的采样器（temperature、top-k/p、重复/存在/频率惩罚）驱动，输出与标准 decode 完全一致——投机只改变产生这些 token 所需的前向次数。
 
-投机解码**默认关闭**。在服务端通过 `--mtp-spec`（环境变量 `TS_MTP_SPEC=1`）启用：
+投机解码**默认关闭**。在服务端或 `TensorSharp.Cli` 上通过 `--mtp-spec`（环境变量 `TS_MTP_SPEC=1`）启用：
 
 ```bash
 # Qwen 3.6 —— 使用 -MTP- 仓库 GGUF，确保主干保留内嵌 NextN 块
@@ -79,7 +79,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/gemma-4-E4B-
 **三种草稿头形态：**
 
 - **Qwen 3.6（内嵌 NextN）** —— GGUF 在主干栈之后带有一个额外解码块（`{arch}.nextn_predict_layers`）以及 NextN 投影 / 归一化张量。无需独立文件，`--mtp-draft-model` 被忽略。主干的递归状态（GatedDeltaNet）会被快照，以便部分被拒的验证批次可以回滚。
-- **GLM 5.2（内嵌 NextN）** —— 形态相同，且官方 [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF) 已经带有该块（`blk.78.nextn.*` 加上一个完整的 MLA + 256 专家解码块），无需额外下载，`--mtp-spec` 就是全部配置。该块只在传入该参数时才会加载：它是一整个解码层（IQ2_XXS 下约 3 GiB），会与 KV 缓存争抢 loader 用来确定上下文长度的同一块显存。glm-dsa 没有递归状态，因此部分被拒的验证批次会保留已接受前缀的 KV，只回退位置计数，不需要重跑。详见 [GLM 卡片](docs/models/glm_zh-cn.md#nextn--mtp-投机解码)。
+- **GLM 5.2（内嵌 NextN）** —— 形态相同，且官方 [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF) 已经带有该块（`blk.78.nextn.*` 加上一个完整的 MLA + 256 专家解码块），无需额外下载，`--mtp-spec` 就是全部配置——在 CLI（`--input`、`--multi-turn-jsonl`、`--interactive`）上与在服务端上都是如此。该块只在传入该参数时才会加载：它是一整个解码层（IQ2_XXS 下约 3 GiB），会与 KV 缓存争抢 loader 用来确定上下文长度的同一块显存。glm-dsa 没有递归状态，因此部分被拒的验证批次会保留已接受前缀的 KV，只回退位置计数，不需要重跑。详见 [GLM 卡片](docs/models/glm_zh-cn.md#nextn--mtp-投机解码)。
 - **Gemma 4（独立 `gemma4-assistant` GGUF）** —— 通过 `--mtp-draft-model` 加载的 EAGLE 风格递归草稿器。它自身不保存任何 K/V：每个草稿层都查询**目标模型**已有的逐层 KV 缓存（最后一个 local 层 + 最后一个 global 层），因此在给定 `(token, hidden)` 时草稿器是无状态的。草稿的隐藏维度必须与目标一致——12B 目标配 12B 草稿，而非 26B-A4B 草稿。草稿 GGUF 不匹配、缺失或不完整会在启动时**立即失败**并给出修复提示，而非静默关闭投机。
 
 **何处有收益**（自动启用；否则引擎走标准 decode）：

@@ -318,6 +318,185 @@ public class GlmDsaMtpTests : IDisposable
         }
     }
 
+    /// <summary>Plain sampled decode — the reference stream sampled speculation
+    /// must reproduce. Mirrors what the CLI's non-speculative loop does: one
+    /// sampler, fed the tokens generated so far.</summary>
+    private static int[] PlainSampled(ModelBase model, int[] prompt, int count, SamplingConfig cfg)
+    {
+        model.ResetKVCache();
+        float[] logits = model.ForwardRefill(prompt);
+        var sampler = new TokenSampler(cfg);
+        var produced = new List<int>(count);
+        for (int i = 0; i < count; i++)
+        {
+            produced.Add(sampler.Sample(logits, produced.GetRange(0, produced.Count)));
+            if (i + 1 < count) logits = model.Forward(new[] { produced[i] });
+        }
+        return produced.ToArray();
+    }
+
+    private static SamplingConfig SampledConfig(float repeatPenalty) => new()
+    {
+        Temperature = 0.8f,
+        TopK = 40,
+        TopP = 0.95f,
+        MinP = 0.05f,
+        RepetitionPenalty = repeatPenalty,
+        PenaltyLastN = 64,
+        Seed = 1234,
+    };
+
+    [Theory]
+    [InlineData(1.0f)]
+    [InlineData(1.15f)]
+    public void GlmDsa_SampledSpeculationMatchesPlainSampling(float repeatPenalty)
+    {
+        // Speculation must be a speed path under a SAMPLER too, not only under
+        // argmax — the CLI's --chat defaults are temp 0.8 / top-k 40 / top-p 0.95,
+        // so an argmax-only speculative path would never engage for the mode
+        // people actually use.
+        //
+        // Every emitted token is drawn from a trunk row with the run's own
+        // sampler, and the sampler is seeded, so the stream must be identical to
+        // plain sampled decoding token for token. Three bookkeeping details make
+        // that true, and each is a silent bias if dropped:
+        //   * the token drawn while verifying a row is emitted as drawn (never
+        //     re-drawn from the same logits, which would bias toward the drafts);
+        //   * accepted drafts enter the penalty history before the next row is
+        //     drawn;
+        //   * the draft head argmaxes the same PENALIZED distribution
+        //     verification draws from.
+        // The repeatPenalty = 1.15 case is the one that exercises the last two:
+        // at 1.0 the penalties are inert and a broken history would go unnoticed.
+        string path = BuildModel();
+        const int maxNew = 24;
+        int[] prompt = Prompt24();
+        SamplingConfig cfg = SampledConfig(repeatPenalty);
+
+        int[] plain;
+        using (var model = ModelBase.Create(path, BackendType.Cpu))
+            plain = PlainSampled(model, prompt, maxNew, cfg);
+
+        using (var model = ModelBase.Create(path, BackendType.Cpu))
+        {
+            var spec = (IMtpSpeculativeModel)model;
+            Assert.True(spec.HasMtp);
+            var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+            {
+                AdaptiveSpeculation = false,
+                // (see GlmDsa_SpeculativeGreedyMatchesPlainGreedy on why the
+                // synthetic model needs the confidence gate opened)
+                MinDraftProb = 0.02f,
+            };
+            List<int> speculative = decoder.GenerateSampled(
+                prompt, maxNew, new TokenSampler(SampledConfig(repeatPenalty)));
+
+            _output.WriteLine($"repeatPenalty={repeatPenalty} drafted={decoder.TokensDrafted} " +
+                              $"accepted={decoder.TokensAccepted} acceptance={decoder.AcceptanceRate:P1} " +
+                              $"verify={decoder.VerifySteps} plain={decoder.PlainSteps}");
+            _output.WriteLine("plain: " + string.Join(",", plain));
+            _output.WriteLine("spec : " + string.Join(",", speculative));
+
+            Assert.Equal(maxNew, speculative.Count);
+            Assert.Equal(plain, speculative.ToArray());
+            Assert.True(decoder.TokensDrafted > 0, "the draft head never proposed a token");
+            // Acceptance is deliberately NOT asserted here. The synthetic weights
+            // are random, so the trunk's distribution over 128 tokens is near
+            // uniform and a sampled draw essentially never lands on the draft
+            // head's argmax — this run is the all-rejected regime, which is the
+            // half that pins "the token drawn while verifying is the token
+            // emitted": re-drawing it would consume the seeded RNG a second time
+            // and the stream above would diverge at the first speculative step.
+            // The accepted half is pinned on the deterministic fake, in
+            // MtpSpeculativeExecutionTests.GenerateSampled_WithAcceptedDrafts_*.
+        }
+    }
+
+    [Fact]
+    public void GlmDsa_SampledSpeculationLeavesTheTrunkCacheWhereSamplingWould()
+    {
+        // The sampled counterpart of GlmDsa_SpeculationLeavesTheTrunkCacheWhere-
+        // GreedyWouldHave: a rejected window must leave no stale KV behind. The
+        // continuation logits are what prove it — a length check would not.
+        string path = BuildModel();
+        const int maxNew = 16;
+        int[] prompt = Prompt24();
+        SamplingConfig cfg = SampledConfig(1.0f);
+
+        int[] plain;
+        float[] plainNext;
+        using (var model = ModelBase.Create(path, BackendType.Cpu))
+        {
+            plain = PlainSampled(model, prompt, maxNew, cfg);
+            plainNext = (float[])model.Forward(new[] { plain[^1] }).Clone();
+        }
+
+        using var specModel = ModelBase.Create(path, BackendType.Cpu);
+        var spec = (IMtpSpeculativeModel)specModel;
+        var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+        {
+            AdaptiveSpeculation = false,
+            MinDraftProb = 0.02f,
+        };
+        List<int> produced = decoder.GenerateSampled(prompt, maxNew, new TokenSampler(SampledConfig(1.0f)));
+        Assert.Equal(plain, produced.ToArray());
+        Assert.Equal(prompt.Length + produced.Count - 1, spec.CacheSeqLen);
+
+        float[] specNext = specModel.Forward(new[] { produced[^1] });
+        for (int v = 0; v < specNext.Length; v++)
+            Assert.Equal(plainNext[v], specNext[v], 3);
+    }
+
+    [Fact]
+    public void GlmDsa_CarryPositionTracksWhereAContinuationMayResume()
+    {
+        // A chat session extends its KV cache across turns by prefilling only the
+        // new suffix. That is sound exactly when the draft head's carry-in hidden
+        // state still describes the token the trunk ends on — which is what
+        // CarryPosition reports. Resuming when it does not is silent: the stream
+        // stays correct because verification is trunk-driven, but the draft head
+        // picks up a row built from the wrong hidden state and acceptance decays.
+        string path = BuildModel();
+        int[] prompt = Prompt24();
+
+        using var model = ModelBase.Create(path, BackendType.Cpu);
+        var spec = (IMtpSpeculativeModel)model;
+        var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+        {
+            AdaptiveSpeculation = false,
+            MinDraftProb = 0.02f,
+        };
+
+        Assert.Equal(-1, decoder.CarryPosition);
+
+        model.ResetKVCache();
+        decoder.Reset();
+        decoder.Prefill(prompt);
+        Assert.Equal(prompt.Length, decoder.CarryPosition);
+        Assert.Equal(spec.CacheSeqLen, decoder.CarryPosition);
+
+        // A run to its natural end leaves the carry-in describing the trunk's
+        // last token, so the next turn may extend.
+        var produced = decoder.GenerateGreedyFrom(
+            model.Forward(new[] { prompt[^1] }), spec.CacheSeqLen, 8);
+        Assert.Equal(spec.CacheSeqLen, decoder.CarryPosition);
+
+        // A run stopped part-way through a verified window rewinds the trunk
+        // below the row the carry-in came from, so it must refuse to resume.
+        int stopAfter = 1;
+        int emitted = 0;
+        decoder.GenerateGreedyFrom(
+            model.Forward(new[] { produced[^1] }), spec.CacheSeqLen, 16,
+            onToken: _ => ++emitted < stopAfter);
+        if (decoder.CarryPosition != -1)
+        {
+            // The stop landed on a step boundary, so nothing was rewound. Say so
+            // rather than asserting a coincidence.
+            _output.WriteLine($"stop fell on a step boundary; carry still valid at {decoder.CarryPosition}");
+            Assert.Equal(spec.CacheSeqLen, decoder.CarryPosition);
+        }
+    }
+
     [Fact]
     public void GlmDsa_TrunkGoldensAreUnchangedByTheMtpBlock()
     {

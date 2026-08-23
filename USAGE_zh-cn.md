@@ -218,9 +218,12 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
 | `--think` | 启用思维链/推理模式。所有系列（含 GLM 5.x）都是按需开启：不加时 GLM 的模板会把推理块立刻闭合（`<think></think>`），模型直接作答；加上后提示里会带上 `Reasoning Effort: Max`，并留下一个未闭合的 `<think>` 交给模型自己收尾。REPL 里用 `/think on\|off` 切换。 |
 | `--tools <path>` | 包含工具/函数定义的 JSON 文件。线格式因系列而异，解析器按架构选取——GLM 5.x 发出的是 XML（`<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`，每个参数一个元素，非纯字符串的值以 `tojson` 编码）而不是 JSON 主体，服务端会把它解析回常规的 OpenAI 工具调用字段，因此客户端看到的仍是标准形状。 |
-| `--draft-model <path>` | 投机解码草稿 GGUF，适用于草稿器以独立文件发布的架构——DeepSeek V4 的 DSpark 支持模块（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）与 Muse-Glimmer 的 DFlash 块级草稿器（见 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md#3-dflash-投机解码)，环境变量 `TS_MUSE_GLIMMER_DFLASH`）。它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。在所有单序列路径（`--input`、`--input-jsonl`、`--multi-turn-jsonl`、`--interactive`）上生效，需要 `--backend cuda` 或 `--backend ggml_cuda`，并且必须是纯 argmax 采样：任何 temperature、top-k/p 或重复/存在/频率惩罚都会将其关闭。环境变量：`TS_DSV4_DSPARK`。 |
-| `--spec-draft-n-max <N>` | 每个投机块最多起草的 token 数（默认：草稿器训练时的块大小；DSpark 为 5，Muse-Glimmer 的 DFlash 为 15） |
-| `--spec-draft-conf-min <p>` | 保留某个起草位置所需的最小**累积**接受概率（置信度头各位置估计值的乘积，默认 `0.35`）。调低会起草更远、回滚更多；调高则更早退回普通 decode。 |
+| `--mtp-spec` / `--no-mtp-spec` | 在把逐 token 草稿头内嵌进主干权重的模型上启用 NextN/MTP 投机解码（默认关闭）——GLM 5.2 的 NextN 块与 Qwen 3.6 的同款，无需额外下载任何文件。草稿头每步最多起草 `--mtp-draft` 个 token，主干用一次批量前向完成验证；每个输出 token 仍然取自主干的某一行，因此得到的 token 流与普通 decode 本该产生的完全一致（贪心配置下为 argmax，带采样器时同分布），这纯粹是一条加速路径。在所有单序列路径（`--input`、`--multi-turn-jsonl`、`--interactive`）上生效。**必须在模型加载之前就出现在命令行上**：对 glm-dsa 而言，正是它告诉原生加载器把约 3 GiB 的 NextN 层调入显存，而这一层要与 KV 缓存争抢上下文长度所依据的那块内存。若权重的草稿块复用主干的 LM head（GLM 5.2 即是如此），在 `--tp N>1` 下会被拒绝。环境变量：`TS_MTP_SPEC`（glm-dsa 还认 `TS_GLM_MTP=1`/`0`，它会覆盖上述两者，便于 A/B 对比）。 |
+| `--mtp-draft <N>` | 每个投机步最多起草的 token 数（取值 1-64，默认 `8`）。它同时决定加载时原生计算图缓存的大小，因此请与 `--mtp-spec` 一并显式传入，而不要依赖默认值。环境变量：`TS_MTP_DRAFT`。 |
+| `--mtp-pmin <f>` | 草稿 token 被保留所需的最低置信度，取值 `(0, 1]`；遇到第一个低置信 token 即停止起草。默认值按草稿器类型选择：逐 token 草稿头为 `0.75`（其 top-10 logits 上的 top-1 概率），块级草稿器为 `0.35`——后者的门限是**累积**前缀概率，因此同一个数字要严格得多。环境变量：`TS_MTP_PMIN`。 |
+| `--draft-model <path>` | 投机解码草稿 GGUF，适用于草稿器以独立文件发布的架构——DeepSeek V4 的 DSpark 支持模块（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）与 Muse-Glimmer 的 DFlash 块级草稿器（见 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md#3-dflash-投机解码)，环境变量 `TS_MUSE_GLIMMER_DFLASH`）。它每步起草一整块 token，主干用一次批量前向验证。每个输出 token 仍然取自主干的某一行——贪心配置下用 argmax，否则用本次运行自己的采样器——因此两种情况下输出流都保持不变。在所有单序列路径（`--input`、`--multi-turn-jsonl`、`--interactive`）上生效，需要 `--backend cuda` 或 `--backend ggml_cuda`。环境变量：`TS_DSV4_DSPARK`。 |
+| `--spec-draft-n-max <N>` | `--mtp-draft` 的旧写法，为块级草稿器保留。每个投机块最多起草的 token 数；块级草稿器还会把它夹到自己训练时的块大小以内（默认即为该块大小：DSpark 为 5，Muse-Glimmer 的 DFlash 为 15）。 |
+| `--spec-draft-conf-min <p>` | `--mtp-pmin` 的旧写法，为块级草稿器保留；这里的门限是**累积**接受概率——置信度头各位置估计值的乘积。调低会起草更远、回滚更多；调高则更早退回普通 decode。默认：块级草稿器为 `0.35`，逐 token 草稿头为 `0.75`。 |
 | `--temperature <f>` | 采样温度（0 = 贪心） |
 | `--top-k <N>` | Top-K 过滤（0 = 关闭） |
 | `--top-p <f>` | Nucleus 采样阈值（1.0 = 关闭） |

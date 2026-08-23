@@ -98,6 +98,7 @@ namespace TensorSharp.Models
             // tok/s on 3x RTX PRO 6000 with no change to decode. Raise it further
             // with TS_GLM_UBATCH when the prompts are long and VRAM allows.
             int nUbatch = ParseEnvInt("TS_GLM_UBATCH", 1024);
+            _nativeUbatch = nUbatch;
             int nThreads = ParseEnvInt("TS_GLM_THREADS", Math.Min(Environment.ProcessorCount, 32));
 
             // GLM-5.2 advertises a 1M-token context, which is ~93 GiB of KV cache

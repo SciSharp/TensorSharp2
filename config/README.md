@@ -169,7 +169,9 @@ Notes:
   about a picture.
 - **MTP speculative decoding** (Gemma configs) is a **server** feature — the draft
   head is wired via `mtp-draft-model`; the CLI ignores it. It is lossless. For
-  Qwen3.6 the draft head is embedded in the trunk, so just add `"mtp-spec": true`.
+  Qwen3.6 and GLM 5.2 the draft head is embedded in the trunk, so just add
+  `"mtp-spec": true`. Both hosts read it: `TensorSharp.Cli` honours the same
+  `--mtp-*` flags a config file expands to.
 - **Image-edit** configs run the DiT pipeline: `--image in.png --prompt "…" --output
   out.png`. Per-edit `--diffusion-steps` / `--cfg` / `--diffusion-seed` are CLI flags.
 - **DiffusionGemma** uses the CLI's iterative denoising path; tune it with

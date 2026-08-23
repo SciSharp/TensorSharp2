@@ -324,11 +324,11 @@ TensorSharp 默认 `confMin = 0.35`；llama.cpp 这条路径上的 `p_min` 默�
   TensorSharp prefill 了 16322 个 token 而 llama.cpp 只有 16126 —— 同样的文本、
   多 1.2% 的 token、不同的续写。在相信任何长上下文数字之前，先比对两侧报告的
   提示 token 数。
-* **绝不要给 `TensorSharp.Cli` 传 `--top-k 1`。** `SamplingConfig.IsGreedy` 要求
-  `TopK <= 0`，所以 `--top-k 1` 通不过 `InteractiveSession.IsArgmaxSampling`，
-  投机路径会静默地不启用，而那次运行会以 "dflash" 的名义报告普通 decode 的成绩。
-  CLI 本来就从 `SamplingConfig.Greedy` 起步，这正对应 llama.cpp 的 `--temp 0`，
-  因此一个采样参数都不要传 —— 并且检查日志里有 `cli.inference speculative:`。
+* **做投机对比时，两侧都用贪心。** CLI 从 `SamplingConfig.Greedy` 起步，这正
+  对应 llama.cpp 的 `--temp 0`，所以一个采样参数都不要传。投机本身如今可与采样
+  组合（验证会用本次运行自己的采样器抽取每一行），但块级草稿器的提案不带惩罚项，
+  接受率会随之变化——那样得到的就不是一次干净的对照。检查日志里有
+  `cli.inference speculative:` 一行，确认投机确实启用了。
 * **128 个生成 token 对投机对比来说太短。** 它比两个暂停区间还短，一次调控器误判
   就能让数字差 2 倍（见上面的 16K 两次重复）。
 

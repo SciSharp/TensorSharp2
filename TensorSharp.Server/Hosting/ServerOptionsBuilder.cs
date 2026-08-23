@@ -14,6 +14,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Server.Hosting
 {
@@ -517,64 +518,26 @@ namespace TensorSharp.Server.Hosting
             if (args == null || args.Length == 0)
                 return false;
 
-            bool changed = false;
+            // The four --mtp-* flags mean the same thing in both hosts, so they are
+            // parsed and validated in one shared place (TensorSharp.Runtime) rather
+            // than kept in step by hand.
+            bool changed = MtpSpeculativeCliFlags.Apply(args);
+
             for (int i = 0; i < args.Length; i++)
             {
-                string a = args[i];
-                if (string.Equals(a, "--mtp-spec", StringComparison.OrdinalIgnoreCase))
-                {
-                    Environment.SetEnvironmentVariable("TS_MTP_SPEC", "1");
-                    changed = true;
-                    continue;
-                }
-                if (string.Equals(a, "--no-mtp-spec", StringComparison.OrdinalIgnoreCase))
-                {
-                    Environment.SetEnvironmentVariable("TS_MTP_SPEC", "0");
-                    changed = true;
-                    continue;
-                }
-                if (TryReadOption(args, ref i, "--mtp-draft", out string draftOpt))
-                {
-                    if (!int.TryParse(draftOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out int draft) || draft <= 0)
-                        throw new ArgumentException($"Invalid value for --mtp-draft: '{draftOpt}'. Expected a positive integer.");
-                    Environment.SetEnvironmentVariable("TS_MTP_DRAFT", draft.ToString(CultureInfo.InvariantCulture));
-                    changed = true;
-                    continue;
-                }
-                if (TryReadOption(args, ref i, "--mtp-pmin", out string pminOpt))
-                {
-                    if (!float.TryParse(pminOpt, NumberStyles.Float, CultureInfo.InvariantCulture, out float pmin)
-                        || pmin <= 0f || pmin > 1f)
-                    {
-                        throw new ArgumentException($"Invalid value for --mtp-pmin: '{pminOpt}'. Expected a probability in (0, 1].");
-                    }
-                    Environment.SetEnvironmentVariable("TS_MTP_PMIN", pmin.ToString(CultureInfo.InvariantCulture));
-                    changed = true;
-                    continue;
-                }
-                // Path to a SEPARATE draft GGUF for models whose MTP draft head
-                // ships as its own file (Gemma 4's "gemma4-assistant"). Qwen3.6
-                // embeds the NextN block in the trunk GGUF and needs no such flag.
-                if (TryReadOption(args, ref i, "--mtp-draft-model", out string draftModelOpt))
-                {
-                    if (string.IsNullOrWhiteSpace(draftModelOpt) || !File.Exists(draftModelOpt))
-                        throw new ArgumentException($"--mtp-draft-model file not found: '{draftModelOpt}'.");
-                    Environment.SetEnvironmentVariable("TS_MTP_DRAFT_MODEL", draftModelOpt);
-                    changed = true;
-                    continue;
-                }
                 // Path to a BLOCK drafter GGUF that has to be resident before
                 // the model's layer split runs (DeepSeek V4's DSpark). Unlike
                 // --mtp-draft-model this one is handed to the model factory, so
                 // it is carried as the same env var the CLI's --draft-model
-                // reads and picked up again by a runtime model switch.
-                if (TryReadOption(args, ref i, "--draft-model", out string dsparkOpt))
+                // reads and picked up again by a runtime model switch. It stays
+                // server-local because the CLI passes its own --draft-model
+                // straight to ModelBase.Create instead.
+                if (MtpSpeculativeCliFlags.TryReadOption(args, ref i, "--draft-model", out string dsparkOpt))
                 {
                     if (string.IsNullOrWhiteSpace(dsparkOpt) || !File.Exists(dsparkOpt))
                         throw new ArgumentException($"--draft-model file not found: '{dsparkOpt}'.");
                     Environment.SetEnvironmentVariable("TS_DSV4_DSPARK", dsparkOpt);
                     changed = true;
-                    continue;
                 }
             }
             return changed;

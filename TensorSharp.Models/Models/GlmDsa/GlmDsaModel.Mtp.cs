@@ -59,6 +59,10 @@ namespace TensorSharp.Models
         /// the draft/catch-up positions are supplied by the caller.</summary>
         private int _mtpCacheSeqLen;
 
+        /// <summary>The micro-batch the native executor was loaded with, so a
+        /// speculative prefill can chunk to match it. See <see cref="MtpPrefillChunkSize"/>.</summary>
+        private int _nativeUbatch;
+
         // Scratch reused across draft steps so a 16-token window does not
         // allocate 16 hidden-sized arrays per decode step.
         private float[] _mtpHScratch;
@@ -160,8 +164,19 @@ namespace TensorSharp.Models
         /// The trunk re-reads the routed experts once per micro-batch, so a
         /// speculative prefill wants whole micro-batches rather than the caller's
         /// default. Matches the native executor's ubatch.
+        ///
+        /// This is not cosmetic on the native path. A speculative prefill is
+        /// chunked by the CALLER — each chunk is one trunk forward whose per-token
+        /// hidden states come back to the host, followed by one draft-block
+        /// catch-up — while the native forward re-chunks whatever it is given by
+        /// its own ubatch. Handing it the caller's generic 512 therefore buys two
+        /// host round trips per micro-batch instead of one, and splits every
+        /// expert tile in half (with 256 experts at top-8, a 512-token chunk
+        /// leaves ~16 rows per expert, so half the tile is padding — the same
+        /// effect that made the plain prefill 984 vs 696 tok/s at 1024).
         /// </summary>
-        public int MtpPrefillChunkSize => UsesNativeExecutor ? 0 : ResolvePrefillChunkSize();
+        public int MtpPrefillChunkSize
+            => UsesNativeExecutor ? Math.Max(1, _nativeUbatch) : ResolvePrefillChunkSize();
 
 
         public void MtpEnsureCapacity(int requiredSeqLen)
