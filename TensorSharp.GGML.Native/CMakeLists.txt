@@ -9,6 +9,30 @@ option(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN "Enable the ggml-vulkan backend whe
 # while auto-detected defaults are re-evaluated. Not read by the build itself.
 option(TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT "The Vulkan on/off choice was made explicitly (build-script cache marker)" OFF)
 
+# This library is 64-bit only, and a 32-bit configure otherwise fails hundreds of
+# lines into the compile with errors that name neither the cause nor the word
+# "32-bit": ggml's Vulkan backend leaves VK_USE_64_BIT_PTR_DEFINES at 0 on a
+# 32-bit target, so vulkan.hpp marks every handle's conversion operator
+# `explicit` and ordinary uses of vk::Buffer stop compiling ("no operator found
+# which takes a left-hand operand of type 'std::basic_ostream'",
+# "'vk::CommandBuffer::copyBuffer': no matching overloaded function"). ggml-cuda
+# is likewise unsupported on 32-bit hosts.
+#
+# This is easy to hit by accident on Windows: the "Developer PowerShell for VS"
+# and "Developer Command Prompt" shortcuts default to the x86 toolset, so a
+# build started from one used to inherit a 32-bit cl.exe. build-windows.ps1 now
+# imports the x64 environment over such a prompt, and this check is the backstop
+# for every other entry point (a hand-run cmake, -A Win32, a cross toolchain
+# file). See https://github.com/zhongkaifu/TensorSharp/discussions/130
+if (CMAKE_SIZEOF_VOID_P AND CMAKE_SIZEOF_VOID_P LESS 8)
+    message(FATAL_ERROR
+        "TensorSharp.GGML.Native requires a 64-bit toolchain, but this one targets "
+        "${CMAKE_SIZEOF_VOID_P}-byte pointers (32-bit). On Windows, run build-windows.ps1 from a plain "
+        "PowerShell so it can set up the x64 MSVC environment itself, or from an \"x64 Native Tools\" "
+        "prompt - the default \"Developer PowerShell for VS\" targets x86. With a Visual Studio "
+        "generator, pass -A x64.")
+endif()
+
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND APPLE)
     message(FATAL_ERROR "TENSORSHARP_GGML_NATIVE_ENABLE_CUDA is supported on Windows and Linux only.")
 endif()
@@ -85,18 +109,23 @@ if (APPLE)
 endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
-    # MSVC 14.50+ (Visual Studio 2026) is newer than the host-compiler range
-    # current CUDA toolkits accept, so nvcc aborts in host_config.h with
-    # "unsupported Microsoft Visual Studio version!" - which surfaces here as
-    # a failed CUDA compiler identification ("No CMAKE_CUDA_COMPILER could be
-    # found" / "not able to compile a simple test program"). Pass
-    # -allow-unsupported-compiler so nvcc proceeds; the flag must be in
-    # CMAKE_CUDA_FLAGS *before* enable_language(CUDA) because CMake uses those
-    # flags during compiler identification too. It becomes a no-op once a CUDA
-    # toolkit that officially supports the installed toolset is used.
-    if (MSVC AND MSVC_VERSION GREATER_EQUAL 1950 AND NOT "${CMAKE_CUDA_FLAGS}" MATCHES "allow-unsupported-compiler")
+    # An MSVC newer than the host-compiler range the installed CUDA toolkit
+    # accepts makes nvcc abort in host_config.h with "unsupported Microsoft
+    # Visual Studio version!", which surfaces here as a failed CUDA compiler
+    # identification ("No CMAKE_CUDA_COMPILER could be found" / "not able to
+    # compile a simple test program"). Pass -allow-unsupported-compiler so nvcc
+    # proceeds; the flag must be in CMAKE_CUDA_FLAGS *before*
+    # enable_language(CUDA) because CMake uses those flags during compiler
+    # identification too.
+    #
+    # Applied on every MSVC host rather than above a fixed MSVC_VERSION: nvcc's
+    # ceiling moves with the toolkit (CUDA 12.6 stops at MSVC 19.49 - the
+    # VS 2026 / 14.5x case from discussion #130 - but CUDA 12.4 already stops at
+    # 19.39, so VS 2022 17.10+ hits the identical error), and the flag is simply
+    # a no-op when the toolset is one nvcc already supports.
+    if (MSVC AND NOT "${CMAKE_CUDA_FLAGS}" MATCHES "allow-unsupported-compiler")
         string(APPEND CMAKE_CUDA_FLAGS " -allow-unsupported-compiler")
-        message(STATUS "MSVC ${MSVC_VERSION} (VS 2026+) is newer than this CUDA toolkit officially supports; adding -allow-unsupported-compiler to CMAKE_CUDA_FLAGS")
+        message(STATUS "MSVC ${MSVC_VERSION}: adding -allow-unsupported-compiler to CMAKE_CUDA_FLAGS so nvcc accepts this host toolset (no-op when it already does)")
     endif()
     # GgmlOps itself compiles a CUDA source (the on-device diffusion sampler), so it needs the
     # CUDA language enabled. CMAKE_CUDA_ARCHITECTURES is normally supplied by build-windows.ps1

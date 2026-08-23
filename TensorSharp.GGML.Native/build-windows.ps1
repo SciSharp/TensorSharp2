@@ -31,7 +31,67 @@ function Normalize-Bool([string] $Value) {
     }
 }
 
+function Resolve-ExplicitCudaCompiler {
+    # The nvcc the caller explicitly asked for, or "" when they did not ask.
+    # CMake documents $env:CUDACXX for exactly this
+    # (Modules/CMakeDetermineCUDACompiler.cmake: "prefer the environment
+    # variable CUDACXX"), and -DCMAKE_CUDA_COMPILER=... is the in-band form.
+    # Both were previously ignored here, so the PATH/CUDA_PATH probing below
+    # silently won instead - discussion #130, where an explicit CUDA 13.3 kept
+    # losing to the 12.6 on PATH.
+    #
+    # $ExtraCMakeArgs is filled by the argument loop further down, so this only
+    # sees -DCMAKE_CUDA_COMPILER once that loop has run.
+    foreach ($arg in $ExtraCMakeArgs) {
+        if ("$arg" -match '^-DCMAKE_CUDA_COMPILER(:[A-Za-z]+)?=(.+)$') {
+            return $Matches[2].Trim('"')
+        }
+    }
+
+    $cudacxx = [Environment]::GetEnvironmentVariable("CUDACXX")
+    if (-not [string]::IsNullOrWhiteSpace($cudacxx)) {
+        return $cudacxx.Trim('"')
+    }
+
+    return ""
+}
+
+function Resolve-ExplicitCudaCompilerPath {
+    # The explicit choice resolved to a full path, or "" when none was made.
+    #
+    # CMake runs the value through get_filename_component(... PROGRAM), so a bare
+    # command name ("nvcc") is legal and resolves against PATH - checking only
+    # Test-Path would reject it and quietly turn CUDA off. Anything that does not
+    # resolve at all is an error: the caller explicitly asked for this compiler,
+    # so a silent CPU-only build would be the wrong answer.
+    $explicit = Resolve-ExplicitCudaCompiler
+    if ([string]::IsNullOrWhiteSpace($explicit)) {
+        return ""
+    }
+
+    if (Test-Path $explicit) {
+        return (Resolve-Path $explicit).Path
+    }
+
+    $command = @(Get-Command $explicit -CommandType Application -ErrorAction SilentlyContinue) | Select-Object -First 1
+    if ($null -ne $command) {
+        return $command.Source
+    }
+
+    throw ("CUDACXX / -DCMAKE_CUDA_COMPILER names '$explicit', which is neither an existing file nor a command on " +
+        "PATH. Point it at nvcc (a full path, or a bare name resolvable on PATH), or clear it - pass --no-cuda if " +
+        "you want a CPU-only build.")
+}
+
 function Test-CudaToolkit {
+    # An explicit choice settles it, even for a toolkit on neither PATH nor
+    # CUDA_PATH - otherwise CUDA would auto-disable and the build would quietly
+    # come out CPU-only. An unresolvable one throws rather than doing the same.
+    if (-not [string]::IsNullOrWhiteSpace((Resolve-ExplicitCudaCompiler))) {
+        Resolve-ExplicitCudaCompilerPath | Out-Null
+        return $true
+    }
+
     if (Get-Command nvcc.exe -ErrorAction SilentlyContinue) {
         return $true
     }
@@ -57,6 +117,17 @@ function Resolve-CudaToolkitBinDir {
     # detection searches PATH, so without this a toolkit that is installed but
     # not on PATH fails the configure with "No CMAKE_CUDA_COMPILER could be
     # found" even though Test-CudaToolkit auto-enabled the backend.
+    #
+    # An explicit CUDACXX / -DCMAKE_CUDA_COMPILER wins outright: CMake resolves
+    # the compiler from it, so putting a *different* toolkit's bin dir first on
+    # PATH would only desync everything that probes PATH (FindCUDAToolkit,
+    # eng/fetch-cudnn.ps1's CUDA-major probe, ggml's own lookups) from the
+    # compiler actually in use. Return that compiler's own bin dir so they agree.
+    $explicit = Resolve-ExplicitCudaCompilerPath
+    if (-not [string]::IsNullOrWhiteSpace($explicit)) {
+        return (Split-Path -Parent $explicit)
+    }
+
     if (Get-Command nvcc.exe -ErrorAction SilentlyContinue) {
         return ""
     }
@@ -162,6 +233,39 @@ function Find-NinjaProgram([object] $VisualStudio) {
     }
 
     return ""
+}
+
+function Read-CachedPointerSize {
+    # Pointer width an existing build tree was configured for: "8" for x64, "4"
+    # for a 32-bit target, "" when there is no configured tree yet.
+    #
+    # Note this does NOT live in CMakeCache.txt - CMAKE_SIZEOF_VOID_P is derived,
+    # not cached. The persisted value is CMAKE_CXX_SIZEOF_DATA_PTR in
+    # CMakeFiles/<cmake-version>/CMakeCXXCompiler.cmake, which is what
+    # CMAKE_SIZEOF_VOID_P is then set from.
+    $compilerFiles = @(Get-ChildItem -Path (Join-Path $BuildDir "CMakeFiles") -Recurse -Filter "CMakeCXXCompiler.cmake" -ErrorAction SilentlyContinue)
+    foreach ($compilerFile in $compilerFiles) {
+        $line = Select-String -Path $compilerFile.FullName -Pattern '^\s*set\(CMAKE_CXX_SIZEOF_DATA_PTR\s+"([0-9]+)"\)' | Select-Object -First 1
+        if ($null -ne $line) {
+            return $line.Matches[0].Groups[1].Value
+        }
+    }
+
+    return ""
+}
+
+function Read-CachedCudaCompiler {
+    $cacheFile = Join-Path $BuildDir "CMakeCache.txt"
+    if (-not (Test-Path $cacheFile)) {
+        return ""
+    }
+
+    $line = Select-String -Path $cacheFile -Pattern "^CMAKE_CUDA_COMPILER:" | Select-Object -First 1
+    if ($null -eq $line) {
+        return ""
+    }
+
+    return (($line.Line -split '=', 2)[1]).Trim()
 }
 
 function Read-CachedGenerator {
@@ -329,10 +433,20 @@ if ($EnableVulkan -eq "ON") {
     }
 }
 
+# Resolved only when CUDA is on: a stale CUDACXX left in the environment must not
+# fail a build that is not using CUDA at all.
+$ExplicitCudaCompiler = if ($EnableCuda -eq "ON") { Resolve-ExplicitCudaCompilerPath } else { "" }
+
 if ($EnableCuda -eq "ON") {
     $CudaBinDir = Resolve-CudaToolkitBinDir
     if (-not [string]::IsNullOrWhiteSpace($CudaBinDir)) {
-        Write-Host "nvcc.exe is not on PATH; using the CUDA toolkit at '$CudaBinDir' (from CUDA_PATH/CUDA_HOME) for this build."
+        if (-not [string]::IsNullOrWhiteSpace($ExplicitCudaCompiler)) {
+            Write-Host "Using the CUDA toolkit at '$CudaBinDir' (from CUDACXX / -DCMAKE_CUDA_COMPILER) for this build."
+        }
+        else {
+            Write-Host "nvcc.exe is not on PATH; using the CUDA toolkit at '$CudaBinDir' (from CUDA_PATH/CUDA_HOME) for this build."
+        }
+
         $env:PATH = "$CudaBinDir;$env:PATH"
     }
 }
@@ -379,6 +493,10 @@ if (($BuildParallelLevel -as [int]) -lt 1) {
 #      NMake Makefiles generator, where `--parallel` is silently ignored.
 $VisualStudio = Get-VisualStudioInstallation
 $NinjaProgram = Find-NinjaProgram $VisualStudio
+# Resolved up front rather than at the first `cmake` call: CMake is a hard
+# prerequisite, and "not recognized as a cmdlet" 400 lines into a build does not
+# tell the user what to install (issue #166).
+$CMakeProgram = Get-RequiredCMakeProgram $VisualStudio
 
 $GeneratorArgs = New-Object System.Collections.Generic.List[string]
 if (-not $UserSetGenerator -and [string]::IsNullOrWhiteSpace($env:CMAKE_GENERATOR)) {
@@ -416,6 +534,15 @@ if ($effectiveGenerator -like "*Ninja*") {
         Write-Warning ("Generator '$effectiveGenerator' needs the MSVC command-line environment but no Visual Studio " +
             "installation was found; run from an 'x64 Native Tools' prompt if the configure step cannot find a compiler.")
     }
+    elseif ((Get-ActiveVcTargetArchitecture) -notin @("", "x64")) {
+        # An MSVC environment is active but targets x86, and no Visual Studio was
+        # found to import the x64 one over it. Say so now: the configure would
+        # otherwise succeed and the build fail much later inside ggml's Vulkan
+        # backend, which does not compile 32-bit (discussion #130).
+        Write-Warning ("The active MSVC environment targets '$(Get-ActiveVcTargetArchitecture)', not x64, and no Visual Studio " +
+            "installation was found to import the x64 environment from. This native build is x64-only - run it " +
+            "from an 'x64 Native Tools' prompt, or set TENSORSHARP_VS_INSTALL_DIR to a Visual Studio installation root.")
+    }
 
     # Pin the ninja we found: when it comes from the Visual Studio install it is
     # not on PATH, so CMake would not otherwise locate it.
@@ -447,6 +574,25 @@ if ($EnableCuda -eq "ON" -and $effectiveGenerator -like "Visual Studio*" -and $n
             "(which drives nvcc directly and needs no VS integration), or install a CUDA toolkit that supports " +
             "this Visual Studio version.")
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitCudaCompiler)) {
+        # CMake reads CUDACXX / CMAKE_CUDA_COMPILER only for non-Visual-Studio
+        # generators - CMakeDetermineCUDACompiler.cmake puts that whole block in
+        # the `else()` of `if(CMAKE_GENERATOR MATCHES "Visual Studio")`. Without
+        # this warning the configure banner would advertise a CUDA_COMPILER that
+        # is silently ignored, which is the very confusion discussion #130 hit.
+        #
+        # -cmatch 'cuda=' catches both "-Tcuda=13.3" and the split "-T"
+        # "cuda=13.3" the argument loop stores as two entries; case-sensitive so
+        # an unrelated -DCMAKE_CUDA_* argument cannot match, because CMake spells
+        # the toolset field lowercase.
+        if (@($ExtraCMakeArgs | Where-Object { "$_" -cmatch 'cuda=' }).Count -eq 0) {
+            Write-Warning ("CUDACXX / -DCMAKE_CUDA_COMPILER ('$ExplicitCudaCompiler') is ignored by the " +
+                "'$effectiveGenerator' generator - CMake honours it only for non-Visual-Studio generators. " +
+                "Pass '-T cuda=<version-or-path>' instead, or install the 'C++ CMake tools for Windows' VS " +
+                "component so this script can use the Ninja generator, which does honour it.")
+        }
+    }
 }
 
 # The generator is sticky in the CMake cache and CMake refuses to reconfigure an
@@ -460,8 +606,38 @@ if (-not [string]::IsNullOrWhiteSpace($CachedGenerator) -and
     Remove-Item -Recurse -Force $BuildDir
 }
 
+# A tree configured 32-bit stays 32-bit: CMake pins the absolute cl.exe path and
+# CMAKE_SIZEOF_VOID_P into the cache on the first configure and will not switch
+# compilers afterwards. So anyone who already hit the x86 build (discussion #130)
+# would apply the vcvars fix above, re-run, and get the byte-identical Vulkan
+# errors. Start such a tree over so the fix actually takes effect.
+$CachedPointerSize = Read-CachedPointerSize
+if (-not [string]::IsNullOrWhiteSpace($CachedPointerSize) -and $CachedPointerSize -ne "8") {
+    Write-Host "Existing build tree was configured for a $([int] $CachedPointerSize * 8)-bit target; removing $BuildDir to reconfigure as x64."
+    Remove-Item -Recurse -Force $BuildDir
+}
+
+# CMake consults CUDACXX only when CMAKE_CUDA_COMPILER is not already cached
+# (Modules/CMakeDetermineCUDACompiler.cmake: `if(NOT CMAKE_CUDA_COMPILER)`), and
+# find_program() caches whatever nvcc it found on the *first* configure -
+# including one that then failed. A later CUDACXX naming a different toolkit is
+# therefore ignored, which is what "it was not being picked up" meant in
+# discussion #130. CMake also refuses to swap a compiler inside an existing tree,
+# so the only fix is to start the tree over, exactly as for a generator change.
+if (-not [string]::IsNullOrWhiteSpace($ExplicitCudaCompiler)) {
+    $CachedCudaCompiler = Read-CachedCudaCompiler
+    # CMake writes the cache entry with forward slashes; $ExplicitCudaCompiler is
+    # already a resolved full path.
+    if (-not [string]::IsNullOrWhiteSpace($CachedCudaCompiler) -and
+        ($CachedCudaCompiler -replace '/', '\') -ne $ExplicitCudaCompiler) {
+        Write-Host "CUDA compiler changed ('$CachedCudaCompiler' -> '$ExplicitCudaCompiler'); removing $BuildDir to reconfigure from scratch."
+        Remove-Item -Recurse -Force $BuildDir
+    }
+}
+
 $GeneratorSummary = if ([string]::IsNullOrWhiteSpace($effectiveGenerator)) { "CMake default" } else { $effectiveGenerator }
-Write-Host "Configuring TensorSharp.GGML.Native (CUDA=$EnableCuda, CUDA_ARCHITECTURES=$CudaArchSummary, VULKAN=$EnableVulkan, TESTS=$BuildTests, GENERATOR=$GeneratorSummary, PARALLEL=$BuildParallelLevel)"
+$CudaCompilerSummary = if ([string]::IsNullOrWhiteSpace($ExplicitCudaCompiler)) { "auto" } else { $ExplicitCudaCompiler }
+Write-Host "Configuring TensorSharp.GGML.Native (CUDA=$EnableCuda, CUDA_COMPILER=$CudaCompilerSummary, CUDA_ARCHITECTURES=$CudaArchSummary, VULKAN=$EnableVulkan, TESTS=$BuildTests, GENERATOR=$GeneratorSummary, PARALLEL=$BuildParallelLevel)"
 
 $CMakeArgs = @(
     "-DCMAKE_BUILD_TYPE=Release",
@@ -488,15 +664,15 @@ if ($EnableCuda -eq "ON") {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "..\eng\fetch-cudnn.ps1")
 }
 
-cmake -S $ScriptDir -B $BuildDir @GeneratorArgs @GeneratorCMakeArgs @CMakeArgs @ExtraCMakeArgs
+& $CMakeProgram -S $ScriptDir -B $BuildDir @GeneratorArgs @GeneratorCMakeArgs @CMakeArgs @ExtraCMakeArgs
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
 
 $BuildArgs = @("--build", $BuildDir, "--config", "Release", "--parallel", "$BuildParallelLevel")
 if ((Normalize-Bool $BuildTests) -eq "ON") {
-    cmake @BuildArgs
+    & $CMakeProgram @BuildArgs
 }
 else {
-    cmake @BuildArgs --target GgmlOps
+    & $CMakeProgram @BuildArgs --target GgmlOps
 }
 if ($LASTEXITCODE -ne 0) { throw "cmake build failed with exit code $LASTEXITCODE" }
 
