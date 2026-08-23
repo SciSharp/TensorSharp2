@@ -247,9 +247,63 @@ namespace tsg
     {
         static const bool enabled = []{
             const char* e = std::getenv("TS_GGML_LOG_VRAM");
-            return e != nullptr && e[0] == '1';
+            return e != nullptr && (e[0] == '1' || e[0] == '2');
         }();
         return enabled;
+    }
+
+    bool vram_log_verbose()
+    {
+        static const bool enabled = []{
+            const char* e = std::getenv("TS_GGML_LOG_VRAM");
+            return e != nullptr && e[0] == '2';
+        }();
+        return enabled;
+    }
+
+    void vram_log_ctx_breakdown(const char* tag, ggml_context* ctx, int top_n)
+    {
+        if (!vram_log_verbose() || ctx == nullptr)
+            return;
+
+        // Only tensors that are still unbound get a slot from
+        // ggml_backend_alloc_ctx_tensors; views alias their source and weights
+        // already point at their cached device buffer.
+        std::unordered_map<std::string, std::pair<int, std::size_t>> by_name;
+        std::size_t total = 0;
+        int count = 0;
+        for (ggml_tensor* t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t))
+        {
+            if (t->data != nullptr || t->view_src != nullptr)
+                continue;
+            const std::size_t bytes = ggml_nbytes(t);
+            total += bytes;
+            ++count;
+            const char* raw = ggml_get_name(t);
+            std::string name = (raw != nullptr && raw[0] != '\0') ? raw : "(unnamed)";
+            // Per-layer tensors are usually named "<role>_<layer>"; strip a
+            // trailing numeric suffix so all 65 layers aggregate into one row.
+            std::size_t cut = name.find_last_not_of("0123456789");
+            if (cut != std::string::npos && cut + 1 < name.size() &&
+                (name[cut] == '_' || name[cut] == '.' || name[cut] == '-'))
+                name.resize(cut);
+            auto& slot = by_name[name];
+            slot.first += 1;
+            slot.second += bytes;
+        }
+
+        std::vector<std::pair<std::string, std::pair<int, std::size_t>>> rows(by_name.begin(), by_name.end());
+        std::sort(rows.begin(), rows.end(),
+            [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+
+        std::fprintf(stderr, "[TSVRAM] %s breakdown: %d unbound tensors, %.1f MB\n",
+            tag, count, total / (1024.0 * 1024.0));
+        const int limit = (top_n > 0 && top_n < static_cast<int>(rows.size())) ? top_n : static_cast<int>(rows.size());
+        for (int i = 0; i < limit; i++)
+            std::fprintf(stderr, "[TSVRAM]     %-40s x%-5d %9.1f MB\n",
+                rows[i].first.c_str(), rows[i].second.first,
+                rows[i].second.second / (1024.0 * 1024.0));
+        std::fflush(stderr);
     }
 
     void vram_log(const char* tag, std::int64_t bytes)
