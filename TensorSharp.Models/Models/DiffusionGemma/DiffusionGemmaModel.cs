@@ -289,6 +289,36 @@ namespace TensorSharp.Models
             // Prompt-KV caching needs the device-resident attention path (it stores/concats K/V tensors).
             _pkvEnabled = _useDeviceGlue && Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV") != "1";
 
+            // Metal lazy-sync (async compute) is unsafe for this model, exactly as it is for Gemma 4
+            // (see Gemma4Model's SetAsyncCompute(false) and the hazard note there). GgmlContext enables
+            // it by default on Metal: a per-op kernel returns without waiting on its command buffer, and
+            // GetFloatPtr / EnsureHostReadable drains pending work before a CPU *read* — but there is no
+            // host-WRITE barrier, so a CPU write followed by a device kernel can dispatch against a stale
+            // cached device buffer for the same host pointer.
+            //
+            // Every per-op path here mixes CPU writes with device kernels: MoERoute reads the router
+            // scores to the host and top-Ks them, the per-expert MoE fallback builds batchInput with
+            // Buffer.MemoryCopy before dispatching ExpertFFN, and the embedding / mask / self-conditioning
+            // helpers all populate tensors on the CPU. Left async, the forward is not even reproducible —
+            // two identical ForwardCanvas calls returned logits differing on ~all 67M floats (cosine as
+            // low as 0.77) on an M5 Pro.
+            //
+            // That is catastrophic specifically BECAUSE of prompt-KV caching: PrefillPrompt runs the
+            // prompt through the per-op stack ONCE and freezes the result as _promptK/_promptV for every
+            // denoising step of the turn, so a corrupted prefill permanently poisons the model's view of
+            // the prompt. The symptom is the Gemma 4 one — fluent text that has lost the prompt's
+            // conditional content (e.g. "请详细介绍最终幻想7" answered as if the user had only typed
+            // "请介绍").
+            //
+            // The cost is small and lands where it matters least: the hot per-step decode is the fused
+            // single-graph path (TryFusedModelLayers), which already drains via host_read_barrier() before
+            // its uploads, so forcing the per-op synchronize falls almost entirely on the one-time prefill.
+            // DIFFUSION_ASYNC_COMPUTE=1 forces it back on. That is UNSAFE (it reintroduces the corruption
+            // above) and exists only to A/B the cost of the synchronize.
+            if (IsGgmlBackend && GgmlBasicOps.GetAsyncCompute() &&
+                Environment.GetEnvironmentVariable("DIFFUSION_ASYNC_COMPUTE") != "1")
+                GgmlBasicOps.SetAsyncCompute(false);
+
             PrepareCudaWeightResidency();
 
             // Self-conditioning (matches the reference sampler) materially improves quality on longer
