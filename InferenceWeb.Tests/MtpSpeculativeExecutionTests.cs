@@ -371,6 +371,123 @@ public class MtpSpeculativeExecutionTests
         return best;
     }
 
+    // ----- sampled verification (MtpSpeculativeDecoder.GenerateSampled) -----
+
+    private static SamplingConfig SampledChatConfig(float repeatPenalty = 1f) => new()
+    {
+        Temperature = 0.8f,
+        TopK = 40,
+        TopP = 0.95f,
+        MinP = 0.05f,
+        RepetitionPenalty = repeatPenalty,
+        PenaltyLastN = 64,
+        Seed = 4242,
+    };
+
+    [Theory]
+    [InlineData(1f)]
+    [InlineData(1.15f)]
+    public void GenerateSampled_WithAcceptedDrafts_EmitsWhatPlainSamplingWouldHave(float repeatPenalty)
+    {
+        // The reference is the SAME loop with drafting gated off, so the two runs
+        // differ in exactly one thing: whether tokens arrived through an accepted
+        // draft window. That is what the CLI's --mtp-spec buys, and what must not
+        // change the stream.
+        //
+        // On this fake the drafts are correct by construction, so acceptance is
+        // near-total and the accept path — onDraftAccepted feeding the penalty
+        // history before the next row is drawn, and the drawn token being emitted
+        // as drawn rather than re-drawn — is exercised on nearly every token. The
+        // synthetic-GLM suite covers the opposite regime (drafts almost always
+        // rejected) against real model arithmetic.
+        const int promptLen = 5;
+        const int maxNew = 24;
+        int[] prompt = Enumerable.Range(1, promptLen).ToArray();
+
+        var plainModel = new FakeMtpModel();
+        var plainDecoder = new MtpSpeculativeDecoder(plainModel, maxDraftTokens: 4)
+        {
+            AdaptiveSpeculation = false,
+            // Above 1: no confidence can clear it, so every step degrades to a
+            // plain single-token decode through the identical code path.
+            MinDraftProb = 2f,
+        };
+        List<int> plain = plainDecoder.GenerateSampled(
+            prompt, maxNew, new TokenSampler(SampledChatConfig(repeatPenalty)));
+        Assert.Equal(0, plainDecoder.TokensDrafted);
+        Assert.Equal(maxNew, plainDecoder.PlainSteps + 1);
+
+        var specModel = new FakeMtpModel();
+        var specDecoder = new MtpSpeculativeDecoder(specModel, maxDraftTokens: 4)
+        {
+            AdaptiveSpeculation = false,
+        };
+        List<int> speculative = specDecoder.GenerateSampled(
+            prompt, maxNew, new TokenSampler(SampledChatConfig(repeatPenalty)));
+
+        Assert.Equal(maxNew, speculative.Count);
+        Assert.Equal(plain, speculative);
+        Assert.True(specDecoder.TokensAccepted > 0,
+            $"no draft was accepted (drafted={specDecoder.TokensDrafted}), so the accept path never ran");
+        Assert.True(specDecoder.VerifySteps < plainDecoder.PlainSteps,
+            "speculation took no fewer trunk passes than plain decoding");
+        Assert.Empty(specModel.ProtocolViolations);
+    }
+
+    [Fact]
+    public void CarryPosition_AfterAFullRun_AllowsAContinuationToExtendTheCache()
+    {
+        // A chat session extends its KV cache across turns by prefilling only the
+        // new suffix. That is sound exactly when the draft head's carry-in hidden
+        // state still describes the token the trunk ends on.
+        const int promptLen = 5;
+        int[] prompt = Enumerable.Range(1, promptLen).ToArray();
+
+        var model = new FakeMtpModel();
+        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 4) { AdaptiveSpeculation = false };
+        Assert.Equal(-1, decoder.CarryPosition);
+
+        List<int> produced = decoder.GenerateGreedy(prompt, 12);
+
+        Assert.Equal(12, produced.Count);
+        Assert.Equal(model.CacheSeqLen, decoder.CarryPosition);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void CarryPosition_AfterARunStoppedMidWindow_RefusesToResume()
+    {
+        // A consumer that stops part-way through a verified window (a stop
+        // sequence, Ctrl+C, an EOS the draft head predicted early) leaves the
+        // trunk holding rows that never reached the caller. Those get rewound —
+        // and the rewind drops the row the carry-in hidden state was taken from.
+        //
+        // Resuming there is silent: the emitted stream would stay correct because
+        // verification is trunk-driven, but the draft head picks up one KV row
+        // built from the wrong hidden state and acceptance decays from there with
+        // nothing in the log to explain it. So the decoder has to say it cannot
+        // resume, and the caller re-prefills instead.
+        const int promptLen = 5;
+        int[] prompt = Enumerable.Range(1, promptLen).ToArray();
+
+        var model = new FakeMtpModel();
+        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 4) { AdaptiveSpeculation = false };
+
+        // Drafts are correct by construction here, so the first speculative step
+        // accepts its whole 4-token window and commits 5 tokens to the trunk.
+        // Stopping after 3 emitted tokens (the prompt's own first token plus two
+        // of that window) therefore strands two committed rows.
+        int emitted = 0;
+        List<int> produced = decoder.GenerateGreedy(prompt, 12, onToken: _ => ++emitted < 3);
+
+        Assert.Equal(3, produced.Count);
+        Assert.Equal(-1, decoder.CarryPosition);
+        // The trunk is left holding exactly what was returned, so a caller
+        // mirroring the cache does not have to reason about where it stopped.
+        Assert.Equal(promptLen + produced.Count, model.CacheSeqLen);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
     /// <summary>
     /// Deterministic NextN/MTP fake. The trunk's argmax for the row of the
     /// token at absolute position p is <see cref="ExpectedNext"/>(p); the

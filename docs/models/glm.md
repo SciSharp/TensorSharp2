@@ -152,13 +152,26 @@ logits = lm_head(h_mtp)
 where `h` is the trunk's **post-`output_norm`** hidden state of the token before
 `t`. The block predicts token *t+1* from token *t*, so chaining it drafts a
 window that the trunk then verifies in a single batched forward. Enable it with
-the server's `--mtp-spec`; there is nothing to download.
+`--mtp-spec` on either host; there is nothing to download.
 
 ```bash
+# CLI — single-shot, chat REPL, or a multi-turn JSONL run
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --n-cpu-moe 20 --mtp-spec --chat
+
+# Server
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
     --model models/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
     --backend ggml_cuda --n-cpu-moe 20 --mtp-spec
 ```
+
+`--mtp-draft N` and `--mtp-pmin X` tune the window and the confidence gate on
+both hosts (see [Measured](#measured)). Verification draws every emitted token
+from a trunk row with whatever sampler the run configured — argmax under
+`--temperature 0`, the chat sampler under `--chat` — so speculation never
+changes which distribution a token comes from, only how many forward passes it
+took to get there.
 
 Three details are worth stating, because getting any of them wrong is silent:
 
@@ -182,7 +195,10 @@ Three details are worth stating, because getting any of them wrong is silent:
 **Opt-in for a reason.** The block is a whole extra decoder layer — ~3 GiB at
 IQ2_XXS — competing for the VRAM the loader sizes the context against, so the
 native loader only pages it in when `--mtp-spec` (`TS_MTP_SPEC`) was set before
-the model loaded. `TS_GLM_MTP=1` / `0` overrides either way for an A/B.
+the model loaded. That is why the flag has to be on the command line rather than
+toggled later, and why adding it to a command that already just fit can shorten
+the context the loader settles on. `TS_GLM_MTP=1` / `0` overrides either way for
+an A/B.
 
 ### Measured
 

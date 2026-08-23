@@ -125,13 +125,24 @@ logits = lm_head(h_mtp)
 
 其中 `h` 是主干经过 **`output_norm` 之后**、`t` 前一个 token 的隐状态。该块由 token *t*
 预测 token *t+1*，把它链式展开就得到一个草稿窗口，主干再用一次批量前向完成验证。
-服务端用 `--mtp-spec` 启用，无需下载任何额外文件：
+CLI 与服务端都用 `--mtp-spec` 启用，无需下载任何额外文件：
 
 ```bash
+# CLI —— 单轮输入、chat REPL 或多轮 JSONL 运行
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
+    --backend ggml_cuda --n-cpu-moe 20 --mtp-spec --chat
+
+# 服务端
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
     --model models/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
     --backend ggml_cuda --n-cpu-moe 20 --mtp-spec
 ```
+
+`--mtp-draft N` 与 `--mtp-pmin X` 在两端都用来调节草稿窗口与置信度阈值（见[实测](#实测)）。
+验证时每个输出 token 都取自主干的某一行，且用的是本次运行所配置的采样器——`--temperature 0`
+下是 argmax，`--chat` 下是聊天采样器——因此投机不会改变 token 来自哪个分布，只改变得到它
+需要几次前向。
 
 有三点必须说清楚，因为弄错了不会报错：
 
@@ -148,7 +159,9 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
 
 **默认关闭是有原因的。** 该块是一整个解码层——IQ2_XXS 下约 3 GiB——会和 KV 缓存争抢
 loader 用来确定上下文长度的同一块显存，因此原生 loader 只在模型加载前设置了
-`--mtp-spec`（`TS_MTP_SPEC`）时才加载它。`TS_GLM_MTP=1` / `0` 可以双向覆盖，便于 A/B。
+`--mtp-spec`（`TS_MTP_SPEC`）时才加载它。这也是为什么这个开关必须写在命令行上、而不能
+事后再切换，以及为什么把它加到一条本来刚好放得下的命令上，会让 loader 最终确定的上下文
+变短。`TS_GLM_MTP=1` / `0` 可以双向覆盖，便于 A/B。
 
 ### 实测
 

@@ -187,21 +187,45 @@ namespace TensorSharp.Cli
             }),
             ("Speculative decoding", new[]
             {
+                new OptionHelp("--mtp-spec | --no-mtp-spec",
+                    "Enable/disable NextN/MTP speculative decoding on models that embed a per-token draft head " +
+                    "in the trunk checkpoint (GLM-5.2, Qwen 3.6). The head drafts up to --mtp-draft tokens and " +
+                    "the trunk verifies them in one batched forward; every emitted token still comes from a " +
+                    "trunk row, so this is a speed path only. Engages on --input, --input-jsonl, " +
+                    "--multi-turn-jsonl and --interactive. Must be passed BEFORE the model loads (it is what " +
+                    "tells glm-dsa to page its ~3 GiB NextN layer into VRAM, which also leaves less room for the " +
+                    "context). Not available under --tp N>1 on a checkpoint whose draft block borrows the " +
+                    "trunk's LM head, which includes GLM-5.2. Default: off; env TS_MTP_SPEC (glm-dsa also honours " +
+                    "TS_GLM_MTP=1/0, which overrides both).",
+                    "--model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf --backend ggml_cuda --mtp-spec --chat"),
+                new OptionHelp("--mtp-draft <N>",
+                    "Maximum tokens drafted per speculative step. Also sizes the native graph cache at load, so " +
+                    "it belongs on the same command line as --mtp-spec. Range: 1-64. Default: 8; env TS_MTP_DRAFT.",
+                    "--mtp-spec --mtp-draft 4"),
+                new OptionHelp("--mtp-pmin <f>",
+                    "Minimum draft confidence for a drafted token to be kept; drafting stops at the first token " +
+                    "below it. Range: 0.0-1.0 (exclusive of 0). Default: chosen per drafter kind - 0.75 for a " +
+                    "per-token head (top-1 probability over its top-10 logits), 0.35 for a block drafter (where " +
+                    "the gate is the CUMULATIVE prefix probability, so the same number is far stricter). " +
+                    "Env: TS_MTP_PMIN.",
+                    "--mtp-spec --mtp-draft 4 --mtp-pmin 0.55"),
                 new OptionHelp("--draft-model <path>",
                     "Block drafter GGUF for architectures whose drafter ships as its own file (DeepSeek V4's " +
                     "DSpark support module). The drafter proposes a whole block of tokens per step and the trunk " +
-                    "verifies it in one batched forward, so greedy output is unchanged. Needs --backend cuda or " +
-                    "ggml_cuda and a pure-argmax sampler: any temperature, top-k/p or penalty turns it off. " +
-                    "Default: none; env TS_DSV4_DSPARK.",
+                    "verifies it in one batched forward. Every emitted token is still drawn from a trunk row - " +
+                    "with argmax under a greedy config, with your sampler otherwise - so output is unchanged " +
+                    "either way. Needs --backend cuda or ggml_cuda. Default: none; env TS_DSV4_DSPARK.",
                     "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf --temperature 0"),
                 new OptionHelp("--spec-draft-n-max <N>",
-                    "Cap on tokens drafted per speculative block. Range: 1 to the drafter's block size. Default: " +
-                    "the drafter's trained block size (5 for DSpark).",
+                    "Older spelling of --mtp-draft, kept for block drafters. Cap on tokens drafted per " +
+                    "speculative block; a block drafter additionally clamps it to its trained block size " +
+                    "(5 for DSpark). Default: the drafter's block size.",
                     "--spec-draft-n-max 3"),
                 new OptionHelp("--spec-draft-conf-min <p>",
-                    "Minimum CUMULATIVE acceptance probability (the product of the confidence head's per-position " +
-                    "estimates) for a drafted position to be kept. Lower drafts further and rolls back more; " +
-                    "higher falls back to plain decode sooner. Range: 0.0-1.0. Default: 0.35.",
+                    "Older spelling of --mtp-pmin, kept for block drafters, where the gate is the CUMULATIVE " +
+                    "acceptance probability (the product of the confidence head's per-position estimates). Lower " +
+                    "drafts further and rolls back more; higher falls back to plain decode sooner. Range: " +
+                    "0.0-1.0. Default: 0.35 for a block drafter, 0.75 for a per-token head.",
                     "--spec-draft-conf-min 0.5"),
             }),
             ("Interactive chat", new[]

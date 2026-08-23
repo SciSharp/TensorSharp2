@@ -117,14 +117,16 @@ TestMatrix 配置中 sweep。
 NextN 块；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）。投机仅对单序列（无并发）请求
 生效，且只在有收益处（ggml 后端与纯 C# `cuda` 后端）启用。它们未注册在
 `EnvVarMatrix.All` 中，也不在默认 TestMatrix 配置里扫描——矩阵特性目录目前没有投机解码
-特性，请用显式服务端运行来验证这些变量。`TS_MTP_*` 也可由 `--mtp-*` 服务端 CLI 参数设置。
+特性，请用显式运行来验证这些变量。`TS_MTP_*` 也可由 `TensorSharp.Cli` 与
+`TensorSharp.Server` 上的 `--mtp-*` 参数设置。
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_MTP_SPEC` | Qwen 3.6、Gemma 4（服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
-| `TS_MTP_DRAFT` | Qwen 3.6、Gemma 4（服务端） | 每个投机步最多起草的 token 数 | `8` | 未注册 | 否 |
-| `TS_MTP_PMIN` | Qwen 3.6、Gemma 4（服务端） | 保留草稿 token 所需最低置信度 | `0.75` | 未注册 | 否 |
+| `TS_MTP_SPEC` | Qwen 3.6、GLM 5.2、Gemma 4（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
+| `TS_MTP_DRAFT` | Qwen 3.6、GLM 5.2、Gemma 4（CLI + 服务端） | 每个投机步最多起草的 token 数 | `8` | 未注册 | 否 |
+| `TS_MTP_PMIN` | Qwen 3.6、GLM 5.2、Gemma 4（CLI + 服务端） | 保留草稿 token 所需最低置信度 | 按草稿器类型而定（`0.75` / `0.35`） | 未注册 | 否 |
 | `TS_MTP_DRAFT_MODEL` | Gemma 4（服务端） | 独立 `gemma4-assistant` 草稿 GGUF 路径 | 无 | 未注册 | 否 |
+| `TS_GLM_MTP` | GLM 5.2 | 强制开启（`1`）或关闭（`0`）NextN 块，双向覆盖 `TS_MTP_SPEC` | 未设置 | 未注册 | 否 |
 | `TS_GMTP_NO_FUSED` | ggml 后端上的 Gemma 4 | 关闭融合多 token 验证 / 草稿步内核（逐算子回退） | 关闭 | 未注册 | 否 |
 | `TS_GMTP_NO_FAST_ROLLBACK` | Gemma 4 | 部分接受时恢复保留前缀回滚，而非稠密快速回滚 | 关闭 | 未注册 | 否 |
 | `TS_GMTP_BATCHED_TRUNK` | Gemma 4 | 验证主干走批量分页路径，而非线性主干 | 关闭 | 未注册 | 否 |

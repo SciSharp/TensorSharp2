@@ -106,10 +106,11 @@ TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --interactive --think --tp 4 --max-tokens 20000
 ```
 
-在 CLI 上，投机需要纯 argmax 采样：独立解码器按 argmax 验证每一行，因此任何会
-改写这些 logits 的设置——非零 temperature、top-k/top-p，或重复/存在/频率惩罚
-（REPL 中的 `/temp`、`/top-k`……）——都会从下一轮开始将其关闭。带图像或音频附件
-的轮次同样不使用投机。
+在 CLI 上，验证会用本次运行所配置的采样器抽取每一行——`--temperature 0` 下是
+argmax，否则就是对话采样器——因此投机可与 REPL 中的 `/temp`、`/top-k`…… 组合。
+在带惩罚项的采样器下有一点需要注意：DSpark 一次提出整块草稿，所以验证所施加的
+重复/存在/频率惩罚并不会施加到该提案上，接受率会随着带惩罚的历史增长而下降。
+带图像或音频附件的轮次则完全不使用投机——那些 embedding 只有普通 prefill 能注入。
 
 ### 在 TensorSharp.Server 上
 
@@ -122,7 +123,7 @@ TensorSharp.Server --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
     --mtp-spec --draft-model DSpark-drafter-Q2K-Q8-0731.gguf
 ```
 
-与 CLI 不同，引擎会用**该请求自己的采样器**抽取每一行验证结果，因此投机可与任意
+引擎同样会用**该请求自己的采样器**抽取每一行验证结果，因此投机可与任意
 采样设置组合，输出就是该采样器本来会产生的结果。惩罚项只影响接受率，而且影响
 很小：同一提示词在 `repeat_penalty` 1.1 与 1.0 下分别是 31.3 与 32.1 tok/s
 （接受率 66% 对 57%——差异来自生成的文本本身，而非惩罚项）。

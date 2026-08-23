@@ -9,21 +9,27 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
     /// <summary>
-    /// Greedy speculative decoding driven by a Qwen3.5/3.6 NextN/MTP draft head
-    /// (llama.cpp's `--spec-type draft-mtp`, vLLM's qwen3_5_mtp speculator).
+    /// Speculative decoding driven by a NextN/MTP draft head — Qwen3.5/3.6 and
+    /// GLM-5.2's embedded NextN block (llama.cpp's `--spec-type draft-mtp`,
+    /// vLLM's qwen3_5_mtp speculator), or a block drafter such as DeepSeek V4's
+    /// DSpark.
     ///
     /// Thin standalone wrapper over <see cref="MtpSpeculativeExecution"/> (the
     /// shared draft/verify/rollback/catch-up core also driven by the engine's
     /// <c>BatchExecutor</c>): owns the whole generate loop — KV reset, chunked
-    /// prompt prefill, greedy argmax verification — for tests and offline use.
+    /// prompt prefill, verification — for the CLI, tests and offline use.
     ///
-    /// Greedy verification makes the output token stream identical to plain
-    /// greedy decoding up to batched-vs-sequential floating point drift.
+    /// Verification draws either with argmax (<see cref="GenerateGreedy"/>) or
+    /// with the caller's sampler (<see cref="GenerateSampled"/>). Either way every
+    /// emitted token comes from a trunk row, so the output stream is the one plain
+    /// decoding would have produced — greedily up to batched-vs-sequential
+    /// floating point drift, and in distribution under a sampler.
     /// Single-sequence; the caller owns the model's KV cache lifecycle.
     /// </summary>
     public sealed class MtpSpeculativeDecoder
@@ -32,6 +38,9 @@ namespace TensorSharp.Models
         private readonly MtpSpeculativeExecution _exec;
         private readonly int _vocab;
         private readonly List<int> _acceptedScratch = new();
+        // Penalty history for a sampled run (see GenerateSampledFrom). Reused
+        // across generations; cleared at the start of each.
+        private readonly List<int> _historyScratch = new();
 
         /// <summary>Maximum tokens drafted per speculative step (llama.cpp n_max).</summary>
         public int MaxDraftTokens => _exec.MaxDraftTokens;
@@ -73,6 +82,23 @@ namespace TensorSharp.Models
         /// (draft / verify / snapshot / rollback / catch-up / plain).</summary>
         public MtpSpecStats Stats => _exec.Stats;
 
+        /// <summary>
+        /// The trunk position this decoder can be resumed at, or -1 when it cannot.
+        /// A per-token draft head chains from the hidden state of the token before
+        /// the one it drafts, so continuing a conversation by prefilling only the
+        /// new suffix is sound exactly when that carry-in still describes the token
+        /// the trunk now ends on. It does after a prefill and after a generation
+        /// that ran to its end; it does NOT after a run that stopped part-way
+        /// through a verified window, because the trunk is then rewound below the
+        /// row the carry-in came from.
+        ///
+        /// Resuming anyway is silent: the emitted stream stays correct (verification
+        /// is trunk-driven), but the draft head's KV picks up one row built from the
+        /// wrong hidden state and acceptance decays from there. A caller that
+        /// extends a cache across turns must check this before prefilling a suffix.
+        /// </summary>
+        public int CarryPosition { get; private set; } = -1;
+
         /// <summary>Wall-clock seconds the last GenerateGreedy call spent in prompt prefill.</summary>
         public double LastPrefillSeconds { get; private set; }
 
@@ -91,7 +117,19 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Reset speculative state and statistics. Does NOT touch the model's KV cache.</summary>
-        public void Reset() => _exec.Reset();
+        public void Reset()
+        {
+            _exec.Reset();
+            CarryPosition = -1;
+        }
+
+        /// <summary>
+        /// Start the statistics and the cost governor over while keeping the
+        /// carry-in hidden state, for a caller that reports per turn but extends
+        /// the same KV cache across turns. See
+        /// <see cref="MtpSpeculativeExecution.ResetStatsAndGovernor"/>.
+        /// </summary>
+        public void ResetStatsAndGovernor() => _exec.ResetStatsAndGovernor();
 
         /// <summary>
         /// Prefill the prompt through the trunk (capturing h_nextn) and replay it
@@ -121,6 +159,7 @@ namespace TensorSharp.Models
                 logits = _exec.PrefillStep(chunk, _model.CacheSeqLen);
                 offset += n;
             }
+            CarryPosition = _model.CacheSeqLen;
             return logits;
         }
 
@@ -145,7 +184,7 @@ namespace TensorSharp.Models
             var sw = System.Diagnostics.Stopwatch.StartNew();
             float[] logits = Prefill(promptTokens);
             LastPrefillSeconds = sw.Elapsed.TotalSeconds;
-            GenerateFrom(logits, promptTokens.Length, maxNewTokens, isStopToken, onToken, output);
+            GenerateFrom(logits, promptTokens.Length, maxNewTokens, null, isStopToken, onToken, output);
             return output;
         }
 
@@ -171,12 +210,76 @@ namespace TensorSharp.Models
 
             var output = new List<int>();
             if (maxNewTokens > 0)
-                GenerateFrom(promptLogits, position, maxNewTokens, isStopToken, onToken, output);
+                GenerateFrom(promptLogits, position, maxNewTokens, null, isStopToken, onToken, output);
             return output;
         }
 
+        /// <summary>
+        /// Speculative generation that draws every emitted token with
+        /// <paramref name="sampler"/> instead of argmax. Resets the model KV cache,
+        /// prefills <paramref name="promptTokens"/>, then decodes as
+        /// <see cref="GenerateSampledFrom"/> does.
+        /// </summary>
+        public List<int> GenerateSampled(int[] promptTokens, int maxNewTokens, TokenSampler sampler,
+            Func<int, bool> isStopToken = null, Func<int, bool> onToken = null)
+        {
+            ArgumentNullException.ThrowIfNull(sampler);
+
+            _model.ResetKVCache();
+            _exec.Reset();
+
+            var output = new List<int>();
+            if (maxNewTokens <= 0)
+                return output;
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            float[] logits = Prefill(promptTokens);
+            LastPrefillSeconds = sw.Elapsed.TotalSeconds;
+            GenerateFrom(logits, promptTokens.Length, maxNewTokens, sampler, isStopToken, onToken, output);
+            return output;
+        }
+
+        /// <summary>
+        /// Speculative generation continuing from <paramref name="promptLogits"/> that
+        /// draws every emitted token with <paramref name="sampler"/> — the sampled
+        /// counterpart of <see cref="GenerateGreedyFrom"/>, and the same contract the
+        /// engine's <c>BatchExecutor</c> gives a served request.
+        ///
+        /// Speculation stays distribution-faithful because every emitted token is
+        /// drawn by <paramref name="sampler"/> from a TRUNK row: the draft only
+        /// decides whether a row was already computed. Three details make that true
+        /// rather than approximately true, and each is a silent bias if dropped:
+        ///
+        ///   * the token drawn while verifying a row is the one emitted — re-drawing
+        ///     it later from the same logits would bias the stream toward the drafts;
+        ///   * accepted drafts enter the penalty history BEFORE the next row is
+        ///     drawn, so a penalized sampler sees exactly the history plain decoding
+        ///     would have given it;
+        ///   * the draft head's logits are penalized with that same history (plus the
+        ///     drafts pending in the window), so drafting argmaxes the distribution
+        ///     verification draws from. Without it acceptance decays toward zero as
+        ///     the history grows.
+        ///
+        /// The caller's own token bookkeeping stays in <paramref name="onToken"/>
+        /// order; the penalty history kept here is private to the sampler.
+        /// </summary>
+        public List<int> GenerateSampledFrom(float[] promptLogits, int position, int maxNewTokens,
+            TokenSampler sampler, Func<int, bool> isStopToken = null, Func<int, bool> onToken = null)
+        {
+            if (promptLogits == null)
+                throw new ArgumentNullException(nameof(promptLogits));
+            ArgumentNullException.ThrowIfNull(sampler);
+
+            var output = new List<int>();
+            if (maxNewTokens > 0)
+                GenerateFrom(promptLogits, position, maxNewTokens, sampler, isStopToken, onToken, output);
+            return output;
+        }
+
+        /// <param name="sampler">Null for argmax verification, otherwise the sampler
+        /// every emitted token is drawn with.</param>
         private void GenerateFrom(float[] promptLogits, int position, int maxNewTokens,
-            Func<int, bool> isStopToken, Func<int, bool> onToken, List<int> output)
+            TokenSampler sampler, Func<int, bool> isStopToken, Func<int, bool> onToken, List<int> output)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             try
@@ -191,7 +294,20 @@ namespace TensorSharp.Models
                 // not have to reason about where the last step stopped.
                 int emitted = position + output.Count;
                 if (_model.CacheSeqLen > emitted)
+                {
+                    // Rewinding drops trunk rows the carry-in hidden state was taken
+                    // from, so it no longer describes the token the trunk ends on.
                     _model.MtpRewindCache(emitted);
+                    CarryPosition = -1;
+                }
+                else
+                {
+                    // The trunk's own length, NOT `emitted`: decoding forwards every
+                    // emitted token except the last, which is drawn from the previous
+                    // row's logits and fed on the next step. The carry-in describes
+                    // the token the trunk actually ends on.
+                    CarryPosition = _model.CacheSeqLen;
+                }
             }
             finally
             {
@@ -200,6 +316,25 @@ namespace TensorSharp.Models
 
             void Decode()
             {
+                // Penalty history for a sampled run: exactly the tokens drawn so
+                // far. Kept apart from `output` because the two move at different
+                // times — an accepted draft has to be in the history BEFORE the
+                // next verify row is drawn (mid-DecodeStep), while it reaches
+                // `output` only once the step returns. Unused under argmax, where
+                // no history is consulted.
+                List<int> history = sampler != null ? _historyScratch : null;
+                history?.Clear();
+
+                // Draws the token a trunk row emits, and records it in the penalty
+                // history. Accepted drafts go through _exec's onDraftAccepted hook
+                // instead — they were drawn by the DRAFT head, not from this row.
+                int Draw(float[] rowLogits)
+                {
+                    if (sampler == null)
+                        return Argmax(rowLogits, _vocab);
+                    return sampler.Sample(rowLogits, history);
+                }
+
                 // Appends a token to the result and reports whether generation
                 // should continue: a stop token ends the run without being
                 // streamed, and the consumer can end it too (cancellation, a
@@ -212,7 +347,8 @@ namespace TensorSharp.Models
                     return onToken == null || onToken(t);
                 }
 
-                int tLast = Argmax(promptLogits, _vocab);
+                int tLast = Draw(promptLogits);
+                history?.Add(tLast);
                 if (!Emit(tLast))
                     return;
 
@@ -227,14 +363,25 @@ namespace TensorSharp.Models
                     _acceptedScratch.Clear();
                     MtpDecodeOutcome outcome = _exec.DecodeStep(
                         tLast, n, kMax,
-                        drawNext: row => Argmax(row, _vocab),
-                        adjustDraftLogits: null,
-                        onDraftAccepted: _acceptedScratch.Add);
+                        drawNext: Draw,
+                        // Penalty-aligned drafting: the draft head must argmax the
+                        // same penalized distribution verification draws from, or
+                        // acceptance decays toward zero as the history grows.
+                        adjustDraftLogits: sampler == null
+                            ? null
+                            : (draftLogits, pendingDrafts) =>
+                                sampler.ApplyPenalties(draftLogits, history, pendingDrafts),
+                        onDraftAccepted: d =>
+                        {
+                            history?.Add(d);
+                            _acceptedScratch.Add(d);
+                        });
 
                     if (!outcome.UsedSpeculation)
                     {
                         // Plain decode step.
-                        int next = Argmax(outcome.NextLogits, _vocab);
+                        int next = Draw(outcome.NextLogits);
+                        history?.Add(next);
                         n += 1;
                         tLast = next;
                         if (!Emit(next))
@@ -248,6 +395,12 @@ namespace TensorSharp.Models
                     // matches the cache.
                     n += outcome.AcceptedCount + 1;
                     tLast = outcome.NextToken;
+                    // The token drawn from the first mismatching (or bonus) row is
+                    // the sequence's next output token. It is emitted as drawn —
+                    // re-drawing it from NextLogits would bias the stream toward
+                    // the drafts — and enters the history here because the accept
+                    // loop only reports the drafts it accepted.
+                    history?.Add(outcome.NextToken);
 
                     // Emit accepted drafts then the corrected/bonus token.
                     int emittedThisStep = 0;

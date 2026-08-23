@@ -24,6 +24,7 @@ using TensorSharp.Cli.Logging;
 using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Cli
 {
@@ -136,6 +137,15 @@ namespace TensorSharp.Cli
             // Same contract for MoE CPU offload: TS_N_CPU_MOE / TS_CPU_MOE seed the
             // default, --n-cpu-moe / --cpu-moe below override it.
             MoeCpuOffloadConfig.ConfigureFromEnvironment();
+
+            // --mtp-spec / --mtp-draft / --mtp-pmin / --mtp-draft-model become
+            // TS_MTP_* before anything else runs, because the request has to reach
+            // the LOADER and not just the decode loop: glm-dsa pages its NextN
+            // block into VRAM (a whole extra 256-expert layer) only when TS_MTP_SPEC
+            // is already set, and sizes its graph cache from TS_MTP_DRAFT. Parsing
+            // these in the switch below would be too late to matter. Shared with
+            // the server so the two hosts cannot drift on names or validation.
+            MtpSpeculativeCliFlags.Apply(args);
 
             string modelPath = null;
             string inputFile = null;
@@ -259,7 +269,21 @@ namespace TensorSharp.Cli
                     case "--mmproj": mmProjPath = args[++i]; break;
                     case "--draft-model": draftModelPath = args[++i]; break;
                     case "--spec-draft-n-max": specDraftMax = int.Parse(args[++i]); break;
-                    case "--spec-draft-conf-min": specDraftConfMin = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                    case "--spec-draft-conf-min":
+                    {
+                        string confStr = args[++i];
+                        // 0 is legal and means "never gate a draft on confidence";
+                        // anything above 1 is not a looser gate but a dead one — no
+                        // probability clears it, so speculation would arm, log, and
+                        // then never draft a single token.
+                        if (!float.TryParse(confStr, NumberStyles.Float, CultureInfo.InvariantCulture, out specDraftConfMin)
+                            || specDraftConfMin < 0f || specDraftConfMin > 1f)
+                        {
+                            throw new ArgumentException(
+                                $"Invalid value for --spec-draft-conf-min: '{confStr}'. Expected a probability in [0, 1].");
+                        }
+                        break;
+                    }
                     case "--max-tokens": maxTokens = int.Parse(args[++i]); break;
                     case "--test": runTest = true; break;
                     case "--backend": backendStr = args[++i].ToLowerInvariant(); break;
@@ -473,6 +497,25 @@ namespace TensorSharp.Cli
                 pagedKvEnableOverride, pagedKvBlockSizeOverride,
                 pagedKvRamMbOverride, pagedKvSsdDirOverride, pagedKvSsdMbOverride,
                 pagedKvQuantBitsOverride);
+
+            // --spec-draft-n-max is the older spelling of --mtp-draft and is parsed
+            // in the switch above, too late for MtpSpeculativeCliFlags.Apply. Publish
+            // it now, while the model has still not been created.
+            SpeculativeDecodingOptions.PublishDraftWindow(specDraftMax);
+
+            // A NextN block with no LM head of its own borrows the trunk's, which is
+            // column-parallel under tensor parallelism — the draft would read one
+            // rank's strip of the vocabulary. The loaders refuse it (and say so on
+            // stderr), but the refusal is easy to miss in a long load, and the
+            // operator has meanwhile lost the VRAM they were budgeting for context.
+            // Say it up front, where the two flags were typed.
+            if (tpDegree > 1 && SchedulerConfig.FromEnvironment().MtpSpeculativeEnabled)
+            {
+                _log.LogWarning(LogEventIds.HostConfiguration,
+                    "--mtp-spec with --tp {Degree}: a draft block that borrows the trunk's LM head cannot draft "
+                    + "under tensor parallelism (GLM-5.2 is one such checkpoint) and speculation will be refused "
+                    + "at load. Drop --tp to speculate, or --mtp-spec to keep the split.", tpDegree);
+            }
 
             if (gpuDeviceOverride.HasValue)
             {
@@ -727,13 +770,15 @@ namespace TensorSharp.Cli
 
             if (multiTurnJsonl != null)
             {
-                RunMultiTurnTest(model, multiTurnJsonl, maxTokens, samplingConfig, enableThinking);
+                RunMultiTurnTest(model, multiTurnJsonl, maxTokens, samplingConfig, enableThinking,
+                    specDraftMax, specDraftConfMin);
                 return;
             }
 
             if (inputJsonl != null)
             {
-                RunJsonlBatch(model, inputJsonl, outputFile, maxTokens, samplingConfig, enableThinking);
+                RunJsonlBatch(model, inputJsonl, outputFile, maxTokens, samplingConfig, enableThinking,
+                    specDraftMax, specDraftConfMin);
                 return;
             }
 
@@ -1061,13 +1106,21 @@ namespace TensorSharp.Cli
         /// then builds the next turn's messages including previous turns.
         /// </summary>
         static void RunMultiTurnTest(ModelBase model, string jsonlPath, int maxTokens,
-            SamplingConfig sampling, bool enableThinking)
+            SamplingConfig sampling, bool enableThinking,
+            int specDraftMax = 0, float specDraftConfMin = -1f)
         {
             if (!File.Exists(jsonlPath))
             {
                 _log.LogError(LogEventIds.CliFailed, "Multi-turn jsonl not found: {File}", jsonlPath);
                 return;
             }
+
+            var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
+
+            // One decoder for the whole run: its draft/verify buffers are sized by
+            // the vocabulary, so rebuilding it per turn costs several MB a turn on a
+            // 155k-token vocabulary for nothing.
+            MtpSpeculativeDecoder multiTurnDecoder = null;
 
             string[] lines = File.ReadAllLines(jsonlPath);
             var history = new List<ChatMessage>();
@@ -1145,27 +1198,34 @@ namespace TensorSharp.Cli
                 double prefillMs;
                 double decodeMs;
 
-                bool turnSpeculative = cfg.IsGreedy
-                    && model is TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel turnSpec
-                    && turnSpec.HasMtp && turnSpec.MtpDraftBlockSize > 0;
-
-                if (turnSpeculative)
+                var turnDecoder = SpeculativeDecodingOptions.TryCreate(
+                    model, specSettings, hasMediaAttachments: false, out string turnDeclineReason,
+                    multiTurnDecoder);
+                if (turnDecoder != null)
+                    multiTurnDecoder = turnDecoder;
+                if (turnDecoder == null && specSettings.Requested && turnDeclineReason != null && turn == 0)
                 {
-                    // Models with a block drafter (DeepSeek V4 + DSpark) cannot
-                    // truncate their compressed caches, so every turn re-prefills
-                    // anyway: hand the whole turn to the speculative decoder,
-                    // which owns the reset, the chunked prefill (replaying the
-                    // drafter's key ring) and the draft/verify loop.
-                    var turnSpecModel = (TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel)model;
+                    _log.LogWarning(LogEventIds.HostConfiguration,
+                        "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                        + "Serving standard decode.", turnDeclineReason);
+                }
+
+                if (turnDecoder != null)
+                {
+                    // The whole turn goes to the speculative decoder, which owns the
+                    // reset, the drafter-aware chunked prefill and the draft/verify
+                    // loop. Re-prefilling every turn is not a compromise here: a
+                    // block drafter's compressed cache cannot be truncated anyway,
+                    // and a prefix the DRAFT head never saw would leave a hole in
+                    // its KV that collapses acceptance for the rest of the turn.
+                    var turnSpecModel = (IMtpSpeculativeModel)model;
                     kvCache.Reset();
-                    var turnDecoder = new MtpSpeculativeDecoder(turnSpecModel, turnSpecModel.MtpDraftBlockSize)
-                    {
-                        MinDraftProb = 0.35f,
-                        PrefillChunkSize = turnSpecModel.MtpPrefillChunkSize > 0
-                            ? turnSpecModel.MtpPrefillChunkSize : 512,
-                    };
-                    var turnTokens = turnDecoder.GenerateGreedy(inputTokens.ToArray(), turnMaxTokens,
-                        t => model.Tokenizer.IsEos(t));
+                    bool turnArgmax = InteractiveSession.IsArgmaxSampling(cfg);
+                    var turnTokens = turnArgmax
+                        ? turnDecoder.GenerateGreedy(inputTokens.ToArray(), turnMaxTokens,
+                            t => model.Tokenizer.IsEos(t))
+                        : turnDecoder.GenerateSampled(inputTokens.ToArray(), turnMaxTokens, sampler,
+                            t => model.Tokenizer.IsEos(t));
                     if (turnTokens.Count > 0 && model.Tokenizer.IsEos(turnTokens[turnTokens.Count - 1]))
                         turnTokens.RemoveAt(turnTokens.Count - 1);
                     generatedTokens.AddRange(turnTokens);
@@ -1175,12 +1235,16 @@ namespace TensorSharp.Cli
 
                     _log.LogInformation(LogEventIds.KvCacheReusePlan,
                         "kv plan=Reset prefillMs={PrefillMs:F1} description={Description}",
-                        prefillMs, $"Full reset: forwarding {inputTokens.Count} tokens (block speculative)");
+                        prefillMs, $"Full reset: forwarding {inputTokens.Count} tokens (speculative)");
                     _log.LogInformation(LogEventIds.CliBenchmark,
-                        "multi-turn speculative: drafted={Drafted} accepted={Accepted} acceptanceRate={Rate:F3} " +
-                        "verifySteps={Verify} plainSteps={Plain} rollbacks={Rollbacks}",
+                        "multi-turn speculative: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode} " +
+                        "drafted={Drafted} accepted={Accepted} acceptanceRate={Rate:F3} " +
+                        "verifySteps={VerifySteps} plainSteps={Plain} rollbacks={Rollbacks} parked={Parked}",
+                        SpeculativeDecodingOptions.DescribeDrafter(turnSpecModel), turnDecoder.MaxDraftTokens,
+                        turnDecoder.MinDraftProb, turnArgmax ? "argmax" : "sampled",
                         turnDecoder.TokensDrafted, turnDecoder.TokensAccepted, turnDecoder.AcceptanceRate,
-                        turnDecoder.VerifySteps, turnDecoder.PlainSteps, turnDecoder.RollbackSteps);
+                        turnDecoder.VerifySteps, turnDecoder.PlainSteps, turnDecoder.RollbackSteps,
+                        turnDecoder.ParkedSteps);
                 }
                 else
                 {
@@ -1302,13 +1366,20 @@ namespace TensorSharp.Cli
         }
 
         static void RunJsonlBatch(ModelBase model, string inputJsonlPath, string outputFile, int defaultMaxTokens,
-            SamplingConfig defaultSampling, bool enableThinking = false)
+            SamplingConfig defaultSampling, bool enableThinking = false,
+            int specDraftMax = 0, float specDraftConfMin = -1f)
         {
             if (!File.Exists(inputJsonlPath))
             {
                 _log.LogError(LogEventIds.CliFailed, "JSONL file not found: {File}", inputJsonlPath);
                 return;
             }
+
+            // One decoder for the whole batch: its buffers are sized by the
+            // vocabulary, and every request resets it anyway.
+            var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
+            MtpSpeculativeDecoder batchDecoder = null;
+            bool specDeclineLogged = false;
 
             string[] lines = File.ReadAllLines(inputJsonlPath);
             var results = new List<string>();
@@ -1374,37 +1445,102 @@ namespace TensorSharp.Cli
                         "jsonl batch [{RequestId}] inputTokens={TokenCount} first20=[{First20}]",
                         id, inputTokens.Count, string.Join(", ", inputTokens.Take(20)));
 
-                    var sw = Stopwatch.StartNew();
-                    float[] logits = model.Forward(inputTokens.ToArray());
-                    double prefillMs = sw.Elapsed.TotalMilliseconds;
-
                     var cfg = sampling ?? SamplingConfig.Greedy;
                     var sampler = new TokenSampler(cfg);
                     var generatedTokens = new List<int>();
                     var sb = new StringBuilder();
 
-                    for (int step = 0; step < maxTokens; step++)
+                    bool requestHasMedia = (imagePaths != null && imagePaths.Count > 0)
+                                           || (audioPaths != null && audioPaths.Count > 0) || isVideo;
+                    // Assigned back only on success: a request that declines (media,
+                    // say) must not throw away the decoder the next one can reuse.
+                    var requestDecoder = SpeculativeDecodingOptions.TryCreate(
+                        model, specSettings, requestHasMedia, out string specDeclineReason, batchDecoder);
+                    if (requestDecoder != null)
                     {
-                        int nextToken = sampler.Sample(logits, generatedTokens);
-                        if (model.Tokenizer.IsEos(nextToken)) break;
-
-                        generatedTokens.Add(nextToken);
-                        string decoded = model.Tokenizer.Decode(generatedTokens);
-                        sb.Clear();
-                        sb.Append(decoded);
-
-                        if (cfg.StopSequences != null)
+                        if (!ReferenceEquals(batchDecoder, requestDecoder))
                         {
-                            var (trimmed, shouldStop) = sampler.CheckStopSequences(decoded);
-                            if (shouldStop)
-                            {
-                                sb.Clear();
-                                sb.Append(trimmed);
-                                break;
-                            }
+                            _log.LogInformation(LogEventIds.HostConfiguration,
+                                "jsonl batch speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2}",
+                                SpeculativeDecodingOptions.DescribeDrafter((IMtpSpeculativeModel)model),
+                                requestDecoder.MaxDraftTokens, requestDecoder.MinDraftProb);
+                        }
+                        batchDecoder = requestDecoder;
+                    }
+                    if (requestDecoder == null && specSettings.Requested && specDeclineReason != null
+                        && !specDeclineLogged)
+                    {
+                        specDeclineLogged = true;
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                            + "Serving standard decode.", specDeclineReason);
+                    }
+
+                    var sw = Stopwatch.StartNew();
+                    double prefillMs;
+
+                    if (requestDecoder != null)
+                    {
+                        // The decoder owns the reset and the drafter-aware prefill;
+                        // every emitted token still comes from a trunk row.
+                        bool KeepGoing(int t)
+                        {
+                            generatedTokens.Add(t);
+                            string soFar = model.Tokenizer.Decode(generatedTokens);
+                            sb.Clear();
+                            sb.Append(soFar);
+                            if (cfg.StopSequences == null || cfg.StopSequences.Count == 0)
+                                return true;
+                            var (trimmed, shouldStop) = sampler.CheckStopSequences(soFar);
+                            if (!shouldStop)
+                                return true;
+                            sb.Clear();
+                            sb.Append(trimmed);
+                            return false;
                         }
 
-                        logits = model.Forward(new[] { nextToken });
+                        int[] promptArray = inputTokens.ToArray();
+                        bool batchArgmax = InteractiveSession.IsArgmaxSampling(cfg);
+                        if (batchArgmax)
+                        {
+                            requestDecoder.GenerateGreedy(promptArray, maxTokens,
+                                t => model.Tokenizer.IsEos(t), KeepGoing);
+                        }
+                        else
+                        {
+                            requestDecoder.GenerateSampled(promptArray, maxTokens, sampler,
+                                t => model.Tokenizer.IsEos(t), KeepGoing);
+                        }
+                        prefillMs = requestDecoder.LastPrefillSeconds * 1000.0;
+                    }
+                    else
+                    {
+                        float[] logits = model.Forward(inputTokens.ToArray());
+                        prefillMs = sw.Elapsed.TotalMilliseconds;
+
+                        for (int step = 0; step < maxTokens; step++)
+                        {
+                            int nextToken = sampler.Sample(logits, generatedTokens);
+                            if (model.Tokenizer.IsEos(nextToken)) break;
+
+                            generatedTokens.Add(nextToken);
+                            string decoded = model.Tokenizer.Decode(generatedTokens);
+                            sb.Clear();
+                            sb.Append(decoded);
+
+                            if (cfg.StopSequences != null)
+                            {
+                                var (trimmed, shouldStop) = sampler.CheckStopSequences(decoded);
+                                if (shouldStop)
+                                {
+                                    sb.Clear();
+                                    sb.Append(trimmed);
+                                    break;
+                                }
+                            }
+
+                            logits = model.Forward(new[] { nextToken });
+                        }
                     }
 
                     double totalMs = sw.Elapsed.TotalMilliseconds;
@@ -2344,18 +2480,34 @@ namespace TensorSharp.Cli
                     "Reduce --max-tokens, use a shorter PDF, or choose a model with a larger context window.");
             }
 
-            // Block speculative decoding (DeepSeek V4 + DSpark, Muse-Glimmer +
-            // DFlash): the drafter proposes a block per step and the trunk verifies
-            // it in one batched forward. Greedy verification keeps the emitted
-            // stream identical to plain greedy decoding, so it is only a speed path.
+            // Speculative decoding: a draft head proposes tokens and the trunk
+            // verifies them in one batched forward. Either a block drafter
+            // (DeepSeek V4 + DSpark, Muse-Glimmer + DFlash) or a per-token NextN/MTP
+            // head under --mtp-spec (GLM-5.2, Qwen 3.6). Every emitted token still
+            // comes from a trunk row, so this is a speed path only.
             {
                 var specCfg = samplingConfig ?? SamplingConfig.Greedy;
-                if (InteractiveSession.IsArgmaxSampling(specCfg)
-                    && model is TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel blockSpec
-                    && blockSpec.HasMtp && blockSpec.MtpDraftBlockSize > 0)
+                var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
+                var specDecoder = SpeculativeDecodingOptions.TryCreate(
+                    model, specSettings,
+                    // The single-shot path renders one message; media reaches the
+                    // model through the injector, which the speculative prefill
+                    // cannot drive.
+                    hasMediaAttachments: (imagePaths != null && imagePaths.Count > 0)
+                                         || (audioPaths != null && audioPaths.Count > 0)
+                                         || isVideo,
+                    out string specDeclineReason);
+
+                if (specDecoder != null)
                 {
-                    return RunBlockSpeculativeInference(model, blockSpec, inputTokens, maxTokens,
-                        enableThinking, tools, silent, specDraftMax, specDraftConfMin);
+                    return RunSpeculativeInference(model, (IMtpSpeculativeModel)model, specDecoder,
+                        inputTokens, maxTokens, specCfg, enableThinking, tools, silent);
+                }
+                if (specSettings.Requested && specDeclineReason != null && !silent)
+                {
+                    _log.LogWarning(LogEventIds.HostConfiguration,
+                        "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                        + "Serving standard decode.", specDeclineReason);
                 }
             }
 
@@ -2568,35 +2720,59 @@ namespace TensorSharp.Cli
         }
 
         /// <summary>
-        /// Greedy generation through the shared block-speculative core (DSpark):
-        /// prompt prefill replays the drafter's key ring, then every step drafts
-        /// one block and verifies it with a single batched trunk forward.
+        /// Single-shot generation through the shared speculative core: prompt
+        /// prefill runs the drafter-aware path so the draft head's cache covers the
+        /// prompt, then every step drafts (a block for DSpark/DFlash, a chained
+        /// window for a per-token NextN/MTP head) and verifies it with one batched
+        /// trunk forward. Every emitted token is drawn from a trunk row — with
+        /// argmax under a greedy config, with <paramref name="sampling"/> otherwise
+        /// — so speculation only changes how many forwards it took to get there.
         /// </summary>
-        static string RunBlockSpeculativeInference(ModelBase model, TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel spec,
-            List<int> inputTokens, int maxTokens, bool enableThinking, List<ToolFunction> tools,
-            bool silent, int specDraftMax, float specDraftConfMin)
+        static string RunSpeculativeInference(ModelBase model, IMtpSpeculativeModel spec,
+            MtpSpeculativeDecoder decoder, List<int> inputTokens, int maxTokens,
+            SamplingConfig sampling, bool enableThinking, List<ToolFunction> tools, bool silent)
         {
-            int window = spec.MtpDraftBlockSize;
-            if (specDraftMax > 0)
-                window = Math.Min(window, specDraftMax);
-
-            var decoder = new MtpSpeculativeDecoder(spec, window)
-            {
-                // Cumulative acceptance gate (see MtpSpeculativeExecution):
-                // an extra verify row costs ~a quarter of a decode step on a
-                // sparse-MoE trunk, so drafting past a ~0.35 prefix-acceptance
-                // estimate is expected-negative.
-                MinDraftProb = specDraftConfMin >= 0f ? specDraftConfMin : 0.35f,
-                PrefillChunkSize = spec.MtpPrefillChunkSize > 0 ? spec.MtpPrefillChunkSize : 512,
-            };
-
             var parser = OutputParserFactory.Create(model.Config.Architecture);
             parser.Init(enableThinking, tools);
             bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
             bool showThinking = enableThinking || parser.AlwaysRequired;
 
-            var generated = decoder.GenerateGreedy(inputTokens.ToArray(), maxTokens,
-                t => model.Tokenizer.IsEos(t));
+            bool argmax = InteractiveSession.IsArgmaxSampling(sampling);
+            if (!silent)
+            {
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "cli.inference speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode}",
+                    SpeculativeDecodingOptions.DescribeDrafter(spec), decoder.MaxDraftTokens,
+                    decoder.MinDraftProb, argmax ? "argmax" : "sampled");
+            }
+
+            // --stop has to work here exactly as it does on the plain path: it is a
+            // sampler-level stop, not an EOS, so the decoder only sees it through
+            // this callback — and a speculative window can put several tokens past
+            // the marker into the result before the check runs, which is why the
+            // TRIMMED text is what gets returned rather than the token stream.
+            var sampler = new TokenSampler(sampling);
+            bool hasStopSequences = sampling?.StopSequences != null && sampling.StopSequences.Count > 0;
+            var emitted = new List<int>();
+            string trimmedAtStop = null;
+
+            bool OnToken(int t)
+            {
+                emitted.Add(t);
+                if (!hasStopSequences)
+                    return true;
+                var (trimmed, shouldStop) = sampler.CheckStopSequences(model.Tokenizer.Decode(emitted));
+                if (!shouldStop)
+                    return true;
+                trimmedAtStop = trimmed;
+                return false;
+            }
+
+            int[] prompt = inputTokens.ToArray();
+            var generated = argmax
+                ? decoder.GenerateGreedy(prompt, maxTokens, t => model.Tokenizer.IsEos(t), OnToken)
+                : decoder.GenerateSampled(prompt, maxTokens, sampler,
+                    t => model.Tokenizer.IsEos(t), OnToken);
 
             bool hitEos = generated.Count > 0 && model.Tokenizer.IsEos(generated[generated.Count - 1]);
             if (hitEos)
@@ -2615,15 +2791,26 @@ namespace TensorSharp.Cli
                     generated.Count, decodeMs,
                     decodeMs > 0 ? generated.Count / (decodeMs / 1000.0) : 0.0);
                 _log.LogInformation(LogEventIds.CliBenchmark,
-                    "cli.inference speculative: window={Window} confMin={ConfMin:F2} drafted={Drafted} accepted={Accepted} " +
-                    "acceptanceRate={Rate:F3} verifySteps={Verify} plainSteps={Plain} rollbacks={Rollbacks} " +
+                    "cli.inference speculative: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode} " +
+                    "drafted={Drafted} accepted={Accepted} " +
+                    "acceptanceRate={Rate:F3} verifySteps={VerifySteps} plainSteps={Plain} rollbacks={Rollbacks} " +
                     "parked={Parked} plainMsPerTok={PlainMs:F1} specMsPerTok={SpecMs:F1}",
-                    window, decoder.MinDraftProb, decoder.TokensDrafted, decoder.TokensAccepted,
+                    SpeculativeDecodingOptions.DescribeDrafter(spec), decoder.MaxDraftTokens,
+                    decoder.MinDraftProb, argmax ? "argmax" : "sampled",
+                    decoder.TokensDrafted, decoder.TokensAccepted,
                     decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps,
                     decoder.ParkedSteps, decoder.PlainMsPerToken, decoder.SpecMsPerToken);
                 _log.LogInformation(LogEventIds.ChatCompleted,
                     "cli.inference finishReason={FinishReason} tokens={Tokens}",
-                    hitEos ? "eos" : "max_tokens", generated.Count);
+                    trimmedAtStop != null ? "stop_sequence" : hitEos ? "eos" : "max_tokens",
+                    generated.Count);
+            }
+
+            if (trimmedAtStop != null)
+            {
+                if (useParser)
+                    return FormatParsedResult(parser.Add(trimmedAtStop, true), showThinking);
+                return trimmedAtStop;
             }
 
             string decoded = model.Tokenizer.Decode(generated);

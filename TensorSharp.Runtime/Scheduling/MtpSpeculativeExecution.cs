@@ -634,6 +634,20 @@ namespace TensorSharp.Runtime.Scheduling
             _rowLogits = new float[_vocab];
         }
 
+        /// <summary>
+        /// Start the statistics and the cost governor over WITHOUT touching the
+        /// carry-in hidden state, for a caller that reports per turn while keeping
+        /// the draft head aligned with a KV cache it is extending. Resetting the
+        /// stats alone would leave the governor's round accumulators running behind
+        /// zeroed counters — a per-turn log that reads 0.0 ms/token — and would
+        /// carry a park decided on one turn's context into the next.
+        /// </summary>
+        public void ResetStatsAndGovernor()
+        {
+            Stats.Reset();
+            GovernorReset();
+        }
+
         /// <summary>Reset speculative state and statistics. Does NOT touch the model's KV cache.</summary>
         public void Reset()
         {
