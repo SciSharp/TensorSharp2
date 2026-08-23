@@ -603,6 +603,16 @@ namespace tsg
     bool vram_log_enabled();
     void vram_log(const char* tag, std::int64_t bytes);
 
+    // TS_GGML_LOG_VRAM=2 additionally breaks a persistent graph buffer down by
+    // tensor. A whole-model graph allocated with ggml_backend_alloc_ctx_tensors
+    // gives every intermediate its own slot, so a single "500 MB" line hides
+    // which tensor shape actually owns the buffer; this aggregates the still
+    // unbound (= about to be allocated) tensors by name, largest first, so the
+    // per-layer offender is named rather than guessed at. Call it on the graph's
+    // context immediately BEFORE the allocation.
+    bool vram_log_verbose();
+    void vram_log_ctx_breakdown(const char* tag, ggml_context* ctx, int top_n);
+
     // --- Backend management ---
 
     ggml_backend_t create_backend_instance(int backend_type);

@@ -55,6 +55,8 @@ namespace TensorSharp.Models
         private int _numExpertsUsed;
         private int _expertFfnLength;
         private int _sharedExpertFfnLength;
+        // Cached ForwardRefill chunk width; see ResolvePrefillChunkSize.
+        private int _prefillChunkSize;
         private bool _normTopKProb;
         private bool[] _isMoeLayer;
         private bool[] _hasSharedExperts;
@@ -1528,7 +1530,46 @@ namespace TensorSharp.Models
         // chunks so the per-layer attention-score allocation stays bounded. Because a
         // chunk runs as ONE fused-verify graph, the chunk size is also that graph's
         // width, which bounds the MoE activation peak. Override with TS_PREFILL_CHUNK.
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Only the full-attention layers hold a KV cache — the GatedDeltaNet
+        /// layers carry a fixed-size recurrent state instead, which does not grow
+        /// with the context and so plays no part in this per-token figure.
+        /// </remarks>
+        protected override long KvCacheBytesPerToken
+        {
+            get
+            {
+                if (_isRecurrent == null || Config == null)
+                    return 0;
+                int attnLayers = 0;
+                for (int l = 0; l < TotalLayerCount; l++)
+                    if (!_isRecurrent[l]) attnLayers++;
+                if (attnLayers <= 0)
+                    return 0;
+                long elems = 2L * attnLayers * Config.NumKVHeads * Config.HeadDim;   // K + V
+                return _kvCacheDtype.ToDType().ByteLengthFor(elems);
+            }
+        }
+
+        /// <inheritdoc/>
+        protected override int GgmlPrefillChunkWarmupLength =>
+            IsGgmlBackend ? ResolvePrefillChunkSize() : 0;
+
         private int ResolvePrefillChunkSize()
+        {
+            // Resolved once and cached: the chunk width IS the fused-verify graph's
+            // shape, and a width that drifts with whatever happens to be free right
+            // now would make every prompt a fresh shape (persist-cache churn on
+            // CUDA, pipeline rebuilds on Vulkan) instead of reusing the one the
+            // startup warmup already built.
+            if (_prefillChunkSize > 0)
+                return _prefillChunkSize;
+            _prefillChunkSize = ComputePrefillChunkSize();
+            return _prefillChunkSize;
+        }
+
+        private int ComputePrefillChunkSize()
         {
             string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
             if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
@@ -1543,7 +1584,37 @@ namespace TensorSharp.Models
             // (a variable/larger chunk makes each prompt length a fresh shape whose pipeline
             // + graph is built cold inside the measured TTFT — measured to REGRESS
             // multi-prompt Vulkan runs). CUDA (cuBLAS/MMQ, no WDDM demotion) keeps 2048.
-            return _backend == BackendType.GgmlVulkan ? 768 : 2048;
+            if (_backend == BackendType.GgmlVulkan)
+                return 768;
+
+            // CUDA used to keep a flat 2048 on the reasoning that only Vulkan
+            // suffers the WDDM demotion described above. It does not: the same
+            // card demotes a CUDA allocation just as happily once the card is
+            // full, and on a model whose weights nearly fill VRAM the 2048-wide
+            // graph's ~500 MB of scratch is what fills it. Cap the width against
+            // the VRAM actually left after the weights are resident.
+            //
+            // This is not purely a memory trade. Measured on a 16 GB RTX 3080
+            // Laptop, Qwen3.8-27B-UD-IQ4_XS, 5000-token chunked prefill:
+            //   2048 -> 521 tok/s, 505 MB of graph scratch
+            //   1024 -> 533 tok/s, 253 MB
+            //    512 -> 500 tok/s, 128 MB
+            // so the narrower graph is also the faster one until 512, where the
+            // per-chunk fixed cost finally shows. 1024 is therefore the floor
+            // rather than the smallest width that fits: it is both faster than the
+            // 2048 it replaces and less than half the memory, so there is nothing
+            // to buy by going narrower. A card with room is unaffected — it still
+            // gets the full 2048.
+            const int desired = 2048;
+            if (!GpuMemoryBudget.TryGetSpareBytes(_backend, out long spare))
+                return desired;
+            // Peak live activation of one fused-verify chunk, per token: the
+            // gate+up pair dominates (2 x intermediate), plus the hidden-sized
+            // residual/attention intermediates the allocator keeps alive
+            // alongside it. Deliberately a slight over-estimate — erring wide
+            // costs a little prefill throughput, erring narrow costs eviction.
+            long bytesPerToken = 4L * (2L * Config.IntermediateSize + 8L * Config.HiddenSize);
+            return GpuMemoryBudget.FitTokens(spare, bytesPerToken, desired, minTokens: 1024, granularity: 512);
         }
 
         // Gates the whole-model fused prefill path (TSGgml_Qwen35ModelVerify, one

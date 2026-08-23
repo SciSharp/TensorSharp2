@@ -767,6 +767,16 @@ namespace TensorSharp.Server.Hosting
                     changed = true;
                     continue;
                 }
+                // Wan 2.2 A14B ships as a PAIR of expert GGUFs and needs both. They are
+                // auto-resolved by name when they sit together, but a config file has to
+                // be able to name the second one explicitly — that is the only way its
+                // auto-download entry can exist at all.
+                if (TryReadOption(args, ref i, "--wan-dit2", out string wanDit2Opt))
+                {
+                    SetQwenImageCompanionEnv("--wan-dit2", "TS_WAN_DIT2", wanDit2Opt);
+                    changed = true;
+                    continue;
+                }
                 // Fixed output size for every edit (bypasses the auto VRAM area clamp, but is still
                 // capped at the hardware memory ceiling so an oversized request can't OOM into
                 // garbage). Read by QwenImagePipeline as TS_QWEN_IMAGE_WIDTH/HEIGHT. Per-request
@@ -1162,6 +1172,15 @@ namespace TensorSharp.Server.Hosting
                 {
                     continue;
                 }
+                // Wan video companions, consumed by the same earlier pass. They were
+                // missing here, so `--wan-vae`/`--wan-te` — both documented in --help —
+                // reached the unknown-flag trap below and the server refused to start.
+                if (TryReadOption(args, ref i, "--wan-vae", out _)
+                    || TryReadOption(args, ref i, "--wan-te", out _)
+                    || TryReadOption(args, ref i, "--wan-dit2", out _))
+                {
+                    continue;
+                }
                 if (string.Equals(args[i], "--offload-cpu", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;   // consumed by ApplyQwenImageCompanionCliFlags (boolean flag)
@@ -1208,6 +1227,7 @@ namespace TensorSharp.Server.Hosting
                 "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
                 "--draft-model",
                 "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
+                "--wan-vae", "--wan-te", "--wan-dit2",
                 "--offload-cpu",
                 "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",
                 "--tp", "--tp-node-id", "--tp-peers",

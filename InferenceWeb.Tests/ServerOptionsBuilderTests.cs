@@ -470,6 +470,7 @@ public class ServerOptionsBuilderTests : IDisposable
             "--continuous-batching", "--prefill-chunk-size",
             "--mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model", "--draft-model",
             "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
+            "--wan-vae", "--wan-te", "--wan-dit2",
             "--offload-cpu",
             "--n-cpu-moe", "--cpu-moe", "--cpu-moe-threads",
             "--config",
@@ -480,6 +481,47 @@ public class ServerOptionsBuilderTests : IDisposable
 
         Assert.Contains("Default:", usage);
         Assert.Contains("Example:", usage);
+    }
+
+    // ---- Wan video companion flags ----
+    // These are applied by an earlier pass that READS but does not REMOVE them, so
+    // the later validation pass has to recognise them too. It did not: --wan-vae and
+    // --wan-te were both documented on the usage page and both made the server refuse
+    // to start with "Unknown option '--wan-vae'". A --config file naming those keys
+    // was therefore unusable, which is exactly what the Wan video configs need.
+
+    [Theory]
+    [InlineData("--wan-vae")]
+    [InlineData("--wan-te")]
+    [InlineData("--wan-dit2")]
+    public void Build_WanCompanionFlags_AreAccepted(string flag)
+    {
+        string path = Path.Combine(_baseDir, "companion.bin");
+        File.WriteAllBytes(path, new byte[] { 1, 2, 3, 4 });
+        string env = flag switch
+        {
+            "--wan-vae" => "TS_WAN_VAE",
+            "--wan-te" => "TS_WAN_TE",
+            _ => "TS_WAN_DIT2",
+        };
+        string? saved = Environment.GetEnvironmentVariable(env);
+        try
+        {
+            string[] args = { flag, path };
+
+            // Pass 1 (what Program.cs runs first): the flag's whole job is to reach
+            // the model loader as an env override.
+            Assert.True(ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args));
+            Assert.Equal(path, Environment.GetEnvironmentVariable(env));
+
+            // Pass 2: that pass READS the flag but leaves it in argv, so the option
+            // parser has to tolerate it. This is the half that was broken.
+            Assert.NotNull(ServerOptionsBuilder.Build(args, _baseDir));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(env, saved);
+        }
     }
 
     // ---- MoE CPU offload (--n-cpu-moe / --cpu-moe) ----

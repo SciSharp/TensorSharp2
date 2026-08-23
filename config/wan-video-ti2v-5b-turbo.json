@@ -1,0 +1,58 @@
+{
+  // Wan 2.2 TI2V-5B Turbo — text-to-video AND image-to-video, 720p, 5 seconds.
+  //
+  // THREE networks cooperate per generation and all three auto-download here:
+  //   1. the DiT           (--model)     the denoiser; "Turbo" = step-distilled
+  //   2. the Wan 2.2 VAE   (--wan-vae)   pixels <-> the 48-channel video latent
+  //   3. UMT5-XXL          (--wan-te)    the text encoder
+  // They are loaded one stage at a time and each is released before the next, so
+  // peak VRAM is max(text encoder, DiT + attention, VAE) rather than their sum.
+  //
+  //   TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+  //   TensorSharp.Cli    --config config/wan-video-ti2v-5b-turbo.json \
+  //                      --prompt "a red fox trotting through falling snow" --output fox.mp4
+  //
+  // Turbo is step-DISTILLED: TensorSharp detects that from the file name and
+  // switches to 4 steps with guidance off, which is ~25x fewer DiT passes than the
+  // 50-step base recipe. Do not pass --diffusion-steps/--cfg unless you mean to
+  // override that. See config/wan-video-ti2v-5b.json for the undistilled model.
+  //
+  // Downloads ~9.5 GB total (DiT 5.4 GB + text encoder 6.0 GB is the bulk; the
+  // Q4_0 DiT is ~3.0 GB if you prefer it — swap the file name in both lines).
+  "variables": {
+    // Where the model files live. Portable by design: override the location with
+    // the TENSORSHARP_MODELS environment variable, otherwise this resolves to a
+    // "models" folder next to the repository (relative paths in a config are
+    // resolved against the config file, so no drive letter is baked in and the
+    // same file works on Windows, Linux and macOS).
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "hf": "https://huggingface.co"
+  },
+
+  "backend": "ggml_cuda",
+
+  // 121 frames at 24 fps = 5.04 s. The frame count is snapped to 4k+1. Fewer
+  // frames is the single cheapest quality-neutral saving: 61 frames roughly
+  // quarters the attention work and halves the VAE decode.
+  "video-frames": 121,
+  "fps": 24,
+
+  "model": {
+    "path": "${modelRoot}/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf",
+    "urls": [ "${hf}/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF/resolve/main/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf" ]
+  },
+
+  // The Wan 2.2 VAE (48-channel, 16x16x4 compression). TI2V-5B needs THIS one —
+  // the Wan 2.1 VAE is a different latent space and will not load in its place.
+  "wan-vae": {
+    "path": "${modelRoot}/Wan2.2_VAE.safetensors",
+    "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/VAE/Wan2.2_VAE.safetensors" ]
+  },
+
+  // Shared by every Wan model (2.1 and 2.2 alike), so it is downloaded once and
+  // reused by the other Wan configs in this folder.
+  "wan-te": {
+    "path": "${modelRoot}/umt5-xxl-encoder-Q8_0.gguf",
+    "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q8_0.gguf" ]
+  }
+}

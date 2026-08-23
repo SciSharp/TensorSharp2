@@ -34,6 +34,43 @@ VRAM is roughly `max(TE, DiT + attention, VAE)` — TI2V-5B Q8_0 generates
 81-frame 480p image-to-video on a 16 GB GPU in under 8 minutes, and both A14B
 Q4_K_M experts run sequentially on the same card.
 
+### Quickest way to get all of them: a config file
+
+Because several files have to line up, the ready-made configs in
+[`config/`](../../config/README.md#video-generation-wan) name every network and
+download whatever is missing on the first run:
+
+```bash
+# Text-to-video AND image-to-video, 4-step distilled (~9.5 GB on first run).
+TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+
+TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
+  --prompt "a red fox trotting through falling snow" --output fox.mp4
+
+# Image-to-video: the image becomes frame 0, the prompt drives the motion.
+TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
+  --image first_frame.png --prompt "she turns and smiles" --output clip.mp4
+```
+
+| Config | DiT | VAE | Text encoder | Modes | First-run download |
+|---|---|---|---|---|---|
+| `wan-video-ti2v-5b-turbo.json` | TI2V-5B Turbo (4-step) | Wan 2.2 | UMT5-XXL | T2V + I2V | ~9.5 GB |
+| `wan-video-ti2v-5b.json` | TI2V-5B (50-step) | Wan 2.2 | UMT5-XXL | T2V + I2V | ~11.4 GB |
+| `wan-video-i2v-a14b.json` | A14B high **+** low noise | Wan 2.1 | UMT5-XXL | I2V only | ~24 GB |
+
+The models are stored wherever `TENSORSHARP_MODELS` points, or in a `models/`
+folder next to the repository when it is unset — the configs contain no absolute
+paths, so the same file works on Windows, Linux and macOS.
+
+**The two VAEs are not interchangeable**: TI2V-5B needs the Wan 2.2 VAE
+(48-channel latent, 16×16×4), while A14B and the Wan 2.1 models need the Wan 2.1
+VAE (16-channel, 8×8×4). Loading the wrong one fails at startup rather than
+producing bad video. UMT5-XXL is shared by all of them, so it downloads once.
+
+To point at files you already have, use `--wan-vae`, `--wan-te` and (for A14B)
+`--wan-dit2`, or drop everything in one folder next to the DiT and let the
+same-directory scan find it.
+
 ## Backends
 
 Video generation runs on every TensorSharp backend except MLX (`--backend mlx`

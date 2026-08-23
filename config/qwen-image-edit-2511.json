@@ -12,7 +12,7 @@
   // --cfg, --diffusion-seed, --width, --height. With the Lightning LoRA merged
   // the sampler auto-selects its fast few-step schedule.
   "variables": {
-    "modelRoot": "/Users/zhongkaifu/work/models/Qwen"
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },
 
   "backend": "ggml_metal",

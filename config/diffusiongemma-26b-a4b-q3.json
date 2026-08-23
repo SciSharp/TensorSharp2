@@ -5,7 +5,7 @@
   //   TensorSharp.Cli --config config/diffusiongemma-26b-a4b-q3.json --input prompt.txt \
   //     --diffusion-steps 48 --diffusion-seed 0 --max-tokens 256
   "variables": {
-    "root": "C:/Works/models/q3"
+    "root": "${TENSORSHARP_MODELS:-../models}/q3"
   },
 
   "backend": "ggml_cuda",

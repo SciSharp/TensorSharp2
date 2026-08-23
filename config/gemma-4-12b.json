@@ -6,7 +6,7 @@
   //   TensorSharp.Cli    --config config/gemma-4-12b.json --image photo.png
   //   TensorSharp.Server --config config/gemma-4-12b.json
   "variables": {
-    "root": "C:/Works/models/gemma_mtp/qat"
+    "root": "${TENSORSHARP_MODELS:-../models}/gemma_mtp/qat"
   },
 
   "backend": "ggml_cuda",

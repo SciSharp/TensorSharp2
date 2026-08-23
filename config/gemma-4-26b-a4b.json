@@ -5,7 +5,7 @@
   //   TensorSharp.Cli    --config config/gemma-4-26b-a4b.json --image photo.png
   //   TensorSharp.Server --config config/gemma-4-26b-a4b.json
   "variables": {
-    "modelRoot": "C:/Works/models"
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },
 
   "backend": "ggml_cuda",

@@ -185,8 +185,15 @@ namespace
         ggml_tensor* k_cache_cpy = ggml_cpy(ctx, k_write, k_dst);
         ggml_tensor* v_cache_cpy = ggml_cpy(ctx, v_write, v_dst);
 
-        ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen, kv_cache_type);
-        ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen, kv_cache_type);
+        // The GQA narrowing in kv_window_needs_cuda_flash_attn_copy: with a mask
+        // and max_bias == 0 (both hold for the flash_attn_ext below) ggml-cuda
+        // cannot reach the truncated-view-misreading VEC kernel on this shape, so
+        // the window does not have to be materialised. Only pass the ratio when a
+        // mask is actually present — that is the helper's caller contract.
+        const int fattn_gqa_ratio =
+            (attn_mask != nullptr && num_kv_heads > 0) ? num_heads / num_kv_heads : 0;
+        ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen, kv_cache_type, 1, fattn_gqa_ratio);
+        ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen, kv_cache_type, 1, fattn_gqa_ratio);
         if (k_full == nullptr || v_full == nullptr)
         {
             set_last_error("Failed to create KV cache views for Qwen3.5 attention layer decode.");
@@ -1258,8 +1265,19 @@ namespace
                     }
                     mask_for_attn = t.attn_mask;
                 }
-                ggml_tensor* k_full = view_kv_cache_window(ctx, t.k_cache_base, head_dim, cache_size, num_kv_heads, 0, attnKvLen, kv_cache_type);
-                ggml_tensor* v_full = view_kv_cache_window(ctx, t.v_cache_base, head_dim, cache_size, num_kv_heads, 0, attnKvLen, kv_cache_type);
+                // See the same computation in TSGgml_Qwen35AttentionLayerDecode:
+                // with a mask present the flash-attn op below cannot land on the
+                // VEC kernel that misreads a truncated window, so the window stays
+                // a view instead of being copied into the persistent graph buffer
+                // (32 window-sized copies per token, and the same again pinned in
+                // the graph's buffer — 335 MB at 5K context on this model).
+                // use_non_flash_attn hands the window to a cpy chain instead, which
+                // is stride-correct on its own; the CUDA-only predicate is already
+                // inert on the backends that take that path.
+                const int fattn_gqa_ratio =
+                    (mask_for_attn != nullptr && num_kv_heads > 0) ? num_heads / num_kv_heads : 0;
+                ggml_tensor* k_full = view_kv_cache_window(ctx, t.k_cache_base, head_dim, cache_size, num_kv_heads, 0, attnKvLen, kv_cache_type, 1, fattn_gqa_ratio);
+                ggml_tensor* v_full = view_kv_cache_window(ctx, t.v_cache_base, head_dim, cache_size, num_kv_heads, 0, attnKvLen, kv_cache_type, 1, fattn_gqa_ratio);
                 if (k_full == nullptr || v_full == nullptr)
                 {
                     set_last_error("Qwen3.5 model decode: failed to build KV cache views.");
@@ -1875,6 +1893,7 @@ namespace
             // Stable unique slots are faster than lifetime-packed scratch for
             // this replayed Metal graph and retain capture-safe addresses on
             // CUDA/Vulkan.
+            vram_log_ctx_breakdown("q35-decode-persist", ctx, 12);
             persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (persist_buf == nullptr)
             {
@@ -2855,6 +2874,7 @@ namespace
         ggml_backend_buffer_t persist_buf = nullptr;
         if (persist)
         {
+            vram_log_ctx_breakdown("q35-batched-decode-persist", ctx, 12);
             persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (persist_buf == nullptr)
             {

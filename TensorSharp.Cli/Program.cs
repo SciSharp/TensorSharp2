@@ -218,6 +218,7 @@ namespace TensorSharp.Cli
             string negativePrompt = null;
             string wanVaePath = null;
             string wanTePath = null;
+            string wanDit2Path = null;
             string draftModelPath = null;
             int specDraftMax = 0;
             float specDraftConfMin = -1f;
@@ -251,6 +252,7 @@ namespace TensorSharp.Cli
                     case "--negative-prompt": negativePrompt = args[++i]; break;
                     case "--wan-vae": wanVaePath = args[++i]; break;
                     case "--wan-te": wanTePath = args[++i]; break;
+                    case "--wan-dit2": wanDit2Path = args[++i]; break;
                     case "--offload-cpu": offloadCpu = true; break;
                     case "--audio": audioPath = args[++i]; break;
                     case "--video": videoPath = args[++i]; break;
@@ -509,6 +511,7 @@ namespace TensorSharp.Cli
             // Wan T2V: companion overrides (same env-var mechanism WanVideoModel reads).
             ApplyQwenImageCompanionOverride("--wan-vae", "TS_WAN_VAE", wanVaePath);
             ApplyQwenImageCompanionOverride("--wan-te", "TS_WAN_TE", wanTePath);
+            ApplyQwenImageCompanionOverride("--wan-dit2", "TS_WAN_DIT2", wanDit2Path);
 
             if (MoeCpuOffloadConfig.IsEnabled)
             {

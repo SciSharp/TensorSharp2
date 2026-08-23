@@ -10,7 +10,7 @@
   // are reused afterward. This is the standard -it build; point "path" at your
   // own file to host a different variant.
   "variables": {
-    "modelRoot": "C:/models",
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "repo": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main"
   },
 

@@ -34,6 +34,41 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 可在 16 GB GPU 上不到 8 分钟生成 81 帧 480p 图生视频；两个 A14B Q4_K_M 专家
 可在同一张卡上顺序运行。
 
+### 最快的上手方式：使用配置文件
+
+视频生成需要多个网络协同，因此最省事的做法是使用
+[`config/`](../../config/README.md#video-generation-wan) 中现成的配置文件——
+它们会声明全部网络，并在首次运行时自动下载缺失的文件：
+
+```bash
+# 文生视频 + 图生视频，4 步蒸馏（首次运行约下载 9.5 GB）
+TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+
+TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
+  --prompt "a red fox trotting through falling snow" --output fox.mp4
+
+# 图生视频：图片成为首帧，提示词控制动作
+TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
+  --image first_frame.png --prompt "she turns and smiles" --output clip.mp4
+```
+
+| 配置文件 | DiT | VAE | 文本编码器 | 支持模式 | 首次下载 |
+|---|---|---|---|---|---|
+| `wan-video-ti2v-5b-turbo.json` | TI2V-5B Turbo（4 步） | Wan 2.2 | UMT5-XXL | 文生 + 图生 | 约 9.5 GB |
+| `wan-video-ti2v-5b.json` | TI2V-5B（50 步） | Wan 2.2 | UMT5-XXL | 文生 + 图生 | 约 11.4 GB |
+| `wan-video-i2v-a14b.json` | A14B 高噪 **+** 低噪 | Wan 2.1 | UMT5-XXL | 仅图生 | 约 24 GB |
+
+模型存放位置由 `TENSORSHARP_MODELS` 环境变量决定；未设置时存放在仓库同级的
+`models/` 目录。配置文件中不含任何绝对路径，因此同一个文件在 Windows、Linux 与
+macOS 上都能直接使用，无需修改。
+
+**两个 VAE 不可互换**：TI2V-5B 需要 Wan 2.2 VAE（48 通道潜空间，16×16×4 压缩），
+而 A14B 与 Wan 2.1 系列需要 Wan 2.1 VAE（16 通道，8×8×4）。装错会在启动时报错，
+而不是生成错误的视频。UMT5-XXL 为所有 Wan 模型共用，只需下载一次。
+
+若要指向已有文件，使用 `--wan-vae`、`--wan-te`，以及（A14B）`--wan-dit2`；
+或把它们与 DiT 放在同一目录，由同目录扫描自动找到。
+
 ## 后端
 
 除 MLX 外，视频生成在 TensorSharp 的每个后端上都可运行（`--backend mlx` 会在

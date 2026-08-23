@@ -757,6 +757,15 @@ namespace TensorSharp.Models
         protected virtual int NativeCudaPrefillWarmupLength => 32;
 
         /// <summary>
+        /// Width of one ForwardRefill chunk on the GGML GPU backends, for models
+        /// that size it themselves (see Qwen35Model.ResolvePrefillChunkSize).
+        /// The startup prefill warmup uses it so the shared reuse-gallocr is grown
+        /// to exactly the shape real requests build and no wider. 0 = the model has
+        /// no opinion and the architecture default stands.
+        /// </summary>
+        protected virtual int GgmlPrefillChunkWarmupLength => 0;
+
+        /// <summary>
         /// Additional input tokens a model needs beyond its target prefill rows.
         /// For example, a refill implementation may reserve one final token for
         /// the logits-producing decode pass. Applied after the startup-cost cap;
@@ -777,14 +786,24 @@ namespace TensorSharp.Models
                 _backend,
                 requestedContextLength,
                 gpuDefault,
-                NativeCudaInitialCacheAllocationLength);
+                NativeCudaInitialCacheAllocationLength,
+                KvCacheBytesPerToken);
         }
+
+        /// <summary>
+        /// Device bytes one token of KV cache costs across every attention layer
+        /// (K and V together). Lets the initial allocation be capped against free
+        /// VRAM instead of a fixed token count. 0 = unknown, which keeps the fixed
+        /// default and today's behaviour exactly.
+        /// </summary>
+        protected virtual long KvCacheBytesPerToken => 0;
 
         internal static int ResolveInitialCacheAllocationLength(
             BackendType backend,
             int requestedContextLength,
             int gpuDefault = 8192,
-            int nativeCudaDefault = 2048)
+            int nativeCudaDefault = 2048,
+            long kvBytesPerToken = 0)
         {
             // GPU backends can be sensitive to allocating a multi-gigabyte KV
             // cache up-front when the model advertises a 256K+ context window. Cap the initial
@@ -827,6 +846,21 @@ namespace TensorSharp.Models
                     BackendType.GgmlMetal => Math.Min(gpuDefault, 2048),
                     _ => gpuDefault,
                 };
+                // Same reasoning as the GgmlMetal cap above, for the same reason —
+                // it is just that on WDDM the driver pages the excess out to host
+                // RAM instead of purging wired buffers. A fixed 8192 is fine on a
+                // card with room and ruinous on one where the weights already fill
+                // it, so cap it against what is actually free once the model is
+                // resident (this runs after weight upload). The cache still grows on
+                // demand, and MAX_CONTEXT still reserves the full window up front.
+                if (kvBytesPerToken > 0 &&
+                    GpuMemoryBudget.TryGetSpareBytes(backend, out long spare))
+                {
+                    // At most half the spare goes to KV: the rest has to cover the
+                    // prefill and decode graph scratch, which is sized separately.
+                    effectiveDefault = GpuMemoryBudget.FitTokens(
+                        spare / 2, kvBytesPerToken, effectiveDefault, minTokens: 2048, granularity: 1024);
+                }
                 return Math.Min(requestedContextLength, effectiveDefault);
             }
 
@@ -5679,6 +5713,17 @@ namespace TensorSharp.Models
                     NativeCudaPrefillWarmupLength,
                     explicitWarmupLengthValue);
                 bool explicitWarmupLength = explicitWarmupLengthValue.HasValue;
+                // The point of the multi-token warmup is to pre-grow the shared
+                // reuse-gallocr to the shape real requests will use, so a model
+                // whose chunk width is narrower than the 2048 default must warm at
+                // ITS width — warming wider grows that allocator to a size nothing
+                // afterwards needs and hands the VRAM back to nobody.
+                if (!explicitWarmupLength && !conservativeWarmup)
+                {
+                    int chunkWidth = GgmlPrefillChunkWarmupLength;
+                    if (chunkWidth >= 2 && chunkWidth < warmupLength)
+                        warmupLength = chunkWidth;
+                }
                 int warmupTokenOverhead =
                     _backend == BackendType.Cuda && !conservativeWarmup
                         ? NativeCudaPrefillWarmupTokenOverhead

@@ -219,6 +219,21 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
 
 **Wan video generation** — prompt (+ optional first-frame image) → H.264 MP4; needs the DiT + video VAE + UMT5-XXL text encoder ([hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF))
 
+Video is the one pipeline that needs three separate networks, so the shortest route is a
+ready-made config — it names all three and downloads whatever is missing:
+
+```bash
+TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+TensorSharp.Cli    --config config/wan-video-ti2v-5b-turbo.json \
+    --prompt "a cute fluffy orange cat walking through a sunny garden" --output cat.mp4
+```
+
+`config/wan-video-ti2v-5b.json` is the undistilled 50-step variant and
+`config/wan-video-i2v-a14b.json` the two-expert 14B image-to-video model; see
+[config/README.md](config/README.md#video-generation-wan). Files land wherever
+`TENSORSHARP_MODELS` points, or in `models/` next to the repository. The manual
+route is below.
+
 ```bash
 # The step-distilled Turbo DiT: 4 denoise passes instead of 100, detected from the file name.
 # Note the Wan2_2 underscore in the Turbo file name; the VAE and encoder come from the base repos.
