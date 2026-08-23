@@ -24,6 +24,7 @@ project.fragment.lock.json
 artifacts/
 TensorSharp.GGML.Native/build/
 TensorSharp.GGML.Native/build-windows/
+TensorSharp.GGML.Native/build-ios/
 
 # mlx-c/mlx are fetched and built at build time by
 # TensorSharp.Backends.MLX/build-native-macos.sh; neither the build tree nor the

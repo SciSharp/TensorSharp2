@@ -33,6 +33,12 @@ function Test-Truthy([string] $Value) {
 }
 
 function Invoke-CMakeDefanged([string] $FailureMessage, [string[]] $Arguments) {
+    # Resolved per call (rather than once at script scope) because the only
+    # caller sits behind a Test-Path guard - a toolchain that is already
+    # provisioned must not need a cmake at all. Throws with install instructions
+    # when there is none; see issue #166.
+    $cmakeProgram = Get-RequiredCMakeProgram $VisualStudio
+
     # This script usually runs inside an MSBuild Exec task, whose logger scans
     # every output line for the canonical MSBuild error/warning format and fails
     # the managed build when one matches - even when the caller catches the
@@ -42,7 +48,7 @@ function Invoke-CMakeDefanged([string] $FailureMessage, [string[]] $Arguments) {
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $output = & cmake @Arguments 2>&1
+        $output = & $cmakeProgram @Arguments 2>&1
     }
     finally {
         $ErrorActionPreference = $previousPreference

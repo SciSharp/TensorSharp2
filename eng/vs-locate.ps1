@@ -35,14 +35,35 @@ function Get-VisualStudioGeneratorName([string] $Version) {
     }
 }
 
+function Get-VisualStudioMajorFromDirectoryName([string] $Name) {
+    # The installer's directory under "Microsoft Visual Studio" is the release
+    # *year* through VS 2022 ("2019", "2022") but the *major version* from
+    # VS 2026 on ("18" - the layout discussion #130's reporter pasted:
+    # "C:\Program Files\Microsoft Visual Studio\18\Community"). Normalise both
+    # shapes to the major version so callers can compare and sort them uniformly.
+    # Returns 0 when the name is neither.
+    switch ("$Name".Trim()) {
+        "2017" { return 15 }
+        "2019" { return 16 }
+        "2022" { return 17 }
+        "2026" { return 18 }
+    }
+
+    if ("$Name".Trim() -match '^\d{1,3}$') {
+        return [int] $Name
+    }
+
+    return 0
+}
+
 function Get-VisualStudioVersionFromPath([string] $Path) {
-    # The filesystem probe has no version metadata, only the release-year
-    # directory ("...\Microsoft Visual Studio\2022\Community").
-    if ("$Path" -match '\\Microsoft Visual Studio\\(\d{4})\\') {
-        switch ($Matches[1]) {
-            "2019" { return "16.0" }
-            "2022" { return "17.0" }
-            "2026" { return "18.0" }
+    # The filesystem probe has no version metadata, only the installer's
+    # directory name ("...\Microsoft Visual Studio\2022\Community",
+    # "...\Microsoft Visual Studio\18\Community").
+    if ("$Path" -match '\\Microsoft Visual Studio\\([^\\]+)\\') {
+        $major = Get-VisualStudioMajorFromDirectoryName $Matches[1]
+        if ($major -gt 0) {
+            return "$major.0"
         }
     }
 
@@ -124,10 +145,13 @@ function Find-VisualStudioViaFilesystem {
             continue
         }
 
-        $yearDirs = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^\d{4}$' } |
-            Sort-Object -Property Name -Descending
-        foreach ($yearDir in $yearDirs) {
+        # Both directory shapes ("2022" and "18") normalise to a major version,
+        # so newest-first sorting keeps working across the VS 2026 rename - a
+        # plain string sort would rank "2022" above "18".
+        $versionDirs = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { (Get-VisualStudioMajorFromDirectoryName $_.Name) -gt 0 } |
+            Sort-Object -Property @{ Expression = { Get-VisualStudioMajorFromDirectoryName $_.Name } } -Descending
+        foreach ($yearDir in $versionDirs) {
             # Any edition will do (Community/Professional/Enterprise/BuildTools);
             # they all ship the same vcvars64.bat and MSVC toolset.
             $editionDirs = Get-ChildItem -Path $yearDir.FullName -Directory -ErrorAction SilentlyContinue
@@ -162,6 +186,97 @@ function Get-VisualStudioInstallation {
     return Find-VisualStudioViaFilesystem
 }
 
+# Resolve the cmake to drive the native build.
+#
+# CMake is a hard prerequisite that nothing here installs, and the failure mode
+# when it is missing is a bare "cmake : The term 'cmake' is not recognized ..."
+# from whichever script reached it first - issue #166, where the reporter had to
+# work out for themselves that CMake was what they were missing. Prefer a cmake
+# on PATH; otherwise fall back to the one Visual Studio's "C++ CMake tools for
+# Windows" component ships (the same component that provides the ninja found by
+# Find-NinjaProgram), which is how a VS-only machine has a working CMake without
+# ever installing one. Returns "" when neither exists, so callers can fail with
+# an actionable message.
+function Find-CMakeProgram([object] $VisualStudio) {
+    $onPath = Get-Command cmake.exe -ErrorAction SilentlyContinue
+    if ($null -ne $onPath) {
+        return $onPath.Source
+    }
+
+    if ($null -ne $VisualStudio) {
+        $bundled = Join-Path $VisualStudio.Path "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+        if (Test-Path $bundled) {
+            return $bundled
+        }
+    }
+
+    return ""
+}
+
+# Find-CMakeProgram, or throw with an actionable message when there is no cmake.
+function Get-RequiredCMakeProgram([object] $VisualStudio) {
+    $cmakeProgram = Find-CMakeProgram $VisualStudio
+    if ([string]::IsNullOrWhiteSpace($cmakeProgram)) {
+        throw ("CMake was not found. The native GGML library is configured and built with CMake 3.20+, " +
+            "which is a prerequisite this build does not install for you. Install it from " +
+            "https://cmake.org/download/ (tick 'Add CMake to the system PATH'), or add the " +
+            "'C++ CMake tools for Windows' component to Visual Studio - it ships both cmake.exe and " +
+            "ninja.exe and this script will find that copy without any PATH changes.")
+    }
+
+    return $cmakeProgram
+}
+
+# Report the target architecture ("x86" / "x64" / "arm64") of the MSVC developer
+# environment already active in this process, or "" when none is active or it
+# cannot be determined.
+#
+# Only an *x64* environment is usable here, and "is VCToolsInstallDir set?" is
+# not enough to tell: the "Developer PowerShell for VS" and "Developer Command
+# Prompt" shortcuts default to the **x86** toolset and set VCToolsInstallDir
+# exactly like the "x64 Native Tools" prompt does. Inheriting that x86
+# environment builds the whole native library 32-bit, which fails deep inside
+# ggml's Vulkan backend rather than at configure time: a 32-bit target leaves
+# VK_USE_64_BIT_PTR_DEFINES at 0, so vulkan.hpp makes every handle's conversion
+# operator `explicit` (VULKAN_HPP_TYPESAFE_EXPLICIT) and ordinary uses of
+# vk::Buffer stop compiling - "no operator found which takes a left-hand operand
+# of type 'std::basic_ostream'", "'vk::CommandBuffer::copyBuffer': no matching
+# overloaded function". See https://github.com/zhongkaifu/TensorSharp/discussions/130
+function Get-ActiveVcTargetArchitecture {
+    # VsDevCmd.bat records the target it set up here, so this is authoritative
+    # for every environment that came from a VS prompt or from vcvars - including
+    # one Import-VcVarsEnvironment just applied. It is also read straight from
+    # the process environment, which keeps it correct immediately after an
+    # import, whereas a PATH-based probe depends on PowerShell's command cache
+    # having noticed the new PATH.
+    #
+    # `Platform` is deliberately not consulted: Import-VcVarsEnvironment drops it
+    # (see below), so it is absent even after a perfectly good x64 import.
+    if (-not [string]::IsNullOrWhiteSpace($env:VSCMD_ARG_TGT_ARCH)) {
+        return "$env:VSCMD_ARG_TGT_ARCH".Trim().ToLowerInvariant()
+    }
+
+    # Fallbacks for an MSVC environment assembled by something other than
+    # VsDevCmd (a CI action that exports only part of the environment, a
+    # hand-rolled setup). The toolset lays its compilers out under
+    # bin\Host<host>\<target>, so the first such directory on PATH is the one a
+    # compiler-driven generator (Ninja, NMake) would pick cl.exe from. Matching
+    # PATH directly rather than resolving cl.exe keeps this correct even when
+    # PowerShell's command cache has not yet noticed a PATH change.
+    foreach ($entry in ("$env:PATH" -split ';')) {
+        if ("$entry" -match '\\bin\\Host[^\\]+\\([^\\]+)\\?$') {
+            return $Matches[1].ToLowerInvariant()
+        }
+    }
+
+    $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+    if ($null -ne $cl -and "$($cl.Source)" -match '\\Host[^\\]+\\([^\\]+)\\cl\.exe$') {
+        return $Matches[1].ToLowerInvariant()
+    }
+
+    return ""
+}
+
 # Import the MSVC command-line environment (PATH/INCLUDE/LIB/LIBPATH) into the
 # current process, the way an "x64 Native Tools" prompt does. Generators that
 # invoke the compilers directly (Ninja, NMake) need it; the Visual Studio
@@ -170,13 +285,39 @@ function Get-VisualStudioInstallation {
 # The variables land in this PowerShell process only, so an MSBuild that shelled
 # out to this script never sees them.
 function Import-VcVarsEnvironment([string] $VcVarsPath) {
+    $activeArch = Get-ActiveVcTargetArchitecture
     if (-not [string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
-        Write-Host "MSVC environment already active (VCToolsInstallDir=$env:VCToolsInstallDir); not importing vcvars."
-        return
+        if ($activeArch -eq "x64") {
+            Write-Host "MSVC x64 environment already active (VCToolsInstallDir=$env:VCToolsInstallDir); not importing vcvars."
+            return
+        }
+
+        if ([string]::IsNullOrWhiteSpace($activeArch)) {
+            # A toolset is active but nothing identifies its target. Leave it
+            # alone: importing would silently retarget a deliberately configured
+            # environment - CI pins an older toolset with
+            # `ilammy/msvc-dev-cmd@v1 toolset: "14.44"` because CUDA 12.6 rejects
+            # VS 2026's default 14.5x, and re-running vcvars64 would drag it back
+            # to the default. Warn instead, so a genuinely 32-bit environment
+            # still leaves a trace to explain a later failure.
+            Write-Warning ("An MSVC environment is active (VCToolsInstallDir=$env:VCToolsInstallDir) but its target " +
+                "architecture could not be determined; assuming x64 and using it as-is. This native build is " +
+                "x64-only - if the compile fails inside ggml's Vulkan backend, re-run from a plain PowerShell so " +
+                "this script can set up the x64 environment itself.")
+            return
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace($VcVarsPath) -or -not (Test-Path $VcVarsPath)) {
         throw "vcvars64.bat not found at '$VcVarsPath'."
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
+        # Active and definitely not x64 - import the x64 environment over it
+        # instead of silently producing a 32-bit build.
+        Write-Host ("MSVC environment already active but targets '$activeArch', not x64 " +
+            "(the 'Developer PowerShell for VS' and 'Developer Command Prompt' shortcuts default to x86); " +
+            "importing the x64 environment over it - this native build is x64-only.")
     }
 
     Write-Host "Importing MSVC environment from $VcVarsPath"
@@ -191,10 +332,31 @@ function Import-VcVarsEnvironment([string] $VcVarsPath) {
         $env:PATH = "$installerDir;$env:PATH"
     }
 
+    # vcvars is not re-entrant: VsDevCmd.bat keys off VSCMD_VER and declines to
+    # initialise a second time in a shell that already carries a developer
+    # environment. The child cmd.exe below inherits this process's variables, so
+    # when we are importing x64 *over* an active x86 environment that guard would
+    # make the import a silent no-op and leave the 32-bit toolset in place.
+    # Clear that state for the child only, and with it the stale x86
+    # INCLUDE/LIB/LIBPATH search paths that vcvars would otherwise append to.
+    #
+    # `set "VAR="` (quoted) is the form that really unsets: `set VAR=` before an
+    # `&` separator captures the space and leaves VAR set to " ", which still
+    # trips `if defined`. PATH is deliberately left alone - vcvars *prepends* its
+    # x64 tool directories, so they win over any x86 ones already there, and
+    # rewriting it here would drop the Installer directory prepended above.
+    $childState = @(
+        "VSCMD_VER", "VSCMD_ARG_HOST_ARCH", "VSCMD_ARG_TGT_ARCH", "VSCMD_ARG_APP_PLAT",
+        "__VSCMD_PREINIT_PATH", "VCToolsInstallDir", "VCToolsVersion", "VCINSTALLDIR",
+        "INCLUDE", "LIB", "LIBPATH"
+    ) | ForEach-Object { "set `"$_=`"" }
+
     try {
-        # cmd /s /c "<quoted bat> && set": /s makes cmd strip only the outermost
-        # quote pair, which keeps the quoted path (spaces) intact.
-        $lines = & cmd.exe /s /c "`"$VcVarsPath`" && set"
+        # cmd /s /c "<resets> & <quoted bat> && set": /s makes cmd strip only the
+        # outermost quote pair, which keeps the quoted path (spaces) intact. `&`
+        # binds looser than `&&`, so the resets run unconditionally and `set` still
+        # runs only if vcvars succeeded - keeping the exit code checked below.
+        $lines = & cmd.exe /s /c "$($childState -join ' & ') & `"$VcVarsPath`" && set"
     }
     finally {
         # vcvars' own PATH (captured in $lines) is applied below; drop the
@@ -227,6 +389,17 @@ function Import-VcVarsEnvironment([string] $VcVarsPath) {
 
     if ($applied -eq 0) {
         throw "vcvars64.bat produced no environment variables."
+    }
+
+    # Confirm the import actually landed an x64 toolset. Without this a surprise
+    # here (a mangled PATH, a vcvars that silently no-opped) degrades into a
+    # 32-bit build whose only symptom is a wall of vulkan.hpp template errors
+    # hundreds of lines into the compile.
+    $importedArch = Get-ActiveVcTargetArchitecture
+    if (-not [string]::IsNullOrWhiteSpace($importedArch) -and $importedArch -ne "x64") {
+        throw ("Imported '$VcVarsPath' but the MSVC environment still targets '$importedArch' rather than x64. " +
+            "This native build is x64-only; run it from a plain PowerShell (not a Developer Prompt) so the " +
+            "script can set up the environment itself, or from an 'x64 Native Tools' prompt.")
     }
 }
 
