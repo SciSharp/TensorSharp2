@@ -786,39 +786,39 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.NotNull(options);
     }
 
-    // ----- MTP speculative-decoding CLI flags -----
+    // ----- speculative-decoding CLI flags -----
 
     [Fact]
-    public void ApplyMtpSpeculativeCliFlags_SpecFlag_EnablesSchedulerSpeculation()
+    public void ApplySpeculativeCliFlags_SpecFlag_EnablesSchedulerSpeculation()
     {
-        _env.Set("TS_MTP_SPEC", null);
-        bool applied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(new[] { "--mtp-spec" });
+        _env.ClearSpeculationVars();
+        bool applied = ServerOptionsBuilder.ApplySpeculativeCliFlags(new[] { "--mtp-spec" });
         Assert.True(applied);
         Assert.Equal("1", Environment.GetEnvironmentVariable("TS_MTP_SPEC"));
-        Assert.True(SchedulerConfig.FromEnvironment().MtpSpeculativeEnabled);
+        Assert.True(SchedulerConfig.FromEnvironment().Speculation.Enabled);
     }
 
     [Fact]
-    public void ApplyMtpSpeculativeCliFlags_NoSpecFlag_DisablesSpeculation()
+    public void ApplySpeculativeCliFlags_NoSpecFlag_DisablesSpeculation()
     {
+        _env.ClearSpeculationVars();
         _env.Set("TS_MTP_SPEC", "1");
-        bool applied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(new[] { "--no-mtp-spec" });
+        bool applied = ServerOptionsBuilder.ApplySpeculativeCliFlags(new[] { "--no-mtp-spec" });
         Assert.True(applied);
         Assert.Equal("0", Environment.GetEnvironmentVariable("TS_MTP_SPEC"));
-        Assert.False(SchedulerConfig.FromEnvironment().MtpSpeculativeEnabled);
+        Assert.False(SchedulerConfig.FromEnvironment().Speculation.Enabled);
     }
 
     [Fact]
-    public void ApplyMtpSpeculativeCliFlags_DraftModel_DoesNotCollideWithDraftCount()
+    public void ApplySpeculativeCliFlags_DraftModel_DoesNotCollideWithDraftCount()
     {
         // --mtp-draft is a prefix of --mtp-draft-model; the parser must route each
         // to its own env var rather than mis-reading the longer flag as the shorter.
-        _env.Set("TS_MTP_DRAFT", null);
-        _env.Set("TS_MTP_DRAFT_MODEL", null);
+        _env.ClearSpeculationVars();
         string draftFile = Path.Combine(_baseDir, "draft.gguf");
         File.WriteAllText(draftFile, "stub");   // the parser validates File.Exists
 
-        bool applied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(new[]
+        bool applied = ServerOptionsBuilder.ApplySpeculativeCliFlags(new[]
         {
             "--mtp-draft", "5",
             "--mtp-draft-model", draftFile,
@@ -827,30 +827,30 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.True(applied);
         Assert.Equal("5", Environment.GetEnvironmentVariable("TS_MTP_DRAFT"));
         Assert.Equal(draftFile, Environment.GetEnvironmentVariable("TS_MTP_DRAFT_MODEL"));
-        Assert.Equal(5, SchedulerConfig.FromEnvironment().MtpMaxDraftTokens);
+        Assert.Equal(5, SchedulerConfig.FromEnvironment().Speculation.MaxDraftTokens);
     }
 
     [Fact]
-    public void ApplyMtpSpeculativeCliFlags_MissingDraftModelFile_ThrowsArgumentException()
+    public void ApplySpeculativeCliFlags_MissingDraftModelFile_ThrowsArgumentException()
     {
         var ex = Assert.Throws<ArgumentException>(() =>
-            ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(
+            ServerOptionsBuilder.ApplySpeculativeCliFlags(
                 new[] { "--mtp-draft-model", Path.Combine(_baseDir, "does-not-exist.gguf") }));
         Assert.Contains("--mtp-draft-model", ex.Message);
     }
 
     [Fact]
-    public void ApplyMtpSpeculativeCliFlags_BlockDraftModel_IsRoutedToItsOwnEnvVar()
+    public void ApplySpeculativeCliFlags_BlockDraftModel_IsRoutedToItsOwnEnvVar()
     {
         // --draft-model (a block drafter handed to the model factory) and
         // --mtp-draft-model (a draft head attached after load) are different
         // mechanisms; each must reach its own consumer.
         _env.Set("TS_DSV4_DSPARK", null);
-        _env.Set("TS_MTP_DRAFT_MODEL", null);
+        _env.ClearSpeculationVars();
         string blockDraft = Path.Combine(_baseDir, "dspark.gguf");
         File.WriteAllText(blockDraft, "stub");
 
-        bool applied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(new[]
+        bool applied = ServerOptionsBuilder.ApplySpeculativeCliFlags(new[]
         {
             "--mtp-spec",
             "--draft-model", blockDraft,
@@ -862,10 +862,10 @@ public class ServerOptionsBuilderTests : IDisposable
     }
 
     [Fact]
-    public void ApplyMtpSpeculativeCliFlags_MissingBlockDraftFile_ThrowsArgumentException()
+    public void ApplySpeculativeCliFlags_MissingBlockDraftFile_ThrowsArgumentException()
     {
         var ex = Assert.Throws<ArgumentException>(() =>
-            ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(
+            ServerOptionsBuilder.ApplySpeculativeCliFlags(
                 new[] { "--draft-model", Path.Combine(_baseDir, "does-not-exist.gguf") }));
         Assert.Contains("--draft-model", ex.Message);
     }
@@ -876,18 +876,18 @@ public class ServerOptionsBuilderTests : IDisposable
         // A per-token head and a block drafter threshold different quantities,
         // so an unset --mtp-pmin must stay unset rather than baking in either
         // one's default.
-        _env.Set("TS_MTP_PMIN", null);
-        Assert.Null(SchedulerConfig.FromEnvironment().MtpMinDraftProb);
+        _env.ClearSpeculationVars();
+        Assert.Null(SchedulerConfig.FromEnvironment().Speculation.MinDraftProb);
 
         _env.Set("TS_MTP_PMIN", "0.5");
-        Assert.Equal(0.5f, SchedulerConfig.FromEnvironment().MtpMinDraftProb);
+        Assert.Equal(0.5f, SchedulerConfig.FromEnvironment().Speculation.MinDraftProb);
     }
 
     [Fact]
-    public void MtpStartupValidation_NoActivationError_ReturnsNull()
+    public void SpeculationStartupValidation_NoActivationError_ReturnsNull()
     {
-        Assert.Null(MtpStartupValidation.GetFatalActivationError(null));
-        Assert.Null(MtpStartupValidation.GetFatalActivationError(string.Empty));
+        Assert.Null(SpeculationStartupValidation.GetFatalActivationError(null));
+        Assert.Null(SpeculationStartupValidation.GetFatalActivationError(string.Empty));
     }
 
     [Fact]
@@ -898,7 +898,7 @@ public class ServerOptionsBuilderTests : IDisposable
         // operator never saw, so the server ran with speculation silently off.
         // Startup must now fail fast, surfacing the reason plus a remediation hint.
         const string reason = "MTP draft backbone dim 2816 != target hidden size 3840.";
-        string msg = MtpStartupValidation.GetFatalActivationError(reason);
+        string msg = SpeculationStartupValidation.GetFatalActivationError(reason);
         Assert.NotNull(msg);
         Assert.Contains(reason, msg);
         Assert.Contains("--mtp-draft-model", msg);

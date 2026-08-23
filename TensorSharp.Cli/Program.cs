@@ -25,6 +25,7 @@ using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Cli
 {
@@ -145,7 +146,7 @@ namespace TensorSharp.Cli
             // is already set, and sizes its graph cache from TS_MTP_DRAFT. Parsing
             // these in the switch below would be too late to matter. Shared with
             // the server so the two hosts cannot drift on names or validation.
-            MtpSpeculativeCliFlags.Apply(args);
+            SpeculativeCliFlags.Apply(args);
 
             string modelPath = null;
             string inputFile = null;
@@ -499,7 +500,7 @@ namespace TensorSharp.Cli
                 pagedKvQuantBitsOverride);
 
             // --spec-draft-n-max is the older spelling of --mtp-draft and is parsed
-            // in the switch above, too late for MtpSpeculativeCliFlags.Apply. Publish
+            // in the switch above, too late for SpeculativeCliFlags.Apply. Publish
             // it now, while the model has still not been created.
             SpeculativeDecodingOptions.PublishDraftWindow(specDraftMax);
 
@@ -509,12 +510,12 @@ namespace TensorSharp.Cli
             // stderr), but the refusal is easy to miss in a long load, and the
             // operator has meanwhile lost the VRAM they were budgeting for context.
             // Say it up front, where the two flags were typed.
-            if (tpDegree > 1 && SchedulerConfig.FromEnvironment().MtpSpeculativeEnabled)
+            if (tpDegree > 1 && SchedulerConfig.FromEnvironment().Speculation.Enabled)
             {
                 _log.LogWarning(LogEventIds.HostConfiguration,
-                    "--mtp-spec with --tp {Degree}: a draft block that borrows the trunk's LM head cannot draft "
+                    "--spec with --tp {Degree}: a draft block that borrows the trunk's LM head cannot draft "
                     + "under tensor parallelism (GLM-5.2 is one such checkpoint) and speculation will be refused "
-                    + "at load. Drop --tp to speculate, or --mtp-spec to keep the split.", tpDegree);
+                    + "at load. Drop --tp to speculate, or --no-spec to keep the split.", tpDegree);
             }
 
             if (gpuDeviceOverride.HasValue)
@@ -590,6 +591,18 @@ namespace TensorSharp.Cli
             }
 
             using var model = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath);
+
+            // Speculator weights that ship as their own file (Gemma 4's
+            // gemma4-assistant draft head, named with --spec-draft-model) attach
+            // to the target here, through the same loader the server uses. A
+            // drafter is an optimization: failing to attach one warns and falls
+            // back to plain decoding rather than failing the run.
+            if (!SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(model, out string draftHeadError))
+            {
+                _log.LogWarning(LogEventIds.HostConfiguration,
+                    "{Error} Speculative decoding will serve standard decoding instead.", draftHeadError);
+            }
+
             modelLoadSw.Stop();
             _log.LogInformation(LogEventIds.ModelLoadCompleted,
                 "Loaded model {ModelFile} architecture={Architecture} contextLength={ContextLength} kvCacheDtype={KvCacheDtype} elapsedMs={ElapsedMs:F1}",
@@ -1120,7 +1133,7 @@ namespace TensorSharp.Cli
             // One decoder for the whole run: its draft/verify buffers are sized by
             // the vocabulary, so rebuilding it per turn costs several MB a turn on a
             // 155k-token vocabulary for nothing.
-            MtpSpeculativeDecoder multiTurnDecoder = null;
+            SpeculativeDecoder multiTurnDecoder = null;
 
             string[] lines = File.ReadAllLines(jsonlPath);
             var history = new List<ChatMessage>();
@@ -1206,7 +1219,7 @@ namespace TensorSharp.Cli
                 if (turnDecoder == null && specSettings.Requested && turnDeclineReason != null && turn == 0)
                 {
                     _log.LogWarning(LogEventIds.HostConfiguration,
-                        "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                        "--spec was requested but speculative decoding is not available: {Reason} "
                         + "Serving standard decode.", turnDeclineReason);
                 }
 
@@ -1218,7 +1231,7 @@ namespace TensorSharp.Cli
                     // block drafter's compressed cache cannot be truncated anyway,
                     // and a prefix the DRAFT head never saw would leave a hole in
                     // its KV that collapses acceptance for the rest of the turn.
-                    var turnSpecModel = (IMtpSpeculativeModel)model;
+                    var turnSpecModel = (ISpeculativeTarget)model;
                     kvCache.Reset();
                     bool turnArgmax = InteractiveSession.IsArgmaxSampling(cfg);
                     var turnTokens = turnArgmax
@@ -1240,7 +1253,7 @@ namespace TensorSharp.Cli
                         "multi-turn speculative: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode} " +
                         "drafted={Drafted} accepted={Accepted} acceptanceRate={Rate:F3} " +
                         "verifySteps={VerifySteps} plainSteps={Plain} rollbacks={Rollbacks} parked={Parked}",
-                        SpeculativeDecodingOptions.DescribeDrafter(turnSpecModel), turnDecoder.MaxDraftTokens,
+                        SpeculativeDecodingOptions.DescribeDrafter(turnDecoder), turnDecoder.MaxDraftTokens,
                         turnDecoder.MinDraftProb, turnArgmax ? "argmax" : "sampled",
                         turnDecoder.TokensDrafted, turnDecoder.TokensAccepted, turnDecoder.AcceptanceRate,
                         turnDecoder.VerifySteps, turnDecoder.PlainSteps, turnDecoder.RollbackSteps,
@@ -1378,7 +1391,7 @@ namespace TensorSharp.Cli
             // One decoder for the whole batch: its buffers are sized by the
             // vocabulary, and every request resets it anyway.
             var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
-            MtpSpeculativeDecoder batchDecoder = null;
+            SpeculativeDecoder batchDecoder = null;
             bool specDeclineLogged = false;
 
             string[] lines = File.ReadAllLines(inputJsonlPath);
@@ -1462,7 +1475,7 @@ namespace TensorSharp.Cli
                         {
                             _log.LogInformation(LogEventIds.HostConfiguration,
                                 "jsonl batch speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2}",
-                                SpeculativeDecodingOptions.DescribeDrafter((IMtpSpeculativeModel)model),
+                                SpeculativeDecodingOptions.DescribeDrafter(requestDecoder),
                                 requestDecoder.MaxDraftTokens, requestDecoder.MinDraftProb);
                         }
                         batchDecoder = requestDecoder;
@@ -1472,7 +1485,7 @@ namespace TensorSharp.Cli
                     {
                         specDeclineLogged = true;
                         _log.LogWarning(LogEventIds.HostConfiguration,
-                            "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                            "--spec was requested but speculative decoding is not available: {Reason} "
                             + "Serving standard decode.", specDeclineReason);
                     }
 
@@ -2500,13 +2513,13 @@ namespace TensorSharp.Cli
 
                 if (specDecoder != null)
                 {
-                    return RunSpeculativeInference(model, (IMtpSpeculativeModel)model, specDecoder,
+                    return RunSpeculativeInference(model, (ISpeculativeTarget)model, specDecoder,
                         inputTokens, maxTokens, specCfg, enableThinking, tools, silent);
                 }
                 if (specSettings.Requested && specDeclineReason != null && !silent)
                 {
                     _log.LogWarning(LogEventIds.HostConfiguration,
-                        "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                        "--spec was requested but speculative decoding is not available: {Reason} "
                         + "Serving standard decode.", specDeclineReason);
                 }
             }
@@ -2728,8 +2741,8 @@ namespace TensorSharp.Cli
         /// argmax under a greedy config, with <paramref name="sampling"/> otherwise
         /// — so speculation only changes how many forwards it took to get there.
         /// </summary>
-        static string RunSpeculativeInference(ModelBase model, IMtpSpeculativeModel spec,
-            MtpSpeculativeDecoder decoder, List<int> inputTokens, int maxTokens,
+        static string RunSpeculativeInference(ModelBase model, ISpeculativeTarget spec,
+            SpeculativeDecoder decoder, List<int> inputTokens, int maxTokens,
             SamplingConfig sampling, bool enableThinking, List<ToolFunction> tools, bool silent)
         {
             var parser = OutputParserFactory.Create(model.Config.Architecture);
@@ -2742,7 +2755,7 @@ namespace TensorSharp.Cli
             {
                 _log.LogInformation(LogEventIds.HostConfiguration,
                     "cli.inference speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode}",
-                    SpeculativeDecodingOptions.DescribeDrafter(spec), decoder.MaxDraftTokens,
+                    SpeculativeDecodingOptions.DescribeDrafter(decoder), decoder.MaxDraftTokens,
                     decoder.MinDraftProb, argmax ? "argmax" : "sampled");
             }
 
@@ -2795,7 +2808,7 @@ namespace TensorSharp.Cli
                     "drafted={Drafted} accepted={Accepted} " +
                     "acceptanceRate={Rate:F3} verifySteps={VerifySteps} plainSteps={Plain} rollbacks={Rollbacks} " +
                     "parked={Parked} plainMsPerTok={PlainMs:F1} specMsPerTok={SpecMs:F1}",
-                    SpeculativeDecodingOptions.DescribeDrafter(spec), decoder.MaxDraftTokens,
+                    SpeculativeDecodingOptions.DescribeDrafter(decoder), decoder.MaxDraftTokens,
                     decoder.MinDraftProb, argmax ? "argmax" : "sampled",
                     decoder.TokensDrafted, decoder.TokensAccepted,
                     decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps,

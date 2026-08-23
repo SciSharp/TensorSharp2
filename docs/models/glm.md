@@ -204,7 +204,7 @@ an A/B.
 
 2× RTX PRO 6000 Blackwell (97 GiB each), GLM-5.2-UD-IQ2_XXS, `--n-cpu-moe 20`,
 21-token prompt, 160 tokens generated, greedy
-(`InferenceWeb.Tests/GlmDsaMtpModelTests.cs`). Each run takes the plain baseline
+(`InferenceWeb.Tests/GlmDsaSpeculativeModelTests.cs`). Each run takes the plain baseline
 as the median of three, because the host-side expert matmul is the noisy half of
 the comparison — and the whole benchmark was then repeated five times, because
 one round is not enough to tell a 5% tuning effect from that noise.

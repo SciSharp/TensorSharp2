@@ -7,6 +7,8 @@
 using System.Collections.Generic;
 using System.Text;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Runtime.Scheduling
 {
     /// <summary>
@@ -56,61 +58,71 @@ namespace TensorSharp.Runtime.Scheduling
             int multimodalCount = batchedModalSafe ? 0 : features.MultimodalPendingCount;
             int textCount = features.SequenceCount - multimodalCount;
 
-            // ---- NextN/MTP speculative decoding ----
-            // Deliberately NOT gated on options.BatchedPathDisabled: the MTP
-            // routes predate that switch and must keep engaging under it.
-            if (config.MtpSpeculativeEnabled)
+            // ---- Speculative decoding ----
+            // Deliberately NOT gated on options.BatchedPathDisabled: the
+            // speculative routes predate that switch and must keep engaging
+            // under it.
+            if (config.Speculation.Enabled)
             {
-                if (!caps.HasMtpDraftHead)
+                if (!caps.SupportsSpeculativeTrunk)
                 {
                     rejections.Add(new ExecutionPathRejection(
-                        ExecutionPathKind.MtpPerSequence,
-                        "requested (--mtp-spec) but the loaded weights have no NextN/MTP draft head"));
+                        ExecutionPathKind.SpeculativePerSequence,
+                        "requested (--spec) but this architecture has no speculative trunk "
+                        + "(it cannot verify a draft window in one pass)"));
                 }
-                else if (!caps.MtpSpeculationProfitable)
+                else if (!caps.HasDraftHead
+                         && SpeculatorRegistry.RequiresDraftHead(config.Speculation.SpeculatorName))
+                {
+                    rejections.Add(new ExecutionPathRejection(
+                        ExecutionPathKind.SpeculativePerSequence,
+                        $"requested (--spec) but the loaded weights have no draft head; "
+                        + $"--spec-type {SpeculatorRegistry.NGram} needs none"));
+                }
+                else if (!caps.SpeculationProfitable)
                 {
                     // Serving standard decode is faster than per-op speculative
                     // verify/draft on this backend; executor logs a one-time notice.
                     mtpUnprofitable = true;
                     rejections.Add(new ExecutionPathRejection(
-                        ExecutionPathKind.MtpPerSequence,
+                        ExecutionPathKind.SpeculativePerSequence,
                         "speculation unprofitable on this backend; serving standard decode"));
                 }
-                else if (caps.SupportsBatchedMtpTrunk)
+                else if (caps.SupportsBatchedSpecTrunk)
                 {
                     // Batched-trunk models never take the per-sequence detour:
                     // if the trunk declines, the normal batched path serves the
                     // step (keeps K/V in paged storage).
                     if (!solo)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.MtpBatchedTrunk, "multi-sequence step"));
+                            ExecutionPathKind.SpeculativeBatchedTrunk, "multi-sequence step"));
                     else if (features.SoloHasPendingMultimodal)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.MtpBatchedTrunk, "pending multimodal embeddings need the per-seq inject hook"));
+                            ExecutionPathKind.SpeculativeBatchedTrunk, "pending multimodal embeddings need the per-seq inject hook"));
                     else if (fusedResident)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.MtpBatchedTrunk, "sequence lives in a per-request fused cache"));
+                            ExecutionPathKind.SpeculativeBatchedTrunk, "sequence lives in a per-request fused cache"));
                     else
-                        candidates.Add(ExecutionPathKind.MtpBatchedTrunk); // declinable (arming/continuity)
+                        candidates.Add(ExecutionPathKind.SpeculativeBatchedTrunk); // declinable (arming/continuity)
                 }
                 else
                 {
                     // Linear-trunk speculation requires the per-sequence route.
                     if (!solo)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.MtpPerSequence, "multi-sequence step"));
+                            ExecutionPathKind.SpeculativePerSequence, "multi-sequence step"));
                     else if (features.SoloKvInPagedStorage)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.MtpPerSequence, "sequence K/V lives in paged storage; linear cache would be empty"));
+                            ExecutionPathKind.SpeculativePerSequence, "sequence K/V lives in paged storage; linear cache would be empty"));
                     else if (features.SoloHasPendingMultimodal)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.MtpPerSequence, "pending multimodal embeddings need Forward's inject hook"));
+                            ExecutionPathKind.SpeculativePerSequence, "pending multimodal embeddings need Forward's inject hook"));
                     else if (fusedResident)
                         rejections.Add(new ExecutionPathRejection(
-                            ExecutionPathKind.MtpPerSequence, "sequence lives in a per-request fused cache"));
+                            ExecutionPathKind.SpeculativePerSequence, "sequence lives in a per-request fused cache"));
                     else
                     {
-                        candidates.Add(ExecutionPathKind.MtpPerSequence); // terminal
+                        candidates.Add(ExecutionPathKind.SpeculativePerSequence); // terminal
                         return Build(candidates, rejections, mtpUnprofitable);
                     }
                 }
@@ -253,15 +265,24 @@ namespace TensorSharp.Runtime.Scheduling
             else
                 sb.Append("available");
 
-            sb.Append("\nMTP speculative decoding: ");
-            if (!config.MtpSpeculativeEnabled)
+            sb.Append("\nSpeculative decoding: ");
+            if (!config.Speculation.Enabled)
                 sb.Append("off (not requested)");
-            else if (!caps.HasMtpDraftHead)
-                sb.Append("requested but unavailable (no draft head in weights)");
-            else if (!caps.MtpSpeculationProfitable)
+            else if (!caps.SupportsSpeculativeTrunk)
+                sb.Append("requested but unavailable (architecture has no speculative trunk)");
+            else if (!caps.HasDraftHead
+                     && SpeculatorRegistry.RequiresDraftHead(config.Speculation.SpeculatorName))
+            {
+                sb.Append("requested but unavailable (no draft head in weights; --spec-type ")
+                  .Append(SpeculatorRegistry.NGram).Append(" needs none)");
+            }
+            else if (!caps.SpeculationProfitable)
                 sb.Append("requested but unprofitable on this backend (serving standard decode)");
             else
-                sb.Append(caps.SupportsBatchedMtpTrunk ? "available (trunk=batched)" : "available (trunk=linear)");
+            {
+                sb.Append("available (algorithm=").Append(config.Speculation.SpeculatorName)
+                  .Append(caps.SupportsBatchedSpecTrunk ? ", trunk=batched)" : ", trunk=linear)");
+            }
 
             sb.Append("\nKV snapshot/swap fallback: ");
             if (!caps.SupportsKvStateSnapshot)
@@ -294,10 +315,10 @@ namespace TensorSharp.Runtime.Scheduling
             bool mtpUnprofitable)
         {
             // A plan whose last candidate can decline would leave the step
-            // unserved; PerSequence never declines, MtpPerSequence /
+            // unserved; PerSequence never declines, SpeculativePerSequence /
             // PerSequenceFused / SingleSequenceFused / MixedMultimodalSplit
             // are terminal by construction.
-            if (candidates.Count == 0 || candidates[^1] == ExecutionPathKind.MtpBatchedTrunk
+            if (candidates.Count == 0 || candidates[^1] == ExecutionPathKind.SpeculativeBatchedTrunk
                 || candidates[^1] == ExecutionPathKind.BatchedPaged)
             {
                 candidates.Add(ExecutionPathKind.PerSequence);
@@ -306,7 +327,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 Candidates = candidates,
                 Rejections = rejections,
-                MtpUnprofitable = mtpUnprofitable,
+                SpeculationUnprofitable = mtpUnprofitable,
             };
         }
     }

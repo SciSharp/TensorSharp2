@@ -33,8 +33,8 @@
 // layers to the target's last local layer (n_layer-2) and the global draft layer to
 // the target's last global layer (n_layer-1), and — with shared KV — uses the SAME
 // position for every drafted token (the recurrence flows purely through h). That
-// makes MtpCatchUp / the recurrent-state snapshot no-ops here: the draft is stateless
-// given (token, h), so the shared MtpSpeculativeExecution core's draft/verify/rollback
+// makes DraftCatchUp / the recurrent-state snapshot no-ops here: the draft is stateless
+// given (token, h), so the shared SpeculativeExecution core's draft/verify/rollback
 // loop drives it with only an attention-KV position rewind on rejection.
 using System;
 using TensorSharp;
@@ -43,9 +43,11 @@ using TensorSharp.GGML;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Models
 {
-    public partial class Gemma4Model : IMtpBatchedSpeculativeModel
+    public partial class Gemma4Model : IBatchedSpeculativeModel
     {
         // Draft-head hyper-parameters (read from the assistant GGUF).
         private int _mtpNumLayers;
@@ -58,7 +60,7 @@ namespace TensorSharp.Models
         private int _mtpGlobalDonor;     // target layer whose KV the global draft layer reads
 
         // Batched-trunk speculative mode: when the verify runs through the
-        // batched paged path (IMtpBatchedSpeculativeModel), the draft must read
+        // batched paged path (IBatchedSpeculativeModel), the draft must read
         // the sequence's PAGED donor KV (_g4PagedK) via its block table instead
         // of the model's single linear cache. SpecForwardBatched sets these; the
         // linear SpecForward clears the mode.
@@ -67,7 +69,12 @@ namespace TensorSharp.Models
         private float[] _mtpDraftScores;  // reusable softmax scratch for the paged draft attention
 
         /// <summary>True when a usable Gemma 4 assistant draft head is loaded.</summary>
-        public bool HasMtp { get; private set; }
+        public bool HasDraftHead { get; private set; }
+
+        /// <summary>The gemma4-assistant head drafts one token per pass,
+        /// chaining its own hidden output, so it is served by
+        /// <see cref="DraftHeadSpeculator"/>.</summary>
+        public DraftHeadKind DraftHeadKind => HasDraftHead ? DraftHeadKind.PerToken : DraftHeadKind.None;
 
         /// <summary>
         /// Speculation profitability per backend:
@@ -87,7 +94,11 @@ namespace TensorSharp.Models
         /// CPU / MLX (no fused kernels AND no GPU-resident per-op path) stay off — there
         /// the verify can't keep up and the engine serves the fast standard decode.
         /// </summary>
-        public bool MtpSpeculationProfitable => HasMtp && (IsGgmlBackend || _backend == BackendType.Cuda);
+        // Gated on HasDraftHead as well as the backend because Gemma 4's
+        // SpecForward is not drafter-independent: it refuses to run without the
+        // MTP head (it shares the fused verify kernel with it), so a weight-free
+        // speculator has no trunk to verify with here.
+        public bool SpeculationProfitable => HasDraftHead && (IsGgmlBackend || _backend == BackendType.Cuda);
 
         /// <summary>
         /// Load the Gemma 4 assistant (MTP draft) GGUF and attach it to this target
@@ -171,14 +182,14 @@ namespace TensorSharp.Models
             }
 
             // Sanity-check the tensors the draft step relies on are present.
-            HasMtp = HasLinearWeight("mtp.nextn.pre_projection.weight")
+            HasDraftHead = HasLinearWeight("mtp.nextn.pre_projection.weight")
                 && HasLinearWeight("mtp.nextn.post_projection.weight")
                 && HasLinearWeight("mtp.token_embd.weight")
                 && _weights.ContainsKey("mtp.output_norm.weight");
-            for (int il = 0; il < _mtpNumLayers && HasMtp; il++)
+            for (int il = 0; il < _mtpNumLayers && HasDraftHead; il++)
             {
                 string p = $"mtp.blk.{il}";
-                HasMtp = HasLinearWeight($"{p}.attn_q.weight") && HasLinearWeight($"{p}.attn_output.weight")
+                HasDraftHead = HasLinearWeight($"{p}.attn_q.weight") && HasLinearWeight($"{p}.attn_output.weight")
                     && HasLinearWeight($"{p}.ffn_gate.weight") && HasLinearWeight($"{p}.ffn_up.weight")
                     && HasLinearWeight($"{p}.ffn_down.weight")
                     && _weights.ContainsKey($"{p}.attn_norm.weight") && _weights.ContainsKey($"{p}.attn_q_norm.weight")
@@ -194,10 +205,10 @@ namespace TensorSharp.Models
             // own query-head count (passed as num_heads), so it serves a smaller-
             // head draft (E4B: 4 vs the target's 8) too — it reads the donor KV via
             // GQA grouping onto the donor's KV heads.
-            if (HasMtp && IsGgmlBackend)
+            if (HasDraftHead && IsGgmlBackend)
                 BuildMtpDraftArrays();
 
-            Console.WriteLine(HasMtp
+            Console.WriteLine(HasDraftHead
                 ? $"  Gemma 4 MTP draft head ready ({_mtpNumLayers} layers, hidden {_mtpHidden}, " +
                   $"draftHeads={_mtpDraftHeads}, ple={_pleDim}, donors local={_mtpLocalDonor}/global={_mtpGlobalDonor}, " +
                   $"fusedDraft={(_mtpDraftArrays != null ? "yes" : "no")})."
@@ -270,7 +281,7 @@ namespace TensorSharp.Models
         }
 
         // ====================================================================
-        // IMtpSpeculativeModel
+        // ISpeculativeModel
         // ====================================================================
 
         /// <summary>
@@ -285,7 +296,7 @@ namespace TensorSharp.Models
         /// </summary>
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
-            if (!HasMtp)
+            if (!HasDraftHead)
                 throw new InvalidOperationException("Model has no Gemma 4 MTP draft head.");
 
             _mtpBatchedMode = false;   // this is the linear-cache trunk
@@ -500,7 +511,7 @@ namespace TensorSharp.Models
         /// Only the LAST row of <paramref name="hAllOut"/> is filled: the draft head
         /// consumes the hidden state of the token preceding the next pending token
         /// (the executor's PrefillStep copies only that last row into its pending-h),
-        /// and Gemma 4's <see cref="MtpCatchUp"/> is a no-op, so the earlier rows are
+        /// and Gemma 4's <see cref="DraftCatchUp"/> is a no-op, so the earlier rows are
         /// never read. (A real verify batch, which DOES need every row, never reaches
         /// here — it sets allLogitsRows and is small.)
         /// </summary>
@@ -538,9 +549,9 @@ namespace TensorSharp.Models
         /// recurrence flows through h, not through new K/V), so the incoming
         /// <paramref name="pos"/> argument is intentionally ignored.
         /// </summary>
-        public unsafe void MtpDraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
+        public unsafe void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
-            if (!HasMtp)
+            if (!HasDraftHead)
                 throw new InvalidOperationException("Model has no Gemma 4 MTP draft head.");
 
             // Trunk position; the donor KV holds [0, fixedPos). The linear trunk
@@ -725,13 +736,13 @@ namespace TensorSharp.Models
 
         /// <summary>Gemma 4's draft head holds no KV of its own (it reads the
         /// target's), so there is nothing to replay — the no-op here is correct.</summary>
-        public void MtpCatchUp(int[] tokens, float[] hRows, int startPos) { }
+        public void DraftCatchUp(int[] tokens, float[] hRows, int startPos) { }
 
         /// <summary>Pre-grow the trunk KV caches. Safe at any time for Gemma 4: the
         /// draft writes no MTP rows into the cache (it only reads the target's).
         /// In batched-trunk mode the K/V lives in paged blocks the scheduler owns,
         /// so growing the (unused) linear cache would just waste memory.</summary>
-        public void MtpEnsureCapacity(int requiredSeqLen)
+        public void SpecEnsureCapacity(int requiredSeqLen)
         {
             if (_mtpBatchedMode) return;
             EnsureCacheCapacity(requiredSeqLen);
@@ -739,10 +750,10 @@ namespace TensorSharp.Models
 
         /// <summary>No recurrent (GDN/SSM) state in Gemma 4 — drafting is stateless
         /// given (token, h), so verify rollback needs only an attention-KV rewind.</summary>
-        public void MtpSnapshotRecurrentState() { }
+        public void SpecSnapshotRecurrentState() { }
 
-        /// <summary>See <see cref="MtpSnapshotRecurrentState"/>.</summary>
-        public void MtpRestoreRecurrentState() { }
+        /// <summary>See <see cref="SpecSnapshotRecurrentState"/>.</summary>
+        public void SpecRestoreRecurrentState() { }
 
         /// <summary>
         /// Rewind the trunk KV position counter after rejected speculative tokens.
@@ -750,7 +761,7 @@ namespace TensorSharp.Models
         /// re-forward and the causal mask never reads past the live position, so no
         /// data movement is needed (the SWA circular cache re-writes the same slots).
         /// </summary>
-        public void MtpRewindCache(int length)
+        public void SpecRewindCache(int length)
         {
             if (length < 0 || length > _cacheSeqLen)
                 throw new ArgumentOutOfRangeException(nameof(length),
@@ -787,12 +798,12 @@ namespace TensorSharp.Models
         /// dense exact-match validation). Escape hatch: TS_GMTP_NO_FAST_ROLLBACK=1.
         /// Honoured only on the linear trunk.
         /// </summary>
-        public bool MtpVerifyPersistsAcceptedKv =>
+        public bool SpecVerifyPersistsAcceptedKv =>
             (_numExperts > 0 || _pleDim > 0 || _backend == BackendType.Cuda)
             && !_mtpBatchedMode && !s_noFastRollback;
 
         // ====================================================================
-        // IMtpBatchedSpeculativeModel — speculative trunk on the batched paged
+        // IBatchedSpeculativeModel — speculative trunk on the batched paged
         // path. The verify runs through ForwardBatch (one sequence, K+1 tokens):
         // its matmuls are batched GEMMs that read the 12B weights ONCE for all
         // K+1 rows, so a verify amortises to ~one batched decode step (unlike the
@@ -814,7 +825,7 @@ namespace TensorSharp.Models
         /// (e.g. to compose with a paged-fused verify once that lands).
         /// </summary>
         public bool SupportsBatchedSpecTrunk =>
-            HasMtp && IsGgmlBackend && CanUseBatchedSpecPath()
+            HasDraftHead && IsGgmlBackend && CanUseBatchedSpecPath()
             && Environment.GetEnvironmentVariable("TS_GMTP_BATCHED_TRUNK") == "1";
 
         private bool CanUseBatchedSpecPath()
@@ -1022,12 +1033,12 @@ namespace TensorSharp.Models
         }
 
         /// <summary>No recurrent state in Gemma 4 — nothing to snapshot per slot.</summary>
-        public void MtpSnapshotRecurrentStateSlots(SequenceState seq) { }
+        public void SpecSnapshotRecurrentStateSlots(SequenceState seq) { }
 
         /// <summary>No recurrent state in Gemma 4 — nothing to restore. Paged
         /// attention needs no KV rewind: each pass passes its own sequence length,
         /// and rejected slots are overwritten by the kept-prefix re-forward.</summary>
-        public void MtpRestoreRecurrentStateSlots(SequenceState seq) { }
+        public void SpecRestoreRecurrentStateSlots(SequenceState seq) { }
 
         // Single-query attention of the draft's Q against the sequence's PAGED
         // donor K/V (_g4PagedK[donor], a host float[] indexed by slot). Mirrors the

@@ -263,27 +263,39 @@ namespace TensorSharp.Server.Hosting
                     "turns at the GPU. Default: 1024.",
                     "--prefill-chunk-size 256"),
             }),
-            ("MTP speculative decoding (models that ship an MTP/NextN draft head)", new[]
+            ("Speculative decoding", new[]
             {
-                new OptionHelp("--mtp-spec | --no-mtp-spec",
-                    "Enable/disable MTP speculative decoding. Default: off.",
-                    "--mtp-spec"),
-                new OptionHelp("--mtp-draft <N>",
-                    "Maximum draft tokens per step. Default: 8.",
-                    "--mtp-draft 4"),
-                new OptionHelp("--mtp-pmin <f>",
-                    "Minimum draft confidence in (0, 1]; drafting stops below it. Default: per drafter kind " +
-                    "— 0.75 for a per-token draft head, 0.35 for a block drafter (where the gate is the " +
-                    "CUMULATIVE prefix probability, so the same number means something much stricter).",
-                    "--mtp-pmin 0.6"),
-                new OptionHelp("--mtp-draft-model <path>",
+                new OptionHelp("--spec | --no-spec",
+                    "Enable/disable speculative decoding: a drafter proposes the next few tokens and the trunk " +
+                    "verifies them in one batched forward. Every emitted token still comes from a trunk row, so " +
+                    "the output is what standard decoding would have produced. Engages for solo (non-concurrent) " +
+                    "sequences. Accepted as --mtp-spec / --no-mtp-spec too. Default: off.",
+                    "--spec"),
+                new OptionHelp("--spec-type <name>",
+                    "Speculation algorithm: 'auto' (default) uses whatever drafter the checkpoint carries; " +
+                    "'draft-head' and 'block' pin one explicitly; 'ngram' needs no trained weights at all and " +
+                    "works on every model, drafting by suffix match over the context (strong when the answer " +
+                    "quotes its input: summarizing, editing, structured output, agentic loops).",
+                    "--spec --spec-type ngram"),
+                new OptionHelp("--spec-draft <N>",
+                    "Maximum draft tokens per step (1-64). Accepted as --mtp-draft too. Default: 8.",
+                    "--spec-draft 4"),
+                new OptionHelp("--spec-pmin <f>",
+                    "Draft-confidence gate in (0, 1]; drafting stops below it. What the number means is per " +
+                    "algorithm, so each brings its own default — 0.75 for a per-token draft head, 0.35 for a " +
+                    "block drafter (where the gate is the CUMULATIVE prefix probability, so the same number " +
+                    "means something much stricter), 0 for n-gram. Accepted as --mtp-pmin too.",
+                    "--spec-pmin 0.6"),
+                new OptionHelp("--spec-draft-model <path>",
                     "Separate draft GGUF for models whose draft head ships as its own file (Gemma 4 assistant). " +
-                    "Qwen3.6 embeds the draft head and needs no flag. Default: none.",
-                    "--mtp-draft-model gemma-4-E4B-it-assistant.Q8_0.gguf"),
+                    "Qwen 3.6 and GLM 5.2 embed their NextN block and need no flag. Accepted as " +
+                    "--mtp-draft-model too. Default: none.",
+                    "--spec-draft-model gemma-4-E4B-it-assistant.Q8_0.gguf"),
                 new OptionHelp("--draft-model <path>",
                     "Block drafter GGUF for architectures whose drafter must be resident before the layer " +
-                    "split (DeepSeek V4's DSpark). Needs --mtp-spec, engages for solo sequences on the cuda " +
-                    "and ggml_cuda backends. Default: none; env TS_DSV4_DSPARK.",
+                    "split (DeepSeek V4's DSpark). Naming the file IS the request, so it needs no --spec; " +
+                    "engages for solo sequences on the cuda and ggml_cuda backends. Default: none; " +
+                    "env TS_DSV4_DSPARK.",
                     "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf"),
             }),
             ("Qwen-Image-Edit companion models (qwen_image DiT GGUFs)", new[]

@@ -6,6 +6,8 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System.Text;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Runtime.Scheduling
 {
     /// <summary>
@@ -17,7 +19,7 @@ namespace TensorSharp.Runtime.Scheduling
     ///
     /// In TensorSharp a model instance embodies its backend choice (e.g.
     /// Qwen 3.5 reports <c>SupportsPerSequenceFusedForward</c> only on
-    /// GGML-CUDA/Metal, Gemma 4 reports <c>MtpSpeculationProfitable</c> only
+    /// GGML-CUDA/Metal, Gemma 4 reports <c>SpeculationProfitable</c> only
     /// where its fused verify kernels exist), so this record is the merged
     /// "backend capabilities + model requirements" view: each field is the
     /// answer to "can THIS model on THIS backend run that path?". Model-level
@@ -78,27 +80,36 @@ namespace TensorSharp.Runtime.Scheduling
         /// possible at all).</summary>
         public bool HasMultimodalInjector { get; init; }
 
-        /// <summary>Loaded weights contain a usable NextN/MTP draft head.</summary>
-        public bool HasMtpDraftHead { get; init; }
+        /// <summary>Model implements <see cref="ISpeculativeTarget"/>: it can
+        /// verify a whole draft window in one trunk pass and undo a rejected
+        /// tail. This is the ONLY capability a weight-free speculator
+        /// (<see cref="NGramSpeculator"/>) needs.</summary>
+        public bool SupportsSpeculativeTrunk { get; init; }
+
+        /// <summary>Loaded weights contain a usable learned draft head (a
+        /// NextN/MTP block, a DSpark/DFlash block drafter). Algorithms that
+        /// need trained speculator weights require this; n-gram does not.</summary>
+        public bool HasDraftHead { get; init; }
 
         /// <summary>Speculative decoding is expected to be profitable on this
         /// backend (the accelerated multi-token verify/draft kernels exist);
         /// when false the engine serves standard decode even if speculation
         /// was requested.</summary>
-        public bool MtpSpeculationProfitable { get; init; }
+        public bool SpeculationProfitable { get; init; }
 
         /// <summary>The speculative trunk can run through the batched paged
-        /// path (<see cref="IMtpBatchedSpeculativeModel"/>), composing with
+        /// path (<see cref="IBatchedSpeculativeTarget"/>), composing with
         /// prefix caching and concurrency transitions.</summary>
-        public bool SupportsBatchedMtpTrunk { get; init; }
+        public bool SupportsBatchedSpecTrunk { get; init; }
 
         /// <summary>Snapshot the capability surface of <paramref name="model"/>.
         /// Cheap (flag/property reads); called once per engine step.</summary>
         public static ExecutionCapabilities FromModel(IModelArchitecture model)
         {
             var batched = model as IBatchedPagedModel;
-            var spec = model as IMtpSpeculativeModel;
-            bool hasMtp = spec != null && spec.HasMtp;
+            var spec = model as ISpeculativeTarget;
+            bool specTrunk = spec != null;
+            bool draftHead = spec is IDraftHead head && head.HasDraftHead;
             return new ExecutionCapabilities
             {
                 SupportsBatchedPagedAttention = batched != null,
@@ -110,10 +121,11 @@ namespace TensorSharp.Runtime.Scheduling
                 SupportsCrossSequenceKvReuse = model.SupportsCrossSequenceKvReuse,
                 MaxReusablePrefixTokens = model.MaxReusablePrefixTokens,
                 HasMultimodalInjector = model.MultimodalInjector != null,
-                HasMtpDraftHead = hasMtp,
-                MtpSpeculationProfitable = hasMtp && spec.MtpSpeculationProfitable,
-                SupportsBatchedMtpTrunk = hasMtp
-                    && spec is IMtpBatchedSpeculativeModel batchedSpec
+                SupportsSpeculativeTrunk = specTrunk,
+                HasDraftHead = draftHead,
+                SpeculationProfitable = specTrunk && spec.SpeculationProfitable,
+                SupportsBatchedSpecTrunk = specTrunk
+                    && spec is IBatchedSpeculativeTarget batchedSpec
                     && batchedSpec.SupportsBatchedSpecTrunk,
             };
         }
@@ -133,11 +145,12 @@ namespace TensorSharp.Runtime.Scheduling
             sb.Append(", maxReusablePrefix=");
             sb.Append(MaxReusablePrefixTokens == int.MaxValue ? "unbounded" : MaxReusablePrefixTokens.ToString());
             sb.Append(", multimodal=").Append(Flag(HasMultimodalInjector));
-            sb.Append(", mtpDraftHead=").Append(Flag(HasMtpDraftHead));
-            if (HasMtpDraftHead)
+            sb.Append(", specTrunk=").Append(Flag(SupportsSpeculativeTrunk));
+            if (SupportsSpeculativeTrunk)
             {
-                sb.Append(", mtpProfitable=").Append(Flag(MtpSpeculationProfitable));
-                sb.Append(", mtpBatchedTrunk=").Append(Flag(SupportsBatchedMtpTrunk));
+                sb.Append(", draftHead=").Append(Flag(HasDraftHead));
+                sb.Append(", specProfitable=").Append(Flag(SpeculationProfitable));
+                sb.Append(", specBatchedTrunk=").Append(Flag(SupportsBatchedSpecTrunk));
             }
             return sb.ToString();
         }

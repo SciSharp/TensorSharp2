@@ -73,7 +73,7 @@ namespace TensorSharp.Models
             {
                 float[] lBuf = logitsOut ?? EnsureSpecLogits(Config.VocabSize);
                 float[] hBuf = hOut ?? EnsureSpecH(Config.HiddenSize);
-                if (!GgmlGlmNative.MtpDraftStep(_native, token, hPrev, pos, lBuf, hBuf))
+                if (!GgmlGlmNative.DraftStep(_native, token, hPrev, pos, lBuf, hBuf))
                     throw new InvalidOperationException("glm-dsa native MTP draft step failed (see stderr).");
             }
         }
@@ -82,7 +82,7 @@ namespace TensorSharp.Models
         {
             lock (_nativeSync)
             {
-                if (!GgmlGlmNative.MtpCatchUp(_native, tokens, hRows, startPos))
+                if (!GgmlGlmNative.DraftCatchUp(_native, tokens, hRows, startPos))
                     throw new InvalidOperationException("glm-dsa native MTP catch-up failed (see stderr).");
             }
         }

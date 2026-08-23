@@ -47,13 +47,13 @@ namespace TensorSharp.Server
         /// activated on the loaded target (missing file, wrong architecture, an
         /// incompatible draft, or an incomplete GGUF), this holds a
         /// human-readable reason. It is <c>null</c> when no draft was requested or
-        /// when the draft loaded successfully (<c>HasMtp</c>). The startup loader
+        /// when the draft loaded successfully (<c>HasDraftHead</c>). The startup loader
         /// promotes a non-null value to a fail-fast error so an explicit but
         /// unusable draft can't silently leave speculation disabled — matching the
         /// fail-fast contract the rest of startup configuration follows. Runtime
         /// (Web UI) model switches read the warning log but do not fail.
         /// </summary>
-        public string MtpDraftActivationError { get; private set; }
+        public string DraftHeadActivationError { get; private set; }
 
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
         public string LoadedModelPath => _loadedModelPath;
@@ -148,7 +148,7 @@ namespace TensorSharp.Server
             _model = null;
             _loadedModelPath = null;
             _loadedMmProjPath = null;
-            MtpDraftActivationError = null;
+            DraftHeadActivationError = null;
 
             if (!string.IsNullOrEmpty(previousModel))
             {
@@ -193,7 +193,7 @@ namespace TensorSharp.Server
                 // block-draft head to put it in, instead of leaving the operator
                 // to wonder why speculation never engages.
                 if (!string.IsNullOrEmpty(blockDraftPath)
-                    && _model is not TensorSharp.Runtime.Scheduling.IMtpSpeculativeModel { HasMtp: true })
+                    && _model is not TensorSharp.Runtime.Speculative.IDraftHead { HasDraftHead: true })
                 {
                     _logger.LogWarning(
                         "--draft-model '{Draft}' was given but the loaded model ({Architecture} on {Backend}) has no " +
@@ -223,57 +223,19 @@ namespace TensorSharp.Server
                     _loadedMmProjPath = mmProjPath;
                 }
 
-                // Gemma 4 MTP: the draft head ships as a SEPARATE GGUF
-                // (gemma4-assistant). Load it onto the target so HasMtp turns on
-                // and --mtp-spec engages. (Qwen3.6 embeds its NextN block in the
-                // trunk and needs no separate file.) MtpDraftActivationError was
+                // Speculator weights that ship as their own file (Gemma 4's
+                // gemma4-assistant draft head) are attached here, by the same
+                // shared loader the CLI uses. DraftHeadActivationError was
                 // cleared when the previous model was unloaded.
-                string mtpDraftPath = Environment.GetEnvironmentVariable("TS_MTP_DRAFT_MODEL");
-                if (!string.IsNullOrEmpty(mtpDraftPath))
+                if (!SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(_model, out string draftError))
                 {
-                    if (_model is Gemma4Model g4)
-                    {
-                        if (!File.Exists(mtpDraftPath))
-                        {
-                            MtpDraftActivationError = $"MTP draft model file not found: {mtpDraftPath}";
-                            _logger.LogWarning("{Error}; speculation disabled.", MtpDraftActivationError);
-                        }
-                        else
-                        {
-                            try
-                            {
-                                g4.LoadMtpDraftWeights(mtpDraftPath);
-                                if (g4.HasMtp)
-                                {
-                                    _logger.LogInformation("Loaded Gemma 4 MTP draft head {Draft} (HasMtp=True)",
-                                        Path.GetFileName(mtpDraftPath));
-                                }
-                                else
-                                {
-                                    MtpDraftActivationError =
-                                        $"MTP draft '{Path.GetFileName(mtpDraftPath)}' loaded but is incomplete (required draft tensors missing).";
-                                    _logger.LogWarning("{Error}; speculation disabled.", MtpDraftActivationError);
-                                }
-                            }
-                            catch (Exception mtpEx)
-                            {
-                                MtpDraftActivationError =
-                                    $"Failed to load MTP draft '{Path.GetFileName(mtpDraftPath)}': {mtpEx.Message}";
-                                _logger.LogWarning(mtpEx, "Failed to load MTP draft {Path}; speculation disabled.", mtpDraftPath);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // A draft GGUF was named but the loaded model's architecture
-                        // does not consume a separate draft file (e.g. Qwen3.6 embeds
-                        // its NextN block in the trunk). Record it so the operator
-                        // isn't left wondering why their --mtp-draft-model was ignored.
-                        MtpDraftActivationError =
-                            $"--mtp-draft-model was given but the loaded model architecture " +
-                            $"'{Architecture ?? "unknown"}' does not use a separate MTP draft GGUF.";
-                        _logger.LogWarning("{Error}; speculation disabled.", MtpDraftActivationError);
-                    }
+                    DraftHeadActivationError = draftError;
+                    _logger.LogWarning("{Error}; speculation disabled.", draftError);
+                }
+                else if (SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath() is { } attachedDraft)
+                {
+                    _logger.LogInformation("Loaded draft head {Draft} (HasDraftHead=True)",
+                        Path.GetFileName(attachedDraft));
                 }
 
                 loadSw.Stop();
@@ -296,7 +258,7 @@ namespace TensorSharp.Server
                 _model = null;
                 _loadedModelPath = null;
                 _loadedMmProjPath = null;
-                MtpDraftActivationError = null;
+                DraftHeadActivationError = null;
                 throw;
             }
         }

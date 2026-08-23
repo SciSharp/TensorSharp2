@@ -26,12 +26,12 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
-public class GlmDsaMtpTests : IDisposable
+public class GlmDsaSpeculativeTests : IDisposable
 {
     private readonly ITestOutputHelper _output;
     private readonly string _dir;
 
-    public GlmDsaMtpTests(ITestOutputHelper output)
+    public GlmDsaSpeculativeTests(ITestOutputHelper output)
     {
         _output = output;
         _dir = Path.Combine(Path.GetTempPath(), "ts-glm-mtp-" + Guid.NewGuid().ToString("N"));
@@ -75,15 +75,15 @@ public class GlmDsaMtpTests : IDisposable
     public void GlmDsa_MtpDraftHeadIsDetected()
     {
         using var model = ModelBase.Create(BuildModel(), BackendType.Cpu);
-        var spec = Assert.IsAssignableFrom<IMtpSpeculativeModel>(model);
+        var spec = Assert.IsAssignableFrom<ISpeculativeModel>(model);
 
-        Assert.True(spec.HasMtp, "the synthetic glm-dsa model ships a complete NextN block");
-        Assert.Equal(GlmDsaSyntheticModelBuilder.Hidden, spec.MtpHiddenSize);
+        Assert.True(spec.HasDraftHead, "the synthetic glm-dsa model ships a complete NextN block");
+        Assert.Equal(GlmDsaSyntheticModelBuilder.Hidden, spec.SpecFeatureSize);
         // Per-token drafting, not a DSpark-style block drafter.
-        Assert.Equal(0, spec.MtpDraftBlockSize);
-        Assert.True(spec.MtpVerifyPersistsAcceptedKv,
+        Assert.Equal(0, spec.DraftBlockSize);
+        Assert.True(spec.SpecVerifyPersistsAcceptedKv,
             "glm-dsa has no recurrent state, so a verify's KV writes survive a partial rejection");
-        Assert.True(spec.MtpSpeculationProfitable);
+        Assert.True(spec.SpeculationProfitable);
     }
 
     [Fact]
@@ -103,7 +103,7 @@ public class GlmDsaMtpTests : IDisposable
 
         using (var model = ModelBase.Create(path, BackendType.Cpu))
         {
-            var spec = (IMtpSpeculativeModel)model;
+            var spec = (ISpeculativeModel)model;
             model.ResetKVCache();
             var h = new float[(long)prompt.Length * hidden];
             var logits = new float[vocab];
@@ -142,7 +142,7 @@ public class GlmDsaMtpTests : IDisposable
         // One batch, all rows.
         using (var model = ModelBase.Create(path, BackendType.Cpu))
         {
-            var spec = (IMtpSpeculativeModel)model;
+            var spec = (ISpeculativeModel)model;
             model.ResetKVCache();
             var h = new float[(long)prompt.Length * hidden];
             var logits = new float[(long)prompt.Length * vocab];
@@ -161,8 +161,8 @@ public class GlmDsaMtpTests : IDisposable
     public void GlmDsa_MtpDraftStepProducesUsableLogits()
     {
         using var model = ModelBase.Create(BuildModel(), BackendType.Cpu);
-        var spec = (IMtpSpeculativeModel)model;
-        int hidden = spec.MtpHiddenSize;
+        var spec = (ISpeculativeModel)model;
+        int hidden = spec.SpecFeatureSize;
         int vocab = model.Config.VocabSize;
         int[] prompt = Prompt24();
 
@@ -175,7 +175,7 @@ public class GlmDsaMtpTests : IDisposable
         // hidden state of token k-1 (row 0 carries in zeros, as at generation start).
         var paired = new float[(long)prompt.Length * hidden];
         Array.Copy(hAll, 0, paired, hidden, (long)(prompt.Length - 1) * hidden);
-        spec.MtpCatchUp(prompt, paired, 0);
+        spec.DraftCatchUp(prompt, paired, 0);
 
         int next = Argmax(promptLogits);
         var lastH = new float[hidden];
@@ -183,7 +183,7 @@ public class GlmDsaMtpTests : IDisposable
 
         var draftLogits = new float[vocab];
         var draftH = new float[hidden];
-        spec.MtpDraftStep(next, lastH, prompt.Length, draftLogits, draftH);
+        spec.DraftStep(next, lastH, prompt.Length, draftLogits, draftH);
 
         Assert.All(draftLogits, v => Assert.False(float.IsNaN(v) || float.IsInfinity(v)));
         double hNorm = 0;
@@ -210,9 +210,9 @@ public class GlmDsaMtpTests : IDisposable
 
         using (var model = ModelBase.Create(path, BackendType.Cpu))
         {
-            var spec = (IMtpSpeculativeModel)model;
-            Assert.True(spec.HasMtp);
-            var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+            var spec = (ISpeculativeModel)model;
+            Assert.True(spec.HasDraftHead);
+            var decoder = new SpeculativeDecoder(spec, maxDraftTokens: 4)
             {
                 // Force drafting on: the cost governor exists to protect
                 // throughput, and on a 1.9 MB model it would measure noise.
@@ -261,8 +261,8 @@ public class GlmDsaMtpTests : IDisposable
         }
 
         using var specModel = ModelBase.Create(path, BackendType.Cpu);
-        var spec = (IMtpSpeculativeModel)specModel;
-        var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+        var spec = (ISpeculativeModel)specModel;
+        var decoder = new SpeculativeDecoder(spec, maxDraftTokens: 4)
         {
             AdaptiveSpeculation = false,
             MinDraftProb = 0.02f,
@@ -286,7 +286,7 @@ public class GlmDsaMtpTests : IDisposable
     {
         // Drive the window deliberately wide so rejections are frequent, then
         // check the emitted stream still matches greedy. This is the path
-        // MtpVerifyPersistsAcceptedKv takes: no rollback re-forward, just a
+        // SpecVerifyPersistsAcceptedKv takes: no rollback re-forward, just a
         // position rewind, so a bug here shows up as a corrupted continuation
         // rather than a crash.
         string path = BuildModel();
@@ -299,8 +299,8 @@ public class GlmDsaMtpTests : IDisposable
 
         using (var model = ModelBase.Create(path, BackendType.Cpu))
         {
-            var spec = (IMtpSpeculativeModel)model;
-            var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 8)
+            var spec = (ISpeculativeModel)model;
+            var decoder = new SpeculativeDecoder(spec, maxDraftTokens: 8)
             {
                 AdaptiveSpeculation = false,
                 // Draft regardless of confidence so the window is always full and
@@ -379,9 +379,9 @@ public class GlmDsaMtpTests : IDisposable
 
         using (var model = ModelBase.Create(path, BackendType.Cpu))
         {
-            var spec = (IMtpSpeculativeModel)model;
-            Assert.True(spec.HasMtp);
-            var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+            var spec = (ISpeculativeModel)model;
+            Assert.True(spec.HasDraftHead);
+            var decoder = new SpeculativeDecoder(spec, maxDraftTokens: 4)
             {
                 AdaptiveSpeculation = false,
                 // (see GlmDsa_SpeculativeGreedyMatchesPlainGreedy on why the
@@ -408,7 +408,7 @@ public class GlmDsaMtpTests : IDisposable
             // emitted": re-drawing it would consume the seeded RNG a second time
             // and the stream above would diverge at the first speculative step.
             // The accepted half is pinned on the deterministic fake, in
-            // MtpSpeculativeExecutionTests.GenerateSampled_WithAcceptedDrafts_*.
+            // SpeculativeExecutionTests.GenerateSampled_WithAcceptedDrafts_*.
         }
     }
 
@@ -432,8 +432,8 @@ public class GlmDsaMtpTests : IDisposable
         }
 
         using var specModel = ModelBase.Create(path, BackendType.Cpu);
-        var spec = (IMtpSpeculativeModel)specModel;
-        var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+        var spec = (ISpeculativeModel)specModel;
+        var decoder = new SpeculativeDecoder(spec, maxDraftTokens: 4)
         {
             AdaptiveSpeculation = false,
             MinDraftProb = 0.02f,
@@ -460,8 +460,8 @@ public class GlmDsaMtpTests : IDisposable
         int[] prompt = Prompt24();
 
         using var model = ModelBase.Create(path, BackendType.Cpu);
-        var spec = (IMtpSpeculativeModel)model;
-        var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+        var spec = (ISpeculativeModel)model;
+        var decoder = new SpeculativeDecoder(spec, maxDraftTokens: 4)
         {
             AdaptiveSpeculation = false,
             MinDraftProb = 0.02f,

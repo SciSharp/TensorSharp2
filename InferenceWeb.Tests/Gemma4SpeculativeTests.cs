@@ -37,10 +37,10 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Requires", "Models")]
-public class Gemma4MtpTests
+public class Gemma4SpeculativeTests
 {
     private readonly ITestOutputHelper _output;
-    public Gemma4MtpTests(ITestOutputHelper output) { _output = output; }
+    public Gemma4SpeculativeTests(ITestOutputHelper output) { _output = output; }
 
     private const string DefaultModelDir = @"C:\Works\models\gemma_mtp";
 
@@ -56,7 +56,7 @@ public class Gemma4MtpTests
         _output.WriteLine($"[gmtp] target={Path.GetFileName(targetPath)} draft={Path.GetFileName(draftPath)} backend={ResolveBackend()}");
         using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
-        Xunit.Assert.True(model.HasMtp, "model should expose a Gemma 4 MTP draft head");
+        Xunit.Assert.True(model.HasDraftHead, "model should expose a Gemma 4 MTP draft head");
 
         string prompt = "The capital of France is Paris. The capital of Japan is Tokyo. " +
                         "The capital of Italy is";
@@ -77,7 +77,7 @@ public class Gemma4MtpTests
         }
 
         // Speculative greedy.
-        var spec = new MtpSpeculativeDecoder(model, maxDraft);
+        var spec = new SpeculativeDecoder(model, maxDraft);
         List<int> specTokens = spec.GenerateGreedy(tokens, maxNew);
 
         _output.WriteLine($"[gmtp] baseline: \"{Trim(model.Tokenizer.Decode(baseline))}\"");
@@ -132,7 +132,7 @@ public class Gemma4MtpTests
         _output.WriteLine($"[gmtp-long] target={Path.GetFileName(targetPath)} backend={ResolveBackend()}");
         using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
-        Xunit.Assert.True(model.HasMtp);
+        Xunit.Assert.True(model.HasDraftHead);
 
         string prompt = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT");
         string promptFile = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT_FILE");
@@ -159,7 +159,7 @@ public class Gemma4MtpTests
         // during the prompt prefill; post-fix it must complete. Match the prefill
         // chunk size to the baseline's ForwardRefill chunk (the server's default,
         // 1024) so the prefill-time comparison is apples-to-apples.
-        var spec = new MtpSpeculativeDecoder(model, maxDraft)
+        var spec = new SpeculativeDecoder(model, maxDraft)
         {
             PrefillChunkSize = EnvInt("TS_GMTP_PREFILL_CHUNK", 1024),
         };
@@ -201,7 +201,7 @@ public class Gemma4MtpTests
         _output.WriteLine($"[gmtp-bench] target={Path.GetFileName(targetPath)} backend={ResolveBackend()}");
         using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
-        Xunit.Assert.True(model.HasMtp);
+        Xunit.Assert.True(model.HasDraftHead);
 
         string prompt = "Write a short story about a robot learning to paint. " +
                         "Once upon a time, in a small workshop at the edge of the city,";
@@ -246,7 +246,7 @@ public class Gemma4MtpTests
         double baseUnfusedTps = (maxNew - 1) / swUnfused.Elapsed.TotalSeconds;
 
         // Speculative greedy.
-        var spec = new MtpSpeculativeDecoder(model, maxDraft);
+        var spec = new SpeculativeDecoder(model, maxDraft);
         string pminEnv = Environment.GetEnvironmentVariable("TS_GMTP_PMIN");
         if (!string.IsNullOrEmpty(pminEnv) && float.TryParse(pminEnv, out float pmin))
             spec.MinDraftProb = pmin;
@@ -286,7 +286,7 @@ public class Gemma4MtpTests
         _output.WriteLine($"[gmtp-engine] target={Path.GetFileName(targetPath)} backend={ResolveBackend()}");
         using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
-        Xunit.Assert.True(model.HasMtp);
+        Xunit.Assert.True(model.HasDraftHead);
 
         string prompt = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT");
         string promptFile = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT_FILE");
@@ -307,9 +307,12 @@ public class Gemma4MtpTests
         {
             var cfg = new SchedulerConfig
             {
-                MtpSpeculativeEnabled = mtp,
-                MtpMaxDraftTokens = maxDraft,
-                MtpMinDraftProb = EnvFloat("TS_GMTP_PMIN", 0.6f),
+                Speculation = new SpeculationOptions
+                {
+                    Enabled = mtp,
+                    MaxDraftTokens = maxDraft,
+                    MinDraftProb = EnvFloat("TS_GMTP_PMIN", 0.6f),
+                },
                 NumBlocks = 64,
                 BlockSize = 256,
                 MaxNumBatchedTokens = 1024,
@@ -353,10 +356,10 @@ public class Gemma4MtpTests
 
         // On a backend that can drive the accelerated MTP path, speculation must
         // engage (drafted>0). On a backend that cannot (e.g. --backend cuda, the
-        // pure-C# CUDA path with no fused multi-token kernels), MtpSpeculationProfitable
+        // pure-C# CUDA path with no fused multi-token kernels), SpeculationProfitable
         // is false: the engine intentionally serves standard decode (drafted==0) so
         // speculation never regresses throughput below MTP-off.
-        if (model.MtpSpeculationProfitable)
+        if (model.SpeculationProfitable)
         {
             Xunit.Assert.True(on.drafted > 0, "spec trunk never drafted — MTP not engaged through the engine");
         }
@@ -394,7 +397,7 @@ public class Gemma4MtpTests
         _output.WriteLine($"[gmtp-oom] target={Path.GetFileName(targetPath)} backend={ResolveBackend()} maxNew={maxNew} maxDraft={maxDraft}");
         using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
         model.LoadMtpDraftWeights(draftPath);
-        Xunit.Assert.True(model.HasMtp);
+        Xunit.Assert.True(model.HasDraftHead);
 
         // Faithful repro: the reported OOM ran with --mmproj loaded, which holds
         // ~1.2 GB resident even for text-only chat. Load it when TS_GMTP_MMPROJ
@@ -426,9 +429,12 @@ public class Gemma4MtpTests
 
         var cfg = new SchedulerConfig
         {
-            MtpSpeculativeEnabled = true,
-            MtpMaxDraftTokens = maxDraft,
-            MtpMinDraftProb = EnvFloat("TS_GMTP_PMIN", 0.75f),
+            Speculation = new SpeculationOptions
+            {
+                Enabled = true,
+                MaxDraftTokens = maxDraft,
+                MinDraftProb = EnvFloat("TS_GMTP_PMIN", 0.75f),
+            },
             NumBlocks = 64,
             BlockSize = 256,
             MaxNumBatchedTokens = 1024,

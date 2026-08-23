@@ -82,7 +82,7 @@ bool redisFlagsApplied = ServerOptionsBuilder.ApplyRedisCliFlags(args);
 bool continuousBatchingFlagApplied = ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(args);
 // Translate --mtp-spec / --mtp-draft / --mtp-pmin into the TS_MTP_* env vars
 // read by SchedulerConfig.FromEnvironment when the engine is constructed.
-bool mtpSpecFlagsApplied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(args);
+bool specFlagsApplied = ServerOptionsBuilder.ApplySpeculativeCliFlags(args);
 // Translate --qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj into the
 // TS_QWEN_IMAGE_* env vars QwenImageModel reads to locate the VAE, Qwen2.5-VL
 // text-encoder, and mmproj GGUFs. Must run before the startup model is loaded.
@@ -201,17 +201,17 @@ if (redisFlagsApplied)
         Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL") ?? "(disabled)");
 }
 
-if (mtpSpecFlagsApplied)
+if (specFlagsApplied)
 {
     var schedCfg = TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment();
     string blockDraft = Environment.GetEnvironmentVariable("TS_DSV4_DSPARK");
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "MTP speculative decoding configured via CLI: enabled={Enabled} maxDraft={MaxDraft} pMin={PMin} draftModel={DraftModel} " +
-        "(engages for solo sequences on models that ship a draft head)",
-        schedCfg.MtpSpeculativeEnabled, schedCfg.MtpMaxDraftTokens,
-        schedCfg.MtpMinDraftProb.HasValue
-            ? schedCfg.MtpMinDraftProb.Value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
-            : "auto (per drafter kind)",
+        "Speculative decoding configured via CLI: enabled={Enabled} algorithm={Algorithm} maxDraft={MaxDraft} " +
+        "pMin={PMin} draftModel={DraftModel} (engages for solo sequences)",
+        schedCfg.Speculation.Enabled, schedCfg.Speculation.SpeculatorName, schedCfg.Speculation.MaxDraftTokens,
+        schedCfg.Speculation.MinDraftProb.HasValue
+            ? schedCfg.Speculation.MinDraftProb.Value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
+            : "auto (per algorithm)",
         string.IsNullOrEmpty(blockDraft) ? "(none)" : Path.GetFileName(blockDraft));
 }
 

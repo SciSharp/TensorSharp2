@@ -29,6 +29,32 @@ internal sealed class EnvScope : IDisposable
         Environment.SetEnvironmentVariable(name, value);
     }
 
+    /// <summary>
+    /// Clear every speculative-decoding variable, in BOTH spellings. A flag
+    /// applied through <c>SpeculativeCliFlags</c> is published twice - under
+    /// <c>TS_SPEC_*</c> for managed readers and <c>TS_MTP_*</c> for the glm-dsa
+    /// native loader - so a test that clears only one spelling still reads the
+    /// other one's leftovers.
+    /// </summary>
+    public void ClearSpeculationVars()
+    {
+        foreach (string name in new[]
+                 {
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.Enabled,
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.Type,
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.Draft,
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.PMin,
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.DraftModel,
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.LegacyEnabled,
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.LegacyDraft,
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.LegacyPMin,
+                     TensorSharp.Runtime.Speculative.SpeculationEnvVars.LegacyDraftModel,
+                 })
+        {
+            Set(name, null);
+        }
+    }
+
     public void Dispose()
     {
         foreach (var kv in _originals)

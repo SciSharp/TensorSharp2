@@ -60,10 +60,10 @@ namespace TensorSharp.Server
         /// <summary>
         /// Non-null when an explicitly requested <c>--mtp-draft-model</c> could not
         /// be activated on the loaded target (see
-        /// <see cref="ModelLifecycleService.MtpDraftActivationError"/>). The startup
+        /// <see cref="ModelLifecycleService.DraftHeadActivationError"/>). The startup
         /// loader promotes it to a fail-fast error.
         /// </summary>
-        public string MtpDraftActivationError => _lifecycle.MtpDraftActivationError;
+        public string DraftHeadActivationError => _lifecycle.DraftHeadActivationError;
 
         /// <summary>
         /// Legacy compatibility shim. The engine owns KV state, so no server

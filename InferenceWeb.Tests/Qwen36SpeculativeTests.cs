@@ -31,10 +31,10 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Requires", "Models")]
-public class Qwen36MtpTests
+public class Qwen36SpeculativeTests
 {
     private readonly ITestOutputHelper _output;
-    public Qwen36MtpTests(ITestOutputHelper output) { _output = output; }
+    public Qwen36SpeculativeTests(ITestOutputHelper output) { _output = output; }
 
     private const string DefaultModelDir = @"C:\Works\models\mtp";
 
@@ -49,7 +49,7 @@ public class Qwen36MtpTests
 
         _output.WriteLine($"[mtp] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
         using var model = (Qwen35Model)ModelBase.Create(modelPath, ResolveBackend());
-        Xunit.Assert.True(model.HasMtp, "model should expose a NextN/MTP draft head");
+        Xunit.Assert.True(model.HasDraftHead, "model should expose a NextN/MTP draft head");
 
         string prompt = "Q: What is the capital of France?\nA: The capital of France is Paris.\n" +
                         "Q: What is the capital of Japan?\nA:";
@@ -74,7 +74,7 @@ public class Qwen36MtpTests
         swBaseDecode.Stop();
 
         // Speculative: MTP draft + batched trunk verification.
-        var spec = new MtpSpeculativeDecoder(model, maxDraft);
+        var spec = new SpeculativeDecoder(model, maxDraft);
         List<int> specTokens = spec.GenerateGreedy(tokens, maxNew);
 
         string baseText = model.Tokenizer.Decode(baseline);
@@ -115,7 +115,7 @@ public class Qwen36MtpTests
 
         _output.WriteLine($"[mtp-bench] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
         using var model = (Qwen35Model)ModelBase.Create(modelPath, ResolveBackend());
-        Xunit.Assert.True(model.HasMtp);
+        Xunit.Assert.True(model.HasDraftHead);
 
         string prompt = "Write a short story about a robot learning to paint. " +
                         "Once upon a time, in a small workshop at the edge of the city,";
@@ -145,7 +145,7 @@ public class Qwen36MtpTests
         double baseTps = (maxNew - 1) / swDecode.Elapsed.TotalSeconds;
 
         // Speculative greedy.
-        var spec = new MtpSpeculativeDecoder(model, maxDraft);
+        var spec = new SpeculativeDecoder(model, maxDraft);
         string pminEnv = Environment.GetEnvironmentVariable("TS_MTP_PMIN");
         if (!string.IsNullOrEmpty(pminEnv) && float.TryParse(pminEnv, out float pmin))
             spec.MinDraftProb = pmin;
@@ -182,7 +182,7 @@ public class Qwen36MtpTests
 
         _output.WriteLine($"[mtp-profile] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
         using var model = (Qwen35Model)ModelBase.Create(modelPath, ResolveBackend());
-        Xunit.Assert.True(model.HasMtp);
+        Xunit.Assert.True(model.HasDraftHead);
 
         string prompt = "Write a long, detailed essay about the history of video games. Begin:";
         int[] tokens = model.Tokenizer.Encode(prompt, addSpecial: false).ToArray();
@@ -192,7 +192,7 @@ public class Qwen36MtpTests
         model.ForwardRefill(tokens);
         model.Forward(new[] { tokens[^1] });
 
-        var spec = new MtpSpeculativeDecoder(model, maxDraft);
+        var spec = new SpeculativeDecoder(model, maxDraft);
         model.ResetSpecLayerTimings();
         var specTokens = spec.GenerateGreedy(tokens, maxNew);
 

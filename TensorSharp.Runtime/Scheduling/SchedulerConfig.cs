@@ -4,6 +4,8 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Runtime.Scheduling
 {
     /// <summary>
@@ -76,24 +78,14 @@ namespace TensorSharp.Runtime.Scheduling
         /// swap at block boundaries.</summary>
         public int DecodeQuantumTokens { get; init; } = 256;
 
-        /// <summary>Enable NextN/MTP speculative decoding for solo sequences on
-        /// models that expose a draft head (Qwen3.6). Default OFF. CLI:
-        /// <c>--mtp-spec</c>; env: <c>TS_MTP_SPEC</c>.</summary>
-        public bool MtpSpeculativeEnabled { get; init; }
-
-        /// <summary>Maximum tokens drafted per speculative step (llama.cpp
-        /// n_max). CLI: <c>--mtp-draft</c>; env: <c>TS_MTP_DRAFT</c>.</summary>
-        public int MtpMaxDraftTokens { get; init; } = 8;
-
         /// <summary>
-        /// Minimum draft confidence for a drafted token to be kept, or null to
-        /// let the drafter pick (<see cref="MtpSpeculativeExecution.MinDraftProb"/>:
-        /// 0.75 per-token, 0.35 cumulative for a block drafter). The two gates
-        /// threshold different quantities, so one shared default cannot serve
-        /// both — leave this unset unless the operator asked for a specific
-        /// value. CLI: <c>--mtp-pmin</c>; env: <c>TS_MTP_PMIN</c>.
+        /// Speculative decoding policy for this engine: whether to speculate,
+        /// with which algorithm, how wide a window and what confidence gate.
+        /// Default: off. One value object rather than loose fields so a new
+        /// knob reaches the executor without threading a parameter through the
+        /// scheduler. See <see cref="SpeculationOptions"/>.
         /// </summary>
-        public float? MtpMinDraftProb { get; init; }
+        public SpeculationOptions Speculation { get; init; } = SpeculationOptions.Disabled;
 
         public static SchedulerConfig Default => new();
 
@@ -109,9 +101,7 @@ namespace TensorSharp.Runtime.Scheduling
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 256),
                 EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
-                MtpSpeculativeEnabled = ReadBool("TS_MTP_SPEC", false),
-                MtpMaxDraftTokens = ReadInt("TS_MTP_DRAFT", 8),
-                MtpMinDraftProb = ReadFloatOrNull("TS_MTP_PMIN"),
+                Speculation = SpeculationOptions.FromEnvironment(),
             };
             return cfg;
         }
@@ -122,21 +112,6 @@ namespace TensorSharp.Runtime.Scheduling
             if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out int v) && v > 0)
                 return v;
             return fallback;
-        }
-
-        /// <summary>Reads an optional probability: null when unset or unusable,
-        /// so the consumer can apply its own kind-specific default.</summary>
-        private static float? ReadFloatOrNull(string name)
-        {
-            string raw = System.Environment.GetEnvironmentVariable(name);
-            if (!string.IsNullOrEmpty(raw)
-                && float.TryParse(raw, System.Globalization.NumberStyles.Float,
-                    System.Globalization.CultureInfo.InvariantCulture, out float v)
-                && v > 0f)
-            {
-                return v;
-            }
-            return null;
         }
 
         private static float ReadFloat(string name, float fallback)

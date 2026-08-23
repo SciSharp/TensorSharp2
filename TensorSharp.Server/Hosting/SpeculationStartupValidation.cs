@@ -20,7 +20,7 @@ namespace TensorSharp.Server.Hosting
     /// contract <c>--mmproj</c>/backend/model-path misconfiguration already follow.
     /// Kept as a tiny pure function so it can be unit-tested without loading a model.
     /// </summary>
-    internal static class MtpStartupValidation
+    internal static class SpeculationStartupValidation
     {
         /// <summary>
         /// Returns the operator-facing fatal error message when an explicitly

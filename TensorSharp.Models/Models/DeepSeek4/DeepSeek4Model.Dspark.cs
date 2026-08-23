@@ -10,21 +10,23 @@
 //
 // DSpark is a BLOCK drafter -- one forward pass proposes the whole speculative
 // window -- so it plugs into the shared draft/verify/rollback core through
-// IMtpSpeculativeModel.MtpDraftBlock instead of the per-token MtpDraftStep, and
+// ISpeculativeModel.DraftBlock instead of the per-token DraftStep, and
 // reports the wider hidden row (the concatenated target-layer features its
-// main_proj consumes) through MtpHiddenSize.
+// main_proj consumes) through SpecFeatureSize.
 //
 // Rollback is free here: the verify pass wrote correct KV for every token it
 // processed, and the engine's rings are sized so a rejected tail can never
 // alias a row a later pass still reads, so partial acceptance only rewinds the
-// position counter (MtpVerifyPersistsAcceptedKv).
+// position counter (SpecVerifyPersistsAcceptedKv).
 using System;
 using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Models
 {
-    public partial class DeepSeek4Model : IMtpSpeculativeModel
+    public partial class DeepSeek4Model : ISpeculativeModel
     {
         /// <summary>Path of the DSpark drafter GGUF, if one was configured
         /// (<c>--draft-model</c> / <c>TS_DSV4_DSPARK</c>).</summary>
@@ -38,11 +40,18 @@ namespace TensorSharp.Models
 
         /// <summary>True when a DSpark drafter is loaded and usable, on either
         /// executor: the direct-CUDA engine or the native ggml one.</summary>
-        public bool HasMtp => (_cudaExec != null && _cudaExec.HasDspark) || _nativeDsparkBlock > 0;
+        public bool HasDraftHead => (_cudaExec != null && _cudaExec.HasDspark) || _nativeDsparkBlock > 0;
+
+        /// <summary>DSpark proposes a whole block per pass, so it is served by
+        /// <see cref="BlockDraftSpeculator"/>.</summary>
+        public DraftHeadKind DraftHeadKind => HasDraftHead ? DraftHeadKind.Block : DraftHeadKind.None;
 
         /// <summary>Both DSpark implementations run the batched verify on their
         /// own accelerated path.</summary>
-        public bool MtpSpeculationProfitable => HasMtp;
+        // Gated on the drafter because SpecForward runs the DSpark-aware executor
+        // path (RequireDspark) and has no meaning without it, so a weight-free
+        // speculator has no trunk to verify with here.
+        public bool SpeculationProfitable => HasDraftHead;
 
         /// <summary>
         /// Width of the hidden row handed between the trunk and the drafter. The
@@ -51,23 +60,23 @@ namespace TensorSharp.Models
         /// drafter key ring inside the trunk graph and needs nothing from the
         /// host, so its rows are a single (unused) float.
         /// </summary>
-        public int MtpHiddenSize => _cudaExec != null && _cudaExec.HasDspark ? _cudaExec.DsparkFeatureSize : 1;
+        public int SpecFeatureSize => _cudaExec != null && _cudaExec.HasDspark ? _cudaExec.DsparkFeatureSize : 1;
 
-        public int MtpDraftBlockSize => _cudaExec != null ? _cudaExec.DsparkBlockSize : _nativeDsparkBlock;
+        public int DraftBlockSize => _cudaExec != null ? _cudaExec.DsparkBlockSize : _nativeDsparkBlock;
 
         /// <summary>Prefill in whole engine micro-batches: the MoE trunk reads
         /// every touched expert's weights once per micro-batch, so halving the
         /// chunk nearly doubles prefill weight traffic per token.</summary>
-        public int MtpPrefillChunkSize => _cudaExec != null ? _cudaExec.UBatch : _nativeUBatch;
+        public int SpecPrefillChunkSize => _cudaExec != null ? _cudaExec.UBatch : _nativeUBatch;
 
         /// <summary>Both engines replay the drafter key ring from their own
         /// on-device features, so prefill needs no per-row readback.</summary>
-        public bool MtpPrefillSelfCatchUp => true;
+        public bool DraftSelfCatchUp => true;
 
         /// <summary>The verify batch writes reusable KV for every row, and the
         /// engine's rings tolerate a rejected tail, so partial acceptance needs
         /// no re-forward.</summary>
-        public bool MtpVerifyPersistsAcceptedKv => true;
+        public bool SpecVerifyPersistsAcceptedKv => true;
 
         /// <summary>Trunk position tracked by the executor (the base class's
         /// counter is not used by the DSV4 executors).</summary>
@@ -99,7 +108,7 @@ namespace TensorSharp.Models
             }
         }
 
-        public int MtpDraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
+        public int DraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
         {
             RequireDspark();
             lock (_sync)
@@ -113,7 +122,7 @@ namespace TensorSharp.Models
         /// <summary>Row k of <paramref name="hRows"/> is the hidden state of the
         /// token BEFORE tokens[k], i.e. the features of position startPos+k-1 --
         /// which is exactly the position whose drafter key it writes.</summary>
-        public void MtpCatchUp(int[] tokens, float[] hRows, int startPos)
+        public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
             RequireDspark();
             lock (_sync)
@@ -125,7 +134,7 @@ namespace TensorSharp.Models
             }
         }
 
-        public void MtpRewindCache(int length)
+        public void SpecRewindCache(int length)
         {
             RequireDspark();
             lock (_sync)
@@ -139,20 +148,20 @@ namespace TensorSharp.Models
 
         /// <summary>DSpark drafts a whole block per step; the per-token draft
         /// entry point is never used.</summary>
-        public void MtpDraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
-            => throw new NotSupportedException("DeepSeek V4 drafts whole blocks; use MtpDraftBlock.");
+        public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
+            => throw new NotSupportedException("DeepSeek V4 drafts whole blocks; use DraftBlock.");
 
         // The DSV4 caches are preallocated for the whole context and hold no
         // recurrent state that a rejected draft could corrupt.
-        public void MtpEnsureCapacity(int requiredSeqLen) { }
+        public void SpecEnsureCapacity(int requiredSeqLen) { }
 
-        public void MtpSnapshotRecurrentState() { }
+        public void SpecSnapshotRecurrentState() { }
 
-        public void MtpRestoreRecurrentState() { }
+        public void SpecRestoreRecurrentState() { }
 
         private void RequireDspark()
         {
-            if (!HasMtp)
+            if (!HasDraftHead)
                 throw new InvalidOperationException("No DSpark drafter is loaded for this DeepSeek V4 model.");
         }
     }

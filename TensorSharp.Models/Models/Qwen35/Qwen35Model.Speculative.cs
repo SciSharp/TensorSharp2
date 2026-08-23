@@ -30,13 +30,15 @@ using System.Diagnostics;
 using TensorSharp;
 using TensorSharp.Runtime.Scheduling;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Models
 {
-    // IMtpBatchedSpeculativeModel (extends IMtpSpeculativeModel) is the
+    // IBatchedSpeculativeModel (extends ISpeculativeModel) is the
     // Runtime-side contract BatchExecutor drives for engine-path speculation;
     // every member is implemented below or inherited from ModelBase
     // (CacheSeqLen, MaxContextLength).
-    public partial class Qwen35Model : IMtpBatchedSpeculativeModel
+    public partial class Qwen35Model : IBatchedSpeculativeModel
     {
         // NextN/MTP weights (cached once at load; null when the GGUF has no MTP block).
         private QuantizedWeight _mtpEhProjQW;
@@ -56,7 +58,11 @@ namespace TensorSharp.Models
         /// <summary>
         /// True when the loaded GGUF contains a usable NextN/MTP draft block.
         /// </summary>
-        public bool HasMtp { get; private set; }
+        public bool HasDraftHead { get; private set; }
+
+        /// <summary>Qwen 3.6's NextN block drafts one token per pass, so it is
+        /// served by <see cref="DraftHeadSpeculator"/>.</summary>
+        public DraftHeadKind DraftHeadKind => HasDraftHead ? DraftHeadKind.PerToken : DraftHeadKind.None;
 
         /// <summary>Trunk layer count (excludes NextN/MTP blocks).</summary>
         public int NumTrunkLayers => Config.NumLayers;
@@ -100,16 +106,16 @@ namespace TensorSharp.Models
             // draft from the wrong weight; the trunk itself is unaffected.
             bool borrowsSplitHead = _tpLmHeadKey != null && _mtpHeadQW == null && _mtpHeadF32 == null;
 
-            HasMtp = _numNextnLayers == 1 && hasProj && _mtpEnormW != null && _mtpHnormW != null
+            HasDraftHead = _numNextnLayers == 1 && hasProj && _mtpEnormW != null && _mtpHnormW != null
                 && hasAttn && _attnNormW[_mtpLayerIdx] != null && _postAttnNormW[_mtpLayerIdx] != null
                 && !borrowsSplitHead;
 
             if (borrowsSplitHead)
                 Console.WriteLine("  NextN/MTP block has no own head and the LM head is column-parallel under TP; " +
                     "MTP drafting disabled.");
-            else if (_numNextnLayers > 0 && !HasMtp)
+            else if (_numNextnLayers > 0 && !HasDraftHead)
                 Console.WriteLine("  NextN/MTP block present but incomplete; MTP drafting disabled.");
-            else if (HasMtp)
+            else if (HasDraftHead)
                 Console.WriteLine($"  NextN/MTP draft head ready (layer {_mtpLayerIdx}, " +
                     $"moe={( _isMoeLayer != null && _isMoeLayer[_mtpLayerIdx] ? "yes" : "no")}, " +
                     $"ownHead={(_mtpHeadQW != null || _mtpHeadF32 != null ? "yes" : "no")})");
@@ -200,9 +206,9 @@ namespace TensorSharp.Models
         /// and <paramref name="hOut"/> (hidden floats) with the MTP hidden state
         /// used to chain the next draft step.
         /// </summary>
-        public unsafe void MtpDraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
+        public unsafe void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
-            if (!HasMtp)
+            if (!HasDraftHead)
                 throw new InvalidOperationException("Model has no NextN/MTP draft block.");
             EnterSpecSession();
             EnsureCacheCapacity(pos + 1);
@@ -255,9 +261,9 @@ namespace TensorSharp.Models
         /// </summary>
         private float[] _mtpCatchupLogits;
 
-        public void MtpCatchUp(int[] tokens, float[] hRows, int startPos)
+        public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
-            if (!HasMtp)
+            if (!HasDraftHead)
                 throw new InvalidOperationException("Model has no NextN/MTP draft block.");
             EnterSpecSession();
             EnsureCacheCapacity(startPos + tokens.Length);
@@ -448,14 +454,14 @@ namespace TensorSharp.Models
         /// _cacheSeqLen, so growing mid-draft would drop the MTP rows written
         /// past the trunk position; callers pre-grow before drafting instead.
         /// </summary>
-        public void MtpEnsureCapacity(int requiredSeqLen) => EnsureCacheCapacity(requiredSeqLen);
+        public void SpecEnsureCapacity(int requiredSeqLen) => EnsureCacheCapacity(requiredSeqLen);
 
         /// <summary>
         /// Snapshot the GDN recurrent state of every trunk layer. Taken right
         /// before a speculative verify batch so a partial rejection can roll the
         /// recurrent state back (attention KV needs only a position rewind).
         /// </summary>
-        public void MtpSnapshotRecurrentState()
+        public void SpecSnapshotRecurrentState()
         {
             // Direct-CUDA fast path: snapshot the GDN state device-to-device
             // (async cuMemcpyDtoD on the stream) instead of draining it to host
@@ -483,8 +489,8 @@ namespace TensorSharp.Models
             }
         }
 
-        /// <summary>Restore the GDN recurrent state captured by <see cref="MtpSnapshotRecurrentState"/>.</summary>
-        public void MtpRestoreRecurrentState()
+        /// <summary>Restore the GDN recurrent state captured by <see cref="SpecSnapshotRecurrentState"/>.</summary>
+        public void SpecRestoreRecurrentState()
         {
             if (_backend == BackendType.Cuda)
             {
@@ -557,7 +563,7 @@ namespace TensorSharp.Models
         /// next forward simply overwrites (the causal mask never reads past the
         /// current position), so no data movement is needed.
         /// </summary>
-        public void MtpRewindCache(int length)
+        public void SpecRewindCache(int length)
         {
             if (length < 0 || length > _cacheSeqLen)
                 throw new ArgumentOutOfRangeException(nameof(length),
@@ -566,7 +572,7 @@ namespace TensorSharp.Models
         }
 
         // ====================================================================
-        // Batched-trunk speculative decoding (IMtpBatchedSpeculativeModel):
+        // Batched-trunk speculative decoding (IBatchedSpeculativeModel):
         // trunk passes run through ForwardBatch (paged KV via the sequence's
         // block table, per-slot GDN state) so speculation rides the same
         // kernels as the non-speculative batched baseline. The MTP draft head
@@ -601,8 +607,15 @@ namespace TensorSharp.Models
         /// <c>TS_QWEN35_FUSED_VERIFY=1</c>, cuts the verify ~20x and is the path that
         /// makes spec competitive — long context / large drafts.) The user asked that
         /// the flag be respected regardless, so don't second-guess it here.
+        ///
+        /// Not gated on <see cref="HasDraftHead"/>: this asks about the TRUNK's
+        /// multi-token verify, which here is the ordinary layer stack with a
+        /// hidden-state tap and does not touch the NextN block. A weight-free
+        /// speculator (<c>--spec-type ngram</c>) therefore works on a Qwen 3.5/3.6
+        /// checkpoint that ships no draft head at all; whether a LEARNED drafter
+        /// exists is the registry's question, not this one.
         /// </summary>
-        public bool MtpSpeculationProfitable => HasMtp;
+        public bool SpeculationProfitable => true;
 
         /// <summary>Batched spec trunk needs the GGML batched paged path (the
         /// MLX backend keeps GDN state inside opaque per-slot MLX caches the
@@ -610,7 +623,7 @@ namespace TensorSharp.Models
         /// verify (<see cref="TryFullModelVerify"/>) is enabled we route spec to the
         /// LINEAR trunk instead (SpecForward), whose KV/GDN state the fused verify
         /// reads/writes; the batched paged trunk uses a different (paged) store.</summary>
-        public bool SupportsBatchedSpecTrunk => HasMtp && IsGgmlBackend && IsBatchedPathEnabled() && !_fusedVerifyEnabled;
+        public bool SupportsBatchedSpecTrunk => HasDraftHead && IsGgmlBackend && IsBatchedPathEnabled() && !_fusedVerifyEnabled;
 
         public void SpecForwardBatched(SequenceState seq, int[] tokens, int startPos,
             float[] hAllOut, float[] logitsOut, bool allLogitsRows)
@@ -665,7 +678,7 @@ namespace TensorSharp.Models
                 Array.Copy(perSeq[0], logitsOut, Config.VocabSize);
         }
 
-        public unsafe void MtpSnapshotRecurrentStateSlots(SequenceState seq)
+        public unsafe void SpecSnapshotRecurrentStateSlots(SequenceState seq)
         {
             ArgumentNullException.ThrowIfNull(seq);
             if (_q35GdnSlotConvBuf == null)
@@ -704,7 +717,7 @@ namespace TensorSharp.Models
             _mtpSlotSnapshotSlot = slot;
         }
 
-        public unsafe void MtpRestoreRecurrentStateSlots(SequenceState seq)
+        public unsafe void SpecRestoreRecurrentStateSlots(SequenceState seq)
         {
             ArgumentNullException.ThrowIfNull(seq);
             int slot = seq.BlockTable.Blocks[0].Id;

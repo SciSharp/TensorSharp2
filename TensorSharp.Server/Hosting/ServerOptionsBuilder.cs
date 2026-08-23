@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using TensorSharp.Runtime.Speculative;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -513,26 +514,26 @@ namespace TensorSharp.Server.Hosting
         /// default. Returns true when at least one flag was applied so the
         /// caller can emit a startup-log line.
         /// </summary>
-        public static bool ApplyMtpSpeculativeCliFlags(string[] args)
+        public static bool ApplySpeculativeCliFlags(string[] args)
         {
             if (args == null || args.Length == 0)
                 return false;
 
-            // The four --mtp-* flags mean the same thing in both hosts, so they are
-            // parsed and validated in one shared place (TensorSharp.Runtime) rather
-            // than kept in step by hand.
-            bool changed = MtpSpeculativeCliFlags.Apply(args);
+            // The speculative-decoding flags mean the same thing in both hosts,
+            // so they are parsed and validated in one shared place
+            // (TensorSharp.Runtime.Speculative) rather than kept in step by hand.
+            bool changed = SpeculativeCliFlags.Apply(args);
 
             for (int i = 0; i < args.Length; i++)
             {
                 // Path to a BLOCK drafter GGUF that has to be resident before
                 // the model's layer split runs (DeepSeek V4's DSpark). Unlike
-                // --mtp-draft-model this one is handed to the model factory, so
+                // --spec-draft-model this one is handed to the model factory, so
                 // it is carried as the same env var the CLI's --draft-model
                 // reads and picked up again by a runtime model switch. It stays
                 // server-local because the CLI passes its own --draft-model
                 // straight to ModelBase.Create instead.
-                if (MtpSpeculativeCliFlags.TryReadOption(args, ref i, "--draft-model", out string dsparkOpt))
+                if (SpeculativeCliFlags.TryReadOption(args, ref i, "--draft-model", out string dsparkOpt))
                 {
                     if (string.IsNullOrWhiteSpace(dsparkOpt) || !File.Exists(dsparkOpt))
                         throw new ArgumentException($"--draft-model file not found: '{dsparkOpt}'.");
@@ -1107,7 +1108,7 @@ namespace TensorSharp.Server.Hosting
                     continue;
                 }
                 // MTP speculative-decoding flags are consumed by
-                // ApplyMtpSpeculativeCliFlags(args) in a separate earlier pass.
+                // ApplySpeculativeCliFlags(args) in a separate earlier pass.
                 // Recognise + skip them here so they don't trip the
                 // unknown-arg trap below.
                 if (string.Equals(args[i], "--mtp-spec", StringComparison.OrdinalIgnoreCase) ||

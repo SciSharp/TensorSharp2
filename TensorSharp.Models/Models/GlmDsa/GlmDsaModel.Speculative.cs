@@ -43,12 +43,14 @@ using System;
 using TensorSharp.Core;
 using TensorSharp.Runtime.Scheduling;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Models
 {
-    public partial class GlmDsaModel : IMtpSpeculativeModel
+    public partial class GlmDsaModel : ISpeculativeModel
     {
         // NextN wiring of the draft block. Null until ResolveMtpLayer() finds a
-        // complete block; _mtpLayer stays -1 in that case and HasMtp is false.
+        // complete block; _mtpLayer stays -1 in that case and HasDraftHead is false.
         private Tensor _mtpEnormW;
         private Tensor _mtpHnormW;
         private Tensor _mtpHeadNormW;      // nextn.shared_head_norm (falls back to output_norm)
@@ -60,7 +62,7 @@ namespace TensorSharp.Models
         private int _mtpCacheSeqLen;
 
         /// <summary>The micro-batch the native executor was loaded with, so a
-        /// speculative prefill can chunk to match it. See <see cref="MtpPrefillChunkSize"/>.</summary>
+        /// speculative prefill can chunk to match it. See <see cref="SpecPrefillChunkSize"/>.</summary>
         private int _nativeUbatch;
 
         // Scratch reused across draft steps so a 16-token window does not
@@ -68,7 +70,11 @@ namespace TensorSharp.Models
         private float[] _mtpHScratch;
 
         /// <summary>True when the loaded weights contain a usable NextN/MTP draft block.</summary>
-        public bool HasMtp { get; private set; }
+        public bool HasDraftHead { get; private set; }
+
+        /// <summary>GLM-5.2's NextN block drafts one token per pass, so it is
+        /// served by <see cref="DraftHeadSpeculator"/>.</summary>
+        public DraftHeadKind DraftHeadKind => HasDraftHead ? DraftHeadKind.PerToken : DraftHeadKind.None;
 
         /// <summary>
         /// Decide whether the checkpoint actually carries the MTP block, and cache
@@ -78,7 +84,7 @@ namespace TensorSharp.Models
         /// </summary>
         private void ResolveMtpLayer()
         {
-            HasMtp = false;
+            HasDraftHead = false;
             _mtpLayer = -1;
             if (_numNextnLayers <= 0)
                 return;
@@ -134,22 +140,22 @@ namespace TensorSharp.Models
             }
 
             _mtpLayer = il;
-            HasMtp = true;
+            HasDraftHead = true;
             Console.WriteLine($"  NextN/MTP draft head ready (block {il}, dense attention, " +
                               $"ffn={(il < _numDenseLead ? "dense" : "moe")}, " +
                               $"ownEmbd={(_mtpEmbdF32 != null ? "yes" : "no")}, ownHead={(ownHead ? "yes" : "no")})");
         }
 
-        // ---- IMtpSpeculativeModel -------------------------------------------
+        // ---- ISpeculativeModel -------------------------------------------
 
         /// <summary>
         /// The draft block is one 256-expert MoE layer against a 78-layer trunk, so
         /// a draft step costs ~1.3% of a trunk decode step and the verify amortizes
         /// the whole trunk over the window. That holds on every backend GLM runs on;
-        /// the runtime cost governor in MtpSpeculativeExecution still measures it and
+        /// the runtime cost governor in SpeculativeExecution still measures it and
         /// parks drafting if a particular prompt/context makes it a loss.
         /// </summary>
-        public bool MtpSpeculationProfitable => true;
+        public bool SpeculationProfitable => true;
 
         /// <summary>
         /// The verify batch writes MLA rows (and, on the trunk, indexer keys) for
@@ -158,7 +164,7 @@ namespace TensorSharp.Models
         /// the position rewound. On a long context that removes the dominant
         /// rollback cost — a whole extra trunk forward.
         /// </summary>
-        public bool MtpVerifyPersistsAcceptedKv => true;
+        public bool SpecVerifyPersistsAcceptedKv => true;
 
         /// <summary>
         /// The trunk re-reads the routed experts once per micro-batch, so a
@@ -175,11 +181,11 @@ namespace TensorSharp.Models
         /// leaves ~16 rows per expert, so half the tile is padding — the same
         /// effect that made the plain prefill 984 vs 696 tok/s at 1024).
         /// </summary>
-        public int MtpPrefillChunkSize
+        public int SpecPrefillChunkSize
             => UsesNativeExecutor ? Math.Max(1, _nativeUbatch) : ResolvePrefillChunkSize();
 
 
-        public void MtpEnsureCapacity(int requiredSeqLen)
+        public void SpecEnsureCapacity(int requiredSeqLen)
         {
             if (UsesNativeExecutor)
                 return;                       // native caches are sized to n_ctx at load
@@ -188,12 +194,12 @@ namespace TensorSharp.Models
 
         /// <summary>glm-dsa has no recurrent state: MLA rows and indexer keys are
         /// per-position and a rewind is exact.</summary>
-        public void MtpSnapshotRecurrentState() { }
+        public void SpecSnapshotRecurrentState() { }
 
-        /// <summary>See <see cref="MtpSnapshotRecurrentState"/>.</summary>
-        public void MtpRestoreRecurrentState() { }
+        /// <summary>See <see cref="SpecSnapshotRecurrentState"/>.</summary>
+        public void SpecRestoreRecurrentState() { }
 
-        public void MtpRewindCache(int length)
+        public void SpecRewindCache(int length)
         {
             if (length < 0)
                 throw new ArgumentOutOfRangeException(nameof(length));
@@ -276,7 +282,7 @@ namespace TensorSharp.Models
         /// <paramref name="hOut"/> receives the draft block's own hidden state so
         /// the next step in the window can chain from it.
         /// </summary>
-        public void MtpDraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
+        public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
             RequireMtp();
             ArgumentNullException.ThrowIfNull(hPrev);
@@ -293,7 +299,7 @@ namespace TensorSharp.Models
         /// tracks the real context. Row k of <paramref name="hRows"/> is the trunk
         /// hidden state of the token PRECEDING <c>tokens[k]</c>.
         /// </summary>
-        public void MtpCatchUp(int[] tokens, float[] hRows, int startPos)
+        public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
             RequireMtp();
             ArgumentNullException.ThrowIfNull(tokens);
@@ -461,7 +467,7 @@ namespace TensorSharp.Models
 
         private void RequireMtp()
         {
-            if (!HasMtp)
+            if (!HasDraftHead)
                 throw new InvalidOperationException("This glm-dsa checkpoint has no NextN/MTP draft block.");
         }
     }

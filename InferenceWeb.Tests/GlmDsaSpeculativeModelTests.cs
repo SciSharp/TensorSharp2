@@ -7,7 +7,7 @@
 //
 // NextN/MTP speculative decoding on a REAL GLM-5.x checkpoint.
 //
-// GlmDsaMtpTests covers the architecture on a 1.9 MB synthetic model, which
+// GlmDsaSpeculativeTests covers the architecture on a 1.9 MB synthetic model, which
 // proves the wiring but says nothing about either thing that actually matters
 // here: whether a draft head trained on this model predicts well enough to be
 // accepted, and whether the fused verify beats plain decode. Both need the real
@@ -35,14 +35,14 @@ using Xunit.Abstractions;
 namespace InferenceWeb.Tests;
 
 [Trait("Requires", "Models")]
-public class GlmDsaMtpModelTests
+public class GlmDsaSpeculativeModelTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
     private const string EnvBackend = "TS_GLM_BACKEND";
     private const string EnvTokens = "TS_GLM_MTP_TOKENS";
 
     private readonly ITestOutputHelper _output;
-    public GlmDsaMtpModelTests(ITestOutputHelper output) { _output = output; }
+    public GlmDsaSpeculativeModelTests(ITestOutputHelper output) { _output = output; }
 
     private const string Prompt =
         "Explain, in a single paragraph, why speculative decoding does not change " +
@@ -85,11 +85,11 @@ public class GlmDsaMtpModelTests
         using var model = ModelBase.Create(modelPath, ResolveBackend());
         Assert.Equal("glm-dsa", model.Config.Architecture);
 
-        var spec = Assert.IsAssignableFrom<IMtpSpeculativeModel>(model);
-        Assert.True(spec.HasMtp,
+        var spec = Assert.IsAssignableFrom<ISpeculativeModel>(model);
+        Assert.True(spec.HasDraftHead,
             "the NextN/MTP draft block did not load — check the loader's stderr for why " +
             "(a trunk-only checkpoint, or no room on the device)");
-        Assert.Equal(model.Config.HiddenSize, spec.MtpHiddenSize);
+        Assert.Equal(model.Config.HiddenSize, spec.SpecFeatureSize);
 
         int[] prompt = model.Tokenizer.Encode(Prompt, addSpecial: true).ToArray();
         int vocab = model.Config.VocabSize;
@@ -149,7 +149,7 @@ public class GlmDsaMtpModelTests
         // for the batched comparison below.
         model.ResetKVCache();
         model.ForwardRefill(prompt);
-        var h1 = new float[spec.MtpHiddenSize];
+        var h1 = new float[spec.SpecFeatureSize];
         var specRow = new float[vocab];
         spec.SpecForward(new[] { plain[0] }, h1, specRow, allLogitsRows: false);
 
@@ -182,7 +182,7 @@ public class GlmDsaMtpModelTests
         const int W = 8;
         int argmaxFlips = 0, compared = 0, top5Mismatch = 0;
         double worstAbs = 0;
-        var hAll = new float[(long)W * spec.MtpHiddenSize];
+        var hAll = new float[(long)W * spec.SpecFeatureSize];
         var rowLogits = new float[(long)W * vocab];
         for (int start = 0; start + 1 < maxNew; start += W)
         {
@@ -249,7 +249,7 @@ public class GlmDsaMtpModelTests
         {
             var toks = new int[rows];
             for (int i = 0; i < rows; i++) toks[i] = plain[i % maxNew];
-            var hBuf = new float[(long)rows * spec.MtpHiddenSize];
+            var hBuf = new float[(long)rows * spec.SpecFeatureSize];
             var lBuf = new float[(long)rows * vocab];
 
             model.ResetKVCache();
@@ -271,10 +271,10 @@ public class GlmDsaMtpModelTests
         // A gate no finite confidence can clear (1.0f itself is reachable: the
         // top-1 probability over the top-10 logits rounds to exactly 1.0f for a
         // sufficiently peaked head) makes every step degrade to a plain decode
-        // THROUGH the speculative code: same cache bookkeeping, same MtpCatchUp
+        // THROUGH the speculative code: same cache bookkeeping, same DraftCatchUp
         // calls, same rewinds. If this does not reproduce greedy exactly, the
         // bug is in this file's subject and not in floating point.
-        var noDraft = new MtpSpeculativeDecoder(spec, maxDraftTokens: 4)
+        var noDraft = new SpeculativeDecoder(spec, maxDraftTokens: 4)
         {
             AdaptiveSpeculation = false,
             MinDraftProb = float.MaxValue,
@@ -309,7 +309,7 @@ public class GlmDsaMtpModelTests
         long defaultDrafted = 0;
         foreach (var (k, pMin) in configs)
         {
-            var decoder = new MtpSpeculativeDecoder(spec, maxDraftTokens: k)
+            var decoder = new SpeculativeDecoder(spec, maxDraftTokens: k)
             {
                 // Measure the drafter, not the governor's opinion of it: the
                 // governor is exercised on the server path, and here it would
@@ -371,8 +371,8 @@ public class GlmDsaMtpModelTests
         MoeCpuOffloadConfig.ConfigureFromEnvironment();
 
         using var model = ModelBase.Create(modelPath, ResolveBackend());
-        var spec = (IMtpSpeculativeModel)model;
-        Assert.False(spec.HasMtp, "the draft block must stay unloaded unless speculation was requested");
+        var spec = (ISpeculativeModel)model;
+        Assert.False(spec.HasDraftHead, "the draft block must stay unloaded unless speculation was requested");
 
         int[] prompt = model.Tokenizer.Encode(Prompt, addSpecial: true).ToArray();
         model.ResetKVCache();

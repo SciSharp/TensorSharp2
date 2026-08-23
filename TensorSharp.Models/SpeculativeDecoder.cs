@@ -12,18 +12,21 @@ using System.Collections.Generic;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Models
 {
     /// <summary>
-    /// Speculative decoding driven by a NextN/MTP draft head — Qwen3.5/3.6 and
-    /// GLM-5.2's embedded NextN block (llama.cpp's `--spec-type draft-mtp`,
-    /// vLLM's qwen3_5_mtp speculator), or a block drafter such as DeepSeek V4's
-    /// DSpark.
+    /// The standalone speculative generate loop: KV reset, chunked prompt
+    /// prefill, and the emit/stop/penalty-history bookkeeping around
+    /// <see cref="SpeculativeExecution"/> — the shared draft/verify/rollback core
+    /// that the engine's <c>BatchExecutor</c> also drives, one step per scheduler
+    /// iteration. Used by the CLI, the tests and offline callers.
     ///
-    /// Thin standalone wrapper over <see cref="MtpSpeculativeExecution"/> (the
-    /// shared draft/verify/rollback/catch-up core also driven by the engine's
-    /// <c>BatchExecutor</c>): owns the whole generate loop — KV reset, chunked
-    /// prompt prefill, verification — for the CLI, tests and offline use.
+    /// Algorithm-agnostic: whatever <see cref="ISpeculator"/> it is given does
+    /// the drafting — a per-token NextN/MTP head (Qwen 3.5/3.6, GLM-5.2, Gemma 4),
+    /// a block drafter (DeepSeek V4 DSpark, Muse-Glimmer DFlash), or the
+    /// weight-free n-gram speculator, which needs no draft head at all.
     ///
     /// Verification draws either with argmax (<see cref="GenerateGreedy"/>) or
     /// with the caller's sampler (<see cref="GenerateSampled"/>). Either way every
@@ -32,10 +35,10 @@ namespace TensorSharp.Models
     /// floating point drift, and in distribution under a sampler.
     /// Single-sequence; the caller owns the model's KV cache lifecycle.
     /// </summary>
-    public sealed class MtpSpeculativeDecoder
+    public sealed class SpeculativeDecoder
     {
-        private readonly IMtpSpeculativeModel _model;
-        private readonly MtpSpeculativeExecution _exec;
+        private readonly ISpeculativeTarget _model;
+        private readonly SpeculativeExecution _exec;
         private readonly int _vocab;
         private readonly List<int> _acceptedScratch = new();
         // Penalty history for a sampled run (see GenerateSampledFrom). Reused
@@ -46,10 +49,9 @@ namespace TensorSharp.Models
         public int MaxDraftTokens => _exec.MaxDraftTokens;
 
         /// <summary>
-        /// Minimum draft confidence (top-1 probability over the draft head's
-        /// top-10 logits, matching llama.cpp's top-k(10) draft sampler) for a
-        /// drafted token to be kept. Drafting stops at the first low-confidence
-        /// token.
+        /// The drafter's confidence gate; drafting stops at the first token below
+        /// it. What the number MEANS is the algorithm's business — see
+        /// <see cref="ISpeculator.MinDraftProb"/>.
         /// </summary>
         public float MinDraftProb
         {
@@ -80,7 +82,7 @@ namespace TensorSharp.Models
 
         /// <summary>Wall-clock phase breakdown of the speculative decode loop
         /// (draft / verify / snapshot / rollback / catch-up / plain).</summary>
-        public MtpSpecStats Stats => _exec.Stats;
+        public SpeculationStats Stats => _exec.Stats;
 
         /// <summary>
         /// The trunk position this decoder can be resumed at, or -1 when it cannot.
@@ -105,16 +107,57 @@ namespace TensorSharp.Models
         /// <summary>Wall-clock seconds the last GenerateGreedy call spent past prefill.</summary>
         public double LastDecodeSeconds { get; private set; }
 
-        // Default draft window: 8. The MinDraftProb gate stops drafting at the
-        // first low-confidence token, so a longer window only extends confident
-        // streaks — measured 1.21x vs 1.08x (window 4) on Qwen3.6-35B-A3B
-        // ggml_cpu at unchanged 86% acceptance; neutral on 27B ggml_cuda.
-        public MtpSpeculativeDecoder(IMtpSpeculativeModel model, int maxDraftTokens = 8)
+        /// <summary>
+        /// Decode <paramref name="model"/> with an explicit algorithm - the
+        /// general form. Any <see cref="ISpeculator"/> works, including one that
+        /// needs no draft head at all (<see cref="NGramSpeculator"/>).
+        /// </summary>
+        public SpeculativeDecoder(ISpeculativeTarget model, ISpeculator speculator)
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
-            _exec = new MtpSpeculativeExecution(model, maxDraftTokens);
+            ArgumentNullException.ThrowIfNull(speculator);
+            _exec = new SpeculativeExecution(model, speculator);
             _vocab = model.Config.VocabSize;
         }
+
+        /// <summary>
+        /// Decode <paramref name="model"/> with the algorithm
+        /// <paramref name="options"/> selects (default: whatever drafter the
+        /// checkpoint carries).
+        /// </summary>
+        /// <exception cref="ArgumentException">No registered algorithm can serve
+        /// this model; the message says why.</exception>
+        public SpeculativeDecoder(ISpeculativeTarget model, SpeculationOptions options)
+            : this(model, Resolve(model, options))
+        {
+        }
+
+        /// <summary>
+        /// Convenience for the common case: use the checkpoint's own draft head
+        /// with a window of <paramref name="maxDraftTokens"/>.
+        ///
+        /// The default window is 8. A confidence gate stops drafting at the
+        /// first low-confidence token, so a longer window only extends confident
+        /// streaks — measured 1.21x vs 1.08x (window 4) on Qwen3.6-35B-A3B
+        /// ggml_cpu at unchanged 86% acceptance; neutral on 27B ggml_cuda.
+        /// </summary>
+        public SpeculativeDecoder(ISpeculativeModel model,
+            int maxDraftTokens = SpeculationOptions.DefaultMaxDraftTokens)
+            : this(model, new SpeculationOptions { Enabled = true, MaxDraftTokens = maxDraftTokens })
+        {
+        }
+
+        private static ISpeculator Resolve(ISpeculativeTarget model, SpeculationOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(model);
+            var speculator = SpeculatorRegistry.Create(model, options, out string declineReason);
+            if (speculator == null)
+                throw new ArgumentException($"Speculative decoding is unavailable: {declineReason}", nameof(model));
+            return speculator;
+        }
+
+        /// <summary>The algorithm this decoder drafts with.</summary>
+        public ISpeculator Speculator => _exec.Speculator;
 
         /// <summary>Reset speculative state and statistics. Does NOT touch the model's KV cache.</summary>
         public void Reset()
@@ -127,13 +170,14 @@ namespace TensorSharp.Models
         /// Start the statistics and the cost governor over while keeping the
         /// carry-in hidden state, for a caller that reports per turn but extends
         /// the same KV cache across turns. See
-        /// <see cref="MtpSpeculativeExecution.ResetStatsAndGovernor"/>.
+        /// <see cref="SpeculativeExecution.ResetStatsAndGovernor"/>.
         /// </summary>
         public void ResetStatsAndGovernor() => _exec.ResetStatsAndGovernor();
 
         /// <summary>
-        /// Prefill the prompt through the trunk (capturing h_nextn) and replay it
-        /// through the MTP block so its KV cache covers the whole prompt.
+        /// Prefill the prompt through the trunk (capturing per-row hidden states
+        /// when the speculator needs them) and hand the chunks to the speculator
+        /// so its own state covers the whole prompt.
         /// Returns the last-position logits (vocab floats, caller-owned copy).
         /// </summary>
         public float[] Prefill(int[] promptTokens)
@@ -144,7 +188,7 @@ namespace TensorSharp.Models
             // A trunk that keeps its draft head in sync internally wants the whole
             // prompt in one call: chunking it only adds a host round trip per
             // chunk, which stalls the trunk's own micro-batch pipelining.
-            int chunkSize = _model.MtpPrefillSelfCatchUp
+            int chunkSize = _exec.PrefillSelfCatchUp
                 ? Math.Max(1, promptTokens.Length)
                 : Math.Max(1, PrefillChunkSize);
             float[] logits = null;
@@ -164,7 +208,7 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Greedy generation with MTP speculative decoding. Resets the model KV
+        /// Greedy generation with speculative decoding. Resets the model KV
         /// cache, prefills <paramref name="promptTokens"/>, then emits up to
         /// <paramref name="maxNewTokens"/> tokens (the stop token, when hit, is
         /// included as the final element). <paramref name="onToken"/>, when
@@ -297,7 +341,7 @@ namespace TensorSharp.Models
                 {
                     // Rewinding drops trunk rows the carry-in hidden state was taken
                     // from, so it no longer describes the token the trunk ends on.
-                    _model.MtpRewindCache(emitted);
+                    _model.SpecRewindCache(emitted);
                     CarryPosition = -1;
                 }
                 else
@@ -361,7 +405,7 @@ namespace TensorSharp.Models
                     int kMax = maxNewTokens - output.Count;
 
                     _acceptedScratch.Clear();
-                    MtpDecodeOutcome outcome = _exec.DecodeStep(
+                    SpeculativeStepOutcome outcome = _exec.DecodeStep(
                         tLast, n, kMax,
                         drawNext: Draw,
                         // Penalty-aligned drafting: the draft head must argmax the

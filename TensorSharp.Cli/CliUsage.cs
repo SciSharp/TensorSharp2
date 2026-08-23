@@ -187,42 +187,61 @@ namespace TensorSharp.Cli
             }),
             ("Speculative decoding", new[]
             {
-                new OptionHelp("--mtp-spec | --no-mtp-spec",
-                    "Enable/disable NextN/MTP speculative decoding on models that embed a per-token draft head " +
-                    "in the trunk checkpoint (GLM-5.2, Qwen 3.6). The head drafts up to --mtp-draft tokens and " +
-                    "the trunk verifies them in one batched forward; every emitted token still comes from a " +
-                    "trunk row, so this is a speed path only. Engages on --input, --input-jsonl, " +
-                    "--multi-turn-jsonl and --interactive. Must be passed BEFORE the model loads (it is what " +
-                    "tells glm-dsa to page its ~3 GiB NextN layer into VRAM, which also leaves less room for the " +
-                    "context). Not available under --tp N>1 on a checkpoint whose draft block borrows the " +
-                    "trunk's LM head, which includes GLM-5.2. Default: off; env TS_MTP_SPEC (glm-dsa also honours " +
+                new OptionHelp("--spec | --no-spec",
+                    "Enable/disable speculative decoding: a drafter proposes the next few tokens and the trunk " +
+                    "verifies them in ONE batched forward. Every emitted token still comes from a trunk row, so " +
+                    "this is a speed path only - the output is what plain decoding would have produced. Engages " +
+                    "on --input, --input-jsonl, --multi-turn-jsonl and --interactive. Must be passed BEFORE the " +
+                    "model loads (it is what tells glm-dsa to page its ~3 GiB NextN layer into VRAM, which also " +
+                    "leaves less room for the context). Not available under --tp N>1 on a checkpoint whose draft " +
+                    "block borrows the trunk's LM head, which includes GLM-5.2. Accepted as --mtp-spec / " +
+                    "--no-mtp-spec too. Default: off; env TS_SPEC (or TS_MTP_SPEC; glm-dsa also honours " +
                     "TS_GLM_MTP=1/0, which overrides both).",
-                    "--model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf --backend ggml_cuda --mtp-spec --chat"),
-                new OptionHelp("--mtp-draft <N>",
+                    "--model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf --backend ggml_cuda --spec --chat"),
+                new OptionHelp("--spec-type <name>",
+                    "Which speculation ALGORITHM to draft with. 'auto' (default) uses whatever drafter the " +
+                    "checkpoint carries: a per-token NextN/MTP head (GLM-5.2, Qwen 3.6, Gemma 4's separate " +
+                    "assistant GGUF) or a block drafter (DeepSeek V4 DSpark, Muse-Glimmer DFlash). " +
+                    "'draft-head' and 'block' pin one of those explicitly. 'ngram' needs NO trained weights at " +
+                    "all - it drafts by finding where the last few tokens occurred earlier in the context and " +
+                    "proposing what followed, so it works on every model and is strong on summarizing, editing, " +
+                    "translating, repetitive structured output and agentic loops, where the answer quotes the " +
+                    "prompt. Env: TS_SPEC_TYPE.",
+                    "--spec --spec-type ngram --spec-draft 8"),
+                new OptionHelp("--spec-draft <N>",
                     "Maximum tokens drafted per speculative step. Also sizes the native graph cache at load, so " +
-                    "it belongs on the same command line as --mtp-spec. Range: 1-64. Default: 8; env TS_MTP_DRAFT.",
-                    "--mtp-spec --mtp-draft 4"),
-                new OptionHelp("--mtp-pmin <f>",
-                    "Minimum draft confidence for a drafted token to be kept; drafting stops at the first token " +
-                    "below it. Range: 0.0-1.0 (exclusive of 0). Default: chosen per drafter kind - 0.75 for a " +
-                    "per-token head (top-1 probability over its top-10 logits), 0.35 for a block drafter (where " +
-                    "the gate is the CUMULATIVE prefix probability, so the same number is far stricter). " +
-                    "Env: TS_MTP_PMIN.",
-                    "--mtp-spec --mtp-draft 4 --mtp-pmin 0.55"),
+                    "it belongs on the same command line as --spec. Accepted as --mtp-draft too. Range: 1-64. " +
+                    "Default: 8; env TS_SPEC_DRAFT (or TS_MTP_DRAFT).",
+                    "--spec --spec-draft 4"),
+                new OptionHelp("--spec-pmin <f>",
+                    "Confidence gate below which drafting stops. What the number MEANS is the algorithm's " +
+                    "business, so each picks its own default rather than sharing one: 0.75 for a per-token head " +
+                    "(top-1 probability over its top-10 logits), 0.35 for a block drafter (the CUMULATIVE prefix " +
+                    "probability, so the same number is far stricter), 0 for n-gram (where it scales the required " +
+                    "match length instead). Accepted as --mtp-pmin too. Range: 0.0-1.0 (exclusive of 0). " +
+                    "Env: TS_SPEC_PMIN (or TS_MTP_PMIN).",
+                    "--spec --spec-draft 4 --spec-pmin 0.55"),
+                new OptionHelp("--spec-draft-model <path>",
+                    "Draft-head GGUF for architectures whose speculator weights ship as their own file " +
+                    "(Gemma 4's gemma4-assistant). Loaded onto the target at startup so --spec can engage. " +
+                    "Qwen 3.6 and GLM-5.2 embed their NextN block in the trunk GGUF and need no such flag. " +
+                    "Accepted as --mtp-draft-model too. Default: none; env TS_SPEC_DRAFT_MODEL.",
+                    "--spec --spec-draft-model gemma-4-12B-it-Q4_0-MTP.gguf"),
                 new OptionHelp("--draft-model <path>",
-                    "Block drafter GGUF for architectures whose drafter ships as its own file (DeepSeek V4's " +
-                    "DSpark support module). The drafter proposes a whole block of tokens per step and the trunk " +
-                    "verifies it in one batched forward. Every emitted token is still drawn from a trunk row - " +
-                    "with argmax under a greedy config, with your sampler otherwise - so output is unchanged " +
-                    "either way. Needs --backend cuda or ggml_cuda. Default: none; env TS_DSV4_DSPARK.",
+                    "Block drafter GGUF that has to be resident before the model's layer split runs (DeepSeek " +
+                    "V4's DSpark support module, Muse-Glimmer's DFlash). The drafter proposes a whole block of " +
+                    "tokens per step and the trunk verifies it in one batched forward. Naming the file IS the " +
+                    "request - such a drafter needs no --spec. Every emitted token is still drawn from a trunk " +
+                    "row - with argmax under a greedy config, with your sampler otherwise - so output is " +
+                    "unchanged either way. Default: none; env TS_DSV4_DSPARK.",
                     "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf --temperature 0"),
                 new OptionHelp("--spec-draft-n-max <N>",
-                    "Older spelling of --mtp-draft, kept for block drafters. Cap on tokens drafted per " +
+                    "Older spelling of --spec-draft, kept for block drafters. Cap on tokens drafted per " +
                     "speculative block; a block drafter additionally clamps it to its trained block size " +
                     "(5 for DSpark). Default: the drafter's block size.",
                     "--spec-draft-n-max 3"),
                 new OptionHelp("--spec-draft-conf-min <p>",
-                    "Older spelling of --mtp-pmin, kept for block drafters, where the gate is the CUMULATIVE " +
+                    "Older spelling of --spec-pmin, kept for block drafters, where the gate is the CUMULATIVE " +
                     "acceptance probability (the product of the confidence head's per-position estimates). Lower " +
                     "drafts further and rolls back more; higher falls back to plain decode sooner. Range: " +
                     "0.0-1.0. Default: 0.35 for a block drafter, 0.75 for a per-token head.",

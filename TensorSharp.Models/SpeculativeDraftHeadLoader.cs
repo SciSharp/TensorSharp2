@@ -1,0 +1,94 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
+using System;
+using System.IO;
+using TensorSharp.Runtime.Speculative;
+
+namespace TensorSharp.Models
+{
+    /// <summary>
+    /// Attaches SPECULATOR WEIGHTS that ship as their own file to the target
+    /// model that was just loaded — layer 3 of the speculative stack, and the
+    /// one part that is unavoidably model-specific.
+    ///
+    /// Most checkpoints carry their drafter inside the trunk GGUF (Qwen 3.6 and
+    /// GLM-5.2 embed a NextN block), so nothing happens here. Gemma 4's draft
+    /// head ships separately as <c>gemma4-assistant</c> and has to be loaded
+    /// onto the target before <see cref="IDraftHead.HasDraftHead"/> turns on.
+    ///
+    /// Shared by the CLI and the server so a <c>--spec-draft-model</c> means the
+    /// same thing in both. It used to live only in the server, which made the
+    /// CLI accept the flag and silently ignore it.
+    /// </summary>
+    public static class SpeculativeDraftHeadLoader
+    {
+        /// <summary>
+        /// Path of the separate draft-head GGUF the operator configured, or null.
+        /// </summary>
+        public static string ConfiguredDraftHeadPath()
+        {
+            string path = Environment.GetEnvironmentVariable(SpeculationEnvVars.DraftModel);
+            if (string.IsNullOrWhiteSpace(path))
+                path = Environment.GetEnvironmentVariable(SpeculationEnvVars.LegacyDraftModel);
+            return string.IsNullOrWhiteSpace(path) ? null : path;
+        }
+
+        /// <summary>
+        /// Load the configured draft-head GGUF onto <paramref name="model"/>.
+        /// Returns true when there was nothing to do or the head attached
+        /// successfully; false with <paramref name="error"/> set to an
+        /// operator-facing explanation otherwise. Never throws: a drafter is an
+        /// optimization, and failing to attach one must degrade to plain
+        /// decoding rather than fail the load.
+        /// </summary>
+        public static bool TryAttachConfiguredDraftHead(ModelBase model, out string error)
+        {
+            error = null;
+            string draftPath = ConfiguredDraftHeadPath();
+            if (draftPath == null)
+                return true;
+
+            if (model is not Gemma4Model gemma4)
+            {
+                // A draft GGUF was named but this architecture does not consume a
+                // separate draft file (Qwen 3.6 embeds its NextN block in the
+                // trunk). Say so rather than leave the operator wondering why
+                // their flag was ignored.
+                error = $"--spec-draft-model was given but the loaded model architecture "
+                        + $"'{model?.Config?.Architecture ?? "unknown"}' does not use a separate draft GGUF.";
+                return false;
+            }
+
+            if (!File.Exists(draftPath))
+            {
+                error = $"Draft-head model file not found: {draftPath}";
+                return false;
+            }
+
+            try
+            {
+                gemma4.LoadMtpDraftWeights(draftPath);
+            }
+            catch (Exception ex)
+            {
+                error = $"Failed to load draft head '{Path.GetFileName(draftPath)}': {ex.Message}";
+                return false;
+            }
+
+            if (!gemma4.HasDraftHead)
+            {
+                error = $"Draft head '{Path.GetFileName(draftPath)}' loaded but is incomplete "
+                        + "(required draft tensors missing).";
+                return false;
+            }
+            return true;
+        }
+    }
+}

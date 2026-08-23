@@ -6,7 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
 // Unit tests for NextN/MTP speculative decoding: the shared
-// MtpSpeculativeExecution core (draft / verify / rollback / catch-up protocol
+// SpeculativeExecution core (draft / verify / rollback / catch-up protocol
 // against a deterministic fake model — no GGUF needed) and the engine path
 // (BatchExecutor routing, ExtraTokens streaming, block-boundary draft capping,
 // EOS inside an accepted draft window).
@@ -17,22 +17,23 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Speculative;
 
 namespace InferenceWeb.Tests;
 
-public class MtpSpeculativeExecutionTests
+public class SpeculativeExecutionTests
 {
     private const int VocabSize = 64;
     private const int HiddenSize = 4;
     private const int BlockSize = 8;
 
-    // ----- shared-core tests (drive MtpSpeculativeExecution directly) -----
+    // ----- shared-core tests (drive SpeculativeExecution directly) -----
 
     [Fact]
     public void DecodeStep_PerfectDrafts_AcceptsWholeWindowAndReturnsBonus()
     {
-        var model = new FakeMtpModel();
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 4);
+        var model = new FakeSpeculativeModel();
+        var exec = NewExec(model, maxDraftTokens: 4);
 
         int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
 
@@ -56,8 +57,8 @@ public class MtpSpeculativeExecutionTests
     [Fact]
     public void DecodeStep_WrongDraft_RollsBackRecurrentStateAndCorrects()
     {
-        var model = new FakeMtpModel();
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 4);
+        var model = new FakeSpeculativeModel();
+        var exec = NewExec(model, maxDraftTokens: 4);
 
         int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
         model.DraftWrongPositions.Add(pos + 1); // second draft is wrong
@@ -81,8 +82,8 @@ public class MtpSpeculativeExecutionTests
     [Fact]
     public void DecodeStep_LowConfidenceDrafts_DegradesToPlainStep()
     {
-        var model = new FakeMtpModel();
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 4);
+        var model = new FakeSpeculativeModel();
+        var exec = NewExec(model, maxDraftTokens: 4);
 
         int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
         model.LowConfidencePositions.Add(pos); // first draft already unconfident
@@ -102,8 +103,8 @@ public class MtpSpeculativeExecutionTests
     [Fact]
     public void DecodeStep_AdjustDraftLogitsHook_SeesGrowingPendingWindowAndRedirectsDrafts()
     {
-        var model = new FakeMtpModel();
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 3);
+        var model = new FakeSpeculativeModel();
+        var exec = NewExec(model, maxDraftTokens: 3);
 
         int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
 
@@ -125,7 +126,7 @@ public class MtpSpeculativeExecutionTests
         // penalties do), the REWRITTEN argmax is what gets verified: divert
         // the first draft to a token the trunk disagrees with -> rejection.
         model.Reset();
-        exec = new MtpSpeculativeExecution(model, maxDraftTokens: 3);
+        exec = NewExec(model, maxDraftTokens: 3);
         pos = PrefillPrompt(model, exec, promptLen: 5, out lastToken);
         int diverted = (model.ExpectedNext(pos) + 1) % VocabSize;
         var outcome2 = exec.DecodeStep(lastToken, pos, kMax: 3,
@@ -142,7 +143,7 @@ public class MtpSpeculativeExecutionTests
     // ----- engine-path tests (InferenceEngine + BatchExecutor routing) -----
 
     [Fact]
-    public void EngineMtpSpec_GreedyStream_MatchesPlainDecodeAcrossBlockBoundaries()
+    public void EngineSpec_GreedyStream_MatchesPlainDecodeAcrossBlockBoundaries()
     {
         // BlockSize 8 with 40 generated tokens crosses several block
         // boundaries; the executor must cap each draft window to the blocks
@@ -153,11 +154,11 @@ public class MtpSpeculativeExecutionTests
         const int promptLen = 5;
         const int maxNew = 40;
 
-        var model = new FakeMtpModel();
+        var model = new FakeSpeculativeModel();
         model.DraftWrongPositions.Add(promptLen + 7);
         model.DraftWrongPositions.Add(promptLen + 19);
 
-        var seq = RunEngineRequest(model, promptLen, maxNew, mtpEnabled: true);
+        var seq = RunEngineRequest(model, promptLen, maxNew, specEnabled: true);
 
         Assert.Equal(SequenceStatus.FinishedLengthCapped, seq.Status);
         Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
@@ -168,16 +169,16 @@ public class MtpSpeculativeExecutionTests
     }
 
     [Fact]
-    public void EngineMtpSpec_EosInsideAcceptedWindow_StopsAndTruncatesTrailingDrafts()
+    public void EngineSpec_EosInsideAcceptedWindow_StopsAndTruncatesTrailingDrafts()
     {
         const int promptLen = 5;
-        var model = new FakeMtpModel();
+        var model = new FakeSpeculativeModel();
         // The 6th generated token is EOS; with an 8-token draft window it
         // lands inside an accepted speculative batch.
         int eosToken = model.ExpectedNext(promptLen + 4);
         model.EosTokenId = eosToken;
 
-        var seq = RunEngineRequest(model, promptLen, maxNewTokens: 32, mtpEnabled: true);
+        var seq = RunEngineRequest(model, promptLen, maxNewTokens: 32, specEnabled: true);
 
         Assert.Equal(SequenceStatus.FinishedStopped, seq.Status);
         // Output ends at EOS (kept, per the engine's contract) with the
@@ -191,7 +192,7 @@ public class MtpSpeculativeExecutionTests
     [Theory]
     [InlineData(false)] // linear trunk
     [InlineData(true)]  // batched (paged) trunk
-    public void EngineMtpSpec_PrefixCaching_EosPastBlockBoundary_FinishesWithoutThrow(bool batchedTrunk)
+    public void EngineSpec_PrefixCaching_EosPastBlockBoundary_FinishesWithoutThrow(bool batchedTrunk)
     {
         // Production repro (the server enables prefix caching by default): a
         // long speculative generation crosses a generated block boundary, then
@@ -202,7 +203,7 @@ public class MtpSpeculativeExecutionTests
         // used to hash positions past the end of that list and throw
         // ArgumentOutOfRangeException(pos) — the crash this change fixes.
         const int promptLen = 8; // fills block 0 exactly
-        var model = new FakeMtpModel { BatchedTrunkEnabled = batchedTrunk };
+        var model = new FakeSpeculativeModel { BatchedTrunkEnabled = batchedTrunk };
         // EOS = the 7th generated token (output index 6). Its committed
         // position (15) sits just below the block-1 boundary (16), so the
         // accepted draft tail pushes the committed count to/past 16 while the
@@ -211,7 +212,7 @@ public class MtpSpeculativeExecutionTests
         model.EosTokenId = eosToken;
 
         var seq = RunEngineRequest(model, promptLen, maxNewTokens: 64,
-            mtpEnabled: true, enablePrefixCaching: true);
+            specEnabled: true, enablePrefixCaching: true);
 
         Assert.Equal(SequenceStatus.FinishedStopped, seq.Status);
         Assert.Equal(7, seq.OutputTokens.Count);
@@ -221,7 +222,7 @@ public class MtpSpeculativeExecutionTests
     }
 
     [Fact]
-    public void EngineMtpSpec_BatchedTrunk_GreedyStream_MatchesPlainDecodeAcrossBlockBoundaries()
+    public void EngineSpec_BatchedTrunk_GreedyStream_MatchesPlainDecodeAcrossBlockBoundaries()
     {
         // Batched-trunk speculation: every trunk pass must go through
         // SpecForwardBatched (the linear SpecForward stays untouched), the
@@ -231,11 +232,11 @@ public class MtpSpeculativeExecutionTests
         const int promptLen = 5;
         const int maxNew = 40;
 
-        var model = new FakeMtpModel { BatchedTrunkEnabled = true };
+        var model = new FakeSpeculativeModel { BatchedTrunkEnabled = true };
         model.DraftWrongPositions.Add(promptLen + 7);
         model.DraftWrongPositions.Add(promptLen + 19);
 
-        var seq = RunEngineRequest(model, promptLen, maxNew, mtpEnabled: true);
+        var seq = RunEngineRequest(model, promptLen, maxNew, specEnabled: true);
 
         Assert.Equal(SequenceStatus.FinishedLengthCapped, seq.Status);
         Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
@@ -251,14 +252,14 @@ public class MtpSpeculativeExecutionTests
     }
 
     [Fact]
-    public void EngineMtpSpec_BatchedTrunk_EosInsideAcceptedWindow_StopsAndTruncates()
+    public void EngineSpec_BatchedTrunk_EosInsideAcceptedWindow_StopsAndTruncates()
     {
         const int promptLen = 5;
-        var model = new FakeMtpModel { BatchedTrunkEnabled = true };
+        var model = new FakeSpeculativeModel { BatchedTrunkEnabled = true };
         int eosToken = model.ExpectedNext(promptLen + 4);
         model.EosTokenId = eosToken;
 
-        var seq = RunEngineRequest(model, promptLen, maxNewTokens: 32, mtpEnabled: true);
+        var seq = RunEngineRequest(model, promptLen, maxNewTokens: 32, specEnabled: true);
 
         Assert.Equal(SequenceStatus.FinishedStopped, seq.Status);
         Assert.Equal(ExpectedChain(model, promptLen, 5), seq.OutputTokens.Take(5));
@@ -269,20 +270,20 @@ public class MtpSpeculativeExecutionTests
     }
 
     [Fact]
-    public void EngineMtpSpec_Disabled_ProducesSameStreamWithoutSpeculation()
+    public void EngineSpec_Disabled_ProducesSameStreamWithoutSpeculation()
     {
         const int promptLen = 5;
         const int maxNew = 16;
-        var model = new FakeMtpModel();
+        var model = new FakeSpeculativeModel();
 
-        var seq = RunEngineRequest(model, promptLen, maxNew, mtpEnabled: false);
+        var seq = RunEngineRequest(model, promptLen, maxNew, specEnabled: false);
 
         Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
         Assert.Null(seq.SpecStats);
     }
 
     // --mtp-spec is requested but the backend can't drive the accelerated MTP
-    // path (MtpSpeculationProfitable=false, e.g. the pure-C# CUDA backend for
+    // path (SpeculationProfitable=false, e.g. the pure-C# CUDA backend for
     // Gemma 4). The engine must serve the fast standard decode — never the
     // net-negative per-op spec path — so speculation never engages: no
     // SpecForward calls (linear OR batched) and no spec stats, with output
@@ -290,17 +291,17 @@ public class MtpSpeculativeExecutionTests
     [Theory]
     [InlineData(false)]   // linear-trunk-capable model
     [InlineData(true)]    // batched-trunk-capable model
-    public void EngineMtpSpec_UnprofitableBackend_FallsBackToStandardDecode(bool batchedTrunk)
+    public void EngineSpec_UnprofitableBackend_FallsBackToStandardDecode(bool batchedTrunk)
     {
         const int promptLen = 5;
         const int maxNew = 16;
-        var model = new FakeMtpModel
+        var model = new FakeSpeculativeModel
         {
-            MtpSpeculationProfitable = false,
+            SpeculationProfitable = false,
             BatchedTrunkEnabled = batchedTrunk,
         };
 
-        var seq = RunEngineRequest(model, promptLen, maxNew, mtpEnabled: true);
+        var seq = RunEngineRequest(model, promptLen, maxNew, specEnabled: true);
 
         Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
         Assert.Equal(0, model.LinearSpecForwardCalls);
@@ -310,7 +311,23 @@ public class MtpSpeculativeExecutionTests
 
     // ----- helpers -----
 
-    private static int PrefillPrompt(FakeMtpModel model, MtpSpeculativeExecution exec, int promptLen, out int lastToken)
+    /// <summary>Build the shared core over whatever algorithm the fake's draft
+    /// head implies — the same resolution the engine and the CLI go through.</summary>
+    private static SpeculativeExecution NewExec(FakeSpeculativeModel model, int maxDraftTokens,
+        float? minDraftProb = null)
+    {
+        var options = new SpeculationOptions
+        {
+            Enabled = true,
+            MaxDraftTokens = maxDraftTokens,
+            MinDraftProb = minDraftProb,
+        };
+        var speculator = SpeculatorRegistry.Create(model, options, out string decline);
+        Assert.True(speculator != null, decline);
+        return new SpeculativeExecution(model, speculator);
+    }
+
+    private static int PrefillPrompt(FakeSpeculativeModel model, SpeculativeExecution exec, int promptLen, out int lastToken)
     {
         int[] prompt = Enumerable.Range(1, promptLen).ToArray();
         float[] logits = exec.PrefillStep(prompt, 0);
@@ -321,7 +338,7 @@ public class MtpSpeculativeExecutionTests
 
     /// <summary>The deterministic greedy stream: token i of the generation is
     /// the trunk's argmax for the row at absolute position promptLen-1+i.</summary>
-    private static List<int> ExpectedChain(FakeMtpModel model, int promptLen, int count)
+    private static List<int> ExpectedChain(FakeSpeculativeModel model, int promptLen, int count)
     {
         var expected = new List<int>(count);
         for (int i = 0; i < count; i++)
@@ -329,8 +346,8 @@ public class MtpSpeculativeExecutionTests
         return expected;
     }
 
-    private static SequenceState RunEngineRequest(FakeMtpModel model, int promptLen, int maxNewTokens,
-        bool mtpEnabled, bool enablePrefixCaching = false)
+    private static SequenceState RunEngineRequest(FakeSpeculativeModel model, int promptLen, int maxNewTokens,
+        bool specEnabled, bool enablePrefixCaching = false)
     {
         var cfg = new SchedulerConfig
         {
@@ -341,9 +358,12 @@ public class MtpSpeculativeExecutionTests
             BlockSize = BlockSize,
             EnablePrefixCaching = enablePrefixCaching,
             DecodeQuantumTokens = 1,
-            MtpSpeculativeEnabled = mtpEnabled,
-            MtpMaxDraftTokens = 8,
-            MtpMinDraftProb = 0.5f,
+            Speculation = new SpeculationOptions
+            {
+                Enabled = specEnabled,
+                MaxDraftTokens = 8,
+                MinDraftProb = 0.5f,
+            },
         };
         using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
 
@@ -371,7 +391,7 @@ public class MtpSpeculativeExecutionTests
         return best;
     }
 
-    // ----- sampled verification (MtpSpeculativeDecoder.GenerateSampled) -----
+    // ----- sampled verification (SpeculativeDecoder.GenerateSampled) -----
 
     private static SamplingConfig SampledChatConfig(float repeatPenalty = 1f) => new()
     {
@@ -404,8 +424,8 @@ public class MtpSpeculativeExecutionTests
         const int maxNew = 24;
         int[] prompt = Enumerable.Range(1, promptLen).ToArray();
 
-        var plainModel = new FakeMtpModel();
-        var plainDecoder = new MtpSpeculativeDecoder(plainModel, maxDraftTokens: 4)
+        var plainModel = new FakeSpeculativeModel();
+        var plainDecoder = new SpeculativeDecoder(plainModel, maxDraftTokens: 4)
         {
             AdaptiveSpeculation = false,
             // Above 1: no confidence can clear it, so every step degrades to a
@@ -417,8 +437,8 @@ public class MtpSpeculativeExecutionTests
         Assert.Equal(0, plainDecoder.TokensDrafted);
         Assert.Equal(maxNew, plainDecoder.PlainSteps + 1);
 
-        var specModel = new FakeMtpModel();
-        var specDecoder = new MtpSpeculativeDecoder(specModel, maxDraftTokens: 4)
+        var specModel = new FakeSpeculativeModel();
+        var specDecoder = new SpeculativeDecoder(specModel, maxDraftTokens: 4)
         {
             AdaptiveSpeculation = false,
         };
@@ -443,8 +463,8 @@ public class MtpSpeculativeExecutionTests
         const int promptLen = 5;
         int[] prompt = Enumerable.Range(1, promptLen).ToArray();
 
-        var model = new FakeMtpModel();
-        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 4) { AdaptiveSpeculation = false };
+        var model = new FakeSpeculativeModel();
+        var decoder = new SpeculativeDecoder(model, maxDraftTokens: 4) { AdaptiveSpeculation = false };
         Assert.Equal(-1, decoder.CarryPosition);
 
         List<int> produced = decoder.GenerateGreedy(prompt, 12);
@@ -470,8 +490,8 @@ public class MtpSpeculativeExecutionTests
         const int promptLen = 5;
         int[] prompt = Enumerable.Range(1, promptLen).ToArray();
 
-        var model = new FakeMtpModel();
-        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 4) { AdaptiveSpeculation = false };
+        var model = new FakeSpeculativeModel();
+        var decoder = new SpeculativeDecoder(model, maxDraftTokens: 4) { AdaptiveSpeculation = false };
 
         // Drafts are correct by construction here, so the first speculative step
         // accepts its whole 4-token window and commits 5 tokens to the trunk.
@@ -505,8 +525,8 @@ public class MtpSpeculativeExecutionTests
     [Fact]
     public void BlockDraft_PerfectBlock_AcceptsWholeBlockInOneDraftCall()
     {
-        var model = new FakeMtpModel { BlockDraftSize = 5 };
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 8);
+        var model = new FakeSpeculativeModel { BlockDraftSize = 5 };
+        var exec = NewExec(model, maxDraftTokens: 8);
 
         // The window is clamped to the drafter's trained block size.
         Assert.Equal(5, exec.MaxDraftTokens);
@@ -529,12 +549,12 @@ public class MtpSpeculativeExecutionTests
     {
         // Every position is individually above the gate, but the prefix product
         // falls below it at position 3 (0.8^3 = 0.512 >= 0.5 > 0.8^4 = 0.41).
-        var model = new FakeMtpModel
+        var model = new FakeSpeculativeModel
         {
             BlockDraftSize = 5,
             BlockConfidences = new[] { 0.8f, 0.8f, 0.8f, 0.8f, 0.8f },
         };
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5) { MinDraftProb = 0.5f };
+        var exec = NewExec(model, maxDraftTokens: 5, minDraftProb: 0.5f);
 
         int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
         var accepted = new List<int>();
@@ -549,8 +569,8 @@ public class MtpSpeculativeExecutionTests
     [Fact]
     public void BlockDraft_WrongDraftMidBlock_KeepsPrefixAndCorrects()
     {
-        var model = new FakeMtpModel { BlockDraftSize = 5 };
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+        var model = new FakeSpeculativeModel { BlockDraftSize = 5 };
+        var exec = NewExec(model, maxDraftTokens: 5);
 
         int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
         model.DraftWrongPositions.Add(pos + 2); // third drafted token is wrong
@@ -569,8 +589,8 @@ public class MtpSpeculativeExecutionTests
     [Fact]
     public void PrefillSelfCatchUp_SkipsPerRowCaptureAndCatchUp()
     {
-        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+        var model = new FakeSpeculativeModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var exec = NewExec(model, maxDraftTokens: 5);
 
         var prompt = new int[6];
         for (int i = 0; i < prompt.Length; i++)
@@ -593,11 +613,11 @@ public class MtpSpeculativeExecutionTests
         // The two gates threshold different quantities — a per-token head's
         // top-1 probability vs a block's CUMULATIVE prefix probability — so one
         // shared default badly mis-gates whichever it wasn't chosen for.
-        var perToken = new MtpSpeculativeExecution(new FakeMtpModel(), maxDraftTokens: 4);
-        Assert.Equal(MtpSpeculativeExecution.DefaultTokenMinDraftProb, perToken.MinDraftProb);
+        var perToken = NewExec(new FakeSpeculativeModel(), maxDraftTokens: 4);
+        Assert.Equal(DraftHeadSpeculator.DefaultGate, perToken.MinDraftProb);
 
-        var block = new MtpSpeculativeExecution(new FakeMtpModel { BlockDraftSize = 5 }, maxDraftTokens: 8);
-        Assert.Equal(MtpSpeculativeExecution.DefaultBlockMinDraftProb, block.MinDraftProb);
+        var block = NewExec(new FakeSpeculativeModel { BlockDraftSize = 5 }, maxDraftTokens: 8);
+        Assert.Equal(BlockDraftSpeculator.DefaultGate, block.MinDraftProb);
         Assert.True(block.MinDraftProb < perToken.MinDraftProb);
         // The window still clamps to what the drafter was trained to propose.
         Assert.Equal(5, block.MaxDraftTokens);
@@ -609,12 +629,12 @@ public class MtpSpeculativeExecutionTests
         // Regression for the server default: a per-token-sized 0.75 gate against
         // the cumulative product truncated nearly every block to nothing, so
         // speculation cost the drafter's time and bought no tokens.
-        var model = new FakeMtpModel
+        var model = new FakeSpeculativeModel
         {
             BlockDraftSize = 5,
             BlockConfidences = new[] { 0.9f, 0.85f, 0.8f, 0.75f, 0.7f },
         };
-        var exec = new MtpSpeculativeExecution(model, maxDraftTokens: 5);
+        var exec = NewExec(model, maxDraftTokens: 5);
         int pos = PrefillPrompt(model, exec, promptLen: 5, out int lastToken);
         var outcome = exec.DecodeStep(lastToken, pos, kMax: 5, drawNext: Argmax);
 
@@ -624,11 +644,9 @@ public class MtpSpeculativeExecutionTests
 
         // The same block under the per-token default keeps half as many: the
         // product falls under 0.75 already at the third position (0.612).
-        var strictModel = new FakeMtpModel { BlockDraftSize = 5, BlockConfidences = model.BlockConfidences };
-        var strict = new MtpSpeculativeExecution(strictModel, maxDraftTokens: 5)
-        {
-            MinDraftProb = MtpSpeculativeExecution.DefaultTokenMinDraftProb,
-        };
+        var strictModel = new FakeSpeculativeModel { BlockDraftSize = 5, BlockConfidences = model.BlockConfidences };
+        var strict = NewExec(strictModel, maxDraftTokens: 5,
+            minDraftProb: DraftHeadSpeculator.DefaultGate);
         int pos2 = PrefillPrompt(strictModel, strict, promptLen: 5, out int lastToken2);
         strict.DecodeStep(lastToken2, pos2, kMax: 5, drawNext: Argmax);
         Assert.Equal(2, strict.Stats.TokensDrafted);
@@ -639,8 +657,8 @@ public class MtpSpeculativeExecutionTests
     [Fact]
     public void GenerateGreedy_StreamsEveryEmittedTokenAndWithholdsTheStopToken()
     {
-        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
-        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+        var model = new FakeSpeculativeModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new SpeculativeDecoder(model, maxDraftTokens: 5);
 
         var prompt = new[] { 1, 2, 3, 4, 5 };
         // Generated token j is the trunk's prediction at position prompt.Length-1+j,
@@ -666,8 +684,8 @@ public class MtpSpeculativeExecutionTests
         // its whole accepted window in one forward, so stopping part-way through
         // emitting it runs the trunk past the result — the decoder has to drop that
         // tail rather than leave the caller's cache mirror guessing.
-        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
-        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+        var model = new FakeSpeculativeModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new SpeculativeDecoder(model, maxDraftTokens: 5);
 
         var prompt = new[] { 1, 2, 3, 4, 5 };
         var streamed = new List<int>();
@@ -687,8 +705,8 @@ public class MtpSpeculativeExecutionTests
     {
         // The multi-turn chat path: turn 2 prefills only its new tokens on top of
         // the cache turn 1 left behind, then decodes from there.
-        var model = new FakeMtpModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
-        var decoder = new MtpSpeculativeDecoder(model, maxDraftTokens: 5);
+        var model = new FakeSpeculativeModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var decoder = new SpeculativeDecoder(model, maxDraftTokens: 5);
 
         var prompt = new[] { 1, 2, 3, 4, 5 };
         var turn1 = decoder.GenerateGreedy(prompt, maxNewTokens: 6);
@@ -713,14 +731,14 @@ public class MtpSpeculativeExecutionTests
         Assert.True(decoder.TokensDrafted > 0);
     }
 
-    private sealed class FakeMtpModel : IMtpBatchedSpeculativeModel
+    private sealed class FakeSpeculativeModel : IBatchedSpeculativeModel
     {
         private readonly List<int> _trunk = new();
         private int _recurrentState;       // advances with the trunk
         private int _recurrentSnapshot = -1;
 
         // Block drafting (DSpark): a positive size routes the executor through
-        // MtpDraftBlock, and BlockConfidences is what the confidence head
+        // DraftBlock, and BlockConfidences is what the confidence head
         // reports for each block position.
         public int BlockDraftSize { get; set; }
         public float[] BlockConfidences { get; set; }
@@ -742,7 +760,7 @@ public class MtpSpeculativeExecutionTests
         public int SlotSnapshotCalls { get; private set; }
         public int SlotRestoreCalls { get; private set; }
 
-        public FakeMtpModel()
+        public FakeSpeculativeModel()
         {
             Tokenizer = new FakeTokenizer(this);
         }
@@ -806,11 +824,14 @@ public class MtpSpeculativeExecutionTests
             return logits;
         }
 
-        // ---- IMtpSpeculativeModel ----
-        public bool HasMtp => true;
+        // ---- ISpeculativeModel ----
+        public bool HasDraftHead => true;
+
+        public DraftHeadKind DraftHeadKind =>
+            BlockDraftSize > 0 ? DraftHeadKind.Block : DraftHeadKind.PerToken;
         // Mirrors a backend that lacks the accelerated MTP kernels (e.g. the
         // pure-C# CUDA backend for Gemma 4): the engine must NOT engage spec.
-        public bool MtpSpeculationProfitable { get; set; } = true;
+        public bool SpeculationProfitable { get; set; } = true;
         public int CacheSeqLen => _trunk.Count;
         public int MaxContextLength => 4096;
 
@@ -852,7 +873,7 @@ public class MtpSpeculativeExecutionTests
             }
         }
 
-        public void MtpDraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
+        public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
             // The hidden chained into a draft at position pos must be the
             // hidden of the token at pos-1 (encoded as pos; zeros before the
@@ -873,13 +894,13 @@ public class MtpSpeculativeExecutionTests
                 hOut[hh] = pos + 1;
         }
 
-        public int MtpDraftBlockSize => BlockDraftSize;
+        public int DraftBlockSize => BlockDraftSize;
 
-        public bool MtpPrefillSelfCatchUp => PrefillSelfCatchUp;
+        public bool DraftSelfCatchUp => PrefillSelfCatchUp;
 
         /// <summary>One-pass block draft: position i predicts the token after
         /// position pos+i, mirroring what a DSpark block does.</summary>
-        public int MtpDraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
+        public int DraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
         {
             BlockDraftCalls++;
             float expectH = position == 0 ? 0f : position;
@@ -899,7 +920,7 @@ public class MtpSpeculativeExecutionTests
             return n;
         }
 
-        public void MtpCatchUp(int[] tokens, float[] hRows, int startPos)
+        public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
             for (int k = 0; k < tokens.Length; k++)
             {
@@ -912,15 +933,15 @@ public class MtpSpeculativeExecutionTests
             }
         }
 
-        public void MtpEnsureCapacity(int requiredSeqLen) { }
+        public void SpecEnsureCapacity(int requiredSeqLen) { }
 
-        public void MtpSnapshotRecurrentState()
+        public void SpecSnapshotRecurrentState()
         {
             SnapshotCalls++;
             _recurrentSnapshot = _recurrentState;
         }
 
-        public void MtpRestoreRecurrentState()
+        public void SpecRestoreRecurrentState()
         {
             RestoreCalls++;
             if (_recurrentSnapshot < 0)
@@ -928,7 +949,7 @@ public class MtpSpeculativeExecutionTests
             _recurrentState = _recurrentSnapshot;
         }
 
-        public void MtpRewindCache(int length)
+        public void SpecRewindCache(int length)
         {
             if (length < 0 || length > _trunk.Count)
             {
@@ -938,7 +959,7 @@ public class MtpSpeculativeExecutionTests
             _trunk.RemoveRange(length, _trunk.Count - length);
         }
 
-        // ---- IMtpBatchedSpeculativeModel ----
+        // ---- IBatchedSpeculativeModel ----
         public bool SupportsBatchedSpecTrunk => BatchedTrunkEnabled;
 
         public void SpecForwardBatched(SequenceState seq, int[] tokens, int startPos,
@@ -954,13 +975,13 @@ public class MtpSpeculativeExecutionTests
             ForwardCore(tokens, hAllOut, logitsOut, allLogitsRows);
         }
 
-        public void MtpSnapshotRecurrentStateSlots(SequenceState seq)
+        public void SpecSnapshotRecurrentStateSlots(SequenceState seq)
         {
             SlotSnapshotCalls++;
             _recurrentSnapshot = _recurrentState;
         }
 
-        public void MtpRestoreRecurrentStateSlots(SequenceState seq)
+        public void SpecRestoreRecurrentStateSlots(SequenceState seq)
         {
             SlotRestoreCalls++;
             if (_recurrentSnapshot < 0)
@@ -976,11 +997,11 @@ public class MtpSpeculativeExecutionTests
 
         private sealed class FakeTokenizer : ITokenizer
         {
-            private readonly FakeMtpModel _owner;
-            public FakeTokenizer(FakeMtpModel owner)
+            private readonly FakeSpeculativeModel _owner;
+            public FakeTokenizer(FakeSpeculativeModel owner)
             {
                 _owner = owner;
-                Vocab = new string[MtpSpeculativeExecutionTests.VocabSize];
+                Vocab = new string[SpeculativeExecutionTests.VocabSize];
                 for (int i = 0; i < Vocab.Length; i++) Vocab[i] = i.ToString();
             }
             public string[] Vocab { get; }

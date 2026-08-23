@@ -13,9 +13,9 @@
 //
 // DFlash (llama.cpp src/models/dflash.cpp) is a BLOCK drafter: one forward pass
 // proposes the whole speculative window, so it plugs into the shared
-// draft/verify/rollback core through IMtpSpeculativeModel.MtpDraftBlock instead
-// of the per-token MtpDraftStep, and it reports a WIDE hidden row through
-// MtpHiddenSize -- the concatenated per-layer input residuals of the target
+// draft/verify/rollback core through ISpeculativeModel.DraftBlock instead
+// of the per-token DraftStep, and it reports a WIDE hidden row through
+// SpecFeatureSize -- the concatenated per-layer input residuals of the target
 // layers its encoder consumes (5 x 6656 = 33280 for Muse-Glimmer 30B).
 //
 // Three passes, transcribed from llama_model_dflash::graph:
@@ -47,7 +47,7 @@
 // Rollback is free: the trunk verify writes correct KV for every row it
 // processes into the linear (non-circular) cache and Muse-Glimmer has no
 // recurrent state, so partial acceptance only rewinds the position counter
-// (MtpVerifyPersistsAcceptedKv).
+// (SpecVerifyPersistsAcceptedKv).
 // ---------------------------------------------------------------------------
 using System;
 using System.Diagnostics;
@@ -57,9 +57,11 @@ using TensorSharp.MLX;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Models
 {
-    public partial class MuseGlimmerModel : ModelBase, IMtpSpeculativeModel
+    public partial class MuseGlimmerModel : ModelBase, ISpeculativeModel
     {
         // Per-layer weight-name slots (index into _dflashLayerNames[il]).
         private const int DfAttnNorm = 0;
@@ -355,30 +357,37 @@ namespace TensorSharp.Models
         }
 
         // ====================================================================
-        // IMtpSpeculativeModel
+        // ISpeculativeModel
         // ====================================================================
 
-        public bool HasMtp => HasDFlash;
+        public bool HasDraftHead => HasDFlash;
+
+        /// <summary>DFlash proposes a whole block per pass, so it is served by
+        /// <see cref="BlockDraftSpeculator"/>.</summary>
+        public DraftHeadKind DraftHeadKind => _hasDFlash ? DraftHeadKind.Block : DraftHeadKind.None;
 
         /// <summary>Speculation is profitable exactly when a drafter is loaded: the
         /// verify batch is a single ordinary multi-token Muse-Glimmer forward (the
         /// same batched-attention path a prefill chunk takes), so it amortises the
         /// 30B weight read over the whole window on every backend the model runs
         /// on.</summary>
-        public bool MtpSpeculationProfitable => HasDFlash;
+        // Gated on the drafter because SpecForward captures DFlash's own feature
+        // rows (RequireDFlash) and has no meaning without it, so a weight-free
+        // speculator has no trunk to verify with here.
+        public bool SpeculationProfitable => HasDFlash;
 
         /// <summary>The concatenated target-layer input residuals the encoder
         /// consumes: TargetLayerIds.Length * hidden (5 * 6656 = 33280), NOT the
         /// model's hidden size.</summary>
-        public int MtpHiddenSize => _dflash != null ? _dflash.FeatureSize : Config.HiddenSize;
+        public int SpecFeatureSize => _dflash != null ? _dflash.FeatureSize : Config.HiddenSize;
 
         /// <summary>Number of DRAFTS a block produces, i.e. block_size - 1 (15):
         /// row 0 of the block is the anchor's own prediction and plain DFlash
         /// discards it (only DSpark consumes it).</summary>
-        public int MtpDraftBlockSize => _hasDFlash ? _dflash.MaxDraftTokens : 0;
+        public int DraftBlockSize => _hasDFlash ? _dflash.MaxDraftTokens : 0;
 
         /// <summary>See <see cref="DFlashPrefillChunkDefault"/>.</summary>
-        public int MtpPrefillChunkSize
+        public int SpecPrefillChunkSize
         {
             get
             {
@@ -394,18 +403,18 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The drafter is fed from the host: every prefill chunk hands its
-        /// per-row features back so <see cref="MtpCatchUp"/> can fill the ring.</summary>
-        public bool MtpPrefillSelfCatchUp => false;
+        /// per-row features back so <see cref="DraftCatchUp"/> can fill the ring.</summary>
+        public bool DraftSelfCatchUp => false;
 
         /// <summary>The verify batch writes correct KV for every row at its true
         /// position into the linear cache, and Muse-Glimmer holds no recurrent
         /// state, so a partial acceptance only needs a position rewind.</summary>
-        public bool MtpVerifyPersistsAcceptedKv => true;
+        public bool SpecVerifyPersistsAcceptedKv => true;
 
         /// <summary>
         /// Trunk forward that additionally captures, per row, the concatenated
         /// INPUT residuals of the target layers in dflash.target_layers (row stride
-        /// <see cref="MtpHiddenSize"/>) and, with <paramref name="allLogitsRows"/>,
+        /// <see cref="SpecFeatureSize"/>) and, with <paramref name="allLogitsRows"/>,
         /// LM-head logits for every row instead of only the last. Advances the KV
         /// cache exactly like Forward().
         /// </summary>
@@ -433,7 +442,7 @@ namespace TensorSharp.Models
             int feat = _dflash.FeatureSize;
             EnsureCacheCapacity(startPos + seqLen);
 
-            // Buffer-size contract (IMtpSpeculativeModel.SpecForward): a hidden
+            // Buffer-size contract (ISpeculativeModel.SpecForward): a hidden
             // buffer too small for one row per token means the caller only wants
             // the LAST row, written to row 0.
             bool captureAll = false, captureLast = false;
@@ -546,7 +555,7 @@ namespace TensorSharp.Models
         /// <summary>
         /// SpecForward on the fused kernel. The kernel writes the captured residuals
         /// BLOCK-major (one [hidden, n_tokens] block per target layer); the
-        /// IMtpSpeculativeModel contract wants them ROW-major (per token, the blocks
+        /// ISpeculativeModel contract wants them ROW-major (per token, the blocks
         /// concatenated into one FeatureSize-wide row), so they are transposed on the
         /// way out. That is 5 x 6656 x n floats of host copying against a whole trunk
         /// forward - negligible, and it keeps the contract unchanged.
@@ -629,9 +638,9 @@ namespace TensorSharp.Models
         /// tracks the real context. Row k of <paramref name="hRows"/> is the feature
         /// row of the token PRECEDING tokens[k] -- i.e. of absolute position
         /// <paramref name="startPos"/> + k - 1, which is exactly the position whose
-        /// drafter key it writes (hence the -1, as in DeepSeek4Model.MtpCatchUp).
+        /// drafter key it writes (hence the -1, as in DeepSeek4Model.DraftCatchUp).
         /// </summary>
-        public void MtpCatchUp(int[] tokens, float[] hRows, int startPos)
+        public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
             RequireDFlash();
             if (tokens == null || tokens.Length == 0 || hRows == null)
@@ -681,7 +690,7 @@ namespace TensorSharp.Models
         /// <paramref name="draftOut"/>; <paramref name="confOut"/> receives their
         /// top-1 softmax probabilities.
         /// </summary>
-        public int MtpDraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
+        public int DraftBlock(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
         {
             RequireDFlash();
             if (position <= 0 || draftOut == null || draftOut.Length == 0)
@@ -697,12 +706,12 @@ namespace TensorSharp.Models
 
         /// <summary>DFlash drafts whole blocks; the per-token entry point is never
         /// used.</summary>
-        public void MtpDraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
-            => throw new NotSupportedException("Muse-Glimmer DFlash drafts whole blocks; use MtpDraftBlock.");
+        public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
+            => throw new NotSupportedException("Muse-Glimmer DFlash drafts whole blocks; use DraftBlock.");
 
         /// <summary>Pre-grows the trunk KV cache to cover the whole speculative
         /// window. The drafter's ring is fixed-size and needs nothing.</summary>
-        public void MtpEnsureCapacity(int requiredSeqLen)
+        public void SpecEnsureCapacity(int requiredSeqLen)
         {
             if (!_hasDFlash)
                 return;
@@ -711,10 +720,10 @@ namespace TensorSharp.Models
 
         /// <summary>No recurrent (GDN/SSM) state in Muse-Glimmer -- drafting and
         /// verifying are stateless given the KV cache.</summary>
-        public void MtpSnapshotRecurrentState() { }
+        public void SpecSnapshotRecurrentState() { }
 
-        /// <summary>See <see cref="MtpSnapshotRecurrentState"/>.</summary>
-        public void MtpRestoreRecurrentState() { }
+        /// <summary>See <see cref="SpecSnapshotRecurrentState"/>.</summary>
+        public void SpecRestoreRecurrentState() { }
 
         /// <summary>
         /// Rewinds the trunk KV position counter after rejected speculative tokens.
@@ -723,7 +732,7 @@ namespace TensorSharp.Models
         /// The drafter's ring is untouched: it only ever holds committed positions,
         /// and the next catch-up rewrites the ones a rejected tail would have needed.
         /// </summary>
-        public void MtpRewindCache(int length)
+        public void SpecRewindCache(int length)
         {
             if (length < 0 || length > _cacheSeqLen)
             {
