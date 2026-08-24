@@ -28,7 +28,7 @@ public class ModelReloadRollbackTests : IDisposable
     public void MissingFile_IsRejectedWithCurrentModelStillLoaded()
     {
         var factory = new ScriptedFactory();
-        var svc = NewService(factory);
+        using var svc = NewService(factory);
         string pathA = WriteMinimalGguf("model-a.gguf");
         factory.Enqueue(p => new FakeModel(p));
         svc.LoadModel(pathA, null, "cpu");
@@ -47,7 +47,7 @@ public class ModelReloadRollbackTests : IDisposable
     public void NonGgufFile_IsRejectedWithCurrentModelStillLoaded()
     {
         var factory = new ScriptedFactory();
-        var svc = NewService(factory);
+        using var svc = NewService(factory);
         string pathA = WriteMinimalGguf("model-a.gguf");
         factory.Enqueue(p => new FakeModel(p));
         svc.LoadModel(pathA, null, "cpu");
@@ -66,7 +66,7 @@ public class ModelReloadRollbackTests : IDisposable
     public void TruncatedGguf_IsRejectedWithCurrentModelStillLoaded()
     {
         var factory = new ScriptedFactory();
-        var svc = NewService(factory);
+        using var svc = NewService(factory);
         string pathA = WriteMinimalGguf("model-a.gguf");
         factory.Enqueue(p => new FakeModel(p));
         svc.LoadModel(pathA, null, "cpu");
@@ -84,7 +84,7 @@ public class ModelReloadRollbackTests : IDisposable
     public void TruncatedMmProj_IsRejectedWithCurrentModelStillLoaded()
     {
         var factory = new ScriptedFactory();
-        var svc = NewService(factory);
+        using var svc = NewService(factory);
         string pathA = WriteMinimalGguf("model-a.gguf");
         factory.Enqueue(p => new FakeModel(p));
         svc.LoadModel(pathA, null, "cpu");
@@ -103,7 +103,7 @@ public class ModelReloadRollbackTests : IDisposable
     public void FailedLoad_RestoresPreviousModel()
     {
         var factory = new ScriptedFactory();
-        var svc = NewService(factory);
+        using var svc = NewService(factory);
         string pathA = WriteMinimalGguf("model-a.gguf");
         string pathB = WriteMinimalGguf("model-b.gguf");
         factory.Enqueue(p => new FakeModel(p));
@@ -162,7 +162,7 @@ public class ModelReloadRollbackTests : IDisposable
     public void SuccessfulReload_SwapsAndDisposesPreviousModel()
     {
         var factory = new ScriptedFactory();
-        var svc = NewService(factory);
+        using var svc = NewService(factory);
         string pathA = WriteMinimalGguf("model-a.gguf");
         string pathB = WriteMinimalGguf("model-b.gguf");
         factory.Enqueue(p => new FakeModel(p));
