@@ -46,6 +46,83 @@ public class ConfigFileArgsTests : IDisposable
         return path;
     }
 
+    // ---- video companion keys, old and new ----------------------------------
+    // Config keys ARE CLI flags (NormalizeFlag just prefixes '--'), so renaming the
+    // companion flags renamed these keys too. Both spellings must expand, or every
+    // config file written before the rename breaks.
+
+    [Fact]
+    public void Expand_LegacyWanCompanionKeys_StillExpandToFlags()
+    {
+        string cfg = WriteConfig("""
+        {
+          "model": "wan.gguf",
+          "wan-vae": "vae.safetensors",
+          "wan-te": "umt5.gguf",
+          "wan-dit2": "low_noise.gguf"
+        }
+        """);
+
+        var result = ConfigFileArgs.Expand(new[] { "--config", cfg });
+
+        Assert.Contains("--wan-vae", result);
+        Assert.Contains("--wan-te", result);
+        Assert.Contains("--wan-dit2", result);
+    }
+
+    [Fact]
+    public void Expand_GenericVideoCompanionKeys_ExpandToFlags()
+    {
+        string cfg = WriteConfig("""
+        {
+          "model": "wan.gguf",
+          "video-vae": "vae.safetensors",
+          "video-text-encoder": "umt5.gguf",
+          "video-dit2": "low_noise.gguf",
+          "audio-vae": "audio_vae.safetensors"
+        }
+        """);
+
+        var result = ConfigFileArgs.Expand(new[] { "--config", cfg });
+
+        Assert.Contains("--video-vae", result);
+        Assert.Contains("--video-text-encoder", result);
+        Assert.Contains("--video-dit2", result);
+        Assert.Contains("--audio-vae", result);
+    }
+
+    [Fact]
+    public void Expand_ShippedVideoConfigs_UseTheGenericKeys()
+    {
+        // Guard the repo's own presets: they were migrated to the generic keys, and a
+        // stray legacy key here would be silently fine at runtime but inconsistent.
+        string repoRoot = FindRepoRoot();
+        if (repoRoot is null) return;   // running outside a source checkout
+
+        foreach (string name in new[]
+                 {
+                     "wan-video-ti2v-5b.json",
+                     "wan-video-ti2v-5b-turbo.json",
+                     "wan-video-i2v-a14b.json",
+                 })
+        {
+            string path = Path.Combine(repoRoot, "config", name);
+            if (!File.Exists(path)) continue;
+            string text = File.ReadAllText(path);
+            Assert.DoesNotContain("\"wan-vae\"", text);
+            Assert.DoesNotContain("\"wan-te\"", text);
+            Assert.DoesNotContain("\"wan-dit2\"", text);
+        }
+    }
+
+    private static string FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "TensorSharp.slnx")))
+            dir = dir.Parent;
+        return dir?.FullName;
+    }
+
     [Fact]
     public void Expand_NoConfigFlag_ReturnsArgsUnchanged()
     {

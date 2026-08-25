@@ -54,6 +54,30 @@
     </ItemGroup>
     <Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>
+  <!-- The ggml native library is produced by TensorSharp.GGML.Native's CMake build
+       and copied into TensorSharp.Backends.GGML's output by its own post-build
+       target. That copy does not reach this project: the ProjectReference item set
+       is resolved before the referenced project's post-build step runs, so a rebuilt
+       dylib leaves a STALE copy here and tests then fail with
+       EntryPointNotFoundException for any newly added op — or, worse, silently run
+       old kernels. Copy it directly from the native build directory instead. -->
+  <PropertyGroup>
+    <GgmlNativeBuildDirForTests>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build</GgmlNativeBuildDirForTests>
+    <GgmlNativeBuildDirForTests Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDirForTests>
+    <GgmlNativeBinaryNameForTests Condition="$([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryNameForTests>
+    <GgmlNativeBinaryNameForTests Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryNameForTests>
+    <GgmlNativeBinaryNameForTests Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryNameForTests>
+  </PropertyGroup>
+  <Target Name="CopyGgmlNativeBinaryForTests" AfterTargets="Build"
+          Condition="'$(GgmlNativeBinaryNameForTests)' != ''">
+    <ItemGroup>
+      <GgmlNativeForTests Include="$(GgmlNativeBuildDirForTests)/$(GgmlNativeBinaryNameForTests)"
+                          Condition="Exists('$(GgmlNativeBuildDirForTests)/$(GgmlNativeBinaryNameForTests)')" />
+      <GgmlNativeForTests Include="$(GgmlNativeBuildDirForTests)/Release/$(GgmlNativeBinaryNameForTests)"
+                          Condition="Exists('$(GgmlNativeBuildDirForTests)/Release/$(GgmlNativeBinaryNameForTests)')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(GgmlNativeForTests)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>

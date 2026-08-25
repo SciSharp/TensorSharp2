@@ -10,6 +10,7 @@ using System.Linq;
 using TensorSharp;
 using TensorSharp.Core;
 using TensorSharp.Runtime;
+using TensorSharp.Models.Video;
 
 namespace TensorSharp.Models.WanVideo
 {
@@ -39,10 +40,10 @@ namespace TensorSharp.Models.WanVideo
     /// Companions resolve next to the DiT GGUF or via the <c>TS_WAN_VAE</c> /
     /// <c>TS_WAN_TE</c> / <c>TS_WAN_DIT2</c> environment variables. Not an autoregressive
     /// text model; generation is driven through <see cref="GenerateVideo"/>.
-    /// Text-to-video works on every variant; supplying <see cref="WanVideoParams.Image"/>
+    /// Text-to-video works on every variant; supplying <see cref="VideoGenerationParams.Image"/>
     /// generates image-to-video on the Wan 2.2 models (TI2V-5B / I2V-A14B).
     /// </summary>
-    public sealed class WanVideoModel : ModelBase
+    public sealed class WanVideoModel : ModelBase, IVideoGenerationModel
     {
         private readonly string _ditPath;
         private readonly string _vaePath;
@@ -285,15 +286,24 @@ namespace TensorSharp.Models.WanVideo
         }
 
         /// <summary>Generate a video from a text prompt (plus an optional conditioning image
-        /// via <see cref="WanVideoParams.Image"/> on the Wan 2.2 models).</summary>
-        public GeneratedVideo GenerateVideo(string prompt, WanVideoParams p = null)
+        /// via <see cref="VideoGenerationParams.Image"/> on the Wan 2.2 models).</summary>
+        public GeneratedVideo GenerateVideo(string prompt, VideoGenerationParams p = null)
         {
             var pipeline = GetPipeline();
-            return pipeline.Generate(prompt, p ?? new WanVideoParams());
+            return pipeline.Generate(prompt, p ?? new VideoGenerationParams());
         }
 
         private WanVideoPipeline _pipeline;
         private WanVideoPipeline GetPipeline() => _pipeline ??= new WanVideoPipeline(this);
+
+        // ---- IVideoGenerationModel capabilities ----
+        // Wan is video-only and takes at most a first-frame image; the reference-conditioning
+        // and joint-audio paths belong to other families (MiniMax-H3).
+        string IVideoGenerationModel.VideoModelFamily => "wan";
+        bool IVideoGenerationModel.SupportsAudio => false;
+        bool IVideoGenerationModel.SupportsImageConditioning => true;
+        bool IVideoGenerationModel.SupportsEndImageConditioning => false;
+        bool IVideoGenerationModel.SupportsReferenceConditioning => false;
 
         // ---- IModelArchitecture autoregressive surface: not applicable ----
         protected override float[] ForwardCore(int[] tokens) =>

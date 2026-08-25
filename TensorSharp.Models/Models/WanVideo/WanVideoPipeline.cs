@@ -20,6 +20,7 @@ using System;
 using System.Diagnostics;
 using TensorSharp.GGML;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.Video;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.WanVideo
@@ -30,6 +31,10 @@ namespace TensorSharp.Models.WanVideo
         public RgbImage[] Frames { get; init; }
         public int Fps { get; init; }
         public long Seed { get; init; }
+
+        /// <summary>The decoded audio track, on models that generate audio jointly with
+        /// the video (MiniMax-H3). Null for video-only models such as Wan.</summary>
+        public GeneratedVideoAudio Audio { get; init; }
     }
 
     internal sealed class WanVideoPipeline : IDisposable
@@ -69,11 +74,11 @@ namespace TensorSharp.Models.WanVideo
             ? new WanDirectVae(Dctx, _model.VaePath)
             : new WanVae(_model.VaePath);
 
-        public GeneratedVideo Generate(string prompt, WanVideoParams p)
+        public GeneratedVideo Generate(string prompt, VideoGenerationParams p)
         {
             try
             {
-                return GenerateCore(prompt, p ?? new WanVideoParams());
+                return GenerateCore(prompt, p ?? new VideoGenerationParams());
             }
             finally
             {
@@ -105,7 +110,7 @@ namespace TensorSharp.Models.WanVideo
             }
         }
 
-        private GeneratedVideo GenerateCore(string prompt, WanVideoParams p)
+        private GeneratedVideo GenerateCore(string prompt, VideoGenerationParams p)
         {
             // On the GGML backends the networks run through the native whole-graph
             // kernels; make sure that backend is the active one. The direct
@@ -221,7 +226,7 @@ namespace TensorSharp.Models.WanVideo
                                   $"(480p: 832x480, 720p: 1280x704{(ti2v ? ", the TI2V-5B native recipe" : "")}); " +
                                   "expect soft, distorted results. Prefer generating at a supported resolution " +
                                   "(e.g. --width 480 --height 704 for portrait) and downscaling afterwards.");
-            // Guidance-delta cache (opt-in; see WanVideoParams.CfgCacheStride).
+            // Guidance-delta cache (opt-in; see VideoGenerationParams.CfgCacheStride).
             int cfgStride = useCfg ? Math.Max(0, p.CfgCacheStride) : 0;
             int passes = steps;
             if (useCfg)
@@ -628,13 +633,13 @@ namespace TensorSharp.Models.WanVideo
     /// <summary>
     /// Periodic "still working" ticks for the phases that spend minutes inside one
     /// blocking native call (a DiT pass, a VAE band). Ticks go to the console and,
-    /// when the caller supplied one, to <see cref="WanVideoParams.OnProgress"/> —
+    /// when the caller supplied one, to <see cref="VideoGenerationParams.OnProgress"/> —
     /// the Web UI turns them into a live status line. TS_WAN_HEARTBEAT_S=0 silences
     /// the ticks (the phase-transition reports still fire).
     /// </summary>
     internal sealed class WanHeartbeat : IDisposable
     {
-        private readonly WanVideoParams _p;
+        private readonly VideoGenerationParams _p;
         private readonly Stopwatch _total;
         private readonly System.Threading.Timer _timer;
         private readonly object _lock = new();
@@ -643,7 +648,7 @@ namespace TensorSharp.Models.WanVideo
         private double _eta = -1;
         private Stopwatch _since = Stopwatch.StartNew();
 
-        public WanHeartbeat(WanVideoParams p, Stopwatch total)
+        public WanHeartbeat(VideoGenerationParams p, Stopwatch total)
         {
             _p = p;
             _total = total;
@@ -668,7 +673,7 @@ namespace TensorSharp.Models.WanVideo
         public void Report(string phase, int step, int totalSteps, string detail, double eta, bool heartbeat)
         {
             lock (_lock) { _eta = eta; }
-            _p?.OnProgress?.Invoke(new WanProgress
+            _p?.OnProgress?.Invoke(new VideoGenerationProgress
             {
                 Phase = phase, Step = step, TotalSteps = totalSteps, Detail = detail,
                 ElapsedSeconds = _total.Elapsed.TotalSeconds, EtaSeconds = eta, Heartbeat = heartbeat,

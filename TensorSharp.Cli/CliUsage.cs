@@ -437,43 +437,99 @@ namespace TensorSharp.Cli
                     "resolution does not fit beside the resident weights).",
                     "--offload-cpu"),
                 new OptionHelp("--video-frames <N>",
-                    "Wan video generation: number of output frames, snapped to 4k+1 (the VAE's temporal grid); " +
-                    "1 = a single still image. Default: 33 (49 for Wan2.2-TI2V). With a Wan 2.2 model, " +
-                    "--image <file> supplies the first frame for image-to-video.",
+                    "Video generation: number of output frames, snapped to the model's temporal grid " +
+                    "(4k+1 for Wan, 17k+5 for MiniMax-H3); 1 = a single still image where the model allows it. " +
+                    "Default: the model's own (33; 49 for Wan2.2-TI2V).",
                     "--video-frames 81"),
                 new OptionHelp("--fps <N>",
-                    "Wan video generation: playback frame rate of the saved MP4. Default: 16 " +
-                    "(24 for Wan2.2-TI2V, the models' training rates).",
+                    "Video generation: playback frame rate of the saved MP4. Default: the model's training " +
+                    "rate (16, or 24 for Wan2.2-TI2V). Models trained at a fixed rate — MiniMax-H3 at 24 fps — " +
+                    "override any other value.",
                     "--fps 24"),
                 new OptionHelp("--flow-shift <F>",
-                    "Wan FlowMatch timestep shift. Default: 0 — the model's official recipe (5.0 for Wan 2.2, " +
+                    "FlowMatch timestep shift. Default: 0 — the model's official recipe (5.0 for Wan 2.2, " +
                     "12.0 for A14B T2V; Wan 2.1: 8.0 for the 1.3B model's video runs, else 3.0 at <= 480p, " +
-                    "5.0 above).",
+                    "5.0 above; 12.0 for MiniMax-H3). On models with a joint audio stream this shifts the " +
+                    "video stream only.",
                     "--flow-shift 5.0"),
                 new OptionHelp("--sampler <name>",
-                    "Wan sampler: unipc (the official Wan sampler; multistep predictor-corrector, " +
-                    "better quality at the same step count) or euler. Default: unipc.",
+                    "Sampler: unipc (the official Wan sampler; multistep predictor-corrector, better quality " +
+                    "at the same step count) or euler. Default: the model's own (unipc for Wan).",
                     "--sampler unipc"),
                 new OptionHelp("--negative-prompt <text>",
-                    "Wan video generation: negative prompt for classifier-free guidance. Default: the official " +
-                    "Wan negative prompt.",
+                    "Video generation: negative prompt for classifier-free guidance. Default: the model's " +
+                    "official negative prompt. Unused at --cfg 1.0, where no negative pass runs.",
                     "--negative-prompt \"static, blurry\""),
                 new OptionHelp("--cfg-cache-stride <N>",
-                    "Wan guidance cache: run the unconditional CFG pass on one step in N and reuse the cached " +
+                    "Guidance cache: run the unconditional CFG pass on one step in N and reuse the cached " +
                     "guidance direction in between (the first three steps and the last always recompute it). " +
                     "At 50 steps, 2 runs 77 of the 100 passes (1.30x faster) and 3 runs 70 (1.43x). This is an " +
-                    "approximation — leave it off when matching a reference sample matters. Default: 0 (off).",
+                    "approximation — leave it off when matching a reference sample matters, and it has no " +
+                    "effect at --cfg 1.0. Default: 0 (off).",
                     "--cfg-cache-stride 2"),
-                new OptionHelp("--wan-vae <path>",
-                    "Wan video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B). Default: " +
-                    "same-directory scan next to the DiT model, VAE/ subfolders included (TS_WAN_VAE env var " +
-                    "also works).",
-                    "--wan-vae Wan2.2_VAE.safetensors"),
-                new OptionHelp("--wan-te <path>",
-                    "UMT5-XXL text-encoder GGUF for Wan video generation. Default: same-directory scan " +
-                    "(TS_WAN_TE env var also works). Wan 2.2 A14B also auto-resolves the second high/low-noise " +
-                    "expert GGUF by name (TS_WAN_DIT2 env var overrides).",
-                    "--wan-te umt5-xxl-encoder-Q8_0.gguf"),
+                new OptionHelp("--video-mode <mode>",
+                    "How to interpret supplied images, on models with more than one conditioning " +
+                    "mode. Default: inferred from what you pass. MiniMax-H3 accepts t2v (text " +
+                    "only), i2v (the image IS the first frame and gets animated), fl2v (first and " +
+                    "last frame), ref (the images are identity/appearance references for a NEW " +
+                    "scene, not the first frame). i2v/fl2v need the fl2va checkpoint and ref needs " +
+                    "ref2va — they are separate files. On the ref2va checkpoint a plain --image is " +
+                    "taken as a reference, so clients that only attach one image work unchanged.",
+                    "--video-mode i2v"),
+                new OptionHelp("--end-image <file>",
+                    "Last-frame conditioning image, on models that accept one (MiniMax-H3 first/last-frame " +
+                    "mode). Combined with --image the clip is steered to start and end on the two frames.",
+                    "--end-image last.png"),
+                new OptionHelp("--ref-image <file>",
+                    "Reference image for reference-conditioned models (MiniMax-H3 Ref2VA): the subject " +
+                    "carries over while camera, background and composition come from the prompt. " +
+                    "Repeatable up to 9; the prompt refers to them positionally as <Picture 1>, " +
+                    "<Picture 2>, ... References are only ever scaled DOWN and keep their own aspect " +
+                    "ratio, so the output size still comes from --width/--height.",
+                    "--ref-image cat.png"),
+                new OptionHelp("--ref-video <path>",
+                    "Reference video clip for reference-conditioned models. Repeatable; referred to in the " +
+                    "prompt as <Video 1>, <Video 2>, ... Accepts a video FILE or a directory of frames; " +
+                    "either way it is resampled onto the model's own 24 fps and its own canvas. Pair a " +
+                    "soundtrack with --ref-video-audio.",
+                    "--ref-video clip/"),
+                new OptionHelp("--ref-video-audio <file>",
+                    "Soundtrack for the reference video at the SAME position: the first " +
+                    "--ref-video-audio pairs with the first --ref-video, and so on. Separate from " +
+                    "--ref-video because a container's audio track is not readable through the " +
+                    "frame decoder. Omit it for a silent reference clip. WAV, MP3 or Ogg.",
+                    "--ref-video-audio clip.wav"),
+                new OptionHelp("--ref-audio <file>",
+                    "Reference audio clip for reference-conditioned models. Repeatable; referred to in the " +
+                    "prompt as <Audio 1>, <Audio 2>, ... WAV, MP3 or Ogg, resampled to the audio VAE's " +
+                    "32 kHz stereo and truncated to the generated clip's duration.",
+                    "--ref-audio theme.wav"),
+                new OptionHelp("--no-audio",
+                    "Skip audio decoding on models that generate an audio track jointly with the video " +
+                    "(MiniMax-H3). Saves the audio VAE's time and memory when only the picture is wanted. " +
+                    "Ignored by video-only models.",
+                    "--no-audio"),
+                new OptionHelp("--video-vae <path>",
+                    "Video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B; " +
+                    "minimax_h3_video_vae_fp16.safetensors for MiniMax-H3). Default: same-directory scan next " +
+                    "to the DiT model, VAE/ subfolders included (TS_VIDEO_VAE env var also works). " +
+                    "The former spelling --wan-vae is still accepted.",
+                    "--video-vae Wan2.2_VAE.safetensors"),
+                new OptionHelp("--video-text-encoder <path>",
+                    "Text-encoder GGUF for video generation (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). " +
+                    "Default: same-directory scan (TS_VIDEO_TEXT_ENCODER env var also works). Also spelled " +
+                    "--video-te; the former spelling --wan-te is still accepted.",
+                    "--video-text-encoder umt5-xxl-encoder-Q8_0.gguf"),
+                new OptionHelp("--video-dit2 <path>",
+                    "Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise pair). " +
+                    "Default: auto-resolved by filename next to the first expert (TS_VIDEO_DIT2 env var also " +
+                    "works). The former spelling --wan-dit2 is still accepted.",
+                    "--video-dit2 wan2.2_i2v_low_noise.gguf"),
+                new OptionHelp("--audio-vae <path>",
+                    "Audio VAE for models that generate an audio track jointly with the video " +
+                    "(minimax_h3_audio_vae_fp32.safetensors). Without it such a model still runs and produces " +
+                    "video, just no audio (TS_VIDEO_AUDIO_VAE env var also works).",
+                    "--audio-vae minimax_h3_audio_vae_fp32.safetensors"),
             }),
             ("Configuration file", new[]
             {

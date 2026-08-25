@@ -824,6 +824,466 @@ public struct WanVaeDecodeArgs
     public int StructBytes;
 }
 
+// ---------------------------------------------------------------------------
+// MiniMax-H3. MUST match the structs in ggml_ops_minimax_h3.cpp exactly.
+// ---------------------------------------------------------------------------
+
+/// <summary>One linear layer. Ne0/Ne1 are ggml order: Ne0 = in_features,
+/// Ne1 = out_features. The weight keeps its on-disk dtype (F16 for the VAEs);
+/// the bias, when present, is always F32.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3Lin
+{
+    public IntPtr W;
+    public IntPtr B;              // IntPtr.Zero = no bias
+    public long Ne0, Ne1;
+    public long Bytes;            // weight byte count
+    public int Type;              // ggml_type of the weight
+    public int Pad;
+}
+
+/// <summary>One MiniMax-H3 video-VAE ViT decoder block.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3VitBlockW
+{
+    public IntPtr Norm1;          // [dim] F32, RMSNorm affine
+    public IntPtr Norm2;
+    public IntPtr Scale1;         // [dim] F32, LayerScale on the attention branch
+    public IntPtr Scale2;
+    public H3Lin Qkv;             // [dim, 3*dim], per-head interleaved
+    public H3Lin Out;             // [dim, dim]
+    public H3Lin W1;              // [dim, 2*inner] (gate | value)
+    public H3Lin W2;              // [inner, dim]
+}
+
+/// <summary>Whole MiniMax-H3 video VAE ViT decode (TSGgml_MiniMaxH3VideoVaeDecode).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3VideoVaeDecodeArgs
+{
+    public int StructBytes;
+    public int NumBlocks;
+
+    public IntPtr Latent;         // F32 [latentC, tokens], tokens in (t,h,w) order
+    public IntPtr Out;            // F32 [patchDim, tokens] written
+    public IntPtr Cos;            // F32 [rotDim, tokens + numRegister + 1]
+    public IntPtr Sin;
+    public IntPtr RegisterTokens; // F32 [dim, numRegister]
+    public IntPtr NormOutW;       // F32 [dim]
+    public IntPtr NormOutB;       // F32 [dim]
+
+    public H3Lin PostQuant;       // the 1x1x1 conv, as a per-token linear
+    public H3Lin XEmbedder;
+    public H3Lin ProjOut;
+
+    public IntPtr Blocks;         // H3VitBlockW[NumBlocks]
+
+    public int Tokens;
+    public int LatentC;
+    public int Dim;
+    public int Heads;
+    public int HeadDim;
+    public int Inner;
+    public int RotDim;
+    public int NumRegister;
+    public int PatchDim;
+    public float Eps;
+}
+
+/// <summary>One Qwen3-VL text-encoder layer for MiniMax-H3.
+/// MUST match native TSGH3TeLayerW.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3TeLayerW
+{
+    public IntPtr InputNorm;      // [hidden] F32
+    public IntPtr PostAttnNorm;   // [hidden] F32
+    public IntPtr QNorm;          // [headDim] F32, Qwen3 per-head QK norm
+    public IntPtr KNorm;          // [headDim] F32
+    public H3Lin Q, K, V, O;
+    public H3Lin Gate, Up, Down;
+}
+
+/// <summary>Qwen3-VL text-encoder prefill (TSGgml_MiniMaxH3TextEncode).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3TextEncodeArgs
+{
+    public int StructBytes;
+    public int NumLayers;
+
+    public IntPtr Embeddings;     // F32 [hidden, seq]
+    public IntPtr Out;            // F32 [hidden, seq] written
+    public IntPtr Cos;            // F32 [headDim, seq]
+    public IntPtr Sin;
+    public IntPtr FinalNorm;      // F32 [hidden]; Zero = skip (H3 has no final norm)
+    /// <summary>Qwen3-VL DeepStack residuals, dense F32 [hidden, seq, NumDeepstack]
+    /// and zero outside the image spans. Zero when there are no reference images.</summary>
+    public IntPtr Deepstack;
+
+    public IntPtr Layers;         // H3TeLayerW[NumLayers]
+
+    public int Hidden;
+    public int Heads;
+    public int KvHeads;
+    public int HeadDim;
+    public int Seq;
+    public int Causal;
+    public float Eps;
+    public int NumDeepstack;
+}
+
+/// <summary>One run of conditioning tokens and the projection it goes through:
+/// 0 = video patches, 1 = audio latents. MUST match native TSGH3CondChunk.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3CondChunk
+{
+    public int Kind;
+    public int Count;
+}
+
+/// <summary>A run of tokens sharing one AdaLN row. <see cref="Col"/> is the base
+/// column into the block's modulation matrix viewed as [hidden, 18*nTimesteps];
+/// parameter p sits at Col + p. MUST match native TSGH3DitSegment.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3DitSegment
+{
+    public int Start;
+    public int End;
+    public int Col;
+    public int Pad;
+}
+
+/// <summary>A token-refiner block: the DiT block layout minus AdaLN.
+/// MUST match native TSGH3RefinerBlockW.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3RefinerBlockW
+{
+    public IntPtr Norm1, Norm2, QNorm, KNorm;
+    public H3Lin Qkv, Out, Fc1, Fc2;
+}
+
+/// <summary>One MiniMax-H3 DiT block. MUST match native TSGH3DitBlockW.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3DitBlockW
+{
+    public IntPtr Norm1, Norm2, QNorm, KNorm;
+    public H3Lin AdaLn;      // [timeEmbedDim, 18*hidden] + bias
+    public H3Lin Qkv;        // [hidden, 3*inner]
+    public H3Lin Out;        // [inner, hidden]
+    public H3Lin Fc1;        // [hidden, 2*ffn] (gate | value)
+    public H3Lin Fc2;        // [ffn, hidden]
+}
+
+/// <summary>One MiniMax-H3 diffusion step (TSGgml_MiniMaxH3DitForward).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3DitForwardArgs
+{
+    public int StructBytes;
+    public int NumBlocks;
+    public int NumRefinerBlocks;
+    public int NumSegments;
+
+    public IntPtr VideoTokens;    // F32 [videoPatchDim, videoCount], pre-patchified
+    public IntPtr AudioTokens;    // F32 [audioChannels, audioCount]
+    public IntPtr TextHidden;     // F32 [textDim, textCount]
+    public IntPtr TimeEmbed;      // F32 [timeEmbedDim, nTimesteps]
+    public IntPtr Cos;            // F32 [rotDim, nTok]
+    public IntPtr Sin;
+    public IntPtr VideoOut;       // F32 [videoPatchDim, videoCount] written
+    public IntPtr AudioOut;       // F32 [audioChannels, audioCount] written
+
+    public H3Lin VideoPatchProj, AudioPatchProj, ConditionProj;
+
+    public IntPtr Refiner;        // H3RefinerBlockW[NumRefinerBlocks]
+    public IntPtr RefinerFinalNorm;
+    public IntPtr Blocks;         // H3DitBlockW[NumBlocks]
+    public IntPtr Segments;       // H3DitSegment[NumSegments]
+
+    public IntPtr FinalNorm;
+    public H3Lin FinalAdaLn, FinalVideoOut, FinalAudioOut;
+
+    public int NTok;
+    public int TextCount;
+    /// <summary>Conditioning video tokens, prepended to VideoTokens and sharing its
+    /// projection; they sit between the text and the target audio in the sequence.</summary>
+    public int ConditionCount;
+    /// <summary>Ref2VA condition audio latents, F32 [audioChannels, ConditionAudioCount].
+    /// Zero for FL2VA, whose conditioning is all pictures.</summary>
+    public IntPtr ConditionAudio;
+    /// <summary>H3CondChunk[NumCondChunks] describing the conditioning run in
+    /// sequence order. Zero keeps the plain "all video patches" layout.</summary>
+    public IntPtr CondChunks;
+    public int NumCondChunks;
+    public int ConditionAudioCount;
+    public int AudioStart, AudioCount;
+    public int VideoStart, VideoCount;
+    public int AudioCol, VideoCol;
+    public int Hidden, Heads, HeadDim, Inner, Ffn;
+    public int RotDim, TimeEmbedDim, NTimesteps;
+    public int VideoPatchDim, AudioChannels, TextDim;
+    public float Eps;
+    public float VideoScale;
+    public float AudioScale;
+}
+
+/// <summary>A 2-D convolution kernel in ggml order [KW, KH, IC, OC].
+/// MUST match native TSGH3Conv.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3Conv
+{
+    public IntPtr W;
+    public IntPtr B;          // nullable, F32 [OC]
+    public long Kw, Kh, Ic, Oc;
+    public int Type;
+    public int Pad;
+}
+
+/// <summary>One encoder residual block. MUST match native TSGH3EncResBlock.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3EncResBlock
+{
+    public IntPtr Norm1W, Norm1B, Norm2W, Norm2B;
+    public H3Conv Conv1, Conv2;
+    public H3Conv Shortcut;   // W = Zero when the channel count is unchanged
+}
+
+/// <summary>One encoder level. MUST match native TSGH3EncLevel.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3EncLevel
+{
+    public H3EncResBlock Block0, Block1;
+    public H3Conv Downsample; // W = Zero when the level does not downsample
+    public int SpaceStride;
+    public int Pad;
+}
+
+/// <summary>Single-frame MiniMax-H3 video VAE encode (TSGgml_MiniMaxH3VideoVaeEncode).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3VideoVaeEncodeArgs
+{
+    public int StructBytes;
+    public int NumLevels;
+
+    public IntPtr Image;      // F32 [W, H, 3], ImageNet-normalized
+    public IntPtr Out;        // F32 [W/16, H/16, latentChannels] written
+
+    public H3Conv ConvIn;
+    public IntPtr Levels;     // H3EncLevel[NumLevels]
+    public IntPtr NormOutW, NormOutB;
+    public H3Conv ConvOut;
+    public H3Conv QuantConv;
+
+    public int Width, Height;
+    public int LatentChannels;
+    public int Groups;
+    public float Eps;
+}
+
+/// <summary>A 1-D convolution. MUST match native TSGH3Conv1d.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3Conv1d
+{
+    public IntPtr W;          // [K, IC, OC] ggml order
+    public IntPtr B;          // nullable
+    public long K, Ic, Oc;
+    /// <summary>Bias length. A transposed conv's weight is [Cin, Cout, K] in torch,
+    /// so reversing the dims puts Cout in <see cref="Ic"/> while the bias stays Cout
+    /// long — hence carrying this explicitly.</summary>
+    public long BiasLen;
+    public int Type;
+    public int Stride, Padding, Dilation;
+}
+
+/// <summary>An alias-free SnakeBeta activation. MUST match native TSGH3Act1d.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3Act1d
+{
+    public IntPtr Alpha;      // [C] F32, log-scale
+    public IntPtr Beta;       // [C] F32, log-scale
+    public IntPtr UpFilter;   // [K] F32, kaiser
+    public IntPtr DownFilter;
+    public int Channels;
+    public int Kernel;
+}
+
+/// <summary>Mono MiniMax-H3 audio VAE decode (TSGgml_MiniMaxH3AudioVaeDecode).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3AudioVaeDecodeArgs
+{
+    public int StructBytes;
+    public int NumStages;
+    public int NumConvs;
+    public int NumActs;
+
+    public IntPtr Latent;     // F32 [T, latentChannels]
+    public IntPtr Out;        // F32 [samples] written
+
+    public H3Conv1d DecInProj, ConvPre, ConvPost;
+
+    public IntPtr Convs;      // H3Conv1d[]: ups first, then per (stage, amp) convs1[3] + convs2[3]
+    public IntPtr Acts;       // H3Act1d[]: per (stage, amp) 6, then activation_post
+    public IntPtr Rates;      // int[NumStages]
+
+    public int LatentLen;
+    public int LatentChannels;
+    public int AmpsPerStage;
+    public int Samples;
+    public float SnakeEps;
+}
+
+/// <summary>One Qwen3-VL vision block. MUST match native TSGH3VisBlockW.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3VisBlockW
+{
+    public IntPtr Norm1W, Norm1B, Norm2W, Norm2B;
+    public H3Lin Qkv, Proj, Fc1, Fc2;
+}
+
+/// <summary>A vision merger. MUST match native TSGH3VisMerger.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3VisMerger
+{
+    public IntPtr NormW, NormB;
+    public H3Lin Fc1, Fc2;
+    /// <summary>1 = normalize at <c>dim</c> BEFORE the 2x2 merge (the final merger);
+    /// 0 = normalize at <c>dim*4</c> AFTER it (the DeepStack mergers).</summary>
+    public int NormBeforeMerge;
+    public int Pad;
+}
+
+/// <summary>A 3-D convolution kernel, ggml order [KW, KH, KD, IC*OC] — which is
+/// torch's [OC, IC, KD, KH, KW] read backwards. MUST match native TSGH3Conv3d.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3Conv3d
+{
+    public IntPtr W;
+    public IntPtr B;
+    public long Kw, Kh, Kd, Ic, Oc;
+    public int Type;
+    public int Pad;
+}
+
+/// <summary>MUST match native TSGH3EncResBlock3D.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3EncResBlock3D
+{
+    public IntPtr Norm1W, Norm1B, Norm2W, Norm2B;
+    public H3Conv3d Conv1, Conv2, Shortcut;
+}
+
+/// <summary>MUST match native TSGH3EncLevel3D.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3EncLevel3D
+{
+    public H3EncResBlock3D Block0, Block1;
+    public H3Conv3d Downsample;
+    public int SpaceStride;
+    public int TimeStride;
+}
+
+/// <summary>Multi-frame causal 3-D video VAE encode
+/// (TSGgml_MiniMaxH3VideoVaeEncode3D).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3VideoVaeEncode3DArgs
+{
+    public int StructBytes;
+    public int NumLevels;
+    public IntPtr Video;      // F32 [W, H, T, 3], ImageNet-normalized
+    public IntPtr Out;        // F32 [W/16, H/16, Tl, latentChannels] written
+    public H3Conv3d ConvIn;
+    public IntPtr Levels;     // H3EncLevel3D[NumLevels]
+    public IntPtr NormOutW, NormOutB;
+    public H3Conv3d ConvOut, QuantConv;
+    public int Width, Height, Frames, LatentFrames, LatentChannels, Groups;
+    public float Eps;
+}
+
+/// <summary>DAC Snake1d. alpha is LINEAR here, unlike the decoder's log-scale
+/// alpha/beta; <see cref="AlphaEps"/> carries alpha + 1e-9 so the divide guard
+/// needs no scalar in the graph. MUST match native TSGH3Snake1d.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3Snake1d
+{
+    public IntPtr Alpha;
+    public IntPtr AlphaEps;
+    public int Channels;
+    public int Pad;
+}
+
+/// <summary>One DAC residual unit. MUST match native TSGH3AudioEncResUnit.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3AudioEncResUnit
+{
+    public H3Snake1d Act1;
+    public H3Conv1d Conv1;
+    public H3Snake1d Act2;
+    public H3Conv1d Conv2;
+}
+
+/// <summary>One DAC encoder stage. MUST match native TSGH3AudioEncBlock.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3AudioEncBlock
+{
+    public H3AudioEncResUnit Unit0, Unit1, Unit2;   // dilations 1, 3, 9
+    public H3Snake1d Act;
+    public H3Conv1d Down;
+}
+
+/// <summary>The 2048 -> 32 causal-attention projection. MUST match native
+/// TSGH3AudioAttnProj.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3AudioAttnProj
+{
+    public IntPtr Norm1W, Norm1B, Norm3W, Norm3B, Norm2W, Norm2B, MlpNormW, MlpNormB;
+    public H3Lin Qkv;
+    /// <summary>Concatenated q_bias, ZEROS, v_bias — the checkpoint has no key bias.</summary>
+    public IntPtr QkvBias;
+    public H3Lin AttnProj, Proj, W0, W1, W2;
+    public int Heads;
+    public int Pad;
+}
+
+/// <summary>MiniMax-H3 audio VAE encoder (TSGgml_MiniMaxH3AudioVaeEncode).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3AudioVaeEncodeArgs
+{
+    public int StructBytes;
+    public int NumBlocks;
+    public IntPtr Wave;          // F32 [samples], one mono plane
+    public IntPtr Out;           // F32 [frames, latentChannels] written
+    public H3Conv1d ConvIn;
+    public IntPtr Blocks;        // H3AudioEncBlock[NumBlocks]
+    public H3Snake1d FinalAct;
+    public H3Conv1d FinalConv;
+    public H3AudioAttnProj Pre;
+    public H3Conv1d MeanProj;
+    public int Samples, Frames, LatentChannels, TrunkChannels;
+    public float Eps;
+    public int Pad;
+}
+
+/// <summary>Qwen3-VL vision tower (TSGgml_MiniMaxH3VisionEncode).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3VisionEncodeArgs
+{
+    public int StructBytes;
+    public int NumBlocks;
+    public int NumDeepstack;
+    public int Pad;
+
+    public IntPtr Patches;    // F32 [patchDim, tokens]
+    public IntPtr PosEmbed;   // F32 [dim, tokens]
+    public IntPtr Cos;        // F32 [headDim, tokens]
+    public IntPtr Sin;
+    public IntPtr Out;        // F32 [outDim, merged * (1 + numDeepstack)] written
+
+    public H3Lin PatchEmbed;
+    public IntPtr Blocks;             // H3VisBlockW[NumBlocks]
+    public IntPtr DeepstackLayers;    // int[NumDeepstack]
+    public IntPtr Mergers;            // H3VisMerger[1 + NumDeepstack]; [0] is the final one
+
+    public int Tokens, Dim, Heads, HeadDim, PatchDim, MergeSize, OutDim;
+    public float Eps;
+}
+
 // One encoder Resample stage. MUST match native TSGWanVaeDownW.
 [StructLayout(LayoutKind.Sequential)]
 public struct WanVaeDownW
@@ -2483,6 +2943,114 @@ internal enum GgmlIndexReductionOp
             int r = TSGgml_WanVaeDecode(in desc);
             if (r == 0)
                 Console.Error.WriteLine($"[wan-vae FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3VideoVaeDecode(in H3VideoVaeDecodeArgs desc);
+
+        /// <summary>MiniMax-H3 video VAE ViT decode: one graph for the whole
+        /// 36-block transformer, latent tokens in and pixel patches out.</summary>
+        public static bool TryMiniMaxH3VideoVaeDecode(in H3VideoVaeDecodeArgs desc)
+        {
+            int r = TSGgml_MiniMaxH3VideoVaeDecode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-video-vae FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3TextEncode(in H3TextEncodeArgs desc);
+
+        /// <summary>Qwen3-VL text-encoder prefill for MiniMax-H3: the whole
+        /// 50-layer trunk in one graph, returning raw hidden states.</summary>
+        public static bool TryMiniMaxH3TextEncode(in H3TextEncodeArgs desc)
+        {
+            int r = TSGgml_MiniMaxH3TextEncode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-te FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3DitForward(in H3DitForwardArgs desc);
+
+        /// <summary>One MiniMax-H3 diffusion step: the whole 50-block packed
+        /// audio-video transformer in one graph.</summary>
+        public static bool TryMiniMaxH3DitForward(in H3DitForwardArgs desc)
+        {
+            int r = TSGgml_MiniMaxH3DitForward(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-dit FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3VideoVaeEncode(in H3VideoVaeEncodeArgs desc);
+
+        /// <summary>Single-frame MiniMax-H3 video VAE encode, for image conditioning.</summary>
+        public static bool TryMiniMaxH3VideoVaeEncode(in H3VideoVaeEncodeArgs desc)
+        {
+            int r = TSGgml_MiniMaxH3VideoVaeEncode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-vae-encode FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3AudioVaeDecode(in H3AudioVaeDecodeArgs desc);
+
+        /// <summary>Mono MiniMax-H3 audio VAE (BigVGAN) decode in one graph.</summary>
+        public static bool TryMiniMaxH3AudioVaeDecode(in H3AudioVaeDecodeArgs desc)
+        {
+            int r = TSGgml_MiniMaxH3AudioVaeDecode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-audio-vae FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3VideoVaeEncode3D(in H3VideoVaeEncode3DArgs desc);
+
+        /// <summary>Causal 3-D video encode: a clip of frames to its latent.</summary>
+        public static bool TryMiniMaxH3VideoVaeEncode3D(in H3VideoVaeEncode3DArgs desc)
+        {
+            int r = TSGgml_MiniMaxH3VideoVaeEncode3D(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-video-encode3d FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3AudioVaeEncode(in H3AudioVaeEncodeArgs desc);
+
+        /// <summary>DAC audio encoder: one mono plane of PCM to its latent.</summary>
+        public static bool TryMiniMaxH3AudioVaeEncode(in H3AudioVaeEncodeArgs desc)
+        {
+            int r = TSGgml_MiniMaxH3AudioVaeEncode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-audio-encode FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3VisionEncode(in H3VisionEncodeArgs desc);
+
+        /// <summary>Qwen3-VL vision tower: one graph producing the final merger output
+        /// plus the three DeepStack outputs.</summary>
+        public static bool TryMiniMaxH3VisionEncode(in H3VisionEncodeArgs desc)
+        {
+            int r = TSGgml_MiniMaxH3VisionEncode(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-vision FAIL] {GetLastErrorMessage("(no native error)")}");
             return r != 0;
         }
 

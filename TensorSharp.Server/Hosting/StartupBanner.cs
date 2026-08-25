@@ -56,17 +56,24 @@ namespace TensorSharp.Server.Hosting
             }
 
             logger.LogInformation(LogEventIds.HostConfiguration,
-                "Server configuration: hostedModel={HostedModel} hostedMmProj={HostedMmProj} defaultMaxTokens={DefaultMaxTokens}{MaxTokensPinned} wanVideoFrames={WanVideoFrames} wanVideoFps={WanVideoFps} videoSampleFps={VideoSampleFps} videoMaxFrames={VideoMaxFrames} listen={ListenAddress}",
+                "Server configuration: hostedModel={HostedModel} hostedMmProj={HostedMmProj} defaultMaxTokens={DefaultMaxTokens}{MaxTokensPinned} videoFrames={VideoFrames} videoFps={VideoFps} videoSize={VideoSize} videoSteps={VideoSteps} videoMode={VideoMode} videoSampleFps={VideoSampleFps} videoMaxFrames={VideoMaxFrames} listen={ListenAddress}",
                 options.StartupModelPath ?? "(none)",
                 options.StartupMmProjPath ?? "(none)",
                 options.DefaultMaxTokens,
                 options.MaxTokensPinned ? " (server cap)" : string.Empty,
-                options.DefaultWanVideoFrames > 0
-                    ? options.DefaultWanVideoFrames.ToString(CultureInfo.InvariantCulture)
+                options.DefaultVideoFrames > 0
+                    ? options.DefaultVideoFrames.ToString(CultureInfo.InvariantCulture)
                     : "model-default",
-                options.DefaultWanVideoFps > 0
-                    ? options.DefaultWanVideoFps.ToString(CultureInfo.InvariantCulture)
+                options.DefaultVideoFps > 0
+                    ? options.DefaultVideoFps.ToString(CultureInfo.InvariantCulture)
                     : "model-default",
+                options.DefaultVideoWidth > 0 || options.DefaultVideoHeight > 0
+                    ? $"{options.DefaultVideoWidth}x{options.DefaultVideoHeight}"
+                    : "model-default",
+                options.DefaultVideoSteps > 0
+                    ? options.DefaultVideoSteps.ToString(CultureInfo.InvariantCulture)
+                    : "model-default",
+                string.IsNullOrWhiteSpace(options.DefaultVideoMode) ? "auto" : options.DefaultVideoMode,
                 MediaHelper.GetConfiguredVideoSampleFps().ToString("0.###", CultureInfo.InvariantCulture),
                 MediaHelper.GetConfiguredMaxVideoFrames(),
                 listenAddress);

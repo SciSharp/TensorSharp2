@@ -212,7 +212,7 @@ Notes:
 - **UMT5-XXL is shared** by every Wan model, so the ~6 GB encoder downloads once and
   the other Wan configs reuse it from `${modelRoot}`.
 - **A14B needs both experts.** They are auto-paired by their `high_noise`/`low_noise`
-  names when they sit in the same folder; `wan-dit2` in the config is what lets the
+  names when they sit in the same folder; `video-dit2` in the config is what lets the
   second one auto-download.
 - **Turbo/Lightning/distilled checkpoints are detected from the file name** and
   switch to 4 steps with guidance off — around 25× fewer DiT passes. The startup log

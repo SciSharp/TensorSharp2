@@ -1,0 +1,44 @@
+{
+  // MiniMax-H3 — joint video + 32 kHz stereo audio generation.
+  //
+  // Four files are needed and they come from two repos:
+  //   1. the denoiser        (--model)                the packed audio-video DiT
+  //   2. Qwen3-VL-32B        (--video-text-encoder)   the text encoder, 50 layers
+  //   3. the video VAE       (--video-vae)            16x spatial / 4x temporal
+  //   4. the audio VAE       (--audio-vae)            optional; omit for silent video
+  //
+  // H3 is CFG-distilled: cfg MUST be 1.0 and 4-8 steps is the operating point.
+  // The frame count snaps to the 17k+5 grid and fps is pinned to 24.
+  //
+  // The text encoder ships NO tokenizer — put vocab.json and merges.txt from
+  // MiniMaxAI/MiniMax-H3/processor beside it, or set TS_VIDEO_TOKENIZER.
+  "backend": "ggml_metal",
+
+  "model": {
+    "path": "minimax_h3_fl2va_pruned-Q4_K.gguf",
+    "repo": "unsloth/MiniMax-H3-GGUF",
+    "file": "minimax_h3_fl2va_pruned-Q4_K.gguf"
+  },
+  "video-text-encoder": {
+    "path": "qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+    "repo": "unsloth/MiniMax-H3-GGUF",
+    "file": "qwen3vl_32b_minimax_h3-Q4_K_M.gguf"
+  },
+  "video-vae": {
+    "path": "minimax_h3_video_vae_fp16.safetensors",
+    "repo": "Comfy-Org/MiniMax-H3",
+    "file": "vae/minimax_h3_video_vae_fp16.safetensors"
+  },
+  "audio-vae": {
+    "path": "minimax_h3_audio_vae_fp32.safetensors",
+    "repo": "Comfy-Org/MiniMax-H3",
+    "file": "vae/minimax_h3_audio_vae_fp32.safetensors"
+  },
+
+  "width": 640,
+  "height": 384,
+  "video-frames": 22,
+  "fps": 24,
+  "diffusion-steps": 8,
+  "cfg": 1.0
+}

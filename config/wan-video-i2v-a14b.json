@@ -4,9 +4,9 @@
   // FOUR networks here, because A14B splits the denoiser into TWO experts that
   // run in sequence over the schedule:
   //   1. the high-noise DiT (--model)     early, structure-forming steps
-  //   2. the low-noise DiT  (--wan-dit2)  later, detail-forming steps
-  //   3. the Wan 2.1 VAE    (--wan-vae)   16-channel latent (NOT the 2.2 VAE)
-  //   4. UMT5-XXL           (--wan-te)    the text encoder, shared with 2.2
+  //   2. the low-noise DiT  (--video-dit2)  later, detail-forming steps
+  //   3. the Wan 2.1 VAE    (--video-vae)   16-channel latent (NOT the 2.2 VAE)
+  //   4. UMT5-XXL           (--video-text-encoder)    the text encoder, shared with 2.2
   // The first expert's VRAM is released when the schedule crosses the boundary,
   // so both fit sequentially on one card rather than needing room for both.
   //
@@ -17,7 +17,7 @@
   // the Web UI, or pass --image with the CLI.
   //
   // The two experts are auto-paired by their high_noise/low_noise names when they
-  // sit in the same folder, so --wan-dit2 below is really just what lets this
+  // sit in the same folder, so --video-dit2 below is really just what lets this
   // config DOWNLOAD the second one; it would be found without it.
   //
   // Downloads ~24 GB (two 9 GB experts + the 6 GB text encoder). TI2V-5B is the
@@ -41,19 +41,19 @@
     "path": "${modelRoot}/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf",
     "urls": [ "${a14b}/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf" ]
   },
-  "wan-dit2": {
+  "video-dit2": {
     "path": "${modelRoot}/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf",
     "urls": [ "${a14b}/low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf" ]
   },
 
   // A14B uses the Wan 2.1 VAE (16-channel, 8x8x4). Using the 2.2 VAE here fails:
   // it is a different latent space with a different channel count.
-  "wan-vae": {
+  "video-vae": {
     "path": "${modelRoot}/Wan2.1_VAE.safetensors",
     "urls": [ "${hf}/QuantStack/Wan2.2-I2V-A14B-GGUF/resolve/main/VAE/Wan2.1_VAE.safetensors" ]
   },
 
-  "wan-te": {
+  "video-text-encoder": {
     "path": "${modelRoot}/umt5-xxl-encoder-Q8_0.gguf",
     "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q8_0.gguf" ]
   }

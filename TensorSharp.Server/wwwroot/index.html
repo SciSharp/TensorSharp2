@@ -896,6 +896,9 @@ let isGenerating = false;
 let currentAbortController = null;
 let currentLoadedModel = null;
 let currentArchitecture = null;
+// Architectures whose /api/models 'architecture' id means "this model generates video".
+// The id comes from GGUF metadata, so it is matched rather than renamed.
+const VIDEO_ARCHITECTURES = new Set(['wan', 'wan2.1', 'wan2.2', 'minimax-h3']);
 let needsCacheReset = false;
 let shouldAutoScroll = true;
 let serverDefaultMaxTokens = 20000;
@@ -1293,7 +1296,7 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, queueDiv) {
   if (queueDiv) queueDiv.style.display = 'none';
   bubbleText.textContent = 'Starting video generation… (this takes a few minutes)';
   const i2vImage = userMsg.imagePaths && userMsg.imagePaths.length > 0 ? userMsg.imagePaths[0] : null;
-  statsDiv.textContent = i2vImage ? 'Wan Image-to-Video' : 'Wan Text-to-Video';
+  statsDiv.textContent = i2vImage ? 'Image-to-Video' : 'Text-to-Video';
   const t0 = performance.now();
 
   try {
@@ -1412,9 +1415,9 @@ async function requestAssistantResponse() {
       return;
     }
 
-    // Wan video generation: the prompt (plus an optional attached image as the
-    // first frame, Wan 2.2 image-to-video) produces a video, not chat text.
-    if (currentArchitecture === 'wan' && _lastUser) {
+    // Video generation: the prompt (plus an optional attached image as the first
+    // frame) produces a video, not chat text. Every video architecture routes here.
+    if (VIDEO_ARCHITECTURES.has(currentArchitecture) && _lastUser) {
       await runVideoGenerate(_lastUser, bubbleText, statsDiv, queueDiv);
       return;
     }

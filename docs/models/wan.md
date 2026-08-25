@@ -24,8 +24,8 @@ in one folder — subfolders like `VAE/`, `HighNoise/`, `LowNoise/` included):
 |---|---|---|
 | DiT (the `--model` GGUF, `general.architecture = wan`) | e.g. `Wan2.2-TI2V-5B-Q8_0.gguf` | [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF), [QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF), [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf) |
 | second A14B expert (A14B only) | the matching `…HighNoise…`/`…LowNoise…` GGUF | same repo (`TS_WAN_DIT2` overrides; auto-found by name in the same/sibling folder) |
-| UMT5-XXL text encoder | `umt5-xxl-encoder-Q8_0.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) (`--wan-te` / `TS_WAN_TE`) |
-| Wan 2.1 video VAE (2.1 + A14B) | `wan_2.1_vae.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors) (`--wan-vae` / `TS_WAN_VAE`) |
+| UMT5-XXL text encoder | `umt5-xxl-encoder-Q8_0.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) (`--video-text-encoder` / `TS_WAN_TE`) |
+| Wan 2.1 video VAE (2.1 + A14B) | `wan_2.1_vae.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors) (`--video-vae` / `TS_WAN_VAE`) |
 | Wan 2.2 video VAE (TI2V-5B) | `Wan2.2_VAE.safetensors` | bundled in [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE) |
 
 The text encoder is released from VRAM before the denoise starts, the VAE
@@ -67,8 +67,8 @@ paths, so the same file works on Windows, Linux and macOS.
 VAE (16-channel, 8×8×4). Loading the wrong one fails at startup rather than
 producing bad video. UMT5-XXL is shared by all of them, so it downloads once.
 
-To point at files you already have, use `--wan-vae`, `--wan-te` and (for A14B)
-`--wan-dit2`, or drop everything in one folder next to the DiT and let the
+To point at files you already have, use `--video-vae`, `--video-text-encoder` and (for A14B)
+`--video-dit2`, or drop everything in one folder next to the DiT and let the
 same-directory scan find it.
 
 ## Backends

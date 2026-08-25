@@ -32,8 +32,8 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Qwen-Image-Edit | Lightning LoRA（可选，4/8 步） | [lightx2v/Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning)，文件 `Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`（0.850 GB）；用 `--qwen-image-lora` / `TS_QWEN_IMAGE_LORA` 加载，会自动按文件名里的步数把采样默认值切到该步数 + CFG 1.0（基础默认为 30 步、CFG 2.5） |
 | Wan 视频生成 | **步数蒸馏 DiT（首选）** | **这是最大的提速手段——除非要复现参考样例，都应该用它。**蒸馏 checkpoint 生成同一段视频只跑 4 次去噪，而官方配方要跑 100 次：在 M5 Pro / `ggml_metal` 上以 1088×832×121 帧实测，端到端 **17 分 30 秒**，而基础 checkpoint 是 **3 小时 30 分**——同一个请求，其他参数一律不变。TI2V-5B：[hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF)，文件 `Wan2_2-TI2V-5B-Turbo-Q8_0.gguf`（5.40 GB），另有 Q6_K（4.22 GB）、Q5_K_M（3.82 GB）、Q4_K_M（3.44 GB），最小到 Q2_K（1.86 GB）。**注意文件名里是 `Wan2_2` 下划线**，照抄基础仓库的 `Wan2.2` 写法会 404。I2V-A14B：[jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF](https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF)，Lightning 已合并进两个专家；需同时下载 `high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf` **和** `low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf`（各 9.66 GB；Q8_0 15.42 GB，Q2_K 5.31 GB），放在同一个 `--local-dir` 下，`--model` 指向任意一个即可，另一个专家会自动找到。备选：[Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF](https://huggingface.co/Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF)（`FastWan2.2-TI2V-5B-q8_0.gguf`，5.41 GB）。**无需任何参数**：TensorSharp 读取 DiT 文件名，命中 `turbo` / `distill` / `lightning` / `lightx2v` / `fastwan` / `-dmd` 或显式的 `<N>steps`（1-16）即切换到该步数并关闭 guidance，加载时打印 `step-distilled checkpoint detected -> N steps, guidance off`；`--diffusion-steps` / `--cfg` 可覆盖。Turbo 与 A14B 蒸馏仓库都不含 VAE 和文本编码器，请从下面两行获取 |
 | Wan 视频生成 | 基础 DiT（`--model` GGUF） | 完整官方配方（50 步 × 2 次 CFG = 100 次 DiT 前向）——需要对齐参考样例时才用，否则优先用上一行的蒸馏版本。Wan 2.2 文/图生视频：[QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF)（`Wan2.2-TI2V-5B-Q8_0.gguf` 5.40 GB 或 `Wan2.2-TI2V-5B-Q4_K_M.gguf` 3.43 GB，仓库自带 `VAE/Wan2.2_VAE.safetensors`）、[QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF) 或 [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF)（`HighNoise/` 与 `LowNoise/` 两个专家缺一不可，两个仓库都自带 `VAE/Wan2.1_VAE.safetensors`）；Wan 2.1 文生视频：[samuelchristlie/Wan2.1-T2V-1.3B-GGUF](https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF)（`Wan2.1-T2V-1.3B-Q8_0.gguf` / `-F16.gguf`）或 [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf)（文件名为小写，如 `wan2.1-t2v-14b-Q8_0.gguf`）——这两个 2.1 仓库都不含 VAE 和编码器。`general.architecture` 为 `wan` / `wan2.1` / `wan2.2`。参见 [docs/models/wan.md](docs/models/wan.md) |
-| Wan 视频生成 | UMT5-XXL 文本编码器（必需，所有 Wan checkpoint 都要） | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf)：`umt5-xxl-encoder-Q8_0.gguf`（6.04 GB），内存紧张可用 `umt5-xxl-encoder-Q5_K_M.gguf`（4.15 GB）/ `umt5-xxl-encoder-Q4_K_M.gguf`（3.66 GB）。负责把提示词编码成条件向量，去噪开始前即从显存释放。放在 DiT 旁或用 `--wan-te` / `TS_WAN_TE` 指定 |
-| Wan 视频生成 | 视频 VAE（必需） | 把 latent 解码成画面——**用哪个由 DiT 自己决定**，不是由你选：TI2V-5B 需要 [`Wan2.2_VAE.safetensors`](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE)（TI2V-5B 仓库自带），Wan 2.1 与 A14B 需要 `Wan2.1_VAE.safetensors`——两个 QuantStack A14B 仓库里就有 `VAE/Wan2.1_VAE.safetensors`，也可单独下载 [`wan_2.1_vae.safetensors`](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors)。上面的蒸馏仓库都不含 VAE，请从这里配一个对应的。放在 DiT 旁（`VAE/` 子目录亦可）或用 `--wan-vae` / `TS_WAN_VAE` 指定 |
+| Wan 视频生成 | UMT5-XXL 文本编码器（必需，所有 Wan checkpoint 都要） | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf)：`umt5-xxl-encoder-Q8_0.gguf`（6.04 GB），内存紧张可用 `umt5-xxl-encoder-Q5_K_M.gguf`（4.15 GB）/ `umt5-xxl-encoder-Q4_K_M.gguf`（3.66 GB）。负责把提示词编码成条件向量，去噪开始前即从显存释放。放在 DiT 旁或用 `--video-text-encoder` / `TS_WAN_TE` 指定 |
+| Wan 视频生成 | 视频 VAE（必需） | 把 latent 解码成画面——**用哪个由 DiT 自己决定**，不是由你选：TI2V-5B 需要 [`Wan2.2_VAE.safetensors`](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE)（TI2V-5B 仓库自带），Wan 2.1 与 A14B 需要 `Wan2.1_VAE.safetensors`——两个 QuantStack A14B 仓库里就有 `VAE/Wan2.1_VAE.safetensors`，也可单独下载 [`wan_2.1_vae.safetensors`](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors)。上面的蒸馏仓库都不含 VAE，请从这里配一个对应的。放在 DiT 旁（`VAE/` 子目录亦可）或用 `--video-vae` / `TS_WAN_VAE` 指定 |
 
 ### DSpark draft 模型
 
@@ -204,12 +204,12 @@ hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir 
 
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_cuda \
-    --wan-vae models/VAE/Wan2.2_VAE.safetensors --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --video-vae models/VAE/Wan2.2_VAE.safetensors --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf \
     --prompt "a cute fluffy orange cat walking through a sunny garden with flowers" \
     --output cat.mp4 --width 832 --height 480 --video-frames 81
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
     --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_cuda \
-    --wan-vae models/VAE/Wan2.2_VAE.safetensors --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --video-vae models/VAE/Wan2.2_VAE.safetensors --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf \
     --video-frames 121 --fps 24
 ```
 
@@ -220,7 +220,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
 `--video-frames` / `--fps` 只是默认值，单个请求可以覆盖。Wan 是唯一不支持 `--backend mlx` 的系列，
 请使用 `ggml_cuda`、`ggml_metal`、`ggml_vulkan`、`ggml_cpu`、`cuda` 或 `cpu`。
 
-三个文件放在同一个目录下时（`VAE/` 子目录也算），`--wan-vae` / `--wan-te` 可以省略，会自动解析。
+三个文件放在同一个目录下时（`VAE/` 子目录也算），`--video-vae` / `--video-text-encoder` 可以省略，会自动解析。
 双专家的 A14B 模型需要**同时**下载两个专家到同一个 `--local-dir`，`--model` 指向其中任意一个：
 
 ```bash
@@ -231,8 +231,8 @@ hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir 
 
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model models/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf \
-    --backend ggml_cuda --wan-vae models/VAE/Wan2.1_VAE.safetensors \
-    --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --backend ggml_cuda --video-vae models/VAE/Wan2.1_VAE.safetensors \
+    --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf \
     --prompt "the ship sails into the storm, waves crashing" --image ship.jpg --output ship.mp4
 ```
 

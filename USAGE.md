@@ -133,8 +133,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <qwen-image-edit-DiT.gguf
     --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0
 
 # Wan video generation (prompt -> H.264 MP4). The UMT5-XXL text-encoder GGUF and
-# video-VAE companions are resolved next to the DiT GGUF (or set --wan-te /
-# --wan-vae). Wan 2.1 T2V, Wan 2.2 TI2V-5B, and Wan 2.2 A14B (both experts)
+# video-VAE companions are resolved next to the DiT GGUF (or set --video-text-encoder /
+# --video-vae). Wan 2.1 T2V, Wan 2.2 TI2V-5B, and Wan 2.2 A14B (both experts)
 # are auto-detected, and so are step-distilled (Turbo / Lightning / FastWan)
 # checkpoints -- 4 DiT passes instead of 100 for the same video. See the
 # "Video generation (Wan)" section below and docs/models/wan.md.
@@ -280,15 +280,27 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen2.5-VL mmproj (vision grounding) GGUF. |
 | `--qwen-image-lora <path>` | Qwen-Image-Edit Lightning distillation LoRA (`.safetensors`). Applied as a runtime F32 side-path next to each targeted projection (`y = W_quant·x + b + (alpha/rank)·up·(down·x)`) with the quantized base weights left untouched — **not** merged into them. Auto-derives the step count from the file name (e.g. 4 or 8), switches CFG to 1.0 and pins the timestep shift to 3, so the default 30 steps × 2 CFG passes (60 DiT forwards) become 4–8. Needs the whole-model or fused per-block CUDA forward — on a path without the side-path it throws rather than emitting noise. Env: `TS_QWEN_IMAGE_LORA`. |
 | `--width <px>` / `--height <px>` | Output size for Qwen-Image-Edit and Wan video. Default: `0` — auto (Qwen-Image-Edit: the source size, VRAM-clamped; Wan: the model's native area at the input image's aspect ratio, 1280×704 for TI2V-5B and 832×480 otherwise). |
-| `--video-frames <N>` | Wan video frame count, snapped to `4k+1` (default: 33; 49 for Wan2.2-TI2V). `1` generates a still image (use `--output out.png`). |
-| `--fps <N>` | Wan video playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). |
-| `--flow-shift <F>` | Wan FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1). |
-| `--sampler <name>` | Wan sampler: `unipc` (official Wan sampler, default) or `euler`. |
-| `--negative-prompt <text>` | Wan negative prompt (default: the official Wan negative prompt). |
+| `--video-frames <N>` | Video frame count, snapped to the model's temporal grid (`4k+1` for Wan, `17k+5` for MiniMax-H3). Default: 33; 49 for Wan2.2-TI2V. `1` generates a still image where the model supports it (use `--output out.png`). |
+| `--fps <N>` | Playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value. |
+| `--flow-shift <F>` | FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1, 12.0 for MiniMax-H3). On models with a joint audio stream this shifts the video stream only. |
+| `--sampler <name>` | Sampler: `unipc` (the official Wan sampler, default for Wan) or `euler`. |
+| `--negative-prompt <text>` | Negative prompt for classifier-free guidance (default: the model's official negative prompt). Unused at `--cfg 1.0`, where no negative pass runs. |
 | _(step-distilled checkpoints)_ | Auto-detected from the DiT file name (`Turbo`, `distill`, `Lightning`, `lightx2v`, `FastWan`, `-dmd`, or an explicit `…-4steps-…` / `…8step…` for 1–16): the pipeline switches to that step count with guidance off, turning the official 50-step × CFG recipe's 100 DiT passes into 4. This is the single biggest speed lever for Wan — see **[Video generation (Wan)](#video-generation-wan)** below. `--diffusion-steps` / `--cfg` override it. |
 | `--cfg-cache-stride <N>` | Wan guidance cache: run the unconditional CFG pass on one step in `N` and reuse the cached guidance direction in between (default off — every step runs both passes). `2` ≈ 1.30x faster, `3` ≈ 1.43x; approximate, so leave it off when matching a reference sample matters. |
-| `--wan-vae <path>` | Override the resolved Wan video VAE (`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`). Env: `TS_WAN_VAE`. |
-| `--wan-te <path>` | Override the resolved UMT5-XXL text-encoder GGUF. Env: `TS_WAN_TE`. Wan 2.2 A14B additionally resolves the second high/low-noise expert automatically (env: `TS_WAN_DIT2`). |
+| `--video-vae <path>` | Override the resolved video VAE (`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`; `minimax_h3_video_vae_fp16.safetensors` for MiniMax-H3). Env: `TS_VIDEO_VAE` (`TS_WAN_VAE` also honoured). |
+| `--video-text-encoder <path>` | Override the resolved text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Also spelled `--video-te`. Env: `TS_VIDEO_TEXT_ENCODER` (`TS_WAN_TE` also honoured). |
+| `--video-dit2 <path>` | Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner). Auto-resolved by name when the pair is co-located. Env: `TS_VIDEO_DIT2` (`TS_WAN_DIT2` also honoured). |
+| `--audio-vae <path>` | Audio VAE for models that generate an audio track jointly with the video (`minimax_h3_audio_vae_fp32.safetensors`). Without it such a model still produces video, just no audio. Env: `TS_VIDEO_AUDIO_VAE`. |
+| `--end-image <file>` | Last-frame conditioning image, on models that accept one (MiniMax-H3 first/last-frame mode). Combined with `--image` the clip is steered to start and end on the two frames. |
+| `--ref-image <file>` | Reference image for reference-conditioned models (MiniMax-H3 Ref2VA): the subject carries over while camera, background and composition come from the prompt. Repeatable up to 9; referred to in the prompt as `<Picture 1>`, `<Picture 2>`, … |
+| `--ref-video <path>` | Reference video clip. Repeatable; referred to as `<Video 1>`, `<Video 2>`, … |
+| `--ref-audio <file>` | Reference audio clip. Repeatable; referred to as `<Audio 1>`, `<Audio 2>`, … |
+| `--no-audio` | Skip audio decoding on models that generate an audio track jointly with the video. Ignored by video-only models. |
+
+> **Renamed flags.** `--wan-vae`, `--wan-te` and `--wan-dit2` became `--video-vae`,
+> `--video-text-encoder` and `--video-dit2` when video generation stopped being
+> Wan-only. The old spellings are still accepted everywhere — on the CLI, on the
+> server, and as config-file keys — so existing configs keep working unchanged.
 | `--tp <N>` | Tensor parallelism degree — split the model across N GPUs in a single process (default: `1`). Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. Requires `--tp-peers`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. |
@@ -606,6 +618,133 @@ the rest. Either way `--stop` sequences pinned on the server stay in force under
 `config` (merged with the request's) and are replaced by the request under
 `request`.
 
+## Video generation with audio (MiniMax-H3)
+
+MiniMax-H3 generates video **and a native 32 kHz stereo soundtrack together** — the
+audio is part of the model output, not dubbed on afterwards. It is CFG-distilled, so
+`--cfg 1.0` is required and 4–8 steps is the operating point.
+
+Four files are needed; companions resolve automatically if they sit next to the
+denoiser. The text encoder ships **no tokenizer**, so `vocab.json` and `merges.txt`
+from [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
+must be beside it (or point `TS_VIDEO_TOKENIZER` at them).
+
+**Text to video.** Writes `fox.mp4` plus `fox.wav` with the generated soundtrack:
+
+```bash
+tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --prompt "a red fox trotting through falling snow, cinematic" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+  --output fox.mp4
+```
+
+**Image to video — animate a photo.** The image becomes the FIRST FRAME and the
+prompt drives what happens next:
+
+```bash
+tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --image portrait.jpg \
+  --prompt "the person turns toward the camera and smiles, subtle handheld motion" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+  --output animated.mp4
+```
+
+**First and last frame.** Both ends are pinned and the model fills in the motion:
+
+```bash
+tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --image start.png --end-image end.png --prompt "a slow cinematic push-in" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+  --output morph.mp4
+```
+
+**Picking the mode.** An image means two different things to H3, and they use
+different checkpoints. The mode is inferred from what you pass; `--video-mode` states
+it explicitly.
+
+| What you want | `--video-mode` | Checkpoint |
+| --- | --- | --- |
+| "animate this photo" | `i2v` | `minimax_h3_fl2va_pruned-*` |
+| "go from photo A to photo B" | `fl2v` | `minimax_h3_fl2va_pruned-*` |
+| "use this person, brand-new scene" | `ref` | `minimax_h3_ref2va_pruned-*` |
+| "reference this product, new angle and background" | `ref` | `minimax_h3_ref2va_pruned-*` |
+| text only | `t2v` | either |
+
+Reference conditioning keeps the subject and changes everything else — camera,
+background and composition come from the prompt, and the first frame need not
+resemble the reference at all:
+
+```bash
+tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --ref-image person.jpg --ref-image bottle.png \
+  --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
+  --output rooftop.mp4
+```
+
+Up to nine `--ref-image`s. They are only ever scaled down and keep their own aspect
+ratio, so the output canvas still comes from `--width`/`--height`. A plain `--image`
+on the Ref2VA checkpoint is treated as a reference too, so clients that only attach
+"an image" work unchanged.
+
+A reference can also be a **clip** (`--ref-video`, a video file or a directory of
+frames) or a **soundtrack** (`--ref-audio`). A clip's own audio goes in separately
+with `--ref-video-audio`, paired by position, because a container's audio track is
+not readable through the frame decoder:
+
+```bash
+tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --ref-video walk.mp4 --ref-video-audio walk.wav \
+  --prompt "the same woman walks along a beach at sunset, wide shot" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
+  --output beach.mp4
+```
+
+A reference clip is the most expensive input H3 takes — a 22-frame 448x320 one adds
+980 conditioning tokens on top of the 1680 the output needs, plus about 14 s to
+encode. It is resampled to 24 fps, pulled onto the 17k+5 grid, and shown to the
+language model at 2 fps.
+
+**Quality.** Two settings dominate:
+
+| Lever | Default | What it does |
+| --- | --- | --- |
+| `--width` / `--height` | 640×384, or the image's aspect at that area | **Biggest factor.** Faces need pixels — at 256×256 they come back blurry and malformed whatever else you set. |
+| `--diffusion-steps` | 20 | Removes coloured fringing around moving subjects. 8 is the fast lane, ~20 clean, past ~30 gains little. |
+| `--diffusion-seed` | random | Some seeds compose better; cheapest retry. |
+| model quant | — | `-Q8_0` denoiser over `-Q4_K` if memory allows. |
+
+`--cfg` is not a quality lever (H3 only accepts 1.0) and `--negative-prompt` does
+nothing, because there is no unconditional pass.
+
+**On the server, size is a startup flag** — the Web UI sends only the prompt and the
+image, so requests inherit the server defaults:
+
+```bash
+./TensorSharp.Server --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --video-width 640 --video-height 384 --video-steps 20 --video-frames 22 --port 5001
+```
+
+`--video-mode` pins the conditioning mode for a deployment that only offers one;
+omit it and each request's mode is inferred from what it supplies.
+
+Omit `--video-width`/`--video-height` and each request takes its aspect ratio from
+the uploaded image, which avoids stretching a 4:3 photo into a 16:9 frame.
+
+**Sizes.** Width and height round up to a multiple of 32; the frame count rounds up
+onto the `17k+5` grid (5, 22, 39, …) and fps is pinned to 24. TensorSharp currently
+generates one VAE temporal chunk, so **22 frames** is the working length.
+
+**Audio** is written as a sidecar `.wav` rather than muxed, because muxing needs an
+encoder that may not be installed. Combine them with:
+
+```bash
+ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4
+```
+
+Full detail, including the architecture and the verification numbers:
+[docs/models/minimax-h3.md](docs/models/minimax-h3.md).
+
 ## Video generation (Wan)
 
 A `wan` GGUF turns a prompt — plus an optional first-frame image on the Wan 2.2
@@ -626,7 +765,7 @@ Every family also needs the UMT5-XXL text encoder
 (`umt5-xxl-encoder-Q8_0.gguf`) and the matching video VAE. All three companions
 are resolved from the DiT's own directory, subfolders such as `VAE/`,
 `HighNoise/` and `LowNoise/` included, so one `--local-dir` is enough;
-`--wan-vae` / `--wan-te` (and `TS_WAN_DIT2` for the second A14B expert)
+`--video-vae` / `--video-text-encoder` (and `TS_WAN_DIT2` for the second A14B expert)
 override the search.
 
 Wan is the one family that rejects a backend outright: it runs on `ggml_cuda`,

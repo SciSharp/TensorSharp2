@@ -156,8 +156,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
       <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning 蒸馏 LoRA（<code>.safetensors</code>），作为运行期旁路挂在原封不动的量化基础权重旁边（<strong>不</strong>合并）。它从文件名自动推导去噪步数并把 CFG 切换为 1.0，使默认的 60 次 DiT 前向降到 4–8 次。环境变量：<code>TS_QWEN_IMAGE_LORA</code>。</td></tr>
       <tr><td><code>--video-frames &lt;N&gt;</code></td><td>Wan：请求未带 <code>frames</code> 时的默认输出帧数，会对齐到 <code>4k+1</code>。模型默认 33，Wan2.2-TI2V 为 49。请求值会覆盖它 —— 这是默认值，不是上限。</td></tr>
       <tr><td><code>--fps &lt;N&gt;</code></td><td>Wan：请求未带 <code>fps</code> 时的默认 MP4 播放帧率。模型默认 16，Wan2.2-TI2V 为 24。fps 只改变播放速度，不改变生成的计算量。</td></tr>
-      <tr><td><code>--wan-vae &lt;path&gt;</code></td><td>Wan 视频 VAE（<code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>）。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_WAN_VAE</code>。</td></tr>
-      <tr><td><code>--wan-te &lt;path&gt;</code></td><td>Wan 使用的 UMT5-XXL 文本编码器 GGUF。默认在同目录扫描（环境变量 <code>TS_WAN_TE</code>）。Wan 2.2 A14B 还会按文件名自动解析第二个 high/low noise 专家 GGUF（<code>TS_WAN_DIT2</code>）。</td></tr>
+      <tr><td><code>--video-vae &lt;path&gt;</code></td><td>Wan 视频 VAE（<code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>）。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_WAN_VAE</code>。</td></tr>
+      <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>Wan 使用的 UMT5-XXL 文本编码器 GGUF。默认在同目录扫描（环境变量 <code>TS_WAN_TE</code>）。Wan 2.2 A14B 还会按文件名自动解析第二个 high/low noise 专家 GGUF（<code>TS_WAN_DIT2</code>）。</td></tr>
     </tbody>
   </table>
   </div>

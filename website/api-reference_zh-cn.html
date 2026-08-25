@@ -70,7 +70,7 @@
       <tr><td><code>--flow-shift &lt;F&gt;</code> / <code>--sampler &lt;name&gt;</code></td><td>Wan 的 FlowMatch 时间步偏移（<code>0</code> = 使用模型官方配方）与采样器：<code>unipc</code>（默认）或 <code>euler</code>。</td></tr>
       <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>Wan 无分类器引导的负向提示词（默认为 Wan 官方负向提示词）。在本就无引导的步数蒸馏检查点上不起作用。</td></tr>
       <tr><td><code>--cfg-cache-stride &lt;N&gt;</code></td><td>Wan 引导缓存：每 N 步只跑一次无条件 CFG 分支，其间复用缓存的引导方向（默认 <code>0</code> = 关闭）。50 步下 <code>2</code> 为 1.30×、<code>3</code> 为 1.43×。属于近似方法；在蒸馏检查点上无效。</td></tr>
-      <tr><td><code>--wan-vae / --wan-te &lt;path&gt;</code></td><td>覆盖解析到的 Wan 伴随文件——因果 3D 视频 VAE 与 UMT5-XXL 文本编码器。环境变量 <code>TS_WAN_VAE</code> / <code>TS_WAN_TE</code>；A14B 的第二个专家用 <code>TS_WAN_DIT2</code>（仅环境变量）。</td></tr>
+      <tr><td><code>--video-vae / --video-text-encoder &lt;path&gt;</code></td><td>覆盖解析到的 Wan 伴随文件——因果 3D 视频 VAE 与 UMT5-XXL 文本编码器。环境变量 <code>TS_WAN_VAE</code> / <code>TS_WAN_TE</code>；A14B 的第二个专家用 <code>TS_WAN_DIT2</code>（仅环境变量）。</td></tr>
       <tr><td><code>--paged-kv-quant-bits &lt;0|2|4|8&gt;</code></td><td>TurboQuant 分页 KV 块压缩（0 = 关闭）。</td></tr>
       <tr><td><code>--benchmark / --bench-prefill / --bench-decode / --bench-runs</code></td><td>合成吞吐基准。</td></tr>
       <tr><td><code>--bench-kvcache / --bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准。</td></tr>

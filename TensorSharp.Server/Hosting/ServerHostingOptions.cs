@@ -40,8 +40,12 @@ namespace TensorSharp.Server.Hosting
             IReadOnlyList<BackendOption> supportedBackends,
             int defaultMaxTokens,
             bool maxTokensPinned,
-            int defaultWanVideoFrames,
-            int defaultWanVideoFps,
+            int defaultVideoFrames,
+            int defaultVideoFps,
+            int defaultVideoWidth,
+            int defaultVideoHeight,
+            int defaultVideoSteps,
+            string defaultVideoMode,
             string uploadDirectory,
             string logDirectory,
             bool fileLoggingEnabled,
@@ -63,8 +67,12 @@ namespace TensorSharp.Server.Hosting
                 SupportedBackendValues.Add(SupportedBackends[i].Value);
             DefaultMaxTokens = defaultMaxTokens;
             MaxTokensPinned = maxTokensPinned;
-            DefaultWanVideoFrames = defaultWanVideoFrames;
-            DefaultWanVideoFps = defaultWanVideoFps;
+            DefaultVideoFrames = defaultVideoFrames;
+            DefaultVideoFps = defaultVideoFps;
+            DefaultVideoWidth = defaultVideoWidth;
+            DefaultVideoHeight = defaultVideoHeight;
+            DefaultVideoSteps = defaultVideoSteps;
+            DefaultVideoMode = defaultVideoMode;
             UploadDirectory = uploadDirectory;
             LogDirectory = logDirectory;
             FileLoggingEnabled = fileLoggingEnabled;
@@ -127,14 +135,40 @@ namespace TensorSharp.Server.Hosting
         /// omits <c>frames</c>. Zero delegates to the loaded Wan model's native
         /// default (33, or 49 for Wan2.2-TI2V).
         /// </summary>
-        public int DefaultWanVideoFrames { get; }
+        public int DefaultVideoFrames { get; }
 
         /// <summary>
         /// Default Wan MP4 playback rate used when a video-generation request
         /// omits <c>fps</c>. Zero delegates to the loaded Wan model's native
         /// default (16, or 24 for Wan2.2-TI2V).
         /// </summary>
-        public int DefaultWanVideoFps { get; }
+        public int DefaultVideoFps { get; }
+
+        /// <summary>
+        /// Default output width used when a video-generation request omits
+        /// <c>width</c>, from <c>--video-width</c> (or <c>--width</c>). Zero
+        /// delegates to the model's own default, which for MiniMax-H3 takes the
+        /// aspect ratio from the conditioning image.
+        /// </summary>
+        public int DefaultVideoWidth { get; }
+
+        /// <summary>Default output height; see <see cref="DefaultVideoWidth"/>.</summary>
+        public int DefaultVideoHeight { get; }
+
+        /// <summary>
+        /// Default denoising steps used when a video-generation request omits
+        /// <c>steps</c>, from <c>--video-steps</c>. Zero delegates to the model's own
+        /// default. This is the main quality/time trade-off after resolution.
+        /// </summary>
+        public int DefaultVideoSteps { get; }
+
+        /// <summary>
+        /// Default conditioning mode used when a video-generation request omits
+        /// <c>videoMode</c>, from <c>--video-mode</c>. Null lets the model infer it
+        /// from what the request supplies, which is right for every model except a
+        /// deliberately-pinned deployment.
+        /// </summary>
+        public string DefaultVideoMode { get; }
 
         /// <summary>Absolute path to the directory used for user uploads.</summary>
         public string UploadDirectory { get; }

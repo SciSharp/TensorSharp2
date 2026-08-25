@@ -123,6 +123,35 @@ namespace TensorSharp.Models.QwenImage
             return Resize(img, w, h);
         }
 
+        /// <summary>Resize to exactly w x h WITHOUT distorting: the source is centre-cropped
+        /// to the target aspect first, then scaled.
+        ///
+        /// <para>Stretching is the wrong trade for anything a generative model conditions
+        /// on. A 4:3 photo squeezed into 5:3 makes every face 25% narrower, and the model
+        /// faithfully reproduces the distortion for the whole clip — which reads as
+        /// "blurry" and "the person looks wrong" rather than as a geometry error. Losing
+        /// a strip off the edges is the cheaper mistake.</para></summary>
+        public static RgbImage ResizeCover(RgbImage img, int w, int h)
+        {
+            if (w == img.Width && h == img.Height) return img;
+            double target = w / (double)h, source = img.Width / (double)img.Height;
+            int cropW = img.Width, cropH = img.Height;
+            if (source > target) cropW = Math.Max(1, (int)Math.Round(img.Height * target));
+            else if (source < target) cropH = Math.Max(1, (int)Math.Round(img.Width / target));
+
+            RgbImage cropped = img;
+            if (cropW != img.Width || cropH != img.Height)
+            {
+                int x0 = (img.Width - cropW) / 2, y0 = (img.Height - cropH) / 2;
+                var px = new float[(long)cropW * cropH * 3];
+                for (int y = 0; y < cropH; y++)
+                    Array.Copy(img.Pixels, ((long)(y0 + y) * img.Width + x0) * 3,
+                               px, (long)y * cropW * 3, (long)cropW * 3);
+                cropped = new RgbImage(cropW, cropH, px);
+            }
+            return Resize(cropped, w, h);
+        }
+
         public static RgbImage Resize(RgbImage img, int w, int h)
         {
             if (w == img.Width && h == img.Height) return img;

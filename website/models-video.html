@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Video Generation — TensorSharp Wiki</title>
-  <meta name="description" content="Wan 2.1 / 2.2 text-to-video and image-to-video: downloads, run recipes, and the checkpoint choice that decides whether a clip takes minutes or hours.">
+  <meta name="description" content="MiniMax-H3 joint audio-video generation and Wan 2.1 / 2.2 text-to-video: downloads, run recipes, and the checkpoint choice that decides whether a clip takes minutes or hours.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -14,10 +14,58 @@
 <body data-page="models-video">
 <a class="skip" href="#content">Skip to content</a>
 <main class="content" id="content">
-  <div class="breadcrumb"><a href="index.html">Home</a> › <a href="models.html">Supported Models</a> › Video Generation (Wan 2.1 / 2.2)</div>
-  <h1>Video Generation (Wan 2.1 / 2.2)</h1>
-  <p class="lede">Wan turns a prompt — and, on the Wan 2.2 checkpoints, an uploaded first frame — into an H.264 MP4. This page covers the downloads, the run recipes, and the settings that decide the wall clock.</p>
+  <div class="breadcrumb"><a href="index.html">Home</a> › <a href="models.html">Supported Models</a> › Video Generation</div>
+  <h1>Video Generation</h1>
+  <p class="lede">Two families: <strong>MiniMax-H3</strong> generates video together with a native stereo soundtrack, and <strong>Wan 2.1 / 2.2</strong> generates video alone. This page covers the downloads, the run recipes, and the settings that decide the wall clock.</p>
   <div class="callout note"><div class="ic">💡</div><p>These commands follow the same conventions as the text-model recipes — the Hugging Face CLI, a source build from the repository root, and <code>--backend</code> swapped to match your hardware. See <a href="models-text.html#download-run">Download &amp; run, per family</a>.</p></div>
+
+  <h2 id="minimax-h3">MiniMax-H3 (prompt → video <em>with audio</em>)</h2>
+  <p>H3 denoises video and 32&nbsp;kHz stereo audio in <strong>one</strong> packed latent, so the soundtrack is part of the model output rather than something added afterwards. It is CFG-distilled, so <code>--cfg 1.0</code> is required and 4–8 steps is the operating point. Four files are needed, from two repositories:</p>
+  <pre data-lang="bash"><code># denoiser + text encoder
+hf download unsloth/MiniMax-H3-GGUF minimax_h3_fl2va_pruned-Q4_K.gguf --local-dir models
+hf download unsloth/MiniMax-H3-GGUF qwen3vl_32b_minimax_h3-Q4_K_M.gguf --local-dir models
+# the two VAEs
+hf download Comfy-Org/MiniMax-H3 vae/minimax_h3_video_vae_fp16.safetensors --local-dir models
+hf download Comfy-Org/MiniMax-H3 vae/minimax_h3_audio_vae_fp32.safetensors --local-dir models
+# the text encoder ships NO tokenizer — take it from the upstream repo
+hf download MiniMaxAI/MiniMax-H3 processor/vocab.json processor/merges.txt --local-dir models
+
+# text → video (+ audio). Writes fox.mp4 and fox.wav
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --prompt "a red fox trotting through falling snow, cinematic" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output fox.mp4</code></pre>
+
+  <h3 id="h3-modes">What an image means</h3>
+  <p>An image can mean two completely different things to H3, and they use <strong>different checkpoints</strong>. The mode is inferred from what you pass; <code>--video-mode</code> states it explicitly.</p>
+  <table>
+    <thead><tr><th>What you want</th><th><code>--video-mode</code></th><th>Checkpoint</th></tr></thead>
+    <tbody>
+      <tr><td>“animate this photo” — it becomes the first frame</td><td><code>i2v</code></td><td><code>minimax_h3_fl2va_pruned-*</code></td></tr>
+      <tr><td>“go from photo A to photo B”</td><td><code>fl2v</code></td><td><code>minimax_h3_fl2va_pruned-*</code></td></tr>
+      <tr><td>“use this person, brand-new scene”</td><td><code>ref</code></td><td><code>minimax_h3_ref2va_pruned-*</code></td></tr>
+      <tr><td>“reference this product, new angle and background”</td><td><code>ref</code></td><td><code>minimax_h3_ref2va_pruned-*</code></td></tr>
+      <tr><td>text only</td><td><code>t2v</code></td><td>either</td></tr>
+    </tbody>
+  </table>
+  <pre data-lang="bash"><code># animate a photo: it becomes the first frame
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --image portrait.jpg \
+    --prompt "the person turns toward the camera and smiles, subtle handheld motion" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output animated.mp4
+
+# first and last frame: both ends pinned, the model fills in the motion
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --image start.png --end-image end.png \
+    --prompt "a slow cinematic push-in" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output morph.mp4
+
+# reference: keep the subject, change camera, background and composition
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --ref-image person.jpg --ref-image bottle.png \
+    --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 --output rooftop.mp4</code></pre>
+  <p>Up to nine <code>--ref-image</code>s. References are only ever scaled down and keep their own aspect ratio, so the output canvas still comes from <code>--width</code>/<code>--height</code>. A plain <code>--image</code> on the Ref2VA checkpoint is treated as a reference too, so clients that only attach “an image” — the Web UI among them — work unchanged. A reference can also be a clip (<code>--ref-video</code>, a video file or a directory of frames) or a soundtrack (<code>--ref-audio</code>); a clip&rsquo;s own audio goes in separately with <code>--ref-video-audio</code>, paired by position, because a container&rsquo;s audio track is not readable through the frame decoder. A reference clip is the most expensive input H3 takes &mdash; a 22-frame 448&times;320 one adds 980 conditioning tokens on top of the 1680 the output needs.</p>
+  <div class="callout note"><div class="ic">💡</div><p>Width and height round up to a multiple of 32, the frame count rounds up onto the <code>17k+5</code> grid (5, 22, 39, …) and fps is pinned to 24. Audio is written as a sidecar <code>.wav</code>; combine it with <code>ffmpeg -i out.mp4 -i out.wav -c:v copy -c:a aac final.mp4</code>. Full detail in the <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3.md">MiniMax-H3 card</a>.</p></div>
 
   <h2 id="wan">Wan 2.1 / 2.2 (prompt → video, image → video)</h2>
   <p><strong>Download the Turbo DiT, not the base one.</strong> The base <code>Wan2.2-TI2V-5B</code> follows the official 50-step × CFG recipe — 100 DiT passes per video. The step-distilled Turbo build of the same model is trained to run guidance-free in 4 steps, TensorSharp recognizes it from the file name, and the identical request comes back <strong>in minutes instead of hours</strong>. The Turbo repository ships only the DiT, so the VAE and the text encoder still come from the base repositories:</p>
@@ -28,16 +76,16 @@ hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir 
 
 # text → video
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
-    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf --video-vae models/VAE/Wan2.2_VAE.safetensors \
     --prompt "A red fox trotting through falling snow, cinematic" \
     --video-frames 81 --fps 24 --output out.mp4 --backend ggml_cuda
 # image → video (the image becomes the first frame; Wan 2.2 models only)
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
-    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf --video-vae models/VAE/Wan2.2_VAE.safetensors \
     --image first_frame.png --prompt "the camera pushes in as the waves rise" \
     --output out.mp4 --backend ggml_cuda
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf \
-    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf --video-vae models/VAE/Wan2.2_VAE.safetensors \
     --backend ggml_cuda --video-frames 121 --fps 24</code></pre>
   <p>At load the console confirms the detection with <code>step-distilled checkpoint detected -&gt; 4 steps, guidance off (--diffusion-steps / --cfg override)</code>. Measured on an M5 Pro with <code>ggml_metal</code>, a 1088×832 × 121-frame (5 s, 720p-class) image-to-video request costs 100 DiT passes ≈ <strong>3 h 30 m</strong> on the base checkpoint and 4 passes = <strong>17 m 30 s</strong> on the Turbo one — the same flags, the same resolution, only the <code>--model</code> path differs. At 480p (736×544 × 121f) the Turbo checkpoint finishes in <strong>6 m 19 s</strong>.</p>
   <p>To reproduce the base recipe instead — for a reference sample, or on a Wan 2.1 checkpoint that has no distilled build — swap the first download and the <code>--model</code> paths:</p>
@@ -45,7 +93,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Wan2_2-TI2V-
 
 # 50 steps x 2 CFG passes; --cfg-cache-stride trades a little accuracy for 1.30x / 1.43x
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Wan2.2-TI2V-5B-Q8_0.gguf \
-    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.2_VAE.safetensors \
+    --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf --video-vae models/VAE/Wan2.2_VAE.safetensors \
     --prompt "A red fox trotting through falling snow, cinematic" \
     --video-frames 81 --fps 24 --cfg-cache-stride 2 --output out.mp4 --backend ggml_cuda</code></pre>
   <p>For Wan 2.2 A14B image-to-video, download <em>both</em> distilled experts under one <code>--local-dir</code> — the loader finds the low-noise partner from the high-noise file name, so only one <code>--model</code> path is passed. A14B uses the Wan 2.1 VAE:</p>
@@ -57,7 +105,7 @@ hf download QuantStack/Wan2.2-I2V-A14B-GGUF VAE/Wan2.1_VAE.safetensors --local-d
 
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model models/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf \
-    --wan-te models/umt5-xxl-encoder-Q8_0.gguf --wan-vae models/VAE/Wan2.1_VAE.safetensors \
+    --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf --video-vae models/VAE/Wan2.1_VAE.safetensors \
     --image first_frame.png --prompt "the camera pushes in as the waves rise" \
     --output out.mp4 --backend ggml_cuda</code></pre>
   <div class="callout tip"><div class="ic">⚡</div><p><strong>Generate at a resolution Wan was trained at.</strong> Wan is trained at 480p (832×480) and 720p (1280×704), and TI2V-5B is natively a 720p model. Below ~0.3 MP the DiT is out of distribution and the video gets soft, unstable and color-drifting no matter how many steps you spend — the pipeline warns when you cross that line. Generate at 480p and downscale afterwards rather than generating small.</p></div>
@@ -65,8 +113,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
   <h2 id="video">Video generation (Wan 2.1 / 2.2)</h2>
   <p>Wan turns a <strong>prompt</strong> — and, on the Wan 2.2 checkpoints, an <strong>uploaded first frame</strong> — into an H.264 MP4. The <code>--model</code> GGUF is only the DiT; TensorSharp resolves two companions next to it (a <code>VAE/</code>, <code>HighNoise/</code> or <code>LowNoise/</code> subfolder is fine):</p>
   <ul>
-    <li><strong>UMT5-XXL text encoder</strong> — prompt → conditioning (<code>--wan-te</code> / <code>TS_WAN_TE</code>). Released from VRAM before the denoise starts.</li>
-    <li><strong>Causal 3D video VAE</strong> — latent ↔ frames (<code>--wan-vae</code> / <code>TS_WAN_VAE</code>). Which one is required is read off the DiT itself, not chosen by you: Wan 2.1 and A14B use <code>wan_2.1_vae</code>; TI2V-5B uses <code>Wan2.2_VAE</code>.</li>
+    <li><strong>UMT5-XXL text encoder</strong> — prompt → conditioning (<code>--video-text-encoder</code> / <code>TS_WAN_TE</code>). Released from VRAM before the denoise starts.</li>
+    <li><strong>Causal 3D video VAE</strong> — latent ↔ frames (<code>--video-vae</code> / <code>TS_WAN_VAE</code>). Which one is required is read off the DiT itself, not chosen by you: Wan 2.1 and A14B use <code>wan_2.1_vae</code>; TI2V-5B uses <code>Wan2.2_VAE</code>.</li>
     <li><strong>The A14B second expert</strong> — the two 14B experts must both be present. Put them in one directory, or in <code>HighNoise/</code> + <code>LowNoise/</code> subdirectories, and the loader pairs them from the file names (<code>TS_WAN_DIT2</code> overrides; there is no CLI flag).</li>
   </ul>
   <div class="table-scroll">

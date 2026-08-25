@@ -126,7 +126,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <qwen-image-edit-DiT.gguf
     --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0
 
 # Wan 视频生成（提示词 -> H.264 MP4）。UMT5-XXL 文本编码器 GGUF 与视频 VAE
-# 伴随文件会在 DiT GGUF 旁解析（或用 --wan-te / --wan-vae 指定）。
+# 伴随文件会在 DiT GGUF 旁解析（或用 --video-text-encoder / --video-vae 指定）。
 # Wan 2.1 T2V、Wan 2.2 TI2V-5B 与 Wan 2.2 A14B（两个专家）都会自动识别；
 # 步数蒸馏（Turbo / Lightning / FastWan）检查点同样自动识别——同一段视频只需
 # 4 次 DiT 前向而不是 100 次。详见下文“视频生成（Wan）”与 docs/models/wan_zh-cn.md。
@@ -264,8 +264,19 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--negative-prompt <text>` | Wan 负向提示词（默认：官方 Wan 负向提示词）。 |
 | _（步数蒸馏检查点）_ | 按 DiT 文件名自动识别（`Turbo`、`distill`、`Lightning`、`lightx2v`、`FastWan`、`-dmd`，或显式的 `…-4steps-…` / `…8step…`，N 取 1–16）：管线切换到该步数并关闭引导，把官方 50 步 × CFG 配方的 100 次 DiT 前向变成 4 次。这是 Wan 最大的提速手段——详见下文 **[视频生成（Wan）](#视频生成wan)**。`--diffusion-steps` / `--cfg` 可覆盖它。 |
 | `--cfg-cache-stride <N>` | Wan 引导缓存：每 `N` 步只跑一次无条件 CFG 前向，其余步复用缓存的引导方向（默认关闭——每步都跑两次前向）。`2` 约快 1.30×，`3` 约快 1.43×；属于近似，需要严格对齐参考样本时请关闭。 |
-| `--wan-vae <path>` | 覆盖解析到的 Wan 视频 VAE（`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`）。环境变量：`TS_WAN_VAE`。 |
-| `--wan-te <path>` | 覆盖解析到的 UMT5-XXL 文本编码器 GGUF。环境变量：`TS_WAN_TE`。Wan 2.2 A14B 还会自动解析第二个 high/low-noise 专家（环境变量 `TS_WAN_DIT2`）。 |
+| `--video-vae <path>` | 覆盖解析到的视频 VAE（`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`；MiniMax-H3 用 `minimax_h3_video_vae_fp16.safetensors`）。环境变量：`TS_VIDEO_VAE`（同时兼容 `TS_WAN_VAE`）。 |
+| `--video-text-encoder <path>` | 覆盖解析到的文本编码器 GGUF（Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B）。亦可写作 `--video-te`。环境变量：`TS_VIDEO_TEXT_ENCODER`（同时兼容 `TS_WAN_TE`）。 |
+| `--video-dit2 <path>` | 双专家模型的第二个扩散专家（Wan 2.2 A14B 的 high/low-noise 搭档）。两者同目录时按文件名自动解析。环境变量：`TS_VIDEO_DIT2`（同时兼容 `TS_WAN_DIT2`）。 |
+| `--audio-vae <path>` | 与视频联合生成音轨的模型所用的音频 VAE（`minimax_h3_audio_vae_fp32.safetensors`）。不提供时该类模型仍能出图，只是没有音频。环境变量：`TS_VIDEO_AUDIO_VAE`。 |
+| `--end-image <file>` | 末帧条件图，适用于支持该能力的模型（MiniMax-H3 的首尾帧模式）。与 `--image` 一起使用时，片段会被引导为从首帧开始、到末帧结束。 |
+| `--ref-image <file>` | 参考图，用于参考条件模型（MiniMax-H3 Ref2VA）：主体特征保留下来，而机位、背景和构图由提示词决定。最多可重复传入 9 次；在提示词中按 `<Picture 1>`、`<Picture 2>`… 引用。 |
+| `--ref-video <path>` | 参考视频片段。可重复传入；在提示词中按 `<Video 1>`、`<Video 2>`… 引用。 |
+| `--ref-audio <file>` | 参考音频片段。可重复传入；在提示词中按 `<Audio 1>`、`<Audio 2>`… 引用。 |
+| `--no-audio` | 对与视频联合生成音轨的模型跳过音频解码。纯视频模型会忽略该开关。 |
+
+> **参数改名。** 视频生成不再只有 Wan，因此 `--wan-vae`、`--wan-te`、`--wan-dit2`
+> 改名为 `--video-vae`、`--video-text-encoder`、`--video-dit2`。旧写法在命令行、
+> 服务端以及配置文件键名中依然全部兼容，已有配置无需改动。
 | `--test` | 运行内置的分词器、Qwen3 聊天模板与 ollama 对比测试 |
 | `--test-templates <dir>` | 对 `<dir>` 下的每个 *.gguf 校验硬编码模板与 GGUF Jinja2 模板的一致性 |
 | `--config <path>` | 从 JSON 配置文件读取参数（命令行参数会覆盖它）。支持 `${变量}` 与通过 `{ "path": ..., "urls": [...] }` 自动下载模型。可重复。见[配置文件](#配置文件cli--server)。 |
@@ -566,6 +577,120 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 于服务端参数与环境变量，其余参数仍由服务端填充。无论哪种模式，服务端 `--stop`
 在 `config` 下始终生效（与请求的列表合并），在 `request` 下则被请求替换。
 
+## 音视频生成（MiniMax-H3）
+
+MiniMax-H3 **同时生成视频与原生 32 kHz 立体声音轨**——音频是模型输出的一部分，
+不是事后配上去的。它是 CFG 蒸馏模型，因此必须用 `--cfg 1.0`，4–8 步是常用工作点。
+
+需要四个文件；若与去噪器放在同一目录会自动解析。文本编码器**不带分词器**，
+需要把 [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
+的 `vocab.json` 与 `merges.txt` 放在它旁边（或设置 `TS_VIDEO_TOKENIZER`）。
+
+**文生视频。** 输出 `fox.mp4` 和带音轨的 `fox.wav`：
+
+```bash
+tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --prompt "a red fox trotting through falling snow, cinematic" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+  --output fox.mp4
+```
+
+**图生视频——让照片动起来。** 图片成为**第一帧**，提示词决定后续动作：
+
+```bash
+tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --image portrait.jpg \
+  --prompt "the person turns toward the camera and smiles, subtle handheld motion" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+  --output animated.mp4
+```
+
+**首尾帧。** 两端钉住，模型补出中间的运动：
+
+```bash
+tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --image start.png --end-image end.png --prompt "a slow cinematic push-in" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+  --output morph.mp4
+```
+
+**模式选择。** 一张图对 H3 有两种完全不同的含义，且使用不同的检查点。
+不指定时自动推断，`--video-mode` 用于显式声明。
+
+| 你想要什么 | `--video-mode` | 检查点 |
+| --- | --- | --- |
+| “让这张照片动起来” | `i2v` | `minimax_h3_fl2va_pruned-*` |
+| “从照片 A 变到照片 B” | `fl2v` | `minimax_h3_fl2va_pruned-*` |
+| “用这个人物，生成全新场景” | `ref` | `minimax_h3_ref2va_pruned-*` |
+| “参考这个产品/人物，但换机位、背景和构图” | `ref` | `minimax_h3_ref2va_pruned-*` |
+| 只有文本 | `t2v` | 都可以 |
+
+参考条件保留主体、其余全部重来——机位、背景和构图都由提示词决定，第一帧完全
+不必与参考图相似：
+
+```bash
+tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --ref-image person.jpg --ref-image bottle.png \
+  --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
+  --output rooftop.mp4
+```
+
+最多九张 `--ref-image`。参考图只会被缩小并保持自身宽高比，输出画布仍然由
+`--width`/`--height` 决定。在 Ref2VA 检查点上，普通的 `--image` 同样会被当作参考图，
+因此只会“上传一张图”的客户端无需改动即可使用。
+
+参考也可以是**视频片段**（`--ref-video`，视频文件或帧目录）或**音频**
+（`--ref-audio`）。视频自带的声音用 `--ref-video-audio` 按位置配对单独给出，
+因为容器里的音轨无法通过帧解码器读取：
+
+```bash
+tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --ref-video walk.mp4 --ref-video-audio walk.wav \
+  --prompt "the same woman walks along a beach at sunset, wide shot" \
+  --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
+  --output beach.mp4
+```
+
+参考视频是 H3 最昂贵的输入——22 帧 448x320 的参考会在输出所需的 1680 个 token 之外
+再加 980 个条件 token，编码本身还要约 14 秒。它会被重采样到 24 fps、对齐到 17k+5
+网格，并以 2 fps 呈现给语言模型。
+
+**质量。** 有两个设置起决定性作用：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `--width` / `--height` | 640×384；有图时按该面积取图片宽高比 | **影响最大。** 人脸需要像素——256×256 下无论其他参数怎么调都会糊、都会变形。 |
+| `--diffusion-steps` | 20 | 消除运动主体周围的彩色边缘。8 步是快速档，约 20 步干净，超过 30 提升有限。 |
+| `--diffusion-seed` | 随机 | 有些种子构图更好，最省事的重试手段。 |
+| 量化等级 | — | 显存允许就用 `-Q8_0` 去噪器而不是 `-Q4_K`。 |
+
+`--cfg` 不是质量参数（H3 只接受 1.0），`--negative-prompt` 也不起作用，因为没有无条件分支。
+
+**在服务端，尺寸是启动参数**——Web UI 只发送提示词和图片，请求会继承服务端默认值：
+
+```bash
+./TensorSharp.Server --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+  --video-width 640 --video-height 384 --video-steps 20 --video-frames 22 --port 5001
+```
+
+`--video-mode` 可以为只提供一种模式的部署固定条件模式；不指定时每个请求按其
+自身携带的输入自动推断。
+
+不指定 `--video-width`/`--video-height` 时，每个请求会按上传图片的宽高比来，
+避免把 4:3 的照片拉成 16:9。
+
+**尺寸。** 宽高向上取整到 32 的倍数；帧数向上对齐到 `17k+5` 网格（5、22、39…），
+fps 固定为 24。目前只生成一个 VAE 时间块，因此**实际可用长度是 22 帧**。
+
+**音频**写成独立的 `.wav`，因为封装进 MP4 需要一个未必安装的编码器。合并：
+
+```bash
+ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4
+```
+
+完整说明见 [docs/models/minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md)。
+
 ## 视频生成（Wan）
 
 一个 `wan` GGUF 可以把提示词——Wan 2.2 模型还可再加一张首帧图片——变成 H.264 MP4，
@@ -583,7 +708,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 
 每个家族都还需要 UMT5-XXL 文本编码器（`umt5-xxl-encoder-Q8_0.gguf`）和匹配的视频 VAE。
 这三个伴随文件都会从 DiT 自身所在目录解析，包括 `VAE/`、`HighNoise/`、`LowNoise/` 这类
-子目录，因此一个 `--local-dir` 就够了；`--wan-vae` / `--wan-te`（以及第二个 A14B 专家的
+子目录，因此一个 `--local-dir` 就够了；`--video-vae` / `--video-text-encoder`（以及第二个 A14B 专家的
 `TS_WAN_DIT2`）可以覆盖搜索结果。
 
 Wan 是唯一会直接拒绝某个后端的家族：它可以运行在 `ggml_cuda`、`ggml_vulkan`、

@@ -214,13 +214,31 @@ public class DiffusionGemmaTests
 
         var prompt = RenderPrompt(model, "请详细介绍最终幻想7");
         int C = model.CanvasLength;
-        var canvas = new int[C];
-        for (int i = 0; i < C; i++) canvas[i] = model.MaskTokenId;
 
+        // The canvas MUST change between steps, and self-conditioning MUST be fed, or this test is
+        // blind: with a constant all-mask canvas every step re-uploads identical bytes, so a stale
+        // device buffer still holds the right data and a real race passes unnoticed. The sampler
+        // re-noises rejected positions every step, which is what makes the per-step
+        // Embedding(canvasTokens) a host-write the next device kernel must observe.
         float[] Run()
         {
             model.PrefillPrompt(prompt);
-            return (float[])model.DecodeCanvas(canvas, null, 0f, 1f).Clone();
+            var canvas = new int[C];
+            for (int i = 0; i < C; i++) canvas[i] = model.MaskTokenId;
+            float[] logits = null, sc = null;
+            for (int step = 0; step < 4; step++)
+            {
+                logits = model.DecodeCanvas(canvas, sc, step == 0 ? 0f : 1f, 1.25f);
+                sc = logits;                       // alias, exactly as DenoiseBlock does
+                // deterministic re-noise so both runs see the identical token stream
+                uint h = (uint)(step * 2654435761u + 1);
+                for (int i = 0; i < C; i++)
+                {
+                    h ^= h << 13; h ^= h >> 17; h ^= h << 5;
+                    if ((h & 3) == 0) canvas[i] = (int)(h % (uint)model.VocabSize);
+                }
+            }
+            return (float[])logits.Clone();
         }
 
         float[] a = Run();
@@ -229,10 +247,10 @@ public class DiffusionGemmaTests
         for (long i = 0; i < a.LongLength; i++)
             if (BitConverter.SingleToInt32Bits(a[i]) != BitConverter.SingleToInt32Bits(b[i])) differing++;
 
-        _output.WriteLine($"[diffusion-gemma][repro] prefill+decode differing={differing}/{a.LongLength}");
+        _output.WriteLine($"[diffusion-gemma][repro] prefill+4 decode steps differing={differing}/{a.LongLength}");
         Assert.True(differing == 0,
             $"prefill+decode is not reproducible: {differing}/{a.LongLength} logits differ between two " +
-            "identical runs — the frozen prompt K/V are being corrupted");
+            "identical runs — the frozen prompt K/V or a per-step canvas upload is being corrupted");
     }
 
     // End-to-end mirror of the reported failure: a CJK prompt asking for a detailed description of

@@ -42,6 +42,24 @@ public class ServerOptionsBuilderTests : IDisposable
     }
 
     [Fact]
+    public void Build_VideoMode_IsCapturedAndValidatedAtStartup()
+    {
+        var options = ServerOptionsBuilder.Build(new[] { "--video-mode", "ref" }, _baseDir);
+        Assert.Equal("ref", options.DefaultVideoMode);
+
+        // A typo should stop the server coming up rather than surfacing on the first
+        // request an hour later.
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.Build(new[] { "--video-mode", "animate" }, _baseDir));
+    }
+
+    [Fact]
+    public void Build_VideoMode_DefaultsToUnsetSoEachRequestInfersIt()
+    {
+        Assert.Null(ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir).DefaultVideoMode);
+    }
+
+    [Fact]
     public void Build_NoSamplingFlags_UsesSamplingConfigDefaults()
     {
         var options = ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir);
@@ -143,8 +161,8 @@ public class ServerOptionsBuilderTests : IDisposable
 
         // Zero is the Wan pipeline's sentinel for choosing the loaded model's
         // native defaults (33/16 generally, 49/24 for TI2V).
-        Assert.Equal(0, options.DefaultWanVideoFrames);
-        Assert.Equal(0, options.DefaultWanVideoFps);
+        Assert.Equal(0, options.DefaultVideoFrames);
+        Assert.Equal(0, options.DefaultVideoFps);
     }
 
     [Fact]
@@ -156,8 +174,8 @@ public class ServerOptionsBuilderTests : IDisposable
 
         // Scalar options are last-one-wins, which also lets a real command line
         // override values expanded from --config ahead of it.
-        Assert.Equal(121, options.DefaultWanVideoFrames);
-        Assert.Equal(24, options.DefaultWanVideoFps);
+        Assert.Equal(121, options.DefaultVideoFrames);
+        Assert.Equal(24, options.DefaultVideoFps);
     }
 
     [Theory]
@@ -522,6 +540,86 @@ public class ServerOptionsBuilderTests : IDisposable
         {
             Environment.SetEnvironmentVariable(env, saved);
         }
+    }
+
+    // ---- generic video companion flags, and the --wan-* aliases they replaced ----
+    // The companion flags were renamed model-agnostic when a second video model arrived.
+    // Both spellings must survive all THREE passes that know about them (env pass,
+    // validation pass, typo-suggestion list), and both must land on the same env vars —
+    // WanVideoModel still reads TS_WAN_*, so dropping that would silently break Wan.
+
+    [Theory]
+    [InlineData("--video-vae", "TS_VIDEO_VAE", "TS_WAN_VAE")]
+    [InlineData("--video-text-encoder", "TS_VIDEO_TEXT_ENCODER", "TS_WAN_TE")]
+    [InlineData("--video-te", "TS_VIDEO_TEXT_ENCODER", "TS_WAN_TE")]
+    [InlineData("--video-dit2", "TS_VIDEO_DIT2", "TS_WAN_DIT2")]
+    public void Build_VideoCompanionFlags_SetBothGenericAndLegacyEnv(
+        string flag, string genericEnv, string legacyEnv)
+    {
+        string path = Path.Combine(_baseDir, "companion.bin");
+        File.WriteAllBytes(path, new byte[] { 1, 2, 3, 4 });
+        string? savedGeneric = Environment.GetEnvironmentVariable(genericEnv);
+        string? savedLegacy = Environment.GetEnvironmentVariable(legacyEnv);
+        try
+        {
+            string[] args = { flag, path };
+
+            Assert.True(ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args));
+            Assert.Equal(path, Environment.GetEnvironmentVariable(genericEnv));
+            // The legacy name keeps being published so Wan keeps loading its companions.
+            Assert.Equal(path, Environment.GetEnvironmentVariable(legacyEnv));
+
+            // ...and the later validation pass must not reject the flag it left in argv.
+            Assert.NotNull(ServerOptionsBuilder.Build(args, _baseDir));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(genericEnv, savedGeneric);
+            Environment.SetEnvironmentVariable(legacyEnv, savedLegacy);
+        }
+    }
+
+    [Fact]
+    public void Build_AudioVaeFlag_IsAcceptedAndSetsItsEnv()
+    {
+        string path = Path.Combine(_baseDir, "audio-vae.safetensors");
+        File.WriteAllBytes(path, new byte[] { 1, 2, 3, 4 });
+        string? saved = Environment.GetEnvironmentVariable("TS_VIDEO_AUDIO_VAE");
+        try
+        {
+            string[] args = { "--audio-vae", path };
+            Assert.True(ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args));
+            Assert.Equal(path, Environment.GetEnvironmentVariable("TS_VIDEO_AUDIO_VAE"));
+            Assert.NotNull(ServerOptionsBuilder.Build(args, _baseDir));
+        }
+        finally { Environment.SetEnvironmentVariable("TS_VIDEO_AUDIO_VAE", saved); }
+    }
+
+    [Theory]
+    // old spelling            new spelling                 env var they must agree on
+    [InlineData("--wan-vae", "--video-vae", "TS_WAN_VAE")]
+    [InlineData("--wan-te", "--video-text-encoder", "TS_WAN_TE")]
+    [InlineData("--wan-dit2", "--video-dit2", "TS_WAN_DIT2")]
+    public void Build_OldAndNewCompanionSpellings_AreEquivalent(
+        string oldFlag, string newFlag, string env)
+    {
+        string path = Path.Combine(_baseDir, "companion.bin");
+        File.WriteAllBytes(path, new byte[] { 1, 2, 3, 4 });
+        string? saved = Environment.GetEnvironmentVariable(env);
+        try
+        {
+            Environment.SetEnvironmentVariable(env, null);
+            Assert.True(ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(new[] { oldFlag, path }));
+            string? viaOld = Environment.GetEnvironmentVariable(env);
+
+            Environment.SetEnvironmentVariable(env, null);
+            Assert.True(ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(new[] { newFlag, path }));
+            string? viaNew = Environment.GetEnvironmentVariable(env);
+
+            Assert.Equal(path, viaOld);
+            Assert.Equal(viaOld, viaNew);
+        }
+        finally { Environment.SetEnvironmentVariable(env, saved); }
     }
 
     // ---- MoE CPU offload (--n-cpu-moe / --cpu-moe) ----

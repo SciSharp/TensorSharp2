@@ -156,8 +156,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
       <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning distillation LoRA (<code>.safetensors</code>), applied as a runtime side-path beside the untouched quantized base weights (not merged). Auto-derives the denoise step count from the file name and switches CFG to 1.0, taking the default 60 DiT forwards down to 4–8. Env: <code>TS_QWEN_IMAGE_LORA</code>.</td></tr>
       <tr><td><code>--video-frames &lt;N&gt;</code></td><td>Wan: default output frame count when a request omits <code>frames</code>, snapped to <code>4k+1</code>. Model default: 33, or 49 for Wan2.2-TI2V. A request value overrides it — this is a default, not a cap.</td></tr>
       <tr><td><code>--fps &lt;N&gt;</code></td><td>Wan: default MP4 playback rate when a request omits <code>fps</code>. Model default: 16, or 24 for Wan2.2-TI2V. FPS changes playback rate, not generation work.</td></tr>
-      <tr><td><code>--wan-vae &lt;path&gt;</code></td><td>Wan video VAE (<code>wan_2.1_vae.safetensors</code>, or <code>Wan2.2_VAE.safetensors</code> for TI2V-5B). Default: same-directory scan next to the DiT, <code>VAE/</code> subfolders included. Env: <code>TS_WAN_VAE</code>.</td></tr>
-      <tr><td><code>--wan-te &lt;path&gt;</code></td><td>UMT5-XXL text-encoder GGUF for Wan. Default: same-directory scan (env <code>TS_WAN_TE</code>). Wan 2.2 A14B also auto-resolves its second high/low-noise expert GGUF by name (<code>TS_WAN_DIT2</code>).</td></tr>
+      <tr><td><code>--video-vae &lt;path&gt;</code></td><td>Wan video VAE (<code>wan_2.1_vae.safetensors</code>, or <code>Wan2.2_VAE.safetensors</code> for TI2V-5B). Default: same-directory scan next to the DiT, <code>VAE/</code> subfolders included. Env: <code>TS_WAN_VAE</code>.</td></tr>
+      <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>UMT5-XXL text-encoder GGUF for Wan. Default: same-directory scan (env <code>TS_WAN_TE</code>). Wan 2.2 A14B also auto-resolves its second high/low-noise expert GGUF by name (<code>TS_WAN_DIT2</code>).</td></tr>
     </tbody>
   </table>
   </div>

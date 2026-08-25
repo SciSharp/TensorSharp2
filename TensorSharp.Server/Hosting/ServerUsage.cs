@@ -320,29 +320,63 @@ namespace TensorSharp.Server.Hosting
                     "target resolution does not fit beside the resident weights).",
                     "--offload-cpu"),
             }),
-            ("Wan video-generation defaults and companion models (wan DiT GGUFs)", new[]
+            ("Video-generation defaults and companion models", new[]
             {
+                new OptionHelp("--video-width <px>",
+                    "Default output width when a request omits 'width'. THE main quality lever: " +
+                    "the Web UI sends no size of its own, so without this every clip is generated " +
+                    "at the model's default. 640x384 is a good starting point for MiniMax-H3; " +
+                    "--width is accepted as an alias. Rounded up to the model's grid.",
+                    "--video-width 640"),
+                new OptionHelp("--video-height <px>",
+                    "Default output height when a request omits 'height'. Alias: --height. " +
+                    "If only one of width/height is given, MiniMax-H3 takes the other from the " +
+                    "conditioning image's aspect ratio.",
+                    "--video-height 384"),
+                new OptionHelp("--video-steps <N>",
+                    "Default denoising steps when a request omits 'steps'. The quality/time " +
+                    "trade-off after resolution. MiniMax-H3 is step-distilled and CFG-free: 8 is " +
+                    "the default, 20 is the default here, 16-24 is visibly cleaner, past ~30 gains little.",
+                    "--video-steps 16"),
+                new OptionHelp("--video-mode <mode>",
+                    "Default conditioning mode when a request omits 'videoMode': t2v (text only), " +
+                    "i2v (the image is the first frame and is animated), fl2v (first AND last frame " +
+                    "pinned) or ref (the images are identity/appearance references for a new scene). " +
+                    "Omit it and the mode is inferred from what each request supplies, which is " +
+                    "usually what you want; pin it for a deployment that only offers one.",
+                    "--video-mode ref"),
                 new OptionHelp("--video-frames <N>",
-                    "Default output frame count when a Wan request omits 'frames'. The count is snapped to the " +
-                    "VAE temporal grid (4k+1). Model default: 33, or 49 for Wan2.2-TI2V. A request value overrides it.",
+                    "Default output frame count when a request omits 'frames'. The count is snapped to the " +
+                    "model's temporal grid (4k+1 for Wan, 17k+5 for MiniMax-H3). Model default: 33, or 49 for " +
+                    "Wan2.2-TI2V. A request value overrides it.",
                     "--video-frames 121"),
                 new OptionHelp("--fps <N>",
-                    "Default MP4 playback rate when a Wan request omits 'fps'. Model default: 16, or 24 for " +
-                    "Wan2.2-TI2V. A request value overrides it; FPS changes playback rate, not generation work.",
+                    "Default MP4 playback rate when a request omits 'fps'. Model default: 16, or 24 for " +
+                    "Wan2.2-TI2V. A request value overrides it; FPS changes playback rate, not generation work. " +
+                    "Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value.",
                     "--fps 24"),
-                new OptionHelp("--wan-vae <path>",
-                    "Wan video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B). " +
-                    "Default: same-directory scan next to the DiT model, VAE/ subfolders included " +
-                    "(TS_WAN_VAE).",
-                    "--wan-vae Wan2.2_VAE.safetensors"),
-                new OptionHelp("--wan-te <path>",
-                    "UMT5-XXL text-encoder GGUF. Default: same-directory scan (TS_WAN_TE).",
-                    "--wan-te umt5-xxl-encoder-Q8_0.gguf"),
-                new OptionHelp("--wan-dit2 <path>",
-                    "Wan 2.2 A14B second expert GGUF (the high/low-noise partner of --model). Default: " +
-                    "auto-resolved by name from the same or a sibling folder (TS_WAN_DIT2); needed only " +
-                    "when the pair is not co-located, or to name it in a --config file.",
-                    "--wan-dit2 wan2.2_i2v_A14b_low_noise-Q4_K_M.gguf"),
+                new OptionHelp("--video-vae <path>",
+                    "Video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B; " +
+                    "minimax_h3_video_vae_fp16.safetensors for MiniMax-H3). Default: same-directory scan next " +
+                    "to the DiT model, VAE/ subfolders included (TS_VIDEO_VAE). The former spelling " +
+                    "--wan-vae is still accepted.",
+                    "--video-vae Wan2.2_VAE.safetensors"),
+                new OptionHelp("--video-text-encoder <path>",
+                    "Text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Default: " +
+                    "same-directory scan (TS_VIDEO_TEXT_ENCODER). Also spelled --video-te; the former " +
+                    "spelling --wan-te is still accepted.",
+                    "--video-text-encoder umt5-xxl-encoder-Q8_0.gguf"),
+                new OptionHelp("--video-dit2 <path>",
+                    "Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner of " +
+                    "--model). Default: auto-resolved by name from the same or a sibling folder " +
+                    "(TS_VIDEO_DIT2); needed only when the pair is not co-located, or to name it in a " +
+                    "--config file. The former spelling --wan-dit2 is still accepted.",
+                    "--video-dit2 wan2.2_i2v_A14b_low_noise-Q4_K_M.gguf"),
+                new OptionHelp("--audio-vae <path>",
+                    "Audio VAE for models that generate an audio track jointly with the video " +
+                    "(minimax_h3_audio_vae_fp32.safetensors). Without it such a model still runs and produces " +
+                    "video, just no audio (TS_VIDEO_AUDIO_VAE).",
+                    "--audio-vae minimax_h3_audio_vae_fp32.safetensors"),
             }),
             ("Upload storage (the uploads/ directory next to the server binary)", new[]
             {

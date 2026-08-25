@@ -894,9 +894,43 @@ A14B I2V 3.5/3.5, T2V 4.0/3.0, `cfg2` being the low-noise expert's scale;
 Wan 2.1 6.0), `steps` (50 TI2V / 40 A14B / 30 Wan 2.1), `fps` (24 TI2V, else
 16 when neither the request nor server startup supplies it), `sampler`
 (`"unipc"` default / `"euler"`), `flowShift` (official recipes),
-`negative_prompt` (defaults to the official Wan negative prompt), `frames`
-snapped to `4k+1` (`1` = a still image). When `image` is given without an
-explicit `size`, the output follows the image's aspect ratio.
+`negative_prompt` (defaults to the model's official negative prompt), `frames`
+snapped to the model's temporal grid (`4k+1` for Wan, `17k+5` for MiniMax-H3;
+`1` = a still image). When `image` is given without an explicit `size`, the
+output follows the image's aspect ratio.
+
+Models that condition on more than a first frame, or that generate an audio
+track jointly with the video, take these additional fields — each accepted in
+both camelCase and snake_case, and each naming a file previously uploaded via
+`/api/upload` (paths outside the upload directory are rejected):
+`endImage`/`end_image` (last-frame conditioning),
+`referenceImages`/`reference_images`, `referenceVideos`/`reference_videos`,
+`referenceAudios`/`reference_audios` (arrays, referred to in the prompt as
+`<Picture N>` / `<Video N>` / `<Audio N>`),
+`referenceVideoAudios`/`reference_video_audios` (soundtracks paired BY INDEX with
+`referenceVideos`), and
+`generateAudio`/`generate_audio` (default `true`; set `false` to skip audio
+decoding), and `videoMode`/`video_mode` (`t2v`, `i2v`, `fl2v` or `ref`; omitted
+means "infer it from what this request supplies"). Video-only models ignore all
+of them.
+
+Reference conditioning — the subject carries over while the camera, background
+and composition come from the prompt — needs the model's reference checkpoint:
+
+```bash
+curl -s localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
+  "prompt": "the same woman sits at a table in a sunlit cafe by a window, wide shot",
+  "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0,
+  "referenceImages": ["person.jpg", "bottle.png"], "videoMode": "ref"
+}'
+```
+
+Asking a checkpoint for a mode it was not trained for is answered with `400` and
+the model's own explanation of which file to load instead. On MiniMax-H3's
+Ref2VA checkpoint a plain `imagePath` is treated as a reference, so a client
+that only knows how to attach one image needs no extra field. When a model returns an audio
+track it is written alongside the video and linked as `audioUrl` (`audio_url`
+on the OpenAI-shaped route).
 `POST /api/video-generate` accepts the same body with `width`/`height` instead
 of `size` plus `imagePath` (a previously uploaded file from `/api/upload`) and
 returns an `{ ok, url, ... }` envelope; the streaming variant

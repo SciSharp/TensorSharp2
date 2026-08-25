@@ -3,8 +3,8 @@
   //
   // THREE networks cooperate per generation and all three auto-download here:
   //   1. the DiT           (--model)     the denoiser; "Turbo" = step-distilled
-  //   2. the Wan 2.2 VAE   (--wan-vae)   pixels <-> the 48-channel video latent
-  //   3. UMT5-XXL          (--wan-te)    the text encoder
+  //   2. the Wan 2.2 VAE   (--video-vae)   pixels <-> the 48-channel video latent
+  //   3. UMT5-XXL          (--video-text-encoder)    the text encoder
   // They are loaded one stage at a time and each is released before the next, so
   // peak VRAM is max(text encoder, DiT + attention, VAE) rather than their sum.
   //
@@ -44,14 +44,14 @@
 
   // The Wan 2.2 VAE (48-channel, 16x16x4 compression). TI2V-5B needs THIS one —
   // the Wan 2.1 VAE is a different latent space and will not load in its place.
-  "wan-vae": {
+  "video-vae": {
     "path": "${modelRoot}/Wan2.2_VAE.safetensors",
     "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/VAE/Wan2.2_VAE.safetensors" ]
   },
 
   // Shared by every Wan model (2.1 and 2.2 alike), so it is downloaded once and
   // reused by the other Wan configs in this folder.
-  "wan-te": {
+  "video-text-encoder": {
     "path": "${modelRoot}/umt5-xxl-encoder-Q8_0.gguf",
     "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q8_0.gguf" ]
   }

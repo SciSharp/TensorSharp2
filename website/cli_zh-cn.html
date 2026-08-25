@@ -123,7 +123,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
 
   <h3 id="video">视频生成（Wan 2.1 / 2.2）</h3>
   <pre data-lang="bash"><code># 提示词 -> H.264 MP4。UMT5-XXL 文本编码器与视频 VAE 会在 DiT GGUF
-# 旁边自动解析（也可用 --wan-te / --wan-vae 指定）。
+# 旁边自动解析（也可用 --video-text-encoder / --video-vae 指定）。
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;Wan2.2-TI2V-5B-Q8_0.gguf&gt; \
     --prompt "A red fox trotting through falling snow, cinematic" \
@@ -294,8 +294,8 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>无分类器引导使用的负向提示词（默认为 Wan 官方负向提示词）。对步数蒸馏权重无效，因为它本身就不使用引导。</td></tr>
       <tr><td><code>--cfg-cache-stride &lt;N&gt;</code></td><td>引导缓存：每 N 步才跑一次无条件 CFG 分支，其余步复用缓存的引导方向（前三步与最后一步始终重算）。50 步时，<code>2</code> 只跑 100 次前向中的 77 次（快 1.30×），<code>3</code> 跑 70 次（1.43×）。默认 <code>0</code> = 关闭。它是一种近似 —— 需要对齐参考样本时请保持关闭；另外它在蒸馏权重上没有意义（根本没有无条件分支可缓存）。</td></tr>
       <tr><td><code>--diffusion-steps &lt;N&gt;</code> / <code>--cfg &lt;F&gt;</code></td><td>覆盖配方或自动识别到的蒸馏取值。基础权重上用 30 步替代 50 步，观感非常接近而开销少 1.7×。</td></tr>
-      <tr><td><code>--wan-vae &lt;path&gt;</code></td><td>视频 VAE（<code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>）。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_WAN_VAE</code>。需要哪个 VAE 由 DiT 自己决定，而不是由你指定。</td></tr>
-      <tr><td><code>--wan-te &lt;path&gt;</code></td><td>UMT5-XXL 文本编码器 GGUF。默认在同目录扫描。环境变量：<code>TS_WAN_TE</code>。Wan 2.2 A14B 还会按文件名自动解析第二个 high/low noise 专家 GGUF（用 <code>TS_WAN_DIT2</code> 覆盖；它没有对应的命令行参数）。</td></tr>
+      <tr><td><code>--video-vae &lt;path&gt;</code></td><td>视频 VAE（<code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>）。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_WAN_VAE</code>。需要哪个 VAE 由 DiT 自己决定，而不是由你指定。</td></tr>
+      <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>UMT5-XXL 文本编码器 GGUF。默认在同目录扫描。环境变量：<code>TS_WAN_TE</code>。Wan 2.2 A14B 还会按文件名自动解析第二个 high/low noise 专家 GGUF（用 <code>TS_WAN_DIT2</code> 覆盖；它没有对应的命令行参数）。</td></tr>
     </tbody>
   </table>
   </div>

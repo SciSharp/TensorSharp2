@@ -39,8 +39,12 @@ namespace TensorSharp.Server.Hosting
                 out string configuredMmProj,
                 out string configuredBackend,
                 out int? configuredMaxTokens,
-                out int? configuredWanVideoFrames,
-                out int? configuredWanVideoFps,
+                out int? configuredVideoFrames,
+                out int? configuredVideoFps,
+                out int? configuredVideoWidth,
+                out int? configuredVideoHeight,
+                out int? configuredVideoSteps,
+                out string configuredVideoMode,
                 out SamplingOverrides configuredSampling,
                 out SamplingPrecedence? configuredPrecedence,
                 out ListenOverrides configuredListen,
@@ -110,8 +114,12 @@ namespace TensorSharp.Server.Hosting
                 supportedBackends,
                 defaultMaxTokens,
                 maxTokensPinned,
-                configuredWanVideoFrames ?? 0,
-                configuredWanVideoFps ?? 0,
+                configuredVideoFrames ?? 0,
+                configuredVideoFps ?? 0,
+                configuredVideoWidth ?? 0,
+                configuredVideoHeight ?? 0,
+                configuredVideoSteps ?? 0,
+                configuredVideoMode,
                 uploadDirectory,
                 logDirectory,
                 fileLoggingEnabled,
@@ -126,7 +134,7 @@ namespace TensorSharp.Server.Hosting
         /// <summary>Backend originally requested via <c>--backend</c> / <c>BACKEND</c> (without the OS-default fallback).</summary>
         public static string ReadConfiguredBackendInput(string[] args)
         {
-            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _, out _, out _, out _, out _);
+            ParseArgs(args, out _, out _, out string configuredBackend, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _);
             return configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
         }
 
@@ -717,27 +725,44 @@ namespace TensorSharp.Server.Hosting
                     changed = true;
                     continue;
                 }
-                // Wan text-to-video companions (same env-var override mechanism,
-                // read by WanVideoModel).
-                if (TryReadOption(args, ref i, "--wan-vae", out string wanVaeOpt))
+                // Video-generation companions (same env-var override mechanism). Each path
+                // is published under the generic TS_VIDEO_* name AND the historical TS_WAN_*
+                // one, so WanVideoModel keeps reading what it always did. The --wan-*
+                // spellings predate the second video model and stay accepted; config files
+                // in the wild use them.
+                if (TryReadOption(args, ref i, "--video-vae", out string videoVaeOpt)
+                    || TryReadOption(args, ref i, "--wan-vae", out videoVaeOpt))
                 {
-                    SetQwenImageCompanionEnv("--wan-vae", "TS_WAN_VAE", wanVaeOpt);
+                    SetQwenImageCompanionEnv("--video-vae", "TS_VIDEO_VAE", videoVaeOpt);
+                    SetQwenImageCompanionEnv("--video-vae", "TS_WAN_VAE", videoVaeOpt);
                     changed = true;
                     continue;
                 }
-                if (TryReadOption(args, ref i, "--wan-te", out string wanTeOpt))
+                if (TryReadOption(args, ref i, "--video-text-encoder", out string videoTeOpt)
+                    || TryReadOption(args, ref i, "--video-te", out videoTeOpt)
+                    || TryReadOption(args, ref i, "--wan-te", out videoTeOpt))
                 {
-                    SetQwenImageCompanionEnv("--wan-te", "TS_WAN_TE", wanTeOpt);
+                    SetQwenImageCompanionEnv("--video-text-encoder", "TS_VIDEO_TEXT_ENCODER", videoTeOpt);
+                    SetQwenImageCompanionEnv("--video-text-encoder", "TS_WAN_TE", videoTeOpt);
                     changed = true;
                     continue;
                 }
-                // Wan 2.2 A14B ships as a PAIR of expert GGUFs and needs both. They are
-                // auto-resolved by name when they sit together, but a config file has to
-                // be able to name the second one explicitly — that is the only way its
-                // auto-download entry can exist at all.
-                if (TryReadOption(args, ref i, "--wan-dit2", out string wanDit2Opt))
+                // Dual-expert models (Wan 2.2 A14B) ship as a PAIR of GGUFs and need both.
+                // They are auto-resolved by name when they sit together, but a config file
+                // has to be able to name the second one explicitly — that is the only way
+                // its auto-download entry can exist at all.
+                if (TryReadOption(args, ref i, "--video-dit2", out string videoDit2Opt)
+                    || TryReadOption(args, ref i, "--wan-dit2", out videoDit2Opt))
                 {
-                    SetQwenImageCompanionEnv("--wan-dit2", "TS_WAN_DIT2", wanDit2Opt);
+                    SetQwenImageCompanionEnv("--video-dit2", "TS_VIDEO_DIT2", videoDit2Opt);
+                    SetQwenImageCompanionEnv("--video-dit2", "TS_WAN_DIT2", videoDit2Opt);
+                    changed = true;
+                    continue;
+                }
+                // Audio VAE for models that generate an audio track jointly with the video.
+                if (TryReadOption(args, ref i, "--audio-vae", out string audioVaeOpt))
+                {
+                    SetQwenImageCompanionEnv("--audio-vae", "TS_VIDEO_AUDIO_VAE", audioVaeOpt);
                     changed = true;
                     continue;
                 }
@@ -817,8 +842,12 @@ namespace TensorSharp.Server.Hosting
             out string configuredMmProj,
             out string configuredBackend,
             out int? configuredMaxTokens,
-            out int? configuredWanVideoFrames,
-            out int? configuredWanVideoFps,
+            out int? configuredVideoFrames,
+            out int? configuredVideoFps,
+            out int? configuredVideoWidth,
+            out int? configuredVideoHeight,
+            out int? configuredVideoSteps,
+            out string configuredVideoMode,
             out SamplingOverrides configuredSampling,
             out SamplingPrecedence? configuredPrecedence,
             out ListenOverrides configuredListen,
@@ -829,8 +858,12 @@ namespace TensorSharp.Server.Hosting
             configuredMmProj = null;
             configuredBackend = null;
             configuredMaxTokens = null;
-            configuredWanVideoFrames = null;
-            configuredWanVideoFps = null;
+            configuredVideoFrames = null;
+            configuredVideoFps = null;
+            configuredVideoWidth = null;
+            configuredVideoHeight = null;
+            configuredVideoSteps = null;
+            configuredVideoMode = null;
             configuredSampling = default;
             configuredPrecedence = null;
             configuredListen = default;
@@ -890,12 +923,55 @@ namespace TensorSharp.Server.Hosting
                     continue;
                 }
 
+                // --video-width / --video-height seed the size of every video request.
+                // --width / --height ALSO seed them: an operator who starts the server
+                // with a size reasonably expects video to use it, and the Web UI sends
+                // no size of its own. (They keep their Qwen-Image-Edit meaning too;
+                // that pass reads them separately and leaves them in argv.)
+                if (TryReadOption(args, ref i, "--video-width", out string videoWidthOption)
+                    || TryReadOption(args, ref i, "--width", out videoWidthOption))
+                {
+                    if (!TryParsePositiveInt(videoWidthOption, out int parsedVideoWidth))
+                        throw new ArgumentException(
+                            $"Invalid value for --video-width: '{videoWidthOption}'. Expected a positive integer.");
+                    configuredVideoWidth = parsedVideoWidth;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--video-height", out string videoHeightOption)
+                    || TryReadOption(args, ref i, "--height", out videoHeightOption))
+                {
+                    if (!TryParsePositiveInt(videoHeightOption, out int parsedVideoHeight))
+                        throw new ArgumentException(
+                            $"Invalid value for --video-height: '{videoHeightOption}'. Expected a positive integer.");
+                    configuredVideoHeight = parsedVideoHeight;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--video-steps", out string videoStepsOption))
+                {
+                    if (!TryParsePositiveInt(videoStepsOption, out int parsedVideoSteps))
+                        throw new ArgumentException(
+                            $"Invalid value for --video-steps: '{videoStepsOption}'. Expected a positive integer.");
+                    configuredVideoSteps = parsedVideoSteps;
+                    continue;
+                }
+
+                if (TryReadOption(args, ref i, "--video-mode", out string videoModeOption))
+                {
+                    // Validate at startup rather than on the first request: a typo here
+                    // should stop the server coming up, not surface an hour later.
+                    TensorSharp.Models.MiniMaxH3.MiniMaxH3ModeResolver.Parse(videoModeOption);
+                    configuredVideoMode = videoModeOption;
+                    continue;
+                }
+
                 if (TryReadOption(args, ref i, "--video-frames", out string videoFramesOption))
                 {
                     if (!TryParsePositiveInt(videoFramesOption, out int parsedVideoFrames))
                         throw new ArgumentException(
                             $"Invalid value for --video-frames: '{videoFramesOption}'. Expected a positive integer.");
-                    configuredWanVideoFrames = parsedVideoFrames;
+                    configuredVideoFrames = parsedVideoFrames;
                     continue;
                 }
 
@@ -904,7 +980,7 @@ namespace TensorSharp.Server.Hosting
                     if (!TryParsePositiveInt(fpsOption, out int parsedFps))
                         throw new ArgumentException(
                             $"Invalid value for --fps: '{fpsOption}'. Expected a positive integer.");
-                    configuredWanVideoFps = parsedFps;
+                    configuredVideoFps = parsedFps;
                     continue;
                 }
 
@@ -1136,12 +1212,22 @@ namespace TensorSharp.Server.Hosting
                 {
                     continue;
                 }
-                // Wan video companions, consumed by the same earlier pass. They were
+                // Video companions, consumed by the same earlier pass. They were once
                 // missing here, so `--wan-vae`/`--wan-te` — both documented in --help —
                 // reached the unknown-flag trap below and the server refused to start.
-                if (TryReadOption(args, ref i, "--wan-vae", out _)
+                // Every spelling, old and new, must be listed or that regression returns.
+                if (TryReadOption(args, ref i, "--video-vae", out _)
+                    || TryReadOption(args, ref i, "--video-text-encoder", out _)
+                    || TryReadOption(args, ref i, "--video-te", out _)
+                    || TryReadOption(args, ref i, "--video-dit2", out _)
+                    || TryReadOption(args, ref i, "--audio-vae", out _)
+                    || TryReadOption(args, ref i, "--wan-vae", out _)
                     || TryReadOption(args, ref i, "--wan-te", out _)
-                    || TryReadOption(args, ref i, "--wan-dit2", out _))
+                    || TryReadOption(args, ref i, "--wan-dit2", out _)
+                    || TryReadOption(args, ref i, "--video-width", out _)
+                    || TryReadOption(args, ref i, "--video-height", out _)
+                    || TryReadOption(args, ref i, "--video-steps", out _)
+                    || TryReadOption(args, ref i, "--video-mode", out _))
                 {
                     continue;
                 }
@@ -1191,6 +1277,8 @@ namespace TensorSharp.Server.Hosting
                 "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
                 "--draft-model",
                 "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
+                "--video-vae", "--video-text-encoder", "--video-te", "--video-dit2", "--audio-vae",
+                "--video-width", "--video-height", "--video-steps", "--video-mode",
                 "--wan-vae", "--wan-te", "--wan-dit2",
                 "--offload-cpu",
                 "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",

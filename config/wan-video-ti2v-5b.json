@@ -3,8 +3,8 @@
   //
   // Same three networks as the Turbo config, same auto-download:
   //   1. the DiT           (--model)     the denoiser
-  //   2. the Wan 2.2 VAE   (--wan-vae)   pixels <-> the 48-channel video latent
-  //   3. UMT5-XXL          (--wan-te)    the text encoder
+  //   2. the Wan 2.2 VAE   (--video-vae)   pixels <-> the 48-channel video latent
+  //   3. UMT5-XXL          (--video-text-encoder)    the text encoder
   //
   //   TensorSharp.Server --config config/wan-video-ti2v-5b.json
   //
@@ -37,12 +37,12 @@
     "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/Wan2.2-TI2V-5B-Q8_0.gguf" ]
   },
 
-  "wan-vae": {
+  "video-vae": {
     "path": "${modelRoot}/Wan2.2_VAE.safetensors",
     "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/VAE/Wan2.2_VAE.safetensors" ]
   },
 
-  "wan-te": {
+  "video-text-encoder": {
     "path": "${modelRoot}/umt5-xxl-encoder-Q8_0.gguf",
     "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q8_0.gguf" ]
   }

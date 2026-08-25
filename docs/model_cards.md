@@ -37,6 +37,7 @@ input.
 | Muse-Glimmer | `muse-glimmer`, `muse_glimmer` | Interleaved-SWA text + image chat with thinking and ATEM tools; DFlash block speculative decoding via a separate `--draft-model` GGUF | [models/muse-glimmer.md](models/muse-glimmer.md) | [models/muse-glimmer_zh-cn.md](models/muse-glimmer_zh-cn.md) |
 | Qwen-Image-Edit | `qwen_image`, `qwen-image` | **Image editing** — prompt + input image → edited image, through a 60-block MMDiT diffusion loop; a Lightning LoRA cuts 60 DiT forwards to 4–8 | [models/qwenimage.md](models/qwenimage.md) | [models/qwenimage_zh-cn.md](models/qwenimage_zh-cn.md) |
 | Wan video | `wan`, `wan2.1`, `wan2.2` | **Video generation** — prompt (+ optional first frame) → H.264 MP4, Wan 2.1 T2V and Wan 2.2 TI2V-5B / A14B; a step-distilled checkpoint turns the 100-DiT-pass recipe into 4 | [models/wan.md](models/wan.md) | [models/wan_zh-cn.md](models/wan_zh-cn.md) |
+| MiniMax-H3 | `minimax-h3` | **Joint audio-video generation** — prompt (+ optional keyframes or references) → video with native 32 kHz stereo audio, from one packed-latent diffusion transformer. Text-to-video, image-to-video, first/last frame and reference-to-video, all CFG-free at 4-8 steps | [models/minimax-h3.md](models/minimax-h3.md) | — |
 
 Each card walks an engineer or researcher from "I have never heard of this
 model" to "I can explain the forward graph and reproduce the inference path
