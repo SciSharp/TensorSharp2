@@ -1,20 +1,35 @@
 {
-  // MiniMax-H3 — joint video + 32 kHz stereo audio generation. This is the FL2VA
-  // checkpoint: text-to-video, image-to-video, and first-and-last-frame.
+  // MiniMax-H3 — joint video + 32 kHz stereo audio generation. This is the REF2VA
+  // checkpoint: text-to-video plus REFERENCE conditioning, where the images, clips
+  // and soundtracks you pass are an identity and appearance reference for a brand
+  // new scene rather than frames the clip has to reproduce.
   //
-  //   TensorSharp.Server --config config/minimax-h3-fl2va.json
+  //   TensorSharp.Server --config config/minimax-h3-ref2va.json
   //
-  //   TensorSharp.Cli --config config/minimax-h3-fl2va.json \
-  //     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+  //   TensorSharp.Cli --config config/minimax-h3-ref2va.json \
+  //     --ref-image person.png --ref-image jacket.png \
+  //     --prompt "she walks through a night market, neon reflections" --output out.mp4
+  //
+  // FL2VA and Ref2VA are SEPARATE CHECKPOINTS, not a setting. This one refuses
+  // --image/--end-image as keyframes and config/minimax-h3-fl2va.json refuses
+  // references; the error names the other file. A plain --image here is taken as a
+  // single reference, so a client that only knows how to attach "an image" — the Web
+  // UI among them — works against this config without any extra field.
+  //
+  // Up to NINE references, in any mix: --ref-image (a still), --ref-video (a clip, or
+  // a folder of frames), --ref-audio (a soundtrack), and --ref-video-audio to give the
+  // i-th --ref-video its own sound. Each one takes its own stretch of the shared
+  // timeline BEFORE the generated clip and keeps its own aspect ratio, so a reference
+  // reads as material that came before the shot rather than as its first frame.
   //
   // Four networks cooperate, and naming them here is what lets them auto-download
-  // into ${modelRoot} on the first run (~33.5 GB in total) and be reused after:
-  //   1. the denoiser     (model)               the packed audio-video DiT   10.64 GiB
+  // into ${modelRoot} on the first run (~33.4 GB in total) and be reused after:
+  //   1. the denoiser     (model)               the packed audio-video DiT   10.60 GiB
   //   2. Qwen3-VL-32B     (video-text-encoder)  the text encoder, 50 layers  16.97 GiB
   //   3. the video VAE    (video-vae)           16x spatial / 4x temporal     5.21 GB
   //   4. the audio VAE    (audio-vae)           32 kHz stereo soundtrack      0.61 GB
-  // Each is loaded and released in turn, so peak VRAM is max(...) and not the sum.
-  // Delete the "audio-vae" entry and you still get video, just silent.
+  // Only the denoiser differs from the FL2VA config; the other three are shared and
+  // will not download a second time if you already ran that one.
   //
   // ONE FILE PAIR IS NOT AUTOMATED. The text-encoder GGUF carries no tokenizer, and
   // auto-download can only fill in options that are flags — the tokenizer is not
@@ -49,13 +64,17 @@
   // it, so `--backend ggml_metal` still runs this file on Apple silicon.
   "backend": "ggml_cuda",
 
+  // The one entry that differs from minimax-h3-fl2va.json. The partition is read off
+  // the FILE NAME, so keep "ref2va" in it if you rename or requantize.
   "model": {
-    "path": "${modelRoot}/minimax_h3_fl2va_pruned-Q4_K.gguf",
-    "urls": [ "${gguf}/minimax_h3_fl2va_pruned-Q4_K.gguf" ]
+    "path": "${modelRoot}/minimax_h3_ref2va_pruned-Q4_K.gguf",
+    "urls": [ "${gguf}/minimax_h3_ref2va_pruned-Q4_K.gguf" ]
   },
 
   // Truncated to 50 layers with the final norm removed, and freed before the
   // denoise starts. Swap in -Q2_K_M.gguf (12.20 GiB) to pair with a smaller denoiser.
+  // References go through this network's vision tower as well as through the video
+  // VAE, so it is not optional here even for a text-only prompt.
   "video-text-encoder": {
     "path": "${modelRoot}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
     "urls": [ "${gguf}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf" ]
@@ -70,7 +89,9 @@
   },
 
   // Decodes the jointly generated audio latent to 32 kHz stereo, written as a
-  // sidecar .wav beside the video.
+  // sidecar .wav beside the video. Its ENCODER is also what a --ref-audio goes
+  // through, so dropping this entry costs you reference soundtracks as well as the
+  // generated one.
   "audio-vae": {
     "path": "${modelRoot}/minimax_h3_audio_vae_fp32.safetensors",
     "urls": [

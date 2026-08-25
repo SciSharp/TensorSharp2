@@ -896,6 +896,11 @@ let isGenerating = false;
 let currentAbortController = null;
 let currentLoadedModel = null;
 let currentArchitecture = null;
+// What the loaded model does with attached pictures, straight from /api/models.
+// Null for a non-video model. The same three images are three REFERENCES on
+// MiniMax-H3 Ref2VA and a refused request on FL2VA, so this decides the shape of a
+// video request rather than merely labelling it.
+let currentVideoCaps = null;
 // Architectures whose /api/models 'architecture' id means "this model generates video".
 // The id comes from GGUF metadata, so it is matched rather than renamed.
 const VIDEO_ARCHITECTURES = new Set(['wan', 'wan2.1', 'wan2.2', 'minimax-h3']);
@@ -963,6 +968,7 @@ function renderEmptyState() {
 function legacyStatusBadge(data) {
   currentLoadedModel = data.loaded || null;
   currentArchitecture = data.architecture || null;
+  currentVideoCaps = data.video || null;
 
   if (!currentLoadedModel) {
     statusBadge.textContent = 'No model configured';
@@ -985,6 +991,7 @@ function legacyStatusBadge(data) {
 function updateStatusBadge(data) {
   currentLoadedModel = data.loaded || null;
   currentArchitecture = data.architecture || null;
+  currentVideoCaps = data.video || null;
 
   if (!currentLoadedModel) {
     statusBadge.textContent = 'No model configured';
@@ -1148,6 +1155,8 @@ async function sendMessage() {
   const msg = { role: 'user', content: userContent };
 
   const imagePaths = [];
+  const stillImagePaths = [];
+  const videoFilePaths = [];
   const audioPaths = [];
   const textFilePaths = [];
   let isVideo = false;
@@ -1157,8 +1166,10 @@ async function sendMessage() {
   attachmentsCopy.forEach(att => {
     if (att.mediaType === 'image') {
       imagePaths.push(att.file);
+      stillImagePaths.push(att.file);
     } else if (att.mediaType === 'video') {
       isVideo = true;
+      if (att.file) videoFilePaths.push(att.file);
       if (att.frames) att.frames.forEach(f => imagePaths.push(f));
     } else if (att.mediaType === 'audio') {
       audioPaths.push(att.file);
@@ -1186,6 +1197,8 @@ async function sendMessage() {
   }
 
   if (imagePaths.length > 0) msg.imagePaths = imagePaths;
+  if (stillImagePaths.length > 0) msg.stillImagePaths = stillImagePaths;
+  if (videoFilePaths.length > 0) msg.videoFilePaths = videoFilePaths;
   if (audioPaths.length > 0) msg.audioPaths = audioPaths;
   if (textFilePaths.length > 0) msg.textFilePaths = textFilePaths;
   if (isVideo) msg.isVideo = true;
@@ -1295,13 +1308,51 @@ function fmtDuration(s) {
 async function runVideoGenerate(userMsg, bubbleText, statsDiv, queueDiv) {
   if (queueDiv) queueDiv.style.display = 'none';
   bubbleText.textContent = 'Starting video generation… (this takes a few minutes)';
-  const i2vImage = userMsg.imagePaths && userMsg.imagePaths.length > 0 ? userMsg.imagePaths[0] : null;
-  statsDiv.textContent = i2vImage ? 'Image-to-Video' : 'Text-to-Video';
+  // What attached media MEANS depends on the checkpoint, and only the server knows
+  // which one is loaded. A reference model (MiniMax-H3 Ref2VA) takes stills, clips
+  // and soundtracks as identity and appearance references for a brand-new scene and
+  // accepts several at once; a keyframe model takes the first still as the opening
+  // frame and, where it does first-and-last, a second as the closing one. Sending the
+  // attachments down the wrong one of those is not a degraded clip, it is a refused
+  // request, so the payload is shaped from /api/models rather than guessed here.
+  // With no capability block (an older server, or a model that reports none) this
+  // falls through to exactly the single-image request the UI has always sent.
+  const caps = currentVideoCaps || {};
+  // Stills only: imagePaths flattens an attached clip into its frames, and nine of
+  // those are nine unrelated reference pictures rather than the one clip meant.
+  const stills = userMsg.stillImagePaths || userMsg.imagePaths || [];
+  const clips = userMsg.videoFilePaths || [];
+  const sounds = userMsg.audioPaths || [];
+  const payload = { prompt: userMsg.content || '' };
+  let mode = 'Text-to-Video';
+  let unused = 0;
+
+  if (caps.supportsReferenceConditioning) {
+    const cap = caps.maxReferenceImages > 0 ? caps.maxReferenceImages : stills.length;
+    const refs = stills.slice(0, cap);
+    unused = stills.length - refs.length;
+    if (refs.length) payload.referenceImages = refs;
+    if (clips.length) payload.referenceVideos = clips;
+    if (sounds.length) payload.referenceAudios = sounds;
+    const parts = [];
+    if (refs.length) parts.push(refs.length + (refs.length === 1 ? ' image' : ' images'));
+    if (clips.length) parts.push(clips.length + (clips.length === 1 ? ' clip' : ' clips'));
+    if (sounds.length) parts.push(sounds.length + (sounds.length === 1 ? ' soundtrack' : ' soundtracks'));
+    mode = parts.length ? 'Reference-to-Video \u00b7 ' + parts.join(' + ') : 'Text-to-Video';
+  } else if (stills.length > 0) {
+    payload.imagePath = stills[0];
+    mode = 'Image-to-Video';
+    if (stills.length > 1 && caps.supportsEndImageConditioning) {
+      payload.endImage = stills[1];
+      mode = 'First-and-last-frame';
+    }
+    unused = stills.length - (payload.endImage ? 2 : 1);
+  }
+  statsDiv.textContent = mode +
+    (unused > 0 ? ' (' + unused + (unused === 1 ? ' image' : ' images') + ' not used)' : '');
   const t0 = performance.now();
 
   try {
-    const payload = { prompt: userMsg.content || '' };
-    if (i2vImage) payload.imagePath = i2vImage;
     const res = await fetch('/api/video-generate/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -11,6 +11,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using TensorSharp.Runtime;
 using TensorSharp.Server.Hosting;
 
@@ -113,6 +114,120 @@ public class ConfigFileArgsTests : IDisposable
             Assert.DoesNotContain("\"wan-te\"", text);
             Assert.DoesNotContain("\"wan-dit2\"", text);
         }
+    }
+
+    // ---- every shipped config must be startable by BOTH hosts ----------------
+    // config/README.md promises "Every file works with both hosts (only
+    // host-recognized keys are used)". That promise has teeth on the server: an
+    // unrecognized flag is not ignored there, it refuses to start. Config keys ARE
+    // flags, so a CLI-only key in a shipped preset is a startup failure for every
+    // server user of that file -- which is how minimax-h3-fl2va.json shipped with
+    // "diffusion-steps" and "cfg" (the server spells steps --video-steps, and takes
+    // no --cfg at all).
+    //
+    // Keep this set in step with the flags ServerOptionsBuilder actually reads. A
+    // new server flag used by a new config has to be added here too; that is the
+    // point -- the addition is where you notice whether the CLI spells it the same.
+    private static readonly HashSet<string> ServerRecognizedConfigKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "model", "mmproj", "backend", "max-tokens", "host", "port", "urls", "no-webui",
+        "temperature", "top-k", "top-p", "min-p", "seed", "stop", "sampling-precedence",
+        "repeat-penalty", "repeat-last-n", "presence-penalty", "frequency-penalty",
+        "continuous-batching", "no-continuous-batching", "paged-batching", "no-paged-batching",
+        "prefill-chunk-size", "kv-cache-dtype", "gpu-device", "tp", "tp-node-id", "tp-peers",
+        "paged-kv", "paged-kv-cache", "no-paged-kv", "no-paged-kv-cache", "paged-kv-block-size",
+        "paged-kv-ram-mb", "paged-kv-ssd-dir", "paged-kv-ssd-mb", "paged-kv-quant-bits",
+        "paged-kv-redis-url", "paged-kv-redis-ttl", "redis-url",
+        "cpu-moe", "n-cpu-moe", "cpu-moe-threads", "offload-cpu",
+        "mtp-spec", "no-mtp-spec", "mtp-draft", "mtp-pmin", "mtp-draft-model", "draft-model",
+        "qwen-image-vae", "qwen-image-vl", "qwen-image-mmproj", "qwen-image-lora",
+        "video-vae", "video-text-encoder", "video-te", "video-dit2", "audio-vae",
+        "video-width", "video-height", "video-steps", "video-mode", "video-frames", "fps",
+        "wan-vae", "wan-te", "wan-dit2", "width", "height",
+        "upload-max-mb", "upload-quota-mb", "upload-ttl-hours",
+    };
+
+    [Fact]
+    public void ShippedConfigs_UseOnlyKeysTheServerAccepts()
+    {
+        string repoRoot = FindRepoRoot();
+        if (repoRoot is null) return;   // running outside a source checkout
+        string configDir = Path.Combine(repoRoot, "config");
+        if (!Directory.Exists(configDir)) return;
+
+        foreach (string path in Directory.GetFiles(configDir, "*.json"))
+        {
+            foreach (string key in TopLevelOptionKeys(path))
+            {
+                Assert.True(
+                    ServerRecognizedConfigKeys.Contains(key),
+                    $"config/{Path.GetFileName(path)}: option {Quote(key)} is not read by the server, "
+                    + $"so --config on the server would fail with \"Unknown option '--{key}'\".");
+            }
+        }
+    }
+
+    // A file entry that names no URL cannot self-provision: on a machine without the
+    // file the run stops at "path not found and no download URL was provided". The
+    // shape matters as much as the presence -- an entry is understood only when its
+    // source sits under "url"/"urls", and ConfigFileArgs silently ignores any other
+    // field. minimax-h3-fl2va.json shipped naming its sources "repo"/"file": valid
+    // JSON, obvious intent, and nothing downloaded.
+    [Fact]
+    public void ShippedConfigs_FileEntries_NameADownloadSource()
+    {
+        string repoRoot = FindRepoRoot();
+        if (repoRoot is null) return;
+        string configDir = Path.Combine(repoRoot, "config");
+        if (!Directory.Exists(configDir)) return;
+
+        var understood = new HashSet<string>(StringComparer.Ordinal) { "path", "url", "urls", "sha256" };
+
+        foreach (string path in Directory.GetFiles(configDir, "*.json"))
+        {
+            using JsonDocument doc = ParseConfig(path);
+            foreach (JsonProperty option in doc.RootElement.EnumerateObject())
+            {
+                if (option.Value.ValueKind != JsonValueKind.Object) continue;
+                if (IsReserved(option.Name)) continue;
+
+                string where = $"config/{Path.GetFileName(path)} option {Quote(option.Name)}";
+                foreach (JsonProperty field in option.Value.EnumerateObject())
+                {
+                    Assert.True(
+                        understood.Contains(field.Name),
+                        $"{where} has field {Quote(field.Name)}, which ConfigFileArgs does not read "
+                        + "-- a download entry is { path, urls[, sha256] }.");
+                }
+
+                Assert.True(
+                    option.Value.TryGetProperty("urls", out _) || option.Value.TryGetProperty("url", out _),
+                    $"{where} names no urls, so it cannot download on a machine that lacks the file.");
+            }
+        }
+    }
+
+    private static string Quote(string value) => "\"" + value + "\"";
+
+    private static bool IsReserved(string key) =>
+        key.Equals("variables", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("vars", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("$schema", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The shipped configs are JSON with comments, read here exactly as
+    /// <see cref="ConfigFileArgs"/> reads them.</summary>
+    private static JsonDocument ParseConfig(string path) =>
+        JsonDocument.Parse(
+            File.ReadAllText(path),
+            new JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip });
+
+    private static IEnumerable<string> TopLevelOptionKeys(string path)
+    {
+        using JsonDocument doc = ParseConfig(path);
+        return doc.RootElement.EnumerateObject()
+            .Select(prop => prop.Name)
+            .Where(name => !IsReserved(name))
+            .ToList();
     }
 
     private static string FindRepoRoot()

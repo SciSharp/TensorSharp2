@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using TensorSharp.GGML;
 using TensorSharp.Runtime;
 using TensorSharp.Models.QwenImage;
@@ -324,11 +325,18 @@ namespace TensorSharp.Models.MiniMaxH3
                     videoShift: videoShift, audioShift: MiniMaxH3Scheduler.AudioShift,
                     references: referenceBlocks);
 
+                if (step == 0) RequireChunksMatchLayout(condChunks, layout);
+
                 var (vVel, aVel) = _dit.Forward(
                     videoPatches, videoCount, audioLatent, audioCount,
                     textHidden, textLength, layout, sigma,
                     conditionTokens, conditionCount,
                     conditionAudio, conditionAudioCount, condChunks, videoShift);
+
+                // Both streams share one trunk, so one bad number takes the whole
+                // clip down; check them before it is integrated into the latent.
+                RequireFinite(vVel, "video velocity", step, steps, layout.TokenCount);
+                RequireFinite(aVel, "audio velocity", step, steps, layout.TokenCount);
 
                 MiniMaxH3Scheduler.EulerStep(videoPatches, vVel, sigma, sigmas[step + 1]);
                 MiniMaxH3Scheduler.EulerStep(audioLatent, aVel, sigma, sigmas[step + 1]);
@@ -338,6 +346,12 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (step == 0)
                     Console.WriteLine($"  [h3] {layout.TokenCount} packed tokens; " +
                                       $"first step in {total.Elapsed.TotalSeconds - textClock.Elapsed.TotalSeconds:F1}s");
+                if (TraceEnabled)
+                    Console.WriteLine(
+                        $"  [h3] step {step + 1}/{steps} sigma={sigma:F4} " +
+                        $"| video latent rms={Rms(videoPatches):F3} absmax={AbsMax(videoPatches):F2} " +
+                        $"velocity rms={Rms(vVel):F3} absmax={AbsMax(vVel):F2} " +
+                        $"| audio latent rms={Rms(audioLatent):F3} velocity rms={Rms(aVel):F3}");
             }
 
             // ---- decode video ----
@@ -603,20 +617,30 @@ namespace TensorSharp.Models.MiniMaxH3
             // The published Ref2VA takes at most nine references; more is a mistake
             // worth naming rather than a sequence quietly ballooning past what the
             // model was trained on.
-            const int maxReferences = 9;
-            if (paths.Count > maxReferences)
+            if (paths.Count > MiniMaxH3Geometry.MaxReferences)
                 throw new ArgumentException(
-                    $"MiniMax-H3 Ref2VA accepts at most {maxReferences} reference images; " +
-                    $"{paths.Count} were supplied.", nameof(p));
+                    $"MiniMax-H3 Ref2VA accepts at most {MiniMaxH3Geometry.MaxReferences} " +
+                    $"reference images; {paths.Count} were supplied.", nameof(p));
 
             var images = new List<RgbImage>(paths.Count);
             foreach (string path in paths) images.Add(Fit(ImageIO.Load(path)));
             return images;
         }
 
+        /// <summary>Snap a reference dimension onto the VAE's 32-pixel grid, breaking ties
+        /// the way the reference implementation does.
+        ///
+        /// <para>The tie-break is asked for explicitly because the two languages disagree:
+        /// the reference computes <c>(int)std::round(size * scale / 32.f) * 32</c>, and
+        /// <c>std::round</c> goes half AWAY FROM ZERO, while .NET's <see cref="Math.Round(double)"/>
+        /// goes half to EVEN. A reference whose scaled height lands on 2.5 grid units
+        /// becomes 96 px there and 64 px here — a whole latent row's difference in the
+        /// conditioning, from a default nobody chose. Same reasoning as
+        /// <see cref="FormatSeconds"/>, opposite direction.</para></summary>
         private static int SnapToVaeGrid(double value) =>
             Math.Max(MiniMaxH3Geometry.SpatialMultiple,
-                     (int)Math.Round(value / MiniMaxH3Geometry.SpatialMultiple)
+                     (int)Math.Round(value / MiniMaxH3Geometry.SpatialMultiple,
+                                     MidpointRounding.AwayFromZero)
                         * MiniMaxH3Geometry.SpatialMultiple);
 
         /// <summary>Present the references to the language model and run the vision
@@ -666,6 +690,15 @@ namespace TensorSharp.Models.MiniMaxH3
                         break;
 
                     default:
+                        // A clip that came with its own soundtrack is presented as TWO
+                        // things, not one: the reference pushes an AUDIO item and then a
+                        // VIDEO item, so the prompt reads "<Audio 1>: <Video 1>: ...".
+                        // Emitting only the video label also stopped the audio counter,
+                        // which then renumbered every later standalone soundtrack — a
+                        // divergence that cannot appear with a single reference and grows
+                        // with each extra one.
+                        if (reference.Kind == MiniMaxH3ReferenceKind.VideoAudio)
+                            builder.Append("<Audio ").Append(++sounds).Append(">: ");
                         builder.Append("<Video ").Append(++videos).Append(">: ");
                         var shown = reference.Presented;
                         for (int i = 0; i < shown.Count; i += 2)
@@ -781,6 +814,91 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             latentFrames = 1;
             return _vae.EncodeFrame(image);
+        }
+
+        /// <summary>Check that the conditioning chunk list describes the same runs, in the
+        /// same order, that the layout put in the sequence.
+        ///
+        /// <para>These are built by two independent loops — this file fills
+        /// <c>condChunks</c> while encoding, and <see cref="MiniMaxH3Layout.Build"/> emits
+        /// segments — and the native side reassembles the conditioning rows POSITIONALLY
+        /// from the chunk list, discarding the segment's source index. So they agree by
+        /// construction rather than by contract, and if they ever stopped agreeing the
+        /// symptom would be reference 2's tokens sitting where reference 1's belong: a
+        /// plausible clip conditioned on the wrong pictures, with nothing reported. That
+        /// cannot happen with a single reference, which is exactly why it is worth
+        /// asserting now that several are the point.</para>
+        ///
+        /// <para>Runs once per request, over a handful of chunks.</para></summary>
+        private static void RequireChunksMatchLayout(
+            IReadOnlyList<H3CondChunk> chunks, MiniMaxH3PackedLayout layout)
+        {
+            if (chunks is not { Count: > 0 }) return;
+
+            var expected = new List<(int Kind, int Count)>();
+            foreach (var segment in layout.Segments)
+            {
+                if (segment.Kind == MiniMaxH3SegmentKind.ConditionVideo)
+                    expected.Add((0, segment.Length));
+                else if (segment.Kind == MiniMaxH3SegmentKind.ConditionAudio)
+                    expected.Add((1, segment.Length));
+            }
+
+            string Describe(IEnumerable<(int Kind, int Count)> runs) =>
+                string.Join(", ", runs.Select(r => $"{(r.Kind == 0 ? "video" : "audio")}x{r.Count}"));
+
+            var actual = chunks.Select(c => (Kind: c.Kind, Count: c.Count)).ToList();
+            if (actual.Count != expected.Count || !actual.SequenceEqual(expected))
+                throw new InvalidOperationException(
+                    "MiniMax-H3 conditioning is inconsistent: the encoder produced [" +
+                    Describe(actual) + "] but the packed layout expects [" + Describe(expected) +
+                    "]. The denoiser rebuilds these rows by position, so continuing would " +
+                    "condition the clip on the wrong references rather than fail.");
+        }
+
+        /// <summary>Per-step magnitude trace, off unless <c>TS_H3_TRACE=1</c>. A
+        /// diverging sample is visible in the latent's absmax several steps before it
+        /// reaches infinity, and without this the only symptom is the finished file.</summary>
+        private static readonly bool TraceEnabled =
+            Environment.GetEnvironmentVariable("TS_H3_TRACE") == "1";
+
+        private static double Rms(float[] v)
+        {
+            double sum = 0; long n = 0;
+            foreach (float x in v) if (float.IsFinite(x)) { sum += (double)x * x; n++; }
+            return n == 0 ? double.NaN : Math.Sqrt(sum / n);
+        }
+
+        private static float AbsMax(float[] v)
+        {
+            float m = 0;
+            foreach (float x in v) if (float.IsFinite(x) && Math.Abs(x) > m) m = Math.Abs(x);
+            return m;
+        }
+
+        /// <summary>Stop a diverged sample rather than writing it out as a black clip.
+        ///
+        /// <para>This failure mode is silent by construction: a NaN or -Inf video latent
+        /// decodes to a pixel the RGB clamp pins at 0 and an audio latent the WAV writer
+        /// clamps to -1, so the user gets a plausible-looking file — right length, right
+        /// frame rate, right soundtrack duration — that is uniformly black with a
+        /// saturated buzz, and nothing anywhere reported an error. A flow-matching
+        /// velocity is O(1) by construction, so a non-finite one is a numeric failure
+        /// upstream and there is nothing left to salvage from the run.</para></summary>
+        private static void RequireFinite(float[] values, string what, int step, int steps, int tokens)
+        {
+            for (long i = 0; i < values.LongLength; i++)
+            {
+                if (float.IsFinite(values[i])) continue;
+                throw new InvalidOperationException(
+                    $"MiniMax-H3 denoising diverged: the {what} is " +
+                    $"{(float.IsNaN(values[i]) ? "NaN" : "infinite")} at step {step + 1}/{steps} " +
+                    $"(element {i} of {values.LongLength}, {tokens} packed tokens). Every frame " +
+                    "would decode to black and the soundtrack to a saturated buzz, so the run is " +
+                    "stopped instead. Re-run with TS_H3_TRACE=1 to see where the magnitudes left " +
+                    "their normal range, and with a shorter clip to confirm the length is what " +
+                    "triggers it.");
+            }
         }
 
         /// <summary>Nudge a conditioning latent off the clean manifold.

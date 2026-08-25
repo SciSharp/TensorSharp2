@@ -131,6 +131,7 @@ are reused afterward. If you already have a file at that `path`, it is used as-i
 | [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~9.5 GB) | **Video generation**, 4-step distilled, text- **and** image-to-video |
 | [`wan-video-ti2v-5b.json`](wan-video-ti2v-5b.json) | Wan 2.2 TI2V-5B: DiT + video VAE + UMT5 (~11.4 GB) | Video generation, undistilled 50-step reference recipe |
 | [`wan-video-i2v-a14b.json`](wan-video-i2v-a14b.json) | Wan 2.2 I2V-A14B: **two** expert DiTs + Wan 2.1 VAE + UMT5 (~24 GB) | Image-to-video, two-expert schedule |
+| [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~33.5 GB) | Video **with a soundtrack**; four networks, two source repos |
 
 `server-basic.json` uses the standard `gemma-4-E4B-it` build — point its `path` at
 your own file to host a different variant.
@@ -223,3 +224,66 @@ Notes:
 - `video-frames` is snapped to `4k+1`. Halving it is the cheapest quality-neutral
   saving: self-attention is O(tokens²), so 121 → 61 frames is roughly 4× less
   attention work and half the VAE decode.
+
+## Video generation with sound (MiniMax-H3)
+
+MiniMax-H3 denoises video **and 32 kHz stereo audio in one packed latent**, so a run
+writes an `.mp4` and a matching `.wav`. Four networks cooperate rather than three,
+which makes a config file the practical way to run it:
+
+```bash
+TensorSharp.Server --config config/minimax-h3-fl2va.json
+
+TensorSharp.Cli --config config/minimax-h3-fl2va.json \
+  --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+
+# Image-to-video, and first-and-last-frame:
+TensorSharp.Cli --config config/minimax-h3-fl2va.json \
+  --image start.png --end-image end.png \
+  --prompt "a slow cinematic push-in" --output morph.mp4
+
+# References, on the OTHER checkpoint: up to nine, in any mix of stills, clips
+# and soundtracks. The clip does not reproduce them; it borrows the identity and
+# appearance they carry into a brand-new scene.
+TensorSharp.Cli --config config/minimax-h3-ref2va.json \
+  --ref-image person.png --ref-image jacket.png --ref-image street.png \
+  --prompt "she walks through a night market, neon reflections" --output out.mp4
+```
+
+| Config | Denoiser | VAEs | Text encoder | Modes |
+|---|---|---|---|---|
+| [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | FL2VA pruned (Q4_K) | H3 video **+ H3 audio** | Qwen3-VL-32B | T2V + I2V + first/last frame |
+| [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | Ref2VA pruned (Q4_K) | H3 video **+ H3 audio** | Qwen3-VL-32B | T2V + references (stills, clips, soundtracks) |
+
+Notes:
+
+- **The first run downloads ~33.5 GB** — denoiser 10.64 GiB, text encoder 16.97 GiB,
+  video VAE 5.21 GB, audio VAE 0.61 GB. All four come from unsloth, with Comfy-Org
+  listed as a second source for the two VAEs. Each network is loaded and released in
+  turn, so peak VRAM is `max(...)` and not the sum.
+- **Drop the `audio-vae` entry and you still get video**, just silent — that entry is
+  what decodes the audio half of the latent.
+- **The text encoder ships no tokenizer**, and auto-download cannot fill that gap: it
+  only resolves options that are flags, and the tokenizer is not one. Put `vocab.json`
+  and `merges.txt` from
+  [MiniMaxAI/MiniMax-H3/processor](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
+  next to the encoder GGUF in `${modelRoot}`, or point `TS_VIDEO_TOKENIZER` at the
+  folder holding them. Without them the run stops when the encoder loads.
+- **Steps and guidance are host-specific, so no shipped config sets them.** The server
+  takes `--video-steps N` and has no `--cfg` at all; the CLI takes `--diffusion-steps N`
+  and `--cfg`. A flag the server does not know is not ignored — it refuses to start —
+  so a config carrying a CLI-only key would break `TensorSharp.Server --config`. H3 is
+  CFG-distilled and enforces cfg 1.0 itself; its default is 20 steps, and 4-8 is the
+  fast operating point.
+- **`video-frames` snaps to the `17k+5` grid** (22, 39, 56 …), not Wan's `4k+1`, and
+  fps is pinned to 24.
+- **References need the other checkpoint**, which now has its own file. FL2VA and Ref2VA
+  are separate checkpoints rather than a setting: `minimax-h3-fl2va.json` refuses
+  `--ref-image` and `minimax-h3-ref2va.json` refuses `--image` as a keyframe, and each
+  error names the other file. Only the `model` entry differs between the two configs, so
+  the text encoder and both VAEs are shared and will not download twice.
+- **Ref2VA takes up to nine references in any mix** — `--ref-image` (a still),
+  `--ref-video` (a clip, or a folder of frames), `--ref-audio` (a soundtrack), and
+  `--ref-video-audio` to give the i-th `--ref-video` its own sound. Each takes its own
+  stretch of the shared timeline before the generated clip and keeps its own aspect
+  ratio, so every reference you add lengthens the packed sequence the DiT attends over.

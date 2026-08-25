@@ -83,12 +83,20 @@ namespace TensorSharp.Models.MiniMaxH3
                     : hasFirst ? MiniMaxH3Mode.ImageToVideo
                     : MiniMaxH3Mode.TextToVideo);
 
-            Validate(mode, partition, hasFirst, hasLast, hasRefs || imageIsReference);
+            Validate(mode, partition, hasFirst, hasLast,
+                     hasRefs || imageIsReference, namedReferences: hasRefs);
             return mode;
         }
 
+        /// <param name="hasRefs">Anything is being treated as a reference, including a
+        /// plain image on the Ref2VA checkpoint.</param>
+        /// <param name="namedReferences">The request actually NAMED reference inputs.
+        /// Distinct from <paramref name="hasRefs"/> because a bare --image becoming a
+        /// reference is an accommodation, while --image alongside --ref-image is a
+        /// contradiction.</param>
         private static void Validate(MiniMaxH3Mode mode, MiniMaxH3Partition partition,
-                                     bool hasFirst, bool hasLast, bool hasRefs)
+                                     bool hasFirst, bool hasLast, bool hasRefs,
+                                     bool namedReferences)
         {
             bool wantsReference = mode == MiniMaxH3Mode.Reference;
             bool haveReference = partition == MiniMaxH3Partition.Reference;
@@ -114,6 +122,16 @@ namespace TensorSharp.Models.MiniMaxH3
             if (mode == MiniMaxH3Mode.Reference && !hasRefs)
                 throw new InvalidOperationException(
                     "--video-mode ref needs at least one --ref-image / --ref-video / --ref-audio.");
+            // The reference implementation refuses this outright rather than picking a
+            // winner: "Ref2VA cannot be combined with --init-img or --end-img in one
+            // request." Quietly dropping the keyframe is the worse failure, because the
+            // clip that comes back looks like the request was honoured.
+            if (mode == MiniMaxH3Mode.Reference && namedReferences && (hasFirst || hasLast))
+                throw new InvalidOperationException(
+                    "MiniMax-H3 cannot take keyframes and references in one request: " +
+                    "--image/--end-image pin a frame the clip must reproduce, and a reference " +
+                    "is deliberately not that. Drop the keyframe to keep the references, or " +
+                    "drop the references and load the FL2VA checkpoint to animate the image.");
             if (mode is MiniMaxH3Mode.TextToVideo && (hasFirst || hasLast || hasRefs))
                 throw new InvalidOperationException(
                     "--video-mode t2v was requested but images were supplied; drop them or pick " +

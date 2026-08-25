@@ -151,6 +151,26 @@ namespace TensorSharp.Server.ProtocolAdapters
             var mmProjFiles = string.IsNullOrWhiteSpace(_options.StartupMmProjPath)
                 ? new List<string>()
                 : new List<string> { Path.GetFileName(_options.StartupMmProjPath) };
+            // What the loaded model does with attached pictures, when it is a video model.
+            // The Web UI cannot work this out for itself and the answer changes what a
+            // request should even contain: the same three images are three REFERENCES on
+            // Ref2VA and an illegal request on FL2VA, which takes a first frame and a last
+            // frame and nothing else. Null for every non-video model, so the UI can test
+            // one field instead of pattern-matching an architecture string.
+            object video = null;
+            if (_svc.Model is TensorSharp.Models.Video.IVideoGenerationModel videoModel)
+            {
+                video = new
+                {
+                    family = videoModel.VideoModelFamily,
+                    supportsAudio = videoModel.SupportsAudio,
+                    supportsImageConditioning = videoModel.SupportsImageConditioning,
+                    supportsEndImageConditioning = videoModel.SupportsEndImageConditioning,
+                    supportsReferenceConditioning = videoModel.SupportsReferenceConditioning,
+                    maxReferenceImages = videoModel.MaxReferenceImages,
+                };
+            }
+
             return Results.Json(new
             {
                 models = files,
@@ -162,6 +182,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 supportedBackends = _options.SupportedBackends,
                 architecture = _svc.Architecture,
                 defaultMaxTokens = _options.DefaultMaxTokens,
+                video,
             });
         }
 

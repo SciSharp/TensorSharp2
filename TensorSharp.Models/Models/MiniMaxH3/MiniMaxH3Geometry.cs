@@ -58,6 +58,23 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>Shortest clip the 17k+5 frame grid allows.</summary>
         public const int MinFrames = 5;
 
+        /// <summary>Reference images one request may carry.
+        ///
+        /// <para>This is TENSORSHARP'S limit, not the checkpoint's: the reference
+        /// implementation lets <c>--ref-image</c> repeat without a bound. It is here because
+        /// every reference is extra tokens in a sequence that is already attended over
+        /// bidirectionally and unmasked, and that sequence length is a numeric budget rather
+        /// than just a speed one — see the FP16 accumulator ceiling documented on
+        /// <c>h3_attend</c>. Nine references at a typical size is a few hundred extra tokens;
+        /// an unbounded list is how someone discovers the ceiling the hard way.</para>
+        ///
+        /// <para>Lives here rather than at the one place that used to enforce it because
+        /// three parts of the stack need the same number and they must not drift: the
+        /// pipeline refuses a tenth reference, the model reports the cap through
+        /// <c>IVideoGenerationModel.MaxReferenceImages</c>, and the Web UI stops sending
+        /// attachments at it.</para></summary>
+        public const int MaxReferences = 9;
+
         /// <summary>Round a pixel dimension up to the 32-px grid the model requires.</summary>
         public static int AlignSpatial(int size)
         {

@@ -30,6 +30,25 @@ That writes `fox.mp4` plus `fox.wav` with the generated soundtrack.
 | Video VAE encode + decode | working, tiled |
 | Clips past 22 frames | working (the VAE decodes 5 latent frames at a time) |
 
+### Long clips and the FP16 attention ceiling
+
+H3 attends bidirectionally over ONE packed sequence, so its key count is the whole
+clip rather than a window: a 640x384 request is 2364 packed tokens at 22 frames but
+8646 at 107. ggml's flash-attention kernels keep the softmax numerator in FP16 and
+give it three bits of headroom, so that key count is a numeric budget, and H3 is the
+model that spends it - `v_norm` does not exist in the checkpoint, so the value stream
+carries the same unbounded magnitudes that `h3_mm` guards against one op later. Left
+alone, a 107-frame clip overflowed to NaN on the first denoise step and came back
+with every pixel black and every audio sample clamped, while 73 frames of the same
+request rendered correctly.
+
+`h3_attend` now pre-scales V by a power of two derived from the key count and undoes
+it on the output - exact, because attention is linear in V - so the accumulator sees
+a bounded number of effective keys at any clip length. The sampler also refuses to
+write a diverged clip: a non-finite velocity fails the request naming the step it
+appeared at, rather than saving a black file. Set `TS_H3_TRACE=1` to print the latent
+and velocity magnitudes for every step.
+
 ## Performance
 
 M5 Pro / Metal, 22 frames, 8 steps, identical seed, versus
@@ -159,8 +178,20 @@ Notes:
   their own aspect ratio. Nothing is stretched to the output canvas, and the output
   canvas is *not* taken from the reference — say what you want with
   `--width`/`--height`.
-* Each reference costs about 63 extra sequence tokens at typical sizes, so nine
-  references is noticeably slower than one.
+* **Each reference is extra tokens in the same packed sequence**, so the cost is
+  linear and easy to predict: a 640x384 reference is 240 tokens, one at 576x448 is
+  252. Measured on an RTX 3080 Laptop against a 640x384 22-frame clip, a denoise step
+  goes from 4.37 s with no references to 9.38 s with eight — about 626 ms per
+  reference per step, flat from one to eight.
+* **Past about four references the Qwen3-VL pass dominates, not the denoiser.** Every
+  reference adds roughly 250 vision placeholder tokens to the prompt, and that prompt
+  is prefilled through all 50 layers: two references make a 548-token prompt and eight
+  make 2086, so text conditioning grows from ~65 s to ~447 s while the whole 8-step
+  denoise costs ~75 s. Reach for fewer, better references before reaching for fewer
+  steps.
+* TensorSharp caps reference images at nine. The reference implementation has no cap;
+  this one exists because the packed sequence is attended over unmasked and its length
+  is a numeric budget as well as a time one.
 * Say who is in frame. The reference supplies identity; the prompt still has to
   describe the shot, or you get a well-rendered scene with the subject missing.
 * A reference can also be a **clip** or a **soundtrack**, not just a still — see

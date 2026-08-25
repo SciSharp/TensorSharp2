@@ -133,23 +133,54 @@ ggml_tensor* h3_vit_rope(ggml_context* ctx, ggml_tensor* x,
     return ggml_concat(ctx, rotated, tail, 0);
 }
 
-// Quantized matmul with overflow-safe activation pre-scaling. ggml quantizes the
-// activation to q8_1, whose per-block FP16 sum overflows past roughly 2000 per
-// element. Two inputs in this file are unbounded and need the guard: the attention
-// output feeding o_proj, and the SwiGLU hidden state feeding down_proj (which
-// reaches the thousands). Everything else consumes an RMSNorm output that stays
-// O(10), where the guard would only cost two extra full-tensor passes.
-//
-// q8_1 is scale-invariant in precision because the per-block scale adapts, so
-// scaling by 1/K before and K after is exact rather than approximate.
+// Effective keys one FP16 softmax numerator is allowed to sum over before V is
+// pre-scaled. See h3_flash_v_scale for the arithmetic; 256 leaves the
+// accumulator 8 * 65504 / 256 = 2047 of room on |V| itself, an order of
+// magnitude above the activations h3_mm below documents as "reaching the
+// thousands".
+constexpr int kH3FlashKeyBudget = 256;
+
+// Smallest power of two that brings `keys` down to the budget, and exactly 1.0
+// for any sequence already short enough -- so short sequences (every oracle
+// fixture in the test suite among them) stay bit-identical.
+float h3_flash_v_scale(int keys)
+{
+    float s = 1.0f;
+    while (keys > kH3FlashKeyBudget * s) s *= 2.0f;
+    return s;
+}
+
 // Full bidirectional attention over a packed sequence.
 //
 // q/k/v arrive as [head_dim, heads, seq]. The explicit path materializes a
 // [seq, seq, heads] score matrix, which at 640x384 would be ~14 GB for the DiT and
 // ~6 GB per VAE layer -- the reference sidesteps that by tiling the VAE. Flash
 // attention never materializes it, so one call covers the whole frame with no tile
-// seams. K/V are cast to F16 because that is what the kernel takes; the accumulate
-// stays F32.
+// seams. K/V are cast to F16 because that is what the kernel takes.
+//
+// THE ACCUMULATE IS NOT F32, whatever ggml_flash_attn_ext_set_prec below looks
+// like it asks for. Every flash-attention kernel in the vendored ggml keeps the
+// softmax NUMERATOR -- sum_j exp(s_j - max) * V_j -- in FP16 registers
+// (T_C_VKQ = tile<16, 8, half2>, ggml-cuda/fattn-mma-f16.cuh), and nothing under
+// ggml-cuda/ or ggml-metal/ ever reads op_params for GGML_OP_FLASH_ATTN_EXT, so
+// the prec request is inert. What the kernel does give the accumulator is three
+// bits of headroom: FATTN_KQ_MAX_OFFSET (ggml-cuda/fattn-common.cuh) inflates the
+// running maximum by log(8), capping every softmax weight at 1/8. A row of N keys
+// therefore reaches N/8 * |V| and overflows to Inf once N * |V| > 8 * 65504.
+//
+// H3 walks straight into that ceiling and no other model here does. Its attention
+// is bidirectional over ONE packed sequence with no mask, so N is the whole clip
+// rather than a sliding window (2364 tokens for 22 frames, 8646 for 107), and V is
+// the one stream carrying no norm: q_norm and k_norm exist in the checkpoint,
+// v_norm does not, which is the same unbounded magnitude that makes h3_mm's guard
+// necessary one op later. Measured at 640x384: 73 frames (N=6134, tolerates
+// |V| <= 85) renders correctly and 107 frames (N=8646, tolerates only 61) came
+// back pure black, because one Inf here poisons the shared trunk and takes the
+// video AND the audio stream down with it.
+//
+// Attention is LINEAR in V, so scaling V down before the kernel and scaling the
+// result back up afterwards is exact -- and by a power of two it is exact through
+// the FP16 cast as well, being nothing but an exponent shift.
 ggml_tensor* h3_attend(ggml_context* ctx, ggml_backend_t backend,
                        ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
                        int hd, int heads, int seq, float scale, bool allowFlash)
@@ -165,14 +196,23 @@ ggml_tensor* h3_attend(ggml_context* ctx, ggml_backend_t backend,
     if (allowFlash)
     {
         ggml_tensor* vp = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+        // Keep the kernel's FP16 numerator in range no matter how long the clip
+        // is: the accumulator now sums over at most kH3FlashKeyBudget effective
+        // keys' worth of V, and the output is scaled back on the way out.
+        const float vScale = h3_flash_v_scale(seq);
         ggml_tensor* kf = ggml_cast(ctx, kp, GGML_TYPE_F16);
-        ggml_tensor* vf = ggml_cast(ctx, vp, GGML_TYPE_F16);
+        ggml_tensor* vf = ggml_cast(ctx,
+            vScale == 1.0f ? vp : ggml_scale(ctx, vp, 1.0f / vScale), GGML_TYPE_F16);
         ggml_tensor* out = ggml_flash_attn_ext(ctx, qp, kf, vf, nullptr, scale, 0.0f, 0.0f);
         if (out != nullptr && ggml_backend_supports_op(backend, out))
         {
+            // Inert on every backend built here (see the note above the function);
+            // kept because the request is the right one and costs nothing, but the
+            // V pre-scale is what actually keeps the accumulator finite.
             ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
             // [hd, heads, seq] contiguous -> [inner, seq].
-            return ggml_reshape_2d(ctx, ggml_cont(ctx, out), hd * heads, seq);
+            ggml_tensor* merged = ggml_reshape_2d(ctx, ggml_cont(ctx, out), hd * heads, seq);
+            return vScale == 1.0f ? merged : ggml_scale(ctx, merged, vScale);
         }
     }
 
@@ -184,6 +224,15 @@ ggml_tensor* h3_attend(ggml_context* ctx, ggml_backend_t backend,
         ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), hd * heads, seq);
 }
 
+// Quantized matmul with overflow-safe activation pre-scaling. ggml quantizes the
+// activation to q8_1, whose per-block FP16 sum overflows past roughly 2000 per
+// element. Two inputs in this file are unbounded and need the guard: the attention
+// output feeding o_proj, and the SwiGLU hidden state feeding down_proj (which
+// reaches the thousands). Everything else consumes an RMSNorm output that stays
+// O(10), where the guard would only cost two extra full-tensor passes.
+//
+// q8_1 is scale-invariant in precision because the per-block scale adapts, so
+// scaling by 1/K before and K after is exact rather than approximate.
 constexpr float kH3MmScale = 1024.0f;
 
 ggml_tensor* h3_mm(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, bool guard)
@@ -363,7 +412,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecod
         ggml_tensor* copied = ggml_cpy(ctx, patches, outT);
         ggml_set_output(copied);
 
-        const std::size_t nodes = static_cast<std::size_t>(nl) * 96 + 2048;
+        const std::size_t nodes = static_cast<std::size_t>(nl) * 104 + 2048;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, nodes, false);
         if (graph == nullptr)
         { set_last_error("MiniMaxH3VideoVaeDecode: graph alloc failed."); return 0; }
@@ -611,7 +660,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         ggml_tensor* copied = ggml_cpy(ctx, h, outT);
         ggml_set_output(copied);
 
-        const std::size_t nodes = static_cast<std::size_t>(nl) * 96 + 2048;
+        const std::size_t nodes = static_cast<std::size_t>(nl) * 104 + 2048;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, nodes, false);
         if (graph == nullptr)
         { set_last_error("MiniMaxH3TextEncode: graph alloc failed."); return 0; }
@@ -1147,9 +1196,25 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         ggml_tensor* acopy = ggml_cpy(ctx, audioOut, aoutT);
         ggml_set_output(vcopy); ggml_set_output(acopy);
 
+        // 104 rather than 96 per layer: h3_attend's V pre-scale and output
+        // re-scale are two more nodes per attention, and the budget is an
+        // upper bound rather than a count.
+        //
+        // 32 rather than 24 per SEGMENT because that is what the segment loops
+        // actually cost. modulate() emits, per segment, a view + cont of the
+        // slice, two modColumn views, a mul, two adds and (past the first) a
+        // concat = 8; gatedResidual() emits two view+cont pairs, one modColumn
+        // view, a mul, an add and a concat = 8. A block runs two of each, so a
+        // layer spends 32 * nseg on modulation alone. At 24 the shortfall was
+        // 8 * nseg - 24 per layer, hidden by the flat 4096 for as long as the
+        // segment count stayed small: fl2va has about six segments, but Ref2VA
+        // adds one or two per reference block plus one per vision span in the
+        // prompt, and at fourteen segments a 50-layer graph runs past the end
+        // and ggml_build_forward_expand trips GGML_ASSERT(n_nodes < size),
+        // which aborts the process rather than returning an error.
         const std::size_t nodes =
-            static_cast<std::size_t>(nl) * (96 + static_cast<std::size_t>(nseg) * 24) +
-            static_cast<std::size_t>(nref) * 96 + 4096;
+            static_cast<std::size_t>(nl) * (104 + static_cast<std::size_t>(nseg) * 32) +
+            static_cast<std::size_t>(nref) * 104 + 4096;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, nodes, false);
         if (graph == nullptr)
         { set_last_error("MiniMaxH3DitForward: graph alloc failed."); return 0; }
@@ -2053,7 +2118,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
         ggml_tensor* copied = ggml_cpy(ctx, stacked, outT);
         ggml_set_output(copied);
 
-        const std::size_t nodes = static_cast<std::size_t>(nl) * 96 + 4096;
+        const std::size_t nodes = static_cast<std::size_t>(nl) * 104 + 4096;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, nodes, false);
         if (graph == nullptr)
         { set_last_error("MiniMaxH3VisionEncode: graph alloc failed."); return 0; }

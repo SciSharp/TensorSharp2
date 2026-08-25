@@ -140,6 +140,8 @@ namespace TensorSharp.Models.MiniMaxH3
             Partition == MiniMaxH3Partition.FirstLastFrame;
         bool IVideoGenerationModel.SupportsReferenceConditioning =>
             Partition == MiniMaxH3Partition.Reference;
+        int IVideoGenerationModel.MaxReferenceImages =>
+            Partition == MiniMaxH3Partition.Reference ? MiniMaxH3Geometry.MaxReferences : 0;
 
         // ---- not an autoregressive model ----
         protected override float[] ForwardCore(int[] tokens) =>

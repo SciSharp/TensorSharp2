@@ -32,5 +32,14 @@ namespace TensorSharp.Models.Video
 
         /// <summary>True when the model accepts reference images/videos/audio.</summary>
         bool SupportsReferenceConditioning { get; }
+
+        /// <summary>How many reference images the model accepts, or 0 when it takes none.
+        ///
+        /// <para>A client that lets someone attach pictures needs the number BEFORE it sends
+        /// anything — the alternative is posting ten images and getting the whole request
+        /// refused, which is a worse way to learn the limit than a disabled control. The
+        /// default answers 0 for every model that does not do reference conditioning, so a
+        /// model only implements this if it has a real cap to report.</para></summary>
+        int MaxReferenceImages => 0;
     }
 }
