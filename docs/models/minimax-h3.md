@@ -93,6 +93,12 @@ tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
 
 The image becomes the **first frame** and the prompt drives what happens next.
 
+A keyframe is conditioned **twice**, and both halves matter: the VAE-encoded latent
+pins the frame it is anchored to, and the same picture goes through the Qwen3-VL
+vision tower into the prompt, where it describes the scene for the whole clip. The
+latent alone fades — the clip starts on the image and wanders off within a second
+or two, which is invisible at 22 frames and obvious at 124.
+
 ```sh
 tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --image portrait.jpg \

@@ -79,6 +79,27 @@ namespace TensorSharp.Models.MiniMaxH3
                 ? LoadReferences(p, width, height, shape.Frames)
                 : null;
 
+            // A KEYFRAME is conditioned twice, and both halves matter.
+            //
+            // The VAE-encoded latent pins the frame it is anchored to. On its own that
+            // fades: the clip starts on the image and wanders off within a second or
+            // two, which is invisible at 22 frames and obvious at 124. The second half
+            // is this — the same picture goes through the Qwen3-VL vision tower into
+            // the PROMPT, where it describes the scene for the whole clip rather than
+            // for one frame. The reference does this for keyframes exactly as it does
+            // for Ref2VA references; leaving it out is what made long clips drift.
+            var keyframes = new List<RgbImage>();
+            var keyframeAtEndFlags = new List<bool>();
+            if (mode is MiniMaxH3Mode.ImageToVideo or MiniMaxH3Mode.FirstLastFrame)
+            {
+                // Fitted to the generation canvas ONCE, here: the same pixels go to the
+                // VAE and to the vision tower, which is what the reference presents. The
+                // original photo would give the tower a far finer patch grid — a 1024x768
+                // source is 768 merged tokens against 108 for a 384x288 canvas — and that
+                // is a different conditioning signal, not a better one.
+                ResolveKeyframes(p, shape, keyframes, keyframeAtEndFlags);
+            }
+
             // ---- text conditioning (then give the 17 GB encoder back) ----
             float[] textHidden;
             int textLength;
@@ -90,7 +111,27 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 string presented = prompt ?? string.Empty;
                 List<MiniMaxH3PromptImage> promptImages = null;
-                if (references is { Count: > 0 })
+                if (keyframes.Count > 0)
+                {
+                    if (!te.HasVision)
+                        throw new InvalidOperationException(
+                            "image conditioning needs the Qwen3-VL vision tower, and this " +
+                            "text-encoder checkpoint does not carry one. Point --video-text-encoder " +
+                            "at the full qwen3vl_32b_minimax_h3 GGUF.");
+                    var shown = new List<MiniMaxH3Reference>(keyframes.Count);
+                    foreach (RgbImage frame in keyframes)
+                        shown.Add(new MiniMaxH3Reference
+                        {
+                            Kind = MiniMaxH3ReferenceKind.Image,
+                            Frames = new List<RgbImage> { frame },
+                            Presented = new List<RgbImage> { frame },
+                            Timestamps = new List<float> { 0f },
+                        });
+                    (presented, promptImages) = BuildReferencePrompt(te, shown, prompt);
+                    Console.WriteLine($"  [h3] {keyframes.Count} keyframe(s) presented to the " +
+                                      $"vision tower -> {promptImages.Count} vision span(s)");
+                }
+                else if (references is { Count: > 0 })
                 {
                     if (!te.HasVision)
                         throw new InvalidOperationException(
@@ -131,22 +172,8 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 _vae ??= _model.CreateVideoVae();
                 var parts = new List<float[]>();
-                void AddKeyframe(RgbImage img, bool atEnd)
+                void AddKeyframe(RgbImage scaled, bool atEnd)
                 {
-                    // Centre-crop rather than stretch. The keyframe IS the first frame,
-                    // so any distortion here is baked into every frame that follows.
-                    if (img.Width != shape.Width || img.Height != shape.Height)
-                    {
-                        double want = shape.Width / (double)shape.Height;
-                        double have = img.Width / (double)img.Height;
-                        if (Math.Abs(want - have) / have > 0.02)
-                            Console.WriteLine(
-                                $"  [h3] conditioning image is {img.Width}x{img.Height} " +
-                                $"({have:F2}:1) but the canvas is {shape.Width}x{shape.Height} " +
-                                $"({want:F2}:1); centre-cropping to fit. Leave --width/--height " +
-                                "unset to take the canvas from the image instead.");
-                    }
-                    var scaled = ImageIO.ResizeCover(img, shape.Width, shape.Height);
                     float[] latent = _vae.EncodeFrame(scaled);
                     _vae.NormalizeLatent(latent);
                     AddVisualNoise(latent, seed);
@@ -156,10 +183,8 @@ namespace TensorSharp.Models.MiniMaxH3
                     keyframeAtEnd.Add(atEnd);
                 }
 
-                RgbImage first = p.ResolveImage();
-                RgbImage last = p.ResolveEndImage();
-                if (first != null) AddKeyframe(first, atEnd: false);
-                if (last != null) AddKeyframe(last, atEnd: true);
+                for (int i = 0; i < keyframes.Count; i++)
+                    AddKeyframe(keyframes[i], keyframeAtEndFlags[i]);
 
                 int perFrame = shape.TokenGridWidth * shape.TokenGridHeight;
                 conditionCount = parts.Count * perFrame;
@@ -679,6 +704,47 @@ namespace TensorSharp.Models.MiniMaxH3
         internal static string FormatSeconds(float seconds) =>
             Math.Round(seconds, 1, MidpointRounding.ToEven)
                 .ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+
+        /// <summary>Fit the request's keyframes to the generation canvas, in timeline
+        /// order (start then end).
+        ///
+        /// <para>Fitted ONCE, here: the same pixels go to the VAE and to the vision
+        /// tower, which is what the reference presents. Handing the tower the original
+        /// photo instead gives it a far finer patch grid — a 1024x768 source is 768
+        /// merged tokens against 108 for a 384x288 canvas — and that is a different
+        /// conditioning signal, not a better one.</para></summary>
+        internal static void ResolveKeyframes(VideoGenerationParams p, MiniMaxH3Shape shape,
+                                              List<RgbImage> frames, List<bool> atEnd)
+        {
+            RgbImage first = p.ResolveImage();
+            RgbImage last = p.ResolveEndImage();
+            if (first != null)
+            {
+                WarnOnAspectCrop(first, shape);
+                frames.Add(ImageIO.ResizeCover(first, shape.Width, shape.Height));
+                atEnd.Add(false);
+            }
+            if (last != null)
+            {
+                frames.Add(ImageIO.ResizeCover(last, shape.Width, shape.Height));
+                atEnd.Add(true);
+            }
+        }
+
+        /// <summary>Say so when the canvas forces a crop. Centre-cropping is the right
+        /// trade against stretching — a squeezed face is baked into every frame — but it
+        /// silently loses the edges of the shot, so it should never be a surprise.</summary>
+        private static void WarnOnAspectCrop(RgbImage img, MiniMaxH3Shape shape)
+        {
+            if (img.Width == shape.Width && img.Height == shape.Height) return;
+            double want = shape.Width / (double)shape.Height;
+            double have = img.Width / (double)img.Height;
+            if (Math.Abs(want - have) / have <= 0.02) return;
+            Console.WriteLine(
+                $"  [h3] conditioning image is {img.Width}x{img.Height} ({have:F2}:1) but the " +
+                $"canvas is {shape.Width}x{shape.Height} ({want:F2}:1); centre-cropping to fit. " +
+                "Leave --width/--height unset to take the canvas from the image instead.");
+        }
 
         /// <summary>Mark which prompt tokens are modulated on the visual stream.
         ///

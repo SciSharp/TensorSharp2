@@ -165,6 +165,41 @@ namespace InferenceWeb.Tests
         }
 
         [Fact]
+        public void KeyframesAreFittedToTheCanvasAndOrderedStartThenEnd()
+        {
+            // A keyframe is conditioned TWICE: the VAE latent pins its frame, and the
+            // same picture goes through the vision tower into the prompt so it steers
+            // the whole clip. Both halves must see the SAME canvas-sized pixels — the
+            // tower's token count follows the image's own size, so presenting the
+            // original photo is a different signal, not a sharper one.
+            var shape = MiniMaxH3Geometry.Resolve(384, 288, 22, MiniMaxH3Geometry.Fps);
+            var wide = new TensorSharp.Models.QwenImage.RgbImage(
+                1024, 768, new float[1024L * 768 * 3]);
+            var tall = new TensorSharp.Models.QwenImage.RgbImage(
+                600, 800, new float[600L * 800 * 3]);
+
+            var frames = new List<TensorSharp.Models.QwenImage.RgbImage>();
+            var atEnd = new List<bool>();
+            MiniMaxH3Pipeline.ResolveKeyframes(
+                new VideoGenerationParams { Image = wide, EndImage = tall }, shape, frames, atEnd);
+
+            Assert.Equal(2, frames.Count);
+            Assert.Equal(new[] { false, true }, atEnd);
+            foreach (var f in frames)
+            {
+                Assert.Equal(shape.Width, f.Width);
+                Assert.Equal(shape.Height, f.Height);
+            }
+
+            // An end frame on its own is still marked as the END of the timeline.
+            frames.Clear(); atEnd.Clear();
+            MiniMaxH3Pipeline.ResolveKeyframes(
+                new VideoGenerationParams { EndImage = tall }, shape, frames, atEnd);
+            Assert.Single(frames);
+            Assert.Equal(new[] { true }, atEnd);
+        }
+
+        [Fact]
         public void AudioLatentRateIs40Hz()
         {
             // 32 kHz / 800 (the audio VAE's total stride) = 40 latents per second.
