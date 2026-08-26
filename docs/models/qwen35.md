@@ -914,6 +914,36 @@ the 48 recurrent layers - which is why the default window is 3 and not 8.
 the two halves can be measured apart; either is also the automatic fallback for
 any shape the kernel will not persist.
 
+### 12.6 Folding the MTP catch-up into the first draft step
+
+llama.cpp's `draft-mtp` runs the MTP block once over `n_accepted + 1` rows: one
+pass that both replays the verified tokens through the draft head and takes the
+first draft step. TensorSharp ran those as two calls, and because a draft call's
+cost is mostly fixed - its own graph, launch and readback, ~6 ms of which only
+about 1 ms is arithmetic - that extra call was the largest single difference
+between the two engines on this model.
+
+`Qwen35Model.DraftCatchUpAndStep` does both in one `TryFusedMtpBlock` call over
+all rows. The kernel already folds the LM head over the LAST `n_logits` rows, so
+asking for one logit row returns exactly the row the draft needs; the normed
+hidden comes back for every row and the last one chains the next step. The fold
+is an identity rather than an approximation: the block is causal over its own
+KV, so its last row sees exactly the replayed rows either way, and the output is
+byte-identical with acceptance unchanged.
+
+`DraftHeadSpeculator` stashes the commit and folds it into the next `Propose`,
+flushing it as an ordinary catch-up whenever the stashed rows do not run right up
+to the next step's position. Measured on Qwen3.8-27B-UD-IQ3_XXS: `catchUpMs`
+191 -> 0, +4.0% at 256 tokens and +5.3% on prose. `TS_MTP_FOLD_CATCHUP=0`
+restores the two-call shape.
+
+The remaining per-step difference is `MtpProjectInput`, the C# front end that
+builds the block's input (embedding, `enorm`, `hnorm`, concat, `eh_proj`). Over a
+256-token run it costs 462 ms against the fused kernel's 804 ms across 208
+calls - 2.2 ms of every 6.1 ms draft call - spent on about six separate device op
+launches, each of which synchronises because the lazy-sync path is Metal-only.
+Folding it into the fused MTP graph is the next step.
+
 ## 13. Output parser and chat template
 
 - `Qwen35OutputParser` inherits `Qwen3OutputParser`, so the wire format is

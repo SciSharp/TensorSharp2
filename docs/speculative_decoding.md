@@ -336,33 +336,71 @@ day.
 ### Against llama.cpp
 
 llama.cpp b10630 on the same files and card: Muse-Glimmer plain 19.7 / DFlash
-22.0; Qwen 3.8 plain 18.7 prose, 19.9 factual, and its `draft-mtp` 25.2 prose /
-38.6 factual. llama.cpp cannot load a DFlash2 drafter at all - it rejects the
-file with "wrong number of tensors; expected 81, got 58", the 23 convolution and
-selector tensors it has no code for.
+22.0. It cannot load a DFlash2 drafter at all - it rejects the file with "wrong
+number of tensors; expected 81, got 58", the 23 convolution and selector tensors
+it has no code for - so on DFlash2 there is nothing to compare against.
 
-**Read the MTP row carefully, because a first pass at it was wrong.** llama.cpp
-turns thinking mode on by default for this checkpoint and TensorSharp does not,
-so the two engines were answering the same prompt with different continuations -
-and since acceptance is a property of the continuation, that comparison measured
-the text, not the engine. Matched (`--think` on both, 200 tokens, same prompt):
+On MTP there is, and getting it right took two corrections. A first pass ran the
+two engines on the same prompt without noticing that llama.cpp turns thinking
+mode ON by default for this checkpoint and TensorSharp does not, so they were
+answering with different continuations; since acceptance is a property of the
+continuation, that measured the text rather than the engine. The numbers below
+are a true like-for-like: same prompt, thinking disabled on both
+(`chat_template_kwargs: {"enable_thinking": false}`), greedy, 256 tokens, draft
+window 3.
 
 | | tokens/accept call | acceptance | tok/s | ms/step |
 | --- | ---: | ---: | ---: | ---: |
-| llama.cpp `draft-mtp` | 3.55 | 0.856 | 38.1 | 92.8 |
-| TensorSharp `--spec` | 3.5 | 0.838 | 29.8 | 107.7 |
+| llama.cpp `draft-mtp` | 3.63 | 0.885 | 39.4 | 92.1 |
+| TensorSharp `--spec` | 3.67 | 0.932 | 33.9 | 97.4 |
 
-**Drafting is at parity; the residual is per-step cost.** Both engines draft 167
-tokens over the same continuation and accept ~143 of them, so the MTP block and
-the acceptance rule are doing the same work. What is left is 15 ms per step, and
-TensorSharp's own phase counters say where it goes: a verify is 81 ms, the three
-draft calls 18 ms, and the catch-up 8 ms.
+**Drafting is at parity or better** - TensorSharp gets slightly more tokens per
+verify call than llama.cpp does. The gap is entirely per-step cost, and
+TensorSharp's own phase counters locate it: a verify is 77 ms (llama.cpp's works
+out to about the same), and the draft calls are 20 ms against roughly 13.
 
-That catch-up is the concrete difference. llama.cpp runs its MTP block ONCE over
-`n_accepted + 1` rows - folding the catch-up over the accepted tokens and the
-first draft step into a single call - where TensorSharp runs the catch-up and
-then a separate first `DraftStep`. Folding them is worth roughly the 8 ms, and
-is the clearest remaining item.
+One caution about llama.cpp as a yardstick: its eval time reproduces to within
+0.04% run to run on this card (2886.84 ms and 2885.74 ms on two identical
+requests), where TensorSharp swings by several percent. The variance is
+TensorSharp's, not the machine's.
+
+#### What was eliminated
+
+llama.cpp runs its MTP block ONCE over `n_accepted + 1` rows, folding the
+catch-up over the accepted tokens and the first draft step into a single call.
+TensorSharp ran a catch-up and then a separate first `DraftStep`, and on a head
+whose per-call cost is mostly fixed that extra call was the largest single
+difference. It now folds too (`SupportsFusedCatchUpStep` /
+`DraftCatchUpAndStep`, `TS_MTP_FOLD_CATCHUP=0` to revert): `catchUpMs` 191 -> 0,
+worth +4.0% at 256 tokens and +5.3% on prose, with byte-identical output and
+unchanged acceptance.
+
+#### What is left, measured
+
+Three things were checked and are NOT the problem, which is worth recording
+because each looks like an obvious suspect:
+
+- **CUDA-graph capture of the verify.** `TS_GGML_LOG_DEBUG=1` surfaces ggml's
+  "CUDA graph warmup complete"/"reset" lines. Capture does churn (the persist
+  cache evicts across draft shapes), but raising
+  `TS_Q35_VERIFY_CACHE_BUDGET_MB` from 1536 to 3072 halves the resets and
+  changes throughput not at all.
+- **The MTP draft graph not persisting.** `TS_Q35_MTP_DRAFT_PERSIST=1` moves
+  `draftMs` by less than the run-to-run noise.
+- **The confidence gate.** llama.cpp does not gate at all; dropping `--spec-pmin`
+  to 0.05 is a wash on both prompts, because the steps it declines genuinely
+  would have drafted badly.
+
+What IS left is the per-call overhead of the MTP block. Instrumenting the two
+halves over a 256-token run: the C# input projection (`MtpProjectInput` -
+embedding, two RMS norms, a concat and `eh_proj`) costs 462 ms against the fused
+block kernel's 804 ms, over 208 calls. That is 2.2 ms of every 6.1 ms draft
+call, and **6.4% of the whole run**, spent on about six separate device op
+launches. Caching its scratch tensors changes nothing (the allocator already
+pools), so the cost is the launches themselves: on CUDA every op synchronises,
+because the lazy-sync path (`TS_GGML_ASYNC_COMPUTE`) is Metal-only - it relies
+on Metal's zero-copy host mapping. Folding the projection into the fused MTP
+graph, so the whole draft step is one graph, is the next concrete step.
 
 Three things in that table are worth reading carefully.
 

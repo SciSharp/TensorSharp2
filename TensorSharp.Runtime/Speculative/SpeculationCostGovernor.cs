@@ -108,9 +108,15 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>
         /// Measure speculation against plain decoding at runtime and skip drafting
         /// while it is measurably slower. On by default; set false to force the
-        /// drafter on for A/B measurement.
+        /// drafter on for A/B measurement (TS_SPEC_ADAPTIVE=0 does the same from
+        /// the environment, which is how the plain-baseline cost itself is
+        /// measured - a round's baseline steps are plain decodes, and they are not
+        /// free).
         /// </summary>
-        public bool Enabled { get; set; } = true;
+        public bool Enabled { get; set; } = DefaultEnabled;
+
+        private static readonly bool DefaultEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_SPEC_ADAPTIVE"), "0", StringComparison.Ordinal);
 
         /// <summary>True while a losing verdict is actively suppressing drafting
         /// (as opposed to a round merely taking its plain baseline). Only these

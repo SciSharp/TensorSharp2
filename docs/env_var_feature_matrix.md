@@ -191,6 +191,9 @@ A/B switch, plus long-context sizing knobs. None are registered in
 | `TS_Q35_VERIFY_DEFER_STATE` | Qwen 3.5 / 3.8 speculative verify | `0` downloads the post-window recurrent state after every persisted call instead of leaving it on the device for a slot commit; separable from the snapshots because it also covers the single-row steps a speculative session interleaves with verifies | ON | not registered | no |
 | `TS_Q35_VERIFY_STRIDED_VIEWS` | Qwen 3.5 / 3.8 speculative verify | `0` disables the contiguous strided KV views on CUDA and Metal, falling back to per-head `set_rows` writes | ON | not registered | no |
 | `TS_Q35_MTP_DRAFT_PERSIST` | Qwen 3.5 / 3.8 MTP draft graph | `1` lets the single-layer MTP draft graph use the persist/replay cache. Default off: the graph used to deadlock on CUDA-graph capture replay, and the knob exists to re-test that on a current ggml. Worth ~1% | OFF | not registered | no |
+| `TS_MTP_FOLD_CATCHUP` | Qwen 3.x NextN/MTP speculation | `0` runs the draft-head catch-up and the first draft step as two calls instead of folding them into one pass over `n_accepted + 1` rows (llama.cpp's draft-mtp shape). Worth ~4-5% | ON | not registered | no |
+| `TS_SPEC_ADAPTIVE` | Speculative decoding (all drafters) | `0` disables the cost governor, so drafting is never measured against a plain baseline and never parked. For A/B measurement: a governor round's baseline steps are plain decodes and they are not free | ON | not registered | no |
+| `TS_GGML_LOG_DEBUG` | GGML backends | `1` passes ggml's DEBUG log channel through instead of dropping it. Carries the CUDA backend's "CUDA graph warmup complete"/"reset" lines, which are the only way to see whether a graph is actually being CUDA-graph-captured | OFF | not registered | no |
 
 ## Out-of-Matrix GLM 5.x (`glm-dsa`) Knobs
 
