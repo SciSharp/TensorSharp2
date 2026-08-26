@@ -3616,7 +3616,8 @@ internal enum GgmlIndexReductionOp
             int[] mropePos, int[] mropeSections,
             int tpDegree, IntPtr[] tpPlanOut,
             IntPtr captureData, int[] captureLayers, int captureCount,
-            int stateSnapshots, IntPtr stateSnapshotsUsed, int deviceStateCurrent);
+            int stateSnapshots, IntPtr stateSnapshotsUsed, int deviceStateCurrent,
+            int deferStateDownload);
 
         public static bool Qwen35ModelVerify(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
@@ -3634,7 +3635,7 @@ internal enum GgmlIndexReductionOp
             int tpDegree = 1, IntPtr[] tpPlanOut = null,
             IntPtr captureData = default, int[] captureLayers = null, int captureCount = 0,
             int stateSnapshots = 1, IntPtr stateSnapshotsUsed = default,
-            bool deviceStateCurrent = false)
+            bool deviceStateCurrent = false, bool deferStateDownload = false)
         {
             return TSGgml_Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -3648,7 +3649,8 @@ internal enum GgmlIndexReductionOp
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
                 tpDegree, tpPlanOut, captureData, captureLayers, captureCount,
-                stateSnapshots, stateSnapshotsUsed, deviceStateCurrent ? 1 : 0) != 0;
+                stateSnapshots, stateSnapshotsUsed, deviceStateCurrent ? 1 : 0,
+                deferStateDownload ? 1 : 0) != 0;
         }
 
         [LibraryImport(DllName)]
@@ -3660,6 +3662,9 @@ internal enum GgmlIndexReductionOp
         /// host round trip. The next verify can then skip its state upload, which is
         /// the point: that upload plus the matching download was the largest per-step
         /// cost of speculative decoding on a Qwen 3.5/3.8 hybrid trunk.
+        ///
+        /// <paramref name="slot"/> counts back from the end of the verified batch;
+        /// -1 means the post-window state, which is what a single-row step commits.
         /// </summary>
         public static bool Qwen35CommitStateSnapshot(int slot, int numRecurrentLayers)
             => TSGgml_Qwen35CommitStateSnapshot(slot, numRecurrentLayers) != 0;

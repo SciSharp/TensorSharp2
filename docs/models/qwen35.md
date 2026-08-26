@@ -892,12 +892,27 @@ Three changes in the fused verify kernel and its caller removed all of it:
    them - and a commit only happens after the rollback decision.
    `SpecSnapshotRecurrentState` therefore copies nothing.
 
+4. The single-row steps a speculative session falls back to (when the drafter
+   declines) defer their download too. Such a step's post-window state is just
+   the `*_state_out` slices and nothing decides anything about it later, so the
+   caller commits slot -1 at once. Before this, each one broke the device-state
+   chain - 151 MB down, and the next verify uploaded it again - which on an MTP
+   run was 46 steps out of 125.
+
 Effect on 256 prose tokens with DFlash2: `rollbackMs` 3604 -> 0, `snapshotMs`
-919 -> 69, 15.5 -> 20.9 tok/s; MTP 15.7 -> 19.1. The cost is VRAM - the GDN op's
-output grows by one ~150 MB state per slot across the 48 recurrent layers - which
-is why the default window is 3 and not 8. `TS_Q35_VERIFY_SNAPSHOTS=0` restores
-the old restore-and-re-forward path, which is also the automatic fallback for any
-shape the kernel will not persist.
+919 -> 69. Deferring the one-row steps is worth a further 5-20% on top,
+paired-run (DFlash2 factual 22.0 -> 27.1, MTP prose 19.1 -> 21.4), and it is also
+the more exact path: committing on the device is a raw copy of the tensor the
+graph produced, where the host round trip went through an unpack-and-repack, so
+on the factual prompt it reproduces plain decoding byte for byte while the host
+path drifted in the last few tokens.
+
+The cost is VRAM - the GDN op's output grows by one ~150 MB state per slot across
+the 48 recurrent layers - which is why the default window is 3 and not 8.
+`TS_Q35_VERIFY_SNAPSHOTS=0` restores the old restore-and-re-forward path and
+`TS_Q35_VERIFY_DEFER_STATE=0` keeps the snapshots but restores the download, so
+the two halves can be measured apart; either is also the automatic fallback for
+any shape the kernel will not persist.
 
 ## 13. Output parser and chat template
 

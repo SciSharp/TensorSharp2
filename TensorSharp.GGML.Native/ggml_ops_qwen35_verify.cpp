@@ -91,6 +91,11 @@ namespace
         /// a device-to-device tensor copy. Index [i * n_snapshots + slot].
         std::vector<ggml_tensor*> conv_snap_slots, delta_snap_slots;
         int n_snapshots = 0;
+        /// The post-window state was NOT downloaded; the caller commits it (or one
+        /// snapshot slot) into the live slices on the device instead. True for every
+        /// step of a speculative session, single-row plain steps included - which is
+        /// the point: the 151 MB state then never crosses PCIe at all.
+        bool deferred_state = false;
         std::size_t buffer_bytes = 0;
         std::uint64_t lru = 0;
         void reset()
@@ -102,6 +107,7 @@ namespace
             conv_in.clear(); delta_in.clear(); conv_out.clear(); delta_out.clear();
             conv_snaps.clear(); delta_snaps.clear();
             conv_snap_slots.clear(); delta_snap_slots.clear(); n_snapshots = 0;
+            deferred_state = false;
             capture_out.clear(); capture_count = 0;
             n = window = num_layers = out_vocab = n_logits = 0; has_normed = false; sig = nullptr;
             buffer_bytes = 0;
@@ -275,7 +281,8 @@ namespace
         const std::int32_t* mrope_pos, const std::int32_t* mrope_sections,
         int tp_degree, void** tp_plan_out,
         float* capture_data, const int* capture_layers, int capture_count,
-        int state_snapshots, int* state_snapshots_used, int device_state_current)
+        int state_snapshots, int* state_snapshots_used, int device_state_current,
+        int defer_state_download)
     {
         if (state_snapshots_used != nullptr)
             *state_snapshots_used = 1;
@@ -404,7 +411,17 @@ namespace
         // TP always takes the non-persist path: the plan executes after this
         // call returns, so the context is parked in g_q35v_tp instead, and a
         // prefill-sized graph never repeats its exact shape anyway.
-        const bool fv_persist = fv_persist_cfg && (n_logits >= N) && !use_mrope && num_layers > 1 && !tp_mode && !any_cpu_moe;
+        // num_layers == 1 is the MTP draft block. It was pinned to the non-persist
+        // path because its captured graph used to deadlock the stream on the third
+        // replay; TS_Q35_MTP_DRAFT_PERSIST=1 re-tests that on the current ggml,
+        // because rebuilding a graph per draft call costs ~3.7 ms of the 6.2 ms a
+        // draft step takes.
+        static const bool mtp_draft_persist = []{
+            const char* e = std::getenv("TS_Q35_MTP_DRAFT_PERSIST");
+            return e != nullptr && e[0] == '1';
+        }();
+        const bool fv_persist = fv_persist_cfg && (n_logits >= N) && !use_mrope
+            && (num_layers > 1 || mtp_draft_persist) && !tp_mode && !any_cpu_moe;
 
         const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
         const std::size_t deltaStateBytes = static_cast<std::size_t>(head_k_dim) * head_v_dim * num_v_heads * sizeof(float);
@@ -445,15 +462,19 @@ namespace
             }
         }
 
-        const int n_snap = (fv_snapshots_cfg && fv_persist && !resident_state
-                            && state_snapshots > 1 && state_snapshots <= N)
+        // Deferring the state download needs a graph whose output tensors outlive
+        // the call, which is exactly the persist path; resident mode has nothing to
+        // defer (it updates the state in place).
+        const bool defer_state = fv_snapshots_cfg && defer_state_download != 0 && fv_persist && !resident_state;
+        const int n_snap = (defer_state && state_snapshots > 1 && state_snapshots <= N)
             ? state_snapshots : 1;
-        // The caller has to know whether the post-window state was downloaded (as
-        // it always used to be) or left on the device for a later slot fetch - the
-        // two need different rollback handling and guessing wrong silently decodes
-        // from a stale recurrent state.
+        // What the caller has to do next, and getting it wrong silently decodes from
+        // a stale recurrent state:
+        //    0 -> deferred with no snapshots; commit slot -1 (the post-window state)
+        //    1 -> downloaded, as it always used to be; nothing to do
+        //   >1 -> deferred with N snapshots; commit slot (N-1-accepted)
         if (state_snapshots_used != nullptr)
-            *state_snapshots_used = n_snap;
+            *state_snapshots_used = defer_state ? (n_snap > 1 ? n_snap : 0) : 1;
 
         // ===== Persist reuse fast-path: upload the per-call inputs + replay =====
         if (fv_persist)
@@ -465,7 +486,8 @@ namespace
                     c.n_logits != n_logits ||
                     c.has_normed != (normed_out != nullptr) ||
                     c.capture_count != cap_count ||
-                    c.n_snapshots != n_snap)
+                    c.n_snapshots != n_snap ||
+                    c.deferred_state != defer_state)
                     continue;
                 // llama.cpp pattern (llama-context.cpp): before re-setting the inputs of
                 // a REUSED graph we must fully synchronize, else we overwrite input
@@ -499,8 +521,11 @@ namespace
                 // caller wants (a previous verify's snapshot was committed into them
                 // on the device), so the ~300 MB round trip this upload and the
                 // matching download used to cost per step is simply not paid.
-                if (ggml_backend_graph_compute(g_backend, c.graph) != GGML_STATUS_SUCCESS) { c.reset(); break; }
-                if (!resident_state && c.n_snapshots <= 1)
+                // Profiled (a plain compute unless TS_GGML_NODE_PROFILE is set): this
+                // is the hot path - every warm speculative verify replays here - and
+                // it was the one graph the node profiler could not see.
+                if (tsg::graph_compute_profiled(g_backend, c.graph, "qwen35 verify replay") != GGML_STATUS_SUCCESS) { c.reset(); break; }
+                if (!resident_state && !c.deferred_state)
                 {
                     int gi = 0;
                     for (int l = 0; l < num_layers; l++)
@@ -511,9 +536,8 @@ namespace
                         gi++;
                     }
                 }
-                // With snapshots the state stays on the device until the caller knows
-                // how much of the draft was accepted and fetches exactly one slot.
-                g_q35vc_last_snap = c.n_snapshots > 1 ? &c : nullptr;
+                // Deferred: the state stays on the device until the caller commits it.
+                g_q35vc_last_snap = c.deferred_state ? &c : nullptr;
                 g_q35vc_snap_conv_bytes = convStateBytes;
                 g_q35vc_snap_delta_bytes = deltaStateBytes;
                 if (normed_out != nullptr && c.normed_out != nullptr)
@@ -819,10 +843,19 @@ namespace
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * (260 + 2 * num_kv_heads) + 1024;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
         ggml_tensor* hidden = hidden_t;
-        // llama.cpp feeds strided head/token views directly to Metal's norm, CPY,
-        // and gated-delta-net kernels. Keep the established materialized layout on
-        // CUDA/Vulkan, whose capture/replay paths were validated with those CONTs.
-        const bool metal_strided_views = g_backend_type == BACKEND_TYPE_METAL;
+        // llama.cpp feeds strided head/token views straight to the norm, CPY and
+        // gated-delta-net kernels rather than materializing them, and ggml-cuda
+        // consumes the strides just as ggml-metal does. Doing the same here removes
+        // ~170 CONT nodes and their copies from a 64-layer graph. Metal was already
+        // on this path; CUDA/Vulkan joined it after the outputs were checked
+        // byte-identical. TS_Q35_VERIFY_STRIDED_VIEWS=0 restores the materializing
+        // layout if a backend ever disagrees.
+        static const bool strided_views_cfg = []{
+            const char* e = std::getenv("TS_Q35_VERIFY_STRIDED_VIEWS");
+            return e == nullptr || e[0] != '0';
+        }();
+        const bool metal_strided_views = strided_views_cfg
+            && (g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CUDA);
         std::vector<ggml_tensor*> capture_out(cap_count, nullptr);
         for (int l = 0; l < num_layers; l++)
         {
@@ -1712,7 +1745,7 @@ namespace
         // mode skips the state download (it stays device-resident, updated in-place);
         // so does snapshot mode, where the caller fetches exactly one slot once it
         // knows how much of the draft the sampler accepted.
-        if (!resident_state && n_snap <= 1)
+        if (!resident_state && !defer_state)
         {
             for (int l = 0; l < num_layers; l++)
             {
@@ -1754,6 +1787,7 @@ namespace
             slot->capture_count = cap_count;
             slot->capture_out = capture_out;
             slot->n_snapshots = n_snap;
+            slot->deferred_state = defer_state;
             slot->conv_snaps.clear(); slot->delta_snaps.clear();
             slot->conv_snap_slots.clear(); slot->delta_snap_slots.clear();
             if (n_snap > 1)
@@ -1785,16 +1819,16 @@ namespace
                 slot->delta_out.push_back(lt[l].delta_state_out);
             }
             slot->lru = ++g_q35vc_clock;
-            g_q35vc_last_snap = n_snap > 1 ? slot : nullptr;
+            g_q35vc_last_snap = defer_state ? slot : nullptr;
             g_q35vc_snap_conv_bytes = convStateBytes;
             g_q35vc_snap_delta_bytes = deltaStateBytes;
             // Bound the resident persist-graph total: evict LRU entries (never the one
             // just built) so the cache never re-overcommits VRAM across many N shapes.
             q35_verify_cache_evict_to_budget(0, slot);
         }
-        else if (n_snap > 1)
+        else if (defer_state)
         {
-            // A snapshotting call that did not persist cannot be fetched from.
+            // A deferring call that did not persist cannot be committed from.
             g_q35vc_last_snap = nullptr;
         }
         clear_last_error();
@@ -1823,7 +1857,8 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
     const std::int32_t* mrope_pos, const std::int32_t* mrope_sections,
     int tp_degree, void** tp_plan_out,
     float* capture_data, const int* capture_layers, int capture_count,
-    int state_snapshots, int* state_snapshots_used, int device_state_current)
+    int state_snapshots, int* state_snapshots_used, int device_state_current,
+    int defer_state_download)
 {
     try
     {
@@ -1839,7 +1874,8 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
             lm_head_data, lm_head_type, lm_head_ne0, lm_head_ne1, lm_head_bytes,
             final_norm_data, normed_out, n_logit_rows, mrope_pos, mrope_sections,
             tp_degree, tp_plan_out, capture_data, capture_layers, capture_count,
-            state_snapshots, state_snapshots_used, device_state_current);
+            state_snapshots, state_snapshots_used, device_state_current,
+            defer_state_download);
         return r;
     }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
@@ -1936,14 +1972,20 @@ TSG_EXPORT int TSGgml_Qwen35CommitStateSnapshot(int slot, int num_recurrent_laye
     try
     {
         Q35VerifyCache* c = g_q35vc_last_snap;
-        if (c == nullptr || !c->valid || c->n_snapshots <= 1)
+        if (c == nullptr || !c->valid || !c->deferred_state)
             return 0;
-        if (slot < 0 || slot >= c->n_snapshots)
+        // slot -1 is the post-window state in the *_state_out slices, which is what a
+        // single-row step (and a fully-accepted verify with no snapshots) commits.
+        const bool from_out = slot < 0;
+        if (!from_out && (c->n_snapshots <= 1 || slot >= c->n_snapshots))
             return 0;
         if (static_cast<int>(c->conv_in.size()) != num_recurrent_layers
             || static_cast<int>(c->delta_in.size()) != num_recurrent_layers
-            || static_cast<int>(c->conv_snap_slots.size()) != num_recurrent_layers * c->n_snapshots
-            || static_cast<int>(c->delta_snap_slots.size()) != num_recurrent_layers * c->n_snapshots)
+            || static_cast<int>(c->conv_out.size()) != num_recurrent_layers
+            || static_cast<int>(c->delta_out.size()) != num_recurrent_layers
+            || (!from_out
+                && (static_cast<int>(c->conv_snap_slots.size()) != num_recurrent_layers * c->n_snapshots
+                    || static_cast<int>(c->delta_snap_slots.size()) != num_recurrent_layers * c->n_snapshots)))
         {
             set_last_error("Qwen3.5 state commit: recurrent layer count mismatch.");
             return 0;
@@ -1951,9 +1993,9 @@ TSG_EXPORT int TSGgml_Qwen35CommitStateSnapshot(int slot, int num_recurrent_laye
 
         for (int i = 0; i < num_recurrent_layers; i++)
         {
-            const int idx = i * c->n_snapshots + slot;
-            ggml_tensor* csrc = c->conv_snap_slots[idx];
-            ggml_tensor* dsrc = c->delta_snap_slots[idx];
+            const int idx = i * c->n_snapshots + (from_out ? 0 : slot);
+            ggml_tensor* csrc = from_out ? c->conv_out[i] : c->conv_snap_slots[idx];
+            ggml_tensor* dsrc = from_out ? c->delta_out[i] : c->delta_snap_slots[idx];
             if (csrc == nullptr || dsrc == nullptr || c->conv_in[i] == nullptr || c->delta_in[i] == nullptr)
                 return 0;
             // ggml_backend_tensor_copy is void and ASSERTS same-layout; the slot

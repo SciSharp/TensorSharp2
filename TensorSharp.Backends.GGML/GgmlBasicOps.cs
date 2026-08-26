@@ -2451,7 +2451,7 @@ namespace TensorSharp.GGML
             int tpDegree = 1, IntPtr[] tpPlanOut = null,
             IntPtr captureData = default, int[] captureLayers = null, int captureCount = 0,
             int stateSnapshots = 1, IntPtr stateSnapshotsUsed = default,
-            bool deviceStateCurrent = false)
+            bool deviceStateCurrent = false, bool deferStateDownload = false)
         {
             return GgmlNative.Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -2465,7 +2465,7 @@ namespace TensorSharp.GGML
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
                 tpDegree, tpPlanOut, captureData, captureLayers, captureCount, stateSnapshots,
-                stateSnapshotsUsed, deviceStateCurrent);
+                stateSnapshotsUsed, deviceStateCurrent, deferStateDownload);
         }
 
         /// <summary>Commit one recurrent-state snapshot into the live device state

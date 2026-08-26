@@ -310,16 +310,59 @@ predictable the continuation is: a free-form "explain how a GPU does a matmul"
 | Muse-Glimmer 30B IQ2_XXS | DFlash (1.6 GB) | 25.4 (1.36x) | - |
 | Muse-Glimmer 30B IQ2_XXS | DFlash2 Q4_K_M (1.6 GB) | 23.0 (1.23x) | - |
 | Muse-Glimmer 30B IQ2_XXS | DFlash2 Q8_0 (3.0 GB) | 14.1 (0.75x) | - |
-| Qwen 3.8 27B IQ3_XXS | none | 18.3 | 19.5 |
-| Qwen 3.8 27B IQ3_XXS | NextN/MTP | 19.1 (1.04x) | 32.6 (1.67x) |
-| Qwen 3.8 27B IQ3_XXS | DFlash2 Q4_K_M | 20.9 (1.14x) | 31.7 (1.63x) |
-| Qwen 3.8 27B IQ3_XXS | DFlash2 Q4_K_M, `--spec-draft 7` | 12.3 (0.67x) | 34.8 (1.78x) |
+| Qwen 3.8 27B IQ3_XXS | none | 17.9 | 17.1 |
+| Qwen 3.8 27B IQ3_XXS | NextN/MTP | 20.4 (1.14x) | 30.1 (1.76x) |
+| Qwen 3.8 27B IQ3_XXS | DFlash2 Q4_K_M | 15.3 (0.85x) | 25.8 (1.51x) |
+| Qwen 3.8 27B IQ3_XXS | DFlash2 Q4_K_M, `--spec-draft 7` | 9.8 (0.55x) | 23.5 (1.37x) |
 
-For reference, llama.cpp b10630 on the same files and card: Muse-Glimmer plain
-19.7 / DFlash 22.0; Qwen 3.8 plain 18.7 prose, 19.9 factual, and its `draft-mtp`
-25.2 prose / 38.6 factual. llama.cpp cannot load a DFlash2 drafter at all - it
-rejects the file with "wrong number of tensors; expected 81, got 58", the 23
-convolution and selector tensors it has no code for.
+The four Qwen rows are one uninterrupted sweep, so they are comparable to each
+other; the Muse-Glimmer rows are from a separate one and are not comparable to
+them in absolute terms.
+
+Treat the absolute numbers as indicative, not exact. On this laptop card a plain
+decode - which does identical work per token whatever the prompt - measured 18.7
+and 16.5 tok/s in two back-to-back runs of the same binary. Anything under about
+15% apart on a single run is noise here; the comparisons below that matter were
+all made as paired runs, alternating the configurations inside one batch.
+
+That caveat is not theoretical: an earlier revision of this page reported DFlash2
+on the prose prompt at 20.9 tok/s (1.14x), and it does not reproduce. Repeated
+paired runs put it at 0.85-0.96x - break-even at best on free-form prose - while
+the plain baseline measured beside them barely moved. The factual rows and the
+MTP rows did reproduce. Believe the ratios, re-measure before believing a
+single-run figure, and do not compare a number here against one taken on another
+day.
+
+### Against llama.cpp
+
+llama.cpp b10630 on the same files and card: Muse-Glimmer plain 19.7 / DFlash
+22.0; Qwen 3.8 plain 18.7 prose, 19.9 factual, and its `draft-mtp` 25.2 prose /
+38.6 factual. llama.cpp cannot load a DFlash2 drafter at all - it rejects the
+file with "wrong number of tensors; expected 81, got 58", the 23 convolution and
+selector tensors it has no code for.
+
+**Read the MTP row carefully, because a first pass at it was wrong.** llama.cpp
+turns thinking mode on by default for this checkpoint and TensorSharp does not,
+so the two engines were answering the same prompt with different continuations -
+and since acceptance is a property of the continuation, that comparison measured
+the text, not the engine. Matched (`--think` on both, 200 tokens, same prompt):
+
+| | tokens/accept call | acceptance | tok/s | ms/step |
+| --- | ---: | ---: | ---: | ---: |
+| llama.cpp `draft-mtp` | 3.55 | 0.856 | 38.1 | 92.8 |
+| TensorSharp `--spec` | 3.5 | 0.838 | 29.8 | 107.7 |
+
+**Drafting is at parity; the residual is per-step cost.** Both engines draft 167
+tokens over the same continuation and accept ~143 of them, so the MTP block and
+the acceptance rule are doing the same work. What is left is 15 ms per step, and
+TensorSharp's own phase counters say where it goes: a verify is 81 ms, the three
+draft calls 18 ms, and the catch-up 8 ms.
+
+That catch-up is the concrete difference. llama.cpp runs its MTP block ONCE over
+`n_accepted + 1` rows - folding the catch-up over the accepted tokens and the
+first draft step into a single call - where TensorSharp runs the catch-up and
+then a separate first `DraftStep`. Folding them is worth roughly the 8 ms, and
+is the clearest remaining item.
 
 Three things in that table are worth reading carefully.
 
@@ -331,10 +374,14 @@ WDDM paging and the trunk's own verify slows from 78 ms to 128 ms. Match the
 drafter quant to the headroom, not to the best available fidelity.
 
 **The window is a workload choice, and the default is the conservative one.**
-Qwen 3.8 defaults to 3 (see `SpecPreferredDraftWindow`). On the factual prompt a
-window of 7 is worth another 10%; on prose it is worth -40%, because a wider
-window buys verify rows that get rejected AND makes the recurrent-state
-snapshots below proportionally larger. `--spec-draft N` overrides it.
+Qwen 3.8 defaults to 3 (see `SpecPreferredDraftWindow`). Widening it to 7 costs
+9% on the factual prompt and 36% on prose, because a wider window buys verify
+rows that get rejected AND makes the recurrent-state snapshots below
+proportionally larger - ~150 MB per slot here, which on a card with no headroom
+is its own second penalty. `--spec-draft N` overrides it. (An earlier revision
+claimed a window of 7 WON by 10% on the factual prompt; that was measured before
+the state stopped round-tripping, when a wider window amortised a fixed per-step
+transfer that no longer exists.)
 
 **What the drafter proposes is only half the story on a recurrent trunk** - the
 other half is what a REJECTION costs, which is the next section.
@@ -372,15 +419,33 @@ that (`ggml_ops_qwen35_verify.cpp`, `Qwen35Model.GatedDeltaNet.cs`):
    commit only happens after the rollback decision. `SpecSnapshotRecurrentState`
    copies nothing.
 
+4. **The single-row steps stop round-tripping too.** A speculative session is
+   not all verifies: when the drafter declines to propose, the step falls
+   through to an ordinary one-row forward, and those ran the old download.
+   Each one broke the device-state chain - 151 MB down, and the *next* verify
+   had to upload it again - which on an MTP run (46 such steps out of 125) was
+   most of what was left. A one-row step's post-window state is simply the
+   `*_state_out` slices and nothing decides anything about it later, so the
+   kernel now defers it as well and the caller commits slot -1 immediately:
+   one device-to-device copy instead of 302 MB across PCIe.
+
 The measured effect on Qwen3.8-27B, DFlash2, 256 prose tokens: `rollbackMs`
 3604 -> 0, `snapshotMs` 919 -> 69, and 15.5 -> 20.9 tok/s. On the factual prompt
-24.3 -> 31.7. Output is unchanged: the same greedy continuation, byte-identical
-to plain decoding and to the old restore-and-re-forward path.
+24.3 -> 31.7. Deferring the one-row steps (4) is worth a further 5-20% on top,
+paired-run: DFlash2 factual 22.0 -> 27.1, MTP prose 19.1 -> 21.4.
 
-`TS_Q35_VERIFY_SNAPSHOTS=0` restores the old path (it is also what a shape the
-kernel will not persist falls back to, automatically). The cost of the snapshots
-is VRAM: the GDN op's output grows by one state per slot, ~150 MB per slot for
-this model across all 48 recurrent layers, which is the other reason the default
+Output is unchanged - in fact it is *more* exactly unchanged than before.
+Committing on the device is a raw copy of the tensor the graph produced, where
+the host round trip went through the state's unpack-and-repack; on the factual
+prompt the device path reproduces plain decoding byte for byte while the host
+path drifted in the last few tokens.
+
+`TS_Q35_VERIFY_SNAPSHOTS=0` restores the old path entirely, and
+`TS_Q35_VERIFY_DEFER_STATE=0` keeps the snapshots but restores the download, so
+the two halves can be measured apart. Either is also what a shape the kernel
+will not persist falls back to, automatically. The cost of the snapshots is
+VRAM: the GDN op's output grows by one state per slot, ~150 MB per slot for this
+model across all 48 recurrent layers, which is the other reason the default
 window is 3 rather than 8.
 
 ## Where n-gram pays

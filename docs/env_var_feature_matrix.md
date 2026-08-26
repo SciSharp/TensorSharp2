@@ -188,6 +188,9 @@ A/B switch, plus long-context sizing knobs. None are registered in
 | `TS_DFLASH_CONV` | DFlash2 drafter | `0` drops the grouped dynamic convolution (attribution only, as above) | ON | not registered | no |
 | `TS_DFLASH_SELECTOR_DEBUG` | DFlash2 drafter (per-op path) | `1` prints the first blocks' lattice attribution: unary spread, transition spread, and whether the walk left the unary argmax | OFF | not registered | no |
 | `TS_Q35_VERIFY_SNAPSHOTS` | Qwen 3.5 / 3.8 speculative verify | `0` reverts to restoring a pre-verify recurrent-state copy and re-forwarding the accepted prefix instead of keeping one snapshot per row | ON | not registered | no |
+| `TS_Q35_VERIFY_DEFER_STATE` | Qwen 3.5 / 3.8 speculative verify | `0` downloads the post-window recurrent state after every persisted call instead of leaving it on the device for a slot commit; separable from the snapshots because it also covers the single-row steps a speculative session interleaves with verifies | ON | not registered | no |
+| `TS_Q35_VERIFY_STRIDED_VIEWS` | Qwen 3.5 / 3.8 speculative verify | `0` disables the contiguous strided KV views on CUDA and Metal, falling back to per-head `set_rows` writes | ON | not registered | no |
+| `TS_Q35_MTP_DRAFT_PERSIST` | Qwen 3.5 / 3.8 MTP draft graph | `1` lets the single-layer MTP draft graph use the persist/replay cache. Default off: the graph used to deadlock on CUDA-graph capture replay, and the knob exists to re-test that on a current ggml. Worth ~1% | OFF | not registered | no |
 
 ## Out-of-Matrix GLM 5.x (`glm-dsa`) Knobs
 

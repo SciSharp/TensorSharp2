@@ -1734,6 +1734,13 @@ namespace TensorSharp.Models
         private static readonly bool _fvSnapshotsEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_Q35_VERIFY_SNAPSHOTS"), "0", StringComparison.Ordinal);
 
+        /// Leave the post-window recurrent state on the device and commit it there,
+        /// instead of downloading 151 MB and uploading it again next call. Separable
+        /// from the snapshots themselves because it is the part that also applies to
+        /// the single-row plain steps a speculative session interleaves with verifies.
+        private static readonly bool _fvDeferStateEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q35_VERIFY_DEFER_STATE"), "0", StringComparison.Ordinal);
+
         internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1, int rowOffset = 0,
             float[] captureData = null, int[] captureLayers = null)
         {
@@ -2008,6 +2015,15 @@ namespace TensorSharp.Models
             // asking for N snapshots there would size the graph for nothing.
             int requestedSnapshots = (_fvSnapshotsEnabled && !residentThisCall && nLogitRows <= 0 && seqLen > 1)
                 ? seqLen : 1;
+            // Defer the state download on every call the kernel will persist - the
+            // all-rows verify AND the single-row plain steps a speculative session
+            // interleaves with it. Those plain steps used to break the device-state
+            // chain: each one downloaded 151 MB and forced the NEXT verify to upload
+            // it again, which on an MTP run (46 plain steps of 125) was most of the
+            // gap to the captured decode. A prefill chunk (0 < nLogitRows < seqLen)
+            // is not persisted and keeps the host path.
+            bool deferState = _fvSnapshotsEnabled && _fvDeferStateEnabled && !residentThisCall
+                && (nLogitRows <= 0 || seqLen == 1);
             int snapshotsUsed = 1;
             // The live state is already correct on the device exactly when the last
             // step committed a snapshot into it and nothing has drained it since.
@@ -2039,7 +2055,8 @@ namespace TensorSharp.Models
                     captureCount: capCount,
                     stateSnapshots: requestedSnapshots,
                     stateSnapshotsUsed: (IntPtr)(&snapshotsUsed),
-                    deviceStateCurrent: deviceStateCurrent);
+                    deviceStateCurrent: deviceStateCurrent,
+                    deferStateDownload: deferState);
             }
             if (!ok2)
             {
@@ -2059,6 +2076,25 @@ namespace TensorSharp.Models
                 _fvSnapshotRows = seqLen;
                 _fvStateResident = false;
                 _kvCacheHostDirty = true;
+                return true;
+            }
+
+            if (snapshotsUsed == 0)
+            {
+                // Deferred with no snapshots: a single-row step, whose post-window
+                // state is simply the *_state_out slices. Nothing decides anything
+                // about it later, so commit it now - one device-to-device copy
+                // instead of 151 MB down here and 151 MB back up next call.
+                _fvDeviceStateCurrent = false;
+                _fvSnapshotRows = 0;
+                _fvStateResident = false;
+                _kvCacheHostDirty = true;
+                if (!CommitRecurrentStateSnapshot(-1))
+                {
+                    throw new InvalidOperationException(
+                        "Qwen3.5 verify deferred its recurrent state but it could not be committed; "
+                        + "the host mirror is stale. Set TS_Q35_VERIFY_SNAPSHOTS=0 to fall back.");
+                }
                 return true;
             }
 
@@ -2188,6 +2224,8 @@ namespace TensorSharp.Models
         /// this step nor the next pays the ~300 MB round trip. Falls back to pulling
         /// the slot into the host mirrors when the device commit is unavailable.
         /// </summary>
+        /// <param name="slot">Tokens back from the end of the verified batch, or -1
+        /// for the post-window state (what a single-row step commits).</param>
         private unsafe bool CommitRecurrentStateSnapshot(int slot)
         {
             if (!PrepareRecurrentStatePointers())
@@ -2200,8 +2238,13 @@ namespace TensorSharp.Models
                 return true;
             }
 
-            if (!GgmlBasicOps.Qwen35FetchStateSnapshot(slot, _fvSnapConvPtrs, _fvSnapDeltaPtrs,
-                    _fvRecurrentLayers.Length))
+            // The device commit is unavailable; fall back to pulling the slot into the
+            // host mirrors. There is no host fallback for slot -1 (the caller only
+            // asks for it when the kernel said it deferred, which implies a live
+            // entry), so report failure rather than read a slot that is not there.
+            if (slot < 0
+                || !GgmlBasicOps.Qwen35FetchStateSnapshot(slot, _fvSnapConvPtrs, _fvSnapDeltaPtrs,
+                        _fvRecurrentLayers.Length))
             {
                 return false;
             }
