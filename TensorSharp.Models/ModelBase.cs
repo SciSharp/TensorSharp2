@@ -83,6 +83,30 @@ namespace TensorSharp.Models
             _ownerToken = ownerToken;
         }
 
+        /// <summary>
+        /// A non-owning view over ONE expert of a stacked expert tensor
+        /// (<c>ffn_gate_exps</c> and friends), so a model whose GGUF stacks its
+        /// experts can still drive the per-expert linear paths that unstacked files
+        /// get for free. The view borrows the stack's buffer - it must not free it -
+        /// and holds the stack as its owner token so the memory outlives it.
+        /// </summary>
+        public static QuantizedWeight CreateExpertView(StackedExpertWeights stacked, int expert)
+        {
+            if (stacked == null)
+                throw new ArgumentNullException(nameof(stacked));
+            if (expert < 0 || expert >= stacked.NumExperts)
+                throw new ArgumentOutOfRangeException(nameof(expert));
+
+            return new QuantizedWeight(
+                stacked.Data + (nint)(expert * stacked.PerExpertRawBytes),
+                stacked.PerExpertRawBytes,
+                stacked.GgmlType,
+                stacked.PerExpertNe0,
+                stacked.PerExpertNe1,
+                ownsBuffer: false,
+                ownerToken: stacked);
+        }
+
         public void Dispose()
         {
             ReleaseHostData();
@@ -6315,6 +6339,9 @@ namespace TensorSharp.Models
                 "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),
                 "muse-glimmer" or "muse_glimmer" => new MuseGlimmerModel(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 "deepseek4" => new DeepSeek4Model(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
+                // Qwen3.8-Flash-Next: hyper-connections, PLE n-gram embeddings, Qwen
+                // Sparse Attention and Gated DeltaNet over a 512-expert MoE.
+                "qwen4exp" => new Qwen4ExpModel(ggufPath, backend, tpDegree, tpGroup),
                 // GLM-5.x with DeepSeek Sparse Attention (MLA + lightning indexer + sigmoid MoE).
                 "glm-dsa" or "glm_dsa" => new GlmDsaModel(ggufPath, backend, tpDegree, tpGroup),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),

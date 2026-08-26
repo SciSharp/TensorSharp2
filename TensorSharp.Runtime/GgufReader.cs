@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -523,6 +523,31 @@ namespace TensorSharp.Runtime
         {
             if (!Metadata.TryGetValue(key, out var v)) return null;
             if (v is bool[] ba) return ba;
+            return null;
+        }
+
+        /// <summary>
+        /// A UINT64 metadata array. Used by the qwen4exp PLE n-gram hash, whose
+        /// multipliers and per-head vocabulary sizes are 64-bit by construction -
+        /// the hash multiplies token ids by ~2^44 constants and takes the result
+        /// modulo a ~20 M row count, so nothing narrower carries it.
+        /// </summary>
+        public ulong[]? GetUint64Array(string key)
+        {
+            if (!Metadata.TryGetValue(key, out var v)) return null;
+            if (v is ulong[] ua) return ua;
+            if (v is uint[] u32)
+            {
+                var result = new ulong[u32.Length];
+                for (int i = 0; i < u32.Length; i++) result[i] = u32[i];
+                return result;
+            }
+            if (v is long[] i64)
+            {
+                var result = new ulong[i64.Length];
+                for (int i = 0; i < i64.Length; i++) result[i] = (ulong)i64[i];
+                return result;
+            }
             return null;
         }
 

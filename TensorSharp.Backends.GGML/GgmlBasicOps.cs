@@ -2911,7 +2911,7 @@ namespace TensorSharp.GGML
             Tensor alpha, Tensor beta,
             Tensor state, Tensor gatedOut,
             IntPtr dtBiasData, IntPtr aLogData, IntPtr ssmNormWData,
-            int chunkSize, float eps)
+            int chunkSize, float eps, int gateMode = 0)
         {
             if (q == null || k == null || v == null || z == null
                 || alpha == null || beta == null || state == null || gatedOut == null)
@@ -2935,7 +2935,7 @@ namespace TensorSharp.GGML
                 qView, kView, vView, zView,
                 alphaView, betaView, stateView, gatedOutView,
                 dtBiasData, aLogData, ssmNormWData,
-                chunkSize, eps);
+                chunkSize, eps, gateMode);
         }
 
         /// <summary>

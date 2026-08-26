@@ -3809,7 +3809,8 @@ internal enum GgmlIndexReductionOp
             IntPtr aLogData,
             IntPtr ssmNormWData,
             int chunkSize,
-            float eps);
+            float eps,
+            int gateMode);
 
         // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; same 32-byte
         // POD layout on 64-bit (two ints, two padding ints, two pointers).
@@ -5564,12 +5565,13 @@ internal enum GgmlIndexReductionOp
             IntPtr aLogData,
             IntPtr ssmNormWData,
             int chunkSize,
-            float eps)
+            float eps,
+            int gateMode = 0)
         {
             CheckResult(TSGgml_GatedDeltaNetChunkedF32(
                 q, k, v, z, alpha, beta, state, gatedOut,
                 dtBiasData, aLogData, ssmNormWData,
-                chunkSize, eps), "gated_delta_net_chunked");
+                chunkSize, eps, gateMode), "gated_delta_net_chunked");
         }
 
         // Batched per-token Nemotron Mamba2 step. Runs all (seq, token) pairs
