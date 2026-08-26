@@ -14,7 +14,7 @@
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
 | Batched / paged forward | **Default ON** — set `TS_QWEN35_BATCHED=0` (or `--no-continuous-batching`) to force the legacy per-sequence KV-swap path for A/B comparison. Includes a per-slot GatedDeltaNet recurrent-state pool and optional native batched GDN kernel (`TS_QWEN35_BATCHED_GDN_NATIVE=1`). See §11. |
-| MTP speculative decoding | Qwen 3.6 — NextN draft block embedded in the trunk GGUF (no separate file; MTP-retaining GGUFs only, see [Downloads](#downloads)); engage with the server flag `--mtp-spec`. GDN recurrent-state snapshot/rollback on partial accept. Engages for solo (non-concurrent) sequences whenever the GGUF retains the NextN block. See §12. |
+| MTP speculative decoding | Qwen 3.6 — NextN draft block embedded in the trunk GGUF (no separate file; MTP-retaining GGUFs only, see [Downloads](#downloads)); engage with `--spec` on **either host** — `TensorSharp.Cli` and `TensorSharp.Server` share [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs), and `--mtp-spec` is an accepted alias. GDN recurrent-state snapshot/rollback on partial accept. Engages for solo (non-concurrent) sequences whenever the GGUF retains the NextN block. See §12. |
 | Output parser | `Qwen35OutputParser` (inherits `Qwen3OutputParser`) |
 
 ## Downloads
@@ -32,8 +32,9 @@ name their projector `mmproj-F16.gguf`, so they must not share a directory):
 > `nextn_predict_layers`) is retained **only** in the GGUFs from
 > `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`. The base-repo
 > [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
-> files (same file names) strip it — on those, `--mtp-spec` silently falls back
-> to standard decode.
+> files (same file names) strip it — on those, `--spec` silently falls back
+> to standard decode (`--spec-type ngram` still works there, since it needs no
+> trained drafter weights).
 
 The conversion cards identify the corresponding official Qwen repositories as
 their base models; those upstream cards declare Apache-2.0.
@@ -56,12 +57,19 @@ printf '%s\n' 'Describe this image.' > prompt.txt
 dotnet run --project TensorSharp.Cli -c Release -- --model models/qwen3.5-9b/Qwen3.5-9B-UD-Q4_K_XL.gguf --mmproj models/qwen3.5-9b/mmproj-F16.gguf --input prompt.txt --image photo.png --max-tokens 512
 ```
 
-Server MTP demo (`--mtp-spec` and the other `--mtp-*` flags exist **only on
-TensorSharp.Server** — `TensorSharp.Cli` has no MTP flags; on the CLI, MTP is
-reachable only via the `TS_MTP_*` env vars):
+MTP demo. `--spec` and the rest of the `--spec-*` family are parsed by the same
+[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)
+on **both hosts**, so `TensorSharp.Cli` and `TensorSharp.Server` cannot drift on
+names, validation or defaults; the older `--mtp-*` spellings are accepted
+aliases. They have to be on the command line that *loads* the model, because
+`--spec-draft` also sizes the native graph cache at load time:
 
 ```bash
-dotnet run --project TensorSharp.Server -c Release -- --model models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --mtp-spec
+# server
+dotnet run --project TensorSharp.Server -c Release -- --model models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --spec
+
+# CLI — speculation engages on --input, --input-jsonl, --multi-turn-jsonl and --interactive
+dotnet run --project TensorSharp.Cli -c Release -- --model models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --spec --spec-draft 4 --input prompt.txt --max-tokens 512
 ```
 
 ## 1. Origin and intent
@@ -757,18 +765,19 @@ before the per-layer loop, exactly as in the legacy forward.
 ## 12. MTP / NextN speculative decoding (Qwen 3.6)
 
 Qwen 3.6 GGUFs can ship a **NextN / multi-token-prediction (MTP) draft block** that
-`TensorSharp.Server` uses for lossless speculative decoding on solo (non-concurrent)
+both hosts use for lossless speculative decoding on solo (non-concurrent)
 sequences. Of the public conversions, only
 [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
 retains the block (see [Downloads](#downloads)); GGUFs without it silently serve
 standard decode. Source:
-[`Qwen35Model.Mtp.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.Mtp.cs),
+[`Qwen35Model.Speculative.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.Speculative.cs),
 driven through the shared
-[`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs)
-draft / verify / rollback core. Unlike Gemma 4, no separate draft GGUF is needed —
-the block is embedded in the trunk file, so `--mtp-draft-model` is not used
-(explicitly passing one that cannot be activated on the startup model is a
-fail-fast startup error).
+[`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
+draft / verify / rollback core — the `draft-head` algorithm of the pluggable
+`--spec-type` layer, not a Qwen-specific loop. Unlike Gemma 4, no separate draft
+GGUF is needed — the block is embedded in the trunk file, so `--spec-draft-model`
+(alias `--mtp-draft-model`) is not used (explicitly passing one that cannot be
+activated on the startup model is a fail-fast startup error).
 
 ### 12.1 Embedded NextN block
 
@@ -800,17 +809,25 @@ On the CUDA backend the snapshot is taken device-side to avoid host round-trips.
 
 ### 12.3 Profitability and tuning
 
-Speculation is off by default; enable with the **server** flag `--mtp-spec` (env
-`TS_MTP_SPEC=1`; `TensorSharp.Cli` has no MTP flags). It
-engages on solo (non-concurrent) sequences whenever the loaded GGUF retains the
-NextN block; on GGUFs without it the engine silently serves standard decode.
-`--mtp-draft` (default `8`) bounds the
-draft window and `--mtp-pmin` (default `0.75`) is the minimum draft confidence to
-keep a token. On `ggml_cuda`, the GDN chunked-prefill kernel also speeds the
-speculative verify: measured on Qwen3.6-27B IQ2_XXS it cut MTP speculative-verify
-decode from 217 to 174 ms/token (see §8, `GDN_CHUNK_PREFILL_MIN_SEQ_LEN`). See the
-[MTP / speculative decoding](../../FEATURES.md#mtp--nextn-speculative-decoding) for the full
-flag list.
+Speculation is off by default; enable with `--spec` (env `TS_SPEC`, or the legacy
+`TS_MTP_SPEC=1` the native loader reads) on **either** `TensorSharp.Cli` or
+`TensorSharp.Server` — [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)
+is shared by both hosts, and `--mtp-spec` is an accepted alias. It engages on solo
+(non-concurrent) sequences whenever the loaded GGUF retains the NextN block; on
+GGUFs without it the engine silently serves standard decode.
+`--spec-draft` (alias `--mtp-draft`, range 1-64, default `8`) bounds the draft
+window and also sizes the native graph cache at load, so it belongs on the same
+command line as `--spec`; `--spec-pmin` (alias `--mtp-pmin`, default `0.75` for a
+per-token head — top-1 probability over its top-10 logits) is the minimum draft
+confidence to keep a token. `--spec-type draft-head` pins this path explicitly;
+`auto` (the default) already selects it from the checkpoint. On `ggml_cuda`, the
+GDN chunked-prefill kernel also speeds the speculative verify: measured on
+Qwen3.6-27B IQ2_XXS it cut MTP speculative-verify decode from 217 to 174 ms/token
+(see §8, `GDN_CHUNK_PREFILL_MIN_SEQ_LEN`). See
+[Speculative decoding](../../FEATURES.md#speculative-decoding) for the full flag
+list and the other three algorithms — including `--spec-type ngram`, which needs
+no trained weights at all and therefore also runs on the Qwen 3.5 checkpoints that
+ship no draft block.
 
 ## 13. Output parser and chat template
 

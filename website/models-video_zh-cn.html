@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>视频生成 — TensorSharp 维基</title>
-  <meta name="description" content="Wan 2.1 / 2.2 文生视频与图生视频：下载、运行示例，以及决定一段视频是几分钟还是几小时的检查点选择。">
+  <meta name="description" content="MiniMax-H3 在同一个打包潜变量里同时生成视频与原生 32 kHz 立体声音频——首尾帧、参考图、参考片段与参考音轨；Wan 2.1 / 2.2 只生成视频。下载、运行示例，以及决定端到端耗时的设置。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -14,13 +14,13 @@
 <body data-page="models-video">
 <a class="skip" href="#content">跳到正文</a>
 <main class="content" id="content">
-  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › <a href="models_zh-cn.html">支持的模型</a> › 视频生成（Wan 2.1 / 2.2）</div>
-  <h1>视频生成（Wan 2.1 / 2.2）</h1>
-  <p class="lede">Wan 把提示词——在 Wan 2.2 检查点上还可以加一张首帧图像——变成 H.264 MP4。本页包含下载、运行示例，以及决定端到端耗时的设置。</p>
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › <a href="models_zh-cn.html">支持的模型</a> › 视频生成</div>
+  <h1>视频生成</h1>
+  <p class="lede">两个家族：<strong>MiniMax-H3</strong> 在生成视频的同时生成原生立体声音轨，<strong>Wan 2.1 / 2.2</strong> 只生成视频。本页包含下载、运行示例，以及决定端到端耗时的设置。</p>
   <div class="callout note"><div class="ic">💡</div><p>这些命令遵循与文本模型示例相同的约定：Hugging Face CLI、从仓库根目录源码构建，并把 <code>--backend</code> 换成与你硬件匹配的值。参见<a href="models-text_zh-cn.html#download-run">按家族下载与运行</a>。</p></div>
 
-    <h2 id="minimax-h3">MiniMax-H3（提示词 → 视频<em>带音频</em>）</h2>
-  <p>H3 在<strong>同一个</strong>打包潜变量里对视频和 32&nbsp;kHz 立体声音频一起去噪，所以音轨是模型输出的一部分，而不是事后配上去的。它是 CFG 蒸馏模型，必须用 <code>--cfg 1.0</code>，4–8 步是常用工作点。需要四个文件，来自两个仓库：</p>
+  <h2 id="minimax-h3">MiniMax-H3（提示词 → 视频<em>带音频</em>）</h2>
+  <p>H3 在<strong>同一个</strong>打包潜变量里对视频和 32&nbsp;kHz 立体声音频一起去噪，所以音轨是模型输出的一部分，而不是事后配上去的。它是 CFG 蒸馏模型，必须用 <code>--cfg 1.0</code>，4–8 步是常用工作点（默认 20 步）。在 M5 Pro 上用 <code>ggml_metal</code>、22 帧、8 步、同一随机种子实测：256×256 比 <code>stable-diffusion.cpp</code> 快 <strong>2.4×</strong>（49.3 s → <strong>20.9 s</strong>），640×384 快 <strong>1.7×</strong>（108.5 s → <strong>63.1 s</strong>）。需要四个文件，来自两个仓库：</p>
   <pre data-lang="bash"><code># 去噪器 + 文本编码器
 hf download unsloth/MiniMax-H3-GGUF minimax_h3_fl2va_pruned-Q4_K.gguf --local-dir models
 hf download unsloth/MiniMax-H3-GGUF qwen3vl_32b_minimax_h3-Q4_K_M.gguf --local-dir models
@@ -35,8 +35,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_p
     --backend ggml_metal --prompt "a red fox trotting through falling snow, cinematic" \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output fox.mp4</code></pre>
 
+  <p>也可以把四个网络都写进配置文件，让第一次运行自动下载——<code>config/minimax-h3-fl2va.json</code> 用于关键帧，<code>config/minimax-h3-ref2va.json</code> 用于参考。两者只有 <code>model</code> 一项不同，因此文本编码器与两个 VAE 只下载一次并共用（总计约 33.5 GB）。上面那对分词器文件是自动下载唯一补不上的东西，因为它不是一个命令行选项：</p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/minimax-h3-ref2va.json</code></pre>
+
   <h3 id="h3-modes">一张图代表什么</h3>
   <p>一张图对 H3 有两种<strong>完全不同</strong>的含义，而且用<strong>不同的检查点</strong>。不指定时会自动推断，<code>--video-mode</code> 用于显式声明。</p>
+  <div class="table-scroll">
   <table>
     <thead><tr><th>你想要什么</th><th><code>--video-mode</code></th><th>检查点</th></tr></thead>
     <tbody>
@@ -47,6 +53,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_p
       <tr><td>只有文本</td><td><code>t2v</code></td><td>都可以</td></tr>
     </tbody>
   </table>
+  </div>
+  <p>两个去噪器是<em>不同的文件</em>而不是一个开关，而且各自会指名拒绝对方的输入：在 FL2VA 上要求 <code>ref</code>，报错会告诉你去加载 <code>minimax_h3_ref2va_pruned-*.gguf</code>；在 Ref2VA 上把 <code>--image</code>/<code>--end-image</code> 当关键帧传，报错会告诉你去加载 FL2VA 那个文件，或者改用 <code>--ref-image</code> 传这张图。关键帧与显式参考同时出现时会被直接拒绝，而不是悄悄丢掉其中一个——一段看起来"照做了"的视频才是更糟的失败。用的是哪个分区由<em>文件名</em>决定：名字里含 <code>ref2va</code>（不区分大小写）即选择参考条件路径，重命名或重新量化时请把它保留下来。</p>
   <pre data-lang="bash"><code># 让照片动起来：它成为第一帧
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
     --backend ggml_metal --image portrait.jpg \
@@ -64,10 +72,43 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_
     --backend ggml_metal --ref-image person.jpg --ref-image bottle.png \
     --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 --output rooftop.mp4</code></pre>
-  <p>最多九张 <code>--ref-image</code>。参考图只会被缩小并保持自身宽高比，输出画布仍由 <code>--width</code>/<code>--height</code> 决定。在 Ref2VA 检查点上，普通的 <code>--image</code> 同样会被当作参考图，因此只会"上传一张图"的客户端（包括 Web UI）无需改动即可使用。参考也可以是视频片段（<code>--ref-video</code>，视频文件或帧目录）或音频（<code>--ref-audio</code>）；视频自带的声音用 <code>--ref-video-audio</code> 按位置配对单独给出，因为容器里的音轨无法通过帧解码器读取。参考视频是 H3 最昂贵的输入——22 帧 448&times;320 的参考会在输出所需的 1680 个 token 之外再加 980 个条件 token。</p>
-  <div class="callout note"><div class="ic">💡</div><p>宽高向上取整到 32 的倍数，帧数向上对齐到 <code>17k+5</code> 网格（5、22、39…），fps 固定 24。音频写成独立的 <code>.wav</code>；用 <code>ffmpeg -i out.mp4 -i out.wav -c:v copy -c:a aac final.mp4</code> 合并。完整说明见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3_zh-cn.md">MiniMax-H3 模型卡</a>。</p></div>
+  <p>参考图只会被缩小并保持自身宽高比，输出画布仍由 <code>--width</code>/<code>--height</code> 决定。在 Ref2VA 检查点上，普通的 <code>--image</code> 会被当作单张参考，因此只会"上传一张图"的客户端（包括 Web UI）无需改动即可使用。</p>
 
-  <h2 id="wan">n 2.1 / 2.2（提示词 → 视频、图像 → 视频）</h2>
+  <h3 id="h3-references">参考：静图、片段与音轨</h3>
+  <p>最多 <strong>九个</strong>参考，可以任意混搭。<code>--ref-image</code> 是静图，提示词里按位置称作 <code>&lt;Picture 1&gt;</code>、<code>&lt;Picture 2&gt;</code>……；<code>--ref-video</code> 是片段——视频文件或帧目录——会被重采样到 H3 自己的 24 fps 与自己的画布，称作 <code>&lt;Video 1&gt;</code>、<code>&lt;Video 2&gt;</code>……；<code>--ref-audio</code> 是音轨，重采样到音频 VAE 的 32 kHz 立体声并截断到所生成片段的时长。片段自带的声音要用 <code>--ref-video-audio</code> 单独给出，<em>按位置</em>与 <code>--ref-video</code> 配对，因为容器里的音轨无法通过帧解码器读取。</p>
+  <pre data-lang="bash"><code># 一个参考片段，外加它自己的音轨
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --ref-video walk.mp4 --ref-video-audio walk.wav \
+    --prompt "the same woman walks along a beach at sunset, wide shot, waves behind her" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 --output beach.mp4
+
+# 一张静图，加一段独立音轨
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --ref-image singer.jpg --ref-audio song.wav \
+    --prompt "she performs on a small club stage under a single spotlight" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 --output stage.mp4</code></pre>
+  <p>每个参考都是<em>同一条</em>打包序列里的额外 token，因此去噪器这边的开销是线性的、也容易预估：640×384 的参考是 240 个 token，576×448 的是 252 个；在 RTX 3080 Laptop 上对 640×384、22 帧的片段实测，单个去噪步从没有参考时的 4.37 s 变成八个参考时的 9.38 s——大约<strong>每个参考每步 626 ms</strong>，从一个到八个基本恒定。超过大约四个参考之后，主导的就变成 <strong>Qwen3-VL 那一趟，而不是去噪器</strong>：每个参考会给提示词加上约 250 个视觉占位 token，而这条提示词要过完整 50 层——两个参考是 548 token 的提示词，八个就是 2086，文本条件从约 65 s 涨到约 447 s，而整个 8 步去噪只要约 75 s。与其减少步数，不如先减少参考数量、提高参考质量。</p>
+  <p>参考<em>片段</em>是 H3 最昂贵的输入：22 帧 448×320 的参考会在输出本身所需的 1680 个 token 之外再加 980 个条件 token，而且 VAE 还得先把这 22 帧全部编码——在 M5 Pro 上实测，编码 14 s，之后每个去噪步约 9 s，而不带参考时只要 5 s。语言模型以 2 fps、每次两帧的方式看这段片段；去噪器则以潜变量的形式看到全部内容。</p>
+
+  <h3 id="h3-length">长度、尺寸，以及长片段的上限</h3>
+  <p>宽高向<strong>上</strong>取整到 32 的倍数。帧数向上对齐到 <code>17k+5</code> 网格——5、22、39、56、73、90……——这来自视频 VAE 的时间分块，而不是随意选定的；fps 无论请求写什么都固定为 24。任意网格长度的片段都能正确解码：VAE 每次跑 5 个潜变量帧、带 2 帧前瞻，并对接缝做交叉淡化。反过来，一次性解码长片段会让细节被逐渐冲淡——对着条件照片测量，第 0 帧的相关度从 22 帧时的 0.97 掉到 90 帧时的 0.86——所以分块是正确性要求，而不是优化。只想要画面时用 <code>--no-audio</code> 跳过音频解码，省下音频 VAE 的时间与内存。</p>
+  <div class="callout warn"><div class="ic">⚠️</div><p><strong>长片段过去会整片全黑。</strong>H3 在一条不加掩码的打包序列上做双向注意力，因此它的 key 数量就是整段片段——22 帧是 2364 个 token，107 帧是 8646——而所有内置的 ggml flash attention 内核都把 softmax 分子保持在 FP16，只留三个比特的余量。107 帧的片段在第一个去噪步就溢出成 NaN，回来时每个像素全黑、每个音频采样被削平，而同一条请求在 73 帧下却完全正常。现在 <code>h3_attend</code> 会按 key 数量取一个 2 的幂预先缩放 V，并在输出上还原——由于注意力对 V 是线性的，这一步是精确的；采样器也不再保存已经发散的片段，而是让请求失败并指出是哪一步，不再写出一个全黑文件。设 <code>TS_H3_TRACE=1</code> 可打印每一步的潜变量与速度幅值。</p></div>
+  <div class="callout note"><div class="ic">💡</div><p>音频写成 MP4 旁边的 <code>.wav</code> 独立文件，而不是混流进去，因为混流需要一个未必装了的编码器；用 <code>ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4</code> 合并。完整说明见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3_zh-cn.md">MiniMax-H3 模型卡</a>。</p></div>
+
+  <h3 id="h3-server">部署到服务端</h3>
+  <p>在服务端，尺寸是<strong>启动参数</strong>，因为浏览器不会自己发尺寸：<code>--video-width 640 --video-height 384 --video-steps 20</code> 是文档给出的起点（<code>--width</code> / <code>--height</code> 是别名；只给其中一个时，H3 会从条件图像的宽高比推出另一个）。<code>--video-mode</code> 用于给只提供一种模式的部署固定条件模式；不写它，则每条请求各自推断，通常这才是你想要的。<code>--video-frames</code>、<code>--fps</code>、<code>--video-vae</code>、<code>--video-text-encoder</code> 与 <code>--audio-vae</code> 补齐其余部分。服务端完全没有 <code>--cfg</code>，这也是随仓库提供的配置既不设步数也不设引导的原因。</p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+
+curl -s http://localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
+  "prompt": "a red fox trotting through falling snow, cinematic",
+  "width": 640, "height": 384, "frames": 22, "steps": 8, "cfg": 1.0,
+  "imagePath": "card.jpeg", "videoMode": "i2v"
+}'</code></pre>
+  <p>有三条路由接收这个请求体：<code>POST /api/video-generate</code>、<code>POST /api/video-generate/stream</code>（同样的东西，外加 SSE 进度事件）以及 OpenAI 形状的 <code>POST /v1/videos/generations</code>。三者共用同一个解析器，因此 <code>videoMode</code>、<code>generateAudio</code>、<code>endImage</code>、<code>referenceImages</code>、<code>referenceVideos</code>、<code>referenceAudios</code> 与 <code>referenceVideoAudios</code> 在三条路由上都可用，并且各自还接受下划线写法；<code>referenceVideoAudios</code> 按下标与 <code>referenceVideos</code> 配对。响应里带 <code>audioUrl</code>（OpenAI 路由上是 <code>audio_url</code>），模型没有产生音轨时为 null。所有文件字段都必须指向此前通过 <code>/api/upload</code> 上传的文件，并被限制在上传目录之内。模型层面的拒绝（加载了错误的检查点、关键帧与参考混用）会以 <strong>400 加上模型自己的报错信息</strong>返回，而不是笼统的 500。</p>
+  <p><code>GET /api/models</code> 会返回一个 <code>video</code> 对象——非视频模型一律为 null——其中包含 <code>family</code>（<code>minimax-h3</code>）、<code>supportsAudio</code>、<code>supportsImageConditioning</code>、<code>supportsEndImageConditioning</code>、<code>supportsReferenceConditioning</code> 与 <code>maxReferenceImages</code>。Web UI 正是靠它判断该不该提供首帧、尾帧，或最多九个参考：它根据 <code>supportsReferenceConditioning</code> 启用参考附件控件，并在 <code>maxReferenceImages</code> 处停止添加，而不是去匹配架构字符串。</p>
+
+  <h2 id="wan">Wan 2.1 / 2.2（提示词 → 视频、图像 → 视频）</h2>
   <p><strong>请下载 Turbo 版 DiT，而不是基础版。</strong>基础的 <code>Wan2.2-TI2V-5B</code> 走官方的 50 步 × CFG 配方，也就是每段视频 100 次 DiT 前向；同一模型的步数蒸馏 Turbo 版本经过训练可在无引导的 4 步内完成，TensorSharp 会从文件名识别出来，于是同一条请求<strong>从数小时变成数分钟</strong>。Turbo 仓库只提供 DiT，VAE 与文本编码器仍从基础仓库获取：</p>
   <pre data-lang="bash"><code># 快车道：DiT 前向 4 次而不是 100 次。注意 “Wan2_2” 用的是下划线。
 hf download hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --local-dir models
@@ -110,7 +151,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --output out.mp4 --backend ggml_cuda</code></pre>
   <div class="callout tip"><div class="ic">⚡</div><p><strong>请在 Wan 训练过的分辨率上生成。</strong>Wan 的训练分辨率是 480p（832×480）与 720p（1280×704），TI2V-5B 原生就是 720p 模型。低于约 0.3 MP 时 DiT 已经超出分布，无论花多少步，画面都会发糊、不稳定并出现偏色——低于该阈值时流水线会给出警告。请先在受支持的分辨率上生成，再缩小，而不是直接生成小尺寸。</p></div>
 
-  <h2 id="video">视频生成（Wan 2.1 / 2.2）</h2>
+  <h2 id="video">Wan 的伴随文件、成本与分辨率</h2>
   <p>Wan 把<strong>提示词</strong>——在 Wan 2.2 检查点上还可以加一张<strong>上传的首帧图像</strong>——变成 H.264 MP4。<code>--model</code> 指定的 GGUF 只是 DiT，TensorSharp 会在其旁边解析两个伴随文件（放在 <code>VAE/</code>、<code>HighNoise/</code> 或 <code>LowNoise/</code> 子目录中同样可以）：</p>
   <ul>
     <li><strong>UMT5-XXL 文本编码器</strong> —— 提示词 → 条件向量（<code>--video-text-encoder</code> / <code>TS_WAN_TE</code>）。去噪开始前即从显存释放。</li>

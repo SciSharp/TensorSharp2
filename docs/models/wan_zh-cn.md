@@ -7,6 +7,12 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 （Wan 2.2 模型可再加一张首帧图片），输出 H.264 MP4，`TensorSharp.Cli` 与
 `TensorSharp.Server`（OpenAI 风格 API + 自带 Web UI 聊天）均可驱动。
 
+> **Wan 是只生成视频的家族。** TensorSharp 中更新的视频模型是
+> [MiniMax-H3](minimax-h3_zh-cn.md)：它在**同一份打包潜变量**里把视频与
+> **原生 32 kHz 立体声音频一起生成**——支持文生视频、图生视频、首尾帧与参考生视频，
+> 并在 CFG-free 的 4–8 步下运行。只需要视频时仍然选 Wan，它也是拥有步数蒸馏检查点、
+> 能把 100 次 DiT 前向的官方配方降到 4 次的那个家族。
+
 支持的模型家族（按 DiT GGUF 自动识别）：
 
 | 家族 | 潜空间 | VAE | 模式 | 说明 |
@@ -37,7 +43,7 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 ### 最快的上手方式：使用配置文件
 
 视频生成需要多个网络协同，因此最省事的做法是使用
-[`config/`](../../config/README.md#video-generation-wan) 中现成的配置文件——
+[`config/`](../../config/README.md#video-generation-video-only-wan) 中现成的配置文件——
 它们会声明全部网络，并在首次运行时自动下载缺失的文件：
 
 ```bash

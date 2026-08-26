@@ -30,6 +30,11 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Qwen-Image-Edit | VAE + Qwen2.5-VL（必需） | [QuantStack VAE](https://huggingface.co/QuantStack/Qwen-Image-Edit-GGUF) 中的 `VAE/Qwen_Image-VAE.safetensors` + [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) |
 | Qwen-Image-Edit | 视觉 mmproj（可选） | [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) 中的 `mmproj-BF16.gguf`，用 `--qwen-image-mmproj` / `TS_QWEN_IMAGE_MMPROJ` 加载，可让编辑指令参考源图内容 |
 | Qwen-Image-Edit | Lightning LoRA（可选，4/8 步） | [lightx2v/Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning)，文件 `Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`（0.850 GB）；用 `--qwen-image-lora` / `TS_QWEN_IMAGE_LORA` 加载，会自动按文件名里的步数把采样默认值切到该步数 + CFG 1.0（基础默认为 30 步、CFG 2.5） |
+| MiniMax-H3 音视频生成 | 去噪器（`--model` GGUF） | **两个独立的 checkpoint，不是开关**——加载哪一个决定了它接受什么条件输入。[unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：`minimax_h3_fl2va_pruned-Q4_K.gguf`（10.64 GiB）用于文生视频 / 图生视频 / 首尾帧，`minimax_h3_ref2va_pruned-Q4_K.gguf`（10.60 GiB）用于身份与外观参考。另有 Q8_0（19.97 GiB）到 Q2_K（6.26 GiB）。H3 是 CFG 蒸馏模型：**必须传 `--cfg 1.0`**，步数取 4-8。这些 GGUF **完全没有元数据**，TensorSharp 靠张量表识别它们，并从文件名读出分区——重命名或重新量化时请保留 `fl2va` / `ref2va`。两个 checkpoint 共用下面三个网络，所以事后再加另一个只需下它自己的约 10.6 GiB |
+| MiniMax-H3 音视频生成 | Qwen3-VL-32B 文本编码器（必需） | 同仓库：`qwen3vl_32b_minimax_h3-Q4_K_M.gguf`（16.97 GiB），或 `-Q2_K_M.gguf`（12.20 GiB）以搭配最小的那几个去噪器。截断到 50 层并去掉最后的 norm，去噪开始前即从显存释放。**它不含分词器**——还需要下一行那两个文件 |
+| MiniMax-H3 音视频生成 | `vocab.json` + `merges.txt`（必需） | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)——编码器 GGUF 缺的那对 Qwen2 字节级 BPE 文件，也是配置文件唯一无法替你自动下载的东西（自动下载只能补齐“是参数”的条目，而分词器不是）。放在编码器旁边，或用 `TS_VIDEO_TOKENIZER` 指向存放它们的目录 |
+| MiniMax-H3 音视频生成 | 视频 VAE（必需） | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae) 里的 `minimax_h3_video_vae_fp16.safetensors`（5.21 GB）。空间 16 倍 / 时间 4 倍，解码器是纯 Transformer。放在去噪器旁或用 `--video-vae` 指定 |
+| MiniMax-H3 音视频生成 | 音频 VAE（可选） | 同一目录下的 `minimax_h3_audio_vae_fp32.safetensors`（0.61 GB）。把联合生成的音频 latent 解码成 32 kHz 立体声，作为旁挂 `.wav` 写在视频边上。**不下载也照样出视频**，只是没有声音。用 `--audio-vae` 指定 |
 | Wan 视频生成 | **步数蒸馏 DiT（首选）** | **这是最大的提速手段——除非要复现参考样例，都应该用它。**蒸馏 checkpoint 生成同一段视频只跑 4 次去噪，而官方配方要跑 100 次：在 M5 Pro / `ggml_metal` 上以 1088×832×121 帧实测，端到端 **17 分 30 秒**，而基础 checkpoint 是 **3 小时 30 分**——同一个请求，其他参数一律不变。TI2V-5B：[hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF)，文件 `Wan2_2-TI2V-5B-Turbo-Q8_0.gguf`（5.40 GB），另有 Q6_K（4.22 GB）、Q5_K_M（3.82 GB）、Q4_K_M（3.44 GB），最小到 Q2_K（1.86 GB）。**注意文件名里是 `Wan2_2` 下划线**，照抄基础仓库的 `Wan2.2` 写法会 404。I2V-A14B：[jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF](https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF)，Lightning 已合并进两个专家；需同时下载 `high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf` **和** `low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf`（各 9.66 GB；Q8_0 15.42 GB，Q2_K 5.31 GB），放在同一个 `--local-dir` 下，`--model` 指向任意一个即可，另一个专家会自动找到。备选：[Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF](https://huggingface.co/Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF)（`FastWan2.2-TI2V-5B-q8_0.gguf`，5.41 GB）。**无需任何参数**：TensorSharp 读取 DiT 文件名，命中 `turbo` / `distill` / `lightning` / `lightx2v` / `fastwan` / `-dmd` 或显式的 `<N>steps`（1-16）即切换到该步数并关闭 guidance，加载时打印 `step-distilled checkpoint detected -> N steps, guidance off`；`--diffusion-steps` / `--cfg` 可覆盖。Turbo 与 A14B 蒸馏仓库都不含 VAE 和文本编码器，请从下面两行获取 |
 | Wan 视频生成 | 基础 DiT（`--model` GGUF） | 完整官方配方（50 步 × 2 次 CFG = 100 次 DiT 前向）——需要对齐参考样例时才用，否则优先用上一行的蒸馏版本。Wan 2.2 文/图生视频：[QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF)（`Wan2.2-TI2V-5B-Q8_0.gguf` 5.40 GB 或 `Wan2.2-TI2V-5B-Q4_K_M.gguf` 3.43 GB，仓库自带 `VAE/Wan2.2_VAE.safetensors`）、[QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF) 或 [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF)（`HighNoise/` 与 `LowNoise/` 两个专家缺一不可，两个仓库都自带 `VAE/Wan2.1_VAE.safetensors`）；Wan 2.1 文生视频：[samuelchristlie/Wan2.1-T2V-1.3B-GGUF](https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF)（`Wan2.1-T2V-1.3B-Q8_0.gguf` / `-F16.gguf`）或 [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf)（文件名为小写，如 `wan2.1-t2v-14b-Q8_0.gguf`）——这两个 2.1 仓库都不含 VAE 和编码器。`general.architecture` 为 `wan` / `wan2.1` / `wan2.2`。参见 [docs/models/wan.md](docs/models/wan.md) |
 | Wan 视频生成 | UMT5-XXL 文本编码器（必需，所有 Wan checkpoint 都要） | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf)：`umt5-xxl-encoder-Q8_0.gguf`（6.04 GB），内存紧张可用 `umt5-xxl-encoder-Q5_K_M.gguf`（4.15 GB）/ `umt5-xxl-encoder-Q4_K_M.gguf`（3.66 GB）。负责把提示词编码成条件向量，去噪开始前即从显存释放。放在 DiT 旁或用 `--video-text-encoder` / `TS_WAN_TE` 指定 |
@@ -79,7 +84,7 @@ Gemma 4 目前已有可用的推测解码路径：上表中的 `gemma4-assistant
 
 ### 按模型下载并运行
 
-以下命令从仓库根目录运行；请先按平台安装完整的 [.NET 10 SDK](DEVELOPMENT_zh-cn.md#安装-net-10-sdk)，再执行 `dotnet build TensorSharp.slnx -c Release`。仅安装 Runtime 无法构建下方使用的二进制文件。`hf` 来自 Hugging Face CLI（`pip install -U huggingface_hub`），所有文件都会下载到 `./models`。通用提示：单次文本提示词通过 `--input` 文件传入（`--prompt` 用于 Qwen-Image-Edit 的编辑指令和 Wan 的视频提示词）；CLI 默认贪心采样，且不加 `--max-tokens` 时只生成 100 个 token；服务端固定监听 **http://localhost:5000**。按硬件把示例中的 `ggml_cuda` 换成 `ggml_metal`、`ggml_vulkan` 或 `ggml_cpu`（见 [选择后端](README_zh-cn.md#选择后端)）。
+以下命令从仓库根目录运行；请先按平台安装完整的 [.NET 10 SDK](DEVELOPMENT_zh-cn.md#安装-net-10-sdk)，再执行 `dotnet build TensorSharp.slnx -c Release`。仅安装 Runtime 无法构建下方使用的二进制文件。`hf` 来自 Hugging Face CLI（`pip install -U huggingface_hub`），所有文件都会下载到 `./models`。通用提示：单次文本提示词通过 `--input` 文件传入（`--prompt` 用于 Qwen-Image-Edit 的编辑指令，以及视频生成——MiniMax-H3 与 Wan——的提示词）；CLI 默认贪心采样，且不加 `--max-tokens` 时只生成 100 个 token；服务端固定监听 **http://localhost:5000**。按硬件把示例中的 `ggml_cuda` 换成 `ggml_metal`、`ggml_vulkan` 或 `ggml_cpu`（见 [选择后端](README_zh-cn.md#选择后端)）。
 
 ```bash
 echo "列出三条关于月球的事实。" > prompt.txt
@@ -193,7 +198,88 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
 
 （在 Web UI 里上传图片并输入编辑指令即可。Lightning LoRA 的下载与 `--qwen-image-lora` 参数是可选的——加上后去噪降到 4 步、CFG 1.0。）
 
-**Wan 视频生成**（提示词 + 可选首帧图片 → H.264 MP4；需要 DiT + 视频 VAE + UMT5-XXL 文本编码器）：
+**MiniMax-H3 音视频生成**（提示词 + 可选关键帧或参考 → H.264 MP4，**外加原生 32 kHz 立体声音频，在同一个打包 latent 里一起生成**）：
+
+这里有四个网络协同工作，所以最短路径是现成的配置文件——它把四个都写好了，缺什么下什么（首次运行约 33.5 GB）：
+
+```bash
+TensorSharp.Server --config config/minimax-h3-fl2va.json
+TensorSharp.Cli    --config config/minimax-h3-fl2va.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+```
+
+`config/minimax-h3-ref2va.json` 是另一个 checkpoint：最多九个身份与外观参考——静态图、片段、音轨——
+用于一个全新的镜头，而不是必须被复现的帧。FL2VA 与 Ref2VA 是**两个独立的 checkpoint，不是一个开关**，
+向其中一个索要另一个的条件输入会直接报错，并在错误信息里点名你真正需要的那个文件。两份配置只有去噪器
+不同（那边约 33.4 GB），下面三个网络是共用的，所以第二份配置只会下它自己的 DiT。参见
+[config/README.md](config/README.md#video-generation-with-sound-minimax-h3)。文件会落到
+`TENSORSHARP_MODELS` 指向的位置，或仓库旁边的 `models/`。
+
+有一对文件无论走哪条路都不会自动下载：文本编码器的 GGUF 不含分词器，而自动下载只能补齐“是参数”的条目。
+
+```bash
+curl -L -o models/vocab.json https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/processor/vocab.json
+curl -L -o models/merges.txt https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/processor/merges.txt
+```
+
+手动路线如下。
+
+```bash
+# FL2VA 是文生视频 / 图生视频 / 首尾帧的 checkpoint；需要参考条件时换成
+# minimax_h3_ref2va_pruned-Q4_K.gguf。两个 VAE 在 unsloth/MiniMax-H3-GGUF 自己的
+# vae/ 目录下也有镜像，Comfy-Org 慢的时候可以换过去。
+hf download unsloth/MiniMax-H3-GGUF minimax_h3_fl2va_pruned-Q4_K.gguf --local-dir models
+hf download unsloth/MiniMax-H3-GGUF qwen3vl_32b_minimax_h3-Q4_K_M.gguf --local-dir models
+hf download Comfy-Org/MiniMax-H3 vae/minimax_h3_video_vae_fp16.safetensors --local-dir models
+hf download Comfy-Org/MiniMax-H3 vae/minimax_h3_audio_vae_fp32.safetensors --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-text-encoder models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf \
+    --video-vae models/vae/minimax_h3_video_vae_fp16.safetensors \
+    --audio-vae models/vae/minimax_h3_audio_vae_fp32.safetensors \
+    --prompt "a red fox trotting through falling snow, cinematic" \
+    --output fox.mp4 --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-text-encoder models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf \
+    --video-vae models/vae/minimax_h3_video_vae_fp16.safetensors \
+    --audio-vae models/vae/minimax_h3_audio_vae_fp32.safetensors \
+    --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+```
+
+上面这条 CLI 命令会写出 `fox.mp4` **和 `fox.wav`**：音轨是旁挂文件，从不混流进 MP4，因为混流需要一个
+不一定装了的编码器——用 `ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4` 合并即可。
+所有文件都在同一个目录下时，三个伴随文件参数都可以省略：去噪器所在目录及其上一级会被递归扫描，子目录也算。
+不下载音频 VAE，或者加上 `--no-audio`，仍然会出视频——只是没有声音。
+
+H3 是 CFG 蒸馏模型，**必须传 `--cfg 1.0`**，更高的值会被直接拒绝；管线自身的默认是 20 步，4-8 步是快速
+工作点，代价是运动主体边缘会有一些彩色条纹，到 ~20 步就消失了。宽高向上取整到 32 的倍数，帧数对齐到
+`17k+5` 网格（5、22、39、56、73、90……），fps 无论你传什么都被钉死在 24。服务端的步数参数叫
+`--video-steps`，而且根本没有 `--cfg`——这正是随附配置两个都不设的原因。
+
+条件输入方面：`--image first.png` 把这张图作为首帧动起来；再加上
+`--end-image last.png --video-mode fl2v` 就是在首尾两帧之间插值；而在 Ref2VA checkpoint 上，`--ref-image`（可重复，最多九个）、
+`--ref-video`、`--ref-video-audio` 与 `--ref-audio` 则是把身份与外观带进一个全新的镜头。在 M5 Pro 的
+Metal 上以 22 帧、8 步、相同随机种子实测，H3 比 stable-diffusion.cpp 在 256×256 下快 **2.4 倍**
+（49.3 秒 → 20.9 秒），在 640×384 下快 **1.7 倍**（108.5 秒 → 63.1 秒）。参见
+[docs/models/minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md)。
+
+**Wan 视频生成**（提示词 + 可选首帧图片 → H.264 MP4，仅视频；需要 DiT + 视频 VAE + UMT5-XXL 文本编码器）：
+
+Wan 同样需要三个独立的网络，所以这里最省事的路子依然是现成的配置文件——它把三者
+一并列出，缺哪个就下载哪个：
+
+```bash
+TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+TensorSharp.Cli    --config config/wan-video-ti2v-5b-turbo.json \
+    --prompt "a cute fluffy orange cat walking through a sunny garden" --output cat.mp4
+```
+
+`config/wan-video-ti2v-5b.json` 是未蒸馏的 50 步版本，`config/wan-video-i2v-a14b.json`
+是双专家的 14B 图生视频模型；详见
+[config/README.md](config/README.md#video-generation-video-only-wan)。文件会落到
+`TENSORSHARP_MODELS` 指向的位置，或仓库旁边的 `models/`。手动下载的方式在下面。
 
 ```bash
 # 步数蒸馏的 Turbo DiT：只跑 4 次去噪而不是 100 次，由文件名自动识别。

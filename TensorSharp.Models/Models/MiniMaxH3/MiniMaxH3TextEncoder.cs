@@ -62,6 +62,8 @@ namespace TensorSharp.Models.MiniMaxH3
         // holds their buffers at teardown.
         private readonly List<IntPtr> _bound = new();
         private readonly H3TeLayerW[] _layers;
+        /// <summary>Bytes of the encoder file, used only to size layer groups.</summary>
+        private readonly long _trunkBytes;
         private GCHandle _layersPin;
         private readonly GgufTensorInfo _embed;
         private bool _disposed;
@@ -72,6 +74,8 @@ namespace TensorSharp.Models.MiniMaxH3
         public MiniMaxH3TextEncoder(string ggufPath, string tokenizerDir = null)
         {
             _gguf = new GgufFile(ggufPath);
+            try { _trunkBytes = new FileInfo(ggufPath).Length; } catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
             // The text encoder is a SEPARATE file from the denoiser, so nothing on the
             // main load path has looked at it. A bad copy here fails as NaN deep in the
             // vision tower rather than as a bad file, so check it while the answer is
@@ -524,29 +528,65 @@ namespace TensorSharp.Models.MiniMaxH3
             var dPin = deepstack == null ? default : GCHandle.Alloc(deepstack, GCHandleType.Pinned);
             try
             {
-                var args = new H3TextEncodeArgs
+                int groupSize = ResolveLayerGroup(layers, numDeepstack);
+                long layerStride = Marshal.SizeOf<H3TeLayerW>();
+                IntPtr layerBase = _layersPin.AddrOfPinnedObject();
+                // Ping-pong the hidden state between the caller's output buffer and a scratch
+                // one, so the last group always lands in outp.
+                float[] scratch = groupSize >= layers ? null : new float[(long)seq * hidden];
+                var scratchPin = scratch == null
+                    ? default : GCHandle.Alloc(scratch, GCHandleType.Pinned);
+                try
                 {
-                    StructBytes = Marshal.SizeOf<H3TextEncodeArgs>(),
-                    NumLayers = layers,
-                    Embeddings = ePin.AddrOfPinnedObject(),
-                    Out = oPin.AddrOfPinnedObject(),
-                    Cos = cPin.AddrOfPinnedObject(),
-                    Sin = sPin.AddrOfPinnedObject(),
-                    // H3 removed the final norm; the DiT wants the unnormalized state.
-                    FinalNorm = IntPtr.Zero,
-                    Deepstack = deepstack == null ? IntPtr.Zero : dPin.AddrOfPinnedObject(),
-                    NumDeepstack = numDeepstack,
-                    Layers = _layersPin.AddrOfPinnedObject(),
-                    Hidden = hidden,
-                    Heads = Config.Heads,
-                    KvHeads = Config.KvHeads,
-                    HeadDim = Config.HeadDim,
-                    Seq = seq,
-                    Causal = 1,
-                    Eps = Config.Eps,
-                };
-                if (!GgmlBasicOps.TryMiniMaxH3TextEncode(in args))
-                    throw new InvalidOperationException("MiniMax-H3 text encode failed.");
+                    int groups = (layers + groupSize - 1) / groupSize;
+                    IntPtr src = ePin.AddrOfPinnedObject();
+                    for (int g = 0; g < groups; g++)
+                    {
+                        int start = g * groupSize;
+                        int count = Math.Min(groupSize, layers - start);
+                        bool last = g == groups - 1;
+                        IntPtr dst = last ? oPin.AddrOfPinnedObject()
+                                          : ((g % 2 == 0 && scratch != null)
+                                             ? scratchPin.AddrOfPinnedObject()
+                                             : oPin.AddrOfPinnedObject());
+                        var args = new H3TextEncodeArgs
+                        {
+                            StructBytes = Marshal.SizeOf<H3TextEncodeArgs>(),
+                            NumLayers = count,
+                            Embeddings = src,
+                            Out = dst,
+                            Cos = cPin.AddrOfPinnedObject(),
+                            Sin = sPin.AddrOfPinnedObject(),
+                            // H3 removed the final norm; the DiT wants the unnormalized state.
+                            FinalNorm = IntPtr.Zero,
+                            // DeepStack taps land on the first NumDeepstack layers only, which
+                            // ResolveLayerGroup keeps inside group 0.
+                            Deepstack = (g == 0 && deepstack != null)
+                                ? dPin.AddrOfPinnedObject() : IntPtr.Zero,
+                            NumDeepstack = g == 0 ? numDeepstack : 0,
+                            Layers = layerBase + (nint)(start * layerStride),
+                            Hidden = hidden,
+                            Heads = Config.Heads,
+                            KvHeads = Config.KvHeads,
+                            HeadDim = Config.HeadDim,
+                            Seq = seq,
+                            Causal = 1,
+                            Eps = Config.Eps,
+                        };
+                        if (!GgmlBasicOps.TryMiniMaxH3TextEncode(in args))
+                            throw new InvalidOperationException(
+                                "MiniMax-H3 text encode failed.");
+                        if (!last)
+                        {
+                            ReleaseLayerResidency(start, count);
+                            src = dst;
+                        }
+                    }
+                }
+                finally
+                {
+                    if (scratchPin.IsAllocated) scratchPin.Free();
+                }
             }
             finally
             {
@@ -568,6 +608,66 @@ namespace TensorSharp.Models.MiniMaxH3
         /// encoded as-is with no BOS/EOS.</summary>
         public List<int> Tokenize(string prompt) =>
             Tokenizer.Encode(prompt ?? string.Empty, addSpecial: false);
+
+        /// <summary>How many trunk layers to make device-resident at once.
+        ///
+        /// <para>Qwen3-VL-32B is ~17 GB at Q4_K_M, which does not fit a 16 GB card. The driver
+        /// does not refuse the allocation - on Windows/WDDM it backs the overflow with shared
+        /// host memory, so the whole trunk then runs at PCIe speed. Splitting the trunk into
+        /// groups and handing each group's device copy back after it runs keeps peak residency
+        /// at one group instead of fifty layers, at the cost of re-uploading on the next call.
+        ///
+        /// <para>Returns the full layer count - a single call, byte-for-byte today's behaviour -
+        /// whenever the trunk already fits, so cards with room pay nothing. The first group is
+        /// never smaller than the DeepStack tap count, because those taps are applied by
+        /// layer index within a call.</para></summary>
+        private int ResolveLayerGroup(int layers, int numDeepstack)
+        {
+            if (layers <= 1)
+                return layers;
+            // Escape hatch, and how the grouped path is A/B tested against the
+            // single-call one: TS_H3_TE_GROUP=<n> pins the group size, and any
+            // n >= layers reproduces the original whole-trunk call exactly.
+            string ov = Environment.GetEnvironmentVariable("TS_H3_TE_GROUP");
+            if (!string.IsNullOrWhiteSpace(ov) && int.TryParse(ov, out int forced) && forced > 0)
+                return Math.Min(layers, Math.Max(forced, Math.Max(1, numDeepstack)));
+            // Grouping is OFF unless asked for, and that is a measured decision rather
+            // than a default-safe one. On a 16 GB card the 17 GB trunk does overflow into
+            // shared host memory, and grouping does remove the overflow - peak device use
+            // fell from 16041 MiB to 12981 MiB at 640x384. It was still 3 s SLOWER over
+            // three runs (68.6 s against 65.8 s best-of-3).
+            //
+            // The reason is that the trunk is a ONE-SHOT prefill: a prompt is typically a
+            // few dozen tokens, so every weight is read exactly once and the overflowed
+            // ~1.3 GB costs a single PCIe crossing. Grouping cannot make that cheaper - it
+            // still moves all 17 GB - and it adds an allocate/invalidate cycle per group.
+            // Spill only compounds when weights are re-read per step, which is the DENOISER
+            // (see MiniMaxH3DiT.ReleaseDeviceResidency, where releasing before the VAE was
+            // worth 22 s), not this trunk.
+            //
+            // Kept because it is the right tool when device memory, not time, is the
+            // binding constraint - a smaller card, or another process needing the VRAM.
+            return layers;
+        }
+
+        /// <summary>Drop the device-resident copies of one layer group's weights. The host
+        /// pointers are mmapped GGUF pages and stay valid, so a later call re-uploads them.</summary>
+        private void ReleaseLayerResidency(int start, int count)
+        {
+            for (int i = start; i < start + count && i < _layers.Length; i++)
+            {
+                var lw = _layers[i];
+                Drop(lw.InputNorm); Drop(lw.PostAttnNorm); Drop(lw.QNorm); Drop(lw.KNorm);
+                Drop(lw.Q.W); Drop(lw.Q.B); Drop(lw.K.W); Drop(lw.K.B);
+                Drop(lw.V.W); Drop(lw.V.B); Drop(lw.O.W); Drop(lw.O.B);
+                Drop(lw.Gate.W); Drop(lw.Gate.B); Drop(lw.Up.W); Drop(lw.Up.B);
+                Drop(lw.Down.W); Drop(lw.Down.B);
+            }
+            static void Drop(IntPtr p)
+            {
+                if (p != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(p);
+            }
+        }
 
         public void Dispose()
         {

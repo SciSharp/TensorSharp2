@@ -18,7 +18,7 @@
 | 思维链模式 | 是（`<\|channel>thought ... <channel\|>`） |
 | 工具调用 | 是（`<\|tool_call>call:name{...}<tool_call\|>`） |
 | 批处理 / 分页前向 | **默认启用** —— `IBatchedPagedModel.ForwardBatch` 处理双 head_dim、KV donor 共享、PLE 注入、SWA + 全局混合的分页 K/V 缓冲。设置 `TS_GEMMA4_BATCHED=0` 可强制回退到旧单序列 KV 交换路径。详见 §11。 |
-| MTP 投机解码 | 可选 —— 通过服务端的 `--mtp-draft-model`（`TS_MTP_DRAFT_MODEL`）加载独立的 `gemma4-assistant` EAGLE 风格草稿 GGUF，并用 `--mtp-spec` 启用（两者均为 `TensorSharp.Server` 标志；CLI 没有 MTP 标志）。在 ggml 后端与纯 C# `cuda` 后端上有收益。详见 §12。 |
+| MTP 投机解码 | 可选 —— 通过 `--spec-draft-model`（`TS_SPEC_DRAFT_MODEL`）加载独立的 `gemma4-assistant` EAGLE 风格草稿 GGUF，并用 `--spec` 启用。两个标志在**两个宿主上都可用**：`TensorSharp.Cli` 与 `TensorSharp.Server` 共用同一个 [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)，`--mtp-draft-model` / `--mtp-spec` 仍作为别名被接受。在 ggml 后端与纯 C# `cuda` 后端上有收益。详见 §12。 |
 | 输出解析器 | `Gemma4OutputParser` |
 
 ## 下载
@@ -100,12 +100,21 @@ dotnet run --project TensorSharp.Cli -c Release -- --model models/gemma-4-E4B-it
   --image photo.png --max-tokens 512 --backend ggml_cuda
 ```
 
-带 MTP 投机解码的服务端（`--mtp-spec` / `--mtp-draft-model` 仅是
-`TensorSharp.Server` 的标志 —— `TensorSharp.Cli` 没有 MTP 标志）：
+带 MTP 投机解码。`--spec` 与 `--spec-draft-model` 由同一个
+[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)
+在**两个宿主上**解析，因此 `TensorSharp.Cli` 与 `TensorSharp.Server` 的拼写完全一致
+（`--mtp-spec` / `--mtp-draft-model` 作为别名被接受）。两者都必须出现在*加载*模型的那条
+命令行上 —— 草稿 GGUF 在启动时挂到目标模型上，而无法激活的 `--spec-draft-model` 会在启动时
+立即失败，而不是静默地不做投机（§12.2）：
 
 ```bash
+# 服务端
 dotnet run --project TensorSharp.Server -c Release -- --model models/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf \
-  --backend ggml_cuda --mtp-spec --mtp-draft-model models/mtp-gemma-4-12B-it.gguf
+  --backend ggml_cuda --spec --spec-draft-model models/mtp-gemma-4-12B-it.gguf
+
+# CLI —— 投机在 --input、--input-jsonl、--multi-turn-jsonl 与 --interactive 下均会启用
+dotnet run --project TensorSharp.Cli -c Release -- --model models/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf \
+  --backend ggml_cuda --spec --spec-draft-model models/mtp-gemma-4-12B-it.gguf --input prompt.txt --max-tokens 512
 ```
 
 然后打开 `http://localhost:5000` 使用聊天 UI。
@@ -549,14 +558,17 @@ Gemma 4 是 TensorSharp 中最难移植到分页批处理的模型，因为它�
 
 ## 12. MTP 投机解码（gemma4-assistant 草稿头）
 
-Gemma 4 在 `TensorSharp.Server` 中支持为单序列（无并发）请求做无损的**多 token
+Gemma 4 在两个宿主上都支持为单序列（无并发）请求做无损的**多 token
 预测（MTP）投机解码**。与 Qwen 3.6 把 NextN 块内嵌在主干 GGUF 不同，Gemma 4 的草稿头
-作为一个**独立的小 `gemma4-assistant` GGUF** 发布，通过 `--mtp-draft-model`（环境变量
-`TS_MTP_DRAFT_MODEL`）加载。源码：
-[`Gemma4Model.Mtp.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Mtp.cs)，
+作为一个**独立的小 `gemma4-assistant` GGUF** 发布，通过 `--spec-draft-model`（别名
+`--mtp-draft-model`；环境变量 `TS_SPEC_DRAFT_MODEL`，旧名 `TS_MTP_DRAFT_MODEL`）加载，
+并由 [`SpeculativeDraftHeadLoader`](../../TensorSharp.Models/SpeculativeDraftHeadLoader.cs)
+在启动时挂到目标模型上。源码：
+[`Gemma4Model.Speculative.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs)，
 由共享的
-[`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs)
-起草 / 验证 / 回滚核心驱动。
+[`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
+起草 / 验证 / 回滚核心驱动 —— Gemma 4 对应可插拔 `--spec-type` 层中的 `draft-head` 算法，
+`auto` 会依据 checkpoint 自动选中它。
 
 ### 12.1 EAGLE 风格递归草稿器
 
@@ -585,14 +597,16 @@ KV 缓存，并对每个起草 token 复用相同位置（递归只通过 `h` �
 ### 12.2 草稿 / 目标配对（快速失败）
 
 草稿的输出 backbone 维度（`{arch}.embedding_length_out`）**必须等于目标的隐藏维度**——
-12B 目标配 12B 草稿，而非 26B-A4B 草稿。当给了 `--mtp-draft-model` 但草稿无法激活（文件缺失、
+12B 目标配 12B 草稿，而非 26B-A4B 草稿。当给了 `--spec-draft-model` 但草稿无法激活（文件缺失、
 隐藏维不匹配、或缺少必要的草稿张量）时，服务端会在启动时**立即失败**并给出修复提示
-（[`MtpStartupValidation`](../../TensorSharp.Server/Hosting/MtpStartupValidation.cs)），
+（[`SpeculationStartupValidation`](../../TensorSharp.Server/Hosting/SpeculationStartupValidation.cs)），
 而不是静默地不做投机继续运行。
 
 ### 12.3 后端收益与融合内核
 
-`MtpSpeculationProfitable` 决定是否真正启用投机：
+`SpeculationProfitable`
+（[`Gemma4Model.Speculative.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs)）
+决定是否真正启用投机：
 
 - **ggml 后端（CUDA / Metal）** —— 运行融合单图内核：多 token 验证
   （`NativeGemma4ModelVerify`，26B-A4B MoE 用 `TryFusedMoEModelVerify`）和融合草稿步
@@ -609,8 +623,13 @@ KV 缓存，并对每个起草 token 复用相同位置（递归只通过 `h` �
 26B-A4B MoE 目标还需要在 `ggml_cuda` 上修复加载期 OOM（跳过 per-expert 设备预加载）后，MTP
 投机才成为净收益。
 
-启用 / 关闭与调优使用通用的 `--mtp-spec` / `--mtp-draft` / `--mtp-pmin` 参数；见
-[MTP / 投机解码](../../FEATURES_zh-cn.md#mtp--nextn-投机解码)。
+启用 / 关闭与调优使用通用的 `--spec` / `--spec-draft` / `--spec-pmin` 参数（别名
+`--mtp-spec` / `--mtp-draft` / `--mtp-pmin`），它们由 `TensorSharp.Cli` 与
+`TensorSharp.Server` 共用的同一个
+[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs) 解析；
+完整参数列表与其他算法见[投机解码](../../FEATURES_zh-cn.md#投机解码) —— 其中
+`--spec-type ngram` 完全不需要草稿 GGUF，因此即便旁边没有 assistant 文件，也能在
+Gemma 4 checkpoint 上运行。
 
 ## 13. 输出解析器与聊天模板
 
@@ -648,7 +667,7 @@ rank 保留全部 128 个专家，但只持有每个专家 FFN 宽度的 `1/tp`�
 
 ### 已完成
 
-- **MTP 投机解码（gemma4-assistant 草稿）** —— 独立的 EAGLE 风格草稿 GGUF（`--mtp-draft-model`）
+- **MTP 投机解码（gemma4-assistant 草稿）** —— 独立的 EAGLE 风格草稿 GGUF（`--spec-draft-model`）
   加速单序列 decode（§12）。ggml 后端运行融合多 token 验证（稠密 `NativeGemma4ModelVerify`
   与 MoE `TryFusedMoEModelVerify`）和融合草稿步（`NativeGemma4DraftStep`）内核，部分接受时用
   稠密快速回滚；纯 C# `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿。26B-A4B MoE 目标还需要

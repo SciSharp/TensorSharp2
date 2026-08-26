@@ -23,8 +23,8 @@
     <thead><tr><th>风格</th><th>端点</th></tr></thead>
     <tbody>
       <tr><td><strong>兼容 Ollama</strong></td><td><code>/api/generate</code>、<code>/api/chat/ollama</code>、<code>/api/tags</code>、<code>/api/show</code></td></tr>
-      <tr><td><strong>兼容 OpenAI</strong></td><td><code>/v1/chat/completions</code>、<code>/v1/models</code></td></tr>
-      <tr><td><strong>Web UI (SSE)</strong></td><td><code>/api/chat</code>、<code>/api/sessions</code>、<code>/api/models</code>、<code>/api/models/load</code>、<code>/api/upload</code>、<code>/api/image-edit</code>、<code>/api/image-edit/stream</code></td></tr>
+      <tr><td><strong>兼容 OpenAI</strong></td><td><code>/v1/chat/completions</code>、<code>/v1/models</code>、<code>/v1/videos/generations</code></td></tr>
+      <tr><td><strong>Web UI (SSE)</strong></td><td><code>/api/chat</code>、<code>/api/sessions</code>、<code>/api/models</code>、<code>/api/models/load</code>、<code>/api/upload</code>、<code>/api/image-edit</code>、<code>/api/image-edit/stream</code>、<code>/api/video-generate</code>、<code>/api/video-generate/stream</code></td></tr>
       <tr><td><strong>工具端点</strong></td><td><code>/api/version</code>、<code>/api/queue/status</code></td></tr>
     </tbody>
   </table>
@@ -259,8 +259,25 @@ curl -N -X POST http://localhost:5000/api/chat \
   <h3 id="imageedit-api">图像编辑（<code>/api/image-edit</code> · <code>/api/image-edit/stream</code>）</h3>
   <p>托管模型为 <code>qwen_image</code> DiT 时可用。<code>POST /api/image-edit</code> 执行一次编辑：可提交 multipart（<code>image</code> 文件 + <code>prompt</code>，以及可选 <code>steps</code>、<code>cfg</code>、<code>seed</code>），也可提交 JSON <code>{"imagePath": "...", "prompt": "...", "steps": 0, "cfg": 0, "seed": 0}</code>；其中 <code>imagePath</code> 必须指向上传目录中的文件，<code>steps</code> / <code>cfg</code> 为 <code>0</code> 表示自动。响应为 <code>{ ok, url, width, height, elapsedSeconds }</code>，PNG 从 <code>/uploads/</code> 提供。<code>POST /api/image-edit/stream</code> 接收相同 JSON，但以 SSE 流式返回去噪进度：每步帧为 <code>{"imageEdit": true, "step": i, "total": N, "image": "data:image/png;base64,..."}</code>（最多 8 张均匀预览），最后返回 <code>{"done": true, "url": "...", "width": ..., "height": ..., "elapsedSeconds": ...}</code>。整个进程中的编辑请求串行执行。</p>
 
-  <h3 id="video-api">视频生成（<code>/v1/videos/generations</code> · <code>/api/video-generate</code>）</h3>
-  <p>当托管的模型是 <code>wan</code> DiT 时可用。<code>POST /v1/videos/generations</code> 接收 OpenAI images 风格的请求体——<code>{"prompt": "…", "size": "832x480", "frames": 81, "steps": 0, "cfg": 0, "seed": 0, "fps": 24, "negative_prompt": "…", "response_format": "url"|"b64_json"}</code>——返回 <code>{ created, data: [{ url }] }</code>，MP4 由 <code>/uploads/</code> 提供。Web UI 形态的 <code>POST /api/video-generate</code> 接收 <code>{ prompt, width?, height?, frames?, steps?, cfg?, cfg2?, seed?, fps?, flowShift?, negativePrompt?, sampler?, cfgCacheStride? }</code> 以及可选的首帧图像，返回 <code>{ ok, url, width, height, frames, fps, seed, codec, elapsedSeconds }</code>；<code>POST /api/video-generate/stream</code> 以 SSE 流式返回同一任务的去噪进度。视频生成在进程内串行执行。</p>
+  <h3 id="video-api">视频生成（<code>/api/video-generate</code> · <code>/api/video-generate/stream</code> · <code>/v1/videos/generations</code>）</h3>
+  <p>当托管的模型能生成视频时可用 —— MiniMax-H3，或只生成视频的 Wan。判定依据是 <code>IVideoGenerationModel</code> 接缝而不是架构字符串，因此其他模型会返回 <code>400</code> 与 <code>The loaded model is not a video-generation model.</code>。模型自己拒绝的请求 —— 用 Ref2VA 的输入去跑 FL2VA 权重、在同一个请求体里同时给关键帧与具名参考、模式缺少必需输入 —— 在 <code>/api/video-generate</code> 上以 <code>400</code> 返回模型自己的报错信息，而不是笼统的 500；在流式接口上则以终止帧 <code>{"done": true, "error": …}</code> 返回同一条信息。三个接口共用同一个解析器，因此字段完全一致；视频生成在进程内串行执行。</p>
+  <pre data-lang="bash"><code># MiniMax-H3：提示词 -> MP4，外加一同生成的 32 kHz 立体声 WAV
+curl -s http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{
+        "prompt": "a red fox trotting through falling snow, cinematic",
+        "width": 640, "height": 384, "frames": 22, "fps": 24,
+        "steps": 8, "cfg": 1.0, "seed": 42,
+        "videoMode": "t2v", "generateAudio": true
+      }'</code></pre>
+  <pre data-lang="json"><code>{ "ok": true, "url": "/uploads/video-8f3c….mp4", "audioUrl": "/uploads/video-8f3c….wav",
+  "width": 640, "height": 384, "frames": 22, "fps": 24,
+  "seed": 42, "codec": "h264", "elapsedSeconds": 63.1 }</code></pre>
+  <p>请求字段（camelCase）：<code>prompt</code>（必填）、<code>width</code>、<code>height</code>、<code>frames</code>、<code>steps</code>、<code>cfg</code>、<code>cfg2</code>、<code>seed</code>、<code>fps</code>、<code>flowShift</code>、<code>negativePrompt</code>、<code>sampler</code>、<code>cfgCacheStride</code>、<code>videoMode</code>（<code>t2v</code> / <code>i2v</code> / <code>fl2v</code> / <code>ref</code>）、<code>generateAudio</code>、<code>imagePath</code>、<code>image</code>、<code>endImage</code>、<code>referenceImages</code>、<code>referenceVideos</code>、<code>referenceAudios</code>、<code>referenceVideoAudios</code>。其中为音视频联合生成与参考条件新增的七个字段同时接受 snake_case —— <code>video_mode</code>、<code>generate_audio</code>、<code>end_image</code>、<code>reference_images</code>、<code>reference_videos</code>、<code>reference_audios</code>、<code>reference_video_audios</code> —— 两种写法同时出现时 camelCase 优先；其余字段只接受 camelCase。</p>
+  <p><code>image</code> 是内联 base64 形式（允许带 <code>data:…;base64,</code> 前缀）。<code>imagePath</code>、<code>endImage</code> 以及每一个 <code>reference*</code> 条目都必须指向 <code>/api/upload</code> 之前返回过的文件，并被限制在上传目录之内 —— 目录之外的路径会被拒绝，报错形如 <code>referenceImages entries must reference previously uploaded files.</code>。<code>referenceVideoAudios</code> 与 <code>referenceVideos</code> <em>按下标</em>配对：第 <em>i</em> 项就是第 <em>i</em> 段片段的音轨。当模型没有产出音轨时 <code>audioUrl</code> 为 <code>null</code> —— 音频以旁挂 WAV 写出，而不是混流进 MP4。</p>
+  <p><code>POST /api/video-generate/stream</code> 接收相同请求体，并以 SSE 流式返回：每个心跳是 <code>{"videoGen": true, "step": i, "total": N, "phase": …, "detail": …, "elapsedSeconds": …, "etaSeconds": …}</code>，最后是终止帧 <code>{"done": true, "url": …, "audioUrl": …, "width": …, "height": …, "frames": …, "fps": …, "seed": …, "codec": …, "elapsedSeconds": …}</code> —— 或者 <code>{"done": true, "error": …}</code>。</p>
+  <p><code>POST /v1/videos/generations</code> 是同一任务的 OpenAI images 风格封装。在上述字段之外，它还接受 <code>"size": "832x480"</code>（会拆成 width/height）、<code>negative_prompt</code>，以及取值 <code>"url"</code> 或 <code>"b64_json"</code> 的 <code>response_format</code>，返回 <code>{ created, data: [{ url, b64_json }], audio_url, width, height, frames, fps, seed, codec, elapsed_seconds }</code>，MP4 由 <code>/uploads/</code> 提供。</p>
+  <p><code>GET /api/models</code> 是客户端在构造请求之前了解托管视频模型能接受什么的入口：除模型列表外，它还会返回一个 <code>video</code> 对象，包含 <code>family</code>（<code>"minimax-h3"</code> 或 <code>"wan"</code>）、<code>supportsAudio</code>、<code>supportsImageConditioning</code>、<code>supportsEndImageConditioning</code>、<code>supportsReferenceConditioning</code> 与 <code>maxReferenceImages</code>（MiniMax-H3 Ref2VA 上为 9）—— 对所有非视频模型则为 <code>null</code>。内置网页界面读的正是这一块，用来决定该提供哪些附件控件 —— 首帧、尾帧，或数量被 <code>maxReferenceImages</code> 限住的参考图 —— 而不是去匹配架构名字符串；完全拿不到这一块时（较旧的服务端，或不上报能力的模型），它会退回到一直以来那种单张图像的请求形式。</p>
 
   <h2 id="sampling">6 · 采样参数</h2>
   <h4>Ollama 风格（在 <code>options</code> 对象内）</h4>

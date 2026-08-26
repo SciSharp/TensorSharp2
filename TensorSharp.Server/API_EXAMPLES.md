@@ -23,6 +23,7 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 | Sessions | Web UI uses per-tab sessions; Ollama/OpenAI compatibility endpoints share the default session |
 | Uploads | `/api/upload` accepts image / video / audio / text / **PDF** files; born-digital PDFs return extracted text, scanned PDFs return page images for vision-capable models (`TS_PDF_MAX_PAGES` caps pages read) |
 | Image editing | Qwen-Image-Edit (`qwen_image`) models are served through `/api/image-edit` and `/api/image-edit/stream`, not the chat endpoints |
+| Video generation | Any video-generation model — MiniMax-H3 (`minimax-h3`), Wan 2.1 / 2.2 (`wan`) — is served through `/api/video-generate`, `/api/video-generate/stream` and `/v1/videos/generations`; MiniMax-H3 returns a 32 kHz stereo `.wav` sidecar alongside the MP4, and `/api/models` advertises what conditioning the loaded checkpoint takes |
 | Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`; `response_format` (`json_object` / `json_schema`) cannot be combined with `think` or `tools` |
 
 > **Network safety:** the server listens on `0.0.0.0:5000` and has no API-key
@@ -665,7 +666,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. When the hosted model generates video it also returns a `video` object — `family` (`"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
 
 ---
 
@@ -839,14 +840,107 @@ followed by a final
 Requests against a model that is not Qwen-Image-Edit return 400; concurrent
 edits are serialized by a process-wide lock.
 
-### Video Generation (`/v1/videos/generations`, Wan)
+### Video Generation (`/api/video-generate`, `/v1/videos/generations`)
+
+Three endpoints share one parser and one gate: `POST /api/video-generate`,
+`POST /api/video-generate/stream` (SSE, what the Web UI chat uses) and the
+OpenAI-shaped `POST /v1/videos/generations`. Any model that implements the video
+seam serves all three — MiniMax-H3 or Wan 2.1 / 2.2 — and anything else answers
+400 with `The loaded model is not a video-generation model.` The `video` block on
+`GET /api/models` says which conditioning the hosted checkpoint actually accepts.
+
+#### MiniMax-H3 — video **and** native 32 kHz stereo audio
+
+MiniMax-H3 denoises the video and a 32 kHz stereo soundtrack as one packed latent,
+so a request returns an MP4 **and** a `.wav` written beside it (see
+[docs/models/minimax-h3.md](../docs/models/minimax-h3.md) for the four cooperating
+networks). Launch the server in one terminal; the text encoder and both VAEs are
+auto-resolved by a scan of the denoiser's own folder and its parent, so name them
+with `--video-text-encoder` / `--video-vae` / `--audio-vae` only when they live
+elsewhere — the encoder additionally needs `vocab.json` and `merges.txt` beside
+it, because its GGUF ships no tokenizer:
+
+```bash
+TensorSharp.Server --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+  --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+```
+
+`--video-width`/`--video-height` matter more here than for any other model: the
+Web UI sends no size of its own, so without them every clip comes out at the
+model's default. Frame counts snap to H3's `17k+5` grid (5, 22, 39, 56, 73, 90 …),
+width and height round up to a multiple of 32, and fps is pinned to 24 whatever a
+request asks for. H3 is CFG-distilled — guidance above `1.0` is refused outright —
+so `steps` is the quality lever: 20 is the model's default and 4-8 is the fast
+operating point.
+
+In another terminal:
+
+```bash
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a red fox trotting through falling snow, cinematic",
+       "width": 640, "height": 384, "frames": 22, "steps": 8, "cfg": 1.0, "seed": 42}'
+```
+
+```json
+{"ok": true, "url": "/uploads/video-<guid>.mp4",
+ "audioUrl": "/uploads/video-<guid>.wav",
+ "width": 640, "height": 384, "frames": 22, "fps": 24, "seed": 42,
+ "codec": "h264", "elapsedSeconds": 63.1}
+```
+
+(That 640×384 / 22-frame / 8-step configuration measured 63.1 s of generation on an
+M5 Pro under Metal — 1.7× faster than stable-diffusion.cpp at its best-performing
+configuration; at 256×256 it is 20.9 s against 49.3 s, 2.4×.)
+
+`audioUrl` (`audio_url` on the OpenAI-shaped route) is `null` when the model
+produced no track — a video-only model, an H3 run with no audio VAE resolved, or
+one that sent `"generateAudio": false`. The track is never muxed into the MP4:
+muxing needs an encoder that cannot be assumed present, whereas a WAV always
+writes and the client can mux it itself.
+
+**What an image means depends on the checkpoint.** `videoMode` is `t2v`, `i2v`
+(the image IS the first frame and gets animated), `fl2v` (first and last frame) or
+`ref` (identity and appearance references for a new scene); omit it and the mode
+is inferred from what the request supplies. `i2v`/`fl2v` need the FL2VA
+checkpoint and `ref` needs Ref2VA — separate files, not a setting. Asking a
+checkpoint for a mode it was not trained for is answered with 400 carrying the
+model's own explanation of which file to load instead.
+
+```bash
+# First-and-last-frame, FL2VA checkpoint. Both names are the "file" a previous
+# /api/upload returned; anything outside the upload directory is rejected.
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a slow cinematic push-in", "videoMode": "fl2v",
+       "imagePath": "<file from /api/upload>", "endImage": "<file from /api/upload>",
+       "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0}'
+```
+
+Reference conditioning — the subject carries over while the camera, background and
+composition come from the prompt — needs the Ref2VA checkpoint, and takes up to
+**nine** references in any mix of stills, clips and soundtracks:
+
+```bash
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "the same woman sits at a table in a sunlit cafe by a window, wide shot",
+       "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0,
+       "referenceImages": ["person.jpg", "bottle.png"], "videoMode": "ref"}'
+```
+
+On Ref2VA a plain `imagePath` with no `videoMode`, no `endImage` and no named
+references is taken as a single reference, so a client that only knows how to
+attach one image — the bundled Web UI among them — needs no extra field.
+
+#### Wan 2.1 / 2.2 — video only
 
 When the hosted `--model` is a Wan DiT GGUF (architecture `wan` — Wan 2.1 T2V,
-Wan 2.2 TI2V-5B, or Wan 2.2 A14B), a prompt generates an H.264 MP4 (see
-[docs/models/wan.md](../docs/models/wan.md) for the companion models). Launch
-the server in one terminal; these flags set defaults for the Web UI and requests
-that omit `frames`/`fps`. At the model's native 24 fps, 121 frames is about five
-seconds of playback:
+Wan 2.2 TI2V-5B, or Wan 2.2 A14B), a prompt generates an H.264 MP4 and no audio
+track (see [docs/models/wan.md](../docs/models/wan.md) for the companion models).
+Launch the server in one terminal; these flags set defaults for the Web UI and
+requests that omit `frames`/`fps`. At the model's native 24 fps, 121 frames is
+about five seconds of playback:
 
 ```bash
 TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
@@ -899,10 +993,13 @@ snapped to the model's temporal grid (`4k+1` for Wan, `17k+5` for MiniMax-H3;
 `1` = a still image). When `image` is given without an explicit `size`, the
 output follows the image's aspect ratio.
 
+#### Fields every video endpoint takes
+
 Models that condition on more than a first frame, or that generate an audio
 track jointly with the video, take these additional fields — each accepted in
-both camelCase and snake_case, and each naming a file previously uploaded via
-`/api/upload` (paths outside the upload directory are rejected):
+both camelCase and snake_case (camelCase wins when both are present), and each
+naming a file previously uploaded via `/api/upload` (paths outside the upload
+directory are rejected):
 `endImage`/`end_image` (last-frame conditioning),
 `referenceImages`/`reference_images`, `referenceVideos`/`reference_videos`,
 `referenceAudios`/`reference_audios` (arrays, referred to in the prompt as
@@ -914,31 +1011,26 @@ decoding), and `videoMode`/`video_mode` (`t2v`, `i2v`, `fl2v` or `ref`; omitted
 means "infer it from what this request supplies"). Video-only models ignore all
 of them.
 
-Reference conditioning — the subject carries over while the camera, background
-and composition come from the prompt — needs the model's reference checkpoint:
+Everything else is camelCase only — `width`, `height`, `frames`, `steps`, `cfg`,
+`cfg2`, `seed`, `fps`, `flowShift`, `negativePrompt`, `sampler`,
+`cfgCacheStride`, `imagePath` (a previously uploaded file) and `image` (the
+inline base64 alternative). `size`, `negative_prompt` and `response_format`
+exist on `/v1/videos/generations` alone.
 
-```bash
-curl -s localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
-  "prompt": "the same woman sits at a table in a sunlit cafe by a window, wide shot",
-  "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0,
-  "referenceImages": ["person.jpg", "bottle.png"], "videoMode": "ref"
-}'
-```
-
-Asking a checkpoint for a mode it was not trained for is answered with `400` and
-the model's own explanation of which file to load instead. On MiniMax-H3's
-Ref2VA checkpoint a plain `imagePath` is treated as a reference, so a client
-that only knows how to attach one image needs no extra field. When a model returns an audio
-track it is written alongside the video and linked as `audioUrl` (`audio_url`
-on the OpenAI-shaped route).
-`POST /api/video-generate` accepts the same body with `width`/`height` instead
-of `size` plus `imagePath` (a previously uploaded file from `/api/upload`) and
-returns an `{ ok, url, ... }` envelope; the streaming variant
+`POST /api/video-generate` takes the same body with `width`/`height` instead of
+`size` and returns
+`{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }`,
+`audioUrl` being null when the model produced no track. The streaming variant
 `POST /api/video-generate/stream` (used by the Web UI chat) emits
-`{"videoGen": true, "step": 12, "total": 30}` SSE events per denoising step and
-a final `{"done": true, "url": ..., "frames": 81, "fps": 24, ...}`. Requests
-against a model that is not Wan return 400; concurrent generations are
-serialized by a process-wide lock.
+`{"videoGen": true, "step": 12, "total": 20, "phase": "denoise", "detail": ..., "elapsedSeconds": ..., "etaSeconds": ...}`
+ticks — `phase` runs `text-encode`, `image-encode` (only when the request carries
+conditioning images), `denoise`, `vae-decode`, `audio-decode`,
+`done` — and a final
+`{"done": true, "url": ..., "audioUrl": ..., "width": ..., "height": ..., "frames": 22, "fps": 24, "seed": ..., "codec": "h264", "elapsedSeconds": ...}`,
+or `{"done": true, "error": "..."}` when the run fails. Requests against a model
+that is not a video-generation model return 400 with `The loaded model is not a
+video-generation model.`; concurrent generations are serialized by a
+process-wide lock.
 
 ---
 

@@ -132,12 +132,42 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <qwen-image-edit-DiT.gguf
     --prompt "Make the sky a dramatic sunset." --output edited.png \
     --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0
 
-# Wan video generation (prompt -> H.264 MP4). The UMT5-XXL text-encoder GGUF and
-# video-VAE companions are resolved next to the DiT GGUF (or set --video-text-encoder /
-# --video-vae). Wan 2.1 T2V, Wan 2.2 TI2V-5B, and Wan 2.2 A14B (both experts)
-# are auto-detected, and so are step-distilled (Turbo / Lightning / FastWan)
-# checkpoints -- 4 DiT passes instead of 100 for the same video. See the
-# "Video generation (Wan)" section below and docs/models/wan.md.
+# MiniMax-H3 video generation with sound (prompt -> H.264 MP4 plus a 32 kHz
+# stereo .wav sidecar). One diffusion transformer denoises a packed video+audio
+# latent, so the soundtrack is model output rather than something dubbed on
+# afterwards. The Qwen3-VL-32B text encoder, the video VAE and the audio VAE are
+# resolved next to the DiT GGUF (or set --video-text-encoder / --video-vae /
+# --audio-vae). H3 is CFG-distilled: --cfg 1.0 is required, and 4-8 steps is the
+# fast lane against a 20-step default. See "Video generation with audio
+# (MiniMax-H3)" below and docs/models/minimax-h3.md.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <minimax_h3_fl2va_pruned-Q4_K.gguf> \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4 \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+    --backend ggml_cuda
+
+# MiniMax-H3 conditioning: on the fl2va checkpoint --image IS the first frame and
+# --end-image pins the last one. On the ref2va checkpoint the same picture is an
+# identity reference for a brand-new scene instead (--ref-image, repeatable up to
+# nine, plus --ref-video / --ref-video-audio / --ref-audio). --video-mode
+# t2v|i2v|fl2v|ref states which reading you meant when it is not obvious.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <minimax_h3_fl2va_pruned-Q4_K.gguf> \
+    --image start.png --end-image end.png --video-mode fl2v \
+    --prompt "a slow cinematic push-in" --output morph.mp4 \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+    --backend ggml_cuda
+
+# The same run from a shipped config, which auto-downloads all four networks on
+# first use (config/minimax-h3-ref2va.json is the reference checkpoint).
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+
+# Wan video generation, video only (prompt -> H.264 MP4). The UMT5-XXL
+# text-encoder GGUF and video-VAE companions are resolved next to the DiT GGUF
+# (or set --video-text-encoder / --video-vae). Wan 2.1 T2V, Wan 2.2 TI2V-5B, and
+# Wan 2.2 A14B (both experts) are auto-detected, and so are step-distilled
+# (Turbo / Lightning / FastWan) checkpoints -- 4 DiT passes instead of 100 for
+# the same video. See the "Video generation (Wan)" section below and
+# docs/models/wan.md.
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <Wan2.2-TI2V-5B.gguf> \
     --prompt "a lovely cat walking through a garden" --output cat.mp4 \
     --width 832 --height 480 --video-frames 49 --backend ggml_cuda \
@@ -161,7 +191,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prom
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.2 --seed 42
 
 # DSpark block speculative decoding (DeepSeek V4): point --model at the first shard
-# and --draft-model at the DSpark drafter GGUF. Needs greedy sampling.
+# and --draft-model at the DSpark drafter GGUF. Every emitted token is still drawn
+# from a trunk row, so a greedy run stays byte-exact and a sampled one stays in
+# distribution -- --temperature 0 below just makes the comparison exact.
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <DeepSeek-V4-Flash-...-00001-of-00005.gguf> \
     --backend ggml_cuda --draft-model <DSpark-drafter.gguf> \
     --input prompt.txt --max-tokens 200 --temperature 0
@@ -239,8 +271,8 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
 | `--think` | Enable thinking/reasoning mode (chain-of-thought). Opt-in on every family, GLM 5.x included: without it the GLM template closes the reasoning block immediately (`<think></think>`) so the model answers directly, and with it the prompt carries `Reasoning Effort: Max` and leaves the block open for the model to close. `/think on\|off` toggles it inside the REPL. |
 | `--tools <path>` | JSON file with tool/function definitions. Wire formats differ by family and the parser is picked from the architecture — GLM 5.x emits XML (`<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`, one element per argument, values `tojson`-encoded when they are not plain strings) rather than a JSON body, and the server parses that back into the usual OpenAI tool-call fields so clients see the standard shape. |
-| `--spec` / `--no-spec`<br>*(aliases `--mtp-spec` / `--no-mtp-spec`)* | Enable speculative decoding (default off). With the default `--spec-type auto` this uses the per-token draft head embedded in the trunk checkpoint — GLM 5.2's NextN block and Qwen 3.6's, with nothing extra to download. The head drafts up to `--mtp-draft` tokens and the trunk verifies them in one batched forward; every emitted token still comes from a trunk row, so the stream is the one plain decoding would have produced (argmax under a greedy config, in distribution under a sampler) and this is a speed path only. Engages on every single-sequence path (`--input`, `--input-jsonl`, `--multi-turn-jsonl`, `--interactive`). **Must be on the command line before the model loads**: for glm-dsa it is what tells the native loader to page the ~3 GiB NextN layer into VRAM, and that layer competes with the KV cache for the memory the context is sized against. Refused under `--tp N>1` on a checkpoint whose draft block borrows the trunk's LM head, which includes GLM 5.2. Env: `TS_MTP_SPEC` (glm-dsa also honours `TS_GLM_MTP=1`/`0`, which overrides both, for A/B runs). |
-| `--spec-type <name>` | Speculation **algorithm**: `auto` (default, use the checkpoint's own drafter), `draft-head`, `block`, or `ngram`. `ngram` needs no trained weights and works on every model — it drafts by finding where the last few tokens occurred earlier in the context and proposing what followed, so it is strong wherever the answer quotes its input (summarizing, editing, translating, repetitive structured output, agentic loops) and falls back to plain decode elsewhere. Env: `TS_SPEC_TYPE`. See [Speculative Decoding in TensorSharp](docs/speculative_decoding.md). |
+| `--spec` / `--no-spec`<br>*(aliases `--mtp-spec` / `--no-mtp-spec`)* | Enable speculative decoding (default off). With the default `--spec-type auto` this uses the per-token draft head embedded in the trunk checkpoint — GLM 5.2's NextN block and Qwen 3.6's, with nothing extra to download. The head drafts up to `--mtp-draft` tokens and the trunk verifies them in one batched forward; every emitted token still comes from a trunk row, so the stream is the one plain decoding would have produced (argmax under a greedy config, in distribution under a sampler) and this is a speed path only. Engages on every single-sequence path (`--input`, `--input-jsonl`, `--multi-turn-jsonl`, `--interactive`). **Must be on the command line before the model loads**: for glm-dsa it is what tells the native loader to page the ~3 GiB NextN layer into VRAM, and that layer competes with the KV cache for the memory the context is sized against. Refused under `--tp N>1` on a checkpoint whose draft block borrows the trunk's LM head, which includes GLM 5.2. Env: `TS_SPEC` (legacy `TS_MTP_SPEC`, still read by the glm-dsa native loader; glm-dsa also honours `TS_GLM_MTP=1`/`0`, which overrides both, for A/B runs). |
+| `--spec-type <name>`<br>*(alias `--mtp-type`)* | Speculation **algorithm**: `auto` (default, use the checkpoint's own drafter), `draft-head`, `block`, or `ngram`. `ngram` needs no trained weights and works on every model — it drafts by finding where the last few tokens occurred earlier in the context and proposing what followed, so it is strong wherever the answer quotes its input (summarizing, editing, translating, repetitive structured output, agentic loops) and falls back to plain decode elsewhere. Measured 45.2 tok/s against 31.4 plain (1.44x) on Qwen3.5-9B (Q8_0, `ggml_metal`, M5 Pro) — a checkpoint that ships no draft head at all — with byte-identical output. Env: `TS_SPEC_TYPE`. See [Speculative Decoding in TensorSharp](docs/speculative_decoding.md). |
 | `--spec-draft <N>`<br>*(alias `--mtp-draft`)* | Maximum tokens drafted per speculative step (range 1-64, default `8`). Also sizes the native graph cache at load, so pass it alongside `--spec` rather than relying on the default. Env: `TS_SPEC_DRAFT` (or `TS_MTP_DRAFT`). |
 | `--spec-pmin <f>`<br>*(alias `--mtp-pmin`)* | Draft-confidence gate in `(0, 1]`; drafting stops at the first token below it. What the number MEANS is the algorithm's business, so each brings its own default: `0.75` for a per-token head (top-1 probability over its top-10 logits), `0.35` for a block drafter (the CUMULATIVE prefix probability, so the same number is far stricter), `0` for n-gram (where it scales the required match length instead). Env: `TS_SPEC_PMIN` (or `TS_MTP_PMIN`). |
 | `--spec-draft-model <path>`<br>*(alias `--mtp-draft-model`)* | Draft-head GGUF for architectures whose speculator weights ship as their own file (Gemma 4's `gemma4-assistant`). Loaded onto the target at startup so `--spec` can engage. The draft's hidden size must match the target (pair the 12B target with its 12B draft, not the 26B-A4B one). Qwen 3.6 and GLM 5.2 embed their NextN block in the trunk GGUF and need no such flag. Env: `TS_SPEC_DRAFT_MODEL`. |
@@ -274,33 +306,31 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--image <path>` | Input image for Qwen-Image-Edit (also the image input for multimodal chat). Required to trigger image-edit mode on a `qwen_image` DiT GGUF. |
 | `--prompt <text>` | Qwen-Image-Edit edit instruction (falls back to `--input` file contents if omitted). |
 | `--output <path>` | Qwen-Image-Edit output PNG path (default: `edited.png`). |
-| `--cfg <F>` | Qwen-Image-Edit true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 2.5 (the Qwen-Image-Edit-2511 recommendation; 4.0 over-guides and distorts faces), or 1.0 when a Lightning LoRA is loaded. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. |
+| `--cfg <F>` | Qwen-Image-Edit true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 2.5 (the Qwen-Image-Edit-2511 recommendation; 4.0 over-guides and distorts faces), or 1.0 when a Lightning LoRA is loaded. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. On MiniMax-H3 the only accepted value is `1.0` (its default): the checkpoint ships CFG-distilled and anything higher is refused up front rather than run and degraded. `TensorSharp.Server` has no `--cfg` at all — a request body can still carry `cfg`. |
 | `--qwen-image-vae <path>` | Override the resolved Qwen-Image VAE companion (`.gguf` or `.safetensors`). |
 | `--qwen-image-vl <path>` | Override the resolved Qwen2.5-VL-7B text-encoder GGUF. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen2.5-VL mmproj (vision grounding) GGUF. |
 | `--qwen-image-lora <path>` | Qwen-Image-Edit Lightning distillation LoRA (`.safetensors`). Applied as a runtime F32 side-path next to each targeted projection (`y = W_quant·x + b + (alpha/rank)·up·(down·x)`) with the quantized base weights left untouched — **not** merged into them. Auto-derives the step count from the file name (e.g. 4 or 8), switches CFG to 1.0 and pins the timestep shift to 3, so the default 30 steps × 2 CFG passes (60 DiT forwards) become 4–8. Needs the whole-model or fused per-block CUDA forward — on a path without the side-path it throws rather than emitting noise. Env: `TS_QWEN_IMAGE_LORA`. |
-| `--width <px>` / `--height <px>` | Output size for Qwen-Image-Edit and Wan video. Default: `0` — auto (Qwen-Image-Edit: the source size, VRAM-clamped; Wan: the model's native area at the input image's aspect ratio, 1280×704 for TI2V-5B and 832×480 otherwise). |
-| `--video-frames <N>` | Video frame count, snapped to the model's temporal grid (`4k+1` for Wan, `17k+5` for MiniMax-H3). Default: 33; 49 for Wan2.2-TI2V. `1` generates a still image where the model supports it (use `--output out.png`). |
+| `--width <px>` / `--height <px>` | Output size for Qwen-Image-Edit and video generation. Default: `0` — auto (Qwen-Image-Edit: the source size, VRAM-clamped; MiniMax-H3: 640×384, or that area at the conditioning image's aspect ratio, rounded up to a multiple of 32; Wan: the model's native area at the input image's aspect ratio, 1280×704 for TI2V-5B and 832×480 otherwise). |
+| `--video-frames <N>` | Video frame count, snapped to the model's temporal grid (`4k+1` for Wan; `17k+5` for MiniMax-H3 — 5, 22, 39, 56, 73, 90 …). Default: 33; 49 for Wan2.2-TI2V, 22 for MiniMax-H3. `1` generates a still image where the model supports it (use `--output out.png`). |
 | `--fps <N>` | Playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value. |
 | `--flow-shift <F>` | FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1, 12.0 for MiniMax-H3). On models with a joint audio stream this shifts the video stream only. |
-| `--sampler <name>` | Sampler: `unipc` (the official Wan sampler, default for Wan) or `euler`. |
-| `--negative-prompt <text>` | Negative prompt for classifier-free guidance (default: the model's official negative prompt). Unused at `--cfg 1.0`, where no negative pass runs. |
-| _(step-distilled checkpoints)_ | Auto-detected from the DiT file name (`Turbo`, `distill`, `Lightning`, `lightx2v`, `FastWan`, `-dmd`, or an explicit `…-4steps-…` / `…8step…` for 1–16): the pipeline switches to that step count with guidance off, turning the official 50-step × CFG recipe's 100 DiT passes into 4. This is the single biggest speed lever for Wan — see **[Video generation (Wan)](#video-generation-wan)** below. `--diffusion-steps` / `--cfg` override it. |
-| `--cfg-cache-stride <N>` | Wan guidance cache: run the unconditional CFG pass on one step in `N` and reuse the cached guidance direction in between (default off — every step runs both passes). `2` ≈ 1.30x faster, `3` ≈ 1.43x; approximate, so leave it off when matching a reference sample matters. |
+| `--sampler <name>` | Sampler: `unipc` (the official Wan sampler, default for Wan) or `euler`. A Wan-family knob — MiniMax-H3 runs its own flow-match schedule and does not read it. |
+| `--negative-prompt <text>` | Negative prompt for classifier-free guidance (default: the model's official negative prompt). Unused at `--cfg 1.0`, where no negative pass runs — so it does nothing at all on MiniMax-H3, which only accepts `--cfg 1.0`. |
+| _(step-distilled checkpoints)_ | Auto-detected from the DiT file name (`Turbo`, `distill`, `Lightning`, `lightx2v`, `FastWan`, `-dmd`, or an explicit `…-4steps-…` / `…8step…` for 1–16): the pipeline switches to that step count with guidance off, turning the official 50-step × CFG recipe's 100 DiT passes into 4. This is the single biggest speed lever anywhere in TensorSharp — see **[Video generation (Wan)](#video-generation-wan)** below. `--diffusion-steps` / `--cfg` override it. |
+| `--cfg-cache-stride <N>` | Wan guidance cache: run the unconditional CFG pass on one step in `N` and reuse the cached guidance direction in between (default off — every step runs both passes). `2` ≈ 1.30x faster, `3` ≈ 1.43x; approximate, so leave it off when matching a reference sample matters. No effect at `--cfg 1.0`, and therefore none on MiniMax-H3. |
 | `--video-vae <path>` | Override the resolved video VAE (`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`; `minimax_h3_video_vae_fp16.safetensors` for MiniMax-H3). Env: `TS_VIDEO_VAE` (`TS_WAN_VAE` also honoured). |
 | `--video-text-encoder <path>` | Override the resolved text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Also spelled `--video-te`. Env: `TS_VIDEO_TEXT_ENCODER` (`TS_WAN_TE` also honoured). |
 | `--video-dit2 <path>` | Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner). Auto-resolved by name when the pair is co-located. Env: `TS_VIDEO_DIT2` (`TS_WAN_DIT2` also honoured). |
 | `--audio-vae <path>` | Audio VAE for models that generate an audio track jointly with the video (`minimax_h3_audio_vae_fp32.safetensors`). Without it such a model still produces video, just no audio. Env: `TS_VIDEO_AUDIO_VAE`. |
+| `--video-mode <mode>` | How to read the images you pass, on models with more than one conditioning mode. Default: inferred from what you supply. MiniMax-H3 accepts `t2v` (text only), `i2v` (the image **is** the first frame and gets animated), `fl2v` (first and last frame) and `ref` (the images are identity/appearance references for a **new** scene). `i2v`/`fl2v` need the FL2VA checkpoint and `ref` needs Ref2VA — separate files, not settings, and asking for the wrong one fails with the name of the other. |
 | `--end-image <file>` | Last-frame conditioning image, on models that accept one (MiniMax-H3 first/last-frame mode). Combined with `--image` the clip is steered to start and end on the two frames. |
-| `--ref-image <file>` | Reference image for reference-conditioned models (MiniMax-H3 Ref2VA): the subject carries over while camera, background and composition come from the prompt. Repeatable up to 9; referred to in the prompt as `<Picture 1>`, `<Picture 2>`, … |
-| `--ref-video <path>` | Reference video clip. Repeatable; referred to as `<Video 1>`, `<Video 2>`, … |
-| `--ref-audio <file>` | Reference audio clip. Repeatable; referred to as `<Audio 1>`, `<Audio 2>`, … |
-| `--no-audio` | Skip audio decoding on models that generate an audio track jointly with the video. Ignored by video-only models. |
-
-> **Renamed flags.** `--wan-vae`, `--wan-te` and `--wan-dit2` became `--video-vae`,
-> `--video-text-encoder` and `--video-dit2` when video generation stopped being
-> Wan-only. The old spellings are still accepted everywhere — on the CLI, on the
-> server, and as config-file keys — so existing configs keep working unchanged.
+| `--ref-image <file>` | Reference image for reference-conditioned models (MiniMax-H3 Ref2VA): the subject carries over while camera, background and composition come from the prompt. Repeatable up to 9; referred to in the prompt as `<Picture 1>`, `<Picture 2>`, … References are only ever scaled **down** and keep their own aspect ratio, so the output size still comes from `--width`/`--height`. |
+| `--ref-video <path>` | Reference video clip — a video **file** or a directory of frames, either way resampled onto the model's own 24 fps and canvas. Repeatable; referred to as `<Video 1>`, `<Video 2>`, … |
+| `--ref-video-audio <file>` | Soundtrack for the `--ref-video` at the **same position**: the first pairs with the first, and so on. Separate from `--ref-video` because a container's audio track is not readable through the frame decoder; omit it for a silent reference clip. WAV, MP3 or Ogg. |
+| `--ref-audio <file>` | Reference audio clip. Repeatable; referred to as `<Audio 1>`, `<Audio 2>`, … Resampled to the audio VAE's 32 kHz stereo and truncated to the generated clip's duration. |
+| `--no-audio` | Skip audio decoding on models that generate an audio track jointly with the video (MiniMax-H3), saving the audio VAE's time and memory. Ignored by video-only models. |
+| _(renamed flags)_ | `--wan-vae`, `--wan-te` and `--wan-dit2` became `--video-vae`, `--video-text-encoder` and `--video-dit2` when video generation stopped being Wan-only. The old spellings are still accepted everywhere — on the CLI, on the server, and as config-file keys — so existing configs keep working unchanged. |
 | `--tp <N>` | Tensor parallelism degree — split the model across N GPUs in a single process (default: `1`). Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. Requires `--tp-peers`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. |
@@ -394,8 +424,20 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf
 # Multimodal models: host an explicit projector too
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
 
-# Wan video generation: use 121 frames at 24 fps (about five seconds) whenever
-# the Web UI or an API request does not supply its own frames / fps value.
+# MiniMax-H3: video and its 32 kHz stereo soundtrack generated together. Size,
+# steps and frame count are startup flags because the Web UI sends no numbers of
+# its own; 640x384 is the documented starting point. Each run writes an .mp4 plus
+# a sidecar .wav. See "Video generation with audio (MiniMax-H3)" below.
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+
+# The same host from a shipped config (config/minimax-h3-ref2va.json swaps in the
+# reference checkpoint; only the denoiser differs, so nothing re-downloads).
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/minimax-h3-fl2va.json
+
+# Wan video generation, video only: use 121 frames at 24 fps (about five seconds)
+# whenever the Web UI or an API request does not supply its own frames / fps value.
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/Wan2.2-TI2V-5B.gguf --backend ggml_cuda \
     --video-frames 121 --fps 24
 
@@ -453,8 +495,16 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--help` | Print the parameter reference (also shown when the server is started with no arguments) and exit |
 | `--max-tokens <N>` | Maximum tokens to generate: fills in when a request omits its own limit, and caps a request that asks for more. Applies to every endpoint (Web UI, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses`). Default: `20000`, which is a plain default and does not cap. Env: `MAX_TOKENS`. |
-| `--video-frames <N>` | Default output frame count for Wan video generation when a Web UI or API request omits `frames`. The VAE snaps it to `4k+1`; `121` frames at 24 fps is about five seconds. Without this flag, the model default is `33` (`49` for Wan 2.2 TI2V). An explicit request `frames` value overrides this default. |
-| `--fps <N>` | Default playback frame rate for Wan MP4 output when a Web UI or API request omits `fps`. Without this flag, the model default is `16` fps (`24` for Wan 2.2 TI2V). An explicit request `fps` value overrides this default; changing only FPS changes playback speed rather than the generated frame count. |
+| `--video-width <px>` | Default output width for video generation when a Web UI or API request omits `width`; alias `--width`. **The main quality lever on the server**, because the Web UI sends no size of its own — without it every clip comes out at the model default. `640` (with `--video-height 384`) is the documented starting point for MiniMax-H3. Rounded up to the model's grid. |
+| `--video-height <px>` | Default output height when a request omits `height`; alias `--height`. If only one of the two is given, MiniMax-H3 takes the other from the conditioning image's aspect ratio, which is what stops a 4:3 photo being stretched into a 16:9 frame. |
+| `--video-steps <N>` | Default denoising steps when a request omits `steps` — the quality/time trade-off after resolution. MiniMax-H3's own default is `20`; `4`–`8` is the fast operating point, `16`–`24` is visibly cleaner, past ~30 gains little. |
+| `--video-mode <mode>` | Default conditioning mode when a request omits `videoMode`: `t2v` (text only), `i2v` (the image is the first frame and is animated), `fl2v` (first **and** last frame pinned) or `ref` (the images are identity/appearance references for a new scene). Omit it and each request's mode is inferred from what it supplies, which is usually what you want; pin it for a deployment that only offers one. |
+| `--video-frames <N>` | Default output frame count for video generation when a Web UI or API request omits `frames`. Snapped to the model's temporal grid — `4k+1` for Wan, where `121` frames at 24 fps is about five seconds; `17k+5` for MiniMax-H3. Without this flag, the model default is `33` (`49` for Wan 2.2 TI2V, `22` for MiniMax-H3). An explicit request `frames` value overrides this default. |
+| `--fps <N>` | Default playback frame rate for the generated MP4 when a Web UI or API request omits `fps`. Without this flag, the model default is `16` fps (`24` for Wan 2.2 TI2V). An explicit request `fps` value overrides this default; changing only FPS changes playback speed rather than the generated frame count. Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value. |
+| `--video-vae <path>` | Override the resolved video VAE (`wan_2.1_vae.safetensors` / `Wan2.2_VAE.safetensors`; `minimax_h3_video_vae_fp16.safetensors` for MiniMax-H3). Default: a same-directory scan next to the DiT, `VAE/` subfolders included. Env: `TS_VIDEO_VAE`; `--wan-vae` still accepted. |
+| `--video-text-encoder <path>` | Override the resolved text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Also spelled `--video-te`. Env: `TS_VIDEO_TEXT_ENCODER`; `--wan-te` still accepted. |
+| `--video-dit2 <path>` | Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner of `--model`). Auto-resolved by name when the pair is co-located. Env: `TS_VIDEO_DIT2`; `--wan-dit2` still accepted. |
+| `--audio-vae <path>` | Audio VAE for models that generate an audio track jointly with the video (`minimax_h3_audio_vae_fp32.safetensors`). Without it such a model still runs and produces video, just no audio. Env: `TS_VIDEO_AUDIO_VAE`. |
 | `--temperature <f>` | Sampling temperature (`0` = greedy) |
 | `--top-k <N>` | Top-K filtering (`0` = disabled) |
 | `--top-p <f>` | Nucleus sampling threshold (`1.0` = disabled) |
@@ -471,13 +521,11 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
 | `--prefill-chunk-size <N>` | Chunked-prefill granularity under contention — the maximum prefill tokens scheduled per step while other requests are running, so parallel decodes get frequent turns at the GPU (default: `1024`). Env: `TS_SCHED_PREFILL_CHUNK`. |
-| `--spec` / `--no-spec`<br>*(aliases `--mtp-spec` / `--no-mtp-spec`)* | Enable speculative decoding (default off). With the default `--spec-type auto` this uses whichever multi-token-prediction draft head the checkpoint ships (Qwen 3.6's embedded NextN block, or a Gemma 4 `gemma4-assistant` draft loaded via `--mtp-draft-model`). Engages for solo (non-concurrent) sequences: the draft head proposes up to `--mtp-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode. Engaged automatically only where profitable: Qwen 3.6 reports its embedded NextN block profitable on every backend, while Gemma 4's separate draft head engages on the ggml backends and on the direct `cuda` backend only. CPU / GGML CPU / MLX serve standard decode. Env: `TS_MTP_SPEC`. |
-| `--spec-type <name>` | Speculation algorithm: `auto` (default) / `draft-head` / `block` / `ngram`. `ngram` needs no trained weights and works on every model. Env: `TS_SPEC_TYPE`. |
+| `--spec` / `--no-spec`<br>*(aliases `--mtp-spec` / `--no-mtp-spec`)* | Enable speculative decoding (default off). With the default `--spec-type auto` this uses whichever multi-token-prediction draft head the checkpoint ships (Qwen 3.6's embedded NextN block, or a Gemma 4 `gemma4-assistant` draft loaded via `--mtp-draft-model`). Engages for solo (non-concurrent) sequences: the draft head proposes up to `--mtp-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode. Engaged automatically only where profitable: Qwen 3.6 reports its embedded NextN block profitable on every backend, while Gemma 4's separate draft head engages on the ggml backends and on the direct `cuda` backend only. CPU / GGML CPU / MLX serve standard decode. Env: `TS_SPEC` (legacy `TS_MTP_SPEC`). |
+| `--spec-type <name>`<br>*(alias `--mtp-type`)* | Speculation algorithm: `auto` (default) / `draft-head` / `block` / `ngram`. `ngram` needs no trained weights and works on every model — it drafts by finding where the last few tokens occurred earlier in the context and proposing what followed, so it is strong wherever the answer quotes its input. Env: `TS_SPEC_TYPE`. |
 | `--spec-draft <N>`<br>*(alias `--mtp-draft`)* | Maximum tokens drafted per speculative step (default `8`). Env: `TS_SPEC_DRAFT` (or `TS_MTP_DRAFT`). |
 | `--spec-pmin <f>`<br>*(alias `--mtp-pmin`)* | Draft-confidence gate in `(0, 1]`; drafting stops at the first token below it. Default per algorithm — `0.75` for a per-token draft head (top-1 probability over its top-10 logits), `0.35` for a block drafter (the CUMULATIVE prefix probability, so far stricter), `0` for n-gram. Env: `TS_SPEC_PMIN` (or `TS_MTP_PMIN`). |
 | `--draft-model <path>` | Speculative-decoding draft model for architectures whose drafter ships as its own file: DeepSeek V4's DSpark support GGUF (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)) and Muse-Glimmer's DFlash drafter (see [Muse-Glimmer](docs/models/muse-glimmer.md#3-dflash-speculative-decoding), env `TS_MUSE_GLIMMER_DFLASH`). Either one drafts a whole block per step and the trunk verifies it in one batched forward. Every emitted token is still drawn from a trunk row — with argmax under a greedy config, with the run's own sampler otherwise — so the output stream is unchanged either way. Engages on every single-sequence CLI path — `--input`, `--multi-turn-jsonl` and `--interactive` — with `--backend cuda` or `--backend ggml_cuda`; `TensorSharp.Server` accepts the same flag alongside `--mtp-spec`. One caveat under a penalized sampler: a block drafter proposes its whole block in one pass, so the repetition/presence/frequency penalties that verification applies are not applied to the proposal, and acceptance falls as the penalized history grows. A per-token head (`--mtp-spec`) does not have that problem — its drafts are penalized with the same history. Env: `TS_DSV4_DSPARK`. |
-| `--spec-draft-n-max <N>` | Cap on tokens drafted per speculative block (default: the drafter's trained block size). |
-| `--spec-draft-conf-min <p>` | Minimum cumulative acceptance probability (the product of the confidence head's per-position estimates) for a drafted position to be kept (default `0.35`). |
 | `--spec-draft-model <path>`<br>*(alias `--mtp-draft-model`)* | Path to a separate draft-head GGUF for architectures whose draft head ships as its own file (Gemma 4's `gemma4-assistant`). The draft's hidden size must match the target (e.g. pair the 12B target with its 12B draft, not the 26B-A4B draft); a mismatched or incomplete draft fails fast at startup with a remediation hint. Ignored for Qwen 3.6, which embeds its NextN block in the trunk GGUF. Env: `TS_MTP_DRAFT_MODEL`. |
 | `--paged-kv` / `--no-paged-kv` | Legacy compatibility flags for the removed per-session paged-KV manager. Current server KV state is engine-owned; use continuous-batching / `TS_SCHED_*` knobs for the engine. Aliases: `--paged-kv-cache` / `--no-paged-kv-cache`. |
 | `--paged-kv-block-size <N>` | Legacy standalone paged-KV block size. The current server engine uses `TS_SCHED_BLOCK_SIZE`. |
@@ -507,8 +555,8 @@ did unconditionally.
 | `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `MAX_TOKENS` | Maximum generation length when `--max-tokens` is not passed: fills in when a request omits its own limit and caps a request that asks for more (default: `20000`, which is a plain default and does not cap) |
 | `MAX_CONTEXT` | Context window to allocate, overriding the length the GGUF advertises. Set, it is a **hard limit**: honoured when the caches plus one full `n_ubatch` graph fit, refused with the numbers when they do not. Left unset, the advertised length is a **ceiling** — after the weights load, the runtime asks the devices how much VRAM is actually free, sizes the context to fit, and logs what it picked. GLM-5.2 advertises 1,048,576 tokens (~93 GiB of KV); on 3x RTX PRO 6000 the pick is 342,272 on the layer split, 91,136 with `--tp 3`, and 646,400 with `--n-cpu-moe 30` |
-| `VIDEO_SAMPLE_FPS` | Frames sampled per second from an **input video prompt** for multimodal understanding; time-based extraction (default: `1`). This is unrelated to the Wan output setting `--fps`. |
-| `VIDEO_MAX_FRAMES` | Optional upper bound on frames extracted from an **input video prompt** (evenly down-sampled); unset/`0` means no cap (default: no cap). This is unrelated to Wan output `--video-frames`. |
+| `VIDEO_SAMPLE_FPS` | Frames sampled per second from an **input video prompt** for multimodal understanding; time-based extraction (default: `1`). This is unrelated to the video-generation output setting `--fps`. |
+| `VIDEO_MAX_FRAMES` | Optional upper bound on frames extracted from an **input video prompt** (evenly down-sampled); unset/`0` means no cap (default: no cap). This is unrelated to the video-generation output setting `--video-frames`. |
 | `PORT` / `HOST` | Listen port / bind interface when `--port` / `--host` are not passed (defaults: `5000`, `0.0.0.0`) |
 | `ASPNETCORE_URLS` | Full listen URL(s) when none of `--port`, `--host`, `--urls`, `PORT`, or `HOST` is set |
 | `TENSORSHARP_TEMPERATURE` | Sampling temperature when `--temperature` is not passed. Counts as operator-configured, so it also outranks the request body under the default `--sampling-precedence config` |
@@ -620,14 +668,65 @@ the rest. Either way `--stop` sequences pinned on the server stay in force under
 
 ## Video generation with audio (MiniMax-H3)
 
-MiniMax-H3 generates video **and a native 32 kHz stereo soundtrack together** — the
-audio is part of the model output, not dubbed on afterwards. It is CFG-distilled, so
-`--cfg 1.0` is required and 4–8 steps is the operating point.
+MiniMax-H3 generates video **and a native 32 kHz stereo soundtrack together** — one
+diffusion transformer denoises a packed video+audio latent in a single token sequence,
+so the audio is part of the model output rather than something dubbed on afterwards.
+Up to 15 s at 24 fps. It is CFG-distilled, so `--cfg 1.0` is required; the pipeline
+defaults to 20 denoising steps and 4–8 is the fast operating point. Measured on an
+M5 Pro with Metal at 22 frames, 8 steps and an identical seed, it runs 2.4× faster
+than stable-diffusion.cpp at 256×256 (49.3 s → **20.9 s**) and 1.7× at 640×384
+(108.5 s → **63.1 s**).
 
-Four files are needed; companions resolve automatically if they sit next to the
-denoiser. The text encoder ships **no tokenizer**, so `vocab.json` and `merges.txt`
-from [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
+Four networks are needed — one of the two denoisers plus three shared companions.
+Each is loaded and released in turn, so peak VRAM is the largest of them rather than
+their sum:
+
+| Role | File | Size |
+| --- | --- | --- |
+| Denoiser — keyframes (`t2v` / `i2v` / `fl2v`) | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 10.64 GiB |
+| Denoiser — references (`t2v` / `ref`) | `minimax_h3_ref2va_pruned-Q4_K.gguf` | 10.60 GiB |
+| Text encoder (Qwen3-VL-32B, 50 layers) | `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` | 16.97 GiB |
+| Video VAE (16× spatial / 4× temporal) | `minimax_h3_video_vae_fp16.safetensors` | 5.21 GB |
+| Audio VAE (32 kHz stereo) | `minimax_h3_audio_vae_fp32.safetensors` | 0.61 GB |
+
+Which denoiser is loaded is read off the **file name**: one containing `ref2va` selects
+the reference checkpoint, anything else the first/last-frame one — so a rename or a
+requantization has to keep `ref2va` in the name.
+
+Companions resolve automatically when they sit next to the denoiser; otherwise name
+them with `--video-text-encoder`, `--video-vae` and `--audio-vae`. Leave the audio VAE
+out and you still get video, just silent — as does `--no-audio`, which skips the audio
+decode to save its time and memory; on Ref2VA that same VAE's encoder is what a
+`--ref-audio` goes through, so dropping it costs reference soundtracks as well as the
+generated one. The text encoder ships **no tokenizer**, so
+`vocab.json` and `merges.txt` from
+[MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
 must be beside it (or point `TS_VIDEO_TOKENIZER` at them).
+
+The two shipped configs name all four networks, which is what lets them auto-download
+into `${modelRoot}` on the first run (~33.5 GB, or ~33.4 GB for the Ref2VA set) and be
+reused after. Only the denoiser differs between them, so running the second one
+downloads nothing but its own DiT:
+
+```bash
+# Keyframes: text-to-video, image-to-video, first-and-last-frame
+tensorsharp --config config/minimax-h3-fl2va.json \
+  --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+
+# References: same subject, brand-new scene
+tensorsharp --config config/minimax-h3-ref2va.json \
+  --ref-image person.png --ref-image jacket.png \
+  --prompt "she walks through a night market, neon reflections" --output market.mp4
+
+# Either file also hosts the server
+./TensorSharp.Server --config config/minimax-h3-fl2va.json
+```
+
+Both configs pin `"backend": "ggml_cuda"` and `640×384 × 22` frames at 24 fps;
+`--backend ggml_metal` on the command line overrides the backend. Neither sets steps
+or guidance, because the two hosts spell steps differently (`--diffusion-steps` on the
+CLI, `--video-steps` on the server) and the server takes no `--cfg` at all — so the
+model's own defaults apply.
 
 **Text to video.** Writes `fox.mp4` plus `fox.wav` with the generated soundtrack:
 
@@ -670,6 +769,13 @@ it explicitly.
 | "reference this product, new angle and background" | `ref` | `minimax_h3_ref2va_pruned-*` |
 | text only | `t2v` | either |
 
+Combinations that cannot mean one thing are refused up front, by name, rather than
+half-honoured: `ref` on the FL2VA checkpoint, keyframes on Ref2VA, `i2v` without an
+image, `fl2v` without `--image` and/or `--end-image`, `ref` with nothing to reference,
+`t2v` with images supplied, and keyframes together with named references — a clip that
+comes back looking like the request was honoured is the worse failure. Each message
+names the checkpoint to load or the flag to drop.
+
 Reference conditioning keeps the subject and changes everything else — camera,
 background and composition come from the prompt, and the first frame need not
 resemble the reference at all:
@@ -705,6 +811,20 @@ A reference clip is the most expensive input H3 takes — a 22-frame 448x320 one
 encode. It is resampled to 24 fps, pulled onto the 17k+5 grid, and shown to the
 language model at 2 fps.
 
+**References are not free, and the second cost is the one that bites.** Inside the
+denoiser they are linear and cheap: a 640×384 reference is 240 tokens, and on an RTX
+3080 Laptop a 22-frame 640×384 step goes from 4.37 s with no references to 9.38 s with
+eight — ~626 ms per reference per step, flat from one to eight. The Qwen3-VL pass is
+where it turns: each reference adds ~250 vision placeholder tokens to the prompt and
+all 50 layers prefill them, so two references make a 548-token prompt and eight make a
+2086-token one, and text conditioning grows from ~65 s to ~447 s while the whole 8-step
+denoise still costs ~75 s. Past roughly four references the encoder, not the denoiser,
+is the run — reach for fewer, better references before reaching for fewer steps. The
+nine-reference cap is TensorSharp's own: the packed sequence is attended over unmasked,
+so its length is a numeric budget as well as a time one. Say who is in frame, too — the
+reference supplies the identity, but the prompt still has to describe the shot, or the
+scene comes back well rendered with the subject missing.
+
 **Quality.** Two settings dominate:
 
 | Lever | Default | What it does |
@@ -717,8 +837,10 @@ language model at 2 fps.
 `--cfg` is not a quality lever (H3 only accepts 1.0) and `--negative-prompt` does
 nothing, because there is no unconditional pass.
 
-**On the server, size is a startup flag** — the Web UI sends only the prompt and the
-image, so requests inherit the server defaults:
+**On the server, size is a startup flag.** The browser sends the prompt plus whatever
+conditioning the hosted checkpoint advertises — a first frame, a last frame, or up to
+`maxReferenceImages` references — and nothing numeric at all, so every clip inherits
+the server defaults:
 
 ```bash
 ./TensorSharp.Server --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
@@ -731,9 +853,55 @@ omit it and each request's mode is inferred from what it supplies.
 Omit `--video-width`/`--video-height` and each request takes its aspect ratio from
 the uploaded image, which avoids stretching a 4:3 photo into a 16:9 frame.
 
+**The HTTP surface.** Three endpoints generate video, all registered with the request
+timeout disabled: `POST /api/video-generate`, `POST /api/video-generate/stream` (the
+same body over SSE, ticking `{ videoGen, step, total, phase, detail, elapsedSeconds,
+etaSeconds }` and ending on `{ done: true, … }`) and the OpenAI-shaped
+`POST /v1/videos/generations`. All three share one parser, so one body works
+everywhere: `prompt` (required), `width`, `height`, `frames`, `steps`, `cfg`, `cfg2`,
+`seed`, `fps`, `flowShift`, `negativePrompt`, `sampler`, `cfgCacheStride`, `videoMode`,
+`generateAudio`, `imagePath` (or inline base64 `image`), `endImage`, `referenceImages`,
+`referenceVideos`, `referenceAudios` and `referenceVideoAudios` — the last paired **by
+index** with `referenceVideos`. The fields added for joint audio-video and reference
+conditioning also accept a snake_case spelling (`video_mode`, `generate_audio`,
+`end_image`, `reference_images`, …), camelCase winning if both are sent; the older
+fields are camelCase only. Every path field must name a file previously uploaded
+through `/api/upload` and is confined to the upload directory.
+
+`/api/video-generate` answers
+`{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }`, with
+`audioUrl` null when the model generated no track; `/v1/videos/generations` also takes
+`size` as `"832x480"`, `negative_prompt` and `response_format` (`url` or `b64_json`)
+and answers `{ created, data: [{ url, b64_json }], audio_url, width, height, frames,
+fps, seed, codec, elapsed_seconds }`. A request the model can explain — the wrong
+checkpoint for the mode, a mode without its inputs, keyframes and references together —
+comes back as a 400 carrying the model's own message instead of a generic 500, and a
+host whose model does not generate video answers `The loaded model is not a
+video-generation model.`
+
+`GET /api/models` carries a `video` object whenever the hosted model generates video
+and `null` otherwise, which is how a client learns what to offer without pattern-matching
+an architecture string: `family` (`minimax-h3`), `supportsAudio` (true once an audio VAE
+resolved), `supportsImageConditioning`, `supportsEndImageConditioning` (FL2VA only),
+`supportsReferenceConditioning` and `maxReferenceImages` (9, on Ref2VA). The Web UI
+reads exactly those fields to decide whether to attach a last frame or references.
+
 **Sizes.** Width and height round up to a multiple of 32; the frame count rounds up
-onto the `17k+5` grid (5, 22, 39, …) and fps is pinned to 24. TensorSharp currently
-generates one VAE temporal chunk, so **22 frames** is the working length.
+onto the `17k+5` grid (5, 22, 39, 56, 73, 90 …) and fps is pinned to 24, giving up to
+15 s of clip. Any grid length decodes correctly — the video VAE runs 5 latent frames
+at a time with a 2-frame look-ahead and cross-fades the seams. Decoding a long clip in
+one call instead washes detail out progressively (measured against the conditioning
+photo, frame 0 falls from 0.97 correlation at 22 frames to 0.86 at 90), so the chunking
+is a correctness requirement rather than an optimization.
+
+**When a long clip diverges it fails instead of saving.** H3 attends bidirectionally
+over the whole clip, so the key count *is* the clip — 2364 packed tokens at 22 frames,
+8646 at 107 — and a diverged flow-matching velocity would decode to a file that looks
+right in every property except that every pixel is black and every audio sample is
+clamped. A non-finite velocity therefore fails the request, naming the step it appeared
+at, rather than writing that file. Set `TS_H3_TRACE=1` to print the latent and velocity
+magnitudes for every step; the absmax leaves its normal range several steps before it
+reaches infinity.
 
 **Audio** is written as a sidecar `.wav` rather than muxed, because muxing needs an
 encoder that may not be installed. Combine them with:
@@ -749,7 +917,12 @@ Full detail, including the architecture and the verification numbers:
 
 A `wan` GGUF turns a prompt — plus an optional first-frame image on the Wan 2.2
 models — into an H.264 MP4, from `TensorSharp.Cli`, the server's three video
-endpoints, and the Web UI chat. Full architecture detail is in the
+endpoints, and the Web UI chat. Wan is the **video-only** family: it reports no
+audio, no end-frame and no reference conditioning, so `--end-image`, `--ref-image`,
+`--ref-video`, `--ref-video-audio`, `--ref-audio`, `--audio-vae` and `--no-audio` are
+MiniMax-H3 flags in practice — for a clip that comes back with a soundtrack see
+[Video generation with audio (MiniMax-H3)](#video-generation-with-audio-minimax-h3)
+above. Full architecture detail is in the
 [Wan card](docs/models/wan.md); this section is the operator's view: which
 checkpoint to download, and which knobs actually change the wall clock.
 
@@ -776,8 +949,8 @@ Wan is the one family that rejects a backend outright: it runs on `ggml_cuda`,
 
 ### The fast lane: step-distilled checkpoints
 
-**This is the single biggest speed lever in Wan, and it costs nothing but a
-different download.** The official Wan2.2-TI2V-5B recipe is 50 steps × 2
+**This is the single biggest speed lever anywhere in TensorSharp, and it costs
+nothing but a different download.** The official Wan2.2-TI2V-5B recipe is 50 steps × 2
 classifier-free-guidance passes = **100 DiT passes**. A step-distilled
 checkpoint (Turbo / Lightning / FastWan / DMD) is trained to run guidance-free
 in a handful of steps, so the same video costs **4 DiT passes** — 1/25th of the

@@ -32,7 +32,7 @@ dotnet run --project TensorSharp.Server -c Release --no-build -- --model models/
   -H "Content-Type: application/json" \
   -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'</code></pre>
   <p>API 基址是 <strong><code>http://localhost:5000</code></strong>。内置聊天 UI 位于 <strong><a href="http://localhost:5000/index.html"><code>http://localhost:5000/index.html</code></a></strong>；<code>GET /</code> 是存活检查接口，返回 <code>"TensorSharp.Server is running"</code>。</p>
-  <div class="callout note"><div class="ic">📌</div><p>推理必须在启动时传入 <code>--model</code>。服务器只托管启动时指定的 GGUF，以及可选且必须显式传入的 <code>--mmproj</code>；它不会扫描模型目录或自动探测投影器。<code>/api/models/load</code> 只能用其他受支持后端重新加载同一启动组合。无模型进程不能在运行时选择 GGUF。监听地址固定为 <code>http://0.0.0.0:5000</code>，没有端口参数。</p></div>
+  <div class="callout note"><div class="ic">📌</div><p>推理必须在启动时传入 <code>--model</code>。服务器只托管启动时指定的 GGUF，以及可选且必须显式传入的 <code>--mmproj</code>；它不会扫描模型目录或自动探测投影器。<code>/api/models/load</code> 只能用其他受支持后端重新加载同一启动组合。无模型进程不能在运行时选择 GGUF。默认监听地址是 <code>http://0.0.0.0:5000</code>；<code>--port</code>、<code>--host</code> 与 <code>--urls</code>（环境变量 <code>PORT</code> / <code>HOST</code> / <code>ASPNETCORE_URLS</code>）可以改变它。</p></div>
   <div class="callout warn"><div class="ic">🔐</div><p>服务端没有内置 API Key 身份验证或 TLS，并监听所有网络接口。本机使用时请依靠主机防火墙；需要远程访问时应置于带身份验证的 HTTPS 反向代理之后，不要把 5000 端口直接暴露给不可信网络。</p></div>
 
   <h3>已构建的源码目录</h3>
@@ -68,22 +68,36 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf
     <li>消息编辑与删除，并可从对话中任意位置重新生成。</li>
     <li>当托管 <code>diffusion-gemma</code> GGUF 时，提供 DiffusionGemma 去噪预览（每步替换整条助手消息，最后定稿）。</li>
     <li>托管 <code>qwen_image</code> DiT 时提供 Qwen-Image-Edit：上传图像并输入编辑指令后，最多 8 帧实时去噪预览会原位刷新，最终 PNG 提供下载链接。</li>
-    <li>托管 <code>wan</code> DiT 时提供 Wan 视频生成：输入提示词（可选附一张图像作为首帧），浏览器通过 SSE 实时显示逐步去噪进度，直到 MP4 出现并提供下载链接。<strong>浏览器只发送这两样东西</strong> —— 详见下文<a href="#video">视频生成</a>。</li>
+    <li>托管视频生成模型（MiniMax-H3 或 Wan）时提供视频生成：输入提示词，附上所加载权重声明支持的条件输入，浏览器通过 SSE 实时显示逐步去噪进度，直到 MP4 出现并提供下载链接。在 MiniMax-H3 上还会同时返回一条 32&nbsp;kHz 立体声音轨 —— 它与画面出自同一次生成。<strong>所有数值仍然来自启动参数</strong> —— 详见下文<a href="#video">视频生成</a>。</li>
     <li>自由滚动 —— 在新 token 流式输出时阅读较早的回复；自动滚动会在回到底部时恢复。</li>
   </ul>
 
-  <h2 id="video">视频生成（Wan）：网页界面能设什么，什么只能靠 API</h2>
-  <p>托管一个 <code>wan</code> DiT，网页界面就变成了一个视频生成器。有必要清楚地知道浏览器实际控制了请求中多小的一部分：一次 Wan 任务可能跑几分钟，也可能跑几小时，而浏览器在任务开始后无法再改变这一点。</p>
-  <div class="callout warn"><div class="ic">⏱️</div><p><strong>浏览器只发送两个字段：<code>prompt</code>，以及（当你附加图像时）作为首帧的 <code>imagePath</code>。</strong>帧数、fps、分辨率、去噪步数、CFG、seed、flow shift、采样器、负向提示词与引导缓存<em>都没有</em>在界面上暴露 —— 它们全部来自启动参数或模型自身的配方。若要按请求设置这些值，请直接调用 <a href="http-api_zh-cn.html#video-api"><code>POST /api/video-generate</code></a> 或 <code>/v1/videos/generations</code>。</p></div>
+  <h2 id="video">视频生成：网页界面能设什么，什么只能靠 API</h2>
+  <p>托管一个视频生成模型（MiniMax-H3 或 Wan），网页界面就变成了一个视频生成器。这些接口判断的是 <code>IVideoGenerationModel</code> 接缝而不是架构字符串，因此其他模型会返回 <code>400</code> 与 <code>The loaded model is not a video-generation model.</code>。有必要清楚地知道浏览器实际控制了请求中多小的一部分：一次视频任务可能跑几分钟，也可能跑几小时，而浏览器在任务开始后无法再改变这一点。</p>
+  <pre data-lang="bash"><code># MiniMax-H3：画面与它的 32 kHz 立体声音轨在同一个潜变量里一起去噪
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+
+# 同样的几何参数，换另一个权重：用身份 / 外观参考生成一个新场景
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model ./models/minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-width 640 --video-height 384 --video-steps 20 --video-frames 22</code></pre>
+  <p>FL2VA 与 Ref2VA 是两个权重文件，而不是两档设置：加载哪一个决定了附上的图像被当作关键帧还是参考，<code>/api/models</code> 报给浏览器的也正是这一点。<code>config/minimax-h3-fl2va.json</code> 与 <code>config/minimax-h3-ref2va.json</code> 带的是同一套几何参数，并会在首次运行时下载去噪器、共享的 Qwen3-VL-32B 文本编码器与两个 VAE —— 但不包括分词器，因为它不是一个命令行参数：请把上游 <code>MiniMaxAI/MiniMax-H3</code> 仓库 <code>processor/</code> 目录下的 <code>vocab.json</code> 与 <code>merges.txt</code> 放到编码器旁边，或让 <code>TS_VIDEO_TOKENIZER</code> 指向存放它们的目录。</p>
+  <div class="callout warn"><div class="ic">⏱️</div><p><strong>浏览器发送的是提示词，外加所加载模型声明支持的条件输入</strong> —— 首帧、尾帧，或最多 <code>maxReferenceImages</code> 张参考图，以及随附的参考片段与音轨 —— 这份请求体是按 <code>GET /api/models</code> 返回的 <code>video</code> 能力对象拼出来的，而不是靠架构名去猜。帧数、fps、分辨率、去噪步数、seed、flow shift、采样器、负向提示词与引导缓存<em>都没有</em>在界面上暴露：它们来自启动参数或模型自身的配方。引导则根本没有对应的启动参数 —— <strong>服务端完全没有 <code>--cfg</code></strong> —— 只能在请求里设置，而 MiniMax-H3 会拒绝任何大于 <code>1.0</code> 的取值，因为它出厂就是 CFG 蒸馏过的。若要按请求设置这些值，请直接调用 <a href="http-api_zh-cn.html#video-api"><code>POST /api/video-generate</code></a> 或 <code>/v1/videos/generations</code>。</p></div>
   <p>进程在启动时就已决定的部分：</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>由什么决定</th><th>设置项</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td><code>--model</code>（进程内固定）</td><td>去噪前向次数、引导</td><td><strong>最大的单项成本因素。</strong>基础的 Wan2.2-TI2V-5B 走官方配方 50 步 × 2 次 CFG = 100 次 DiT 前向；步数蒸馏的 <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重会从文件名被识别出来，只跑 4 次无引导前向。在 M5 Pro 上、1088×832 × 121 帧的同一个请求，这就是约 3 h 30 m 与 17 m 30 s 的差别。→ <a href="benchmarks_zh-cn.html#wan">实测数据</a> · <a href="models-video_zh-cn.html#wan">下载</a></td></tr>
-      <tr><td><code>--video-frames N</code></td><td>默认帧数</td><td>这是服务端范围的<em>默认值</em>，不是上限：请求里带 <code>frames</code> 就会覆盖它。数值会对齐到 <code>4k+1</code>。不传该参数时按模型配方来 —— Wan2.2-TI2V 为 49 帧，其余为 33 帧。</td></tr>
-      <tr><td><code>--fps N</code></td><td>默认播放帧率</td><td>同样是默认值，可被请求中的 <code>fps</code> 独立覆盖。不传时配方给出 Wan2.2-TI2V 24 fps、其余 16 fps。fps 只改变播放速度，不改变计算量。</td></tr>
-      <tr><td>请求本身（仅 API）</td><td>其余全部</td><td><code>width</code>、<code>height</code>、<code>frames</code>、<code>steps</code>、<code>cfg</code>、<code>cfg2</code>、<code>seed</code>、<code>fps</code>、<code>flowShift</code>、<code>sampler</code>、<code>negativePrompt</code>、<code>cfgCacheStride</code>。</td></tr>
+      <tr><td><code>--model</code>（进程内固定）</td><td>属于哪个家族，以及去噪前向次数</td><td><strong>最大的单项成本因素。</strong>MiniMax-H3 经过 CFG 蒸馏，每一步都只是一次无引导前向 —— 默认 20 步，快速工作点是 4–8 步。基础的 Wan2.2-TI2V-5B 走官方配方 50 步 × 2 次 CFG = 100 次 DiT 前向；步数蒸馏的 <em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重会从文件名被识别出来，只跑 4 次无引导前向。在 M5 Pro 上、1088×832 × 121 帧的同一个请求，这就是约 3 h 30 m 与 17 m 30 s 的差别。→ <a href="benchmarks_zh-cn.html#minimax-h3">H3 实测</a> · <a href="benchmarks_zh-cn.html#wan">Wan 实测</a> · <a href="models-video_zh-cn.html">下载</a></td></tr>
+      <tr><td><code>--video-width N</code> / <code>--video-height N</code></td><td>默认输出尺寸</td><td><strong>服务端最主要的画质杠杆</strong>，因为网页界面自己不发送尺寸：不设它们，每段视频都按模型默认尺寸生成。MiniMax-H3 的推荐起点是 640×384；只给出宽高之一时，H3 会按条件图像的宽高比推出另一个。别名：<code>--width</code> / <code>--height</code>。</td></tr>
+      <tr><td><code>--video-steps N</code></td><td>默认去噪步数</td><td>分辨率之后第二重要的质量/耗时取舍。MiniMax-H3 默认 20 步；4–8 步是快速工作点，16–24 步明显更干净，超过约 30 步收益很小。请求中的 <code>steps</code> 会覆盖它。</td></tr>
+      <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>默认条件模式</td><td>为未带 <code>videoMode</code> 的请求钉住 <code>t2v</code> / <code>i2v</code> / <code>fl2v</code> / <code>ref</code>。不传它，每个请求会按自身携带的内容推断模式，通常这才是你想要的；只提供单一模式的部署才需要钉住它。</td></tr>
+      <tr><td><code>--video-frames N</code></td><td>默认帧数</td><td>这是服务端范围的<em>默认值</em>，不是上限：请求里带 <code>frames</code> 就会覆盖它。数值会对齐到模型自身的时间网格 —— Wan 为 <code>4k+1</code>，MiniMax-H3 为 <code>17k+5</code>。不传该参数时按模型配方来 —— Wan2.2-TI2V 为 49 帧，其余 Wan 权重为 33 帧，MiniMax-H3 为 22 帧。</td></tr>
+      <tr><td><code>--fps N</code></td><td>默认播放帧率</td><td>同样是默认值，可被请求中的 <code>fps</code> 独立覆盖。不传时配方给出 Wan2.2-TI2V 24 fps、其余 16 fps；MiniMax-H3 以固定 24 fps 训练，会覆盖任何其他取值。fps 只改变播放速度，不改变计算量。</td></tr>
+      <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>是否会返回音轨</td><td>只对与视频联合生成音频的模型有意义（<code>minimax_h3_audio_vae_fp32.safetensors</code>）。不传它，MiniMax-H3 照样能跑并产出视频，只是没有声音 —— 而 <code>/api/models</code> 上的 <code>supportsAudio</code> 会报 <code>false</code>。</td></tr>
+      <tr><td>请求本身（仅 API）</td><td>其余全部</td><td><code>width</code>、<code>height</code>、<code>frames</code>、<code>steps</code>、<code>cfg</code>、<code>cfg2</code>、<code>seed</code>、<code>fps</code>、<code>flowShift</code>、<code>sampler</code>、<code>negativePrompt</code>、<code>cfgCacheStride</code>、<code>videoMode</code>、<code>generateAudio</code>、<code>endImage</code>、<code>referenceImages</code>、<code>referenceVideos</code>、<code>referenceAudios</code>、<code>referenceVideoAudios</code>。</td></tr>
     </tbody>
   </table>
   </div>
@@ -91,16 +105,16 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ./models/model.gguf
   <pre data-lang="bash"><code>curl -s http://localhost:5000/api/video-generate \
   -H "Content-Type: application/json" \
   -d '{
-        "prompt": "the camera pushes in as the waves rise",
-        "width": 736, "height": 544,
-        "frames": 81, "fps": 24,
-        "steps": 30, "seed": 42,
-        "flowShift": 5.0, "sampler": "unipc",
-        "negativePrompt": "static, blurry",
-        "cfgCacheStride": 2
+        "prompt": "a red fox trotting through falling snow, cinematic",
+        "width": 640, "height": 384,
+        "frames": 22, "fps": 24,
+        "steps": 8, "cfg": 1.0, "seed": 42,
+        "videoMode": "t2v",
+        "generateAudio": true
       }'</code></pre>
-  <p><code>"image"</code> 字段可直接携带 base64 首帧（允许带 <code>data:…;base64,</code> 前缀）；<code>"imagePath"</code> 是 Web UI 使用的形式，必须引用 <code>/api/upload</code> 已经返回过的文件。OpenAI 形态的 <code>POST /v1/videos/generations</code> 接收同样的参数，但尺寸写作 <code>"size": "832x480"</code>、负向提示词写作 <code>"negative_prompt"</code>。完整的请求/响应结构见 <a href="http-api_zh-cn.html#video-api">HTTP API</a> 页。</p>
-  <div class="callout tip"><div class="ic">💡</div><p><strong>开跑长任务之前，先估算规模。</strong>开销主要由 DiT token 数决定（<code>latent_frames × (h/2) × (w/2)</code>），而自注意力是 O(token²)，因此帧数与帧面积的影响远大于步数。按效果排序：换用步数蒸馏权重、减少帧数、减小帧面积（但不要低于约 0.3 MP）、在基础权重上减少步数，最后是 <code>"cfgCacheStride": 2</code> 或 <code>3</code>（1.30× / 1.43×）。480p（约 0.4 MP）是 Wan 训练过的分辨率，属于真正的输出档位，而非降级模式。</p></div>
+  <p>返回体是 <code>{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }</code>；<code>audioUrl</code> 指向旁挂的 WAV，当模型没有产出音轨时为 <code>null</code>。Wan 使用同样的请求体，只是换成它自己的旋钮 —— <code>"flowShift": 5.0</code>、<code>"sampler": "unipc"</code>、<code>"negativePrompt"</code>、<code>"cfgCacheStride": 2</code> —— 这些 MiniMax-H3 一个都用不上，因为它在 <code>"cfg": 1.0</code> 下无引导运行。</p>
+  <p><code>"image"</code> 字段可直接携带 base64 条件帧（允许带 <code>data:…;base64,</code> 前缀）；<code>"imagePath"</code>、<code>"endImage"</code> 以及每一个 <code>reference*</code> 条目都是 Web UI 使用的形式，必须引用 <code>/api/upload</code> 已经返回过的文件 —— 任何解析到上传目录之外的路径都会被拒绝。OpenAI 形态的 <code>POST /v1/videos/generations</code> 接收同样的参数，但尺寸写作 <code>"size": "832x480"</code>、负向提示词写作 <code>"negative_prompt"</code>。完整的请求/响应结构见 <a href="http-api_zh-cn.html#video-api">HTTP API</a> 页。</p>
+  <div class="callout tip"><div class="ic">💡</div><p><strong>开跑长任务之前，先估算规模。</strong>开销主要由 DiT token 数决定（<code>latent_frames × (h/2) × (w/2)</code>），而自注意力是 O(token²)，因此帧数与帧面积的影响远大于步数。在 MiniMax-H3 上的顺序是分辨率、帧数、步数 —— 它本来就不用引导，没有蒸馏杠杆可拉。在 Wan 上：换用步数蒸馏权重、减少帧数、减小帧面积（但不要低于约 0.3 MP）、在基础权重上减少步数，最后是 <code>"cfgCacheStride": 2</code> 或 <code>3</code>（1.30× / 1.43×）。480p（约 0.4 MP）是 Wan 训练过的分辨率，属于真正的输出档位，而非降级模式。</p></div>
 
   <h2 id="config">配置文件（<code>--config</code>）</h2>
   <p>可以用 <code>--config</code> 传入一个 JSON 文件，取代冗长的命令行；<a href="cli_zh-cn.html">CLI</a> 读取相同格式。<strong>命令行参数始终优先</strong>——先应用文件中的值，命令行上再次给出的参数会覆盖它们，因此可以在多台主机上复用同一个文件，只覆盖需要变化的部分。<code>--config</code> 可重复以叠加多个文件（后者优先）。允许注释与尾随逗号。</p>
@@ -154,10 +168,14 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
       <tr><td><code>--paged-kv-quant-bits &lt;b&gt;</code></td><td>旧的独立 TurboQuant 设置；服务端参数接受 <code>0</code>、<code>4</code> 或 <code>8</code>（运行时环境变量与 CLI 还接受 <code>2</code>）。</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-Edit 伴随 GGUF（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
       <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning 蒸馏 LoRA（<code>.safetensors</code>），作为运行期旁路挂在原封不动的量化基础权重旁边（<strong>不</strong>合并）。它从文件名自动推导去噪步数并把 CFG 切换为 1.0，使默认的 60 次 DiT 前向降到 4–8 次。环境变量：<code>TS_QWEN_IMAGE_LORA</code>。</td></tr>
-      <tr><td><code>--video-frames &lt;N&gt;</code></td><td>Wan：请求未带 <code>frames</code> 时的默认输出帧数，会对齐到 <code>4k+1</code>。模型默认 33，Wan2.2-TI2V 为 49。请求值会覆盖它 —— 这是默认值，不是上限。</td></tr>
-      <tr><td><code>--fps &lt;N&gt;</code></td><td>Wan：请求未带 <code>fps</code> 时的默认 MP4 播放帧率。模型默认 16，Wan2.2-TI2V 为 24。fps 只改变播放速度，不改变生成的计算量。</td></tr>
-      <tr><td><code>--video-vae &lt;path&gt;</code></td><td>Wan 视频 VAE（<code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>）。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_WAN_VAE</code>。</td></tr>
-      <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>Wan 使用的 UMT5-XXL 文本编码器 GGUF。默认在同目录扫描（环境变量 <code>TS_WAN_TE</code>）。Wan 2.2 A14B 还会按文件名自动解析第二个 high/low noise 专家 GGUF（<code>TS_WAN_DIT2</code>）。</td></tr>
+      <tr><td><code>--video-width &lt;px&gt;</code> / <code>--video-height &lt;px&gt;</code></td><td>请求未带 <code>width</code>/<code>height</code> 时的默认输出尺寸。<strong>视频最主要的画质杠杆</strong>，因为网页界面自己不发送尺寸；MiniMax-H3 的推荐起点是 640×384，只给出宽高之一时 H3 会按条件图像的宽高比推出另一个。别名：<code>--width</code> / <code>--height</code>。</td></tr>
+      <tr><td><code>--video-steps &lt;N&gt;</code></td><td>请求未带 <code>steps</code> 时的默认去噪步数。MiniMax-H3 默认 20 步；4–8 步是快速工作点，16–24 步明显更干净，超过约 30 步收益很小。</td></tr>
+      <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>请求未带 <code>videoMode</code> 时的默认条件模式：<code>t2v</code>、<code>i2v</code>、<code>fl2v</code> 或 <code>ref</code>。不传它，每个请求会按自身携带的内容推断模式，通常这才是你想要的。</td></tr>
+      <tr><td><code>--video-frames &lt;N&gt;</code></td><td>请求未带 <code>frames</code> 时的默认输出帧数，会对齐到模型自身的时间网格（Wan 为 <code>4k+1</code>，MiniMax-H3 为 <code>17k+5</code>）。模型默认 33，Wan2.2-TI2V 为 49，MiniMax-H3 为 22。请求值会覆盖它 —— 这是默认值，不是上限。</td></tr>
+      <tr><td><code>--fps &lt;N&gt;</code></td><td>请求未带 <code>fps</code> 时的默认 MP4 播放帧率。模型默认 16，Wan2.2-TI2V 为 24。以固定帧率训练的模型（MiniMax-H3，24 fps）会覆盖任何其他取值。fps 只改变播放速度，不改变生成的计算量。</td></tr>
+      <tr><td><code>--video-vae &lt;path&gt;</code></td><td>视频 VAE —— <code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>，MiniMax-H3 用 <code>minimax_h3_video_vae_fp16.safetensors</code>。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_VIDEO_VAE</code>；旧写法 <code>--wan-vae</code> 仍被接受。</td></tr>
+      <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>文本编码器 GGUF —— Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B。默认在同目录扫描（环境变量 <code>TS_VIDEO_TEXT_ENCODER</code>；也可写作 <code>--video-te</code>，旧写法为 <code>--wan-te</code>）。当 Wan 2.2 A14B 的两个专家不在一起时，用 <code>--video-dit2</code> / <code>TS_VIDEO_DIT2</code> 指定第二个 high/low noise 专家。</td></tr>
+      <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>与视频联合生成音轨的模型所用的音频 VAE（<code>minimax_h3_audio_vae_fp32.safetensors</code>）。不传它这类模型照样能跑并产出视频，只是没有声音。环境变量：<code>TS_VIDEO_AUDIO_VAE</code>。</td></tr>
     </tbody>
   </table>
   </div>
@@ -186,7 +204,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
     </tbody>
   </table>
   </div>
-  <p class="page-foot-note">当前二进制固定监听 <code>http://0.0.0.0:5000</code>；Docker Space 镜像在构建时把该常量改为 <code>7860</code>。</p>
+  <p class="page-foot-note">服务器默认监听 <code>http://0.0.0.0:5000</code>；<code>--port</code>、<code>--host</code> 与 <code>--urls</code>（或环境变量 <code>PORT</code> / <code>HOST</code> / <code>ASPNETCORE_URLS</code>）可以改变它，Docker Space 镜像设置的是 <code>PORT=7860</code>。</p>
 
   <h2 id="tunables">连续批处理调参</h2>
   <p>调度器 / 引擎的旋钮在进程启动时读取。通过环境变量（或会被翻译成它们的 <code>--continuous-batching</code> 系列参数）设置。</p>

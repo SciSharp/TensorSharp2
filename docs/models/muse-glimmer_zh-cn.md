@@ -242,7 +242,7 @@ decode 在 60 token 上下文时打平，到 128K 降到 0.86x —— 差距随 
 #### 为什么 TensorSharp 那一列是区间而 llama.cpp 不是
 
 TensorSharp 在草稿模型前面放了一个**自适应成本调控器**
-（[`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs)
+（[`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
 的 `AdaptiveSpeculation`，默认开启）。投机只是速度优化，因此执行器会分别测量
 带起草与不带起草的 ms/token，一旦起草更慢就把草稿模型**暂停**
 `ParkedProbeInterval = 64` 步再重新探测。llama.cpp 没有这套机制 —— 它每步都起草。

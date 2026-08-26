@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 支持的模型</div>
   <h1>支持的模型</h1>
-  <p class="lede">TensorSharp 加载 GGUF 格式的模型，并从文件的 <code>general.architecture</code> 元数据自动识别架构。选择适合你硬件的量化（低内存用 <code>Q4_K_M</code>，更高质量用 <code>Q8_0</code>）。</p>
+  <p class="lede">TensorSharp 加载 GGUF 格式的模型，并从文件的 <code>general.architecture</code> 元数据自动识别架构——MiniMax-H3 是例外，它公开的 GGUF 完全没有元数据，只能靠张量表来识别。选择适合你硬件的量化（低内存用 <code>Q4_K_M</code>，更高质量用 <code>Q8_0</code>）。</p>
   <div class="callout note"><div class="ic">📘</div><p><strong>Gemma 4 E4B 是《From Tensors to Tokens》采用的示例模型。</strong>配套图书提供从张量基础到多模态推理的连贯构建过程；这组参考页面则提供最新下载与能力细节。<a href="book_zh-cn.html">了解本书 →</a></p></div>
 
   <h2 id="browse">浏览模型参考</h2>
@@ -25,7 +25,7 @@
     <a class="card" href="models-downloads_zh-cn.html"><div class="ic">⬇️</div><h3>模型下载</h3><p>所有 GGUF，以及各家族所需的投影器、VAE、编码器与草稿模型。</p></a>
     <a class="card" href="models-text_zh-cn.html"><div class="ic">🧠</div><h3>文本与 LLM 模型</h3><p>十一种架构及其运行示例，加上多模态输入、思考模式与工具调用。</p></a>
     <a class="card" href="models-image_zh-cn.html"><div class="ic">🖼️</div><h3>图像生成</h3><p>Qwen-Image-Edit、Lightning LoRA，以及 DiT 步缓存。</p></a>
-    <a class="card" href="models-video_zh-cn.html"><div class="ic">🎬</div><h3>视频生成</h3><p>Wan 2.1 / 2.2，以及把数小时变成几分钟的蒸馏检查点。</p></a>
+    <a class="card" href="models-video_zh-cn.html"><div class="ic">🎬</div><h3>视频生成</h3><p>MiniMax-H3 带原生立体声音频，以及 Wan 2.1 / 2.2 与那个把数小时变成几分钟的蒸馏检查点。</p></a>
   </div>
 
   <h2 id="table">支持的架构</h2>
@@ -34,7 +34,7 @@
     <thead><tr><th>架构</th><th>GGUF 架构键</th><th>示例模型</th><th>多模态</th><th>思考</th><th>工具</th><th>MTP 推测</th></tr></thead>
     <tbody>
       <tr><td><strong>DeepSeek V4 Flash</strong></td><td><code>deepseek4</code></td><td>DeepSeek-V4-Flash（284B MoE，256 专家，压缩稀疏注意力，1M 上下文）</td><td>仅文本</td><td class="yes">是</td><td class="yes">是（DSML）</td><td class="yes">是（DSpark 块级草稿器，独立 GGUF）</td></tr>
-      <tr><td><strong>GLM 5.x</strong></td><td><code>glm-dsa</code></td><td>GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文）</td><td>仅文本</td><td class="yes">是</td><td class="yes">是（XML 工具调用）</td><td class="no">&mdash;</td></tr>
+      <tr><td><strong>GLM 5.x</strong></td><td><code>glm-dsa</code></td><td>GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文）</td><td>仅文本</td><td class="yes">是</td><td class="yes">是（XML 工具调用）</td><td class="no">—</td></tr>
       <tr><td><strong>Gemma 4</strong></td><td><code>gemma4</code></td><td>gemma-4-E4B、12B、31B、26B-A4B (MoE)</td><td>图像、视频、音频</td><td class="yes">是</td><td class="yes">是</td><td class="yes">是（独立草稿）</td></tr>
       <tr><td><strong>Gemma 3</strong></td><td><code>gemma3</code></td><td>gemma-3-4b</td><td>图像</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen 3</strong></td><td><code>qwen3</code>、<code>qwen2</code>、<code>qwen2vl</code>、<code>qwen2_vl</code></td><td>Qwen3-4B。Qwen2 / Qwen2.5-VL 的 GGUF 也由同一实现加载，按纯文本对话使用</td><td>仅文本</td><td class="yes">是</td><td class="yes">是</td><td class="no">—</td></tr>
@@ -45,6 +45,7 @@
       <tr><td><strong>Muse-Glimmer</strong></td><td><code>muse-glimmer</code>、<code>muse_glimmer</code></td><td>Muse-Glimmer-30B（交错滑动窗口 + NoPE 全注意力层，注意力输出门控）</td><td>图像</td><td class="yes">是</td><td class="yes">是（ATEM）</td><td class="yes">是（DFlash 块草稿模型，独立 GGUF）</td></tr>
       <tr><td><strong>DiffusionGemma</strong></td><td><code>diffusion-gemma</code>、<code>diffusion_gemma</code></td><td>diffusion-gemma 文本扩散 GGUF</td><td>仅文本</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen-Image-Edit</strong></td><td><code>qwen_image</code>、<code>qwen-image</code></td><td>qwen-image-edit MMDiT（+ VAE 与 Qwen2.5-VL 伴随文件）</td><td>图像编辑（图像+文本 → 图像）</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
+      <tr><td><strong>MiniMax-H3</strong></td><td><code>minimax-h3</code>、<code>minimax_h3</code></td><td>MiniMax-H3 FL2VA / Ref2VA 去噪器（+ Qwen3-VL-32B 文本编码器、视频 VAE 与音频 VAE 伴随文件）。公开的 GGUF 没有任何元数据，靠张量表识别</td><td>视频输出 <strong>+ 32 kHz 立体声音频</strong>（文本 → 视频、图像 → 视频、首尾帧、参考 → 视频）</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
       <tr><td><strong>Wan 视频</strong></td><td><code>wan</code>、<code>wan2.1</code>、<code>wan2.2</code></td><td>Wan 2.1 T2V 1.3B/14B、Wan 2.2 TI2V-5B、Wan 2.2 A14B T2V/I2V（两个 14B 专家）（+ UMT5-XXL 与视频 VAE 伴随文件）</td><td>视频输出（文本 → 视频、图像 → 视频）</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
     </tbody>
   </table>
@@ -52,11 +53,12 @@
   <p class="page-foot-note">各模型的详细架构卡（前向图、组件、参数，以及 TensorSharp 如何优化 prefill/decode）位于仓库的 <code>docs/models/</code> 下。</p>
 
   <h2 id="fast-lane">哪个更快——每个家族最关键的那一项设置</h2>
-  <p>每个模型家族都有一项主导端到端耗时的设置。第一行是最容易被忽略的一项：在 Wan 上，你下载的是哪个检查点，直接决定一段 5 秒 720p 视频是跑三个半小时还是十七分钟——而且不需要加任何参数。</p>
+  <p>每个模型家族都有一项主导端到端耗时的设置。两个视频家族最容易被忽略，而且被忽略的点还不一样：MiniMax-H3 出厂即经 CFG 蒸馏，杠杆是你要多少步、多少像素，而不是去换哪个文件；而在 Wan 上，你下载的是哪个检查点，直接决定一段 5 秒 720p 视频是跑三个半小时还是十七分钟——而且不需要加任何参数。</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>家族</th><th>快车道</th><th>实测效果</th></tr></thead>
     <tbody>
+      <tr><td><strong>MiniMax-H3</strong></td><td><strong>它本身就经过 CFG 蒸馏</strong>——没有更快的文件可换。用 <code>--cfg 1.0</code> 跑 <strong>4–8 步</strong>（默认 20 步），把省下的时间花在 <code>--width</code> / <code>--height</code> 上</td><td>M5 Pro / <code>ggml_metal</code>、22 帧、8 步、相同种子，对比 <code>stable-diffusion.cpp</code>：256×256 <strong>49.3 s → 20.9 s</strong>（快 2.4×），640×384 <strong>108.5 s → 63.1 s</strong>（快 1.7×）。步数买到的是质量而不只是时间——同一条 640×384 图生视频请求，8 步 79 s、运动的手周围有彩色边缘，24 步 212 s、干净</td></tr>
       <tr><td><strong>Wan 视频</strong></td><td><strong>加载步数蒸馏检查点</strong>——DiT 文件名中含 <code>Turbo</code>、<code>distill</code>、<code>Lightning</code>、<code>lightx2v</code>、<code>FastWan</code>、<code>-dmd</code> 或 <code>…-4steps-…</code> 即被自动识别，无需任何参数</td><td><strong>100 次 DiT 前向 → 4 次</strong>，关闭引导。同一条 1088×832×121 帧图生视频请求，M5 Pro / <code>ggml_metal</code>：<strong>约 3 小时 30 分 → 17 分 30 秒</strong></td></tr>
       <tr><td>Wan 视频</td><td><code>--cfg-cache-stride 2</code> / <code>3</code>——仅适用于未蒸馏的基础检查点</td><td>50 步下 1.30× / 1.43×（100 次前向只跑 77 / 70 次）。属于近似方法；在本就无引导的蒸馏检查点上没有意义</td></tr>
       <tr><td>Qwen-Image-Edit</td><td>用 <code>--qwen-image-lora</code> 加载 Lightning 蒸馏 LoRA</td><td>基础配方 30 步、cfg 2.5，即 60 次 DiT 前向 → <strong>4–8 次</strong>、cfg 1.0。544×1184、4 步的热态编辑：40.44 s，对比 <code>stable-diffusion.cpp</code> 的 48.16 s</td></tr>
@@ -70,7 +72,7 @@
     </tbody>
   </table>
   </div>
-  <p class="page-foot-note">Wan、Qwen-Image-Edit 与 DiffusionGemma 构造时不接受张量并行度，因此 <code>--tp</code> 对它们无效。Wan 也是唯一会直接拒绝某个后端的家族：不支持 <code>mlx</code>。</p>
+  <p class="page-foot-note">MiniMax-H3、Wan、Qwen-Image-Edit 与 DiffusionGemma 构造时不接受张量并行度，因此 <code>--tp</code> 对它们无效。在视频家族里，Wan 还是唯一会直接拒绝某个后端的：不支持 <code>mlx</code>。</p>
 
   <div class="content-footer">
     <a href="backends_zh-cn.html">← 计算后端</a>

@@ -416,6 +416,26 @@ namespace TensorSharp.Models.MiniMaxH3
             return (videoOut, audioOut);
         }
 
+        /// <summary>Hand the DiT's device-resident weight copies back to the driver without
+        /// tearing the model down. Every weight here is a pointer into the mmapped GGUF, so
+        /// dropping the device cache leaves the host pages in place and a later <see cref="Forward"/>
+        /// simply re-uploads them.
+        ///
+        /// <para>The denoise loop is the last thing that needs the DiT, and the video VAE that
+        /// runs after it is another multi-GB model. Holding ~10.6 GB of finished denoiser
+        /// resident across that decode is what pushes a 16 GB card past its dedicated VRAM and
+        /// into shared host memory, where every access crosses PCIe. Releasing first keeps peak
+        /// usage at max(DiT, VAE) instead of their sum, which is what the pipeline always
+        /// claimed to do.</para></summary>
+        public void ReleaseDeviceResidency()
+        {
+            if (_disposed) return;
+            foreach (IntPtr ptr in _bound)
+                if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
+            // _bound is deliberately NOT cleared: the pointers stay valid, Dispose still
+            // needs them, and a later Forward re-caches under the very same keys.
+        }
+
         public void Dispose()
         {
             if (_disposed) return;

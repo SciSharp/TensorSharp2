@@ -6,8 +6,12 @@ diffusion transformer denoises a packed video+audio latent in a single token
 sequence, so the soundtrack is part of the model output rather than something
 added afterwards.
 
-TensorSharp runs it as native whole-network ggml graphs — one graph per network,
-weights bound resident straight from the GGUF/safetensors mmap.
+TensorSharp runs it as **seven** native whole-network ggml graphs — text encode,
+vision encode, the DiT forward, and encode + decode for each of the two VAEs —
+with weights bound resident straight from the GGUF/safetensors mmap. The public
+entry point is `MiniMaxH3Model.GenerateVideo(prompt, VideoGenerationParams)`,
+behind the shared `IVideoGenerationModel` seam, so the CLI and the server drive
+H3 and Wan down one path instead of type-testing each concrete model.
 
 ```sh
 tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
@@ -62,25 +66,48 @@ best-performing configuration:
 
 ## Files
 
-H3 needs four files. The two denoisers are **separate checkpoints, not settings** —
-which one you load decides what conditioning it accepts.
+Four networks cooperate, so a run needs four files. The two denoisers are
+**separate checkpoints, not settings** — which one you load decides what
+conditioning it accepts.
 
-| File | Source |
-|---|---|
-| `minimax_h3_fl2va_pruned-Q4_K.gguf` | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF) — text + keyframes |
-| `minimax_h3_ref2va_pruned-Q4_K.gguf` | same repo — text + references |
-| `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` | same repo — the text encoder, shared |
-| `minimax_h3_video_vae_fp16.safetensors` | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) |
-| `minimax_h3_audio_vae_fp32.safetensors` | same repo — omit for silent video |
+| File | Size | Source |
+|---|---|---|
+| `minimax_h3_fl2va_pruned-Q4_K.gguf` | 10.64 GiB | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF) — text + keyframes |
+| `minimax_h3_ref2va_pruned-Q4_K.gguf` | 10.60 GiB | same repo — text + references |
+| `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` | 16.97 GiB | same repo — the text encoder, shared (`-Q2_K_M.gguf`, 12.20 GiB, pairs with a smaller denoiser) |
+| `minimax_h3_video_vae_fp16.safetensors` | 5.21 GB | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) (also mirrored under `vae/` in the unsloth repo) |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.61 GB | same repo — omit for silent video |
+
+About 33.5 GB for one set. Each network is loaded and **released** in turn, so
+peak VRAM is `max(...)`, not the sum; adding the second denoiser later costs only
+its own ~10.6 GiB, because the encoder and both VAEs are shared.
 
 Companions resolve automatically next to the denoiser, or with `--video-vae`,
 `--video-text-encoder`, `--audio-vae`.
 
-> **The text-encoder GGUF carries no tokenizer.** Put `vocab.json` and `merges.txt`
+Two shipped configs download the lot on first run and only differ in their `model`
+entry, so the encoder and the VAEs are fetched once:
+
+```sh
+TensorSharp.Server --config config/minimax-h3-fl2va.json      # keyframes
+TensorSharp.Cli    --config config/minimax-h3-ref2va.json \
+  --ref-image person.png --prompt "…" --output out.mp4        # references
+```
+
+Both name `"backend": "ggml_cuda"` (a `--backend` on the command line wins) and set
+width 640, height 384, 22 frames, 24 fps. Neither sets steps or guidance: a shipped
+config has to parse on both hosts, and the two spell steps differently
+(`--video-steps N` on the server, `--diffusion-steps N` on the CLI), while the
+server takes no `--cfg` at all — so the model's own defaults apply.
+
+> **The text-encoder GGUF carries no tokenizer**, and that is the one thing a config
+> cannot fetch for you: auto-download fills in options that are **flags**, and the
+> tokenizer is not one. Put `vocab.json` and `merges.txt`
 > from [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
 > beside it, or point `TS_VIDEO_TOKENIZER` at them. Neither published GGUF has any
 > metadata at all, so TensorSharp identifies H3 by its tensors rather than by an
-> architecture string.
+> architecture string (arch keys `minimax-h3` / `minimax_h3` are accepted when a
+> file does declare one).
 
 > **`--cfg 1.0` is required.** H3 is CFG-distilled; above 1.0 it degrades badly and
 > TensorSharp refuses. 4–8 steps is the operating point, so iteration is fast.
@@ -98,6 +125,12 @@ inferred from what you pass.
 | "use this person, brand-new scene" | `ref` | Ref2VA |
 | "reference this product, new angle and background" | `ref` | Ref2VA |
 | text only | `t2v` | either |
+
+Which partition is active is read off the **file name** — `ref2va` anywhere in it,
+case-insensitively — so keep that substring if you rename or requantize. Asking one
+checkpoint for the other's mode does not silently drop the input: the request fails
+with a message naming the file to load instead. Keyframes and named references in
+the same request are refused outright, on either checkpoint.
 
 ### Text to video
 
@@ -192,6 +225,11 @@ Notes:
 * TensorSharp caps reference images at nine. The reference implementation has no cap;
   this one exists because the packed sequence is attended over unmasked and its length
   is a numeric budget as well as a time one.
+* References are **labelled in the order you pass them** before the language model
+  sees them — `<Picture 1>`, `<Picture 2>` … for stills, `<Video 1>` … for clips,
+  `<Audio 1>` … for soundtracks — so a prompt can name one: "the jacket from
+  `<Picture 2>`". A clip that arrived with its own soundtrack is presented as
+  *two* items and takes an `<Audio n>` label as well as a `<Video n>` one.
 * Say who is in frame. The reference supplies identity; the prompt still has to
   describe the shot, or you get a well-rendered scene with the subject missing.
 * A reference can also be a **clip** or a **soundtrack**, not just a still — see
@@ -287,7 +325,9 @@ source photo to it before generating.
 
 `--cfg` is **not** a quality lever here — H3 is CFG-distilled and only accepts 1.0.
 `--negative-prompt` does nothing for the same reason: there is no unconditional
-pass to steer away from.
+pass to steer away from, and `--cfg-cache-stride`, which caches that pass, has
+nothing to cache. `--sampler` is a Wan-family knob; H3 runs its own flow-match
+schedule and ignores it.
 
 Measured on the same image-to-video request (M5 Pro, `ggml_metal`, seed 42, 22 frames):
 
@@ -300,10 +340,12 @@ Measured on the same image-to-video request (M5 Pro, `ggml_metal`, seed 42, 22 f
 
 > **On the server, size is a startup flag.** The Web UI sends only the prompt and
 > the image, so requests inherit the server's defaults. Start it with
-> `--video-width 640 --video-height 384 --video-steps 20` (or omit them and let each
-> request pick the aspect from its image). `--width` / `--height` are accepted as
-> aliases, and `--video-mode` pins the conditioning mode for a deployment that only
-> offers one.
+> `--video-width 640 --video-height 384 --video-steps 20 --video-frames 22` (or omit
+> width and height and let each request pick the aspect from its image; give only
+> one of the two and H3 takes the other from the conditioning image). `--width` /
+> `--height` are accepted as aliases, and `--video-mode` pins the conditioning mode
+> for a deployment that only offers one. The server has **no `--cfg`** — there is
+> nothing to set, since H3 enforces 1.0 itself.
 
 > **Forcing a size that does not match your image stretches it.** A 4:3 photo forced
 > into 640×384 is squeezed ~25% horizontally, which is exactly the kind of distortion
@@ -319,9 +361,12 @@ Measured on the same image-to-video request (M5 Pro, `ggml_metal`, seed 42, 22 f
 
 ## Sizes and lengths
 
-* Width and height are rounded **up** to a multiple of 32.
-* Frame count is rounded up onto the **17k+5** grid — 5, 22, 39, 56, 90 … — which
-  comes from the video VAE's temporal chunking, not from an arbitrary choice.
+* Width and height are rounded **up** to a multiple of 32. Default 640×384, or
+  that area at the conditioning image's aspect ratio.
+* Frame count is rounded up onto the **17k+5** grid — 5, 22, 39, 56, 73, 90, 107,
+  124 … — which comes from the video VAE's temporal chunking, not from an
+  arbitrary choice: each 5-latent-frame chunk yields 17 pixel frames, on top of a
+  5-frame lead-in. Default 22.
 * fps is pinned to 24; any other value is overridden.
 * Clips of any grid length decode correctly: the VAE runs 5 latent frames at a
   time with a 2-frame look-ahead and cross-fades the seams, exactly as the
@@ -331,6 +376,10 @@ Measured on the same image-to-video request (M5 Pro, `ggml_metal`, seed 42, 22 f
   requirement, not an optimization.
 
 ## HTTP API
+
+Three routes share one parser: `POST /api/video-generate`,
+`POST /api/video-generate/stream` (same body, SSE progress ticks) and the
+OpenAI-shaped `POST /v1/videos/generations`.
 
 ```sh
 curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d '{
@@ -351,10 +400,31 @@ curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d
 ```
 
 Returns `{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }`.
-`imagePath` / `endImage` / `referenceImages` name files previously uploaded through
-`/api/upload`; paths outside the upload directory are rejected. The OpenAI-shaped
-`/v1/videos/generations` accepts the same fields in snake_case (`reference_images`,
-`video_mode`) and returns `audio_url`.
+`audioUrl` is null when the model produced no track. The full field set is `prompt`,
+`width`, `height`, `frames`, `steps`, `cfg`, `fps`, `imagePath`, `videoMode`,
+`generateAudio`, `endImage`, `referenceImages`, `referenceVideos`,
+`referenceAudios`, `referenceVideoAudios`. Most of them are **camelCase only** —
+`videoMode`, `generateAudio`, `endImage` and the four `reference*` lists are the
+only ones that also accept a snake_case spelling (`video_mode`, `generate_audio`,
+`end_image`, `reference_images`, …), and camelCase wins when both are present.
+Sending `image_path` or `flow_shift` is silently ignored rather than rejected, so
+prefer camelCase everywhere. `referenceVideoAudios` pairs **by index** with
+`referenceVideos`, the same positional rule `--ref-video-audio` follows. `imagePath` / `endImage` /
+`referenceImages` name files previously uploaded through `/api/upload`; paths
+outside the upload directory are rejected. `/v1/videos/generations` shares the same
+parser, so the same seven fields accept snake_case there too (`video_mode`,
+`reference_images`, …); it returns `audio_url` rather than `audioUrl`.
+
+A model rejection — the wrong checkpoint for the mode, or keyframes together with
+references — comes back as a **400 carrying the model's own message**, not a generic
+500, so the file to load instead is in the response body.
+
+`GET /api/models` answers with a `video` object (null for every non-video model)
+carrying `family` (`minimax-h3`), `supportsAudio`, `supportsImageConditioning`,
+`supportsEndImageConditioning`, `supportsReferenceConditioning` and
+`maxReferenceImages`. That is how the Web UI decides whether to offer a first frame,
+a last frame or up to nine references, instead of pattern-matching an architecture
+string.
 
 Audio is written as a sidecar WAV rather than muxed into the MP4, because muxing
 needs an encoder that may not be installed. To combine them:
@@ -362,6 +432,9 @@ needs an encoder that may not be installed. To combine them:
 ```sh
 ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4
 ```
+
+`--no-audio` (`"generateAudio": false`) skips the audio decode entirely, saving the
+audio VAE's time and memory; video-only models ignore it.
 
 ## Architecture
 

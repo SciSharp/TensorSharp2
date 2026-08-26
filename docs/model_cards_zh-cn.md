@@ -32,8 +32,8 @@
 | Mistral 3 | `mistral3` | 稠密文本 + 图像对话，YaRN 校正 RoPE 与 Pixtral 视觉编码器 | [models/mistral3_zh-cn.md](models/mistral3_zh-cn.md) | [models/mistral3.md](models/mistral3.md) |
 | Muse-Glimmer | `muse-glimmer`、`muse_glimmer` | 交错滑动窗口的文本 + 图像对话，支持思维链与 ATEM 工具调用；通过独立 `--draft-model` GGUF 支持 DFlash 块级投机解码 | [models/muse-glimmer_zh-cn.md](models/muse-glimmer_zh-cn.md) | [models/muse-glimmer.md](models/muse-glimmer.md) |
 | Qwen-Image-Edit | `qwen_image`、`qwen-image` | **图像编辑**——提示词 + 输入图像 → 编辑后的图像，走 60 块 MMDiT 扩散循环；Lightning LoRA 可把 60 次 DiT 前向降到 4–8 次 | [models/qwenimage_zh-cn.md](models/qwenimage_zh-cn.md) | [models/qwenimage.md](models/qwenimage.md) |
-| Wan 视频 | `wan`、`wan2.1`、`wan2.2` | **视频生成**——提示词（可选首帧图）→ H.264 MP4，涵盖 Wan 2.1 T2V 与 Wan 2.2 TI2V-5B / A14B；换用步数蒸馏检查点可把 100 次 DiT 前向的官方配方降到 4 次 | [models/wan_zh-cn.md](models/wan_zh-cn.md) | [models/wan.md](models/wan.md) |
-| MiniMax-H3 | `minimax-h3` | **音视频联合生成**——提示词（可选关键帧或参考图）→ 视频 **+ 原生 32 kHz 立体声音频**，由同一个打包潜变量扩散 Transformer 一起生成；支持文生视频、图生视频（照片作为首帧）、首尾帧、参考生视频 | [models/minimax-h3_zh-cn.md](models/minimax-h3_zh-cn.md) | [models/minimax-h3.md](models/minimax-h3.md) |
+| MiniMax-H3 | `minimax-h3`、`minimax_h3` | **音视频联合生成**——提示词（可选关键帧或参考图）→ 视频 **+ 原生 32 kHz 立体声音频**，由同一个扩散 Transformer 在一份打包潜变量里一起生成；支持文生视频、图生视频（照片作为首帧）、首尾帧、参考生视频，全部在 CFG-free 的 4–8 步下运行 | [models/minimax-h3_zh-cn.md](models/minimax-h3_zh-cn.md) | [models/minimax-h3.md](models/minimax-h3.md) |
+| Wan 视频 | `wan`、`wan2.1`、`wan2.2` | **视频生成，仅视频**——提示词（可选首帧图）→ H.264 MP4，涵盖 Wan 2.1 T2V 与 Wan 2.2 TI2V-5B / A14B；换用步数蒸馏检查点可把 100 次 DiT 前向的官方配方降到 4 次 | [models/wan_zh-cn.md](models/wan_zh-cn.md) | [models/wan.md](models/wan.md) |
 
 每张卡片会把工程师或研究员从“从未听说过这个模型”带到“可以解释它的前向计算图，
 并能在 TensorSharp 中复现推理路径”，统一覆盖：

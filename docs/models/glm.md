@@ -220,7 +220,7 @@ every run (and in a `--n-cpu-moe 34` variant), by ~4% on average — but never b
 enough, and never consistently enough, to be worth hard-coding as a per-model
 default: sweeping the gate alone at k=8 won three runs and lost three. The two
 knobs interact, so sweep them together rather than one at a time. The runtime
-cost governor in `MtpSpeculativeExecution` measures the model/drafter pair
+cost governor in `SpeculativeExecution` measures the model/drafter pair
 either way and parks drafting if it stops paying.
 
 Why a narrower window helps at all: a verify amortizes unusually well here — the

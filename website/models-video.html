@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Video Generation — TensorSharp Wiki</title>
-  <meta name="description" content="MiniMax-H3 joint audio-video generation and Wan 2.1 / 2.2 text-to-video: downloads, run recipes, and the checkpoint choice that decides whether a clip takes minutes or hours.">
+  <meta name="description" content="MiniMax-H3 generates video and native 32 kHz stereo audio together in one packed latent — keyframes, references, clips and soundtracks; Wan 2.1 / 2.2 generate video alone. Downloads, run recipes, and the settings that decide the wall clock.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -20,7 +20,7 @@
   <div class="callout note"><div class="ic">💡</div><p>These commands follow the same conventions as the text-model recipes — the Hugging Face CLI, a source build from the repository root, and <code>--backend</code> swapped to match your hardware. See <a href="models-text.html#download-run">Download &amp; run, per family</a>.</p></div>
 
   <h2 id="minimax-h3">MiniMax-H3 (prompt → video <em>with audio</em>)</h2>
-  <p>H3 denoises video and 32&nbsp;kHz stereo audio in <strong>one</strong> packed latent, so the soundtrack is part of the model output rather than something added afterwards. It is CFG-distilled, so <code>--cfg 1.0</code> is required and 4–8 steps is the operating point. Four files are needed, from two repositories:</p>
+  <p>H3 denoises video and 32&nbsp;kHz stereo audio in <strong>one</strong> packed latent, so the soundtrack is part of the model output rather than something added afterwards. It is CFG-distilled, so <code>--cfg 1.0</code> is required and 4–8 steps is the operating point against a 20-step default. Measured on an M5 Pro with <code>ggml_metal</code> at 22 frames, 8 steps and an identical seed, it runs <strong>2.4×</strong> faster than <code>stable-diffusion.cpp</code> at 256×256 (49.3 s → <strong>20.9 s</strong>) and <strong>1.7×</strong> at 640×384 (108.5 s → <strong>63.1 s</strong>). Four files are needed, from two repositories:</p>
   <pre data-lang="bash"><code># denoiser + text encoder
 hf download unsloth/MiniMax-H3-GGUF minimax_h3_fl2va_pruned-Q4_K.gguf --local-dir models
 hf download unsloth/MiniMax-H3-GGUF qwen3vl_32b_minimax_h3-Q4_K_M.gguf --local-dir models
@@ -35,8 +35,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_p
     --backend ggml_metal --prompt "a red fox trotting through falling snow, cinematic" \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output fox.mp4</code></pre>
 
+  <p>Or name all four networks in a config file and let the first run fetch them — <code>config/minimax-h3-fl2va.json</code> for keyframes, <code>config/minimax-h3-ref2va.json</code> for references. Only the <code>model</code> entry differs between the two, so the text encoder and both VAEs download once and are shared (~33.5 GB in total). The tokenizer pair above is the one thing auto-download cannot fetch, because it is not a flag:</p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/minimax-h3-ref2va.json</code></pre>
+
   <h3 id="h3-modes">What an image means</h3>
   <p>An image can mean two completely different things to H3, and they use <strong>different checkpoints</strong>. The mode is inferred from what you pass; <code>--video-mode</code> states it explicitly.</p>
+  <div class="table-scroll">
   <table>
     <thead><tr><th>What you want</th><th><code>--video-mode</code></th><th>Checkpoint</th></tr></thead>
     <tbody>
@@ -47,6 +53,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_p
       <tr><td>text only</td><td><code>t2v</code></td><td>either</td></tr>
     </tbody>
   </table>
+  </div>
+  <p>The two denoisers are separate files rather than settings, and each refuses the other's inputs <em>by name</em>: ask for <code>ref</code> on FL2VA and the error tells you to load <code>minimax_h3_ref2va_pruned-*.gguf</code>; pass <code>--image</code>/<code>--end-image</code> as keyframes on Ref2VA and it tells you to load the FL2VA file, or to re-pass the picture as <code>--ref-image</code>. Keyframes and named references in one request are refused outright rather than one being quietly dropped — a clip that came back looking like the request was honoured is the worse failure. Which partition is active is read off the <em>file name</em>: <code>ref2va</code> anywhere in it, case-insensitive, selects reference conditioning, so keep it there if you rename or requantize.</p>
   <pre data-lang="bash"><code># animate a photo: it becomes the first frame
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
     --backend ggml_metal --image portrait.jpg \
@@ -64,8 +72,41 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_
     --backend ggml_metal --ref-image person.jpg --ref-image bottle.png \
     --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 --output rooftop.mp4</code></pre>
-  <p>Up to nine <code>--ref-image</code>s. References are only ever scaled down and keep their own aspect ratio, so the output canvas still comes from <code>--width</code>/<code>--height</code>. A plain <code>--image</code> on the Ref2VA checkpoint is treated as a reference too, so clients that only attach “an image” — the Web UI among them — work unchanged. A reference can also be a clip (<code>--ref-video</code>, a video file or a directory of frames) or a soundtrack (<code>--ref-audio</code>); a clip&rsquo;s own audio goes in separately with <code>--ref-video-audio</code>, paired by position, because a container&rsquo;s audio track is not readable through the frame decoder. A reference clip is the most expensive input H3 takes &mdash; a 22-frame 448&times;320 one adds 980 conditioning tokens on top of the 1680 the output needs.</p>
-  <div class="callout note"><div class="ic">💡</div><p>Width and height round up to a multiple of 32, the frame count rounds up onto the <code>17k+5</code> grid (5, 22, 39, …) and fps is pinned to 24. Audio is written as a sidecar <code>.wav</code>; combine it with <code>ffmpeg -i out.mp4 -i out.wav -c:v copy -c:a aac final.mp4</code>. Full detail in the <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3.md">MiniMax-H3 card</a>.</p></div>
+  <p>References are only ever scaled down and keep their own aspect ratio, so the output canvas still comes from <code>--width</code>/<code>--height</code>. A plain <code>--image</code> on the Ref2VA checkpoint is treated as a single reference, so clients that only attach “an image” — the Web UI among them — work against it unchanged.</p>
+
+  <h3 id="h3-references">References: stills, clips and soundtracks</h3>
+  <p>Up to <strong>nine</strong> references, in any mix. <code>--ref-image</code> is a still, referred to in the prompt as <code>&lt;Picture 1&gt;</code>, <code>&lt;Picture 2&gt;</code>, …; <code>--ref-video</code> is a clip — a video file or a directory of frames — resampled onto H3's own 24 fps and its own canvas, and referred to as <code>&lt;Video 1&gt;</code>, <code>&lt;Video 2&gt;</code>, …; <code>--ref-audio</code> is a soundtrack, resampled to the audio VAE's 32 kHz stereo and truncated to the generated clip's duration. A clip's own sound goes in separately with <code>--ref-video-audio</code>, paired <em>by position</em> with <code>--ref-video</code>, because a container's audio track is not readable through the frame decoder.</p>
+  <pre data-lang="bash"><code># a clip, with its own soundtrack alongside it
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --ref-video walk.mp4 --ref-video-audio walk.wav \
+    --prompt "the same woman walks along a beach at sunset, wide shot, waves behind her" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 --output beach.mp4
+
+# a still plus a standalone soundtrack
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --ref-image singer.jpg --ref-audio song.wav \
+    --prompt "she performs on a small club stage under a single spotlight" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 --output stage.mp4</code></pre>
+  <p>Every reference is extra tokens in the <em>same</em> packed sequence, so the denoiser's cost is linear and easy to predict: a 640×384 reference is 240 tokens and one at 576×448 is 252, and on an RTX 3080 Laptop a 640×384 22-frame denoise step goes from 4.37 s with no references to 9.38 s with eight — about <strong>626 ms per reference per step</strong>, flat from one to eight. Past about four references it is the <strong>Qwen3-VL pass that dominates, not the denoiser</strong>: each reference adds roughly 250 vision placeholder tokens to the prompt and that prompt is prefilled through all 50 layers, so two references make a 548-token prompt and eight make 2086 — text conditioning grows from ~65 s to ~447 s while the whole 8-step denoise costs ~75 s. Reach for fewer, better references before reaching for fewer steps.</p>
+  <p>A reference <em>clip</em> is the most expensive input H3 takes: a 22-frame 448×320 one adds 980 conditioning tokens on top of the 1680 the output itself needs, and the VAE has to encode all 22 frames first — on an M5 Pro, 14 s to encode and then about 9 s per denoising step against 5 s without it. The language model sees the clip at 2 fps, two frames at a time; the denoiser sees all of it, as latents.</p>
+
+  <h3 id="h3-length">Length, size, and the long-clip ceiling</h3>
+  <p>Width and height round <strong>up</strong> to a multiple of 32. The frame count rounds up onto the <code>17k+5</code> grid — 5, 22, 39, 56, 73, 90 … — which comes from the video VAE's temporal chunking rather than an arbitrary choice, and fps is pinned to 24 whatever you ask for. Clips of any grid length decode correctly: the VAE runs 5 latent frames at a time with a 2-frame look-ahead and cross-fades the seams. Decoding a long clip in one call instead washes detail out progressively — measured against the conditioning photo, frame 0 fell from 0.97 correlation at 22 frames to 0.86 at 90 — so the chunking is a correctness requirement, not an optimization. <code>--no-audio</code> skips the audio decode when only the picture is wanted, saving the audio VAE's time and memory.</p>
+  <div class="callout warn"><div class="ic">⚠️</div><p><strong>Long clips used to come back black.</strong> H3 attends bidirectionally over one unmasked packed sequence, so its key count is the whole clip — 2364 tokens at 22 frames, 8646 at 107 — and every vendored ggml flash-attention kernel keeps the softmax numerator in FP16 with three bits of headroom. A 107-frame clip overflowed to NaN on the first denoise step and came back with every pixel black and every audio sample clamped, while 73 frames of the same request rendered correctly. <code>h3_attend</code> now pre-scales V by a power of two derived from the key count and undoes it on the output — exact, because attention is linear in V — and the sampler refuses to save a diverged clip, failing the request and naming the step instead of writing a black file. <code>TS_H3_TRACE=1</code> prints the latent and velocity magnitudes for every step.</p></div>
+  <div class="callout note"><div class="ic">💡</div><p>Audio is written as a sidecar <code>.wav</code> next to the MP4 rather than muxed in, because muxing needs an encoder that may not be installed; combine them with <code>ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4</code>. Full detail in the <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3.md">MiniMax-H3 card</a>.</p></div>
+
+  <h3 id="h3-server">Serving it</h3>
+  <p>On the server, size is a <strong>startup flag</strong>, because the browser sends none of its own: <code>--video-width 640 --video-height 384 --video-steps 20</code> is the documented starting point (<code>--width</code> / <code>--height</code> are accepted aliases, and if only one is given H3 takes the other from the conditioning image's aspect ratio). <code>--video-mode</code> pins the conditioning mode for a deployment that offers only one; omit it and every request infers its own. <code>--video-frames</code>, <code>--fps</code>, <code>--video-vae</code>, <code>--video-text-encoder</code> and <code>--audio-vae</code> complete the set. The server has no <code>--cfg</code> at all, which is why the shipped configs set neither steps nor guidance.</p>
+  <pre data-lang="bash"><code>dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
+    --backend ggml_metal --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+
+curl -s http://localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
+  "prompt": "a red fox trotting through falling snow, cinematic",
+  "width": 640, "height": 384, "frames": 22, "steps": 8, "cfg": 1.0,
+  "imagePath": "card.jpeg", "videoMode": "i2v"
+}'</code></pre>
+  <p>Three routes accept that body: <code>POST /api/video-generate</code>, <code>POST /api/video-generate/stream</code> (the same thing with SSE progress ticks) and the OpenAI-shaped <code>POST /v1/videos/generations</code>. They share one parser, so <code>videoMode</code>, <code>generateAudio</code>, <code>endImage</code>, <code>referenceImages</code>, <code>referenceVideos</code>, <code>referenceAudios</code> and <code>referenceVideoAudios</code> work on all three, each also accepting a snake_case spelling; <code>referenceVideoAudios</code> pairs by index with <code>referenceVideos</code>. The response carries <code>audioUrl</code> — <code>audio_url</code> on the OpenAI route — which is null when the model produced no track. Every file field names something previously uploaded through <code>/api/upload</code> and is confined to the upload directory. A model rejection (the wrong checkpoint, keyframes together with references) comes back as a <strong>400 carrying the model's own message</strong> rather than a generic 500.</p>
+  <p><code>GET /api/models</code> answers with a <code>video</code> object — null for every non-video model — carrying <code>family</code> (<code>minimax-h3</code>), <code>supportsAudio</code>, <code>supportsImageConditioning</code>, <code>supportsEndImageConditioning</code>, <code>supportsReferenceConditioning</code> and <code>maxReferenceImages</code>. That is how the Web UI learns whether to offer a first frame, a last frame, or up to nine references: it enables the reference-attachment control on <code>supportsReferenceConditioning</code> and caps the stills at <code>maxReferenceImages</code>, instead of pattern-matching an architecture string.</p>
 
   <h2 id="wan">Wan 2.1 / 2.2 (prompt → video, image → video)</h2>
   <p><strong>Download the Turbo DiT, not the base one.</strong> The base <code>Wan2.2-TI2V-5B</code> follows the official 50-step × CFG recipe — 100 DiT passes per video. The step-distilled Turbo build of the same model is trained to run guidance-free in 4 steps, TensorSharp recognizes it from the file name, and the identical request comes back <strong>in minutes instead of hours</strong>. The Turbo repository ships only the DiT, so the VAE and the text encoder still come from the base repositories:</p>
@@ -110,7 +151,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --output out.mp4 --backend ggml_cuda</code></pre>
   <div class="callout tip"><div class="ic">⚡</div><p><strong>Generate at a resolution Wan was trained at.</strong> Wan is trained at 480p (832×480) and 720p (1280×704), and TI2V-5B is natively a 720p model. Below ~0.3 MP the DiT is out of distribution and the video gets soft, unstable and color-drifting no matter how many steps you spend — the pipeline warns when you cross that line. Generate at 480p and downscale afterwards rather than generating small.</p></div>
 
-  <h2 id="video">Video generation (Wan 2.1 / 2.2)</h2>
+  <h2 id="video">Wan companions, cost and resolution</h2>
   <p>Wan turns a <strong>prompt</strong> — and, on the Wan 2.2 checkpoints, an <strong>uploaded first frame</strong> — into an H.264 MP4. The <code>--model</code> GGUF is only the DiT; TensorSharp resolves two companions next to it (a <code>VAE/</code>, <code>HighNoise/</code> or <code>LowNoise/</code> subfolder is fine):</p>
   <ul>
     <li><strong>UMT5-XXL text encoder</strong> — prompt → conditioning (<code>--video-text-encoder</code> / <code>TS_WAN_TE</code>). Released from VRAM before the denoise starts.</li>

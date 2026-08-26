@@ -27,8 +27,8 @@ dotnet --list-sdks
 
 - **`git` 与网络访问：** GGML/CUDA 原生构建会在首次构建时从 [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) 克隆 ggml 源码到 `ExternalProjects/ggml/`（参见 `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`）。克隆默认跟踪 ggml 的默认分支（`master`）；可用 `TENSORSHARP_GGML_GIT_REF` 指定其他引用，或在克隆完成后设置 `TENSORSHARP_GGML_NO_UPDATE=1` 跳过网络更新（用于离线重建）
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具——GGML 以源码形式内嵌 Metal kernel 并在运行时编译，因此构建期不需要 Metal 编译器。若需使用 MLX 后端，还需通过 `bash TensorSharp.Backends.MLX/build-native-macos.sh` 从 `TensorSharp.Backends.MLX/Native/` 构建 `libmlxc`；该构建**会**编译 Metal shader，因此需要**完整的 Xcode 以及 Metal 工具链**，仅安装命令行工具是不够的。首次构建时 `eng/ensure-metal-toolchain.sh` 会自动完成这一准备工作，详见[构建原生 MLX 库](#构建原生-mlx-库仅-macos)
-- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本。装有多个工具包时，可用 `CUDACXX`（或 `-DCMAKE_CUDA_COMPILER=`）指定用哪个 `nvcc` 构建；`build-windows.ps1` 会优先采用它而不是 `PATH`/`CUDA_PATH`，把选择打印在 `Configuring ...` 一行中，并丢弃使用其他编译器配置过的构建树（CMake 只在首次配置时缓存 CUDA 编译器，此后便会忽略 `CUDACXX`）。注意 CMake 仅在非 Visual Studio 生成器下读取 `CUDACXX`；使用 `Visual Studio NN` 生成器时请改用 `-T cuda=<版本或路径>`。Visual Studio 2026 的 MSVC 14.5x 工具集比当前 CUDA 工具包官方支持的宿主编译器更新，构建会自动向 `nvcc` 传递 `-allow-unsupported-compiler`；请同时安装“适用于 Windows 的 C++ CMake 工具”组件，以便构建使用 Ninja 生成器（Visual Studio 生成器还额外需要为对应 VS 版本提供 MSBuild 集成的 CUDA 工具包）
-- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本。**cuDNN 为可选**：当能找到其头文件与库（`libcudnn9-dev-cuda-12`，或任何提供 `cudnn.h` + `libcudnn` 的包）时，Wan 视频 VAE 的卷积会走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径，解码约快 1.75×；没有它时构建照常成功，VAE 保持 ggml 路径。configure 阶段会打印实际使用的是哪一条
+- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本。装有多个工具包时，可用 `CUDACXX`（或 `-DCMAKE_CUDA_COMPILER=`）指定用哪个 `nvcc` 构建；`build-windows.ps1` 会优先采用它而不是 `PATH`/`CUDA_PATH`，把选择打印在 `Configuring ...` 一行中，并丢弃使用其他编译器配置过的构建树（CMake 只在首次配置时缓存 CUDA 编译器，此后便会忽略 `CUDACXX`）。注意 CMake 仅在非 Visual Studio 生成器下读取 `CUDACXX`；使用 `Visual Studio NN` 生成器时请改用 `-T cuda=<版本或路径>`。Visual Studio 2026 的 MSVC 14.5x 工具集比当前 CUDA 工具包官方支持的宿主编译器更新，构建会自动向 `nvcc` 传递 `-allow-unsupported-compiler`；请同时安装“适用于 Windows 的 C++ CMake 工具”组件，以便构建使用 Ninja 生成器（Visual Studio 生成器还额外需要为对应 VS 版本提供 MSBuild 集成的 CUDA 工具包）。**cuDNN 会自动准备**：首次 CUDA 构建时由 `eng/fetch-cudnn.ps1` 下载到 `ExternalProjects/cudnn/`（下载约 1.8 GB，磁盘占用约 1.1 GB，只解出 `include/` 与 `bin/`），使 Wan / Qwen-Image VAE 的卷积可以走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。已安装的版本（`TS_CUDNN_DIR`、`CUDNN_DIR`、`CUDA_PATH`）优先于下载，`TENSORSHARP_CUDNN=OFF` 可完全跳过；构建不与它链接——运行时用 `LoadLibrary` 解析，因此有没有它，构建与产物都照常工作
+- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本。**cuDNN 会自动准备**：首次 CUDA 构建时，`eng/fetch-cudnn.sh` 会从 NVIDIA 公开的 redist 渠道把固定版本下载到 `ExternalProjects/cudnn/`（无需账号，也无需点选许可），Wan / Qwen-Image VAE 的卷积随后走 cuDNN 而不是 ggml 的 im2col+GEMM 下降路径。系统上已装的 cuDNN（`libcudnn9-dev-cuda-12`、`CUDA_HOME`、`TS_CUDNN_DIR`）优先于下载。它严格可选：获取失败不会让构建失败，编译期只需要头文件，库本身在运行时用 `dlopen` 解析，因此带 cuDNN 构建出的二进制在没有 cuDNN 的机器上照样能跑。`TENSORSHARP_CUDNN=OFF` 完全跳过；configure 阶段会打印实际生效的是哪一条
 - **Windows（GGML Vulkan 后端）：** 这里同样需要 CMake 3.20+ 与 Visual Studio 2022 或 2026 C++ 构建工具——Vulkan 工具链的准备和后端的编译都由 CMake 完成，缺少它会在 `eng/fetch-vulkan-toolchain.ps1` 阶段就失败。Visual Studio 的“适用于 Windows 的 C++ CMake 工具”组件同时自带 `cmake.exe` 与 `ninja.exe`，两者都不在 `PATH` 上时 `build-windows.ps1` 会回退到该副本；否则请从 [cmake.org/download](https://cmake.org/download/) 安装 CMake。原生构建**仅支持 x64**——`build-windows.ps1` 会自行导入 `vcvars64` 环境，包括覆盖已经激活的 *x86* 环境（普通的“Developer PowerShell for VS”默认是 x86，而 ggml 的 Vulkan 后端无法以 32 位编译）。机器有 Vulkan 运行时（每个较新的 GPU 驱动都带的 `System32\vulkan-1.dll`）时自动启用。已安装 [LunarG Vulkan SDK](https://vulkan.lunarg.com/) 时直接使用；未安装时构建会通过 `eng/fetch-vulkan-toolchain.ps1` 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 vulkan-1 导入库、glslc、SPIRV-Headers）准备到 `ExternalProjects/vulkan-toolchain/`。用 `build-windows.ps1 --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出。运行时需要支持 Vulkan 1.3 的 GPU 驱动
 - **Linux（GGML Vulkan 后端）：** 已安装 Vulkan loader（`libvulkan.so.1`）时自动启用。存在发行版开发包时直接使用（`apt install libvulkan-dev glslc spirv-headers`）；否则构建会通过 `eng/fetch-vulkan-toolchain.sh` 把缺失的部分（Vulkan-Headers、shaderc CI 预编译的 glslc、SPIRV-Headers）自动下载到 `ExternalProjects/vulkan-toolchain/`。用 `build-linux.sh --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出
 - GGUF 模型文件（例如来自 [Hugging Face](https://huggingface.co)）
@@ -169,6 +169,21 @@ tensor API 开启时 VAE 依然**正确**：在支持 tensor API 的设备上，
 | `TS_WAN_METAL_TENSOR_API=1` / `=0` | 为 Wan 进程强制开/关 tensor API，覆盖按模型规模的默认值 |
 | `TS_WAN_VAE_GEMM_MAX_MB=<n>` | 强制走 im2col+GEMM VAE 路径并设定 `n` MB 的 im2col 预算（0 强制直接卷积）——双向覆盖自动选择 |
 
+#### MiniMax-H3 与 FP16 flash-attention 分子
+
+与上一节不同，这条不限于 Apple：只要 flash-attention kernel 把 softmax 分子保存在 FP16 里就会遇到，而这里构建的每个后端都是如此。
+
+MiniMax-H3 对**一条**无 mask 的打包序列做双向注意力——文本、条件帧、目标音频与目标视频都在其中——因此 key 数量**就是**整段片段：22 帧为 2364 个打包 token，107 帧为 8646 个。vendored ggml 的每个 flash-attention kernel 都用 FP16 寄存器累加 `sum_j exp(s_j - max) * V_j`，而 `ggml_flash_attn_ext_set_prec(GGML_PREC_F32)` 是空操作——`ggml-cuda/` 与 `ggml-metal/` 里没有任何代码读取 `GGML_OP_FLASH_ATTN_EXT` 的 `op_params`。kernel 留给累加器的余量只有 3 个 bit（`FATTN_KQ_MAX_OFFSET` 把运行最大值抬高 log(8)，使每个 softmax 权重上限为 1/8），因此 N 个 key 的一行会累加到 N/8 × |V|，一旦 N × |V| > 8 × 65504 就溢出为 Inf。只有 H3 会撞上这个上限：checkpoint 里有 `q_norm` 和 `k_norm`，唯独没有 `v_norm`，value 这一路的幅值不受约束。640×384 实测：73 帧正常，107 帧则在**第一个**去噪步就出现 Inf，返回的视频每个像素全黑、每个音频采样被钳位——视频与音频共用同一主干，溢出会连同声音一起拖垮。
+
+修复在 `h3_attend`（`ggml_ops_minimax_h3.cpp`）：按 key 数量取"能把它压到 `kH3FlashKeyBudget` 以内的最小 2 的幂"预先缩放 V，输出时再还原。注意力对 V 是线性的，所以这个修正是**精确**的；又因为倍数是 2 的幂，经过 F16 转换也只是指数位平移而非舍入，因此足够短的序列（包括测试套件里所有 oracle 用例）保持逐位一致。`h3_mm` 对两个激活无界的量化 matmul（送入 `o_proj` 的注意力输出、送入 `down_proj` 的 SwiGLU 隐状态）做同样处理，那里的上限则是 q8_1 每个 block 的 FP16 求和。
+
+| 环境变量 | 作用 |
+|---|---|
+| `TS_H3_TRACE=1` | 打印每个去噪步的 latent 与 velocity 幅值——样本发散时，latent 的 absmax 会比真正变成无穷早若干步露出端倪 |
+| `TS_H3_NO_FLASH=1` | 强制走显式 softmax 路径，用于区分是 flash-attention kernel 的问题还是建模的问题 |
+
+采样器也不再无条件相信结果：velocity 出现非有限值时直接让请求失败并指明是第几步（`MiniMaxH3Pipeline.cs` 的 `RequireFinite`），而不是写出一个长度、帧率、音轨时长都正常但通体全黑的文件——这种失败本来是无声的，因为 RGB 钳位会把 NaN 像素固定成 0，WAV 写出会把 NaN 采样钳到 -1。
+
 ### 构建原生 MLX 库（仅 macOS）
 
 MLX 后端依赖 `libmlxc`（[MLX](https://github.com/ml-explore/mlx) 的 C 绑定）。仓库在 `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` 中固定了已知可用的 `mlx-c` tag，并提供一个辅助脚本来获取和构建：
@@ -206,7 +221,8 @@ TensorSharp/
 ├── TensorSharp.Core/            # 核心张量库（Tensor、Ops、内存、设备抽象，含 CPU SIMD/托管量化内核）
 ├── TensorSharp.Runtime/         # GGUF、分词器、模板、采样、协议解析
 │   ├── Paged/                   # 分页 KV 缓存原语（BlockPool、BlockTable、KvBlock、BlockHashIndex、PagedKvStorage、PagedKvBatchOps、ManagedPagedAttention）
-│   ├── Scheduling/              # 连续批处理引擎（InferenceEngine、BatchExecutor、ContinuousBatchScheduler、SequenceState、SchedulerConfig/Output、InferenceRequestHandle）+ MTP 投机解码核心（MtpSpeculativeExecution）
+│   ├── Scheduling/              # 连续批处理引擎（InferenceEngine、BatchExecutor、ContinuousBatchScheduler、SequenceState、SchedulerConfig/Output、InferenceRequestHandle）
+│   ├── Speculative/             # 投机解码：起草/验证/回滚核心（SpeculativeExecution）、ISpeculator 各算法（DraftHeadSpeculator、BlockDraftSpeculator、NGramSpeculator）与 SpeculatorRegistry、模型侧契约（ISpecTrunk、SpeculativeModelContracts）、共用的参数解析（SpeculativeCliFlags、SpeculationOptions）以及运行期成本裁判
 │   ├── PagedKvCacheManager.cs   # 单会话分页 KV 管理（块分配、前缀复用）
 │   ├── PagedKvBlockStore.cs     # 带可选 SSD 溢出的 RAM/磁盘分级分页块存储
 │   ├── SsdKvBlockTier.cs        # 分页块的 SSD 冷层
@@ -215,19 +231,24 @@ TensorSharp/
 │   ├── KvBlockHash.cs           # 内容寻址的块哈希，用于跨请求前缀复用
 │   └── Logging/                 # JSON-line 文件日志器 + 每轮遥测
 ├── TensorSharp.Models/          # 模型架构实现与多模态编码/注入
-│   ├── Models/<Family>/         # 每个架构一个目录（DeepSeek4、DiffusionGemma、Gemma3、Gemma4、GptOss、Mistral3、Nemotron、Qwen3、Qwen35、QwenImage）
+│   ├── Models/<Family>/         # 每个架构一个目录（DeepSeek4、DiffusionGemma、Gemma3、Gemma4、GlmDsa、GptOss、MiniMaxH3、Mistral3、MuseGlimmer、Nemotron、Qwen3、Qwen35、QwenImage、WanVideo）
 │   │   ├── <Family>Model.cs                # 旧的单序列 ModelBase 实现
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch —— 批处理/分页路径（Mistral3、Gemma4、GptOss、Qwen35、Nemotron、Qwen3）
 │   ├── Models/DeepSeek4/        # DeepSeek V4 Flash：使用整模型执行器而非逐算子前向
-│   ├── Models/GlmDsa/           # GLM 5.x：原生执行器驱动、MLA + DSA indexer 逐算子参考实现、序列 slot
 │   │   ├── DeepSeek4Model.cs               # GGUF 元数据、分词器、聊天模板、执行器选择
 │   │   ├── DeepSeek4CudaExecutor.cs        # 对接 Direct CUDA 整模型引擎
 │   │   ├── DeepSeek4CpuExecutor*.cs        # 100% 纯 C# 整模型执行器（零原生依赖）
 │   │   ├── DeepSeek4Model.Dspark.cs        # DSpark 块级草稿器（draft / 置信度 / Markov 头）
 │   │   └── DeepSeek4Model.PerSeqCache.cs   # 让该模型可被服务端托管的原生 per-sequence slot
+│   ├── Models/GlmDsa/           # GLM 5.x：原生执行器驱动、MLA + DSA indexer 逐算子参考实现、序列 slot
+│   ├── Models/MuseGlimmer/      # Muse-Glimmer：融合整模型前向、视觉编码器、张量并行变体、DFlash 块级草稿器
+│   ├── Models/MiniMaxH3/        # MiniMax-H3 视频 + 联合 32 kHz 立体声音频：打包序列 DiT、Qwen3-VL 文本编码器与视觉塔、视频与音频 VAE、flow-match 调度器、pipeline
+│   ├── Models/WanVideo/         # Wan 2.1/2.2，仅视频：DiT、UMT5-XXL 文本编码器、因果 3D VAE、UniPC 调度器，以及不依赖 ggml 的 WanDirect* `cuda`/`cpu` 路径
+│   ├── Models/Video/            # 两个视频家族共同实现的接缝：IVideoGenerationModel、VideoGenerationParams/Progress、GeneratedVideoAudio、WAV 写出
 │   ├── Paged/                   # 张量侧的分页注意力辅助（TensorPagedAttention）
 │   ├── KvBlockTransfer.cs       # 跨序列的 KV 块 extract/inject 辅助
-│   ├── MtpSpeculativeDecoder.cs # Qwen 3.6、GLM 5.2 与 Gemma 4 共用的 MTP/NextN 起草-验证-回滚驱动
+│   ├── SpeculativeDecoder.cs    # Qwen 3.6、GLM 5.2 与 Gemma 4 共用的模型侧起草-验证-回滚驱动
+│   ├── SpeculativeDraftHeadLoader.cs # 加载独立的草稿器 GGUF（Gemma 4 gemma4-assistant、DSpark、DFlash）并绑定到主干
 │   └── ModelMultimodalInjector.cs # 视觉 / 音频 / 视频嵌入注入
 ├── TensorSharp.Backends.GGML/   # GGML 后端绑定（通过原生库支持 Metal/CUDA/Vulkan/CPU）
 ├── TensorSharp.Backends.Cuda/   # Direct CUDA 后端（CUDA Driver API、cuBLAS、PTX 内核）
@@ -247,8 +268,12 @@ TensorSharp/
 │   ├── ggml_ops_qwen35_gdn_tp.cpp         # Qwen 3.5/3.6 按 rank 的打包 GatedDeltaNet 内核（张量并行）
 │   ├── ggml_ops_qwen35_recurrent_prefill.cpp # Qwen 3.5/3.6 递归层 prefill
 │   ├── ggml_ops_gptoss_decode.cpp         # GPT OSS 整模型 decode 计算图（每 token 一次调度，共享 KV 窗口）
+│   ├── ggml_ops_gptoss_prefill.cpp        # GPT OSS 整模型 prefill：N 个 token 走完全部注意力 + MoE 层，连同折叠的最终 norm 与 LM head 合为一张图
 │   ├── ggml_ops_deepseek4.cpp             # DeepSeek V4 原生整模型执行器（层切分、压缩 KV 缓存、计算图缓存）
 │   ├── ggml_ops_glm_dsa.cpp               # GLM 5.x 原生整模型执行器（MLA + DSA indexer、张量并行、序列 slot）
+│   ├── ggml_ops_muse_glimmer.cpp          # Muse-Glimmer 整模型前向：decode 用持久图（供 ggml-cuda 捕获 CUDA 图）、prefill 用瞬时图，另含张量并行图
+│   ├── ggml_ops_muse_glimmer_vision.cpp   # Muse-Glimmer ViT 块的设备端实现（最大尺寸图像有 16,224 个 patch，逐算子派发会让每步都经宿主同步）
+│   ├── ggml_ops_dflash.cpp                # Muse-Glimmer DFlash 块级草稿器，每个投机步融合为一张图（草稿块 + 借用主干的 LM head）
 │   ├── ggml_ops_dsv4_fused.cu / _cpu.cpp  # DeepSeek V4 在 ggml-cuda 流上的融合自定义算子（及其 CPU 版本）
 │   ├── ggml_ops_gemma4_decode.cpp         # Gemma 4 稠密整模型 decode（CUDA graph 持久化）
 │   ├── ggml_ops_gemma4_batched.cpp        # Gemma 4 稠密 + MoE 按 token 批量 decode
@@ -262,6 +287,8 @@ TensorSharp/
 │   ├── ggml_ops_tp_probe.cu               # 选择 TP 传输方式的 peer-copy / NCCL AllReduce 预检
 │   ├── ggml_ops_diffusion.cpp             # DiffusionGemma 融合 decode-layer / 整模型 / lm-head 内核
 │   ├── ggml_ops_qwen_image.cpp            # Qwen-Image-Edit MMDiT 整模型前向（CUDA 图捕获）+ CFG-batched 内核
+│   ├── ggml_ops_minimax_h3.cpp            # MiniMax-H3 整网络计算图：音视频打包的 DiT、Qwen3-VL 文本编码器与视觉塔、视频 / 音频 VAE 的编码与解码（七个入口，权重直接从调用方 mmap 常驻绑定）
+│   ├── ggml_ops_wan.cpp                   # Wan 2.1/2.2 整图入口：UMT5-XXL 文本编码器、每步 DiT 速度预测（按 shape 持久化以便捕获 CUDA 图）、因果 3D 视频 VAE 编码与解码
 │   ├── ggml_ops_training.cpp              # 仅训练用内核（运行时不使用）
 │   └── tests/                              # 原生单元 + 烟雾测试
 ├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
@@ -296,6 +323,7 @@ TensorSharp/
 ├── docs/                        # 开发者参考文档
 │   ├── models/                  # 按模型架构卡片（每个模型一份 .md，中英双语）
 │   ├── PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md  # 分页 KV 缓存、前缀共享、调度器、按模型批处理状态
+│   ├── speculative_decoding.md  # 起草-验证设计：ISpeculativeTarget / ISpeculator / IDraftHead 三层，以及 draft-head、block 与 ngram 三种算法
 │   └── env_var_feature_matrix.md  # TestMatrix 使用的运行时开关 × 模型/后端/功能覆盖矩阵
 ├── benchmarks/                  # 可重现的基准脚本
 └── ExternalProjects/            # ggml/ 在构建时从 github.com/ggml-org/ggml 克隆（不纳入版本控制）
@@ -355,7 +383,7 @@ TensorSharp 采用分层系统结构：
 
 2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析、分页 KV 缓存（`Runtime/Paged/*`）、连续批处理调度器 / 引擎（`Runtime/Scheduling/*`）、`IKvBlockCodec` 接口及其 `TurboQuantKvCodec` 2-bit / Q4 / Q8 实现，以及 `IModelArchitecture`、`IBatchedPagedModel`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IKVCachePolicy`、`IBackendExecutionPlan` 等抽象。
 
-3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、DiffusionGemma、Qwen 3/3.5、GPT OSS、Nemotron-H、Mistral 3、Qwen-Image-Edit）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-Edit（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像编辑通过 `EditImage()` 进行，由它编排 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
+3. **TensorSharp.Models** 实现 `ModelBase` 以及全部 14 个具体模型架构和多模态辅助组件——11 个文本家族（DeepSeek V4 Flash、GLM 5.x、Gemma 3、Gemma 4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6 系列、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer）与 3 个媒体输出家族（Qwen-Image-Edit、MiniMax-H3、Wan 2.1/2.2）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-Edit（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像编辑通过 `EditImage()` 进行，由它编排 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。视频家族更进一步：`MiniMaxH3Model` 与 `WanVideoModel` 的 `ForwardCore()` 都直接抛异常，生成统一走 `GenerateVideo(prompt, VideoGenerationParams)`，其背后是 `Models/Video/` 里共享的 `IVideoGenerationModel` 接缝——CLI 与服务端因此只用一条路径驱动两者（以及日后新增的模型），而不必逐个判断具体模型类型。MiniMax-H3 在同一个打包 latent 里**同时**去噪视频与 32 kHz 立体声音频，共有七张原生整网络计算图（DiT、Qwen3-VL 文本编码器、视觉塔、视频与音频 VAE 的编码与解码）；Wan 2.1/2.2 则是仅视频的家族，其 DiT、UMT5-XXL 编码器与因果 3D VAE 同样以整图方式运行。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构——MiniMax-H3 例外：其公开发布的 GGUF 完全不带元数据，只能依据张量识别（`ModelBase.cs` 的 `LooksLikeMiniMaxH3`）。
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。除原生量化 matmul（Q4_K_M、Q8_0 等，无需反量化到 FP32）外，还提供分页注意力（`TSGgml_PagedAttentionForward`，含 / 不含注意力 sinks 两种版本）以及架构特定的批处理内核（Mamba2、GatedDeltaNet）。
 
@@ -418,7 +446,7 @@ TensorSharp 采用分层系统结构：
 
 ### 单元测试（xUnit）
 
-`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、MTP / NextN 投机解码正确性与可选端到端探针（`MtpSpeculativeExecutionTests`、`Qwen36SpeculativeTests`、`Gemma4SpeculativeTests`）、DiffusionGemma 去噪 / prompt-KV / 批处理生成探针（`DiffusionGemmaTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，以及服务器 CLI 选项构造（`ServerOptionsBuilderTests`）。
+`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、MTP / NextN 投机解码正确性与可选端到端探针（`SpeculativeExecutionTests`、`Qwen36SpeculativeTests`、`Gemma4SpeculativeTests`）、DiffusionGemma 去噪 / prompt-KV / 批处理生成探针（`DiffusionGemmaTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，以及服务器 CLI 选项构造（`ServerOptionsBuilderTests`）。
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

@@ -6,6 +6,13 @@ prompt (plus an optional first-frame image on the Wan 2.2 models) in, H.264 MP4
 out, from both `TensorSharp.Cli` and `TensorSharp.Server` (OpenAI-style API +
 the bundled Web UI chat).
 
+> **Wan is the video-only family.** The newer video model in TensorSharp is
+> [MiniMax-H3](minimax-h3.md), which generates video **and native 32 kHz stereo
+> audio together in one packed latent** — text-to-video, image-to-video,
+> first/last frame and reference-to-video, CFG-free at 4–8 steps. Wan stays the
+> family to reach for when you want video alone, and it is the one with the
+> step-distilled checkpoints that cut the 100-DiT-pass recipe to 4.
+
 Supported checkpoint families (auto-detected from the DiT GGUF):
 
 | Family | Latent | VAE | Modes | Notes |
@@ -37,7 +44,7 @@ Q4_K_M experts run sequentially on the same card.
 ### Quickest way to get all of them: a config file
 
 Because several files have to line up, the ready-made configs in
-[`config/`](../../config/README.md#video-generation-wan) name every network and
+[`config/`](../../config/README.md#video-generation-video-only-wan) name every network and
 download whatever is missing on the first run:
 
 ```bash

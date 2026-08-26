@@ -41,6 +41,53 @@ namespace TensorSharp.Models.MiniMaxH3
         /// be — the reference tiles at 256 px, we do not need to.</summary>
         private const int MaxVaeTokensPerCall = 16384;
 
+        /// <summary>TS_H3_PHASE=1 prints a per-stage breakdown - encoder open vs trunk,
+        /// every denoise step, and VAE open vs decode. The existing one-line summaries
+        /// tell you a phase was slow; this tells you which half of it.</summary>
+        private static bool PhaseTiming =>
+            Environment.GetEnvironmentVariable("TS_H3_PHASE") == "1";
+
+        /// <summary>Sequentially read the denoiser file so its first upload is a copy out of
+        /// cache rather than a fault storm. TS_H3_PREFAULT: 0 off, 1 serial, 2 overlapped
+        /// with text conditioning, 3 (default) pipelined with the upload itself.
+        ///
+        /// <para>Measured at 640x384, best and median of three paired runs each:
+        /// off 67.2 s, serial 64.4 / 65.8 s, pipelined 63.3 / 63.7 s. Pipelined wins because
+        /// the read and the upload walk the file in the same order and the read is faster
+        /// (2.7 GB/s against ~2.4 GB/s), so it stays ahead and the upload lands on pages that
+        /// are already there; joining first would serialize 4.2 s of read before 4.3 s of
+        /// copy.</para>
+        ///
+        /// <para>Serial is the default because overlapping measured WORSE: 63.7 s against
+        /// 60.4 s at 640x384. The prefault itself finishes faster when overlapped (2.2 s
+        /// against 4.0 s, since it shares the run with GPU work), but the text encoder it
+        /// overlaps with streams its own 17 GB through the same page cache and evicts every
+        /// page the prefault just placed - the first denoiser step went back to 13.7 s,
+        /// against 7.3 s when the read happens after the encoder has been released. Mode 2
+        /// is kept because a host with enough RAM to hold both files would flip that result.</para></summary>
+        private static int PrefaultMode
+        {
+            get
+            {
+                string v = Environment.GetEnvironmentVariable("TS_H3_PREFAULT");
+                if (string.IsNullOrWhiteSpace(v)) return 3;
+                return int.TryParse(v, out int m) && m >= 0 && m <= 3 ? m : 3;
+            }
+        }
+
+        /// <summary>Physical memory free right now, or 0 when it cannot be read. Used only
+        /// to decide whether caching a weight file is worth attempting.</summary>
+        private static long AvailablePhysicalBytes()
+        {
+            try
+            {
+                var info = GC.GetGCMemoryInfo();
+                long avail = info.TotalAvailableMemoryBytes - info.MemoryLoadBytes;
+                return avail > 0 ? avail : 0;
+            }
+            catch (PlatformNotSupportedException) { return 0; }
+        }
+
         public MiniMaxH3Pipeline(MiniMaxH3Model model) { _model = model; }
 
         public GeneratedVideo Generate(string prompt, VideoGenerationParams p)
@@ -101,6 +148,19 @@ namespace TensorSharp.Models.MiniMaxH3
                 ResolveKeyframes(p, shape, keyframes, keyframeAtEndFlags);
             }
 
+            // Warming the denoiser file is pure disk work and the text encoder that runs
+            // next is pure GPU work, so mode 2 starts it here and collects it just before
+            // the first upload. Mode 1 does the same read serially after the encoder is
+            // released, which is safer on a host whose page cache cannot hold both files.
+            System.Threading.Tasks.Task<double> prefault = null;
+            if (PrefaultMode == 2)
+            {
+                string ditPath = _model.DiTPath;
+                long avail = AvailablePhysicalBytes();
+                prefault = System.Threading.Tasks.Task.Run(
+                    () => MiniMaxH3Model.PrefaultWeightFile(ditPath, avail));
+            }
+
             // ---- text conditioning (then give the 17 GB encoder back) ----
             float[] textHidden;
             int textLength;
@@ -108,8 +168,11 @@ namespace TensorSharp.Models.MiniMaxH3
             // but the tokens standing in for a reference image are modulated as VISUAL.
             List<int> textModalities = null;
             var textClock = Stopwatch.StartNew();
+            var teOpenClock = Stopwatch.StartNew();
+            double teRunSeconds = 0;
             using (var te = _model.CreateTextEncoder())
             {
+                teOpenClock.Stop();
                 string presented = prompt ?? string.Empty;
                 List<MiniMaxH3PromptImage> promptImages = null;
                 if (keyframes.Count > 0)
@@ -146,14 +209,59 @@ namespace TensorSharp.Models.MiniMaxH3
                 var ids = te.Tokenize(presented);
                 if (ids.Count == 0) ids.Add(te.Tokenizer.BosTokenId);
                 textLength = ids.Count;
+                var teRunClock = Stopwatch.StartNew();
                 textHidden = te.Encode(ids, promptImages);
+                teRunClock.Stop();
+                teRunSeconds = teRunClock.Elapsed.TotalSeconds;
+                // The trunk is finished with, so the denoiser read can start now and run
+                // alongside the encoder's teardown. Releasing 551 per-tensor device
+                // buffers is ~2 s of driver work (cudaFree measures 1.15 ms apiece on this
+                // card) and the read is ~4 s of disk; they contend for nothing, so
+                // whichever is shorter comes for free. The denoiser cannot upload until
+                // BOTH are done - it needs the VRAM the teardown returns and the pages the
+                // read places - which is exactly the join below.
+                if (PrefaultMode == 1 || PrefaultMode == 3)
+                {
+                    string ditPath = _model.DiTPath;
+                    long avail = AvailablePhysicalBytes();
+                    prefault = System.Threading.Tasks.Task.Run(
+                        () => MiniMaxH3Model.PrefaultWeightFile(ditPath, avail));
+                }
+                if (PhaseTiming)
+                    Console.WriteLine($"  [h3] .. encoder open {teOpenClock.Elapsed.TotalSeconds:F1}s, "
+                                      + $"trunk {teRunClock.Elapsed.TotalSeconds:F1}s");
                 if (promptImages is { Count: > 0 })
                     textModalities = BuildTextModalities(textLength, promptImages);
             }
 
             textClock.Stop();
+            if (PhaseTiming)
+                Console.WriteLine($"  [h3] .. encoder teardown "
+                                  + $"{textClock.Elapsed.TotalSeconds - teOpenClock.Elapsed.TotalSeconds - teRunSeconds:F1}s");
             Console.WriteLine($"  [h3] text conditioning: {textLength} tokens in " +
                               $"{textClock.Elapsed.TotalSeconds:F1}s");
+
+            // The encoder has just handed its ~17 GB back, so this is the moment the host has
+            // room to cache the denoiser. Sequential read now beats scattered fault-in during
+            // the upload; see MiniMaxH3Model.PrefaultWeightFile.
+            // Mode 3 deliberately does NOT join here. The read walks the file in the same
+            // order the upload walks tensors, and it moves faster (2.7 GB/s sequential
+            // against ~2.4 GB/s for the copy), so leaving it running lets it stay ahead
+            // and the upload finds pages already placed. Joining first serializes the two
+            // - 4.2 s of read THEN 4.3 s of copy - where running them together costs
+            // about the longer of the pair.
+            if (prefault != null && PrefaultMode != 3)
+            {
+                var wait = Stopwatch.StartNew();
+                double pf = prefault.GetAwaiter().GetResult();
+                wait.Stop();
+                if (PhaseTiming)
+                    Console.WriteLine(pf >= 0
+                        ? $"  [h3] .. denoiser prefault {pf:F1}s overlapped, "
+                          + $"{wait.Elapsed.TotalSeconds:F1}s still to wait"
+                        : "  [h3] .. denoiser prefault skipped (not enough free RAM)");
+            }
+
 
             var ditClock = Stopwatch.StartNew();
             _dit ??= _model.CreateDiT();
@@ -327,6 +435,7 @@ namespace TensorSharp.Models.MiniMaxH3
 
                 if (step == 0) RequireChunksMatchLayout(condChunks, layout);
 
+                var stepClock = Stopwatch.StartNew();
                 var (vVel, aVel) = _dit.Forward(
                     videoPatches, videoCount, audioLatent, audioCount,
                     textHidden, textLength, layout, sigma,
@@ -346,6 +455,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (step == 0)
                     Console.WriteLine($"  [h3] {layout.TokenCount} packed tokens; " +
                                       $"first step in {total.Elapsed.TotalSeconds - textClock.Elapsed.TotalSeconds:F1}s");
+                if (PhaseTiming)
+                    Console.WriteLine($"  [h3] .. step {step + 1}/{steps} {stepClock.Elapsed.TotalSeconds:F2}s");
                 if (TraceEnabled)
                     Console.WriteLine(
                         $"  [h3] step {step + 1}/{steps} sigma={sigma:F4} " +
@@ -354,18 +465,44 @@ namespace TensorSharp.Models.MiniMaxH3
                         $"| audio latent rms={Rms(audioLatent):F3} velocity rms={Rms(aVel):F3}");
             }
 
+            // The pipelined read (mode 3) is collected here: the denoiser has finished
+            // with the file either way, and a Task holding a FileStream must never be
+            // left dangling.
+            if (prefault != null && PrefaultMode == 3)
+            {
+                double pf3 = prefault.GetAwaiter().GetResult();
+                if (PhaseTiming)
+                    Console.WriteLine(pf3 >= 0
+                        ? $"  [h3] .. denoiser prefault {pf3:F1}s, pipelined with the upload"
+                        : "  [h3] .. denoiser prefault skipped (not enough free RAM)");
+            }
+
             // ---- decode video ----
             Report(p, "vae-decode", steps, steps, total);
+            ReleaseDenoiserIfVaeWouldNotFit();
+            // The VAE is deliberately NOT prefaulted. Measured at 640x384 the read costs
+            // 1.9 s and the decode does not move (9.4 s against 9.1 s), so it is a straight
+            // loss: at 4.85 GB the VAE is small enough that its upload is not fault-bound the
+            // way the 10.6 GB denoiser is, and its decode is compute-bound rather than
+            // transfer-bound. Prefaulting pays only where a large file meets a first-touch
+            // upload.
+            var vaeOpenClock = Stopwatch.StartNew();
             _vae ??= _model.CreateVideoVae();
+            vaeOpenClock.Stop();
 
             float[] latent = MiniMaxH3DiT.UnpatchifyVideo(
                 videoPatches, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth,
                 MiniMaxH3Geometry.VideoLatentChannels);
             _vae.DenormalizeLatent(latent);
 
+            var vaeRunClock = Stopwatch.StartNew();
             float[] pixels = _vae.Decode(
                 latent, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth,
                 (tile, tiles) => Report(p, "vae-decode", steps, steps, total));
+            vaeRunClock.Stop();
+            if (PhaseTiming)
+                Console.WriteLine($"  [h3] .. video VAE open {vaeOpenClock.Elapsed.TotalSeconds:F1}s, "
+                                  + $"decode {vaeRunClock.Elapsed.TotalSeconds:F1}s");
 
             // The decoder now hands back exactly the clip's frames, warm-up and
             // chunk overlaps already resolved.
@@ -984,6 +1121,34 @@ namespace TensorSharp.Models.MiniMaxH3
                 ElapsedSeconds = elapsed,
                 EtaSeconds = eta,
             });
+        }
+
+        /// <summary>Hand the finished denoiser's VRAM back before the video VAE loads, when
+        /// the card does not have room for both.
+        ///
+        /// <para>The DiT is ~10.6 GB at Q4_K and the video VAE another ~5.2 GB. Held together on
+        /// a 16 GB card that is 15.8 GB of weights before a single activation, and Windows/WDDM
+        /// does not fail that allocation - it silently backs the overflow with shared host memory,
+        /// so the decode runs at PCIe speed. Measured on a 16 GB RTX 3080 Laptop at 640x384 x 22
+        /// frames, the decode window sat pinned at 16.0 GB of a 16.4 GB card for its whole
+        /// duration.</para>
+        ///
+        /// <para>This is a cap, not a policy change: when the spare VRAM already fits the VAE the
+        /// denoiser stays resident and behaviour is exactly as before, so cards with room pay
+        /// nothing. When it does not, the release costs a re-upload of the DiT on the NEXT
+        /// request only - the weights are mmapped GGUF pages that are still in RAM - and buys
+        /// back a decode that is not crossing the bus. Non-CUDA GGML backends are left alone:
+        /// unified-memory devices have nothing to hand back.</para></summary>
+        private void ReleaseDenoiserIfVaeWouldNotFit()
+        {
+            if (_dit == null || _model.Backend != BackendType.GgmlCuda)
+                return;
+            if (!GpuMemoryBudget.TryGetSpareBytes(_model.Backend, out long spare))
+                return;   // no reading of the device: leave today's behaviour alone
+            long need = _model.VideoVaeResidentBytesEstimate();
+            if (need <= 0 || spare >= need)
+                return;   // it fits alongside the denoiser; keep it resident
+            _dit.ReleaseDeviceResidency();
         }
 
         public void Dispose()

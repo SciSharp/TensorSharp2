@@ -20,11 +20,11 @@
 
   <h2 id="catalog">亮点</h2>
   <div class="card-grid">
-    <div class="card"><div class="ic">🧠</div><h3>多架构</h3><p>DeepSeek V4 Flash、GLM 5.2、Gemma 4 / 3、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、DiffusionGemma、Qwen-Image-Edit、Wan 视频。</p></div>
+    <div class="card"><div class="ic">🧠</div><h3>多架构</h3><p>DeepSeek V4 Flash、GLM 5.2、Gemma 4 / 3、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、DiffusionGemma、Qwen-Image-Edit、MiniMax-H3 音视频、Wan 视频。</p></div>
     <div class="card"><div class="ic">🖼️</div><h3>多模态</h3><p>图像、视频与音频输入（Gemma 4）；多个其他模型支持图像输入。</p></div>
     <div class="card"><div class="ic">📄</div><h3>PDF 文档</h3><p>在 Web UI 上传 PDF，或在 CLI 传 <code>--pdf</code> —— 文本型 PDF 直接内联，扫描页则交给视觉模型。</p></div>
     <div class="card"><div class="ic">🎨</div><h3>图像编辑</h3><p>Qwen-Image-Edit 将提示词 + 输入图像转为编辑后的图像（MMDiT 扩散）。</p></div>
-    <a class="card" href="models-video_zh-cn.html#video"><div class="ic">🎬</div><h3>视频生成</h3><p>Wan 2.1 / 2.2 把提示词——以及可选的首帧图像——变成 H.264 MP4。换用步数蒸馏权重，5 秒 720p 视频可从数小时缩短到几十分钟。</p></a>
+    <a class="card" href="models-video_zh-cn.html#minimax-h3"><div class="ic">🎬</div><h3>视频生成</h3><p>MiniMax-H3 在<strong>一份打包潜变量里同时生成视频与原生 32 kHz 立体声音频</strong>，无需 CFG，4–8 步即可。Wan 2.1 / 2.2 只生成画面；换用步数蒸馏权重，5 秒 720p 视频可从数小时缩短到几十分钟。</p></a>
     <div class="card"><div class="ic">💭</div><h3>思考模式</h3><p>结构化的思维链，与可见答案分离。</p></div>
     <div class="card"><div class="ic">🛠️</div><h3>工具调用</h3><p>跨三种 API 风格的多轮函数调用。</p></div>
     <div class="card"><div class="ic">📦</div><h3>原生量化计算</h3><p>Q4_K_M、Q8_0、MXFP4、IQ2_XXS 等在 matmul 中直接运算，无需反量化到 FP32。</p></div>
@@ -36,7 +36,7 @@
 
   <h2 id="models-features">模型与模态</h2>
   <ul>
-    <li><strong>多架构支持</strong> —— DeepSeek V4 Flash、GLM 5.2、Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、Qwen-Image-Edit、Wan 2.1 / 2.2 视频。→ <a href="models_zh-cn.html#table">支持的模型</a></li>
+    <li><strong>多架构支持</strong> —— DeepSeek V4 Flash、GLM 5.2、Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer、Qwen-Image-Edit、MiniMax-H3 音视频、Wan 2.1 / 2.2 视频。→ <a href="models_zh-cn.html#table">支持的模型</a></li>
     <li><strong>DeepSeek V4 Flash（284B MoE）</strong> —— 一套压缩稀疏注意力、1M 上下文的架构，配有三套专属的整模型执行器：Direct CUDA 引擎（<code>--backend cuda</code>）、原生 ggml 执行器（<code>ggml_cuda</code> / <code>ggml_vulkan</code>），以及 100% 纯 C# 的 CPU 执行器（<code>--backend cpu</code>，零原生依赖）。权重自动按层切分到所有可见 GPU，服务端以原生 per-sequence slot 与连续批处理托管它。→ <a href="models-text_zh-cn.html#deepseek4">DeepSeek V4</a></li>
     <li><strong>GLM 5.2（744B-A40B MoE）</strong> —— 带权重吸收的多头潜在注意力（MLA）加上 DeepSeek 稀疏注意力的 lightning indexer，256 个路由专家 top-8 加一个共享专家，自报 1M 上下文，直接从 6 分片的 split GGUF 加载。两套实现：一个原生整模型 ggml 执行器（<code>ggml_cuda</code> / <code>ggml_vulkan</code> / <code>ggml_cpu</code> / <code>ggml_metal</code>，把 226 GiB 按层切分到所有可见 GPU），以及 <code>--backend cpu</code>（100% 纯 C#、零原生依赖）与 <code>--backend cuda</code> 使用的托管逐算子路径。→ <a href="models-text_zh-cn.html#glm">GLM 5.x</a></li>
     <li><strong>多模态推理</strong> —— Gemma 4 支持图像、视频与音频输入；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 与 Muse-Glimmer 支持图像。→ <a href="models-text_zh-cn.html#multimodal">多模态</a></li>
@@ -44,7 +44,8 @@
     <li><strong>专家混合（MoE）</strong> —— Gemma 4 MoE（如 26B-A4B）、GPT OSS MoE（gpt-oss-20b）、Qwen 3.5/3.6 MoE（35B-A3B）、Nemotron-H MoE FFN 层，以及 GLM 5.2（744B-A40B：256 个路由专家 top-8 加 1 个共享专家，sigmoid 门控路由带一个只影响选择的 bias 与 x2.5 的路由缩放），配以融合的批量 GPU MoE 调度。</li>
     <li><strong>混合 SSM-Transformer</strong> —— Nemotron-H 在一个模型中混合 Mamba2 SSM 层、注意力层与 MoE FFN。</li>
     <li><strong>混合注意力-循环</strong> —— Qwen 3.5/3.6-family 将全注意力层与 GatedDeltaNet 循环层混合。</li>
-    <li><strong>视频生成</strong> —— Wan 2.1（文本 → 视频）与 Wan 2.2 TI2V-5B / A14B（文本 → 视频，以及图像 → 视频，上传的图像作为首帧）可从 CLI、<code>/v1/videos/generations</code> 或 Web UI 输出 H.264 MP4。把 <code>--model</code> 指向<em>步数蒸馏</em>权重（Turbo / Lightning / FastWan），管线会自动识别，把去噪循环从 100 次 DiT 前向降到 4 次。→ <a href="models-video_zh-cn.html#video">视频生成</a></li>
+    <li><strong>音视频联合生成（MiniMax-H3）</strong> —— 一个 50 块的扩散 Transformer 把视频<em>与</em>原生 32 kHz 立体声音轨当作同一份打包潜变量去噪，音轨因此是模型输出本身，而不是事后配上去的。四种条件模式（<code>--video-mode t2v</code> / <code>i2v</code> / <code>fl2v</code> / <code>ref</code>）：只给提示词、把一张照片当首帧动起来（<code>--image</code>）、给定首尾两张关键帧（<code>--end-image</code>），或用最多九个身份参考——静图、片段与音轨——去生成全新场景（<code>--ref-image</code> / <code>--ref-video</code> / <code>--ref-audio</code>）。两个去噪器是彼此独立的检查点而非开关：关键帧要 FL2VA 那个文件，参考要 Ref2VA 那个。它经过 CFG 蒸馏，因此必须用 <code>--cfg 1.0</code>，默认 20 步、4–8 步是快车道。可从 CLI、<code>/api/video-generate</code>、<code>/v1/videos/generations</code> 或 Web UI 驱动；MP4 会附带一个旁挂的 <code>.wav</code>。→ <a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3</a></li>
+    <li><strong>视频生成，仅画面（Wan 2.1 / 2.2）</strong> —— Wan 2.1（文本 → 视频）与 Wan 2.2 TI2V-5B / A14B（文本 → 视频，以及图像 → 视频，上传的图像作为首帧）可从 CLI、<code>/v1/videos/generations</code> 或 Web UI 输出 H.264 MP4。把 <code>--model</code> 指向<em>步数蒸馏</em>权重（Turbo / Lightning / FastWan），管线会自动识别，把去噪循环从 100 次 DiT 前向降到 4 次。→ <a href="models-video_zh-cn.html#video">视频生成</a></li>
     <li><strong>文本扩散生成</strong> —— DiffusionGemma 使用迭代式 EntropyBound 去噪采样器，而非自回归解码。→ <a href="advanced_zh-cn.html#diffusion">DiffusionGemma</a></li>
     <li><strong>图像编辑（Qwen-Image-Edit）</strong> —— 提示词 + 输入图像，经 60 块 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器生成编辑后的图像（FlowMatch-Euler true-CFG、CUDA 图捕获的 DiT 前向）；可选的 Lightning 蒸馏 LoRA（<code>--qwen-image-lora</code>）能以 CFG 1.0 将去噪循环缩减到寥寥几步。→ <a href="models-image_zh-cn.html#imageedit">图像编辑</a></li>
   </ul>
@@ -70,7 +71,7 @@
     <li><strong>MTP / NextN 推测解码</strong> —— 多 token 预测草稿头加速单序列解码；因请求自身的采样器同时驱动草稿与验证，故无损。→ <a href="advanced_zh-cn.html#mtp">推测解码</a></li>
     <li><strong>DSpark 块级投机解码</strong> —— DeepSeek V4 的草稿器每步提议一整<em>块</em> token（Markov 头让块内每个位置以前一个 token 为条件，置信度头决定起草多远），主干用一次批量前向验证整块。以独立 GGUF 通过 <code>--draft-model</code> 加载；4×A40 实测 decode 提速 1.3–1.4×，多轮对话最高 2.0×，贪心输出与基线逐字节一致。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></li>
     <li><strong>整模型融合 decode 计算图</strong> —— Gemma 4、Qwen 3.5/3.6 与 GPT OSS 把一个 decode token 作为一次 GGML 计算图提交，而不是每层一次，GPU 因此不会在层间空等主机。GPT OSS decode 在 A40 上从 24 → 154 tok/s，且随上下文长度基本持平。→ <a href="advanced_zh-cn.html#perf">性能优化</a></li>
-    <li><strong>扩散模型快车道（视频与图像）</strong> —— <em>步数蒸馏</em>的 Wan 权重（文件名中带 <code>Turbo</code>、<code>distill</code>、<code>Lightning</code>、<code>lightx2v</code>、<code>FastWan</code>、<code>-dmd</code>，或显式的 <code>…-4steps-…</code>）会在加载时被自动识别，只跑 4 次无引导 DiT 前向，而不是基础配方的 100 次 —— 不需要任何参数，只是换一个 <code>--model</code>。实测（M5 Pro、<code>ggml_metal</code>、Wan2.2-TI2V-5B Q8_0、1088×832×121 帧图生视频）：基础权重约 3 小时 30 分，Turbo 权重 17 分 30 秒。此外，F16 注意力 K/V 在 27,404 token 的自注意力上快 2.02×，Metal MPSGraph VAE 卷积把 736×544×81 帧的解码从 159 秒降到 80 秒，<code>--cfg-cache-stride 2</code> / <code>3</code> 在基础权重上再带来 1.30× / 1.43×。图像侧，Qwen-Image-Edit 的 Lightning LoRA 把基础的 30 步 CFG 2.5 换成 4–8 步 CFG 1.0，CUDA 图捕获的整 DiT 前向把 8 步去噪从约 153 秒降到约 63 秒。→ <a href="models-video_zh-cn.html#video">视频生成</a></li>
+    <li><strong>扩散模型快车道（视频与图像）</strong> —— MiniMax-H3 出厂即经 CFG 蒸馏，没有额外的"快权重"要找：<code>--cfg 1.0</code> 下的 4–8 步<em>就是</em>工作点（默认 20 步），在 M5 Pro（<code>ggml_metal</code>、22 帧、8 步、相同种子）上，它在 256×256 比 <code>stable-diffusion.cpp</code> <strong>快 2.4×</strong>（49.3 s → 20.9 s），在 640×384 <strong>快 1.7×</strong>（108.5 s → 63.1 s）。Wan 这边，<em>步数蒸馏</em>的权重（文件名中带 <code>Turbo</code>、<code>distill</code>、<code>Lightning</code>、<code>lightx2v</code>、<code>FastWan</code>、<code>-dmd</code>，或显式的 <code>…-4steps-…</code>）会在加载时被自动识别，只跑 4 次无引导 DiT 前向，而不是基础配方的 100 次 —— 不需要任何参数，只是换一个 <code>--model</code>。实测（M5 Pro、<code>ggml_metal</code>、Wan2.2-TI2V-5B Q8_0、1088×832×121 帧图生视频）：基础权重约 3 小时 30 分，Turbo 权重 17 分 30 秒。此外，F16 注意力 K/V 在 27,404 token 的自注意力上快 2.02×，Metal MPSGraph VAE 卷积把 736×544×81 帧的解码从 159 秒降到 80 秒，<code>--cfg-cache-stride 2</code> / <code>3</code> 在基础权重上再带来 1.30× / 1.43×。图像侧，Qwen-Image-Edit 的 Lightning LoRA 把基础的 30 步 CFG 2.5 换成 4–8 步 CFG 1.0，CUDA 图捕获的整 DiT 前向把 8 步去噪从约 153 秒降到约 63 秒。→ <a href="models-video_zh-cn.html#video">视频生成</a></li>
     <li><strong>原生量化计算</strong> —— 量化权重直接用于 matmul，无需展开为 FP32，节省内存与带宽。</li>
     <li><strong>优化的纯 C# CPU 后端</strong> —— 托管 GEMM 快路径，外加 RMSNorm、RoPE、softmax 与融合激活的融合 SIMD 内核。</li>
     <li><strong>KV 缓存编解码器</strong> —— 可插拔的 <code>IKvBlockCodec</code>，内置面向分页块的 TurboQuant（Q2 / Q4 / Q8）压缩编解码器。</li>

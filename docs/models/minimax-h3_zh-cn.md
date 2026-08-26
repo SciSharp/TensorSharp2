@@ -4,8 +4,11 @@ MiniMax-H3 **同时生成视频与原生立体声音频**，最长 15 秒、24 f
 它不是"视频模型外挂音频"：同一个扩散 Transformer 在**一条 token 序列**里对打包
 在一起的"视频 + 音频"潜变量做去噪，因此声音是模型输出的一部分，而不是事后配上去的。
 
-TensorSharp 用原生 ggml 整图运行它——每个网络一张图，权重直接从 GGUF / safetensors
-的 mmap 常驻绑定。
+TensorSharp 用**七张**原生 ggml 整图运行它——文本编码、视觉编码、DiT 前向，以及两个
+VAE 各自的编码与解码——权重直接从 GGUF / safetensors 的 mmap 常驻绑定。对外的入口是
+`MiniMaxH3Model.GenerateVideo(prompt, VideoGenerationParams)`，位于共用的
+`IVideoGenerationModel` 接缝之后，因此 CLI 与服务端用同一条路径驱动 H3 和 Wan，
+而不必逐个判断具体模型类型。
 
 ```sh
 tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
@@ -54,24 +57,43 @@ M5 Pro / Metal，22 帧、8 步、相同随机种子，对比
 
 ## 需要的文件
 
-H3 需要四个文件。两个去噪器是**两个独立的检查点，而不是开关**——你加载哪个，
-决定了它接受哪种条件输入。
+四个网络协同工作，因此一次运行需要四个文件。两个去噪器是**两个独立的检查点，而不是
+开关**——你加载哪个，决定了它接受哪种条件输入。
 
-| 文件 | 来源 |
-|---|---|
-| `minimax_h3_fl2va_pruned-Q4_K.gguf` | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：文本 + 关键帧 |
-| `minimax_h3_ref2va_pruned-Q4_K.gguf` | 同一仓库：文本 + 参考 |
-| `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` | 同一仓库：文本编码器，两者共用 |
-| `minimax_h3_video_vae_fp16.safetensors` | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) |
-| `minimax_h3_audio_vae_fp32.safetensors` | 同上；不给则输出无声视频 |
+| 文件 | 大小 | 来源 |
+|---|---|---|
+| `minimax_h3_fl2va_pruned-Q4_K.gguf` | 10.64 GiB | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：文本 + 关键帧 |
+| `minimax_h3_ref2va_pruned-Q4_K.gguf` | 10.60 GiB | 同一仓库：文本 + 参考 |
+| `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` | 16.97 GiB | 同一仓库：文本编码器，两者共用（换成 `-Q2_K_M.gguf`，12.20 GiB，可搭配更小的去噪器） |
+| `minimax_h3_video_vae_fp16.safetensors` | 5.21 GB | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)（unsloth 仓库的 `vae/` 下也有镜像） |
+| `minimax_h3_audio_vae_fp32.safetensors` | 0.61 GB | 同上；不给则输出无声视频 |
+
+一套约 33.5 GB。每个网络都是依次加载并**释放**的，所以显存峰值是 `max(...)` 而不是
+总和；之后再补第二个去噪器只多花它自身约 10.6 GiB，因为编码器和两个 VAE 是共用的。
 
 伴随文件会在去噪器旁自动解析，也可用 `--video-vae`、`--video-text-encoder`、
 `--audio-vae` 指定。
 
-> **文本编码器的 GGUF 不带分词器。** 请把
+仓库里有两个配置文件，首次运行会把这些文件全部下载下来；两者只有 `model` 一项不同，
+所以文本编码器和两个 VAE 只会下载一次：
+
+```sh
+TensorSharp.Server --config config/minimax-h3-fl2va.json      # 关键帧
+TensorSharp.Cli    --config config/minimax-h3-ref2va.json \
+  --ref-image person.png --prompt "…" --output out.mp4        # 参考
+```
+
+两者都写了 `"backend": "ggml_cuda"`（命令行上的 `--backend` 优先），并设定宽 640、
+高 384、22 帧、24 fps。两者都**故意不设**步数与 guidance：一个随仓库分发的配置必须在
+两个宿主上都能解析，而两者对步数的拼法不同（服务端是 `--video-steps N`，CLI 是
+`--diffusion-steps N`），并且服务端根本没有 `--cfg`——因此这里用的是模型自己的默认值。
+
+> **文本编码器的 GGUF 不带分词器**，而这恰恰是配置文件唯一没法替你下载的东西：
+> 自动下载只能补齐那些**以命令行选项形式存在**的文件，而分词器不是选项。请把
 > [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
 > 里的 `vocab.json` 和 `merges.txt` 放到它旁边，或用 `TS_VIDEO_TOKENIZER` 指向它们。
-> 两个已发布的 GGUF **完全没有元数据**，因此 TensorSharp 靠张量而不是架构字符串来识别 H3。
+> 两个已发布的 GGUF **完全没有元数据**，因此 TensorSharp 靠张量而不是架构字符串来识别
+> H3（文件里确实写了架构名时，接受 `minimax-h3` / `minimax_h3`）。
 
 > **必须用 `--cfg 1.0`。** H3 是 CFG 蒸馏模型，超过 1.0 质量会明显劣化，
 > TensorSharp 会直接拒绝。4–8 步是常用工作点，所以迭代很快。
@@ -88,6 +110,11 @@ H3 需要四个文件。两个去噪器是**两个独立的检查点，而不是
 | "用这个人物，生成全新场景" | `ref` | Ref2VA |
 | "参考这个产品/人物，但换机位、背景和构图" | `ref` | Ref2VA |
 | 只有文本 | `t2v` | 都可以 |
+
+当前生效的是哪一个分区，是从**文件名**里读出来的——不区分大小写地看有没有 `ref2va`，
+所以改名或重新量化时要保留这个子串。用一个检查点去要另一个检查点的模式，不会静默地
+丢掉输入：请求会直接失败，并在错误信息里指出该改成加载哪个文件。关键帧与具名参考出现
+在同一个请求里，在两个检查点上都会被直接拒绝。
 
 ### 文生视频
 
@@ -160,7 +187,20 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 
 * 参考图只会被**缩小**到生成画面的面积，并保持自身的宽高比，不会被拉伸；
   输出画布也**不会**取自参考图，请用 `--width`/`--height` 明确指定。
-* 常见尺寸下每张参考图大约多占 63 个序列 token，所以九张会明显比一张慢。
+* **每张参考图都是同一条打包序列里的额外 token**，所以开销是线性的、也容易预估：
+  一张 640x384 的参考是 240 个 token，576x448 的是 252 个。在 RTX 3080 Laptop 上、
+  针对 640x384 的 22 帧片段实测，一个去噪步从不带参考的 4.37 秒升到带八张参考的
+  9.38 秒——每张参考每步约 626 毫秒，从一张到八张都是这个斜率。
+* **超过大约四张参考之后，主导耗时的是 Qwen3-VL 那一趟，而不是去噪器。** 每张参考会
+  往提示词里加约 250 个视觉占位 token，而这段提示词要过全部 50 层：两张参考是 548
+  token 的提示词，八张是 2086，于是文本条件从约 65 秒涨到约 447 秒，而整个 8 步去噪
+  才约 75 秒。先想办法减少参考数量、提高参考质量，再考虑减少步数。
+* TensorSharp 把参考图上限定为九张。参考实现本身没有上限；这个上限存在，是因为打包
+  序列是不带 mask 全量注意的，它的长度既是时间预算也是数值预算。
+* 在送进语言模型之前，参考会**按你传入的顺序编号**——静态图是 `<Picture 1>`、
+  `<Picture 2>`……，视频片段是 `<Video 1>`……，音频是 `<Audio 1>`……——所以提示词里
+  可以直接点名："`<Picture 2>` 里的那件夹克"。自带声音的参考视频会被当成**两个**
+  条目呈现，除了 `<Video n>` 还会占用一个 `<Audio n>` 编号。
 * 提示词里要写清画面中有谁。参考图提供身份，镜头内容仍然要靠提示词描述，
   否则会得到一个画得很好、但主体缺席的场景。
 * 参考也可以是**视频片段**或**音频**，不限于静态图——见下文。
@@ -230,7 +270,6 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 > 而关键帧**就是**第一帧，这个变形会被后面每一帧继承。不指定 `--width`/`--height`
 > 可以直接采用图片自身的宽高比；想控制取景就自己裁剪源图。
 
-
 有两个设置起决定性作用，其余的相比之下都是零头。
 
 | 参数 | 默认值 | 作用 |
@@ -242,7 +281,9 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 | 量化等级 | — | 去噪器用 `-Q8_0` 优于 `-Q4_K`，文本编码器用 `Q4_K_M` 优于 `Q2_K_M`，显存够就用更高的。 |
 
 `--cfg` **不是**质量参数：H3 是 CFG 蒸馏模型，只接受 1.0。同理 `--negative-prompt`
-也不起作用——根本没有无条件分支可以用来做反向引导。
+也不起作用——根本没有无条件分支可以用来做反向引导；`--cfg-cache-stride` 缓存的正是
+那一趟无条件计算，因此同样没有可缓存的东西。`--sampler` 是 Wan 家族的开关，H3 跑的是
+自己的 flow-match 时间表，会忽略它。
 
 同一个图生视频请求下实测（M5 Pro、`ggml_metal`、seed 42、22 帧）：
 
@@ -254,8 +295,11 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 | 576×448（图片宽高比）、20 步 | 187 秒 | 最好——没有任何拉伸 |
 
 > **在服务端，尺寸是启动参数。** Web UI 只发送提示词和图片，请求会继承服务端默认值。
-> 启动时加上 `--video-width 640 --video-height 384 --video-steps 20`
-> （或者干脆不加，让每个请求按自己的图片取宽高比）。`--width` / `--height` 是别名。
+> 启动时加上 `--video-width 640 --video-height 384 --video-steps 20 --video-frames 22`
+> （或者宽高干脆不加，让每个请求按自己的图片取宽高比；只给宽高中的一个时，H3 会按
+> 条件图的宽高比推出另一个）。`--width` / `--height` 是别名，`--video-mode` 可以为
+> 只提供一种模式的部署固定条件模式。服务端**没有 `--cfg`**——也没什么可设的，
+> 因为 H3 自己就把它锁在 1.0。
 
 > **强行指定与图片不匹配的尺寸会拉伸画面。** 4:3 的照片被塞进 640×384 会被水平压缩约 25%，
 > 而这正是让人脸"看起来不对"的那种形变。做图生视频时不指定宽高，就会按图片的宽高比来。
@@ -267,11 +311,15 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 
 ## 尺寸与长度
 
-* 宽高向**上**取整到 32 的倍数。
-* 帧数向上对齐到 **17k+5** 网格——5、22、39、56、90……这来自视频 VAE 的时间分块，
-  不是随意规定的。
+* 宽高向**上**取整到 32 的倍数。默认 640×384；有条件图时按该面积取图片的宽高比。
+* 帧数向上对齐到 **17k+5** 网格——5、22、39、56、73、90、107、124……这来自视频 VAE
+  的时间分块，不是随意规定的：每个 5 潜变量帧的分块产出 17 个像素帧，另加 5 帧的
+  起始段。默认 22。
 * fps 固定为 24，传别的值会被覆盖。
-* TensorSharp 目前只生成一个 VAE 时间块，因此**实际可用长度是 22 帧**。
+* **任意网格长度的片段都能正确解码**：VAE 每次跑 5 个潜变量帧，带 2 帧前瞻，并对接缝
+  做交叉淡化，与参考实现一致。反过来把长片段一次性解码，细节会被逐步冲淡——对着条件
+  照片测量，第 0 帧的相关度从 22 帧时的 0.97 掉到 90 帧时的 0.86——所以分块是正确性
+  要求，而不是优化。
 
 > **长片段会保留条件图，但不一定保留取景。** 关键帧钉住的是片段的**开头**。在 124 帧
 > （5.2 秒）里，一个描述了不同镜头的提示词会占上风：把"两个人争吵的中景、手持镜头"
@@ -280,6 +328,10 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 > 想让照片一直在画面里，就在提示词里说明，或者生成更短的片段。
 
 ## HTTP API
+
+三个路由共用同一个解析器：`POST /api/video-generate`、
+`POST /api/video-generate/stream`（请求体相同，以 SSE 推送进度），以及 OpenAI 风格的
+`POST /v1/videos/generations`。
 
 ```sh
 curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d '{
@@ -300,15 +352,34 @@ curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d
 ```
 
 返回 `{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }`。
-`imagePath` / `endImage` / `referenceImages` 引用的是之前通过 `/api/upload` 上传的文件；
-上传目录之外的路径会被拒绝。OpenAI 风格的 `/v1/videos/generations` 接受同样的字段
-（snake_case：`reference_images`、`video_mode`），返回 `audio_url`。
+模型没有产出音轨时 `audioUrl` 为 null。完整字段为 `prompt`、`width`、`height`、`frames`、
+`steps`、`cfg`、`fps`、`imagePath`、`videoMode`、`generateAudio`、`endImage`、
+`referenceImages`、`referenceVideos`、`referenceAudios`、`referenceVideoAudios`。其中大多数
+**只接受 camelCase**——只有 `videoMode`、`generateAudio`、`endImage` 以及四个 `reference*`
+列表同时接受 snake_case 拼法（`video_mode`、`generate_audio`、`end_image`、
+`reference_images` 等），两种拼法同时出现时以 camelCase 为准。写成 `image_path` 或
+`flow_shift` 会被静默忽略而不是报错，因此一律用 camelCase 最稳妥。`referenceVideoAudios`
+与 `referenceVideos` **按下标**配对，和 `--ref-video-audio` 的按位置配对是同一条规则。`imagePath` / `endImage` /
+`referenceImages` 引用的是之前通过 `/api/upload` 上传的文件；上传目录之外的路径会被拒绝。
+`/v1/videos/generations` 接受同样的字段（可用 snake_case 的同样是那七个：`video_mode`、
+`reference_images` 等），返回 `audio_url`。
+
+模型侧的拒绝——检查点与模式不匹配，或关键帧与参考同时出现——会以 **400 并带上模型自己
+的错误信息**返回，而不是一个笼统的 500，因此该改成加载哪个文件就写在响应体里。
+
+`GET /api/models` 会返回一个 `video` 对象（非视频模型为 null），其中包含 `family`
+（`minimax-h3`）、`supportsAudio`、`supportsImageConditioning`、
+`supportsEndImageConditioning`、`supportsReferenceConditioning` 和 `maxReferenceImages`。
+Web UI 正是据此决定要不要提供首帧、尾帧或最多九张参考，而不是去匹配架构字符串。
 
 音频写成独立的 `.wav` 而不是封装进 MP4，因为封装需要一个未必安装的编码器。合并：
 
 ```sh
 ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4
 ```
+
+`--no-audio`（对应 `"generateAudio": false`）会完全跳过音频解码，省下音频 VAE 的时间和
+内存；纯视频模型会忽略它。
 
 ## 架构要点
 

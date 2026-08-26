@@ -119,6 +119,96 @@ namespace TensorSharp.Models.MiniMaxH3
         internal MiniMaxH3TextEncoder CreateTextEncoder() => new(_tePath);
         internal MiniMaxH3DiT CreateDiT() => new(_ditPath);
         internal MiniMaxH3VideoVae CreateVideoVae() => new(_vaePath);
+
+        /// <summary>Pull a weight file through the OS file cache in one sequential pass.
+        ///
+        /// <para>Weights are bound as pointers into the mmapped GGUF, so the first upload faults
+        /// each page in from disk from INSIDE the host-to-device copy. That is the pathological
+        /// case for the driver: measured on a 16 GB RTX 3080 Laptop the 10.6 GB denoiser moved
+        /// at 0.91 GB/s, against 5.97 GB/s for a pageable copy out of resident memory and 2.7 GB/s
+        /// for a plain sequential read of the same file. Reading the file first turns scattered
+        /// fault-in into one streaming read, and the copy then runs at memory speed.</para>
+        ///
+        /// <para>Returns the seconds spent, or -1 when it was skipped. It is skipped when the
+        /// file cannot be sized, and when it is larger than the RAM available to hold it - on a
+        /// host that cannot cache the file this would evict as it goes and cost a second read
+        /// for nothing.</para></summary>
+        internal static double PrefaultWeightFile(string path, long availableBytes)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(path)) return -1;
+                var fi = new FileInfo(path);
+                if (!fi.Exists || fi.Length <= 0) return -1;
+                if (availableBytes > 0 && fi.Length > availableBytes) return -1;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                // ONE stream by default, which is the opposite of
+                // GgufReader.PrefaultFileCache and is deliberate. That one runs before any
+                // other work and has the machine to itself, so sixteen streams are free
+                // speed. This one runs CONCURRENTLY with the encoder teardown and with the
+                // denoiser upload it is warming, and aggressive parallel reads take I/O away
+                // from the very copy they exist to help. Measured at 640x384, best of three:
+                // 1 stream 63.9 s, 4 streams 64.9 s, 16 streams 66.6 s - and the encoder
+                // teardown alone went from 2.2 s to 4.0 s at sixteen. Raise it only on a host
+                // where storage is not the contended resource.
+                int threads = 1;
+                string tenv = Environment.GetEnvironmentVariable("TS_H3_PREFAULT_THREADS");
+                if (!string.IsNullOrEmpty(tenv) && int.TryParse(tenv, out int tset) && tset > 0)
+                    threads = tset;
+                long length = fi.Length;
+                long regionBytes = (length + threads - 1) / threads;
+                System.Threading.Tasks.Parallel.For(0, threads,
+                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
+                    () => new byte[8 << 20],
+                    (region, _, buffer) =>
+                    {
+                        using var handle = File.OpenHandle(
+                            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                        long offset = (long)region * regionBytes;
+                        long end = Math.Min(offset + regionBytes, length);
+                        while (offset < end)
+                        {
+                            int want = (int)Math.Min(buffer.Length, end - offset);
+                            int read = System.IO.RandomAccess.Read(
+                                handle, buffer.AsSpan(0, want), offset);
+                            if (read <= 0) break;
+                            offset += read;
+                        }
+                        return buffer;
+                    },
+                    _ => { });
+                return sw.Elapsed.TotalSeconds;
+            }
+            catch (IOException) { return -1; }
+            catch (UnauthorizedAccessException) { return -1; }
+        }
+
+        /// <summary>The denoiser GGUF, for prefaulting.</summary>
+        internal string DiTPath => _ditPath;
+
+        /// <summary>The video VAE file, for prefaulting.</summary>
+        internal string VideoVaePath => _vaePath;
+
+        /// <summary>Roughly what the video VAE will occupy on the device once resident, used
+        /// to decide whether it can share the card with the still-resident denoiser.
+        ///
+        /// <para>The safetensors file size is the weight footprint almost exactly - the VAE is
+        /// dense F16 with no quantized block overhead - and the extra eighth covers the decode's
+        /// own activations, which are bounded because the decoder already runs 5 latent frames
+        /// at a time and tiles at 256 px. Returns 0 when the size cannot be read, which the
+        /// caller treats as "do not intervene".</para></summary>
+        internal long VideoVaeResidentBytesEstimate()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_vaePath)) return 0;
+                var fi = new FileInfo(_vaePath);
+                if (!fi.Exists) return 0;
+                return fi.Length + fi.Length / 8;
+            }
+            catch (IOException) { return 0; }
+            catch (UnauthorizedAccessException) { return 0; }
+        }
         internal MiniMaxH3AudioVae CreateAudioVae() =>
             _audioVaePath != null ? new MiniMaxH3AudioVae(_audioVaePath) : null;
         internal string AudioVaePath => _audioVaePath;

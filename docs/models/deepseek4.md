@@ -244,7 +244,7 @@ which text was generated, not the penalty).
 Two engine-level limits are worth knowing. Speculation is armed per request at
 a fresh full prefill, and it serves **solo sequences only**: as soon as a second
 request is in flight the planner logs
-`PerSequenceFused; rejected: MtpPerSequence: multi-sequence step` and DSV4's
+`PerSequenceFused; rejected: SpecPerSequence: multi-sequence step` and DSV4's
 per-sequence slots serve the batch at normal decode speed. Concurrency is safe,
 it just isn't speculative.
 

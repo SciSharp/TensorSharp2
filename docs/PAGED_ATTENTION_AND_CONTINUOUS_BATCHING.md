@@ -18,7 +18,7 @@ compatibility shim for queue-status/event shapes.
 | Batched execution | Models that implement `IBatchedPagedModel.ForwardBatch` pack all scheduled sequences into one model call with explicit `positions`, `slotMapping`, `queryStartLoc`, and per-sequence block tables. |
 | Fallback execution | Path selection is centralized in `ExecutionPlanner`: model+backend capabilities (`ExecutionCapabilities`), operator overrides (`ExecutionOptions`), and per-step request features produce an `ExecutionPlan` (selected path, fallback chain, rejection reasons). A model may still decline a specific batch with `NotSupportedException`; the step then falls to the plan's next candidate, ending in the per-sequence KV-swap path. |
 | Native attention | `TSGgml_PagedAttentionForward` gathers paged K/V in C++ and dispatches `ggml_flash_attn_ext`; GPT OSS uses `TSGgml_PagedAttentionForwardWithSinks`. |
-| Speculative decoding | Optional MTP / NextN draft heads accelerate solo (non-concurrent) sequences. `BatchExecutor` drives the shared `MtpSpeculativeExecution` draft / verify / rollback core for models that implement `IMtpBatchedSpeculativeModel` (Qwen 3.6 embedded NextN; Gemma 4 separate `gemma4-assistant` draft GGUF). Off by default; server `--mtp-spec`. See [Speculative decoding (MTP / NextN)](#speculative-decoding-mtp--nextn). |
+| Speculative decoding | Optional MTP / NextN draft heads accelerate solo (non-concurrent) sequences. `BatchExecutor` drives the shared `SpeculativeExecution` draft / verify / rollback core for models that implement `IBatchedSpeculativeTarget` (Qwen 3.6 embedded NextN; Gemma 4 separate `gemma4-assistant` draft GGUF). Off by default; server `--mtp-spec`. See [Speculative decoding (MTP / NextN)](#speculative-decoding-mtp--nextn). |
 | Queue API | `InferenceQueue` is a no-op shim. `/api/queue/status` and queue-position event shapes are retained for clients that expect the fields, not because requests are serialized there. |
 | Diffusion models | DiffusionGemma does not enter this autoregressive `ForwardBatch` contract. CLI generation uses `DiffusionGemmaSampler`; the Web UI uses `DiffusionBatchScheduler` to batch denoising work at block boundaries. |
 
@@ -142,14 +142,14 @@ Key points:
   can run via `IBatchedPagedModel` getters (`BatchedForwardAvailable`,
   `SupportsBatchedMultimodal`, `SupportsPerSequenceFusedForward`,
   `SupportsLinearKVMigration`, …) and the MTP interfaces
-  (`HasMtp`, `MtpSpeculationProfitable`, `SupportsBatchedSpecTrunk`).
+  (`HasMtp`, `SpeculationProfitable`, `SupportsBatchedSpecTrunk`).
   `ExecutionCapabilities.FromModel` snapshots them per step. A per-model
   opt-out such as `TS_QWEN35_BATCHED=0` now surfaces through
   `BatchedForwardAvailable=false` so the planner routes around the batched
   path up front; `ForwardBatch` throwing `NotSupportedException` remains only
   as a per-batch decline, not the routing mechanism.
 - **Plan candidates are ordered and safe.** Declinable candidates
-  (`MtpBatchedTrunk` arming/continuity, `BatchedPaged` migration/refusal)
+  (`SpecBatchedTrunk` arming/continuity, `BatchedPaged` migration/refusal)
   fall through to the next entry; every plan ends in a path that cannot
   decline. `ExecutionPlannerTests` sweeps the capability/feature space to
   assert this invariant.
@@ -158,7 +158,7 @@ Key points:
   `BatchExecutor` logs the plan — selected path, fallback chain, rejection
   reasons — whenever the decision changes (e.g. a concurrency transition),
   so "why did this request not take the fast path?" is a logged fact.
-- **Path kinds** (`ExecutionPathKind`): `MtpBatchedTrunk`, `MtpPerSequence`,
+- **Path kinds** (`ExecutionPathKind`): `SpecBatchedTrunk`, `SpecPerSequence`,
   `PerSequenceFused`, `MixedMultimodalSplit`, `SingleSequenceFused` (the N=1
   fast path), `BatchedPaged`, `PerSequence`.
 
@@ -193,7 +193,7 @@ compute.
 
 When the server's `--mtp-spec` flag (`TS_MTP_SPEC=1`) is set, `BatchExecutor` runs an optional
 multi-token-prediction speculative path for **solo (non-concurrent)** sequences
-on models that implement `IMtpBatchedSpeculativeModel`. The flow per step:
+on models that implement `IBatchedSpeculativeTarget`. The flow per step:
 
 1. **Draft.** The model's draft head proposes up to `TS_MTP_DRAFT` (default `8`)
    future tokens, stopping at the first token whose draft confidence falls below
@@ -207,20 +207,20 @@ on models that implement `IMtpBatchedSpeculativeModel`. The flow per step:
 3. **Rollback.** On partial acceptance, KV (and any recurrent state) past the
    accepted prefix is rolled back before the next step.
 
-Two draft-head shapes share the `MtpSpeculativeExecution` core:
+Two draft-head shapes share the `SpeculativeExecution` core:
 
 | Model | Draft head | State on rejection |
 |---|---|---|
 | Qwen 3.6 | Embedded NextN block in the trunk GGUF (`{arch}.nextn_predict_layers`); no extra file. `--mtp-draft-model` is ignored. | GatedDeltaNet recurrent-state snapshot/restore (device-side on CUDA). |
 | Gemma 4 | Separate EAGLE-style `gemma4-assistant` GGUF via `--mtp-draft-model`; draft layers attend the **target's** last local / global KV (no draft K/V of its own). | Attention-KV position rewind only — the drafter is stateless given `(token, h)`. |
 
-Speculation engages only where it is profitable (`MtpSpeculationProfitable`):
+Speculation engages only where it is profitable (`SpeculationProfitable`):
 ggml backends (fused multi-token-verify + draft-step kernels) and the pure-C#
 `cuda` backend (GPU-resident per-op verify/draft). On CPU / GGML CPU / MLX the
 verify can't keep up, so the engine serves standard decode. Concurrent batches
 never speculate — when more than one sequence is running, every sequence uses the
 normal batched/fallback step. A mismatched or incomplete Gemma 4 draft GGUF
-fails fast at server startup (`MtpStartupValidation`).
+fails fast at server startup (`SpeculationStartupValidation`).
 
 ## Model Status
 
@@ -243,7 +243,7 @@ fails fast at server startup (`MtpStartupValidation`).
 | Scheduler / block pool | `ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests` |
 | Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`, optional `Qwen3BatchedForwardTests` |
-| MTP speculative decoding | `MtpSpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_MTP_E2E=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
+| MTP speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_MTP_E2E=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |
 | DiffusionGemma path | `DiffusionGemmaTests` for denoising, prompt-KV caching, and batched generation probes |
 | End-to-end engine behavior | `EngineParallelInferenceTests` with opt-in real GGUFs via `TS_TEST_MODEL_DIR` |

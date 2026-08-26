@@ -130,7 +130,7 @@ TensorSharp.Server --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
 
 有两个引擎层面的限制值得了解。投机是在一次全新的完整 prefill 时按请求装配的，
 并且**只服务单序列**：一旦有第二个请求在途，planner 就会记录
-`PerSequenceFused; rejected: MtpPerSequence: multi-sequence step`，并由 DSV4 的
+`PerSequenceFused; rejected: SpecPerSequence: multi-sequence step`，并由 DSV4 的
 per-sequence slot 以正常 decode 速度服务这一批。并发是安全的，只是不再投机。
 
 4×A40 实测（`--tp 4`，300 token 的 OpenAI chat completion）：

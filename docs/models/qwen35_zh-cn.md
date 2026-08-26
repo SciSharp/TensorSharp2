@@ -14,7 +14,7 @@
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是（`<tool_call>{...}</tool_call>`） |
 | 批处理 / 分页前向 | **默认启用** —— 设置 `TS_QWEN35_BATCHED=0`（或 `--no-continuous-batching`）可强制走旧的按序列 KV-swap 路径用于 A/B 对比。带每槽位 GatedDeltaNet 递归状态池与可选的原生批处理 GDN 内核（`TS_QWEN35_BATCHED_GDN_NATIVE=1`）。详见 §11。 |
-| MTP 投机解码 | Qwen 3.6 —— NextN 草稿块内嵌在主干 GGUF 中（无需独立文件；仅限保留 MTP 的 GGUF，见[下载](#下载)）；用服务端标志 `--mtp-spec` 启用。部分接受时做 GDN 递归状态快照 / 回滚。只要 GGUF 保留 NextN 块，就会对单序列（无并发）请求启用。详见 §12。 |
+| MTP 投机解码 | Qwen 3.6 —— NextN 草稿块内嵌在主干 GGUF 中（无需独立文件；仅限保留 MTP 的 GGUF，见[下载](#下载)）；在**两个宿主上**都用 `--spec` 启用 —— `TensorSharp.Cli` 与 `TensorSharp.Server` 共用同一个 [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)，`--mtp-spec` 仍作为别名被接受。部分接受时做 GDN 递归状态快照 / 回滚。只要 GGUF 保留 NextN 块，就会对单序列（无并发）请求启用。详见 §12。 |
 | 输出解析器 | `Qwen35OutputParser`（继承 `Qwen3OutputParser`） |
 
 ## 下载
@@ -31,8 +31,8 @@
 > **Qwen 3.6 MTP：** NextN 草稿块（GGUF 元数据键 `nextn_predict_layers`）**只**在
 > `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` 的 GGUF 中保留。基础仓库
 > [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
-> 中的文件（文件名相同）去掉了该块 —— 对这些文件，`--mtp-spec` 会静默回退到
-> 标准 decode。
+> 中的文件（文件名相同）去掉了该块 —— 对这些文件，`--spec` 会静默回退到
+> 标准 decode（`--spec-type ngram` 在那里仍然可用，它不需要训练好的草稿器权重）。
 
 转换模型卡将对应的 Qwen 官方仓库标记为基础模型；这些上游模型卡声明 Apache-2.0。
 
@@ -54,12 +54,18 @@ printf '%s\n' '描述这张图片。' > prompt.txt
 dotnet run --project TensorSharp.Cli -c Release -- --model models/qwen3.5-9b/Qwen3.5-9B-UD-Q4_K_XL.gguf --mmproj models/qwen3.5-9b/mmproj-F16.gguf --input prompt.txt --image photo.png --max-tokens 512
 ```
 
-服务端 MTP 演示（`--mtp-spec` 与其他 `--mtp-*` 标志**只存在于
-TensorSharp.Server** —— `TensorSharp.Cli` 没有 MTP 标志；在 CLI 上只能通过
-`TS_MTP_*` 环境变量启用 MTP）：
+MTP 演示。`--spec` 及其余 `--spec-*` 系列参数由同一个
+[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)
+在**两个宿主上**解析，因此 `TensorSharp.Cli` 与 `TensorSharp.Server` 不会在名字、
+校验或默认值上出现分歧；旧的 `--mtp-*` 拼法仍作为别名被接受。它们必须写在*加载*
+模型的那条命令行上，因为 `--spec-draft` 同时还在加载期决定原生计算图缓存的大小：
 
 ```bash
-dotnet run --project TensorSharp.Server -c Release -- --model models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --mtp-spec
+# 服务端
+dotnet run --project TensorSharp.Server -c Release -- --model models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --spec
+
+# CLI —— 投机在 --input、--input-jsonl、--multi-turn-jsonl 与 --interactive 上生效
+dotnet run --project TensorSharp.Cli -c Release -- --model models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --spec --spec-draft 4 --input prompt.txt --max-tokens 512
 ```
 
 ## 1. 来源与目标
@@ -548,16 +554,17 @@ forward 一致。
 
 ## 12. MTP / NextN 投机解码（Qwen 3.6）
 
-Qwen 3.6 的 GGUF 可以自带一个 **NextN / 多 token 预测（MTP）草稿块**，`TensorSharp.Server`
+Qwen 3.6 的 GGUF 可以自带一个 **NextN / 多 token 预测（MTP）草稿块**，两个宿主都会
 用它为单序列（无并发）请求做无损投机解码。在公开的转换中，只有
 [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
 保留了该块（见[下载](#下载)）；不含该块的 GGUF 会静默走标准 decode。源码：
-[`Qwen35Model.Mtp.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.Mtp.cs)，
+[`Qwen35Model.Speculative.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.Speculative.cs)，
 由共享的
-[`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs)
-起草 / 验证 / 回滚核心驱动。与 Gemma 4 不同，这里无需独立草稿 GGUF——草稿块就内嵌在主干
-文件中，因此不使用 `--mtp-draft-model`（若显式传入一个无法在启动模型上激活的
-草稿模型，会在启动时快速失败报错）。
+[`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
+起草 / 验证 / 回滚核心驱动——它是可插拔的 `--spec-type` 层里的 `draft-head` 算法，
+而不是 Qwen 专属的循环。与 Gemma 4 不同，这里无需独立草稿 GGUF——草稿块就内嵌在主干
+文件中，因此不使用 `--spec-draft-model`（别名 `--mtp-draft-model`；若显式传入一个
+无法在启动模型上激活的草稿模型，会在启动时快速失败报错）。
 
 ### 12.1 内嵌 NextN 块
 
@@ -585,14 +592,20 @@ llama.cpp 的 `graph_mtp` 与 vLLM 的 `Qwen3_5MultiTokenPredictor`。
 
 ### 12.3 收益与调优
 
-投机默认关闭，用**服务端**标志 `--mtp-spec`（环境变量 `TS_MTP_SPEC=1`；
-`TensorSharp.Cli` 没有 MTP 标志）启用。只要加载的 GGUF 保留 NextN 块，它就会对
+投机默认关闭，在 `TensorSharp.Cli` 或 `TensorSharp.Server` 上用 `--spec`（环境变量
+`TS_SPEC`，或原生加载器读取的旧名 `TS_MTP_SPEC=1`）启用 ——
+[`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)
+由两个宿主共用，`--mtp-spec` 仍作为别名被接受。只要加载的 GGUF 保留 NextN 块，它就会对
 单序列（无并发）请求启用；对不含该块的 GGUF，引擎会静默走标准 decode。
-`--mtp-draft`（默认 `8`）限制草稿窗口，
-`--mtp-pmin`（默认 `0.75`）是保留 token 所需的最低草稿置信度。在 `ggml_cuda` 上，GDN 分块
+`--spec-draft`（别名 `--mtp-draft`，取值 1-64，默认 `8`）限制草稿窗口，它同时还在加载期
+决定原生计算图缓存的大小，因此要和 `--spec` 写在同一条命令行上；
+`--spec-pmin`（别名 `--mtp-pmin`，逐 token 草稿头默认 `0.75`，即其 top-10 logits 上的
+top-1 概率）是保留 token 所需的最低草稿置信度。`--spec-type draft-head` 可以显式钉住这条
+路径；默认的 `auto` 已经能从 checkpoint 中把它选出来。在 `ggml_cuda` 上，GDN 分块
 prefill 内核也会加速投机验证：在 Qwen3.6-27B IQ2_XXS 上实测把 MTP 投机验证 decode 从
-217 ms/token 降到 174 ms/token（见 §8，`GDN_CHUNK_PREFILL_MIN_SEQ_LEN`）。完整参数列表见
-[MTP / 投机解码](../../FEATURES_zh-cn.md#mtp--nextn-投机解码)。
+217 ms/token 降到 174 ms/token（见 §8，`GDN_CHUNK_PREFILL_MIN_SEQ_LEN`）。完整参数列表
+以及另外三种算法见 [投机解码](../../FEATURES_zh-cn.md#投机解码) —— 其中 `--spec-type ngram`
+完全不需要训练好的权重，因此在不带草稿块的 Qwen 3.5 checkpoint 上照样能跑。
 
 ## 13. 输出解析器与聊天模板
 

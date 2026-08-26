@@ -335,8 +335,15 @@ namespace TensorSharp.Server.Hosting
                     "--video-height 384"),
                 new OptionHelp("--video-steps <N>",
                     "Default denoising steps when a request omits 'steps'. The quality/time " +
-                    "trade-off after resolution. MiniMax-H3 is step-distilled and CFG-free: 8 is " +
-                    "the default, 20 is the default here, 16-24 is visibly cleaner, past ~30 gains little.",
+                    "trade-off after resolution. The server has NO default of its own - unset, " +
+                    "each model uses its own: 20 for MiniMax-H3, and for Wan the checkpoint's " +
+                    "trained step count when it is step-distilled, otherwise 50 (TI2V-5B), 40 " +
+                    "(A14B) or 30 (Wan 2.1). MiniMax-H3 is step-distilled and CFG-free, so 4-8 " +
+                    "is the fast operating point (some chromatic fringing around moving subjects " +
+                    "at the low end, gone by ~20), 16-24 is visibly cleaner, and past ~30 gains " +
+                    "little. Setting this pins EVERY request, so on a step-distilled Wan " +
+                    "checkpoint it overrides the 4 steps the file was trained for - leave it " +
+                    "unset there rather than paying 4x the work for a worse result.",
                     "--video-steps 16"),
                 new OptionHelp("--video-mode <mode>",
                     "Default conditioning mode when a request omits 'videoMode': t2v (text only), " +
