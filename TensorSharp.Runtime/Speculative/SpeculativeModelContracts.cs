@@ -91,6 +91,23 @@ namespace TensorSharp.Runtime.Speculative
         int SpecPrefillChunkSize => 0;
 
         /// <summary>
+        /// Draft window this trunk would rather have by DEFAULT, or 0 for "no
+        /// preference". It narrows the default only; an operator who passed
+        /// <c>--spec-draft</c> gets exactly what they asked for.
+        ///
+        /// This exists because the cost of a wide window is a property of the
+        /// TRUNK, not of the drafter. On a model with recurrent state a verify
+        /// over N rows runs the chunked recurrent scan instead of the single-token
+        /// update, AND a partial rejection has to restore that state and re-advance
+        /// over the accepted prefix - so the marginal token of window costs far
+        /// more than it does on a dense-attention trunk, where the verify's own KV
+        /// writes are reusable and the rollback is a position rewind. Measured on
+        /// Qwen3.8-27B: the default window 8 gave 9.4 tok/s against 15.5 at 3,
+        /// with the same drafter and the same acceptance per position.
+        /// </summary>
+        int SpecPreferredDraftWindow => 0;
+
+        /// <summary>
         /// True when a verify batch has already written reusable attention KV for
         /// EVERY token it processed (so the accepted prefix's KV is correct in the
         /// live cache), and the model has no recurrent state that a re-forward would
@@ -120,6 +137,14 @@ namespace TensorSharp.Runtime.Speculative
 
         /// <summary>Snapshot the recurrent (GDN/SSM) state before a verify batch.</summary>
         void SpecSnapshotRecurrentState();
+
+        /// <summary>
+        /// How much of the verify that just ran was accepted, delivered on every
+        /// speculative step (full acceptance included) before any rollback happens.
+        /// A trunk that left post-verify state on the device until the accept count
+        /// was known settles it here. Default: nothing to do.
+        /// </summary>
+        void SpecOnVerifyAccepted(int acceptedRows, int verifyRows) { }
 
         /// <summary>Restore the recurrent state captured by <see cref="SpecSnapshotRecurrentState"/>.</summary>
         void SpecRestoreRecurrentState();

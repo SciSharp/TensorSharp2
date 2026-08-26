@@ -180,8 +180,14 @@ A/B switch, plus long-context sizing knobs. None are registered in
 | `TS_MUSE_GLIMMER_VENC_F32` | Muse-Glimmer vision tower | Dequantize the tower to F32 (~7.4 GB) instead of feeding the GGUF quantization to `AddmmQuant` | OFF | not registered | no |
 | `TS_MUSE_GLIMMER_VENC_FUSED` | Muse-Glimmer vision tower on CUDA | Fused vision-block / flash-attention path | ON | not registered | no |
 | `TS_MUSE_GLIMMER_DFLASH` | Muse-Glimmer | DFlash drafter GGUF path (same as the CLI's `--draft-model`) | none | not registered | no |
-| `TS_DFLASH_FUSED` | Muse-Glimmer DFlash | Fused `TSGgml_DFlashInject` / `TSGgml_DFlashDraftBlock` graphs vs the per-op drafter | ON | not registered | no |
-| `TS_DFLASH_PERSIST` | Muse-Glimmer DFlash | Replay the persistent draft graphs instead of rebuilding every step | ON | not registered | no |
+| `TS_QWEN35_DFLASH` | Qwen 3.5 / 3.8 | DFlash / DFlash2 drafter GGUF path (same as the CLI's `--draft-model`) | none | not registered | no |
+| `TS_DFLASH_FUSED` | any DFlash drafter | Fused `TSGgml_DFlashInject` / `TSGgml_DFlashDraftBlock` graphs vs the per-op drafter | ON | not registered | no |
+| `TS_DFLASH_PERSIST` | any DFlash drafter | Replay the persistent draft graphs instead of rebuilding every step | ON | not registered | no |
+| `TS_DFLASH_PREFILL_CHUNK` | any DFlash drafter | Tokens per speculative prefill forward (drives the TRUNK, not only the drafter) | `1024`, capped by the drafter ring and the trunk's own window | not registered | no |
+| `TS_DFLASH_SELECTOR` | DFlash2 drafter | `0` drafts by per-position argmax instead of the candidate lattice (attribution only - the weights were trained with it) | ON | not registered | no |
+| `TS_DFLASH_CONV` | DFlash2 drafter | `0` drops the grouped dynamic convolution (attribution only, as above) | ON | not registered | no |
+| `TS_DFLASH_SELECTOR_DEBUG` | DFlash2 drafter (per-op path) | `1` prints the first blocks' lattice attribution: unary spread, transition spread, and whether the walk left the unary argmax | OFF | not registered | no |
+| `TS_Q35_VERIFY_SNAPSHOTS` | Qwen 3.5 / 3.8 speculative verify | `0` reverts to restoring a pre-verify recurrent-state copy and re-forwarding the accepted prefix instead of keeping one snapshot per row | ON | not registered | no |
 
 ## Out-of-Matrix GLM 5.x (`glm-dsa`) Knobs
 

@@ -48,6 +48,11 @@ namespace TensorSharp.Cli
             /// <summary>Cap on tokens drafted per step. Always positive.</summary>
             public int MaxDraftTokens { get; init; }
 
+            /// <summary>True when the operator actually named that cap, so a model
+            /// that prefers a narrower DEFAULT window
+            /// (ISpeculativeTarget.SpecPreferredDraftWindow) leaves it alone.</summary>
+            public bool MaxDraftTokensExplicit { get; init; }
+
             /// <summary>Draft-confidence gate, or null to let the ALGORITHM apply its own
             /// default — 0.75 for a per-token head, 0.35 for a block drafter, 0 for
             /// n-gram. They threshold different quantities, so there is no shared
@@ -70,6 +75,7 @@ namespace TensorSharp.Cli
                     ? SpeculatorRegistry.Auto
                     : SpeculatorName,
                 MaxDraftTokens = MaxDraftTokens,
+                MaxDraftTokensExplicit = MaxDraftTokensExplicit,
                 MinDraftProb = MinDraftProb,
             };
         }
@@ -122,6 +128,7 @@ namespace TensorSharp.Cli
                 Requested = cfg.Speculation.Enabled,
                 SpeculatorName = cfg.Speculation.SpeculatorName,
                 MaxDraftTokens = specDraftMax > 0 ? specDraftMax : Math.Max(1, cfg.Speculation.MaxDraftTokens),
+                MaxDraftTokensExplicit = specDraftMax > 0 || cfg.Speculation.MaxDraftTokensExplicit,
                 MinDraftProb = specDraftConfMin >= 0f ? specDraftConfMin : cfg.Speculation.MinDraftProb,
                 AnyExplicit = cfg.Speculation.Enabled || specDraftMax > 0 || specDraftConfMin >= 0f
                               || cfg.Speculation.MinDraftProb.HasValue

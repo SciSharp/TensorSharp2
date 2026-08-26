@@ -480,6 +480,14 @@ struct TSGgmlQwen35LayerDesc
     void* shexp_up_w;        // [hidden, shared_ff]
     void* shexp_down_w;      // [shared_ff, hidden]
     void* shexp_gate_inp_w;  // [hidden] F32 (shared-expert sigmoid gate)
+    // Dense FFN with gate and up UNFUSED. A mixed-quant "UD"/dynamic GGUF can
+    // store ffn_gate and ffn_up in different types (IQ2_XS vs IQ2_S, ...), which
+    // a single fused tensor cannot represent and which no imatrix-free
+    // requantization can reconcile. Those layers keep both tensors as they were
+    // quantized and the graph runs two matmuls instead of one. Non-null exactly
+    // when gu_w is null.
+    void* ffn_gate_w;        // ffn_gate [hidden, ff_dense]
+    void* ffn_up_w;          // ffn_up   [hidden, ff_dense]
 
     // --- int64 weight shapes/bytes ---
     std::int64_t qkv_ne0, qkv_ne1, qkv_bytes;
@@ -498,6 +506,8 @@ struct TSGgmlQwen35LayerDesc
     std::int64_t shexp_gate_ne0, shexp_gate_ne1, shexp_gate_bytes;
     std::int64_t shexp_up_ne0, shexp_up_ne1, shexp_up_bytes;
     std::int64_t shexp_down_ne0, shexp_down_ne1, shexp_down_bytes;
+    std::int64_t ffn_gate_ne0, ffn_gate_ne1, ffn_gate_bytes;
+    std::int64_t ffn_up_ne0, ffn_up_ne1, ffn_up_bytes;
 
     // --- int32 scalars ---
     std::int32_t struct_bytes;
@@ -514,6 +524,7 @@ struct TSGgmlQwen35LayerDesc
     // in system RAM. The whole-model decode graph then omits their mul_mat_id
     // chain, pauses after the router, and lets the host multiply them.
     std::int32_t cpu_moe;
+    std::int32_t ffn_gate_type, ffn_up_type;
 };
 
 // Per-layer descriptor for the GPT-OSS whole-model decode kernel

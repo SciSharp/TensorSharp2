@@ -201,7 +201,7 @@ namespace TensorSharp.Cli
                 new OptionHelp("--spec-type <name>",
                     "Which speculation ALGORITHM to draft with. 'auto' (default) uses whatever drafter the " +
                     "checkpoint carries: a per-token NextN/MTP head (GLM-5.2, Qwen 3.6, Gemma 4's separate " +
-                    "assistant GGUF) or a block drafter (DeepSeek V4 DSpark, Muse-Glimmer DFlash). " +
+                    "assistant GGUF) or a block drafter (DeepSeek V4 DSpark, DFlash / DFlash2 on Muse-Glimmer and Qwen 3.8). " +
                     "'draft-head' and 'block' pin one of those explicitly. 'ngram' needs NO trained weights at " +
                     "all - it drafts by finding where the last few tokens occurred earlier in the context and " +
                     "proposing what followed, so it works on every model and is strong on summarizing, editing, " +
@@ -229,7 +229,8 @@ namespace TensorSharp.Cli
                     "--spec --spec-draft-model gemma-4-12B-it-Q4_0-MTP.gguf"),
                 new OptionHelp("--draft-model <path>",
                     "Block drafter GGUF that has to be resident before the model's layer split runs (DeepSeek " +
-                    "V4's DSpark support module, Muse-Glimmer's DFlash). The drafter proposes a whole block of " +
+                    "V4's DSpark support module, the DFlash / DFlash2 drafters for Muse-Glimmer and Qwen 3.8). "
+                    + "The drafter proposes a whole block of " +
                     "tokens per step and the trunk verifies it in one batched forward. Naming the file IS the " +
                     "request - such a drafter needs no --spec. Every emitted token is still drawn from a trunk " +
                     "row - with argmax under a greedy config, with your sampler otherwise - so output is " +

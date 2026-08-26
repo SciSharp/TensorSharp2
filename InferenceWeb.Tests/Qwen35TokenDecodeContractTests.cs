@@ -188,13 +188,17 @@ public class Qwen35TokenDecodeContractTests
         FieldInfo[] fields = typeof(Qwen35LayerDecodeArgs).GetFields(
             BindingFlags.Public | BindingFlags.Instance);
 
-        // 24 int32s: the 23 original scalars plus CpuMoe, the per-layer MoE CPU
-        // offload flag (--n-cpu-moe). It is appended at the END of the int32 run
-        // so the struct stays a pointers / int64 / int32 sequence and the native
-        // TSGgmlQwen35LayerDesc keeps the same offsets for every field before it.
-        Assert.Equal(33, fields.Count(field => field.FieldType == typeof(IntPtr)));
-        Assert.Equal(48, fields.Count(field => field.FieldType == typeof(long)));
-        Assert.Equal(24, fields.Count(field => field.FieldType == typeof(int)));
+        // Every addition is appended at the END of its own run, so the struct stays
+        // a pointers / int64 / int32 sequence and the native TSGgmlQwen35LayerDesc
+        // keeps the same offsets for every field before it. The two most recent:
+        //   CpuMoe                    per-layer MoE CPU offload (--n-cpu-moe)
+        //   FfnGateW / FfnUpW (+ their shapes and types)
+        //                             the dense FFN of a mixed-quant "UD" layer whose
+        //                             ffn_gate and ffn_up have different GGML types
+        //                             and so cannot be fused into one tensor
+        Assert.Equal(35, fields.Count(field => field.FieldType == typeof(IntPtr)));
+        Assert.Equal(54, fields.Count(field => field.FieldType == typeof(long)));
+        Assert.Equal(26, fields.Count(field => field.FieldType == typeof(int)));
         Assert.All(fields, field => Assert.True(
             field.FieldType == typeof(IntPtr) ||
             field.FieldType == typeof(long) ||
@@ -204,10 +208,10 @@ public class Qwen35TokenDecodeContractTests
         static long Align(long value, int alignment)
             => (value + alignment - 1) / alignment * alignment;
 
-        long int64Start = Align(33L * IntPtr.Size, sizeof(long));
-        long int32Start = int64Start + 48L * sizeof(long);
+        long int64Start = Align(35L * IntPtr.Size, sizeof(long));
+        long int32Start = int64Start + 54L * sizeof(long);
         long expectedSize = Align(
-            int32Start + 24L * sizeof(int),
+            int32Start + 26L * sizeof(int),
             Math.Max(IntPtr.Size, sizeof(long)));
 
         Assert.Equal(0, Marshal.OffsetOf<Qwen35LayerDecodeArgs>(
@@ -218,11 +222,24 @@ public class Qwen35TokenDecodeContractTests
             nameof(Qwen35LayerDecodeArgs.StructBytes)).ToInt64());
         Assert.Equal(expectedSize, Marshal.SizeOf<Qwen35LayerDecodeArgs>());
 
-        // CpuMoe must stay last: the native side reads it by name, but the
-        // struct_bytes handshake only catches a size change, not a reordering
-        // of the int32 run.
+        // The int32 run's ORDER is what the struct_bytes handshake cannot check -
+        // it only catches a size change - so pin the tail explicitly. CpuMoe kept
+        // its slot when the split-gate/up pair was appended after it.
         Assert.Equal(
             int32Start + 23L * sizeof(int),
             Marshal.OffsetOf<Qwen35LayerDecodeArgs>(nameof(Qwen35LayerDecodeArgs.CpuMoe)).ToInt64());
+        Assert.Equal(
+            int32Start + 24L * sizeof(int),
+            Marshal.OffsetOf<Qwen35LayerDecodeArgs>(nameof(Qwen35LayerDecodeArgs.FfnGateType)).ToInt64());
+        Assert.Equal(
+            int32Start + 25L * sizeof(int),
+            Marshal.OffsetOf<Qwen35LayerDecodeArgs>(nameof(Qwen35LayerDecodeArgs.FfnUpType)).ToInt64());
+        // Same for the pointer and int64 runs.
+        Assert.Equal(
+            34L * IntPtr.Size,
+            Marshal.OffsetOf<Qwen35LayerDecodeArgs>(nameof(Qwen35LayerDecodeArgs.FfnUpW)).ToInt64());
+        Assert.Equal(
+            int64Start + 48L * sizeof(long),
+            Marshal.OffsetOf<Qwen35LayerDecodeArgs>(nameof(Qwen35LayerDecodeArgs.FfnGateNe0)).ToInt64());
     }
 }

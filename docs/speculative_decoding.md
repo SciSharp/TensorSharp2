@@ -83,7 +83,7 @@ Shipped implementations:
 | Name | Class | Weights | Notes |
 | --- | --- | --- | --- |
 | `draft-head` | `DraftHeadSpeculator` | required | One token per pass, chaining its own hidden output: NextN/MTP (Qwen 3.6, GLM 5.2, Gemma 4's separate assistant GGUF). EAGLE-shaped heads fit here unchanged. |
-| `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, Muse-Glimmer DFlash. |
+| `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, DFlash and DFlash2 (Muse-Glimmer, Qwen 3.8). |
 | `ngram` | `NGramSpeculator` | **none** | Suffix matching over the sequence's own tokens (prompt-lookup decoding). Works on every model. |
 | `auto` | — | — | Default: use whatever drafter the checkpoint carries. |
 
@@ -203,6 +203,185 @@ its own default rather than sharing one: `0.75` for a per-token head (top-1
 probability over its top-10 logits), `0.35` for a block drafter (the CUMULATIVE
 prefix probability, so the same number is far stricter), `0` for n-gram (where it
 scales the required match length instead).
+
+## DFlash and DFlash2
+
+A **DFlash** drafter is a small block-diffusion model that ships as its own GGUF
+(`general.architecture = dflash`) and is bound to one target. It reads the
+target's own residuals rather than only its tokens, and it proposes the whole
+speculative window in ONE forward pass instead of one token at a time:
+
+```
+PASS A  encoder      feat = concat(target residual entering dflash.target_layers)
+                     g    = rmsnorm(fc @ feat, enc.output_norm)
+PASS B  KV inject    K = rope_neox(headnorm(attn_k @ g)) ; V = attn_v @ g
+                     ring[pos % ringRows] <- K, V        (no Q, no attention, no FFN)
+PASS C  block draft  ids = [anchor, MASK x (block_size-1)]
+                     -> draft blocks -> the TARGET's LM head -> block_size-1 drafts
+```
+
+The drafter owns a small sliding-window KV ring of its own, sized from
+`dflash.attention.sliding_window`; the target's KV cache is untouched. Everything
+the drafter needs beyond its own blocks - the token embedding and the LM head -
+is borrowed from the target, so the file is ~1-3 GB against a 27-30B trunk.
+
+**DFlash2** is the same backbone with two additions, both keyed off the GGUF, so
+one code path serves both generations:
+
+* **A grouped dynamic depthwise convolution** around every attention and every
+  FFN sublayer (`dflash.conv_kernel_size`, `dflash.conv_group_size`). One
+  projection of the sublayer's INPUT produces both the filter applied to that
+  input and the filter applied to the sublayer's OUTPUT. Tap *t* of channel *c*
+  at block position *r* is `base[t][c] + delta[r][t][c / group_size]` - static
+  per channel, dynamic per group - multiplying `x[r-t][c]`, and masked to zero
+  for `r < t` so the filter never reaches across a block boundary. It is what
+  gives a block-diffusion draft a local left-to-right signal without a second
+  forward pass.
+
+* **A candidate selector** (`dflash.selector_rank`, `dflash.selector_top_k`).
+  Plain DFlash takes each block position's argmax over the vocabulary
+  INDEPENDENTLY - exactly the weakness of block diffusion, since position *i+1*
+  is chosen without knowing what *i* chose. The selector keeps the top-K
+  candidates per position and scores every (predecessor, candidate) pair through
+  two low-rank `[vocab, r]` codebooks:
+
+  ```
+  score[e][p][c] = unary[e][c] + < A[pred[e][p]] * (P h_e) , B[cand[e][c]] >
+  ```
+
+  `A`/`B` are `selector_predecessor`/`selector_successor`, `P` is
+  `selector_hidden`, `pred[0]` is the verified anchor token and `pred[e]` is
+  `cand[e-1]`. The block is then read off as a greedy walk through that lattice:
+  one small matmul per position, no extra draft forward.
+
+  `unary` is the target LM head's logit for that candidate **after the target's
+  own logit transform** (`dflash.logit_scale`, `dflash.final_logit_softcapping`),
+  which is why those keys exist on a DFlash2 file at all. Plain DFlash takes an
+  argmax and is invariant to both; the lattice ADDS the unary term to a
+  transition score, so an untransformed unary is simply the wrong size and
+  swamps the transition it is meant to compete with. Skipping it on the
+  Muse-Glimmer drafter (scale 0.196, softcap 20) cost more than half the
+  acceptance rate.
+
+Both extensions are no-ops when their keys are absent, so a first-generation
+DFlash file runs through the same code unchanged. `TS_DFLASH_SELECTOR=0` and
+`TS_DFLASH_CONV=0` switch one off for attribution; neither is a supported way to
+run a model, since the weights were trained with both.
+
+### Where it runs
+
+Both passes are one fused GGML graph each (`ggml_ops_dflash.cpp`,
+`TSGgml_DFlashInject` / `TSGgml_DFlashDraftBlock`) on CUDA, Vulkan and Metal,
+with a persistent graph that ggml-cuda can capture and replay; the per-op
+managed drafter is the fallback and the reference the fused path is checked
+against. `TS_DFLASH_FUSED=0` forces it.
+
+The selector's lattice comes back to the host as `k + k*k*(gamma-1)` floats
+(~7 KB) rather than the `[vocab, block]` block a naive readback would move
+(12.9 MB), and the walk itself - inherently sequential, tiny - runs on the host.
+
+### Attaching one
+
+`--draft-model <path>` (or `--spec-draft-model`, or `TS_QWEN35_DFLASH` /
+`TS_MUSE_GLIMMER_DFLASH`). The file's `general.architecture` decides what it is,
+not its name. A target that already carries a NextN/MTP block (Qwen 3.8 does)
+uses the DFlash drafter instead when one is attached: they consume different
+hidden rows and drive different speculators, and the operator named the file
+explicitly.
+
+### What the target has to provide
+
+Only the residual tap. A DFlash target implements `SpecForward` so that, per
+row, it also writes the concatenated residuals ENTERING each layer in
+`dflash.target_layers` - `SpecFeatureSize` wide instead of one hidden. Both
+shipped targets do it inside their fused whole-model kernel (a `ggml_cpy` per
+tapped layer), so speculation does not force the op-by-op loop.
+
+### What to expect
+
+Measured on one RTX 3080 Laptop (16 GB), greedy, best of two runs. Two prompts,
+because acceptance - and therefore everything - depends entirely on how
+predictable the continuation is: a free-form "explain how a GPU does a matmul"
+(prose) and a "list the first 20 primes" (factual).
+
+| target | drafter | prose tok/s | factual tok/s |
+| --- | --- | ---: | ---: |
+| Muse-Glimmer 30B IQ2_XXS | none | 18.7 | - |
+| Muse-Glimmer 30B IQ2_XXS | DFlash (1.6 GB) | 25.4 (1.36x) | - |
+| Muse-Glimmer 30B IQ2_XXS | DFlash2 Q4_K_M (1.6 GB) | 23.0 (1.23x) | - |
+| Muse-Glimmer 30B IQ2_XXS | DFlash2 Q8_0 (3.0 GB) | 14.1 (0.75x) | - |
+| Qwen 3.8 27B IQ3_XXS | none | 18.3 | 19.5 |
+| Qwen 3.8 27B IQ3_XXS | NextN/MTP | 19.1 (1.04x) | 32.6 (1.67x) |
+| Qwen 3.8 27B IQ3_XXS | DFlash2 Q4_K_M | 20.9 (1.14x) | 31.7 (1.63x) |
+| Qwen 3.8 27B IQ3_XXS | DFlash2 Q4_K_M, `--spec-draft 7` | 12.3 (0.67x) | 34.8 (1.78x) |
+
+For reference, llama.cpp b10630 on the same files and card: Muse-Glimmer plain
+19.7 / DFlash 22.0; Qwen 3.8 plain 18.7 prose, 19.9 factual, and its `draft-mtp`
+25.2 prose / 38.6 factual. llama.cpp cannot load a DFlash2 drafter at all - it
+rejects the file with "wrong number of tensors; expected 81, got 58", the 23
+convolution and selector tensors it has no code for.
+
+Three things in that table are worth reading carefully.
+
+**The drafter's SIZE is a first-order performance variable on a card with no
+headroom.** The same DFlash2 drafter at Q8_0 (3.0 GB) instead of Q4_K_M (1.6 GB)
+turns a 1.23x win into a 0.75x loss - not because it drafts worse (its
+acceptance is identical) but because the extra 1.4 GB pushes the trunk into
+WDDM paging and the trunk's own verify slows from 78 ms to 128 ms. Match the
+drafter quant to the headroom, not to the best available fidelity.
+
+**The window is a workload choice, and the default is the conservative one.**
+Qwen 3.8 defaults to 3 (see `SpecPreferredDraftWindow`). On the factual prompt a
+window of 7 is worth another 10%; on prose it is worth -40%, because a wider
+window buys verify rows that get rejected AND makes the recurrent-state
+snapshots below proportionally larger. `--spec-draft N` overrides it.
+
+**What the drafter proposes is only half the story on a recurrent trunk** - the
+other half is what a REJECTION costs, which is the next section.
+
+## Rejection on a recurrent trunk
+
+Qwen 3.5/3.6/3.8 are hybrids: 48 of Qwen 3.8's 64 layers are GatedDeltaNet, and
+GDN carries a recurrent state that a KV cache's "drop the rejected tail" does not
+apply to. Rolling a partially-rejected verify back used to mean restoring a
+pre-verify copy of that state and re-forwarding the accepted prefix through the
+entire trunk - a second whole-model forward - because the state after row *m*
+simply did not exist anywhere. On top of that the state (151 MB for this model)
+crossed PCIe twice per step: uploaded into the verify graph, downloaded again
+after it. Speculation therefore cost MORE than the plain decode it was meant to
+beat: 15.5 tok/s against 18.3 for DFlash2, 15.7 against 18.3 for MTP.
+
+Three changes, all in the fused verify kernel and its Qwen 3.5 caller, removed
+that (`ggml_ops_qwen35_verify.cpp`, `Qwen35Model.GatedDeltaNet.cs`):
+
+1. **The verify keeps one recurrent-state snapshot per row.**
+   `ggml_gated_delta_net` already takes a snapshot count and emits the last K
+   per-token states; the conv state after row *m* is a window of a tensor the
+   graph already builds. The state a rollback wants is therefore never
+   recomputed - it is slot `N-1-accepted`.
+
+2. **A snapshot is committed into the live state on the DEVICE.** Every cached
+   verify graph binds its `*_state_in` from one shared device buffer, so writing
+   a slot into it is visible to the next verify whatever shape it runs at. The
+   state stops round-tripping: the next verify skips its upload, this one skips
+   its download.
+
+3. **The pre-verify snapshot becomes free.** A verify only READS the live
+   slices - it writes its results to `*_state_out` and the snapshot slots - so
+   the slices ARE the pre-verify state until a commit overwrites them, and a
+   commit only happens after the rollback decision. `SpecSnapshotRecurrentState`
+   copies nothing.
+
+The measured effect on Qwen3.8-27B, DFlash2, 256 prose tokens: `rollbackMs`
+3604 -> 0, `snapshotMs` 919 -> 69, and 15.5 -> 20.9 tok/s. On the factual prompt
+24.3 -> 31.7. Output is unchanged: the same greedy continuation, byte-identical
+to plain decoding and to the old restore-and-re-forward path.
+
+`TS_Q35_VERIFY_SNAPSHOTS=0` restores the old path (it is also what a shape the
+kernel will not persist falls back to, automatically). The cost of the snapshots
+is VRAM: the GDN op's output grows by one state per slot, ~150 MB per slot for
+this model across all 48 recurrent layers, which is the other reason the default
+window is 3 rather than 8.
 
 ## Where n-gram pays
 

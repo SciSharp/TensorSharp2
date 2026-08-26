@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -392,6 +392,12 @@ public struct Qwen35LayerDecodeArgs
     public IntPtr ShexpUpW;
     public IntPtr ShexpDownW;
     public IntPtr ShexpGateInpW;
+    /// <summary>Dense FFN with gate and up UNFUSED, for the mixed-quant "UD"
+    /// layers where the two tensors have different GGML types and no
+    /// imatrix-free requantization can bring them together. Non-zero exactly
+    /// when <see cref="GuW"/> is zero; the graph then runs two matmuls.</summary>
+    public IntPtr FfnGateW;
+    public IntPtr FfnUpW;
 
     // int64 weight shapes
     public long QkvNe0, QkvNe1, QkvBytes;
@@ -410,6 +416,8 @@ public struct Qwen35LayerDecodeArgs
     public long ShexpGateNe0, ShexpGateNe1, ShexpGateBytes;
     public long ShexpUpNe0, ShexpUpNe1, ShexpUpBytes;
     public long ShexpDownNe0, ShexpDownNe1, ShexpDownBytes;
+    public long FfnGateNe0, FfnGateNe1, FfnGateBytes;
+    public long FfnUpNe0, FfnUpNe1, FfnUpBytes;
 
     // int32 scalars
     public int StructBytes;
@@ -425,6 +433,8 @@ public struct Qwen35LayerDecodeArgs
     /// <summary>Non-zero keeps this layer's routed experts in system RAM and runs its
     /// MoE FFN on the host (MoeCpuOffloadConfig / --n-cpu-moe).</summary>
     public int CpuMoe;
+    public int FfnGateType;
+    public int FfnUpType;
 }
 
 // Descriptor for the fused DiffusionGemma decode-layer kernel
@@ -2513,7 +2523,23 @@ internal enum GgmlIndexReductionOp
             IntPtr outNormData,
             IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
             IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocabSize, int[] idsOut, float[] confOut);
+            int vocabSize, int[] idsOut, float[] confOut,
+            // DFlash2 grouped dynamic convolution. convTaps == 0 disables it and
+            // every array below may be null (a first-generation drafter).
+            int convTaps, int convGroupSize, int convNumGroups,
+            IntPtr[] attnConvBaseArr,
+            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
+            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
+            IntPtr[] ffnConvBaseArr,
+            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
+            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
+            // DFlash2 candidate selector. selRank == 0 disables it; when it is on,
+            // idsOut/confOut are left untouched and the lattice comes back instead.
+            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
+            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
+            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
+            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
+            float[] selScoresOut, int[] selCandOut);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -2538,7 +2564,18 @@ internal enum GgmlIndexReductionOp
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 kNormArr, ringKArr, ringVArr, ringDtype) != 0;
 
-        /// <summary>DFlash PASS C in one graph, returning the on-device argmax id and its softmax probability per row.</summary>
+        /// <summary>
+        /// DFlash PASS C in one graph.
+        ///
+        /// Plain DFlash returns the on-device argmax id and its softmax probability
+        /// per block row. A DFlash2 drafter (selRank &gt; 0) instead returns the
+        /// candidate ids and the transition lattice the caller walks:
+        /// selCandOut is [selTopK, gamma] and selScoresOut holds the anchor row
+        /// (selTopK floats, block position 0 scored against the verified anchor)
+        /// followed by one [selTopK(pred), selTopK(cand)] matrix per following
+        /// position, candidate-fastest. That is ~7 KB per step against the 12.9 MB
+        /// a [vocab, block] readback would cost.
+        /// </summary>
         public static bool DFlashDraftBlock(
             int[] blockIds, int blockLen, int[] positions,
             int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
@@ -2558,7 +2595,23 @@ internal enum GgmlIndexReductionOp
             IntPtr outNormData,
             IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
             IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocabSize, int[] idsOut, float[] confOut)
+            int vocabSize, int[] idsOut, float[] confOut,
+            // DFlash2 grouped dynamic convolution. convTaps == 0 disables it and
+            // every array below may be null (a first-generation drafter).
+            int convTaps, int convGroupSize, int convNumGroups,
+            IntPtr[] attnConvBaseArr,
+            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
+            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
+            IntPtr[] ffnConvBaseArr,
+            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
+            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
+            // DFlash2 candidate selector. selRank == 0 disables it; when it is on,
+            // idsOut/confOut are left untouched and the lattice comes back instead.
+            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
+            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
+            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
+            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
+            float[] selScoresOut, int[] selCandOut)
             => TSGgml_DFlashDraftBlock(blockIds, blockLen, positions,
                 numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
                 eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
@@ -2575,7 +2628,17 @@ internal enum GgmlIndexReductionOp
                 ringKArr, ringVArr, ringDtype, outNormData,
                 tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes,
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                vocabSize, idsOut, confOut) != 0;
+                vocabSize, idsOut, confOut,
+                convTaps, convGroupSize, convNumGroups,
+                attnConvBaseArr, attnConvProjArr, attnConvProjTypeArr,
+                attnConvProjNe0Arr, attnConvProjNe1Arr, attnConvProjBytesArr,
+                ffnConvBaseArr, ffnConvProjArr, ffnConvProjTypeArr,
+                ffnConvProjNe0Arr, ffnConvProjNe1Arr, ffnConvProjBytesArr,
+                selRank, selTopK, selLogitScale, selLogitSoftcap,
+                selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes,
+                selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes,
+                selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes,
+                selScoresOut, selCandOut) != 0;
 
         /// <summary>Drop the persistent DFlash graphs (ring reallocation / KV reset).</summary>
         public static void DFlashResetCaches() => TSGgml_DFlashResetCaches();
@@ -3551,7 +3614,9 @@ internal enum GgmlIndexReductionOp
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNorm, IntPtr normedOut, int nLogitRows,
             int[] mropePos, int[] mropeSections,
-            int tpDegree, IntPtr[] tpPlanOut);
+            int tpDegree, IntPtr[] tpPlanOut,
+            IntPtr captureData, int[] captureLayers, int captureCount,
+            int stateSnapshots, IntPtr stateSnapshotsUsed, int deviceStateCurrent);
 
         public static bool Qwen35ModelVerify(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
@@ -3566,7 +3631,10 @@ internal enum GgmlIndexReductionOp
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNorm, IntPtr normedOut, int nLogitRows,
             int[] mropePos = null, int[] mropeSections = null,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+            int tpDegree = 1, IntPtr[] tpPlanOut = null,
+            IntPtr captureData = default, int[] captureLayers = null, int captureCount = 0,
+            int stateSnapshots = 1, IntPtr stateSnapshotsUsed = default,
+            bool deviceStateCurrent = false)
         {
             return TSGgml_Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -3579,8 +3647,48 @@ internal enum GgmlIndexReductionOp
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
-                tpDegree, tpPlanOut) != 0;
+                tpDegree, tpPlanOut, captureData, captureLayers, captureCount,
+                stateSnapshots, stateSnapshotsUsed, deviceStateCurrent ? 1 : 0) != 0;
         }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35CommitStateSnapshot(int slot, int numRecurrentLayers);
+
+        /// <summary>
+        /// Commit one recurrent-state snapshot into the live device state, without a
+        /// host round trip. The next verify can then skip its state upload, which is
+        /// the point: that upload plus the matching download was the largest per-step
+        /// cost of speculative decoding on a Qwen 3.5/3.8 hybrid trunk.
+        /// </summary>
+        public static bool Qwen35CommitStateSnapshot(int slot, int numRecurrentLayers)
+            => TSGgml_Qwen35CommitStateSnapshot(slot, numRecurrentLayers) != 0;
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35DrainDeviceState(
+            IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers);
+
+        /// <summary>Read the live device recurrent state back into the host mirrors,
+        /// for anything that has to run the op-by-op recurrent path.</summary>
+        public static bool Qwen35DrainDeviceState(IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers)
+            => TSGgml_Qwen35DrainDeviceState(convOut, deltaOut, numRecurrentLayers) != 0;
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35FetchStateSnapshot(
+            int slot, IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers);
+
+        /// <summary>
+        /// Pull ONE per-token recurrent-state snapshot out of the verify that just
+        /// ran, counting <paramref name="slot"/> tokens back from the end of that
+        /// batch. False when there is nothing to pull (no snapshotting verify has
+        /// run, or the slot is out of range), and the caller keeps its old
+        /// restore-and-re-forward path.
+        /// </summary>
+        public static bool Qwen35FetchStateSnapshot(int slot, IntPtr[] convOut, IntPtr[] deltaOut,
+            int numRecurrentLayers)
+            => TSGgml_Qwen35FetchStateSnapshot(slot, convOut, deltaOut, numRecurrentLayers) != 0;
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

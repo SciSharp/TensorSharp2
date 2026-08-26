@@ -45,6 +45,23 @@ using namespace tsg;
 // slot holding position p is masked from a block query at position qp when
 // qp - p >= n_swa or p > qp; the block's own b columns are never masked, because
 // DFlash drafts with llama_set_causal_attn(ctx_dft, false).
+//
+// ----------------------------------------------------------------------------
+// DFlash2 (conv_taps > 0 / sel_rank > 0) adds two things to the draft graph:
+//
+//   GROUPED DYNAMIC CONVOLUTION around every attention and every FFN sublayer.
+//   One projection of the sublayer INPUT yields both filters; tap t of channel c
+//   at block position r is (base[side][t][c] + delta[r][t][c / group_size]) and
+//   multiplies x[r-t][c], zeroed for r < t. The shift is a get_rows with a
+//   constant index vector and the boundary mask a constant [1,1,b] multiply -
+//   both baked once, because the block layout never changes between steps.
+//
+//   CANDIDATE SELECTOR instead of the per-row argmax. The LM head runs over the
+//   gamma = b-1 PROPOSAL rows only (not the anchor's), a top-k keeps the
+//   candidates, and the pairwise transition scores come back to the host as
+//   k + k*k*(gamma-1) floats - ~7 KB, against 12.9 MB for a [vocab, b] readback.
+//   The walk itself is gamma steps over k candidates and stays on the host: it is
+//   inherently sequential and the data is already small.
 // ============================================================================
 
 namespace
@@ -66,6 +83,11 @@ namespace
         ggml_tensor* ring_v = nullptr;
         ggml_tensor* k_cpy = nullptr;
         ggml_tensor* v_cpy = nullptr;
+        // DFlash2 only.
+        ggml_tensor* attn_conv_base = nullptr;
+        ggml_tensor* attn_conv_proj = nullptr;
+        ggml_tensor* ffn_conv_base = nullptr;
+        ggml_tensor* ffn_conv_proj = nullptr;
     };
 
     // Persistent graph cache. Both entry points key on
@@ -83,6 +105,9 @@ namespace
         ggml_tensor* mask = nullptr;         // draft only (shared across layers)
         ggml_tensor* out = nullptr;
         ggml_tensor* out_conf = nullptr;   // draft only
+        ggml_tensor* out_s0 = nullptr;     // DFlash2 selector: [k] anchor row
+        ggml_tensor* out_scores = nullptr; // DFlash2 selector: [k, k, gamma-1]
+        ggml_tensor* out_cand = nullptr;   // DFlash2 selector: [k, gamma] I32
         const void* sig = nullptr;
         const void* sig_ring = nullptr;
         int n_rows = 0;
@@ -94,6 +119,7 @@ namespace
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
             in_main = pos = kv_index = mask = out = out_conf = nullptr;
+            out_s0 = out_scores = out_cand = nullptr;
             sig = sig_ring = nullptr;
             n_rows = out_count = 0;
         }
@@ -184,6 +210,53 @@ namespace
                 ggml_backend_tensor_set(u.t, resolve_upload_source(u.data), 0, u.bytes);
         }
     };
+
+    // DFlash2 grouped dynamic depthwise convolution over one block.
+    //
+    //   out[r][c] = sum_t (base[side][t][c] + delta[r][t][c / group_size]) * x[r-t][c]
+    //
+    // with tap t masked off for the first t rows of the block. `x` is [hidden, n]
+    // and `coef` the [2 * taps * groups, n] projection of the sublayer input, laid
+    // out side-major then tap then group (the order the checkpoint exports).
+    // shift_idx[t] / tap_mask[t] are the constant row-shift and boundary mask for
+    // tap t (both null at t == 0, which is never shifted and never masked).
+    ggml_tensor* df_grouped_conv(
+        ggml_context* ctx, ggml_tensor* x, ggml_tensor* coef, ggml_tensor* base_w,
+        int side, int taps, int groups, int group_size, int hidden, int n,
+        ggml_tensor** shift_idx, ggml_tensor** tap_mask)
+    {
+        ggml_tensor* x3 = ggml_reshape_3d(ctx, x, group_size, groups, n);   // [S, G, n]
+        ggml_tensor* out = nullptr;
+        for (int tap = 0; tap < taps; tap++)
+        {
+            // Static, per-channel half of the kernel: base[side][tap] as [S, G, 1].
+            const std::size_t base_off =
+                (static_cast<std::size_t>(side) * taps + tap) * static_cast<std::size_t>(hidden) * sizeof(float);
+            ggml_tensor* b3 = ggml_view_3d(ctx, base_w, group_size, groups, 1,
+                                           static_cast<std::size_t>(group_size) * sizeof(float),
+                                           static_cast<std::size_t>(hidden) * sizeof(float), base_off);
+
+            // Dynamic, per-token per-group half: the (side, tap) slice of coef.
+            // Materialized rather than viewed because the slice is strided and the
+            // add below broadcasts it over the group's channels.
+            const std::size_t coef_off =
+                (static_cast<std::size_t>(side) * taps + tap) * static_cast<std::size_t>(groups) * sizeof(float);
+            ggml_tensor* d2 = ggml_cont(ctx, ggml_view_2d(ctx, coef, groups, n, coef->nb[1], coef_off));
+            ggml_tensor* d3 = ggml_reshape_3d(ctx, d2, 1, groups, n);
+
+            ggml_tensor* kern = ggml_add(ctx, ggml_repeat(ctx, b3, x3), d3);  // [S, G, n]
+
+            ggml_tensor* xs = x3;
+            if (tap > 0)
+                xs = ggml_reshape_3d(ctx, ggml_get_rows(ctx, x, shift_idx[tap]), group_size, groups, n);
+
+            ggml_tensor* term = ggml_mul(ctx, kern, xs);
+            if (tap > 0)
+                term = ggml_mul(ctx, term, tap_mask[tap]);                    // [1, 1, n]
+            out = (out == nullptr) ? term : ggml_add(ctx, out, term);
+        }
+        return ggml_reshape_2d(ctx, out, hidden, n);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +464,21 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
     const void* out_norm_data,
     const void* tok_embd_data, int tok_embd_type, std::int64_t tok_embd_ne0, std::int64_t tok_embd_ne1, std::int64_t tok_embd_bytes,
     const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-    int vocab_size, int* ids_out, float* conf_out)
+    int vocab_size, int* ids_out, float* conf_out,
+    // ---- DFlash2 grouped dynamic convolution (conv_taps == 0 disables) ----
+    int conv_taps, int conv_group_size, int conv_num_groups,
+    void** attn_conv_base_arr,
+    void** attn_conv_proj_arr, int* attn_conv_proj_type_arr,
+    std::int64_t* attn_conv_proj_ne0_arr, std::int64_t* attn_conv_proj_ne1_arr, std::int64_t* attn_conv_proj_bytes_arr,
+    void** ffn_conv_base_arr,
+    void** ffn_conv_proj_arr, int* ffn_conv_proj_type_arr,
+    std::int64_t* ffn_conv_proj_ne0_arr, std::int64_t* ffn_conv_proj_ne1_arr, std::int64_t* ffn_conv_proj_bytes_arr,
+    // ---- DFlash2 candidate selector (sel_rank == 0 disables) ----
+    int sel_rank, int sel_top_k, float sel_logit_scale, float sel_logit_softcap,
+    const void* sel_hidden_data, int sel_hidden_type, std::int64_t sel_hidden_ne0, std::int64_t sel_hidden_ne1, std::int64_t sel_hidden_bytes,
+    const void* sel_pred_data, int sel_pred_type, std::int64_t sel_pred_ne0, std::int64_t sel_pred_ne1, std::int64_t sel_pred_bytes,
+    const void* sel_succ_data, int sel_succ_type, std::int64_t sel_succ_ne0, std::int64_t sel_succ_ne1, std::int64_t sel_succ_bytes,
+    float* sel_scores_out, int* sel_cand_out)
 {
     try
     {
@@ -403,6 +490,28 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         const int kv_len = ring_rows + b;      // FIXED across steps -> capturable
         const int q_dim = num_heads * head_dim;
         const int out_count = b;
+
+        const bool use_conv = conv_taps > 0 && conv_group_size > 0 && conv_num_groups > 0
+            && attn_conv_base_arr != nullptr && attn_conv_proj_arr != nullptr
+            && ffn_conv_base_arr != nullptr && ffn_conv_proj_arr != nullptr;
+        const bool use_selector = sel_rank > 0 && sel_top_k > 0
+            && sel_hidden_data != nullptr && sel_pred_data != nullptr && sel_succ_data != nullptr
+            && sel_scores_out != nullptr && sel_cand_out != nullptr;
+        const int gamma = b - 1;               // proposal rows (row 0 is the anchor)
+        if (use_selector && (gamma < 1 || sel_top_k > vocab_size))
+        {
+            set_last_error("DFlash draft: selector needs at least one proposal row and top_k <= vocab.");
+            return 0;
+        }
+        if (use_conv && conv_taps > b)
+        {
+            set_last_error("DFlash draft: conv_kernel_size exceeds the block width.");
+            return 0;
+        }
+        const std::size_t sel_scores_floats = use_selector
+            ? static_cast<std::size_t>(sel_top_k)
+              + static_cast<std::size_t>(sel_top_k) * sel_top_k * (gamma - 1)
+            : 0;
 
         const void* sig = attn_norm_arr[0];
         const void* sig_ring = ring_k_arr[0];
@@ -459,8 +568,23 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             // output, silently collapsed acceptance).
             if (g_backend_type == BACKEND_TYPE_METAL)
                 ggml_backend_synchronize(g_backend);
-            ggml_backend_tensor_get(dc->out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
-            finalize_compute_with_download(dc->out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
+            if (use_selector)
+            {
+                ggml_backend_tensor_get(dc->out_cand, sel_cand_out, 0,
+                    static_cast<std::size_t>(sel_top_k) * gamma * sizeof(std::int32_t));
+                ggml_backend_tensor_get(dc->out_s0, sel_scores_out, 0,
+                    static_cast<std::size_t>(sel_top_k) * sizeof(float));
+                if (dc->out_scores != nullptr)
+                {
+                    finalize_compute_with_download(dc->out_scores, sel_scores_out + sel_top_k,
+                        (sel_scores_floats - sel_top_k) * sizeof(float));
+                }
+            }
+            else
+            {
+                ggml_backend_tensor_get(dc->out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
+                finalize_compute_with_download(dc->out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
+            }
             host_read_barrier();
             clear_last_error();
             return 1;
@@ -488,9 +612,40 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_len, b, 1, 1);
         ggml_set_input(ids_t); ggml_set_input(pos_t); ggml_set_input(mask_t);
 
+        // Constant per-tap row shift and block-boundary mask for the DFlash2
+        // convolution. They depend only on the block width, which is part of the
+        // cache key, so they are written once at build time and survive replay.
+        std::vector<ggml_tensor*> conv_shift(use_conv ? conv_taps : 0, nullptr);
+        std::vector<ggml_tensor*> conv_mask(use_conv ? conv_taps : 0, nullptr);
+        std::vector<std::vector<std::int32_t>> conv_shift_data(use_conv ? conv_taps : 0);
+        std::vector<std::vector<float>> conv_mask_data(use_conv ? conv_taps : 0);
+        for (int tap = 1; tap < (use_conv ? conv_taps : 0); tap++)
+        {
+            conv_shift[tap] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, b);
+            conv_mask[tap] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, b);
+            ggml_set_input(conv_shift[tap]);
+            ggml_set_input(conv_mask[tap]);
+            conv_shift_data[tap].resize(b);
+            conv_mask_data[tap].resize(b);
+            for (int r = 0; r < b; r++)
+            {
+                conv_shift_data[tap][r] = r >= tap ? r - tap : 0;
+                conv_mask_data[tap][r] = r >= tap ? 1.0f : 0.0f;
+            }
+        }
+
         ggml_tensor* tok_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(tok_embd_type), tok_embd_ne0, tok_embd_ne1);
         ggml_tensor* out_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
         ggml_tensor* lm_head_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(lm_head_type), lm_head_ne0, lm_head_ne1);
+        ggml_tensor* sel_hidden_t = nullptr;
+        ggml_tensor* sel_pred_t = nullptr;
+        ggml_tensor* sel_succ_t = nullptr;
+        if (use_selector)
+        {
+            sel_hidden_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(sel_hidden_type), sel_hidden_ne0, sel_hidden_ne1);
+            sel_pred_t   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(sel_pred_type),   sel_pred_ne0,   sel_pred_ne1);
+            sel_succ_t   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(sel_succ_type),   sel_succ_ne0,   sel_succ_ne1);
+        }
 
         // llama.cpp's dflash graph feeds build_inp_embd straight in: no embedding
         // scale and (unlike the Muse-Glimmer trunk) no weightless input RMSNorm.
@@ -513,6 +668,15 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type_arr[l]), down_ne0_arr[l], down_ne1_arr[l]);
             lt.ring_k = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(ring_dtype), head_dim, ring_rows, num_kv_heads);
             lt.ring_v = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(ring_dtype), head_dim, ring_rows, num_kv_heads);
+            if (use_conv)
+            {
+                lt.attn_conv_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, conv_taps, 2);
+                lt.ffn_conv_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, conv_taps, 2);
+                lt.attn_conv_proj = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(attn_conv_proj_type_arr[l]),
+                                                       attn_conv_proj_ne0_arr[l], attn_conv_proj_ne1_arr[l]);
+                lt.ffn_conv_proj = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ffn_conv_proj_type_arr[l]),
+                                                      ffn_conv_proj_ne0_arr[l], ffn_conv_proj_ne1_arr[l]);
+            }
         }
 
         for (int l = 0; l < num_layers; l++)
@@ -520,6 +684,19 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             auto& lt = layers[l];
 
             ggml_tensor* h = ggml_mul(ctx, ggml_rms_norm(ctx, inpL, eps), lt.attn_norm_w);
+
+            // DFlash2: one projection of the sublayer input carries both filters,
+            // so the output-side coefficients are computed here and held across the
+            // attention - they are keyed on the INPUT, not on what attention made.
+            ggml_tensor* attn_conv_coef = nullptr;
+            if (use_conv)
+            {
+                attn_conv_coef = ggml_mul_mat(ctx, lt.attn_conv_proj, h);   // [2*taps*G, b]
+                h = df_grouped_conv(ctx, h, attn_conv_coef, lt.attn_conv_base, /*side=*/0,
+                                    conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
+                                    conv_shift.data(), conv_mask.data());
+            }
+
             ggml_tensor* q = ggml_mul_mat(ctx, lt.q_w, h);
             ggml_tensor* k = ggml_mul_mat(ctx, lt.k_w, h);
             ggml_tensor* v = ggml_mul_mat(ctx, lt.v_w, h);
@@ -561,23 +738,119 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             }
 
             ggml_tensor* attn_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);
+            if (use_conv)
+            {
+                attn_out = df_grouped_conv(ctx, attn_out, attn_conv_coef, lt.attn_conv_base, /*side=*/1,
+                                           conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
+                                           conv_shift.data(), conv_mask.data());
+            }
             ggml_tensor* ffn_inp = ggml_add(ctx, attn_out, inpL);
 
             ggml_tensor* fh = ggml_mul(ctx, ggml_rms_norm(ctx, ffn_inp, eps), lt.ffn_norm_w);
+            ggml_tensor* ffn_conv_coef = nullptr;
+            if (use_conv)
+            {
+                ffn_conv_coef = ggml_mul_mat(ctx, lt.ffn_conv_proj, fh);
+                fh = df_grouped_conv(ctx, fh, ffn_conv_coef, lt.ffn_conv_base, /*side=*/0,
+                                     conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
+                                     conv_shift.data(), conv_mask.data());
+            }
             ggml_tensor* gate = ggml_mul_mat(ctx, lt.gate_w, fh);
             ggml_tensor* up   = ggml_mul_mat(ctx, lt.up_w, fh);
             ggml_tensor* act  = ggml_mul(ctx, ggml_silu(ctx, gate), up);
             ggml_tensor* down = ggml_mul_mat(ctx, lt.down_w, act);
+            if (use_conv)
+            {
+                down = df_grouped_conv(ctx, down, ffn_conv_coef, lt.ffn_conv_base, /*side=*/1,
+                                       conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
+                                       conv_shift.data(), conv_mask.data());
+            }
             inpL = ggml_add(ctx, down, ffn_inp);
         }
 
         ggml_tensor* cur = ggml_mul(ctx, ggml_rms_norm(ctx, inpL, eps), out_norm_t);
+
+        ggml_tensor* sel_s0 = nullptr;
+        ggml_tensor* sel_scores = nullptr;
+        ggml_tensor* sel_cand = nullptr;
+        if (use_selector)
+        {
+            // Only the gamma PROPOSAL rows reach the head; row 0 is the anchor's
+            // own prediction, which the selector never consumes.
+            ggml_tensor* pred_h = ggml_view_2d(ctx, cur, hidden_size, gamma, cur->nb[1], cur->nb[1]);
+            ggml_tensor* sel_logits = ggml_mul_mat(ctx, lm_head_t, pred_h);        // [vocab, gamma]
+            sel_cand = ggml_top_k(ctx, sel_logits, sel_top_k);                     // [k, gamma] I32
+            if (!backend_supports_op(sel_cand))
+            {
+                set_last_error("DFlash draft: this backend has no top-k over the vocabulary.");
+                if (can_persist) ggml_free(ctx);
+                return 0;
+            }
+            ggml_set_output(sel_cand);
+
+            // unary[e][c]: the head logit of candidate c at position e.
+            ggml_tensor* logits3 = ggml_reshape_3d(ctx, sel_logits, 1, vocab_size, gamma);
+            ggml_tensor* unary = ggml_get_rows(ctx, logits3, sel_cand);            // [1, k, gamma]
+            ggml_tensor* unary_kg = ggml_reshape_3d(ctx, unary, sel_top_k, 1, gamma);
+            // The target's LM-head transform. Applied here, after the top-k, because
+            // both halves are monotonic (the candidate set cannot change) and this
+            // touches k*gamma values instead of vocab*gamma. Without it the unary
+            // term enters the lattice at the wrong scale and swamps the transition
+            // scores it is meant to compete with.
+            if (sel_logit_scale != 1.0f)
+                unary_kg = ggml_scale(ctx, unary_kg, sel_logit_scale);
+            if (sel_logit_softcap > 0.0f)
+            {
+                unary_kg = ggml_scale(ctx,
+                    ggml_tanh(ctx, ggml_scale(ctx, unary_kg, 1.0f / sel_logit_softcap)),
+                    sel_logit_softcap);
+            }
+
+            ggml_tensor* ph = ggml_mul_mat(ctx, sel_hidden_t, pred_h);             // [r, gamma]
+            ggml_tensor* cand_flat = ggml_reshape_1d(ctx, sel_cand, static_cast<std::int64_t>(sel_top_k) * gamma);
+            ggml_tensor* keys = ggml_get_rows(ctx, sel_succ_t, cand_flat);         // [r, k*gamma]
+            ggml_tensor* keys3 = ggml_reshape_3d(ctx, keys, sel_rank, sel_top_k, gamma);
+
+            // Position 0's predecessor is the verified anchor, which is block_ids[0]
+            // - the same tensor the embedding lookup already reads.
+            ggml_tensor* anchor_id = ggml_view_1d(ctx, ids_t, 1, 0);
+            ggml_tensor* a0 = ggml_get_rows(ctx, sel_pred_t, anchor_id);           // [r, 1]
+            ggml_tensor* ph0 = ggml_view_2d(ctx, ph, sel_rank, 1, ph->nb[1], 0);
+            ggml_tensor* m0 = ggml_mul(ctx, a0, ph0);                              // [r, 1]
+            ggml_tensor* keys0 = ggml_view_2d(ctx, keys3, sel_rank, sel_top_k, keys3->nb[1], 0);
+            sel_s0 = ggml_add(ctx, ggml_mul_mat(ctx, keys0, m0),
+                              ggml_view_2d(ctx, unary_kg, sel_top_k, 1, unary_kg->nb[1], 0));
+            ggml_set_output(sel_s0);                                               // [k, 1]
+
+            if (gamma > 1)
+            {
+                // Position e's predecessors are position e-1's candidates, so the
+                // predecessor ids are the same tensor shifted by one slot.
+                ggml_tensor* prev_flat = ggml_view_1d(ctx, sel_cand,
+                    static_cast<std::int64_t>(sel_top_k) * (gamma - 1), 0);
+                ggml_tensor* preds = ggml_get_rows(ctx, sel_pred_t, prev_flat);
+                ggml_tensor* preds3 = ggml_reshape_3d(ctx, preds, sel_rank, sel_top_k, gamma - 1);
+                ggml_tensor* ph_rest = ggml_view_3d(ctx, ph, sel_rank, 1, gamma - 1,
+                                                    ph->nb[1], ph->nb[1], ph->nb[1]);
+                ggml_tensor* m = ggml_mul(ctx, preds3, ph_rest);                   // [r, k, gamma-1]
+                ggml_tensor* keys_rest = ggml_view_3d(ctx, keys3, sel_rank, sel_top_k, gamma - 1,
+                                                      keys3->nb[1], keys3->nb[2], keys3->nb[2]);
+                // [k(candidate), k(predecessor), gamma-1] -- candidate fastest, which
+                // is the row the host walk scans.
+                sel_scores = ggml_mul_mat(ctx, keys_rest, m);
+                ggml_tensor* u_rest = ggml_view_3d(ctx, unary_kg, sel_top_k, 1, gamma - 1,
+                                                   unary_kg->nb[1], unary_kg->nb[2], unary_kg->nb[2]);
+                sel_scores = ggml_add(ctx, sel_scores, u_rest);
+                ggml_set_output(sel_scores);
+            }
+        }
+
         // The TARGET's LM head, with NEITHER logit_scale NOR the tanh softcap:
         // llama.cpp's dflash graph ends at build_lora_mm(output, cur).
-        ggml_tensor* logits = ggml_mul_mat(ctx, lm_head_t, cur);        // [vocab, b]
+        ggml_tensor* logits = use_selector ? nullptr : ggml_mul_mat(ctx, lm_head_t, cur);        // [vocab, b]
         // Softmax on device: argmax is invariant under it, and the winning
         // probability IS the confidence the executor multiplies cumulatively.
-        ggml_tensor* probs = ggml_soft_max(ctx, logits);
+        ggml_tensor* probs = use_selector ? nullptr : ggml_soft_max(ctx, logits);
 
         // Reduce to (argmax id, winning probability) ON DEVICE. llama.cpp pulls the
         // whole [vocab, b] block back every draft step -- 202048*16*4 = 12.9 MB of
@@ -585,20 +858,37 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         // large share of its per-step cost. Two b-element tensors carry everything
         // the caller needs: argmax is invariant under softmax, and the winning
         // probability IS the confidence the executor multiplies cumulatively.
-        ggml_tensor* am = ggml_argmax(ctx, probs);                            // [b] I32
-        ggml_tensor* am2 = ggml_reshape_2d(ctx, am, 1, b);                    // [1, b]
-        ggml_tensor* pr3 = ggml_reshape_3d(ctx, probs, 1, vocab_size, b);     // [1, vocab, b]
-        ggml_tensor* mp = ggml_get_rows(ctx, pr3, am2);                       // [1, 1, b] F32
-        ggml_tensor* out = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, b);
-        ggml_tensor* out_conf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b);
-        ggml_tensor* out_node = ggml_cpy(ctx, am, out);
-        ggml_tensor* conf_node = ggml_cpy(ctx, ggml_reshape_1d(ctx, mp, b), out_conf);
-        ggml_set_output(out_node);
-        ggml_set_output(conf_node);
+        ggml_tensor* out = nullptr;
+        ggml_tensor* out_conf = nullptr;
+        ggml_tensor* out_node = nullptr;
+        ggml_tensor* conf_node = nullptr;
+        if (!use_selector)
+        {
+            ggml_tensor* am = ggml_argmax(ctx, probs);                            // [b] I32
+            ggml_tensor* am2 = ggml_reshape_2d(ctx, am, 1, b);                    // [1, b]
+            ggml_tensor* pr3 = ggml_reshape_3d(ctx, probs, 1, vocab_size, b);     // [1, vocab, b]
+            ggml_tensor* mp = ggml_get_rows(ctx, pr3, am2);                       // [1, 1, b] F32
+            out = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, b);
+            out_conf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b);
+            out_node = ggml_cpy(ctx, am, out);
+            conf_node = ggml_cpy(ctx, ggml_reshape_1d(ctx, mp, b), out_conf);
+            ggml_set_output(out_node);
+            ggml_set_output(conf_node);
+        }
 
-        ggml_cgraph* graph = ggml_new_graph_custom(ctx, static_cast<std::size_t>(num_layers) * 128 + 512, false);
-        ggml_build_forward_expand(graph, out_node);
-        ggml_build_forward_expand(graph, conf_node);
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, static_cast<std::size_t>(num_layers) * 256 + 1024, false);
+        if (use_selector)
+        {
+            ggml_build_forward_expand(graph, sel_cand);
+            ggml_build_forward_expand(graph, sel_s0);
+            if (sel_scores != nullptr)
+                ggml_build_forward_expand(graph, sel_scores);
+        }
+        else
+        {
+            ggml_build_forward_expand(graph, out_node);
+            ggml_build_forward_expand(graph, conf_node);
+        }
 
         DfBinder binder;
         binder.dev = ggml_backend_get_device(g_backend);
@@ -621,6 +911,26 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             binder.bind(lt.k_norm_w,    k_norm_arr[l],    head_norm_bytes, true);
             binder.bind(lt.ring_k, ring_k_arr[l], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             binder.bind(lt.ring_v, ring_v_arr[l], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            if (use_conv)
+            {
+                const std::size_t conv_base_bytes =
+                    2u * static_cast<std::size_t>(conv_taps) * hidden_size * sizeof(float);
+                binder.bind(lt.attn_conv_base, attn_conv_base_arr[l], conv_base_bytes, true);
+                binder.bind(lt.ffn_conv_base, ffn_conv_base_arr[l], conv_base_bytes, true);
+                binder.bind(lt.attn_conv_proj, attn_conv_proj_arr[l],
+                            static_cast<std::size_t>(attn_conv_proj_bytes_arr[l]), true);
+                binder.bind(lt.ffn_conv_proj, ffn_conv_proj_arr[l],
+                            static_cast<std::size_t>(ffn_conv_proj_bytes_arr[l]), true);
+            }
+        }
+        if (use_selector)
+        {
+            binder.bind(sel_hidden_t, const_cast<void*>(sel_hidden_data),
+                        static_cast<std::size_t>(sel_hidden_bytes), true);
+            binder.bind(sel_pred_t, const_cast<void*>(sel_pred_data),
+                        static_cast<std::size_t>(sel_pred_bytes), true);
+            binder.bind(sel_succ_t, const_cast<void*>(sel_succ_data),
+                        static_cast<std::size_t>(sel_succ_bytes), true);
         }
         binder.bind(out_norm_t, const_cast<void*>(out_norm_data), norm_bytes, true);
         binder.bind(tok_t, const_cast<void*>(tok_embd_data), static_cast<std::size_t>(tok_embd_bytes), true);
@@ -656,6 +966,13 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         ggml_backend_tensor_set(ids_t, block_ids, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
         ggml_backend_tensor_set(pos_t, positions, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+        for (int tap = 1; tap < (use_conv ? conv_taps : 0); tap++)
+        {
+            ggml_backend_tensor_set(conv_shift[tap], conv_shift_data[tap].data(), 0,
+                static_cast<std::size_t>(b) * sizeof(std::int32_t));
+            ggml_backend_tensor_set(conv_mask[tap], conv_mask_data[tap].data(), 0,
+                static_cast<std::size_t>(b) * sizeof(float));
+        }
 
         if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
         {
@@ -666,10 +983,25 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
         // See the replay path above: Metal must drain before reading the ids.
         if (g_backend_type == BACKEND_TYPE_METAL)
             ggml_backend_synchronize(g_backend);
-        ggml_backend_tensor_get(out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
-        finalize_compute_with_download(out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
-        // Unconditional: conf_out is the caller's host confidence array and on
-        // Metal async mode the download above is only QUEUED.
+        if (use_selector)
+        {
+            ggml_backend_tensor_get(sel_cand, sel_cand_out, 0,
+                static_cast<std::size_t>(sel_top_k) * gamma * sizeof(std::int32_t));
+            ggml_backend_tensor_get(sel_s0, sel_scores_out, 0,
+                static_cast<std::size_t>(sel_top_k) * sizeof(float));
+            if (sel_scores != nullptr)
+            {
+                finalize_compute_with_download(sel_scores, sel_scores_out + sel_top_k,
+                    (sel_scores_floats - sel_top_k) * sizeof(float));
+            }
+        }
+        else
+        {
+            ggml_backend_tensor_get(out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
+            finalize_compute_with_download(out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
+        }
+        // Unconditional: the outputs above land in caller host arrays and on Metal
+        // async mode the download is only QUEUED.
         host_read_barrier();
 
         if (can_persist && slot != nullptr)
@@ -677,6 +1009,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
             slot->ctx = ctx; slot->buffer = persist_buf; slot->graph = graph;
             slot->in_main = ids_t; slot->pos = pos_t; slot->mask = mask_t;
             slot->out = out; slot->out_conf = out_conf;
+            slot->out_s0 = sel_s0; slot->out_scores = sel_scores; slot->out_cand = sel_cand;
             slot->sig = sig; slot->sig_ring = sig_ring; slot->n_rows = b; slot->out_count = out_count;
             slot->valid = true;
         }

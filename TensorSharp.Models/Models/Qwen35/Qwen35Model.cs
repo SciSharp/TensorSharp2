@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -284,6 +284,18 @@ namespace TensorSharp.Models
 
         // Pre-resolved weight references for non-MoE FFN paths.
         private QuantizedWeight[] _ffnGateUpQW;
+        // Mixed-quant "UD"/dynamic GGUFs can store ffn_gate and ffn_up in different
+        // GGML types (IQ2_XS vs IQ2_S, IQ1_S vs IQ2_XXS, ...). One fused tensor
+        // cannot represent that, and both of those types need an importance matrix
+        // to requantize, so ModelBase.FuseGateUpWeights leaves such a layer alone.
+        // These hold the unfused pair for exactly those layers; the FFN then runs
+        // two matmuls instead of one, with the weights untouched. Half the layers
+        // of an unsloth Qwen3.8 UD quant land here, so this is the normal case for
+        // that family, not a corner.
+        private QuantizedWeight[] _ffnGateSplitQW;
+        private Tensor[] _ffnGateSplitF32;
+        private QuantizedWeight[] _ffnUpSplitQW;
+        private Tensor[] _ffnUpSplitF32;
         private Tensor[] _ffnGateUpF32;
         private QuantizedWeight[] _ffnDownQW;
         private Tensor[] _ffnDownF32;
@@ -356,7 +368,11 @@ namespace TensorSharp.Models
         private long _mlxEvalBoundaryTicks;
         private long _mlxCacheEvalTicks;
 
-        public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
+        /// <param name="draftModelPath">Optional DFlash / DFlash2 drafter GGUF
+        /// (general.architecture = "dflash"). When present it replaces the trunk's
+        /// own NextN/MTP block as the drafter.</param>
+        public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            string draftModelPath = null)
             : base(ggufPath, backend, tpDegree, tpGroup)
         {
             _useMetalGdnInplaceState = ShouldUseMetalGdnInplaceState(
@@ -489,6 +505,11 @@ namespace TensorSharp.Models
             InitGDNBuffers();
             CacheRecurrentWeights();
             CacheMtpWeights();
+
+            // --draft-model / TS_QWEN35_DFLASH. Last, because the drafter's tensors
+            // are merged into the trunk's weight dictionaries and its KV ring comes
+            // off the same allocator.
+            TryLoadQwen35DFlash(draftModelPath);
         }
 
         private unsafe void FuseAttentionProjectionWeights()
@@ -963,6 +984,10 @@ namespace TensorSharp.Models
 
             _ffnGateUpQW = new QuantizedWeight[n];
             _ffnGateUpF32 = new Tensor[n];
+            _ffnGateSplitQW = new QuantizedWeight[n];
+            _ffnGateSplitF32 = new Tensor[n];
+            _ffnUpSplitQW = new QuantizedWeight[n];
+            _ffnUpSplitF32 = new Tensor[n];
             _ffnDownQW = new QuantizedWeight[n];
             _ffnDownF32 = new Tensor[n];
 
@@ -981,6 +1006,15 @@ namespace TensorSharp.Models
                 _weights.TryGetValue(_postAttnNormKey[l], out _postAttnNormW[l]);
                 _quantWeights.TryGetValue(_ffnGateUpKey[l], out _ffnGateUpQW[l]);
                 _weights.TryGetValue(_ffnGateUpKey[l], out _ffnGateUpF32[l]);
+                if (_ffnGateUpQW[l] == null && _ffnGateUpF32[l] == null)
+                {
+                    // Unfused mixed-quant layer: keep the pair as it was quantized.
+                    string p = $"blk.{l}.";
+                    _quantWeights.TryGetValue(p + "ffn_gate.weight", out _ffnGateSplitQW[l]);
+                    _weights.TryGetValue(p + "ffn_gate.weight", out _ffnGateSplitF32[l]);
+                    _quantWeights.TryGetValue(p + "ffn_up.weight", out _ffnUpSplitQW[l]);
+                    _weights.TryGetValue(p + "ffn_up.weight", out _ffnUpSplitF32[l]);
+                }
                 _quantWeights.TryGetValue(_ffnDownKey[l], out _ffnDownQW[l]);
                 _weights.TryGetValue(_ffnDownKey[l], out _ffnDownF32[l]);
 
@@ -1469,6 +1503,9 @@ namespace TensorSharp.Models
 
         private bool CopyGdnStateOut(int layer, Span<byte> destination, out int written)
         {
+            // Reads the host mirrors; see RecurrentBlock.
+            DrainDeviceRecurrentState();
+
             written = 0;
             SyncCudaGdnConvStateToHost(layer);
             float[] conv = _convState[layer];
@@ -1498,6 +1535,9 @@ namespace TensorSharp.Models
 
         private bool CopyGdnStateIn(int layer, ReadOnlySpan<byte> source, out int read)
         {
+            // Writes the host mirrors, so whatever the device holds is superseded.
+            DrainDeviceRecurrentState();
+
             read = 0;
             float[] conv = _convState[layer];
             int convBytes = conv.Length * sizeof(float);
@@ -3389,6 +3429,8 @@ namespace TensorSharp.Models
         private Tensor FFNCached(Tensor input, int layer, int seqLen)
         {
             int intermSize = Config.IntermediateSize;
+            if (_ffnGateUpQW[layer] == null && _ffnGateUpF32[layer] == null)
+                return FFNCachedSplitGateUp(input, layer, seqLen);
             Tensor gateUp = LinearForwardCached(input, _ffnGateUpQW[layer], _ffnGateUpF32[layer]);
             int halfDim = intermSize > 0 ? intermSize : (int)(gateUp.Sizes[1] / 2);
 
@@ -3478,6 +3520,15 @@ namespace TensorSharp.Models
             // Fused norm + gate_up projection. Decode reuses a pre-allocated [1, 2*intermSize]
             // buffer to avoid one tensor allocation per layer per token.
             Tensor gateUp = null;
+            if (_ffnGateUpQW[layer] == null && _ffnGateUpF32[layer] == null)
+            {
+                // Unfused mixed-quant gate/up: norm once, then two matmuls.
+                Tensor splitNormed = RMSNormOpCached(residual, postNormW);
+                Tensor splitGate = FFNCachedSplitGateUp(splitNormed, layer, seqLen);
+                splitNormed.Dispose();
+                return splitGate;
+            }
+
             bool ownsGateUp = true;
             if (postNormW != null && _ffnGateUpQW[layer] != null && IsGgmlBackend)
             {
@@ -3548,6 +3599,29 @@ namespace TensorSharp.Models
             gate.Dispose();
             return down;
         }
+
+        /// <summary>
+        /// silu(gate(x)) * up(x) -> down for a layer whose gate and up could not be
+        /// fused (different GGML types, neither requantizable without an importance
+        /// matrix). Same arithmetic as the fused path, one extra matmul.
+        /// </summary>
+        private Tensor FFNCachedSplitGateUp(Tensor input, int layer, int seqLen)
+        {
+            Tensor gate = LinearForwardCached(input, _ffnGateSplitQW[layer], _ffnGateSplitF32[layer]);
+            Tensor up = LinearForwardCached(input, _ffnUpSplitQW[layer], _ffnUpSplitF32[layer]);
+            Ops.SiLUMul(gate, gate, up);
+            up.Dispose();
+            Tensor down = LinearForwardCached(gate, _ffnDownQW[layer], _ffnDownF32[layer]);
+            gate.Dispose();
+            return down;
+        }
+
+        /// <summary>True when layer <paramref name="l"/> has a usable dense FFN,
+        /// fused or split.</summary>
+        private bool HasDenseFfnWeights(int l)
+            => (_ffnGateUpQW[l] != null || _ffnGateUpF32[l] != null)
+               || ((_ffnGateSplitQW[l] != null || _ffnGateSplitF32[l] != null)
+                   && (_ffnUpSplitQW[l] != null || _ffnUpSplitF32[l] != null));
 
         /// <summary>
         /// RMSNorm with a pre-resolved alpha tensor, avoiding the dictionary lookup that
@@ -5993,6 +6067,8 @@ namespace TensorSharp.Models
 
             // Free the on-device MoE decode pointer tables (device u64 buffers).
             FreeQwenCudaMoETables();
+
+            DisposeDFlash();
 
             VisionEncoder?.Dispose();
             foreach (var (visionEmbeddings, _) in _visionEmbeddingsList)

@@ -370,7 +370,7 @@ namespace TensorSharp.Models
         }
     }
 
-    public abstract class ModelBase : IModelArchitecture
+    public abstract partial class ModelBase : IModelArchitecture
     {
         public ModelConfig Config { get; protected set; }
         public ITokenizer Tokenizer { get; protected set; }
@@ -6303,7 +6303,7 @@ namespace TensorSharp.Models
                 // RoPE when the t/h/w position components are equal, which they are
                 // for text tokens, so the vision tower (mmproj) is not required.
                 "qwen3" or "qwen2" or "qwen2vl" or "qwen2_vl" => new Qwen3Model(ggufPath, backend, tpDegree, tpGroup),
-                "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend, tpDegree, tpGroup),
+                "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 "gemma3" => new Gemma3Model(ggufPath, backend, tpDegree, tpGroup),
                 "gemma4" => new Gemma4Model(ggufPath, backend, tpDegree, tpGroup),
                 "diffusion-gemma" or "diffusion_gemma" => new DiffusionGemmaModel(ggufPath, backend),

@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -1626,7 +1626,9 @@ namespace TensorSharp.GGML
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 kNormArr, ringKArr, ringVArr, ringDtype);
 
-        /// <summary>DFlash PASS C (block draft + borrowed LM head + softmax + on-device top-1) in one GGML graph.</summary>
+        /// <summary>DFlash PASS C in one GGML graph: the block draft, then either the
+        /// borrowed LM head + softmax + on-device top-1 (plain DFlash) or the DFlash2
+        /// candidate lattice the caller walks (selRank &gt; 0).</summary>
         public static bool DFlashDraftBlock(
             int[] blockIds, int blockLen, int[] positions,
             int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
@@ -1646,7 +1648,19 @@ namespace TensorSharp.GGML
             IntPtr outNormData,
             IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
             IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocabSize, int[] idsOut, float[] confOut)
+            int vocabSize, int[] idsOut, float[] confOut,
+            int convTaps, int convGroupSize, int convNumGroups,
+            IntPtr[] attnConvBaseArr,
+            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
+            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
+            IntPtr[] ffnConvBaseArr,
+            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
+            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
+            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
+            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
+            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
+            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
+            float[] selScoresOut, int[] selCandOut)
             => GgmlNative.DFlashDraftBlock(blockIds, blockLen, positions,
                 numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
                 eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
@@ -1663,7 +1677,17 @@ namespace TensorSharp.GGML
                 ringKArr, ringVArr, ringDtype, outNormData,
                 tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes,
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                vocabSize, idsOut, confOut);
+                vocabSize, idsOut, confOut,
+                convTaps, convGroupSize, convNumGroups,
+                attnConvBaseArr, attnConvProjArr, attnConvProjTypeArr,
+                attnConvProjNe0Arr, attnConvProjNe1Arr, attnConvProjBytesArr,
+                ffnConvBaseArr, ffnConvProjArr, ffnConvProjTypeArr,
+                ffnConvProjNe0Arr, ffnConvProjNe1Arr, ffnConvProjBytesArr,
+                selRank, selTopK, selLogitScale, selLogitSoftcap,
+                selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes,
+                selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes,
+                selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes,
+                selScoresOut, selCandOut);
 
         /// <summary>Drop the persistent DFlash graphs.</summary>
         public static void DFlashResetCaches() => GgmlNative.DFlashResetCaches();
@@ -2405,7 +2429,12 @@ namespace TensorSharp.GGML
         /// tokens of one sequence as a single graph. Outputs per-row logits
         /// [vocab, N] and post-norm hidden [hidden, N] (normedOut), advancing each
         /// recurrent layer's GDN state from ConvStateIn/DeltaStateIn to
-        /// ConvStateOut/DeltaStateOut. Returns false on an unsupported shape.</summary>
+        /// ConvStateOut/DeltaStateOut. Returns false on an unsupported shape.
+        ///
+        /// captureLayers/captureData additionally tap the residual ENTERING each
+        /// named layer into captureCount consecutive [hidden, N] blocks - what a
+        /// DFlash drafter's encoder consumes, and the reason speculation on this
+        /// trunk does not have to fall back to the op-by-op loop.</summary>
         public static bool Qwen35ModelVerify(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
             IntPtr hidden, int hiddenSize, int startPos, int numTokens,
@@ -2419,7 +2448,10 @@ namespace TensorSharp.GGML
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNorm, IntPtr normedOut, int nLogitRows = -1,
             int[] mropePos = null, int[] mropeSections = null,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+            int tpDegree = 1, IntPtr[] tpPlanOut = null,
+            IntPtr captureData = default, int[] captureLayers = null, int captureCount = 0,
+            int stateSnapshots = 1, IntPtr stateSnapshotsUsed = default,
+            bool deviceStateCurrent = false)
         {
             return GgmlNative.Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -2432,8 +2464,25 @@ namespace TensorSharp.GGML
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
-                tpDegree, tpPlanOut);
+                tpDegree, tpPlanOut, captureData, captureLayers, captureCount, stateSnapshots,
+                stateSnapshotsUsed, deviceStateCurrent);
         }
+
+        /// <summary>Commit one recurrent-state snapshot into the live device state
+        /// (see TSGgml_Qwen35CommitStateSnapshot).</summary>
+        public static bool Qwen35CommitStateSnapshot(int slot, int numRecurrentLayers)
+            => GgmlNative.Qwen35CommitStateSnapshot(slot, numRecurrentLayers);
+
+        /// <summary>Read the live device recurrent state back into the host mirrors
+        /// (see TSGgml_Qwen35DrainDeviceState).</summary>
+        public static bool Qwen35DrainDeviceState(IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers)
+            => GgmlNative.Qwen35DrainDeviceState(convOut, deltaOut, numRecurrentLayers);
+
+        /// <summary>Pull one per-token recurrent-state snapshot out of the verify that
+        /// just ran (see TSGgml_Qwen35FetchStateSnapshot).</summary>
+        public static bool Qwen35FetchStateSnapshot(int slot, IntPtr[] convOut, IntPtr[] deltaOut,
+            int numRecurrentLayers)
+            => GgmlNative.Qwen35FetchStateSnapshot(slot, convOut, deltaOut, numRecurrentLayers);
 
         /// <summary>Release every rank's parked tensor-parallel prefill graph
         /// (see TSGgml_Qwen35ReleaseVerifyTpGraphs).</summary>

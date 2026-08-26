@@ -336,6 +336,12 @@ namespace TensorSharp.Runtime.Speculative
             Stats.TokensDrafted += k;
             Stats.TokensAccepted += m;
 
+            // Tell the trunk the accept count BEFORE deciding how to roll back: a
+            // trunk that deferred post-verify state until this was known settles it
+            // now, and that is what can turn the partial-acceptance branch below from
+            // a whole second forward into a position rewind.
+            _trunk.OnVerifyAccepted(m, k);
+
             // The tokens this step commits to the trunk: the verify batch's
             // accepted prefix plus the token it started from.
             int[] keep = new int[m + 1];

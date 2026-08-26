@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -2877,6 +2877,14 @@ namespace TensorSharp.Cli
                     decoder.TokensDrafted, decoder.TokensAccepted,
                     decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps,
                     decoder.ParkedSteps, decoder.PlainMsPerToken, decoder.SpecMsPerToken);
+                // Where a speculative step actually goes. Cheap (one timestamp per
+                // phase per step) and the only way to tell a slow DRAFTER from a slow
+                // verify or an expensive rollback without a profiler.
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "cli.inference speculative timing: draftMs={DraftMs:F0} verifyMs={VerifyMs:F0} "
+                    + "snapshotMs={SnapMs:F0} rollbackMs={RollMs:F0} catchUpMs={CatchMs:F0} plainMs={PlainMs:F0}",
+                    decoder.Stats.DraftMs, decoder.Stats.VerifyMs, decoder.Stats.SnapshotMs,
+                    decoder.Stats.RollbackMs, decoder.Stats.CatchUpMs, decoder.Stats.PlainMs);
                 _log.LogInformation(LogEventIds.ChatCompleted,
                     "cli.inference finishReason={FinishReason} tokens={Tokens}",
                     trimmedAtStop != null ? "stop_sequence" : hitEos ? "eos" : "max_tokens",

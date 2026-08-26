@@ -182,7 +182,7 @@ namespace TensorSharp.Runtime.Speculative
             if (target is not IDraftHead head || head.DraftHeadKind != DraftHeadKind.PerToken)
                 return null;
             return new DraftHeadSpeculator(head, target.Config.VocabSize, target.SpecFeatureSize,
-                Math.Max(1, options.MaxDraftTokens));
+                ResolveDraftWindow(target, options));
         }
 
         private static ISpeculator CreateBlock(ISpeculativeTarget target, SpeculationOptions options)
@@ -192,7 +192,22 @@ namespace TensorSharp.Runtime.Speculative
             int block = head.DraftBlockSize;
             if (block < 1)
                 return null;
-            return new BlockDraftSpeculator(head, block, Math.Max(1, options.MaxDraftTokens));
+            return new BlockDraftSpeculator(head, block, ResolveDraftWindow(target, options));
+        }
+
+        /// <summary>
+        /// The window to draft with: what the operator asked for, or - when they
+        /// asked for nothing - narrowed to what the trunk prefers. See
+        /// <see cref="ISpeculativeTarget.SpecPreferredDraftWindow"/> for why the
+        /// preference belongs to the target model and not to the algorithm.
+        /// </summary>
+        private static int ResolveDraftWindow(ISpeculativeTarget target, SpeculationOptions options)
+        {
+            int window = Math.Max(1, options.MaxDraftTokens);
+            int preferred = target.SpecPreferredDraftWindow;
+            if (!options.MaxDraftTokensExplicit && preferred > 0)
+                window = Math.Min(window, preferred);
+            return window;
         }
     }
 }
