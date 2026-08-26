@@ -58,13 +58,14 @@ namespace TensorSharp.Models.MiniMaxH3
         /// are already there; joining first would serialize 4.2 s of read before 4.3 s of
         /// copy.</para>
         ///
-        /// <para>Serial is the default because overlapping measured WORSE: 63.7 s against
-        /// 60.4 s at 640x384. The prefault itself finishes faster when overlapped (2.2 s
-        /// against 4.0 s, since it shares the run with GPU work), but the text encoder it
-        /// overlaps with streams its own 17 GB through the same page cache and evicts every
-        /// page the prefault just placed - the first denoiser step went back to 13.7 s,
-        /// against 7.3 s when the read happens after the encoder has been released. Mode 2
-        /// is kept because a host with enough RAM to hold both files would flip that result.</para></summary>
+        /// <para>Mode 2 - overlapping the read with TEXT CONDITIONING rather than with the
+        /// upload - is the one that loses, at 63.7 s against 60.4 s in the run that compared
+        /// them. The read itself finishes faster there (2.2 s against 4.0 s, since it shares
+        /// the wall clock with GPU work), but the encoder it overlaps streams its own 17 GB
+        /// through the same page cache and evicts every page the prefault just placed: the
+        /// first denoiser step went back to 13.7 s, against 7.3 s when the read happens after
+        /// the encoder has been released. It is kept because a host with enough RAM to hold
+        /// both files at once would flip that result.</para></summary>
         private static int PrefaultMode
         {
             get

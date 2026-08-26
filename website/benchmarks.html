@@ -84,7 +84,10 @@
   <p>Two things do <em>not</em> speed this model up on this host. <code>--tp 3</code> takes pp2048 / tg64 from 915.9 / 43.9 to 505.6 / 17.6 — each of the 78 layers needs two all-reduces of a <code>[6144, n_tokens]</code> hidden state, and PCIe with no NVLink cannot pay for that. <code>--n-cpu-moe 30</code> takes it to 94.7 / 16.4. Both are there so a checkpoint that would not otherwise fit runs at all: offload raises the context the loader can size from 342,272 to 646,400 tokens. See <a href="models-text.html#glm">GLM 5.x</a>.</p>
 
   <h2 id="minimax-h3">MiniMax-H3: video and audio in one pass</h2>
-  <p>MiniMax-H3 denoises the picture and a native <strong>32&nbsp;kHz stereo</strong> soundtrack together in one packed latent, so every figure below is for a run that produces both. Apple <strong>M5 Pro</strong>, <code>ggml_metal</code>, <strong>22 frames, 8 steps, identical seed</strong>, against <strong><code>stable-diffusion.cpp</code></strong> at its best-performing configuration:</p>
+  <p>MiniMax-H3 denoises the picture and a native <strong>32&nbsp;kHz stereo</strong> soundtrack together in one packed latent, so every figure below is for a run that produces both. Two machines have been measured against <strong><code>stable-diffusion.cpp</code></strong> on the same 22-frame, 8-step request, and <strong>they do not agree</strong>. Both are below, each labelled with its hardware; neither replaces the other, and an average of the two would describe no machine that exists.</p>
+
+  <h3>Apple M5 Pro, <code>ggml_metal</code></h3>
+  <p><strong>22 frames, 8 steps, identical seed</strong>, against <code>stable-diffusion.cpp</code> at its best-performing configuration:</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Resolution</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>Speedup</th></tr></thead>
@@ -95,6 +98,34 @@
   </table>
   </div>
   <p>Read the second row as the real one: <strong>faces need pixels</strong>, so 640×384 is the starting point and 256×256 is a corner the ratio flatters rather than a size to generate at. Both rows are the same 22-frame, 8-step request, and because the checkpoint is CFG-distilled those 8 steps are 8 DiT passes rather than 16. → <a href="models-video.html#minimax-h3">MiniMax-H3 downloads and modes</a></p>
+
+  <h3>RTX 3080 Laptop 16 GB, <code>ggml_cuda</code></h3>
+  <p>The same request on a deliberately memory-starved box — <strong>16,384 MiB of VRAM and 31.7 GB of RAM against a 33.5 GB model set</strong> (DiT 10.64 GiB, Qwen3-VL-32B 16.97 GiB, video VAE 4.85 GiB, audio VAE 0.56 GiB, the identical files on both engines). 22 frames, 8 steps, identical seed, best of three, shipped build, against <code>stable-diffusion.cpp</code> <code>97d2990</code> with ggml <code>8e800ce</code> rebuilt <code>SD_CUDA=ON</code> for arch 86. Here <code>stable-diffusion.cpp</code> takes the wall clock:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Resolution</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>End to end</th></tr></thead>
+    <tbody>
+      <tr><td>256×256</td><td><span class="yes">37.8 s</span></td><td>43.6 s</td><td>sd.cpp 1.15× faster</td></tr>
+      <tr><td>640×384</td><td><span class="yes">59.8 s</span></td><td>63.7 s</td><td>sd.cpp 1.07× faster</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Peak VRAM on the 16,384 MiB card: TensorSharp <strong>15,780 MiB</strong>, <code>stable-diffusion.cpp</code> <strong>12,035 MiB</strong>. sd.cpp was given <code>--auto-fit --stream-layers --diffusion-fa --rng cpu</code>; its default <code>--offload-to-cpu</code> path cannot run this model on this machine at all, because it tries to pin 17.7 GB into 12.3 GB of free RAM.</p>
+  <p><strong>Per denoise step TensorSharp is ahead on CUDA as well</strong> — <strong>3.325 s against 3.338 s</strong> by the 8-vs-16-step slope, which is the measurement that isolates compute from setup, with 3.00–3.11 s seen directly per step. What it gives away is fixed setup cost, and roughly <strong>3 s of the remaining 3.9 s is not inference at all</strong>: H.264 encoding, where sd.cpp writes MJPEG + PCM into an AVI, plus .NET process startup against a native binary.</p>
+  <div class="callout note"><div class="ic">⚖️</div><p>Two hardware points, two different answers, and both are kept. On the M5 Pro TensorSharp finishes the whole run <strong>1.7–2.4× sooner</strong>; on this 16 GB CUDA laptop it is faster <em>per step</em> and <strong>1.07–1.15× slower end to end</strong>, because neither the weights nor the page cache fit and setup dominates a run this short. On a 16 GB card, plan on the CUDA rows. The per-step margin is 13 ms, so a longer run moves the ratio only slowly.</p></div>
+
+  <h3>What the last optimization pass moved</h3>
+  <p>Same RTX 3080 Laptop, same 22-frame, 8-step workload, before and after:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Resolution</th><th>Before</th><th>After</th><th>Speedup</th></tr></thead>
+    <tbody>
+      <tr><td>640×384</td><td>89.0 s</td><td><span class="yes">63.7 s</span></td><td><span class="yes">1.40×</span></td></tr>
+      <tr><td>256×256</td><td>67.2 s</td><td><span class="yes">43.6 s</span></td><td><span class="yes">1.54×</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Both changes aim at the same 16 GB ceiling. The finished denoiser now hands its device residency back <em>before</em> the video VAE loads, which takes peak VRAM during decode from <strong>16,041 MiB to about 5,600 MiB</strong> and is worth <strong>22 s</strong> at 640×384 — the finished denoiser and the video VAE come to 15.8 GB and do not both fit, and WDDM does not fail that allocation, it silently backs the overflow with host memory and runs the decode at PCIe speed. And the denoiser file is prefaulted in parallel with its own upload, taking the first denoise step from <strong>14.87 s to ≈10.2 s</strong>: weights are bound as pointers into the mmapped GGUF, so without it the first host-to-device copy faults every page in from disk as it copies, at <strong>0.91 GB/s</strong> against 5.97 GB/s from resident pageable memory. Output is byte-identical with the prefault on and off.</p>
 
   <h3>Which lever to pull, and in what order</h3>
   <p><strong>Steps first.</strong> The default is <strong>20</strong> and <strong>4–8</strong> is the fast operating point — some chromatic fringing shows up around moving subjects at 4–8 and is gone by ~20. There is no guidance pass to cache or skip on top of that: the checkpoint ships <strong>CFG-distilled</strong>, <code>--cfg 1.0</code> is required and anything higher is refused, which also leaves <code>--negative-prompt</code> and <code>--cfg-cache-stride</code> inert here — no unconditional pass runs for them to act on. <strong>Then resolution</strong>: <code>--width</code> / <code>--height</code>, rounded up to a multiple of 32, default 640×384. <strong>Then frame count</strong>: <code>--video-frames</code>, snapped up onto the <code>17k+5</code> grid (5, 22, 39, 56, 73, 90, 107 …) at a pinned 24 fps. <strong>Then the number of references</strong>, which past about four outweighs the step count entirely.</p>

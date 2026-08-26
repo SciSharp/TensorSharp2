@@ -166,6 +166,10 @@
       <tr><td><code>TS_WAN_VAE / TS_WAN_TE / TS_WAN_DIT2</code></td><td>上面第一、第二与第四项的旧拼写，仍然有效。音频 VAE 没有对应的 <code>TS_WAN_*</code> 名字。</td></tr>
       <tr><td><code>TS_VIDEO_TOKENIZER</code></td><td>存放 MiniMax-H3 的 <code>vocab.json</code> 与 <code>merges.txt</code> 的目录。文本编码器 GGUF 不带分词器，而自动下载只能补全属于命令行选项的东西，所以要从 <code>MiniMaxAI/MiniMax-H3</code> 的 <code>processor/</code> 取这两个文件，放到编码器旁边或用该变量指向它们所在的目录。</td></tr>
       <tr><td><code>TS_H3_TRACE</code></td><td><code>1</code> 打印 MiniMax-H3 每个去噪步的潜变量与速度幅值。采样器本身已经会在速度出现非有限值时让请求失败并指出是第几步，而不是写出一个全黑的片段；该变量用于看清幅值是在哪里越出 FP16 范围的。</td></tr>
+      <tr><td><code>TS_H3_PREFAULT</code></td><td>顺序读一遍 MiniMax-H3 的去噪器文件，使它的首次上传是从页缓存里做一次拷贝，而不是在 host-to-device 传输内部引发一场缺页风暴（边拷边缺页 0.91 GB/s，页面已常驻时 5.97 GB/s，RTX 3080 Laptop）。默认 <code>3</code>：文本主干交出隐藏状态的那一刻就开始读，并与上传流水线并行，而不是先把它读完再上传。<code>1</code> 为串行；<code>2</code> 与文本条件化重叠 —— 实测更差，因为编码器会把自己的 17 GB 也刷过同一份页缓存，把刚放进去的页挤掉；<code>0</code> 关闭。各模式输出逐字节一致。</td></tr>
+      <tr><td><code>TS_H3_PREFAULT_THREADS</code></td><td>预读使用的读取流数（默认 <code>1</code>）。调大在这台机器上实测更差 —— RTX 3080 Laptop、640x384、三次取最好：1 流 63.9 秒、4 流 64.9 秒、16 流 66.6 秒 —— 因为这次读取是与编码器拆解、以及它正在预热的那次上传并发进行的，并非独占整台机器。</td></tr>
+      <tr><td><code>TS_H3_PHASE</code></td><td><code>1</code> 打印 MiniMax-H3 的分阶段耗时：文本编码器 open / 主干 / 拆解、预读、每一个去噪步，以及 VAE open / decode。原有的一行汇总只告诉你哪个阶段慢，它告诉你慢在这个阶段的哪一半。</td></tr>
+      <tr><td><code>TS_H3_TE_GROUP</code></td><td><code>&lt;n&gt;</code> 让 MiniMax-H3 那 50 层文本编码器主干按每组 <code>n</code> 层运行，每组结束即交还该组的设备副本。默认关闭：在 16 GB 的 RTX 3080 Laptop 上它确实消除了主干的溢出（峰值 16041 -> 12981 MiB）且逐位一致，但主干是对一段短提示的一次性 prefill，反而慢 3 秒。</td></tr>
       <tr><td><code>TS_WAN_DIT_KV_F16</code></td><td><code>0</code> 恢复 Wan DiT 中 F32 的注意力键值。默认使用 F16：单次 27k token 自注意力快 2.02×，DiT 余弦同为 0.999964。</td></tr>
       <tr><td><code>TS_WAN_VAE_MPS_CONV</code></td><td>仅 Metal：<code>0</code> 恢复 Wan VAE 卷积的 ggml im2col+GEMM 下降路径。默认走 MPSGraph（736x544x81f 的一次解码从 159 秒降到 80 秒，数值不变）。</td></tr>
       <tr><td><code>TS_WAN_VAE_GEMM_MAX_MB / TS_WAN_VAE_TILE</code></td><td>Wan VAE im2col GEMM 预算（MB，默认按设备可用显存推导），以及用 <code>0</code> 关闭 ~0.5 MP 以上使用的水平分带切块。</td></tr>

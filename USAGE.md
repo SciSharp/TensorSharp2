@@ -677,6 +677,21 @@ M5 Pro with Metal at 22 frames, 8 steps and an identical seed, it runs 2.4× fas
 than stable-diffusion.cpp at 256×256 (49.3 s → **20.9 s**) and 1.7× at 640×384
 (108.5 s → **63.1 s**).
 
+That comparison is hardware-dependent, and on a memory-starved card it inverts. On a
+16 GB RTX 3080 Laptop with CUDA — same 22 frames, 8 steps, best of three —
+stable-diffusion.cpp finishes first end to end: 1.15× at 256×256 (37.8 s against
+43.6 s) and 1.07× at 640×384 (59.8 s against 63.7 s). Per **denoise step** TensorSharp
+is still ahead on that card (3.325 s against 3.338 s by the 8-vs-16-step slope); what
+it loses is fixed setup cost, and roughly 3 s of the residual 3.9 s is not inference at
+all — H.264 encoding, where stable-diffusion.cpp writes MJPEG+PCM into an AVI, plus
+.NET process startup against a native binary. That machine holds 16 GB of VRAM and
+31.7 GB of RAM against a 33.5 GB model set, so neither the weights nor the page cache
+fit and setup dominates the wall clock; peak VRAM was 15 780 MiB against
+stable-diffusion.cpp's 12 035 MiB on a 16 384 MiB card. stable-diffusion.cpp ran with
+`--auto-fit --stream-layers --diffusion-fa --rng cpu`, because its default
+`--offload-to-cpu` path cannot run this model there at all — it tries to pin 17.7 GB
+into 12.3 GB of free RAM.
+
 Four networks are needed — one of the two denoisers plus three shared companions.
 Each is loaded and released in turn, so peak VRAM is the largest of them rather than
 their sum:
@@ -702,6 +717,27 @@ generated one. The text encoder ships **no tokenizer**, so
 `vocab.json` and `merges.txt` from
 [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
 must be beside it (or point `TS_VIDEO_TOKENIZER` at them).
+
+**What a 16 GB card does with them.** Two behaviours matter once the set stops fitting.
+The denoiser's device residency is handed back **before** the video VAE loads, whenever
+the two would not fit together — otherwise a finished 10.6 GB denoiser sits beside a
+5.2 GB VAE on a 16 GB card, and WDDM does not fail that allocation, it backs the
+overflow with shared host memory and the whole decode runs at PCIe speed (peak VRAM
+during decode 16 041 MiB → ~5 600 MiB, worth 22 s at 640×384). And because weights are
+bound as pointers into the mmapped GGUF, the denoiser file is read through once before
+its first upload — started as soon as the text trunk produces its hidden states, and
+pipelined with the upload rather than joined before it, since an H2D copy that faults
+its pages in as it goes measures 0.91 GB/s on this card against 5.97 GB/s once the
+pages are resident. Together, 640×384 went from 89.0 s to 63.7 s on a 16 GB RTX 3080
+Laptop (256×256: 67.2 s → 43.6 s), output byte-identical either way. The release is
+gated on measured free VRAM and the prefault on free host RAM. When the prefault stands
+down it simply carries on; it says so with
+`denoiser prefault skipped (not enough free RAM)`, but only under `TS_H3_PHASE=1` — on
+default settings a skip is silent. A machine with room for both keeps the previous
+behaviour exactly.
+`TS_H3_PHASE=1` prints the per-stage breakdown — encoder open / trunk / teardown, the
+prefault, every denoise step, VAE open / decode — which is where those seconds show up
+on your own card.
 
 The two shipped configs name all four networks, which is what lets them auto-download
 into `${modelRoot}` on the first run (~33.5 GB, or ~33.4 GB for the Ref2VA set) and be
@@ -1557,6 +1593,18 @@ The full list, including the debug and A/B knobs, is in the
 | Flash attention / fused lightning indexer | ON | `TS_GLM_FA=0`, `TS_GLM_FUSED_LID=0` fall back to primitives | — |
 | Cached built+allocated graphs | `8` | `TS_GLM_GRAPH_CACHE=N` | — |
 | Weight-load parallelism | `16` threads / `64` MB chunks | `TS_GLM_LOAD_THREADS`, `TS_GLM_LOAD_CHUNK_MB` | — |
+
+#### MiniMax-H3 video + audio
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Denoiser residency released before the video VAE loads | ON when the two would not fit in free VRAM (decode peak 16 041 → ~5 600 MiB on a 16 GB card, worth 22 s at 640×384) | — (gated on measured free VRAM) | — |
+| Prefault the denoiser GGUF before its first upload | `3` — read pipelined with the upload | `TS_H3_PREFAULT`: `0` off, `1` serial, `2` overlapped with text conditioning (worse — the encoder streams its own 17 GB through the same page cache and evicts what was just placed), `3` default | — |
+| Prefault read streams | `1` | `TS_H3_PREFAULT_THREADS=N` — more is slower here, because the read runs concurrently with the teardown and upload it is warming (640×384 best of three: 1 stream 63.9 s, 4 streams 64.9 s, 16 streams 66.6 s on a 16 GB RTX 3080 Laptop) | — |
+| Text-encoder trunk run in layer groups, each group's device copy released | OFF | `TS_H3_TE_GROUP=N` layers per group — removes the encoder's own spill (peak 16 041 → 12 981 MiB) and is bit-identical, but measured ~3 s slower on a 16 GB RTX 3080 Laptop: a one-shot prefill reads each weight once, so grouping moves all 17 GB anyway and adds allocate/invalidate churn | — |
+| Per-stage timing breakdown (encoder open / trunk / teardown, prefault, each denoise step, VAE open / decode) | OFF | `TS_H3_PHASE=1` | — |
+| Per-step latent / velocity magnitudes | OFF | `TS_H3_TRACE=1` | — |
+| Companion network + tokenizer overrides | resolved next to the denoiser | `TS_VIDEO_TEXT_ENCODER`, `TS_VIDEO_VAE`, `TS_VIDEO_AUDIO_VAE`, `TS_VIDEO_TOKENIZER` | `--video-te`, `--video-vae`, `--audio-vae` |
 
 #### Tensor parallelism & distributed inference
 

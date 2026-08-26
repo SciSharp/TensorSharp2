@@ -55,14 +55,119 @@ and velocity magnitudes for every step.
 
 ## Performance
 
-M5 Pro / Metal, 22 frames, 8 steps, identical seed, versus
+Two machines, two answers. Both are 22 frames, 8 steps, identical seed, against
 [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) at its
-best-performing configuration:
+best-performing configuration on that machine, with the same weight files on both
+engines. They are reported separately and deliberately not averaged — the CUDA machine is
+memory-starved against this model set in a way the Metal one is not, and that is where
+they part company.
+
+### M5 Pro / Metal
 
 | Resolution | stable-diffusion.cpp | TensorSharp | |
 |---|---|---|---|
 | 256×256 | 49.3 s | **20.9 s** | 2.4× faster |
 | 640×384 | 108.5 s | **63.1 s** | 1.7× faster |
+
+### RTX 3080 Laptop 16 GB / CUDA
+
+Shipped build on `ggml_cuda`, best of three. Driver 566.36, CUDA 12.6, i7-11800H,
+31.7 GB RAM, Windows 11, .NET 10.0.204.
+
+| Resolution | stable-diffusion.cpp | TensorSharp | |
+|---|---|---|---|
+| 256×256 | **37.8 s** | 43.6 s | sd.cpp 1.15× faster |
+| 640×384 | **59.8 s** | 63.7 s | sd.cpp 1.07× faster |
+
+| Engine | Peak VRAM, 640×384 |
+|---|---|
+| TensorSharp | 15 780 MiB |
+| stable-diffusion.cpp | 12 035 MiB |
+
+The card is 16 384 MiB. stable-diffusion.cpp was `97d2990` with ggml `8e800ce`, rebuilt
+from source with `SD_CUDA=ON` for arch 86 and run with
+`--auto-fit --stream-layers --diffusion-fa --rng cpu` — its default `--offload-to-cpu`
+path cannot run this model on this machine at all, because it tries to pin 17.7 GB into
+12.3 GB of free RAM.
+
+### Why the two disagree
+
+Per **denoise step** TensorSharp is ahead on CUDA as well — 3.325 s against 3.338 s by
+the 8-versus-16-step slope, and 3.00–3.11 s measured directly per step. What it loses on
+CUDA is fixed setup cost, and roughly 3 s of the remaining 3.9 s is not inference at all:
+TensorSharp encodes H.264 where sd.cpp writes MJPEG + PCM into an AVI, and a .NET process
+starts against a native binary.
+
+The two hardware points differ because the CUDA machine is a deliberately hostile one —
+16 GB of VRAM and 31.7 GB of RAM against a 33.5 GB model set, so neither the weights nor
+the page cache fit and setup dominates in a way it would not on a card that holds the
+model. Both numbers are real. Which one describes your run depends on how much memory the
+machine has, so check the hardware label before quoting either.
+
+### What this round bought — RTX 3080 Laptop 16 GB / CUDA
+
+Same machine, same workload, before and after the load-time work in
+[VRAM across four networks](#vram-across-four-networks):
+
+| Resolution | before | after | |
+|---|---|---|---|
+| 256×256 | 67.2 s | **43.6 s** | 1.54× |
+| 640×384 | 89.0 s | **63.7 s** | 1.40× |
+
+## VRAM across four networks
+
+Four networks run in sequence, so peak VRAM is `max(...)` rather than the sum — but only
+if each one is handed back before the next arrives, and only if getting the next one onto
+the card is not itself the slow part. On a 16 GB card neither was free. Everything below
+was measured on the RTX 3080 Laptop 16 GB above; `TS_H3_PHASE=1` prints the per-stage
+breakdown these numbers come from.
+
+### The denoiser is released before the video VAE loads
+
+The denoiser is ~10.6 GB at Q4_K and the video VAE another ~5.2 GB. Resident together on
+a 16 GB card that is 15.8 GB of weights before a single activation, and Windows/WDDM does
+not fail the allocation — it silently backs the overflow with shared host memory, so the
+whole decode runs at PCIe speed. The decode window sat pinned at 16 041 MiB of a
+16 384 MiB card for its entire duration.
+
+The finished denoiser's device residency is now handed back first, when the VAE would not
+fit beside it. Peak VRAM during decode fell to about 5 600 MiB, worth **22 s** at
+640x384. It is a cap, not a policy change: the decision reads actual free VRAM, so a card
+with room keeps the denoiser resident and behaves exactly as before, and non-CUDA GGML
+backends are left alone — a unified-memory device has nothing to hand back. The cost is
+re-uploading the DiT on the *next* request only, since its weights are mmapped GGUF pages
+that are still in RAM. The sibling Qwen-Image pipeline already worked this way.
+
+### The denoiser file is read before it is uploaded
+
+Weights are bound as pointers into the mmapped GGUF, so the first upload faulted every
+page in from disk *from inside* the host-to-device copy — the driver's worst case:
+
+| Path | Rate | 10.6 GB would take |
+|---|---|---|
+| H2D from pinned host memory | 19.09 GB/s | 0.56 s |
+| H2D from pageable resident memory | 5.97 GB/s | 1.78 s |
+| Plain sequential read of the file | 2.70 GB/s | 3.93 s |
+| **H2D faulting pages in as it copies** | **0.91 GB/s** | **11.6 s** |
+
+So the denoiser file is now read through sequentially first. Two details make it pay:
+
+* **It starts early.** The read is kicked off the moment the text trunk produces its
+  hidden states, so it runs alongside the encoder's teardown — handing back 551
+  per-tensor device buffers is driver work and the read is disk, and they contend for
+  nothing.
+* **It is not joined before the upload.** The read and the upload walk the file in the
+  same order and the read is the faster of the two, so leaving it running keeps it ahead
+  and the copy lands on pages that are already there. Joining first would serialize a
+  whole read in front of a whole copy.
+
+First denoise step went from 14.87 s to about 10.2 s, and denoiser weight movement from
+11.8 s to 8.25 s. Output is **byte-identical** with the read on and off.
+
+That setup cost was confirmed token-independent before the fix — 11.77 s at 256x256
+against 11.55 s at 640x384 — which is what established it as weight movement rather than
+graph construction. `TS_H3_PREFAULT` selects the mode; see
+[Environment variables](#environment-variables).
 
 ## Files
 
@@ -512,6 +617,57 @@ downsample sandwich so it cannot fold high frequencies back into the band.
 Unlike the video latent, the audio latent is decoded **as-is** — `latents_mean` /
 `latents_std` are *not* applied. Applying them costs about 15× amplitude and yields
 a track that is spectrally plausible but inaudible.
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `TS_H3_PREFAULT` | Sequential read of the denoiser file before its first upload. `0` off, `1` serial (read, then join before the upload), `2` overlapped with text conditioning, `3` **default** — pipelined with the upload |
+| `TS_H3_PREFAULT_THREADS` | Read streams for that prefault, default `1` |
+| `TS_H3_PHASE` | `1` = per-stage breakdown — encoder open / trunk / teardown, the prefault, every denoise step, VAE open / decode. The one-line summaries say a phase was slow; this says which half of it |
+| `TS_H3_TE_GROUP` | `<n>` = run the 50-layer text-encoder trunk in groups of `n` layers, handing each group's device copy back after it runs. **Off by default**; any `n` ≥ the layer count reproduces the single whole-trunk call exactly |
+| `TS_H3_TRACE` | `1` = latent and velocity magnitudes for every denoise step |
+
+**Why `TS_H3_PREFAULT=3` is the default.** Mode 3 leaves the read running while the
+upload proceeds, and wins because both walk the file in the same order and the read is
+the faster of the two, so it stays ahead and the copy finds its pages already placed.
+Mode 1 joins first and serializes a whole read in front of a whole copy. Mode 2 starts
+the read earlier still, overlapping it with text conditioning, and loses: the text
+encoder streams its own 17 GB through the same page cache and evicts the pages the
+prefault has just placed. Mode 2 is kept because a host with enough RAM to hold both
+files would flip that result, and mode 0 is the A/B — the output is identical either way.
+
+**Why one read stream.** This is the opposite of `GgufReader.PrefaultFileCache`, which
+uses sixteen, and the difference is deliberate: that warm-up runs before any other work
+with the machine to itself, while this one runs concurrently with the encoder teardown
+and with the upload it exists to help. Best of three at 640x384 on the RTX 3080 Laptop
+16 GB was 1 stream 63.9 s, 4 streams 64.9 s, 16 streams 66.6 s, and the encoder teardown
+alone rose from 2.2 s to 4.0 s at sixteen. Raise it only where storage is not the contended resource.
+
+**Why `TS_H3_TE_GROUP` is off.** On a 16 GB card the 17 GB Qwen3-VL trunk does overflow
+into shared host memory, and grouping does remove the overflow — peak device use fell
+from 16 041 MiB to 12 981 MiB at 640x384, bit-identical output — but it was **3 s
+slower**. The trunk is a one-shot prefill over a short prompt (ten tokens in the
+measurement), so every weight is read exactly once and the overflowed ~1.3 GB costs a
+single PCIe crossing; grouping cannot make that cheaper, still moves all 17 GB, and adds
+an allocate/invalidate cycle per group. Spill compounds only when weights are re-read per
+step, which is the denoiser, not this trunk. It is kept for the case where device memory
+rather than time is the binding constraint — a smaller card, or another process wanting
+the VRAM.
+
+### What was tried and did not work
+
+Measured on the RTX 3080 Laptop 16 GB, recorded so nobody has to run them again:
+
+| Attempt | Result |
+|---|---|
+| Text-encoder layer grouping (`TS_H3_TE_GROUP`) | Removes the encoder's own spill, 16 041 → 12 981 MiB, bit-identical — and 3 s slower. Off by default |
+| Prefaulting the video VAE too | Straight loss: 1.9 s of read and the decode does not move (9.4 s against 9.1 s). At 4.85 GB it is not fault-bound, and its decode is compute-bound |
+| Multi-stream prefault (`TS_H3_PREFAULT_THREADS`) | Worse here: 63.9 / 64.9 / 66.6 s at 1 / 4 / 16 streams, 640x384 best of three, and the encoder teardown alone 2.2 s → 4.0 s |
+| Overlapping the prefault with text conditioning (`TS_H3_PREFAULT=2`) | Worse than pipelining it with the upload: the encoder evicts the pages just placed |
+| Disabling CUDA graphs | No effect: 65.6 s against 65.8 s |
+| `TS_GGML_ASYNC_COMPUTE=1` | No effect: 67.4 s against 66.2 s. It governs graph submission, not weight upload |
+| ffmpeg in place of the OS H.264 encoder | Slower: 98.2 s. The sidecar encoder was left alone |
 
 ## Verification
 

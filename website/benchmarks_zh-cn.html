@@ -84,7 +84,10 @@
   <p>有两件事在这台机器上<em>不会</em>让它变快。<code>--tp 3</code> 把 pp2048 / tg64 从 915.9 / 43.9 拉到 505.6 / 17.6——78 层里每层都要两次 <code>[6144, n_tokens]</code> 隐状态的 all-reduce，没有 NVLink 的 PCIe 付不起这笔账。<code>--n-cpu-moe 30</code> 则拉到 94.7 / 16.4。它们存在的意义是让原本装不下的权重能跑起来：卸载把加载器能定下的上下文从 342,272 抬到 646,400 token。参见 <a href="models-text_zh-cn.html#glm">GLM 5.x</a>。</p>
 
   <h2 id="minimax-h3">MiniMax-H3：视频与音频一次生成</h2>
-  <p>MiniMax-H3 在同一个打包潜变量里对画面和原生 <strong>32&nbsp;kHz 立体声</strong>音轨一起去噪，因此下面每个数字都是同时产出两者的一次完整运行。Apple <strong>M5 Pro</strong>、<code>ggml_metal</code>、<strong>22 帧、8 步、同一随机种子</strong>，对手是处在其最佳配置下的 <strong><code>stable-diffusion.cpp</code></strong>：</p>
+  <p>MiniMax-H3 在同一个打包潜变量里对画面和原生 <strong>32&nbsp;kHz 立体声</strong>音轨一起去噪，因此下面每个数字都是同时产出两者的一次完整运行。同一条 22 帧、8 步的请求在两台机器上对 <strong><code>stable-diffusion.cpp</code></strong> 做过测量，而<strong>两者的结论并不一致</strong>。两组数据都列在下面，各自标明硬件；它们互不取代，把两者平均出来的数字不对应任何一台真实存在的机器。</p>
+
+  <h3>Apple M5 Pro、<code>ggml_metal</code></h3>
+  <p><strong>22 帧、8 步、同一随机种子</strong>，对手是处在其最佳配置下的 <code>stable-diffusion.cpp</code>：</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>分辨率</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>提速</th></tr></thead>
@@ -95,6 +98,34 @@
   </table>
   </div>
   <p>应当以第二行为准：<strong>人脸需要像素</strong>，所以 640×384 才是起点，256×256 只是让倍数好看的那个角落，而不是真正拿来出片的尺寸。两行都是同一条 22 帧、8 步的请求；由于权重是 CFG 蒸馏的，这 8 步就是 8 次 DiT 前向，而不是 16 次。→ <a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3 下载与模式</a></p>
+
+  <h3>RTX 3080 Laptop 16 GB、<code>ggml_cuda</code></h3>
+  <p>同一条请求，换到一台刻意被内存卡死的机器上 —— <strong>16,384 MiB 显存、31.7 GB 内存，面对 33.5 GB 的模型集合</strong>（DiT 10.64 GiB、Qwen3-VL-32B 16.97 GiB、视频 VAE 4.85 GiB、音频 VAE 0.56 GiB，两个引擎用的是同一批权重文件）。22 帧、8 步、同一随机种子、三次取最好，发布构建；对手是 <code>stable-diffusion.cpp</code> <code>97d2990</code>（ggml <code>8e800ce</code>），按 <code>SD_CUDA=ON</code>、arch 86 重新编译。在这台机器上，整体耗时是 <code>stable-diffusion.cpp</code> 更快：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>分辨率</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>端到端</th></tr></thead>
+    <tbody>
+      <tr><td>256×256</td><td><span class="yes">37.8 s</span></td><td>43.6 s</td><td>sd.cpp 快 1.15×</td></tr>
+      <tr><td>640×384</td><td><span class="yes">59.8 s</span></td><td>63.7 s</td><td>sd.cpp 快 1.07×</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>这块 16,384 MiB 显卡上的显存峰值：TensorSharp <strong>15,780 MiB</strong>，<code>stable-diffusion.cpp</code> <strong>12,035 MiB</strong>。sd.cpp 用的是 <code>--auto-fit --stream-layers --diffusion-fa --rng cpu</code>；它默认的 <code>--offload-to-cpu</code> 路径在这台机器上根本跑不起这个模型 —— 它要把 17.7 GB 锁进只有 12.3 GB 空闲的内存里。</p>
+  <p><strong>按单个去噪步算，TensorSharp 在 CUDA 上同样领先</strong> —— 用 8 步与 16 步的斜率把计算和一次性开销拆开，得到 <strong>3.325 s 对 3.338 s</strong>，直接逐步测量为 3.00–3.11 s。它让出去的完全是固定的启动开销，而剩下 3.9 s 的差距里大约 <strong>3 s 根本不是推理</strong>：一是 H.264 编码 —— sd.cpp 这边只是把 MJPEG + PCM 写进 AVI；二是 .NET 进程启动，对手是原生可执行文件。</p>
+  <div class="callout note"><div class="ic">⚖️</div><p>两个硬件点给出两种答案，两者都保留。在 M5 Pro 上，TensorSharp 整体快 <strong>1.7–2.4×</strong>；在这台 16 GB 的 CUDA 笔记本上，它<em>按步</em>更快，端到端<strong>慢 1.07–1.15×</strong> —— 因为权重和页缓存都装不下，这么短的一次运行里一次性开销占了大头。如果你的显卡是 16 GB，请按 CUDA 这两行来预期。每步的领先只有 13 ms，所以运行拉长也只能非常缓慢地改变这个比例。</p></div>
+
+  <h3>上一轮优化改变了什么</h3>
+  <p>同一台 RTX 3080 Laptop、同样的 22 帧 8 步负载，优化前后：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>分辨率</th><th>之前</th><th>之后</th><th>提速</th></tr></thead>
+    <tbody>
+      <tr><td>640×384</td><td>89.0 s</td><td><span class="yes">63.7 s</span></td><td><span class="yes">1.40×</span></td></tr>
+      <tr><td>256×256</td><td>67.2 s</td><td><span class="yes">43.6 s</span></td><td><span class="yes">1.54×</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>两处改动都是冲着同一个 16 GB 天花板去的。其一，去噪器跑完之后会<em>先</em>交还设备驻留，再去加载视频 VAE，解码期间的显存峰值因此从 <strong>16,041 MiB 降到约 5,600 MiB</strong>，在 640×384 上值 <strong>22 秒</strong> —— 跑完的去噪器加上视频 VAE 一共 15.8 GB，一块 16 GB 的卡装不下，而 WDDM 并不会让这次分配失败，它会悄悄用主机内存兜住溢出的部分，于是整个解码都按 PCIe 的速度在跑。其二，去噪器权重文件会被预读，并且与它自己的上传流水线重叠，把第一个去噪步从 <strong>14.87 s 降到约 10.2 s</strong>：权重是以指针形式绑定在 mmap 的 GGUF 上的，没有预读时，第一次主机到设备的拷贝要在拷贝过程中把每一页都从磁盘缺页调入，速率只有 <strong>0.91 GB/s</strong>，而从已驻留的可分页内存拷贝是 5.97 GB/s。开与不开预读，输出逐字节一致。</p>
 
   <h3>该动哪个杠杆，以及先后顺序</h3>
   <p><strong>先动步数。</strong>默认 <strong>20</strong> 步，<strong>4–8</strong> 步是快速工作点 —— 4–8 步时运动主体周围会出现一些色边，到约 20 步就消失了。除此之外没有引导分支可以缓存或跳过：这个权重出厂就是 <strong>CFG 蒸馏</strong>的，必须 <code>--cfg 1.0</code>，更高的值会被拒绝，这也让 <code>--negative-prompt</code> 与 <code>--cfg-cache-stride</code> 在这里完全失效 —— 根本没有无条件分支供它们作用。<strong>其次是分辨率</strong>：<code>--width</code> / <code>--height</code> 向上取整到 32 的倍数，默认 640×384。<strong>再次是帧数</strong>：<code>--video-frames</code> 向上对齐到 <code>17k+5</code> 网格（5、22、39、56、73、90、107……），fps 固定为 24。<strong>最后才是参考的数量</strong> —— 超过大约四个之后，它的分量就完全盖过步数。</p>
