@@ -350,6 +350,60 @@ namespace TensorSharp.Models
             x.Dispose();
         }
 
+        // Fold the MTP catch-up into the first draft step (llama.cpp's draft-mtp
+        // runs its block over n_accepted + 1 rows). TS_MTP_FOLD_CATCHUP=0 goes back
+        // to a catch-up pass plus a separate first DraftStep.
+        private static readonly bool _mtpFoldCatchUpEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MTP_FOLD_CATCHUP"), "0", StringComparison.Ordinal);
+
+        /// <summary>Only the NextN/MTP head folds. A DFlash drafter proposes whole
+        /// blocks and its commit is a ring write costing ~1 ms, so there is nothing
+        /// worth folding there.</summary>
+        public bool SupportsFusedCatchUpStep
+            => _mtpFoldCatchUpEnabled && HasMtpDraftHead && !HasDFlash;
+
+        private float[] _mtpFoldNormed;
+
+        /// <inheritdoc />
+        public unsafe void DraftCatchUpAndStep(int[] tokens, float[] hRows, int startPos,
+            float[] logitsOut, float[] hOut)
+        {
+            if (!HasMtpDraftHead || HasDFlash)
+                throw new InvalidOperationException("Model has no NextN/MTP draft block to fold.");
+            int n = tokens.Length;
+            int H = Config.HiddenSize;
+            EnterSpecSession();
+            EnsureCacheCapacity(startPos + n);
+
+            // ONE block pass over every row. The kernel folds the LM head over the
+            // last n_logits rows (here 1), so logitsOut is already the last row's;
+            // the normed hidden comes back for all n rows and the last is the one
+            // that chains the next draft step.
+            Tensor x = MtpProjectInput(tokens, hRows);
+            if (_mtpFoldNormed == null || _mtpFoldNormed.Length < (long)H * n)
+                _mtpFoldNormed = new float[(long)H * n];
+            if (TryFusedMtpBlock(x, startPos, n, _mtpFoldNormed, logitsOut, nLogitRows: 1))
+            {
+                x.Dispose();
+                Array.Copy(_mtpFoldNormed, (long)(n - 1) * H, hOut, 0, H);
+                return;
+            }
+            x.Dispose();
+
+            // The fused block declined this shape. Fall back to the two-call form
+            // rather than the op-by-op fold, so this path stays the one that is
+            // already covered by DraftCatchUp/DraftStep.
+            if (n > 1)
+            {
+                var replay = new int[n - 1];
+                Array.Copy(tokens, replay, n - 1);
+                DraftCatchUp(replay, hRows, startPos);
+            }
+            var hLast = new float[H];
+            Array.Copy(hRows, (long)(n - 1) * H, hLast, 0, H);
+            DraftStep(tokens[n - 1], hLast, startPos + n - 1, logitsOut, hOut);
+        }
+
         /// <summary>
         /// Trunk forward for speculative decoding. Identical math to Forward()
         /// but additionally captures the post-final-norm hidden state of every

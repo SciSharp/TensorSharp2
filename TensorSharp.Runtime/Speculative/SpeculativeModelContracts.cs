@@ -274,6 +274,38 @@ namespace TensorSharp.Runtime.Speculative
         /// process()). Row k of <paramref name="hRows"/> is the hidden state of
         /// the token PRECEDING tokens[k].</summary>
         void DraftCatchUp(int[] tokens, float[] hRows, int startPos);
+
+        /// <summary>
+        /// True when this head can replay the verified tokens AND take the first
+        /// draft step in ONE pass, via <see cref="DraftCatchUpAndStep"/>.
+        ///
+        /// This is what llama.cpp's draft-mtp does: it runs its block over
+        /// <c>n_accepted + 1</c> rows rather than a catch-up pass followed by a
+        /// separate first draft. On a head whose per-call cost is mostly fixed
+        /// (a whole extra graph, its own launch and readback), that is one call
+        /// saved per speculative step - measured at 6.4 ms of a 100 ms step on
+        /// Qwen 3.8, i.e. the entire remaining gap to llama.cpp.
+        /// </summary>
+        bool SupportsFusedCatchUpStep => false;
+
+        /// <summary>
+        /// Replay verified trunk tokens and take the first draft step in one
+        /// pass. <paramref name="tokens"/> is the verified run followed by the
+        /// token the next draft starts from, so the last entry is NOT a replay;
+        /// row k of <paramref name="hRows"/> is the hidden state of the token
+        /// preceding tokens[k], as in <see cref="DraftCatchUp"/>. Fills
+        /// <paramref name="logitsOut"/> and <paramref name="hOut"/> from the LAST
+        /// row - byte-identical to what
+        /// <c>DraftCatchUp(tokens[..^1], ...)</c> followed by
+        /// <c>DraftStep(tokens[^1], ...)</c> would produce, because the block is
+        /// causal over its own KV and the last row therefore sees exactly the
+        /// replayed rows either way.
+        /// Only called when <see cref="SupportsFusedCatchUpStep"/> is true.
+        /// </summary>
+        void DraftCatchUpAndStep(int[] tokens, float[] hRows, int startPos,
+            float[] logitsOut, float[] hOut)
+            => throw new NotSupportedException(
+                "This draft head cannot fuse its catch-up with the first draft step.");
     }
 
     /// <summary>Convenience alias for the common case: a model that is its own
