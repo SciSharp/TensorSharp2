@@ -293,10 +293,12 @@ namespace TensorSharp.Server.Hosting
                     "--spec-draft-model gemma-4-E4B-it-assistant.Q8_0.gguf"),
                 new OptionHelp("--draft-model <path>",
                     "Block drafter GGUF for architectures whose drafter must be resident before the layer " +
-                    "split (DeepSeek V4's DSpark). Naming the file IS the request, so it needs no --spec; " +
-                    "engages for solo sequences on the cuda and ggml_cuda backends. Default: none; " +
-                    "env TS_DSV4_DSPARK.",
-                    "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf"),
+                    "split: DeepSeek V4's DSpark, and the DFlash / DFlash2 drafters for Muse-Glimmer and " +
+                    "Qwen 3.8. The file's general.architecture decides which it is, not its name. Naming the " +
+                    "file IS the request, so it needs no --spec; engages for solo sequences on the cuda and " +
+                    "ggml_cuda backends. Default: none; env TS_DSV4_DSPARK / TS_QWEN35_DFLASH / " +
+                    "TS_MUSE_GLIMMER_DFLASH.",
+                    "--draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf"),
             }),
             ("Qwen-Image-Edit companion models (qwen_image DiT GGUFs)", new[]
             {

@@ -534,18 +534,27 @@ namespace TensorSharp.Server.Hosting
 
             for (int i = 0; i < args.Length; i++)
             {
-                // Path to a BLOCK drafter GGUF that has to be resident before
-                // the model's layer split runs (DeepSeek V4's DSpark). Unlike
+                // Path to a BLOCK drafter GGUF that has to be resident before the
+                // model's layer split runs: DeepSeek V4's DSpark, and the DFlash /
+                // DFlash2 drafters for Muse-Glimmer and Qwen 3.8. Unlike
                 // --spec-draft-model this one is handed to the model factory, so
-                // it is carried as the same env var the CLI's --draft-model
-                // reads and picked up again by a runtime model switch. It stays
+                // it is carried as the same env vars the CLI's --draft-model reads
+                // and picked up again by a runtime model switch. It stays
                 // server-local because the CLI passes its own --draft-model
                 // straight to ModelBase.Create instead.
+                //
+                // All THREE are set, because each architecture reads its own and
+                // only the loaded model reads any of them. Setting just the DSpark
+                // one - which is what this did - meant --draft-model was silently
+                // ignored on the server for every DFlash target, the flag's most
+                // common use.
                 if (SpeculativeCliFlags.TryReadOption(args, ref i, "--draft-model", out string dsparkOpt))
                 {
                     if (string.IsNullOrWhiteSpace(dsparkOpt) || !File.Exists(dsparkOpt))
                         throw new ArgumentException($"--draft-model file not found: '{dsparkOpt}'.");
                     Environment.SetEnvironmentVariable("TS_DSV4_DSPARK", dsparkOpt);
+                    Environment.SetEnvironmentVariable("TS_QWEN35_DFLASH", dsparkOpt);
+                    Environment.SetEnvironmentVariable("TS_MUSE_GLIMMER_DFLASH", dsparkOpt);
                     changed = true;
                 }
             }
