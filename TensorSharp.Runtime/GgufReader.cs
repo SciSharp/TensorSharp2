@@ -91,9 +91,20 @@ namespace TensorSharp.Runtime
         {
             _path = path;
             _stream = File.OpenRead(path);
-            Parse();
-            if (!isShard)
-                OpenSiblingShards();
+            try
+            {
+                Parse();
+                if (!isShard)
+                    OpenSiblingShards();
+            }
+            catch
+            {
+                // in case of exceptions, the constructor doesn't complete and Dispose won't be called, so we need to clean up here
+                // We need to call Dispose() and not just close the stream, since the shards may have been opened and need to be disposed as well.
+                Dispose();
+                // rethrow the original exception to preserve the stack trace
+                throw;
+            }
         }
 
         /// <summary>Every file this model is stored in, starting with this one.</summary>
