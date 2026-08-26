@@ -100,7 +100,7 @@ namespace TensorSharp.Models
 
         /// <summary>Width of one encoder input row = TargetLayerIds.Length * HiddenSize
         /// (33280 for the Muse-Glimmer drafter). This is what the model reports as
-        /// IMtpSpeculativeModel.MtpHiddenSize.</summary>
+        /// ISpeculativeModel.SpecFeatureSize.</summary>
         public int FeatureSize => TargetLayerIds.Length * HiddenSize;
 
         /// <summary>Tokens a block actually proposes: the block is

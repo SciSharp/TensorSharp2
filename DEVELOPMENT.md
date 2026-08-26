@@ -169,6 +169,21 @@ The default therefore follows the DiT class (`ApplyArchitectureNativeTunables` i
 | `TS_WAN_METAL_TENSOR_API=1` / `=0` | Force the tensor API on/off for the Wan process, overriding the model-class default |
 | `TS_WAN_VAE_GEMM_MAX_MB=<n>` | Force the im2col+GEMM VAE path with an `n` MB im2col budget (0 forces direct conv) — overrides the automatic choice in both directions |
 
+#### MiniMax-H3 and the FP16 flash-attention numerator
+
+Unlike the note above, this one is not Apple-specific: it applies to every backend whose flash-attention kernel keeps the softmax numerator in FP16, which is all of the ones built here.
+
+MiniMax-H3 attends bidirectionally over **one** packed sequence with no mask — text, conditioning frames, target audio and target video are all in it — so the key count *is* the clip: 2364 packed tokens at 22 frames, 8646 at 107. Every flash-attention kernel in the vendored ggml accumulates `sum_j exp(s_j - max) * V_j` in FP16 registers, and `ggml_flash_attn_ext_set_prec(GGML_PREC_F32)` is inert because nothing under `ggml-cuda/` or `ggml-metal/` reads `op_params` for `GGML_OP_FLASH_ATTN_EXT`. What the kernel does grant the accumulator is three bits of headroom (`FATTN_KQ_MAX_OFFSET` inflates the running maximum by log(8), capping every softmax weight at 1/8), so a row of N keys reaches N/8 × |V| and overflows to Inf once N × |V| > 8 × 65504. H3 walks into that ceiling and no other model here does, because `q_norm` and `k_norm` exist in the checkpoint and `v_norm` does not — the value stream is the one carrying unbounded magnitudes. Measured at 640×384: 73 frames rendered correctly, 107 frames came back with every pixel black and every audio sample clamped, from a single Inf on the **first** denoise step. Video and audio share one trunk, so the overflow takes the soundtrack down with the picture.
+
+`h3_attend` (`ggml_ops_minimax_h3.cpp`) keeps the accumulator in range by pre-scaling V by the smallest power of two that brings the key count down to `kH3FlashKeyBudget`, and undoing that scale on the output. Attention is linear in V, so the correction is **exact** — and a power of two is exact through the F16 cast as well, being nothing but an exponent shift, which is why short sequences (every oracle fixture in the test suite among them) stay bit-identical. `h3_mm` does the same for the two quantized matmuls whose activations are unbounded (the attention output feeding `o_proj`, the SwiGLU hidden state feeding `down_proj`), where the ceiling is q8_1's per-block FP16 sum instead.
+
+| Environment variable | Effect |
+|---|---|
+| `TS_H3_TRACE=1` | Print latent and velocity magnitudes for every denoising step — a diverging sample shows in the latent's absmax several steps before it reaches infinity |
+| `TS_H3_NO_FLASH=1` | Force the explicit softmax path, to separate a flash-attention kernel problem from a modelling one |
+
+The sampler no longer trusts the result either. A non-finite velocity fails the request naming the step it appeared at (`RequireFinite` in `MiniMaxH3Pipeline.cs`) rather than writing out a file of the right length, frame rate and soundtrack duration that is uniformly black — the failure mode is silent by construction, because the RGB clamp pins a NaN pixel at 0 and the WAV writer clamps a NaN sample to -1.
+
 ### Build the native MLX library (macOS only)
 
 The MLX backend depends on `libmlxc` (the C bindings for [MLX](https://github.com/ml-explore/mlx)). The repository pins a known-good tag of `mlx-c` in `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` and a helper script fetches and builds it:
@@ -206,7 +221,8 @@ TensorSharp/
 ├── TensorSharp.Core/            # Core tensor library (Tensor, Ops, memory, device abstraction, CPU SIMD/managed quantized kernels)
 ├── TensorSharp.Runtime/         # GGUF, tokenizers, templates, sampling, protocol parsing
 │   ├── Paged/                   # Paged KV cache primitives (BlockPool, BlockTable, KvBlock, BlockHashIndex, PagedKvStorage, PagedKvBatchOps, ManagedPagedAttention)
-│   ├── Scheduling/              # Continuous batching engine (InferenceEngine, BatchExecutor, ContinuousBatchScheduler, SequenceState, SchedulerConfig/Output, InferenceRequestHandle) + MTP speculative decode core (MtpSpeculativeExecution)
+│   ├── Scheduling/              # Continuous batching engine (InferenceEngine, BatchExecutor, ContinuousBatchScheduler, SequenceState, SchedulerConfig/Output, InferenceRequestHandle)
+│   ├── Speculative/             # Speculative decoding: the draft/verify/rollback core (SpeculativeExecution), the ISpeculator algorithms (DraftHeadSpeculator, BlockDraftSpeculator, NGramSpeculator) + SpeculatorRegistry, the model-side contracts (ISpecTrunk, SpeculativeModelContracts), shared flag parsing (SpeculativeCliFlags, SpeculationOptions) and the runtime cost governor
 │   ├── PagedKvCacheManager.cs   # Per-session paged KV manager (block allocation, prefix reuse)
 │   ├── PagedKvBlockStore.cs     # On-disk / RAM-tiered paged block storage with optional SSD spillover
 │   ├── SsdKvBlockTier.cs        # SSD-backed cold tier for paged blocks
@@ -215,19 +231,24 @@ TensorSharp/
 │   ├── KvBlockHash.cs           # Content-addressed block hash for prefix-cache sharing
 │   └── Logging/                 # JSON-line file logger + per-turn telemetry
 ├── TensorSharp.Models/          # Model architectures and multimodal encoders/injectors
-│   ├── Models/<Family>/         # One folder per architecture (DeepSeek4, DiffusionGemma, Gemma3, Gemma4, GptOss, Mistral3, Nemotron, Qwen3, Qwen35, QwenImage)
+│   ├── Models/<Family>/         # One folder per architecture (DeepSeek4, DiffusionGemma, Gemma3, Gemma4, GlmDsa, GptOss, MiniMaxH3, Mistral3, MuseGlimmer, Nemotron, Qwen3, Qwen35, QwenImage, WanVideo)
 │   │   ├── <Family>Model.cs                # Legacy per-sequence ModelBase implementation
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch — batched/paged path (Mistral3, Gemma4, GptOss, Qwen35, Nemotron, Qwen3)
 │   ├── Models/DeepSeek4/        # DeepSeek V4 Flash: whole-model executors instead of a per-op forward
-│   ├── Models/GlmDsa/           # GLM 5.x: native-executor driver, MLA + DSA indexer per-op reference, sequence slots, NextN/MTP draft head
 │   │   ├── DeepSeek4Model.cs               # GGUF metadata, tokenizer, chat template, executor selection
 │   │   ├── DeepSeek4CudaExecutor.cs        # Bridge to the direct-CUDA whole-model engine
 │   │   ├── DeepSeek4CpuExecutor*.cs        # 100% pure-C# whole-model executor (no native dependencies)
 │   │   ├── DeepSeek4Model.Dspark.cs        # DSpark block drafter (draft / confidence / Markov heads)
 │   │   └── DeepSeek4Model.PerSeqCache.cs   # Native per-sequence slots that make the model servable
+│   ├── Models/GlmDsa/           # GLM 5.x: native-executor driver, MLA + DSA indexer per-op reference, sequence slots, NextN/MTP draft head
+│   ├── Models/MuseGlimmer/      # Muse-Glimmer: fused whole-model forward, vision encoder, tensor-parallel variants, DFlash block drafter
+│   ├── Models/MiniMaxH3/        # MiniMax-H3 video + joint 32 kHz stereo audio: packed-sequence DiT, Qwen3-VL text encoder + vision tower, video and audio VAEs, flow-match scheduler, pipeline
+│   ├── Models/WanVideo/         # Wan 2.1/2.2, video only: DiT, UMT5-XXL text encoder, causal 3D VAE, UniPC scheduler, plus the ggml-independent WanDirect* `cuda`/`cpu` path
+│   ├── Models/Video/            # The seam both video families implement: IVideoGenerationModel, VideoGenerationParams/Progress, GeneratedVideoAudio, WAV writing
 │   ├── Paged/                   # Tensor-side paged-attention helpers (TensorPagedAttention)
 │   ├── KvBlockTransfer.cs       # Helpers for extract/inject of KV blocks across sequences
-│   ├── MtpSpeculativeDecoder.cs # MTP/NextN draft-verify-rollback driver shared by Qwen 3.6, GLM 5.2 and Gemma 4
+│   ├── SpeculativeDecoder.cs    # Model-side draft-verify-rollback driver shared by Qwen 3.6, GLM 5.2 and Gemma 4
+│   ├── SpeculativeDraftHeadLoader.cs # Loads a separate drafter GGUF (Gemma 4 gemma4-assistant, DSpark, DFlash) and binds it to the trunk
 │   └── ModelMultimodalInjector.cs # Vision / audio / video embedding injection
 ├── TensorSharp.Backends.GGML/   # GGML backend bindings (Metal/CUDA/Vulkan/CPU via native library)
 ├── TensorSharp.Backends.Cuda/   # Direct CUDA backend using CUDA Driver API, cuBLAS, and PTX kernels
@@ -247,8 +268,12 @@ TensorSharp/
 │   ├── ggml_ops_qwen35_gdn_tp.cpp         # Qwen 3.5/3.6 per-rank packed GatedDeltaNet kernel (tensor parallel)
 │   ├── ggml_ops_qwen35_recurrent_prefill.cpp # Qwen 3.5/3.6 recurrent-layer prefill
 │   ├── ggml_ops_gptoss_decode.cpp         # GPT OSS whole-model decode graph (one dispatch per token, shared KV window)
+│   ├── ggml_ops_gptoss_prefill.cpp        # GPT OSS whole-model prefill: N tokens through every attention + MoE layer plus the folded final norm and LM head as one graph
 │   ├── ggml_ops_deepseek4.cpp             # DeepSeek V4 native whole-model executor (layer split, compressed KV caches, graph cache)
 │   ├── ggml_ops_glm_dsa.cpp               # GLM 5.x native whole-model executor (MLA + DSA indexer, tensor parallelism, sequence slots, NextN/MTP verify + draft graphs)
+│   ├── ggml_ops_muse_glimmer.cpp          # Muse-Glimmer whole-model forward: persistent decode graph (so ggml-cuda captures it) + transient prefill graph + tensor-parallel graphs
+│   ├── ggml_ops_muse_glimmer_vision.cpp   # Muse-Glimmer ViT block on-device (a max-size image is 16,224 patches, so per-op dispatch synchronizes through the host)
+│   ├── ggml_ops_dflash.cpp                # Muse-Glimmer DFlash block drafter fused into one graph per speculative step (draft blocks + the trunk's borrowed LM head)
 │   ├── ggml_ops_dsv4_fused.cu / _cpu.cpp  # DeepSeek V4 fused custom ops on ggml-cuda's stream (and their CPU counterparts)
 │   ├── ggml_ops_gemma4_decode.cpp         # Gemma 4 dense whole-model decode (CUDA-graph persisted)
 │   ├── ggml_ops_gemma4_batched.cpp        # Gemma 4 dense + MoE token-batched decode
@@ -262,6 +287,8 @@ TensorSharp/
 │   ├── ggml_ops_tp_probe.cu               # Pre-flight peer-copy / NCCL AllReduce probe that picks the TP transport
 │   ├── ggml_ops_diffusion.cpp             # DiffusionGemma fused decode-layer / whole-model / lm-head kernels
 │   ├── ggml_ops_qwen_image.cpp            # Qwen-Image-Edit MMDiT whole-model forward (CUDA-graph-captured) + CFG-batched kernels
+│   ├── ggml_ops_minimax_h3.cpp            # MiniMax-H3 whole-network graphs: the packed audio+video DiT, the Qwen3-VL text encoder and vision tower, and the video / audio VAE encode + decode (seven entry points, weights bound resident from the caller's mmap)
+│   ├── ggml_ops_wan.cpp                   # Wan 2.1/2.2 whole-graph entry points: UMT5-XXL text encoder, per-step DiT velocity prediction (persistent per shape for CUDA-graph capture), causal 3D video VAE encode + decode
 │   ├── ggml_ops_training.cpp              # Training-only kernels (unused at runtime)
 │   └── tests/                              # Native unit + smoke tests
 ├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
@@ -296,6 +323,7 @@ TensorSharp/
 ├── docs/                        # Developer reference
 │   ├── models/                  # Per-model architecture cards (one .md per model, EN + 中文)
 │   ├── PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md  # Paged KV cache, prefix sharing, scheduler, per-model batched-forward status
+│   ├── speculative_decoding.md  # Draft-and-verify design: the ISpeculativeTarget / ISpeculator / IDraftHead layering and the draft-head, block and ngram algorithms
 │   └── env_var_feature_matrix.md  # Runtime flag × model/backend/feature coverage for TestMatrix
 ├── benchmarks/                  # Reproducible benchmark harnesses
 └── ExternalProjects/            # ggml/ is cloned from github.com/ggml-org/ggml at build time (not committed)
@@ -371,7 +399,7 @@ TensorSharp is structured as a layered system:
 
 2. **TensorSharp.Runtime** owns runtime-facing contracts and services: GGUF parsing, tokenization (SentencePiece / BPE), chat template rendering, configurable token sampling, output parsing, paged KV cache (`Runtime/Paged/*`), the continuous-batching scheduler / engine (`Runtime/Scheduling/*`), the `IKvBlockCodec` interface plus the `TurboQuantKvCodec` 2-bit / Q4 / Q8 implementation, and reusable contracts such as `IModelArchitecture`, `IBatchedPagedModel`, `IPromptRenderer`, `IOutputProtocolParser`, `IMultimodalInjector`, `IKVCachePolicy`, and `IBackendExecutionPlan`.
 
-3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, DiffusionGemma, Qwen 3/3.5, GPT OSS, Nemotron-H, Mistral 3, Qwen-Image-Edit). Autoregressive architectures ship the legacy per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Qwen-Image-Edit (`QwenImageModel`) is likewise not autoregressive — `Forward()` throws and image editing runs through `EditImage()`, which orchestrates the MMDiT diffusion transformer, the Qwen-Image VAE, and the Qwen2.5-VL text encoder. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
+3. **TensorSharp.Models** implements `ModelBase` plus the fourteen concrete architectures and their multimodal helpers — eleven text families (DeepSeek V4 Flash, GLM 5.x, Gemma 3, Gemma 4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, Muse-Glimmer) and three media-out families (Qwen-Image-Edit, MiniMax-H3, Wan 2.1/2.2). Autoregressive architectures ship the legacy per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Qwen-Image-Edit (`QwenImageModel`) is likewise not autoregressive — `Forward()` throws and image editing runs through `EditImage()`, which orchestrates the MMDiT diffusion transformer, the Qwen-Image VAE, and the Qwen2.5-VL text encoder. The video families go one step further out: `MiniMaxH3Model` and `WanVideoModel` both throw from `ForwardCore()` and generate through `GenerateVideo(prompt, VideoGenerationParams)` behind the shared `IVideoGenerationModel` seam in `Models/Video/`, so the CLI and the server drive either one — and anything added later — through a single path instead of type-testing the concrete model. MiniMax-H3 denoises video and 32 kHz stereo audio *together* in one packed latent and drives seven native whole-network graphs (DiT, Qwen3-VL text encoder, vision tower, video and audio VAE encode + decode); Wan 2.1/2.2 is the video-only family and runs its DiT, UMT5-XXL encoder and causal 3D VAE the same way. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata — except MiniMax-H3, whose published GGUFs carry no metadata at all and which is therefore detected from its tensors (`LooksLikeMiniMaxH3`, `ModelBase.cs`).
 
 4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32, plus paged-attention (`TSGgml_PagedAttentionForward`, with and without attention sinks) and architecture-specific batched kernels (Mamba2, GatedDeltaNet).
 
@@ -437,7 +465,7 @@ the fused path engages.
 
 ### Unit tests (xUnit)
 
-`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), MTP / NextN speculative-decoding correctness and opt-in end-to-end probes (`MtpSpeculativeExecutionTests`, `Qwen36MtpTests`, `Gemma4MtpTests`), DiffusionGemma denoising / prompt-KV / batched-generation probes (`DiffusionGemmaTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
+`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), MTP / NextN speculative-decoding correctness and opt-in end-to-end probes (`SpeculativeExecutionTests`, `Qwen36SpeculativeTests`, `Gemma4SpeculativeTests`), DiffusionGemma denoising / prompt-KV / batched-generation probes (`DiffusionGemmaTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

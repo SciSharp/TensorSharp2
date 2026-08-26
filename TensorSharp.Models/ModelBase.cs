@@ -6284,7 +6284,14 @@ namespace TensorSharp.Models
             }
 
             using var probe = new GgufFile(ggufPath);
-            string arch = probe.GetString("general.architecture") ?? "qwen3";
+            string arch = probe.GetString("general.architecture");
+            // MiniMax-H3's published GGUFs carry ZERO metadata — no architecture
+            // string at all — so they have to be recognised by their tensors. Without
+            // this they would fall through to the "qwen3" default and load as the
+            // wrong model instead of failing cleanly.
+            if (arch == null && MiniMaxH3.MiniMaxH3Model.LooksLikeMiniMaxH3(probe))
+                arch = MiniMaxH3.MiniMaxH3Model.ArchitectureId;
+            arch ??= "qwen3";
 
             ApplyArchitectureNativeTunables(arch, backend, probe);
 
@@ -6302,6 +6309,7 @@ namespace TensorSharp.Models
                 "diffusion-gemma" or "diffusion_gemma" => new DiffusionGemmaModel(ggufPath, backend),
                 "qwen_image" or "qwen-image" => new QwenImage.QwenImageModel(ggufPath, backend),
                 "wan" or "wan2.1" or "wan2.2" => new WanVideo.WanVideoModel(ggufPath, backend),
+                "minimax-h3" or "minimax_h3" => new MiniMaxH3.MiniMaxH3Model(ggufPath, backend),
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend, tpDegree, tpGroup),
                 "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend, tpDegree, tpGroup),
                 "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),

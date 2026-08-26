@@ -23,6 +23,7 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 | 会话 | Web UI 使用每个浏览器 tab 独立会话；Ollama/OpenAI 兼容端点共享默认会话 |
 | 上传 | `/api/upload` 接受图像 / 视频 / 音频 / 文本 / **PDF** 文件；原生数字 PDF 返回抽取出的文本，扫描版 PDF 在加载了具备视觉能力的模型时返回逐页图像（`TS_PDF_MAX_PAGES` 限制读取页数） |
 | 图像编辑 | Qwen-Image-Edit（`qwen_image`）模型通过 `/api/image-edit` 与 `/api/image-edit/stream` 提供服务，而不是聊天端点 |
+| 视频生成 | 任何视频生成模型 —— MiniMax-H3（`minimax-h3`）、Wan 2.1 / 2.2（`wan`）—— 都通过 `/api/video-generate`、`/api/video-generate/stream` 与 `/v1/videos/generations` 提供服务；MiniMax-H3 在 MP4 之外还会返回一个 32 kHz 立体声 `.wav` 旁挂文件，`/api/models` 会告知当前加载的检查点接受哪些条件输入 |
 | 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`；`response_format`（`json_object` / `json_schema`）不能与 `think` 或 `tools` 同时使用 |
 
 > **网络安全：**服务监听 `0.0.0.0:5000`，没有 API Key 身份验证或内置 TLS。
@@ -92,9 +93,9 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/gemma-
 DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
   dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_metal
 
-# 覆盖 Web UI 的默认 token 上限（默认 20000）。Ollama/OpenAI 兼容端点在请求
-# 未提供 max_tokens / num_predict 时默认使用 200 —— 在这些端点上请按请求
-# 自行设置该值。
+# 覆盖默认 token 预算（默认 20000）。它对每个端点都生效 —— Web UI、Ollama
+# 与 OpenAI —— 只要请求省略了 max_tokens / num_predict 就采用该值，并且会把
+# 要得更多的请求钳制到该值。
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
@@ -658,7 +659,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构以及配置好的默认 `max_tokens`。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构以及配置好的默认 `max_tokens`。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
 
 ---
 
@@ -814,11 +815,97 @@ curl -N -X POST http://localhost:5000/api/image-edit/stream \
 `{"done": true, "url": "/uploads/edit-<guid>.png", "width": 1184, "height": 544, "elapsedSeconds": 40.4}`。
 对非 Qwen-Image-Edit 模型发起的请求返回 400；并发编辑由进程级锁串行执行。
 
-### 视频生成（`/v1/videos/generations`，Wan）
+### 视频生成（`/api/video-generate`、`/v1/videos/generations`）
+
+三个端点共用同一套参数解析和同一道门禁：`POST /api/video-generate`、
+`POST /api/video-generate/stream`（SSE，Web UI 聊天使用的就是它）以及 OpenAI 形态
+的 `POST /v1/videos/generations`。任何实现了视频生成接口的模型都同时服务这三个端
+点 —— MiniMax-H3 或 Wan 2.1 / 2.2 —— 其他模型一律返回 400，并携带
+`The loaded model is not a video-generation model.`。`GET /api/models` 上的
+`video` 块会说明当前承载的检查点到底接受哪些条件输入。
+
+#### MiniMax-H3 —— 视频**与**原生 32 kHz 立体声音频
+
+MiniMax-H3 把视频和 32 kHz 立体声音轨当作同一个打包潜变量一起去噪，因此一次请求
+返回一个 MP4 **以及**写在它旁边的 `.wav`（四个协同网络的细节参见
+[docs/models/minimax-h3_zh-cn.md](../docs/models/minimax-h3_zh-cn.md)）。先在一个
+终端中启动服务器；文本编码器和两个 VAE 会通过扫描去噪器所在目录及其父目录自动解
+析，只有当它们放在别处时才需要用 `--video-text-encoder` / `--video-vae` /
+`--audio-vae` 指定 —— 另外文本编码器的 GGUF 不带分词器，需要把 `vocab.json` 与
+`merges.txt` 放在它旁边：
+
+```bash
+TensorSharp.Server --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+  --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+```
+
+`--video-width`/`--video-height` 在这里比在任何其他模型上都更要紧：Web UI 自己不
+发送尺寸，因此缺了它们每个片段都会以模型默认尺寸产出。帧数会对齐到 H3 的 `17k+5`
+网格（5、22、39、56、73、90……），宽高向上取整到 32 的倍数，fps 不管请求写什么都
+固定为 24。H3 是 CFG 蒸馏过的 —— 大于 `1.0` 的引导系数会被直接拒绝 —— 所以
+`steps` 才是质量杠杆：20 是模型默认值，4-8 步是快速工作点。
+
+再在另一个终端中：
+
+```bash
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "一只红狐在飘落的雪中小跑，电影感",
+       "width": 640, "height": 384, "frames": 22, "steps": 8, "cfg": 1.0, "seed": 42}'
+```
+
+```json
+{"ok": true, "url": "/uploads/video-<guid>.mp4",
+ "audioUrl": "/uploads/video-<guid>.wav",
+ "width": 640, "height": 384, "frames": 22, "fps": 24, "seed": 42,
+ "codec": "h264", "elapsedSeconds": 63.1}
+```
+
+（该 640×384 / 22 帧 / 8 步配置在 M5 Pro 上以 Metal 实测生成耗时 63.1 秒 —— 比
+stable-diffusion.cpp 在其最佳配置下快 1.7×；256×256 下是 20.9 秒对 49.3 秒，
+2.4×。）
+
+`audioUrl`（OpenAI 形态路由上叫 `audio_url`）在模型没有产出音轨时为 `null` ——
+仅视频模型、没有解析到音频 VAE 的 H3 运行，或者请求里写了
+`"generateAudio": false`。音轨从不混流进 MP4：混流需要一个无法假定存在的编码器，
+而 WAV 总是能写出来，客户端可以自己混流。
+
+**一张图像意味着什么，取决于检查点。** `videoMode` 取 `t2v`、`i2v`（图像就是首
+帧，并被赋予动作）、`fl2v`（首帧和尾帧）或 `ref`（为新场景提供身份与外观参考）；
+省略它则从请求提供的内容推断。`i2v`/`fl2v` 需要 FL2VA 检查点，`ref` 需要 Ref2VA
+—— 它们是两个不同的文件，而不是一个开关。让某个检查点去做它没有训练过的模式，会
+得到 400，并携带模型自己的解释，告诉你该改加载哪个文件。
+
+```bash
+# 首尾帧，FL2VA 检查点。两个名字都是先前 /api/upload 返回的 "file"；
+# 上传目录之外的任何路径都会被拒绝。
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "缓慢的电影感推镜", "videoMode": "fl2v",
+       "imagePath": "<file from /api/upload>", "endImage": "<file from /api/upload>",
+       "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0}'
+```
+
+参考条件生成 —— 主体的身份被延续下来，而镜头、背景和构图来自提示词 —— 需要
+Ref2VA 检查点，最多接受**九个**参考，可以是静态图、片段和音轨的任意组合：
+
+```bash
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "同一位女性坐在洒满阳光的咖啡馆窗边桌旁，全景镜头",
+       "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0,
+       "referenceImages": ["person.jpg", "bottle.png"], "videoMode": "ref"}'
+```
+
+在 Ref2VA 上，一个不带 `videoMode`、不带 `endImage`、也没有具名参考的普通
+`imagePath` 会被当作单个参考，因此只会附带一张图片的客户端 —— 内置 Web UI 也在其
+中 —— 不需要任何额外字段。
+
+#### Wan 2.1 / 2.2 —— 仅视频
 
 当通过 `--model` 承载的是 Wan DiT GGUF（架构 `wan` —— Wan 2.1 T2V、
-Wan 2.2 TI2V-5B 或 Wan 2.2 A14B）时，输入提示词即可生成 H.264 MP4（配套模型
-请参阅 [docs/models/wan_zh-cn.md](../docs/models/wan_zh-cn.md)）。先在一个终端中启动
+Wan 2.2 TI2V-5B 或 Wan 2.2 A14B）时，输入提示词即可生成 H.264 MP4，没有音轨
+（配套模型请参阅 [docs/models/wan_zh-cn.md](../docs/models/wan_zh-cn.md)）。先在一个终端中启动
 服务器；下列参数为 Web UI 以及省略 `frames`/`fps` 的请求设置默认值。以模型原生的
 24 fps 生成 121 帧，播放时长约为五秒：
 
@@ -865,17 +952,42 @@ curl -X POST http://localhost:5000/v1/videos/generations \
 `steps`（TI2V 为 50 / A14B 为 40 / Wan 2.1 为 30）、`fps`（当请求和服务启动
 均未指定时，TI2V 为 24，其他模型为 16）、`sampler`（默认 `"unipc"` /
 也可选 `"euler"`）、`flowShift`（官方配方）、
-`negative_prompt`（默认为官方 Wan 负向提示词），以及会对齐到 `4k+1` 的 `frames`
-（`1` = 静态图像）。未显式指定 `size` 而提供了 `image` 时，输出会遵循图像的
-纵横比。
+`negative_prompt`（默认为官方 Wan 负向提示词），以及会对齐到模型时间网格的
+`frames`（Wan 为 `4k+1`，MiniMax-H3 为 `17k+5`；`1` = 静态图像）。未显式指定
+`size` 而提供了 `image` 时，输出会遵循图像的纵横比。
+
+#### 所有视频端点通用的字段
+
+条件输入不止首帧、或者与视频一起生成音轨的模型，还接受下列字段 —— 每个都同时接受
+camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为准），并且每个都指
+向先前通过 `/api/upload` 上传的文件（上传目录之外的路径一律拒绝）：
+`endImage`/`end_image`（尾帧条件），
+`referenceImages`/`reference_images`、`referenceVideos`/`reference_videos`、
+`referenceAudios`/`reference_audios`（数组，在提示词中用
+`<Picture N>` / `<Video N>` / `<Audio N>` 指代），
+`referenceVideoAudios`/`reference_video_audios`（音轨，**按下标**与
+`referenceVideos` 配对），
+`generateAudio`/`generate_audio`（默认 `true`；设为 `false` 可跳过音频解码），
+以及 `videoMode`/`video_mode`（`t2v`、`i2v`、`fl2v` 或 `ref`；省略即表示“从这次
+请求提供的内容推断”）。仅视频模型会忽略它们全部。
+
+其余字段只接受 camelCase —— `width`、`height`、`frames`、`steps`、`cfg`、
+`cfg2`、`seed`、`fps`、`flowShift`、`negativePrompt`、`sampler`、
+`cfgCacheStride`、`imagePath`（先前上传的文件）以及 `image`（内联 base64 的替代
+写法）。`size`、`negative_prompt` 和 `response_format` 只存在于
+`/v1/videos/generations` 上。
 
 `POST /api/video-generate` 接受相同的请求体，但以 `width`/`height` 代替 `size`，
-并额外支持 `imagePath`（引用先前通过 `/api/upload` 上传的文件）；其响应使用
-`{ ok, url, ... }` 外层结构。流式变体 `POST /api/video-generate/stream`（Web UI
-使用）会在每个去噪步骤发送形如
-`{"videoGen": true, "step": 12, "total": 30}` 的 SSE 事件，最后发送
-`{"done": true, "url": ..., "frames": 81, "fps": 24, ...}`。对非 Wan 模型
-发起的请求返回 400；并发生成由进程级锁串行执行。
+返回 `{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }`，
+其中模型没有产出音轨时 `audioUrl` 为 null。流式变体
+`POST /api/video-generate/stream`（Web UI 聊天使用）会发送形如
+`{"videoGen": true, "step": 12, "total": 20, "phase": "denoise", "detail": ..., "elapsedSeconds": ..., "etaSeconds": ...}`
+的进度事件 —— `phase` 的取值为 `text-encode`、`image-encode`（有图像条件时）、
+`denoise`、`vae-decode`、`audio-decode`、`done` —— 最后发送
+`{"done": true, "url": ..., "audioUrl": ..., "width": ..., "height": ..., "frames": 22, "fps": 24, "seed": ..., "codec": "h264", "elapsedSeconds": ...}`，
+运行失败时则是 `{"done": true, "error": "..."}`。对非视频生成模型发起的请求返回
+400，并携带 `The loaded model is not a video-generation model.`；并发生成由进程级
+锁串行执行。
 
 ---
 

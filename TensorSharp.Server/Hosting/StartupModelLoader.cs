@@ -63,8 +63,8 @@ namespace TensorSharp.Server.Hosting
             // swallowed as a warning, leaving the server up with speculation
             // silently off. Promote it to a fail-fast startup error so the operator
             // sees exactly why MTP didn't engage instead of discovering it later.
-            string mtpFatal = MtpStartupValidation.GetFatalActivationError(
-                modelService.MtpDraftActivationError);
+            string mtpFatal = SpeculationStartupValidation.GetFatalActivationError(
+                modelService.DraftHeadActivationError);
             if (mtpFatal != null)
                 throw new InvalidOperationException(mtpFatal);
 

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Benchmarks & Testing — TensorSharp Wiki</title>
-  <meta name="description" content="TensorSharp benchmark results vs llama.cpp, and how the test harness works.">
+  <meta name="description" content="TensorSharp benchmark results vs llama.cpp and stable-diffusion.cpp, the MiniMax-H3 and Wan video speed levers, and how the test harness works.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index.html">Home</a> › Benchmarks &amp; Testing</div>
   <h1>Benchmarks &amp; Testing</h1>
-  <p class="lede">How TensorSharp measures up against other inference engines on the same models and hardware, plus the test harness that guards correctness.</p>
+  <p class="lede">How TensorSharp measures up against other inference engines on the same models and hardware — <code>llama.cpp</code> on text, <code>stable-diffusion.cpp</code> on video generation — plus the test harness that guards correctness.</p>
 
   <h2 id="head-to-head">Head-to-head: TensorSharp vs llama.cpp</h2>
   <p>A <strong>pure-.NET engine going toe-to-toe with the hand-tuned C++ <code>llama.cpp</code></strong> — same GGUF files, same <strong>NVIDIA RTX 3080 Laptop GPU (16 GB)</strong>, one uniform OpenAI <code>/v1/chat/completions</code> surface, and <strong>both engines measured on their GGML CUDA and GGML Vulkan builds</strong> across short-prompt, long-context, and multi-turn chat scenarios. The figures below are the current checked-in run of the <code>benchmarks/engine_comparison</code> harness (<code>docs/engine_comparison_report.md</code>), reproducible on your own hardware.</p>
@@ -83,7 +83,73 @@
   <p>The crossover sits around a thousand prompt tokens, and the micro-batch is why: with 256 experts at top-8, a 512-token chunk routes only ~16 rows to each expert, so most of every expert-GEMM tile is padding and a bigger chunk buys more than anything else on the graph. Below that a whole prefill is one small graph, and the fixed cost per call — the managed hop, the input uploads, the 154,880-wide logits copy back — is a visible fraction of it, which is where llama.cpp's few percent come from. Decode is memory-bound and lands a few percent ahead either way. Output is checked as well as timed: on the same backend TensorSharp reproduces llama.cpp token-for-token on 6/6 recorded prompts on <code>ggml_cuda</code>, 3/3 on <code>ggml_cpu</code>, and 1/1 on the 100% managed <code>cpu</code> backend.</p>
   <p>Two things do <em>not</em> speed this model up on this host. <code>--tp 3</code> takes pp2048 / tg64 from 915.9 / 43.9 to 505.6 / 17.6 — each of the 78 layers needs two all-reduces of a <code>[6144, n_tokens]</code> hidden state, and PCIe with no NVLink cannot pay for that. <code>--n-cpu-moe 30</code> takes it to 94.7 / 16.4. Both are there so a checkpoint that would not otherwise fit runs at all: offload raises the context the loader can size from 342,272 to 646,400 tokens. See <a href="models-text.html#glm">GLM 5.x</a>.</p>
 
-  <h2 id="wan">Wan video: two independent speed levers</h2>
+  <h2 id="minimax-h3">MiniMax-H3: video and audio in one pass</h2>
+  <p>MiniMax-H3 denoises the picture and a native <strong>32&nbsp;kHz stereo</strong> soundtrack together in one packed latent, so every figure below is for a run that produces both. Two machines have been measured against <strong><code>stable-diffusion.cpp</code></strong> on the same 22-frame, 8-step request, and <strong>they do not agree</strong>. Both are below, each labelled with its hardware; neither replaces the other, and an average of the two would describe no machine that exists.</p>
+
+  <h3>Apple M5 Pro, <code>ggml_metal</code></h3>
+  <p><strong>22 frames, 8 steps, identical seed</strong>, against <code>stable-diffusion.cpp</code> at its best-performing configuration:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Resolution</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>Speedup</th></tr></thead>
+    <tbody>
+      <tr><td>256×256</td><td>49.3 s</td><td><span class="yes">20.9 s</span></td><td><span class="yes">2.4×</span></td></tr>
+      <tr><td>640×384</td><td>108.5 s</td><td><span class="yes">63.1 s</span></td><td><span class="yes">1.7×</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Read the second row as the real one: <strong>faces need pixels</strong>, so 640×384 is the starting point and 256×256 is a corner the ratio flatters rather than a size to generate at. Both rows are the same 22-frame, 8-step request, and because the checkpoint is CFG-distilled those 8 steps are 8 DiT passes rather than 16. → <a href="models-video.html#minimax-h3">MiniMax-H3 downloads and modes</a></p>
+
+  <h3>RTX 3080 Laptop 16 GB, <code>ggml_cuda</code></h3>
+  <p>The same request on a deliberately memory-starved box — <strong>16,384 MiB of VRAM and 31.7 GB of RAM against a 33.5 GB model set</strong> (DiT 10.64 GiB, Qwen3-VL-32B 16.97 GiB, video VAE 4.85 GiB, audio VAE 0.56 GiB, the identical files on both engines). 22 frames, 8 steps, identical seed, best of three, shipped build, against <code>stable-diffusion.cpp</code> <code>97d2990</code> with ggml <code>8e800ce</code> rebuilt <code>SD_CUDA=ON</code> for arch 86. Here <code>stable-diffusion.cpp</code> takes the wall clock:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Resolution</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>End to end</th></tr></thead>
+    <tbody>
+      <tr><td>256×256</td><td><span class="yes">37.8 s</span></td><td>43.6 s</td><td>sd.cpp 1.15× faster</td></tr>
+      <tr><td>640×384</td><td><span class="yes">59.8 s</span></td><td>63.7 s</td><td>sd.cpp 1.07× faster</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Peak VRAM on the 16,384 MiB card: TensorSharp <strong>15,780 MiB</strong>, <code>stable-diffusion.cpp</code> <strong>12,035 MiB</strong>. sd.cpp was given <code>--auto-fit --stream-layers --diffusion-fa --rng cpu</code>; its default <code>--offload-to-cpu</code> path cannot run this model on this machine at all, because it tries to pin 17.7 GB into 12.3 GB of free RAM.</p>
+  <p><strong>Per denoise step TensorSharp is ahead on CUDA as well</strong> — <strong>3.325 s against 3.338 s</strong> by the 8-vs-16-step slope, which is the measurement that isolates compute from setup, with 3.00–3.11 s seen directly per step. What it gives away is fixed setup cost, and roughly <strong>3 s of the remaining 3.9 s is not inference at all</strong>: H.264 encoding, where sd.cpp writes MJPEG + PCM into an AVI, plus .NET process startup against a native binary.</p>
+  <div class="callout note"><div class="ic">⚖️</div><p>Two hardware points, two different answers, and both are kept. On the M5 Pro TensorSharp finishes the whole run <strong>1.7–2.4× sooner</strong>; on this 16 GB CUDA laptop it is faster <em>per step</em> and <strong>1.07–1.15× slower end to end</strong>, because neither the weights nor the page cache fit and setup dominates a run this short. On a 16 GB card, plan on the CUDA rows. The per-step margin is 13 ms, so a longer run moves the ratio only slowly.</p></div>
+
+  <h3>What the last optimization pass moved</h3>
+  <p>Same RTX 3080 Laptop, same 22-frame, 8-step workload, before and after:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Resolution</th><th>Before</th><th>After</th><th>Speedup</th></tr></thead>
+    <tbody>
+      <tr><td>640×384</td><td>89.0 s</td><td><span class="yes">63.7 s</span></td><td><span class="yes">1.40×</span></td></tr>
+      <tr><td>256×256</td><td>67.2 s</td><td><span class="yes">43.6 s</span></td><td><span class="yes">1.54×</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Both changes aim at the same 16 GB ceiling. The finished denoiser now hands its device residency back <em>before</em> the video VAE loads, which takes peak VRAM during decode from <strong>16,041 MiB to about 5,600 MiB</strong> and is worth <strong>22 s</strong> at 640×384 — the finished denoiser and the video VAE come to 15.8 GB and do not both fit, and WDDM does not fail that allocation, it silently backs the overflow with host memory and runs the decode at PCIe speed. And the denoiser file is prefaulted in parallel with its own upload, taking the first denoise step from <strong>14.87 s to ≈10.2 s</strong>: weights are bound as pointers into the mmapped GGUF, so without it the first host-to-device copy faults every page in from disk as it copies, at <strong>0.91 GB/s</strong> against 5.97 GB/s from resident pageable memory. Output is byte-identical with the prefault on and off.</p>
+
+  <h3>Which lever to pull, and in what order</h3>
+  <p><strong>Steps first.</strong> The default is <strong>20</strong> and <strong>4–8</strong> is the fast operating point — some chromatic fringing shows up around moving subjects at 4–8 and is gone by ~20. There is no guidance pass to cache or skip on top of that: the checkpoint ships <strong>CFG-distilled</strong>, <code>--cfg 1.0</code> is required and anything higher is refused, which also leaves <code>--negative-prompt</code> and <code>--cfg-cache-stride</code> inert here — no unconditional pass runs for them to act on. <strong>Then resolution</strong>: <code>--width</code> / <code>--height</code>, rounded up to a multiple of 32, default 640×384. <strong>Then frame count</strong>: <code>--video-frames</code>, snapped up onto the <code>17k+5</code> grid (5, 22, 39, 56, 73, 90, 107 …) at a pinned 24 fps. <strong>Then the number of references</strong>, which past about four outweighs the step count entirely.</p>
+
+  <h3>What a reference costs</h3>
+  <p>The Ref2VA checkpoint takes up to nine references — stills, clips, standalone audio — and on the denoiser side they are cheap and completely predictable. On an <strong>RTX 3080 Laptop</strong>, 640×384 × 22 frames, one denoise step goes from <strong>4.37 s</strong> with no references to <strong>9.38 s</strong> with eight: about <strong>626 ms per reference per step</strong>, flat from one reference to eight. The denoiser is not where the run goes.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Ref2VA references</th><th>Prompt tokens into Qwen3-VL</th><th>Text conditioning</th><th>Denoise, s / step</th></tr></thead>
+    <tbody>
+      <tr><td>none</td><td>—</td><td>—</td><td>4.37 s</td></tr>
+      <tr><td>two</td><td>548</td><td>≈65 s</td><td>—</td></tr>
+      <tr><td>eight</td><td>2,086</td><td><strong>≈447 s</strong></td><td>9.38 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Each reference adds roughly 250 vision placeholder tokens to the prompt, and the whole prompt is prefilled through all 50 layers of the Qwen3-VL-32B text encoder. Past about <strong>four</strong> references that pass, not the denoiser, <em>is</em> the run: at eight references the entire 8-step denoise costs ≈75 s against ≈447 s of text conditioning.</p>
+  <div class="callout tip"><div class="ic">⚡</div><p>Reach for <strong>fewer, better references</strong> before reaching for fewer steps. At eight references, taking the step count all the way to zero would save less wall clock than dropping to two references does.</p></div>
+
+  <h3>Numerics against the reference implementation</h3>
+  <p>Each of the four networks is checked separately on the same inputs: text encoder <strong>cos 0.999999</strong>, one DiT step <strong>cos 0.998</strong>, video VAE encode and decode <strong>cos 1.000000</strong>, audio VAE decode <strong>cos 0.999995</strong>.</p>
+  <div class="callout note"><div class="ic">⚖️</div><p>The MiniMax-H3 figures here and the Wan figures below are each measured against <code>stable-diffusion.cpp</code>, on different models, different workloads and different hardware. They are <strong>not</strong> a head-to-head between MiniMax-H3 and Wan — no such comparison is measured in this repository.</p></div>
+
+  <h2 id="wan">Wan video (video only): two independent speed levers</h2>
   <p>Video is the one workload where the wrong choice costs <em>hours</em> rather than seconds, so it is worth seeing the levers apart. Every row below is the <strong>same request</strong> — Apple <strong>M5 Pro (20-core GPU, 48 GB unified)</strong>, <code>ggml_metal</code>, <code>Wan2.2-TI2V-5B</code> Q8_0, image-to-video at <strong>1088×832 × 121 frames = 27,404 DiT tokens</strong> — and the rows differ only in the engine version and in which checkpoint <code>--model</code> pointed at.</p>
   <div class="table-scroll">
   <table>

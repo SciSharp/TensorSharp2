@@ -279,7 +279,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (_handles.TryRemove(seq.RequestId, out var handle))
                 {
-                    LogMtpStatsIfAny(seq);
+                    LogSpeculationStatsIfAny(seq);
                     handle.CompleteWithError(ex);
                     Interlocked.Increment(ref _totalCompleted);
                 }
@@ -435,7 +435,7 @@ namespace TensorSharp.Runtime.Scheduling
                         // stop-sequence hit in the adapter) never reach the
                         // ApplyResults finish paths, so surface speculative
                         // stats here too.
-                        LogMtpStatsIfAny(handle.Sequence);
+                        LogSpeculationStatsIfAny(handle.Sequence);
                         handle.CompleteAborted();
                     }
                     if (_model is Runtime.Scheduling.IBatchedPagedModel batchedAbort)
@@ -454,7 +454,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (r.Error != null)
                 {
-                    LogMtpStatsIfAny(seq);
+                    LogSpeculationStatsIfAny(seq);
                     _scheduler.NotifyError(seq, r.Error, output);
                     handle?.CompleteWithError(r.Error);
                     _handles.TryRemove(seq.RequestId, out _);
@@ -488,7 +488,7 @@ namespace TensorSharp.Runtime.Scheduling
                         if (_model.Tokenizer != null && _model.Tokenizer.IsEos(token))
                         {
                             TruncateUnpublishedTail(seq, emittedCount);
-                            LogMtpStatsIfAny(seq);
+                            LogSpeculationStatsIfAny(seq);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, "eos", output);
                             handle?.CompleteFinished();
                             _handles.TryRemove(seq.RequestId, out _);
@@ -503,7 +503,7 @@ namespace TensorSharp.Runtime.Scheduling
                         if (emittedCount >= seq.MaxNewTokens)
                         {
                             TruncateUnpublishedTail(seq, emittedCount);
-                            LogMtpStatsIfAny(seq);
+                            LogSpeculationStatsIfAny(seq);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "max_tokens", output);
                             handle?.CompleteFinished();
                             _handles.TryRemove(seq.RequestId, out _);
@@ -532,13 +532,13 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>Log cumulative NextN/MTP speculative-decoding counters when
         /// a request that ran speculatively finishes.</summary>
-        private void LogMtpStatsIfAny(SequenceState seq)
+        private void LogSpeculationStatsIfAny(SequenceState seq)
         {
             var st = seq.SpecStats;
             if (st == null || (st.VerifySteps + st.PlainSteps) == 0)
                 return;
             _logger.LogInformation(
-                "MTP speculative stats for {RequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0}",
+                "Speculative decoding stats for {RequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0}",
                 seq.RequestId, st.TokensDrafted, st.TokensAccepted, st.AcceptanceRate,
                 st.VerifySteps, st.PlainSteps, st.RollbackSteps,
                 st.DraftMs, st.VerifyMs, st.SnapshotMs, st.RollbackMs, st.CatchUpMs, st.PlainMs);

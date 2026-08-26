@@ -2020,7 +2020,7 @@ namespace TensorSharp.Models
             if (!_fusedVerifyEnabled || _fvUnsupported
                 || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan))
                 return false;
-            if (!HasMtp || x == null || seqLen < 1)
+            if (!HasDraftHead || x == null || seqLen < 1)
                 return false;
             int mtp = _mtpLayerIdx;
             if (mtp < 0 || _isRecurrent[mtp])     // the MTP block is a full-attention layer

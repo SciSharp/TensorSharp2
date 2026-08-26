@@ -289,6 +289,44 @@ namespace TensorSharp.Models
             // Prompt-KV caching needs the device-resident attention path (it stores/concats K/V tensors).
             _pkvEnabled = _useDeviceGlue && Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV") != "1";
 
+            // Metal lazy-sync (async compute) is unsafe for this model, exactly as it is for Gemma 4
+            // (see Gemma4Model's SetAsyncCompute(false) and the hazard note there). GgmlContext enables
+            // it by default on Metal: a per-op kernel returns without waiting on its command buffer, and
+            // GetFloatPtr / EnsureHostReadable drains pending work before a CPU *read* — but there is no
+            // host-WRITE barrier, so a CPU write followed by a device kernel can dispatch against a stale
+            // cached device buffer for the same host pointer.
+            //
+            // Every per-op path here mixes CPU writes with device kernels: MoERoute reads the router
+            // scores to the host and top-Ks them, the per-expert MoE fallback builds batchInput with
+            // Buffer.MemoryCopy before dispatching ExpertFFN, and the embedding / mask / self-conditioning
+            // helpers all populate tensors on the CPU. Left async, the forward is not even reproducible —
+            // two identical ForwardCanvas calls returned logits differing on ~all 67M floats (cosine as
+            // low as 0.77) on an M5 Pro.
+            //
+            // That is catastrophic specifically BECAUSE of prompt-KV caching: PrefillPrompt runs the
+            // prompt through the per-op stack ONCE and freezes the result as _promptK/_promptV for every
+            // denoising step of the turn, so a corrupted prefill permanently poisons the model's view of
+            // the prompt. The symptom is the Gemma 4 one — fluent text that has lost the prompt's
+            // conditional content (e.g. "请详细介绍最终幻想7" answered as if the user had only typed
+            // "请介绍").
+            //
+            // Measured cost on an M5 Pro (canvas=256, Q4_K_M): prefill is unchanged (~290 ms either way,
+            // the sync lands on work the prefill was going to wait for anyway), and the decode step goes
+            // 183 -> 199 ms, about +8% (~+6% end-to-end). That is the price of a correct answer.
+            //
+            // Do NOT try to reclaim it by keeping async on for the decode loop only. That looks safe and
+            // is not: with the canvas held constant, 48 decode steps are bitwise reproducible under async
+            // (every step re-uploads identical bytes, so a stale device buffer still holds the right
+            // data), yet a real Generate() — which re-noises the canvas each step, making
+            // Embedding(canvasTokens) a genuine per-step host write — comes back off-topic again.
+            // Reproducibility is not correctness here; only the end-to-end answer is.
+            //
+            // DIFFUSION_ASYNC_COMPUTE=1 forces it back on. That is UNSAFE (it reintroduces the corruption
+            // above) and exists only to A/B the cost of the synchronize.
+            if (IsGgmlBackend && GgmlBasicOps.GetAsyncCompute() &&
+                Environment.GetEnvironmentVariable("DIFFUSION_ASYNC_COMPUTE") != "1")
+                GgmlBasicOps.SetAsyncCompute(false);
+
             PrepareCudaWeightResidency();
 
             // Self-conditioning (matches the reference sampler) materially improves quality on longer

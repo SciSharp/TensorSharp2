@@ -34,10 +34,15 @@ TensorSharp loads models in GGUF format. Below are verified Hugging Face repos f
 | Qwen-Image-Edit | Qwen2.5-VL-7B text encoder (required) | [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) — place next to the DiT or set `--qwen-image-vl` / `TS_QWEN_IMAGE_TE` |
 | Qwen-Image-Edit | Vision mmproj (optional) | `mmproj-BF16.gguf` from [unsloth/Qwen2.5-VL-7B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen2.5-VL-7B-Instruct-GGUF) — image-grounded conditioning via `--qwen-image-mmproj` / `TS_QWEN_IMAGE_MMPROJ` |
 | Qwen-Image-Edit | Lightning LoRA (optional, 4/8-step) | [lightx2v/Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) (`Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors`) — `--qwen-image-lora` / `TS_QWEN_IMAGE_LORA`; auto-switches to the LoRA's step count and CFG 1.0 |
+| MiniMax-H3 audio+video | denoiser (the `--model` GGUF) | **Two separate checkpoints, not settings** — which one you load decides what conditioning it accepts. [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF): `minimax_h3_fl2va_pruned-Q4_K.gguf` (10.64 GiB) for text / image-to-video / first-and-last-frame, or `minimax_h3_ref2va_pruned-Q4_K.gguf` (10.60 GiB) for identity/appearance references. Also Q8_0 (19.97 GiB) down to Q2_K (6.26 GiB). H3 is CFG-distilled: **pass `--cfg 1.0`** and 4-8 steps. The GGUFs carry **no metadata at all**, so TensorSharp identifies them by their tensors, and the partition off the file name — keep `fl2va` / `ref2va` in it if you rename or requantize. Both checkpoints share the three networks below, so adding the second one later costs only its own ~10.6 GiB |
+| MiniMax-H3 audio+video | Qwen3-VL-32B text encoder (required) | Same repo: `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` (16.97 GiB), or `-Q2_K_M.gguf` (12.20 GiB) to pair with the two smallest denoisers. Truncated to 50 layers with the final norm removed. Freed before the denoise starts. **It ships no tokenizer** — also download `vocab.json` and `merges.txt` from [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor) and put them beside it (or set `TS_VIDEO_TOKENIZER`) |
+| MiniMax-H3 audio+video | `vocab.json` + `merges.txt` (required) | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor) — the Qwen2 byte-level BPE pair the encoder GGUF omits, and the one thing a config cannot auto-download for you (auto-download fills in options that are flags; the tokenizer is not one). `curl -L -o models/vocab.json https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/processor/vocab.json` and the same for `merges.txt` |
+| MiniMax-H3 audio+video | video VAE (required) | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae) — `minimax_h3_video_vae_fp16.safetensors` (5.21 GB). 16x spatial / 4x temporal, with a pure-transformer decoder. Place next to the denoiser or set `--video-vae` |
+| MiniMax-H3 audio+video | audio VAE (optional) | Same folder — `minimax_h3_audio_vae_fp32.safetensors` (0.61 GB). Decodes the jointly generated audio latent to 32 kHz stereo, written as a sidecar `.wav`. **Omit it and you still get video**, just silent. Set with `--audio-vae` |
 | Wan video generation | **Step-distilled DiT (start here)** | **The single biggest speed lever — pick this unless you are reproducing a reference sample.** A distilled checkpoint runs 4 denoise passes instead of the official recipe's 100 for the same video: measured on M5 Pro / `ggml_metal` at 1088×832×121 frames, **17 m 30 s** end to end versus **3 h 30 m** on the base checkpoint, same request, no other flag changed. TI2V-5B: [hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF) — `Wan2_2-TI2V-5B-Turbo-Q8_0.gguf` (5.40 GB), also Q6_K (4.22 GB), Q5_K_M (3.82 GB), Q4_K_M (3.44 GB), down to Q2_K (1.86 GB). **Mind the `Wan2_2` underscore** — copying the base repo's `Wan2.2` spelling into `hf download` 404s. I2V-A14B: [jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF](https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF) — Lightning already merged into both experts; download `high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf` **and** `low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf` (9.66 GB each; Q8_0 15.42 GB, Q2_K 5.31 GB) under one `--local-dir` and point `--model` at either — the sibling expert is found automatically. Secondary: [Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF](https://huggingface.co/Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF) (`FastWan2.2-TI2V-5B-q8_0.gguf`, 5.41 GB). **No flag is needed**: TensorSharp reads the DiT file name for `turbo` / `distill` / `lightning` / `lightx2v` / `fastwan` / `-dmd` or an explicit `<N>steps` (1-16), switches to that step count with guidance off, and prints `step-distilled checkpoint detected -> N steps, guidance off` on load; `--diffusion-steps` / `--cfg` override it. The Turbo and A14B distilled repos ship no VAE and no text encoder — take those from the two rows below |
 | Wan video generation | Base DiT (the `--model` GGUF) | The full official recipe (50 steps × 2 CFG passes = 100 DiT passes) — use it when you need to match a reference sample; otherwise prefer the distilled row above. Wan 2.2 text/image-to-video: [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF) (`Wan2.2-TI2V-5B-Q8_0.gguf` 5.40 GB or `Wan2.2-TI2V-5B-Q4_K_M.gguf` 3.43 GB; bundles `VAE/Wan2.2_VAE.safetensors`), [QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF) or [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF) (both `HighNoise/` **and** `LowNoise/` experts are required; each repo bundles `VAE/Wan2.1_VAE.safetensors`); Wan 2.1 text-to-video: [samuelchristlie/Wan2.1-T2V-1.3B-GGUF](https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF) (`Wan2.1-T2V-1.3B-Q8_0.gguf` / `-F16.gguf`) or [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf) (lowercase names, e.g. `wan2.1-t2v-14b-Q8_0.gguf`) — neither 2.1 repo ships a VAE or encoder. `general.architecture` = `wan` / `wan2.1` / `wan2.2`. See [docs/models/wan.md](docs/models/wan.md) |
-| Wan video generation | UMT5-XXL text encoder (required, every Wan checkpoint) | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) — `umt5-xxl-encoder-Q8_0.gguf` (6.04 GB), or `umt5-xxl-encoder-Q5_K_M.gguf` (4.15 GB) / `umt5-xxl-encoder-Q4_K_M.gguf` (3.66 GB) for tighter memory. Turns the prompt into conditioning and is freed before the denoise starts. Place next to the DiT or set `--wan-te` / `TS_WAN_TE` |
-| Wan video generation | video VAE (required) | Decodes latents to frames — **which one is decided by the DiT**, not by you: TI2V-5B needs [`Wan2.2_VAE.safetensors`](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE) (bundled in the TI2V-5B repo), Wan 2.1 and A14B need `Wan2.1_VAE.safetensors` — bundled as `VAE/Wan2.1_VAE.safetensors` in both QuantStack A14B repos, or standalone as [`wan_2.1_vae.safetensors`](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors). The distilled repos above ship no VAE, so pair them with the matching file from here. Place next to the DiT (a `VAE/` subfolder works) or set `--wan-vae` / `TS_WAN_VAE` |
+| Wan video generation | UMT5-XXL text encoder (required, every Wan checkpoint) | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) — `umt5-xxl-encoder-Q8_0.gguf` (6.04 GB), or `umt5-xxl-encoder-Q5_K_M.gguf` (4.15 GB) / `umt5-xxl-encoder-Q4_K_M.gguf` (3.66 GB) for tighter memory. Turns the prompt into conditioning and is freed before the denoise starts. Place next to the DiT or set `--video-text-encoder` / `TS_WAN_TE` |
+| Wan video generation | video VAE (required) | Decodes latents to frames — **which one is decided by the DiT**, not by you: TI2V-5B needs [`Wan2.2_VAE.safetensors`](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE) (bundled in the TI2V-5B repo), Wan 2.1 and A14B need `Wan2.1_VAE.safetensors` — bundled as `VAE/Wan2.1_VAE.safetensors` in both QuantStack A14B repos, or standalone as [`wan_2.1_vae.safetensors`](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors). The distilled repos above ship no VAE, so pair them with the matching file from here. Place next to the DiT (a `VAE/` subfolder works) or set `--video-vae` / `TS_WAN_VAE` |
 
 ### DSpark drafters
 
@@ -90,7 +95,7 @@ embedded NextN blocks. Those are different drafters from DSpark.
 
 These commands run from the repository root. First install the [.NET 10 SDK](DEVELOPMENT.md#install-the-net-10-sdk) for your platform and run `dotnet build TensorSharp.slnx -c Release`; a runtime-only installation cannot build the binaries used below.
 
-The `hf download` commands need the Hugging Face CLI (`pip install -U huggingface_hub`) and drop every file into `./models`. Reminders that apply to all blocks: the CLI reads its one-shot prompt from a **file** via `--input` (`--prompt` is the Qwen-Image-Edit edit instruction and the Wan video prompt), samples **greedily** by default, and generates only 100 tokens unless you raise `--max-tokens`; the server always listens on **http://localhost:5000**. Swap `--backend ggml_cuda` for the backend that fits your hardware (see [Pick a Backend](README.md#pick-a-backend)). Create a prompt file first:
+The `hf download` commands need the Hugging Face CLI (`pip install -U huggingface_hub`) and drop every file into `./models`. Reminders that apply to all blocks: the CLI reads its one-shot prompt from a **file** via `--input` (`--prompt` is the Qwen-Image-Edit edit instruction and the video-generation prompt, MiniMax-H3 and Wan alike), samples **greedily** by default, and generates only 100 tokens unless you raise `--max-tokens`; the server always listens on **http://localhost:5000**. Swap `--backend ggml_cuda` for the backend that fits your hardware (see [Pick a Backend](README.md#pick-a-backend)). Create a prompt file first:
 
 ```bash
 echo "Give me three facts about the Moon." > prompt.txt
@@ -217,9 +222,84 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/qwen-image-e
 
 (In the Web UI, attach an image and type the edit instruction. The Lightning LoRA download and `--qwen-image-lora` flag are optional — they cut the denoise to 4 steps at CFG 1.0.)
 
-**Wan video generation** — prompt (+ optional first-frame image) → H.264 MP4; needs the DiT + video VAE + UMT5-XXL text encoder ([hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF))
+**MiniMax-H3 audio+video generation** — prompt (+ optional keyframes or references) → H.264 MP4 **and native 32 kHz stereo audio, generated together in one packed latent** ([unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF))
 
-Video is the one pipeline that needs three separate networks, so the shortest route is a
+Four networks cooperate here, so the shortest route is a ready-made config — it names all four
+and downloads whatever is missing (~33.5 GB on the first run):
+
+```bash
+TensorSharp.Server --config config/minimax-h3-fl2va.json
+TensorSharp.Cli    --config config/minimax-h3-fl2va.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+```
+
+`config/minimax-h3-ref2va.json` is the other checkpoint: up to nine identity and appearance
+references — stills, clips, soundtracks — for a brand-new scene rather than frames the clip has to
+reproduce. FL2VA and Ref2VA are **separate checkpoints, not a setting**, and asking one for the
+other's conditioning fails with a message naming the file you actually need. Only the denoiser
+differs between the two configs (~33.4 GB there), so the three networks below are shared and the
+second config downloads just its own DiT. See
+[config/README.md](config/README.md#video-generation-with-sound-minimax-h3). Files land wherever
+`TENSORSHARP_MODELS` points, or in `models/` next to the repository.
+
+One pair is not automated either way: the text-encoder GGUF carries no tokenizer, and auto-download
+can only fill in options that are flags.
+
+```bash
+curl -L -o models/vocab.json https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/processor/vocab.json
+curl -L -o models/merges.txt https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/processor/merges.txt
+```
+
+The manual route is below.
+
+```bash
+# FL2VA is the text / image-to-video / first-and-last-frame checkpoint; swap in
+# minimax_h3_ref2va_pruned-Q4_K.gguf for reference conditioning. Both VAEs are mirrored
+# in unsloth/MiniMax-H3-GGUF's own vae/ folder if Comfy-Org is slow.
+hf download unsloth/MiniMax-H3-GGUF minimax_h3_fl2va_pruned-Q4_K.gguf --local-dir models
+hf download unsloth/MiniMax-H3-GGUF qwen3vl_32b_minimax_h3-Q4_K_M.gguf --local-dir models
+hf download Comfy-Org/MiniMax-H3 vae/minimax_h3_video_vae_fp16.safetensors --local-dir models
+hf download Comfy-Org/MiniMax-H3 vae/minimax_h3_audio_vae_fp32.safetensors --local-dir models
+
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-text-encoder models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf \
+    --video-vae models/vae/minimax_h3_video_vae_fp16.safetensors \
+    --audio-vae models/vae/minimax_h3_audio_vae_fp32.safetensors \
+    --prompt "a red fox trotting through falling snow, cinematic" \
+    --output fox.mp4 --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+    --video-text-encoder models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf \
+    --video-vae models/vae/minimax_h3_video_vae_fp16.safetensors \
+    --audio-vae models/vae/minimax_h3_audio_vae_fp32.safetensors \
+    --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+```
+
+That CLI run writes `fox.mp4` **and `fox.wav`**: the soundtrack is a sidecar, never muxed in,
+because muxing needs an encoder that may not be installed. Put them together with
+`ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4`. With everything in one folder the three
+companion flags can be dropped: the denoiser's directory and its parent are scanned recursively,
+subfolders included. Drop the audio VAE, or pass `--no-audio`, and you still get video — just silent.
+
+H3 is CFG-distilled, so **`--cfg 1.0` is required** and anything higher is refused outright; the
+pipeline's own default is 20 steps and 4-8 is the fast operating point, at the cost of some
+chromatic fringing around moving subjects that is gone by ~20. Width and height round up to a
+multiple of 32, the frame count snaps to the `17k+5` grid (5, 22, 39, 56, 73, 90 …) and fps is
+pinned to 24 whatever you ask for. On the server the step count is spelled `--video-steps` and
+there is no `--cfg` at all, which is why the shipped configs set neither.
+
+For conditioning, `--image first.png` animates that picture as the first frame; adding
+`--end-image last.png --video-mode fl2v` interpolates between the two; and on the Ref2VA checkpoint
+`--ref-image` (repeatable, up to nine), `--ref-video`, `--ref-video-audio` and `--ref-audio` carry
+identity and appearance into a new scene instead. Measured on an M5 Pro over Metal at 22 frames and
+8 steps with the same seed, H3 runs **2.4x** faster than stable-diffusion.cpp at 256×256
+(49.3 s → 20.9 s) and **1.7x** at 640×384 (108.5 s → 63.1 s). See
+[docs/models/minimax-h3.md](docs/models/minimax-h3.md).
+
+**Wan video generation** — prompt (+ optional first-frame image) → H.264 MP4, video only; needs the DiT + video VAE + UMT5-XXL text encoder ([hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF))
+
+Wan needs three separate networks, so here too the shortest route is a
 ready-made config — it names all three and downloads whatever is missing:
 
 ```bash
@@ -230,7 +310,7 @@ TensorSharp.Cli    --config config/wan-video-ti2v-5b-turbo.json \
 
 `config/wan-video-ti2v-5b.json` is the undistilled 50-step variant and
 `config/wan-video-i2v-a14b.json` the two-expert 14B image-to-video model; see
-[config/README.md](config/README.md#video-generation-wan). Files land wherever
+[config/README.md](config/README.md#video-generation-video-only-wan). Files land wherever
 `TENSORSHARP_MODELS` points, or in `models/` next to the repository. The manual
 route is below.
 
@@ -243,12 +323,12 @@ hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir 
 
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_cuda \
-    --wan-vae models/VAE/Wan2.2_VAE.safetensors --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --video-vae models/VAE/Wan2.2_VAE.safetensors --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf \
     --prompt "a cute fluffy orange cat walking through a sunny garden with flowers" \
     --output cat.mp4 --width 832 --height 480 --video-frames 81
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
     --model models/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_cuda \
-    --wan-vae models/VAE/Wan2.2_VAE.safetensors --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --video-vae models/VAE/Wan2.2_VAE.safetensors --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf \
     --video-frames 121 --fps 24
 ```
 
@@ -260,7 +340,7 @@ for image-to-video, or attach an image in the Web UI (it becomes the first frame
 `--video-frames` / `--fps` are defaults that a request can override. Wan is the one family that does
 not run on `--backend mlx`; use `ggml_cuda`, `ggml_metal`, `ggml_vulkan`, `ggml_cpu`, `cuda` or `cpu`.
 
-If all three files sit in one folder (a `VAE/` subfolder counts) the `--wan-vae` / `--wan-te` flags
+If all three files sit in one folder (a `VAE/` subfolder counts) the `--video-vae` / `--video-text-encoder` flags
 can be dropped — they are resolved automatically. For the two-expert A14B models download **both**
 experts under the same `--local-dir` and point `--model` at either one:
 
@@ -272,8 +352,8 @@ hf download city96/umt5-xxl-encoder-gguf umt5-xxl-encoder-Q8_0.gguf --local-dir 
 
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model models/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf \
-    --backend ggml_cuda --wan-vae models/VAE/Wan2.1_VAE.safetensors \
-    --wan-te models/umt5-xxl-encoder-Q8_0.gguf \
+    --backend ggml_cuda --video-vae models/VAE/Wan2.1_VAE.safetensors \
+    --video-text-encoder models/umt5-xxl-encoder-Q8_0.gguf \
     --prompt "the ship sails into the storm, waves crashing" --image ship.jpg --output ship.mp4
 ```
 

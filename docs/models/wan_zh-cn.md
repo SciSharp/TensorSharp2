@@ -7,6 +7,12 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 （Wan 2.2 模型可再加一张首帧图片），输出 H.264 MP4，`TensorSharp.Cli` 与
 `TensorSharp.Server`（OpenAI 风格 API + 自带 Web UI 聊天）均可驱动。
 
+> **Wan 是只生成视频的家族。** TensorSharp 中更新的视频模型是
+> [MiniMax-H3](minimax-h3_zh-cn.md)：它在**同一份打包潜变量**里把视频与
+> **原生 32 kHz 立体声音频一起生成**——支持文生视频、图生视频、首尾帧与参考生视频，
+> 并在 CFG-free 的 4–8 步下运行。只需要视频时仍然选 Wan，它也是拥有步数蒸馏检查点、
+> 能把 100 次 DiT 前向的官方配方降到 4 次的那个家族。
+
 支持的模型家族（按 DiT GGUF 自动识别）：
 
 | 家族 | 潜空间 | VAE | 模式 | 说明 |
@@ -25,8 +31,8 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 |---|---|---|
 | DiT（`--model` GGUF，`general.architecture = wan`） | 如 `Wan2.2-TI2V-5B-Q8_0.gguf` | [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF)、[QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF)、[city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf) |
 | A14B 第二专家（仅 A14B） | 对应的 `…HighNoise…`/`…LowNoise…` GGUF | 同一仓库（在同级或兄弟目录中按文件名自动查找；`TS_WAN_DIT2` 可覆盖） |
-| UMT5-XXL 文本编码器 | `umt5-xxl-encoder-Q8_0.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf)（`--wan-te` / `TS_WAN_TE`） |
-| Wan 2.1 视频 VAE（2.1 + A14B） | `wan_2.1_vae.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors)（`--wan-vae` / `TS_WAN_VAE`） |
+| UMT5-XXL 文本编码器 | `umt5-xxl-encoder-Q8_0.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf)（`--video-text-encoder` / `TS_WAN_TE`） |
+| Wan 2.1 视频 VAE（2.1 + A14B） | `wan_2.1_vae.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors)（`--video-vae` / `TS_WAN_VAE`） |
 | Wan 2.2 视频 VAE（TI2V-5B） | `Wan2.2_VAE.safetensors` | [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE) 内附 |
 
 文本编码器在去噪开始前、（图生视频时）VAE 编码器在 DiT 加载前、DiT 在 VAE 解码前
@@ -37,7 +43,7 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 ### 最快的上手方式：使用配置文件
 
 视频生成需要多个网络协同，因此最省事的做法是使用
-[`config/`](../../config/README.md#video-generation-wan) 中现成的配置文件——
+[`config/`](../../config/README.md#video-generation-video-only-wan) 中现成的配置文件——
 它们会声明全部网络，并在首次运行时自动下载缺失的文件：
 
 ```bash
@@ -66,7 +72,7 @@ macOS 上都能直接使用，无需修改。
 而 A14B 与 Wan 2.1 系列需要 Wan 2.1 VAE（16 通道，8×8×4）。装错会在启动时报错，
 而不是生成错误的视频。UMT5-XXL 为所有 Wan 模型共用，只需下载一次。
 
-若要指向已有文件，使用 `--wan-vae`、`--wan-te`，以及（A14B）`--wan-dit2`；
+若要指向已有文件，使用 `--video-vae`、`--video-text-encoder`，以及（A14B）`--video-dit2`；
 或把它们与 DiT 放在同一目录，由同目录扫描自动找到。
 
 ## 后端

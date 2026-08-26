@@ -426,13 +426,32 @@ namespace TensorSharp.Runtime
 
             long required = GetRequiredLength(out string? lastTensorName);
             long actual = _stream.Length;
-            if (actual >= required)
-                return;
-            double missingGiB = (required - actual) / (1024.0 * 1024.0 * 1024.0);
-            throw new IOException(
-                $"{_path} is incomplete: the file is {actual} bytes but its {Tensors.Count} tensors need " +
-                $"{required} ({missingGiB:F2} GiB missing; {lastTensorName ?? "?"} is the last one). " +
-                "Re-download this file.");
+            if (actual < required)
+            {
+                double missingGiB = (required - actual) / (1024.0 * 1024.0 * 1024.0);
+                throw new IOException(
+                    $"{_path} is incomplete: the file is {actual} bytes but its {Tensors.Count} tensors need " +
+                    $"{required} ({missingGiB:F2} GiB missing; {lastTensorName ?? "?"} is the last one). " +
+                    "Re-download this file.");
+            }
+
+            // A file LONGER than its tensor table is not truncated, so it loads and
+            // runs — but the surplus has to have come from somewhere, and in practice
+            // it means two writers appended to the same partial download. That
+            // corrupts the interior silently: the model reports sensible shapes, runs
+            // at full speed, and emits garbage. Alignment padding is tens of bytes,
+            // so anything past a mebibyte is worth saying out loud.
+            const long SlackBytes = 1L << 20;
+            if (actual - required > SlackBytes)
+            {
+                double extraGiB = (actual - required) / (1024.0 * 1024.0 * 1024.0);
+                Console.Error.WriteLine(
+                    $"warning: {_path} is {extraGiB:F2} GiB LARGER than its {Tensors.Count} tensors " +
+                    $"need ({actual} bytes on disk, {required} accounted for). A GGUF should end where " +
+                    "its tensor data ends; surplus usually means an interrupted download was resumed " +
+                    "by a second writer, which corrupts the interior without shortening the file. " +
+                    "Verify the size against the publisher and re-download if it differs.");
+            }
         }
 
         public string? GetString(string key, string? defaultValue = null)

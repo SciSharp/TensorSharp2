@@ -151,6 +151,26 @@ namespace TensorSharp.Server.ProtocolAdapters
             var mmProjFiles = string.IsNullOrWhiteSpace(_options.StartupMmProjPath)
                 ? new List<string>()
                 : new List<string> { Path.GetFileName(_options.StartupMmProjPath) };
+            // What the loaded model does with attached pictures, when it is a video model.
+            // The Web UI cannot work this out for itself and the answer changes what a
+            // request should even contain: the same three images are three REFERENCES on
+            // Ref2VA and an illegal request on FL2VA, which takes a first frame and a last
+            // frame and nothing else. Null for every non-video model, so the UI can test
+            // one field instead of pattern-matching an architecture string.
+            object video = null;
+            if (_svc.Model is TensorSharp.Models.Video.IVideoGenerationModel videoModel)
+            {
+                video = new
+                {
+                    family = videoModel.VideoModelFamily,
+                    supportsAudio = videoModel.SupportsAudio,
+                    supportsImageConditioning = videoModel.SupportsImageConditioning,
+                    supportsEndImageConditioning = videoModel.SupportsEndImageConditioning,
+                    supportsReferenceConditioning = videoModel.SupportsReferenceConditioning,
+                    maxReferenceImages = videoModel.MaxReferenceImages,
+                };
+            }
+
             return Results.Json(new
             {
                 models = files,
@@ -162,6 +182,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 supportedBackends = _options.SupportedBackends,
                 architecture = _svc.Architecture,
                 defaultMaxTokens = _options.DefaultMaxTokens,
+                video,
             });
         }
 
@@ -661,21 +682,23 @@ namespace TensorSharp.Server.ProtocolAdapters
             public int Step, Total;
             public bool Final;
             public string Url;
+            // Sidecar WAV for models that generate an audio track jointly with the video.
+            public string AudioUrl;
             public int Width, Height, Frames, Fps;
             public long Seed;
             public string Codec;
             public double Seconds;
             public string Error;
-            // Live progress detail (see WanProgress): which phase is running, how long
+            // Live progress detail (see VideoGenerationProgress): which phase is running, how long
             // it has been running and the projected time left. A 720p/121-frame pass
             // is minutes long, so without these the UI has nothing to show between steps.
             public string Phase, Detail;
             public double Elapsed, Eta = -1;
         }
 
-        private TensorSharp.Models.WanVideo.WanVideoParams ParseVideoParams(JsonElement root, out string error)
+        private TensorSharp.Models.Video.VideoGenerationParams ParseVideoParams(JsonElement root, out string error)
         {
-            return WanVideoParamsParser.Parse(root, _options, out error);
+            return VideoGenerationParamsParser.Parse(root, _options, out error);
         }
 
         /// <summary>
@@ -686,8 +709,8 @@ namespace TensorSharp.Server.ProtocolAdapters
         public async Task<IResult> VideoGenerateAsync(HttpRequest req)
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
-            if (_svc.Model is not TensorSharp.Models.WanVideo.WanVideoModel videoModel)
-                return Results.BadRequest(new { error = "The loaded model is not a Wan video-generation model." });
+            if (_svc.Model is not TensorSharp.Models.Video.IVideoGenerationModel videoModel)
+                return Results.BadRequest(new { error = "The loaded model is not a video-generation model." });
 
             var body = await JsonDocument.ParseAsync(req.Body);
             var root = body.RootElement;
@@ -711,29 +734,63 @@ namespace TensorSharp.Server.ProtocolAdapters
                 prompt, p.Width, p.Height, p.Frames, p.Steps, p.ImageBytes != null);
 
             var sw = Stopwatch.StartNew();
-            var result = await Task.Run(() =>
+            (TensorSharp.Models.WanVideo.GeneratedVideo video, string codec) result;
+            try
             {
-                lock (_videoGenLock)
+                result = await Task.Run(() =>
                 {
-                    var video = videoModel.GenerateVideo(prompt, p);
-                    string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outPath, video.Frames, video.Fps);
-                    return (video, codec);
-                }
-            });
+                    lock (_videoGenLock)
+                    {
+                        var video = videoModel.GenerateVideo(prompt, p);
+                        string c = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outPath, video.Frames, video.Fps);
+                        return (video, c);
+                    }
+                });
+            }
+            catch (Exception ex) when (IsVideoRequestRejection(ex))
+            {
+                // These carry the model's own explanation of what the request asked for
+                // and why this checkpoint cannot do it — which checkpoint to load, which
+                // flag to drop. Swallowing them into a generic 500 would throw away the
+                // only thing that tells the caller how to fix it.
+                logger.LogWarning(LogEventIds.UploadReceived, ex, "Video generate rejected");
+                return Results.BadRequest(new { error = ex.Message });
+            }
             sw.Stop();
             _uploads.RecordFile(outPath);
 
             string url = BuildUploadUrl(outName);
+            string audioUrl = SaveAudioSidecar(result.video.Audio, outName);
             logger.LogInformation(LogEventIds.UploadReceived,
                 "Video generate done: {F} frames -> {Url} ({Sec:F1}s)", result.video.Frames.Length, url, sw.Elapsed.TotalSeconds);
             return Results.Json(new
             {
-                ok = true, url,
+                ok = true, url, audioUrl,
                 width = result.video.Frames[0].Width, height = result.video.Frames[0].Height,
                 frames = result.video.Frames.Length, fps = result.video.Fps,
                 seed = result.video.Seed, codec = result.codec,
                 elapsedSeconds = sw.Elapsed.TotalSeconds,
             });
+        }
+
+        // A generation request the loaded model can explain rather than an internal
+        // failure: the wrong checkpoint for the requested mode, a mode without its
+        // inputs, or a conditioning kind this build does not implement yet.
+        private static bool IsVideoRequestRejection(Exception ex) =>
+            ex is ArgumentException or InvalidOperationException or NotSupportedException;
+
+        // Models that generate audio jointly with the video hand back a track alongside
+        // the frames. It is written as a sidecar WAV rather than muxed into the MP4:
+        // muxing needs an encoder we cannot assume is installed, whereas a WAV always
+        // writes and the client can play or mux it as it likes.
+        private string SaveAudioSidecar(TensorSharp.Models.Video.GeneratedVideoAudio audio, string videoName)
+        {
+            if (audio is not { ChannelCount: > 0, SampleCount: > 0 }) return null;
+            string name = Path.ChangeExtension(videoName, ".wav");
+            string path = Path.Combine(_options.UploadDirectory, name);
+            TensorSharp.Models.Video.WavWriter.Write(path, audio.Channels, audio.SampleRate);
+            _uploads.RecordFile(path);
+            return BuildUploadUrl(name);
         }
 
         /// <summary>
@@ -745,8 +802,8 @@ namespace TensorSharp.Server.ProtocolAdapters
         public async Task<IResult> OpenAIVideoGenerationsAsync(HttpRequest req)
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
-            if (_svc.Model is not TensorSharp.Models.WanVideo.WanVideoModel videoModel)
-                return Results.BadRequest(new { error = new { message = "The loaded model is not a Wan video-generation model.", type = "invalid_request_error" } });
+            if (_svc.Model is not TensorSharp.Models.Video.IVideoGenerationModel videoModel)
+                return Results.BadRequest(new { error = new { message = "The loaded model is not a video-generation model.", type = "invalid_request_error" } });
 
             var body = await JsonDocument.ParseAsync(req.Body);
             var root = body.RootElement;
@@ -798,10 +855,12 @@ namespace TensorSharp.Server.ProtocolAdapters
                 "OpenAI video generation done: {F} frames -> {Url} ({Sec:F1}s)",
                 result.video.Frames.Length, url, sw.Elapsed.TotalSeconds);
             string b64 = wantB64 ? Convert.ToBase64String(await File.ReadAllBytesAsync(outPath)) : null;
+            string audioUrl = SaveAudioSidecar(result.video.Audio, outName);
             return Results.Json(new
             {
                 created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                 data = new[] { new { url, b64_json = b64 } },
+                audio_url = audioUrl,
                 width = result.video.Frames[0].Width,
                 height = result.video.Frames[0].Height,
                 frames = result.video.Frames.Length,
@@ -824,14 +883,14 @@ namespace TensorSharp.Server.ProtocolAdapters
             SseWriter.ApplyHeaders(ctx.Response);
             var ct = ctx.RequestAborted;
 
-            if (_svc.Model is not TensorSharp.Models.WanVideo.WanVideoModel videoModel)
+            if (_svc.Model is not TensorSharp.Models.Video.IVideoGenerationModel videoModel)
             {
-                await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = "The loaded model is not a Wan video-generation model." }, ct);
+                await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = "The loaded model is not a video-generation model." }, ct);
                 return;
             }
 
             string prompt;
-            TensorSharp.Models.WanVideo.WanVideoParams p;
+            TensorSharp.Models.Video.VideoGenerationParams p;
             try
             {
                 var body = await JsonDocument.ParseAsync(ctx.Request.Body, cancellationToken: ct);
@@ -898,6 +957,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                         channel.Writer.TryWrite(new VideoFrame
                         {
                             Final = true, Url = BuildUploadUrl(outName),
+                            AudioUrl = SaveAudioSidecar(video.Audio, outName),
                             Width = video.Frames[0].Width, Height = video.Frames[0].Height,
                             Frames = video.Frames.Length, Fps = video.Fps, Seed = video.Seed,
                             Codec = codec, Seconds = sw.Elapsed.TotalSeconds,
@@ -928,7 +988,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                         else
                             await SseWriter.WriteEventAsync(ctx.Response, new
                             {
-                                done = true, url = f.Url, width = f.Width, height = f.Height,
+                                done = true, url = f.Url, audioUrl = f.AudioUrl, width = f.Width, height = f.Height,
                                 frames = f.Frames, fps = f.Fps, seed = f.Seed, codec = f.Codec,
                                 elapsedSeconds = f.Seconds,
                             }, ct);

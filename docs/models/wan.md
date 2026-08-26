@@ -6,6 +6,13 @@ prompt (plus an optional first-frame image on the Wan 2.2 models) in, H.264 MP4
 out, from both `TensorSharp.Cli` and `TensorSharp.Server` (OpenAI-style API +
 the bundled Web UI chat).
 
+> **Wan is the video-only family.** The newer video model in TensorSharp is
+> [MiniMax-H3](minimax-h3.md), which generates video **and native 32 kHz stereo
+> audio together in one packed latent** — text-to-video, image-to-video,
+> first/last frame and reference-to-video, CFG-free at 4–8 steps. Wan stays the
+> family to reach for when you want video alone, and it is the one with the
+> step-distilled checkpoints that cut the 100-DiT-pass recipe to 4.
+
 Supported checkpoint families (auto-detected from the DiT GGUF):
 
 | Family | Latent | VAE | Modes | Notes |
@@ -24,8 +31,8 @@ in one folder — subfolders like `VAE/`, `HighNoise/`, `LowNoise/` included):
 |---|---|---|
 | DiT (the `--model` GGUF, `general.architecture = wan`) | e.g. `Wan2.2-TI2V-5B-Q8_0.gguf` | [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF), [QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF), [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf) |
 | second A14B expert (A14B only) | the matching `…HighNoise…`/`…LowNoise…` GGUF | same repo (`TS_WAN_DIT2` overrides; auto-found by name in the same/sibling folder) |
-| UMT5-XXL text encoder | `umt5-xxl-encoder-Q8_0.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) (`--wan-te` / `TS_WAN_TE`) |
-| Wan 2.1 video VAE (2.1 + A14B) | `wan_2.1_vae.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors) (`--wan-vae` / `TS_WAN_VAE`) |
+| UMT5-XXL text encoder | `umt5-xxl-encoder-Q8_0.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) (`--video-text-encoder` / `TS_WAN_TE`) |
+| Wan 2.1 video VAE (2.1 + A14B) | `wan_2.1_vae.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors) (`--video-vae` / `TS_WAN_VAE`) |
 | Wan 2.2 video VAE (TI2V-5B) | `Wan2.2_VAE.safetensors` | bundled in [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/tree/main/VAE) |
 
 The text encoder is released from VRAM before the denoise starts, the VAE
@@ -37,7 +44,7 @@ Q4_K_M experts run sequentially on the same card.
 ### Quickest way to get all of them: a config file
 
 Because several files have to line up, the ready-made configs in
-[`config/`](../../config/README.md#video-generation-wan) name every network and
+[`config/`](../../config/README.md#video-generation-video-only-wan) name every network and
 download whatever is missing on the first run:
 
 ```bash
@@ -67,8 +74,8 @@ paths, so the same file works on Windows, Linux and macOS.
 VAE (16-channel, 8×8×4). Loading the wrong one fails at startup rather than
 producing bad video. UMT5-XXL is shared by all of them, so it downloads once.
 
-To point at files you already have, use `--wan-vae`, `--wan-te` and (for A14B)
-`--wan-dit2`, or drop everything in one folder next to the DiT and let the
+To point at files you already have, use `--video-vae`, `--video-text-encoder` and (for A14B)
+`--video-dit2`, or drop everything in one folder next to the DiT and let the
 same-directory scan find it.
 
 ## Backends

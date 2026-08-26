@@ -256,7 +256,7 @@ kill-switch.
 - **Byte-identical greedy** vs current path on: E4B dense, 12B dense, 26B-A4B MoE, E-series
   KV-donor (`swaFreshShared`/`swaPrev`), multimodal bidi spans, MTP verify. Lengths spanning a
   bucket boundary and a mid-bucket chunk, and a >window SWA-wrap tail.
-- Existing suites: `Gemma4BatchedForwardTests`, `Gemma4MtpTests`, `EngineParallelInferenceTests`
+- Existing suites: `Gemma4BatchedForwardTests`, `Gemma4SpeculativeTests`, `EngineParallelInferenceTests`
   (real-model, opt-in), `PrefillChunkingTests`.
 - SWA circular-cache wrap is the highest-risk correctness area for R4 — add a targeted test that
   prefills past the window in bucketed chunks and diffs the KV cache + logits against the per-op

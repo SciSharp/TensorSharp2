@@ -204,7 +204,7 @@ an A/B.
 
 2× RTX PRO 6000 Blackwell (97 GiB each), GLM-5.2-UD-IQ2_XXS, `--n-cpu-moe 20`,
 21-token prompt, 160 tokens generated, greedy
-(`InferenceWeb.Tests/GlmDsaMtpModelTests.cs`). Each run takes the plain baseline
+(`InferenceWeb.Tests/GlmDsaSpeculativeModelTests.cs`). Each run takes the plain baseline
 as the median of three, because the host-side expert matmul is the noisy half of
 the comparison — and the whole benchmark was then repeated five times, because
 one round is not enough to tell a 5% tuning effect from that noise.
@@ -220,7 +220,7 @@ every run (and in a `--n-cpu-moe 34` variant), by ~4% on average — but never b
 enough, and never consistently enough, to be worth hard-coding as a per-model
 default: sweeping the gate alone at k=8 won three runs and lost three. The two
 knobs interact, so sweep them together rather than one at a time. The runtime
-cost governor in `MtpSpeculativeExecution` measures the model/drafter pair
+cost governor in `SpeculativeExecution` measures the model/drafter pair
 either way and parks drafting if it stops paying.
 
 Why a narrower window helps at all: a verify amortizes unusually well here — the

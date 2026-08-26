@@ -19,7 +19,8 @@ namespace InferenceWeb.Tests;
 public class ExecutionPlannerTests
 {
     private static readonly SchedulerConfig PlainConfig = new();
-    private static readonly SchedulerConfig MtpConfig = new() { MtpSpeculativeEnabled = true };
+    private static readonly SchedulerConfig SpecConfig =
+        new() { Speculation = new SpeculationOptions { Enabled = true } };
 
     /// <summary>A model+backend that supports the full batched contract
     /// (like Qwen 3.5 on CUDA), used as the baseline for the tests.</summary>
@@ -242,89 +243,91 @@ public class ExecutionPlannerTests
 
     // ----- speculative decoding (NextN/MTP) -----
 
-    private static ExecutionCapabilities MtpLinearCaps() => BatchedCaps() with
+    private static ExecutionCapabilities SpecLinearCaps() => BatchedCaps() with
     {
-        HasMtpDraftHead = true,
-        MtpSpeculationProfitable = true,
-        SupportsBatchedMtpTrunk = false,
+        SupportsSpeculativeTrunk = true,
+        HasDraftHead = true,
+        SpeculationProfitable = true,
+        SupportsBatchedSpecTrunk = false,
     };
 
-    private static ExecutionCapabilities MtpBatchedTrunkCaps() => BatchedCaps() with
+    private static ExecutionCapabilities SpecBatchedTrunkCaps() => BatchedCaps() with
     {
-        HasMtpDraftHead = true,
-        MtpSpeculationProfitable = true,
-        SupportsBatchedMtpTrunk = true,
+        SupportsSpeculativeTrunk = true,
+        HasDraftHead = true,
+        SpeculationProfitable = true,
+        SupportsBatchedSpecTrunk = true,
     };
 
     [Fact]
-    public void MtpRequested_LinearTrunkModel_RoutesSoloThroughMtpPerSequence()
+    public void SpecRequested_LinearTrunkModel_RoutesSoloThroughSpecPerSequence()
     {
-        var plan = ExecutionPlanner.PlanStep(MtpLinearCaps(), ExecutionOptions.Default, MtpConfig, Seqs(1));
+        var plan = ExecutionPlanner.PlanStep(SpecLinearCaps(), ExecutionOptions.Default, SpecConfig, Seqs(1));
 
-        Assert.Equal(ExecutionPathKind.MtpPerSequence, plan.Selected);
+        Assert.Equal(ExecutionPathKind.SpeculativePerSequence, plan.Selected);
         Assert.Single(plan.Candidates); // terminal: plain per-seq serves if arming fails
     }
 
     [Fact]
-    public void MtpRequested_BatchedTrunkModel_PutsTrunkFirstWithFallbackChain()
+    public void SpecRequested_BatchedTrunkModel_PutsTrunkFirstWithFallbackChain()
     {
-        var plan = ExecutionPlanner.PlanStep(MtpBatchedTrunkCaps(), ExecutionOptions.Default, MtpConfig, Seqs(1));
+        var plan = ExecutionPlanner.PlanStep(SpecBatchedTrunkCaps(), ExecutionOptions.Default, SpecConfig, Seqs(1));
 
-        Assert.Equal(ExecutionPathKind.MtpBatchedTrunk, plan.Selected);
-        // Declinable (arming/continuity), so a non-MTP path must follow.
+        Assert.Equal(ExecutionPathKind.SpeculativeBatchedTrunk, plan.Selected);
+        // Declinable (arming/continuity), so a non-speculative path must follow.
         Assert.True(plan.Candidates.Count >= 2);
-        Assert.NotEqual(ExecutionPathKind.MtpBatchedTrunk, plan.Candidates[1]);
+        Assert.NotEqual(ExecutionPathKind.SpeculativeBatchedTrunk, plan.Candidates[1]);
     }
 
     [Fact]
-    public void MtpRequested_MultiSequenceStep_ServesNormalPaths()
+    public void SpecRequested_MultiSequenceStep_ServesNormalPaths()
     {
-        var plan = ExecutionPlanner.PlanStep(MtpBatchedTrunkCaps(), ExecutionOptions.Default, MtpConfig, Seqs(2));
+        var plan = ExecutionPlanner.PlanStep(SpecBatchedTrunkCaps(), ExecutionOptions.Default, SpecConfig, Seqs(2));
 
         Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
-        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.MtpBatchedTrunk);
+        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativeBatchedTrunk);
     }
 
     [Fact]
-    public void MtpRequested_SoloKvInPagedStorage_LinearTrunkDeclines()
+    public void SpecRequested_SoloKvInPagedStorage_LinearTrunkDeclines()
     {
         var features = Seqs(1) with { SoloKvInPagedStorage = true };
-        var plan = ExecutionPlanner.PlanStep(MtpLinearCaps(), ExecutionOptions.Default, MtpConfig, features);
+        var plan = ExecutionPlanner.PlanStep(SpecLinearCaps(), ExecutionOptions.Default, SpecConfig, features);
 
         // Forward would attend against an empty linear cache; must stay batched.
         Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
-        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.MtpPerSequence);
+        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativePerSequence);
     }
 
     [Fact]
-    public void MtpRequested_ButUnprofitableOnBackend_FlagsNoticeAndServesStandardDecode()
+    public void SpecRequested_ButUnprofitableOnBackend_FlagsNoticeAndServesStandardDecode()
     {
-        var caps = MtpLinearCaps() with { MtpSpeculationProfitable = false };
-        var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, MtpConfig, Seqs(1));
+        var caps = SpecLinearCaps() with { SpeculationProfitable = false };
+        var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, SpecConfig, Seqs(1));
 
-        Assert.True(plan.MtpUnprofitable);
+        Assert.True(plan.SpeculationUnprofitable);
         Assert.Equal(ExecutionPathKind.SingleSequenceFused, plan.Selected);
     }
 
     [Fact]
-    public void MtpRequested_NoDraftHead_ServesStandardDecodeWithoutNotice()
+    public void SpecRequested_NoDraftHead_ServesStandardDecodeWithoutNotice()
     {
-        var plan = ExecutionPlanner.PlanStep(BatchedCaps(), ExecutionOptions.Default, MtpConfig, Seqs(1));
+        var plan = ExecutionPlanner.PlanStep(BatchedCaps(), ExecutionOptions.Default, SpecConfig, Seqs(1));
 
-        Assert.False(plan.MtpUnprofitable);
+        Assert.False(plan.SpeculationUnprofitable);
         Assert.Equal(ExecutionPathKind.SingleSequenceFused, plan.Selected);
     }
 
     [Fact]
-    public void MtpBatchedTrunk_EngagesEvenWhenBatchedPathDisabled()
+    public void SpecBatchedTrunk_EngagesEvenWhenBatchedPathDisabled()
     {
         // Historical behaviour preserved: the MTP routes predate
         // TS_SCHED_DISABLE_BATCHED and must keep engaging under it; on
         // decline the step falls to per-seq (batched is disabled).
         var options = ExecutionOptions.Default with { BatchedPathDisabled = true };
-        var plan = ExecutionPlanner.PlanStep(MtpBatchedTrunkCaps(), options, MtpConfig, Seqs(1));
+        var plan = ExecutionPlanner.PlanStep(SpecBatchedTrunkCaps(), options, SpecConfig, Seqs(1));
 
-        Assert.Equal(ExecutionPathKind.MtpBatchedTrunk, plan.Selected);
+        Assert.Equal(ExecutionPathKind.SpeculativeBatchedTrunk, plan.Selected);
         Assert.Equal(ExecutionPathKind.PerSequence, plan.Candidates[^1]);
     }
 
@@ -357,9 +360,10 @@ public class ExecutionPlannerTests
                 SupportsLinearKvMigration = batchedImpl && migration,
                 SupportsKvStateSnapshot = snapshot,
                 SupportsCrossSequenceKvReuse = snapshot,
-                HasMtpDraftHead = mtp,
-                MtpSpeculationProfitable = mtp,
-                SupportsBatchedMtpTrunk = mtp && trunk,
+                SupportsSpeculativeTrunk = mtp,
+                HasDraftHead = mtp,
+                SpeculationProfitable = mtp,
+                SupportsBatchedSpecTrunk = mtp && trunk,
             };
             var options = ExecutionOptions.Default with { BatchedPathDisabled = disabled };
             var features = new ExecutionStepFeatures
@@ -368,12 +372,12 @@ public class ExecutionPlannerTests
                 MultimodalPendingCount = mmCount,
                 SoloHasPendingMultimodal = count == 1 && mmCount == 1,
             };
-            var plan = ExecutionPlanner.PlanStep(caps, options, MtpConfig, features);
+            var plan = ExecutionPlanner.PlanStep(caps, options, SpecConfig, features);
 
             Assert.NotEmpty(plan.Candidates);
             var last = plan.Candidates[^1];
             Assert.True(
-                last != ExecutionPathKind.MtpBatchedTrunk && last != ExecutionPathKind.BatchedPaged,
+                last != ExecutionPathKind.SpeculativeBatchedTrunk && last != ExecutionPathKind.BatchedPaged,
                 $"plan may end with declinable path {last}: {plan.Describe()}");
             // No duplicate candidates (each path tried at most once).
             Assert.Equal(plan.Candidates.Count, plan.Candidates.Distinct().Count());

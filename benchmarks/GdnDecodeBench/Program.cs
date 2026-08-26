@@ -1,5 +1,5 @@
 // Standalone GatedDeltaNet/MTP decode benchmark, profilable directly under nsys.
-// Mirrors InferenceWeb.Tests.Qwen36MtpTests.Mtp_PerfBench_SpecVsBaseline so the
+// Mirrors InferenceWeb.Tests.Qwen36SpeculativeTests.Mtp_PerfBench_SpecVsBaseline so the
 // numbers are comparable, but as a plain exe (no VSTest host) so external profilers
 // can attach to the CUDA work.
 using System.Diagnostics;
@@ -38,7 +38,7 @@ string mode = Environment.GetEnvironmentVariable("TS_BENCH_MODE") ?? "both"; // 
 
 Console.WriteLine($"[gdn-bench] loading {Path.GetFileName(modelPath)} backend={backend} maxNew={maxNew} draft={maxDraft} mode={mode}");
 using var model = (Qwen35Model)ModelBase.Create(modelPath, backend);
-Console.WriteLine($"[gdn-bench] HasMtp={model.HasMtp}");
+Console.WriteLine($"[gdn-bench] HasDraftHead={model.HasDraftHead}");
 
 if (mode is "concurrent")
 {
@@ -150,7 +150,7 @@ if (mode is "baseline" or "both")
 
 if (mode is "spec" or "both")
 {
-    var spec = new MtpSpeculativeDecoder(model, maxDraft);
+    var spec = new SpeculativeDecoder(model, maxDraft);
     string pminEnv = Environment.GetEnvironmentVariable("TS_MTP_PMIN");
     if (!string.IsNullOrEmpty(pminEnv) && float.TryParse(pminEnv, out float pmin))
         spec.MinDraftProb = pmin;

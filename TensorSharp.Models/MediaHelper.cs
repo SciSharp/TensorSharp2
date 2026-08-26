@@ -146,6 +146,95 @@ namespace TensorSharp.Models
             return frames;
         }
 
+        /// <summary>Sample a video onto a fixed frame rate, returning the extracted
+        /// frame files and the rate the source carried.
+        ///
+        /// <para>Unlike <see cref="ExtractVideoFrames"/>, which samples sparsely for a
+        /// vision-language model, this reproduces a clip on a target timeline: frame
+        /// <c>i</c> of the result is the source frame at <c>i * sourceFps /
+        /// targetFps</c>, so a 30 fps source played onto a 24 fps grid holds frames
+        /// rather than dropping content. A generative video model conditions on
+        /// motion, and sparse sampling would misrepresent it.</para>
+        ///
+        /// <para>Also accepts a DIRECTORY of image files, which is how reference clips
+        /// are usually delivered; the files are taken in sorted order and assumed to be
+        /// at <paramref name="targetFps"/> already unless <paramref name="sourceFpsHint"/>
+        /// says otherwise.</para></summary>
+        /// <param name="maxFrames">Upper bound on the returned count. 0 = no bound.</param>
+        public static (List<string> Frames, double SourceFps) ExtractFramesAtRate(
+            string videoPath, double targetFps, int maxFrames = 0, double sourceFpsHint = 0)
+        {
+            if (string.IsNullOrWhiteSpace(videoPath))
+                throw new ArgumentNullException(nameof(videoPath));
+            if (targetFps <= 0) throw new ArgumentOutOfRangeException(nameof(targetFps));
+
+            if (Directory.Exists(videoPath))
+            {
+                var files = new List<string>(Directory.GetFiles(videoPath));
+                files.RemoveAll(f => !IsImageFile(f));
+                files.Sort(StringComparer.Ordinal);
+                if (files.Count == 0)
+                    throw new InvalidOperationException(
+                        $"'{videoPath}' contains no image files to use as video frames.");
+                double dirFps = sourceFpsHint > 0 ? sourceFpsHint : targetFps;
+                return (Resample(files, dirFps, targetFps, maxFrames), dirFps);
+            }
+
+            if (!File.Exists(videoPath))
+                throw new FileNotFoundException($"video not found: {videoPath}", videoPath);
+
+            using var capture = new VideoCapture(videoPath);
+            if (!capture.IsOpened())
+                throw new InvalidOperationException($"failed to open video file: {videoPath}");
+
+            double sourceFps = capture.Get(VideoCaptureProperties.Fps);
+            if (sourceFpsHint > 0) sourceFps = sourceFpsHint;
+            int totalFrames = (int)capture.Get(VideoCaptureProperties.FrameCount);
+            if (sourceFps <= 0 || totalFrames <= 0)
+                throw new InvalidOperationException(
+                    $"invalid video: fps={sourceFps}, frames={totalFrames}");
+
+            int wanted = (int)Math.Round(totalFrames * targetFps / sourceFps);
+            if (maxFrames > 0) wanted = Math.Min(wanted, maxFrames);
+            wanted = Math.Max(1, wanted);
+
+            string tempDir = Path.Combine(Path.GetTempPath(), $"refvid_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+            var frames = new List<string>(wanted);
+            using var mat = new Mat();
+            for (int i = 0; i < wanted; i++)
+            {
+                int sourceIndex = Math.Min(totalFrames - 1,
+                    (int)Math.Floor(i * sourceFps / targetFps));
+                capture.Set(VideoCaptureProperties.PosFrames, sourceIndex);
+                if (!capture.Read(mat) || mat.Empty()) break;
+                string framePath = Path.Combine(tempDir, $"frame_{frames.Count + 1:D5}.png");
+                SaveMatAsPng(mat, framePath);
+                frames.Add(framePath);
+            }
+            if (frames.Count == 0)
+                throw new InvalidOperationException($"no frames could be read from {videoPath}");
+            return (frames, sourceFps);
+        }
+
+        private static bool IsImageFile(string path)
+        {
+            string ext = Path.GetExtension(path).ToLowerInvariant();
+            return ext is ".png" or ".jpg" or ".jpeg" or ".bmp" or ".webp";
+        }
+
+        // Hold-and-drop resampling of an already-extracted frame list.
+        private static List<string> Resample(List<string> files, double fromFps, double toFps, int maxFrames)
+        {
+            int wanted = (int)Math.Round(files.Count * toFps / fromFps);
+            if (maxFrames > 0) wanted = Math.Min(wanted, maxFrames);
+            wanted = Math.Max(1, wanted);
+            var outp = new List<string>(wanted);
+            for (int i = 0; i < wanted; i++)
+                outp.Add(files[Math.Min(files.Count - 1, (int)Math.Floor(i * fromFps / toFps))]);
+            return outp;
+        }
+
         public static List<int> SelectEvenlySpacedIndices(int count, int maxCount)
         {
             var indices = new List<int>();

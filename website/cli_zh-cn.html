@@ -121,9 +121,36 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --prompt "Make the sky a dramatic sunset." --output edited.png \
     --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0</code></pre>
 
-  <h3 id="video">视频生成（Wan 2.1 / 2.2）</h3>
+  <h3 id="video">视频生成</h3>
+  <p><strong>MiniMax-H3</strong> 在<em>同一个</em>打包潜变量里同时去噪视频与原生 32&nbsp;kHz 立体声音轨，所以声音和画面来自同一次前向。它经过 CFG 蒸馏，因此必须传 <code>--cfg 1.0</code>（更高的取值会被直接拒绝），默认 20 步，而 4–8 步是它的快速工作点：</p>
+  <pre data-lang="bash"><code># 文本 -> H.264 MP4 外加一个旁挂 WAV。写出 fox.mp4 与 fox.wav。
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;minimax_h3_fl2va_pruned-Q4_K.gguf&gt; --backend ggml_metal \
+    --prompt "a red fox trotting through falling snow, cinematic" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+    --output fox.mp4
+
+# 让一张照片动起来：在 FL2VA 权重上，这张图像就是首帧。
+# 再加 --end-image 可以把尾帧也钉住（--video-mode fl2v）。
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;minimax_h3_fl2va_pruned-Q4_K.gguf&gt; --backend ggml_metal \
+    --image portrait.jpg --video-mode i2v \
+    --prompt "the person turns toward the camera and smiles" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+    --output animated.mp4
+
+# 参考：保留主体，围绕它构建一个新场景。需要 Ref2VA 权重，
+# 最多九个 --ref-image；--ref-video / --ref-audio 则接受片段与音轨。
+dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --model &lt;minimax_h3_ref2va_pruned-Q4_K.gguf&gt; --backend ggml_metal \
+    --ref-image person.jpg --ref-image bottle.png --video-mode ref \
+    --prompt "she holds the bottle up to the light on a rooftop at golden hour" \
+    --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
+    --output rooftop.mp4</code></pre>
+  <div class="callout note"><div class="ic">💡</div><p><code>i2v</code> / <code>fl2v</code> 需要 <code>fl2va</code> 权重，<code>ref</code> 需要 <code>ref2va</code> —— 它们是两个不同的文件而不是开关，用错时报错信息会直接点名另一个文件。宽高向上取整到 32 的倍数，帧数向上对齐到 <code>17k+5</code> 网格（5、22、39、56、73、90……），帧率固定为 24。音轨作为旁挂 <code>.wav</code> 写在 MP4 旁边而不是混流进去，因为混流需要一个不一定装了的编码器：<code>ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4</code> 可以把两者合并。<code>--no-audio</code> 则完全跳过音频 VAE。→ <a href="models-video_zh-cn.html#minimax-h3">H3 需要的四个文件</a></p></div>
+  <p><strong>Wan 2.1 / 2.2</strong> 只生成视频，而在那里，<code>--model</code> 指向哪个权重决定了整体耗时：</p>
   <pre data-lang="bash"><code># 提示词 -> H.264 MP4。UMT5-XXL 文本编码器与视频 VAE 会在 DiT GGUF
-# 旁边自动解析（也可用 --wan-te / --wan-vae 指定）。
+# 旁边自动解析（也可用 --video-text-encoder / --video-vae 指定）。
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;Wan2.2-TI2V-5B-Q8_0.gguf&gt; \
     --prompt "A red fox trotting through falling snow, cinematic" \
@@ -229,9 +256,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>从文本或文件设定会话的系统提示。仅交互式 REPL 与 DiffusionGemma 扩散模式使用它；普通单次文本模式会忽略系统提示。</td></tr>
       <tr><td><code>--think</code></td><td>启用思考 / 推理模式（思维链）。</td></tr>
       <tr><td><code>--tools &lt;path&gt;</code></td><td>含工具 / 函数定义的 JSON 文件。</td></tr>
-      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>草稿器以独立文件发布的架构所用的投机解码草稿 GGUF——目前是 DeepSeek V4 的 DSpark 支持模块。它每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变。需要 <code>--backend cuda</code> 或 <code>ggml_cuda</code>，并且必须是纯 argmax 采样（任何 temperature、top-k/p 或惩罚项都会将其关闭）。环境变量：<code>TS_DSV4_DSPARK</code>。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
-      <tr><td><code>--spec-draft-n-max &lt;N&gt;</code></td><td>每个投机块最多起草的 token 数（默认：草稿器训练时的块大小，DSpark 为 5）。</td></tr>
-      <tr><td><code>--spec-draft-conf-min &lt;p&gt;</code></td><td>保留某个起草位置所需的最小<em>累积</em>接受概率（默认 <code>0.35</code>）。调低会起草更远、回滚更多；调高则更早退回普通 decode。</td></tr>
+      <tr><td><code>--spec</code> · <code>--spec-type &lt;name&gt;</code> · <code>--draft-model &lt;path&gt;</code></td><td>投机解码：由草稿器提议接下来的若干 token，主干用一次批量前向完成验证。默认关闭，且必须在模型加载之前出现在命令行上 —— 完整参数见下方的<a href="#spec">投机解码</a>。</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>渲染提示词 + 分词后退出（不生成）。</td></tr>
       <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 在单个进程内把模型切分到 N 张 GPU 上（默认：1）。需要 <code>--backend cuda</code>、<code>ggml_cuda</code> 或 <code>ggml_vulkan</code>；用 <code>TENSORSHARP_TP_DEVICES</code> 指定使用哪几张卡。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
       <tr><td><code>--tp-node-id &lt;N&gt;</code></td><td>多节点分布式张量并行中本节点的 0 起始编号。需与 <code>--tp-peers</code> 一起使用。</td></tr>
@@ -258,6 +283,24 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     </tbody>
   </table>
   </div>
+  <h4 id="spec">投机解码</h4>
+  <p>默认关闭。草稿器提议接下来的若干 token，主干用<strong>一次批量前向</strong>完成验证；每个真正输出的 token 仍然取自主干的某一行，并由本次运行自己的采样器抽出，因此这纯粹是一条提速路径 —— 输出序列与普通解码得到的完全一致。它在 <code>--input</code>、<code>--input-jsonl</code>、<code>--multi-turn-jsonl</code> 与 <code>--interactive</code> 上都会生效，而且这些参数必须在<em>模型加载之前</em>出现在命令行上：<code>--spec</code> 正是让 glm-dsa 把约 3 GiB 的 NextN 层调入显存的那个开关（这同时也会挤占上下文的空间），而 <code>--spec-draft</code> 在加载时就决定了原生计算图缓存的大小。<code>--spec*</code> 是当前的正式写法，旧的 <code>--mtp-*</code> 拼法作为别名继续被接受。→ <a href="advanced_zh-cn.html#mtp">MTP / NextN</a> · <a href="advanced_zh-cn.html#dspark">DSpark</a> · <code>docs/speculative_decoding.md</code></p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>选项</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--spec</code> / <code>--no-spec</code></td><td>开启 / 关闭投机解码。在草稿块借用主干 LM head 的权重上（其中包括 GLM-5.2），<code>--tp N&gt;1</code> 下不可用。别名 <code>--mtp-spec</code> / <code>--no-mtp-spec</code>。默认关闭；环境变量 <code>TS_SPEC</code>（或 <code>TS_MTP_SPEC</code>；glm-dsa 还认 <code>TS_GLM_MTP=1/0</code>，它会覆盖前两者）。</td></tr>
+      <tr><td><code>--spec-type &lt;name&gt;</code></td><td>用哪种投机<em>算法</em>起草。<code>auto</code>（默认）使用权重自带的草稿器 —— 逐 token 的 NextN/MTP 头（GLM-5.2、Qwen 3.6、Gemma 4 的独立 assistant GGUF），或块级草稿器（DeepSeek V4 DSpark、Muse-Glimmer DFlash）。<code>draft-head</code> 与 <code>block</code> 用于显式钉住其中之一。<code>ngram</code> <strong>完全不需要训练权重</strong>：它在上下文里回找最近几个 token 曾经出现过的位置，把当时的后续内容提议出来，因此对任何权重都可用。环境变量：<code>TS_SPEC_TYPE</code>。</td></tr>
+      <tr><td><code>--spec-draft &lt;N&gt;</code></td><td>每个投机步最多起草的 token 数。它同时在加载时决定原生计算图缓存的大小，因此必须与 <code>--spec</code> 写在<em>同一条</em>命令行上。别名 <code>--mtp-draft</code>。取值 1–64，默认 <code>8</code>；环境变量 <code>TS_SPEC_DRAFT</code>（或 <code>TS_MTP_DRAFT</code>）。</td></tr>
+      <tr><td><code>--spec-pmin &lt;f&gt;</code></td><td>低于该置信度就停止起草。这个数<em>代表什么</em>由算法自己定义，所以各算法各有默认值而不共用一个：逐 token 头为 <code>0.75</code>（其 top-10 logits 上的 top-1 概率），块级草稿器为 <code>0.35</code>（<em>累积</em>前缀概率，因此同一个数字要严格得多），n-gram 为 <code>0</code>（在那里它改为缩放所需的匹配长度）。别名 <code>--mtp-pmin</code>。取值 0.0–1.0，不含 0；环境变量 <code>TS_SPEC_PMIN</code>。</td></tr>
+      <tr><td><code>--spec-draft-model &lt;path&gt;</code></td><td>草稿器权重以独立文件发布的架构所用的草稿头 GGUF（Gemma 4 的 <code>gemma4-assistant</code>）。它在启动时被挂到目标模型上，<code>--spec</code> 才能生效。Qwen 3.6 与 GLM-5.2 把 NextN 块嵌在主干 GGUF 内，不需要这个参数 —— 但在 Qwen 3.6 上只有<em>保留</em>了该块的 GGUF 才算数，请用像 <a href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF" target="_blank" rel="noopener">unsloth/Qwen3.6-35B-A3B-MTP-GGUF</a> 这样保留 MTP 的导出；官方仓库用同样的文件名发布的版本已经把这个块剥掉了。别名 <code>--mtp-draft-model</code>；环境变量 <code>TS_SPEC_DRAFT_MODEL</code>。</td></tr>
+      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>必须在模型分层切分<em>之前</em>就驻留的块级草稿器 GGUF —— DeepSeek V4 的 DSpark 支持模块、Muse-Glimmer 的 DFlash。指定这个文件<strong>本身</strong>就是请求：这类草稿器不需要 <code>--spec</code>。DSpark 只存在于 <code>--backend cuda</code> 与 <code>ggml_cuda</code> 上。环境变量：<code>TS_DSV4_DSPARK</code>。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
+      <tr><td><code>--spec-draft-n-max &lt;N&gt;</code></td><td><code>--spec-draft</code> 的旧写法，为块级草稿器保留；块级草稿器还会把它压到自己训练时的块大小（DSpark 为 5）。默认取草稿器的块大小。</td></tr>
+      <tr><td><code>--spec-draft-conf-min &lt;p&gt;</code></td><td><code>--spec-pmin</code> 的旧写法，为块级草稿器保留 —— 在那里这道闸门是<em>累积</em>接受概率。调低会起草更远、回滚更多；调高则更早退回普通 decode。默认块级草稿器为 <code>0.35</code>，逐 token 头为 <code>0.75</code>。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout tip"><div class="ic">⚡</div><p><strong><code>--spec-type ngram</code> 在完全不带草稿器的权重上也能跑。</strong>它靠把上下文原样引用回来起草，因此在答案本就大半写在提示词里的场景上最强：摘要、改写、翻译、重复性结构化输出与 agent 循环。在 Qwen3.5-9B（Q8_0、<code>ggml_metal</code>、M5 Pro）上实测 <strong>45.2 tok/s，对比普通解码的 31.4（1.44×）</strong>，且输出<strong>逐字节一致</strong>。</p></div>
   <h4>DiffusionGemma、基准测试与日志</h4>
   <div class="table-scroll">
   <table>
@@ -281,25 +324,35 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     </tbody>
   </table>
   </div>
-  <h4>视频生成（Wan 2.1 / 2.2）</h4>
-  <p>以下参数在 <code>--model</code> 为 <code>wan</code> DiT GGUF 时生效。<code>--prompt</code> 提供文本，<code>--image</code> 提供图生视频的首帧，<code>--output</code> 指定 MP4 文件名。除非用 <code>--diffusion-steps</code> / <code>--cfg</code> 覆盖，去噪步数与引导强度都来自模型自身的配方。</p>
+  <h4>视频生成（MiniMax-H3 · Wan 2.1 / 2.2）</h4>
+  <p>以下参数在 <code>--model</code> 为视频生成 DiT（MiniMax-H3 或 Wan）时生效。<code>--prompt</code> 提供文本，<code>--image</code> 提供条件帧，<code>--output</code> 指定 MP4 文件名（默认 <code>video.mp4</code>；若扩展名写成 <code>.png</code>，则改为把各帧写成 PNG）。除非用 <code>--diffusion-steps</code> / <code>--cfg</code> 覆盖，去噪步数与引导强度都来自模型自身的配方。</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>选项</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td><code>--video-frames &lt;N&gt;</code></td><td>输出帧数，会对齐到 <code>4k+1</code>（VAE 的时间网格）；<code>1</code> 表示只出一张静态图。默认 33，Wan2.2-TI2V 为 49。帧数同时决定注意力开销与 VAE 解码耗时，是仅次于权重选择的第二大杠杆。</td></tr>
-      <tr><td><code>--fps &lt;N&gt;</code></td><td>保存的 MP4 的播放帧率（默认 16，Wan2.2-TI2V 为 24 —— 即模型的训练帧率）。它只改变播放速度，不改变计算量。</td></tr>
-      <tr><td><code>--flow-shift &lt;F&gt;</code></td><td>FlowMatch timestep shift（默认 <code>0</code> = 模型官方配方：Wan 2.2 为 5.0，A14B T2V 为 12.0；Wan 2.1 中 1.3B 模型的视频运行为 8.0，其余 ≤ 480p 为 3.0、更高为 5.0）。</td></tr>
-      <tr><td><code>--sampler &lt;name&gt;</code></td><td><code>unipc</code>（默认 —— Wan 官方采样器；多步预测-校正，在相同步数下质量更好）或 <code>euler</code>。</td></tr>
-      <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>无分类器引导使用的负向提示词（默认为 Wan 官方负向提示词）。对步数蒸馏权重无效，因为它本身就不使用引导。</td></tr>
-      <tr><td><code>--cfg-cache-stride &lt;N&gt;</code></td><td>引导缓存：每 N 步才跑一次无条件 CFG 分支，其余步复用缓存的引导方向（前三步与最后一步始终重算）。50 步时，<code>2</code> 只跑 100 次前向中的 77 次（快 1.30×），<code>3</code> 跑 70 次（1.43×）。默认 <code>0</code> = 关闭。它是一种近似 —— 需要对齐参考样本时请保持关闭；另外它在蒸馏权重上没有意义（根本没有无条件分支可缓存）。</td></tr>
-      <tr><td><code>--diffusion-steps &lt;N&gt;</code> / <code>--cfg &lt;F&gt;</code></td><td>覆盖配方或自动识别到的蒸馏取值。基础权重上用 30 步替代 50 步，观感非常接近而开销少 1.7×。</td></tr>
-      <tr><td><code>--wan-vae &lt;path&gt;</code></td><td>视频 VAE（<code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>）。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_WAN_VAE</code>。需要哪个 VAE 由 DiT 自己决定，而不是由你指定。</td></tr>
-      <tr><td><code>--wan-te &lt;path&gt;</code></td><td>UMT5-XXL 文本编码器 GGUF。默认在同目录扫描。环境变量：<code>TS_WAN_TE</code>。Wan 2.2 A14B 还会按文件名自动解析第二个 high/low noise 专家 GGUF（用 <code>TS_WAN_DIT2</code> 覆盖；它没有对应的命令行参数）。</td></tr>
+      <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>在拥有多种条件模式的模型上，决定如何解释传入的图像。默认：根据你传了什么自动推断。MiniMax-H3 接受 <code>t2v</code>（纯文本）、<code>i2v</code>（图像<em>就是</em>首帧，会被驱动起来）、<code>fl2v</code>（首帧与尾帧）与 <code>ref</code>（图像是<em>新</em>场景里的身份/外观参考）。<code>i2v</code>/<code>fl2v</code> 需要 <code>fl2va</code> 权重，<code>ref</code> 需要 <code>ref2va</code> —— 它们是不同的文件而不是开关。在 <code>ref2va</code> 上，单独的 <code>--image</code> 会被当作一个参考，因此只会附带一张图的客户端无需改动即可工作。</td></tr>
+      <tr><td><code>--width &lt;px&gt;</code> / <code>--height &lt;px&gt;</code></td><td>输出画布。MiniMax-H3 会把每个维度<em>向上</em>取整到 32 的倍数（VAE 的 16× 空间比乘以 2×2 的 patch），默认 <strong>640×384</strong> —— 这是模型卡自身的工作点，也是人脸还能保持连贯的最小尺寸；只传其中一个时，另一个按条件图像的宽高比推出。Wan 则对齐到它自己的 VAE 网格，并默认取官方配方的面积：TI2V-5B 为 1280×704，其余为 832×480。参考图像永远不会决定画布尺寸。</td></tr>
+      <tr><td><code>--video-frames &lt;N&gt;</code></td><td>输出帧数，会对齐到模型自身的时间网格 —— Wan 为 <code>4k+1</code>，MiniMax-H3 为 <code>17k+5</code>；在模型允许时 <code>1</code> 表示只出一张静态图。默认取模型自身的值（33，Wan2.2-TI2V 为 49；MiniMax-H3 为 22）。帧数同时决定注意力开销与 VAE 解码耗时，是仅次于权重选择的第二大杠杆。</td></tr>
+      <tr><td><code>--fps &lt;N&gt;</code></td><td>保存的 MP4 的播放帧率（默认 16，Wan2.2-TI2V 为 24 —— 即模型的训练帧率）。它只改变播放速度，不改变计算量。以固定帧率训练的模型（MiniMax-H3，24 fps）会覆盖任何其他取值。</td></tr>
+      <tr><td><code>--end-image &lt;file&gt;</code></td><td>尾帧条件图像，用于接受它的模型（MiniMax-H3 的首尾帧模式）。与 <code>--image</code> 一起使用时，片段会被引导为从这两帧开始并结束。</td></tr>
+      <tr><td><code>--ref-image &lt;file&gt;</code></td><td>参考条件模型（MiniMax-H3 Ref2VA）的参考图像：主体被保留，而镜头、背景与构图来自提示词。可重复，最多 <strong>9</strong> 个；提示词按位置以 <code>&lt;Picture 1&gt;</code>、<code>&lt;Picture 2&gt;</code>…… 引用它们。参考图只会被<em>缩小</em>并保持自身宽高比，因此输出尺寸仍由 <code>--width</code>/<code>--height</code> 决定。去噪开销是线性而且平坦的 —— 在 RTX 3080 Laptop 上（640×384、22 帧，从一个参考到八个参考），每个参考每步约 626 ms。但超过大约四个之后，主导开销就不再是去噪器，而是<em>文本</em>那一遍：每个参考会给提示词加上约 250 个视觉占位 token，并要穿过 Qwen3-VL 的全部 50 层做 prefill —— 所以在削减步数之前，先考虑用更少、更好的参考。</td></tr>
+      <tr><td><code>--ref-video &lt;path&gt;</code></td><td>参考视频片段，可重复；提示词中以 <code>&lt;Video 1&gt;</code>、<code>&lt;Video 2&gt;</code>…… 引用。既接受视频<em>文件</em>，也接受一个帧目录；两种情况都会被重采样到模型自身的 24 fps 与画布。参考片段是 H3 代价最高的一类输入：一段 22 帧、448×320 的片段会在输出本身所需的 1680 个 token 之上再加 980 个条件 token，而且 VAE 必须先把这 22 帧全部编码完，第一步去噪才能开始。要给它配音轨请用 <code>--ref-video-audio</code>。</td></tr>
+      <tr><td><code>--ref-video-audio &lt;file&gt;</code></td><td>与<strong>同一位置</strong>的参考视频配对的音轨 —— 第一个对应第一个 <code>--ref-video</code>，依此类推。之所以与 <code>--ref-video</code> 分开，是因为容器里的音轨无法通过帧解码器读取。想要一段无声的参考片段就省略它。支持 WAV、MP3 或 Ogg。</td></tr>
+      <tr><td><code>--ref-audio &lt;file&gt;</code></td><td>独立的参考音轨，可重复；提示词中以 <code>&lt;Audio 1&gt;</code>、<code>&lt;Audio 2&gt;</code>…… 引用。会被重采样到音频 VAE 的 32 kHz 立体声，并截断到所生成片段的时长。</td></tr>
+      <tr><td><code>--no-audio</code></td><td>在与视频联合生成音轨的模型（MiniMax-H3）上跳过音频解码，只要画面时可省下音频 VAE 的时间与显存。纯视频模型会忽略它。</td></tr>
+      <tr><td><code>--flow-shift &lt;F&gt;</code></td><td>FlowMatch timestep shift（默认 <code>0</code> = 模型官方配方：Wan 2.2 为 5.0，A14B T2V 为 12.0；Wan 2.1 中 1.3B 模型的视频运行为 8.0，其余 ≤ 480p 为 3.0、更高为 5.0；MiniMax-H3 为 12.0）。在带联合音频流的模型上，该 shift 只作用于视频流。</td></tr>
+      <tr><td><code>--sampler &lt;name&gt;</code></td><td><code>unipc</code>（Wan 官方采样器；多步预测-校正，在相同步数下质量更好）或 <code>euler</code>。默认取模型自身的值 —— Wan 为 <code>unipc</code>。它是 Wan 家族的旋钮：MiniMax-H3 走自己的 flow-match 调度，会忽略它。</td></tr>
+      <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>无分类器引导使用的负向提示词（默认为模型官方的负向提示词）。在 <code>--cfg 1.0</code> 下不会被用到，因为根本不跑负向分支 —— 所以它对步数蒸馏的 Wan 权重、以及 CFG 蒸馏的 MiniMax-H3 都没有作用。</td></tr>
+      <tr><td><code>--cfg-cache-stride &lt;N&gt;</code></td><td>引导缓存：每 N 步才跑一次无条件 CFG 分支，其余步复用缓存的引导方向（前三步与最后一步始终重算）。50 步时，<code>2</code> 只跑 100 次前向中的 77 次（快 1.30×），<code>3</code> 跑 70 次（1.43×）。默认 <code>0</code> = 关闭。它是一种近似 —— 需要对齐参考样本时请保持关闭；另外在 <code>--cfg 1.0</code> 下它没有意义，因为根本没有无条件分支可缓存。</td></tr>
+      <tr><td><code>--diffusion-steps &lt;N&gt;</code> / <code>--cfg &lt;F&gt;</code></td><td>覆盖配方或自动识别到的蒸馏取值。在基础 Wan 权重上用 30 步替代 50 步，观感非常接近而开销少 1.7×。MiniMax-H3 经过 <strong>CFG 蒸馏</strong>：默认 20 步，任何高于 <code>1.0</code> 的 <code>--cfg</code> 都会被拒绝，而 4–8 步是它的快速工作点。</td></tr>
+      <tr><td><code>--video-vae &lt;path&gt;</code></td><td>视频 VAE —— <code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>，MiniMax-H3 用 <code>minimax_h3_video_vae_fp16.safetensors</code>。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_VIDEO_VAE</code>；旧写法 <code>--wan-vae</code> 仍被接受。需要哪个 VAE 由 DiT 自己决定，而不是由你指定。</td></tr>
+      <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>文本编码器 GGUF —— Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B。默认在同目录扫描。也可写作 <code>--video-te</code>；环境变量 <code>TS_VIDEO_TEXT_ENCODER</code>，旧写法 <code>--wan-te</code> 仍可用。H3 的编码器<strong>不附带分词器</strong> —— 请把 <code>vocab.json</code> 与 <code>merges.txt</code> 放在它旁边，或用 <code>TS_VIDEO_TOKENIZER</code> 指向存放它们的目录。</td></tr>
+      <tr><td><code>--video-dit2 &lt;path&gt;</code></td><td>双专家模型的第二个扩散专家（Wan 2.2 A14B 的 high/low noise 一对）。默认按文件名在第一个专家旁边自动解析。环境变量：<code>TS_VIDEO_DIT2</code>；旧写法 <code>--wan-dit2</code> 仍被接受。</td></tr>
+      <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>与视频联合生成音轨的模型所用的音频 VAE（<code>minimax_h3_audio_vae_fp32.safetensors</code>）。不传它这类模型照样能跑并产出视频，只是没有声音。环境变量：<code>TS_VIDEO_AUDIO_VAE</code>。</td></tr>
     </tbody>
   </table>
   </div>
-  <p>Wan 可运行于 <code>ggml_cuda</code>、<code>ggml_vulkan</code>、<code>ggml_metal</code>、<code>ggml_cpu</code>、<code>cuda</code> 与 <code>cpu</code> —— 它是唯一会直接拒绝 <code>--backend mlx</code> 的模型族 —— 并且不支持 <code>--tp</code>。→ <a href="benchmarks_zh-cn.html#wan">Wan 后端耗时与成本模型</a></p>
+  <p>在视频家族中，Wan 可运行于 <code>ggml_cuda</code>、<code>ggml_vulkan</code>、<code>ggml_metal</code>、<code>ggml_cpu</code>、<code>cuda</code> 与 <code>cpu</code> —— 它是唯一会直接拒绝 <code>--backend mlx</code> 的模型族。Wan 与 MiniMax-H3 都不支持 <code>--tp</code>。→ <a href="benchmarks_zh-cn.html#minimax-h3">MiniMax-H3 实测数据</a> · <a href="benchmarks_zh-cn.html#wan">Wan 后端耗时与成本模型</a></p>
   <p class="page-foot-note">完整参考（含 <code>--test</code>、<code>--test-templates</code> 与分块 prefill 正确性检查）见 <a href="api-reference_zh-cn.html#cli-flags">API 参考</a> 页。</p>
 
   <h2 id="repl">交互式 REPL 命令</h2>

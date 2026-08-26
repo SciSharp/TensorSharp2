@@ -174,7 +174,7 @@ Design points that make the persistent drafter correct:
 ### The adaptive cost governor
 
 Speculation is only ever a speed optimization, so
-[`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs)
+[`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
 measures ms per *emitted* token with drafting and without, and **parks** the
 drafter when drafting loses. Current design (all measured-in-anger):
 
@@ -194,7 +194,7 @@ The confidence floor defaults to `confMin = 0.35` (llama.cpp's `p_min` defaults
 to 0 on this path). Neither setting wins everywhere; making the floor adaptive
 (a small bandit over `{0, 0.15, 0.35, 0.6}`) is the natural next step.
 
-`MtpPrefillChunkSize` (env `TS_DFLASH_PREFILL_CHUNK`, default 1024) sets the
+`SpecPrefillChunkSize` (env `TS_DFLASH_PREFILL_CHUNK`, default 1024) sets the
 width of the **trunk** forward used while a DFlash prefill catches the drafter
 up. It is clamped to what the two rings can absorb in one forward (the
 drafter's `RingRows` = 2080 and the trunk's SWA ring `rows - n_swa`).

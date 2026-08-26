@@ -2104,6 +2104,55 @@ namespace TensorSharp.GGML
             return GgmlNative.TryWanVaeDecode(in args);
         }
 
+        /// <summary>Whole MiniMax-H3 video-VAE ViT decode in ONE ggml graph: latent
+        /// tokens through the 36-block transformer, out as pixel patches.</summary>
+        public static bool TryMiniMaxH3VideoVaeDecode(in H3VideoVaeDecodeArgs args)
+        {
+            return GgmlNative.TryMiniMaxH3VideoVaeDecode(in args);
+        }
+
+        /// <summary>MiniMax-H3's Qwen3-VL text-encoder prefill in ONE ggml graph.</summary>
+        public static bool TryMiniMaxH3TextEncode(in H3TextEncodeArgs args)
+        {
+            return GgmlNative.TryMiniMaxH3TextEncode(in args);
+        }
+
+        /// <summary>One MiniMax-H3 diffusion step in ONE ggml graph.</summary>
+        public static bool TryMiniMaxH3DitForward(in H3DitForwardArgs args)
+        {
+            return GgmlNative.TryMiniMaxH3DitForward(in args);
+        }
+
+        /// <summary>Single-frame MiniMax-H3 video VAE encode in ONE ggml graph.</summary>
+        public static bool TryMiniMaxH3VideoVaeEncode(in H3VideoVaeEncodeArgs args)
+        {
+            return GgmlNative.TryMiniMaxH3VideoVaeEncode(in args);
+        }
+
+        /// <summary>Mono MiniMax-H3 audio VAE (BigVGAN) decode in ONE ggml graph.</summary>
+        public static bool TryMiniMaxH3AudioVaeDecode(in H3AudioVaeDecodeArgs args)
+        {
+            return GgmlNative.TryMiniMaxH3AudioVaeDecode(in args);
+        }
+
+        /// <summary>MiniMax-H3 multi-frame causal 3-D video encode in ONE ggml graph.</summary>
+        public static bool TryMiniMaxH3VideoVaeEncode3D(in H3VideoVaeEncode3DArgs args)
+        {
+            return GgmlNative.TryMiniMaxH3VideoVaeEncode3D(in args);
+        }
+
+        /// <summary>MiniMax-H3 audio VAE encoder in ONE ggml graph.</summary>
+        public static bool TryMiniMaxH3AudioVaeEncode(in H3AudioVaeEncodeArgs args)
+        {
+            return GgmlNative.TryMiniMaxH3AudioVaeEncode(in args);
+        }
+
+        /// <summary>Qwen3-VL vision tower in ONE ggml graph.</summary>
+        public static bool TryMiniMaxH3VisionEncode(in H3VisionEncodeArgs args)
+        {
+            return GgmlNative.TryMiniMaxH3VisionEncode(in args);
+        }
+
         /// <summary>Whole Wan causal 3D video-VAE encode (pixels -> posterior mean) in ONE
         /// ggml graph; 1+4k pixel-frame chunks iterated in-graph with the causal caches.</summary>
         public static bool TryWanVaeEncode(in WanVaeEncodeArgs args)

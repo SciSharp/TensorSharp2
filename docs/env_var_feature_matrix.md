@@ -127,27 +127,40 @@ These variables are real runtime knobs, but they are not registered in
 | `DIFFUSION_SEGMENTED_DECODE` | DiffusionGemma on ggml_cuda | Force per-layer fused decode on (`1`) / off (`0`); auto-selected when the model does not fit VRAM | auto | not registered | no |
 | `DIFFUSION_PIN_STREAMED` | DiffusionGemma on ggml_cuda | Re-home streamed (non-resident) weights into page-locked copies for DMA-speed uploads (costs RAM) | OFF | not registered | no |
 
-## Out-of-Matrix MTP / Speculative-Decoding Knobs
+## Out-of-Matrix Speculative-Decoding Knobs
 
-These gate the optional MTP / NextN speculative decode path in `TensorSharp.Server`
-(Qwen 3.6 embedded NextN block; Gemma 4 separate `gemma4-assistant` draft GGUF).
-Speculation engages only for solo (non-concurrent) sequences and only where it is
-profitable (ggml backends and the pure-C# `cuda` backend). They are not registered
-in `EnvVarMatrix.All` and are not swept by the default TestMatrix config — the
-matrix feature catalog has no speculative-decode feature today, so use explicit
-runs to exercise these. `TS_MTP_*` are also settable via the `--mtp-*` flags on
-both `TensorSharp.Cli` and `TensorSharp.Server`.
+These gate the optional speculative decode path in `TensorSharp.Cli` and
+`TensorSharp.Server` (Qwen 3.6 / GLM 5.2 embedded NextN block; Gemma 4's separate
+`gemma4-assistant` draft GGUF; DeepSeek V4 DSpark and Muse-Glimmer DFlash block
+drafters; the weight-free n-gram speculator). Speculation engages only for solo
+(non-concurrent) sequences and only where it is profitable (ggml backends and the
+pure-C# `cuda` backend). They are not registered in `EnvVarMatrix.All` and are not
+swept by the default TestMatrix config — the matrix feature catalog has no
+speculative-decode feature today, so use explicit runs to exercise these.
 
-| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
-|---|---|---|---|---|---|
-| `TS_MTP_SPEC` | Qwen 3.6, GLM 5.2, Gemma 4 (CLI + server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
-| `TS_MTP_DRAFT` | Qwen 3.6, GLM 5.2, Gemma 4 (CLI + server) | Max tokens drafted per speculative step | `8` | not registered | no |
-| `TS_MTP_PMIN` | Qwen 3.6, GLM 5.2, Gemma 4 (CLI + server) | Min draft-head confidence to keep a token | per drafter kind (`0.75` / `0.35`) | not registered | no |
-| `TS_MTP_DRAFT_MODEL` | Gemma 4 (server) | Path to the separate `gemma4-assistant` draft GGUF | none | not registered | no |
-| `TS_GLM_MTP` | GLM 5.2 | Force the NextN block on (`1`) or off (`0`), overriding `TS_MTP_SPEC` in both directions | unset | not registered | no |
-| `TS_GMTP_NO_FUSED` | Gemma 4 on ggml backends | Disable fused multi-token-verify / draft-step kernels (per-op fallback) | OFF | not registered | no |
-| `TS_GMTP_NO_FAST_ROLLBACK` | Gemma 4 | Restore kept-prefix rollback instead of dense fast rollback on partial accept | OFF | not registered | no |
-| `TS_GMTP_BATCHED_TRUNK` | Gemma 4 | Run the verify trunk through the batched paged path instead of the linear trunk | OFF | not registered | no |
+Each knob has a current `TS_SPEC_*` spelling and a legacy `TS_MTP_*` one. Hosts
+publish **both** when a flag is applied, and readers accept either: the glm-dsa
+**native** loader reads `TS_MTP_SPEC` and `TS_MTP_DRAFT` from C++ while the model
+is loading (it decides whether to page a whole extra 256-expert decoder layer into
+VRAM, and sizes its graph cache), so those names are a cross-language contract
+that cannot simply be renamed. All are also settable via the `--spec*` flags (or
+their `--mtp-*` aliases) on both hosts.
+
+| Env var | Legacy spelling | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|---|
+| `TS_SPEC` | `TS_MTP_SPEC` | Qwen 3.5/3.6, GLM 5.2, Gemma 4, DeepSeek V4, Muse-Glimmer (CLI + server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
+| `TS_SPEC_TYPE` | — | all of the above | Speculation algorithm: `auto` \| `draft-head` \| `block` \| `ngram` | `auto` | not registered | no |
+| `TS_SPEC_DRAFT` | `TS_MTP_DRAFT` | all of the above | Max tokens drafted per speculative step (1-64) | `8` | not registered | no |
+| `TS_SPEC_PMIN` | `TS_MTP_PMIN` | all of the above | Draft-confidence gate; meaning is per algorithm | per algorithm (`0.75` / `0.35` / `0`) | not registered | no |
+| `TS_SPEC_DRAFT_MODEL` | `TS_MTP_DRAFT_MODEL` | Gemma 4 (CLI + server) | Path to the separate `gemma4-assistant` draft GGUF | none | not registered | no |
+| `TS_GLM_MTP` | — | GLM 5.2 | Force the NextN block on (`1`) or off (`0`), overriding `TS_SPEC`/`TS_MTP_SPEC` in both directions | unset | not registered | no |
+| `TS_GMTP_NO_FUSED` | — | Gemma 4 on ggml backends | Disable fused multi-token-verify / draft-step kernels (per-op fallback) | OFF | not registered | no |
+| `TS_GMTP_NO_FAST_ROLLBACK` | — | Gemma 4 | Restore kept-prefix rollback instead of dense fast rollback on partial accept | OFF | not registered | no |
+| `TS_GMTP_BATCHED_TRUNK` | — | Gemma 4 | Run the verify trunk through the batched paged path instead of the linear trunk | OFF | not registered | no |
+
+The design behind these — the three-layer split of model architecture,
+speculation algorithm and speculator weights — is documented in
+[Speculative Decoding in TensorSharp](speculative_decoding.md).
 
 ## Out-of-Matrix Muse-Glimmer & DFlash Knobs
 

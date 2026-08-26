@@ -211,12 +211,12 @@ public class MuseGlimmerParityTests
         if (draftPath == null) return;
 
         using var model = ModelBase.Create(modelPath, ResolveBackend(), draftModelPath: draftPath);
-        var spec = model as IMtpSpeculativeModel;
+        var spec = model as ISpeculativeModel;
         Assert.NotNull(spec);
-        Assert.True(spec.HasMtp, "DFlash drafter did not arm (HasMtp is false).");
-        _output.WriteLine($"DFlash armed: hidden={spec.MtpHiddenSize} blockDrafts={spec.MtpDraftBlockSize}");
+        Assert.True(spec.HasDraftHead, "DFlash drafter did not arm (HasDraftHead is false).");
+        _output.WriteLine($"DFlash armed: hidden={spec.SpecFeatureSize} blockDrafts={spec.DraftBlockSize}");
 
-        var decoder = new MtpSpeculativeDecoder(spec, spec.MtpDraftBlockSize);
+        var decoder = new SpeculativeDecoder(spec, spec.DraftBlockSize);
 
         int mismatches = 0;
         foreach (var rec in records)

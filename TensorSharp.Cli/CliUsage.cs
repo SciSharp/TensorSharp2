@@ -187,42 +187,61 @@ namespace TensorSharp.Cli
             }),
             ("Speculative decoding", new[]
             {
-                new OptionHelp("--mtp-spec | --no-mtp-spec",
-                    "Enable/disable NextN/MTP speculative decoding on models that embed a per-token draft head " +
-                    "in the trunk checkpoint (GLM-5.2, Qwen 3.6). The head drafts up to --mtp-draft tokens and " +
-                    "the trunk verifies them in one batched forward; every emitted token still comes from a " +
-                    "trunk row, so this is a speed path only. Engages on --input, --input-jsonl, " +
-                    "--multi-turn-jsonl and --interactive. Must be passed BEFORE the model loads (it is what " +
-                    "tells glm-dsa to page its ~3 GiB NextN layer into VRAM, which also leaves less room for the " +
-                    "context). Not available under --tp N>1 on a checkpoint whose draft block borrows the " +
-                    "trunk's LM head, which includes GLM-5.2. Default: off; env TS_MTP_SPEC (glm-dsa also honours " +
+                new OptionHelp("--spec | --no-spec",
+                    "Enable/disable speculative decoding: a drafter proposes the next few tokens and the trunk " +
+                    "verifies them in ONE batched forward. Every emitted token still comes from a trunk row, so " +
+                    "this is a speed path only - the output is what plain decoding would have produced. Engages " +
+                    "on --input, --input-jsonl, --multi-turn-jsonl and --interactive. Must be passed BEFORE the " +
+                    "model loads (it is what tells glm-dsa to page its ~3 GiB NextN layer into VRAM, which also " +
+                    "leaves less room for the context). Not available under --tp N>1 on a checkpoint whose draft " +
+                    "block borrows the trunk's LM head, which includes GLM-5.2. Accepted as --mtp-spec / " +
+                    "--no-mtp-spec too. Default: off; env TS_SPEC (or TS_MTP_SPEC; glm-dsa also honours " +
                     "TS_GLM_MTP=1/0, which overrides both).",
-                    "--model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf --backend ggml_cuda --mtp-spec --chat"),
-                new OptionHelp("--mtp-draft <N>",
+                    "--model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf --backend ggml_cuda --spec --chat"),
+                new OptionHelp("--spec-type <name>",
+                    "Which speculation ALGORITHM to draft with. 'auto' (default) uses whatever drafter the " +
+                    "checkpoint carries: a per-token NextN/MTP head (GLM-5.2, Qwen 3.6, Gemma 4's separate " +
+                    "assistant GGUF) or a block drafter (DeepSeek V4 DSpark, Muse-Glimmer DFlash). " +
+                    "'draft-head' and 'block' pin one of those explicitly. 'ngram' needs NO trained weights at " +
+                    "all - it drafts by finding where the last few tokens occurred earlier in the context and " +
+                    "proposing what followed, so it works on every model and is strong on summarizing, editing, " +
+                    "translating, repetitive structured output and agentic loops, where the answer quotes the " +
+                    "prompt. Env: TS_SPEC_TYPE.",
+                    "--spec --spec-type ngram --spec-draft 8"),
+                new OptionHelp("--spec-draft <N>",
                     "Maximum tokens drafted per speculative step. Also sizes the native graph cache at load, so " +
-                    "it belongs on the same command line as --mtp-spec. Range: 1-64. Default: 8; env TS_MTP_DRAFT.",
-                    "--mtp-spec --mtp-draft 4"),
-                new OptionHelp("--mtp-pmin <f>",
-                    "Minimum draft confidence for a drafted token to be kept; drafting stops at the first token " +
-                    "below it. Range: 0.0-1.0 (exclusive of 0). Default: chosen per drafter kind - 0.75 for a " +
-                    "per-token head (top-1 probability over its top-10 logits), 0.35 for a block drafter (where " +
-                    "the gate is the CUMULATIVE prefix probability, so the same number is far stricter). " +
-                    "Env: TS_MTP_PMIN.",
-                    "--mtp-spec --mtp-draft 4 --mtp-pmin 0.55"),
+                    "it belongs on the same command line as --spec. Accepted as --mtp-draft too. Range: 1-64. " +
+                    "Default: 8; env TS_SPEC_DRAFT (or TS_MTP_DRAFT).",
+                    "--spec --spec-draft 4"),
+                new OptionHelp("--spec-pmin <f>",
+                    "Confidence gate below which drafting stops. What the number MEANS is the algorithm's " +
+                    "business, so each picks its own default rather than sharing one: 0.75 for a per-token head " +
+                    "(top-1 probability over its top-10 logits), 0.35 for a block drafter (the CUMULATIVE prefix " +
+                    "probability, so the same number is far stricter), 0 for n-gram (where it scales the required " +
+                    "match length instead). Accepted as --mtp-pmin too. Range: 0.0-1.0 (exclusive of 0). " +
+                    "Env: TS_SPEC_PMIN (or TS_MTP_PMIN).",
+                    "--spec --spec-draft 4 --spec-pmin 0.55"),
+                new OptionHelp("--spec-draft-model <path>",
+                    "Draft-head GGUF for architectures whose speculator weights ship as their own file " +
+                    "(Gemma 4's gemma4-assistant). Loaded onto the target at startup so --spec can engage. " +
+                    "Qwen 3.6 and GLM-5.2 embed their NextN block in the trunk GGUF and need no such flag. " +
+                    "Accepted as --mtp-draft-model too. Default: none; env TS_SPEC_DRAFT_MODEL.",
+                    "--spec --spec-draft-model gemma-4-12B-it-Q4_0-MTP.gguf"),
                 new OptionHelp("--draft-model <path>",
-                    "Block drafter GGUF for architectures whose drafter ships as its own file (DeepSeek V4's " +
-                    "DSpark support module). The drafter proposes a whole block of tokens per step and the trunk " +
-                    "verifies it in one batched forward. Every emitted token is still drawn from a trunk row - " +
-                    "with argmax under a greedy config, with your sampler otherwise - so output is unchanged " +
-                    "either way. Needs --backend cuda or ggml_cuda. Default: none; env TS_DSV4_DSPARK.",
+                    "Block drafter GGUF that has to be resident before the model's layer split runs (DeepSeek " +
+                    "V4's DSpark support module, Muse-Glimmer's DFlash). The drafter proposes a whole block of " +
+                    "tokens per step and the trunk verifies it in one batched forward. Naming the file IS the " +
+                    "request - such a drafter needs no --spec. Every emitted token is still drawn from a trunk " +
+                    "row - with argmax under a greedy config, with your sampler otherwise - so output is " +
+                    "unchanged either way. Default: none; env TS_DSV4_DSPARK.",
                     "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf --temperature 0"),
                 new OptionHelp("--spec-draft-n-max <N>",
-                    "Older spelling of --mtp-draft, kept for block drafters. Cap on tokens drafted per " +
+                    "Older spelling of --spec-draft, kept for block drafters. Cap on tokens drafted per " +
                     "speculative block; a block drafter additionally clamps it to its trained block size " +
                     "(5 for DSpark). Default: the drafter's block size.",
                     "--spec-draft-n-max 3"),
                 new OptionHelp("--spec-draft-conf-min <p>",
-                    "Older spelling of --mtp-pmin, kept for block drafters, where the gate is the CUMULATIVE " +
+                    "Older spelling of --spec-pmin, kept for block drafters, where the gate is the CUMULATIVE " +
                     "acceptance probability (the product of the confidence head's per-position estimates). Lower " +
                     "drafts further and rolls back more; higher falls back to plain decode sooner. Range: " +
                     "0.0-1.0. Default: 0.35 for a block drafter, 0.75 for a per-token head.",
@@ -418,43 +437,99 @@ namespace TensorSharp.Cli
                     "resolution does not fit beside the resident weights).",
                     "--offload-cpu"),
                 new OptionHelp("--video-frames <N>",
-                    "Wan video generation: number of output frames, snapped to 4k+1 (the VAE's temporal grid); " +
-                    "1 = a single still image. Default: 33 (49 for Wan2.2-TI2V). With a Wan 2.2 model, " +
-                    "--image <file> supplies the first frame for image-to-video.",
+                    "Video generation: number of output frames, snapped to the model's temporal grid " +
+                    "(4k+1 for Wan, 17k+5 for MiniMax-H3); 1 = a single still image where the model allows it. " +
+                    "Default: the model's own (33; 49 for Wan2.2-TI2V).",
                     "--video-frames 81"),
                 new OptionHelp("--fps <N>",
-                    "Wan video generation: playback frame rate of the saved MP4. Default: 16 " +
-                    "(24 for Wan2.2-TI2V, the models' training rates).",
+                    "Video generation: playback frame rate of the saved MP4. Default: the model's training " +
+                    "rate (16, or 24 for Wan2.2-TI2V). Models trained at a fixed rate — MiniMax-H3 at 24 fps — " +
+                    "override any other value.",
                     "--fps 24"),
                 new OptionHelp("--flow-shift <F>",
-                    "Wan FlowMatch timestep shift. Default: 0 — the model's official recipe (5.0 for Wan 2.2, " +
+                    "FlowMatch timestep shift. Default: 0 — the model's official recipe (5.0 for Wan 2.2, " +
                     "12.0 for A14B T2V; Wan 2.1: 8.0 for the 1.3B model's video runs, else 3.0 at <= 480p, " +
-                    "5.0 above).",
+                    "5.0 above; 12.0 for MiniMax-H3). On models with a joint audio stream this shifts the " +
+                    "video stream only.",
                     "--flow-shift 5.0"),
                 new OptionHelp("--sampler <name>",
-                    "Wan sampler: unipc (the official Wan sampler; multistep predictor-corrector, " +
-                    "better quality at the same step count) or euler. Default: unipc.",
+                    "Sampler: unipc (the official Wan sampler; multistep predictor-corrector, better quality " +
+                    "at the same step count) or euler. Default: the model's own (unipc for Wan).",
                     "--sampler unipc"),
                 new OptionHelp("--negative-prompt <text>",
-                    "Wan video generation: negative prompt for classifier-free guidance. Default: the official " +
-                    "Wan negative prompt.",
+                    "Video generation: negative prompt for classifier-free guidance. Default: the model's " +
+                    "official negative prompt. Unused at --cfg 1.0, where no negative pass runs.",
                     "--negative-prompt \"static, blurry\""),
                 new OptionHelp("--cfg-cache-stride <N>",
-                    "Wan guidance cache: run the unconditional CFG pass on one step in N and reuse the cached " +
+                    "Guidance cache: run the unconditional CFG pass on one step in N and reuse the cached " +
                     "guidance direction in between (the first three steps and the last always recompute it). " +
                     "At 50 steps, 2 runs 77 of the 100 passes (1.30x faster) and 3 runs 70 (1.43x). This is an " +
-                    "approximation — leave it off when matching a reference sample matters. Default: 0 (off).",
+                    "approximation — leave it off when matching a reference sample matters, and it has no " +
+                    "effect at --cfg 1.0. Default: 0 (off).",
                     "--cfg-cache-stride 2"),
-                new OptionHelp("--wan-vae <path>",
-                    "Wan video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B). Default: " +
-                    "same-directory scan next to the DiT model, VAE/ subfolders included (TS_WAN_VAE env var " +
-                    "also works).",
-                    "--wan-vae Wan2.2_VAE.safetensors"),
-                new OptionHelp("--wan-te <path>",
-                    "UMT5-XXL text-encoder GGUF for Wan video generation. Default: same-directory scan " +
-                    "(TS_WAN_TE env var also works). Wan 2.2 A14B also auto-resolves the second high/low-noise " +
-                    "expert GGUF by name (TS_WAN_DIT2 env var overrides).",
-                    "--wan-te umt5-xxl-encoder-Q8_0.gguf"),
+                new OptionHelp("--video-mode <mode>",
+                    "How to interpret supplied images, on models with more than one conditioning " +
+                    "mode. Default: inferred from what you pass. MiniMax-H3 accepts t2v (text " +
+                    "only), i2v (the image IS the first frame and gets animated), fl2v (first and " +
+                    "last frame), ref (the images are identity/appearance references for a NEW " +
+                    "scene, not the first frame). i2v/fl2v need the fl2va checkpoint and ref needs " +
+                    "ref2va — they are separate files. On the ref2va checkpoint a plain --image is " +
+                    "taken as a reference, so clients that only attach one image work unchanged.",
+                    "--video-mode i2v"),
+                new OptionHelp("--end-image <file>",
+                    "Last-frame conditioning image, on models that accept one (MiniMax-H3 first/last-frame " +
+                    "mode). Combined with --image the clip is steered to start and end on the two frames.",
+                    "--end-image last.png"),
+                new OptionHelp("--ref-image <file>",
+                    "Reference image for reference-conditioned models (MiniMax-H3 Ref2VA): the subject " +
+                    "carries over while camera, background and composition come from the prompt. " +
+                    "Repeatable up to 9; the prompt refers to them positionally as <Picture 1>, " +
+                    "<Picture 2>, ... References are only ever scaled DOWN and keep their own aspect " +
+                    "ratio, so the output size still comes from --width/--height.",
+                    "--ref-image cat.png"),
+                new OptionHelp("--ref-video <path>",
+                    "Reference video clip for reference-conditioned models. Repeatable; referred to in the " +
+                    "prompt as <Video 1>, <Video 2>, ... Accepts a video FILE or a directory of frames; " +
+                    "either way it is resampled onto the model's own 24 fps and its own canvas. Pair a " +
+                    "soundtrack with --ref-video-audio.",
+                    "--ref-video clip/"),
+                new OptionHelp("--ref-video-audio <file>",
+                    "Soundtrack for the reference video at the SAME position: the first " +
+                    "--ref-video-audio pairs with the first --ref-video, and so on. Separate from " +
+                    "--ref-video because a container's audio track is not readable through the " +
+                    "frame decoder. Omit it for a silent reference clip. WAV, MP3 or Ogg.",
+                    "--ref-video-audio clip.wav"),
+                new OptionHelp("--ref-audio <file>",
+                    "Reference audio clip for reference-conditioned models. Repeatable; referred to in the " +
+                    "prompt as <Audio 1>, <Audio 2>, ... WAV, MP3 or Ogg, resampled to the audio VAE's " +
+                    "32 kHz stereo and truncated to the generated clip's duration.",
+                    "--ref-audio theme.wav"),
+                new OptionHelp("--no-audio",
+                    "Skip audio decoding on models that generate an audio track jointly with the video " +
+                    "(MiniMax-H3). Saves the audio VAE's time and memory when only the picture is wanted. " +
+                    "Ignored by video-only models.",
+                    "--no-audio"),
+                new OptionHelp("--video-vae <path>",
+                    "Video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B; " +
+                    "minimax_h3_video_vae_fp16.safetensors for MiniMax-H3). Default: same-directory scan next " +
+                    "to the DiT model, VAE/ subfolders included (TS_VIDEO_VAE env var also works). " +
+                    "The former spelling --wan-vae is still accepted.",
+                    "--video-vae Wan2.2_VAE.safetensors"),
+                new OptionHelp("--video-text-encoder <path>",
+                    "Text-encoder GGUF for video generation (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). " +
+                    "Default: same-directory scan (TS_VIDEO_TEXT_ENCODER env var also works). Also spelled " +
+                    "--video-te; the former spelling --wan-te is still accepted.",
+                    "--video-text-encoder umt5-xxl-encoder-Q8_0.gguf"),
+                new OptionHelp("--video-dit2 <path>",
+                    "Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise pair). " +
+                    "Default: auto-resolved by filename next to the first expert (TS_VIDEO_DIT2 env var also " +
+                    "works). The former spelling --wan-dit2 is still accepted.",
+                    "--video-dit2 wan2.2_i2v_low_noise.gguf"),
+                new OptionHelp("--audio-vae <path>",
+                    "Audio VAE for models that generate an audio track jointly with the video " +
+                    "(minimax_h3_audio_vae_fp32.safetensors). Without it such a model still runs and produces " +
+                    "video, just no audio (TS_VIDEO_AUDIO_VAE env var also works).",
+                    "--audio-vae minimax_h3_audio_vae_fp32.safetensors"),
             }),
             ("Configuration file", new[]
             {

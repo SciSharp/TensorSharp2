@@ -6,7 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
 // Correctness + performance tests for the DiffusionGemma block-diffusion MoE model
-// (architecture key "diffusion-gemma|gemma-diffusion") against a real GGUF. Opt-in via TS_TEST_MODEL_DIR.
+// (architecture key "diffusion-gemma") against a real GGUF. Opt-in via TS_TEST_MODEL_DIR.
 //
 // These tests exercise the full denoising pipeline (DiffusionGemmaModel.ForwardCanvas +
 // DiffusionGemmaSampler EntropyBound sampler). They are skipped cleanly when the model file
@@ -30,6 +30,14 @@ public class DiffusionGemmaTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
 
+    // One pattern for BOTH the [ModelFact] skip gate and TryLoad's file pick. They used to be written
+    // out separately, and the gate's list omitted the unhyphenated spelling that the released weights
+    // actually ship with (diffusiongemma-26B-A4B-it-Q4_K_M.gguf). Every test in this class therefore
+    // reported "no matching GGUF" and skipped even with TS_TEST_MODEL_DIR correctly set, so the whole
+    // suite was silently green while a real prompt-conditioning regression sat in the model.
+    private const string GgufPattern =
+        "diffusion-gemma|gemma-diffusion|diffusiongemma|gemmadiffusion";
+
     private readonly ITestOutputHelper _output;
     public DiffusionGemmaTests(ITestOutputHelper output) { _output = output; }
 
@@ -45,11 +53,9 @@ public class DiffusionGemmaTests
             _output.WriteLine($"{EnvModelDir} not set; skipping");
             return null;
         }
-        string modelPath = Directory.GetFiles(dir, "*.gguf").FirstOrDefault(p =>
-        {
-            var n = Path.GetFileName(p).ToLowerInvariant();
-            return n.Contains("diffusion") && n.Contains("gemma") && !n.Contains("mmproj");
-        });
+        // Same helper (and same pattern) the [ModelFact] gate uses, so a test can never be reported as
+        // runnable and then fail to find its weights, or vice versa.
+        string modelPath = TestGates.FindGguf(dir, GgufPattern);
         if (modelPath == null)
         {
             _output.WriteLine("No diffusion-gemma GGUF available; skipping");
@@ -89,7 +95,7 @@ public class DiffusionGemmaTests
         return model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
     }
 
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void ForwardCanvas_ProducesFiniteLogits_AndArgmaxIsValid()
     {
         using var model = TryLoad();
@@ -124,7 +130,7 @@ public class DiffusionGemmaTests
         _output.WriteLine("[diffusion-gemma] ForwardCanvas produced finite, valid logits.");
     }
 
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void CapitalOfFrance_Generates_Paris()
     {
         using var model = TryLoad();
@@ -148,7 +154,139 @@ public class DiffusionGemmaTests
         Assert.Contains("Paris", text, StringComparison.OrdinalIgnoreCase);
     }
 
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    // Regression guard for the Metal async-compute (lazy-sync) corruption. GgmlContext turns on
+    // lazy-sync for Metal: a per-op kernel returns without waiting on its command buffer. Reads are
+    // safe (GetFloatPtr drains), but there is no host-WRITE barrier, so a CPU write followed by a
+    // device kernel could dispatch against a stale device buffer. Every per-op path in this model
+    // mixes the two (MoERoute's host top-K, the per-expert MoE's Buffer.MemoryCopy, the embedding /
+    // mask / self-conditioning helpers), which made the forward NON-REPRODUCIBLE: two identical
+    // ForwardCanvas calls differed on ~all 67M logits (cosine as low as 0.77) on an M5 Pro.
+    //
+    // A forward pass is a pure function of its inputs, so the strongest possible assertion is
+    // BITWISE equality across two identical calls. This fails loudly on any reintroduction of an
+    // unsynchronised host-write/device-read pair, and it needs no golden data.
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void ForwardCanvas_IsBitwiseReproducible()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        var prompt = RenderPrompt(model, "Describe the video game Final Fantasy VII in detail.");
+        int P = prompt.Length, C = model.CanvasLength;
+        var tokens = new int[P + C];
+        Array.Copy(prompt, tokens, P);
+        for (int i = 0; i < C; i++) tokens[P + i] = model.MaskTokenId;
+
+        // ForwardCanvas returns a reusable internal buffer, so each result must be cloned before the
+        // next call overwrites it.
+        float[] a = (float[])model.ForwardCanvas(tokens, P).Clone();
+        float[] b = (float[])model.ForwardCanvas(tokens, P).Clone();
+
+        long differing = 0;
+        double maxAbs = 0;
+        for (long i = 0; i < a.LongLength; i++)
+        {
+            if (BitConverter.SingleToInt32Bits(a[i]) != BitConverter.SingleToInt32Bits(b[i])) differing++;
+            double d = Math.Abs((double)a[i] - b[i]);
+            if (d > maxAbs) maxAbs = d;
+        }
+        _output.WriteLine($"[diffusion-gemma][repro] differing={differing}/{a.LongLength} maxAbsDiff={maxAbs:F6}");
+        Assert.True(differing == 0,
+            $"ForwardCanvas is not reproducible: {differing}/{a.LongLength} logits differ (maxAbsDiff {maxAbs:F4}) " +
+            "between two identical calls — an unsynchronised host-write/device-read (Metal async compute)");
+    }
+
+    // The same reproducibility guarantee for the prompt-KV path, which is what the server actually
+    // runs. PrefillPrompt walks the per-op stack ONCE and freezes the result as the prompt K/V for
+    // every denoising step of the turn, so a corrupted prefill permanently poisons the model's view
+    // of the prompt — this is why the async-compute race produced fluent but prompt-irrelevant text
+    // rather than mere step-to-step noise.
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void PrefillAndDecode_AreBitwiseReproducible()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+        if (!model.SupportsPromptKvCache)
+        {
+            _output.WriteLine("[diffusion-gemma][repro] CPU backend (no PKV); skipping");
+            return;
+        }
+
+        var prompt = RenderPrompt(model, "请详细介绍最终幻想7");
+        int C = model.CanvasLength;
+
+        // The canvas MUST change between steps, and self-conditioning MUST be fed, or this test is
+        // blind: with a constant all-mask canvas every step re-uploads identical bytes, so a stale
+        // device buffer still holds the right data and a real race passes unnoticed. The sampler
+        // re-noises rejected positions every step, which is what makes the per-step
+        // Embedding(canvasTokens) a host-write the next device kernel must observe.
+        float[] Run()
+        {
+            model.PrefillPrompt(prompt);
+            var canvas = new int[C];
+            for (int i = 0; i < C; i++) canvas[i] = model.MaskTokenId;
+            float[] logits = null, sc = null;
+            for (int step = 0; step < 4; step++)
+            {
+                logits = model.DecodeCanvas(canvas, sc, step == 0 ? 0f : 1f, 1.25f);
+                sc = logits;                       // alias, exactly as DenoiseBlock does
+                // deterministic re-noise so both runs see the identical token stream
+                uint h = (uint)(step * 2654435761u + 1);
+                for (int i = 0; i < C; i++)
+                {
+                    h ^= h << 13; h ^= h >> 17; h ^= h << 5;
+                    if ((h & 3) == 0) canvas[i] = (int)(h % (uint)model.VocabSize);
+                }
+            }
+            return (float[])logits.Clone();
+        }
+
+        float[] a = Run();
+        float[] b = Run();
+        long differing = 0;
+        for (long i = 0; i < a.LongLength; i++)
+            if (BitConverter.SingleToInt32Bits(a[i]) != BitConverter.SingleToInt32Bits(b[i])) differing++;
+
+        _output.WriteLine($"[diffusion-gemma][repro] prefill+4 decode steps differing={differing}/{a.LongLength}");
+        Assert.True(differing == 0,
+            $"prefill+decode is not reproducible: {differing}/{a.LongLength} logits differ between two " +
+            "identical runs — the frozen prompt K/V or a per-step canvas upload is being corrupted");
+    }
+
+    // End-to-end mirror of the reported failure: a CJK prompt asking for a detailed description of
+    // Final Fantasy 7 came back as fluent Chinese that answered as though the user had typed only
+    // "请介绍" ("please introduce") — the prompt's actual subject was gone. Exercises the default
+    // server configuration (prompt-KV cache + fused decode) and asserts the answer is on-topic.
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void Generate_ChinesePrompt_IsOnTopic()
+    {
+        using var model = TryLoad();
+        if (model == null) return;
+
+        var prompt = RenderPrompt(model, "请详细介绍最终幻想7");
+        var sampler = new DiffusionGemmaSampler(model);
+        var p = new DiffusionEbParams { MaxDenoisingSteps = 48, Seed = 0, MaxBlocks = 1 };
+
+        var generated = sampler.Generate(prompt, p);
+        string text = model.Tokenizer.Decode(generated);
+        _output.WriteLine($"[diffusion-gemma][cjk] tokens={generated.Count} text: {text}");
+
+        Assert.True(generated.Count >= 24, $"answer collapsed too early ({generated.Count} tokens)");
+        // The subject must actually appear: the model names the game in Chinese, in Latin, or by
+        // its abbreviation. The pre-fix output contained none of these.
+        bool onTopic =
+            text.Contains("最终幻想") || text.Contains("太空戰士") ||
+            text.Contains("Final Fantasy", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("FF7", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("FFVII", StringComparison.OrdinalIgnoreCase);
+        Assert.True(onTopic,
+            "answer never mentions Final Fantasy VII — the prompt's conditional content was lost: " + text);
+        // The pre-fix answer complained about a "repeated instruction" instead of answering.
+        Assert.False(text.Contains("重复的指令") || text.Contains("重複的指令"),
+            "model reported a repeated/garbled instruction — the prompt reached it corrupted: " + text);
+    }
+
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void Benchmark_StepThroughput()
     {
         using var model = TryLoad();
@@ -172,7 +310,7 @@ public class DiffusionGemmaTests
         Assert.True(msPerStep > 0);
     }
 
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void PromptKvCache_LogitsMatchUnified()
     {
         using var model = TryLoad();
@@ -220,7 +358,7 @@ public class DiffusionGemmaTests
         Assert.True(cosine >= 0.99, $"PKV logits diverged from unified (cosine {cosine:F6}) — likely a bug");
     }
 
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void Benchmark_PromptKvCache_SpeedupOnLongPrompt()
     {
         using var model = TryLoad();
@@ -291,7 +429,7 @@ public class DiffusionGemmaTests
     // because the host softcap/readback raced the in-flight device->host logits blit. A healthy answer is
     // substantial and token-diverse. Exercises the default (fused decode + fused lm_head + PKV) path on the
     // GPU backend. Skipped without TS_TEST_MODEL_DIR.
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void Generate_LongAnswer_IsCoherent_NotDegenerate()
     {
         using var model = TryLoad();
@@ -331,7 +469,7 @@ public class DiffusionGemmaTests
     // (kIOGPUCommandBufferCallbackErrorOutOfMemory). The fix (ReleasePromptKvTensor) frees the cached
     // device copy before disposing each K/V tensor. This test reallocates the prompt K/V many times and
     // asserts the resident device-copy bytes stay bounded (≈ one prefill's K/V), not growing per prefill.
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void PromptKvCache_DeviceCopiesDoNotLeakAcrossPrefills()
     {
         using var model = TryLoad();
@@ -379,7 +517,7 @@ public class DiffusionGemmaTests
     // every block of every turn leaked its prompt K/V device copies. Asserts generation keeps succeeding
     // and resident device memory stays bounded across turns. Uses a fixed prompt so the per-turn resident
     // footprint is constant (isolates the leak from the natural growth of an accumulating chat history).
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void MultiTurn_Generation_DoesNotLeakDeviceMemory()
     {
         using var model = TryLoad();
@@ -422,7 +560,7 @@ public class DiffusionGemmaTests
     // whether it is decoded alone or batched with another sequence (each canvas row's attention/FFN/lm_head
     // depends only on that row + its own prompt K/V, so batching must not perturb it). Uses fixed mask-token
     // canvases with self-conditioning off so the forward is deterministic. Skipped without a GPU/PKV backend.
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void BatchedDecode_LogitsMatchSolo()
     {
         using var model = TryLoad();
@@ -492,7 +630,7 @@ public class DiffusionGemmaTests
     // End-to-end mirror of the reported bug: two prompts generated together in ONE batched run must BOTH
     // produce a correct, non-empty answer (pre-fix, a second parallel request produced nothing). Drives the
     // batched sampler the way the server scheduler does — one block at a time over the active set.
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void BatchedGeneration_TwoPrompts_BothProduceOutput()
     {
         using var model = TryLoad();
@@ -526,7 +664,7 @@ public class DiffusionGemmaTests
     // TrimCanvas, a single request driven through RunBlockBatched must produce TOKEN-IDENTICAL output
     // to the single-request Generate() path — on every backend. Runs a few fixed steps so it is cheap
     // enough for the CPU backends.
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void BatchedScheduler_SingleRequest_MatchesGenerate_AllBackends()
     {
         using var model = TryLoad();
@@ -590,7 +728,7 @@ public class DiffusionGemmaTests
     // throughput; worse, the per-op batched forward is markedly slower per canvas than the fused kernel, so
     // the fused time-slice wins. This benchmark proves that ordering (so the scheduler default is correct)
     // and reports the numbers. Skipped without a GPU/PKV backend.
-    [ModelFact("TS_TEST_MODEL_DIR", "diffusion-gemma|gemma-diffusion")]
+    [ModelFact(EnvModelDir, GgufPattern)]
     public void Benchmark_BatchedDecodeThroughput()
     {
         using var model = TryLoad();

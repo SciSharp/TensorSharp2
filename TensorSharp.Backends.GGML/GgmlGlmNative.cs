@@ -158,7 +158,7 @@ namespace TensorSharp.GGML
         // ---- NextN/MTP speculative decoding -------------------------------
 
         /// <summary>True when the trailing NextN/MTP block was loaded and is usable.</summary>
-        public static bool HasMtp(IntPtr handle) => TSGgml_GlmHasMtp(handle) != 0;
+        public static bool HasDraftHead(IntPtr handle) => TSGgml_GlmHasMtp(handle) != 0;
 
         /// <summary>Hidden size (n_embd) — the width of one h_nextn row.</summary>
         public static int HiddenSize(IntPtr handle) => TSGgml_GlmHiddenSize(handle);
@@ -179,7 +179,7 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>One NextN draft step at <paramref name="pos"/>.</summary>
-        public static unsafe bool MtpDraftStep(IntPtr handle, int token, float[] hPrev, int pos,
+        public static unsafe bool DraftStep(IntPtr handle, int token, float[] hPrev, int pos,
                                                float[] logitsOut, float[] hOut)
         {
             fixed (float* hp = hPrev)
@@ -193,7 +193,7 @@ namespace TensorSharp.GGML
         /// <summary>Replay verified tokens through the NextN block so its KV cache
         /// tracks the trunk. Row k of <paramref name="hRows"/> is the trunk hidden
         /// state of the token preceding <c>tokens[k]</c>.</summary>
-        public static unsafe bool MtpCatchUp(IntPtr handle, int[] tokens, float[] hRows, int startPos)
+        public static unsafe bool DraftCatchUp(IntPtr handle, int[] tokens, float[] hRows, int startPos)
         {
             fixed (int* t = tokens)
             fixed (float* h = hRows)

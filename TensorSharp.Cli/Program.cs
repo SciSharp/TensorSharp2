@@ -25,6 +25,7 @@ using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Cli
 {
@@ -145,7 +146,7 @@ namespace TensorSharp.Cli
             // is already set, and sizes its graph cache from TS_MTP_DRAFT. Parsing
             // these in the switch below would be too late to matter. Shared with
             // the server so the two hosts cannot drift on names or validation.
-            MtpSpeculativeCliFlags.Apply(args);
+            SpeculativeCliFlags.Apply(args);
 
             string modelPath = null;
             string inputFile = null;
@@ -226,9 +227,17 @@ namespace TensorSharp.Cli
             string videoSampler = null;   // null = unipc (the official Wan sampler)
             int cfgCacheStride = 0;       // 0/1 = off: every step runs both CFG passes
             string negativePrompt = null;
-            string wanVaePath = null;
-            string wanTePath = null;
-            string wanDit2Path = null;
+            string videoVaePath = null;
+            string videoTextEncoderPath = null;
+            string videoDit2Path = null;
+            string videoAudioVaePath = null;
+            string endImagePath = null;
+            string videoMode = null;
+            var refImagePaths = new List<string>();
+            var refVideoPaths = new List<string>();
+            var refAudioPaths = new List<string>();
+            var refVideoAudioPaths = new List<string>();
+            bool videoAudioEnabled = true;
             string draftModelPath = null;
             int specDraftMax = 0;
             float specDraftConfMin = -1f;
@@ -260,9 +269,20 @@ namespace TensorSharp.Cli
                     case "--sampler": videoSampler = args[++i]; break;
                     case "--cfg-cache-stride": cfgCacheStride = int.Parse(args[++i]); break;
                     case "--negative-prompt": negativePrompt = args[++i]; break;
-                    case "--wan-vae": wanVaePath = args[++i]; break;
-                    case "--wan-te": wanTePath = args[++i]; break;
-                    case "--wan-dit2": wanDit2Path = args[++i]; break;
+                    // Companion-network paths. The --wan-* spellings predate the second
+                    // video model and stay accepted so existing configs keep working.
+                    case "--video-vae": case "--wan-vae": videoVaePath = args[++i]; break;
+                    case "--video-text-encoder": case "--video-te": case "--wan-te":
+                        videoTextEncoderPath = args[++i]; break;
+                    case "--video-dit2": case "--wan-dit2": videoDit2Path = args[++i]; break;
+                    case "--audio-vae": videoAudioVaePath = args[++i]; break;
+                    case "--end-image": endImagePath = args[++i]; break;
+                    case "--video-mode": videoMode = args[++i]; break;
+                    case "--ref-image": refImagePaths.Add(args[++i]); break;
+                    case "--ref-video": refVideoPaths.Add(args[++i]); break;
+                    case "--ref-audio": refAudioPaths.Add(args[++i]); break;
+                    case "--ref-video-audio": refVideoAudioPaths.Add(args[++i]); break;
+                    case "--no-audio": videoAudioEnabled = false; break;
                     case "--offload-cpu": offloadCpu = true; break;
                     case "--audio": audioPath = args[++i]; break;
                     case "--video": videoPath = args[++i]; break;
@@ -499,7 +519,7 @@ namespace TensorSharp.Cli
                 pagedKvQuantBitsOverride);
 
             // --spec-draft-n-max is the older spelling of --mtp-draft and is parsed
-            // in the switch above, too late for MtpSpeculativeCliFlags.Apply. Publish
+            // in the switch above, too late for SpeculativeCliFlags.Apply. Publish
             // it now, while the model has still not been created.
             SpeculativeDecodingOptions.PublishDraftWindow(specDraftMax);
 
@@ -509,12 +529,12 @@ namespace TensorSharp.Cli
             // stderr), but the refusal is easy to miss in a long load, and the
             // operator has meanwhile lost the VRAM they were budgeting for context.
             // Say it up front, where the two flags were typed.
-            if (tpDegree > 1 && SchedulerConfig.FromEnvironment().MtpSpeculativeEnabled)
+            if (tpDegree > 1 && SchedulerConfig.FromEnvironment().Speculation.Enabled)
             {
                 _log.LogWarning(LogEventIds.HostConfiguration,
-                    "--mtp-spec with --tp {Degree}: a draft block that borrows the trunk's LM head cannot draft "
+                    "--spec with --tp {Degree}: a draft block that borrows the trunk's LM head cannot draft "
                     + "under tensor parallelism (GLM-5.2 is one such checkpoint) and speculation will be refused "
-                    + "at load. Drop --tp to speculate, or --mtp-spec to keep the split.", tpDegree);
+                    + "at load. Drop --tp to speculate, or --no-spec to keep the split.", tpDegree);
             }
 
             if (gpuDeviceOverride.HasValue)
@@ -551,10 +571,13 @@ namespace TensorSharp.Cli
             if (offloadCpu)
                 Environment.SetEnvironmentVariable("TS_QWEN_IMAGE_OFFLOAD_CPU", "1");
 
-            // Wan T2V: companion overrides (same env-var mechanism WanVideoModel reads).
-            ApplyQwenImageCompanionOverride("--wan-vae", "TS_WAN_VAE", wanVaePath);
-            ApplyQwenImageCompanionOverride("--wan-te", "TS_WAN_TE", wanTePath);
-            ApplyQwenImageCompanionOverride("--wan-dit2", "TS_WAN_DIT2", wanDit2Path);
+            // Video generation: companion overrides. Each path is published under both the
+            // generic TS_VIDEO_* name and the historical TS_WAN_* one, so WanVideoModel keeps
+            // reading exactly what it always did while new models read the generic names.
+            ApplyVideoCompanionOverride("--video-vae", videoVaePath, "TS_VIDEO_VAE", "TS_WAN_VAE");
+            ApplyVideoCompanionOverride("--video-text-encoder", videoTextEncoderPath, "TS_VIDEO_TEXT_ENCODER", "TS_WAN_TE");
+            ApplyVideoCompanionOverride("--video-dit2", videoDit2Path, "TS_VIDEO_DIT2", "TS_WAN_DIT2");
+            ApplyVideoCompanionOverride("--audio-vae", videoAudioVaePath, "TS_VIDEO_AUDIO_VAE");
 
             if (MoeCpuOffloadConfig.IsEnabled)
             {
@@ -590,6 +613,18 @@ namespace TensorSharp.Cli
             }
 
             using var model = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath);
+
+            // Speculator weights that ship as their own file (Gemma 4's
+            // gemma4-assistant draft head, named with --spec-draft-model) attach
+            // to the target here, through the same loader the server uses. A
+            // drafter is an optimization: failing to attach one warns and falls
+            // back to plain decoding rather than failing the run.
+            if (!SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(model, out string draftHeadError))
+            {
+                _log.LogWarning(LogEventIds.HostConfiguration,
+                    "{Error} Speculative decoding will serve standard decoding instead.", draftHeadError);
+            }
+
             modelLoadSw.Stop();
             _log.LogInformation(LogEventIds.ModelLoadCompleted,
                 "Loaded model {ModelFile} architecture={Architecture} contextLength={ContextLength} kvCacheDtype={KvCacheDtype} elapsedMs={ElapsedMs:F1}",
@@ -615,25 +650,28 @@ namespace TensorSharp.Cli
                 return;
             }
 
-            // Wan video generation: prompt (+ optional --image for Wan 2.2 image-to-video)
-            // -> MP4 (no autoregressive path).
-            if (model is TensorSharp.Models.WanVideo.WanVideoModel wanModel)
+            // Video generation: prompt (+ optional conditioning) -> MP4, plus a sidecar WAV
+            // on models that generate audio jointly. No autoregressive path.
+            if (model is TensorSharp.Models.Video.IVideoGenerationModel videoModel)
             {
                 string prompt = editPrompt
                     ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : null);
                 if (string.IsNullOrWhiteSpace(prompt))
                 {
-                    Console.Error.WriteLine("Wan video generation requires --prompt \"<description>\" (or --input prompt.txt). " +
-                        "Optionally --image first_frame.png (Wan 2.2 image-to-video), --output out.mp4, --width, " +
-                        "--height, --video-frames, --fps, --diffusion-steps, --cfg, --flow-shift, " +
-                        "--negative-prompt, --diffusion-seed, --cfg-cache-stride.");
+                    Console.Error.WriteLine("Video generation requires --prompt \"<description>\" (or --input prompt.txt). " +
+                        "Optionally --image first_frame.png, --end-image last_frame.png, " +
+                        "--ref-image/--ref-video/--ref-audio (reference-conditioned models), " +
+                        "--output out.mp4, --width, --height, --video-frames, --fps, --diffusion-steps, " +
+                        "--cfg, --flow-shift, --negative-prompt, --diffusion-seed, --cfg-cache-stride, --no-audio.");
                     return;
                 }
-                RunVideoGeneration(wanModel, prompt, outputFile ?? "wan_video.mp4",
+                RunVideoGeneration(videoModel, prompt, outputFile ?? "video.mp4",
                     imageWidth, imageHeight, videoFrames,
                     diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f,
                     diffusionSeedSet ? diffusionSeed : -1, flowShift, videoFps, negativePrompt,
-                    videoSampler, imagePath, cfgCacheStride);
+                    videoSampler, imagePath, cfgCacheStride,
+                    endImagePath, refImagePaths, refVideoPaths, refAudioPaths, videoAudioEnabled,
+                    videoMode, refVideoAudioPaths);
                 return;
             }
 
@@ -1120,7 +1158,7 @@ namespace TensorSharp.Cli
             // One decoder for the whole run: its draft/verify buffers are sized by
             // the vocabulary, so rebuilding it per turn costs several MB a turn on a
             // 155k-token vocabulary for nothing.
-            MtpSpeculativeDecoder multiTurnDecoder = null;
+            SpeculativeDecoder multiTurnDecoder = null;
 
             string[] lines = File.ReadAllLines(jsonlPath);
             var history = new List<ChatMessage>();
@@ -1206,7 +1244,7 @@ namespace TensorSharp.Cli
                 if (turnDecoder == null && specSettings.Requested && turnDeclineReason != null && turn == 0)
                 {
                     _log.LogWarning(LogEventIds.HostConfiguration,
-                        "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                        "--spec was requested but speculative decoding is not available: {Reason} "
                         + "Serving standard decode.", turnDeclineReason);
                 }
 
@@ -1218,7 +1256,7 @@ namespace TensorSharp.Cli
                     // block drafter's compressed cache cannot be truncated anyway,
                     // and a prefix the DRAFT head never saw would leave a hole in
                     // its KV that collapses acceptance for the rest of the turn.
-                    var turnSpecModel = (IMtpSpeculativeModel)model;
+                    var turnSpecModel = (ISpeculativeTarget)model;
                     kvCache.Reset();
                     bool turnArgmax = InteractiveSession.IsArgmaxSampling(cfg);
                     var turnTokens = turnArgmax
@@ -1240,7 +1278,7 @@ namespace TensorSharp.Cli
                         "multi-turn speculative: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode} " +
                         "drafted={Drafted} accepted={Accepted} acceptanceRate={Rate:F3} " +
                         "verifySteps={VerifySteps} plainSteps={Plain} rollbacks={Rollbacks} parked={Parked}",
-                        SpeculativeDecodingOptions.DescribeDrafter(turnSpecModel), turnDecoder.MaxDraftTokens,
+                        SpeculativeDecodingOptions.DescribeDrafter(turnDecoder), turnDecoder.MaxDraftTokens,
                         turnDecoder.MinDraftProb, turnArgmax ? "argmax" : "sampled",
                         turnDecoder.TokensDrafted, turnDecoder.TokensAccepted, turnDecoder.AcceptanceRate,
                         turnDecoder.VerifySteps, turnDecoder.PlainSteps, turnDecoder.RollbackSteps,
@@ -1378,7 +1416,7 @@ namespace TensorSharp.Cli
             // One decoder for the whole batch: its buffers are sized by the
             // vocabulary, and every request resets it anyway.
             var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
-            MtpSpeculativeDecoder batchDecoder = null;
+            SpeculativeDecoder batchDecoder = null;
             bool specDeclineLogged = false;
 
             string[] lines = File.ReadAllLines(inputJsonlPath);
@@ -1462,7 +1500,7 @@ namespace TensorSharp.Cli
                         {
                             _log.LogInformation(LogEventIds.HostConfiguration,
                                 "jsonl batch speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2}",
-                                SpeculativeDecodingOptions.DescribeDrafter((IMtpSpeculativeModel)model),
+                                SpeculativeDecodingOptions.DescribeDrafter(requestDecoder),
                                 requestDecoder.MaxDraftTokens, requestDecoder.MinDraftProb);
                         }
                         batchDecoder = requestDecoder;
@@ -1472,7 +1510,7 @@ namespace TensorSharp.Cli
                     {
                         specDeclineLogged = true;
                         _log.LogWarning(LogEventIds.HostConfiguration,
-                            "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                            "--spec was requested but speculative decoding is not available: {Reason} "
                             + "Serving standard decode.", specDeclineReason);
                     }
 
@@ -1764,12 +1802,15 @@ namespace TensorSharp.Cli
                 $"({sw.Elapsed.TotalSeconds:F1}s, {sw.Elapsed.TotalMilliseconds / Math.Max(1, steps):F0} ms/step)");
         }
 
-        static void RunVideoGeneration(TensorSharp.Models.WanVideo.WanVideoModel model,
+        static void RunVideoGeneration(TensorSharp.Models.Video.IVideoGenerationModel model,
             string prompt, string outputPath, int width, int height, int frames,
             int steps, float cfgScale, int seed, float flowShift, int fps, string negativePrompt,
-            string sampler = null, string imagePath = null, int cfgCacheStride = 0)
+            string sampler = null, string imagePath = null, int cfgCacheStride = 0,
+            string endImagePath = null, IList<string> refImages = null, IList<string> refVideos = null,
+            IList<string> refAudios = null, bool generateAudio = true, string videoMode = null,
+            IList<string> refVideoAudios = null)
         {
-            Console.WriteLine(imagePath != null ? "=== Wan Image-to-Video ===" : "=== Wan Text-to-Video ===");
+            Console.WriteLine(imagePath != null ? "=== Image-to-Video ===" : "=== Text-to-Video ===");
             Console.WriteLine($"  prompt : {prompt}");
             if (imagePath != null)
             {
@@ -1780,9 +1821,26 @@ namespace TensorSharp.Cli
                 }
                 Console.WriteLine($"  image  : {imagePath}");
             }
+            if (endImagePath != null)
+            {
+                if (!File.Exists(endImagePath))
+                {
+                    Console.Error.WriteLine($"End-frame conditioning image not found: {endImagePath}");
+                    return;
+                }
+                Console.WriteLine($"  end    : {endImagePath}");
+            }
+            foreach (var r in refImages ?? (IList<string>)Array.Empty<string>())
+                Console.WriteLine($"  ref-img: {r}");
+            foreach (var r in refVideos ?? (IList<string>)Array.Empty<string>())
+                Console.WriteLine($"  ref-vid: {r}");
+            foreach (var r in refAudios ?? (IList<string>)Array.Empty<string>())
+                Console.WriteLine($"  ref-aud: {r}");
+            foreach (var r in refVideoAudios ?? (IList<string>)Array.Empty<string>())
+                Console.WriteLine($"  ref-vaud: {r}");
             Console.WriteLine($"  -> {outputPath}");
 
-            var p = new TensorSharp.Models.WanVideo.WanVideoParams
+            var p = new TensorSharp.Models.Video.VideoGenerationParams
             {
                 Width = width,
                 Height = height,
@@ -1796,6 +1854,13 @@ namespace TensorSharp.Cli
                 Sampler = sampler,
                 ImagePath = imagePath,
                 CfgCacheStride = cfgCacheStride,
+                EndImagePath = endImagePath,
+                ReferenceImagePaths = refImages,
+                ReferenceVideoPaths = refVideos,
+                ReferenceAudioPaths = refAudios,
+                ReferenceVideoAudioPaths = refVideoAudios,
+                GenerateAudio = generateAudio,
+                Mode = videoMode,
             };
             var sw = Stopwatch.StartNew();
             var video = model.GenerateVideo(prompt, p);
@@ -1817,6 +1882,18 @@ namespace TensorSharp.Cli
             }
             Console.WriteLine($"Saved {video.Frames[0].Width}x{video.Frames[0].Height} x {video.Frames.Length} frames " +
                 $"({codec}, {video.Fps} fps, seed {video.Seed}) to {outputPath} in {sw.Elapsed.TotalSeconds:F1}s");
+
+            // Models that generate audio jointly return a track alongside the frames. It is
+            // written as a sidecar WAV rather than muxed: muxing needs an encoder we cannot
+            // assume is installed, and a sidecar is trivially muxable later with
+            //   ffmpeg -i out.mp4 -i out.wav -c:v copy -c:a aac out_av.mp4
+            if (video.Audio is { ChannelCount: > 0, SampleCount: > 0 })
+            {
+                string wavPath = Path.ChangeExtension(outputPath, ".wav");
+                TensorSharp.Models.Video.WavWriter.Write(wavPath, video.Audio.Channels, video.Audio.SampleRate);
+                Console.WriteLine($"Saved {video.Audio.ChannelCount}-channel " +
+                    $"{video.Audio.SampleRate} Hz audio ({video.Audio.DurationSeconds:F2}s) to {wavPath}");
+            }
         }
 
         static void RunDiffusion(DiffusionGemmaModel model, string rawText, string systemPrompt,
@@ -2500,13 +2577,13 @@ namespace TensorSharp.Cli
 
                 if (specDecoder != null)
                 {
-                    return RunSpeculativeInference(model, (IMtpSpeculativeModel)model, specDecoder,
+                    return RunSpeculativeInference(model, (ISpeculativeTarget)model, specDecoder,
                         inputTokens, maxTokens, specCfg, enableThinking, tools, silent);
                 }
                 if (specSettings.Requested && specDeclineReason != null && !silent)
                 {
                     _log.LogWarning(LogEventIds.HostConfiguration,
-                        "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                        "--spec was requested but speculative decoding is not available: {Reason} "
                         + "Serving standard decode.", specDeclineReason);
                 }
             }
@@ -2728,8 +2805,8 @@ namespace TensorSharp.Cli
         /// argmax under a greedy config, with <paramref name="sampling"/> otherwise
         /// — so speculation only changes how many forwards it took to get there.
         /// </summary>
-        static string RunSpeculativeInference(ModelBase model, IMtpSpeculativeModel spec,
-            MtpSpeculativeDecoder decoder, List<int> inputTokens, int maxTokens,
+        static string RunSpeculativeInference(ModelBase model, ISpeculativeTarget spec,
+            SpeculativeDecoder decoder, List<int> inputTokens, int maxTokens,
             SamplingConfig sampling, bool enableThinking, List<ToolFunction> tools, bool silent)
         {
             var parser = OutputParserFactory.Create(model.Config.Architecture);
@@ -2742,7 +2819,7 @@ namespace TensorSharp.Cli
             {
                 _log.LogInformation(LogEventIds.HostConfiguration,
                     "cli.inference speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode}",
-                    SpeculativeDecodingOptions.DescribeDrafter(spec), decoder.MaxDraftTokens,
+                    SpeculativeDecodingOptions.DescribeDrafter(decoder), decoder.MaxDraftTokens,
                     decoder.MinDraftProb, argmax ? "argmax" : "sampled");
             }
 
@@ -2795,7 +2872,7 @@ namespace TensorSharp.Cli
                     "drafted={Drafted} accepted={Accepted} " +
                     "acceptanceRate={Rate:F3} verifySteps={VerifySteps} plainSteps={Plain} rollbacks={Rollbacks} " +
                     "parked={Parked} plainMsPerTok={PlainMs:F1} specMsPerTok={SpecMs:F1}",
-                    SpeculativeDecodingOptions.DescribeDrafter(spec), decoder.MaxDraftTokens,
+                    SpeculativeDecodingOptions.DescribeDrafter(decoder), decoder.MaxDraftTokens,
                     decoder.MinDraftProb, argmax ? "argmax" : "sampled",
                     decoder.TokensDrafted, decoder.TokensAccepted,
                     decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps,
@@ -3778,6 +3855,22 @@ namespace TensorSharp.Cli
                 Console.WriteLine($"  {i}: {TensorSharp.GGML.GgmlBasicOps.GetVulkanDeviceDescription(i) ?? "(unknown)"}");
             }
             Console.WriteLine("Select one with: --backend ggml_vulkan --gpu-device <index>");
+        }
+
+        // Publish a companion-network path under every env var that consumes it. Video
+        // models read a generic TS_VIDEO_* name; Wan predates that and reads TS_WAN_*, so
+        // both are set and neither model needs to know about the other's naming.
+        static void ApplyVideoCompanionOverride(string flag, string path, params string[] envVars)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return;
+            if (!File.Exists(path))
+                throw new FileNotFoundException($"{flag} file not found: {path}", path);
+            string full = Path.GetFullPath(path);
+            foreach (string envVar in envVars)
+                Environment.SetEnvironmentVariable(envVar, full);
+            _log.LogInformation(LogEventIds.HostConfiguration,
+                "Video companion override {Flag} -> {Path}", flag, full);
         }
 
         static void ApplyQwenImageCompanionOverride(string flag, string envVar, string path)

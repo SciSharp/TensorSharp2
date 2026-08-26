@@ -263,27 +263,39 @@ namespace TensorSharp.Server.Hosting
                     "turns at the GPU. Default: 1024.",
                     "--prefill-chunk-size 256"),
             }),
-            ("MTP speculative decoding (models that ship an MTP/NextN draft head)", new[]
+            ("Speculative decoding", new[]
             {
-                new OptionHelp("--mtp-spec | --no-mtp-spec",
-                    "Enable/disable MTP speculative decoding. Default: off.",
-                    "--mtp-spec"),
-                new OptionHelp("--mtp-draft <N>",
-                    "Maximum draft tokens per step. Default: 8.",
-                    "--mtp-draft 4"),
-                new OptionHelp("--mtp-pmin <f>",
-                    "Minimum draft confidence in (0, 1]; drafting stops below it. Default: per drafter kind " +
-                    "— 0.75 for a per-token draft head, 0.35 for a block drafter (where the gate is the " +
-                    "CUMULATIVE prefix probability, so the same number means something much stricter).",
-                    "--mtp-pmin 0.6"),
-                new OptionHelp("--mtp-draft-model <path>",
+                new OptionHelp("--spec | --no-spec",
+                    "Enable/disable speculative decoding: a drafter proposes the next few tokens and the trunk " +
+                    "verifies them in one batched forward. Every emitted token still comes from a trunk row, so " +
+                    "the output is what standard decoding would have produced. Engages for solo (non-concurrent) " +
+                    "sequences. Accepted as --mtp-spec / --no-mtp-spec too. Default: off.",
+                    "--spec"),
+                new OptionHelp("--spec-type <name>",
+                    "Speculation algorithm: 'auto' (default) uses whatever drafter the checkpoint carries; " +
+                    "'draft-head' and 'block' pin one explicitly; 'ngram' needs no trained weights at all and " +
+                    "works on every model, drafting by suffix match over the context (strong when the answer " +
+                    "quotes its input: summarizing, editing, structured output, agentic loops).",
+                    "--spec --spec-type ngram"),
+                new OptionHelp("--spec-draft <N>",
+                    "Maximum draft tokens per step (1-64). Accepted as --mtp-draft too. Default: 8.",
+                    "--spec-draft 4"),
+                new OptionHelp("--spec-pmin <f>",
+                    "Draft-confidence gate in (0, 1]; drafting stops below it. What the number means is per " +
+                    "algorithm, so each brings its own default — 0.75 for a per-token draft head, 0.35 for a " +
+                    "block drafter (where the gate is the CUMULATIVE prefix probability, so the same number " +
+                    "means something much stricter), 0 for n-gram. Accepted as --mtp-pmin too.",
+                    "--spec-pmin 0.6"),
+                new OptionHelp("--spec-draft-model <path>",
                     "Separate draft GGUF for models whose draft head ships as its own file (Gemma 4 assistant). " +
-                    "Qwen3.6 embeds the draft head and needs no flag. Default: none.",
-                    "--mtp-draft-model gemma-4-E4B-it-assistant.Q8_0.gguf"),
+                    "Qwen 3.6 and GLM 5.2 embed their NextN block and need no flag. Accepted as " +
+                    "--mtp-draft-model too. Default: none.",
+                    "--spec-draft-model gemma-4-E4B-it-assistant.Q8_0.gguf"),
                 new OptionHelp("--draft-model <path>",
                     "Block drafter GGUF for architectures whose drafter must be resident before the layer " +
-                    "split (DeepSeek V4's DSpark). Needs --mtp-spec, engages for solo sequences on the cuda " +
-                    "and ggml_cuda backends. Default: none; env TS_DSV4_DSPARK.",
+                    "split (DeepSeek V4's DSpark). Naming the file IS the request, so it needs no --spec; " +
+                    "engages for solo sequences on the cuda and ggml_cuda backends. Default: none; " +
+                    "env TS_DSV4_DSPARK.",
                     "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf"),
             }),
             ("Qwen-Image-Edit companion models (qwen_image DiT GGUFs)", new[]
@@ -308,29 +320,70 @@ namespace TensorSharp.Server.Hosting
                     "target resolution does not fit beside the resident weights).",
                     "--offload-cpu"),
             }),
-            ("Wan video-generation defaults and companion models (wan DiT GGUFs)", new[]
+            ("Video-generation defaults and companion models", new[]
             {
+                new OptionHelp("--video-width <px>",
+                    "Default output width when a request omits 'width'. THE main quality lever: " +
+                    "the Web UI sends no size of its own, so without this every clip is generated " +
+                    "at the model's default. 640x384 is a good starting point for MiniMax-H3; " +
+                    "--width is accepted as an alias. Rounded up to the model's grid.",
+                    "--video-width 640"),
+                new OptionHelp("--video-height <px>",
+                    "Default output height when a request omits 'height'. Alias: --height. " +
+                    "If only one of width/height is given, MiniMax-H3 takes the other from the " +
+                    "conditioning image's aspect ratio.",
+                    "--video-height 384"),
+                new OptionHelp("--video-steps <N>",
+                    "Default denoising steps when a request omits 'steps'. The quality/time " +
+                    "trade-off after resolution. The server has NO default of its own - unset, " +
+                    "each model uses its own: 20 for MiniMax-H3, and for Wan the checkpoint's " +
+                    "trained step count when it is step-distilled, otherwise 50 (TI2V-5B), 40 " +
+                    "(A14B) or 30 (Wan 2.1). MiniMax-H3 is step-distilled and CFG-free, so 4-8 " +
+                    "is the fast operating point (some chromatic fringing around moving subjects " +
+                    "at the low end, gone by ~20), 16-24 is visibly cleaner, and past ~30 gains " +
+                    "little. Setting this pins EVERY request, so on a step-distilled Wan " +
+                    "checkpoint it overrides the 4 steps the file was trained for - leave it " +
+                    "unset there rather than paying 4x the work for a worse result.",
+                    "--video-steps 16"),
+                new OptionHelp("--video-mode <mode>",
+                    "Default conditioning mode when a request omits 'videoMode': t2v (text only), " +
+                    "i2v (the image is the first frame and is animated), fl2v (first AND last frame " +
+                    "pinned) or ref (the images are identity/appearance references for a new scene). " +
+                    "Omit it and the mode is inferred from what each request supplies, which is " +
+                    "usually what you want; pin it for a deployment that only offers one.",
+                    "--video-mode ref"),
                 new OptionHelp("--video-frames <N>",
-                    "Default output frame count when a Wan request omits 'frames'. The count is snapped to the " +
-                    "VAE temporal grid (4k+1). Model default: 33, or 49 for Wan2.2-TI2V. A request value overrides it.",
+                    "Default output frame count when a request omits 'frames'. The count is snapped to the " +
+                    "model's temporal grid (4k+1 for Wan, 17k+5 for MiniMax-H3). Model default: 33, or 49 for " +
+                    "Wan2.2-TI2V. A request value overrides it.",
                     "--video-frames 121"),
                 new OptionHelp("--fps <N>",
-                    "Default MP4 playback rate when a Wan request omits 'fps'. Model default: 16, or 24 for " +
-                    "Wan2.2-TI2V. A request value overrides it; FPS changes playback rate, not generation work.",
+                    "Default MP4 playback rate when a request omits 'fps'. Model default: 16, or 24 for " +
+                    "Wan2.2-TI2V. A request value overrides it; FPS changes playback rate, not generation work. " +
+                    "Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value.",
                     "--fps 24"),
-                new OptionHelp("--wan-vae <path>",
-                    "Wan video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B). " +
-                    "Default: same-directory scan next to the DiT model, VAE/ subfolders included " +
-                    "(TS_WAN_VAE).",
-                    "--wan-vae Wan2.2_VAE.safetensors"),
-                new OptionHelp("--wan-te <path>",
-                    "UMT5-XXL text-encoder GGUF. Default: same-directory scan (TS_WAN_TE).",
-                    "--wan-te umt5-xxl-encoder-Q8_0.gguf"),
-                new OptionHelp("--wan-dit2 <path>",
-                    "Wan 2.2 A14B second expert GGUF (the high/low-noise partner of --model). Default: " +
-                    "auto-resolved by name from the same or a sibling folder (TS_WAN_DIT2); needed only " +
-                    "when the pair is not co-located, or to name it in a --config file.",
-                    "--wan-dit2 wan2.2_i2v_A14b_low_noise-Q4_K_M.gguf"),
+                new OptionHelp("--video-vae <path>",
+                    "Video VAE (wan_2.1_vae.safetensors, or Wan2.2_VAE.safetensors for TI2V-5B; " +
+                    "minimax_h3_video_vae_fp16.safetensors for MiniMax-H3). Default: same-directory scan next " +
+                    "to the DiT model, VAE/ subfolders included (TS_VIDEO_VAE). The former spelling " +
+                    "--wan-vae is still accepted.",
+                    "--video-vae Wan2.2_VAE.safetensors"),
+                new OptionHelp("--video-text-encoder <path>",
+                    "Text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Default: " +
+                    "same-directory scan (TS_VIDEO_TEXT_ENCODER). Also spelled --video-te; the former " +
+                    "spelling --wan-te is still accepted.",
+                    "--video-text-encoder umt5-xxl-encoder-Q8_0.gguf"),
+                new OptionHelp("--video-dit2 <path>",
+                    "Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner of " +
+                    "--model). Default: auto-resolved by name from the same or a sibling folder " +
+                    "(TS_VIDEO_DIT2); needed only when the pair is not co-located, or to name it in a " +
+                    "--config file. The former spelling --wan-dit2 is still accepted.",
+                    "--video-dit2 wan2.2_i2v_A14b_low_noise-Q4_K_M.gguf"),
+                new OptionHelp("--audio-vae <path>",
+                    "Audio VAE for models that generate an audio track jointly with the video " +
+                    "(minimax_h3_audio_vae_fp32.safetensors). Without it such a model still runs and produces " +
+                    "video, just no audio (TS_VIDEO_AUDIO_VAE).",
+                    "--audio-vae minimax_h3_audio_vae_fp32.safetensors"),
             }),
             ("Upload storage (the uploads/ directory next to the server binary)", new[]
             {

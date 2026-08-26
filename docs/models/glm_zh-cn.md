@@ -166,7 +166,7 @@ loader 用来确定上下文长度的同一块显存，因此原生 loader 只�
 ### 实测
 
 2× RTX PRO 6000 Blackwell（各 97 GiB），GLM-5.2-UD-IQ2_XXS，`--n-cpu-moe 20`，
-21 token 提示，生成 160 token，贪心（`InferenceWeb.Tests/GlmDsaMtpModelTests.cs`）。
+21 token 提示，生成 160 token，贪心（`InferenceWeb.Tests/GlmDsaSpeculativeModelTests.cs`）。
 基线取三次的中位数（17.93 / 17.96 / 18.05 tok/s）——host 侧的专家矩阵乘是这组对比里
 噪声较大的一半。
 
@@ -181,7 +181,7 @@ loader 用来确定上下文长度的同一块显存，因此原生 loader 只�
 **关于调优。** 更窄的窗口配更低的阈值在每一轮（以及 `--n-cpu-moe 34` 的变体）里都是最好或
 并列最好，平均约 4%——但幅度和稳定性都不足以固化成模型级默认值：只单独调阈值、窗口仍为
 k=8 时，四轮里赢三轮输三轮。这两个参数是相互作用的，要一起扫描。无论如何
-`MtpSpeculativeExecution` 里的运行期成本裁判都会实测这一对组合，不划算就停用起草。
+`SpeculativeExecution` 里的运行期成本裁判都会实测这一对组合，不划算就停用起草。
 
 窄窗口为什么有用：这里的验证摊薄效果特别好——主干把路由专家读一次就服务整个窗口：
 

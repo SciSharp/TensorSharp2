@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>基准测试 — TensorSharp 维基</title>
-  <meta name="description" content="TensorSharp 对比 llama.cpp 的基准测试结果，以及测试框架如何运作。">
+  <meta name="description" content="TensorSharp 对比 llama.cpp 与 stable-diffusion.cpp 的基准测试结果、MiniMax-H3 与 Wan 的视频提速杠杆，以及测试框架如何运作。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 基准测试</div>
   <h1>基准测试</h1>
-  <p class="lede">TensorSharp 在相同模型与硬件上与其他推理引擎的对比，以及守护正确性的测试框架。</p>
+  <p class="lede">TensorSharp 在相同模型与硬件上与其他推理引擎的对比 —— 文本对比 <code>llama.cpp</code>，视频生成对比 <code>stable-diffusion.cpp</code> —— 以及守护正确性的测试框架。</p>
 
   <h2 id="head-to-head">同台对比：TensorSharp vs llama.cpp</h2>
   <p>一个<strong>纯 .NET 引擎与手工优化的 C++ <code>llama.cpp</code> 正面较量</strong> —— 相同 GGUF、相同 <strong>NVIDIA RTX 3080 Laptop GPU（16 GB）</strong>、统一的 OpenAI <code>/v1/chat/completions</code> 接口，且<strong>两个引擎均分别在 GGML CUDA 与 GGML Vulkan 构建上测量</strong>，覆盖短提示、长上下文与多轮对话场景。下方数据来自当前签入的 <code>benchmarks/engine_comparison</code> harness 运行（<code>docs/engine_comparison_report.md</code>），可在自己的硬件上复现。</p>
@@ -83,7 +83,73 @@
   <p>交叉点大约落在一千个提示 token 上，原因就是微批：256 个专家 top-8 的情况下，一个 512 token 的分块平均只给每个专家路由约 16 行，于是每个专家 GEMM 的 tile 大部分都是填充，把分块调大比图上任何其他改动都更管用。再往下，一整次 prefill 就是一张小图，每次调用的固定开销——托管层的一跳、输入上传、154,880 宽的 logits 回拷——占比明显，llama.cpp 那几个百分点就来自这里。Decode 受访存约束，两边都是各领先几个百分点。除了计时也校验输出：在同一后端上，TensorSharp 与 llama.cpp 逐 token 一致——<code>ggml_cuda</code> 上 6/6 条录制提示，<code>ggml_cpu</code> 上 3/3，100% 托管的 <code>cpu</code> 后端上 1/1。</p>
   <p>有两件事在这台机器上<em>不会</em>让它变快。<code>--tp 3</code> 把 pp2048 / tg64 从 915.9 / 43.9 拉到 505.6 / 17.6——78 层里每层都要两次 <code>[6144, n_tokens]</code> 隐状态的 all-reduce，没有 NVLink 的 PCIe 付不起这笔账。<code>--n-cpu-moe 30</code> 则拉到 94.7 / 16.4。它们存在的意义是让原本装不下的权重能跑起来：卸载把加载器能定下的上下文从 342,272 抬到 646,400 token。参见 <a href="models-text_zh-cn.html#glm">GLM 5.x</a>。</p>
 
-  <h2 id="wan">Wan 视频：两个彼此独立的提速杠杆</h2>
+  <h2 id="minimax-h3">MiniMax-H3：视频与音频一次生成</h2>
+  <p>MiniMax-H3 在同一个打包潜变量里对画面和原生 <strong>32&nbsp;kHz 立体声</strong>音轨一起去噪，因此下面每个数字都是同时产出两者的一次完整运行。同一条 22 帧、8 步的请求在两台机器上对 <strong><code>stable-diffusion.cpp</code></strong> 做过测量，而<strong>两者的结论并不一致</strong>。两组数据都列在下面，各自标明硬件；它们互不取代，把两者平均出来的数字不对应任何一台真实存在的机器。</p>
+
+  <h3>Apple M5 Pro、<code>ggml_metal</code></h3>
+  <p><strong>22 帧、8 步、同一随机种子</strong>，对手是处在其最佳配置下的 <code>stable-diffusion.cpp</code>：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>分辨率</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>提速</th></tr></thead>
+    <tbody>
+      <tr><td>256×256</td><td>49.3 s</td><td><span class="yes">20.9 s</span></td><td><span class="yes">2.4×</span></td></tr>
+      <tr><td>640×384</td><td>108.5 s</td><td><span class="yes">63.1 s</span></td><td><span class="yes">1.7×</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>应当以第二行为准：<strong>人脸需要像素</strong>，所以 640×384 才是起点，256×256 只是让倍数好看的那个角落，而不是真正拿来出片的尺寸。两行都是同一条 22 帧、8 步的请求；由于权重是 CFG 蒸馏的，这 8 步就是 8 次 DiT 前向，而不是 16 次。→ <a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3 下载与模式</a></p>
+
+  <h3>RTX 3080 Laptop 16 GB、<code>ggml_cuda</code></h3>
+  <p>同一条请求，换到一台刻意被内存卡死的机器上 —— <strong>16,384 MiB 显存、31.7 GB 内存，面对 33.5 GB 的模型集合</strong>（DiT 10.64 GiB、Qwen3-VL-32B 16.97 GiB、视频 VAE 4.85 GiB、音频 VAE 0.56 GiB，两个引擎用的是同一批权重文件）。22 帧、8 步、同一随机种子、三次取最好，发布构建；对手是 <code>stable-diffusion.cpp</code> <code>97d2990</code>（ggml <code>8e800ce</code>），按 <code>SD_CUDA=ON</code>、arch 86 重新编译。在这台机器上，整体耗时是 <code>stable-diffusion.cpp</code> 更快：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>分辨率</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>端到端</th></tr></thead>
+    <tbody>
+      <tr><td>256×256</td><td><span class="yes">37.8 s</span></td><td>43.6 s</td><td>sd.cpp 快 1.15×</td></tr>
+      <tr><td>640×384</td><td><span class="yes">59.8 s</span></td><td>63.7 s</td><td>sd.cpp 快 1.07×</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>这块 16,384 MiB 显卡上的显存峰值：TensorSharp <strong>15,780 MiB</strong>，<code>stable-diffusion.cpp</code> <strong>12,035 MiB</strong>。sd.cpp 用的是 <code>--auto-fit --stream-layers --diffusion-fa --rng cpu</code>；它默认的 <code>--offload-to-cpu</code> 路径在这台机器上根本跑不起这个模型 —— 它要把 17.7 GB 锁进只有 12.3 GB 空闲的内存里。</p>
+  <p><strong>按单个去噪步算，TensorSharp 在 CUDA 上同样领先</strong> —— 用 8 步与 16 步的斜率把计算和一次性开销拆开，得到 <strong>3.325 s 对 3.338 s</strong>，直接逐步测量为 3.00–3.11 s。它让出去的完全是固定的启动开销，而剩下 3.9 s 的差距里大约 <strong>3 s 根本不是推理</strong>：一是 H.264 编码 —— sd.cpp 这边只是把 MJPEG + PCM 写进 AVI；二是 .NET 进程启动，对手是原生可执行文件。</p>
+  <div class="callout note"><div class="ic">⚖️</div><p>两个硬件点给出两种答案，两者都保留。在 M5 Pro 上，TensorSharp 整体快 <strong>1.7–2.4×</strong>；在这台 16 GB 的 CUDA 笔记本上，它<em>按步</em>更快，端到端<strong>慢 1.07–1.15×</strong> —— 因为权重和页缓存都装不下，这么短的一次运行里一次性开销占了大头。如果你的显卡是 16 GB，请按 CUDA 这两行来预期。每步的领先只有 13 ms，所以运行拉长也只能非常缓慢地改变这个比例。</p></div>
+
+  <h3>上一轮优化改变了什么</h3>
+  <p>同一台 RTX 3080 Laptop、同样的 22 帧 8 步负载，优化前后：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>分辨率</th><th>之前</th><th>之后</th><th>提速</th></tr></thead>
+    <tbody>
+      <tr><td>640×384</td><td>89.0 s</td><td><span class="yes">63.7 s</span></td><td><span class="yes">1.40×</span></td></tr>
+      <tr><td>256×256</td><td>67.2 s</td><td><span class="yes">43.6 s</span></td><td><span class="yes">1.54×</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>两处改动都是冲着同一个 16 GB 天花板去的。其一，去噪器跑完之后会<em>先</em>交还设备驻留，再去加载视频 VAE，解码期间的显存峰值因此从 <strong>16,041 MiB 降到约 5,600 MiB</strong>，在 640×384 上值 <strong>22 秒</strong> —— 跑完的去噪器加上视频 VAE 一共 15.8 GB，一块 16 GB 的卡装不下，而 WDDM 并不会让这次分配失败，它会悄悄用主机内存兜住溢出的部分，于是整个解码都按 PCIe 的速度在跑。其二，去噪器权重文件会被预读，并且与它自己的上传流水线重叠，把第一个去噪步从 <strong>14.87 s 降到约 10.2 s</strong>：权重是以指针形式绑定在 mmap 的 GGUF 上的，没有预读时，第一次主机到设备的拷贝要在拷贝过程中把每一页都从磁盘缺页调入，速率只有 <strong>0.91 GB/s</strong>，而从已驻留的可分页内存拷贝是 5.97 GB/s。开与不开预读，输出逐字节一致。</p>
+
+  <h3>该动哪个杠杆，以及先后顺序</h3>
+  <p><strong>先动步数。</strong>默认 <strong>20</strong> 步，<strong>4–8</strong> 步是快速工作点 —— 4–8 步时运动主体周围会出现一些色边，到约 20 步就消失了。除此之外没有引导分支可以缓存或跳过：这个权重出厂就是 <strong>CFG 蒸馏</strong>的，必须 <code>--cfg 1.0</code>，更高的值会被拒绝，这也让 <code>--negative-prompt</code> 与 <code>--cfg-cache-stride</code> 在这里完全失效 —— 根本没有无条件分支供它们作用。<strong>其次是分辨率</strong>：<code>--width</code> / <code>--height</code> 向上取整到 32 的倍数，默认 640×384。<strong>再次是帧数</strong>：<code>--video-frames</code> 向上对齐到 <code>17k+5</code> 网格（5、22、39、56、73、90、107……），fps 固定为 24。<strong>最后才是参考的数量</strong> —— 超过大约四个之后，它的分量就完全盖过步数。</p>
+
+  <h3>一个参考要花多少</h3>
+  <p>Ref2VA 权重最多接受九个参考 —— 静图、片段、独立音轨 —— 在去噪器这一侧它们既便宜又完全可预估。在 <strong>RTX 3080 Laptop</strong> 上，640×384 × 22 帧，单个去噪步从没有参考时的 <strong>4.37 s</strong> 变成八个参考时的 <strong>9.38 s</strong>：大约<strong>每个参考每步 626 ms</strong>，从一个到八个基本恒定。但时间并不花在去噪器上。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Ref2VA 参考数</th><th>进入 Qwen3-VL 的提示 token</th><th>文本条件</th><th>去噪，秒 / 步</th></tr></thead>
+    <tbody>
+      <tr><td>无</td><td>—</td><td>—</td><td>4.37 s</td></tr>
+      <tr><td>两个</td><td>548</td><td>≈65 s</td><td>—</td></tr>
+      <tr><td>八个</td><td>2,086</td><td><strong>≈447 s</strong></td><td>9.38 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>每个参考会给提示词加上约 250 个视觉占位 token，而整条提示词要过完 Qwen3-VL-32B 文本编码器的全部 50 层。超过大约<strong>四个</strong>参考之后，<em>真正</em>占住整次运行的就是这一趟，而不是去噪器：八个参考时，整个 8 步去噪只要约 75 s，文本条件却要约 447 s。</p>
+  <div class="callout tip"><div class="ic">⚡</div><p>与其减少步数，不如先<strong>减少参考数量、提高参考质量</strong>。在八个参考的情况下，把步数一路砍到零省下的时间，都不如把参考减到两个。</p></div>
+
+  <h3>与参考实现的数值一致性</h3>
+  <p>四个网络分别在相同输入上核对：文本编码器 <strong>cos 0.999999</strong>，单个 DiT 步 <strong>cos 0.998</strong>，视频 VAE 编码与解码 <strong>cos 1.000000</strong>，音频 VAE 解码 <strong>cos 0.999995</strong>。</p>
+  <div class="callout note"><div class="ic">⚖️</div><p>这里的 MiniMax-H3 数据与下面的 Wan 数据，各自都是对 <code>stable-diffusion.cpp</code> 测得的，模型不同、负载不同、硬件也不同。它们<strong>不是</strong> MiniMax-H3 与 Wan 之间的同台对比 —— 本仓库并没有这样的对比数据。</p></div>
+
+  <h2 id="wan">Wan 视频（仅视频）：两个彼此独立的提速杠杆</h2>
   <p>视频是唯一一种选错会浪费<em>数小时</em>而非数秒的工作负载，因此值得把两个杠杆分开来看。下表三行是<strong>同一个请求</strong> —— Apple <strong>M5 Pro（20 核 GPU、48 GB 统一内存）</strong>、<code>ggml_metal</code>、<code>Wan2.2-TI2V-5B</code> Q8_0，图生视频，<strong>1088×832 × 121 帧 = 27,404 个 DiT token</strong> —— 各行之间只有引擎版本与 <code>--model</code> 指向哪个权重的区别。</p>
   <div class="table-scroll">
   <table>

@@ -122,8 +122,8 @@ namespace TensorSharp.Models
             // The native loader is the authority on whether the draft block
             // actually made it in: a trunk-only checkpoint, or a device that had
             // no room for the extra layer, both come back without one.
-            HasMtp = GgmlGlmNative.HasMtp(_native);
-            if (HasMtp)
+            HasDraftHead = GgmlGlmNative.HasDraftHead(_native);
+            if (HasDraftHead)
                 _mtpLayer = _numTrunkLayers;
             int vocab = GgmlGlmNative.VocabSize(_native);
             if (vocab > 0)

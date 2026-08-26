@@ -68,7 +68,7 @@ public class UploadRootConfinementTests : IDisposable
         string inside = Path.Combine(_uploadRoot, "cond.png");
         File.WriteAllBytes(inside, new byte[] { 1, 2, 3 });
 
-        var p = WanVideoParamsParser.Parse(VideoRequest(inside), Options(), out string error);
+        var p = VideoGenerationParamsParser.Parse(VideoRequest(inside), Options(), out string error);
 
         Assert.Null(error);
         Assert.Equal(new byte[] { 1, 2, 3 }, p.ImageBytes);
@@ -82,7 +82,7 @@ public class UploadRootConfinementTests : IDisposable
         string outside = Path.Combine(sibling, "cond.png");
         File.WriteAllBytes(outside, new byte[] { 1, 2, 3 });
 
-        var p = WanVideoParamsParser.Parse(VideoRequest(outside), Options(), out string error);
+        var p = VideoGenerationParamsParser.Parse(VideoRequest(outside), Options(), out string error);
 
         Assert.NotNull(error);
         Assert.Null(p.ImageBytes);
@@ -94,7 +94,7 @@ public class UploadRootConfinementTests : IDisposable
         string outside = Path.Combine(_baseDir, "secret.png");
         File.WriteAllBytes(outside, new byte[] { 1, 2, 3 });
 
-        WanVideoParamsParser.Parse(VideoRequest(outside), Options(), out string error);
+        VideoGenerationParamsParser.Parse(VideoRequest(outside), Options(), out string error);
 
         Assert.NotNull(error);
     }
@@ -157,8 +157,12 @@ public class UploadRootConfinementTests : IDisposable
         supportedBackends: null,
         defaultMaxTokens: 100,
         maxTokensPinned: false,
-        defaultWanVideoFrames: 0,
-        defaultWanVideoFps: 0,
+        defaultVideoFrames: 0,
+        defaultVideoFps: 0,
+                defaultVideoWidth: 0,
+                defaultVideoHeight: 0,
+                defaultVideoSteps: 0,
+        defaultVideoMode: null,
         uploadDirectory: _uploadRoot,
         logDirectory: Path.Combine(_baseDir, "logs"),
         fileLoggingEnabled: false,

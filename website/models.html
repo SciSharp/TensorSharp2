@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index.html">Home</a> › Supported Models</div>
   <h1>Supported Models</h1>
-  <p class="lede">TensorSharp loads models in GGUF format and auto-detects the architecture from the file's <code>general.architecture</code> metadata. Pick a quantization that fits your hardware (<code>Q4_K_M</code> for low memory, <code>Q8_0</code> for higher quality).</p>
+  <p class="lede">TensorSharp loads models in GGUF format and auto-detects the architecture from the file's <code>general.architecture</code> metadata — except MiniMax-H3, whose published GGUFs carry no metadata at all and are identified by their tensors instead. Pick a quantization that fits your hardware (<code>Q4_K_M</code> for low memory, <code>Q8_0</code> for higher quality).</p>
   <div class="callout note"><div class="ic">📘</div><p><strong>Gemma 4 E4B is the example model in <em>From Tensors to Tokens</em>.</strong> Read the book for a guided build from tensor fundamentals through multimodal inference; use this reference for current downloads and capability details. <a href="book.html">Explore the book →</a></p></div>
 
   <h2 id="browse">Browse the model reference</h2>
@@ -25,7 +25,7 @@
     <a class="card" href="models-downloads.html"><div class="ic">⬇️</div><h3>Model Downloads</h3><p>Every GGUF, with the projector, VAE, encoder and drafter files each family needs.</p></a>
     <a class="card" href="models-text.html"><div class="ic">🧠</div><h3>Text &amp; LLM Models</h3><p>Eleven architectures, their run recipes, plus multimodal input, thinking and tool calling.</p></a>
     <a class="card" href="models-image.html"><div class="ic">🖼️</div><h3>Image Generation</h3><p>Qwen-Image-Edit, the Lightning LoRA, and the DiT step cache.</p></a>
-    <a class="card" href="models-video.html"><div class="ic">🎬</div><h3>Video Generation</h3><p>Wan 2.1 / 2.2, and the distilled checkpoint that turns hours into minutes.</p></a>
+    <a class="card" href="models-video.html"><div class="ic">🎬</div><h3>Video Generation</h3><p>MiniMax-H3 with native stereo audio, and Wan 2.1 / 2.2 with the distilled checkpoint that turns hours into minutes.</p></a>
   </div>
 
   <h2 id="table">Supported architectures</h2>
@@ -34,7 +34,7 @@
     <thead><tr><th>Architecture</th><th>GGUF arch keys</th><th>Example models</th><th>Multimodal</th><th>Thinking</th><th>Tools</th><th>MTP spec</th></tr></thead>
     <tbody>
       <tr><td><strong>DeepSeek V4 Flash</strong></td><td><code>deepseek4</code></td><td>DeepSeek-V4-Flash (284B MoE, 256 experts, compressed sparse attention, 1M context)</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes (DSML)</td><td class="yes">Yes (DSpark block drafter, separate GGUF)</td></tr>
-      <tr><td><strong>GLM 5.x</strong></td><td><code>glm-dsa</code></td><td>GLM-5.2 (744B-A40B MoE, 256 experts, MLA + DeepSeek Sparse Attention, 1M context)</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes (XML tool calls)</td><td class="no">&mdash;</td></tr>
+      <tr><td><strong>GLM 5.x</strong></td><td><code>glm-dsa</code></td><td>GLM-5.2 (744B-A40B MoE, 256 experts, MLA + DeepSeek Sparse Attention, 1M context)</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes (XML tool calls)</td><td class="no">—</td></tr>
       <tr><td><strong>Gemma 4</strong></td><td><code>gemma4</code></td><td>gemma-4-E4B, 12B, 31B, 26B-A4B (MoE)</td><td>Image, Video, Audio</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes (separate draft)</td></tr>
       <tr><td><strong>Gemma 3</strong></td><td><code>gemma3</code></td><td>gemma-3-4b</td><td>Image</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen 3</strong></td><td><code>qwen3</code>, <code>qwen2</code>, <code>qwen2vl</code>, <code>qwen2_vl</code></td><td>Qwen3-4B. Qwen2 / Qwen2.5-VL GGUFs load through the same class as text-only chat</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
@@ -45,6 +45,7 @@
       <tr><td><strong>Muse-Glimmer</strong></td><td><code>muse-glimmer</code>, <code>muse_glimmer</code></td><td>Muse-Glimmer-30B (interleaved SWA + NoPE, attention output gate)</td><td>Image</td><td class="yes">Yes</td><td class="yes">Yes (ATEM)</td><td class="yes">Yes (DFlash block drafter, separate GGUF)</td></tr>
       <tr><td><strong>DiffusionGemma</strong></td><td><code>diffusion-gemma</code>, <code>diffusion_gemma</code></td><td>diffusion-gemma text-diffusion GGUFs</td><td>Text only</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen-Image-Edit</strong></td><td><code>qwen_image</code>, <code>qwen-image</code></td><td>qwen-image-edit MMDiT (+ VAE &amp; Qwen2.5-VL companions)</td><td>Image edit (image+text → image)</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
+      <tr><td><strong>MiniMax-H3</strong></td><td><code>minimax-h3</code>, <code>minimax_h3</code></td><td>MiniMax-H3 FL2VA / Ref2VA denoisers (+ Qwen3-VL-32B text encoder, video VAE &amp; audio VAE companions). The published GGUFs carry no metadata, so they are recognised by their tensors</td><td>Video <strong>+ 32 kHz stereo audio</strong> out (text → video, image → video, first/last frame, reference → video)</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
       <tr><td><strong>Wan video</strong></td><td><code>wan</code>, <code>wan2.1</code>, <code>wan2.2</code></td><td>Wan 2.1 T2V 1.3B/14B, Wan 2.2 TI2V-5B, Wan 2.2 A14B T2V/I2V (two 14B experts) (+ UMT5-XXL &amp; video-VAE companions)</td><td>Video out (text → video, image → video)</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
     </tbody>
   </table>
@@ -52,11 +53,12 @@
   <p class="page-foot-note">Detailed per-model architecture cards (forward graph, components, parameters, and how TensorSharp optimizes prefill/decode) live under <code>docs/models/</code> in the repository.</p>
 
   <h2 id="fast-lane">Which one is fastest — the lever that matters per family</h2>
-  <p>Every family has one setting that dominates its wall-clock time. The first row is the one people miss most often: on Wan, the checkpoint you download decides whether a 5-second 720p video takes three and a half hours or seventeen minutes, and it needs no flag at all.</p>
+  <p>Every family has one setting that dominates its wall-clock time. The two video families are the ones people miss most often, and they miss them differently: MiniMax-H3 arrives already CFG-distilled, so the lever is how many steps and how many pixels you ask for rather than which file you fetch — while on Wan, the checkpoint you download decides whether a 5-second 720p video takes three and a half hours or seventeen minutes, and it needs no flag at all.</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Family</th><th>Fast lane</th><th>Measured effect</th></tr></thead>
     <tbody>
+      <tr><td><strong>MiniMax-H3</strong></td><td><strong>It is already CFG-distilled</strong> — there is no faster file to fetch. Run <code>--cfg 1.0</code> at <strong>4–8 steps</strong> against the 20-step default, and spend what you save on <code>--width</code> / <code>--height</code></td><td>M5 Pro / <code>ggml_metal</code>, 22 frames, 8 steps, identical seed, against <code>stable-diffusion.cpp</code>: 256×256 <strong>49.3 s → 20.9 s</strong> (2.4× faster), 640×384 <strong>108.5 s → 63.1 s</strong> (1.7×). Steps buy quality, not just time — the same 640×384 image-to-video request is 79 s at 8 steps with coloured fringing around moving hands, and 212 s at 24 steps, clean</td></tr>
       <tr><td><strong>Wan video</strong></td><td><strong>Load a step-distilled checkpoint</strong> — a DiT file name containing <code>Turbo</code>, <code>distill</code>, <code>Lightning</code>, <code>lightx2v</code>, <code>FastWan</code>, <code>-dmd</code> or <code>…-4steps-…</code> is auto-detected. No flag</td><td><strong>100 DiT passes → 4</strong>, guidance off. The same 1088×832×121f image-to-video request on M5 Pro / <code>ggml_metal</code>: <strong>≈ 3 h 30 m → 17 m 30 s</strong></td></tr>
       <tr><td>Wan video</td><td><code>--cfg-cache-stride 2</code> / <code>3</code> — base (non-distilled) checkpoints only</td><td>1.30× / 1.43× at 50 steps (77 / 70 of the 100 passes). Approximate; pointless on a distilled checkpoint, which is already guidance-free</td></tr>
       <tr><td>Qwen-Image-Edit</td><td>Lightning distillation LoRA via <code>--qwen-image-lora</code></td><td>Base recipe 30 steps at cfg 2.5 = 60 DiT forwards → <strong>4–8 forwards</strong> at cfg 1.0. Warm 544×1184 4-step edit: 40.44 s vs <code>stable-diffusion.cpp</code>'s 48.16 s</td></tr>
@@ -70,7 +72,7 @@
     </tbody>
   </table>
   </div>
-  <p class="page-foot-note">Wan, Qwen-Image-Edit and DiffusionGemma are constructed without a tensor-parallel degree, so <code>--tp</code> does not apply to them. Wan is also the one family that refuses a backend outright: <code>mlx</code> is not supported.</p>
+  <p class="page-foot-note">MiniMax-H3, Wan, Qwen-Image-Edit and DiffusionGemma are constructed without a tensor-parallel degree, so <code>--tp</code> does not apply to them. Of the video families, Wan is also the one that refuses a backend outright: <code>mlx</code> is not supported.</p>
 
   <div class="content-footer">
     <a href="backends.html">← Compute Backends</a>

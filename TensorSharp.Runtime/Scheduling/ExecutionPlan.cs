@@ -7,6 +7,8 @@
 using System.Collections.Generic;
 using System.Text;
 
+using TensorSharp.Runtime.Speculative;
+
 namespace TensorSharp.Runtime.Scheduling
 {
     /// <summary>The execution paths the engine can serve one scheduler step
@@ -19,13 +21,13 @@ namespace TensorSharp.Runtime.Scheduling
         /// batched paged path (same kernels as the non-speculative batched
         /// baseline). Declinable: the executor's arming/continuity gate may
         /// pass the step to the next candidate.</summary>
-        MtpBatchedTrunk,
+        SpeculativeBatchedTrunk,
 
         /// <summary>Per-sequence route chosen so LINEAR-trunk MTP speculation
         /// can engage (or keep serving a sequence whose state lives in the
         /// linear cache). Runs plain per-sequence decode when the speculative
         /// context can't arm.</summary>
-        MtpPerSequence,
+        SpeculativePerSequence,
 
         /// <summary>Concurrent sequences served by per-request fused Forward
         /// (own KV holder per request); may internally use true token-batched
@@ -112,7 +114,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>Speculative decoding was requested but is unprofitable on
         /// this backend; the executor surfaces a one-time operator notice.</summary>
-        public bool MtpUnprofitable { get; init; }
+        public bool SpeculationUnprofitable { get; init; }
 
         /// <summary>The path this plan selects (first candidate).</summary>
         public ExecutionPathKind Selected => Candidates[0];

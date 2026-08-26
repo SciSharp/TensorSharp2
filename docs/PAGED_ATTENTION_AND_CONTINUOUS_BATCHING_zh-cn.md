@@ -16,7 +16,7 @@
 | 批处理执行 | 实现 `IBatchedPagedModel.ForwardBatch` 的模型会把本轮所有序列打包到一次模型调用中，显式传入 `positions`、`slotMapping`、`queryStartLoc` 与每序列 block table。 |
 | 回退执行 | 路径选择集中在 `ExecutionPlanner`：模型+后端能力（`ExecutionCapabilities`）、运维覆盖（`ExecutionOptions`）与每步请求特征共同产出 `ExecutionPlan`（选中路径、回退链、被拒原因）。模型仍可对某个具体 batch 抛出 `NotSupportedException`，该步会落入计划中的下一个候选，最终止于按序列 KV-swap 路径。 |
 | 原生注意力 | `TSGgml_PagedAttentionForward` 在 C++ 中聚合分页 K/V 并派发 `ggml_flash_attn_ext`；GPT OSS 使用 `TSGgml_PagedAttentionForwardWithSinks`。 |
-| 投机解码 | 可选的 MTP / NextN 草稿头加速单序列（无并发）请求。`BatchExecutor` 为实现了 `IMtpBatchedSpeculativeModel` 的模型（Qwen 3.6 内嵌 NextN；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）驱动共享的 `MtpSpeculativeExecution` 起草 / 验证 / 回滚核心。默认关闭；服务端 `--mtp-spec`。详见 [投机解码（MTP / NextN）](#投机解码mtp--nextn)。 |
+| 投机解码 | 可选的 MTP / NextN 草稿头加速单序列（无并发）请求。`BatchExecutor` 为实现了 `IBatchedSpeculativeTarget` 的模型（Qwen 3.6 内嵌 NextN；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）驱动共享的 `SpeculativeExecution` 起草 / 验证 / 回滚核心。默认关闭；服务端 `--mtp-spec`。详见 [投机解码（MTP / NextN）](#投机解码mtp--nextn)。 |
 | 队列 API | `InferenceQueue` 是 no-op 兼容层。`/api/queue/status` 与队列位置事件形状保留给依赖这些字段的客户端，不再承担请求串行化。 |
 | 扩散模型 | DiffusionGemma 不进入这套自回归 `ForwardBatch` 契约。CLI 生成使用 `DiffusionGemmaSampler`；Web UI 使用 `DiffusionBatchScheduler` 在 block 边界批处理去噪工作。 |
 
@@ -135,20 +135,20 @@ ExecutionPlan
 - **声明式能力，而非异常探测。** 模型通过 `IBatchedPagedModel` 的 getter
   （`BatchedForwardAvailable`、`SupportsBatchedMultimodal`、
   `SupportsPerSequenceFusedForward`、`SupportsLinearKVMigration` 等）与 MTP
-  接口（`HasMtp`、`MtpSpeculationProfitable`、`SupportsBatchedSpecTrunk`）声明
+  接口（`HasMtp`、`SpeculationProfitable`、`SupportsBatchedSpecTrunk`）声明
   自身能力，`ExecutionCapabilities.FromModel` 每步做一次快照。像
   `TS_QWEN35_BATCHED=0` 这类按模型 opt-out 现在会体现为
   `BatchedForwardAvailable=false`，planner 会提前绕开批处理路径；
   `ForwardBatch` 抛 `NotSupportedException` 仅保留为针对单个 batch 的拒绝，
   不再是路由机制。
-- **候选有序且安全。** 可拒绝的候选（`MtpBatchedTrunk` 的武装/连续性门、
+- **候选有序且安全。** 可拒绝的候选（`SpecBatchedTrunk` 的武装/连续性门、
   `BatchedPaged` 的迁移失败/模型拒绝）会落入下一个候选；每个计划都以不可
   拒绝的路径收尾。`ExecutionPlannerTests` 扫描能力/特征空间验证该不变量。
 - **可观测性。** `InferenceEngine` 启动时输出一次 capability 报告（哪些路径
   静态可用、不可用的原因）；`BatchExecutor` 在决策变化时（如并发切换）记录
   计划——选中路径、回退链、被拒原因——"这个请求为什么没走快路径" 从考古
   变成日志事实。
-- **路径种类**（`ExecutionPathKind`）：`MtpBatchedTrunk`、`MtpPerSequence`、
+- **路径种类**（`ExecutionPathKind`）：`SpecBatchedTrunk`、`SpecPerSequence`、
   `PerSequenceFused`、`MixedMultimodalSplit`、`SingleSequenceFused`（N=1 快速
   路径）、`BatchedPaged`、`PerSequence`。
 
@@ -179,7 +179,7 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 ### 投机解码（MTP / NextN）
 
 当设置服务端 `--mtp-spec` 参数（`TS_MTP_SPEC=1`）时，`BatchExecutor` 会为实现了
-`IMtpBatchedSpeculativeModel` 的模型对**单序列（无并发）**请求运行可选的多 token 预测
+`IBatchedSpeculativeTarget` 的模型对**单序列（无并发）**请求运行可选的多 token 预测
 投机路径。每步流程：
 
 1. **起草。** 模型的草稿头最多提议 `TS_MTP_DRAFT`（默认 `8`）个未来 token，遇到第一个
@@ -189,18 +189,18 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
    会重新推导每个被提交的 token，输出与标准 decode **完全一致**；投机只改变所需的前向次数。
 3. **回滚。** 部分接受时，超出已接受前缀的 KV（及任何递归状态）在下一步前被回滚。
 
-两种草稿头形态共用 `MtpSpeculativeExecution` 核心：
+两种草稿头形态共用 `SpeculativeExecution` 核心：
 
 | 模型 | 草稿头 | 被拒时的状态 |
 |---|---|---|
 | Qwen 3.6 | 主干 GGUF 中内嵌的 NextN 块（`{arch}.nextn_predict_layers`）；无需额外文件。`--mtp-draft-model` 被忽略。 | GatedDeltaNet 递归状态快照 / 恢复（CUDA 上在设备侧完成）。 |
 | Gemma 4 | 通过 `--mtp-draft-model` 加载的独立 EAGLE 风格 `gemma4-assistant` GGUF；草稿层读取**目标**最后一个 local / global 层的 KV（自身无 K/V）。 | 仅注意力 KV 位置回退——草稿器在给定 `(token, h)` 时无状态。 |
 
-投机仅在有收益处启用（`MtpSpeculationProfitable`）：ggml 后端（融合多 token 验证 + 草稿步
+投机仅在有收益处启用（`SpeculationProfitable`）：ggml 后端（融合多 token 验证 + 草稿步
 内核）与纯 C# `cuda` 后端（完全驻留 GPU 的逐算子验证 / 草稿）。在 CPU / GGML CPU / MLX 上验证
 跟不上，因此引擎走标准 decode。并发批次从不投机——当有多个序列在运行时，每个序列都走普通的
 批处理 / 回退步骤。Gemma 4 草稿 GGUF 不匹配或不完整会在服务端启动时立即失败
-（`MtpStartupValidation`）。
+（`SpeculationStartupValidation`）。
 
 ## 模型状态
 
@@ -223,7 +223,7 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 | 调度器 / 块池 | `ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests` |
 | 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由 |
 | 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`、可选 `Qwen3BatchedForwardTests` |
-| MTP 投机解码 | `MtpSpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、可选端到端 `Qwen36MtpTests`（`TS_MTP_E2E=1`）与 `Gemma4MtpTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
+| MTP 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、可选端到端 `Qwen36SpeculativeTests`（`TS_MTP_E2E=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
 | 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |
 | DiffusionGemma 路径 | `DiffusionGemmaTests` 覆盖去噪、prompt-KV 缓存与批处理生成探针 |
 | 端到端引擎行为 | 通过 `TS_TEST_MODEL_DIR` 指向真实 GGUF 后运行的 `EngineParallelInferenceTests` |

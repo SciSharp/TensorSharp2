@@ -18,6 +18,7 @@ using System.Threading;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Cli.Logging;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Cli
 {
@@ -78,7 +79,7 @@ namespace TensorSharp.Cli
         // hidden state that pairs the trunk with the drafter, so a turn that
         // extends the cached prefix continues where the previous one stopped.
         // Rebuilt whenever /model or /backend swaps the loaded model.
-        private MtpSpeculativeDecoder _specDecoder;
+        private SpeculativeDecoder _specDecoder;
         private ModelBase _specDecoderModel;
         private readonly SpeculativeDecodingOptions.Settings _specSettings;
         // One warning per session when speculation was asked for and refused.
@@ -1109,7 +1110,7 @@ namespace TensorSharp.Cli
             // through the shared draft/verify core instead of one forward per
             // token. Its prefill has to go through the drafter-aware path too, so
             // the choice is made before the prompt is forwarded.
-            MtpSpeculativeDecoder specDecoder = ResolveSpeculativeDecoder(renderHistory);
+            SpeculativeDecoder specDecoder = ResolveSpeculativeDecoder(renderHistory);
 
             var prefillSw = Stopwatch.StartNew();
             ReusePlanKind planKind;
@@ -1146,7 +1147,7 @@ namespace TensorSharp.Cli
             string assistantContentBuffer = string.Empty;
             string assistantThinkingBuffer = string.Empty;
             // Per-turn speculative counters (null when the turn decoded plainly).
-            MtpSpecStats specStats = null;
+            SpeculationStats specStats = null;
             int specWindow = 0;
 
             // Streams one generated token: append its bytes, print the decoded
@@ -1251,7 +1252,7 @@ namespace TensorSharp.Cli
                 // short mid-block (Ctrl+C, a stop sequence) leaves the trunk holding
                 // tokens the console never saw, and a cache that under-reports them
                 // would make the next turn prefill at the wrong position.
-                int trunkGenerated = ((IMtpSpeculativeModel)_model).CacheSeqLen - promptCached;
+                int trunkGenerated = ((ISpeculativeTarget)_model).CacheSeqLen - promptCached;
                 int cachedGenerated = Math.Clamp(trunkGenerated, 0, specTokens.Count);
                 if (cachedGenerated > 0)
                     _kvCache.RecordAppend(specTokens.GetRange(0, cachedGenerated), null);
@@ -1353,12 +1354,12 @@ namespace TensorSharp.Cli
         /// with the conversation instead of being rebuilt; rebuilt from scratch on a
         /// model swap (/model, /backend).
         /// </summary>
-        private MtpSpeculativeDecoder ResolveSpeculativeDecoder(List<ChatMessage> renderHistory)
+        private SpeculativeDecoder ResolveSpeculativeDecoder(List<ChatMessage> renderHistory)
         {
             // The session's decoder survives every turn but is not valid past a
             // /model or /backend swap: it holds the previous model's hidden state
             // and buffers sized to its vocabulary.
-            MtpSpeculativeDecoder reusable =
+            SpeculativeDecoder reusable =
                 ReferenceEquals(_specDecoderModel, _model) ? _specDecoder : null;
             var decoder = SpeculativeDecodingOptions.TryCreate(
                 _model, _specSettings,
@@ -1372,7 +1373,7 @@ namespace TensorSharp.Cli
                 {
                     _specDeclineLogged = true;
                     _log.LogWarning(LogEventIds.HostConfiguration,
-                        "--mtp-spec was requested but speculative decoding is not available: {Reason}. "
+                        "--spec was requested but speculative decoding is not available: {Reason} "
                         + "Serving standard decode.", declineReason);
                 }
                 return null;
@@ -1384,7 +1385,7 @@ namespace TensorSharp.Cli
                 _specDecoderModel = _model;
                 _log.LogInformation(LogEventIds.CliStarted,
                     "interactive speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode}",
-                    SpeculativeDecodingOptions.DescribeDrafter((IMtpSpeculativeModel)_model),
+                    SpeculativeDecodingOptions.DescribeDrafter(_specDecoder),
                     _specDecoder.MaxDraftTokens, _specDecoder.MinDraftProb,
                     SpeculativeDecodingOptions.DescribeVerification(_samplingConfig));
             }
@@ -1433,7 +1434,7 @@ namespace TensorSharp.Cli
         /// and otherwise rebuilt — it is never truncated to a common prefix the way
         /// the plain path can. A draft head chains from the hidden state of the
         /// token before the one it drafts, and that state is only held for the
-        /// position the decoder last stopped at (<see cref="MtpSpeculativeDecoder.CarryPosition"/>);
+        /// position the decoder last stopped at (<see cref="SpeculativeDecoder.CarryPosition"/>);
         /// resuming anywhere else would build the draft head's KV from the wrong
         /// hidden state. The emitted stream would stay correct — verification is
         /// trunk-driven — but acceptance would decay for the rest of the session
@@ -1446,7 +1447,7 @@ namespace TensorSharp.Cli
         /// while the decode saving is per-token: on a long session, measure before
         /// assuming speculation still pays.
         /// </summary>
-        private float[] SpeculativePrefill(MtpSpeculativeDecoder decoder, List<int> inputTokens,
+        private float[] SpeculativePrefill(SpeculativeDecoder decoder, List<int> inputTokens,
             out ReusePlanKind kind)
         {
             int cached = _kvCache.Count;
