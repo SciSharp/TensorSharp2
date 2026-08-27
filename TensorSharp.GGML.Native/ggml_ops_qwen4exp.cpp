@@ -146,6 +146,17 @@ namespace
     // sources to decide whether the captured CUDA graph is still valid. With a stable
     // id it recognises the graph and skips that walk. At 96 replays a decode token,
     // that bookkeeping is not a rounding error.
+    // TS_Q4E_GRAPH_UID=0 leaves uid at 0 so ggml-cuda re-checks node properties on
+    // every replay instead of trusting the id.
+    bool q4e_graph_uid_enabled()
+    {
+        static const bool v = []{
+            const char* e = std::getenv("TS_Q4E_GRAPH_UID");
+            return !(e != nullptr && e[0] == '0');
+        }();
+        return v;
+    }
+
     uint64_t q4e_next_graph_uid()
     {
         static uint64_t next = 1;
@@ -397,7 +408,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpFfnBlock(
         ggml_set_output(res_out);
 
         ggml_cgraph* graph = ggml_new_graph(ctx);
-        graph->uid = q4e_next_graph_uid();
+        if (q4e_graph_uid_enabled()) graph->uid = q4e_next_graph_uid();
         ggml_build_forward_expand(graph, res_out);
 
         // ---- bind -------------------------------------------------------------
@@ -724,7 +735,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpGdnBlock(
         ggml_set_output(res_out);
 
         ggml_cgraph* graph = ggml_new_graph(ctx);
-        graph->uid = q4e_next_graph_uid();
+        if (q4e_graph_uid_enabled()) graph->uid = q4e_next_graph_uid();
         ggml_build_forward_expand(graph, res_out);
         // state write-back rides the same graph
         ggml_build_forward_expand(graph, ggml_cpy(ctx, tail, conv_state_out));
@@ -1054,7 +1065,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         ggml_set_output(res_out);
 
         ggml_cgraph* graph = ggml_new_graph(ctx);
-        graph->uid = q4e_next_graph_uid();
+        if (q4e_graph_uid_enabled()) graph->uid = q4e_next_graph_uid();
         // The KV write goes in FIRST. Nothing in res_out's tree depends on it - k_full
         // is a plain view of the cache and ggml does not treat view aliasing as an
         // edge - so node order is the only thing sequencing the write against the

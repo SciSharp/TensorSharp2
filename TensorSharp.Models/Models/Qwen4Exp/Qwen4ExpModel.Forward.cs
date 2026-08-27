@@ -885,11 +885,27 @@ namespace TensorSharp.Models
         // Keeping the residual in the kernels' device buffer across a layer, so the
         // fused halves chain without a host round trip each call.
         //
-        // OFF by default: it measures ~8% on decode but currently produces wrong
-        // output, and 8% does not buy a correctness risk. The remaining bug is in the
-        // hand-off between the resident buffer and the layers still running op-by-op -
-        // the host copy of the residual and its GGML device mirror disagree somewhere
-        // across that boundary. TS_Q4E_RES_RESIDENT=1 re-enables it for debugging.
+        // OFF by default: it measures ~18% on decode (73.3 vs 62.0 t/s) but produces
+        // wrong output, and that does not buy a correctness risk.
+        //
+        // The earlier note here blamed the hand-off with layers still running op-by-op.
+        // That is wrong. Bisected:
+        //
+        //   fused GDN + op-by-op FFN, resident   -> correct
+        //   op-by-op GDN + fused FFN, resident   -> correct
+        //   fused GDN + fused FFN,    resident   -> garbage
+        //
+        // So each kernel's residency is right on its own; it is the two persisted
+        // graphs alternating that breaks. Forcing the residual down to host memory and
+        // back between the two halves does NOT fix it, which rules out both the shared
+        // device buffer hand-off and the residual values themselves - by then the data
+        // has made a full round trip through the host and is provably correct. Also
+        // ruled out: the ggml-cuda graph-uid stamp (TS_Q4E_GRAPH_UID=0 is byte-identical
+        // to =1 here). Something the two kernels share besides the residual is being
+        // disturbed; the shared g_q4e_res_buf binding and ggml-cuda's single captured
+        // graph slot are the two candidates left.
+        //
+        // TS_Q4E_RES_RESIDENT=1 re-enables it for debugging.
         private static readonly bool _resResidentEnabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_RES_RESIDENT"), "1", StringComparison.Ordinal);
         private bool _resOnDevice;
