@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
+#include "ggml-impl.h"   // ggml_cgraph::uid
 
 #include <cmath>
 #include <cstring>
@@ -100,6 +101,19 @@ namespace
     constexpr const char* kQwen4ExpGdnKernel = "qwen4exp fused GDN block";
     constexpr const char* kQwen4ExpAttnKernel = "qwen4exp fused attention block";
     Qwen4ExpFfnCache g_q4e_attn[kQwen4ExpMaxSlots];
+
+    // Stamp every persisted graph with a stable non-zero id.
+    //
+    // ggml_new_graph leaves uid at 0, and ggml-cuda treats 0 as "unknown", so on every
+    // replay it re-walks all ~30 nodes comparing a copy of each tensor struct and its
+    // sources to decide whether the captured CUDA graph is still valid. With a stable
+    // id it recognises the graph and skips that walk. At 96 replays a decode token,
+    // that bookkeeping is not a rounding error.
+    uint64_t q4e_next_graph_uid()
+    {
+        static uint64_t next = 1;
+        return next++;
+    }
 
     // The 4-wide residual, held on the DEVICE for the whole forward.
     //
@@ -217,7 +231,6 @@ TSG_EXPORT int TSGgml_Qwen4ExpFfnBlock(
             }
             else
             {
-                ggml_backend_synchronize(g_backend);
                 ggml_backend_tensor_get(slot->res_out, res_data, 0, res_bytes);
             }
             return 1;
@@ -297,7 +310,10 @@ TSG_EXPORT int TSGgml_Qwen4ExpFfnBlock(
         // weights - llama.cpp's build_moe_ffn with norm_w.
         ggml_tensor* logits = ggml_mul_mat(ctx, w_router, mixed);      // [n_expert, T]
         ggml_tensor* probs = ggml_soft_max(ctx, logits);
-        ggml_tensor* sel = ggml_top_k(ctx, probs, n_expert_used);      // [n_used, T] i32
+        // ggml_argsort_top_k, not ggml_top_k: this is the exact node shape llama.cpp's
+        // build_moe_ffn emits, and ggml-cuda's topk_moe fusion matches on the node
+        // sequence rather than on intent.
+        ggml_tensor* sel = ggml_argsort_top_k(ctx, probs, n_expert_used);  // [n_used, T] i32
 
         ggml_tensor* w_sel = ggml_get_rows(ctx,
                 ggml_reshape_3d(ctx, probs, 1, n_expert, T), sel);     // [1, n_used, T]
@@ -344,6 +360,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpFfnBlock(
         ggml_set_output(res_out);
 
         ggml_cgraph* graph = ggml_new_graph(ctx);
+        graph->uid = q4e_next_graph_uid();
         ggml_build_forward_expand(graph, res_out);
 
         // ---- bind -------------------------------------------------------------
@@ -413,7 +430,6 @@ TSG_EXPORT int TSGgml_Qwen4ExpFfnBlock(
         }
         else
         {
-            ggml_backend_synchronize(g_backend);
             ggml_backend_tensor_get(res_out, res_data, 0, res_bytes);
         }
 
@@ -671,6 +687,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpGdnBlock(
         ggml_set_output(res_out);
 
         ggml_cgraph* graph = ggml_new_graph(ctx);
+        graph->uid = q4e_next_graph_uid();
         ggml_build_forward_expand(graph, res_out);
         // state write-back rides the same graph
         ggml_build_forward_expand(graph, ggml_cpy(ctx, tail, conv_state_out));
@@ -860,7 +877,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
             if (graph_compute_profiled(g_backend, slot->graph, kQwen4ExpAttnKernel) != GGML_STATUS_SUCCESS)
             { slot->reset_graph(); set_last_error("qwen4exp attn block: replay failed."); return 0; }
             if (res_resident) ggml_backend_tensor_copy(slot->res_out, slot->res_in);
-            else { ggml_backend_synchronize(g_backend); ggml_backend_tensor_get(slot->res_out, res_data, 0, res_bytes); }
+            else ggml_backend_tensor_get(slot->res_out, res_data, 0, res_bytes);
             return 1;
         }
         if (slot != nullptr) slot->reset_graph();
@@ -975,6 +992,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         ggml_set_output(res_out);
 
         ggml_cgraph* graph = ggml_new_graph(ctx);
+        graph->uid = q4e_next_graph_uid();
         ggml_build_forward_expand(graph, res_out);
         ggml_build_forward_expand(graph, ggml_cpy(ctx, k_write, k_dst));
         ggml_build_forward_expand(graph, ggml_cpy(ctx, v_write, v_dst));
@@ -1040,7 +1058,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         }
 
         if (res_resident) ggml_backend_tensor_copy(res_out, res_in);
-        else { ggml_backend_synchronize(g_backend); ggml_backend_tensor_get(res_out, res_data, 0, res_bytes); }
+        else ggml_backend_tensor_get(res_out, res_data, 0, res_bytes);
 
         if (slot != nullptr)
         {
