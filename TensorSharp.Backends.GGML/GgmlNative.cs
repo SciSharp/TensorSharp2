@@ -3940,6 +3940,38 @@ internal enum GgmlIndexReductionOp
         }
 
         [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpTokenSpan(
+            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
+            int layerBegin, int layerEnd,
+            IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            int nExpert, int nExpertUsed, int nFf, int nFfSh,
+            float eps, int cacheSlot, int firstFfnOnly);
+
+        public static bool Qwen4ExpTokenSpan(
+            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
+            int layerBegin, int layerEnd,
+            IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            int nExpert, int nExpertUsed, int nFf, int nFfSh,
+            float eps, int cacheSlot, bool firstFfnOnly)
+        {
+            return TSGgml_Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
+                resData, maskData, nEmbd, hc, hcLowRank, nTokens,
+                headKDim, headVDim, nKHeads, nVHeads, dConv,
+                headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                nRot, ropeBase, ropeFreqScale, attnScale,
+                nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
+                firstFfnOnly ? 1 : 0) != 0;
+        }
+
+        [LibraryImport(DllName)]
         private static partial int TSGgml_Qwen4ExpResUpload(IntPtr data, long bytes);
 
         [LibraryImport(DllName)]

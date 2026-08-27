@@ -42,7 +42,7 @@ namespace TensorSharp.Models
         // Per-phase tick counters. Cheap (one timestamp per phase per layer) and the
         // only way to tell a slow recurrence from a slow MoE without a profiler.
         // Reported by TS_Q4E_PROFILE=1.
-        internal long Q4ePleTicks, Q4eHcTicks, Q4eGdnTicks, Q4eAttnTicks, Q4eMoeTicks, Q4eHeadTicks;
+        internal long Q4ePleTicks, Q4eHcTicks, Q4eGdnTicks, Q4eAttnTicks, Q4eMoeTicks, Q4eHeadTicks, Q4eSpanTicks;
         internal long Q4eGdnProjTicks, Q4eGdnPrepTicks, Q4eGdnKernelTicks, Q4eGdnOutTicks;
         internal long Q4eAttnProjTicks, Q4eAttnNormTicks, Q4eAttnRopeTicks, Q4eAttnCoreTicks, Q4eAttnOutTicks;
         private static readonly bool _q4eProfile =
@@ -55,6 +55,7 @@ namespace TensorSharp.Models
             Console.WriteLine(
                 $"[q4e-profile] tokens={tokens} ple={Q4ePleTicks * f:F0}ms hc={Q4eHcTicks * f:F0}ms " +
                 $"gdn={Q4eGdnTicks * f:F0}ms attn={Q4eAttnTicks * f:F0}ms moe={Q4eMoeTicks * f:F0}ms " +
+                $"span={Q4eSpanTicks * f:F0}ms " +
                 $"head={Q4eHeadTicks * f:F0}ms");
             Console.WriteLine(
                 $"[q4e-profile]   gdn: proj={Q4eGdnProjTicks * f:F0} prep={Q4eGdnPrepTicks * f:F0} " +
@@ -128,6 +129,11 @@ namespace TensorSharp.Models
                     GrowCache(ref _idxKCache[l], 1, newCapacity, _indexerHeadDim, DType.Float32);
             }
             _kvCacheCapacity = newCapacity;
+            // The KV tensors just moved: the pinned attention descriptors hold the
+            // old storage pointers and byte counts, and every graph keyed on them -
+            // per-layer and span alike - is stale. Dropping the array forces a refill
+            // with the new pointers and, through the graph keys, a rebuild.
+            _attnArgs = null;
         }
 
         private void GrowCache(ref Tensor cache, int heads, int newLen, int dim, DType dtype)
@@ -197,10 +203,20 @@ namespace TensorSharp.Models
             // Hand the residual to the device once; the fused halves chain through it
             // and only the layers still running op-by-op pull it back.
             _resOnDevice = false;
-            if (_ffnArgs != null && !_fusedFfnUnsupported)
+
+            // The whole token as (almost) one graph: every PLE-free run of layers -
+            // both halves of each - chained into a single persisted GGML graph, so a
+            // decode token is 2 graph launches instead of 96 and the residual crosses
+            // the bus twice instead of 192 times. Anything the span declines falls
+            // back to the per-layer loop below.
+            long tSpan = Stopwatch.GetTimestamp();
+            bool spanDone = TryFusedTokenSpans(res, tokens, seqLen, startPos);
+            if (spanDone) Q4eSpanTicks += Stopwatch.GetTimestamp() - tSpan;
+
+            if (!spanDone && _ffnArgs != null && !_fusedFfnUnsupported)
                 ResidualToDevice(res, seqLen);
 
-            for (int il = 0; il < Config.NumLayers; il++)
+            for (int il = spanDone ? Config.NumLayers : 0; il < Config.NumLayers; il++)
             {
                 long t0 = Stopwatch.GetTimestamp();
                 if (_isPle[il])
@@ -771,42 +787,8 @@ namespace TensorSharp.Models
 
             try
             {
-                if (_attnArgs == null)
-                {
-                    // PINNED: the kernel keys its cached graph on the descriptor address.
-                    _attnArgs = GC.AllocateArray<Qwen4ExpAttnArgs>(Config.NumLayers, pinned: true);
-                    for (int l = 0; l < Config.NumLayers; l++)
-                    {
-                        if (_isRecurrent[l]) continue;
-                        if (!TryFillAttnArgs(l, ref _attnArgs[l])) { _fusedAttnUnsupported = true; return false; }
-                    }
-                }
-
-                // Causal mask, F16, [n_kv_pad, T]: 0 where token t may see cell j. Must
-                // agree with the kernel on the padded width - same predicate, same
-                // stride - because the kernel reads exactly n_kv_pad*T entries.
-                int padded = totalLen;
-                if (UseFlashAttn(_kCache[il].ElementType, Config.HeadDim))
-                {
-                    padded = ((totalLen + KvStride - 1) / KvStride) * KvStride;
-                    if (padded > _kvCacheCapacity) padded = _kvCacheCapacity;
-                }
-                long need = (long)padded * seqLen;
-                if (_attnMask == null || _attnMask.Length < need)
-                    _attnMask = new ushort[need];
-                const ushort NegInfF16 = 0xFC00;
-                // ONE fixed block around the whole fill. Pinning per row ends the pin at
-                // that statement and leaves the writes going through a pointer into an
-                // array the GC is free to move.
-                fixed (ushort* m = _attnMask)
-                {
-                    for (int t = 0; t < seqLen; t++)
-                    {
-                        int limit = startPos + t;
-                        ushort* row = m + (long)t * padded;
-                        for (int j = 0; j < padded; j++) row[j] = j <= limit ? (ushort)0 : NegInfF16;
-                    }
-                }
+                if (!EnsureAttnArgs()) return false;
+                BuildAttnMask(totalLen, seqLen, startPos, _kCache[il].ElementType);
 
                 bool ok;
                 fixed (ushort* maskPtr = _attnMask)
@@ -881,6 +863,262 @@ namespace TensorSharp.Models
         private static IntPtr GetStorageBasePtrOf(Tensor t)
             => TensorComputePrimitives.GetStorageBasePointer(t);
 
+        // ------------------------------------------------------------------
+        // The whole token as (almost) one graph. TS_Q4E_TOKEN_GRAPH=0 falls back to
+        // the per-layer fused kernels; those in turn fall back op-by-op.
+        // ------------------------------------------------------------------
+        // OFF by default. The spans are correct when built fresh every token and for
+        // trivially short contexts, and 25-35% faster than the per-layer kernels -
+        // but a REPLAYED span computes the gated-delta-net node slightly wrong, the
+        // error scaling with context length, and the generation decays into
+        // repetition. Instrumented to the node: inputs (residual, conv state, ssm
+        // state, projections) match a fresh build bit-for-bit and gdn_out does not.
+        // Ruled out by measurement: CUDA graph capture, ggml-cuda fusion, the
+        // resident cache moving weights, uploaded-leaf reuse, the KV pad, stream
+        // races around the state copies, in-place state writes, shared input
+        // tensors. The per-layer path replays the same builder's nodes correctly at
+        // every length, so the residue is specific to the multi-layer graph.
+        private static readonly bool _tokenGraphEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_TOKEN_GRAPH"), "1", StringComparison.Ordinal);
+        // TS_Q4E_SPAN_ATTN=1 chains the attention layers into the span graphs too.
+        // OFF by default: attention inside a span diverges numerically in a way the
+        // per-layer fused attention does not (under investigation), so the default
+        // spans cover the GDN runs - 36 of 48 layers - and attention runs through the
+        // proven per-layer kernel. ~26 graph launches a token instead of 96.
+        // TS_Q4E_DRIVER_TRACE=1 prints the residual L2 after every span and
+        // attention call the driver makes. Diagnosis only.
+        private static readonly bool _driverTrace =
+            string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_DRIVER_TRACE"), "1", StringComparison.Ordinal);
+
+        private unsafe void DriverTrace(Tensor res, int seqLen, string what)
+        {
+            if (!_driverTrace) return;
+            float* rp = GetFloatPtr(res);
+            long n = (long)seqLen * _hcDim;
+            double n2 = 0;
+            for (long i = 0; i < n; i++) n2 += (double)rp[i] * rp[i];
+            Console.Error.WriteLine($"[q4e-drv] {what} l2={Math.Sqrt(n2):E9}");
+        }
+
+        private static readonly bool _spanAttnEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_SPAN_ATTN"), "1", StringComparison.Ordinal);
+        private bool _tokenGraphUnsupported;
+        private byte[] _layerKinds;
+
+        private unsafe bool TryFusedTokenSpans(Tensor res, int[] tokens, int seqLen, int startPos)
+        {
+            if (!_tokenGraphEnabled || _tokenGraphUnsupported || !IsGgmlBackend
+                || _fusedGateUpExperts
+                || !_fusedFfnEnabled || _fusedFfnUnsupported
+                || !_fusedGdnEnabled || _fusedGdnUnsupported
+                || !_fusedAttnEnabled || _fusedAttnUnsupported
+                || _gdnMaxLayers >= 0 || _gdnVerify)
+            {
+                return false;
+            }
+
+
+            // QSA is exact only at or below its budget; one layer past it and the
+            // whole token goes to the per-layer path, which knows how to warn.
+            int totalLen = startPos + seqLen;
+            for (int il = 0; il < Config.NumLayers; il++)
+            {
+                if (!_isRecurrent[il] && UsesQsa(il) && totalLen > _indexerTopK + _compressRatios[il] - 1)
+                    return false;
+            }
+
+            try
+            {
+                if (!EnsureFfnArgs() || !EnsureGdnArgs() || !EnsureAttnArgs())
+                {
+                    _tokenGraphUnsupported = true;
+                    return false;
+                }
+                if (_layerKinds == null)
+                {
+                    // PINNED: its address rides in the span's graph key.
+                    _layerKinds = GC.AllocateArray<byte>(Config.NumLayers, pinned: true);
+                    for (int l = 0; l < Config.NumLayers; l++)
+                        _layerKinds[l] = _isRecurrent[l] ? (byte)1 : (byte)0;
+                }
+
+                int firstAttn = Array.IndexOf(_layerKinds, (byte)0);
+                BuildAttnMask(totalLen, seqLen, startPos,
+                        firstAttn >= 0 ? _kCache[firstAttn].ElementType : DType.Float16);
+
+                bool ranAnything = false;
+                fixed (Qwen4ExpFfnArgs* fp = _ffnArgs)
+                fixed (Qwen4ExpGdnArgs* gp = _gdnArgs)
+                fixed (Qwen4ExpAttnArgs* ap = _attnArgs)
+                fixed (byte* kp = _layerKinds)
+                fixed (ushort* mp = _attnMask)
+                {
+                    int begin = 0, spanIdx = 0;
+                    bool beginFfnOnly = false;
+                    for (int il = 0; il <= Config.NumLayers; il++)
+                    {
+                        // The PLE layer scores its gathered rows against the residual
+                        // on the host, so it cuts the token into spans; so does every
+                        // attention layer unless TS_Q4E_SPAN_ATTN=1.
+                        bool attnCut = il < Config.NumLayers && !_isRecurrent[il] && !_spanAttnEnabled;
+                        bool cut = il == Config.NumLayers || _isPle[il] || attnCut;
+                        if (!cut) continue;
+                        if (il > begin)
+                        {
+                            bool ok = GgmlBasicOps.Qwen4ExpTokenSpan(
+                                (IntPtr)fp, (IntPtr)gp, (IntPtr)ap, (IntPtr)kp,
+                                begin, il,
+                                (IntPtr)GetFloatPtr(res), (IntPtr)mp,
+                                Config.HiddenSize, _hc, _hcLowRank, seqLen,
+                                _headKDim, _headVDim, _numKHeads, _numVHeads, _convKernel,
+                                Config.HeadDim, Config.NumHeads, Config.NumKVHeads,
+                                _kvCacheCapacity, totalLen, startPos,
+                                _ropeDimCount, Config.RopeBase, 1.0f / Config.RopeScale, _attnScale,
+                                _numExperts, _numExpertsUsed, _expertFf, _sharedFf,
+                                Config.Eps, cacheSlot: spanIdx, firstFfnOnly: beginFfnOnly);
+                            if (!ok)
+                            {
+                                _tokenGraphUnsupported = true;
+                                if (ranAnything)
+                                {
+                                    // Layers [0, begin) already advanced the KV cache
+                                    // and the recurrent state; re-running them would
+                                    // apply the token twice. Fail loudly instead of
+                                    // quietly double-stepping the model; the next
+                                    // forward takes the per-layer fallback.
+                                    throw new InvalidOperationException(
+                                        "qwen4exp token span failed mid-token; the per-layer " +
+                                        "fallback takes over on the next forward.");
+                                }
+                                return false;
+                            }
+                            ranAnything = true;
+                            DriverTrace(res, seqLen, $"span{spanIdx} [{begin},{il}) T={seqLen} pos={startPos}");
+                            spanIdx++;
+                            InvalidateTensorDeviceCache(res);
+                        }
+                        if (il < Config.NumLayers && _isPle[il])
+                        {
+                            PleLayer(res, tokens, seqLen, startPos, il);
+                            begin = il;
+                            beginFfnOnly = false;
+                        }
+                        else if (attnCut)
+                        {
+                            // The attention HALF through the proven per-layer kernel;
+                            // the FFN half of this layer rides at the head of the
+                            // next span instead of costing its own launch.
+                            if (!TryFusedAttnBlock(res, il, seqLen, startPos))
+                            {
+                                _tokenGraphUnsupported = true;
+                                if (ranAnything)
+                                {
+                                    throw new InvalidOperationException(
+                                        "qwen4exp token span: the per-layer attention fallback " +
+                                        "failed mid-token; the next forward runs per-layer.");
+                                }
+                                return false;
+                            }
+                            ranAnything = true;
+                            DriverTrace(res, seqLen, $"attn{il} T={seqLen} pos={startPos}");
+                            begin = il;
+                            beginFfnOnly = true;
+                        }
+                    }
+                }
+                _kvCacheHostStale = true;
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                _tokenGraphUnsupported = true;
+                return false;
+            }
+        }
+
+        private bool EnsureAttnArgs()
+        {
+            if (_attnArgs != null) return true;
+            // PINNED: the kernel keys its cached graph on the descriptor address.
+            var args = GC.AllocateArray<Qwen4ExpAttnArgs>(Config.NumLayers, pinned: true);
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_isRecurrent[l]) continue;
+                if (!TryFillAttnArgs(l, ref args[l])) { _fusedAttnUnsupported = true; return false; }
+            }
+            _attnArgs = args;
+            return true;
+        }
+
+        private bool EnsureGdnArgs()
+        {
+            if (_gdnArgs != null) return true;
+            // PINNED for the same reason as the FFN descriptors: the kernel keys its
+            // cached graph on the descriptor address.
+            var args = GC.AllocateArray<Qwen4ExpGdnArgs>(Config.NumLayers, pinned: true);
+            _gdnConvStateT = new Tensor[Config.NumLayers];
+            EnsureGdnScratch();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l]) continue;
+                // The kernel wants the conv history as [d_conv-1, conv_dim] rather
+                // than the host ring the op-by-op path walks.
+                _gdnConvStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
+                Ops.Fill(_gdnConvStateT[l], 0f);
+                if (!TryFillGdnArgs(l, ref args[l])) { _fusedGdnUnsupported = true; return false; }
+            }
+            _gdnArgs = args;
+            return true;
+        }
+
+        private bool EnsureFfnArgs()
+        {
+            if (_ffnArgs != null) return true;
+            // PINNED: the kernel keys its cached graph on the descriptor's address, so
+            // a moving array would look like a different layer every token and rebuild
+            // the graph each time - exactly the cost the cache exists to remove.
+            var args = GC.AllocateArray<Qwen4ExpFfnArgs>(Config.NumLayers, pinned: true);
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (!TryFillFfnArgs(l, ref args[l])) { _fusedFfnUnsupported = true; return false; }
+            _ffnArgs = args;
+            return true;
+        }
+
+        /// <summary>Build the causal F16 mask at the width the kernel will read
+        /// ([n_kv_pad, T]) and return that padded width. Must agree with the kernel
+        /// on the padding - same predicate, same stride - because it reads exactly
+        /// n_kv_pad*T entries.</summary>
+        private unsafe int BuildAttnMask(int totalLen, int seqLen, int startPos, DType kvType)
+        {
+            int padded = totalLen;
+            if (UseFlashAttn(kvType, Config.HeadDim))
+            {
+                padded = ((totalLen + KvStride - 1) / KvStride) * KvStride;
+                if (padded > _kvCacheCapacity) padded = _kvCacheCapacity;
+            }
+            long need = (long)padded * seqLen;
+            if (_attnMask == null || _attnMask.Length < need)
+                _attnMask = new ushort[need];
+            const ushort NegInfF16 = 0xFC00;
+            // ONE fixed block around the whole fill. Pinning per row ends the pin at
+            // that statement and leaves the writes going through a pointer into an
+            // array the GC is free to move.
+            fixed (ushort* m = _attnMask)
+            {
+                for (int t = 0; t < seqLen; t++)
+                {
+                    int limit = startPos + t;
+                    ushort* row = m + (long)t * padded;
+                    for (int j = 0; j < padded; j++) row[j] = j <= limit ? (ushort)0 : NegInfF16;
+                }
+            }
+            return padded;
+        }
+
         // TS_Q4E_FUSED_GDN=0 falls back to the op-by-op recurrent half.
         // Keeping the residual in the kernels' device buffer across a layer, so the
         // fused halves chain without a host round trip each call.
@@ -950,23 +1188,7 @@ namespace TensorSharp.Models
 
             try
             {
-                if (_gdnArgs == null)
-                {
-                    // PINNED for the same reason as the FFN descriptors: the kernel
-                    // keys its cached graph on the descriptor address.
-                    _gdnArgs = GC.AllocateArray<Qwen4ExpGdnArgs>(Config.NumLayers, pinned: true);
-                    _gdnConvStateT = new Tensor[Config.NumLayers];
-                    EnsureGdnScratch();
-                    for (int l = 0; l < Config.NumLayers; l++)
-                    {
-                        if (!_isRecurrent[l]) continue;
-                        // The kernel wants the conv history as [d_conv-1, conv_dim]
-                        // rather than the host ring the op-by-op path walks.
-                        _gdnConvStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
-                        Ops.Fill(_gdnConvStateT[l], 0f);
-                        if (!TryFillGdnArgs(l, ref _gdnArgs[l])) { _fusedGdnUnsupported = true; return false; }
-                    }
-                }
+                if (!EnsureGdnArgs()) return false;
                 if (_gdnConvStateT[il] == null) return false;
 
                 bool ok = GgmlBasicOps.Qwen4ExpGdnBlock(ref _gdnArgs[il],
@@ -1035,16 +1257,7 @@ namespace TensorSharp.Models
 
             try
             {
-                if (_ffnArgs == null)
-                {
-                    // PINNED: the kernel keys its cached graph on the descriptor's
-                    // address, so a moving array would look like a different layer
-                    // every token and rebuild the graph each time - exactly the cost
-                    // the cache exists to remove.
-                    _ffnArgs = GC.AllocateArray<Qwen4ExpFfnArgs>(Config.NumLayers, pinned: true);
-                    for (int l = 0; l < Config.NumLayers; l++)
-                        if (!TryFillFfnArgs(l, ref _ffnArgs[l])) { _fusedFfnUnsupported = true; return false; }
-                }
+                if (!EnsureFfnArgs()) return false;
 
                 bool ok = GgmlBasicOps.Qwen4ExpFfnBlock(ref _ffnArgs[il],
                     (IntPtr)GetFloatPtr(res),

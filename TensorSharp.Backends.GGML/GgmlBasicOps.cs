@@ -2960,6 +2960,31 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>Drop every cached qwen4exp FFN graph (they pin weight bindings).</summary>
+        /// <summary>
+        /// Qwen3.8-Flash-Next token span: layers [layerBegin, layerEnd) - the
+        /// recurrent-or-attention half AND the FFN half of each - as ONE persisted
+        /// GGML graph. With the PLE layer the only host interruption, a token is two
+        /// of these calls instead of 96 per-layer ones.
+        /// </summary>
+        public static bool Qwen4ExpTokenSpan(
+            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
+            int layerBegin, int layerEnd,
+            IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            int nExpert, int nExpertUsed, int nFf, int nFfSh,
+            float eps, int cacheSlot, bool firstFfnOnly = false)
+        {
+            return GgmlNative.Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
+                resData, maskData, nEmbd, hc, hcLowRank, nTokens,
+                headKDim, headVDim, nKHeads, nVHeads, dConv,
+                headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                nRot, ropeBase, ropeFreqScale, attnScale,
+                nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot, firstFfnOnly);
+        }
+
         public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();
 
         public static void GatedDeltaNetChunked(
