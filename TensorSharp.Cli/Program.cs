@@ -1041,9 +1041,22 @@ namespace TensorSharp.Cli
                     _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", imagePath);
                     return;
                 }
-                imagePaths = new List<string> { imagePath };
+                // Every --image in order; imagePath alone would keep only the last.
+                imagePaths = imagePathList.Count > 0
+                    ? new List<string>(imagePathList)
+                    : new List<string> { imagePath };
+                foreach (string ip in imagePaths)
+                {
+                    if (!File.Exists(ip))
+                    {
+                        _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", ip);
+                        return;
+                    }
+                }
                 if (!hasUserInput)
-                    rawText = "What is in this image? Please describe it.";
+                    rawText = imagePaths.Count > 1
+                        ? "What is in these images? Please describe each."
+                        : "What is in this image? Please describe it.";
                 _log.LogInformation(LogEventIds.UploadReceived,
                     "Image input: {ImagePath} ({Bytes})",
                     imagePath, LoggingExtensions.FormatBytes(new FileInfo(imagePath).Length));
@@ -1201,6 +1214,7 @@ namespace TensorSharp.Cli
                 string userMsg;
                 int turnMaxTokens = maxTokens;
                 bool forceReset = false;
+                List<string> turnImages = null;
                 try
                 {
                     var doc = JsonDocument.Parse(line);
@@ -1217,13 +1231,22 @@ namespace TensorSharp.Cli
                         turnMaxTokens = mt.GetInt32();
                     if (root.TryGetProperty("force_reset", out var fr))
                         forceReset = fr.GetBoolean();
+                    if (root.TryGetProperty("images", out var imgs) && imgs.ValueKind == JsonValueKind.Array)
+                    {
+                        turnImages = new List<string>();
+                        foreach (var im in imgs.EnumerateArray())
+                        {
+                            string ip = im.GetString();
+                            if (!string.IsNullOrEmpty(ip)) turnImages.Add(ip);
+                        }
+                    }
                 }
                 catch
                 {
                     userMsg = line;
                 }
 
-                history.Add(new ChatMessage { Role = "user", Content = userMsg });
+                history.Add(new ChatMessage { Role = "user", Content = userMsg, ImagePaths = turnImages });
                 _log.LogInformation(LogEventIds.ChatStarted,
                     "multi-turn turn={Turn}/{TotalTurns} user=\"{User}\"",
                     turn + 1, lines.Length, LoggingExtensions.SanitizeForLog(userMsg));
@@ -1244,6 +1267,12 @@ namespace TensorSharp.Cli
                     addGenerationPrompt: true,
                     enableThinking: enableThinking);
 
+                // Expand image placeholders, prepare (cached) vision embeddings and
+                // the IMRoPE position table over the WHOLE conversation so far.
+                bool anyImages = history.Exists(m => m.ImagePaths != null && m.ImagePaths.Count > 0);
+                if (anyImages)
+                    inputTokens = model.MultimodalInjector.ProcessPromptTokens(history, inputTokens);
+
                 _log.LogInformation(LogEventIds.ChatStarted,
                     "multi-turn prompt tokens={PromptTokens}", inputTokens.Count);
 
@@ -1255,7 +1284,7 @@ namespace TensorSharp.Cli
                 double decodeMs;
 
                 var turnDecoder = SpeculativeDecodingOptions.TryCreate(
-                    model, specSettings, hasMediaAttachments: false, out string turnDeclineReason,
+                    model, specSettings, hasMediaAttachments: anyImages, out string turnDeclineReason,
                     multiTurnDecoder);
                 if (turnDecoder != null)
                     multiTurnDecoder = turnDecoder;
@@ -1385,9 +1414,18 @@ namespace TensorSharp.Cli
                 case ReusePlanKind.PartialReuse:
                 {
                     int reused = plan.ReusedPrefixLength;
-                    int suffixLength = plan.TokensToForward;
+                    // A reuse boundary inside an image span would truncate half an
+                    // injection; the injector pulls it back to the span start.
+                    int clamped = model.MultimodalInjector.ClampReusablePrefix(reused);
+                    if (clamped != reused)
+                        reused = clamped;
+                    int suffixLength = inputTokens.Count - reused;
                     model.TruncateKVCache(reused);
                     kvCache.TruncateTo(reused);
+
+                    // Vision embeddings and the IMRoPE slice for the tokens being
+                    // forwarded, offset by the reused prefix.
+                    model.MultimodalInjector.QueuePromptEmbeddingsForSlice(reused, suffixLength);
 
                     var suffix = new int[suffixLength];
                     for (int i = 0; i < suffixLength; i++)
@@ -1402,6 +1440,7 @@ namespace TensorSharp.Cli
                 {
                     model.ResetKVCache();
                     kvCache.Reset();
+                    model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
                     var allTokens = inputTokens.ToArray();
                     float[] logits = model.Forward(allTokens);
                     kvCache.RecordAppend(allTokens, logits);

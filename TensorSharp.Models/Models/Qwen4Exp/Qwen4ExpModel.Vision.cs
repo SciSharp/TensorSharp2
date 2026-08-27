@@ -21,6 +21,13 @@ namespace TensorSharp.Models
         // encoder runs it as is.
         public Qwen35VisionEncoder VisionEncoder { get; private set; }
 
+        // The GDN recurrence, the PLE conv history and the n-gram history cannot be
+        // rewound to an earlier position, so a cached prefix is only reusable when
+        // the new prompt EXTENDS it exactly - same contract as Qwen3.5. The base
+        // default of true would let a reuse plan truncate mid-conversation and
+        // silently continue from unrewindable state.
+        public override bool SupportsKVCacheTruncation => false;
+
         public void LoadVisionEncoder(string mmProjPath)
         {
             VisionEncoder = new Qwen35VisionEncoder(mmProjPath, _allocator);
@@ -87,6 +94,25 @@ namespace TensorSharp.Models
         public void SetMRoPEPositions(int[] flatThw)
         {
             _pendingMRoPEPositions = flatThw;
+        }
+
+        // How far the rotary position stream lags the KV cache index. An HxW image
+        // occupies H*W cache rows but only max(H,W) positions (IMRoPE compaction),
+        // so after every image the text positions fall behind the cache. llama.cpp's
+        // mtmd advances n_past by the compacted span the same way. Text-only
+        // forwards and decode subtract this gap from their scalar positions so the
+        // stream stays continuous across turns.
+        private int _mropeCacheGap;
+
+        private void UpdateMropeGap(int startPos, int seqLen)
+        {
+            if (_pendingMRoPEPositions == null || _pendingMRoPEPositions.Length < 3 * seqLen || seqLen <= 0)
+                return;
+            // The last prompt token is text, so its T component is the scalar
+            // position stream; the next token continues at that + 1.
+            int lastT = _pendingMRoPEPositions[3 * (seqLen - 1)];
+            _mropeCacheGap = (startPos + seqLen - 1) - lastT;
+            if (_mropeCacheGap < 0) _mropeCacheGap = 0;
         }
 
         private bool EnsureMropeSections()

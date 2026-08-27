@@ -196,6 +196,21 @@ namespace TensorSharp.Runtime
 
             int common = CommonPrefixLength(inputTokens);
 
+            if (Environment.GetEnvironmentVariable("TS_KV_DEBUG") == "1")
+            {
+                Console.Error.WriteLine($"[kv-debug] cached={_tokens.Count} input={inputTokens.Count} common={common}");
+                if (common < _tokens.Count && common < inputTokens.Count)
+                {
+                    int lo = Math.Max(0, common - 3);
+                    var cs = new System.Text.StringBuilder();
+                    var ns = new System.Text.StringBuilder();
+                    for (int i = lo; i < Math.Min(common + 4, _tokens.Count); i++) cs.Append(_tokens[i]).Append(' ');
+                    for (int i = lo; i < Math.Min(common + 4, inputTokens.Count); i++) ns.Append(inputTokens[i]).Append(' ');
+                    Console.Error.WriteLine($"[kv-debug] cache@{lo}: {cs}");
+                    Console.Error.WriteLine($"[kv-debug] input@{lo}: {ns}");
+                }
+            }
+
             // For non-truncatable models (recurrent state): only reuse if the cache is a
             // prefix of the new input.
             if (!supportsTruncation && common < _tokens.Count)

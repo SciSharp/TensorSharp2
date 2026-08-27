@@ -176,6 +176,7 @@ namespace TensorSharp.Models
             }
             if (_pleConvState != null) Array.Clear(_pleConvState);
             ResetPleHistory();
+            _mropeCacheGap = 0;
 
             // The fused kernels keep the conv and recurrent state in their OWN device
             // buffers inside a persisted graph, so zeroing the host copies above does
@@ -351,6 +352,8 @@ namespace TensorSharp.Models
 
             ResidualToHost(res, seqLen);
 
+            if (_pendingMRoPEPositions != null)
+                UpdateMropeGap(startPos, seqLen);
             _pendingMRoPEPositions = null;
 
             if (_spanLogitsValid)
@@ -1155,7 +1158,8 @@ namespace TensorSharp.Models
                                 Config.Eps, cacheSlot: spanIdx, firstFfnOnly: beginFfnOnly,
                                 head: headPtr, logitsOut: logitsPtr,
                                 ple: plePtr, pleLayer: pleLayerArg, pleEmb: pleEmbPtr,
-                                mropePos: mropePtr, mropeSections: sectPtr);
+                                mropePos: mropePtr, mropeSections: sectPtr,
+                                ropePosition: useMrope ? -1 : startPos - _mropeCacheGap);
                             if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {

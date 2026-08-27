@@ -322,9 +322,14 @@ namespace
     // A multimodal graph's pos tensor holds 4 sections (T|H|W|zero, IMRoPE order);
     // mrope3 is the per-token (t,h,w) table for image prompts, null for text where
     // every component is the scalar position.
+    // position indexes the KV cache rows; rope_position is the rotary position of
+    // the first token, which falls BEHIND the cache index once an image has been
+    // compacted into the position stream (IMRoPE gives an HxW image max(H,W)
+    // positions, not HxW). llama.cpp's mtmd advances n_past the same way.
     void q4e_set_attn_indices(ggml_tensor* pos, ggml_tensor* kv_idx, int T, int position,
-                              const int32_t* mrope3 = nullptr)
+                              const int32_t* mrope3 = nullptr, int rope_position = -1)
     {
+        if (rope_position < 0) rope_position = position;
         std::vector<int64_t> k((std::size_t)T);
         for (int i = 0; i < T; ++i) k[i] = position + i;
         ggml_backend_tensor_set(kv_idx, k.data(), 0, (std::size_t)T * sizeof(int64_t));
@@ -333,15 +338,15 @@ namespace
         std::vector<int32_t> p((std::size_t)comps * T);
         if (comps == 1)
         {
-            for (int i = 0; i < T; ++i) p[i] = position + i;
+            for (int i = 0; i < T; ++i) p[i] = rope_position + i;
         }
         else
         {
             for (int i = 0; i < T; ++i)
             {
-                const int32_t t = mrope3 ? mrope3[3 * i + 0] : position + i;
-                const int32_t h = mrope3 ? mrope3[3 * i + 1] : position + i;
-                const int32_t w = mrope3 ? mrope3[3 * i + 2] : position + i;
+                const int32_t t = mrope3 ? mrope3[3 * i + 0] : rope_position + i;
+                const int32_t h = mrope3 ? mrope3[3 * i + 1] : rope_position + i;
+                const int32_t w = mrope3 ? mrope3[3 * i + 2] : rope_position + i;
                 p[i] = t; p[T + i] = h; p[2 * T + i] = w; p[3 * T + i] = 0;
             }
         }
@@ -1599,7 +1604,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
     float eps, int cache_slot, int first_ffn_only,
     const TSGgmlQwen4ExpHeadArgs* head, void* logits_out,
     const TSGgmlQwen4ExpPleArgs* ple, int ple_layer, const void* ple_emb,
-    const int* mrope_pos, const int* mrope_sections)
+    const int* mrope_pos, const int* mrope_sections, int rope_position)
 {
     try
     {
@@ -1684,7 +1689,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
                 ggml_backend_tensor_set(m, mask_data, 0, mask_bytes);
             for (std::size_t i = 0; i < slot->span_pos.size(); ++i)
                 q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position,
-                        use_mrope ? (const int32_t*)mrope_pos : nullptr);
+                        use_mrope ? (const int32_t*)mrope_pos : nullptr, rope_position);
             q4e_note(3, false);
             if (q4e_span_trace() && !slot->span_copies.empty() && T == 1)
             {
@@ -2074,7 +2079,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             ggml_backend_tensor_set(m, mask_data, 0, mask_bytes);
         for (std::size_t i = 0; i < slot->span_pos.size(); ++i)
             q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position,
-                    use_mrope ? (const int32_t*)mrope_pos : nullptr);
+                    use_mrope ? (const int32_t*)mrope_pos : nullptr, rope_position);
 
         const double t_up = q4e_phase_log() ? q4e_now_ms() : 0.0;
         q4e_note(3, true);
