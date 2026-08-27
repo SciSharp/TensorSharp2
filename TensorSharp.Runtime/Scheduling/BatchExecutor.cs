@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -844,7 +844,11 @@ namespace TensorSharp.Runtime.Scheduling
             // we never clobber a (possibly still-running) concurrent request's
             // cache. No-op when the primary cache is already active or the model
             // doesn't use per-request caches.
-            if (_model is IBatchedPagedModel pf && pf.SupportsPerSequenceFusedForward)
+            // Reinstated regardless of the CURRENT capability value: the
+            // capability can latch off after holders already exist (a fused-path
+            // failure), and skipping the restore would leave a per-request
+            // holder checked out for the universal path to trample.
+            if (_model is IBatchedPagedModel pf)
                 pf.RestorePrimaryCache();
 
             // The byte-level KV-state extract/inject in EnsureOwnership does

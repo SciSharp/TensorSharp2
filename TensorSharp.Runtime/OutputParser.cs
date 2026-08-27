@@ -2068,7 +2068,7 @@ namespace TensorSharp.Runtime
                 "gptoss" or "gpt-oss" => new HarmonyOutputParser(),
                 "muse-glimmer" => new MuseGlimmerOutputParser(),
                 "deepseek4" => new DeepSeek4OutputParser(),
-                "glm-dsa" or "glm_dsa" => new GlmDsaOutputParser(),
+                "glm-dsa" or "glm_dsa" or "glm5next" => new GlmDsaOutputParser(),
                 "nemotron_h" or "nemotron_h_moe" => new Qwen3OutputParser(),
                 _ => new PassthroughOutputParser()
             };
@@ -2100,7 +2100,7 @@ namespace TensorSharp.Runtime
             // arrives on the "to=self" channel, so an unparsed stream shows the
             // raw tags and the whole chain of thought as if it were the answer.
             return architecture is "gptoss" or "gpt-oss" or "gemma4" or "deepseek4" or "muse-glimmer"
-                                or "glm-dsa" or "glm_dsa";
+                                or "glm-dsa" or "glm_dsa" or "glm5next";
         }
     }
 }

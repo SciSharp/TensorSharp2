@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
+#include <unordered_map>
 
 using namespace tsg;
 
@@ -45,7 +46,7 @@ namespace
     constexpr const char* kQwen4ExpAttnKernel = "qwen4exp fused attention block";
     constexpr const char* kQwen4ExpSpanKernel = "qwen4exp fused token span";
     constexpr int kQwen4ExpMaxSlots = 128;
-    constexpr int kQwen4ExpSpanSlots = 32;
+    constexpr int kQwen4ExpSpanSlots = 128;
     // A 48-layer span builds ~150 nodes a layer; 16384 leaves headroom.
     constexpr int kQwen4ExpSpanGraphSize = 16384;
 
@@ -159,9 +160,44 @@ namespace
 
     // The PLE conv history: one persistent device buffer (one PLE layer in the
     // shipped checkpoint). ready=false re-seeds from the host on the next build.
-    ggml_backend_buffer_t g_q4e_ple_buf = nullptr;
-    std::size_t g_q4e_ple_bytes = 0;
-    bool g_q4e_ple_ready = false;
+    // ---- per-sequence recurrent-state store -------------------------------
+    // GDN conv+ssm state (one entry per layer per sequence) and the PLE conv
+    // history live in device buffers KEYED BY THE HOST SEED POINTER the C# side
+    // passes in the descriptor (each sequence holder owns its own pinned seed
+    // arrays, so the key is per-sequence per-layer for free). The buffer base
+    // is baked into every persisted graph that binds it; the graphs are keyed
+    // on the (per-holder) descriptor addresses, so a graph only ever binds its
+    // own holder's state entry. `ready` gates the one-time seed upload: a
+    // rebuild binds the existing buffer WITHOUT re-seeding (the device copy is
+    // authoritative; the host seed is stale after the first forward).
+    struct Q4eSeqStateEntry
+    {
+        ggml_backend_buffer_t buf = nullptr;
+        std::size_t bytes = 0;
+        bool ready = false;
+    };
+    std::unordered_map<const void*, Q4eSeqStateEntry> g_q4e_seq_state;
+
+    Q4eSeqStateEntry* q4e_seq_state(const void* key, std::size_t bytes)
+    {
+        if (key == nullptr) return nullptr;
+        Q4eSeqStateEntry& e = g_q4e_seq_state[key];
+        if (e.buf != nullptr && e.bytes < bytes)
+        {
+            ggml_backend_buffer_free(e.buf);
+            e.buf = nullptr;
+            e.ready = false;
+        }
+        if (e.buf == nullptr)
+        {
+            e.buf = ggml_backend_buft_alloc_buffer(
+                    ggml_backend_get_default_buffer_type(g_backend), bytes);
+            e.bytes = bytes;
+            e.ready = false;
+            if (e.buf == nullptr) return nullptr;
+        }
+        return &e;
+    }
 
     // ggml-cuda's flash attention takes F16 K/V and one of a fixed set of head sizes;
     // for head_dim 256 the only other condition is V->ne[0] == K->ne[0], which holds
@@ -1311,24 +1347,20 @@ TSG_EXPORT int TSGgml_Qwen4ExpGdnBlock(
         const std::size_t ssm_bytes = (std::size_t)head_v_dim * head_v_dim * n_v_heads * sizeof(float);
         const std::size_t ssm_off = (conv_bytes + 255) & ~(std::size_t)255;
         bool zero_state = true;
+        Q4eSeqStateEntry* st = nullptr;
         if (slot != nullptr)
         {
-            if (slot->state_buf == nullptr)
+            st = q4e_seq_state(a->conv_state, ssm_off + ssm_bytes);
+            if (st == nullptr)
             {
-                slot->state_buf = ggml_backend_buft_alloc_buffer(
-                        ggml_backend_get_default_buffer_type(g_backend), ssm_off + ssm_bytes);
-                if (slot->state_buf == nullptr)
-                {
-                    ggml_free(ctx);
-                    set_last_error("qwen4exp GDN block: failed to allocate the state buffer.");
-                    return 0;
-                }
-                slot->state_ready = false;
+                ggml_free(ctx);
+                set_last_error("qwen4exp GDN block: failed to allocate the state buffer.");
+                return 0;
             }
-            zero_state = !slot->state_ready;
-            std::uint8_t* base = (std::uint8_t*)ggml_backend_buffer_get_base(slot->state_buf);
-            if (ggml_backend_tensor_alloc(slot->state_buf, conv_state, base) != GGML_STATUS_SUCCESS ||
-                ggml_backend_tensor_alloc(slot->state_buf, ssm_state, base + ssm_off) != GGML_STATUS_SUCCESS)
+            zero_state = !st->ready;
+            std::uint8_t* base = (std::uint8_t*)ggml_backend_buffer_get_base(st->buf);
+            if (ggml_backend_tensor_alloc(st->buf, conv_state, base) != GGML_STATUS_SUCCESS ||
+                ggml_backend_tensor_alloc(st->buf, ssm_state, base + ssm_off) != GGML_STATUS_SUCCESS)
             {
                 ggml_free(ctx);
                 set_last_error("qwen4exp GDN block: failed to bind the state buffer.");
@@ -1353,7 +1385,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpGdnBlock(
         }
 
         binder.flush();
-        if (slot != nullptr) slot->state_ready = true;
+        if (st != nullptr) st->ready = true;
         if (!res_resident) ggml_backend_tensor_set(res_in, res_data, 0, res_bytes);
 
         q4e_note(1, true);
@@ -1792,7 +1824,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         const std::size_t ssm_bytes = (std::size_t)head_v_dim * head_v_dim * n_v_heads * sizeof(float);
         const std::size_t ssm_off = (conv_bytes + 255) & ~(std::size_t)255;
 
-        std::vector<Qwen4ExpFfnCache*> seeded;
+        std::vector<Qwen4ExpFfnCache*> seeded;              // unused since the seq-state map; kept for shape
+        std::vector<Q4eSeqStateEntry*> seeded_states;
         std::vector<ggml_tensor*> kv_tensors;
         std::vector<ggml_tensor*> trace_res;
         std::vector<ggml_tensor*> probe_nodes;
@@ -1820,27 +1853,24 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
 
                 // conv history: persistent device state, like the GDN state.
                 ggml_tensor* conv_state = nullptr;
+                Q4eSeqStateEntry* ple_st = nullptr;
                 if (hist > 0)
                 {
                     const std::size_t st_bytes = (std::size_t)hist * hc_dim2 * sizeof(float);
-                    if (g_q4e_ple_buf == nullptr || g_q4e_ple_bytes < st_bytes)
-                    {
-                        if (g_q4e_ple_buf) ggml_backend_buffer_free(g_q4e_ple_buf);
-                        g_q4e_ple_buf = ggml_backend_buft_alloc_buffer(
-                                ggml_backend_get_default_buffer_type(g_backend), st_bytes);
-                        g_q4e_ple_bytes = st_bytes;
-                        g_q4e_ple_ready = false;
-                        if (g_q4e_ple_buf == nullptr)
-                        { failed = true; fail_what = "ple state alloc"; break; }
-                    }
+                    ple_st = q4e_seq_state(ple->conv_state, st_bytes);
+                    if (ple_st == nullptr)
+                    { failed = true; fail_what = "ple state alloc"; break; }
                     conv_state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim2, hist);
                     ggml_set_input(conv_state);
-                    if (ggml_backend_tensor_alloc(g_q4e_ple_buf, conv_state,
-                            ggml_backend_buffer_get_base(g_q4e_ple_buf)) != GGML_STATUS_SUCCESS)
+                    if (ggml_backend_tensor_alloc(ple_st->buf, conv_state,
+                            ggml_backend_buffer_get_base(ple_st->buf)) != GGML_STATUS_SUCCESS)
                     { failed = true; fail_what = "ple state bind"; break; }
-                    if (!g_q4e_ple_ready)
+                    if (!ple_st->ready)
+                    {
                         binder.upload_list.push_back({conv_state, ple->conv_state,
                                 (std::size_t)hist * hc_dim2 * sizeof(float)});
+                        seeded_states.push_back(ple_st);
+                    }
                 }
 
                 // key/query grouped norms: normalise each stream, scale the full row.
@@ -1914,30 +1944,24 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             else if (kinds[il] != 0)
             {
                 // ---- recurrent half ----
-                Qwen4ExpFfnCache* gslot = &g_q4e_gdn[il];
-                if (gslot->state_buf == nullptr)
-                {
-                    gslot->state_buf = ggml_backend_buft_alloc_buffer(
-                            ggml_backend_get_default_buffer_type(g_backend), ssm_off + ssm_bytes);
-                    if (gslot->state_buf == nullptr)
-                    { failed = true; fail_what = "state buffer alloc"; break; }
-                    gslot->state_ready = false;
-                }
+                Q4eSeqStateEntry* gst = q4e_seq_state(gdn[il].conv_state, ssm_off + ssm_bytes);
+                if (gst == nullptr)
+                { failed = true; fail_what = "state buffer alloc"; break; }
                 ggml_tensor* conv_state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
                         d_conv - 1, (int64_t)conv_dim, 1);
                 ggml_tensor* ssm_state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
                         head_v_dim, head_v_dim, n_v_heads);
                 ggml_set_input(conv_state);
                 ggml_set_input(ssm_state);
-                std::uint8_t* base = (std::uint8_t*)ggml_backend_buffer_get_base(gslot->state_buf);
-                if (ggml_backend_tensor_alloc(gslot->state_buf, conv_state, base) != GGML_STATUS_SUCCESS ||
-                    ggml_backend_tensor_alloc(gslot->state_buf, ssm_state, base + ssm_off) != GGML_STATUS_SUCCESS)
+                std::uint8_t* base = (std::uint8_t*)ggml_backend_buffer_get_base(gst->buf);
+                if (ggml_backend_tensor_alloc(gst->buf, conv_state, base) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_tensor_alloc(gst->buf, ssm_state, base + ssm_off) != GGML_STATUS_SUCCESS)
                 { failed = true; fail_what = "state buffer bind"; break; }
-                if (!gslot->state_ready)
+                if (!gst->ready)
                 {
                     binder.upload_list.push_back({conv_state, gdn[il].conv_state, conv_bytes});
                     binder.upload_list.push_back({ssm_state, gdn[il].ssm_state, ssm_bytes});
-                    seeded.push_back(gslot);
+                    seeded_states.push_back(gst);
                 }
 
                 Q4eGdnWriteback wb{};
@@ -2056,8 +2080,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         const double t_gal = q4e_phase_log() ? q4e_now_ms() : 0.0;
 
         binder.flush();
-        for (Qwen4ExpFfnCache* g : seeded) g->state_ready = true;
-        if (has_ple) g_q4e_ple_ready = true;
+        for (Q4eSeqStateEntry* e : seeded_states) e->ready = true;
         if (ple_emb_in != nullptr)
             ggml_backend_tensor_set(ple_emb_in, ple_emb, 0,
                     (std::size_t)n_embd * T * sizeof(float));
@@ -2239,8 +2262,46 @@ TSG_EXPORT void TSGgml_Qwen4ExpResetFfnCache()
     if (g_q4e_res_ctx) { ggml_free(g_q4e_res_ctx); g_q4e_res_ctx = nullptr; }
     if (g_q4e_res_buf) { ggml_backend_buffer_free(g_q4e_res_buf); g_q4e_res_buf = nullptr; }
     g_q4e_res = nullptr; g_q4e_res_capacity = 0;
-    if (g_q4e_ple_buf) { ggml_backend_buffer_free(g_q4e_ple_buf); g_q4e_ple_buf = nullptr; }
-    g_q4e_ple_bytes = 0; g_q4e_ple_ready = false;
+}
+
+/// Mark one sequence-state entry (keyed by its host seed pointer) as needing a
+/// re-seed on the next graph build. The buffer and its baked addresses stay
+/// valid; only the one-time upload re-arms. Used by the managed reset, whose
+/// host copies are freshly zeroed.
+TSG_EXPORT void TSGgml_Qwen4ExpInvalidateSeqState(const void* key)
+{
+    auto it = g_q4e_seq_state.find(key);
+    if (it != g_q4e_seq_state.end()) it->second.ready = false;
+}
+
+/// Free EVERY sequence-state entry and drop every cached graph. Called on
+/// model dispose so a later model load in the same process can never collide
+/// with stale entries keyed on recycled host addresses.
+TSG_EXPORT void TSGgml_Qwen4ExpReleaseAllSeqState()
+{
+    for (auto& kv : g_q4e_seq_state)
+        if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf);
+    g_q4e_seq_state.clear();
+    TSGgml_Qwen4ExpResetFfnCache();
+}
+
+/// Free the sequence-state entries for a released sequence holder and drop
+/// every cached graph (graphs bake state-buffer addresses; surviving holders
+/// rebuild on their next token and re-bind their still-alive entries without
+/// re-seeding).
+TSG_EXPORT void TSGgml_Qwen4ExpReleaseSeqState(const void* const* keys, int n)
+{
+    bool freed = false;
+    for (int i = 0; i < n; ++i)
+    {
+        auto it = g_q4e_seq_state.find(keys[i]);
+        if (it == g_q4e_seq_state.end()) continue;
+        if (it->second.buf) ggml_backend_buffer_free(it->second.buf);
+        g_q4e_seq_state.erase(it);
+        freed = true;
+    }
+    if (freed)
+        TSGgml_Qwen4ExpResetFfnCache();
 }
 
 } // extern "C"

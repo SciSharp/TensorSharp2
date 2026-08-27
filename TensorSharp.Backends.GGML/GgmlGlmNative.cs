@@ -71,6 +71,12 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern void TSGgml_GlmFree(IntPtr handle);
 
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_GlmQueueVisionRows(IntPtr handle, float* rows, int nRows, int index);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern void TSGgml_GlmClearVisionRows(IntPtr handle);
+
         // ---- NextN/MTP speculative decoding -------------------------------
 
         [DllImport(DllName, CallingConvention = Conv)]
@@ -130,6 +136,21 @@ namespace TensorSharp.GGML
         }
 
         public static void Reset(IntPtr handle) => TSGgml_GlmReset(handle);
+
+        /// <summary>Queue projected vision-embedding rows (glm5next) to override the
+        /// token embeddings of image-placeholder positions in the NEXT Forward call.
+        /// <paramref name="index"/> is the first placeholder's position within that
+        /// call's token array. The queue is consumed by the forward.</summary>
+        public static unsafe bool QueueVisionRows(IntPtr handle, float[] rows, int nRows, int index)
+        {
+            fixed (float* r = rows)
+            {
+                return TSGgml_GlmQueueVisionRows(handle, r, nRows, index) != 0;
+            }
+        }
+
+        /// <summary>Drop queued vision rows (a cancelled or re-planned prompt).</summary>
+        public static void ClearVisionRows(IntPtr handle) => TSGgml_GlmClearVisionRows(handle);
 
         /// <summary>Drop the KV of the tokens after <paramref name="nPast"/>.</summary>
         public static bool Rewind(IntPtr handle, int nPast) => TSGgml_GlmRewind(handle, nPast) != 0;

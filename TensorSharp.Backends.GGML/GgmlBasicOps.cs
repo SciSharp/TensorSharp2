@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -1272,6 +1272,67 @@ namespace TensorSharp.GGML
         /// each). Weight arrays are indexed by block; all blocks share identical shapes.
         /// Returns false on any failure so the caller falls back to the per-block path.
         /// </summary>
+        /// <summary>
+        /// Whole GLM-5.3-Flash vision encoder (24 GLM-OCR ViT blocks) as one
+        /// device-resident GGML graph: RMS norms, fused qkv + per-head q/k RMS
+        /// norms, 2D vision RoPE, SDPA, and the SwiGLU-clamp MLP per block.
+        /// Weights are cached device-resident across encodes.
+        /// </summary>
+        public static unsafe bool GlmVisionEncoder(
+            Tensor hidden, float eps, float attnScale, float swigluLimit,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            float[] cosTable, float[] sinTable,
+            Tensor[] ln1W, Tensor[] qkvW, Tensor[] qkvB,
+            Tensor[] qnW, Tensor[] knW,
+            Tensor[] outW, Tensor[] outB, Tensor[] ln2W,
+            Tensor[] gateW, Tensor[] gateB,
+            Tensor[] upW, Tensor[] upB, Tensor[] downW, Tensor[] downB)
+        {
+            if (!HasNativeBufferStorage(hidden))
+                return false;
+            if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView))
+                return false;
+
+            int blockCount = ln1W.Length;
+            if (blockCount == 0)
+                return false;
+
+            int lnDim = (int)ln1W[0].ElementCount();
+            int qkvNe0 = (int)qkvW[0].Sizes[qkvW[0].DimensionCount - 1];
+            int qkvNe1 = (int)qkvW[0].Sizes[0];
+            long qkvBytes = qkvW[0].ElementCount() * sizeof(float);
+            int outNe0 = (int)outW[0].Sizes[outW[0].DimensionCount - 1];
+            int outNe1 = (int)outW[0].Sizes[0];
+            long outBytes = outW[0].ElementCount() * sizeof(float);
+            int ffnNe0 = (int)upW[0].Sizes[upW[0].DimensionCount - 1];
+            int ffnNe1 = (int)upW[0].Sizes[0];
+            long ffnUpBytes = upW[0].ElementCount() * sizeof(float);
+            long ffnDownBytes = downW[0].ElementCount() * sizeof(float);
+
+            IntPtr[] Ptrs(Tensor[] ws)
+            {
+                var a = new IntPtr[blockCount];
+                for (int i = 0; i < blockCount; i++)
+                    a[i] = GetBufferStart(ws[i]);
+                return a;
+            }
+
+            fixed (float* cosPtr = cosTable, sinPtr = sinTable)
+            {
+                return GgmlNative.GlmVisionEncoder(hiddenView,
+                    blockCount, eps, attnScale, swigluLimit,
+                    numPatches, numHeads, headDim, halfDim,
+                    (IntPtr)cosPtr, (IntPtr)sinPtr,
+                    Ptrs(ln1W), Ptrs(qkvW), Ptrs(qkvB), Ptrs(qnW), Ptrs(knW),
+                    Ptrs(outW), Ptrs(outB), Ptrs(ln2W),
+                    Ptrs(gateW), Ptrs(gateB), Ptrs(upW), Ptrs(upB), Ptrs(downW), Ptrs(downB),
+                    lnDim,
+                    qkvNe0, qkvNe1, qkvBytes,
+                    outNe0, outNe1, outBytes,
+                    ffnNe0, ffnNe1, ffnUpBytes, ffnDownBytes);
+            }
+        }
+
         public static unsafe bool Qwen35VisionEncoder(
             Tensor hidden, float eps, float attnScale,
             int numPatches, int numHeads, int headDim, int halfDim,
@@ -2991,6 +3052,12 @@ namespace TensorSharp.GGML
         }
 
         public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();
+
+        public static void Qwen4ExpInvalidateSeqState(IntPtr key) => GgmlNative.Qwen4ExpInvalidateSeqState(key);
+
+        public static void Qwen4ExpReleaseAllSeqState() => GgmlNative.Qwen4ExpReleaseAllSeqState();
+
+        public static void Qwen4ExpReleaseSeqState(IntPtr[] keys) => GgmlNative.Qwen4ExpReleaseSeqState(keys);
 
         public static void GatedDeltaNetChunked(
             Tensor q, Tensor k, Tensor v, Tensor z,

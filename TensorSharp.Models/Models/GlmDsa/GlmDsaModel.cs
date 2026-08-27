@@ -186,6 +186,11 @@ namespace TensorSharp.Models
                 return;
             }
 
+            if (arch == "glm5next")
+                throw new NotSupportedException(
+                    "glm5next (GLM-5.3-Flash) runs through the native GGML executor only; " +
+                    "use a GGML backend (there is no managed per-op fallback for the KDA/mHC layers yet).");
+
             LoadWeights();
             BuildLayerNames();
             CacheMoeWeightHandles();
@@ -208,6 +213,14 @@ namespace TensorSharp.Models
             InitCaches(initialCacheLength, maxContextLength);
             AllocateScratch();
         }
+
+        /// <summary>
+        /// glm5next's KDA recurrence cannot be rewound to an earlier position, so a
+        /// cached prefix is only reusable when the new prompt EXTENDS it exactly
+        /// (same contract as the Qwen 3.x GDN models). glm-dsa proper has no
+        /// recurrent state and keeps the base behaviour.
+        /// </summary>
+        public override bool SupportsKVCacheTruncation => Config.Architecture != "glm5next";
 
         private int CountIndexerFull()
         {
@@ -303,6 +316,22 @@ namespace TensorSharp.Models
         private bool[] ResolveIndexerTypes(string arch)
         {
             var full = new bool[_numTrunkLayers];
+
+            if (arch == "glm5next")
+            {
+                // GLM-5.3-Flash: attention.head_count_kv is a per-layer array,
+                // 0 on KDA (linear-attention) layers and 1 on MLA+DSA layers.
+                // Every MLA layer carries a full pooled indexer; KDA layers have
+                // none and never share a selection.
+                var kvh = _gguf.GetInt32Array($"{arch}.attention.head_count_kv")
+                          ?? ToInt32(_gguf.GetUint32Array($"{arch}.attention.head_count_kv"));
+                if (kvh != null)
+                {
+                    for (int i = 0; i < full.Length && i < kvh.Length; i++)
+                        full[i] = kvh[i] != 0;
+                    return full;
+                }
+            }
 
             int trainCtx = (int)_gguf.GetUint32($"{arch}.context_length", 0);
             bool pre52 = trainCtx > 0 && trainCtx < 1048576;

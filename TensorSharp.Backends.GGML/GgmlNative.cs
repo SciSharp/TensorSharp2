@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -1840,6 +1840,26 @@ internal enum GgmlIndexReductionOp
             int outNe0, int outNe1, long outBytes, int outBDim,
             int upNe0, int upNe1, long upBytes, int upBDim,
             int downNe0, int downNe1, long downBytes, int downBDim);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_GlmVisionEncoderF32(
+            GgmlTensorView2D hidden,
+            int blockCount, float eps, float attnScale, float swigluLimit,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W,
+            IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] qnW, IntPtr[] knW,
+            IntPtr[] outW, IntPtr[] outB,
+            IntPtr[] ln2W,
+            IntPtr[] gateW, IntPtr[] gateB,
+            IntPtr[] upW, IntPtr[] upB,
+            IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes,
+            int outNe0, int outNe1, long outBytes,
+            int ffnNe0, int ffnNe1, long ffnUpBytes, long ffnDownBytes);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -3916,6 +3936,36 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial void TSGgml_Qwen4ExpResetFfnCache();
 
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_Qwen4ExpInvalidateSeqState(IntPtr key);
+
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_Qwen4ExpReleaseAllSeqState();
+
+        [LibraryImport(DllName)]
+        internal static unsafe partial void TSGgml_Qwen4ExpReleaseSeqState(IntPtr* keys, int n);
+
+        /// <summary>Re-arm the one-time seed upload for one recurrent-state entry
+        /// (keyed by its host seed pointer); the next graph build re-uploads from
+        /// the host copy. Used after the managed reset zeroes that copy.</summary>
+        public static void Qwen4ExpInvalidateSeqState(IntPtr key) => TSGgml_Qwen4ExpInvalidateSeqState(key);
+
+        /// <summary>Free every native sequence-state entry and cached graph
+        /// (model dispose).</summary>
+        public static void Qwen4ExpReleaseAllSeqState() => TSGgml_Qwen4ExpReleaseAllSeqState();
+
+        /// <summary>Free the device recurrent-state entries of a released sequence
+        /// holder and drop every cached graph (surviving holders rebuild and
+        /// re-bind their own still-alive entries).</summary>
+        public static unsafe void Qwen4ExpReleaseSeqState(IntPtr[] keys)
+        {
+            if (keys == null || keys.Length == 0) return;
+            fixed (IntPtr* k = keys)
+            {
+                TSGgml_Qwen4ExpReleaseSeqState(k, keys.Length);
+            }
+        }
+
         /// <summary>
         /// One graph for the hyper-connection mixer, the 512-expert MoE and the
         /// scatter back into the wide residual. Returns false when the backend
@@ -4783,6 +4833,37 @@ internal enum GgmlIndexReductionOp
                 outNe0, outNe1, outBytes, outBDim,
                 upNe0, upNe1, upBytes, upBDim,
                 downNe0, downNe1, downBytes, downBDim);
+            return rc != 0;
+        }
+
+        public static bool GlmVisionEncoder(
+            GgmlTensorView2D hidden,
+            int blockCount, float eps, float attnScale, float swigluLimit,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W,
+            IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] qnW, IntPtr[] knW,
+            IntPtr[] outW, IntPtr[] outB,
+            IntPtr[] ln2W,
+            IntPtr[] gateW, IntPtr[] gateB,
+            IntPtr[] upW, IntPtr[] upB,
+            IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes,
+            int outNe0, int outNe1, long outBytes,
+            int ffnNe0, int ffnNe1, long ffnUpBytes, long ffnDownBytes)
+        {
+            int rc = TSGgml_GlmVisionEncoderF32(hidden,
+                blockCount, eps, attnScale, swigluLimit,
+                numPatches, numHeads, headDim, halfDim,
+                cosTable, sinTable,
+                ln1W, qkvW, qkvB, qnW, knW, outW, outB, ln2W,
+                gateW, gateB, upW, upB, downW, downB,
+                lnDim,
+                qkvNe0, qkvNe1, qkvBytes,
+                outNe0, outNe1, outBytes,
+                ffnNe0, ffnNe1, ffnUpBytes, ffnDownBytes);
             return rc != 0;
         }
 

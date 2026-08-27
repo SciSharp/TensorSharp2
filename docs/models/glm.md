@@ -1,4 +1,4 @@
-# GLM-5.x (`glm-dsa`)
+# GLM-5.x (`glm-dsa`, `glm5next`)
 
 [← back to model index](README.md)
 
@@ -6,7 +6,8 @@ GLM-5.2 is a 744B-parameter MoE (256 routed experts, top-8, plus one shared
 expert) built on **DeepSeek Sparse Attention**: Multi-head Latent Attention with
 weight absorption, and a "lightning indexer" that decides which cached tokens
 each query may attend to. Advertised context: 1M tokens. The GGUF architecture
-id is `glm-dsa`.
+id is `glm-dsa`. **GLM-5.3-Flash** (`glm5next`) runs through the same executor -
+see [its section below](#glm-53-flash-glm5next).
 
 ## The block
 
@@ -457,3 +458,87 @@ dropped from the prompt, matching the template's `clear_thinking` default. Tool 
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`,
 one XML element per argument (values that were rendered with `tojson` are parsed
 back into numbers / arrays / objects).
+
+## GLM-5.3-Flash (`glm5next`)
+
+GLM-5.3-Flash is the hybrid successor: 320B parameters, 288 routed experts
+(top-8, one shared, ×2.5 routed scale), 46 blocks = 45 trunk + 1 NextN. The
+GGUF architecture id is `glm5next`, and it loads through the **same native
+executor** (`ggml_ops_glm_dsa.cpp`) and the same `GlmDsaModel` — the MLA
+attention, the MoE and the graph plumbing are shared with GLM-5.2, with four
+architectural changes layered on top:
+
+| Piece | Shape (GLM-5.3-Flash) | Notes |
+|---|---|---|
+| KDA linear attention | 34 of 45 trunk layers; 64 heads × 128 | `attention.head_count_kv` is a per-layer array: 0 = KDA, 1 = MLA. Short conv (kernel 4, persistent per-sequence tail), l2-normed q/k, per-CHANNEL decay gate bounded below multiplicatively (`kda.gate_lower_bound` −5), fused gated-delta-net recurrence with in-graph state commit |
+| MLA + DSA layers | 11 of 45 (layers 3, 7, …, 43), **NoPE** | `rope.dimension_count` 0: no rope anywhere in the text tower, the 512-wide latent IS the cache row, softmax scale 1/√256 |
+| Pooled indexer | every MLA layer, 4-cell pools, top-k 2048 | key + compressor gate cached as `[key\|gate]` per cell; a softmax over the gates (plus a per-slot position embedding) compresses each pool; **top-k over POOLS then expand to members**, with the query's own trailing pool always attended. Dense below `top_k + kpool − 1` = 2051 cached tokens |
+| Sinkhorn hyper-connections | every layer, ×4 streams | the DeepSeek-V4 mHC recipe (fused `ggml_dsv4_hc_pre/comb/post`, 20 Sinkhorn iterations), embedding replicated ×4, head = UNWEIGHTED stream mean |
+| SwiGLU clamp | all FFNs, limit 10 | `up ∈ [−L, L]`, `gate ∈ (−∞, L]`, before the activation — dense layers, shared expert and routed experts alike |
+| Vision | `mmproj-BF16.gguf` (GLM-OCR ViT) | see below |
+
+The KDA recurrent state (conv tail + delta-net state, ~150 MB per sequence)
+cannot be rewound, so a cached prefix is only reused when the new prompt
+extends it exactly — the same contract as the Qwen 3.x GDN family — and
+`Reset` wipes the state along with the position counter.
+
+### What runs today
+
+- **Layer split across every visible GPU** (the default): ~99 GiB of
+  UD-Q2_K_XL loads across 2×96 GB in ~17 s warm.
+- **`--cpu-moe` / `--n-cpu-moe N`** host-resident experts: works (measured
+  ~35–40 t/s decode with the first 10 layers' experts on the host).
+- **Serving**: per-sequence native slots, concurrent requests decode
+  round-robin (the fused one-graph-per-step batched decode declines glm5next
+  for now and the engine falls back automatically).
+- **Vision**: `--image` / multi-image / multi-turn image sessions through the
+  managed `GlmNextVisionEncoder` (the GLM-OCR ViT: RMS norms, fused QKV,
+  per-head q/k RMS norms, 2D vision RoPE, SwiGLU-clamp MLP, 2×2 conv merger).
+  All 24 blocks run as one device-resident GGML graph
+  (`TSGgml_GlmVisionEncoderF32`); the projected embeddings override the
+  `<|image|>` placeholder rows inside the native executor
+  (`TSGgml_GlmQueueVisionRows`) — the text tower is NoPE, so image tokens
+  need no MRoPE bookkeeping.
+- **Not yet**: `--tp` tensor parallelism (cleanly refused; use the layer
+  split) and NextN/MTP speculation (llama.cpp asserts its glm5next MTP graph
+  unimplemented too; `--mtp-spec` prints a notice and serves standard decode).
+
+### Measured
+
+2× RTX PRO 6000 Blackwell (96 GB), GLM-5.3-Flash-UD-Q2_K_XL (101 GiB), layer
+split, flash attention on, both engines at `n_ubatch` 2048, back to back in one
+session (llama.cpp build 2e0e57f / PR #27754 via `llama-bench`; TensorSharp via the parity harness `--bench`):
+
+| test | llama.cpp | TensorSharp |
+|---|---:|---:|
+| pp2048 | **2070 t/s** | 2014 t/s |
+| pp16384 | 1690 t/s | **1692 t/s** |
+| pp32768 | **1483 t/s** | 1446 t/s |
+| tg64 | 36.6 t/s | **73.5 t/s** |
+
+Decode runs at **2.0× llama.cpp**; prefill is within a few percent either way
+(the same MoE tile-padding economics as GLM-5.2 apply, so `TS_GLM_UBATCH=2048`
+is the setting to keep for long prompts). Greedy replay of llama.cpp goldens
+reproduces the 2741-token long-context record — the pooled sparse-selection
+path — token for token; short records flip on Q2-quant near-ties (llama.cpp's
+own top-2 margin at a flip point is ~0.13 logits with the same candidate set).
+
+### Chat format
+
+GLM-5.3's template always reasons: the `<|system|>Reasoning Effort: Max` line
+is unconditional, the generation prompt always opens `<think>`, and past
+turns keep their reasoning (`clear_thinking` defaults to false). Tool calls
+use the same XML element form as GLM-5.2. Images render as
+`<|begin_of_image|><|image|><|end_of_image|>`, and the host expands
+`<|image|>` to the merged-patch token count.
+
+### Continuous batching (glm5next)
+
+glm5next serves concurrent requests through the same native per-sequence slots
+as GLM-5.2, **plus a fused batched decode**: one graph decodes one token for
+each of 2-16 sequences per step, with per-token KDA recurrence against each
+slot's own persistent state, per-token pooled-indexer scoring and per-token
+attention, while the projections, hyper-connections, router, experts and the
+LM head run once over the batch. Verified by a serial-vs-batched equality
+harness (`benchmarks/ParityHarness --batched`): 3 concurrent sequences, every
+step fused, token-for-token equal to serial decode.

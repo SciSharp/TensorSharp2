@@ -734,7 +734,8 @@ namespace TensorSharp.Cli
                     model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
-            else if (imagePath != null && model.Config.Architecture == "qwen4exp")
+            else if (imagePath != null &&
+                     (model.Config.Architecture == "qwen4exp" || model.Config.Architecture == "glm5next"))
             {
                 // Any mmproj companion beside the model (the published file is
                 // mmproj-BF16.gguf).
@@ -2428,6 +2429,28 @@ namespace TensorSharp.Cli
                         model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
                         _log.LogInformation(LogEventIds.HostConfiguration,
                             "qwen4exp vision: prompt expanded to {Tokens} tokens for {Images} image(s)",
+                            inputTokens.Count, imagePaths.Count);
+                    }
+                    else
+                    {
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                    }
+                }
+                else if (model is GlmDsaModel glmVision)
+                {
+                    // The injector owns the glm5next pipeline: <|image|> expansion
+                    // and the embedding-override spans the native executor applies.
+                    if (glmVision.VisionEncoder != null)
+                    {
+                        var mmHistory = new List<ChatMessage>
+                        {
+                            new ChatMessage { Role = "user", Content = rawText ?? "", ImagePaths = imagePaths }
+                        };
+                        inputTokens = model.MultimodalInjector.ProcessPromptTokens(mmHistory, inputTokens);
+                        model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "glm5next vision: prompt expanded to {Tokens} tokens for {Images} image(s)",
                             inputTokens.Count, imagePaths.Count);
                     }
                     else

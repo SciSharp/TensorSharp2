@@ -63,6 +63,11 @@ namespace TensorSharp.Runtime
         public Dictionary<string, GgufTensorInfo> Tensors { get; } = new();
         public long DataOffset { get; private set; }
 
+        /// <summary>Unaligned end of the KV + tensor table; a shard with no
+        /// tensor data of its own may legitimately end here, before the
+        /// alignment padding that <see cref="DataOffset"/> assumes.</summary>
+        private long _tableEnd;
+
         private FileStream _stream;
         private string _path;
         private MemoryMappedFile? _mappedFile;
@@ -388,6 +393,7 @@ namespace TensorSharp.Runtime
             int alignment = 32;
             if (Metadata.TryGetValue("general.alignment", out var a))
                 alignment = Convert.ToInt32(a);
+            _tableEnd = pos;
             DataOffset = pos + (alignment - pos % alignment) % alignment;
         }
 
@@ -400,7 +406,12 @@ namespace TensorSharp.Runtime
         /// </summary>
         public long GetRequiredLength(out string? lastTensorName)
         {
-            long required = DataOffset;
+            // Split GGUFs often front-load a metadata-only first shard: every
+            // tensor in its table lives in a sibling file, so the file ends
+            // right after the table and the alignment padding DataOffset
+            // assumes never exists. Only demand bytes past the table when a
+            // tensor actually claims them.
+            long required = _tableEnd;
             lastTensorName = null;
             foreach (var t in Tensors.Values)
             {

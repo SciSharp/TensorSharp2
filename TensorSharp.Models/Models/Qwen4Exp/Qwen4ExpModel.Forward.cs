@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -38,6 +38,7 @@ namespace TensorSharp.Models
         // Rows currently allocated in the attention caches; grows on demand up to
         // _maxContextLength.
         private int _kvCacheCapacity;
+        private int _initialKvCacheCapacity;
 
         // Per-phase tick counters. Cheap (one timestamp per phase per layer) and the
         // only way to tell a slow recurrence from a slow MoE without a profiler.
@@ -69,6 +70,7 @@ namespace TensorSharp.Models
         {
             _maxContextLength = maxSeqLen;
             _kvCacheCapacity = initialSeqLen;
+            _initialKvCacheCapacity = initialSeqLen;
             ApplyModelAlignedKvCacheDefault(_quantWeights);
             DType kvDtype = _kvCacheDtype.ToDType();
 
@@ -121,6 +123,10 @@ namespace TensorSharp.Models
             }
 
             int newCapacity = Math.Min(_maxContextLength, Math.Max(requiredSeqLen, _kvCacheCapacity * 2));
+            // The fused path writes the KV cache on the DEVICE; the host mirror
+            // is stale until synced. Growing from the stale mirror would carry
+            // garbage forward for every past position.
+            EnsureKvCacheHostSynchronized();
             DType kvDtype = _kvCacheDtype.ToDType();
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -148,8 +154,38 @@ namespace TensorSharp.Models
                 using var dst = grown.Narrow(1, 0, _cacheSeqLen);
                 Ops.Copy(dst, src);
             }
+            // Evict the old tensor's device-resident copy before its host
+            // pointer is freed: a recycled pinned address must never re-find
+            // the smaller stale device slab.
+            InvalidateTensorDeviceCache(cache);
             cache.Dispose();
             cache = grown;
+        }
+
+        /// <summary>Download the device-resident KV copies back into the host
+        /// mirrors. The fused kernels write KV on the device only; anything that
+        /// reads or copies the host arrays afterwards must sync first.</summary>
+        private void EnsureKvCacheHostSynchronized()
+        {
+            if (!_kvCacheHostStale || !IsGgmlBackend || _kCache == null)
+                return;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_kCache[l] != null) SyncTensorHostCache(_kCache[l]);
+                if (_vCache[l] != null) SyncTensorHostCache(_vCache[l]);
+                if (_idxKCache[l] != null) SyncTensorHostCache(_idxKCache[l]);
+            }
+            _kvCacheHostStale = false;
+        }
+
+        private unsafe void InvalidateActiveSeqState()
+        {
+            if (_gdnConvStateT != null)
+                foreach (var t in _gdnConvStateT)
+                    if (t != null) GgmlBasicOps.Qwen4ExpInvalidateSeqState((IntPtr)GetFloatPtr(t));
+            if (_pleConvState != null && _pleConvState.Length > 0)
+                GgmlBasicOps.Qwen4ExpInvalidateSeqState(
+                    System.Runtime.InteropServices.Marshal.UnsafeAddrOfPinnedArrayElement(_pleConvState, 0));
         }
 
         protected override void ResetKVCacheCore()
@@ -185,10 +221,35 @@ namespace TensorSharp.Models
             // warmup's state leaked into the first real generation, which read as
             // fluent-looking noise while every per-layer check passed.
             if (IsGgmlBackend && (_ffnArgs != null || _gdnArgs != null))
+            {
+                // Re-arm the seed upload for THIS conversation's recurrent-state
+                // entries (their host copies were just zeroed above); other
+                // sequences' entries stay device-authoritative. The graph reset
+                // below then forces the rebuild that performs the re-seed.
+                InvalidateActiveSeqState();
                 GgmlBasicOps.Qwen4ExpResetFfnCache();
+            }
         }
 
         protected override float[] ForwardCore(int[] tokens)
+        {
+            try
+            {
+                return ForwardCoreInner(tokens);
+            }
+            catch
+            {
+                // A thrown forward must not leak this request's pending
+                // multimodal state into the NEXT sequence the engine runs (the
+                // per-sequence executor catches per-request errors and moves on).
+                _pendingMRoPEPositions = null;
+                foreach (var (emb, _) in _visionEmbeddingsList) emb?.Dispose();
+                _visionEmbeddingsList.Clear();
+                throw;
+            }
+        }
+
+        private float[] ForwardCoreInner(int[] tokens)
         {
             _forwardSw.Start();
             int seqLen = tokens.Length;
@@ -1155,7 +1216,7 @@ namespace TensorSharp.Models
                                 _kvCacheCapacity, totalLen, startPos,
                                 _ropeDimCount, Config.RopeBase, 1.0f / Config.RopeScale, _attnScale,
                                 _numExperts, _numExpertsUsed, _expertFf, _sharedFf,
-                                Config.Eps, cacheSlot: spanIdx, firstFfnOnly: beginFfnOnly,
+                                Config.Eps, cacheSlot: spanIdx + _seqSlotBase, firstFfnOnly: beginFfnOnly,
                                 head: headPtr, logitsOut: logitsPtr,
                                 ple: plePtr, pleLayer: pleLayerArg, pleEmb: pleEmbPtr,
                                 mropePos: mropePtr, mropeSections: sectPtr,
@@ -1248,15 +1309,21 @@ namespace TensorSharp.Models
             // PINNED for the same reason as the FFN descriptors: the kernel keys its
             // cached graph on the descriptor address.
             var args = GC.AllocateArray<Qwen4ExpGdnArgs>(Config.NumLayers, pinned: true);
-            _gdnConvStateT = new Tensor[Config.NumLayers];
+            // A per-sequence holder swap may have installed pre-seeded state
+            // tensors; their HOST addresses key the native device-state entries,
+            // so they must be reused, never re-allocated.
+            _gdnConvStateT ??= new Tensor[Config.NumLayers];
             EnsureGdnScratch();
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (!_isRecurrent[l]) continue;
                 // The kernel wants the conv history as [d_conv-1, conv_dim] rather
                 // than the host ring the op-by-op path walks.
-                _gdnConvStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
-                Ops.Fill(_gdnConvStateT[l], 0f);
+                if (_gdnConvStateT[l] == null)
+                {
+                    _gdnConvStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
+                    Ops.Fill(_gdnConvStateT[l], 0f);
+                }
                 if (!TryFillGdnArgs(l, ref args[l])) { _fusedGdnUnsupported = true; return false; }
             }
             _gdnArgs = args;
@@ -1576,6 +1643,9 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            DisposeAllFusedHolders();
+            if (IsGgmlBackend)
+                GgmlBasicOps.Qwen4ExpReleaseAllSeqState();
             if (_kCache != null)
                 foreach (var t in _kCache) t?.Dispose();
             if (_vCache != null)

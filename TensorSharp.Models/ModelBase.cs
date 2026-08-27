@@ -6344,6 +6344,9 @@ namespace TensorSharp.Models
                 "qwen4exp" => new Qwen4ExpModel(ggufPath, backend, tpDegree, tpGroup),
                 // GLM-5.x with DeepSeek Sparse Attention (MLA + lightning indexer + sigmoid MoE).
                 "glm-dsa" or "glm_dsa" => new GlmDsaModel(ggufPath, backend, tpDegree, tpGroup),
+                // GLM-5.3-Flash: hybrid KDA linear attention + nope-only MLA with a
+                // pooled DSA indexer, Sinkhorn hyper-connections, 288-expert MoE.
+                "glm5next" => new GlmDsaModel(ggufPath, backend, tpDegree, tpGroup),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };
         }

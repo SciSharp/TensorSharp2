@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -245,11 +245,14 @@ namespace TensorSharp.Models
         {
             if (_gdnConvOut != null) return;
             // The fused kernel updates the recurrent state in place, so it lives in a
-            // Tensor rather than the float[] the per-token loop used.
-            _gdnStateT = new Tensor[Config.NumLayers];
+            // Tensor rather than the float[] the per-token loop used. A holder
+            // swap may have installed pre-seeded tensors whose addresses key the
+            // native state entries - reuse them.
+            _gdnStateT ??= new Tensor[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (!_isRecurrent[l]) continue;
+                if (_gdnStateT[l] != null) continue;
                 _gdnStateT[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
                 Ops.Fill(_gdnStateT[l], 0f);
             }

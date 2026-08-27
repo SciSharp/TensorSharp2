@@ -1,11 +1,12 @@
-# GLM-5.x（`glm-dsa`）
+# GLM-5.x（`glm-dsa`、`glm5next`）
 
 [← 返回模型索引](README_zh-cn.md) | [English](glm.md)
 
 GLM-5.2 是一个 744B 参数的 MoE 模型（256 个路由专家，top-8，外加 1 个共享专家），
 构建在 **DeepSeek 稀疏注意力**之上：带权重吸收的 Multi-head Latent Attention，
 再加一个 "lightning indexer"，由它决定每个 query 可以看见哪些已缓存的 token。
-官方宣称上下文：1M token。GGUF 架构 id 是 `glm-dsa`。
+官方宣称上下文：1M token。GGUF 架构 id 是 `glm-dsa`。**GLM-5.3-Flash**（`glm5next`）
+复用同一个执行器——见[下文专节](#glm-53-flashglm5next)。
 
 ## 这一层长什么样
 
@@ -377,3 +378,71 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 作答。历史轮次的思考内容始终不会带进提示，与模板 `clear_thinking` 的默认行为一致。工具调用回来的形式是
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`，
 每个参数一个 XML 元素（用 `tojson` 渲染的值会被解析回数字 / 数组 / 对象）。
+
+
+## GLM-5.3-Flash（`glm5next`）
+
+GLM-5.3-Flash 是混合架构的后继者：320B 参数、288 个路由专家（top-8、1 个共享、
+路由权重 ×2.5），46 个 block = 45 层主干 + 1 个 NextN。GGUF 架构 id 是
+`glm5next`，通过**同一个原生执行器**（`ggml_ops_glm_dsa.cpp`）和同一个
+`GlmDsaModel` 加载——MLA 注意力、MoE 与图机制全部与 GLM-5.2 共享，在其上叠加
+四处架构差异：
+
+| 部件 | 形状（GLM-5.3-Flash） | 说明 |
+|---|---|---|
+| KDA 线性注意力 | 45 层主干中的 34 层；64 头 × 128 | `attention.head_count_kv` 是逐层数组：0 = KDA，1 = MLA。短卷积（核 4，逐序列持久尾部）、l2 归一的 q/k、乘法下界（−5）的逐通道衰减门、fused gated-delta-net 递归、图内状态提交 |
+| MLA + DSA 层 | 45 层中的 11 层（第 3、7、…、43 层），**NoPE** | `rope.dimension_count` 为 0：整个文本塔没有 rope，512 宽 latent 即缓存行，softmax 缩放 1/√256 |
+| 池化 indexer | 每个 MLA 层，4 格一池，top-k 2048 | 每格缓存 key + 压缩门（`[key|gate]`）；对门做 softmax（加逐槽位位置嵌入）压缩每池；**对"池"取 top-k 再展开成员**，query 自己的尾池始终可见。缓存低于 `top_k + kpool − 1` = 2051 个 token 时等价于稠密 |
+| Sinkhorn 超连接 | 每一层，×4 流 | DeepSeek-V4 的 mHC 配方（fused `ggml_dsv4_hc_pre/comb/post`，20 次 Sinkhorn 迭代），嵌入复制 ×4，头部是**无权重的流均值** |
+| SwiGLU 截断 | 所有 FFN，上限 10 | 激活前 `up ∈ [−L, L]`、`gate ∈ (−∞, L]`——稠密层、共享专家、路由专家一视同仁 |
+| 视觉 | `mmproj-BF16.gguf`（GLM-OCR ViT） | 见下文 |
+
+KDA 递归状态（卷积尾部 + delta-net 状态，每序列约 150 MB）无法回退，所以只有当
+新 prompt **恰好扩展**缓存前缀时才复用——与 Qwen 3.x GDN 家族相同的契约；`Reset`
+会连同位置计数一起清空该状态。
+
+### 目前能跑什么
+
+- **跨所有可见 GPU 的层切分**（默认）：UD-Q2_K_XL 约 99 GiB，2×96 GB 上热缓存
+  约 17 秒装载。
+- **`--cpu-moe` / `--n-cpu-moe N`** 专家驻留主机内存：可用（前 10 层专家在主机时
+  实测解码约 35–40 t/s）。
+- **服务化**：原生逐序列 slot；并发请求轮询式解码（fused 批量解码对 glm5next
+  暂时拒绝，引擎自动回退）。
+- **视觉**：`--image` / 多图 / 多轮图像会话，经 `GlmNextVisionEncoder`
+  （GLM-OCR ViT：RMS 归一、fused QKV、逐头 q/k RMS 归一、2D 视觉 RoPE、
+  SwiGLU-截断 MLP、2×2 卷积 merger）。24 个 block 作为一张设备驻留 GGML 图执行
+  （`TSGgml_GlmVisionEncoderF32`）；投影后的嵌入在原生执行器内覆盖
+  `<|image|>` 占位行（`TSGgml_GlmQueueVisionRows`）——文本塔是 NoPE，
+  完全不需要 MRoPE 记账。
+- **暂未支持**：`--tp` 张量并行（干净地拒绝；用层切分）与 NextN/MTP 投机
+  （llama.cpp 同样 assert 其 glm5next MTP 图未实现；`--mtp-spec` 打印提示后按
+  标准解码服务）。
+
+### 实测
+
+2× RTX PRO 6000 Blackwell（96 GB），GLM-5.3-Flash-UD-Q2_K_XL（101 GiB），层切分，
+flash attention 开启，两个引擎都用 `n_ubatch` 2048，同一会话背靠背测
+（llama.cpp build 2e0e57f / PR #27754 用 `llama-bench`；TensorSharp 用 parity
+harness 的 `--bench`）：
+
+| 测试 | llama.cpp | TensorSharp |
+|---|---:|---:|
+| pp2048 | **2070 t/s** | 2014 t/s |
+| pp16384 | 1690 t/s | **1692 t/s** |
+| pp32768 | **1483 t/s** | 1446 t/s |
+| tg64 | 36.6 t/s | **73.5 t/s** |
+
+解码达到 **llama.cpp 的 2.0 倍**；prefill 双方相差几个百分点以内（GLM-5.2 的
+MoE tile padding 经济学同样适用，长 prompt 建议保持 `TS_GLM_UBATCH=2048`）。
+对 llama.cpp golden 的贪心重放中，2741 token 的长上下文记录——正是池化稀疏
+选择路径——**逐 token 一致**；短记录会在 Q2 量化的近平手处翻转（翻转点上
+llama.cpp 自己的 top-2 边距也只有约 0.13 logit，候选集完全相同）。
+
+### 对话格式
+
+GLM-5.3 的模板始终思考：`<|system|>Reasoning Effort: Max` 无条件出现，生成提示
+总是以 `<think>` 开启，历史轮次保留思考内容（`clear_thinking` 默认 false）。
+工具调用与 GLM-5.2 相同的 XML 元素形式。图像渲染为
+`<|begin_of_image|><|image|><|end_of_image|>`，宿主把 `<|image|>` 展开为合并
+patch 的 token 数。

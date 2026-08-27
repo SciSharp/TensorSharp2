@@ -215,6 +215,8 @@ in the TP table below.
 | `TS_GLM_FUSED_LID` | GLM 5.x | `0` builds the DSA lightning indexer out of primitives instead of the fused `ggml_lightning_indexer` op | `1` (fused) | `0`, `1` | no |
 | `TS_GLM_TOPK` | GLM 5.x | `0` attends densely past the indexer top-k — an A/B for the sparse selection itself, not a production setting | `1` (sparse) | `0`, `1` | no |
 | `TS_GLM_OP_OFFLOAD` | GLM 5.x on GGML | Scheduler op-offload; turned off automatically once any layer's experts are host-resident | auto | `0`, `1` | no |
+| `TS_GLM_HC_NATIVE` | GLM 5.3-Flash | `0` decomposes the Sinkhorn hyper-connection pre/post ops into batched mul_mats instead of the fused `ggml_dsv4_hc_*` kernels (A/B; auto-decomposed where the backend has no kernel) | probed | `0`, `1` | no |
+| `TS_GLM_VENC_FUSED` | GLM 5.3-Flash vision | `0` runs the GLM-OCR ViT block-by-block through managed ops instead of the one-graph native encoder (`TSGgml_GlmVisionEncoderF32`) | `1` (fused) | `0`, `1` | no |
 | `TS_GLM_VRAM_RESERVE_MB` | GLM 5.x on GGML | Per-device headroom the layer split leaves for compute buffers before it starts placing layers | `3072` | — | no |
 | `TS_GLM_GRAPH_CACHE` | GLM 5.x on GGML | How many built+allocated graphs are kept, so a repeated shape replays instead of rebuilding | `8` | — | no |
 | `TS_GLM_NODES_PER_LAYER` | GLM 5.x on GGML | Graph node budget per layer per rank | `256` | — | no |

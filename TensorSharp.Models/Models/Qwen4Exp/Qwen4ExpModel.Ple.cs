@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -20,7 +20,8 @@ namespace TensorSharp.Models
         // Tokens preceding the current batch, for the n-gram window. A fresh sequence
         // (or one whose positions are not contiguous with the last batch) reads EOS,
         // which is what the reference's zero-padded start gives.
-        private readonly List<int> _pleHistory = new();
+        // Not readonly: the per-sequence holder swap repoints it (PerSeqCache).
+        private List<int> _pleHistory = new();
         private int _pleNextPos;
 
         private void ResetPleHistory()
