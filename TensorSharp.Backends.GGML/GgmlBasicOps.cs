@@ -2921,6 +2921,22 @@ namespace TensorSharp.GGML
                 nTokens, nExpert, nExpertUsed, nFf, nFfShared, eps, cacheSlot, resResident);
         }
 
+        /// <summary>
+        /// Qwen3.8-Flash-Next fused attention half-layer: mixer, joint query|gate
+        /// projection, Q/K norm, partial rotary, KV append, gated attention and the
+        /// scatter, as ONE graph.
+        /// </summary>
+        public static bool Qwen4ExpAttnBlock(ref Qwen4ExpAttnArgs args, IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            float eps, int cacheSlot, bool resResident = false)
+        {
+            return GgmlNative.Qwen4ExpAttnBlock(ref args, resData, maskData, nEmbd, hc, hcLowRank,
+                nTokens, headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                nRot, ropeBase, ropeFreqScale, attnScale, eps, cacheSlot, resResident);
+        }
+
         /// <summary>Copy the 4-wide residual into the device-resident buffer the fused
         /// kernels chain through, and back out again.</summary>
         public static bool Qwen4ExpResUpload(IntPtr data, long bytes)

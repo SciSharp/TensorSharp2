@@ -70,6 +70,10 @@ namespace
         // cannot be replayed the other: a non-resident graph owns a private res_in, so
         // replaying it in resident mode chains nothing and the layers stop composing.
         int res_resident = -1;
+        // Attention only: the mask is an input and the graph shape follows n_kv.
+        ggml_tensor* mask = nullptr;
+        int n_kv = -1;
+        int position = -1;
 
         // Drop the graph but KEEP the recurrent state: a shape change does this.
         void reset_graph()
@@ -79,6 +83,7 @@ namespace
             graph = nullptr; res_in = nullptr; res_out = nullptr;
             conv_in = conv_out = ssm_in = ssm_out = nullptr;
             valid = false; n_tokens = 0; hc_dim = 0; sig = nullptr; res_resident = -1;
+            mask = nullptr; n_kv = -1; position = -1;
         }
 
         // Drop everything including the state: a KV reset does this.
@@ -93,6 +98,8 @@ namespace
     Qwen4ExpFfnCache g_q4e_ffn[kQwen4ExpMaxSlots];
     Qwen4ExpFfnCache g_q4e_gdn[kQwen4ExpMaxSlots];
     constexpr const char* kQwen4ExpGdnKernel = "qwen4exp fused GDN block";
+    constexpr const char* kQwen4ExpAttnKernel = "qwen4exp fused attention block";
+    Qwen4ExpFfnCache g_q4e_attn[kQwen4ExpMaxSlots];
 
     // The 4-wide residual, held on the DEVICE for the whole forward.
     //
@@ -791,6 +798,268 @@ TSG_EXPORT int TSGgml_Qwen4ExpGdnBlock(
     { set_last_error("qwen4exp GDN block: unknown error."); return 0; }
 }
 
+
+// Per-layer weights for the full-attention half of a layer.
+struct TSGgmlQwen4ExpAttnArgs
+{
+    void* hc_norm;
+    void* hc_down;
+    void* hc_up;
+    void* hc_inject;
+    void* wq;               // [n_embd, head_dim * n_head * 2]  (query|gate interleaved)
+    void* wk;               // [n_embd, head_dim * n_head_kv]
+    void* wv;
+    void* wo;               // [head_dim * n_head, n_embd]
+    void* q_norm;           // f32 [head_dim]
+    void* k_norm;           // f32 [head_dim]
+    void* k_cache;          // f16/f32 [head_dim, capacity, n_head_kv]
+    void* v_cache;
+
+    long long hc_down_bytes, hc_up_bytes, hc_inject_bytes;
+    long long wq_bytes, wk_bytes, wv_bytes, wo_bytes;
+    long long kv_bytes;     // per cache
+
+    int hc_down_type, hc_up_type, hc_inject_type;
+    int wq_type, wk_type, wv_type, wo_type;
+    int kv_type;
+};
+
+// mask_data is [n_kv, T] F16, built host-side: 0 where token t may attend to cell j,
+// -inf otherwise. Passing it in keeps the causal/window policy on the host where it
+// is cheap to express and keeps this graph shape-stable.
+TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
+    const TSGgmlQwen4ExpAttnArgs* a,
+    void* res_data,
+    const void* mask_data,
+    int n_embd, int hc, int hc_low_rank, int n_tokens,
+    int head_dim, int n_head, int n_head_kv, int kv_capacity, int n_kv, int position,
+    int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
+    float eps, int cache_slot, int res_resident)
+{
+    try
+    {
+        if (a == nullptr || res_data == nullptr) { set_last_error("qwen4exp attn block: null args."); return 0; }
+        if (!ensure_backend()) return 0;
+
+        const int hc_dim = hc * n_embd;
+        const int T = n_tokens;
+        const int q_dim = head_dim * n_head;
+        const std::size_t res_bytes = (std::size_t)hc_dim * T * sizeof(float);
+        const std::size_t mask_bytes = (std::size_t)n_kv * T * sizeof(uint16_t);
+
+        Qwen4ExpFfnCache* slot = (cache_slot >= 0 && cache_slot < kQwen4ExpMaxSlots)
+            ? &g_q4e_attn[cache_slot] : nullptr;
+
+        // n_kv grows every token, so the graph shape changes constantly; key on it.
+        if (slot != nullptr && slot->valid && slot->n_tokens == T && slot->hc_dim == hc_dim
+            && slot->sig == (const void*)a && slot->res_resident == res_resident
+            && slot->n_kv == n_kv && slot->position == position)
+        {
+            if (!res_resident) ggml_backend_tensor_set(slot->res_in, res_data, 0, res_bytes);
+            ggml_backend_tensor_set(slot->mask, mask_data, 0, mask_bytes);
+            if (graph_compute_profiled(g_backend, slot->graph, kQwen4ExpAttnKernel) != GGML_STATUS_SUCCESS)
+            { slot->reset_graph(); set_last_error("qwen4exp attn block: replay failed."); return 0; }
+            if (res_resident) ggml_backend_tensor_copy(slot->res_out, slot->res_in);
+            else { ggml_backend_synchronize(g_backend); ggml_backend_tensor_get(slot->res_out, res_data, 0, res_bytes); }
+            return 1;
+        }
+        if (slot != nullptr) slot->reset_graph();
+
+        ggml_init_params ip{};
+        ip.mem_size = ggml_tensor_overhead() * 512 + ggml_graph_overhead();
+        ip.mem_buffer = nullptr;
+        ip.no_alloc = true;
+        ggml_context* ctx = ggml_init(ip);
+        if (ctx == nullptr) { set_last_error("qwen4exp attn block: ggml_init failed."); return 0; }
+
+        ggml_tensor* res_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, T);
+        ggml_set_input(res_in);
+        if (res_resident)
+        {
+            if (!q4e_res_ensure(res_bytes) ||
+                ggml_backend_tensor_alloc(g_q4e_res_buf, res_in,
+                        ggml_backend_buffer_get_base(g_q4e_res_buf)) != GGML_STATUS_SUCCESS)
+            {
+                ggml_free(ctx);
+                set_last_error("qwen4exp attn block: failed to bind the residual buffer.");
+                return 0;
+            }
+        }
+
+        ggml_tensor* w_norm   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+        ggml_tensor* w_down   = ggml_new_tensor_2d(ctx, (ggml_type)a->hc_down_type, hc_dim, hc_low_rank);
+        ggml_tensor* w_up     = ggml_new_tensor_2d(ctx, (ggml_type)a->hc_up_type, hc_low_rank, hc_dim);
+        ggml_tensor* w_inject = ggml_new_tensor_2d(ctx, (ggml_type)a->hc_inject_type, hc_dim, hc);
+        ggml_tensor* wq       = ggml_new_tensor_2d(ctx, (ggml_type)a->wq_type, n_embd, q_dim * 2);
+        ggml_tensor* wk       = ggml_new_tensor_2d(ctx, (ggml_type)a->wk_type, n_embd, head_dim * n_head_kv);
+        ggml_tensor* wv       = ggml_new_tensor_2d(ctx, (ggml_type)a->wv_type, n_embd, head_dim * n_head_kv);
+        ggml_tensor* wo       = ggml_new_tensor_2d(ctx, (ggml_type)a->wo_type, q_dim, n_embd);
+        ggml_tensor* q_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor* k_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor* k_cache  = ggml_new_tensor_3d(ctx, (ggml_type)a->kv_type, head_dim, kv_capacity, n_head_kv);
+        ggml_tensor* v_cache  = ggml_new_tensor_3d(ctx, (ggml_type)a->kv_type, head_dim, kv_capacity, n_head_kv);
+
+        ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);
+        ggml_set_input(mask);
+        ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+        ggml_set_input(pos);
+
+        // ---- hyper-connection mixer ----
+        ggml_tensor* res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
+        ggml_tensor* xn = ggml_mul(ctx,
+                ggml_reshape_2d(ctx, ggml_rms_norm(ctx, res3, eps), hc_dim, T), w_norm);
+        ggml_tensor* lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_down, xn), 1.0f / (float)hc));
+        ggml_tensor* gt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo));
+        ggml_tensor* gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gt), n_embd, hc, T);
+        ggml_tensor* mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
+                ggml_row_size(gated->type, n_embd) * hc, 0));
+        for (int c = 1; c < hc; ++c)
+            mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, n_embd, T,
+                    ggml_row_size(gated->type, n_embd) * hc, ggml_row_size(gated->type, n_embd) * c));
+        mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
+        ggml_tensor* inject = ggml_mul_mat(ctx, w_inject, xn);
+
+        // ---- q | gate, interleaved per head ----
+        ggml_tensor* qg = ggml_mul_mat(ctx, wq, mixed);                 // [q_dim*2, T]
+        const std::size_t esz = ggml_element_size(qg);
+        ggml_tensor* q = ggml_view_3d(ctx, qg, head_dim, n_head, T,
+                esz * head_dim * 2, esz * head_dim * 2 * n_head, 0);
+        ggml_tensor* gate = ggml_cont(ctx, ggml_view_3d(ctx, qg, head_dim, n_head, T,
+                esz * head_dim * 2, esz * head_dim * 2 * n_head, esz * head_dim));
+
+        q = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_cont(ctx, q), eps), q_norm_w);
+        ggml_tensor* k = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wk, mixed), head_dim, n_head_kv, T);
+        k = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), k_norm_w);
+        ggml_tensor* v = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wv, mixed), head_dim, n_head_kv, T);
+
+        // Partial rotary over the first n_rot dims. IMRoPE reduces to NEOX when every
+        // position component is equal, which it is for text.
+        q = ggml_rope_ext(ctx, q, pos, nullptr, n_rot, 2, 0, rope_base, rope_freq_scale,
+                          0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(ctx, k, pos, nullptr, n_rot, 2, 0, rope_base, rope_freq_scale,
+                          0.0f, 1.0f, 0.0f, 0.0f);
+
+        // ---- append to the cache ----
+        ggml_tensor* k_write = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, T, kvH]
+        ggml_tensor* v_write = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+        ggml_tensor* k_dst = ggml_view_3d(ctx, k_cache, head_dim, T, n_head_kv,
+                k_cache->nb[1], k_cache->nb[2], (std::size_t)position * k_cache->nb[1]);
+        ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache, head_dim, T, n_head_kv,
+                v_cache->nb[1], v_cache->nb[2], (std::size_t)position * v_cache->nb[1]);
+
+        ggml_tensor* k_full = ggml_view_3d(ctx, k_cache, head_dim, n_kv, n_head_kv,
+                k_cache->nb[1], k_cache->nb[2], 0);
+        ggml_tensor* v_full = ggml_view_3d(ctx, v_cache, head_dim, n_kv, n_head_kv,
+                v_cache->nb[1], v_cache->nb[2], 0);
+
+        // ---- attention ----
+        ggml_tensor* q_attn = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [hd, T, nH]
+        ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q_attn);                 // [n_kv, T, nH]
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask, attn_scale, 0.0f);
+        ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));
+        ggml_tensor* attn = ggml_mul_mat(ctx, v_perm, probs);                    // [hd, T, nH]
+        attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));              // [hd, nH, T]
+
+        // qwen4exp gates the attention output before the output projection.
+        attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        ggml_tensor* proj = ggml_mul_mat(ctx, wo, ggml_reshape_2d(ctx, attn, q_dim, T));
+
+        // ---- hyper-connection scatter ----
+        ggml_tensor* wsc = ggml_reshape_3d(ctx, ggml_scale(ctx,
+                ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float)hc)), 2.0f), 1, hc, T);
+        ggml_tensor* bexp = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, proj, n_embd, 1, T),
+                n_embd, hc, T, 1);
+        ggml_tensor* res_out = ggml_reshape_2d(ctx,
+                ggml_add(ctx, res3, ggml_mul(ctx, bexp, wsc)), hc_dim, T);
+        ggml_set_output(res_out);
+
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, res_out);
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, k_write, k_dst));
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, v_write, v_dst));
+
+        // ---- bind ----
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
+        std::vector<HostBinding> upload_list;
+        auto bind = [&](ggml_tensor* tgt, void* data, std::size_t bytes,
+                        enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            if (tgt == nullptr || data == nullptr) return;
+            if (bytes >= 4096)
+            {
+                bool needs_upload = false;
+                if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
+                { if (needs_upload) upload_list.push_back({tgt, data, bytes}); return; }
+                ggml_backend_buffer_t buf = nullptr;
+                if (try_get_host_ptr_buffer(g_backend, dev, data, bytes, true, buf))
+                { if (ggml_backend_tensor_alloc(buf, tgt, data) == GGML_STATUS_SUCCESS) return; }
+            }
+            upload_list.push_back({tgt, data, bytes});
+        };
+
+        bind(w_norm, a->hc_norm, (std::size_t)hc_dim * sizeof(float));
+        bind(w_down, a->hc_down, (std::size_t)a->hc_down_bytes);
+        bind(w_up, a->hc_up, (std::size_t)a->hc_up_bytes);
+        bind(w_inject, a->hc_inject, (std::size_t)a->hc_inject_bytes);
+        bind(wq, a->wq, (std::size_t)a->wq_bytes);
+        bind(wk, a->wk, (std::size_t)a->wk_bytes);
+        bind(wv, a->wv, (std::size_t)a->wv_bytes);
+        bind(wo, a->wo, (std::size_t)a->wo_bytes);
+        bind(q_norm_w, a->q_norm, (std::size_t)head_dim * sizeof(float));
+        bind(k_norm_w, a->k_norm, (std::size_t)head_dim * sizeof(float));
+        // The caches are read AND written, so they need a device buffer that outlives
+        // the graph rather than a weights binding.
+        bind(k_cache, a->k_cache, (std::size_t)a->kv_bytes, GGML_BACKEND_BUFFER_USAGE_ANY);
+        bind(v_cache, a->v_cache, (std::size_t)a->kv_bytes, GGML_BACKEND_BUFFER_USAGE_ANY);
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+        if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
+        {
+            if (alloc) ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+            set_last_error("qwen4exp attn block: failed to allocate graph tensors.");
+            return 0;
+        }
+
+        for (const HostBinding& hb : upload_list)
+            ggml_backend_tensor_set(hb.tensor, hb.data, 0, hb.bytes);
+        if (!res_resident) ggml_backend_tensor_set(res_in, res_data, 0, res_bytes);
+        ggml_backend_tensor_set(mask, mask_data, 0, mask_bytes);
+        {
+            std::vector<int32_t> p(T);
+            for (int i = 0; i < T; ++i) p[i] = position + i;
+            ggml_backend_tensor_set(pos, p.data(), 0, (std::size_t)T * sizeof(int32_t));
+        }
+
+        if (graph_compute_profiled(g_backend, graph, kQwen4ExpAttnKernel) != GGML_STATUS_SUCCESS)
+        {
+            ggml_gallocr_free(alloc); ggml_free(ctx);
+            set_last_error("qwen4exp attn block: graph compute failed.");
+            return 0;
+        }
+
+        if (res_resident) ggml_backend_tensor_copy(res_out, res_in);
+        else { ggml_backend_synchronize(g_backend); ggml_backend_tensor_get(res_out, res_data, 0, res_bytes); }
+
+        if (slot != nullptr)
+        {
+            slot->ctx = ctx; slot->graph = graph; slot->alloc = alloc;
+            slot->res_in = res_in; slot->res_out = res_out; slot->mask = mask;
+            slot->n_tokens = T; slot->hc_dim = hc_dim; slot->sig = (const void*)a;
+            slot->res_resident = res_resident; slot->n_kv = n_kv; slot->position = position;
+            slot->valid = true;
+            return 1;
+        }
+        ggml_gallocr_free(alloc); ggml_free(ctx);
+        return 1;
+    }
+    catch (const std::exception& e)
+    { set_last_error(std::string("qwen4exp attn block: ") + e.what()); return 0; }
+    catch (...)
+    { set_last_error("qwen4exp attn block: unknown error."); return 0; }
+}
+
 // Copy the residual to / from the device-resident buffer. The op-by-op attention
 // half still works on the host, so it brackets itself with these.
 TSG_EXPORT int TSGgml_Qwen4ExpResUpload(const void* data, long long bytes)
@@ -824,6 +1093,7 @@ TSG_EXPORT void TSGgml_Qwen4ExpResetFfnCache()
     {
         g_q4e_ffn[i].reset();
         g_q4e_gdn[i].reset();
+        g_q4e_attn[i].reset();
     }
     if (g_q4e_res_ctx) { ggml_free(g_q4e_res_ctx); g_q4e_res_ctx = nullptr; }
     if (g_q4e_res_buf) { ggml_backend_buffer_free(g_q4e_res_buf); g_q4e_res_buf = nullptr; }

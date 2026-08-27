@@ -353,6 +353,27 @@ public struct Gemma4MoELayerDecodeArgs
 }
 
     /// <summary>
+    /// Mirrors TSGgmlQwen4ExpAttnArgs in ggml_ops_qwen4exp.cpp - the full-attention
+    /// half of a qwen4exp layer. Pointers first, then int64, then int32.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Qwen4ExpAttnArgs
+    {
+        public IntPtr HcNorm, HcDown, HcUp, HcInject;
+        public IntPtr Wq, Wk, Wv, Wo;
+        public IntPtr QNorm, KNorm;
+        public IntPtr KCache, VCache;
+
+        public long HcDownBytes, HcUpBytes, HcInjectBytes;
+        public long WqBytes, WkBytes, WvBytes, WoBytes;
+        public long KvBytes;
+
+        public int HcDownType, HcUpType, HcInjectType;
+        public int WqType, WkType, WvType, WoType;
+        public int KvType;
+    }
+
+    /// <summary>
     /// Mirrors TSGgmlQwen4ExpGdnArgs in ggml_ops_qwen4exp.cpp - the recurrent half
     /// of a qwen4exp layer. Pointers first, then int64, then int32.
     /// </summary>
@@ -3893,6 +3914,28 @@ internal enum GgmlIndexReductionOp
         {
             return TSGgml_Qwen4ExpGdnBlock(ref args, resData, nEmbd, hc, hcLowRank, nTokens,
                 headKDim, headVDim, nKHeads, nVHeads, dConv, eps, cacheSlot,
+                resResident ? 1 : 0) != 0;
+        }
+
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpAttnBlock(
+            ref Qwen4ExpAttnArgs args,
+            IntPtr resData,
+            IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            float eps, int cacheSlot, int resResident);
+
+        public static bool Qwen4ExpAttnBlock(ref Qwen4ExpAttnArgs args, IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            float eps, int cacheSlot, bool resResident)
+        {
+            return TSGgml_Qwen4ExpAttnBlock(ref args, resData, maskData, nEmbd, hc, hcLowRank,
+                nTokens, headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                nRot, ropeBase, ropeFreqScale, attnScale, eps, cacheSlot,
                 resResident ? 1 : 0) != 0;
         }
 

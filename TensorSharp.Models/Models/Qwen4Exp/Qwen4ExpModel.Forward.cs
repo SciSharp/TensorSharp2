@@ -248,6 +248,31 @@ namespace TensorSharp.Models
                     continue;
                 }
 
+                // The full-attention half is one graph too when the kernel takes the
+                // shape: mixer, query|gate, norms, rotary, KV append, gated attention
+                // and the scatter.
+                if (!_isRecurrent[il] && TryFusedAttnBlock(res, il, seqLen, startPos))
+                {
+                    Q4eAttnTicks += Stopwatch.GetTimestamp() - t1;
+                    if (TryFusedFfnBlock(res, il, seqLen))
+                    {
+                        Q4eMoeTicks += Stopwatch.GetTimestamp() - t1;
+                        continue;
+                    }
+                    ResidualToHost(res, seqLen);
+                    Tensor injA;
+                    Tensor curA = HcMix(res, seqLen,
+                        $"blk.{il}.hc_ffn_norm.weight", $"blk.{il}.hc_ffn_down.weight",
+                        $"blk.{il}.hc_ffn_up.weight", $"blk.{il}.hc_ffn_inject.weight", out injA);
+                    Tensor ffnA = MoeFfn(curA, il, seqLen);
+                    curA.Dispose();
+                    HcCombine(res, ffnA, injA, seqLen);
+                    ffnA.Dispose();
+                    injA.Dispose();
+                    ResidualToDevice(res, seqLen);
+                    continue;
+                }
+
                 ResidualToHost(res, seqLen);
                 Tensor inject;
                 Tensor cur = HcMix(res, seqLen,
@@ -715,6 +740,122 @@ namespace TensorSharp.Models
             for (long i = 0; i < n; i++) rp[i] = input[i];
             InvalidateTensorDeviceCache(res);
         }
+
+        // TS_Q4E_FUSED_ATTN=0 falls back to the op-by-op attention half.
+        private static readonly bool _fusedAttnEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_FUSED_ATTN"), "0", StringComparison.Ordinal);
+        private bool _fusedAttnUnsupported;
+        private Qwen4ExpAttnArgs[] _attnArgs;
+        private ushort[] _attnMask;
+
+        private unsafe bool TryFusedAttnBlock(Tensor res, int il, int seqLen, int startPos)
+        {
+            if (!_fusedAttnEnabled || _fusedAttnUnsupported || !IsGgmlBackend)
+                return false;
+            // QSA is exact only at or below its budget; past that this would silently
+            // become dense, so leave it to the op-by-op path that warns.
+            int totalLen = startPos + seqLen;
+            if (UsesQsa(il) && totalLen > _indexerTopK + _compressRatios[il] - 1)
+                return false;
+
+            try
+            {
+                if (_attnArgs == null)
+                {
+                    // PINNED: the kernel keys its cached graph on the descriptor address.
+                    _attnArgs = GC.AllocateArray<Qwen4ExpAttnArgs>(Config.NumLayers, pinned: true);
+                    for (int l = 0; l < Config.NumLayers; l++)
+                    {
+                        if (_isRecurrent[l]) continue;
+                        if (!TryFillAttnArgs(l, ref _attnArgs[l])) { _fusedAttnUnsupported = true; return false; }
+                    }
+                }
+
+                // Causal mask, F16, [n_kv, T]: 0 where token t may see cell j.
+                long need = (long)totalLen * seqLen;
+                if (_attnMask == null || _attnMask.Length < need)
+                    _attnMask = new ushort[need];
+                const ushort NegInfF16 = 0xFC00;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    int limit = startPos + t;
+                    ushort* row = null;
+                    fixed (ushort* m = _attnMask) row = m + (long)t * totalLen;
+                    for (int j = 0; j < totalLen; j++) row[j] = j <= limit ? (ushort)0 : NegInfF16;
+                }
+
+                bool ok;
+                fixed (ushort* maskPtr = _attnMask)
+                {
+                    ok = GgmlBasicOps.Qwen4ExpAttnBlock(ref _attnArgs[il],
+                        (IntPtr)GetFloatPtr(res), (IntPtr)maskPtr,
+                        Config.HiddenSize, _hc, _hcLowRank, seqLen,
+                        Config.HeadDim, Config.NumHeads, Config.NumKVHeads,
+                        _kvCacheCapacity, totalLen, startPos,
+                        _ropeDimCount, Config.RopeBase, 1.0f / Config.RopeScale, _attnScale,
+                        Config.Eps, cacheSlot: il, resResident: _resOnDevice);
+                }
+                if (!ok) { _fusedAttnUnsupported = true; return false; }
+                if (!_resOnDevice) InvalidateTensorDeviceCache(res);
+                _kvCacheHostStale = true;
+                return true;
+            }
+            catch (Exception)
+            {
+                _fusedAttnUnsupported = true;
+                return false;
+            }
+        }
+
+        // The fused attention kernel writes the KV cache on the device; the host
+        // mirror is behind until something syncs it.
+        private bool _kvCacheHostStale;
+
+        private unsafe bool TryFillAttnArgs(int il, ref Qwen4ExpAttnArgs a)
+        {
+            if (!TryResolveQuant($"blk.{il}.hc_attn_down.weight", out IntPtr hd, out int hdT, out long hdB)
+                || !TryResolveQuant($"blk.{il}.hc_attn_up.weight", out IntPtr hu, out int huT, out long huB)
+                || !TryResolveQuant($"blk.{il}.hc_attn_inject.weight", out IntPtr hj, out int hjT, out long hjB)
+                || !TryResolveQuant($"blk.{il}.attn_q.weight", out IntPtr wq, out int wqT, out long wqB)
+                || !TryResolveQuant($"blk.{il}.attn_k.weight", out IntPtr wk, out int wkT, out long wkB)
+                || !TryResolveQuant($"blk.{il}.attn_v.weight", out IntPtr wv, out int wvT, out long wvB)
+                || !TryResolveQuant($"blk.{il}.attn_output.weight", out IntPtr wo, out int woT, out long woB))
+            {
+                return false;
+            }
+            if (_kCache[il] == null || _vCache[il] == null)
+                return false;
+
+            a.HcNorm = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.hc_attn_norm.weight"]);
+            a.HcDown = hd; a.HcDownType = hdT; a.HcDownBytes = hdB;
+            a.HcUp = hu; a.HcUpType = huT; a.HcUpBytes = huB;
+            a.HcInject = hj; a.HcInjectType = hjT; a.HcInjectBytes = hjB;
+            a.Wq = wq; a.WqType = wqT; a.WqBytes = wqB;
+            a.Wk = wk; a.WkType = wkT; a.WkBytes = wkB;
+            a.Wv = wv; a.WvType = wvT; a.WvBytes = wvB;
+            a.Wo = wo; a.WoType = woT; a.WoBytes = woB;
+            a.QNorm = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.attn_q_norm.weight"]);
+            a.KNorm = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.attn_k_norm.weight"]);
+            a.KCache = GetStorageBasePtrOf(_kCache[il]);
+            a.VCache = GetStorageBasePtrOf(_vCache[il]);
+            a.KvType = FusedGraphKvTypeId(_kCache[il].ElementType);
+            a.KvBytes = _kCache[il].ElementCount() * KvElementSize(_kCache[il].ElementType);
+            return a.KCache != IntPtr.Zero && a.VCache != IntPtr.Zero && a.KvType >= 0;
+        }
+
+        private static int FusedGraphKvTypeId(DType t) => t switch
+        {
+            DType.Float32 => 0,     // GGML_TYPE_F32
+            DType.Float16 => 1,     // GGML_TYPE_F16
+            _ => -1,
+        };
+
+        private static long KvElementSize(DType t) => t == DType.Float32 ? 4 : 2;
+
+        /// <summary>The KV cache's backing device pointer, which is what the fused
+        /// kernel binds so both paths write the same copy.</summary>
+        private static IntPtr GetStorageBasePtrOf(Tensor t)
+            => TensorComputePrimitives.GetStorageBasePointer(t);
 
         // TS_Q4E_FUSED_GDN=0 falls back to the op-by-op recurrent half.
         // Keeping the residual in the kernels' device buffer across a layer, so the
