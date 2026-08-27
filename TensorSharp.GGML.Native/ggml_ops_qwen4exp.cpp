@@ -8,7 +8,8 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
-#include "ggml-impl.h"   // ggml_cgraph::uid
+#include "ggml-impl.h"
+#include <cstdlib>   // ggml_cgraph::uid
 
 #include <cmath>
 #include <cstring>
@@ -73,8 +74,9 @@ namespace
         int res_resident = -1;
         // Attention only: the mask is an input and the graph shape follows n_kv.
         ggml_tensor* mask = nullptr;
+        ggml_tensor* pos = nullptr;
+        ggml_tensor* kv_idx = nullptr;
         int n_kv = -1;
-        int position = -1;
 
         // Drop the graph but KEEP the recurrent state: a shape change does this.
         void reset_graph()
@@ -84,7 +86,7 @@ namespace
             graph = nullptr; res_in = nullptr; res_out = nullptr;
             conv_in = conv_out = ssm_in = ssm_out = nullptr;
             valid = false; n_tokens = 0; hc_dim = 0; sig = nullptr; res_resident = -1;
-            mask = nullptr; n_kv = -1; position = -1;
+            mask = nullptr; pos = nullptr; kv_idx = nullptr; n_kv = -1;
         }
 
         // Drop everything including the state: a KV reset does this.
@@ -99,6 +101,41 @@ namespace
     Qwen4ExpFfnCache g_q4e_ffn[kQwen4ExpMaxSlots];
     Qwen4ExpFfnCache g_q4e_gdn[kQwen4ExpMaxSlots];
     constexpr const char* kQwen4ExpGdnKernel = "qwen4exp fused GDN block";
+    // ggml-cuda's flash attention takes F16 K/V and one of a fixed set of head sizes;
+    // for head_dim 256 the only other condition is V->ne[0] == K->ne[0], which holds
+    // here. TS_Q4E_FLASH_ATTN=0 falls back to the soft_max path.
+    bool q4e_flash_attn_ok(int kv_type, int head_dim)
+    {
+        static const bool enabled = []{
+            const char* e = std::getenv("TS_Q4E_FLASH_ATTN");
+            return !(e != nullptr && e[0] == '0');
+        }();
+        if (!enabled || kv_type != GGML_TYPE_F16) return false;
+        switch (head_dim)
+        {
+            case 64: case 80: case 96: case 112: case 128: case 256: return true;
+            default: return false;
+        }
+    }
+
+    // ggml-cuda picks its GQA-optimised flash-attention kernel only when
+    // K->ne[1] % FATTN_KQ_STRIDE == 0, so the window is padded to that and the pad
+    // masked off. This is what llama.cpp's get_n_kv rounds to, for the same reason.
+    // The padding is only worth it under flash attention: the soft_max path pays for
+    // every padded column instead of skipping the block.
+    constexpr int kQwen4ExpKvStride = 256;
+
+    // Fill the two index inputs: RoPE positions and the KV rows this step writes.
+    // Values change per token, shapes do not - which is what lets the graph persist.
+    void q4e_set_attn_indices(ggml_tensor* pos, ggml_tensor* kv_idx, int T, int position)
+    {
+        std::vector<int32_t> p((std::size_t)T);
+        std::vector<int64_t> k((std::size_t)T);
+        for (int i = 0; i < T; ++i) { p[i] = position + i; k[i] = position + i; }
+        ggml_backend_tensor_set(pos, p.data(), 0, (std::size_t)T * sizeof(int32_t));
+        ggml_backend_tensor_set(kv_idx, k.data(), 0, (std::size_t)T * sizeof(int64_t));
+    }
+
     constexpr const char* kQwen4ExpAttnKernel = "qwen4exp fused attention block";
     Qwen4ExpFfnCache g_q4e_attn[kQwen4ExpMaxSlots];
 
@@ -862,18 +899,28 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         const int T = n_tokens;
         const int q_dim = head_dim * n_head;
         const std::size_t res_bytes = (std::size_t)hc_dim * T * sizeof(float);
-        const std::size_t mask_bytes = (std::size_t)n_kv * T * sizeof(uint16_t);
+        const bool use_flash = q4e_flash_attn_ok(a->kv_type, head_dim);
+        const int kv_stride = use_flash ? kQwen4ExpKvStride : 1;
+        int n_kv_pad = ((n_kv + kv_stride - 1) / kv_stride) * kv_stride;
+        if (n_kv_pad > kv_capacity) n_kv_pad = kv_capacity;
+        const std::size_t mask_bytes = (std::size_t)n_kv_pad * T * sizeof(uint16_t);
 
         Qwen4ExpFfnCache* slot = (cache_slot >= 0 && cache_slot < kQwen4ExpMaxSlots)
             ? &g_q4e_attn[cache_slot] : nullptr;
 
-        // n_kv grows every token, so the graph shape changes constantly; key on it.
+        // Keyed on the PADDED width, so the topology only moves once every stride
+        // tokens instead of every token. Position and the KV write row reach the graph
+        // as inputs, so their values change without the shape moving. Without this the
+        // 12 attention graphs were torn down and rebuilt - new context, new bindings,
+        // fresh gallocr plan - 12 times a token, and a graph that gets rebuilt is
+        // never a graph ggml-cuda has captured.
         if (slot != nullptr && slot->valid && slot->n_tokens == T && slot->hc_dim == hc_dim
             && slot->sig == (const void*)a && slot->res_resident == res_resident
-            && slot->n_kv == n_kv && slot->position == position)
+            && slot->n_kv == n_kv_pad)
         {
             if (!res_resident) ggml_backend_tensor_set(slot->res_in, res_data, 0, res_bytes);
             ggml_backend_tensor_set(slot->mask, mask_data, 0, mask_bytes);
+            q4e_set_attn_indices(slot->pos, slot->kv_idx, T, position);
             if (graph_compute_profiled(g_backend, slot->graph, kQwen4ExpAttnKernel) != GGML_STATUS_SUCCESS)
             { slot->reset_graph(); set_last_error("qwen4exp attn block: replay failed."); return 0; }
             if (res_resident) ggml_backend_tensor_copy(slot->res_out, slot->res_in);
@@ -916,10 +963,13 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         ggml_tensor* k_cache  = ggml_new_tensor_3d(ctx, (ggml_type)a->kv_type, head_dim, kv_capacity, n_head_kv);
         ggml_tensor* v_cache  = ggml_new_tensor_3d(ctx, (ggml_type)a->kv_type, head_dim, kv_capacity, n_head_kv);
 
-        ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);
+        ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_pad, T);
         ggml_set_input(mask);
         ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
         ggml_set_input(pos);
+        // The rows this step writes, as an INPUT rather than a baked view offset.
+        ggml_tensor* kv_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T);
+        ggml_set_input(kv_idx);
 
         // ---- hyper-connection mixer ----
         ggml_tensor* res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
@@ -959,24 +1009,36 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         // ---- append to the cache ----
         ggml_tensor* k_write = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, T, kvH]
         ggml_tensor* v_write = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
-        ggml_tensor* k_dst = ggml_view_3d(ctx, k_cache, head_dim, T, n_head_kv,
-                k_cache->nb[1], k_cache->nb[2], (std::size_t)position * k_cache->nb[1]);
-        ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache, head_dim, T, n_head_kv,
-                v_cache->nb[1], v_cache->nb[2], (std::size_t)position * v_cache->nb[1]);
-
-        ggml_tensor* k_full = ggml_view_3d(ctx, k_cache, head_dim, n_kv, n_head_kv,
+        ggml_tensor* k_full = ggml_view_3d(ctx, k_cache, head_dim, n_kv_pad, n_head_kv,
                 k_cache->nb[1], k_cache->nb[2], 0);
-        ggml_tensor* v_full = ggml_view_3d(ctx, v_cache, head_dim, n_kv, n_head_kv,
+        ggml_tensor* v_full = ggml_view_3d(ctx, v_cache, head_dim, n_kv_pad, n_head_kv,
                 v_cache->nb[1], v_cache->nb[2], 0);
 
         // ---- attention ----
         ggml_tensor* q_attn = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [hd, T, nH]
-        ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q_attn);                 // [n_kv, T, nH]
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-        ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask, attn_scale, 0.0f);
-        ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));
-        ggml_tensor* attn = ggml_mul_mat(ctx, v_perm, probs);                    // [hd, T, nH]
-        attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));              // [hd, nH, T]
+        ggml_tensor* attn = nullptr;
+        if (q4e_flash_attn_ok(a->kv_type, head_dim))
+        {
+            // One fused kernel in place of mul_mat -> soft_max -> cont(permute(V)) ->
+            // mul_mat -> cont(permute). It never materialises the [n_kv, T, n_head]
+            // scores and never copies the whole V window, which at batch 1 is most of
+            // what this half was doing: that cont alone moved n_kv*head_dim*n_head_kv
+            // elements per layer per token. This is also what llama.cpp runs here.
+            // Result lands as [hd, nH, T] - already the layout the gate and the output
+            // projection want, so the trailing permute goes too.
+            attn = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, mask,
+                                       attn_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        }
+        else
+        {
+            ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q_attn);             // [n_kv, T, nH]
+            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+            ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask, attn_scale, 0.0f);
+            ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));
+            attn = ggml_mul_mat(ctx, v_perm, probs);                             // [hd, T, nH]
+            attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));          // [hd, nH, T]
+        }
 
         // qwen4exp gates the attention output before the output projection.
         attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
@@ -993,9 +1055,13 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
 
         ggml_cgraph* graph = ggml_new_graph(ctx);
         graph->uid = q4e_next_graph_uid();
+        // The KV write goes in FIRST. Nothing in res_out's tree depends on it - k_full
+        // is a plain view of the cache and ggml does not treat view aliasing as an
+        // edge - so node order is the only thing sequencing the write against the
+        // read, and this token has to be able to attend to itself.
+        ggml_build_forward_expand(graph, ggml_set_rows(ctx, k_cache, k_write, kv_idx));
+        ggml_build_forward_expand(graph, ggml_set_rows(ctx, v_cache, v_write, kv_idx));
         ggml_build_forward_expand(graph, res_out);
-        ggml_build_forward_expand(graph, ggml_cpy(ctx, k_write, k_dst));
-        ggml_build_forward_expand(graph, ggml_cpy(ctx, v_write, v_dst));
 
         // ---- bind ----
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -1044,11 +1110,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
             ggml_backend_tensor_set(hb.tensor, hb.data, 0, hb.bytes);
         if (!res_resident) ggml_backend_tensor_set(res_in, res_data, 0, res_bytes);
         ggml_backend_tensor_set(mask, mask_data, 0, mask_bytes);
-        {
-            std::vector<int32_t> p(T);
-            for (int i = 0; i < T; ++i) p[i] = position + i;
-            ggml_backend_tensor_set(pos, p.data(), 0, (std::size_t)T * sizeof(int32_t));
-        }
+        q4e_set_attn_indices(pos, kv_idx, T, position);
 
         if (graph_compute_profiled(g_backend, graph, kQwen4ExpAttnKernel) != GGML_STATUS_SUCCESS)
         {
@@ -1064,8 +1126,9 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         {
             slot->ctx = ctx; slot->graph = graph; slot->alloc = alloc;
             slot->res_in = res_in; slot->res_out = res_out; slot->mask = mask;
+            slot->pos = pos; slot->kv_idx = kv_idx;
             slot->n_tokens = T; slot->hc_dim = hc_dim; slot->sig = (const void*)a;
-            slot->res_resident = res_resident; slot->n_kv = n_kv; slot->position = position;
+            slot->res_resident = res_resident; slot->n_kv = n_kv_pad;
             slot->valid = true;
             return 1;
         }

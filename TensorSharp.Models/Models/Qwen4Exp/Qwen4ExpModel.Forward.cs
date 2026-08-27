@@ -748,6 +748,17 @@ namespace TensorSharp.Models
         private Qwen4ExpAttnArgs[] _attnArgs;
         private ushort[] _attnMask;
 
+        // Must mirror kQwen4ExpKvStride and q4e_flash_attn_ok in ggml_ops_qwen4exp.cpp.
+        private const int KvStride = 256;
+        private static readonly bool FlashAttnEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_FLASH_ATTN"), "0", StringComparison.Ordinal);
+
+        private static bool UseFlashAttn(DType kvType, int headDim)
+        {
+            if (!FlashAttnEnabled || kvType != DType.Float16) return false;
+            return headDim is 64 or 80 or 96 or 112 or 128 or 256;
+        }
+
         private unsafe bool TryFusedAttnBlock(Tensor res, int il, int seqLen, int startPos)
         {
             if (!_fusedAttnEnabled || _fusedAttnUnsupported || !IsGgmlBackend)
@@ -771,8 +782,16 @@ namespace TensorSharp.Models
                     }
                 }
 
-                // Causal mask, F16, [n_kv, T]: 0 where token t may see cell j.
-                long need = (long)totalLen * seqLen;
+                // Causal mask, F16, [n_kv_pad, T]: 0 where token t may see cell j. Must
+                // agree with the kernel on the padded width - same predicate, same
+                // stride - because the kernel reads exactly n_kv_pad*T entries.
+                int padded = totalLen;
+                if (UseFlashAttn(_kCache[il].ElementType, Config.HeadDim))
+                {
+                    padded = ((totalLen + KvStride - 1) / KvStride) * KvStride;
+                    if (padded > _kvCacheCapacity) padded = _kvCacheCapacity;
+                }
+                long need = (long)padded * seqLen;
                 if (_attnMask == null || _attnMask.Length < need)
                     _attnMask = new ushort[need];
                 const ushort NegInfF16 = 0xFC00;
@@ -784,8 +803,8 @@ namespace TensorSharp.Models
                     for (int t = 0; t < seqLen; t++)
                     {
                         int limit = startPos + t;
-                        ushort* row = m + (long)t * totalLen;
-                        for (int j = 0; j < totalLen; j++) row[j] = j <= limit ? (ushort)0 : NegInfF16;
+                        ushort* row = m + (long)t * padded;
+                        for (int j = 0; j < padded; j++) row[j] = j <= limit ? (ushort)0 : NegInfF16;
                     }
                 }
 
