@@ -734,6 +734,24 @@ namespace TensorSharp.Cli
                     model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
+            else if (imagePath != null && model.Config.Architecture == "qwen4exp")
+            {
+                // Any mmproj companion beside the model (the published file is
+                // mmproj-BF16.gguf).
+                string modelDir = Path.GetDirectoryName(modelPath);
+                string autoMmproj = null;
+                if (modelDir != null && Directory.Exists(modelDir))
+                {
+                    foreach (string candidate in Directory.GetFiles(modelDir, "*mmproj*.gguf"))
+                    { autoMmproj = candidate; break; }
+                }
+                if (autoMmproj != null)
+                {
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Auto-loading vision encoder: {MmProj}", autoMmproj);
+                    model.MultimodalInjector.LoadProjectors(autoMmproj);
+                }
+            }
             else if (imagePath != null &&
                      (model.Config.Architecture == "qwen35" ||
                       model.Config.Architecture == "qwen35moe" ||
@@ -2349,6 +2367,29 @@ namespace TensorSharp.Cli
                         }
                         _log.LogInformation(LogEventIds.HostConfiguration,
                             "Total tokens after Mistral3 image expansion: {TotalTokens}", inputTokens.Count);
+                    }
+                    else
+                    {
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                    }
+                }
+                else if (model is Qwen4ExpModel q4eVision)
+                {
+                    // The injector owns the whole qwen4exp pipeline: image-pad
+                    // expansion, embedding cache and the (T,H,W) IMRoPE table the
+                    // token-span kernel rotates image positions with.
+                    if (q4eVision.VisionEncoder != null)
+                    {
+                        var mmHistory = new List<ChatMessage>
+                        {
+                            new ChatMessage { Role = "user", Content = rawText ?? "", ImagePaths = imagePaths }
+                        };
+                        inputTokens = model.MultimodalInjector.ProcessPromptTokens(mmHistory, inputTokens);
+                        model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "qwen4exp vision: prompt expanded to {Tokens} tokens for {Images} image(s)",
+                            inputTokens.Count, imagePaths.Count);
                     }
                     else
                     {

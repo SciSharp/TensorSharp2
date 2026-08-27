@@ -93,6 +93,8 @@ namespace
         // Span only: the first layer contributes only its FFN half (its attention
         // half already ran through the per-layer kernel).
         int first_ffn_only = 0;
+        // Whether the pos tensor carries the 4 IMRoPE sections (image prompts).
+        int use_mrope = 0;
         // Recurrent state, read through *_in and written through *_out; the caller
         // copies out -> in after every compute. The span writes the state in place
         // instead and only uses the buffer.
@@ -135,6 +137,7 @@ namespace
             sig2 = nullptr; sig3 = nullptr; sig4 = nullptr; sig5 = nullptr;
             logits = nullptr; ple_emb_in = nullptr;
             layer_begin = -1; layer_end = -1; kv_capacity = -1; first_ffn_only = 0;
+            use_mrope = 0;
             mask = nullptr; pos = nullptr; kv_idx = nullptr; n_kv = -1;
             span_copies.clear(); rebinds.clear(); gdn_probe.clear();
             span_masks.clear(); span_pos.clear(); span_kvidx.clear();
@@ -316,13 +319,33 @@ namespace
 
     // Fill the two index inputs: RoPE positions and the KV rows this step writes.
     // Values change per token, shapes do not - which is what lets the graph persist.
-    void q4e_set_attn_indices(ggml_tensor* pos, ggml_tensor* kv_idx, int T, int position)
+    // A multimodal graph's pos tensor holds 4 sections (T|H|W|zero, IMRoPE order);
+    // mrope3 is the per-token (t,h,w) table for image prompts, null for text where
+    // every component is the scalar position.
+    void q4e_set_attn_indices(ggml_tensor* pos, ggml_tensor* kv_idx, int T, int position,
+                              const int32_t* mrope3 = nullptr)
     {
-        std::vector<int32_t> p((std::size_t)T);
         std::vector<int64_t> k((std::size_t)T);
-        for (int i = 0; i < T; ++i) { p[i] = position + i; k[i] = position + i; }
-        ggml_backend_tensor_set(pos, p.data(), 0, (std::size_t)T * sizeof(int32_t));
+        for (int i = 0; i < T; ++i) k[i] = position + i;
         ggml_backend_tensor_set(kv_idx, k.data(), 0, (std::size_t)T * sizeof(int64_t));
+        if (pos == nullptr) return;
+        const int comps = (int)(pos->ne[0] / T);
+        std::vector<int32_t> p((std::size_t)comps * T);
+        if (comps == 1)
+        {
+            for (int i = 0; i < T; ++i) p[i] = position + i;
+        }
+        else
+        {
+            for (int i = 0; i < T; ++i)
+            {
+                const int32_t t = mrope3 ? mrope3[3 * i + 0] : position + i;
+                const int32_t h = mrope3 ? mrope3[3 * i + 1] : position + i;
+                const int32_t w = mrope3 ? mrope3[3 * i + 2] : position + i;
+                p[i] = t; p[T + i] = h; p[2 * T + i] = w; p[3 * T + i] = 0;
+            }
+        }
+        ggml_backend_tensor_set(pos, p.data(), 0, p.size() * sizeof(int32_t));
     }
 
     // TS_Q4E_LOG=1 reports how often each kernel rebuilt its graph rather than
@@ -885,7 +908,8 @@ static ggml_tensor* q4e_nodes_attn(
     int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
     float eps, bool use_flash,
     std::vector<ggml_tensor*>* kv_out = nullptr,
-    std::vector<ggml_tensor*>* probe = nullptr)
+    std::vector<ggml_tensor*>* probe = nullptr,
+    const int32_t* mrope_sections = nullptr)
 {
     const int hc_dim = hc * n_embd;
     const int q_dim = head_dim * n_head;
@@ -932,11 +956,25 @@ static ggml_tensor* q4e_nodes_attn(
     ggml_tensor* v = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wv, mixed), head_dim, n_head_kv, T);
 
     // Partial rotary over the first n_rot dims. IMRoPE reduces to NEOX when every
-    // position component is equal, which it is for text.
-    q = ggml_rope_ext(ctx, q, pos, nullptr, n_rot, 2, 0, rope_base, rope_freq_scale,
-                      0.0f, 1.0f, 0.0f, 0.0f);
-    k = ggml_rope_ext(ctx, k, pos, nullptr, n_rot, 2, 0, rope_base, rope_freq_scale,
-                      0.0f, 1.0f, 0.0f, 0.0f);
+    // position component is equal, which it is for text - so text graphs keep the
+    // exact NEOX path they have always had (byte-stable), and only a graph whose
+    // pos tensor carries the 4 IMRoPE sections takes the multi-axis rotation, the
+    // same op llama.cpp's qwen4exp runs.
+    if (mrope_sections != nullptr)
+    {
+        int sect[4] = { mrope_sections[0], mrope_sections[1], mrope_sections[2], mrope_sections[3] };
+        q = ggml_rope_multi(ctx, q, pos, nullptr, n_rot, sect, GGML_ROPE_TYPE_IMROPE,
+                            0, rope_base, rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_multi(ctx, k, pos, nullptr, n_rot, sect, GGML_ROPE_TYPE_IMROPE,
+                            0, rope_base, rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+    }
+    else
+    {
+        q = ggml_rope_ext(ctx, q, pos, nullptr, n_rot, 2, 0, rope_base, rope_freq_scale,
+                          0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(ctx, k, pos, nullptr, n_rot, 2, 0, rope_base, rope_freq_scale,
+                          0.0f, 1.0f, 0.0f, 0.0f);
+    }
 
     // ---- append to the cache ----
     ggml_tensor* k_write = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, T, kvH]
@@ -1560,7 +1598,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
     int n_expert, int n_expert_used, int n_ff, int n_ff_sh,
     float eps, int cache_slot, int first_ffn_only,
     const TSGgmlQwen4ExpHeadArgs* head, void* logits_out,
-    const TSGgmlQwen4ExpPleArgs* ple, int ple_layer, const void* ple_emb)
+    const TSGgmlQwen4ExpPleArgs* ple, int ple_layer, const void* ple_emb,
+    const int* mrope_pos, const int* mrope_sections)
 {
     try
     {
@@ -1578,6 +1617,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             return 0;
         }
         const bool has_ple = ple != nullptr && ple_layer >= layer_begin && ple_layer < layer_end;
+        const bool use_mrope = mrope_pos != nullptr && mrope_sections != nullptr;
         if (has_ple && ple_emb == nullptr)
         {
             set_last_error("qwen4exp token span: the PLE block needs the gathered rows.");
@@ -1633,7 +1673,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             && slot->kv_capacity == kv_capacity && slot->n_kv == n_kv_pad
             && slot->first_ffn_only == first_ffn_only
             && slot->sig4 == (const void*)head
-            && slot->sig5 == (const void*)(has_ple ? ple : nullptr))
+            && slot->sig5 == (const void*)(has_ple ? ple : nullptr)
+            && slot->use_mrope == (use_mrope ? 1 : 0))
         {
             ggml_backend_tensor_set(slot->res_in, res_data, 0, res_bytes);
             if (slot->ple_emb_in != nullptr)
@@ -1642,7 +1683,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             for (ggml_tensor* m : slot->span_masks)
                 ggml_backend_tensor_set(m, mask_data, 0, mask_bytes);
             for (std::size_t i = 0; i < slot->span_pos.size(); ++i)
-                q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position);
+                q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position,
+                        use_mrope ? (const int32_t*)mrope_pos : nullptr);
             q4e_note(3, false);
             if (q4e_span_trace() && !slot->span_copies.empty() && T == 1)
             {
@@ -1718,7 +1760,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         {
             mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_pad, T);
             ggml_set_input(mask);
-            pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+            pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, use_mrope ? 4 * T : T);
             ggml_set_input(pos);
             kv_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T);
             ggml_set_input(kv_idx);
@@ -1934,7 +1976,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
                         head_dim, n_head, n_head_kv, kv_capacity, n_kv_pad,
                         n_rot, rope_base, rope_freq_scale, attn_scale, eps, fa_here,
                         &kv_tensors,
-                        (q4e_span_trace() && attn_seen == 1 && T == 1) ? &probe_nodes : nullptr);
+                        (q4e_span_trace() && attn_seen == 1 && T == 1) ? &probe_nodes : nullptr,
+                        use_mrope ? (const int32_t*)mrope_sections : nullptr);
                 ggml_build_forward_expand(graph, res);
             }
             if (q4e_span_trace()) { ggml_set_output(res); trace_res.push_back(res); }
@@ -2030,7 +2073,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         for (ggml_tensor* m : slot->span_masks)
             ggml_backend_tensor_set(m, mask_data, 0, mask_bytes);
         for (std::size_t i = 0; i < slot->span_pos.size(); ++i)
-            q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position);
+            q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position,
+                    use_mrope ? (const int32_t*)mrope_pos : nullptr);
 
         const double t_up = q4e_phase_log() ? q4e_now_ms() : 0.0;
         q4e_note(3, true);
@@ -2138,6 +2182,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         slot->layer_begin = layer_begin; slot->layer_end = layer_end;
         slot->kv_capacity = kv_capacity; slot->n_kv = n_kv_pad;
         slot->first_ffn_only = first_ffn_only;
+        slot->use_mrope = use_mrope ? 1 : 0;
         slot->rebinds = std::move(binder.cached);
         slot->res_resident = 0;
         slot->valid = true;

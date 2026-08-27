@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -1072,7 +1072,7 @@ namespace TensorSharp.Runtime
                     if (msg.ImagePaths != null)
                         foreach (var _ in msg.ImagePaths) sb.Append("<start_of_image>");
                 }
-                else if (architecture is "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe")
+                else if (architecture is "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe" or "qwen4exp")
                 {
                     if (msg.ImagePaths != null)
                         foreach (var _ in msg.ImagePaths)

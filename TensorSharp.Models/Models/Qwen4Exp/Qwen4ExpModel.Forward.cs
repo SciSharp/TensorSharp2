@@ -196,6 +196,7 @@ namespace TensorSharp.Models
 
             long tEmb = Stopwatch.GetTimestamp();
             Tensor embd = Embedding(tokens);           // [T, n_embd]
+            InjectVisionEmbeddings(embd, seqLen);
             _embTicks += Stopwatch.GetTimestamp() - tEmb;
             PhaseLog(seqLen, "embedding", tEmb);
 
@@ -217,6 +218,14 @@ namespace TensorSharp.Models
             long tSpan = Stopwatch.GetTimestamp();
             bool spanDone = TryFusedTokenSpans(res, tokens, seqLen, startPos);
             if (spanDone) Q4eSpanTicks += Stopwatch.GetTimestamp() - tSpan;
+            if (!spanDone && _pendingMRoPEPositions != null)
+            {
+                // The fallback paths rotate with scalar positions only; running an
+                // image prompt through them would be silently wrong.
+                throw new NotSupportedException(
+                    "qwen4exp image prompts need the token-span path "
+                    + "(TS_Q4E_TOKEN_GRAPH=0 and image inputs cannot be combined).");
+            }
 
             if (!spanDone && _ffnArgs != null && !_fusedFfnUnsupported)
                 ResidualToDevice(res, seqLen);
@@ -341,6 +350,8 @@ namespace TensorSharp.Models
             }
 
             ResidualToHost(res, seqLen);
+
+            _pendingMRoPEPositions = null;
 
             if (_spanLogitsValid)
             {
@@ -1061,6 +1072,18 @@ namespace TensorSharp.Models
                 _spanLogitsValid = false;
                 bool fuseHead = EnsureHeadArgs();
                 bool fusePle = EnsurePleArgs();
+
+                // Image prompts carry a (T,H,W) IMRoPE position table; the span
+                // kernel takes it as-is and text forwards pass nothing.
+                bool useMrope = _pendingMRoPEPositions != null
+                    && _pendingMRoPEPositions.Length >= 3 * seqLen
+                    && EnsureMropeSections();
+                if (useMrope)
+                {
+                    if (_mropePosPinned == null || _mropePosPinned.Length < 3 * seqLen)
+                        _mropePosPinned = GC.AllocateArray<int>(3 * seqLen, pinned: true);
+                    Array.Copy(_pendingMRoPEPositions, _mropePosPinned, 3 * seqLen);
+                }
                 if (fusePle)
                 {
                     // The hash mutates the n-gram history, so it runs exactly once and
@@ -1102,6 +1125,13 @@ namespace TensorSharp.Models
                                 fixed (float* lp = _spanLogits)
                                 { headPtr = (IntPtr)hp; logitsPtr = (IntPtr)lp; }
                             }
+                            IntPtr mropePtr = IntPtr.Zero, sectPtr = IntPtr.Zero;
+                            if (useMrope)
+                            {
+                                fixed (int* mp2 = _mropePosPinned)
+                                fixed (int* sp2 = _mropeSectionsPinned)
+                                { mropePtr = (IntPtr)mp2; sectPtr = (IntPtr)sp2; }
+                            }
                             IntPtr plePtr = IntPtr.Zero, pleEmbPtr = IntPtr.Zero;
                             int pleLayerArg = -1;
                             if (fusePle && _pleLayerIndex >= begin && _pleLayerIndex < il)
@@ -1124,7 +1154,8 @@ namespace TensorSharp.Models
                                 _numExperts, _numExpertsUsed, _expertFf, _sharedFf,
                                 Config.Eps, cacheSlot: spanIdx, firstFfnOnly: beginFfnOnly,
                                 head: headPtr, logitsOut: logitsPtr,
-                                ple: plePtr, pleLayer: pleLayerArg, pleEmb: pleEmbPtr);
+                                ple: plePtr, pleLayer: pleLayerArg, pleEmb: pleEmbPtr,
+                                mropePos: mropePtr, mropeSections: sectPtr);
                             if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {
