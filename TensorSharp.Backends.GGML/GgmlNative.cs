@@ -353,6 +353,18 @@ public struct Gemma4MoELayerDecodeArgs
 }
 
     /// <summary>
+    /// Mirrors TSGgmlQwen4ExpPleArgs in ggml_ops_qwen4exp.cpp - the PLE block run
+    /// inside the span; only the n-gram hash and the table gather stay host-side.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Qwen4ExpPleArgs
+    {
+        public IntPtr KeyW, ValueW, NormKey, NormQuery, NormConv, Conv1dT, ConvState;
+        public long KeyBytes, ValueBytes;
+        public int KeyType, ValueType, Kern, Dil;
+    }
+
+    /// <summary>
     /// Mirrors TSGgmlQwen4ExpHeadArgs in ggml_ops_qwen4exp.cpp - the final
     /// hyper-connection mixer (which IS the output norm) plus the LM head.
     /// </summary>
@@ -3963,7 +3975,8 @@ internal enum GgmlIndexReductionOp
             int nRot, float ropeBase, float ropeFreqScale, float attnScale,
             int nExpert, int nExpertUsed, int nFf, int nFfSh,
             float eps, int cacheSlot, int firstFfnOnly,
-            IntPtr head, IntPtr logitsOut);
+            IntPtr head, IntPtr logitsOut,
+            IntPtr ple, int pleLayer, IntPtr pleEmb);
 
         public static bool Qwen4ExpTokenSpan(
             IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
@@ -3975,7 +3988,8 @@ internal enum GgmlIndexReductionOp
             int nRot, float ropeBase, float ropeFreqScale, float attnScale,
             int nExpert, int nExpertUsed, int nFf, int nFfSh,
             float eps, int cacheSlot, bool firstFfnOnly,
-            IntPtr head, IntPtr logitsOut)
+            IntPtr head, IntPtr logitsOut,
+            IntPtr ple, int pleLayer, IntPtr pleEmb)
         {
             return TSGgml_Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
                 resData, maskData, nEmbd, hc, hcLowRank, nTokens,
@@ -3983,7 +3997,7 @@ internal enum GgmlIndexReductionOp
                 headDim, nHead, nHeadKv, kvCapacity, nKv, position,
                 nRot, ropeBase, ropeFreqScale, attnScale,
                 nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
-                firstFfnOnly ? 1 : 0, head, logitsOut) != 0;
+                firstFfnOnly ? 1 : 0, head, logitsOut, ple, pleLayer, pleEmb) != 0;
         }
 
         [LibraryImport(DllName)]

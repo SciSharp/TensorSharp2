@@ -84,7 +84,9 @@ namespace
         const void* sig2 = nullptr;
         const void* sig3 = nullptr;
         const void* sig4 = nullptr;      // head descriptor, or null
+        const void* sig5 = nullptr;      // PLE descriptor, or null
         ggml_tensor* logits = nullptr;
+        ggml_tensor* ple_emb_in = nullptr;
         int layer_begin = -1;
         int layer_end = -1;
         int kv_capacity = -1;
@@ -130,7 +132,8 @@ namespace
             graph = nullptr; res_in = nullptr; res_out = nullptr;
             conv_in = conv_out = ssm_in = ssm_out = nullptr;
             valid = false; n_tokens = 0; hc_dim = 0; sig = nullptr; res_resident = -1;
-            sig2 = nullptr; sig3 = nullptr; sig4 = nullptr; logits = nullptr;
+            sig2 = nullptr; sig3 = nullptr; sig4 = nullptr; sig5 = nullptr;
+            logits = nullptr; ple_emb_in = nullptr;
             layer_begin = -1; layer_end = -1; kv_capacity = -1; first_ffn_only = 0;
             mask = nullptr; pos = nullptr; kv_idx = nullptr; n_kv = -1;
             span_copies.clear(); rebinds.clear(); gdn_probe.clear();
@@ -150,6 +153,12 @@ namespace
     Qwen4ExpFfnCache g_q4e_gdn[kQwen4ExpMaxSlots];
     Qwen4ExpFfnCache g_q4e_attn[kQwen4ExpMaxSlots];
     Qwen4ExpFfnCache g_q4e_span[kQwen4ExpSpanSlots];
+
+    // The PLE conv history: one persistent device buffer (one PLE layer in the
+    // shipped checkpoint). ready=false re-seeds from the host on the next build.
+    ggml_backend_buffer_t g_q4e_ple_buf = nullptr;
+    std::size_t g_q4e_ple_bytes = 0;
+    bool g_q4e_ple_ready = false;
 
     // ggml-cuda's flash attention takes F16 K/V and one of a fixed set of head sizes;
     // for head_dim 256 the only other condition is V->ne[0] == K->ne[0], which holds
@@ -357,6 +366,20 @@ namespace
             return !(e != nullptr && e[0] == '0');
         }();
         return v;
+    }
+
+    // TS_Q4E_PHASE=1 prints wall times for the span build phases at T>1.
+    bool q4e_phase_log()
+    {
+        static const bool v = []{
+            const char* e = std::getenv("TS_Q4E_PHASE");
+            return e != nullptr && e[0] == '1';
+        }();
+        return v;
+    }
+    double q4e_now_ms()
+    {
+        return (double)ggml_time_us() / 1000.0;
     }
 
     uint64_t q4e_next_graph_uid()
@@ -1483,6 +1506,28 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
 // cpy(tail -> conv_state) expanded after the nodes that read conv_state, so
 // node order sequences the write behind the read.
 // ============================================================================
+// The PLE block riding inside the span. Only the n-gram hash and the gather
+// from the ~320M-row host table stay on the CPU; the gathered rows arrive as a
+// graph input and the projections, norms, gating, dilated depthwise conv and
+// the residual add all run on the device. The conv history is persistent
+// device state, written in place like the GDN state.
+struct TSGgmlQwen4ExpPleArgs
+{
+    void* key_w;            // [n_embd, hc_dim]
+    void* value_w;          // [n_embd, n_embd]
+    void* norm_key;         // f32 [hc_dim]
+    void* norm_query;       // f32 [hc_dim]
+    void* norm_conv;        // f32 [hc_dim]
+    void* conv1d_t;         // f32 [hc_dim, kern] - tap-major transpose of ple_conv1d
+    void* conv_state;       // f32 [hc_dim, hist] seed (host layout matches)
+
+    long long key_bytes, value_bytes;
+
+    int key_type, value_type;
+    int kern;               // conv kernel taps
+    int dil;                // dilation (the n-gram size)
+};
+
 // The output stage: the final hyper-connection mixer (which IS the output norm -
 // qwen4exp ships no separate one) and the LM head, riding the tail of the last
 // span. The mixer runs on the LAST token only - at prefill the managed path used
@@ -1514,7 +1559,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
     int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
     int n_expert, int n_expert_used, int n_ff, int n_ff_sh,
     float eps, int cache_slot, int first_ffn_only,
-    const TSGgmlQwen4ExpHeadArgs* head, void* logits_out)
+    const TSGgmlQwen4ExpHeadArgs* head, void* logits_out,
+    const TSGgmlQwen4ExpPleArgs* ple, int ple_layer, const void* ple_emb)
 {
     try
     {
@@ -1529,6 +1575,12 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         if ((head != nullptr) != (logits_out != nullptr))
         {
             set_last_error("qwen4exp token span: head and logits_out come together.");
+            return 0;
+        }
+        const bool has_ple = ple != nullptr && ple_layer >= layer_begin && ple_layer < layer_end;
+        if (has_ple && ple_emb == nullptr)
+        {
+            set_last_error("qwen4exp token span: the PLE block needs the gathered rows.");
             return 0;
         }
 
@@ -1580,9 +1632,13 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             && slot->layer_begin == layer_begin && slot->layer_end == layer_end
             && slot->kv_capacity == kv_capacity && slot->n_kv == n_kv_pad
             && slot->first_ffn_only == first_ffn_only
-            && slot->sig4 == (const void*)head)
+            && slot->sig4 == (const void*)head
+            && slot->sig5 == (const void*)(has_ple ? ple : nullptr))
         {
             ggml_backend_tensor_set(slot->res_in, res_data, 0, res_bytes);
+            if (slot->ple_emb_in != nullptr)
+                ggml_backend_tensor_set(slot->ple_emb_in, ple_emb, 0,
+                        (std::size_t)n_embd * T * sizeof(float));
             for (ggml_tensor* m : slot->span_masks)
                 ggml_backend_tensor_set(m, mask_data, 0, mask_bytes);
             for (std::size_t i = 0; i < slot->span_pos.size(); ++i)
@@ -1638,6 +1694,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         }
         slot->reset_graph();
 
+        const double t0 = q4e_phase_log() ? q4e_now_ms() : 0.0;
         const int n_layers = layer_end - layer_begin;
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() * ((std::size_t)n_layers * 256 + 1024)
@@ -1670,6 +1727,13 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             slot->span_kvidx.push_back(kv_idx);
         }
 
+        ggml_tensor* ple_emb_in = nullptr;
+        if (has_ple)
+        {
+            ple_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+            ggml_set_input(ple_emb_in);
+        }
+
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, kQwen4ExpSpanGraphSize, false);
         if (q4e_graph_uid_enabled()) graph->uid = q4e_next_graph_uid();
 
@@ -1692,6 +1756,109 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
 
         for (int il = layer_begin; il < layer_end && !failed; ++il)
         {
+            if (has_ple && il == ple_layer)
+            {
+                // ---- the PLE block, ahead of this layer's halves ----
+                const int hc_dim2 = hc_dim;
+                const int kern = ple->kern;
+                const int dil = ple->dil;
+                const int hist = (kern - 1) * dil;
+
+                ggml_tensor* w_key   = ggml_new_tensor_2d(ctx, (ggml_type)ple->key_type, n_embd, hc_dim2);
+                ggml_tensor* w_value = ggml_new_tensor_2d(ctx, (ggml_type)ple->value_type, n_embd, n_embd);
+                ggml_tensor* w_nk    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim2);
+                ggml_tensor* w_nq    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim2);
+                ggml_tensor* w_nc    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim2);
+                ggml_tensor* w_ct    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim2, kern);
+
+                // conv history: persistent device state, like the GDN state.
+                ggml_tensor* conv_state = nullptr;
+                if (hist > 0)
+                {
+                    const std::size_t st_bytes = (std::size_t)hist * hc_dim2 * sizeof(float);
+                    if (g_q4e_ple_buf == nullptr || g_q4e_ple_bytes < st_bytes)
+                    {
+                        if (g_q4e_ple_buf) ggml_backend_buffer_free(g_q4e_ple_buf);
+                        g_q4e_ple_buf = ggml_backend_buft_alloc_buffer(
+                                ggml_backend_get_default_buffer_type(g_backend), st_bytes);
+                        g_q4e_ple_bytes = st_bytes;
+                        g_q4e_ple_ready = false;
+                        if (g_q4e_ple_buf == nullptr)
+                        { failed = true; fail_what = "ple state alloc"; break; }
+                    }
+                    conv_state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim2, hist);
+                    ggml_set_input(conv_state);
+                    if (ggml_backend_tensor_alloc(g_q4e_ple_buf, conv_state,
+                            ggml_backend_buffer_get_base(g_q4e_ple_buf)) != GGML_STATUS_SUCCESS)
+                    { failed = true; fail_what = "ple state bind"; break; }
+                    if (!g_q4e_ple_ready)
+                        binder.upload_list.push_back({conv_state, ple->conv_state,
+                                (std::size_t)hist * hc_dim2 * sizeof(float)});
+                }
+
+                // key/query grouped norms: normalise each stream, scale the full row.
+                auto gnorm = [&](ggml_tensor* x, ggml_tensor* w) {
+                    ggml_tensor* x3 = ggml_reshape_3d(ctx, x, n_embd, hc, T);
+                    ggml_tensor* nx = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, x3, eps), hc_dim2, T);
+                    return ggml_mul(ctx, nx, w);
+                };
+
+                ggml_tensor* keyn = gnorm(ggml_mul_mat(ctx, w_key, ple_emb_in), w_nk);   // [hc_dim, T]
+                ggml_tensor* qryn = gnorm(res, w_nq);
+
+                // Per-stream dot, scaled, signed-sqrt, sigmoid: the PLE gate.
+                ggml_tensor* prod = ggml_reshape_3d(ctx, ggml_mul(ctx, keyn, qryn), n_embd, hc, T);
+                ggml_tensor* sdot = ggml_scale(ctx, ggml_sum_rows(ctx, prod),
+                        1.0f / std::sqrt((float)n_embd));                                 // [1, hc, T]
+                ggml_tensor* sg   = ggml_sgn(ctx, sdot);
+                ggml_tensor* mag  = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_mul(ctx, sdot, sg),
+                        1e-6f, 3.0e38f));
+                ggml_tensor* gate = ggml_sigmoid(ctx, ggml_mul(ctx, sg, mag));            // [1, hc, T]
+
+                ggml_tensor* val  = ggml_mul_mat(ctx, w_value, ple_emb_in);               // [n_embd, T]
+                ggml_tensor* v3   = ggml_repeat_4d(ctx,
+                        ggml_reshape_3d(ctx, val, n_embd, 1, T), n_embd, hc, T, 1);
+                ggml_tensor* gated = ggml_reshape_2d(ctx, ggml_mul(ctx, v3, gate), hc_dim2, T);
+
+                // Dilated causal depthwise conv over the conv-normed gate output.
+                ggml_tensor* normc = gnorm(gated, w_nc);
+                ggml_tensor* padded = (conv_state != nullptr)
+                        ? ggml_concat(ctx, conv_state, normc, 1)                          // [hc_dim, hist+T]
+                        : normc;
+                ggml_tensor* acc = nullptr;
+                for (int kk = 0; kk < kern; ++kk)
+                {
+                    // tap kk reads (kern-1-kk) dilated positions back: with hist rows
+                    // of history in front, that is a plain offset of kk*dil rows.
+                    ggml_tensor* slice = ggml_view_2d(ctx, padded, hc_dim2, T,
+                            padded->nb[1], (std::size_t)(kk * dil) * padded->nb[1]);
+                    ggml_tensor* wk = ggml_view_2d(ctx, w_ct, hc_dim2, 1,
+                            w_ct->nb[1], (std::size_t)kk * w_ct->nb[1]);
+                    ggml_tensor* term = ggml_mul(ctx, slice, wk);
+                    acc = (acc == nullptr) ? term : ggml_add(ctx, acc, term);
+                }
+                ggml_tensor* conv = ggml_silu(ctx, acc);                                  // [hc_dim, T]
+
+                // res += gated + conv
+                res = ggml_add(ctx, ggml_add(ctx, res, gated), conv);
+                ggml_build_forward_expand(graph, res);
+                if (conv_state != nullptr)
+                {
+                    // Keep the last `hist` rows for the next batch; ordered after
+                    // every read of the state by the expand above.
+                    ggml_tensor* tail = ggml_view_2d(ctx, padded, hc_dim2, hist,
+                            padded->nb[1], (std::size_t)T * padded->nb[1]);
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx, tail, conv_state));
+                }
+
+                binder.add(w_key, ple->key_w, (std::size_t)ple->key_bytes);
+                binder.add(w_value, ple->value_w, (std::size_t)ple->value_bytes);
+                binder.add(w_nk, ple->norm_key, (std::size_t)hc_dim2 * sizeof(float));
+                binder.add(w_nq, ple->norm_query, (std::size_t)hc_dim2 * sizeof(float));
+                binder.add(w_nc, ple->norm_conv, (std::size_t)hc_dim2 * sizeof(float));
+                binder.add(w_ct, ple->conv1d_t, (std::size_t)hc_dim2 * kern * sizeof(float));
+            }
+
             if (il == layer_begin && first_ffn_only != 0)
             {
                 // The attention half of this layer already ran per-layer; the span
@@ -1787,6 +1954,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             return 0;
         }
 
+        const double t_nodes = q4e_phase_log() ? q4e_now_ms() : 0.0;
         ggml_tensor* res_out = res;
         ggml_tensor* logits = nullptr;
         if (head != nullptr)
@@ -1828,6 +1996,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             ggml_set_output(res_out);
         }
 
+        const double t_pregal = q4e_phase_log() ? q4e_now_ms() : 0.0;
         ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
         if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
         {
@@ -1836,9 +2005,14 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             set_last_error("qwen4exp token span: failed to allocate graph tensors.");
             return 0;
         }
+        const double t_gal = q4e_phase_log() ? q4e_now_ms() : 0.0;
 
         binder.flush();
         for (Qwen4ExpFfnCache* g : seeded) g->state_ready = true;
+        if (has_ple) g_q4e_ple_ready = true;
+        if (ple_emb_in != nullptr)
+            ggml_backend_tensor_set(ple_emb_in, ple_emb, 0,
+                    (std::size_t)n_embd * T * sizeof(float));
 
         // A fresh sequence starts with a KV cache whose device copy holds whatever
         // was already in that memory - the host buffer it uploads from is a pooled
@@ -1858,12 +2032,21 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         for (std::size_t i = 0; i < slot->span_pos.size(); ++i)
             q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position);
 
+        const double t_up = q4e_phase_log() ? q4e_now_ms() : 0.0;
         q4e_note(3, true);
         if (graph_compute_profiled(g_backend, graph, kQwen4ExpSpanKernel) != GGML_STATUS_SUCCESS)
         {
             ggml_gallocr_free(alloc); ggml_free(ctx);
             set_last_error("qwen4exp token span: graph compute failed.");
             return 0;
+        }
+        if (q4e_phase_log() && T > 1)
+        {
+            ggml_backend_synchronize(g_backend);
+            const double t_cmp = q4e_now_ms();
+            fprintf(stderr, "[q4e-phase] span %d..%d T=%d: nodes=%.1fms binder=%.1fms gallocr=%.1fms uploads=%.1fms compute=%.1fms%c",
+                    layer_begin, layer_end, T,
+                    t_nodes - t0, t_pregal - t_nodes, t_gal - t_pregal, t_up - t_gal, t_cmp - t_up, 10);
         }
 
         // See the replay path: the drain before the copies is load-bearing.
@@ -1950,6 +2133,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         slot->n_tokens = T; slot->hc_dim = hc_dim;
         slot->sig = (const void*)ffn; slot->sig2 = (const void*)gdn; slot->sig3 = (const void*)attn;
         slot->sig4 = (const void*)head; slot->logits = logits;
+        slot->sig5 = (const void*)(has_ple ? ple : nullptr);
+        slot->ple_emb_in = ple_emb_in;
         slot->layer_begin = layer_begin; slot->layer_end = layer_end;
         slot->kv_capacity = kv_capacity; slot->n_kv = n_kv_pad;
         slot->first_ffn_only = first_ffn_only;
@@ -2004,6 +2189,8 @@ TSG_EXPORT void TSGgml_Qwen4ExpResetFfnCache()
     if (g_q4e_res_ctx) { ggml_free(g_q4e_res_ctx); g_q4e_res_ctx = nullptr; }
     if (g_q4e_res_buf) { ggml_backend_buffer_free(g_q4e_res_buf); g_q4e_res_buf = nullptr; }
     g_q4e_res = nullptr; g_q4e_res_capacity = 0;
+    if (g_q4e_ple_buf) { ggml_backend_buffer_free(g_q4e_ple_buf); g_q4e_ple_buf = nullptr; }
+    g_q4e_ple_bytes = 0; g_q4e_ple_ready = false;
 }
 
 } // extern "C"

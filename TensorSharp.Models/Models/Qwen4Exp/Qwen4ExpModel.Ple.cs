@@ -9,6 +9,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading.Tasks;
 using TensorSharp.Core;
 
 namespace TensorSharp.Models
@@ -119,40 +121,55 @@ namespace TensorSharp.Models
         ///
         /// Updates <paramref name="res"/> in place.
         /// </summary>
+        // The per-token stages parallelize above this batch size; below it the
+        // Parallel.For overhead costs more than it saves (decode is T=1).
+        private const int PleParallelThreshold = 16;
+
         private unsafe void PleLayer(Tensor res, int[] tokens, int seqLen, int startPos, int il)
         {
             int n = Config.HiddenSize;
+            long tStage = Stopwatch.GetTimestamp();
             int[] rows = ComputePleRows(tokens, startPos);
+            PhaseLog(seqLen, "ple.rows", tStage);
 
             // Gather: heads laid out slowest, so a token's rows concatenate into one
             // hidden-wide vector.
+            tStage = Stopwatch.GetTimestamp();
             var emb = new Tensor(_allocator, DType.Float32, seqLen, n);
             GatherPleRows(emb, rows, seqLen);
+            PhaseLog(seqLen, "ple.gather", tStage);
 
+            tStage = Stopwatch.GetTimestamp();
             Tensor key = LinearForward(emb, $"blk.{il}.ple_key.weight");     // [T, hcDim]
             Tensor value = LinearForward(emb, $"blk.{il}.ple_value.weight"); // [T, n_embd]
             emb.Dispose();
+            PhaseLog(seqLen, "ple.proj", tStage);
 
+            tStage = Stopwatch.GetTimestamp();
             GroupedNormInPlace(key, $"blk.{il}.ple_norm_key.weight", seqLen);
             var query = new Tensor(_allocator, DType.Float32, seqLen, _hcDim);
             Ops.Copy(query, res);
             GroupedNormInPlace(query, $"blk.{il}.ple_norm_query.weight", seqLen);
+            PhaseLog(seqLen, "ple.norms", tStage);
+            tStage = Stopwatch.GetTimestamp();
 
             // Per-stream dot product, then a signed square root before the sigmoid.
+            // Token rows are independent, so a prefill spreads them across cores.
             var gated = new Tensor(_allocator, DType.Float32, seqLen, _hcDim);
             {
-                float* kp = GetFloatPtr(key);
-                float* qp = GetFloatPtr(query);
-                float* vp = GetFloatPtr(value);
-                float* gp = GetFloatPtr(gated);
+                long kA = (long)GetFloatPtr(key);
+                long qA = (long)GetFloatPtr(query);
+                long vA = (long)GetFloatPtr(value);
+                long gA = (long)GetFloatPtr(gated);
                 float invSqrt = 1.0f / MathF.Sqrt(n);
-                for (int t = 0; t < seqLen; t++)
+                int hc = _hc, hcDim = _hcDim;
+                void GateToken(int t)
                 {
-                    float* kr = kp + (long)t * _hcDim;
-                    float* qr = qp + (long)t * _hcDim;
-                    float* vr = vp + (long)t * n;
-                    float* gr = gp + (long)t * _hcDim;
-                    for (int c = 0; c < _hc; c++)
+                    float* kr = (float*)kA + (long)t * hcDim;
+                    float* qr = (float*)qA + (long)t * hcDim;
+                    float* vr = (float*)vA + (long)t * n;
+                    float* gr = (float*)gA + (long)t * hcDim;
+                    for (int c = 0; c < hc; c++)
                     {
                         float* kc = kr + (long)c * n;
                         float* qc = qr + (long)c * n;
@@ -166,9 +183,13 @@ namespace TensorSharp.Models
                         for (int i = 0; i < n; i++) gc[i] = vr[i] * g;
                     }
                 }
+                if (seqLen >= PleParallelThreshold) Parallel.For(0, seqLen, GateToken);
+                else for (int t = 0; t < seqLen; t++) GateToken(t);
                 InvalidateTensorDeviceCache(gated);
             }
             key.Dispose(); query.Dispose(); value.Dispose();
+            PhaseLog(seqLen, "ple.gate", tStage);
+            tStage = Stopwatch.GetTimestamp();
 
             // Dilated causal depthwise conv over the gated value, as a sum of shifted
             // per-channel-scaled copies. History from earlier batches is prepended so a
@@ -197,27 +218,33 @@ namespace TensorSharp.Models
                             pad + (long)(hist + t) * _hcDim, _hcDim * 4L, _hcDim * 4L);
                     }
 
-                    float* cp = GetFloatPtr(conv);
-                    float* wp = GetFloatPtr(_weights[$"blk.{il}.ple_conv1d.weight"]);
-                    for (int t = 0; t < seqLen; t++)
+                    long cA = (long)GetFloatPtr(conv);
+                    long wA = (long)GetFloatPtr(_weights[$"blk.{il}.ple_conv1d.weight"]);
+                    long pA = (long)pad;
+                    int hcDim = _hcDim;
+                    // `padded` is fully written above and only read here, so the
+                    // output rows are independent.
+                    void ConvToken(int t)
                     {
-                        float* o = cp + (long)t * _hcDim;
-                        for (int c = 0; c < _hcDim; c++) o[c] = 0f;
+                        float* o = (float*)cA + (long)t * hcDim;
+                        for (int c = 0; c < hcDim; c++) o[c] = 0f;
                         for (int kk = 0; kk < kern; kk++)
                         {
                             // tap kk reads (kern-1-kk) dilated positions back
                             int r = hist + t - (kern - 1 - kk) * dil;
                             if (r < 0) continue;
-                            float* x = pad + (long)r * _hcDim;
+                            float* x = (float*)pA + (long)r * hcDim;
+                            float* wp = (float*)wA;
                             // ple_conv1d is [kernel, channels]: column kk is one
                             // weight per channel
-                            for (int c = 0; c < _hcDim; c++)
+                            for (int c = 0; c < hcDim; c++)
                                 o[c] += x[c] * wp[(long)c * kern + kk];
                         }
-                        for (int c = 0; c < _hcDim; c++)
+                        for (int c = 0; c < hcDim; c++)
                             o[c] = o[c] / (1.0f + MathF.Exp(-o[c]));
                     }
-
+                    if (seqLen >= PleParallelThreshold) Parallel.For(0, seqLen, ConvToken);
+                    else for (int t = 0; t < seqLen; t++) ConvToken(t);
                 }
                 // Keep the last `hist` rows for the next batch.
                 Array.Copy(padded, (long)(total - hist) * _hcDim, _pleConvState, 0L,
@@ -225,18 +252,29 @@ namespace TensorSharp.Models
                 InvalidateTensorDeviceCache(conv);
             }
             normed.Dispose();
+            PhaseLog(seqLen, "ple.conv", tStage);
+            tStage = Stopwatch.GetTimestamp();
 
             // res += gated + conv
             {
-                float* rp = GetFloatPtr(res);
-                float* gp = GetFloatPtr(gated);
-                float* cp = GetFloatPtr(conv);
-                long total = (long)seqLen * _hcDim;
-                for (long i = 0; i < total; i++) rp[i] += gp[i] + cp[i];
+                long rA = (long)GetFloatPtr(res);
+                long gA = (long)GetFloatPtr(gated);
+                long cA = (long)GetFloatPtr(conv);
+                int hcDim = _hcDim;
+                void AddToken(int t)
+                {
+                    float* rp = (float*)rA + (long)t * hcDim;
+                    float* gp = (float*)gA + (long)t * hcDim;
+                    float* cp = (float*)cA + (long)t * hcDim;
+                    for (int i = 0; i < hcDim; i++) rp[i] += gp[i] + cp[i];
+                }
+                if (seqLen >= PleParallelThreshold) Parallel.For(0, seqLen, AddToken);
+                else for (int t = 0; t < seqLen; t++) AddToken(t);
                 InvalidateTensorDeviceCache(res);
             }
             gated.Dispose();
             conv.Dispose();
+            PhaseLog(seqLen, "ple.add", tStage);
         }
 
         /// <summary>
@@ -261,7 +299,26 @@ namespace TensorSharp.Models
                         "qwen4exp needs a host copy of the PLE n-gram table: it is gathered "
                         + $"{_pleHeads} scattered rows per token, which no device get_rows path serves.");
                 }
-                PopulateQuantizedRows(flat, qw, rows);
+                // Row dequants are independent native calls scattered over a ~24 GB
+                // table; a prefill reads tens of thousands of them, so spread the
+                // page-touching and the dequant across cores.
+                long qRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                int dim = (int)qw.Ne0;
+                long baseA = (long)qw.Data;
+                long dstA = (long)GetFloatPtr(flat);
+                var ggmlType = qw.GgmlType;
+                void DequantRow(int i)
+                {
+                    NativeDequant.DequantizeToFloat32Native(
+                        ggmlType,
+                        (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
+                        (IntPtr)((float*)dstA + (long)i * dim),
+                        dim);
+                }
+                if (rows.Length >= PleParallelThreshold * _pleHeads)
+                    Parallel.For(0, rows.Length, DequantRow);
+                else
+                    for (int i = 0; i < rows.Length; i++) DequantRow(i);
                 InvalidateTensorDeviceCache(dest);
                 return;
             }
@@ -279,6 +336,47 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Gather the n-gram rows into a raw [T * hidden] float buffer - the span
+        /// uploads it as a graph input.
+        /// </summary>
+        private unsafe void GatherPleRowsRaw(float* dst, int[] rows, int seqLen)
+        {
+            const string name = "per_layer_token_embd.weight";
+            if (_quantWeights.TryGetValue(name, out var qw))
+            {
+                if (!qw.HasHostData)
+                    throw new InvalidOperationException("qwen4exp needs a host copy of the PLE n-gram table.");
+                long qRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                int dim = (int)qw.Ne0;
+                long baseA = (long)qw.Data;
+                long dstA = (long)dst;
+                var ggmlType = qw.GgmlType;
+                void DequantRow(int i)
+                {
+                    NativeDequant.DequantizeToFloat32Native(
+                        ggmlType,
+                        (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
+                        (IntPtr)((float*)dstA + (long)i * dim),
+                        dim);
+                }
+                if (rows.Length >= PleParallelThreshold * _pleHeads)
+                    Parallel.For(0, rows.Length, DequantRow);
+                else
+                    for (int i = 0; i < rows.Length; i++) DequantRow(i);
+                return;
+            }
+
+            Tensor table = _weights[name];
+            float* src = GetFloatPtr(table);
+            long rowBytes = _pleHeadDim * sizeof(float);
+            for (int i = 0; i < rows.Length; i++)
+            {
+                Buffer.MemoryCopy(src + (long)rows[i] * _pleHeadDim,
+                    dst + (long)i * _pleHeadDim, rowBytes, rowBytes);
+            }
+        }
+
+        /// <summary>
         /// RMS norm over each residual stream separately, then an affine weight that
         /// spans the whole hc*n_embd row - the same shape the hyper-connection mixer
         /// uses. In place.
@@ -286,13 +384,15 @@ namespace TensorSharp.Models
         private unsafe void GroupedNormInPlace(Tensor x, string weightName, int seqLen)
         {
             int n = Config.HiddenSize;
-            float* p = GetFloatPtr(x);
-            float* w = GetFloatPtr(_weights[weightName]);
+            long pA = (long)GetFloatPtr(x);
+            long wA = (long)GetFloatPtr(_weights[weightName]);
             float eps = Config.Eps;
-            for (int t = 0; t < seqLen; t++)
+            int hc = _hc, hcDim = _hcDim;
+            void NormToken(int t)
             {
-                float* row = p + (long)t * _hcDim;
-                for (int c = 0; c < _hc; c++)
+                float* row = (float*)pA + (long)t * hcDim;
+                float* w = (float*)wA;
+                for (int c = 0; c < hc; c++)
                 {
                     float* xc = row + (long)c * n;
                     double ss = 0;
@@ -302,6 +402,8 @@ namespace TensorSharp.Models
                     for (int i = 0; i < n; i++) xc[i] = xc[i] * inv * w[b + i];
                 }
             }
+            if (seqLen >= PleParallelThreshold) Parallel.For(0, seqLen, NormToken);
+            else for (int t = 0; t < seqLen; t++) NormToken(t);
             InvalidateTensorDeviceCache(x);
         }
     }

@@ -103,7 +103,9 @@ namespace TensorSharp.Models
             }
 
             if (_pleHeads > 0)
-                _pleConvState = new float[(long)(_pleConvKernel - 1) * _pleNgram * _hcDim];
+                // PINNED: the span kernel seeds its device conv state from this address.
+                _pleConvState = GC.AllocateArray<float>(
+                    checked((int)((long)(_pleConvKernel - 1) * _pleNgram * _hcDim)), pinned: true);
 
             _cacheSeqLen = 0;
         }
@@ -195,10 +197,13 @@ namespace TensorSharp.Models
             long tEmb = Stopwatch.GetTimestamp();
             Tensor embd = Embedding(tokens);           // [T, n_embd]
             _embTicks += Stopwatch.GetTimestamp() - tEmb;
+            PhaseLog(seqLen, "embedding", tEmb);
 
             // The wide residual starts as hc identical copies of the embedding.
+            long tBr = Stopwatch.GetTimestamp();
             Tensor res = BroadcastToStreams(embd, seqLen);
             embd.Dispose();
+            PhaseLog(seqLen, "broadcast", tBr);
 
             // Hand the residual to the device once; the fused halves chain through it
             // and only the layers still running op-by-op pull it back.
@@ -389,14 +394,18 @@ namespace TensorSharp.Models
         {
             int n = Config.HiddenSize;
             var res = new Tensor(_allocator, DType.Float32, seqLen, _hcDim);
-            float* src = GetFloatPtr(x);
-            float* dst = GetFloatPtr(res);
-            for (int t = 0; t < seqLen; t++)
+            long srcA = (long)GetFloatPtr(x);
+            long dstA = (long)GetFloatPtr(res);
+            int hc = _hc, hcDim = _hcDim;
+            void CopyToken(int t)
             {
-                float* s = src + (long)t * n;
-                for (int c = 0; c < _hc; c++)
-                    Buffer.MemoryCopy(s, dst + (long)t * _hcDim + (long)c * n, n * 4L, n * 4L);
+                float* s = (float*)srcA + (long)t * n;
+                float* d = (float*)dstA + (long)t * hcDim;
+                for (int c = 0; c < hc; c++)
+                    Buffer.MemoryCopy(s, d + (long)c * n, n * 4L, n * 4L);
             }
+            if (seqLen >= 16) System.Threading.Tasks.Parallel.For(0, seqLen, CopyToken);
+            else for (int t = 0; t < seqLen; t++) CopyToken(t);
             InvalidateTensorDeviceCache(res);
             return res;
         }
@@ -892,6 +901,17 @@ namespace TensorSharp.Models
         private static readonly bool _driverTrace =
             string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_DRIVER_TRACE"), "1", StringComparison.Ordinal);
 
+        // TS_Q4E_PHASE=1 prints host-side wall times for a prefill forward.
+        private static readonly bool _phaseLog =
+            string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_PHASE"), "1", StringComparison.Ordinal);
+
+        private static void PhaseLog(int seqLen, string what, long t0)
+        {
+            if (!_phaseLog || seqLen <= 1) return;
+            double ms = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
+            Console.Error.WriteLine($"[q4e-cs] T={seqLen} {what}={ms:F1}ms");
+        }
+
         private unsafe void DriverTrace(Tensor res, int seqLen, string what)
         {
             if (!_driverTrace) return;
@@ -913,6 +933,57 @@ namespace TensorSharp.Models
         private byte[] _layerKinds;
         // The final mixer + LM head riding the last span. _spanLogits holds the
         // downloaded [vocab] row when the head was fused this forward.
+        // The PLE block inside the span: only the hash and the table gather stay on
+        // the host; the gathered rows ride in as a graph input.
+        private Qwen4ExpPleArgs[] _pleArgs;
+        private bool _pleArgsFailed;
+        private float[] _pleConvWT;
+        private float[] _pleEmbBuf;
+        private int _pleLayerIndex = -1;
+
+        private unsafe bool EnsurePleArgs()
+        {
+            if (_pleArgs != null) return true;
+            if (_pleArgsFailed) return false;
+            int il = -1;
+            for (int l = 0; l < Config.NumLayers; l++) if (_isPle[l]) { il = l; break; }
+            if (il < 0) { _pleArgsFailed = true; return false; }
+            if (!TryResolveQuant($"blk.{il}.ple_key.weight", out IntPtr kw, out int kwT, out long kwB)
+                || !TryResolveQuant($"blk.{il}.ple_value.weight", out IntPtr vw, out int vwT, out long vwB)
+                || !_weights.ContainsKey($"blk.{il}.ple_norm_key.weight")
+                || !_weights.ContainsKey($"blk.{il}.ple_norm_query.weight")
+                || !_weights.ContainsKey($"blk.{il}.ple_norm_conv.weight")
+                || !_weights.TryGetValue($"blk.{il}.ple_conv1d.weight", out Tensor convW))
+            {
+                _pleArgsFailed = true;
+                return false;
+            }
+
+            int kern = _pleConvKernel;
+            // ple_conv1d is [channels, kern] with the taps fastest; the graph wants a
+            // contiguous per-channel column per tap, so transpose once. PINNED: the
+            // kernel binds this address for the graph's lifetime.
+            _pleConvWT = GC.AllocateArray<float>(_hcDim * kern, pinned: true);
+            float* wp = GetFloatPtr(convW);
+            for (int c = 0; c < _hcDim; c++)
+                for (int kk = 0; kk < kern; kk++)
+                    _pleConvWT[(long)kk * _hcDim + c] = wp[(long)c * kern + kk];
+
+            var args = GC.AllocateArray<Qwen4ExpPleArgs>(1, pinned: true);
+            args[0].KeyW = kw; args[0].KeyType = kwT; args[0].KeyBytes = kwB;
+            args[0].ValueW = vw; args[0].ValueType = vwT; args[0].ValueBytes = vwB;
+            args[0].NormKey = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.ple_norm_key.weight"]);
+            args[0].NormQuery = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.ple_norm_query.weight"]);
+            args[0].NormConv = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.ple_norm_conv.weight"]);
+            fixed (float* ct = _pleConvWT) args[0].Conv1dT = (IntPtr)ct;   // pinned array
+            fixed (float* cs = _pleConvState) args[0].ConvState = (IntPtr)cs; // pinned array
+            args[0].Kern = kern;
+            args[0].Dil = _pleNgram;
+            _pleLayerIndex = il;
+            _pleArgs = args;
+            return true;
+        }
+
         private Qwen4ExpHeadArgs[] _headArgs;
         private bool _headArgsFailed;
         private float[] _spanLogits;
@@ -981,12 +1052,28 @@ namespace TensorSharp.Models
                 }
 
                 int firstAttn = Array.IndexOf(_layerKinds, (byte)0);
+                long tMask = Stopwatch.GetTimestamp();
                 BuildAttnMask(totalLen, seqLen, startPos,
                         firstAttn >= 0 ? _kCache[firstAttn].ElementType : DType.Float16);
+                PhaseLog(seqLen, "mask", tMask);
 
                 bool ranAnything = false;
                 _spanLogitsValid = false;
                 bool fuseHead = EnsureHeadArgs();
+                bool fusePle = EnsurePleArgs();
+                if (fusePle)
+                {
+                    // The hash mutates the n-gram history, so it runs exactly once and
+                    // in call order, same as the host path did.
+                    long tG = Stopwatch.GetTimestamp();
+                    int[] pleRows = ComputePleRows(tokens, startPos);
+                    long need = (long)seqLen * Config.HiddenSize;
+                    if (_pleEmbBuf == null || _pleEmbBuf.Length < need)
+                        _pleEmbBuf = GC.AllocateArray<float>(checked((int)need), pinned: true);
+                    fixed (float* eb = _pleEmbBuf)
+                        GatherPleRowsRaw(eb, pleRows, seqLen);
+                    PhaseLog(seqLen, "ple.gather", tG);
+                }
                 fixed (Qwen4ExpFfnArgs* fp = _ffnArgs)
                 fixed (Qwen4ExpGdnArgs* gp = _gdnArgs)
                 fixed (Qwen4ExpAttnArgs* ap = _attnArgs)
@@ -997,11 +1084,11 @@ namespace TensorSharp.Models
                     bool beginFfnOnly = false;
                     for (int il = 0; il <= Config.NumLayers; il++)
                     {
-                        // The PLE layer scores its gathered rows against the residual
-                        // on the host, so it cuts the token into spans; so does every
-                        // attention layer unless TS_Q4E_SPAN_ATTN=1.
+                        // The host-side PLE layer cuts the token into spans - unless
+                        // the PLE block rides inside the span, which is the default.
+                        // So does every attention layer unless TS_Q4E_SPAN_ATTN=1.
                         bool attnCut = il < Config.NumLayers && !_isRecurrent[il] && !_spanAttnEnabled;
-                        bool cut = il == Config.NumLayers || _isPle[il] || attnCut;
+                        bool cut = il == Config.NumLayers || (_isPle[il] && !fusePle) || attnCut;
                         if (!cut) continue;
                         if (il > begin)
                         {
@@ -1015,6 +1102,16 @@ namespace TensorSharp.Models
                                 fixed (float* lp = _spanLogits)
                                 { headPtr = (IntPtr)hp; logitsPtr = (IntPtr)lp; }
                             }
+                            IntPtr plePtr = IntPtr.Zero, pleEmbPtr = IntPtr.Zero;
+                            int pleLayerArg = -1;
+                            if (fusePle && _pleLayerIndex >= begin && _pleLayerIndex < il)
+                            {
+                                fixed (Qwen4ExpPleArgs* pp = _pleArgs)
+                                fixed (float* eb = _pleEmbBuf)
+                                { plePtr = (IntPtr)pp; pleEmbPtr = (IntPtr)eb; }
+                                pleLayerArg = _pleLayerIndex;
+                            }
+                            long tSpan = Stopwatch.GetTimestamp();
                             bool ok = GgmlBasicOps.Qwen4ExpTokenSpan(
                                 (IntPtr)fp, (IntPtr)gp, (IntPtr)ap, (IntPtr)kp,
                                 begin, il,
@@ -1026,7 +1123,8 @@ namespace TensorSharp.Models
                                 _ropeDimCount, Config.RopeBase, 1.0f / Config.RopeScale, _attnScale,
                                 _numExperts, _numExpertsUsed, _expertFf, _sharedFf,
                                 Config.Eps, cacheSlot: spanIdx, firstFfnOnly: beginFfnOnly,
-                                head: headPtr, logitsOut: logitsPtr);
+                                head: headPtr, logitsOut: logitsPtr,
+                                ple: plePtr, pleLayer: pleLayerArg, pleEmb: pleEmbPtr);
                             if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {
@@ -1045,13 +1143,16 @@ namespace TensorSharp.Models
                                 return false;
                             }
                             ranAnything = true;
+                            PhaseLog(seqLen, $"span[{begin},{il})", tSpan);
                             DriverTrace(res, seqLen, $"span{spanIdx} [{begin},{il}) T={seqLen} pos={startPos}");
                             spanIdx++;
                             InvalidateTensorDeviceCache(res);
                         }
                         if (il < Config.NumLayers && _isPle[il])
                         {
+                            long tPle = Stopwatch.GetTimestamp();
                             PleLayer(res, tokens, seqLen, startPos, il);
+                            PhaseLog(seqLen, "ple", tPle);
                             begin = il;
                             beginFfnOnly = false;
                         }
