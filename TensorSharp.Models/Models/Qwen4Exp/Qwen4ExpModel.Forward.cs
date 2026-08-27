@@ -157,10 +157,26 @@ namespace TensorSharp.Models
                     Ops.Fill(_gdnStateT[l], 0f);
                     InvalidateTensorDeviceCache(_gdnStateT[l]);
                 }
+                // The fused recurrent kernel keeps the conv history in its own
+                // [d_conv-1, conv_dim] tensor rather than the host ring.
+                if (_gdnConvStateT != null && _gdnConvStateT[l] != null)
+                {
+                    Ops.Fill(_gdnConvStateT[l], 0f);
+                    InvalidateTensorDeviceCache(_gdnConvStateT[l]);
+                }
                 if (_gdnConvWriteIdx != null) _gdnConvWriteIdx[l] = 0;
             }
             if (_pleConvState != null) Array.Clear(_pleConvState);
             ResetPleHistory();
+
+            // The fused kernels keep the conv and recurrent state in their OWN device
+            // buffers inside a persisted graph, so zeroing the host copies above does
+            // not reach them. Dropping the graphs makes the next call rebuild and
+            // re-upload from the (now zeroed) host state. Without this the kernel
+            // warmup's state leaked into the first real generation, which read as
+            // fluent-looking noise while every per-layer check passed.
+            if (IsGgmlBackend && (_ffnArgs != null || _gdnArgs != null))
+                GgmlBasicOps.Qwen4ExpResetFfnCache();
         }
 
         protected override float[] ForwardCore(int[] tokens)
@@ -178,13 +194,61 @@ namespace TensorSharp.Models
             Tensor res = BroadcastToStreams(embd, seqLen);
             embd.Dispose();
 
+            // Hand the residual to the device once; the fused halves chain through it
+            // and only the layers still running op-by-op pull it back.
+            _resOnDevice = false;
+            if (_ffnArgs != null && !_fusedFfnUnsupported)
+                ResidualToDevice(res, seqLen);
+
             for (int il = 0; il < Config.NumLayers; il++)
             {
                 long t0 = Stopwatch.GetTimestamp();
                 if (_isPle[il])
+                {
+                    ResidualToHost(res, seqLen);
                     PleLayer(res, tokens, seqLen, startPos, il);
+                    ResidualToDevice(res, seqLen);
+                }
                 long t1 = Stopwatch.GetTimestamp(); Q4ePleTicks += t1 - t0;
 
+                // The recurrent half - mixer, projections, causal conv, the delta-net
+                // recurrence and the scatter - is one graph when the kernel takes the
+                // shape. That is ~9 GGML submissions collapsed into 1 on 36 of the 48
+                // layers, on a path that is dispatch bound.
+                // Verify once for a single-token step and once for a multi-token one:
+                // the conv history and the multi-token recurrence only exercise the
+                // second, and a kernel can be right for one and wrong for the other.
+                if (_isRecurrent[il] && _gdnVerify
+                    && ((seqLen == 1 && !_gdnVerified1) || (seqLen > 1 && !_gdnVerifiedN)))
+                {
+                    VerifyGdnBlock(res, il, seqLen);
+                    if (seqLen == 1) _gdnVerified1 = true; else _gdnVerifiedN = true;
+                }
+
+                if (_isRecurrent[il] && TryFusedGdnBlock(res, il, seqLen))
+                {
+                    long tg = Stopwatch.GetTimestamp(); Q4eGdnTicks += tg - t1;
+                    if (TryFusedFfnBlock(res, il, seqLen))
+                    {
+                        Q4eMoeTicks += Stopwatch.GetTimestamp() - tg;
+                        continue;
+                    }
+                    // FFN fell back; run the op-by-op FFN half below with a fresh mixer.
+                    ResidualToHost(res, seqLen);
+                    Tensor injF;
+                    Tensor curF = HcMix(res, seqLen,
+                        $"blk.{il}.hc_ffn_norm.weight", $"blk.{il}.hc_ffn_down.weight",
+                        $"blk.{il}.hc_ffn_up.weight", $"blk.{il}.hc_ffn_inject.weight", out injF);
+                    Tensor ffnF = MoeFfn(curF, il, seqLen);
+                    curF.Dispose();
+                    HcCombine(res, ffnF, injF, seqLen);
+                    ffnF.Dispose();
+                    injF.Dispose();
+                    ResidualToDevice(res, seqLen);
+                    continue;
+                }
+
+                ResidualToHost(res, seqLen);
                 Tensor inject;
                 Tensor cur = HcMix(res, seqLen,
                     $"blk.{il}.hc_attn_norm.weight", $"blk.{il}.hc_attn_down.weight",
@@ -201,7 +265,20 @@ namespace TensorSharp.Models
                 HcCombine(res, blockOut, inject, seqLen);
                 blockOut.Dispose();
                 inject.Dispose();
+                _ = t3;
+                if (_ffnArgs != null && !_fusedFfnUnsupported)
+                    ResidualToDevice(res, seqLen);
 
+                // The mixer, the experts and the scatter are one graph when the
+                // fused kernel takes the shape - 8 GGML submissions collapsed into
+                // 1, 48 times a token, on a path that is dispatch bound.
+                if (TryFusedFfnBlock(res, il, seqLen))
+                {
+                    Q4eMoeTicks += Stopwatch.GetTimestamp() - t3;
+                    continue;
+                }
+
+                ResidualToHost(res, seqLen);
                 cur = HcMix(res, seqLen,
                     $"blk.{il}.hc_ffn_norm.weight", $"blk.{il}.hc_ffn_down.weight",
                     $"blk.{il}.hc_ffn_up.weight", $"blk.{il}.hc_ffn_inject.weight", out inject);
@@ -216,6 +293,8 @@ namespace TensorSharp.Models
                 inject.Dispose();
                 Q4eHcTicks += Stopwatch.GetTimestamp() - t5;
             }
+
+            ResidualToHost(res, seqLen);
 
             // The final mixer IS the output norm - qwen4exp ships no separate one.
             Tensor normed = HcMix(res, seqLen,
@@ -551,6 +630,315 @@ namespace TensorSharp.Models
         /// cost 2.7 s of prefill when it was applied unconditionally.
         /// </summary>
         private const int HostElementwiseMaxRows = 8;
+
+        // TS_Q4E_GDN_VERIFY=1 runs the fused recurrent half and the op-by-op one on
+        // the SAME input and state, and reports how far apart they are. Diagnostic
+        // only: it runs once, on the first recurrent layer of the first forward,
+        // where the state is still zero so both paths start from the same place.
+        private static readonly bool _gdnVerify =
+            string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_GDN_VERIFY"), "1", StringComparison.Ordinal);
+        private bool _gdnVerified1, _gdnVerifiedN;
+
+        private unsafe void VerifyGdnBlock(Tensor res, int il, int seqLen)
+        {
+            long n = (long)seqLen * _hcDim;
+            var input = new float[n];
+            var fused = new float[n];
+            float* rp = GetFloatPtr(res);
+            for (long i = 0; i < n; i++) input[i] = rp[i];
+
+            void ZeroState()
+            {
+                EnsureGdnScratch();
+                if (_gdnStateT?[il] != null) { Ops.Fill(_gdnStateT[il], 0f); InvalidateTensorDeviceCache(_gdnStateT[il]); }
+                if (_gdnConvStateT?[il] != null) { Ops.Fill(_gdnConvStateT[il], 0f); InvalidateTensorDeviceCache(_gdnConvStateT[il]); }
+                if (_gdnConvState?[il] != null) Array.Clear(_gdnConvState[il]);
+                if (_gdnConvWriteIdx != null) _gdnConvWriteIdx[il] = 0;
+            }
+
+            // TWO consecutive calls: the second one is the only thing that exercises
+            // the state written back by the first, which a single call cannot check.
+            const int Iters = 2;
+
+            // ---- fused ----
+            ZeroState();
+            for (int it = 0; it < Iters; it++)
+            {
+                for (long i = 0; i < n; i++) rp[i] = input[i];
+                InvalidateTensorDeviceCache(res);
+                if (!TryFusedGdnBlock(res, il, seqLen))
+                { Console.WriteLine("[q4e-verify] fused GDN declined the shape."); return; }
+            }
+            for (long i = 0; i < n; i++) fused[i] = rp[i];
+
+            // ---- op-by-op, from the same input and state ----
+            ZeroState();
+            for (int it = 0; it < Iters; it++)
+            {
+                for (long i = 0; i < n; i++) rp[i] = input[i];
+                InvalidateTensorDeviceCache(res);
+
+                Tensor inj;
+                Tensor cur = HcMix(res, seqLen,
+                    $"blk.{il}.hc_attn_norm.weight", $"blk.{il}.hc_attn_down.weight",
+                    $"blk.{il}.hc_attn_up.weight", $"blk.{il}.hc_attn_inject.weight", out inj);
+                Tensor blockOut = GdnLayer(cur, il, seqLen);
+                cur.Dispose();
+                HcCombine(res, blockOut, inj, seqLen);
+                blockOut.Dispose();
+                inj.Dispose();
+            }
+
+            // Compare the block's CONTRIBUTION (res_after - res_before), not the
+            // residual: the residual is dominated by the pass-through, so a large
+            // error in what the block adds hides inside it.
+            double maxAbs = 0, refMax = 0, contribMax = 0, contribErr = 0;
+            long worst = -1;
+            for (long i = 0; i < n; i++)
+            {
+                double refC = rp[i] - input[i];
+                double fusC = fused[i] - input[i];
+                double d = Math.Abs(fusC - refC);
+                if (d > contribErr) { contribErr = d; worst = i; }
+                contribMax = Math.Max(contribMax, Math.Abs(refC));
+                maxAbs = Math.Max(maxAbs, Math.Abs(fused[i] - rp[i]));
+                refMax = Math.Max(refMax, Math.Abs(rp[i]));
+            }
+            Console.WriteLine($"[q4e-verify] layer {il} seqLen {seqLen}: " +
+                $"residual maxAbs={maxAbs:E3} rel={(refMax > 0 ? maxAbs / refMax : 0):E3} | " +
+                $"CONTRIB maxAbs={contribErr:E3} rel={(contribMax > 0 ? contribErr / contribMax : 0):E3} " +
+                $"contribMax={contribMax:E3}" +
+                (worst >= 0 ? $" | fusedC={fused[worst] - input[worst]:E3} refC={rp[worst] - input[worst]:E3}" : ""));
+
+            // Leave the state as the op-by-op path left it: that one is the reference.
+            ZeroState();
+            for (long i = 0; i < n; i++) rp[i] = input[i];
+            InvalidateTensorDeviceCache(res);
+        }
+
+        // TS_Q4E_FUSED_GDN=0 falls back to the op-by-op recurrent half.
+        // Keeping the residual in the kernels' device buffer across a layer, so the
+        // fused halves chain without a host round trip each call.
+        //
+        // OFF by default: it measures ~8% on decode but currently produces wrong
+        // output, and 8% does not buy a correctness risk. The remaining bug is in the
+        // hand-off between the resident buffer and the layers still running op-by-op -
+        // the host copy of the residual and its GGML device mirror disagree somewhere
+        // across that boundary. TS_Q4E_RES_RESIDENT=1 re-enables it for debugging.
+        private static readonly bool _resResidentEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_RES_RESIDENT"), "1", StringComparison.Ordinal);
+        private bool _resOnDevice;
+
+        /// <summary>Bring the residual back to the host so op-by-op code can read it.</summary>
+        private unsafe void ResidualToHost(Tensor res, int seqLen)
+        {
+            if (!_resOnDevice) return;
+            long bytes = (long)seqLen * _hcDim * sizeof(float);
+            if (GgmlBasicOps.Qwen4ExpResDownload((IntPtr)GetFloatPtr(res), bytes))
+                InvalidateTensorDeviceCache(res);
+            _resOnDevice = false;
+        }
+
+        /// <summary>Hand the residual to the device so the fused kernels can chain.</summary>
+        private unsafe bool ResidualToDevice(Tensor res, int seqLen)
+        {
+            if (_resOnDevice) return true;
+            if (!_resResidentEnabled || !IsGgmlBackend) return false;
+            long bytes = (long)seqLen * _hcDim * sizeof(float);
+            _resOnDevice = GgmlBasicOps.Qwen4ExpResUpload((IntPtr)GetFloatPtr(res), bytes);
+            return _resOnDevice;
+        }
+
+        private static readonly bool _fusedGdnEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_FUSED_GDN"), "0", StringComparison.Ordinal);
+        private bool _fusedGdnUnsupported;
+        private static readonly int _gdnMaxLayers =
+            int.TryParse(Environment.GetEnvironmentVariable("TS_Q4E_GDN_MAX_LAYERS"), out int gm) ? gm : -1;
+        private Qwen4ExpGdnArgs[] _gdnArgs;
+        private Tensor[] _gdnConvStateT;
+
+        private unsafe bool TryFusedGdnBlock(Tensor res, int il, int seqLen)
+        {
+            if (!_fusedGdnEnabled || _fusedGdnUnsupported || !IsGgmlBackend)
+                return false;
+            // Bisect handle: TS_Q4E_GDN_MAX_LAYERS=N fuses only layers below N and
+            // leaves the rest op-by-op, which separates a per-layer error from one
+            // that only appears once it compounds across 36 of them.
+            if (_gdnMaxLayers >= 0 && il >= _gdnMaxLayers)
+                return false;
+
+            try
+            {
+                if (_gdnArgs == null)
+                {
+                    // PINNED for the same reason as the FFN descriptors: the kernel
+                    // keys its cached graph on the descriptor address.
+                    _gdnArgs = GC.AllocateArray<Qwen4ExpGdnArgs>(Config.NumLayers, pinned: true);
+                    _gdnConvStateT = new Tensor[Config.NumLayers];
+                    EnsureGdnScratch();
+                    for (int l = 0; l < Config.NumLayers; l++)
+                    {
+                        if (!_isRecurrent[l]) continue;
+                        // The kernel wants the conv history as [d_conv-1, conv_dim]
+                        // rather than the host ring the op-by-op path walks.
+                        _gdnConvStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
+                        Ops.Fill(_gdnConvStateT[l], 0f);
+                        if (!TryFillGdnArgs(l, ref _gdnArgs[l])) { _fusedGdnUnsupported = true; return false; }
+                    }
+                }
+                if (_gdnConvStateT[il] == null) return false;
+
+                bool ok = GgmlBasicOps.Qwen4ExpGdnBlock(ref _gdnArgs[il],
+                    (IntPtr)GetFloatPtr(res),
+                    Config.HiddenSize, _hc, _hcLowRank, seqLen,
+                    _headKDim, _headVDim, _numKHeads, _numVHeads, _convKernel,
+                    Config.Eps, cacheSlot: il, resResident: _resOnDevice);
+                if (!ok) { _fusedGdnUnsupported = true; return false; }
+                if (!_resOnDevice) InvalidateTensorDeviceCache(res);
+                return true;
+            }
+            catch (Exception)
+            {
+                _fusedGdnUnsupported = true;
+                return false;
+            }
+        }
+
+        private unsafe bool TryFillGdnArgs(int il, ref Qwen4ExpGdnArgs a)
+        {
+            if (!TryResolveQuant($"blk.{il}.hc_attn_down.weight", out IntPtr hd, out int hdT, out long hdB)
+                || !TryResolveQuant($"blk.{il}.hc_attn_up.weight", out IntPtr hu, out int huT, out long huB)
+                || !TryResolveQuant($"blk.{il}.hc_attn_inject.weight", out IntPtr hj, out int hjT, out long hjB)
+                || !TryResolveQuant($"blk.{il}.attn_qkv.weight", out IntPtr qv, out int qvT, out long qvB)
+                || !TryResolveQuant($"blk.{il}.attn_gate.weight", out IntPtr gt, out int gtT, out long gtB)
+                || !TryResolveQuant($"blk.{il}.ssm_beta.weight", out IntPtr bt, out int btT, out long btB)
+                || !TryResolveQuant($"blk.{il}.ssm_alpha.weight", out IntPtr al, out int alT, out long alB)
+                || !TryResolveQuant($"blk.{il}.ssm_out.weight", out IntPtr op, out int opT, out long opB))
+            {
+                return false;
+            }
+            // The conv kernel has to be F32: the graph multiplies it against F32
+            // activations without a cast.
+            if (!_weights.TryGetValue($"blk.{il}.ssm_conv1d.weight", out Tensor convW))
+                return false;
+
+            a.HcNorm = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.hc_attn_norm.weight"]);
+            a.HcDown = hd; a.HcDownType = hdT; a.HcDownBytes = hdB;
+            a.HcUp = hu; a.HcUpType = huT; a.HcUpBytes = huB;
+            a.HcInject = hj; a.HcInjectType = hjT; a.HcInjectBytes = hjB;
+            a.Qkv = qv; a.QkvType = qvT; a.QkvBytes = qvB;
+            a.Gate = gt; a.GateType = gtT; a.GateBytes = gtB;
+            a.Beta = bt; a.BetaType = btT; a.BetaBytes = btB;
+            a.Alpha = al; a.AlphaType = alT; a.AlphaBytes = alB;
+            a.OutProj = op; a.OutProjType = opT; a.OutProjBytes = opB;
+            a.Conv1d = (IntPtr)GetFloatPtr(convW);
+            a.SsmDt = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.ssm_dt.bias"]);
+            a.SsmA = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.ssm_a"]);
+            a.SsmNorm = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.ssm_norm.weight"]);
+            a.ConvState = (IntPtr)GetFloatPtr(_gdnConvStateT[il]);
+            a.SsmState = (IntPtr)GetFloatPtr(_gdnStateT[il]);
+            return true;
+        }
+
+        // TS_Q4E_FUSED_FFN=0 falls back to the op-by-op mixer + MoE + scatter,
+        // which is also the automatic fallback for any shape the kernel declines.
+        private static readonly bool _fusedFfnEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_FUSED_FFN"), "0", StringComparison.Ordinal);
+        private bool _fusedFfnUnsupported;
+        private Qwen4ExpFfnArgs[] _ffnArgs;
+
+        private unsafe bool TryFusedFfnBlock(Tensor res, int il, int seqLen)
+        {
+            if (!_fusedFfnEnabled || _fusedFfnUnsupported || !IsGgmlBackend || _fusedGateUpExperts)
+                return false;
+
+            try
+            {
+                if (_ffnArgs == null)
+                {
+                    // PINNED: the kernel keys its cached graph on the descriptor's
+                    // address, so a moving array would look like a different layer
+                    // every token and rebuild the graph each time - exactly the cost
+                    // the cache exists to remove.
+                    _ffnArgs = GC.AllocateArray<Qwen4ExpFfnArgs>(Config.NumLayers, pinned: true);
+                    for (int l = 0; l < Config.NumLayers; l++)
+                        if (!TryFillFfnArgs(l, ref _ffnArgs[l])) { _fusedFfnUnsupported = true; return false; }
+                }
+
+                bool ok = GgmlBasicOps.Qwen4ExpFfnBlock(ref _ffnArgs[il],
+                    (IntPtr)GetFloatPtr(res),
+                    Config.HiddenSize, _hc, _hcLowRank, seqLen,
+                    _numExperts, _numExpertsUsed, _expertFf, _sharedFf, Config.Eps,
+                    cacheSlot: il, resResident: _resOnDevice);
+                if (!ok)
+                {
+                    _fusedFfnUnsupported = true;
+                    return false;
+                }
+                if (!_resOnDevice) InvalidateTensorDeviceCache(res);
+                return true;
+            }
+            catch (Exception)
+            {
+                _fusedFfnUnsupported = true;
+                return false;
+            }
+        }
+
+        private unsafe bool TryFillFfnArgs(int il, ref Qwen4ExpFfnArgs a)
+        {
+            if (!_stackedExpertWeights.TryGetValue($"blk.{il}.ffn_gate_exps.weight", out var g)
+                || !_stackedExpertWeights.TryGetValue($"blk.{il}.ffn_up_exps.weight", out var u)
+                || !_stackedExpertWeights.TryGetValue($"blk.{il}.ffn_down_exps.weight", out var d))
+            {
+                return false;
+            }
+
+            if (!TryResolveQuant($"blk.{il}.hc_ffn_down.weight", out IntPtr hd, out int hdT, out long hdB)
+                || !TryResolveQuant($"blk.{il}.hc_ffn_up.weight", out IntPtr hu, out int huT, out long huB)
+                || !TryResolveQuant($"blk.{il}.hc_ffn_inject.weight", out IntPtr hj, out int hjT, out long hjB)
+                || !TryResolveQuant($"blk.{il}.ffn_gate_inp.weight", out IntPtr rt, out int rtT, out long rtB)
+                || !TryResolveQuant($"blk.{il}.ffn_gate_shexp.weight", out IntPtr sg, out int sgT, out long sgB)
+                || !TryResolveQuant($"blk.{il}.ffn_up_shexp.weight", out IntPtr su, out int suT, out long suB)
+                || !TryResolveQuant($"blk.{il}.ffn_down_shexp.weight", out IntPtr sd, out int sdT, out long sdB))
+            {
+                return false;
+            }
+
+            a.HcNorm = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.hc_ffn_norm.weight"]);
+            a.HcDown = hd; a.HcDownType = hdT; a.HcDownBytes = hdB;
+            a.HcUp = hu; a.HcUpType = huT; a.HcUpBytes = huB;
+            a.HcInject = hj; a.HcInjectType = hjT; a.HcInjectBytes = hjB;
+            a.Router = rt; a.RouterType = rtT; a.RouterBytes = rtB;
+            a.GateExps = g.Data; a.GateExpsType = g.GgmlType; a.GateExpsBytes = g.TotalRawBytes;
+            a.UpExps = u.Data; a.UpExpsType = u.GgmlType; a.UpExpsBytes = u.TotalRawBytes;
+            a.DownExps = d.Data; a.DownExpsType = d.GgmlType; a.DownExpsBytes = d.TotalRawBytes;
+            a.ShGateInp = (IntPtr)GetFloatPtr(_weights[$"blk.{il}.ffn_gate_inp_shexp.weight"]);
+            a.ShGate = sg; a.ShGateType = sgT; a.ShGateBytes = sgB;
+            a.ShUp = su; a.ShUpType = suT; a.ShUpBytes = suB;
+            a.ShDown = sd; a.ShDownType = sdT; a.ShDownBytes = sdB;
+            return true;
+        }
+
+        /// <summary>Resolve a weight to (device cache key, ggml type, raw bytes),
+        /// from either its quantized or its F32 form.</summary>
+        private unsafe bool TryResolveQuant(string name, out IntPtr ptr, out int type, out long bytes)
+        {
+            if (_quantWeights.TryGetValue(name, out var qw))
+            {
+                ptr = qw.CacheKey; type = qw.GgmlType; bytes = qw.RawBytes;
+                return true;
+            }
+            if (_weights.TryGetValue(name, out var w))
+            {
+                ptr = (IntPtr)GetFloatPtr(w);
+                type = 0;                                   // GGML_TYPE_F32
+                bytes = w.ElementCount() * sizeof(float);
+                return true;
+            }
+            ptr = IntPtr.Zero; type = 0; bytes = 0;
+            return false;
+        }
 
         private int[] _moeSelExperts;
         private float[] _moeRouteWts;

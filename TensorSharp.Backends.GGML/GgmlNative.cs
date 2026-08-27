@@ -352,6 +352,45 @@ public struct Gemma4MoELayerDecodeArgs
     public float LayerOutputScale;
 }
 
+    /// <summary>
+    /// Mirrors TSGgmlQwen4ExpGdnArgs in ggml_ops_qwen4exp.cpp - the recurrent half
+    /// of a qwen4exp layer. Pointers first, then int64, then int32.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Qwen4ExpGdnArgs
+    {
+        public IntPtr HcNorm, HcDown, HcUp, HcInject;
+        public IntPtr Qkv, Gate, Beta, Alpha;
+        public IntPtr Conv1d, SsmDt, SsmA, SsmNorm, OutProj;
+        public IntPtr ConvState, SsmState;
+
+        public long HcDownBytes, HcUpBytes, HcInjectBytes;
+        public long QkvBytes, GateBytes, BetaBytes, AlphaBytes, OutProjBytes;
+
+        public int HcDownType, HcUpType, HcInjectType;
+        public int QkvType, GateType, BetaType, AlphaType, OutProjType;
+    }
+
+    /// <summary>
+    /// Mirrors TSGgmlQwen4ExpFfnArgs in ggml_ops_qwen4exp.cpp. Pointers first,
+    /// then int64, then int32 - append within a run rather than reordering.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Qwen4ExpFfnArgs
+    {
+        public IntPtr HcNorm, HcDown, HcUp, HcInject;
+        public IntPtr Router, GateExps, UpExps, DownExps;
+        public IntPtr ShGateInp, ShGate, ShUp, ShDown;
+
+        public long HcDownBytes, HcUpBytes, HcInjectBytes;
+        public long RouterBytes, GateExpsBytes, UpExpsBytes, DownExpsBytes;
+        public long ShGateBytes, ShUpBytes, ShDownBytes;
+
+        public int HcDownType, HcUpType, HcInjectType;
+        public int RouterType, GateExpsType, UpExpsType, DownExpsType;
+        public int ShGateType, ShUpType, ShDownType;
+    }
+
 // Descriptor for the Qwen3.5/3.6 full-model decode kernel
 // (TSGgml_Qwen35ModelDecode). Field order/types MUST match the native
 // TSGgmlQwen35LayerDesc struct EXACTLY: 23 pointers, then 27 int64, then 13 int32.
@@ -3811,6 +3850,65 @@ internal enum GgmlIndexReductionOp
             int chunkSize,
             float eps,
             int gateMode);
+
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpFfnBlock(
+            ref Qwen4ExpFfnArgs args,
+            IntPtr resData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int nExpert, int nExpertUsed, int nFf, int nFfShared,
+            float eps, int cacheSlot, int resResident);
+
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpGdnBlock(
+            ref Qwen4ExpGdnArgs args,
+            IntPtr resData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            float eps, int cacheSlot, int resResident);
+
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_Qwen4ExpResetFfnCache();
+
+        /// <summary>
+        /// One graph for the hyper-connection mixer, the 512-expert MoE and the
+        /// scatter back into the wide residual. Returns false when the backend
+        /// declines the shape, so the caller falls back to the op-by-op path.
+        /// </summary>
+        public static bool Qwen4ExpFfnBlock(ref Qwen4ExpFfnArgs args, IntPtr resData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int nExpert, int nExpertUsed, int nFf, int nFfShared, float eps, int cacheSlot,
+            bool resResident)
+        {
+            return TSGgml_Qwen4ExpFfnBlock(ref args, resData,
+                nEmbd, hc, hcLowRank, nTokens,
+                nExpert, nExpertUsed, nFf, nFfShared, eps, cacheSlot,
+                resResident ? 1 : 0) != 0;
+        }
+
+        public static bool Qwen4ExpGdnBlock(ref Qwen4ExpGdnArgs args, IntPtr resData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            float eps, int cacheSlot, bool resResident)
+        {
+            return TSGgml_Qwen4ExpGdnBlock(ref args, resData, nEmbd, hc, hcLowRank, nTokens,
+                headKDim, headVDim, nKHeads, nVHeads, dConv, eps, cacheSlot,
+                resResident ? 1 : 0) != 0;
+        }
+
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpResUpload(IntPtr data, long bytes);
+
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpResDownload(IntPtr data, long bytes);
+
+        public static bool Qwen4ExpResUpload(IntPtr data, long bytes)
+            => TSGgml_Qwen4ExpResUpload(data, bytes) != 0;
+
+        public static bool Qwen4ExpResDownload(IntPtr data, long bytes)
+            => TSGgml_Qwen4ExpResDownload(data, bytes) != 0;
+
+        public static void Qwen4ExpResetFfnCache() => TSGgml_Qwen4ExpResetFfnCache();
 
         // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; same 32-byte
         // POD layout on 64-bit (two ints, two padding ints, two pointers).

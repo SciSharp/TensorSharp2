@@ -2906,6 +2906,46 @@ namespace TensorSharp.GGML
         /// <param name="ssmNormWData">Per-D RMSNorm weights [headDim].</param>
         /// <param name="chunkSize">Chunk size (must be a positive power of two).</param>
         /// <param name="eps">Epsilon used for L2Norm and RMSNorm.</param>
+        /// <summary>
+        /// Qwen3.8-Flash-Next fused FFN half-layer: the hyper-connection mixer, the
+        /// 512-expert MoE and the scatter back into the 4-wide residual as ONE graph.
+        /// Returns false when the backend declines the shape, so the caller can fall
+        /// back to the op-by-op path.
+        /// </summary>
+        public static bool Qwen4ExpFfnBlock(ref Qwen4ExpFfnArgs args, IntPtr resData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int nExpert, int nExpertUsed, int nFf, int nFfShared, float eps, int cacheSlot,
+            bool resResident = false)
+        {
+            return GgmlNative.Qwen4ExpFfnBlock(ref args, resData, nEmbd, hc, hcLowRank,
+                nTokens, nExpert, nExpertUsed, nFf, nFfShared, eps, cacheSlot, resResident);
+        }
+
+        /// <summary>Copy the 4-wide residual into the device-resident buffer the fused
+        /// kernels chain through, and back out again.</summary>
+        public static bool Qwen4ExpResUpload(IntPtr data, long bytes)
+            => GgmlNative.Qwen4ExpResUpload(data, bytes);
+
+        public static bool Qwen4ExpResDownload(IntPtr data, long bytes)
+            => GgmlNative.Qwen4ExpResDownload(data, bytes);
+
+        /// <summary>
+        /// Qwen3.8-Flash-Next fused recurrent half-layer: mixer, projections, causal
+        /// depthwise conv, the Gated DeltaNet recurrence and the scatter, as ONE graph.
+        /// The conv and recurrent state are updated in place inside it.
+        /// </summary>
+        public static bool Qwen4ExpGdnBlock(ref Qwen4ExpGdnArgs args, IntPtr resData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            float eps, int cacheSlot, bool resResident = false)
+        {
+            return GgmlNative.Qwen4ExpGdnBlock(ref args, resData, nEmbd, hc, hcLowRank, nTokens,
+                headKDim, headVDim, nKHeads, nVHeads, dConv, eps, cacheSlot, resResident);
+        }
+
+        /// <summary>Drop every cached qwen4exp FFN graph (they pin weight bindings).</summary>
+        public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();
+
         public static void GatedDeltaNetChunked(
             Tensor q, Tensor k, Tensor v, Tensor z,
             Tensor alpha, Tensor beta,
