@@ -776,12 +776,17 @@ namespace TensorSharp.Models
                 if (_attnMask == null || _attnMask.Length < need)
                     _attnMask = new ushort[need];
                 const ushort NegInfF16 = 0xFC00;
-                for (int t = 0; t < seqLen; t++)
+                // ONE fixed block around the whole fill. Pinning per row ends the pin at
+                // that statement and leaves the writes going through a pointer into an
+                // array the GC is free to move.
+                fixed (ushort* m = _attnMask)
                 {
-                    int limit = startPos + t;
-                    ushort* row = null;
-                    fixed (ushort* m = _attnMask) row = m + (long)t * totalLen;
-                    for (int j = 0; j < totalLen; j++) row[j] = j <= limit ? (ushort)0 : NegInfF16;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int limit = startPos + t;
+                        ushort* row = m + (long)t * totalLen;
+                        for (int j = 0; j < totalLen; j++) row[j] = j <= limit ? (ushort)0 : NegInfF16;
+                    }
                 }
 
                 bool ok;
