@@ -353,6 +353,19 @@ public struct Gemma4MoELayerDecodeArgs
 }
 
     /// <summary>
+    /// Mirrors TSGgmlQwen4ExpHeadArgs in ggml_ops_qwen4exp.cpp - the final
+    /// hyper-connection mixer (which IS the output norm) plus the LM head.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Qwen4ExpHeadArgs
+    {
+        public IntPtr HcNorm, HcDown, HcUp, Head;
+        public long HcDownBytes, HcUpBytes, HeadBytes;
+        public int HcDownType, HcUpType, HeadType;
+        public int Vocab;
+    }
+
+    /// <summary>
     /// Mirrors TSGgmlQwen4ExpAttnArgs in ggml_ops_qwen4exp.cpp - the full-attention
     /// half of a qwen4exp layer. Pointers first, then int64, then int32.
     /// </summary>
@@ -3949,7 +3962,8 @@ internal enum GgmlIndexReductionOp
             int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
             int nRot, float ropeBase, float ropeFreqScale, float attnScale,
             int nExpert, int nExpertUsed, int nFf, int nFfSh,
-            float eps, int cacheSlot, int firstFfnOnly);
+            float eps, int cacheSlot, int firstFfnOnly,
+            IntPtr head, IntPtr logitsOut);
 
         public static bool Qwen4ExpTokenSpan(
             IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
@@ -3960,7 +3974,8 @@ internal enum GgmlIndexReductionOp
             int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
             int nRot, float ropeBase, float ropeFreqScale, float attnScale,
             int nExpert, int nExpertUsed, int nFf, int nFfSh,
-            float eps, int cacheSlot, bool firstFfnOnly)
+            float eps, int cacheSlot, bool firstFfnOnly,
+            IntPtr head, IntPtr logitsOut)
         {
             return TSGgml_Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
                 resData, maskData, nEmbd, hc, hcLowRank, nTokens,
@@ -3968,7 +3983,7 @@ internal enum GgmlIndexReductionOp
                 headDim, nHead, nHeadKv, kvCapacity, nKv, position,
                 nRot, ropeBase, ropeFreqScale, attnScale,
                 nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
-                firstFfnOnly ? 1 : 0) != 0;
+                firstFfnOnly ? 1 : 0, head, logitsOut) != 0;
         }
 
         [LibraryImport(DllName)]

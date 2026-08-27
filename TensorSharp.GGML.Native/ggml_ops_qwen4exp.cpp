@@ -83,6 +83,8 @@ namespace
         // Span graphs are keyed on all three descriptor arrays and the layer range.
         const void* sig2 = nullptr;
         const void* sig3 = nullptr;
+        const void* sig4 = nullptr;      // head descriptor, or null
+        ggml_tensor* logits = nullptr;
         int layer_begin = -1;
         int layer_end = -1;
         int kv_capacity = -1;
@@ -107,6 +109,7 @@ namespace
         // persistent state tensor.
         std::vector<std::pair<ggml_tensor*, ggml_tensor*>> span_copies;
         std::vector<Q4eCachedBind> rebinds;
+        unsigned rebind_tick = 0;
         // Span attention inputs, one set per in-span attention layer. Private per
         // layer, exactly as the per-layer kernels have them.
         std::vector<ggml_tensor*> span_masks;
@@ -127,7 +130,7 @@ namespace
             graph = nullptr; res_in = nullptr; res_out = nullptr;
             conv_in = conv_out = ssm_in = ssm_out = nullptr;
             valid = false; n_tokens = 0; hc_dim = 0; sig = nullptr; res_resident = -1;
-            sig2 = nullptr; sig3 = nullptr;
+            sig2 = nullptr; sig3 = nullptr; sig4 = nullptr; logits = nullptr;
             layer_begin = -1; layer_end = -1; kv_capacity = -1; first_ffn_only = 0;
             mask = nullptr; pos = nullptr; kv_idx = nullptr; n_kv = -1;
             span_copies.clear(); rebinds.clear(); gdn_probe.clear();
@@ -172,12 +175,15 @@ namespace
     // every padded column instead of skipping the block.
     constexpr int kQwen4ExpKvStride = 256;
 
-    // The span carries the GDN state through separate output tensors copied back
-    // after each compute - the per-layer dataflow, and the DEFAULT. Writing the
-    // state in place inside the graph (TS_Q4E_SPAN_STATE=graph) is faster on paper
-    // and measurably WRONG in practice: the historical in-place failure reproduced
-    // exactly, with node order controlled, CUDA graph capture off and buffers
-    // zeroed. It stays available only for investigation.
+    // The span writes the GDN state in place inside the graph - cpy(tail ->
+    // conv_state) expanded after every node that reads the state, so node order
+    // sequences the write behind the read. This is the DEFAULT: no host-issued
+    // copies and no extra synchronize per span. The historical "in-place writes
+    // do not take effect" failures - including an earlier note in this file
+    // declaring them measurably wrong - were the gallocr leaf-free bug corrupting
+    // the small gate weights, not the write-back; with uploaded leafs
+    // OUTPUT-flagged the in-place dataflow verifies clean at every length.
+    // TS_Q4E_SPAN_STATE=host restores the copied-out dataflow for comparison.
     // TS_Q4E_SPAN_REBUILD=1 disables the span replay path entirely - every call
     // rebuilds the graph. Diagnosis only: separates a wrong-graph bug from a
     // wrong-replay one.
@@ -219,7 +225,7 @@ namespace
     {
         static const bool v = []{
             const char* e = std::getenv("TS_Q4E_SPAN_STATE");
-            return e != nullptr && e[0] == 'g';
+            return !(e != nullptr && e[0] == 'h');
         }();
         return v;
     }
@@ -230,6 +236,11 @@ namespace
     // (needs_upload with an unmoved pointer) are handled in place.
     bool q4e_refresh_bindings(Qwen4ExpFfnCache* slot, ggml_backend_dev_t dev)
     {
+        // The full walk is a few hundred hash lookups; a moved device copy has
+        // never been observed (the guard exists as insurance), so sample it. A
+        // rebuild always re-binds everything regardless.
+        if (++slot->rebind_tick % 32 != 1)
+            return true;
         for (const Q4eCachedBind& cb : slot->rebinds)
         {
             void* before = cb.tensor->data;
@@ -434,13 +445,18 @@ namespace
                         bytes, 10);
             }
             // The tensor becomes a gallocr-owned leaf, uploaded once at build time.
-            // It MUST be flagged as an input: gallocr treats an unflagged leaf like
-            // any intermediate and reuses its memory after the last consumer, so the
-            // FIRST compute overwrites the weight in place and every REPLAY of the
-            // graph reads garbage. A build works exactly once; that is precisely the
-            // difference between a rebuilt-per-token graph that stays correct and a
-            // persisted one that decays.
+            // It MUST carry the OUTPUT flag: ggml_gallocr_free_node only exempts
+            // outputs ("graph outputs are never freed") - the INPUT flag controls
+            // early allocation but the free path ignores it - so an unprotected
+            // leaf is freed after its last consumer and its memory reused by later
+            // intermediates. The FIRST compute reads the weight correctly and then
+            // overwrites it in place; every REPLAY of the persisted graph reads
+            // whatever activations landed there, an error that scales with their
+            // magnitude. A build works exactly once - precisely the difference
+            // between a rebuilt-per-token graph that stays correct and a persisted
+            // one that decays. The INPUT flag stays for the early allocation.
             ggml_set_input(tgt);
+            ggml_set_output(tgt);
             upload_list.push_back({tgt, data, bytes});
         }
 
@@ -1467,6 +1483,23 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
 // cpy(tail -> conv_state) expanded after the nodes that read conv_state, so
 // node order sequences the write behind the read.
 // ============================================================================
+// The output stage: the final hyper-connection mixer (which IS the output norm -
+// qwen4exp ships no separate one) and the LM head, riding the tail of the last
+// span. The mixer runs on the LAST token only - at prefill the managed path used
+// to mix every position and throw all but one away.
+struct TSGgmlQwen4ExpHeadArgs
+{
+    void* hc_norm;          // f32 [hc_dim]
+    void* hc_down;          // [hc_dim, hc_low_rank]
+    void* hc_up;            // [hc_low_rank, hc_dim]
+    void* head;             // [n_embd, vocab]
+
+    long long hc_down_bytes, hc_up_bytes, head_bytes;
+
+    int hc_down_type, hc_up_type, head_type;
+    int vocab;
+};
+
 TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
     const TSGgmlQwen4ExpFfnArgs* ffn,
     const TSGgmlQwen4ExpGdnArgs* gdn,
@@ -1480,7 +1513,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
     int head_dim, int n_head, int n_head_kv, int kv_capacity, int n_kv, int position,
     int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
     int n_expert, int n_expert_used, int n_ff, int n_ff_sh,
-    float eps, int cache_slot, int first_ffn_only)
+    float eps, int cache_slot, int first_ffn_only,
+    const TSGgmlQwen4ExpHeadArgs* head, void* logits_out)
 {
     try
     {
@@ -1492,6 +1526,11 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             return 0;
         }
         if (!ensure_backend()) return 0;
+        if ((head != nullptr) != (logits_out != nullptr))
+        {
+            set_last_error("qwen4exp token span: head and logits_out come together.");
+            return 0;
+        }
 
         const int hc_dim = hc * n_embd;
         const int T = n_tokens;
@@ -1540,7 +1579,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             && slot->sig3 == (const void*)attn
             && slot->layer_begin == layer_begin && slot->layer_end == layer_end
             && slot->kv_capacity == kv_capacity && slot->n_kv == n_kv_pad
-            && slot->first_ffn_only == first_ffn_only)
+            && slot->first_ffn_only == first_ffn_only
+            && slot->sig4 == (const void*)head)
         {
             ggml_backend_tensor_set(slot->res_in, res_data, 0, res_bytes);
             for (ggml_tensor* m : slot->span_masks)
@@ -1571,6 +1611,15 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
                 set_last_error("qwen4exp token span: replay failed.");
                 return 0;
             }
+            if (slot->logits != nullptr)
+            {
+                for (const auto& c : slot->span_copies)
+                    ggml_backend_tensor_copy(c.first, c.second);
+                ggml_backend_tensor_get(slot->logits, logits_out, 0,
+                        (std::size_t)head->vocab * sizeof(float));
+                q4e_trace_state(slot, "replay", position);
+                return 1;
+            }
             // The synchronize is LOAD-BEARING: ggml_backend_tensor_copy issues a
             // legacy-stream memcpy, and ggml-cuda's compute stream is non-blocking,
             // so without the drain the copy can read conv_out/ssm_out while the
@@ -1600,6 +1649,26 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
 
         ggml_tensor* res_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, T);
         ggml_set_input(res_in);
+
+        // ONE mask, position and write-row tensor shared by every attention layer
+        // in the span - same values for all, so three uploads a replay instead of
+        // three dozen. (Private per-layer copies were briefly used to bisect the
+        // leaf-free bug; the shared tensors were never at fault.)
+        ggml_tensor* mask = nullptr;
+        ggml_tensor* pos = nullptr;
+        ggml_tensor* kv_idx = nullptr;
+        if (has_attn)
+        {
+            mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_pad, T);
+            ggml_set_input(mask);
+            pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+            ggml_set_input(pos);
+            kv_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T);
+            ggml_set_input(kv_idx);
+            slot->span_masks.push_back(mask);
+            slot->span_pos.push_back(pos);
+            slot->span_kvidx.push_back(kv_idx);
+        }
 
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, kQwen4ExpSpanGraphSize, false);
         if (q4e_graph_uid_enabled()) graph->uid = q4e_next_graph_uid();
@@ -1692,17 +1761,6 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
                 // ---- attention half (expands its own KV write first) ----
                 bool fa_here = use_flash && (attn_seen < q4e_span_fa_max());
                 ++attn_seen;
-                // Private inputs per attention layer, exactly as the per-layer kernel
-                // has them.
-                ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_pad, T);
-                ggml_set_input(mask);
-                ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
-                ggml_set_input(pos);
-                ggml_tensor* kv_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T);
-                ggml_set_input(kv_idx);
-                slot->span_masks.push_back(mask);
-                slot->span_pos.push_back(pos);
-                slot->span_kvidx.push_back(kv_idx);
                 res = q4e_nodes_attn(ctx, graph, binder, &attn[il], res,
                         mask, pos, kv_idx,
                         n_embd, hc, hc_low_rank, T,
@@ -1730,7 +1788,45 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         }
 
         ggml_tensor* res_out = res;
-        ggml_set_output(res_out);
+        ggml_tensor* logits = nullptr;
+        if (head != nullptr)
+        {
+            // ---- final mixer on the LAST token only, then the LM head ----
+            ggml_tensor* w_fnorm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+            ggml_tensor* w_fdown = ggml_new_tensor_2d(ctx, (ggml_type)head->hc_down_type, hc_dim, hc_low_rank);
+            ggml_tensor* w_fup   = ggml_new_tensor_2d(ctx, (ggml_type)head->hc_up_type, hc_low_rank, hc_dim);
+            ggml_tensor* w_head  = ggml_new_tensor_2d(ctx, (ggml_type)head->head_type, n_embd, head->vocab);
+
+            ggml_tensor* last = ggml_view_2d(ctx, res_out, hc_dim, 1,
+                    res_out->nb[1], (std::size_t)(T - 1) * res_out->nb[1]);
+            ggml_tensor* res3f = ggml_reshape_3d(ctx, ggml_cont(ctx, last), n_embd, hc, 1);
+            ggml_tensor* xnf = ggml_mul(ctx,
+                    ggml_reshape_2d(ctx, ggml_rms_norm(ctx, res3f, eps), hc_dim, 1), w_fnorm);
+            ggml_tensor* lof = ggml_silu(ctx, ggml_scale(ctx,
+                    ggml_mul_mat(ctx, w_fdown, xnf), 1.0f / (float)hc));
+            ggml_tensor* gtf = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_fup, lof));
+            ggml_tensor* gatedf = ggml_reshape_3d(ctx, ggml_mul(ctx, xnf, gtf), n_embd, hc, 1);
+            ggml_tensor* mixedf = ggml_cont(ctx, ggml_view_2d(ctx, gatedf, n_embd, 1,
+                    ggml_row_size(gatedf->type, n_embd) * hc, 0));
+            for (int c = 1; c < hc; ++c)
+                mixedf = ggml_add(ctx, mixedf, ggml_view_2d(ctx, gatedf, n_embd, 1,
+                        ggml_row_size(gatedf->type, n_embd) * hc,
+                        ggml_row_size(gatedf->type, n_embd) * c));
+            mixedf = ggml_scale(ctx, mixedf, 1.0f / (float)hc);
+
+            logits = ggml_mul_mat(ctx, w_head, mixedf);       // [vocab, 1]
+            ggml_set_output(logits);
+            ggml_build_forward_expand(graph, logits);
+
+            binder.add(w_fnorm, head->hc_norm, (std::size_t)hc_dim * sizeof(float));
+            binder.add(w_fdown, head->hc_down, (std::size_t)head->hc_down_bytes);
+            binder.add(w_fup, head->hc_up, (std::size_t)head->hc_up_bytes);
+            binder.add(w_head, head->head, (std::size_t)head->head_bytes);
+        }
+        else
+        {
+            ggml_set_output(res_out);
+        }
 
         ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
         if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
@@ -1775,7 +1871,10 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             ggml_backend_synchronize(g_backend);
         for (const auto& c : slot->span_copies)
             ggml_backend_tensor_copy(c.first, c.second);
-        ggml_backend_tensor_get(res_out, res_data, 0, res_bytes);
+        if (logits != nullptr)
+            ggml_backend_tensor_get(logits, logits_out, 0, (std::size_t)head->vocab * sizeof(float));
+        else
+            ggml_backend_tensor_get(res_out, res_data, 0, res_bytes);
         q4e_trace_probe(slot, "build", position);
         q4e_trace_state(slot, "build", position);
 
@@ -1850,6 +1949,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         slot->res_in = res_in; slot->res_out = res_out;
         slot->n_tokens = T; slot->hc_dim = hc_dim;
         slot->sig = (const void*)ffn; slot->sig2 = (const void*)gdn; slot->sig3 = (const void*)attn;
+        slot->sig4 = (const void*)head; slot->logits = logits;
         slot->layer_begin = layer_begin; slot->layer_end = layer_end;
         slot->kv_capacity = kv_capacity; slot->n_kv = n_kv_pad;
         slot->first_ffn_only = first_ffn_only;

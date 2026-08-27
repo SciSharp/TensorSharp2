@@ -2975,14 +2975,16 @@ namespace TensorSharp.GGML
             int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
             int nRot, float ropeBase, float ropeFreqScale, float attnScale,
             int nExpert, int nExpertUsed, int nFf, int nFfSh,
-            float eps, int cacheSlot, bool firstFfnOnly = false)
+            float eps, int cacheSlot, bool firstFfnOnly = false,
+            IntPtr head = default, IntPtr logitsOut = default)
         {
             return GgmlNative.Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
                 resData, maskData, nEmbd, hc, hcLowRank, nTokens,
                 headKDim, headVDim, nKHeads, nVHeads, dConv,
                 headDim, nHead, nHeadKv, kvCapacity, nKv, position,
                 nRot, ropeBase, ropeFreqScale, attnScale,
-                nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot, firstFfnOnly);
+                nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot, firstFfnOnly,
+                head, logitsOut);
         }
 
         public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();

@@ -337,6 +337,18 @@ namespace TensorSharp.Models
 
             ResidualToHost(res, seqLen);
 
+            if (_spanLogitsValid)
+            {
+                // The last span already produced the logits; the residual is dead.
+                res.Dispose();
+                _logitsBuffer = _spanLogits;
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                _forwardSw.Stop();
+                ReportQ4eProfile(seqLen);
+                return _logitsBuffer;
+            }
+
             // The final mixer IS the output norm - qwen4exp ships no separate one.
             Tensor normed = HcMix(res, seqLen,
                 "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight",
@@ -867,24 +879,14 @@ namespace TensorSharp.Models
         // The whole token as (almost) one graph. TS_Q4E_TOKEN_GRAPH=0 falls back to
         // the per-layer fused kernels; those in turn fall back op-by-op.
         // ------------------------------------------------------------------
-        // OFF by default. The spans are correct when built fresh every token and for
-        // trivially short contexts, and 25-35% faster than the per-layer kernels -
-        // but a REPLAYED span computes the gated-delta-net node slightly wrong, the
-        // error scaling with context length, and the generation decays into
-        // repetition. Instrumented to the node: inputs (residual, conv state, ssm
-        // state, projections) match a fresh build bit-for-bit and gdn_out does not.
-        // Ruled out by measurement: CUDA graph capture, ggml-cuda fusion, the
-        // resident cache moving weights, uploaded-leaf reuse, the KV pad, stream
-        // races around the state copies, in-place state writes, shared input
-        // tensors. The per-layer path replays the same builder's nodes correctly at
-        // every length, so the residue is specific to the multi-layer graph.
+        // ON by default: a decode token is two graph launches. The long hunt that
+        // once kept this off ended at a single root cause - gallocr frees an
+        // uploaded leaf weight after its last consumer unless it carries the OUTPUT
+        // flag, so the first compute overwrote the small weights (dt/a/ssm-norm,
+        // the attention q/k norms) and every replay read decayed garbage. With the
+        // flag in place every configuration that used to degenerate verifies clean.
         private static readonly bool _tokenGraphEnabled =
-            string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_TOKEN_GRAPH"), "1", StringComparison.Ordinal);
-        // TS_Q4E_SPAN_ATTN=1 chains the attention layers into the span graphs too.
-        // OFF by default: attention inside a span diverges numerically in a way the
-        // per-layer fused attention does not (under investigation), so the default
-        // spans cover the GDN runs - 36 of 48 layers - and attention runs through the
-        // proven per-layer kernel. ~26 graph launches a token instead of 96.
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_TOKEN_GRAPH"), "0", StringComparison.Ordinal);
         // TS_Q4E_DRIVER_TRACE=1 prints the residual L2 after every span and
         // attention call the driver makes. Diagnosis only.
         private static readonly bool _driverTrace =
@@ -900,10 +902,46 @@ namespace TensorSharp.Models
             Console.Error.WriteLine($"[q4e-drv] {what} l2={Math.Sqrt(n2):E9}");
         }
 
+        // TS_Q4E_SPAN_ATTN=0 cuts the spans at attention layers and runs those
+        // halves through the per-layer kernel - the hybrid that served while
+        // attention-in-span was misdiagnosed as a numeric amplifier. The actual
+        // culprit was the q/k norm weights (1KB gallocr leafs) being freed and
+        // overwritten; with them protected, attention chains into the span.
         private static readonly bool _spanAttnEnabled =
-            string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_SPAN_ATTN"), "1", StringComparison.Ordinal);
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_SPAN_ATTN"), "0", StringComparison.Ordinal);
         private bool _tokenGraphUnsupported;
         private byte[] _layerKinds;
+        // The final mixer + LM head riding the last span. _spanLogits holds the
+        // downloaded [vocab] row when the head was fused this forward.
+        private Qwen4ExpHeadArgs[] _headArgs;
+        private bool _headArgsFailed;
+        private float[] _spanLogits;
+        private bool _spanLogitsValid;
+
+        private unsafe bool EnsureHeadArgs()
+        {
+            if (_headArgs != null) return true;
+            if (_headArgsFailed) return false;
+            if (!TryResolveQuant("output_hc_down.weight", out IntPtr hd, out int hdT, out long hdB)
+                || !TryResolveQuant("output_hc_up.weight", out IntPtr hu, out int huT, out long huB)
+                || !_weights.ContainsKey("output_hc_norm.weight")
+                || (!TryResolveQuant("output.weight", out IntPtr wh, out int whT, out long whB)
+                    && !TryResolveQuant("token_embd.weight", out wh, out whT, out whB)))
+            {
+                _headArgsFailed = true;
+                return false;
+            }
+            // PINNED: the kernel keys the span graph on the descriptor address.
+            var args = GC.AllocateArray<Qwen4ExpHeadArgs>(1, pinned: true);
+            args[0].HcNorm = (IntPtr)GetFloatPtr(_weights["output_hc_norm.weight"]);
+            args[0].HcDown = hd; args[0].HcDownType = hdT; args[0].HcDownBytes = hdB;
+            args[0].HcUp = hu; args[0].HcUpType = huT; args[0].HcUpBytes = huB;
+            args[0].Head = wh; args[0].HeadType = whT; args[0].HeadBytes = whB;
+            args[0].Vocab = Config.VocabSize;
+            _spanLogits = GC.AllocateArray<float>(Config.VocabSize, pinned: true);
+            _headArgs = args;
+            return true;
+        }
 
         private unsafe bool TryFusedTokenSpans(Tensor res, int[] tokens, int seqLen, int startPos)
         {
@@ -947,6 +985,8 @@ namespace TensorSharp.Models
                         firstAttn >= 0 ? _kCache[firstAttn].ElementType : DType.Float16);
 
                 bool ranAnything = false;
+                _spanLogitsValid = false;
+                bool fuseHead = EnsureHeadArgs();
                 fixed (Qwen4ExpFfnArgs* fp = _ffnArgs)
                 fixed (Qwen4ExpGdnArgs* gp = _gdnArgs)
                 fixed (Qwen4ExpAttnArgs* ap = _attnArgs)
@@ -965,6 +1005,16 @@ namespace TensorSharp.Models
                         if (!cut) continue;
                         if (il > begin)
                         {
+                            // The last span carries the final mixer + LM head and
+                            // hands back logits instead of the residual.
+                            bool last = il == Config.NumLayers && fuseHead;
+                            IntPtr headPtr = IntPtr.Zero, logitsPtr = IntPtr.Zero;
+                            if (last)
+                            {
+                                fixed (Qwen4ExpHeadArgs* hp = _headArgs)
+                                fixed (float* lp = _spanLogits)
+                                { headPtr = (IntPtr)hp; logitsPtr = (IntPtr)lp; }
+                            }
                             bool ok = GgmlBasicOps.Qwen4ExpTokenSpan(
                                 (IntPtr)fp, (IntPtr)gp, (IntPtr)ap, (IntPtr)kp,
                                 begin, il,
@@ -975,7 +1025,9 @@ namespace TensorSharp.Models
                                 _kvCacheCapacity, totalLen, startPos,
                                 _ropeDimCount, Config.RopeBase, 1.0f / Config.RopeScale, _attnScale,
                                 _numExperts, _numExpertsUsed, _expertFf, _sharedFf,
-                                Config.Eps, cacheSlot: spanIdx, firstFfnOnly: beginFfnOnly);
+                                Config.Eps, cacheSlot: spanIdx, firstFfnOnly: beginFfnOnly,
+                                head: headPtr, logitsOut: logitsPtr);
+                            if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {
                                 _tokenGraphUnsupported = true;
