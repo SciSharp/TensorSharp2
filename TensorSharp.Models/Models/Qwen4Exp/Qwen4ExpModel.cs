@@ -136,9 +136,15 @@ namespace TensorSharp.Models
         /// <summary>Assign each layer to a GPU as a contiguous run, in pipeline
         /// order, balancing the bytes that actually become device-resident.
         ///
-        /// Rank 0 also carries the token embedding, the final mixer + LM head and the
-        /// vision tower, so it is charged those bytes up front and takes
-        /// correspondingly fewer layers rather than an equal share.
+        /// Device 0 is charged the token embedding up front and the LAST device the
+        /// final mixer + LM head, so each takes correspondingly fewer layers than an
+        /// equal share.
+        ///
+        /// NOT modelled: the vision tower. Qwen35VisionEncoder owns its weights in
+        /// its own dictionary, loaded from the mmproj GGUF AFTER this constructor has
+        /// run, and it executes on rank 0 - so a multimodal run puts roughly another
+        /// gigabyte on device 0 that this balance cannot see. TS_Q4E_LAYER_SPLIT
+        /// exists for exactly that case.
         ///
         /// See <see cref="PackLayersOntoDevices"/> for why the runs are contiguous.
         /// </summary>
@@ -175,7 +181,9 @@ namespace TensorSharp.Models
                 AccumulateWeightBytes(kv.Key, kv.Value.Storage.ByteLength, layerBytes, ref sharedBytes);
             }
 
-            _layerDevice = PackLayersOntoDevices(layerBytes, sharedBytes, headBytes, LayerSplitDegree);
+            _layerDevice = ParseLayerSplitOverride(Environment.GetEnvironmentVariable("TS_Q4E_LAYER_SPLIT"),
+                                  n, LayerSplitDegree)
+                ?? PackLayersOntoDevices(layerBytes, sharedBytes, headBytes, LayerSplitDegree);
 
             var counts = new int[LayerSplitDegree];
             var bytes = new long[LayerSplitDegree];
@@ -191,10 +199,10 @@ namespace TensorSharp.Models
         /// <summary>
         /// Assign each layer to a device as a CONTIGUOUS, MONOTONIC run, balancing
         /// device-resident bytes. Device 0 starts already holding
-        /// <paramref name="sharedBytes"/> (the embedding and the vision tower) and the
-        /// LAST device starts holding <paramref name="headBytes"/> (the final
-        /// hyper-connection mixer and the LM head, which ride the last span), so each
-        /// takes correspondingly fewer layers than an equal share.
+        /// <paramref name="sharedBytes"/> (the token embedding) and the LAST device
+        /// starts holding <paramref name="headBytes"/> (the final hyper-connection
+        /// mixer and the LM head, which ride the last span), so each takes
+        /// correspondingly fewer layers than an equal share.
         ///
         /// Contiguous and monotonic is a correctness property, not tidiness: each
         /// device boundary inside a token is a span cut and a residual hand-off, so
@@ -235,6 +243,59 @@ namespace TensorSharp.Models
                 map[l] = dev;
                 used += layerBytes[l];
             }
+            return map;
+        }
+
+        /// <summary>
+        /// Explicit layer counts per GPU from <c>TS_Q4E_LAYER_SPLIT</c>, e.g.
+        /// <c>TS_Q4E_LAYER_SPLIT=20,28</c> for "20 layers on GPU 0, 28 on GPU 1".
+        ///
+        /// The automatic balance prices weights, and cannot see everything that ends
+        /// up on a device: the vision tower lands on device 0 after the map is built,
+        /// and per-request KV grows on the layer's own device. When a run is close
+        /// enough to the VRAM ceiling for that to matter, this is the override -
+        /// llama.cpp's <c>--tensor-split</c> serves the same purpose.
+        ///
+        /// Returns null (use the automatic balance) when unset; throws on a value
+        /// that cannot be honoured, because silently ignoring an explicit placement
+        /// request is how a run OOMs with the operator believing they fixed it.
+        /// </summary>
+        internal static int[] ParseLayerSplitOverride(string spec, int numLayers, int deviceCount)
+        {
+            if (string.IsNullOrWhiteSpace(spec) || deviceCount <= 1 || numLayers <= 0)
+                return null;
+
+            string[] parts = spec.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length != deviceCount)
+            {
+                throw new ArgumentException(
+                    $"TS_Q4E_LAYER_SPLIT lists {parts.Length} device(s) but {deviceCount} GPU(s) were requested.");
+            }
+
+            var counts = new int[deviceCount];
+            long sum = 0;
+            for (int d = 0; d < deviceCount; d++)
+            {
+                if (!int.TryParse(parts[d].Trim(), out counts[d]) || counts[d] < 1)
+                {
+                    throw new ArgumentException(
+                        $"TS_Q4E_LAYER_SPLIT entry '{parts[d]}' is not a positive layer count. "
+                        + "Every GPU in the split must run at least one layer.");
+                }
+                sum += counts[d];
+            }
+            if (sum != numLayers)
+            {
+                throw new ArgumentException(
+                    $"TS_Q4E_LAYER_SPLIT assigns {sum} layers but the model has {numLayers}.");
+            }
+
+            var map = new int[numLayers];
+            int l = 0;
+            for (int d = 0; d < deviceCount; d++)
+                for (int i = 0; i < counts[d]; i++)
+                    map[l++] = d;
+            Console.WriteLine($"  Layer split: honouring TS_Q4E_LAYER_SPLIT={spec}");
             return map;
         }
 

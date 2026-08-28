@@ -55,10 +55,10 @@ public class Qwen4ExpLayerSplitTests
     [Fact]
     public void SharedBytesShiftLayersOffDevice0()
     {
-        // Device 0 also carries the token embedding and the vision tower (the head
-        // group is charged to the LAST device instead - see below). Charging those
-        // bytes is the whole point: an equal LAYER count would make gpu0 the one
-        // that runs out of VRAM.
+        // Device 0 also carries the token embedding (the head group is charged to
+        // the LAST device instead - see below; the vision tower is not modelled at
+        // all, see BuildLayerDeviceMap). Charging those bytes is the whole point: an
+        // equal LAYER count would make gpu0 the one that runs out of VRAM.
         int[] even = Qwen4ExpModel.PackLayersOntoDevices(Uniform(48, 1000), 0, 0, 2);
         int[] loaded = Qwen4ExpModel.PackLayersOntoDevices(Uniform(48, 1000), 12_000, 0, 2);
 
@@ -129,6 +129,50 @@ public class Qwen4ExpLayerSplitTests
         Assert.Equal(60, first + mid + last);
         Assert.True(mid > first && mid > last,
             $"middle device should take the most layers: {first}/{mid}/{last}");
+    }
+
+
+    // ---- TS_Q4E_LAYER_SPLIT override ----------------------------------------
+
+    [Fact]
+    public void Override_Unset_UsesTheAutomaticBalance()
+    {
+        Assert.Null(Qwen4ExpModel.ParseLayerSplitOverride(null, 48, 2));
+        Assert.Null(Qwen4ExpModel.ParseLayerSplitOverride("", 48, 2));
+        Assert.Null(Qwen4ExpModel.ParseLayerSplitOverride("   ", 48, 2));
+    }
+
+    [Fact]
+    public void Override_IgnoredWithoutASplit()
+    {
+        Assert.Null(Qwen4ExpModel.ParseLayerSplitOverride("48", 48, 1));
+    }
+
+    [Fact]
+    public void Override_AssignsExactlyTheRequestedCounts()
+    {
+        int[] map = Qwen4ExpModel.ParseLayerSplitOverride("20,28", 48, 2);
+        Assert.NotNull(map);
+        Assert.Equal(20, map.Count(d => d == 0));
+        Assert.Equal(28, map.Count(d => d == 1));
+        // Still contiguous and monotonic - the seam count must not change.
+        for (int i = 1; i < map.Length; i++)
+            Assert.True(map[i] == map[i - 1] || map[i] == map[i - 1] + 1);
+    }
+
+    [Theory]
+    [InlineData("20,29", 48, 2)]      // counts do not sum to the layer count
+    [InlineData("20", 48, 2)]         // too few devices
+    [InlineData("10,20,18", 48, 2)]   // too many devices
+    [InlineData("0,48", 48, 2)]       // a GPU with no layers is a seam for nothing
+    [InlineData("-1,49", 48, 2)]      // negative
+    [InlineData("twenty,28", 48, 2)]  // unparseable
+    public void Override_RejectsAnythingItCannotHonour(string spec, int layers, int devices)
+    {
+        // Throwing matters: silently falling back to the automatic balance would let
+        // an operator believe they had placed the layers when they had not.
+        Assert.Throws<System.ArgumentException>(
+            () => Qwen4ExpModel.ParseLayerSplitOverride(spec, layers, devices));
     }
 
     [Fact]

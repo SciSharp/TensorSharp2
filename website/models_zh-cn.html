@@ -23,7 +23,7 @@
   <p>完整参考分为四个页面。如果你已经确定要用哪个模型，从"模型下载"开始；如果还在挑选，从对应的分类页面开始。</p>
   <div class="card-grid">
     <a class="card" href="models-downloads_zh-cn.html"><div class="ic">⬇️</div><h3>模型下载</h3><p>所有 GGUF，以及各家族所需的投影器、VAE、编码器与草稿模型。</p></a>
-    <a class="card" href="models-text_zh-cn.html"><div class="ic">🧠</div><h3>文本与 LLM 模型</h3><p>十一种架构及其运行示例，加上多模态输入、思考模式与工具调用。</p></a>
+    <a class="card" href="models-text_zh-cn.html"><div class="ic">🧠</div><h3>文本与 LLM 模型</h3><p>十二种架构及其运行示例，加上多模态输入、思考模式与工具调用。</p></a>
     <a class="card" href="models-image_zh-cn.html"><div class="ic">🖼️</div><h3>图像生成</h3><p>Qwen-Image-Edit、Lightning LoRA，以及 DiT 步缓存。</p></a>
     <a class="card" href="models-video_zh-cn.html"><div class="ic">🎬</div><h3>视频生成</h3><p>MiniMax-H3 带原生立体声音频，以及 Wan 2.1 / 2.2 与那个把数小时变成几分钟的蒸馏检查点。</p></a>
   </div>
@@ -34,11 +34,12 @@
     <thead><tr><th>架构</th><th>GGUF 架构键</th><th>示例模型</th><th>多模态</th><th>思考</th><th>工具</th><th>MTP 推测</th></tr></thead>
     <tbody>
       <tr><td><strong>DeepSeek V4 Flash</strong></td><td><code>deepseek4</code></td><td>DeepSeek-V4-Flash（284B MoE，256 专家，压缩稀疏注意力，1M 上下文）</td><td>仅文本</td><td class="yes">是</td><td class="yes">是（DSML）</td><td class="yes">是（DSpark 块级草稿器，独立 GGUF）</td></tr>
-      <tr><td><strong>GLM 5.x</strong></td><td><code>glm-dsa</code></td><td>GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文）</td><td>仅文本</td><td class="yes">是</td><td class="yes">是（XML 工具调用）</td><td class="no">—</td></tr>
+      <tr><td><strong>GLM 5.x</strong></td><td><code>glm-dsa</code>、<code>glm5next</code></td><td>GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文）；GLM-5.3-Flash（320B，288 个路由专家，45 个主干层里 34 层 KDA 线性注意力，另外 11 层是 NoPE MLA/DSA 配池化索引器）</td><td>5.3-Flash 支持图像（5.2 仅文本）</td><td class="yes">是</td><td class="yes">是（XML 工具调用）</td><td class="no">—</td></tr>
       <tr><td><strong>Gemma 4</strong></td><td><code>gemma4</code></td><td>gemma-4-E4B、12B、31B、26B-A4B (MoE)</td><td>图像、视频、音频</td><td class="yes">是</td><td class="yes">是</td><td class="yes">是（独立草稿）</td></tr>
       <tr><td><strong>Gemma 3</strong></td><td><code>gemma3</code></td><td>gemma-3-4b</td><td>图像</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen 3</strong></td><td><code>qwen3</code>、<code>qwen2</code>、<code>qwen2vl</code>、<code>qwen2_vl</code></td><td>Qwen3-4B。Qwen2 / Qwen2.5-VL 的 GGUF 也由同一实现加载，按纯文本对话使用</td><td>仅文本</td><td class="yes">是</td><td class="yes">是</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen 3.5 / 3.6</strong></td><td><code>qwen35</code>、<code>qwen35moe</code>、<code>qwen3next</code></td><td>Qwen3.5-9B、Qwen3.5/3.6-35B-A3B (MoE)</td><td>图像</td><td class="yes">是</td><td class="yes">是</td><td class="yes">3.6 支持（内嵌 NextN——仅限保留 NextN 块的 GGUF，例如 <code>-MTP-</code> 仓库）</td></tr>
+      <tr><td><strong>Qwen 3.8 Flash Next</strong></td><td><code>qwen4exp</code></td><td>Qwen3.8-Flash-Next（混合 MoE：GatedDeltaNet 递归层与全注意力层交错，其中一部分挂在 Qwen 稀疏注意力的索引器之后；PLE n-gram 嵌入块；×4 超连接流；512 专家、每 token 用 10 个）</td><td>图像</td><td class="yes">是</td><td class="yes">是</td><td class="no">—</td></tr>
       <tr><td><strong>GPT OSS</strong></td><td><code>gptoss</code>、<code>gpt-oss</code></td><td>gpt-oss-20b (MoE)</td><td>仅文本</td><td class="yes">是（始终）</td><td class="yes">是</td><td class="no">—</td></tr>
       <tr><td><strong>Nemotron-H</strong></td><td><code>nemotron_h</code>、<code>nemotron_h_moe</code></td><td>Nemotron-H-8B、47B、Nemotron 3 Nano Omni</td><td>图像（Omni）</td><td class="yes">是</td><td class="yes">是</td><td class="no">—</td></tr>
       <tr><td><strong>Mistral 3</strong></td><td><code>mistral3</code></td><td>Mistral-Small-3.1-24B-Instruct</td><td>图像</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
@@ -72,7 +73,7 @@
     </tbody>
   </table>
   </div>
-  <p class="page-foot-note">MiniMax-H3、Wan、Qwen-Image-Edit 与 DiffusionGemma 构造时不接受张量并行度，因此 <code>--tp</code> 对它们无效。在视频家族里，Wan 还是唯一会直接拒绝某个后端的：不支持 <code>mlx</code>。</p>
+  <p class="page-foot-note">MiniMax-H3、Wan、Qwen-Image-Edit 与 DiffusionGemma 构造时不接受张量并行度，因此 <code>--tp</code> 对它们无效。在视频家族里，Wan 还是唯一会直接拒绝某个后端的：不支持 <code>mlx</code>。在 Qwen 3.8 Flash Next 上，<code>--tp N</code> 的含义又不一样——它跑的是<strong>按层切分</strong>，每张 GPU 持有一段连续的完整层、不切分任何权重，因此是容量特性而非速度特性：2× A100-80GB、UD-Q2_K_XL（73.4 GiB）下，贪心输出与单卡逐字节相同，显存变成 24.2 + 26.2 GB，prefill（约 1520–1550 t/s）与 decode（约 56 t/s）都没有变化。GLM-5.3-Flash 会明确拒绝 <code>--tp</code>，改用它的按层切分。既不支持张量并行、也不支持按层切分的架构，现在会在 stderr 上直说，并只用一张 GPU 运行，而不是让其余的卡白白闲着。</p>
 
   <div class="content-footer">
     <a href="backends_zh-cn.html">← 计算后端</a>

@@ -23,7 +23,7 @@
   <p>The full reference is split across four pages. Start with downloads if you know which model you want, or with a category page if you are still choosing.</p>
   <div class="card-grid">
     <a class="card" href="models-downloads.html"><div class="ic">⬇️</div><h3>Model Downloads</h3><p>Every GGUF, with the projector, VAE, encoder and drafter files each family needs.</p></a>
-    <a class="card" href="models-text.html"><div class="ic">🧠</div><h3>Text &amp; LLM Models</h3><p>Eleven architectures, their run recipes, plus multimodal input, thinking and tool calling.</p></a>
+    <a class="card" href="models-text.html"><div class="ic">🧠</div><h3>Text &amp; LLM Models</h3><p>Twelve architectures, their run recipes, plus multimodal input, thinking and tool calling.</p></a>
     <a class="card" href="models-image.html"><div class="ic">🖼️</div><h3>Image Generation</h3><p>Qwen-Image-Edit, the Lightning LoRA, and the DiT step cache.</p></a>
     <a class="card" href="models-video.html"><div class="ic">🎬</div><h3>Video Generation</h3><p>MiniMax-H3 with native stereo audio, and Wan 2.1 / 2.2 with the distilled checkpoint that turns hours into minutes.</p></a>
   </div>
@@ -34,11 +34,12 @@
     <thead><tr><th>Architecture</th><th>GGUF arch keys</th><th>Example models</th><th>Multimodal</th><th>Thinking</th><th>Tools</th><th>MTP spec</th></tr></thead>
     <tbody>
       <tr><td><strong>DeepSeek V4 Flash</strong></td><td><code>deepseek4</code></td><td>DeepSeek-V4-Flash (284B MoE, 256 experts, compressed sparse attention, 1M context)</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes (DSML)</td><td class="yes">Yes (DSpark block drafter, separate GGUF)</td></tr>
-      <tr><td><strong>GLM 5.x</strong></td><td><code>glm-dsa</code></td><td>GLM-5.2 (744B-A40B MoE, 256 experts, MLA + DeepSeek Sparse Attention, 1M context)</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes (XML tool calls)</td><td class="no">—</td></tr>
+      <tr><td><strong>GLM 5.x</strong></td><td><code>glm-dsa</code>, <code>glm5next</code></td><td>GLM-5.2 (744B-A40B MoE, 256 experts, MLA + DeepSeek Sparse Attention, 1M context); GLM-5.3-Flash (320B, 288 routed experts, KDA linear attention on 34 of 45 trunk layers + NoPE MLA/DSA with a pooled indexer on the other 11)</td><td>Image on 5.3-Flash (5.2 is text only)</td><td class="yes">Yes</td><td class="yes">Yes (XML tool calls)</td><td class="no">—</td></tr>
       <tr><td><strong>Gemma 4</strong></td><td><code>gemma4</code></td><td>gemma-4-E4B, 12B, 31B, 26B-A4B (MoE)</td><td>Image, Video, Audio</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes (separate draft)</td></tr>
       <tr><td><strong>Gemma 3</strong></td><td><code>gemma3</code></td><td>gemma-3-4b</td><td>Image</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen 3</strong></td><td><code>qwen3</code>, <code>qwen2</code>, <code>qwen2vl</code>, <code>qwen2_vl</code></td><td>Qwen3-4B. Qwen2 / Qwen2.5-VL GGUFs load through the same class as text-only chat</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
       <tr><td><strong>Qwen 3.5 / 3.6</strong></td><td><code>qwen35</code>, <code>qwen35moe</code>, <code>qwen3next</code></td><td>Qwen3.5-9B, Qwen3.5/3.6-35B-A3B (MoE)</td><td>Image</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes on 3.6 (embedded NextN — only in GGUFs that retain the NextN block, e.g. the <code>-MTP-</code> repos)</td></tr>
+      <tr><td><strong>Qwen 3.8 Flash Next</strong></td><td><code>qwen4exp</code></td><td>Qwen3.8-Flash-Next (hybrid MoE: GatedDeltaNet recurrent layers interleaved with full attention, some behind Qwen Sparse Attention's indexer, a PLE n-gram embedding block, ×4 hyper-connection streams, 512 experts / 10 used)</td><td>Image</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
       <tr><td><strong>GPT OSS</strong></td><td><code>gptoss</code>, <code>gpt-oss</code></td><td>gpt-oss-20b (MoE)</td><td>Text only</td><td class="yes">Yes (always)</td><td class="yes">Yes</td><td class="no">—</td></tr>
       <tr><td><strong>Nemotron-H</strong></td><td><code>nemotron_h</code>, <code>nemotron_h_moe</code></td><td>Nemotron-H-8B, 47B, Nemotron 3 Nano Omni</td><td>Image (Omni)</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
       <tr><td><strong>Mistral 3</strong></td><td><code>mistral3</code></td><td>Mistral-Small-3.1-24B-Instruct</td><td>Image</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
@@ -72,7 +73,7 @@
     </tbody>
   </table>
   </div>
-  <p class="page-foot-note">MiniMax-H3, Wan, Qwen-Image-Edit and DiffusionGemma are constructed without a tensor-parallel degree, so <code>--tp</code> does not apply to them. Of the video families, Wan is also the one that refuses a backend outright: <code>mlx</code> is not supported.</p>
+  <p class="page-foot-note">MiniMax-H3, Wan, Qwen-Image-Edit and DiffusionGemma are constructed without a tensor-parallel degree, so <code>--tp</code> does not apply to them. Of the video families, Wan is also the one that refuses a backend outright: <code>mlx</code> is not supported. On Qwen 3.8 Flash Next <code>--tp N</code> means something else again — it runs a <strong>layer split</strong>, each GPU holding a contiguous run of whole layers with nothing sharded, which is a capacity feature rather than a speed one: on 2× A100-80GB with UD-Q2_K_XL (73.4 GiB) the greedy output is byte-identical to the single-GPU run, VRAM lands at 24.2 + 26.2 GB, and prefill (~1520–1550 t/s) and decode (~56 t/s) are unchanged. GLM-5.3-Flash refuses <code>--tp</code> cleanly and uses its layer split instead. Architectures that support neither tensor parallelism nor a layer split now say so on stderr and run on one GPU instead of silently leaving the others idle.</p>
 
   <div class="content-footer">
     <a href="backends.html">← Compute Backends</a>

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Text &amp; LLM Models — TensorSharp Wiki</title>
-  <meta name="description" content="Download-and-run recipes for all eleven text architectures, plus multimodal input, thinking mode and tool calling.">
+  <meta name="description" content="Download-and-run recipes for all twelve text architectures, plus multimodal input, thinking mode and tool calling.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -84,6 +84,36 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
   <p>The advertised 1M-token context is a <em>ceiling</em>, not a promise: 1M tokens of MLA cache is about 93 GiB, so once the weights land the loader asks the devices how much VRAM is actually free, sizes the context to what fits alongside one full prefill graph, and logs what it picked. On 3× RTX PRO 6000 that is 342,272 tokens on the plain layer split, 646,400 with <code>--n-cpu-moe 30</code>, and 91,136 under <code>--tp 3</code> (every rank holds a full-length cache). Set <code>MAX_CONTEXT</code> to make a specific length a hard requirement instead — it is honoured if it fits and refused with the numbers if it does not.</p>
   <p><code>--tp N</code> works here too, but on PCIe-attached cards it is a capacity feature rather than a speed one: the two all-reduces every one of the 78 layers needs cost more bus time than the split saves, so <code>--tp 3</code> measures pp2048 505.6 / tg64 17.6 tok/s against 915.9 / 43.9 on the layer split. Concurrency is served by native per-sequence slots (each request owns its MLA and indexer caches), and <code>TS_BATCHED_FUSED_DECODE=1</code> opts into a batched fused decode worth 1.81× aggregate at 4 concurrent requests. See <a href="distributed.html#architectures">Tensor parallelism</a> and <a href="advanced.html#continuous-batching">Continuous batching</a>.</p>
 
+  <h3 id="glm53">GLM-5.3-Flash (320B MoE, text + image, thinking, tools)</h3>
+  <p>The hybrid successor loads through the <em>same</em> native whole-model ggml executor and the same model class as GLM-5.2 — its GGUF architecture id is <code>glm5next</code> — with four architectural changes layered on top. 320B parameters, 288 routed experts at top-8 plus one shared, 46 blocks = 45 trunk + 1 NextN. <strong>KDA linear attention</strong> runs on 34 of the 45 trunk layers; the other 11 are <strong>NoPE MLA + DSA</strong> (no rope anywhere in the text tower, the 512-wide latent <em>is</em> the cache row); the indexer is <strong>pooled</strong> — 4-cell pools, top-k 2048 taken over pools and then expanded to their members; hyper-connections are Sinkhorn over ×4 streams; and every SwiGLU is clamped at limit 10. The KDA recurrent state cannot be rewound, so a cached prefix is reused only when the new prompt extends it exactly.</p>
+  <pre data-lang="bash"><code># ~101 GiB for the UD-Q2_K_XL tier — pick a different quant directory for more or less
+hf download unsloth/GLM-5.3-Flash-GGUF --include "UD-Q2_K_XL/*" --local-dir models
+hf download unsloth/GLM-5.3-Flash-GGUF mmproj-BF16.gguf --local-dir models
+
+# Layer split across every visible GPU — point --model at the FIRST shard
+# (N is however many shards the quant directory you downloaded holds)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --backend ggml_cuda --input prompt.txt --max-tokens 200
+
+# Image understanding — the GLM-OCR ViT ships as mmproj-BF16.gguf
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --mmproj models/mmproj-BF16.gguf --image photo.png --input question.txt \
+    --max-tokens 300 --backend ggml_cuda
+
+# Not enough VRAM? Keep the routed experts of the first N layers in system RAM
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --backend ggml_cuda --n-cpu-moe 10 --input prompt.txt --max-tokens 200
+
+# Served over HTTP
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --mmproj models/mmproj-BF16.gguf --backend ggml_cuda</code></pre>
+  <p>What runs today: the layer split across every visible GPU (the default), <code>--cpu-moe</code> / <code>--n-cpu-moe N</code> host-resident experts, per-sequence native slots for serving, and vision — <code>--image</code>, multi-image prompts and multi-turn image sessions, through the GLM-OCR ViT. <strong>Not yet</strong>: <code>--tp</code> tensor parallelism, which is cleanly refused (use the layer split), and NextN/MTP speculation.</p>
+  <p>Measured on 2× RTX PRO 6000 Blackwell (96 GB) with GLM-5.3-Flash-UD-Q2_K_XL (101 GiB), layer split, both engines at <code>n_ubatch</code> 2048, back to back: pp2048 <strong>2070 t/s</strong> for llama.cpp against 2014 for TensorSharp, pp16384 1690 against <strong>1692</strong>, pp32768 <strong>1483</strong> against 1446, and tg64 36.6 against <strong>73.5</strong>. Prefill is within a few percent either way; decode runs at <strong>2.0× llama.cpp</strong>.</p>
+
   <h3 id="gemma3">Gemma 3 (text + image)</h3>
   <pre data-lang="bash"><code>hf download ggml-org/gemma-3-4b-it-GGUF gemma-3-4b-it-Q4_K_M.gguf --local-dir models
 hf download ggml-org/gemma-3-4b-it-GGUF mmproj-model-f16.gguf --local-dir models
@@ -108,6 +138,30 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Qwen3.5-9B-U
   <pre data-lang="bash"><code>hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --local-dir models
 
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --mtp-spec</code></pre>
+
+  <h3 id="qwen4exp">Qwen 3.8 Flash Next (hybrid MoE, text + image, thinking, tools)</h3>
+  <p>A hybrid mixture-of-experts model whose GGUF architecture id is <code>qwen4exp</code>: GatedDeltaNet recurrent layers interleaved with full-attention layers (some behind Qwen Sparse Attention's indexer), a PLE n-gram embedding block, ×4 hyper-connection streams and a 512-expert MoE. 48 layers, hidden size 2560, 24 query / 2 KV heads at head_dim 256, a 248,320-token vocabulary, 10 of the 512 experts used per token, GDN on 36 of the 48 layers and PLE on layer 1. On the GGML backends the whole token runs as (almost) <strong>one graph</strong> — embedding, in-graph PLE, all 48 layers, the final mixer and the LM head — replayed from a shape-keyed cache of captured graphs. Vision rides the Qwen3.5-VL tower with (T,H,W) IMRoPE positions, so multi-image prompts and multi-turn image sessions both work, with KV reused across turns as long as the new prompt extends the cached prefix exactly (the GDN recurrence cannot rewind). Concurrent requests are served through per-sequence state holders — each request owns its attention KV and indexer caches, its GDN and PLE state — so switching between them is a reference swap. Thinking and tool calling both work.</p>
+  <pre data-lang="bash"><code># ~73.4 GiB for the UD-Q2_K_XL tier — pick a different quant directory for more or less
+hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q2_K_XL/*" --local-dir models
+hf download unsloth/Qwen3.8-Flash-Next-GGUF mmproj-BF16.gguf --local-dir models
+
+# Text — point --model at the FIRST shard
+# (N is however many shards the quant directory you downloaded holds)
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --backend ggml_cuda --input prompt.txt --max-tokens 300
+
+# Image understanding
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --mmproj models/mmproj-BF16.gguf --image photo.png --input question.txt \
+    --max-tokens 300 --backend ggml_cuda
+
+# Two GPUs: --tp N runs a LAYER SPLIT here, not tensor parallelism
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --mmproj models/mmproj-BF16.gguf --backend ggml_cuda --tp 2</code></pre>
+  <p><code>--tp N</code> on <code>qwen4exp</code> is a <strong>layer split</strong>: each GPU holds a contiguous run of whole layers. Nothing is sharded, so it is not tensor parallelism — and it is the same (and only) multi-GPU mode llama.cpp offers this architecture, whose <code>-sm row</code> refuses to load it. Treat it as a capacity feature rather than a speed one. On 2× A100-80GB with Qwen3.8-Flash-Next-UD-Q2_K_XL (73.4 GiB) the greedy output is <strong>byte-identical</strong> between the 1-GPU and 2-GPU runs (same SHA-256), VRAM lands at 24.2 GB + 26.2 GB instead of the whole model on one card, and throughput is unchanged: prefill ~1520–1550 t/s and decode ~56 t/s either way. llama.cpp on the same box measures pp1536 1094 / tg128 61.2 on one GPU and 1200 / 61.5 on two with <code>-sm layer</code>, so it too gains about 10% prefill and nothing on decode. Startup prints which mode ran and the per-GPU layer/byte split; <code>TS_Q4E_LAYER_SPLIT=20,28</code> overrides the balance with explicit layer counts per GPU (llama.cpp's <code>--tensor-split</code> in spirit) and throws rather than silently ignoring a value it cannot honour — useful, because the automatic balance prices weights and cannot see the vision tower, which loads later and lands on GPU 0.</p>
 
   <h3 id="gptoss">GPT OSS (text, thinking always on, tools)</h3>
   <pre data-lang="bash"><code>hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --local-dir models
@@ -162,6 +216,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongem
       <tr><td>Gemma 4</td><td>Image · Video · Audio</td><td>Images PNG/JPEG/HEIC; Video MP4 (1 fps via OpenCV); Audio WAV 16 kHz mono / MP3 / OGG. E4B projector: <code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code>.</td></tr>
       <tr><td>Gemma 3</td><td>Image</td><td>PNG / JPEG / HEIC. Non-gated 4B projector: <code>mmproj-model-f16.gguf</code>.</td></tr>
       <tr><td>Qwen 3.5 / 3.6</td><td>Image</td><td>Dynamic-resolution vision encoder. The 9B / 3.6 repositories use <code>mmproj-F16.gguf</code>.</td></tr>
+      <tr><td>Qwen 3.8 Flash Next</td><td>Image</td><td>The Qwen3.5-VL tower with (T,H,W) IMRoPE positions; multi-image prompts and multi-turn image sessions, with KV reuse across turns when the new prompt extends the cached prefix exactly. Projector: <code>mmproj-BF16.gguf</code> (same repo).</td></tr>
+      <tr><td>GLM 5.x (5.3-Flash)</td><td>Image</td><td>The GLM-OCR ViT — all 24 blocks run as one device-resident graph, and the projected rows override the <code>&lt;|image|&gt;</code> placeholders inside the native executor. Multi-image and multi-turn image sessions. Projector: <code>mmproj-BF16.gguf</code> (same repo). GLM-5.2 is text only.</td></tr>
       <tr><td>Mistral 3</td><td>Image</td><td>Pixtral vision encoder. Projector: <code>mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf</code>.</td></tr>
       <tr><td>Muse-Glimmer</td><td>Image</td><td>50-layer sparse-window ViT with 2D RoPE and a 2×2 pixel shuffle; the image is stretched (no padding, no tiling) to a grid chosen the same way llama.cpp chooses it. Projector: <code>mmproj-Muse-Glimmer-30B-Q8_0.gguf</code>.</td></tr>
       <tr><td>Nemotron-H (Omni)</td><td>Image</td><td>RADIO / v2_vl ViT encoder. Pass the matching <code>--mmproj</code>; image tokens expand at <code>&lt;image&gt;</code> placeholders. Audio is preprocessed only — real audio inference needs a Parakeet audio mmproj that the GGUF distribution does not ship.</td></tr>
@@ -171,13 +227,14 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongem
   <p>Send images/audio/video via the <a href="cli.html#examples">CLI</a> (<code>--image</code>, <code>--video</code>, <code>--audio</code>), the <a href="server.html#webui">Web UI</a> uploads, or the <a href="http-api.html">HTTP API</a> (base64 <code>images</code> array for Ollama, <code>image_url</code> data URI for OpenAI). <strong>PDF documents</strong> are supported too — born-digital PDFs have their complete text layer extracted and inlined into the prompt; scanned PDFs fall back to page images for vision-capable models — via the CLI's <code>--pdf</code> flag (one-shot mode) or the Web UI upload (<code>TS_PDF_MAX_PAGES</code> caps the page count; default: all pages).</p>
 
   <h2 id="thinking">Thinking / reasoning mode</h2>
-  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4, GLM 5.x, Muse-Glimmer) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
+  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Qwen 3.8 Flash Next, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4, GLM 5.x, Muse-Glimmer) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
   <ul>
     <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags.</li>
+    <li><strong>Qwen 3.8 Flash Next</strong> — the same <code>&lt;think&gt;…&lt;/think&gt;</code> tags, but always on: the generation prompt opens the block unconditionally, so there is no non-thinking mode to switch to.</li>
     <li><strong>Gemma 4</strong> — <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> tags.</li>
     <li><strong>GPT OSS</strong> — Harmony format: <code>&lt;|channel|&gt;analysis</code> for thinking, <code>&lt;|channel|&gt;final</code> for the answer.</li>
     <li><strong>DeepSeek V4</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags; the chat template closes the block immediately unless thinking is requested, so reasoning is opt-in.</li>
-    <li><strong>GLM 5.x</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags, also opt-in: <code>--think</code> adds a <code>Reasoning Effort: Max</code> system line and leaves the block open for the model to close, and without it the prompt emits an empty <code>&lt;think&gt;&lt;/think&gt;</code>. Earlier turns' reasoning is always dropped from the prompt.</li>
+    <li><strong>GLM 5.x</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags, also opt-in: <code>--think</code> adds a <code>Reasoning Effort: Max</code> system line and leaves the block open for the model to close, and without it the prompt emits an empty <code>&lt;think&gt;&lt;/think&gt;</code>. Earlier turns' reasoning is always dropped from the prompt. <strong>GLM-5.3-Flash always reasons</strong>: its <code>Reasoning Effort: Max</code> system line is unconditional, the generation prompt always opens <code>&lt;think&gt;</code>, and past turns keep their reasoning.</li>
     <li><strong>Muse-Glimmer</strong> — an <code>assistant to=self</code> reasoning channel emitted by the chat template.</li>
   </ul>
   <p>Enable it via <code>--think</code> (CLI), <code>"think": true</code> (Ollama API / Web UI), or the thinking toggle in the browser. Responses expose the reasoning separately — e.g. <code>message.thinking</code> in the Ollama chat response.</p>

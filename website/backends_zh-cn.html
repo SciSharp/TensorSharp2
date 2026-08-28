@@ -55,7 +55,7 @@
     <li><strong>GGML Vulkan</strong>（<code>ggml_vulkan</code>，Windows/Linux + AMD/Intel/NVIDIA）—— 与厂商无关的 GPU 路径，支持任何带 Vulkan 1.3 驱动的 GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。在多 GPU 主机上（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡），用 <code>--gpu-device N</code>（或环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）选择设备，用 <code>--list-gpus</code> 列出可见设备。</li>
   </ul>
   <p>三者都在不反量化为 FP32 的情况下运行原生量化 matmul（Q4_K_M、Q8_0 ……），并配有驱动 <code>ggml_flash_attn_ext</code> 的原生分页注意力内核。</p>
-  <p><strong>多 GPU。</strong>GGML CUDA 与 GGML Vulkan 同样支持<a href="distributed_zh-cn.html">张量并行</a>：<code>--tp N</code> 让每个 rank 在自己的 GPU 上拥有独立的 ggml 后端、权重分片与 KV 缓存，由 rank 工作线程池并发驱动，跨 GPU AllReduce 走 ggml 的集合通信（构建时能找到 NCCL 就用 NCCL），小载荷则在主机内存中归约。融合的按 rank block 计算图让 Gemma 4 上 <code>--tp 2</code> 的 decode 快于单卡，也让超出单卡显存的模型能够完整跑在 GPU 上。</p>
+  <p><strong>多 GPU。</strong>GGML CUDA 与 GGML Vulkan 同样支持<a href="distributed_zh-cn.html">张量并行</a>：<code>--tp N</code> 让每个 rank 在自己的 GPU 上拥有独立的 ggml 后端、权重分片与 KV 缓存，由 rank 工作线程池并发驱动，跨 GPU AllReduce 走 ggml 的集合通信（构建时能找到 NCCL 就用 NCCL），小载荷则在主机内存中归约。融合的按 rank block 计算图让 Gemma 4 上 <code>--tp 2</code> 的 decode 快于单卡，也让超出单卡显存的模型能够完整跑在 GPU 上。它们同样承载另一种多 GPU 模式 —— <strong>按层切分</strong>：每张 GPU 拿整层、没有集合通信、不切分任何权重，DeepSeek V4 Flash 与 GLM 5.x 自动如此，Qwen 3.8 Flash Next 上的 <code>--tp N</code> 跑的也是它，换来的是容量而非速度。→ <a href="distributed_zh-cn.html#vs-layer-split">TP 与按层切分</a></p>
   <div class="callout tip"><div class="ic">⚡</div><p><strong>已验证的 E4B 快路径：</strong>仓库基准已在这些 GGML 原生 GPU 后端上验证 Gemma 4 E4B Q8_0 家族。E4B 的 PLE 与共享 KV 布局会进入融合整模型 prefill/verify 和单图 decode 路径，服务端 N=1 时也会自动选择融合路径。请从 <a href="getting-started_zh-cn.html#e4b-fast-lane">Gemma 4 E4B 指南</a>开始。</p></div>
 
   <h3 id="mlx">MLX Metal</h3>
@@ -63,7 +63,7 @@
 
   <h3 id="cuda">直接 CUDA</h3>
   <p><code>--backend cuda</code> 是一条纯 C# 路径，使用 CUDA Driver API、cuBLAS GEMM，以及常见 float32 运算的 PTX 内核（fill、一元/二元/三元、激活、RMSNorm、softmax、RoPE/RoPEEx、SDPA、GQA prefill/decode、因果掩码、gather/concat），外加受支持量化类型的原生量化 matmul/get-rows。未支持的运算在保留张量语义的前提下走 CPU 回退。它也是<a href="advanced_zh-cn.html#mtp">MTP 推测解码</a>能获益的纯 C# 后端。</p>
-  <p>它支持<strong>张量并行</strong>：<code>--tp N</code> 把一个模型切分到 N 张 CUDA GPU 上，<code>--tp-node-id</code> / <code>--tp-peers</code> 则把并行组扩展到多台机器。GGML CUDA 与 GGML Vulkan 后端同样支持切分（见上文）；MLX 与 CPU 后端为单设备 —— 在多 GPU 主机上它们只会选择其中一张卡（不带 <code>--tp</code> 时 Vulkan 用 <code>--gpu-device</code>），而不会切分模型。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></p>
+  <p>它支持<strong>张量并行</strong>：<code>--tp N</code> 把一个模型切分到 N 张 CUDA GPU 上，<code>--tp-node-id</code> / <code>--tp-peers</code> 则把并行组扩展到多台机器。GGML CUDA 与 GGML Vulkan 后端同样支持切分（见上文）；不过在走整模型执行器的架构上 <code>--tp</code> 是另一层含义 —— 在 Qwen 3.8 Flash Next 上是按层切分，在 DeepSeek V4 Flash 上只是设备数上限，在 GLM-5.3-Flash 上则是干脆拒绝。MLX 与 CPU 后端为单设备 —— 在多 GPU 主机上它们只会选择其中一张卡（不带 <code>--tp</code> 时 Vulkan 用 <code>--gpu-device</code>），而不会切分模型。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></p>
 
   <h3 id="cpu">CPU 后端</h3>
   <ul>
@@ -85,6 +85,7 @@
     <li><strong><code>--backend ggml_cuda</code> / <code>ggml_vulkan</code> / <code>ggml_cpu</code> / <code>ggml_metal</code></strong> —— 原生 ggml 执行器：自行加载 6 分片的 split GGUF，把 226 GiB 权重按层切分到所有可见 GPU，在设备上持有 MLA 与 lightning indexer 的缓存，并通过按形状键控的图缓存把每个微批作为一张计算图提交，使稳态 decode 重放同一张已分配（在 CUDA 上还已捕获）的图。</li>
     <li><strong><code>--backend cpu</code>（100% 托管、零原生依赖）与 <code>--backend cuda</code></strong> —— <code>TensorSharp.Models/Models/GlmDsa</code> 里的逐算子路径，同时也是原生执行器对拍所依据的参考实现；在 GGML 后端上设 <code>TS_GLM_NATIVE=0</code> 即可切过去做 A/B。MLX 不支持这一系列。</li>
   </ul>
+  <p><strong>GLM-5.3-Flash</strong>（<code>glm5next</code>）走的是同一个原生执行器与同一个 <code>GlmDsaModel</code>，按层切分方式也相同；它会拒绝 <code>--tp</code> 而不是去切分权重，NextN/MTP 推测解码目前也尚未为它实现。</p>
   <p>由于 1M token 的 MLA 缓存约 93 GiB，自报的上下文被当作上限处理：权重落盘后，加载器会测量实际空闲的显存并按能装下的大小定上下文，同时打印它的选择（3 卡按层切分为 342,272 token）。设 <code>MAX_CONTEXT</code> 则把某个长度变成硬性要求。参见 <a href="models-text_zh-cn.html#glm">GLM 5.x</a>。</p>
 
   <div class="callout note"><div class="ic">🔎</div><p>服务器会在 <code>GET /api/models</code>（<code>supportedBackends</code>）中报告主机上实际可用的后端。如果缺少 CUDA 或 MLX 后端，说明主机在启动时未检测到可用的驱动 / 运行时。如果缺少 <code>ggml_vulkan</code>，说明原生桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。</p></div>
