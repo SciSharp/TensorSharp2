@@ -1272,6 +1272,67 @@ namespace TensorSharp.GGML
         /// each). Weight arrays are indexed by block; all blocks share identical shapes.
         /// Returns false on any failure so the caller falls back to the per-block path.
         /// </summary>
+        /// <summary>
+        /// Whole GLM-5.3-Flash vision encoder (24 GLM-OCR ViT blocks) as one
+        /// device-resident GGML graph: RMS norms, fused qkv + per-head q/k RMS
+        /// norms, 2D vision RoPE, SDPA, and the SwiGLU-clamp MLP per block.
+        /// Weights are cached device-resident across encodes.
+        /// </summary>
+        public static unsafe bool GlmVisionEncoder(
+            Tensor hidden, float eps, float attnScale, float swigluLimit,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            float[] cosTable, float[] sinTable,
+            Tensor[] ln1W, Tensor[] qkvW, Tensor[] qkvB,
+            Tensor[] qnW, Tensor[] knW,
+            Tensor[] outW, Tensor[] outB, Tensor[] ln2W,
+            Tensor[] gateW, Tensor[] gateB,
+            Tensor[] upW, Tensor[] upB, Tensor[] downW, Tensor[] downB)
+        {
+            if (!HasNativeBufferStorage(hidden))
+                return false;
+            if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView))
+                return false;
+
+            int blockCount = ln1W.Length;
+            if (blockCount == 0)
+                return false;
+
+            int lnDim = (int)ln1W[0].ElementCount();
+            int qkvNe0 = (int)qkvW[0].Sizes[qkvW[0].DimensionCount - 1];
+            int qkvNe1 = (int)qkvW[0].Sizes[0];
+            long qkvBytes = qkvW[0].ElementCount() * sizeof(float);
+            int outNe0 = (int)outW[0].Sizes[outW[0].DimensionCount - 1];
+            int outNe1 = (int)outW[0].Sizes[0];
+            long outBytes = outW[0].ElementCount() * sizeof(float);
+            int ffnNe0 = (int)upW[0].Sizes[upW[0].DimensionCount - 1];
+            int ffnNe1 = (int)upW[0].Sizes[0];
+            long ffnUpBytes = upW[0].ElementCount() * sizeof(float);
+            long ffnDownBytes = downW[0].ElementCount() * sizeof(float);
+
+            IntPtr[] Ptrs(Tensor[] ws)
+            {
+                var a = new IntPtr[blockCount];
+                for (int i = 0; i < blockCount; i++)
+                    a[i] = GetBufferStart(ws[i]);
+                return a;
+            }
+
+            fixed (float* cosPtr = cosTable, sinPtr = sinTable)
+            {
+                return GgmlNative.GlmVisionEncoder(hiddenView,
+                    blockCount, eps, attnScale, swigluLimit,
+                    numPatches, numHeads, headDim, halfDim,
+                    (IntPtr)cosPtr, (IntPtr)sinPtr,
+                    Ptrs(ln1W), Ptrs(qkvW), Ptrs(qkvB), Ptrs(qnW), Ptrs(knW),
+                    Ptrs(outW), Ptrs(outB), Ptrs(ln2W),
+                    Ptrs(gateW), Ptrs(gateB), Ptrs(upW), Ptrs(upB), Ptrs(downW), Ptrs(downB),
+                    lnDim,
+                    qkvNe0, qkvNe1, qkvBytes,
+                    outNe0, outNe1, outBytes,
+                    ffnNe0, ffnNe1, ffnUpBytes, ffnDownBytes);
+            }
+        }
+
         public static unsafe bool Qwen35VisionEncoder(
             Tensor hidden, float eps, float attnScale,
             int numPatches, int numHeads, int headDim, int halfDim,
@@ -1626,7 +1687,9 @@ namespace TensorSharp.GGML
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 kNormArr, ringKArr, ringVArr, ringDtype);
 
-        /// <summary>DFlash PASS C (block draft + borrowed LM head + softmax + on-device top-1) in one GGML graph.</summary>
+        /// <summary>DFlash PASS C in one GGML graph: the block draft, then either the
+        /// borrowed LM head + softmax + on-device top-1 (plain DFlash) or the DFlash2
+        /// candidate lattice the caller walks (selRank &gt; 0).</summary>
         public static bool DFlashDraftBlock(
             int[] blockIds, int blockLen, int[] positions,
             int numLayers, int hiddenSize, int headDim, int numHeads, int numKvHeads, int ringRows,
@@ -1646,7 +1709,19 @@ namespace TensorSharp.GGML
             IntPtr outNormData,
             IntPtr tokEmbdData, int tokEmbdType, long tokEmbdNe0, long tokEmbdNe1, long tokEmbdBytes,
             IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            int vocabSize, int[] idsOut, float[] confOut)
+            int vocabSize, int[] idsOut, float[] confOut,
+            int convTaps, int convGroupSize, int convNumGroups,
+            IntPtr[] attnConvBaseArr,
+            IntPtr[] attnConvProjArr, int[] attnConvProjTypeArr,
+            long[] attnConvProjNe0Arr, long[] attnConvProjNe1Arr, long[] attnConvProjBytesArr,
+            IntPtr[] ffnConvBaseArr,
+            IntPtr[] ffnConvProjArr, int[] ffnConvProjTypeArr,
+            long[] ffnConvProjNe0Arr, long[] ffnConvProjNe1Arr, long[] ffnConvProjBytesArr,
+            int selRank, int selTopK, float selLogitScale, float selLogitSoftcap,
+            IntPtr selHiddenData, int selHiddenType, long selHiddenNe0, long selHiddenNe1, long selHiddenBytes,
+            IntPtr selPredData, int selPredType, long selPredNe0, long selPredNe1, long selPredBytes,
+            IntPtr selSuccData, int selSuccType, long selSuccNe0, long selSuccNe1, long selSuccBytes,
+            float[] selScoresOut, int[] selCandOut)
             => GgmlNative.DFlashDraftBlock(blockIds, blockLen, positions,
                 numLayers, hiddenSize, headDim, numHeads, numKvHeads, ringRows,
                 eps, ropeBase, ropeFreqScale, kqScale, ringSlotPos, slidingWindow,
@@ -1663,7 +1738,17 @@ namespace TensorSharp.GGML
                 ringKArr, ringVArr, ringDtype, outNormData,
                 tokEmbdData, tokEmbdType, tokEmbdNe0, tokEmbdNe1, tokEmbdBytes,
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                vocabSize, idsOut, confOut);
+                vocabSize, idsOut, confOut,
+                convTaps, convGroupSize, convNumGroups,
+                attnConvBaseArr, attnConvProjArr, attnConvProjTypeArr,
+                attnConvProjNe0Arr, attnConvProjNe1Arr, attnConvProjBytesArr,
+                ffnConvBaseArr, ffnConvProjArr, ffnConvProjTypeArr,
+                ffnConvProjNe0Arr, ffnConvProjNe1Arr, ffnConvProjBytesArr,
+                selRank, selTopK, selLogitScale, selLogitSoftcap,
+                selHiddenData, selHiddenType, selHiddenNe0, selHiddenNe1, selHiddenBytes,
+                selPredData, selPredType, selPredNe0, selPredNe1, selPredBytes,
+                selSuccData, selSuccType, selSuccNe0, selSuccNe1, selSuccBytes,
+                selScoresOut, selCandOut);
 
         /// <summary>Drop the persistent DFlash graphs.</summary>
         public static void DFlashResetCaches() => GgmlNative.DFlashResetCaches();
@@ -2405,7 +2490,12 @@ namespace TensorSharp.GGML
         /// tokens of one sequence as a single graph. Outputs per-row logits
         /// [vocab, N] and post-norm hidden [hidden, N] (normedOut), advancing each
         /// recurrent layer's GDN state from ConvStateIn/DeltaStateIn to
-        /// ConvStateOut/DeltaStateOut. Returns false on an unsupported shape.</summary>
+        /// ConvStateOut/DeltaStateOut. Returns false on an unsupported shape.
+        ///
+        /// captureLayers/captureData additionally tap the residual ENTERING each
+        /// named layer into captureCount consecutive [hidden, N] blocks - what a
+        /// DFlash drafter's encoder consumes, and the reason speculation on this
+        /// trunk does not have to fall back to the op-by-op loop.</summary>
         public static bool Qwen35ModelVerify(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
             IntPtr hidden, int hiddenSize, int startPos, int numTokens,
@@ -2419,7 +2509,10 @@ namespace TensorSharp.GGML
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNorm, IntPtr normedOut, int nLogitRows = -1,
             int[] mropePos = null, int[] mropeSections = null,
-            int tpDegree = 1, IntPtr[] tpPlanOut = null)
+            int tpDegree = 1, IntPtr[] tpPlanOut = null,
+            IntPtr captureData = default, int[] captureLayers = null, int captureCount = 0,
+            int stateSnapshots = 1, IntPtr stateSnapshotsUsed = default,
+            bool deviceStateCurrent = false, bool deferStateDownload = false)
         {
             return GgmlNative.Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -2432,8 +2525,25 @@ namespace TensorSharp.GGML
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
-                tpDegree, tpPlanOut);
+                tpDegree, tpPlanOut, captureData, captureLayers, captureCount, stateSnapshots,
+                stateSnapshotsUsed, deviceStateCurrent, deferStateDownload);
         }
+
+        /// <summary>Commit one recurrent-state snapshot into the live device state
+        /// (see TSGgml_Qwen35CommitStateSnapshot).</summary>
+        public static bool Qwen35CommitStateSnapshot(int slot, int numRecurrentLayers)
+            => GgmlNative.Qwen35CommitStateSnapshot(slot, numRecurrentLayers);
+
+        /// <summary>Read the live device recurrent state back into the host mirrors
+        /// (see TSGgml_Qwen35DrainDeviceState).</summary>
+        public static bool Qwen35DrainDeviceState(IntPtr[] convOut, IntPtr[] deltaOut, int numRecurrentLayers)
+            => GgmlNative.Qwen35DrainDeviceState(convOut, deltaOut, numRecurrentLayers);
+
+        /// <summary>Pull one per-token recurrent-state snapshot out of the verify that
+        /// just ran (see TSGgml_Qwen35FetchStateSnapshot).</summary>
+        public static bool Qwen35FetchStateSnapshot(int slot, IntPtr[] convOut, IntPtr[] deltaOut,
+            int numRecurrentLayers)
+            => GgmlNative.Qwen35FetchStateSnapshot(slot, convOut, deltaOut, numRecurrentLayers);
 
         /// <summary>Release every rank's parked tensor-parallel prefill graph
         /// (see TSGgml_Qwen35ReleaseVerifyTpGraphs).</summary>
@@ -2857,12 +2967,108 @@ namespace TensorSharp.GGML
         /// <param name="ssmNormWData">Per-D RMSNorm weights [headDim].</param>
         /// <param name="chunkSize">Chunk size (must be a positive power of two).</param>
         /// <param name="eps">Epsilon used for L2Norm and RMSNorm.</param>
+        /// <summary>
+        /// Qwen3.8-Flash-Next fused FFN half-layer: the hyper-connection mixer, the
+        /// 512-expert MoE and the scatter back into the 4-wide residual as ONE graph.
+        /// Returns false when the backend declines the shape, so the caller can fall
+        /// back to the op-by-op path.
+        /// </summary>
+        public static bool Qwen4ExpFfnBlock(ref Qwen4ExpFfnArgs args, IntPtr resData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int nExpert, int nExpertUsed, int nFf, int nFfShared, float eps, int cacheSlot,
+            bool resResident = false)
+        {
+            return GgmlNative.Qwen4ExpFfnBlock(ref args, resData, nEmbd, hc, hcLowRank,
+                nTokens, nExpert, nExpertUsed, nFf, nFfShared, eps, cacheSlot, resResident);
+        }
+
+        /// <summary>
+        /// Qwen3.8-Flash-Next fused attention half-layer: mixer, joint query|gate
+        /// projection, Q/K norm, partial rotary, KV append, gated attention and the
+        /// scatter, as ONE graph.
+        /// </summary>
+        public static bool Qwen4ExpAttnBlock(ref Qwen4ExpAttnArgs args, IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            float eps, int cacheSlot, bool resResident = false)
+        {
+            return GgmlNative.Qwen4ExpAttnBlock(ref args, resData, maskData, nEmbd, hc, hcLowRank,
+                nTokens, headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                nRot, ropeBase, ropeFreqScale, attnScale, eps, cacheSlot, resResident);
+        }
+
+        /// <summary>Copy the 4-wide residual into the device-resident buffer the fused
+        /// kernels chain through, and back out again.</summary>
+        public static bool Qwen4ExpResUpload(IntPtr data, long bytes)
+            => GgmlNative.Qwen4ExpResUpload(data, bytes);
+
+        public static bool Qwen4ExpResDownload(IntPtr data, long bytes)
+            => GgmlNative.Qwen4ExpResDownload(data, bytes);
+
+        /// <summary>
+        /// Qwen3.8-Flash-Next fused recurrent half-layer: mixer, projections, causal
+        /// depthwise conv, the Gated DeltaNet recurrence and the scatter, as ONE graph.
+        /// The conv and recurrent state are updated in place inside it.
+        /// </summary>
+        public static bool Qwen4ExpGdnBlock(ref Qwen4ExpGdnArgs args, IntPtr resData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            float eps, int cacheSlot, bool resResident = false)
+        {
+            return GgmlNative.Qwen4ExpGdnBlock(ref args, resData, nEmbd, hc, hcLowRank, nTokens,
+                headKDim, headVDim, nKHeads, nVHeads, dConv, eps, cacheSlot, resResident);
+        }
+
+        /// <summary>Drop every cached qwen4exp FFN graph (they pin weight bindings).</summary>
+        /// <summary>
+        /// Qwen3.8-Flash-Next token span: layers [layerBegin, layerEnd) - the
+        /// recurrent-or-attention half AND the FFN half of each - as ONE persisted
+        /// GGML graph. With the PLE layer the only host interruption, a token is two
+        /// of these calls instead of 96 per-layer ones.
+        /// </summary>
+        public static bool Qwen4ExpTokenSpan(
+            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
+            int layerBegin, int layerEnd,
+            IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            int nExpert, int nExpertUsed, int nFf, int nFfSh,
+            float eps, int cacheSlot, bool firstFfnOnly = false,
+            IntPtr head = default, IntPtr logitsOut = default,
+            IntPtr ple = default, int pleLayer = -1, IntPtr pleEmb = default,
+            IntPtr mropePos = default, IntPtr mropeSections = default,
+            int ropePosition = -1,
+            // GPU this span's layers live on (layer split). -1 / 0 = the current
+            // rank, which is the only rank on a single-GPU run.
+            int device = 0)
+        {
+            return GgmlNative.Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
+                resData, maskData, nEmbd, hc, hcLowRank, nTokens,
+                headKDim, headVDim, nKHeads, nVHeads, dConv,
+                headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                nRot, ropeBase, ropeFreqScale, attnScale,
+                nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot, firstFfnOnly,
+                head, logitsOut, ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition,
+                device);
+        }
+
+        public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();
+
+        public static void Qwen4ExpInvalidateSeqState(IntPtr key) => GgmlNative.Qwen4ExpInvalidateSeqState(key);
+
+        public static void Qwen4ExpReleaseAllSeqState() => GgmlNative.Qwen4ExpReleaseAllSeqState();
+
+        public static void Qwen4ExpReleaseSeqState(IntPtr[] keys) => GgmlNative.Qwen4ExpReleaseSeqState(keys);
+
         public static void GatedDeltaNetChunked(
             Tensor q, Tensor k, Tensor v, Tensor z,
             Tensor alpha, Tensor beta,
             Tensor state, Tensor gatedOut,
             IntPtr dtBiasData, IntPtr aLogData, IntPtr ssmNormWData,
-            int chunkSize, float eps)
+            int chunkSize, float eps, int gateMode = 0)
         {
             if (q == null || k == null || v == null || z == null
                 || alpha == null || beta == null || state == null || gatedOut == null)
@@ -2886,7 +3092,7 @@ namespace TensorSharp.GGML
                 qView, kView, vView, zView,
                 alphaView, betaView, stateView, gatedOutView,
                 dtBiasData, aLogData, ssmNormWData,
-                chunkSize, eps);
+                chunkSize, eps, gateMode);
         }
 
         /// <summary>

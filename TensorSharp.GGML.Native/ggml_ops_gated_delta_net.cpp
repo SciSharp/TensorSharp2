@@ -172,7 +172,9 @@ namespace
 //      with cross-chunk recurrent state propagation. qGExp = q * gExp is
 //      pre-computed once over the full chunked layout so the per-chunk loop
 //      body contains four mul_mat / two broadcast mul / two add ops only.
-//   6. Runs RMSNorm and gates by silu(z).
+//   6. Runs RMSNorm and gates by silu(z), or by sigmoid(z) when gate_mode is 1.
+//      Qwen 3.5 / Qwen3-Next use silu; qwen4exp (Qwen3.8-Flash-Next) is identical
+//      apart from this one activation, so it rides the same kernel.
 //   7. Writes the output back to gated_out and the updated recurrent state
 //      back to the state tensor.
 TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
@@ -188,7 +190,8 @@ TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
     void* a_log_data,
     void* ssm_norm_w_data,
     int chunk_size,
-    float eps)
+    float eps,
+    int gate_mode)
 {
     try
     {
@@ -514,8 +517,8 @@ TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
 
             // z permute (D, H, T, 1) -> (D, T, H, 1), silu, multiply.
             ggml_tensor* z_p     = ggml_cont(ctx, ggml_permute(ctx, z, 0, 2, 1, 3));
-            ggml_tensor* z_silu  = ggml_silu(ctx, z_p);
-            ggml_tensor* gated   = ggml_mul(ctx, attn_rms, z_silu);                          // (D, T, H, 1)
+            ggml_tensor* z_act   = gate_mode == 1 ? ggml_sigmoid(ctx, z_p) : ggml_silu(ctx, z_p);
+            ggml_tensor* gated   = ggml_mul(ctx, attn_rms, z_act);                           // (D, T, H, 1)
 
             // Permute back to (D, H, T, 1) and copy into output binding.
             ggml_tensor* gated_out = ggml_cont(ctx, ggml_permute(ctx, gated, 0, 2, 1, 3));

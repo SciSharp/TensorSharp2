@@ -9,8 +9,11 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
+using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Speculative;
 using TensorSharp.Server.Hosting;
 
 namespace InferenceWeb.Tests;
@@ -486,6 +489,7 @@ public class ServerOptionsBuilderTests : IDisposable
             "--paged-kv", "--paged-kv-block-size", "--paged-kv-ram-mb",
             "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
             "--continuous-batching", "--prefill-chunk-size",
+            "--spec", "--spec-draft", "--spec-pmin", "--spec-draft-model",
             "--mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model", "--draft-model",
             "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
             "--wan-vae", "--wan-te", "--wan-dit2",
@@ -1277,4 +1281,175 @@ public class ServerOptionsBuilderTests : IDisposable
         var options = ServerOptionsBuilder.Build(new[] { "--no-webui" }, _baseDir);
         Assert.False(options.WebUiEnabled);
     }
+
+    // ---- Usage page vs parser: the whole class of "documented but rejected" ----
+    //
+    // The server applies several flag families in passes that run BEFORE
+    // ServerOptionsBuilder.Build and that READ argv without removing anything.
+    // Build then walks the same argv and throws "Unknown option" for whatever it
+    // does not explicitly recognise. Every such family therefore needs an entry in
+    // Build's skip list, and twice one was missed: --wan-vae/--wan-te (fixed with a
+    // one-off test below), then EVERY --spec* spelling, which made
+    //   TensorSharp.Server --model m.gguf --draft-model d.gguf --mtp-spec --spec-draft 3
+    // die with `Unknown option '--spec-draft'` even though --help documents it.
+    //
+    // These tests close the class instead of the instance: they enumerate the usage
+    // page itself, so a flag can never again be documented-but-rejected, or
+    // accepted-but-unsuggestible, without a red test.
+
+    /// <summary>A plausible value for a flag, keyed on the placeholder its usage
+    /// entry declares. Files must exist because several appliers stat them.</summary>
+    private string[] SampleArgsFor(string flag, string usage)
+    {
+        string filePath = Path.Combine(_baseDir, "sample.gguf");
+        if (!File.Exists(filePath)) File.WriteAllBytes(filePath, new byte[] { 1, 2, 3, 4 });
+
+        // Value flags are the ones the usage page renders as "<flag> <placeholder>".
+        int idx = usage.IndexOf(flag + " <", StringComparison.Ordinal);
+        if (idx < 0)
+            return new[] { flag };                       // bare switch
+
+        int lt = idx + flag.Length + 1;
+        int gt = usage.IndexOf('>', lt);
+        string placeholder = gt > lt ? usage.Substring(lt + 1, gt - lt - 1) : string.Empty;
+
+        string value = placeholder switch
+        {
+            "path" or "path|none" or "dir" => filePath,
+            "url" => "localhost:6379",
+            "t" => "f16",
+            "name" => "ngram",
+            "type" => "ggml_cpu",
+            "mode" => "ref",
+            "config|request" => "config",
+            "list" => "10.0.0.1:9500",
+            "text" => "</s>",
+            "address" => "127.0.0.1",
+            "urls" => "http://0.0.0.0:18099",
+            "f" or "p" or "x" => "0.5",
+            _ => "1",
+        };
+        return new[] { flag, value };
+    }
+
+    [Fact]
+    public void Build_AcceptsEveryFlagOnTheUsagePage()
+    {
+        var sw = new StringWriter();
+        ServerUsage.PrintUsage(sw);
+        string usage = sw.ToString();
+
+        var rejected = new List<string>();
+        int checkedFlags = 0;
+        foreach (string flag in ServerUsage.DocumentedFlags())
+        {
+            // --config is consumed and REMOVED by ConfigFileArgs.Expand before
+            // Build ever sees it, so Build legitimately does not know it.
+            if (flag == "--config") continue;
+            checkedFlags++;
+
+            using var scope = new EnvScope();
+            string[] args = SampleArgsFor(flag, usage);
+            Exception ex = Record.Exception(() =>
+            {
+                ServerOptionsBuilder.ApplySpeculativeCliFlags(args);
+                ServerOptionsBuilder.Build(args, _baseDir);
+            });
+            if (ex is ArgumentException ae &&
+                ae.Message.StartsWith("Unknown option", StringComparison.Ordinal))
+            {
+                rejected.Add(flag + " -> " + ae.Message);
+            }
+        }
+
+        // Guard against a vacuous pass: an accessor that yielded nothing would
+        // otherwise make this test green while checking nothing at all.
+        Assert.True(checkedFlags > 40, $"DocumentedFlags() yielded only {checkedFlags} flags.");
+        Assert.True(rejected.Count == 0,
+            "These flags are on the --help page but ServerOptionsBuilder.Build rejects them:\n  "
+            + string.Join("\n  ", rejected));
+    }
+
+    [Fact]
+    public void SuggestFlagCorrection_KnowsEverySpeculativeSpelling()
+    {
+        // A typo near a real flag must suggest THAT flag. Before the fix "--spe"
+        // suggested "--seed" (Levenshtein 2) because no --spec* name was in the
+        // known-flag table at all - an actively misleading hint.
+        foreach (string flag in SpeculativeCliFlags.SwitchFlags)
+        {
+            string typo = flag.Substring(0, flag.Length - 1);
+            var ex = Assert.Throws<ArgumentException>(
+                () => ServerOptionsBuilder.Build(new[] { typo }, _baseDir));
+            Assert.Contains("Did you mean '" + flag + "'", ex.Message);
+        }
+    }
+
+    [Theory]
+    [InlineData("--spec")]
+    [InlineData("--no-spec")]
+    [InlineData("--mtp-spec")]
+    [InlineData("--no-mtp-spec")]
+    [InlineData("--spec-draft")]
+    [InlineData("--mtp-draft")]
+    [InlineData("--spec-type")]
+    [InlineData("--mtp-type")]
+    [InlineData("--spec-pmin")]
+    [InlineData("--mtp-pmin")]
+    [InlineData("--spec-draft-model")]
+    [InlineData("--mtp-draft-model")]
+    [InlineData("--draft-model")]
+    public void Build_SpeculativeFlags_SurviveBothPasses(string flag)
+    {
+        string draft = Path.Combine(_baseDir, "draft.gguf");
+        File.WriteAllBytes(draft, new byte[] { 1, 2, 3, 4 });
+
+        string[] args = flag switch
+        {
+            "--spec" or "--no-spec" or "--mtp-spec" or "--no-mtp-spec" => new[] { flag },
+            "--spec-draft" or "--mtp-draft" => new[] { flag, "3" },
+            "--spec-type" or "--mtp-type" => new[] { flag, "ngram" },
+            "--spec-pmin" or "--mtp-pmin" => new[] { flag, "0.6" },
+            _ => new[] { flag, draft },
+        };
+
+        // Pass 1: the applier consumes it (--draft-model is server-local and
+        // handled by ApplySpeculativeCliFlags' own extra branch, not the tables).
+        ServerOptionsBuilder.ApplySpeculativeCliFlags(args);
+
+        // Pass 2: the unknown-arg trap must not trip on that very same argv.
+        var ex = Record.Exception(() => ServerOptionsBuilder.Build(args, _baseDir));
+        Assert.False(
+            ex is ArgumentException ae && ae.Message.StartsWith("Unknown option", StringComparison.Ordinal),
+            flag + " was consumed by ApplySpeculativeCliFlags but rejected by Build: " + ex?.Message);
+
+        // And the "=" spelling, which takes TryReadOne's prefix branch.
+        if (args.Length == 2)
+        {
+            string[] eqArgs = { flag + "=" + args[1] };
+            ServerOptionsBuilder.ApplySpeculativeCliFlags(eqArgs);
+            var ex2 = Record.Exception(() => ServerOptionsBuilder.Build(eqArgs, _baseDir));
+            Assert.False(
+                ex2 is ArgumentException ae2 && ae2.Message.StartsWith("Unknown option", StringComparison.Ordinal),
+                flag + "=VALUE was rejected by Build: " + ex2?.Message);
+        }
+    }
+
+    [Fact]
+    public void ConfigFile_SpecKeys_StartTheServer()
+    {
+        // A --config file naming the current spellings must work end to end:
+        // ConfigFileArgs.Expand turns {"spec-draft": 3} into --spec-draft 3, which
+        // then has to survive Build. This is the surface the shipped configs use.
+        string cfg = Path.Combine(_baseDir, "spec.json");
+        File.WriteAllText(cfg, "{ \"spec\": true, \"spec-draft\": 3, \"spec-pmin\": 0.6 }");
+
+        string[] expanded = ConfigFileArgs.Expand(new[] { "--config", cfg });
+        ServerOptionsBuilder.ApplySpeculativeCliFlags(expanded);
+        var ex = Record.Exception(() => ServerOptionsBuilder.Build(expanded, _baseDir));
+        Assert.False(
+            ex is ArgumentException ae && ae.Message.StartsWith("Unknown option", StringComparison.Ordinal),
+            "config-file spec keys were rejected: " + ex?.Message);
+    }
+
 }

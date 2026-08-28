@@ -88,6 +88,25 @@ namespace TensorSharp.Models
         public bool HasFusedSequenceCache(string requestId)
             => requestId != null && _fusedHolders != null && _fusedHolders.ContainsKey(requestId);
 
+        // Continuous-batching cache-handoff trace, off unless TS_CB_DEBUG=1.
+        //
+        // Worth keeping: this state machine has four ways in and out of a fused
+        // episode and its failures are silent - the model keeps decoding, just
+        // against the wrong cache. Reading the handoff order directly is what
+        // identified the un-zeroed replacement primary cache that made the first
+        // single-stream request after any concurrent burst emit <pad> forever.
+        private static readonly bool _cbDebug =
+            string.Equals(Environment.GetEnvironmentVariable("TS_CB_DEBUG"), "1", StringComparison.Ordinal);
+        private void CbTrace(string what)
+        {
+            if (!_cbDebug) return;
+            Console.Error.WriteLine(
+                $"[cb] {what} activeKey={_activeFusedKey ?? "<primary>"} seqLen={_cacheSeqLen} " +
+                $"cap={_kvCacheGlobalCapacity} holders={(_fusedHolders?.Count ?? 0)} " +
+                $"retained={(_retainedFusedHolders?.Count ?? 0)} primarySaved={(_primaryHolder != null)} " +
+                $"k0hash={(_kvCacheK != null && _kvCacheK.Length > 0 && _kvCacheK[0] != null ? _kvCacheK[0].GetHashCode() : 0)}");
+        }
+
         private Gemma4KvCacheHolder SnapshotActiveCache() => new Gemma4KvCacheHolder
         {
             K = _kvCacheK,
@@ -113,19 +132,12 @@ namespace TensorSharp.Models
 
         private Gemma4KvCacheHolder CreateFreshHolder()
         {
+            // AllocateKvCacheArrays zero-fills: the token-batched fused-decode
+            // kernel reads a FIXED 256-padded attention window over each holder's
+            // cache, and positions beyond the written length are masked (-inf)
+            // but must still be finite or the softmax is poisoned.
             AllocateKvCacheArrays(_initialGlobalCacheLength,
                 out var k, out var v, out var sizes, out _);
-            // The token-batched fused-decode kernel reads a FIXED 256-padded
-            // attention window over each holder's cache; positions beyond the
-            // written length are masked (-inf) but must still be finite, so zero
-            // the freshly-allocated caches (AllocateKvCacheArrays skips zeroing on
-            // GgmlCuda/Mlx). Garbage (NaN/Inf) there otherwise poisons the softmax.
-            var zeroed = new HashSet<Tensor>();
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (k[l] != null && zeroed.Add(k[l])) Ops.Fill(k[l], 0f);
-                if (v[l] != null && zeroed.Add(v[l])) Ops.Fill(v[l], 0f);
-            }
             return new Gemma4KvCacheHolder
             {
                 K = k,
@@ -151,6 +163,7 @@ namespace TensorSharp.Models
 
             if (string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal))
                 return false; // already active
+            CbTrace($"BindSequenceCache({requestId}) ENTER");
 
             // Save whatever cache is currently checked out so its (possibly
             // grown) tensors aren't lost when we repoint the active fields.
@@ -172,6 +185,7 @@ namespace TensorSharp.Models
             }
             LoadCacheHolder(holder);
             _activeFusedKey = requestId;
+            CbTrace($"BindSequenceCache({requestId}) fresh={fresh}");
             return fresh;
         }
 
@@ -189,6 +203,7 @@ namespace TensorSharp.Models
             // Only meaningful when the primary cache is the one currently active
             // (i.e. the N==1 owner ran most recently). If a fused holder is
             // already checked out there is nothing to adopt.
+            CbTrace($"AdoptPrimaryCacheToFused({requestId}) ENTER");
             if (_activeFusedKey != null)
                 return;
             if (_fusedHolders.ContainsKey(requestId))
@@ -202,6 +217,9 @@ namespace TensorSharp.Models
 
             // Give the primary a fresh empty allocation so a future N==1 step for
             // a never-fused request doesn't reset the adopted holder's tensors.
+            // AllocateKvCacheArrays zero-fills it - this cache is handed straight
+            // to the next single-stream request by RestorePrimaryCache, whose
+            // fused decode reads the 256-padded window past the written length.
             AllocateKvCacheArrays(_initialGlobalCacheLength,
                 out var k, out var v, out var sizes, out _);
             _primaryHolder = new Gemma4KvCacheHolder
@@ -213,6 +231,7 @@ namespace TensorSharp.Models
                 SeqLen = 0,
                 HostDirty = false,
             };
+            CbTrace($"AdoptPrimaryCacheToFused({requestId}) DONE freshPrimary");
         }
 
         /// <summary>Reinstate the primary cache as the model's active cache.
@@ -222,6 +241,7 @@ namespace TensorSharp.Models
         /// No-op when the primary cache is already active.</summary>
         public void RestorePrimaryCache()
         {
+            CbTrace("RestorePrimaryCache ENTER");
             if (_activeFusedKey == null)
                 return;
             // Save the checked-out fused holder, then swap the primary back in.
@@ -232,6 +252,7 @@ namespace TensorSharp.Models
                 LoadCacheHolder(_primaryHolder);
                 _primaryHolder = null;
             }
+            CbTrace("RestorePrimaryCache DONE");
         }
 
         /// <summary>Release a finished/aborted request's per-request cache. The
@@ -244,6 +265,7 @@ namespace TensorSharp.Models
                 return;
             if (!_fusedHolders.TryGetValue(requestId, out var holder))
                 return;
+            CbTrace($"OnSequenceReleased({requestId})");
 
             if (string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal))
             {
@@ -282,6 +304,7 @@ namespace TensorSharp.Models
                 return false;
             if (!_fusedHolders.TryGetValue(requestId, out var holder))
                 return false;
+            CbTrace($"RetainSequenceCache({requestId})");
 
             if (string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal))
             {

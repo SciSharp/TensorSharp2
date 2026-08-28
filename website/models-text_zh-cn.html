@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>文本与 LLM 模型 — TensorSharp 维基</title>
-  <meta name="description" content="十一种文本架构的下载与运行示例，以及多模态输入、思考模式与工具调用。">
+  <meta name="description" content="十二种文本架构的下载与运行示例，以及多模态输入、思考模式与工具调用。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -84,6 +84,36 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
   <p>自报的 1M 上下文是<em>上限</em>而非承诺：1M token 的 MLA 缓存约 93 GiB，所以权重落盘之后加载器会去问各设备实际还剩多少显存，按「缓存加一整个 prefill 计算图」能装下的大小定上下文，并把选中的值打印出来。在 3× RTX PRO 6000 上，按层切分是 342,272 token，<code>--n-cpu-moe 30</code> 是 646,400，<code>--tp 3</code> 是 91,136（每个 rank 都要各自持有一份全长缓存）。想把某个长度变成硬性要求，就设 <code>MAX_CONTEXT</code>——放得下就照办，放不下会带着数字直接报错。</p>
   <p><code>--tp N</code> 这里也能用，但在 PCIe 互连的卡上它是容量特性而非速度特性：78 层里每层都要两次 all-reduce，占用的总线时间比拆分省下的算力还多，所以 <code>--tp 3</code> 实测 pp2048 505.6 / tg64 17.6 tok/s，而按层切分是 915.9 / 43.9。并发靠原生的按序列槽位承载（每个请求拥有自己的 MLA 与索引器缓存），<code>TS_BATCHED_FUSED_DECODE=1</code> 可以开启批处理融合解码，4 路并发下总吞吐 1.81 倍。参见<a href="distributed_zh-cn.html#architectures">张量并行</a>与<a href="advanced_zh-cn.html#continuous-batching">连续批处理</a>。</p>
 
+  <h3 id="glm53">GLM-5.3-Flash（320B MoE，文本 + 图像、思考、工具）</h3>
+  <p>这个混合架构的后继型号走的是与 GLM-5.2 <em>完全相同</em>的原生整模型 ggml 执行器和同一个模型类——GGUF 架构 id 是 <code>glm5next</code>——只是在其上叠了四处架构改动。320B 参数，288 个路由专家 top-8 外加一个共享专家，46 个块 = 45 个主干块 + 1 个 NextN 块。45 个主干层里有 34 层是 <strong>KDA 线性注意力</strong>；另外 11 层是 <strong>NoPE MLA + DSA</strong>（文本塔里任何地方都没有 rope，512 宽的潜变量本身<em>就是</em>缓存行）；索引器是<strong>池化</strong>的——4 格一池，top-k 2048 在池上取，再展开到池内成员；超连接是 ×4 流的 Sinkhorn 版本；所有 SwiGLU 都按上限 10 做钳位。KDA 的递归状态无法回退，因此只有当新提示恰好是缓存前缀的延长时才会复用该前缀。</p>
+  <pre data-lang="bash"><code># UD-Q2_K_XL 这一档约 101 GiB——想要更大或更小可换一个量化目录
+hf download unsloth/GLM-5.3-Flash-GGUF --include "UD-Q2_K_XL/*" --local-dir models
+hf download unsloth/GLM-5.3-Flash-GGUF mmproj-BF16.gguf --local-dir models
+
+# 按层切分到所有可见 GPU —— --model 指向第一个分片
+# （N 取决于你下载的那个量化目录里有多少个分片）
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --backend ggml_cuda --input prompt.txt --max-tokens 200
+
+# 图像理解 —— GLM-OCR ViT 以 mmproj-BF16.gguf 形式发布
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --mmproj models/mmproj-BF16.gguf --image photo.png --input question.txt \
+    --max-tokens 300 --backend ggml_cuda
+
+# 显存不够？把前 N 层的路由专家留在系统内存里
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --backend ggml_cuda --n-cpu-moe 10 --input prompt.txt --max-tokens 200
+
+# 以 HTTP 服务方式运行
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --mmproj models/mmproj-BF16.gguf --backend ggml_cuda</code></pre>
+  <p>目前能跑的：默认的按层切分（分到所有可见 GPU）、<code>--cpu-moe</code> / <code>--n-cpu-moe N</code> 把专家放在主机内存、以服务形式运行时的原生按序列槽位，以及视觉——<code>--image</code>、多图提示与多轮图像会话，都走 GLM-OCR ViT。<strong>暂不支持</strong>：<code>--tp</code> 张量并行（会被明确拒绝，请改用按层切分）与 NextN/MTP 推测解码。</p>
+  <p>实测：2× RTX PRO 6000 Blackwell（96 GB）、GLM-5.3-Flash-UD-Q2_K_XL（101 GiB）、按层切分、两个引擎都用 <code>n_ubatch</code> 2048、背靠背运行：pp2048 llama.cpp <strong>2070 t/s</strong> 对 TensorSharp 2014，pp16384 1690 对 <strong>1692</strong>，pp32768 <strong>1483</strong> 对 1446，tg64 36.6 对 <strong>73.5</strong>。prefill 双方相差不过几个百分点；decode 是 llama.cpp 的 <strong>2.0×</strong>。</p>
+
   <h3 id="gemma3">Gemma 3（文本 + 图像）</h3>
   <pre data-lang="bash"><code>hf download ggml-org/gemma-3-4b-it-GGUF gemma-3-4b-it-Q4_K_M.gguf --local-dir models
 hf download ggml-org/gemma-3-4b-it-GGUF mmproj-model-f16.gguf --local-dir models
@@ -108,6 +138,30 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Qwen3.5-9B-U
   <pre data-lang="bash"><code>hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --local-dir models
 
 dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --mtp-spec</code></pre>
+
+  <h3 id="qwen4exp">Qwen 3.8 Flash Next（混合 MoE，文本 + 图像、思考、工具）</h3>
+  <p>一个混合专家模型，GGUF 架构 id 为 <code>qwen4exp</code>：GatedDeltaNet 递归层与全注意力层交错（其中一部分还挂在 Qwen 稀疏注意力的索引器之后），一个 PLE n-gram 嵌入块，×4 的超连接流，以及 512 专家的 MoE。48 层，隐藏维度 2560，24 个 query 头 / 2 个 KV 头、head_dim 256，词表 248,320，每个 token 从 512 个专家里用 10 个，48 层中有 36 层带 GDN，PLE 在第 1 层。在各 ggml 后端上，整个 token（几乎）作为<strong>一张图</strong>跑完——嵌入、图内 PLE、全部 48 层、最后的混合器与 LM 头——并从按形状索引的已捕获图缓存中回放。视觉走 Qwen3.5-VL 塔，使用 (T,H,W) IMRoPE 位置，因此多图提示与多轮图像会话都可用；只要新提示恰好是缓存前缀的延长，跨轮的 KV 就会被复用（GDN 递归无法回退）。并发请求由按序列的状态持有者承载——每个请求拥有自己的注意力 KV 与索引器缓存、自己的 GDN 与 PLE 状态——因此请求之间的切换只是换一个引用。思考与工具调用都可用。</p>
+  <pre data-lang="bash"><code># UD-Q2_K_XL 这一档约 73.4 GiB——想要更大或更小可换一个量化目录
+hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q2_K_XL/*" --local-dir models
+hf download unsloth/Qwen3.8-Flash-Next-GGUF mmproj-BF16.gguf --local-dir models
+
+# 纯文本 —— --model 指向第一个分片
+# （N 取决于你下载的那个量化目录里有多少个分片）
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --backend ggml_cuda --input prompt.txt --max-tokens 300
+
+# 图像理解
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model models/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --mmproj models/mmproj-BF16.gguf --image photo.png --input question.txt \
+    --max-tokens 300 --backend ggml_cuda
+
+# 两张 GPU：这里的 --tp N 走的是按层切分，不是张量并行
+dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+    --model models/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-0000N.gguf \
+    --mmproj models/mmproj-BF16.gguf --backend ggml_cuda --tp 2</code></pre>
+  <p><code>qwen4exp</code> 上的 <code>--tp N</code> 是<strong>按层切分</strong>：每张 GPU 持有一段连续的完整层。它不切分任何权重，所以并不是张量并行——而且这也是 llama.cpp 为该架构提供的同一种（且唯一的）多卡模式，它的 <code>-sm row</code> 会直接拒绝加载这个模型。请把它当作容量特性而非速度特性。在 2× A100-80GB、Qwen3.8-Flash-Next-UD-Q2_K_XL（73.4 GiB）上：单卡与双卡的贪心输出<strong>逐字节相同</strong>（SHA-256 一致）；显存是 24.2 GB + 26.2 GB，而不是整个模型压在一张卡上；吞吐没有变化——两种跑法都是 prefill 约 1520–1550 t/s、decode 约 56 t/s。作为对照，llama.cpp 在同一台机器上单卡 pp1536 1094 / tg128 61.2，双卡 <code>-sm layer</code> 1200 / 61.5，同样是 prefill 涨约 10%、decode 不涨。启动时会打印实际走的是哪种模式，以及每张卡分到的层数与字节数；<code>TS_Q4E_LAYER_SPLIT=20,28</code> 可以用显式的每卡层数覆盖自动均衡（相当于 llama.cpp 的 <code>--tensor-split</code>），遇到无法满足的值会直接抛错而不是悄悄忽略——这很有用，因为自动均衡只按权重定价，看不到稍后才加载、并且会落在 GPU 0 上的视觉塔。</p>
 
   <h3 id="gptoss">GPT OSS（文本、始终思考、工具）</h3>
   <pre data-lang="bash"><code>hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --local-dir models
@@ -162,6 +216,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongem
       <tr><td>Gemma 4</td><td>图像 · 视频 · 音频</td><td>图像 PNG/JPEG/HEIC；视频 MP4（经 OpenCV 以 1 fps 采样）；音频 WAV 16 kHz 单声道 / MP3 / OGG。E4B 投影器：<code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code>。</td></tr>
       <tr><td>Gemma 3</td><td>图像</td><td>PNG / JPEG / HEIC。非 gated 4B 投影器：<code>mmproj-model-f16.gguf</code>。</td></tr>
       <tr><td>Qwen 3.5 / 3.6</td><td>图像</td><td>动态分辨率视觉编码器；9B / 3.6 仓库使用 <code>mmproj-F16.gguf</code>。</td></tr>
+      <tr><td>Qwen 3.8 Flash Next</td><td>图像</td><td>Qwen3.5-VL 视觉塔，使用 (T,H,W) IMRoPE 位置；支持多图提示与多轮图像会话，新提示恰好延长缓存前缀时跨轮复用 KV。投影器：<code>mmproj-BF16.gguf</code>（同仓库）。</td></tr>
+      <tr><td>GLM 5.x（5.3-Flash）</td><td>图像</td><td>GLM-OCR ViT——24 个块作为一张常驻设备的图跑完，投影后的行在原生执行器内部覆盖 <code>&lt;|image|&gt;</code> 占位。支持多图与多轮图像会话。投影器：<code>mmproj-BF16.gguf</code>（同仓库）。GLM-5.2 仅文本。</td></tr>
       <tr><td>Mistral 3</td><td>图像</td><td>Pixtral 视觉编码器。投影器：<code>mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf</code>。</td></tr>
       <tr><td>Muse-Glimmer</td><td>图像</td><td>50 层稀疏窗口 ViT，采用 2D RoPE 与 2×2 像素混洗；图像按 llama.cpp 相同的方式选定网格后直接拉伸（不填充、不切块）。投影器：<code>mmproj-Muse-Glimmer-30B-Q8_0.gguf</code>。</td></tr>
       <tr><td>Nemotron-H (Omni)</td><td>图像</td><td>RADIO / v2_vl ViT 编码器。传入匹配的 <code>--mmproj</code>；图像 token 在 <code>&lt;image&gt;</code> 占位处展开。当前 GGUF 分发未附真实音频推理需要的 Parakeet mmproj。</td></tr>
@@ -171,13 +227,14 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/diffusiongem
   <p>通过 <a href="cli_zh-cn.html#examples">CLI</a>（<code>--image</code>、<code>--video</code>、<code>--audio</code>、<code>--pdf</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 上传，或 <a href="http-api_zh-cn.html">HTTP API</a>（Ollama 用 base64 <code>images</code> 数组，OpenAI 用 <code>image_url</code> data URI）发送文件。数字版 PDF 会提取文本；扫描版 PDF 会转换为页面图像并需要视觉模型。</p>
 
   <h2 id="thinking">思考 / 推理模式</h2>
-  <p>具备思考能力的模型（Qwen 3、Qwen 3.5/3.6、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、GLM 5.x、Muse-Glimmer）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
+  <p>具备思考能力的模型（Qwen 3、Qwen 3.5/3.6、Qwen 3.8 Flash Next、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、GLM 5.x、Muse-Glimmer）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
   <ul>
     <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签。</li>
+    <li><strong>Qwen 3.8 Flash Next</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，但始终开启：生成提示会无条件打开该块，没有非思考模式可切。</li>
     <li><strong>Gemma 4</strong> —— <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> 标签。</li>
     <li><strong>GPT OSS</strong> —— Harmony 格式：<code>&lt;|channel|&gt;analysis</code> 用于思考，<code>&lt;|channel|&gt;final</code> 用于答案。</li>
     <li><strong>DeepSeek V4</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签；不显式开启思考时聊天模板会立即闭合该块，因此推理是按需启用的。</li>
-    <li><strong>GLM 5.x</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，也是按需开启：加 <code>--think</code> 会补上 <code>Reasoning Effort: Max</code> 系统行并留下一个未闭合的块由模型自己收尾，不加时提示里写的是空的 <code>&lt;think&gt;&lt;/think&gt;</code>。历史轮次的思考内容始终不会带进提示。</li>
+    <li><strong>GLM 5.x</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，也是按需开启：加 <code>--think</code> 会补上 <code>Reasoning Effort: Max</code> 系统行并留下一个未闭合的块由模型自己收尾，不加时提示里写的是空的 <code>&lt;think&gt;&lt;/think&gt;</code>。历史轮次的思考内容始终不会带进提示。<strong>GLM-5.3-Flash 则始终思考</strong>：它的 <code>Reasoning Effort: Max</code> 系统行是无条件的，生成提示总是打开 <code>&lt;think&gt;</code>，历史轮次的思考内容也会保留。</li>
     <li><strong>Muse-Glimmer</strong> —— 聊天模板输出的 <code>assistant to=self</code> 推理通道。</li>
   </ul>
   <p>通过 <code>--think</code>（CLI）、<code>"think": true</code>（Ollama API / Web UI）或浏览器中的思考开关启用。响应会单独暴露推理 —— 例如 Ollama 聊天响应中的 <code>message.thinking</code>。</p>

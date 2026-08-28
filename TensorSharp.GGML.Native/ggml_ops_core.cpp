@@ -155,10 +155,23 @@ namespace tsg
              std::strcmp(value, "ON") == 0);
     }
 
+    // ggml's DEBUG channel is where the CUDA backend reports whether a graph is
+    // being CUDA-graph-captured ("CUDA graph warmup complete" / "... reset"),
+    // which is not otherwise observable and is worth ~19 ms per replay on a
+    // 3765-node graph under WDDM. Off by default because it is chatty.
+    static bool ggml_debug_log_enabled()
+    {
+        static const bool v = []{
+            const char* e = std::getenv("TS_GGML_LOG_DEBUG");
+            return is_truthy_env(e);
+        }();
+        return v;
+    }
+
     static void filtered_ggml_log(enum ggml_log_level level, const char* text, void* user_data)
     {
         (void) user_data;
-        if (level == GGML_LOG_LEVEL_DEBUG)
+        if (level == GGML_LOG_LEVEL_DEBUG && !ggml_debug_log_enabled())
             return;
         std::fputs(text, stderr);
         std::fflush(stderr);

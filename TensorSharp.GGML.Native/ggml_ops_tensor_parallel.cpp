@@ -1310,7 +1310,8 @@ TSG_EXPORT int TSGgml_SetNativeEnvironmentVariable(const char* name, const char*
 // Bring up `count` backends on the given physical device indices. Rank 0 reuses
 // the already-initialized singleton when its device matches, so a TP run does
 // not pay for a second context on the main GPU. Returns 1 on success.
-TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndices, int count, int concurrentRanks)
+static int tsg_multi_device_init(int backendType, const int* deviceIndices, int count,
+                                 int concurrentRanks, bool enableCollectives)
 {
     try
     {
@@ -1442,13 +1443,22 @@ TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndic
 
         tsg::g_device_count.store(count, std::memory_order_release);
         // Resolve the collective backend eagerly so an NCCL/P2P init failure is
-        // reported at startup rather than mid-decode.
-        if (count > 1)
+        // reported at startup rather than mid-decode. A LAYER SPLIT skips this:
+        // it never reduces across devices, and bringing NCCL up anyway would
+        // spend the startup time and take on the lying-P2P hang risk for a
+        // collective that is never issued.
+        if (count > 1 && enableCollectives)
         {
             const bool device_ar = tsg::tp_comm_ensure();
             std::fprintf(stderr,
                 "[TP] GGML tensor parallelism: %d device(s), AllReduce=%s\n",
                 count, device_ar ? "device (backend collective)" : "host");
+            std::fflush(stderr);
+        }
+        else if (count > 1)
+        {
+            std::fprintf(stderr,
+                "[GGML] multi-device (layer split): %d device(s), no collectives\n", count);
             std::fflush(stderr);
         }
         return 1;
@@ -1458,6 +1468,22 @@ TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndic
         tsg::set_last_error(ex.what());
         return 0;
     }
+}
+
+TSG_EXPORT int TSGgml_TensorParallelInit(int backendType, const int* deviceIndices, int count, int concurrentRanks)
+{
+    return tsg_multi_device_init(backendType, deviceIndices, count, concurrentRanks, true);
+}
+
+// Bring up one backend per device WITHOUT a cross-device collective, for the
+// layer-split path: each GPU owns a contiguous run of layers and the only thing
+// that crosses a device boundary is the residual, which the caller hands over
+// through host memory. Same device bring-up as TensorParallelInit in every other
+// respect, so ranks, the per-device resident weight caches and the VRAM budgets
+// all work identically.
+TSG_EXPORT int TSGgml_MultiDeviceInit(int backendType, const int* deviceIndices, int count)
+{
+    return tsg_multi_device_init(backendType, deviceIndices, count, /*concurrentRanks*/ 1, false);
 }
 
 // 1 when the fused tensor-parallel path can run (several ranks spanning every

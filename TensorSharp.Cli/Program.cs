@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -735,6 +735,25 @@ namespace TensorSharp.Cli
                 }
             }
             else if (imagePath != null &&
+                     (model.Config.Architecture == "qwen4exp" || model.Config.Architecture == "glm5next"))
+            {
+                // Any mmproj companion beside the model (the published file is
+                // mmproj-BF16.gguf).
+                string modelDir = Path.GetDirectoryName(modelPath);
+                string autoMmproj = null;
+                if (modelDir != null && Directory.Exists(modelDir))
+                {
+                    foreach (string candidate in Directory.GetFiles(modelDir, "*mmproj*.gguf"))
+                    { autoMmproj = candidate; break; }
+                }
+                if (autoMmproj != null)
+                {
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Auto-loading vision encoder: {MmProj}", autoMmproj);
+                    model.MultimodalInjector.LoadProjectors(autoMmproj);
+                }
+            }
+            else if (imagePath != null &&
                      (model.Config.Architecture == "qwen35" ||
                       model.Config.Architecture == "qwen35moe" ||
                       model.Config.Architecture == "qwen3next"))
@@ -1023,9 +1042,22 @@ namespace TensorSharp.Cli
                     _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", imagePath);
                     return;
                 }
-                imagePaths = new List<string> { imagePath };
+                // Every --image in order; imagePath alone would keep only the last.
+                imagePaths = imagePathList.Count > 0
+                    ? new List<string>(imagePathList)
+                    : new List<string> { imagePath };
+                foreach (string ip in imagePaths)
+                {
+                    if (!File.Exists(ip))
+                    {
+                        _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", ip);
+                        return;
+                    }
+                }
                 if (!hasUserInput)
-                    rawText = "What is in this image? Please describe it.";
+                    rawText = imagePaths.Count > 1
+                        ? "What is in these images? Please describe each."
+                        : "What is in this image? Please describe it.";
                 _log.LogInformation(LogEventIds.UploadReceived,
                     "Image input: {ImagePath} ({Bytes})",
                     imagePath, LoggingExtensions.FormatBytes(new FileInfo(imagePath).Length));
@@ -1183,6 +1215,7 @@ namespace TensorSharp.Cli
                 string userMsg;
                 int turnMaxTokens = maxTokens;
                 bool forceReset = false;
+                List<string> turnImages = null;
                 try
                 {
                     var doc = JsonDocument.Parse(line);
@@ -1199,13 +1232,22 @@ namespace TensorSharp.Cli
                         turnMaxTokens = mt.GetInt32();
                     if (root.TryGetProperty("force_reset", out var fr))
                         forceReset = fr.GetBoolean();
+                    if (root.TryGetProperty("images", out var imgs) && imgs.ValueKind == JsonValueKind.Array)
+                    {
+                        turnImages = new List<string>();
+                        foreach (var im in imgs.EnumerateArray())
+                        {
+                            string ip = im.GetString();
+                            if (!string.IsNullOrEmpty(ip)) turnImages.Add(ip);
+                        }
+                    }
                 }
                 catch
                 {
                     userMsg = line;
                 }
 
-                history.Add(new ChatMessage { Role = "user", Content = userMsg });
+                history.Add(new ChatMessage { Role = "user", Content = userMsg, ImagePaths = turnImages });
                 _log.LogInformation(LogEventIds.ChatStarted,
                     "multi-turn turn={Turn}/{TotalTurns} user=\"{User}\"",
                     turn + 1, lines.Length, LoggingExtensions.SanitizeForLog(userMsg));
@@ -1226,6 +1268,12 @@ namespace TensorSharp.Cli
                     addGenerationPrompt: true,
                     enableThinking: enableThinking);
 
+                // Expand image placeholders, prepare (cached) vision embeddings and
+                // the IMRoPE position table over the WHOLE conversation so far.
+                bool anyImages = history.Exists(m => m.ImagePaths != null && m.ImagePaths.Count > 0);
+                if (anyImages)
+                    inputTokens = model.MultimodalInjector.ProcessPromptTokens(history, inputTokens);
+
                 _log.LogInformation(LogEventIds.ChatStarted,
                     "multi-turn prompt tokens={PromptTokens}", inputTokens.Count);
 
@@ -1237,7 +1285,7 @@ namespace TensorSharp.Cli
                 double decodeMs;
 
                 var turnDecoder = SpeculativeDecodingOptions.TryCreate(
-                    model, specSettings, hasMediaAttachments: false, out string turnDeclineReason,
+                    model, specSettings, hasMediaAttachments: anyImages, out string turnDeclineReason,
                     multiTurnDecoder);
                 if (turnDecoder != null)
                     multiTurnDecoder = turnDecoder;
@@ -1367,9 +1415,18 @@ namespace TensorSharp.Cli
                 case ReusePlanKind.PartialReuse:
                 {
                     int reused = plan.ReusedPrefixLength;
-                    int suffixLength = plan.TokensToForward;
+                    // A reuse boundary inside an image span would truncate half an
+                    // injection; the injector pulls it back to the span start.
+                    int clamped = model.MultimodalInjector.ClampReusablePrefix(reused);
+                    if (clamped != reused)
+                        reused = clamped;
+                    int suffixLength = inputTokens.Count - reused;
                     model.TruncateKVCache(reused);
                     kvCache.TruncateTo(reused);
+
+                    // Vision embeddings and the IMRoPE slice for the tokens being
+                    // forwarded, offset by the reused prefix.
+                    model.MultimodalInjector.QueuePromptEmbeddingsForSlice(reused, suffixLength);
 
                     var suffix = new int[suffixLength];
                     for (int i = 0; i < suffixLength; i++)
@@ -1384,6 +1441,7 @@ namespace TensorSharp.Cli
                 {
                     model.ResetKVCache();
                     kvCache.Reset();
+                    model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
                     var allTokens = inputTokens.ToArray();
                     float[] logits = model.Forward(allTokens);
                     kvCache.RecordAppend(allTokens, logits);
@@ -1713,6 +1771,18 @@ namespace TensorSharp.Cli
             if (!pinned.HasFlag(SamplingFields.TopP)) cfg.TopP = 0.95f;
             if (!pinned.HasFlag(SamplingFields.MinP)) cfg.MinP = 0.05f;
             if (!pinned.HasFlag(SamplingFields.PenaltyLastN)) cfg.PenaltyLastN = 64;
+            // NOTE: RepetitionPenalty is deliberately NOT defaulted here. The chat
+            // config is seeded from SamplingConfig.Greedy, which sets it to 1.0
+            // (disabled), and PenaltyLastN=64 above therefore penalises nothing -
+            // which looks like an oversight but is exactly llama.cpp's default pair
+            // (common/common.h: penalty_last_n=64, penalty_repeat=1.0), and matching
+            // that chain is this method's stated contract. A 1.1 default was tried
+            // while chasing an endless-repetition report on Qwen3.8-Flash-Next; the
+            // real cause turned out to be a mid-sequence fused-path fallback that
+            // reset the recurrent state (see Qwen4ExpModel.WarnIfQsaBudgetExceeded),
+            // and once that was fixed the seed that looped no longer did. Operators
+            // who want a penalty pass --repeat-penalty; a GGUF can also ask for one
+            // via general.sampling.penalty_repeat, applied just below.
 
             // 2. The model's own recommendation wins over our generic defaults.
             string fromModel = model?.Config?.RecommendedSampling?.ApplyTo(cfg, pinned) ?? string.Empty;
@@ -2356,6 +2426,51 @@ namespace TensorSharp.Cli
                             "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
                     }
                 }
+                else if (model is Qwen4ExpModel q4eVision)
+                {
+                    // The injector owns the whole qwen4exp pipeline: image-pad
+                    // expansion, embedding cache and the (T,H,W) IMRoPE table the
+                    // token-span kernel rotates image positions with.
+                    if (q4eVision.VisionEncoder != null)
+                    {
+                        var mmHistory = new List<ChatMessage>
+                        {
+                            new ChatMessage { Role = "user", Content = rawText ?? "", ImagePaths = imagePaths }
+                        };
+                        inputTokens = model.MultimodalInjector.ProcessPromptTokens(mmHistory, inputTokens);
+                        model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "qwen4exp vision: prompt expanded to {Tokens} tokens for {Images} image(s)",
+                            inputTokens.Count, imagePaths.Count);
+                    }
+                    else
+                    {
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                    }
+                }
+                else if (model is GlmDsaModel glmVision)
+                {
+                    // The injector owns the glm5next pipeline: <|image|> expansion
+                    // and the embedding-override spans the native executor applies.
+                    if (glmVision.VisionEncoder != null)
+                    {
+                        var mmHistory = new List<ChatMessage>
+                        {
+                            new ChatMessage { Role = "user", Content = rawText ?? "", ImagePaths = imagePaths }
+                        };
+                        inputTokens = model.MultimodalInjector.ProcessPromptTokens(mmHistory, inputTokens);
+                        model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "glm5next vision: prompt expanded to {Tokens} tokens for {Images} image(s)",
+                            inputTokens.Count, imagePaths.Count);
+                    }
+                    else
+                    {
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                    }
+                }
                 else
                 {
                     int imagePadId = model.Tokenizer.LookupToken("<|image_pad|>");
@@ -2877,6 +2992,14 @@ namespace TensorSharp.Cli
                     decoder.TokensDrafted, decoder.TokensAccepted,
                     decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps,
                     decoder.ParkedSteps, decoder.PlainMsPerToken, decoder.SpecMsPerToken);
+                // Where a speculative step actually goes. Cheap (one timestamp per
+                // phase per step) and the only way to tell a slow DRAFTER from a slow
+                // verify or an expensive rollback without a profiler.
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "cli.inference speculative timing: draftMs={DraftMs:F0} verifyMs={VerifyMs:F0} "
+                    + "snapshotMs={SnapMs:F0} rollbackMs={RollMs:F0} catchUpMs={CatchMs:F0} plainMs={PlainMs:F0}",
+                    decoder.Stats.DraftMs, decoder.Stats.VerifyMs, decoder.Stats.SnapshotMs,
+                    decoder.Stats.RollbackMs, decoder.Stats.CatchUpMs, decoder.Stats.PlainMs);
                 _log.LogInformation(LogEventIds.ChatCompleted,
                     "cli.inference finishReason={FinishReason} tokens={Tokens}",
                     trimmedAtStop != null ? "stop_sequence" : hitEos ? "eos" : "max_tokens",

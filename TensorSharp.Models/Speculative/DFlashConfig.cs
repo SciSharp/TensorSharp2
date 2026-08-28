@@ -15,9 +15,31 @@ namespace TensorSharp.Models
     /// <summary>
     /// Hyper-parameters of a DFlash speculative drafter GGUF
     /// (general.architecture = "dflash"), the block drafter that ships alongside a
-    /// Muse-Glimmer target. Parsed from the drafter file only; every tensor the
-    /// drafter needs beyond its own blocks (token_embd, output) is borrowed from
-    /// the target model.
+    /// target model (Muse-Glimmer, Qwen 3.8, ...). Parsed from the drafter file
+    /// only; every tensor the drafter needs beyond its own blocks (token_embd,
+    /// output) is borrowed from the target model.
+    ///
+    /// TWO GENERATIONS share this architecture id, and which one a file is comes
+    /// from the keys it carries, not from its name:
+    ///
+    ///   DFlash  - plain block diffusion. Each block position's token is the
+    ///             argmax of the target LM head over that position's draft hidden
+    ///             state, chosen INDEPENDENTLY of its neighbours.
+    ///   DFlash2 - the same backbone plus two additions
+    ///             (<see cref="HasConv"/> / <see cref="HasSelector"/>):
+    ///               * a grouped dynamic depthwise K-tap convolution wrapped
+    ///                 around every attention and every FFN sublayer
+    ///                 (dflash.conv_kernel_size / dflash.conv_group_size), whose
+    ///                 taps are produced per token by a projection of that
+    ///                 sublayer's own input and masked at the block boundary, and
+    ///               * a CANDIDATE SELECTOR (dflash.selector_rank /
+    ///                 dflash.selector_top_k): instead of an independent argmax,
+    ///                 the top-K candidates of adjacent positions are scored
+    ///                 pairwise through two low-rank [vocab, r] codebooks and the
+    ///                 block is read off as a walk through that lattice, so a
+    ///                 position's token is conditioned on the one before it.
+    ///             Both are no-ops when their keys are absent, which is what lets
+    ///             one code path serve both generations.
     ///
     /// DFlash runs three passes (llama.cpp src/models/dflash.cpp):
     ///   A. ENCODE  - the target's per-layer INPUT residuals at
@@ -98,6 +120,68 @@ namespace TensorSharp.Models
         /// past the anchor.</summary>
         public int MaskTokenId { get; private set; } = -1;
 
+        /// <summary>dflash.conv_kernel_size: taps of the grouped dynamic
+        /// convolution (2 for the shipped DFlash2 drafters). 0 = no convolution,
+        /// i.e. a first-generation DFlash file.</summary>
+        public int ConvKernelSize { get; private set; }
+
+        /// <summary>dflash.conv_group_size: channels sharing one dynamic tap
+        /// coefficient (16). The STATIC part of the kernel is per channel
+        /// (blk.N.attn_conv_base); only the per-token delta is per group.</summary>
+        public int ConvGroupSize { get; private set; }
+
+        /// <summary>dflash.selector_rank: width of the two [vocab, r] transition
+        /// codebooks. 0 = no selector (plain DFlash).</summary>
+        public int SelectorRank { get; private set; }
+
+        /// <summary>dflash.selector_top_k: candidates kept per block position
+        /// before the lattice walk (16).</summary>
+        public int SelectorTopK { get; private set; }
+
+        /// <summary>Channel groups of the dynamic convolution
+        /// (<see cref="HiddenSize"/> / <see cref="ConvGroupSize"/>).</summary>
+        public int ConvNumGroups => ConvGroupSize > 0 ? HiddenSize / ConvGroupSize : 0;
+
+        /// <summary>Columns of one conv_proj output row: both sides (the sublayer's
+        /// input and its output) x taps x groups.</summary>
+        public int ConvProjOutSize => 2 * ConvKernelSize * ConvNumGroups;
+
+        /// <summary>True when this drafter wraps its sublayers in the DFlash2
+        /// grouped dynamic convolution.</summary>
+        public bool HasConv => ConvKernelSize > 0 && ConvGroupSize > 0;
+
+        /// <summary>True when this drafter picks its block through the DFlash2
+        /// candidate-selector lattice instead of a per-position argmax.</summary>
+        public bool HasSelector => SelectorRank > 0 && SelectorTopK > 0;
+
+        /// <summary>
+        /// dflash.logit_scale: the multiplier the TARGET applies to its LM-head
+        /// output. Only the DFlash2 selector needs it, and it needs it badly: the
+        /// lattice ADDS the unary logit to a transition score, so an unscaled unary
+        /// term is simply the wrong size and swamps the transition it is supposed to
+        /// compete with. (Plain DFlash takes an argmax, which is invariant under a
+        /// positive scale, which is why llama.cpp's DFlash graph can ignore it and
+        /// why this key only appears on a DFlash2 file whose target has one -
+        /// Muse-Glimmer's 0.196, against Qwen 3.8's absent = 1.0.)
+        /// </summary>
+        public float LogitScale { get; private set; } = 1f;
+
+        /// <summary>dflash.final_logit_softcapping: the target's tanh softcap, applied
+        /// to the selector's unary term after <see cref="LogitScale"/>. 0 = none.
+        /// Same reasoning as <see cref="LogitScale"/>: monotonic, so it cannot change
+        /// which candidates the top-k picks, but it very much changes how they weigh
+        /// against the transition scores.</summary>
+        public float FinalLogitSoftcap { get; private set; }
+
+        /// <summary>True when the selector's unary term needs the target's logit
+        /// transform applied before it enters the lattice.</summary>
+        public bool HasUnaryLogitTransform => LogitScale != 1f || FinalLogitSoftcap > 0f;
+
+        /// <summary>True for a second-generation drafter (either extension
+        /// present). Descriptive only - every code path keys on
+        /// <see cref="HasConv"/> / <see cref="HasSelector"/> individually.</summary>
+        public bool IsDFlash2 => HasConv || HasSelector;
+
         /// <summary>Width of one encoder input row = TargetLayerIds.Length * HiddenSize
         /// (33280 for the Muse-Glimmer drafter). This is what the model reports as
         /// ISpeculativeModel.SpecFeatureSize.</summary>
@@ -154,11 +238,50 @@ namespace TensorSharp.Models
                 // A missing key yields uint.MaxValue, which casts to -1 and is
                 // rejected by ValidateSelfConsistent below.
                 MaskTokenId = (int)gguf.GetUint32("tokenizer.ggml.mask_token_id", uint.MaxValue),
+                // DFlash2 extensions. Absent in a first-generation file, and a zero
+                // there means the same thing as absent: the feature is off.
+                ConvKernelSize = (int)gguf.GetUint32($"{ArchName}.conv_kernel_size", 0),
+                ConvGroupSize = (int)gguf.GetUint32($"{ArchName}.conv_group_size", 0),
+                SelectorRank = (int)gguf.GetUint32($"{ArchName}.selector_rank", 0),
+                SelectorTopK = (int)gguf.GetUint32($"{ArchName}.selector_top_k", 0),
+                LogitScale = gguf.GetFloat32($"{ArchName}.logit_scale", 1f),
+                FinalLogitSoftcap = gguf.GetFloat32($"{ArchName}.final_logit_softcapping", 0f),
             };
 
+            cfg.ApplyDiagnosticOverrides();
             cfg.ValidateSelfConsistent();
             return cfg;
         }
+
+        /// <summary>
+        /// TS_DFLASH_SELECTOR=0 / TS_DFLASH_CONV=0 turn off a DFlash2 extension and
+        /// run the checkpoint as a first-generation DFlash drafter.
+        ///
+        /// DIAGNOSTIC ONLY. Neither is a supported way to run the model: the weights
+        /// were trained WITH both, so switching one off changes what the drafter
+        /// predicts. What they are for is attribution - how much of the acceptance
+        /// rate comes from the selector, how much from the convolution, and what each
+        /// costs per draft step - which is otherwise unanswerable without a second
+        /// checkpoint.
+        /// </summary>
+        private void ApplyDiagnosticOverrides()
+        {
+            if (IsDisabled("TS_DFLASH_SELECTOR") && HasSelector)
+            {
+                Console.WriteLine("  DFlash: TS_DFLASH_SELECTOR=0 - drafting with per-position argmax instead of the candidate lattice (diagnostic).");
+                SelectorRank = 0;
+                SelectorTopK = 0;
+            }
+            if (IsDisabled("TS_DFLASH_CONV") && HasConv)
+            {
+                Console.WriteLine("  DFlash: TS_DFLASH_CONV=0 - drafting without the grouped dynamic convolution (diagnostic).");
+                ConvKernelSize = 0;
+                ConvGroupSize = 0;
+            }
+        }
+
+        private static bool IsDisabled(string envVar)
+            => string.Equals(Environment.GetEnvironmentVariable(envVar), "0", StringComparison.Ordinal);
 
         private void ValidateSelfConsistent()
         {
@@ -183,6 +306,38 @@ namespace TensorSharp.Models
                 throw new InvalidOperationException($"{ArchName}.attention.sliding_window {SlidingWindow} must be positive.");
             if (MaskTokenId < 0)
                 throw new InvalidOperationException("tokenizer.ggml.mask_token_id is missing from the DFlash GGUF; the block draft has no mask id to fill its slots with.");
+            // Both DFlash2 extensions are all-or-nothing: half a convolution, or a
+            // rank with no top-k, describes a file we cannot execute, and quietly
+            // ignoring the half that IS present would draft from a different model
+            // than the one that was trained.
+            if ((ConvKernelSize > 0) != (ConvGroupSize > 0))
+            {
+                throw new InvalidOperationException(
+                    "DFlash grouped convolution needs conv_kernel_size and conv_group_size together "
+                    + $"(got {ConvKernelSize} / {ConvGroupSize}).");
+            }
+            if (HasConv)
+            {
+                if (HiddenSize % ConvGroupSize != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"{ArchName}.conv_group_size {ConvGroupSize} must divide embedding_length {HiddenSize}.");
+                }
+                if (ConvKernelSize > BlockSize)
+                {
+                    // Tap t is masked out for the first t positions of a block, so a
+                    // kernel wider than the block silently reduces to a narrower one -
+                    // a shape the trained weights were never meant to run in.
+                    throw new NotSupportedException(
+                        $"{ArchName}.conv_kernel_size {ConvKernelSize} exceeds block_size {BlockSize}.");
+                }
+            }
+            if ((SelectorRank > 0) != (SelectorTopK > 0))
+            {
+                throw new InvalidOperationException(
+                    "DFlash selector needs selector_rank and selector_top_k together "
+                    + $"(got {SelectorRank} / {SelectorTopK}).");
+            }
             if (SwaPattern.Length != NumLayers)
             {
                 throw new InvalidOperationException(
@@ -202,8 +357,13 @@ namespace TensorSharp.Models
         }
 
         public override string ToString()
-            => $"dflash(layers={NumLayers}, hidden={HiddenSize}, ffn={IntermediateSize}, heads={NumHeads}/{NumKVHeads}x{HeadDim}, " +
+            => $"{(IsDFlash2 ? "dflash2" : "dflash")}(layers={NumLayers}, hidden={HiddenSize}, " +
+               $"ffn={IntermediateSize}, heads={NumHeads}/{NumKVHeads}x{HeadDim}, " +
                $"block={BlockSize}, drafts={MaxDraftTokens}, swa={SlidingWindow}, ring={RingRows}, " +
-               $"targets=[{string.Join(",", TargetLayerIds)}], feature={FeatureSize}, mask={MaskTokenId})";
+               $"targets=[{string.Join(",", TargetLayerIds)}], feature={FeatureSize}, mask={MaskTokenId}" +
+               (HasConv ? $", conv={ConvKernelSize}x{ConvGroupSize}({ConvNumGroups}g)" : string.Empty) +
+               (HasSelector ? $", selector=r{SelectorRank}/k{SelectorTopK}" : string.Empty) +
+               (LogitScale != 1f ? $", logit_scale={LogitScale:G6}" : string.Empty) +
+               (FinalLogitSoftcap > 0f ? $", softcap={FinalLogitSoftcap:G6}" : string.Empty) + ")";
     }
 }

@@ -33,6 +33,10 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MultiDeviceInit(int backendType, int[] deviceIndices, int count);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_SetActiveDevice(int rank);
 
         [LibraryImport(DllName)]
@@ -137,6 +141,30 @@ namespace TensorSharp.GGML
             {
                 throw new InvalidOperationException(GetLastErrorMessage(
                     $"Failed to initialize GGML tensor parallelism across {deviceIndices.Length} device(s)."));
+            }
+            s_cachedRankValid = false;
+        }
+
+        /// <summary>
+        /// Bring up one ggml backend per listed GPU for a LAYER SPLIT: same device
+        /// setup as <see cref="TensorParallelInit"/>, but no cross-device collective
+        /// is created.
+        ///
+        /// A layer split never reduces across devices - each GPU owns a contiguous
+        /// run of layers and only the residual crosses a boundary, through host
+        /// memory - so initialising NCCL/P2P would spend the startup time and take
+        /// on the lying-P2P first-collective hang risk for machinery that is never
+        /// used.
+        /// </summary>
+        public static void MultiDeviceInit(GgmlBackendType backendType, int[] deviceIndices)
+        {
+            if (deviceIndices == null || deviceIndices.Length == 0)
+                throw new ArgumentException("At least one device index is required.", nameof(deviceIndices));
+
+            if (TSGgml_MultiDeviceInit((int)backendType, deviceIndices, deviceIndices.Length) == 0)
+            {
+                throw new InvalidOperationException(GetLastErrorMessage(
+                    $"Failed to initialize {deviceIndices.Length} GGML device(s) for a layer split."));
             }
             s_cachedRankValid = false;
         }

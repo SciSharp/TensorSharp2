@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -670,11 +670,17 @@ namespace TensorSharp.Runtime
             if (IsGlmDsa(architecture))
                 return RenderGlmDsa(messages, addGenerationPrompt, enableThinking, tools);
 
+            if (IsGlm5Next(architecture))
+                return RenderGlm5Next(messages, addGenerationPrompt, enableThinking, tools);
+
             return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
         }
 
         internal static bool IsGlmDsa(string? architecture)
             => architecture == "glm-dsa" || architecture == "glm_dsa";
+
+        internal static bool IsGlm5Next(string? architecture)
+            => architecture == "glm5next";
 
         private const string GlmToolsHeader =
             "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" +
@@ -753,6 +759,90 @@ namespace TensorSharp.Runtime
                             content = content.Substring(close + "</think>".Length);
                         }
                         sb.Append("<think></think>");
+                        content = content.Trim();
+                        if (content.Length > 0)
+                            sb.Append(content);
+                        prevWasTool = false;
+                        break;
+                    }
+                }
+            }
+
+            if (addGenerationPrompt)
+                sb.Append("<|assistant|>").Append(enableThinking ? "<think>" : "<think></think>");
+
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// GLM-5.3-Flash (glm5next) chat format, mirroring the template shipped in
+        /// the GGUF. Differences from GLM-5.2:
+        /// <list type="bullet">
+        /// <item>The reasoning-effort system line is ALWAYS emitted (the template
+        /// defaults <c>reasoning_effort</c> to <c>max</c>); this family has no
+        /// thinking-off prompt shape, so <paramref name="enableThinking"/> only
+        /// decides whether the generation prompt's <c>&lt;think&gt;</c> block is
+        /// left open or closed immediately.</item>
+        /// <item><c>clear_thinking</c> defaults to FALSE: historical assistant
+        /// turns KEEP their reasoning when the message still carries it.</item>
+        /// <item>No newline after the <c>&lt;|assistant|&gt;</c> tag.</item>
+        /// </list>
+        /// </summary>
+        public static string RenderGlm5Next(List<ChatMessage> messages, bool addGenerationPrompt = true,
+            bool enableThinking = true, List<ToolFunction>? tools = null)
+        {
+            var sb = new StringBuilder();
+            sb.Append("[gMASK]<sop>");
+            sb.Append("<|system|>Reasoning Effort: Max");
+
+            if (tools != null && tools.Count > 0)
+            {
+                sb.Append(GlmToolsHeader);
+                foreach (var tool in tools)
+                    sb.Append(ToolFunctionToJson(tool)).Append('\n');
+                sb.Append(GlmToolsFooter);
+            }
+
+            bool prevWasTool = false;
+            foreach (var m in messages)
+            {
+                switch (m.Role)
+                {
+                    case "system":
+                        sb.Append("<|system|>").Append(m.Content ?? "");
+                        prevWasTool = false;
+                        break;
+                    case "user":
+                    case "developer":
+                        sb.Append("<|user|>").Append(m.Content ?? "");
+                        prevWasTool = false;
+                        break;
+                    case "tool":
+                        // One <|observation|> opens a RUN of tool results.
+                        if (!prevWasTool)
+                            sb.Append("<|observation|>");
+                        sb.Append("<tool_response>").Append(m.Content ?? "").Append("</tool_response>");
+                        prevWasTool = true;
+                        break;
+                    case "assistant":
+                    {
+                        sb.Append("<|assistant|>");
+                        string content = m.Content ?? string.Empty;
+                        int open = content.IndexOf("<think>", StringComparison.Ordinal);
+                        int close = content.IndexOf("</think>", StringComparison.Ordinal);
+                        if (close >= 0)
+                        {
+                            // clear_thinking defaults false: past reasoning stays.
+                            string reasoning = content.Substring(
+                                open >= 0 ? open + "<think>".Length : 0,
+                                (close) - (open >= 0 ? open + "<think>".Length : 0));
+                            sb.Append("<think>").Append(reasoning).Append("</think>");
+                            content = content.Substring(close + "</think>".Length);
+                        }
+                        else
+                        {
+                            sb.Append("<think></think>");
+                        }
                         content = content.Trim();
                         if (content.Length > 0)
                             sb.Append(content);
@@ -1072,7 +1162,7 @@ namespace TensorSharp.Runtime
                     if (msg.ImagePaths != null)
                         foreach (var _ in msg.ImagePaths) sb.Append("<start_of_image>");
                 }
-                else if (architecture is "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe")
+                else if (architecture is "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe" or "qwen4exp")
                 {
                     if (msg.ImagePaths != null)
                         foreach (var _ in msg.ImagePaths)
@@ -1083,6 +1173,15 @@ namespace TensorSharp.Runtime
                     if (msg.ImagePaths != null)
                         foreach (var _ in msg.ImagePaths)
                             sb.Append("[IMG]");
+                }
+                else if (architecture == "glm5next")
+                {
+                    // GLM-5.3-Flash: the template's emit_image() macro. The host
+                    // later expands the single <|image|> into N placeholder
+                    // tokens matching the merged patch count.
+                    if (msg.ImagePaths != null)
+                        foreach (var _ in msg.ImagePaths)
+                            sb.Append("<|begin_of_image|><|image|><|end_of_image|>");
                 }
                 else if (architecture is "muse-glimmer" or "muse_glimmer")
                 {

@@ -149,6 +149,12 @@ namespace TensorSharp.Models
                 case Qwen35Model q35:
                     q35.LoadVisionEncoder(mmProjPath);
                     break;
+                case Qwen4ExpModel q4e:
+                    q4e.LoadVisionEncoder(mmProjPath);
+                    break;
+                case GlmDsaModel glm:
+                    glm.LoadVisionEncoder(mmProjPath);
+                    break;
                 case Mistral3Model m3:
                     m3.LoadVisionEncoder(mmProjPath);
                     break;
@@ -180,6 +186,10 @@ namespace TensorSharp.Models
                 return ProcessGemma3History(g3, history, inputTokens);
             if (_model is Qwen35Model q35)
                 return ProcessQwen35History(q35, history, inputTokens);
+            if (_model is Qwen4ExpModel q4e)
+                return ProcessQwenVLHistory(q4e.VisionEncoder, history, inputTokens);
+            if (_model is GlmDsaModel glm)
+                return ProcessGlmNextHistory(glm, history, inputTokens);
             if (_model is Mistral3Model m3)
                 return ProcessMistral3History(m3, history, inputTokens);
             if (_model is NemotronModel nem)
@@ -252,6 +262,11 @@ namespace TensorSharp.Models
             if (mropeSlice != null && _model is Qwen35Model q35)
             {
                 q35.SetMRoPEPositions(mropeSlice);
+                queued = true;
+            }
+            else if (mropeSlice != null && _model is Qwen4ExpModel q4m)
+            {
+                q4m.SetMRoPEPositions(mropeSlice);
                 queued = true;
             }
             return queued;
@@ -496,8 +511,16 @@ namespace TensorSharp.Models
         }
 
         private List<int> ProcessQwen35History(Qwen35Model model, List<ChatMessage> history, List<int> inputTokens)
+            => ProcessQwenVLHistory(model.VisionEncoder, history, inputTokens);
+
+        /// <summary>
+        /// Shared Qwen-VL-family prompt processing: Qwen3.5-VL and Qwen3.8-Flash-Next
+        /// use the same qwen3vl_merger tower, image-pad expansion and (T,H,W) IMRoPE
+        /// position assignment.
+        /// </summary>
+        private List<int> ProcessQwenVLHistory(Qwen35VisionEncoder encoder, List<ChatMessage> history, List<int> inputTokens)
         {
-            if (model.VisionEncoder == null)
+            if (encoder == null)
                 return inputTokens;
 
             var imagePaths = GetImagePathsInPromptOrder(history);
@@ -508,12 +531,12 @@ namespace TensorSharp.Models
             if (imagePadId < 0)
                 return inputTokens;
 
-            var processor = new Qwen35ImageProcessor(model.VisionEncoder.PatchSize, model.VisionEncoder.SpatialMergeSize);
+            var processor = new Qwen35ImageProcessor(encoder.PatchSize, encoder.SpatialMergeSize);
             var cachedEmbeddings = new CachedEmbedding[imagePaths.Count];
             var tokenCounts = new int[imagePaths.Count];
             for (int i = 0; i < imagePaths.Count; i++)
             {
-                cachedEmbeddings[i] = GetOrCreateQwen35VisionEmbedding(model, processor, imagePaths[i]);
+                cachedEmbeddings[i] = GetOrCreateQwenVLVisionEmbedding(encoder, processor, imagePaths[i]);
                 tokenCounts[i] = cachedEmbeddings[i].TokenCount;
             }
 
@@ -815,17 +838,78 @@ namespace TensorSharp.Models
             });
         }
 
-        private CachedEmbedding GetOrCreateQwen35VisionEmbedding(
-            Qwen35Model model,
+        private CachedEmbedding GetOrCreateQwenVLVisionEmbedding(
+            Qwen35VisionEncoder encoder,
             Qwen35ImageProcessor processor,
             string imagePath)
         {
             return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
             {
                 var (pixels, resizedHeight, resizedWidth) = processor.ProcessImage(fullPath);
-                Tensor embeddings = model.VisionEncoder.Encode(pixels, resizedHeight, resizedWidth);
+                Tensor embeddings = encoder.Encode(pixels, resizedHeight, resizedWidth);
                 int mergedH = resizedHeight / processor.PatchSize / processor.MergeSize;
                 int mergedW = resizedWidth / processor.PatchSize / processor.MergeSize;
+                return CreateCachedEmbedding(fullPath, embeddings, mergedH, mergedW);
+            });
+        }
+
+        /// <summary>
+        /// GLM-5.3-Flash (glm5next) prompt processing: expand each <c>&lt;|image|&gt;</c>
+        /// placeholder to the image's merged-patch token count and record the
+        /// embedding spans. The text tower is NoPE, so unlike the Qwen-VL family
+        /// no MRoPE position table is built - image tokens occupy ordinary
+        /// sequential positions.
+        /// </summary>
+        private List<int> ProcessGlmNextHistory(GlmDsaModel model, List<ChatMessage> history, List<int> inputTokens)
+        {
+            var encoder = model.VisionEncoder;
+            if (encoder == null)
+                return inputTokens;
+
+            var imagePaths = GetImagePathsInPromptOrder(history);
+            if (imagePaths.Count == 0)
+                return inputTokens;
+
+            int imageId = _model.Tokenizer.LookupToken("<|image|>");
+            if (imageId < 0)
+                return inputTokens;
+
+            var processor = new GlmNextImageProcessor(encoder.PatchSize, encoder.SpatialMergeSize);
+            var cachedEmbeddings = new CachedEmbedding[imagePaths.Count];
+            var tokenCounts = new int[imagePaths.Count];
+            for (int i = 0; i < imagePaths.Count; i++)
+            {
+                cachedEmbeddings[i] = GetOrCreateGlmNextVisionEmbedding(encoder, processor, imagePaths[i]);
+                tokenCounts[i] = cachedEmbeddings[i].TokenCount;
+            }
+
+            inputTokens = ChatTemplate.ExpandImageTokens(inputTokens, imageId, tokenCounts);
+
+            int searchFrom = 0;
+            for (int i = 0; i < imagePaths.Count; i++)
+            {
+                int start = FindTokenPosition(inputTokens, imageId, searchFrom);
+                if (start < 0)
+                    break;
+                _preparedVisionEmbeddings.Add(new PreparedEmbeddingSpan(
+                    cachedEmbeddings[i], start, start, start + tokenCounts[i]));
+                searchFrom = start + tokenCounts[i];
+            }
+
+            return inputTokens;
+        }
+
+        private CachedEmbedding GetOrCreateGlmNextVisionEmbedding(
+            GlmNextVisionEncoder encoder,
+            GlmNextImageProcessor processor,
+            string imagePath)
+        {
+            return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
+            {
+                var (pixels, canvasH, canvasW) = processor.ProcessImage(fullPath);
+                Tensor embeddings = encoder.Encode(pixels, canvasH, canvasW);
+                int mergedH = canvasH / processor.PatchSize / processor.MergeSize;
+                int mergedW = canvasW / processor.PatchSize / processor.MergeSize;
                 return CreateCachedEmbedding(fullPath, embeddings, mergedH, mergedW);
             });
         }
@@ -911,6 +995,26 @@ namespace TensorSharp.Models
                             continue;
 
                         q35.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
+                        queued = true;
+                    }
+                    break;
+                case Qwen4ExpModel q4pv:
+                    foreach (var span in bucket)
+                    {
+                        if (span.EndPosition <= reusablePrefixTokenCount)
+                            continue;
+
+                        q4pv.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
+                        queued = true;
+                    }
+                    break;
+                case GlmDsaModel glmv:
+                    foreach (var span in bucket)
+                    {
+                        if (span.EndPosition <= reusablePrefixTokenCount)
+                            continue;
+
+                        glmv.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
                         queued = true;
                     }
                     break;
@@ -1006,6 +1110,28 @@ namespace TensorSharp.Models
                             continue;
 
                         q35.SetVisionEmbeddings(embeddings, insertPosition);
+                        queued = true;
+                    }
+                    break;
+                case Qwen4ExpModel q4v:
+                    foreach (var span in bucket)
+                    {
+                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
+                                out Tensor embeddings, out int insertPosition))
+                            continue;
+
+                        q4v.SetVisionEmbeddings(embeddings, insertPosition);
+                        queued = true;
+                    }
+                    break;
+                case GlmDsaModel glmsv:
+                    foreach (var span in bucket)
+                    {
+                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
+                                out Tensor embeddings, out int insertPosition))
+                            continue;
+
+                        glmsv.SetVisionEmbeddings(embeddings, insertPosition);
                         queued = true;
                     }
                     break;

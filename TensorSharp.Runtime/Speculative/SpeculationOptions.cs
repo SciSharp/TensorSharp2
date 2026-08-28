@@ -39,6 +39,15 @@ namespace TensorSharp.Runtime.Speculative
         public int MaxDraftTokens { get; init; } = DefaultMaxDraftTokens;
 
         /// <summary>
+        /// True when the operator actually asked for <see cref="MaxDraftTokens"/>,
+        /// rather than inheriting the default. A model whose trunk makes a wide
+        /// window expensive can narrow the DEFAULT
+        /// (<see cref="ISpeculativeTarget.SpecPreferredDraftWindow"/>); it must not
+        /// silently override a number the operator typed.
+        /// </summary>
+        public bool MaxDraftTokensExplicit { get; init; }
+
+        /// <summary>
         /// Confidence gate, or null to let the algorithm pick its own
         /// (<see cref="ISpeculator.DefaultMinDraftProb"/>). The gates threshold
         /// DIFFERENT quantities per algorithm, so one shared default cannot
@@ -87,6 +96,10 @@ namespace TensorSharp.Runtime.Speculative
                 SpeculatorName = ReadString(SpeculationEnvVars.Type, null) ?? SpeculatorRegistry.Auto,
                 MaxDraftTokens = ReadPositiveInt(SpeculationEnvVars.Draft, SpeculationEnvVars.LegacyDraft,
                     DefaultMaxDraftTokens),
+                // The flags layer writes these only when the operator passed one.
+                MaxDraftTokensExplicit =
+                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(SpeculationEnvVars.Draft))
+                    || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(SpeculationEnvVars.LegacyDraft)),
                 MinDraftProb = ReadFloatOrNull(SpeculationEnvVars.PMin, SpeculationEnvVars.LegacyPMin),
             };
         }

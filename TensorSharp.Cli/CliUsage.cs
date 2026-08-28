@@ -126,7 +126,9 @@ namespace TensorSharp.Cli
                     "Split the model across N GPUs on this machine (tensor parallelism): each GPU holds 1/N of " +
                     "every weight and the shards cooperate on every token. Use it when a model does not fit on one " +
                     "GPU. Range: 1 to the number of local GPUs. Applies to the cuda, ggml_cuda, and ggml_vulkan " +
-                    "backends. Default: 1 — no splitting (TENSORSHARP_TP_DEGREE env var overrides).",
+                    "backends. " +
+                    "Multi-GPU is implemented PER ARCHITECTURE, not per backend, and in two forms. Architectures that shard weights run true tensor parallelism. qwen4exp (Qwen3.8-Flash-Next) shards nothing, so --tp N runs it as a LAYER SPLIT instead - each GPU holds a contiguous run of whole layers, which is the same and only multi-GPU mode llama.cpp offers for it. That is a CAPACITY feature: it lets a model, context or resident-weight set that one GPU cannot hold fit across several, and is not expected to raise tok/s. The startup line says which mode actually ran. An architecture that supports neither says so on stderr and runs on one GPU rather than silently leaving the others idle. " +
+                    "Default: 1 — no splitting (TENSORSHARP_TP_DEGREE env var overrides).",
                     "--backend ggml_cuda --tp 2"),
                 new OptionHelp("--tp-node-id <N>",
                     "This node's 0-based ID for multi-node (distributed) tensor parallelism over TCP. Node 0 is " +
@@ -201,7 +203,7 @@ namespace TensorSharp.Cli
                 new OptionHelp("--spec-type <name>",
                     "Which speculation ALGORITHM to draft with. 'auto' (default) uses whatever drafter the " +
                     "checkpoint carries: a per-token NextN/MTP head (GLM-5.2, Qwen 3.6, Gemma 4's separate " +
-                    "assistant GGUF) or a block drafter (DeepSeek V4 DSpark, Muse-Glimmer DFlash). " +
+                    "assistant GGUF) or a block drafter (DeepSeek V4 DSpark, DFlash / DFlash2 on Muse-Glimmer and Qwen 3.8). " +
                     "'draft-head' and 'block' pin one of those explicitly. 'ngram' needs NO trained weights at " +
                     "all - it drafts by finding where the last few tokens occurred earlier in the context and " +
                     "proposing what followed, so it works on every model and is strong on summarizing, editing, " +
@@ -229,7 +231,8 @@ namespace TensorSharp.Cli
                     "--spec --spec-draft-model gemma-4-12B-it-Q4_0-MTP.gguf"),
                 new OptionHelp("--draft-model <path>",
                     "Block drafter GGUF that has to be resident before the model's layer split runs (DeepSeek " +
-                    "V4's DSpark support module, Muse-Glimmer's DFlash). The drafter proposes a whole block of " +
+                    "V4's DSpark support module, the DFlash / DFlash2 drafters for Muse-Glimmer and Qwen 3.8). "
+                    + "The drafter proposes a whole block of " +
                     "tokens per step and the trunk verifies it in one batched forward. Naming the file IS the " +
                     "request - such a drafter needs no --spec. Every emitted token is still drawn from a trunk " +
                     "row - with argmax under a greedy config, with your sampler otherwise - so output is " +

@@ -245,7 +245,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--cpu-moe` / `-cmoe` | `--n-cpu-moe all` 的简写。默认：关闭（环境变量 `TS_CPU_MOE`）。 |
 | `--cpu-moe-threads <N>` | 主机侧专家矩阵乘的工作线程数。默认：在核数多于 8 的主机上取本进程实际可用 CPU 并行度（`hardware_concurrency`，再受调度亲和性掩码与 cgroup CPU 配额约束）的**一半**，低于 8 时取「全部减一」。另一半并非浪费——加速器提交线程，以及 `TensorSharp.Server` 里的 Kestrel 与调度器，同样需要可被调度，而 .NET 自己的线程池是按机器 CPU 数而不是 cgroup 配额来定的。把它设到接近配额是悬崖而不是缓坡：在 95 CPU 配额下，托管的 26B MoE 在 64 线程时实测 20.7 tok/s，71 线程时只剩 8.2。独占机器上可以调高（环境变量 `TS_CPU_MOE_THREADS`）。 |
 | `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16`、`q8_0` 或 `q4_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径。 |
-| `--tp <N>` | 张量并行度 —— 在单个进程内把模型切分到 N 张 GPU 上（默认：`1`）。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
+| `--tp <N>` | 多卡度 —— 单个进程内把模型摊到几张 GPU 上（默认：`1`）。到底走哪一种多卡模式由架构决定，而不是由你决定：实现了张量并行的走**张量并行**（在层*内部*切权重），Qwen 3.8 Flash Next（`qwen4exp`）与 DeepSeek V4 走**按层切分**（整层落在单卡 —— 买的是容量，不是速度）。两者都不支持的架构会在 stderr 上明确说明并只用一张卡。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
 | `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |
 | `--tp-peers <list>` | 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。所有节点必须使用完全相同的列表。必须与 `--tp-node-id` 一起使用。 |
 | `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
@@ -463,7 +463,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `--model <path>` | 需要托管的 GGUF 文件（推理时必填；如传入了其他参数但未指定该项，服务仍可启动，但 `/api/models/load` 会报告未加载模型） |
 | `--mmproj <path>` | 多模态投影器 GGUF（仅给文件名时按模型目录解析；传 `none` 可显式禁用）。需要先指定 `--model`。 |
 | `--backend <type>` | 默认计算后端：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan` |
-| `--tp <N>` | 张量并行度 —— 把托管的模型切分到本机 N 张 GPU 上（默认：`1`）。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。环境变量：`TENSORSHARP_TP_DEGREE`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
+| `--tp <N>` | 多卡度 —— 把托管的模型摊到本机几张 GPU 上（默认：`1`）。架构实现了张量并行就走张量并行；Qwen 3.8 Flash Next（`qwen4exp`）与 DeepSeek V4 走按层切分（整层落在单卡 —— 买的是容量，不是速度）。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。环境变量：`TENSORSHARP_TP_DEGREE`。详见[张量并行与分布式推理](#张量并行与分布式推理)。 |
 | `--tp-node-id <N>` | 多节点（分布式）张量并行中本节点的 0 起始编号。服务端只能是节点 `0`（对外提供 HTTP 的 driver）；其余节点请用 `TensorSharp.Cli` 启动。必须与 `--tp-peers` 一起使用。环境变量：`TENSORSHARP_TP_NODE_ID`。 |
 | `--tp-peers <list>` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，按节点 ID 排序，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `--tp-node-id` 一起使用。环境变量：`TENSORSHARP_TP_PEERS`。 |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
@@ -544,8 +544,9 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --config config/server-basi
 | `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
-| `TENSORSHARP_TP_DEGREE` | 张量并行度 —— 把模型切分到本机多少张 GPU 上（默认：`1`）。当未传 `--tp` 参数时作为 `ModelBase.Create` 的兜底来源；`TensorSharp.Cli` 与 `TensorSharp.Server` 都提供了 `--tp <N>` 参数。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。 |
+| `TENSORSHARP_TP_DEGREE` | 多卡度 —— 把模型摊到本机多少张 GPU 上（默认：`1`）。当未传 `--tp` 参数时作为 `ModelBase.Create` 的兜底来源；`TensorSharp.Cli` 与 `TensorSharp.Server` 都提供了 `--tp <N>` 参数。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。在改走按层切分而非张量并行的架构（`qwen4exp`、DeepSeek V4）上，它只是个设备数，而不是切分度。 |
 | `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`；默认 `0..tp-1`）。用于 GGML 后端上的 TP。 |
+| `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next（`qwen4exp`）多卡按层切分时每张 GPU 分到的层数（逗号分隔，例如 `20,28`），用于取代自动的显存均衡。给出无法满足的值时会直接抛错，而不是静默忽略。 |
 | `TENSORSHARP_TP_NODE_ID` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `TENSORSHARP_TP_PEERS` 一起设置。 |
 | `TENSORSHARP_TP_PEERS` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `TENSORSHARP_TP_NODE_ID` 一起设置。 |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 各节点向 peer 发起连接的重试窗口（默认：`120` 秒）。若节点由人工或较慢的编排系统间隔较久启动，可调大该值。 |
@@ -1181,20 +1182,38 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 **按层切分**则是把*整层*放到不同设备上并顺序执行——设备 0 算第 0..k 层，把隐状态
 交给设备 1，依此类推。切点并不是简单的 `n_layer/N`：加载器会测量每张卡的空闲显存，
 再做装箱以均衡「占用预算的最大比例」，因此配置不一致的一组卡也能被均匀填满。没有
-集合通信、层内也不切分，因此在慢速互连上不花额外代价，但同一时刻只有一张卡在忙。这只适用于**两个架构——DeepSeek V4 Flash（`deepseek4`）
-与 GLM 5.x（`glm-dsa`）**，因为只有它们走各自的整模型执行器；而且这是它们**不加任何
-参数时的默认行为**：它们会摊到所有可见 GPU 上，因为两者都装不进单卡。`TS_DSV4_NGPU`
-与 `TS_GLM_NGPU` 用来限制使用几张卡。
+集合通信、层内也不切分，因此在慢速互连上不花额外代价，但同一时刻只有一张卡在忙。它适用于所有
+走自己整模型执行器的架构——**DeepSeek V4 Flash（`deepseek4`）**、**GLM 5.x（`glm-dsa` / `glm5next`，
+GLM-5.2 与 GLM-5.3-Flash 都算）**与 **Qwen 3.8 Flash Next（`qwen4exp`）**。前两者**不加任何
+参数时的默认行为**就是它：它们会摊到所有可见 GPU 上，因为两者都装不进单卡，`TS_DSV4_NGPU`
+与 `TS_GLM_NGPU` 用来限制使用几张卡。`qwen4exp` 上则是按需开启——默认单卡，写了 `--tp N` 才切分。
 
 在**其他所有架构**上，不加 `--tp` 就是**只用一张 GPU**。通用的逐算子路径与融合图
 路径都没有自动按层切分——装不下单卡的模型会在加载时失败，而不会被悄悄摊开。（那条
 会告诉你正好需要多少 `--n-cpu-moe N` 的拒绝信息，来自 DeepSeek V4 与 GLM 5.x 的
-整模型加载器。）
+整模型加载器。）对既不支持张量并行、也没有按层切分的架构传 `--tp N`，现在会在 stderr
+上明确说明并回到单卡运行，而不是让其余的卡白白闲着。
 
 所以在一台 3 卡机器上：只写 `--backend ggml_cuda`，GLM 5.x 与 DeepSeek V4 会用满三张卡
-（按层切分），Gemma 4 只用一张；再加上 `--tp 3`，GLM 5.x 切换成张量并行，DeepSeek V4 只是把按层切分限制在这 3 张卡上
-（那里的 `--tp N` 仅仅是个设备数，与 `TS_DSV4_NGPU` 等价），Gemma 4 则用上三张卡。
+（按层切分），Gemma 4 与 Qwen 3.8 Flash Next 只用一张；再加上 `--tp 3`，GLM 5.x 切换成张量并行（GLM-5.3-Flash 会拒绝
+`--tp`，继续用按层切分），DeepSeek V4 只是把按层切分限制在这 3 张卡上
+（那里的 `--tp N` 仅仅是个设备数，与 `TS_DSV4_NGPU` 等价），Gemma 4 则用上三张卡，
+Qwen 3.8 Flash Next 得到三路按层切分。
 在 GLM 5.x 上这个切换只会更慢，换来的仅仅是容量——见下文的**预期效果**实测数据。
+
+**Qwen 3.8 Flash Next（`qwen4exp`）是新加入的那个。**它的 `--tp N` 走的是按层切分：每张
+GPU 拿到一段连续的整层。这不是张量并行——`qwen4exp` 不切分任何权重——而且这也是
+llama.cpp 对这个架构唯一提供的多卡模式（它的 `-sm row` 会直接拒绝加载）。所以请把它
+当作容量特性。在 2× A100-80GB、Qwen3.8-Flash-Next-UD-Q2_K_XL（73.4 GiB）上实测：单卡与
+双卡的贪心输出**逐字节一致**（SHA-256 相同）；显存从一张卡扛下全部变成 24.2 GB + 26.2 GB，
+大致各占一半；吞吐则没有变化——prefill 约 1520-1550 t/s、decode 约 56 t/s，两种跑法都一样。
+作为参照，同一台机器上的 llama.cpp 单卡为 pp1536 1094 / tg128 61.2，双卡 `-sm layer` 为
+1200 / 61.5——它同样是 prefill 约 +10%、decode 不变。启动时会打印实际走的是哪种模式，
+以及每张卡分到的层数与字节数。
+
+`TS_Q4E_LAYER_SPLIT=20,28` 可以用显式的每卡层数覆盖自动均衡（精神上等同于 llama.cpp 的
+`--tensor-split`）。给出无法满足的值时它会直接抛错，而不是静默忽略。这个开关值得一用，
+是因为自动均衡只按权重定价，看不到视觉塔——视觉塔是后加载的，会落在 GPU 0 上。
 
 ### 本地张量并行（单进程，多 GPU）
 
@@ -1261,9 +1280,10 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | Gemma 3 | ✅ | 分离 Q/K/V，GELU，滑动窗口 |
 | Gemma 4 | ✅ | 稠密 TP + MoE。GGML 上融合的整模 MoE 主干在**每个专家内部**切分（gate/up 列并行、down 行并行），从而保留全局专家 id；`TS_GEMMA4_TP_FUSED_MOE=0` 可回退到逐算子的整专家路径。Direct CUDA 上为逐专家切分 |
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属；GGML 上为专家并行 MoE（每个 rank 持有整个专家，shared expert 仍按 Megatron 切分）与列并行 LM head，Direct CUDA 上为专家切分。`cuda` 与 `ggml_cuda` / `ggml_vulkan` 均可运行——GGML 路径使用打包的按 rank GDN 内核（`TSGgml_Qwen35GdnLayerTP`）并把循环状态常驻设备 |
+| Qwen 3.8 Flash Next | 按层切分 | 不是张量并行：`--tp N` 让每张 GPU 拿到一段连续的整层，这也是 llama.cpp 对 `qwen4exp` 唯一提供的多卡模式（它的 `-sm row` 会直接拒绝加载）。买的是容量而不是速度——2× A100-80GB、Qwen3.8-Flash-Next-UD-Q2_K_XL（73.4 GiB）实测：贪心输出与单卡逐字节一致（SHA-256 相同），显存从一张卡扛下全部变成 24.2 + 26.2 GB，prefill 约 1520-1550 t/s、decode 约 56 t/s 两种跑法一致。`TS_Q4E_LAYER_SPLIT=20,28` 可手动指定每卡层数 |
 | GPT OSS | ✅ | MoE 专家切分，attention sink，YaRN。`cuda` 与 GGML 后端均可运行；GGML 路径目前仍按 token 逐个遍历专家（尚未使用专家并行） |
 | Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算，MoE 专家切分。GGML 上的限制与 GPT OSS 相同 |
-| GLM 5.x | ✅ | MLA 的头按列并行（`attn_q_b` / `attn_k_b` / `attn_v_b`）、`attn_output` 按行并行；256 个路由专家是**在每个专家内部按行切**（gate/up 列并行、down 行并行）而不是按专家 id 切，因为 `ggml_mul_mat_id` 要求一个 token 选中的专家 id 互不相同。路由器、norm、DSA 索引器、共享专家与前 3 个稠密层都是复制的；每层两次 all-reduce。`TS_GLM_TP_SHARD` 选择切哪一半（1 头、2 专家、3 两者都切），`TS_GLM_TP_OVERSUBSCRIBE=1` 允许多个 rank 挤在同一张卡上做正确性测试。仅限 GGML 后端 |
+| GLM 5.x | ✅ | MLA 的头按列并行（`attn_q_b` / `attn_k_b` / `attn_v_b`）、`attn_output` 按行并行；256 个路由专家是**在每个专家内部按行切**（gate/up 列并行、down 行并行）而不是按专家 id 切，因为 `ggml_mul_mat_id` 要求一个 token 选中的专家 id 互不相同。路由器、norm、DSA 索引器、共享专家与前 3 个稠密层都是复制的；每层两次 all-reduce。`TS_GLM_TP_SHARD` 选择切哪一半（1 头、2 专家、3 两者都切），`TS_GLM_TP_OVERSUBSCRIBE=1` 允许多个 rank 挤在同一张卡上做正确性测试。仅限 GGML 后端。GLM-5.3-Flash（`glm5next`）是例外：它会拒绝 `--tp`，改用其默认的按层切分 |
 | DiffusionGemma | — | 不适用（扩散模型） |
 | Qwen-Image-Edit | — | 不适用（图像生成） |
 
@@ -1322,6 +1342,7 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 | `TS_GGML_TP_PARALLEL=0` | 顺序而非并发地驱动各 rank（诊断用） |
 | `TS_GGML_TP_FUSED_MATMUL=1` | 由单个线程提交两个 rank 的线性层（默认关闭；它每次调用都要为每个 rank 分配设备缓冲，在 Qwen 3.5 35B 上实测慢 2.3×） |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 超过该元素数量时 AllReduce 走设备集合通信（默认 262144） |
+| `TS_Q4E_LAYER_SPLIT=20,28` | 仅 Qwen 3.8 Flash Next：用显式的每卡层数取代按层切分的自动显存均衡。给出无法满足的值时直接抛错而不是静默忽略——这个开关有用，是因为自动均衡只按权重定价，看不到后加载、会落在 GPU 0 上的视觉塔 |
 | `TS_GGML_F32_RESIDENT=0` | 每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | 仅 Gemma 4：从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径。融合路径在 26B 上加载时会物化约 10.5 GB 的专家分片（约 36 秒），换来约 10× 的 decode |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | ggml-cuda 集合通信在多大载荷以上把 F32 转成 BF16 再归约。TensorSharp 把 ggml 的默认值（1 字节，即总是转换）提高到 1 MB，使 decode 规模的集合通信精确归约；设为 `0` 则完全禁用转换 |
@@ -1449,6 +1470,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 |---|---|---|---|
 | 本地张量并行（单进程，多 GPU） | 关闭（`1` 张 GPU） | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N`（CLI 与服务端） |
 | TP 各 rank 使用的 GPU 序号（GGML 后端） | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
+| `qwen4exp` 按层切分（`--tp N`）每张卡的显式层数 | 自动显存均衡 | `TS_Q4E_LAYER_SPLIT=20,28` | — |
 | 分布式 TP 节点编号（多节点） | 未设置（关闭） | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N`（CLI 与服务端；服务端必须是节点 `0`） |
 | 分布式 TP peer 端点 | 未设置（关闭） | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2`（CLI 与服务端） |
 | peer 连接重试窗口（多节点） | `120` 秒 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |

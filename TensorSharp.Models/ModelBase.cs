@@ -83,6 +83,30 @@ namespace TensorSharp.Models
             _ownerToken = ownerToken;
         }
 
+        /// <summary>
+        /// A non-owning view over ONE expert of a stacked expert tensor
+        /// (<c>ffn_gate_exps</c> and friends), so a model whose GGUF stacks its
+        /// experts can still drive the per-expert linear paths that unstacked files
+        /// get for free. The view borrows the stack's buffer - it must not free it -
+        /// and holds the stack as its owner token so the memory outlives it.
+        /// </summary>
+        public static QuantizedWeight CreateExpertView(StackedExpertWeights stacked, int expert)
+        {
+            if (stacked == null)
+                throw new ArgumentNullException(nameof(stacked));
+            if (expert < 0 || expert >= stacked.NumExperts)
+                throw new ArgumentOutOfRangeException(nameof(expert));
+
+            return new QuantizedWeight(
+                stacked.Data + (nint)(expert * stacked.PerExpertRawBytes),
+                stacked.PerExpertRawBytes,
+                stacked.GgmlType,
+                stacked.PerExpertNe0,
+                stacked.PerExpertNe1,
+                ownsBuffer: false,
+                ownerToken: stacked);
+        }
+
         public void Dispose()
         {
             ReleaseHostData();
@@ -370,7 +394,7 @@ namespace TensorSharp.Models
         }
     }
 
-    public abstract class ModelBase : IModelArchitecture
+    public abstract partial class ModelBase : IModelArchitecture
     {
         public ModelConfig Config { get; protected set; }
         public ITokenizer Tokenizer { get; protected set; }
@@ -516,8 +540,23 @@ namespace TensorSharp.Models
         protected int _forwardCount;
         protected Stopwatch _forwardSw = new Stopwatch();
 
-        protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
+        /// <summary>
+        /// Number of GPUs this model spreads its LAYERS across (1 = single GPU).
+        ///
+        /// This is llama.cpp's <c>--split-mode layer</c>, not tensor parallelism:
+        /// each GPU owns a contiguous run of whole layers, nothing is sharded and
+        /// no collective is ever issued - only the residual crosses a device
+        /// boundary, and it does so through host memory. It is a CAPACITY feature
+        /// (measured on 2xA100 with llama.cpp: +10% prefill, +0.5% decode when the
+        /// model already fits on one GPU), so the win is running a model, context
+        /// or resident-weight set that one GPU cannot hold.
+        /// </summary>
+        protected int LayerSplitDegree { get; }
+
+        protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1,
+            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1)
         {
+            LayerSplitDegree = Math.Max(1, layerSplitDegree);
             _backend = backend;
             // The pure-C# CPU backend must never touch native (ggml P/Invoke) dequant — route
             // every dequant/row-size through the managed implementation (bit-exact vs native,
@@ -549,9 +588,25 @@ namespace TensorSharp.Models
                     // A caller-supplied group (multi-node) already owns the
                     // multi-GPU context; reuse it rather than initializing the
                     // devices a second time.
-                    _ggmlContext = FindGgmlContext(_tpGroup) ?? CreateGgmlContext(ggmlType, tpDegree);
-                    _tpGroup ??= CreateGgmlTpGroup(_ggmlContext);
-                    _allocator = _tpGroup != null ? _tpGroup.GetAllocator(0) : new GgmlAllocator(_ggmlContext, 0);
+                    if (LayerSplitDegree > 1)
+                    {
+                        // LAYER SPLIT: one backend per GPU, NO tensor-parallel group.
+                        // _tpGroup must stay null - IsTensorParallel gates the weight
+                        // sharding and AllReduce machinery, none of which applies here,
+                        // and leaving it set would also make the startup banner claim a
+                        // transport that is never used.
+                        _ggmlContext = CreateGgmlContext(ggmlType, LayerSplitDegree, enableCollectives: false);
+                        _allocator = new GgmlAllocator(_ggmlContext, 0);
+                    }
+                    else
+                    {
+                        // A caller-supplied group (multi-node) already owns the
+                        // multi-GPU context; reuse it rather than initializing the
+                        // devices a second time.
+                        _ggmlContext = FindGgmlContext(_tpGroup) ?? CreateGgmlContext(ggmlType, tpDegree);
+                        _tpGroup ??= CreateGgmlTpGroup(_ggmlContext);
+                        _allocator = _tpGroup != null ? _tpGroup.GetAllocator(0) : new GgmlAllocator(_ggmlContext, 0);
+                    }
                     break;
                 }
                 case BackendType.Cuda:
@@ -578,7 +633,8 @@ namespace TensorSharp.Models
         /// TENSORSHARP_TP_DEVICES (e.g. "0,2") to pick specific GPUs, which is how
         /// you avoid a display-attached or otherwise busy card.
         /// </summary>
-        private static GgmlContext CreateGgmlContext(GgmlBackendType backendType, int tpDegree)
+        private static GgmlContext CreateGgmlContext(GgmlBackendType backendType, int tpDegree,
+            bool enableCollectives = true)
         {
             if (tpDegree <= 1)
                 return new GgmlContext(new[] { 0 }, backendType);
@@ -588,9 +644,9 @@ namespace TensorSharp.Models
             if (available < tpDegree)
             {
                 throw new InvalidOperationException(
-                    $"Requested tensor-parallel degree {tpDegree} but the GGML {backendType} backend sees only {available} GPU(s).");
+                    $"Requested {tpDegree} GPU(s) but the GGML {backendType} backend sees only {available}.");
             }
-            return new GgmlContext(devices, backendType);
+            return new GgmlContext(devices, backendType, enableCollectives);
         }
 
         private static int[] ParseTpDevices(int tpDegree)
@@ -930,11 +986,25 @@ namespace TensorSharp.Models
 
         protected void InitializeCacheTensor(Tensor tensor)
         {
-            // First allocation still zero-fills on every backend that keeps a host
-            // copy (including Vulkan/Metal): the fused kernels' flash-padding may
-            // read never-written cache rows, which must be finite.
-            if (tensor != null && (ShouldZeroFillCacheTensors ||
-                _backend == BackendType.GgmlVulkan || _backend == BackendType.GgmlMetal))
+            // ALLOCATION-time zero, on every backend that can do it. The fused
+            // decode kernels read a flash/attention window padded past the rows any
+            // token has written; a masked-off column contributes nothing only if
+            // its K row is FINITE, and an Inf in never-written memory plus the
+            // -inf mask is NaN - which takes the whole softmax row, then every
+            // logit, then argmax, which returns token 0 forever.
+            //
+            // GgmlCuda used to be excluded here (via ShouldZeroFillCacheTensors)
+            // and got recycled, uncleared pool blocks instead. That is the same
+            // defect in ten model families at once: every KV grow past the initial
+            // capacity, and every freshly-allocated per-request cache, could come
+            // up non-finite. The perf argument for skipping the fill belongs to
+            // ResetCacheTensor (per REQUEST, potentially multi-GB), not here -
+            // this runs once per cache allocation, next to the allocation itself.
+            //
+            // Mlx stays excluded: its Fill goes through MlxNative.Full, whose
+            // behaviour for block-quantized KV dtypes is unverified on this
+            // machine, and no Mlx-specific failure of this kind has been observed.
+            if (tensor != null && _backend != BackendType.Mlx)
                 Ops.Fill(tensor, 0f);
         }
 
@@ -1532,6 +1602,7 @@ namespace TensorSharp.Models
                     mappedHostViews++;
             }
 
+            int activeRank = 0;
             foreach (var kv in _quantWeights)
             {
                 string weightName = kv.Key;
@@ -1548,6 +1619,23 @@ namespace TensorSharp.Models
                 // reach the bytes (and lazily upload on demand if ever needed).
                 if (!ShouldPreloadCudaQuantWeightToDevice(weightName))
                     continue;
+
+                // LAYER SPLIT: upload this weight to the GPU that owns its layer.
+                // Exactly one rank, because ReleaseHostData() below frees the host
+                // copy - a second preload elsewhere would upload from freed memory.
+                // Weights that are NOT preloaded (the stacked experts, vetoed by
+                // ShouldPreloadCudaQuantWeightToDevice) keep their host views and are
+                // bound lazily by the native binder on whichever rank is active when
+                // their layer runs, so they distribute across the GPUs for free.
+                if (LayerSplitDegree > 1)
+                {
+                    int rank = PreloadRankForWeight(weightName);
+                    if (rank != activeRank)
+                    {
+                        GgmlBasicOps.SetActiveRank(rank);
+                        activeRank = rank;
+                    }
+                }
 
                 // llama.cpp keeps token_embd on the host (its CPU_Mapped model
                 // buffer): embedding lookup is a row gather, and when the quant
@@ -1586,6 +1674,9 @@ namespace TensorSharp.Models
                         mappedHostViews--;
                 }
             }
+
+            if (activeRank != 0)
+                GgmlBasicOps.SetActiveRank(0);
 
             if (mappedHostViews == 0)
                 _gguf?.Dispose();
@@ -1958,7 +2049,7 @@ namespace TensorSharp.Models
         private static readonly bool s_retainAllHostQuantWeights =
             Environment.GetEnvironmentVariable("TS_GGML_RETAIN_HOST_WEIGHTS") == "1";
 
-        private static bool ShouldRetainCudaHostQuantWeight(string weightName)
+        protected virtual bool ShouldRetainCudaHostQuantWeight(string weightName)
         {
             return s_retainAllHostQuantWeights ||
                 string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal) ||
@@ -1977,6 +2068,14 @@ namespace TensorSharp.Models
         /// expert belonging to a <c>--n-cpu-moe</c> layer is multiplied on the host
         /// and uploading it would spend exactly the VRAM the flag exists to save.
         /// </summary>
+        /// <summary>
+        /// GPU that should hold <paramref name="weightName"/> under a layer split.
+        /// Default 0 (everything on the first GPU); a model that splits overrides
+        /// this to return the rank owning the weight's layer. Only consulted when
+        /// <see cref="LayerSplitDegree"/> &gt; 1.
+        /// </summary>
+        protected virtual int PreloadRankForWeight(string weightName) => 0;
+
         protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
             => !MoeCpuOffloadConfig.IsOffloadedExpertWeightName(weightName);
 
@@ -2105,12 +2204,30 @@ namespace TensorSharp.Models
             InvalidateTensorDeviceCache(result);
         }
 
+        /// <summary>
+        /// True when this model's FFN can run <c>ffn_gate</c> and <c>ffn_up</c> as
+        /// two separate projections - i.e. when <see cref="FuseGateUpWeights"/> is
+        /// allowed to leave a layer unfused.
+        ///
+        /// Default false, deliberately: most families look up
+        /// <c>blk.N.ffn_gate_up.weight</c> unconditionally and would either throw
+        /// or (worse) bind a null weight and produce silent garbage. Mixed-IQ "UD"
+        /// GGUFs make that reachable, so a family that has not implemented the
+        /// split path must say so at load time rather than fail later.
+        /// </summary>
+        protected virtual bool SupportsSplitGateUpFfn => false;
+
         protected unsafe void FuseGateUpWeights(int numLayers = 0)
         {
             if (numLayers <= 0)
                 numLayers = Config.NumLayers;
             int fused = 0;
             int requantized = 0;
+            // "layer:gateType+upType" - the type pair is the only place the
+            // mismatch is ever surfaced, and it is what a future GGUF tripping a
+            // DIFFERENT combination has to be diagnosed from.
+            var splitLayers = new List<string>();
+            var requantLayers = new List<string>();
             for (int l = 0; l < numLayers; l++)
             {
                 string gateName = $"blk.{l}.ffn_gate.weight";
@@ -2132,18 +2249,31 @@ namespace TensorSharp.Models
                         requant = TryRequantizeForFusion(gw, uw, out bool requantIsGate);
                         if (requant == null)
                         {
-                            Console.WriteLine(
-                                $"  WARNING: layer {l} ffn_gate ({(Runtime.GgmlTensorType)(uint)gw.GgmlType}) and ffn_up " +
-                                $"({(Runtime.GgmlTensorType)(uint)uw.GgmlType}) quant types differ and requantization is " +
-                                "unavailable; gate/up left unfused.");
+                            // ggml refuses to quantize INTO IQ2_XXS / IQ2_XS /
+                            // IQ1_S without an importance matrix
+                            // (ggml_quantize_requires_imatrix), so a layer whose gate
+                            // and up are both such types cannot be brought to a
+                            // common type at load time. Collect and report ONCE below
+                            // - ten per-layer WARNINGs read like ten problems - and
+                            // let the report say whether this family can actually run
+                            // the two projections separately (SupportsSplitGateUpFfn).
+                            splitLayers.Add(
+                                $"{l}:{(Runtime.GgmlTensorType)(uint)gw.GgmlType}+" +
+                                $"{(Runtime.GgmlTensorType)(uint)uw.GgmlType}");
                             continue;
                         }
                         if (requantIsGate) gateSrc = requant; else upSrc = requant;
                         requantized++;
+                        requantLayers.Add(
+                            $"{l}:{(Runtime.GgmlTensorType)(uint)gw.GgmlType}+" +
+                            $"{(Runtime.GgmlTensorType)(uint)uw.GgmlType}->" +
+                            $"{(Runtime.GgmlTensorType)(uint)requant.GgmlType}");
                     }
 
-                    // Gate-up fusion must always succeed: model FFN code expects
-                    // a single fused tensor at guName. If MLX view-fusion fails
+                    // Where fusion IS possible it must produce a tensor at guName.
+                    // (It is not always possible - see the split path above - and the
+                    // FFN of every model that can load such a GGUF handles a missing
+                    // guName by running gate and up separately.) If MLX view-fusion fails
                     // (gate/up not contiguous in the GGUF file), fall back to a
                     // copy. Cost is bounded — 2 tensors × per-layer, host memory
                     // released after the MLX device upload.
@@ -2175,6 +2305,37 @@ namespace TensorSharp.Models
                 Console.WriteLine(requantized > 0
                     ? $"  Fused projections: {fused} Gate+Up ({requantized} mixed-quant layers requantized to a common type)"
                     : $"  Fused projections: {fused} Gate+Up");
+            if (requantLayers.Count > 0)
+            {
+                // A dequantize+requantize of already-lossy weights is a real
+                // (small) quality and VRAM change. It used to happen silently.
+                Console.WriteLine(
+                    $"    Requantized to fuse: {string.Join(", ", requantLayers)}");
+            }
+            if (splitLayers.Count > 0)
+            {
+                // ggml refuses to quantize INTO IQ2_XXS / IQ2_XS / IQ1_S without an
+                // importance matrix, so a layer whose gate and up are BOTH such
+                // types cannot be brought to a common type at load time.
+                if (SupportsSplitGateUpFfn)
+                {
+                    Console.WriteLine(
+                        $"  Split projections: {splitLayers.Count} of {numLayers} layers keep separate " +
+                        "ffn_gate/ffn_up (mixed IQ quant types that would need an importance matrix to " +
+                        "requantize). This model runs them as two matmuls instead of one, with identical " +
+                        "output - no action needed.");
+                }
+                else
+                {
+                    Console.Error.WriteLine(
+                        $"  WARNING: {splitLayers.Count} of {numLayers} layers have mixed-IQ ffn_gate/ffn_up that " +
+                        "cannot be fused (requantizing into IQ2_XXS/IQ2_XS/IQ1_S needs an importance matrix), and " +
+                        $"this architecture ({Config?.Architecture ?? "unknown"}) has no split-FFN path. Those layers " +
+                        "have no usable FFN weight and generation will be wrong or will fail. Use a GGUF whose " +
+                        "ffn_gate and ffn_up share a quant type - most non-UD quants do.");
+                }
+                Console.WriteLine($"    Layers: {string.Join(", ", splitLayers)}");
+            }
         }
 
         /// <summary>
@@ -6294,8 +6455,9 @@ namespace TensorSharp.Models
             arch ??= "qwen3";
 
             ApplyArchitectureNativeTunables(arch, backend, probe);
+            tpDegree = ResolveTensorParallelSupport(arch, backend, tpDegree, ref tpGroup, out int layerSplit);
 
-            return arch switch
+            ModelBase model = arch switch
             {
                 // qwen2vl is Qwen2/Qwen2.5-VL. Its language model is Qwen3's block
                 // with a QKV bias and no QK norm, both of which Qwen3Model detects
@@ -6303,7 +6465,7 @@ namespace TensorSharp.Models
                 // RoPE when the t/h/w position components are equal, which they are
                 // for text tokens, so the vision tower (mmproj) is not required.
                 "qwen3" or "qwen2" or "qwen2vl" or "qwen2_vl" => new Qwen3Model(ggufPath, backend, tpDegree, tpGroup),
-                "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend, tpDegree, tpGroup),
+                "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 "gemma3" => new Gemma3Model(ggufPath, backend, tpDegree, tpGroup),
                 "gemma4" => new Gemma4Model(ggufPath, backend, tpDegree, tpGroup),
                 "diffusion-gemma" or "diffusion_gemma" => new DiffusionGemmaModel(ggufPath, backend),
@@ -6315,10 +6477,127 @@ namespace TensorSharp.Models
                 "mistral3" => new Mistral3Model(ggufPath, backend, tpDegree, tpGroup),
                 "muse-glimmer" or "muse_glimmer" => new MuseGlimmerModel(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
                 "deepseek4" => new DeepSeek4Model(ggufPath, backend, tpDegree, tpGroup, draftModelPath),
+                // Qwen3.8-Flash-Next: hyper-connections, PLE n-gram embeddings, Qwen
+                // Sparse Attention and Gated DeltaNet over a 512-expert MoE.
+                "qwen4exp" => new Qwen4ExpModel(ggufPath, backend, tpDegree, tpGroup, layerSplit),
                 // GLM-5.x with DeepSeek Sparse Attention (MLA + lightning indexer + sigmoid MoE).
                 "glm-dsa" or "glm_dsa" => new GlmDsaModel(ggufPath, backend, tpDegree, tpGroup),
+                // GLM-5.3-Flash: hybrid KDA linear attention + nope-only MLA with a
+                // pooled DSA indexer, Sinkhorn hyper-connections, 288-expert MoE.
+                "glm5next" => new GlmDsaModel(ggufPath, backend, tpDegree, tpGroup),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };
+
+            model.WarnIfTensorParallelShardedNothing(arch);
+            return model;
+        }
+
+        /// <summary>
+        /// Architectures that accept a <c>tpDegree</c> parameter but implement no
+        /// weight sharding, so tensor parallelism would load the whole model on
+        /// rank 0 and leave the other GPUs holding nothing but a CUDA context and
+        /// NCCL buffers.
+        ///
+        /// This list exists because TP is opt-in PER MODEL CLASS (each TP-capable
+        /// ctor shards behind <c>if (IsTensorParallel)</c>), while the flag is
+        /// accepted globally. An architecture that never wrote that code got a
+        /// real 2-GPU context, a real NCCL comm, and the banner "Tensor
+        /// parallelism (GGML Cuda): 2 GPUs" - and then ran entirely on GPU 0, with
+        /// nothing anywhere saying so. Silence plus a banner asserting the
+        /// opposite is the worst possible outcome; be explicit instead.
+        ///
+        /// Keep in sync with the ctors: an architecture belongs here exactly when
+        /// nothing under its Models/ directory references <c>IsTensorParallel</c>
+        /// or <c>_tpGroup</c>. (DeepSeek V4 is deliberately absent - it drives
+        /// multiple GPUs through its own executor, sized by TS_DSV4_NGPU, not
+        /// through the shared TP group.)
+        /// </summary>
+        internal static readonly Dictionary<string, string> ArchitecturesWithoutTensorParallel =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["qwen4exp"] =
+                    "qwen4exp (Qwen3.8-Flash-Next) has no tensor-parallel path: none of its weights are " +
+                    "sharded, and its decode is one persisted single-device GGML graph per token whose " +
+                    "GDN/PLE recurrent state lives in device buffers owned by a single backend.",
+            };
+
+        /// <summary>
+        /// Architectures that use several GPUs by LAYER SPLIT instead - each GPU
+        /// owns a contiguous run of whole layers, nothing is sharded and no
+        /// collective is issued. This is what llama.cpp does by default
+        /// (<c>--split-mode layer</c>); for these architectures it is also the ONLY
+        /// multi-GPU mode llama.cpp offers, since <c>-sm row</c> refuses to load them.
+        ///
+        /// <c>--tp N</c> is honoured as "use N GPUs" for these, because that is what
+        /// an operator asking for N GPUs means; the startup line says which mode
+        /// actually ran so nobody has to infer it from nvidia-smi.
+        /// </summary>
+        internal static readonly HashSet<string> ArchitecturesWithLayerSplit =
+            new(StringComparer.OrdinalIgnoreCase) { "qwen4exp" };
+
+        /// <summary>
+        /// Decide whether the requested tensor-parallel degree can actually be
+        /// honoured for <paramref name="arch"/>. A single-node request degrades to
+        /// one GPU with a loud explanation (so an existing <c>--tp N</c> script
+        /// keeps working, just honestly); a DISTRIBUTED group throws, because one
+        /// node quietly dropping to a single rank desynchronises the collective.
+        /// </summary>
+        internal static int ResolveTensorParallelSupport(string arch, BackendType backend, int tpDegree,
+            ref ITensorParallelGroup tpGroup, out int layerSplitDegree)
+        {
+            layerSplitDegree = 1;
+            bool wantsTp = tpDegree > 1 || tpGroup != null;
+            if (!wantsTp)
+                return tpDegree;
+            if (!ArchitecturesWithoutTensorParallel.TryGetValue(arch ?? string.Empty, out string why))
+                return tpDegree;
+
+            if (tpGroup != null)
+            {
+                throw new NotSupportedException(
+                    why + " A distributed tensor-parallel group cannot be downgraded on one node without " +
+                    "desynchronising the others, so this run is refused. Start the node without --tp-node-id/--tp-peers.");
+            }
+
+            // No sharding, but the architecture can still spread its LAYERS across
+            // the GPUs. That is what an operator asking for N GPUs wants, and it is
+            // the same mode llama.cpp uses for these models, so honour --tp N as a
+            // layer split rather than throwing the second GPU away.
+            bool splitCapable = ArchitecturesWithLayerSplit.Contains(arch ?? string.Empty)
+                && (backend == BackendType.GgmlCuda || backend == BackendType.GgmlVulkan);
+            if (splitCapable)
+            {
+                layerSplitDegree = tpDegree;
+                Console.WriteLine(
+                    $"  Multi-GPU: {tpDegree} GPUs by LAYER SPLIT (each GPU holds a contiguous run of whole " +
+                    "layers), not tensor parallelism - this architecture shards no weights. Same mode " +
+                    "llama.cpp uses for it. This raises capacity; it is not expected to raise decode speed.");
+                return 1;
+            }
+
+            Console.Error.WriteLine(
+                $"WARNING: --tp {tpDegree} ignored. {why} Running on ONE GPU; the extra GPUs would have been " +
+                "given a CUDA context and NCCL buffers and then left idle. To choose WHICH GPU, set " +
+                "CUDA_VISIBLE_DEVICES (e.g. CUDA_VISIBLE_DEVICES=1).");
+            return 1;
+        }
+
+        /// <summary>
+        /// Backstop for the next architecture that lands without TP: tensor
+        /// parallelism was requested and the group is live, yet the model sharded
+        /// no weights at all, so every rank but 0 is idle. Costs one dictionary
+        /// count and only ever runs on a TP load.
+        /// </summary>
+        private void WarnIfTensorParallelShardedNothing(string arch)
+        {
+            if (!IsTensorParallel)
+                return;
+            if (_tpQuantWeights.Count > 0 || _tpWeights.Count > 0)
+                return;
+            Console.Error.WriteLine(
+                $"WARNING: tensor parallelism is active ({_tpGroup.Degree} ranks) but architecture '{arch}' " +
+                "sharded 0 weights - the whole model is resident on rank 0 and the other GPUs are idle. " +
+                "This architecture has no tensor-parallel implementation; run without --tp.");
         }
     }
 }

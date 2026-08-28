@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -842,6 +842,12 @@ namespace TensorSharp.Models
 
         private Tensor RecurrentBlock(Tensor hidden, int layer, int seqLen, int startPos)
         {
+            // The op-by-op recurrent path reads the HOST state mirrors, so a
+            // speculative session that has been keeping the authoritative state in
+            // the verify kernel's device slices has to hand it back first. A no-op
+            // after the first layer of the first such forward.
+            DrainDeviceRecurrentState();
+
             bool isMoeLayer = _isMoeLayer != null && _isMoeLayer[layer];
 
             // ---- Path A: Fused dense FFN (non-MoE layers) ----
@@ -1164,6 +1170,31 @@ namespace TensorSharp.Models
             InvalidateFullDecodeState(hardBindings: true);
         }
 
+        /// <summary>
+        /// Point a layer descriptor's dense FFN at either the fused gate_up tensor
+        /// or, for a mixed-quant layer that could not be fused, at the original
+        /// gate and up pair. Exactly one of the two is populated, and the native
+        /// graphs branch on GuW being null.
+        /// </summary>
+        private void FillDenseFfnArgs(ref Qwen35LayerDecodeArgs a, int l)
+        {
+            if (_ffnGateUpQW[l] != null || _ffnGateUpF32[l] != null)
+            {
+                var gu = ResolveW(_ffnGateUpQW[l], _ffnGateUpF32[l]);
+                a.GuW = gu.ptr; a.GuType = gu.type; a.GuNe0 = gu.ne0; a.GuNe1 = gu.ne1; a.GuBytes = gu.bytes;
+                a.FfDense = (int)(gu.ne1 / 2);
+                a.FfnGateW = IntPtr.Zero; a.FfnUpW = IntPtr.Zero;
+                return;
+            }
+
+            var g = ResolveW(_ffnGateSplitQW[l], _ffnGateSplitF32[l]);
+            var u = ResolveW(_ffnUpSplitQW[l], _ffnUpSplitF32[l]);
+            a.GuW = IntPtr.Zero; a.GuType = 0; a.GuNe0 = 0; a.GuNe1 = 0; a.GuBytes = 0;
+            a.FfnGateW = g.ptr; a.FfnGateType = g.type; a.FfnGateNe0 = g.ne0; a.FfnGateNe1 = g.ne1; a.FfnGateBytes = g.bytes;
+            a.FfnUpW = u.ptr; a.FfnUpType = u.type; a.FfnUpNe0 = u.ne0; a.FfnUpNe1 = u.ne1; a.FfnUpBytes = u.bytes;
+            a.FfDense = (int)g.ne1;
+        }
+
         // Resolve a linear-projection weight to (ptr, ggml-type, ne0, ne1, bytes)
         // from EITHER its quantized form or its F32 form (small projections such as
         // ssm_beta / ssm_alpha are stored F32). F32 weights are [out, in] tensors,
@@ -1310,7 +1341,7 @@ namespace TensorSharp.Models
                             && _layerStackedGate[l] != null && _layerStackedUp[l] != null && _layerStackedDown[l] != null
                             && HasW(_ffnGateShexpQW[l], _ffnGateShexpF32[l]) && HasW(_ffnUpShexpQW[l], _ffnUpShexpF32[l])
                             && HasW(_ffnDownShexpQW[l], _ffnDownShexpF32[l]) && _ffnGateInpShexpVec[l] != null)
-                        : (HasW(_ffnGateUpQW[l], _ffnGateUpF32[l]) && HasW(_ffnDownQW[l], _ffnDownF32[l]));
+                        : (HasDenseFfnWeights(l) && HasW(_ffnDownQW[l], _ffnDownF32[l]));
                     bool ok = _attnNormW[l] != null && _postAttnNormW[l] != null && ffnOk;
                     if (ok && !_isRecurrent[l])
                         ok = (HasW(_attnQkvQW[l], _attnQkvF32[l])
@@ -1430,11 +1461,9 @@ namespace TensorSharp.Models
                     a.IsMoe = isMoe ? 1 : 0;
                     if (!isMoe)
                     {
-                        var gu = ResolveW(_ffnGateUpQW[l], _ffnGateUpF32[l]);
                         var dn = ResolveW(_ffnDownQW[l], _ffnDownF32[l]);
-                        a.GuW = gu.ptr; a.GuType = gu.type; a.GuNe0 = gu.ne0; a.GuNe1 = gu.ne1; a.GuBytes = gu.bytes;
                         a.DownW = dn.ptr; a.DownType = dn.type; a.DownNe0 = dn.ne0; a.DownNe1 = dn.ne1; a.DownBytes = dn.bytes;
-                        a.FfDense = (int)(gu.ne1 / 2);
+                        FillDenseFfnArgs(ref a, l);
                     }
                     else
                     {
@@ -1656,7 +1685,64 @@ namespace TensorSharp.Models
                 !(nLogitRows > 0 && nLogitRows < seqLen);
         }
 
-        internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1, int rowOffset = 0)
+        /// <param name="captureData">Optional DFlash residual taps: receives
+        /// <paramref name="captureLayers"/>.Length consecutive [hidden, seqLen]
+        /// blocks, block c holding the residual ENTERING layer captureLayers[c].
+        /// Null (the normal case) costs nothing.</param>
+        // ---- per-token recurrent-state snapshots (see SpecOnVerifyAccepted) ----
+
+        /// <summary>Recurrent layers, in the order the native descriptor array lists
+        /// them - the order TSGgml_Qwen35FetchStateSnapshot returns slots in.</summary>
+        private int[] _fvRecurrentLayers;
+        private IntPtr[] _fvSnapConvPtrs;
+        private IntPtr[] _fvSnapDeltaPtrs;
+
+        /// <summary>Rows of the verify whose snapshots are live on the device, or 0
+        /// when the last verify downloaded its post-window state the old way.</summary>
+        private int _fvSnapshotRows;
+
+        /// <summary>True when the accepted prefix's recurrent state was recovered
+        /// from a snapshot, so the executor can keep the verify's KV writes and skip
+        /// the kept-prefix re-forward.</summary>
+        private bool _fvAcceptedPrefixCommitted;
+
+        /// <summary>
+        /// The LIVE recurrent state lives on the device and the host mirror is stale.
+        /// Set when a snapshot is committed device-side, cleared the moment anything
+        /// drains it back. While it holds, a verify skips both halves of the ~300 MB
+        /// per-step state round trip - which is what made speculative decoding on
+        /// this trunk cost more than the plain decode it was meant to beat.
+        /// </summary>
+        private bool _fvDeviceStateCurrent;
+
+        /// <summary>Pull the live device state back into the host mirrors and clear
+        /// <see cref="_fvDeviceStateCurrent"/>. Every path that reads the mirrors -
+        /// the op-by-op recurrent block, a prefill chunk, a state snapshot - goes
+        /// through here first.</summary>
+        internal unsafe void DrainDeviceRecurrentState()
+        {
+            if (!_fvDeviceStateCurrent)
+                return;
+            _fvDeviceStateCurrent = false;
+            if (!PrepareRecurrentStatePointers())
+                return;
+            if (!GgmlBasicOps.Qwen35DrainDeviceState(_fvSnapConvPtrs, _fvSnapDeltaPtrs, _fvRecurrentLayers.Length))
+                return;
+            UnpackRecurrentStateFromNative();
+        }
+
+        private static readonly bool _fvSnapshotsEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q35_VERIFY_SNAPSHOTS"), "0", StringComparison.Ordinal);
+
+        /// Leave the post-window recurrent state on the device and commit it there,
+        /// instead of downloading 151 MB and uploading it again next call. Separable
+        /// from the snapshots themselves because it is the part that also applies to
+        /// the single-row plain steps a speculative session interleaves with verifies.
+        private static readonly bool _fvDeferStateEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_Q35_VERIFY_DEFER_STATE"), "0", StringComparison.Ordinal);
+
+        internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1, int rowOffset = 0,
+            float[] captureData = null, int[] captureLayers = null)
         {
             // Run one whole-model prefill/verify graph on every GGML GPU backend.
             // CUDA and Vulkan use per-head set_rows KV writes. Metal uses contiguous
@@ -1727,7 +1813,7 @@ namespace TensorSharp.Models
                             && _layerStackedGate[l] != null && _layerStackedUp[l] != null && _layerStackedDown[l] != null
                             && HasW(_ffnGateShexpQW[l], _ffnGateShexpF32[l]) && HasW(_ffnUpShexpQW[l], _ffnUpShexpF32[l])
                             && HasW(_ffnDownShexpQW[l], _ffnDownShexpF32[l]) && _ffnGateInpShexpVec[l] != null)
-                        : (HasW(_ffnGateUpQW[l], _ffnGateUpF32[l]) && HasW(_ffnDownQW[l], _ffnDownF32[l]));
+                        : (HasDenseFfnWeights(l) && HasW(_ffnDownQW[l], _ffnDownF32[l]));
                     bool ok = _attnNormW[l] != null && _postAttnNormW[l] != null && ffnOk;
                     if (ok && !_isRecurrent[l])
                         ok = (HasW(_attnQkvQW[l], _attnQkvF32[l])
@@ -1791,11 +1877,9 @@ namespace TensorSharp.Models
                 a.IsMoe = isMoe ? 1 : 0;
                 if (!isMoe)
                 {
-                    var gu = ResolveW(_ffnGateUpQW[l], _ffnGateUpF32[l]);
                     var dn = ResolveW(_ffnDownQW[l], _ffnDownF32[l]);
-                    a.GuW = gu.ptr; a.GuType = gu.type; a.GuNe0 = gu.ne0; a.GuNe1 = gu.ne1; a.GuBytes = gu.bytes;
                     a.DownW = dn.ptr; a.DownType = dn.type; a.DownNe0 = dn.ne0; a.DownNe1 = dn.ne1; a.DownBytes = dn.bytes;
-                    a.FfDense = (int)(gu.ne1 / 2);
+                    FillDenseFfnArgs(ref a, l);
                 }
                 else
                 {
@@ -1920,9 +2004,36 @@ namespace TensorSharp.Models
 
             var lmh = ResolveW(_lmHeadQW, _lmHeadF32);
             IntPtr finalNormPtr = (IntPtr)GetFloatPtr(_finalNormW);
+            int capCount = (captureData != null && captureLayers != null) ? captureLayers.Length : 0;
+
+            // Ask the kernel to keep one recurrent-state snapshot per row of an
+            // all-rows verify (the speculative one). Without them a partial accept
+            // has to restore a pre-verify copy of the state and re-forward the
+            // accepted prefix through the whole trunk; with them the state it would
+            // have recomputed is already on the device and costs one slot fetch.
+            // Only the all-rows verify: a prefill chunk is never rolled back, and
+            // asking for N snapshots there would size the graph for nothing.
+            int requestedSnapshots = (_fvSnapshotsEnabled && !residentThisCall && nLogitRows <= 0 && seqLen > 1)
+                ? seqLen : 1;
+            // Defer the state download on every call the kernel will persist - the
+            // all-rows verify AND the single-row plain steps a speculative session
+            // interleaves with it. Those plain steps used to break the device-state
+            // chain: each one downloaded 151 MB and forced the NEXT verify to upload
+            // it again, which on an MTP run (46 plain steps of 125) was most of the
+            // gap to the captured decode. A prefill chunk (0 < nLogitRows < seqLen)
+            // is not persisted and keeps the host path.
+            bool deferState = _fvSnapshotsEnabled && _fvDeferStateEnabled && !residentThisCall
+                && (nLogitRows <= 0 || seqLen == 1);
+            int snapshotsUsed = 1;
+            // The live state is already correct on the device exactly when the last
+            // step committed a snapshot into it and nothing has drained it since.
+            bool deviceStateCurrent = _fvDeviceStateCurrent;
+            _fvSnapshotRows = 0;
+            _fvAcceptedPrefixCommitted = false;
             bool ok2;
             fixed (float* lp = logitsOut)
             fixed (float* np = normedOut)
+            fixed (float* cp = captureData)
             {
                 ok2 = GgmlBasicOps.Qwen35ModelVerify(
                     _fvLayers, n,
@@ -1938,13 +2049,56 @@ namespace TensorSharp.Models
                     (IntPtr)lp, Config.VocabSize,
                     lmh.ptr, lmh.type, lmh.ne0, lmh.ne1, lmh.bytes,
                     finalNormPtr, normedOut != null ? (IntPtr)np : IntPtr.Zero, nLogitRows,
-                    mropePos, mropeSecs);
+                    mropePos, mropeSecs, tpDegree: 1, tpPlanOut: null,
+                    captureData: capCount > 0 ? (IntPtr)cp : IntPtr.Zero,
+                    captureLayers: capCount > 0 ? captureLayers : null,
+                    captureCount: capCount,
+                    stateSnapshots: requestedSnapshots,
+                    stateSnapshotsUsed: (IntPtr)(&snapshotsUsed),
+                    deviceStateCurrent: deviceStateCurrent,
+                    deferStateDownload: deferState);
             }
             if (!ok2)
             {
                 _fvUnsupported = true;
                 return false;
             }
+
+            if (snapshotsUsed > 1)
+            {
+                // Whatever the device held on entry, the graph has now consumed it;
+                // the authoritative state is the snapshot set until one is committed.
+                _fvDeviceStateCurrent = false;
+                // The state is on the device in snapshotsUsed slots and stays there
+                // until SpecOnVerifyAccepted knows which one the accepted prefix
+                // wants. Nothing below (which drains the post-window state into the
+                // host mirror) applies, and nothing may read that mirror in between.
+                _fvSnapshotRows = seqLen;
+                _fvStateResident = false;
+                _kvCacheHostDirty = true;
+                return true;
+            }
+
+            if (snapshotsUsed == 0)
+            {
+                // Deferred with no snapshots: a single-row step, whose post-window
+                // state is simply the *_state_out slices. Nothing decides anything
+                // about it later, so commit it now - one device-to-device copy
+                // instead of 151 MB down here and 151 MB back up next call.
+                _fvDeviceStateCurrent = false;
+                _fvSnapshotRows = 0;
+                _fvStateResident = false;
+                _kvCacheHostDirty = true;
+                if (!CommitRecurrentStateSnapshot(-1))
+                {
+                    throw new InvalidOperationException(
+                        "Qwen3.5 verify deferred its recurrent state but it could not be committed; "
+                        + "the host mirror is stale. Set TS_Q35_VERIFY_SNAPSHOTS=0 to fall back.");
+                }
+                return true;
+            }
+
+            _fvDeviceStateCurrent = false;
 
             // Write the post-window GDN state back to the C# (host) representation so the
             // snapshot / rollback / any op-by-op fallback see the current state.
@@ -1988,6 +2142,114 @@ namespace TensorSharp.Models
             // explicitly downloaded and converted to the host ring above.
             _kvCacheHostDirty = true;
             _gdnStateHostDirty = false;
+            return true;
+        }
+
+        /// <summary>
+        /// Pull one per-row recurrent-state snapshot out of the verify that just ran
+        /// into the host mirrors the rest of the model reads: the GDN delta state
+        /// tensors and the conv ring.
+        ///
+        /// The conv ring is transposed on the way in for the same reason the ordinary
+        /// post-verify drain transposes it - the kernel stores a conv window
+        /// time-major ([convDim, conv_dim]) and the op-by-op path indexes it
+        /// channel-major.
+        /// </summary>
+        private unsafe bool PrepareRecurrentStatePointers()
+        {
+            if (!IsGgmlBackend || _fvConvOut == IntPtr.Zero || _convState == null || _fvGdnSlot == null)
+                return false;
+
+            int n = Config.NumLayers;
+            if (_fvRecurrentLayers == null)
+            {
+                int count = 0;
+                for (int l = 0; l < n; l++)
+                    if (_isRecurrent[l]) count++;
+                _fvRecurrentLayers = new int[count];
+                int w = 0;
+                for (int l = 0; l < n; l++)
+                    if (_isRecurrent[l]) _fvRecurrentLayers[w++] = l;
+                _fvSnapConvPtrs = new IntPtr[_fvRecurrentLayers.Length];
+                _fvSnapDeltaPtrs = new IntPtr[_fvRecurrentLayers.Length];
+            }
+
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convBlock = (_convKernel - 1) * qkvDim;
+            float* convOutBase = (float*)_fvConvOut;
+            for (int i = 0; i < _fvRecurrentLayers.Length; i++)
+            {
+                int l = _fvRecurrentLayers[i];
+                if (_deltaStateTensor[l] == null)
+                    return false;
+                _fvSnapConvPtrs[i] = (IntPtr)(convOutBase + (long)_fvGdnSlot[l] * convBlock);
+                _fvSnapDeltaPtrs[i] = (IntPtr)GetFloatPtr(_deltaStateTensor[l]);
+            }
+            return true;
+        }
+
+        /// <summary>The conv window comes back time-major ([convDim, conv_dim], the
+        /// kernel's layout) and the op-by-op path indexes it channel-major, so the
+        /// ring is transposed on the way in - the same transpose the ordinary
+        /// post-verify drain does.</summary>
+        private unsafe void UnpackRecurrentStateFromNative()
+        {
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convDim = _convKernel - 1;
+            int convBlock = convDim * qkvDim;
+            float* convOutBase = (float*)_fvConvOut;
+
+            for (int i = 0; i < _fvRecurrentLayers.Length; i++)
+            {
+                int l = _fvRecurrentLayers[i];
+                float* convSrc = convOutBase + (long)_fvGdnSlot[l] * convBlock;
+                float[] ring = _convState[l];
+                for (int t = 0; t < convDim; t++)
+                {
+                    int dstBase = t * qkvDim;
+                    for (int ch = 0; ch < qkvDim; ch++)
+                        ring[dstBase + ch] = convSrc[ch * convDim + t];
+                }
+                _convStateWriteIdx[l] = 0;
+                InvalidateTensorDeviceCache(_deltaStateTensor[l]);
+                if (_backend != BackendType.GgmlMetal)
+                    GgmlBasicOps.InvalidateHostBuffer((IntPtr)GetFloatPtr(_deltaStateTensor[l]));
+            }
+            _gdnStateHostDirty = false;
+        }
+
+        /// <summary>
+        /// Settle the accepted prefix's recurrent state. Preferred form: commit the
+        /// snapshot into the LIVE state on the device and leave it there, so neither
+        /// this step nor the next pays the ~300 MB round trip. Falls back to pulling
+        /// the slot into the host mirrors when the device commit is unavailable.
+        /// </summary>
+        /// <param name="slot">Tokens back from the end of the verified batch, or -1
+        /// for the post-window state (what a single-row step commits).</param>
+        private unsafe bool CommitRecurrentStateSnapshot(int slot)
+        {
+            if (!PrepareRecurrentStatePointers())
+                return false;
+
+            if (GgmlBasicOps.Qwen35CommitStateSnapshot(slot, _fvRecurrentLayers.Length))
+            {
+                _fvDeviceStateCurrent = true;
+                _gdnStateHostDirty = true;   // the host mirror is now behind
+                return true;
+            }
+
+            // The device commit is unavailable; fall back to pulling the slot into the
+            // host mirrors. There is no host fallback for slot -1 (the caller only
+            // asks for it when the kernel said it deferred, which implies a live
+            // entry), so report failure rather than read a slot that is not there.
+            if (slot < 0
+                || !GgmlBasicOps.Qwen35FetchStateSnapshot(slot, _fvSnapConvPtrs, _fvSnapDeltaPtrs,
+                        _fvRecurrentLayers.Length))
+            {
+                return false;
+            }
+            UnpackRecurrentStateFromNative();
+            _fvDeviceStateCurrent = false;
             return true;
         }
 
@@ -2097,13 +2359,11 @@ namespace TensorSharp.Models
 
             if (!isMoe)
             {
-                if (!HasW(_ffnGateUpQW[l], _ffnGateUpF32[l]) || !HasW(_ffnDownQW[l], _ffnDownF32[l]))
+                if (!HasDenseFfnWeights(l) || !HasW(_ffnDownQW[l], _ffnDownF32[l]))
                     return false;
-                var gu = ResolveW(_ffnGateUpQW[l], _ffnGateUpF32[l]);
                 var dn = ResolveW(_ffnDownQW[l], _ffnDownF32[l]);
-                a.GuW = gu.ptr; a.GuType = gu.type; a.GuNe0 = gu.ne0; a.GuNe1 = gu.ne1; a.GuBytes = gu.bytes;
                 a.DownW = dn.ptr; a.DownType = dn.type; a.DownNe0 = dn.ne0; a.DownNe1 = dn.ne1; a.DownBytes = dn.bytes;
-                a.FfDense = (int)(gu.ne1 / 2);
+                FillDenseFfnArgs(ref a, l);
             }
             else
             {

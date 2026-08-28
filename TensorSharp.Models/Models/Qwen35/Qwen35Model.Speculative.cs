@@ -58,11 +58,66 @@ namespace TensorSharp.Models
         /// <summary>
         /// True when the loaded GGUF contains a usable NextN/MTP draft block.
         /// </summary>
-        public bool HasDraftHead { get; private set; }
+        private bool HasMtpDraftHead { get; set; }
+
+        /// <summary>
+        /// True when SOME learned drafter is attached: the trunk's own NextN/MTP
+        /// block, or an external DFlash/DFlash2 file. They are alternatives, not
+        /// layers - see <see cref="DraftHeadKind"/>.
+        /// </summary>
+        public bool HasDraftHead => HasMtpDraftHead || HasDFlash;
 
         /// <summary>Qwen 3.6's NextN block drafts one token per pass, so it is
-        /// served by <see cref="DraftHeadSpeculator"/>.</summary>
-        public DraftHeadKind DraftHeadKind => HasDraftHead ? DraftHeadKind.PerToken : DraftHeadKind.None;
+        /// served by <see cref="DraftHeadSpeculator"/>; a DFlash drafter proposes a
+        /// whole block per pass and is served by
+        /// <see cref="BlockDraftSpeculator"/>. An attached DFlash file wins, because
+        /// the operator named it explicitly and the two consume different hidden
+        /// rows.</summary>
+        public DraftHeadKind DraftHeadKind => HasDFlash
+            ? DraftHeadKind.Block
+            : (HasMtpDraftHead ? DraftHeadKind.PerToken : DraftHeadKind.None);
+
+        /// <summary>The drafter's hidden row: the trunk's own hidden size for MTP,
+        /// and the concatenated dflash.target_layers residuals for DFlash.</summary>
+        public int SpecFeatureSize => HasDFlash ? _dflash.FeatureSize : Config.HiddenSize;
+
+        /// <summary>DFlash prefills the drafter's ring from the trunk's per-row
+        /// features, so it wants whole micro-batches; MTP has no preference.</summary>
+        public int SpecPrefillChunkSize => HasDFlash ? DFlashPrefillChunkSize : 0;
+
+        /// <summary>
+        /// Three, not the shared default of eight, whenever this checkpoint has
+        /// GatedDeltaNet layers - which every Qwen 3.5/3.6/3.8 hybrid does.
+        ///
+        /// A wide window is priced by the trunk here, not by the drafter: a verify
+        /// over N rows runs the GDN chunked scan rather than the single-token
+        /// recurrent update, and a partial rejection has to restore the recurrent
+        /// state (there is no per-row checkpoint to rewind to) and re-advance over
+        /// the accepted prefix - a second whole-trunk forward, plus the state moving
+        /// across PCIe twice. Both costs grow with the window while acceptance per
+        /// position falls, so the marginal drafted token stops paying long before it
+        /// would on a dense-attention trunk.
+        ///
+        /// Measured on Qwen3.8-27B-UD-IQ3_XXS (RTX 3080 Laptop, greedy, 256 tokens,
+        /// DFlash2 drafter): window 8 -> 9.4 tok/s, 4 -> 13.7, 3 -> 15.5, against
+        /// 18.3 plain. The trunk's own NextN/MTP head behaves the same way, so this
+        /// is not a property of either drafter.
+        ///
+        /// An operator who passes --spec-draft still gets exactly that number.
+        /// </summary>
+        public int SpecPreferredDraftWindow => HasAnyRecurrentLayer ? 3 : 0;
+
+        private bool HasAnyRecurrentLayer
+        {
+            get
+            {
+                if (_isRecurrent == null)
+                    return false;
+                foreach (bool r in _isRecurrent)
+                    if (r) return true;
+                return false;
+            }
+        }
 
         /// <summary>Trunk layer count (excludes NextN/MTP blocks).</summary>
         public int NumTrunkLayers => Config.NumLayers;
@@ -106,16 +161,16 @@ namespace TensorSharp.Models
             // draft from the wrong weight; the trunk itself is unaffected.
             bool borrowsSplitHead = _tpLmHeadKey != null && _mtpHeadQW == null && _mtpHeadF32 == null;
 
-            HasDraftHead = _numNextnLayers == 1 && hasProj && _mtpEnormW != null && _mtpHnormW != null
+            HasMtpDraftHead = _numNextnLayers == 1 && hasProj && _mtpEnormW != null && _mtpHnormW != null
                 && hasAttn && _attnNormW[_mtpLayerIdx] != null && _postAttnNormW[_mtpLayerIdx] != null
                 && !borrowsSplitHead;
 
             if (borrowsSplitHead)
                 Console.WriteLine("  NextN/MTP block has no own head and the LM head is column-parallel under TP; " +
                     "MTP drafting disabled.");
-            else if (_numNextnLayers > 0 && !HasDraftHead)
+            else if (_numNextnLayers > 0 && !HasMtpDraftHead)
                 Console.WriteLine("  NextN/MTP block present but incomplete; MTP drafting disabled.");
-            else if (HasDraftHead)
+            else if (HasMtpDraftHead)
                 Console.WriteLine($"  NextN/MTP draft head ready (layer {_mtpLayerIdx}, " +
                     $"moe={( _isMoeLayer != null && _isMoeLayer[_mtpLayerIdx] ? "yes" : "no")}, " +
                     $"ownHead={(_mtpHeadQW != null || _mtpHeadF32 != null ? "yes" : "no")})");
@@ -208,7 +263,9 @@ namespace TensorSharp.Models
         /// </summary>
         public unsafe void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
-            if (!HasDraftHead)
+            if (HasDFlash)
+                throw new NotSupportedException("A DFlash drafter proposes whole blocks; use DraftBlock.");
+            if (!HasMtpDraftHead)
                 throw new InvalidOperationException("Model has no NextN/MTP draft block.");
             EnterSpecSession();
             EnsureCacheCapacity(pos + 1);
@@ -263,7 +320,15 @@ namespace TensorSharp.Models
 
         public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
-            if (!HasDraftHead)
+            if (HasDFlash)
+            {
+                // The DFlash ring holds committed positions only, and the executor
+                // hands back exactly the rows it committed.
+                EnterSpecSession();
+                DFlashCommit(tokens, hRows, startPos);
+                return;
+            }
+            if (!HasMtpDraftHead)
                 throw new InvalidOperationException("Model has no NextN/MTP draft block.");
             EnterSpecSession();
             EnsureCacheCapacity(startPos + tokens.Length);
@@ -283,6 +348,60 @@ namespace TensorSharp.Models
             EnsureKvCacheHostSynchronized();
             x = AttentionBlock(x, _mtpLayerIdx, tokens.Length, startPos);
             x.Dispose();
+        }
+
+        // Fold the MTP catch-up into the first draft step (llama.cpp's draft-mtp
+        // runs its block over n_accepted + 1 rows). TS_MTP_FOLD_CATCHUP=0 goes back
+        // to a catch-up pass plus a separate first DraftStep.
+        private static readonly bool _mtpFoldCatchUpEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MTP_FOLD_CATCHUP"), "0", StringComparison.Ordinal);
+
+        /// <summary>Only the NextN/MTP head folds. A DFlash drafter proposes whole
+        /// blocks and its commit is a ring write costing ~1 ms, so there is nothing
+        /// worth folding there.</summary>
+        public bool SupportsFusedCatchUpStep
+            => _mtpFoldCatchUpEnabled && HasMtpDraftHead && !HasDFlash;
+
+        private float[] _mtpFoldNormed;
+
+        /// <inheritdoc />
+        public unsafe void DraftCatchUpAndStep(int[] tokens, float[] hRows, int startPos,
+            float[] logitsOut, float[] hOut)
+        {
+            if (!HasMtpDraftHead || HasDFlash)
+                throw new InvalidOperationException("Model has no NextN/MTP draft block to fold.");
+            int n = tokens.Length;
+            int H = Config.HiddenSize;
+            EnterSpecSession();
+            EnsureCacheCapacity(startPos + n);
+
+            // ONE block pass over every row. The kernel folds the LM head over the
+            // last n_logits rows (here 1), so logitsOut is already the last row's;
+            // the normed hidden comes back for all n rows and the last is the one
+            // that chains the next draft step.
+            Tensor x = MtpProjectInput(tokens, hRows);
+            if (_mtpFoldNormed == null || _mtpFoldNormed.Length < (long)H * n)
+                _mtpFoldNormed = new float[(long)H * n];
+            if (TryFusedMtpBlock(x, startPos, n, _mtpFoldNormed, logitsOut, nLogitRows: 1))
+            {
+                x.Dispose();
+                Array.Copy(_mtpFoldNormed, (long)(n - 1) * H, hOut, 0, H);
+                return;
+            }
+            x.Dispose();
+
+            // The fused block declined this shape. Fall back to the two-call form
+            // rather than the op-by-op fold, so this path stays the one that is
+            // already covered by DraftCatchUp/DraftStep.
+            if (n > 1)
+            {
+                var replay = new int[n - 1];
+                Array.Copy(tokens, replay, n - 1);
+                DraftCatchUp(replay, hRows, startPos);
+            }
+            var hLast = new float[H];
+            Array.Copy(hRows, (long)(n - 1) * H, hLast, 0, H);
+            DraftStep(tokens[n - 1], hLast, startPos + n - 1, logitsOut, hOut);
         }
 
         /// <summary>
@@ -316,6 +435,41 @@ namespace TensorSharp.Models
             long t0 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t0;
+
+            if (HasDFlash)
+            {
+                // Buffer-size contract (ISpeculativeTarget.SpecForward): a hidden
+                // buffer too small for one row per token means the caller only wants
+                // the LAST row, written to row 0.
+                int feat = _dflash.FeatureSize;
+                bool captureAll = false, captureLast = false;
+                if (hAllOut != null && hAllOut.LongLength > 0)
+                {
+                    captureAll = hAllOut.LongLength >= (long)seqLen * feat;
+                    captureLast = !captureAll;
+                    if (captureLast && hAllOut.LongLength < feat)
+                    {
+                        throw new ArgumentException(
+                            $"DFlash hidden capture buffer holds {hAllOut.LongLength} floats; one feature row needs {feat}.",
+                            nameof(hAllOut));
+                    }
+                }
+
+                if (!TryDFlashSpecForwardFused(hidden, startPos, seqLen, hAllOut, logitsOut,
+                        allLogitsRows, captureAll, captureLast))
+                {
+                    DFlashSpecForwardPerOp(hidden, startPos, seqLen, hAllOut, logitsOut,
+                        allLogitsRows, captureAll, captureLast);
+                }
+                else
+                {
+                    hidden.Dispose();
+                }
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                _forwardSw.Stop();
+                return;
+            }
 
             // Fast path: run the whole trunk over the N tokens as ONE fused GGML
             // graph (TSGgml_Qwen35ModelVerify) instead of the op-by-op layer loop.
@@ -457,12 +611,83 @@ namespace TensorSharp.Models
         public void SpecEnsureCapacity(int requiredSeqLen) => EnsureCacheCapacity(requiredSeqLen);
 
         /// <summary>
+        /// True when the accepted prefix of the last verify is already committed:
+        /// its attention KV was written at the right positions by the verify itself,
+        /// and its recurrent state came back out of a per-row snapshot in
+        /// <see cref="SpecOnVerifyAccepted"/>. The executor then only has to rewind
+        /// the position, instead of restoring a pre-verify state copy and
+        /// re-forwarding the accepted prefix through all 64 layers.
+        ///
+        /// Necessarily per-step rather than a constant: whether the verify kept
+        /// snapshots depends on the shape it ran at (only the persisted, all-rows,
+        /// host-state verify does), and getting it wrong in either direction decodes
+        /// from the wrong recurrent state.
+        /// </summary>
+        public bool SpecVerifyPersistsAcceptedKv => _fvAcceptedPrefixCommitted;
+
+        /// <summary>
+        /// Settle the recurrent state for the accepted prefix. When the verify left
+        /// per-row snapshots on the device, the state after row <paramref name="acceptedRows"/>
+        /// is slot (rows - 1 - accepted) - counting back from the end of the batch -
+        /// and one fetch replaces the whole restore-and-re-forward.
+        ///
+        /// Called on EVERY speculative step, full acceptance included: with snapshots
+        /// on, even a fully-accepted verify has not written its post-window state to
+        /// the host mirror yet, and slot 0 is that state.
+        /// </summary>
+        public void SpecOnVerifyAccepted(int acceptedRows, int verifyRows)
+        {
+            _fvAcceptedPrefixCommitted = false;
+            if (_fvSnapshotRows <= 0)
+                return;                       // the old path already drained the state
+
+            int rows = _fvSnapshotRows;
+            _fvSnapshotRows = 0;
+            int slot = rows - 1 - acceptedRows;
+            if (slot < 0 || slot >= rows)
+            {
+                // Cannot happen for a well-formed accept count, and silently taking
+                // the wrong slot would decode from the wrong state.
+                throw new InvalidOperationException(
+                    $"Recurrent-state snapshot slot {slot} outside [0, {rows}) (accepted {acceptedRows} of {verifyRows}).");
+            }
+
+            if (!CommitRecurrentStateSnapshot(slot))
+            {
+                // The state is still on the device and the host mirror is stale, so
+                // the executor MUST take the restore-and-re-forward path - which is
+                // exactly what leaving _fvAcceptedPrefixCommitted false selects, and
+                // which is correct because the pre-verify snapshot is untouched.
+                return;
+            }
+            _fvAcceptedPrefixCommitted = true;
+        }
+
+        /// <summary>
         /// Snapshot the GDN recurrent state of every trunk layer. Taken right
         /// before a speculative verify batch so a partial rejection can roll the
         /// recurrent state back (attention KV needs only a position rewind).
         /// </summary>
+        /// <summary>
+        /// Set when <see cref="SpecSnapshotRecurrentState"/> skipped its host copy
+        /// because the pre-verify state was already sitting in the verify kernel's
+        /// live device slices - which a verify only ever READS, so those slices ARE
+        /// the snapshot until a snapshot commit overwrites them.
+        /// </summary>
+        private bool _fvSnapshotIsDeviceLive;
+
         public void SpecSnapshotRecurrentState()
         {
+            // Nothing to copy: the state the verify is about to run from lives in the
+            // shared device slices, the verify writes its results elsewhere (the
+            // *_state_out slices and the snapshot slots), and the only thing that ever
+            // overwrites the live slices is a snapshot commit - which happens after
+            // the rollback decision. So the slices remain a perfectly good "snapshot"
+            // for as long as one is needed, at no cost.
+            _fvSnapshotIsDeviceLive = _fvDeviceStateCurrent;
+            if (_fvSnapshotIsDeviceLive)
+                return;
+
             // Direct-CUDA fast path: snapshot the GDN state device-to-device
             // (async cuMemcpyDtoD on the stream) instead of draining it to host
             // bytes. The host path does an EnsureHostReadable DtoH per recurrent
@@ -492,6 +717,17 @@ namespace TensorSharp.Models
         /// <summary>Restore the GDN recurrent state captured by <see cref="SpecSnapshotRecurrentState"/>.</summary>
         public void SpecRestoreRecurrentState()
         {
+            if (_fvSnapshotIsDeviceLive)
+            {
+                // The pre-verify state is in the live device slices; the host mirrors
+                // are whatever the verify left there. Bring the slices back so the
+                // kept-prefix re-forward and any op-by-op path see the right state.
+                _fvSnapshotIsDeviceLive = false;
+                _fvDeviceStateCurrent = true;      // the slices are authoritative
+                DrainDeviceRecurrentState();
+                return;
+            }
+
             if (_backend == BackendType.Cuda)
             {
                 MtpRestoreRecurrentStateCudaDevice();
@@ -623,7 +859,10 @@ namespace TensorSharp.Models
         /// verify (<see cref="TryFullModelVerify"/>) is enabled we route spec to the
         /// LINEAR trunk instead (SpecForward), whose KV/GDN state the fused verify
         /// reads/writes; the batched paged trunk uses a different (paged) store.</summary>
-        public bool SupportsBatchedSpecTrunk => HasDraftHead && IsGgmlBackend && IsBatchedPathEnabled() && !_fusedVerifyEnabled;
+        // A DFlash drafter keeps ONE ring for ONE sequence and its catch-up is driven
+        // from the linear trunk's per-row features, so it cannot ride the paged
+        // multi-sequence trunk; those requests take the linear speculative path.
+        public bool SupportsBatchedSpecTrunk => HasMtpDraftHead && !HasDFlash && IsGgmlBackend && IsBatchedPathEnabled() && !_fusedVerifyEnabled;
 
         public void SpecForwardBatched(SequenceState seq, int[] tokens, int startPos,
             float[] hAllOut, float[] logitsOut, bool allLogitsRows)

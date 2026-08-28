@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -106,6 +106,22 @@ namespace TensorSharp.Runtime
             if (IsQwen35FamilyArch(architecture) && enableThinking)
                 return "<think>\n";
 
+            // qwen4exp appends `<think>` to the generation prompt UNCONDITIONALLY -
+            // the model always reasons - so the cache always holds it, whatever the
+            // thinking flag says. (The trailing newline is trimmed away again at
+            // interior boundaries when the renderer's own TrimEnd behaviour calls
+            // for it, mirroring the generation prompt.)
+            if (architecture == "qwen4exp")
+                return "<think>\n";
+
+            // GLM-5.3-Flash (glm5next) likewise ALWAYS opens a <think> block in the
+            // generation prompt (its template has no thinking-off shape), with no
+            // newline after it. Re-rendered history goes through the template's
+            // empty-<think></think> branch, which the strip above removes; this
+            // restores the half the cache actually holds.
+            if (architecture == "glm5next")
+                return "<think>";
+
             // Qwen 3.5 family with thinking DISABLED is rendered through the hardcoded
             // RenderQwen35 path, which DOES emit `<think>\n\n</think>\n\n` for past
             // assistant messages already - so no injection is needed.
@@ -189,7 +205,8 @@ namespace TensorSharp.Runtime
                 || architecture == "qwen35moe"
                 || architecture == "qwen3next"
                 || architecture == "qwen3vl"
-                || architecture == "qwen3vlmoe";
+                || architecture == "qwen3vlmoe"
+                || architecture == "qwen4exp";
         }
 
         /// <summary>
@@ -290,7 +307,7 @@ namespace TensorSharp.Runtime
             // at the first assistant boundary, so the re-rendered prefix diverges there
             // and every multi-turn request re-prefills the whole conversation. Drop it
             // before injecting the suffix that reproduces what the cache actually saw.
-            if (enableThinking)
+            if (enableThinking || architecture == "qwen4exp" || architecture == "glm5next")
                 text = StripEmptyThinkBlockBeforePlaceholders(text);
 
             string suffix = GetAssistantGenerationSuffix(architecture, enableThinking);

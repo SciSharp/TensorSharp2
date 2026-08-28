@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 
 namespace TensorSharp.Server.Hosting
@@ -135,6 +136,7 @@ namespace TensorSharp.Server.Hosting
                     "Split the model across N GPUs on this machine (tensor parallelism): each GPU holds 1/N of every " +
                     "weight and the shards cooperate on every token. Use it when a model does not fit on one GPU. " +
                     "Range: 1 to the number of local GPUs. Applies to the cuda, ggml_cuda, and ggml_vulkan backends. " +
+                    "Multi-GPU is implemented PER ARCHITECTURE, not per backend, and in two forms. Architectures that shard weights run true tensor parallelism. qwen4exp (Qwen3.8-Flash-Next) shards nothing, so --tp N runs it as a LAYER SPLIT instead - each GPU holds a contiguous run of whole layers, which is the same and only multi-GPU mode llama.cpp offers for it. That is a CAPACITY feature: it lets a model, context or resident-weight set that one GPU cannot hold fit across several, and is not expected to raise tok/s. The startup line says which mode actually ran. An architecture that supports neither says so on stderr and runs on one GPU rather than silently leaving the others idle. " +
                     "Default: 1 — no splitting (TENSORSHARP_TP_DEGREE env var overrides).",
                     "--model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2"),
                 new OptionHelp("--tp-node-id <N>",
@@ -293,10 +295,12 @@ namespace TensorSharp.Server.Hosting
                     "--spec-draft-model gemma-4-E4B-it-assistant.Q8_0.gguf"),
                 new OptionHelp("--draft-model <path>",
                     "Block drafter GGUF for architectures whose drafter must be resident before the layer " +
-                    "split (DeepSeek V4's DSpark). Naming the file IS the request, so it needs no --spec; " +
-                    "engages for solo sequences on the cuda and ggml_cuda backends. Default: none; " +
-                    "env TS_DSV4_DSPARK.",
-                    "--draft-model DSpark-drafter-Q2K-Q8-0731.gguf"),
+                    "split: DeepSeek V4's DSpark, and the DFlash / DFlash2 drafters for Muse-Glimmer and " +
+                    "Qwen 3.8. The file's general.architecture decides which it is, not its name. Naming the " +
+                    "file IS the request, so it needs no --spec; engages for solo sequences on the cuda and " +
+                    "ggml_cuda backends. Default: none; env TS_DSV4_DSPARK / TS_QWEN35_DFLASH / " +
+                    "TS_MUSE_GLIMMER_DFLASH.",
+                    "--draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf"),
             }),
             ("Qwen-Image-Edit companion models (qwen_image DiT GGUFs)", new[]
             {
@@ -422,6 +426,43 @@ namespace TensorSharp.Server.Hosting
                     "--help"),
             }),
         };
+
+        /// <summary>
+        /// Every flag token named on the usage page, placeholders stripped.
+        ///
+        /// Exists so a test can assert the page and the parser agree. They drifted
+        /// twice: <c>--wan-vae</c>/<c>--wan-te</c> and later every <c>--spec*</c>
+        /// spelling were documented here while ServerOptionsBuilder.ParseArgs
+        /// rejected them as unknown options, so the server refused to start on a
+        /// flag its own <c>--help</c> advertised.
+        ///
+        /// Placeholders are removed BEFORE splitting on '|', because a value
+        /// placeholder can itself contain one (<c>--mmproj &lt;path|none&gt;</c>,
+        /// <c>--sampling-precedence &lt;config|request&gt;</c>).
+        /// </summary>
+        internal static IEnumerable<string> DocumentedFlags()
+        {
+            foreach (var (_, options) in Sections)
+            {
+                foreach (var opt in options)
+                {
+                    string flag = opt.Flag;
+                    int lt;
+                    while ((lt = flag.IndexOf('<')) >= 0)
+                    {
+                        int gt = flag.IndexOf('>', lt);
+                        if (gt < 0) { flag = flag.Substring(0, lt); break; }
+                        flag = flag.Remove(lt, gt - lt + 1);
+                    }
+                    foreach (string part in flag.Split('|'))
+                    {
+                        string token = part.Trim();
+                        if (token.StartsWith("--", StringComparison.Ordinal))
+                            yield return token;
+                    }
+                }
+            }
+        }
 
         public static void PrintUsage(TextWriter writer)
         {

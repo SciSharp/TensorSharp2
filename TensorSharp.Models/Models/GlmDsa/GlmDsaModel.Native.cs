@@ -197,6 +197,7 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            VisionEncoder?.Dispose();
             lock (_nativeSync)
             {
                 if (_native != IntPtr.Zero)

@@ -477,8 +477,9 @@ namespace TensorSharp.Models
                     var alloc = _tpGroup.GetAllocator(r);
                     _tpKvCacheK[l][r] = new Tensor(alloc, kvDtype, kvHeadsPerGpu, cacheLen, headDim);
                     _tpKvCacheV[l][r] = new Tensor(alloc, kvDtype, kvHeadsPerGpu, cacheLen, headDim);
-                    InitializeCacheTensor(_tpKvCacheK[l][r]);
-                    InitializeCacheTensor(_tpKvCacheV[l][r]);
+                    // Same finite-padding requirement as the single-GPU cache.
+                    InitGemma4CacheTensor(_tpKvCacheK[l][r]);
+                    InitGemma4CacheTensor(_tpKvCacheV[l][r]);
                 }
             }
 
@@ -516,8 +517,8 @@ namespace TensorSharp.Models
                     var alloc = _tpGroup.GetAllocator(r);
                     var newK = new Tensor(alloc, kvDtype, kvHeadsPerGpu, newCapacity, headDim);
                     var newV = new Tensor(alloc, kvDtype, kvHeadsPerGpu, newCapacity, headDim);
-                    InitializeCacheTensor(newK);
-                    InitializeCacheTensor(newV);
+                    InitGemma4CacheTensor(newK);
+                    InitGemma4CacheTensor(newV);
 
                     if (_cacheSeqLen > 0)
                     {

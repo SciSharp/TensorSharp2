@@ -34,6 +34,17 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Snapshot recurrent state before a verify batch.</summary>
         void SnapshotRecurrentState();
 
+        /// <summary>
+        /// The accept count for the verify that just ran, handed to the trunk
+        /// BEFORE any rollback decision and on EVERY step - full acceptance
+        /// included. A trunk that defers part of its post-verify bookkeeping until
+        /// it knows how much was accepted settles it here; Qwen 3.5/3.8 uses it to
+        /// pick the recurrent-state snapshot for the accepted prefix, which is what
+        /// lets <see cref="TryCommitVerifiedPrefix"/> then succeed on a recurrent
+        /// model at all. Default: nothing to do.
+        /// </summary>
+        void OnVerifyAccepted(int acceptedRows, int verifyRows) { }
+
         /// <summary>Roll the trunk back to <paramref name="position"/>
         /// committed tokens: restore the recurrent snapshot and rewind any
         /// attention-KV bookkeeping.</summary>
@@ -64,6 +75,9 @@ namespace TensorSharp.Runtime.Speculative
             => _model.SpecForward(tokens, hAllOut, logitsOut, allLogitsRows);
 
         public void SnapshotRecurrentState() => _model.SpecSnapshotRecurrentState();
+
+        public void OnVerifyAccepted(int acceptedRows, int verifyRows)
+            => _model.SpecOnVerifyAccepted(acceptedRows, verifyRows);
 
         public void Rollback(int position)
         {

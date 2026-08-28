@@ -29,7 +29,7 @@ namespace TensorSharp.Models
     /// plus a 3.2 M-element scan -- and that readback is a large share of its per-step
     /// cost. Two 16-element tensors carry everything the executor needs.
     /// </summary>
-    public partial class MuseGlimmerModel
+    public abstract partial class ModelBase
     {
         private sealed class DFlashArrays
         {
@@ -61,6 +61,23 @@ namespace TensorSharp.Models
             public long LmHeadNe0, LmHeadNe1, LmHeadBytes;
 
             public int RingRows;
+
+            /// <summary>DFlash2 grouped convolution: per layer, the static base
+            /// kernel [hidden, taps, 2] and the projection that produces both taps
+            /// from the sublayer input. Null on a first-generation drafter.</summary>
+            public IntPtr[] AttnConvBase, FfnConvBase;
+            public IntPtr[] AttnConvProj, FfnConvProj;
+            public int[] AttnConvProjType, FfnConvProjType;
+            public long[] AttnConvProjNe0, AttnConvProjNe1, AttnConvProjBytes;
+            public long[] FfnConvProjNe0, FfnConvProjNe1, FfnConvProjBytes;
+
+            /// <summary>DFlash2 candidate selector: the hidden projection and the
+            /// two [vocab, rank] transition codebooks. Zero when absent.</summary>
+            public IntPtr SelHidden, SelPred, SelSucc;
+            public int SelHiddenType, SelPredType, SelSuccType;
+            public long SelHiddenNe0, SelHiddenNe1, SelHiddenBytes;
+            public long SelPredNe0, SelPredNe1, SelPredBytes;
+            public long SelSuccNe0, SelSuccNe1, SelSuccBytes;
         }
 
         private DFlashArrays _dflashArrays;
@@ -120,6 +137,11 @@ namespace TensorSharp.Models
             (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan ||
              _backend == BackendType.GgmlMetal);
 
+        /// <summary>A quantized weight the fused kernels can bind by cache key.
+        /// (ModelBase has no such helper; the trunk kernels each roll their own.)</summary>
+        private bool TryDFlashQuant(string name, out QuantizedWeight qw)
+            => _quantWeights.TryGetValue(name, out qw) && qw != null && qw.CacheKey != IntPtr.Zero;
+
         private unsafe void BuildDFlashArrays()
         {
             _dflashFusedProbed = true;
@@ -146,14 +168,22 @@ namespace TensorSharp.Models
                 RingK = new IntPtr[n], RingV = new IntPtr[n],
                 RingRows = _dflashRingRows,
             };
+            if (cfg.HasConv)
+            {
+                a.AttnConvBase = new IntPtr[n]; a.FfnConvBase = new IntPtr[n];
+                a.AttnConvProj = new IntPtr[n]; a.FfnConvProj = new IntPtr[n];
+                a.AttnConvProjType = new int[n]; a.FfnConvProjType = new int[n];
+                a.AttnConvProjNe0 = new long[n]; a.AttnConvProjNe1 = new long[n]; a.AttnConvProjBytes = new long[n];
+                a.FfnConvProjNe0 = new long[n]; a.FfnConvProjNe1 = new long[n]; a.FfnConvProjBytes = new long[n];
+            }
 
             for (int l = 0; l < n; l++)
             {
                 string[] wn = _dflashLayerNames[l];
-                if (!TryQuant(wn[DfAttnQ], out var q) || !TryQuant(wn[DfAttnK], out var k)
-                    || !TryQuant(wn[DfAttnV], out var v) || !TryQuant(wn[DfAttnOutput], out var o)
-                    || !TryQuant(wn[DfFfnGate], out var gate) || !TryQuant(wn[DfFfnUp], out var up)
-                    || !TryQuant(wn[DfFfnDown], out var down))
+                if (!TryDFlashQuant(wn[DfAttnQ], out var q) || !TryDFlashQuant(wn[DfAttnK], out var k)
+                    || !TryDFlashQuant(wn[DfAttnV], out var v) || !TryDFlashQuant(wn[DfAttnOutput], out var o)
+                    || !TryDFlashQuant(wn[DfFfnGate], out var gate) || !TryDFlashQuant(wn[DfFfnUp], out var up)
+                    || !TryDFlashQuant(wn[DfFfnDown], out var down))
                 {
                     Console.WriteLine($"  DFlash fused drafter disabled: layer {l} has a non-quantized projection.");
                     return;
@@ -180,10 +210,29 @@ namespace TensorSharp.Models
 
                 a.RingK[l] = TensorComputePrimitives.GetStoragePointer(_dflashRingK[l]);
                 a.RingV[l] = TensorComputePrimitives.GetStoragePointer(_dflashRingV[l]);
+
+                if (!cfg.HasConv)
+                    continue;
+                if (!TryDFlashQuant(wn[DfAttnConvProj], out var acp) || !TryDFlashQuant(wn[DfFfnConvProj], out var fcp))
+                {
+                    Console.WriteLine($"  DFlash fused drafter disabled: layer {l} has a non-quantized conv projection.");
+                    return;
+                }
+                if (!_weights.TryGetValue(wn[DfAttnConvBase], out var acb) || !_weights.TryGetValue(wn[DfFfnConvBase], out var fcb))
+                {
+                    Console.WriteLine($"  DFlash fused drafter disabled: layer {l} is missing a conv base kernel.");
+                    return;
+                }
+                a.AttnConvBase[l] = (IntPtr)GetFloatPtr(acb);
+                a.FfnConvBase[l] = (IntPtr)GetFloatPtr(fcb);
+                a.AttnConvProj[l] = acp.CacheKey; a.AttnConvProjType[l] = acp.GgmlType;
+                a.AttnConvProjNe0[l] = acp.Ne0; a.AttnConvProjNe1[l] = acp.Ne1; a.AttnConvProjBytes[l] = acp.RawBytes;
+                a.FfnConvProj[l] = fcp.CacheKey; a.FfnConvProjType[l] = fcp.GgmlType;
+                a.FfnConvProjNe0[l] = fcp.Ne0; a.FfnConvProjNe1[l] = fcp.Ne1; a.FfnConvProjBytes[l] = fcp.RawBytes;
             }
 
             string fcName = DFlashConfig.WeightPrefix + "fc.weight";
-            if (!TryQuant(fcName, out var fc))
+            if (!TryDFlashQuant(fcName, out var fc))
             {
                 Console.WriteLine("  DFlash fused drafter disabled: the encoder projection is not quantized.");
                 return;
@@ -201,7 +250,8 @@ namespace TensorSharp.Models
 
             // Both borrowed from the target, exactly as llama.cpp's dflash graph does
             // through cparams.ctx_other -- the drafter owns neither.
-            if (!TryQuant("token_embd.weight", out var tok) || !TryQuant(TargetOutputWeightName, out var head))
+            if (!TryDFlashQuant("token_embd.weight", out var tok)
+                || !TryDFlashQuant(DFlashTargetOutputWeightName, out var head))
             {
                 Console.WriteLine("  DFlash fused drafter disabled: the target embedding/LM head is not quantized.");
                 return;
@@ -209,8 +259,27 @@ namespace TensorSharp.Models
             a.TokEmbd = tok.CacheKey; a.TokEmbdType = tok.GgmlType; a.TokEmbdNe0 = tok.Ne0; a.TokEmbdNe1 = tok.Ne1; a.TokEmbdBytes = tok.RawBytes;
             a.LmHead = head.CacheKey; a.LmHeadType = head.GgmlType; a.LmHeadNe0 = head.Ne0; a.LmHeadNe1 = head.Ne1; a.LmHeadBytes = head.RawBytes;
 
+            if (cfg.HasSelector)
+            {
+                if (!TryDFlashQuant(DFlashConfig.WeightPrefix + "selector_hidden.weight", out var selH)
+                    || !TryDFlashQuant(DFlashConfig.WeightPrefix + "selector_predecessor.weight", out var selP)
+                    || !TryDFlashQuant(DFlashConfig.WeightPrefix + "selector_successor.weight", out var selS))
+                {
+                    Console.WriteLine("  DFlash fused drafter disabled: a selector table is not quantized.");
+                    return;
+                }
+                a.SelHidden = selH.CacheKey; a.SelHiddenType = selH.GgmlType;
+                a.SelHiddenNe0 = selH.Ne0; a.SelHiddenNe1 = selH.Ne1; a.SelHiddenBytes = selH.RawBytes;
+                a.SelPred = selP.CacheKey; a.SelPredType = selP.GgmlType;
+                a.SelPredNe0 = selP.Ne0; a.SelPredNe1 = selP.Ne1; a.SelPredBytes = selP.RawBytes;
+                a.SelSucc = selS.CacheKey; a.SelSuccType = selS.GgmlType;
+                a.SelSuccNe0 = selS.Ne0; a.SelSuccNe1 = selS.Ne1; a.SelSuccBytes = selS.RawBytes;
+            }
+
             _dflashArrays = a;
-            Console.WriteLine($"  DFlash fused drafter armed ({n} draft layers, ring {a.RingRows} rows, on-device top-1).");
+            Console.WriteLine($"  DFlash fused drafter armed ({n} draft layers, ring {a.RingRows} rows, "
+                + (cfg.HasSelector ? "on-device lattice" : "on-device top-1")
+                + (cfg.HasConv ? $", conv {cfg.ConvKernelSize}x{cfg.ConvGroupSize}" : string.Empty) + ").");
         }
 
         private DFlashArrays GetDFlashArrays()
@@ -302,7 +371,8 @@ namespace TensorSharp.Models
             if (!ok)
                 return false;
 
-            _dflashRingFilled = Math.Max(_dflashRingFilled, startPos + n);
+            // See DFlashInjectKv: the frontier must be able to move backwards.
+            _dflashRingFilled = startPos + n;
             _dflashRingHostStale = true;
             return true;
         }
@@ -332,6 +402,21 @@ namespace TensorSharp.Models
                 positions[i] = position + i;
             }
 
+            // The selector's lattice comes back instead of an argmax: k*k floats per
+            // transition plus one k-wide row for the anchor's own position, which is
+            // ~7 KB against the 12.9 MB a [vocab, b] readback would cost. The walk
+            // itself is gamma steps over k candidates and belongs on the host.
+            int gamma = b - 1;
+            int k = cfg.SelectorTopK;
+            if (cfg.HasSelector)
+            {
+                long need = (long)k + (long)k * k * Math.Max(0, gamma - 1);
+                if (_dflashSelScores == null || _dflashSelScores.LongLength < need)
+                    _dflashSelScores = new float[need];
+                if (_dflashSelCand == null || _dflashSelCand.Length < gamma * k)
+                    _dflashSelCand = new int[gamma * k];
+            }
+
             bool ok = GgmlBasicOps.DFlashDraftBlock(
                 ids, b, positions,
                 cfg.NumLayers, cfg.HiddenSize, cfg.HeadDim, cfg.NumHeads, cfg.NumKVHeads, _dflashRingRows,
@@ -351,9 +436,21 @@ namespace TensorSharp.Models
                 a.OutNorm,
                 a.TokEmbd, a.TokEmbdType, a.TokEmbdNe0, a.TokEmbdNe1, a.TokEmbdBytes,
                 a.LmHead, a.LmHeadType, a.LmHeadNe0, a.LmHeadNe1, a.LmHeadBytes,
-                Config.VocabSize, _dflashDraftIds, _dflashDraftConf);
+                Config.VocabSize, _dflashDraftIds, _dflashDraftConf,
+                cfg.HasConv ? cfg.ConvKernelSize : 0, cfg.ConvGroupSize, cfg.ConvNumGroups,
+                a.AttnConvBase, a.AttnConvProj, a.AttnConvProjType, a.AttnConvProjNe0, a.AttnConvProjNe1, a.AttnConvProjBytes,
+                a.FfnConvBase, a.FfnConvProj, a.FfnConvProjType, a.FfnConvProjNe0, a.FfnConvProjNe1, a.FfnConvProjBytes,
+                cfg.HasSelector ? cfg.SelectorRank : 0, cfg.HasSelector ? cfg.SelectorTopK : 0,
+                cfg.LogitScale, cfg.FinalLogitSoftcap,
+                a.SelHidden, a.SelHiddenType, a.SelHiddenNe0, a.SelHiddenNe1, a.SelHiddenBytes,
+                a.SelPred, a.SelPredType, a.SelPredNe0, a.SelPredNe1, a.SelPredBytes,
+                a.SelSucc, a.SelSuccType, a.SelSuccNe0, a.SelSuccNe1, a.SelSuccBytes,
+                cfg.HasSelector ? _dflashSelScores : null, cfg.HasSelector ? _dflashSelCand : null);
             if (!ok)
                 return -1;
+
+            if (cfg.HasSelector)
+                return DFlashWalkLattice(gamma, k, _dflashSelScores, _dflashSelCand, draftOut, confOut);
 
             // Row 0 is the anchor's own prediction; plain DFlash discards it.
             int drafted = b - 1;
@@ -364,6 +461,41 @@ namespace TensorSharp.Models
                     confOut[i] = _dflashDraftConf[i + 1];
             }
             return drafted;
+        }
+
+        private float[] _dflashSelScores;
+        private int[] _dflashSelCand;
+
+        /// <summary>
+        /// The greedy walk through the transition lattice the kernel produced.
+        /// <paramref name="scores"/> holds the anchor row first (k floats: position
+        /// 0's scores against the verified anchor) and then one [k(pred), k(cand)]
+        /// matrix per following position, candidate-fastest. Each step takes the
+        /// argmax over candidates of the row selected by the previous step's choice,
+        /// which is exactly what the reference implementation's temperature-0 path
+        /// does.
+        /// </summary>
+        internal static int DFlashWalkLattice(int gamma, int k, float[] scores, int[] cand, int[] draftOut, float[] confOut)
+        {
+            float[] row = new float[k];
+
+            int chosen = 0;
+            for (int e = 0; e < gamma; e++)
+            {
+                long baseIdx = e == 0
+                    ? 0
+                    : (long)k + ((long)(e - 1) * k + chosen) * k;
+                Array.Copy(scores, baseIdx, row, 0, k);
+
+                chosen = 0;
+                for (int c = 1; c < k; c++)
+                    if (row[c] > row[chosen]) chosen = c;
+
+                draftOut[e] = cand[e * k + chosen];
+                if (confOut != null && e < confOut.Length)
+                    confOut[e] = DFlashSoftmaxAt(row, chosen);
+            }
+            return gamma;
         }
     }
 }

@@ -1483,7 +1483,7 @@ namespace TensorSharp.Models
                 embeddings?.Dispose();
             _pendingVisionEmbeddingsList.Clear();
             _onesForEmbNorm?.Dispose();
-            DisposeDFlash();
+            DisposeDFlashDrafter();
             DisposeMuseGlimmerTpState();
             if (_kvCacheK != null)
                 foreach (var t in _kvCacheK) t?.Dispose();

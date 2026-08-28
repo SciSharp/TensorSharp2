@@ -206,6 +206,7 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_GEMMA4_TP_FUSED_MOE` | GGML 上 TP 下的 Gemma 4 MoE | `0` 表示从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径 | 开启（融合主干） | 未注册 | 否 |
 | `TS_GLM_TP_SHARD` | GGML 上 TP 下的 GLM 5.x | 切分哪一半：`1` 注意力头，`2` 路由专家，`3` 两者都切。路由专家是在每个专家内部按行切分，而不是按专家 id 分配，因为 `ggml_mul_mat_id` 要求同一 token 选中的专家 id 互不相同 | `3`（两者） | `1`, `2`, `3` | 否 |
 | `TS_GLM_TP_OVERSUBSCRIBE` | GGML 上 TP 下的 GLM 5.x | `1` 允许多个 rank 共享一张 GPU，用于在单卡机器上验证切分的正确性 | `0`（一 rank 一卡） | `0`, `1` | 否 |
+| `TS_Q4E_LAYER_SPLIT` | `--tp N` 下按层切分的 Qwen 3.8 Flash Next（`qwen4exp`） | 直接指定每张 GPU 分到的层数（逗号分隔，例如 `20,28`），取代自动的显存均衡；给出无法满足的值时会直接抛错，而不是静默忽略。这个架构上的 `--tp N` 是按层切分而非张量并行——`qwen4exp` 不切分任何权重 | 自动（按各设备空闲显存装箱） | 未注册 | 否 |
 | `GGML_CUDA_ALLREDUCE` | 本地 TP，`ggml_cuda` | `nccl` / `internal` / `none` —— 直接透传给 ggml 的集合通信选择；显式设置同时会跳过启动前探测 | 自动（构建时能找到 NCCL 且通过探测就用 NCCL） | 未注册 | 否 |
 | `TS_GGML_TP_AR_PROBE` | 本地 TP，`ggml_cuda` | `0` 跳过 NCCL 启动前探测；`force` 忽略缓存的判定（`~/.cache/tensorsharp/tp-collective-probe`）重新探测。探测在模型加载前端到端跑一次小型 AllReduce —— 一些云主机声称支持 P2P 但数据永远送不到，NCCL 的第一次集合通信会让两块 GPU 永远空转 | 探测开启，判定按 驱动/NCCL/GPU 组合缓存 | 未注册 | 否 |
 | `TS_GGML_TP_AR_PROBE_MS` | 本地 TP，`ggml_cuda` | 探测 AllReduce 的完成期限；超时即判定集合通信不可用并改走钉页主机内存的 `internal` 管线；`0` 关闭探测 | `10000` 毫秒 | 未注册 | 否 |

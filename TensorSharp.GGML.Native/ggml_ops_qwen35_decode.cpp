@@ -987,6 +987,7 @@ namespace
             // ffn (dense)
             ggml_tensor* post_attn_norm_w;
             ggml_tensor* gu_w;
+            ggml_tensor* ffn_gate_w; ggml_tensor* ffn_up_w;
             ggml_tensor* down_w;
             // ffn (MoE)
             ggml_tensor* gate_inp_w;
@@ -1044,7 +1045,15 @@ namespace
             // FFN
             if (d.is_moe == 0)
             {
-                t.gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gu_type), d.gu_ne0, d.gu_ne1);
+                if (d.gu_w != nullptr)
+                {
+                    t.gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gu_type), d.gu_ne0, d.gu_ne1);
+                }
+                else
+                {
+                    t.ffn_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ffn_gate_type), d.ffn_gate_ne0, d.ffn_gate_ne1);
+                    t.ffn_up_w   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ffn_up_type),   d.ffn_up_ne0,   d.ffn_up_ne1);
+                }
                 t.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.down_type), d.down_ne0, d.down_ne1);
             }
             else
@@ -1474,8 +1483,18 @@ namespace
             {
                 // Dense SwiGLU over the packed gate/up projection is faster than
                 // splitting it into two Metal matmuls for this quantized model.
-                ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed_2d);
-                ggml_tensor* act_2d = ggml_swiglu(ctx, gu);
+                ggml_tensor* act_2d;
+                if (t.gu_w != nullptr)
+                {
+                    act_2d = ggml_swiglu(ctx, ggml_mul_mat(ctx, t.gu_w, ffn_normed_2d));
+                }
+                else
+                {
+                    // Unfused mixed-quant gate/up: two matmuls, same arithmetic.
+                    ggml_tensor* g = ggml_mul_mat(ctx, t.ffn_gate_w, ffn_normed_2d);
+                    ggml_tensor* u = ggml_mul_mat(ctx, t.ffn_up_w, ffn_normed_2d);
+                    act_2d = ggml_mul(ctx, ggml_silu(ctx, g), u);
+                }
                 ggml_tensor* down_mm = ggml_mul_mat(ctx, t.down_w, act_2d);
                 ffn_down = ggml_reshape_1d(ctx, down_mm, H);
                 if (tp_mode) { tp_partial.push_back(down_mm); tp_boundary.push_back(ffn_down); }
@@ -1804,7 +1823,15 @@ namespace
             bind_or_mark(t.post_attn_norm_w, d.post_attn_norm_w, static_cast<std::size_t>(H) * sizeof(float), true);
             if (d.is_moe == 0)
             {
-                bind_or_mark(t.gu_w, d.gu_w, static_cast<std::size_t>(d.gu_bytes), true);
+                if (t.gu_w != nullptr)
+                {
+                    bind_or_mark(t.gu_w, d.gu_w, static_cast<std::size_t>(d.gu_bytes), true);
+                }
+                else
+                {
+                    bind_or_mark(t.ffn_gate_w, d.ffn_gate_w, static_cast<std::size_t>(d.ffn_gate_bytes), true);
+                    bind_or_mark(t.ffn_up_w,   d.ffn_up_w,   static_cast<std::size_t>(d.ffn_up_bytes),   true);
+                }
                 bind_or_mark(t.down_w, d.down_w, static_cast<std::size_t>(d.down_bytes), true);
             }
             else
@@ -2499,6 +2526,7 @@ namespace
             ggml_tensor* conv_state_in; ggml_tensor* delta_state_in;
             ggml_tensor* conv_state_out; ggml_tensor* delta_state_out;
             ggml_tensor* gu_w; ggml_tensor* down_w;
+            ggml_tensor* ffn_gate_w; ggml_tensor* ffn_up_w;
             ggml_tensor* gate_inp_w; ggml_tensor* gate_exps; ggml_tensor* up_exps; ggml_tensor* down_exps;
             ggml_tensor* shexp_gate_w; ggml_tensor* shexp_up_w; ggml_tensor* shexp_down_w; ggml_tensor* shexp_gate_inp_w;
         };
@@ -2542,7 +2570,15 @@ namespace
             }
             if (d.is_moe == 0)
             {
-                t.gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gu_type), d.gu_ne0, d.gu_ne1);
+                if (d.gu_w != nullptr)
+                {
+                    t.gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.gu_type), d.gu_ne0, d.gu_ne1);
+                }
+                else
+                {
+                    t.ffn_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ffn_gate_type), d.ffn_gate_ne0, d.ffn_gate_ne1);
+                    t.ffn_up_w   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ffn_up_type),   d.ffn_up_ne0,   d.ffn_up_ne1);
+                }
                 t.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.down_type), d.down_ne0, d.down_ne1);
             }
             else
@@ -2713,9 +2749,21 @@ namespace
             if (d.is_moe == 0)
             {
                 const std::int64_t ffDense = d.ff_dense;
-                ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed); // [2*ffDense, T]
-                ggml_tensor* g_part = ggml_cont(ctx, ggml_view_2d(ctx, gu, ffDense, T, gu->nb[1], 0));
-                ggml_tensor* u_part = ggml_cont(ctx, ggml_view_2d(ctx, gu, ffDense, T, gu->nb[1], static_cast<std::size_t>(ffDense) * sizeof(float)));
+                ggml_tensor* g_part;
+                ggml_tensor* u_part;
+                if (t.gu_w != nullptr)
+                {
+                    ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed); // [2*ffDense, T]
+                    g_part = ggml_cont(ctx, ggml_view_2d(ctx, gu, ffDense, T, gu->nb[1], 0));
+                    u_part = ggml_cont(ctx, ggml_view_2d(ctx, gu, ffDense, T, gu->nb[1], static_cast<std::size_t>(ffDense) * sizeof(float)));
+                }
+                else
+                {
+                    // Unfused mixed-quant gate/up: two matmuls, and the halves are
+                    // already dense so the two conts above are not needed either.
+                    g_part = ggml_mul_mat(ctx, t.ffn_gate_w, ffn_normed);
+                    u_part = ggml_mul_mat(ctx, t.ffn_up_w, ffn_normed);
+                }
                 ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, g_part), u_part); // [ffDense, T]
                 ffn_out = ggml_mul_mat(ctx, t.down_w, act); // [H, T]
             }
@@ -2823,7 +2871,15 @@ namespace
             bind_or_mark(t.post_attn_norm_w, d.post_attn_norm_w, static_cast<std::size_t>(H) * sizeof(float), true);
             if (d.is_moe == 0)
             {
-                bind_or_mark(t.gu_w, d.gu_w, static_cast<std::size_t>(d.gu_bytes), true);
+                if (t.gu_w != nullptr)
+                {
+                    bind_or_mark(t.gu_w, d.gu_w, static_cast<std::size_t>(d.gu_bytes), true);
+                }
+                else
+                {
+                    bind_or_mark(t.ffn_gate_w, d.ffn_gate_w, static_cast<std::size_t>(d.ffn_gate_bytes), true);
+                    bind_or_mark(t.ffn_up_w,   d.ffn_up_w,   static_cast<std::size_t>(d.ffn_up_bytes),   true);
+                }
                 bind_or_mark(t.down_w, d.down_w, static_cast<std::size_t>(d.down_bytes), true);
             }
             else

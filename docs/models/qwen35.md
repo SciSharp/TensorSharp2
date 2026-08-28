@@ -14,7 +14,7 @@
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
 | Batched / paged forward | **Default ON** — set `TS_QWEN35_BATCHED=0` (or `--no-continuous-batching`) to force the legacy per-sequence KV-swap path for A/B comparison. Includes a per-slot GatedDeltaNet recurrent-state pool and optional native batched GDN kernel (`TS_QWEN35_BATCHED_GDN_NATIVE=1`). See §11. |
-| MTP speculative decoding | Qwen 3.6 — NextN draft block embedded in the trunk GGUF (no separate file; MTP-retaining GGUFs only, see [Downloads](#downloads)); engage with `--spec` on **either host** — `TensorSharp.Cli` and `TensorSharp.Server` share [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs), and `--mtp-spec` is an accepted alias. GDN recurrent-state snapshot/rollback on partial accept. Engages for solo (non-concurrent) sequences whenever the GGUF retains the NextN block. See §12. |
+| MTP speculative decoding | Qwen 3.6 — NextN draft block embedded in the trunk GGUF (no separate file; MTP-retaining GGUFs only, see [Downloads](#downloads)); engage with `--spec` on **either host** — `TensorSharp.Cli` and `TensorSharp.Server` share [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs), and `--mtp-spec` is an accepted alias. GDN recurrent-state snapshot/rollback on partial accept. Engages for solo (non-concurrent) sequences whenever the GGUF retains the NextN block. Qwen 3.8 additionally accepts a **DFlash2** block drafter as a separate `--draft-model` GGUF (§12.4). See §12. |
 | Output parser | `Qwen35OutputParser` (inherits `Qwen3OutputParser`) |
 
 ## Downloads
@@ -828,6 +828,121 @@ Qwen3.6-27B IQ2_XXS it cut MTP speculative-verify decode from 217 to 174 ms/toke
 list and the other three algorithms — including `--spec-type ngram`, which needs
 no trained weights at all and therefore also runs on the Qwen 3.5 checkpoints that
 ship no draft block.
+
+### 12.4 DFlash2 block drafting (Qwen 3.8)
+
+Qwen 3.8 has a second, unrelated drafter available: **DFlash2**, a 5-layer
+block-diffusion model that ships as its own GGUF
+([z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF),
+`general.architecture = dflash`). Where the NextN block drafts one token per
+forward, DFlash2 proposes a whole block of 7 in one, reading the trunk's own
+residuals rather than only its last hidden state. Attach it with `--draft-model`;
+naming the file IS the request, no `--spec` needed. The drafter and the NextN
+block are alternatives, not layers - when a DFlash file is attached it wins, and
+the loader says so.
+
+The algorithm, the drafter's KV ring, its fused graphs and the candidate-selector
+lattice are all shared code
+([`ModelBase.DFlash.cs`](../../TensorSharp.Models/Speculative/ModelBase.DFlash.cs),
+[`speculative_decoding.md`](../speculative_decoding.md#dflash-and-dflash2)). What
+belongs to this model is only the residual tap: `SpecForward` additionally writes
+the residual ENTERING each layer named in `dflash.target_layers` (`[6, 20, 34, 48,
+62]` for the shipped drafter), packed into one 25600-wide row per token. It is
+done inside the fused whole-model verify kernel - one `ggml_cpy` per tapped layer
+into a `[hidden, N]` output block - so speculation does not force the op-by-op
+layer loop
+([`Qwen35Model.DFlash.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.DFlash.cs)).
+
+**What it is worth depends almost entirely on the workload.** Measured on one
+RTX 3080 Laptop with Qwen3.8-27B-UD-IQ3_XXS, greedy, best of two runs: on
+free-form prose 18.3 tok/s plain against 20.9 with DFlash2 (1.14x) and 19.1 with
+the trunk's own NextN block; on a highly predictable prompt ("list the first 20
+primes") 19.5 plain against 31.7 (1.63x), or 34.8 at `--spec-draft 7`. The
+default window is 3 (§12.5) and the wider window is only worth taking when
+acceptance is high - on prose it costs 40%.
+
+Quality is unaffected: on the factual prompt the DFlash2 continuation was
+byte-identical to the plain one, and to the pre-snapshot rollback path.
+
+### 12.5 Recurrent-state snapshots (why speculation stopped losing)
+
+Both drafters used to be a NET LOSS on this trunk - 15.5 tok/s for DFlash2 and
+15.7 for MTP against 18.3 plain - and the reason was not the drafters. It was
+what a REJECTION cost. The GDN recurrent state of §12.2 cannot be truncated like
+a KV cache, so a partially-rejected verify restored a pre-verify copy of it and
+re-forwarded the accepted prefix through all 64 layers: a second whole-model
+forward per rejection. The state also crossed PCIe twice per step - 151 MB up
+into the verify graph, 151 MB back down after it - whether anything was rejected
+or not.
+
+Three changes in the fused verify kernel and its caller removed all of it:
+
+1. `ggml_gated_delta_net` already accepts a snapshot count K and emits the last
+   K per-token states; the conv state after row *m* is a window of the
+   `conv_input` tensor the graph already builds. The verify now keeps one
+   snapshot per row, so the state a rollback wants is never recomputed - it is
+   slot `N-1-accepted`.
+2. `TSGgml_Qwen35CommitStateSnapshot` writes that slot into the LIVE state
+   entirely on the device. Every cached verify graph binds `*_state_in` from one
+   shared device buffer (`g_q35v_state_buf`), so the write is visible to the next
+   verify whatever shape it runs at - and that verify then skips its state
+   upload, as this step skipped its download.
+3. A verify only READS the live slices (it writes `*_state_out` and the snapshot
+   slots), so those slices ARE the pre-verify state until a commit overwrites
+   them - and a commit only happens after the rollback decision.
+   `SpecSnapshotRecurrentState` therefore copies nothing.
+
+4. The single-row steps a speculative session falls back to (when the drafter
+   declines) defer their download too. Such a step's post-window state is just
+   the `*_state_out` slices and nothing decides anything about it later, so the
+   caller commits slot -1 at once. Before this, each one broke the device-state
+   chain - 151 MB down, and the next verify uploaded it again - which on an MTP
+   run was 46 steps out of 125.
+
+Effect on 256 prose tokens with DFlash2: `rollbackMs` 3604 -> 0, `snapshotMs`
+919 -> 69. Deferring the one-row steps is worth a further 5-20% on top,
+paired-run (DFlash2 factual 22.0 -> 27.1, MTP prose 19.1 -> 21.4), and it is also
+the more exact path: committing on the device is a raw copy of the tensor the
+graph produced, where the host round trip went through an unpack-and-repack, so
+on the factual prompt it reproduces plain decoding byte for byte while the host
+path drifted in the last few tokens.
+
+The cost is VRAM - the GDN op's output grows by one ~150 MB state per slot across
+the 48 recurrent layers - which is why the default window is 3 and not 8.
+`TS_Q35_VERIFY_SNAPSHOTS=0` restores the old restore-and-re-forward path and
+`TS_Q35_VERIFY_DEFER_STATE=0` keeps the snapshots but restores the download, so
+the two halves can be measured apart; either is also the automatic fallback for
+any shape the kernel will not persist.
+
+### 12.6 Folding the MTP catch-up into the first draft step
+
+llama.cpp's `draft-mtp` runs the MTP block once over `n_accepted + 1` rows: one
+pass that both replays the verified tokens through the draft head and takes the
+first draft step. TensorSharp ran those as two calls, and because a draft call's
+cost is mostly fixed - its own graph, launch and readback, ~6 ms of which only
+about 1 ms is arithmetic - that extra call was the largest single difference
+between the two engines on this model.
+
+`Qwen35Model.DraftCatchUpAndStep` does both in one `TryFusedMtpBlock` call over
+all rows. The kernel already folds the LM head over the LAST `n_logits` rows, so
+asking for one logit row returns exactly the row the draft needs; the normed
+hidden comes back for every row and the last one chains the next step. The fold
+is an identity rather than an approximation: the block is causal over its own
+KV, so its last row sees exactly the replayed rows either way, and the output is
+byte-identical with acceptance unchanged.
+
+`DraftHeadSpeculator` stashes the commit and folds it into the next `Propose`,
+flushing it as an ordinary catch-up whenever the stashed rows do not run right up
+to the next step's position. Measured on Qwen3.8-27B-UD-IQ3_XXS: `catchUpMs`
+191 -> 0, +4.0% at 256 tokens and +5.3% on prose. `TS_MTP_FOLD_CATCHUP=0`
+restores the two-call shape.
+
+The remaining per-step difference is `MtpProjectInput`, the C# front end that
+builds the block's input (embedding, `enorm`, `hnorm`, concat, `eh_proj`). Over a
+256-token run it costs 462 ms against the fused kernel's 804 ms across 208
+calls - 2.2 ms of every 6.1 ms draft call - spent on about six separate device op
+launches, each of which synchronises because the lazy-sync path is Metal-only.
+Folding it into the fused MTP graph is the next step.
 
 ## 13. Output parser and chat template
 

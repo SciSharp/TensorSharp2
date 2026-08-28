@@ -91,6 +91,23 @@ namespace TensorSharp.Runtime.Speculative
         int SpecPrefillChunkSize => 0;
 
         /// <summary>
+        /// Draft window this trunk would rather have by DEFAULT, or 0 for "no
+        /// preference". It narrows the default only; an operator who passed
+        /// <c>--spec-draft</c> gets exactly what they asked for.
+        ///
+        /// This exists because the cost of a wide window is a property of the
+        /// TRUNK, not of the drafter. On a model with recurrent state a verify
+        /// over N rows runs the chunked recurrent scan instead of the single-token
+        /// update, AND a partial rejection has to restore that state and re-advance
+        /// over the accepted prefix - so the marginal token of window costs far
+        /// more than it does on a dense-attention trunk, where the verify's own KV
+        /// writes are reusable and the rollback is a position rewind. Measured on
+        /// Qwen3.8-27B: the default window 8 gave 9.4 tok/s against 15.5 at 3,
+        /// with the same drafter and the same acceptance per position.
+        /// </summary>
+        int SpecPreferredDraftWindow => 0;
+
+        /// <summary>
         /// True when a verify batch has already written reusable attention KV for
         /// EVERY token it processed (so the accepted prefix's KV is correct in the
         /// live cache), and the model has no recurrent state that a re-forward would
@@ -120,6 +137,14 @@ namespace TensorSharp.Runtime.Speculative
 
         /// <summary>Snapshot the recurrent (GDN/SSM) state before a verify batch.</summary>
         void SpecSnapshotRecurrentState();
+
+        /// <summary>
+        /// How much of the verify that just ran was accepted, delivered on every
+        /// speculative step (full acceptance included) before any rollback happens.
+        /// A trunk that left post-verify state on the device until the accept count
+        /// was known settles it here. Default: nothing to do.
+        /// </summary>
+        void SpecOnVerifyAccepted(int acceptedRows, int verifyRows) { }
 
         /// <summary>Restore the recurrent state captured by <see cref="SpecSnapshotRecurrentState"/>.</summary>
         void SpecRestoreRecurrentState();
@@ -249,6 +274,38 @@ namespace TensorSharp.Runtime.Speculative
         /// process()). Row k of <paramref name="hRows"/> is the hidden state of
         /// the token PRECEDING tokens[k].</summary>
         void DraftCatchUp(int[] tokens, float[] hRows, int startPos);
+
+        /// <summary>
+        /// True when this head can replay the verified tokens AND take the first
+        /// draft step in ONE pass, via <see cref="DraftCatchUpAndStep"/>.
+        ///
+        /// This is what llama.cpp's draft-mtp does: it runs its block over
+        /// <c>n_accepted + 1</c> rows rather than a catch-up pass followed by a
+        /// separate first draft. On a head whose per-call cost is mostly fixed
+        /// (a whole extra graph, its own launch and readback), that is one call
+        /// saved per speculative step - measured at 6.4 ms of a 100 ms step on
+        /// Qwen 3.8, i.e. the entire remaining gap to llama.cpp.
+        /// </summary>
+        bool SupportsFusedCatchUpStep => false;
+
+        /// <summary>
+        /// Replay verified trunk tokens and take the first draft step in one
+        /// pass. <paramref name="tokens"/> is the verified run followed by the
+        /// token the next draft starts from, so the last entry is NOT a replay;
+        /// row k of <paramref name="hRows"/> is the hidden state of the token
+        /// preceding tokens[k], as in <see cref="DraftCatchUp"/>. Fills
+        /// <paramref name="logitsOut"/> and <paramref name="hOut"/> from the LAST
+        /// row - byte-identical to what
+        /// <c>DraftCatchUp(tokens[..^1], ...)</c> followed by
+        /// <c>DraftStep(tokens[^1], ...)</c> would produce, because the block is
+        /// causal over its own KV and the last row therefore sees exactly the
+        /// replayed rows either way.
+        /// Only called when <see cref="SupportsFusedCatchUpStep"/> is true.
+        /// </summary>
+        void DraftCatchUpAndStep(int[] tokens, float[] hRows, int startPos,
+            float[] logitsOut, float[] hOut)
+            => throw new NotSupportedException(
+                "This draft head cannot fuse its catch-up with the first draft step.");
     }
 
     /// <summary>Convenience alias for the common case: a model that is its own

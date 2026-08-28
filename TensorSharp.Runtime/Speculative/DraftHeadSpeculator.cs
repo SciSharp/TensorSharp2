@@ -48,6 +48,21 @@ namespace TensorSharp.Runtime.Speculative
         private readonly float[] _hA;
         private readonly float[] _hB;
 
+        // Catch-up folding (llama.cpp's draft-mtp, which runs its block over
+        // n_accepted + 1 rows instead of a catch-up pass plus a first draft step).
+        // Commit stashes the verified run instead of replaying it; the next Propose
+        // appends the token it starts from and does both in ONE head call. Worth a
+        // whole head call per speculative step, which on Qwen 3.8 is 6.4 ms of 100.
+        private readonly bool _fold;
+        private int[] _pendTokens;
+        private float[] _pendH;
+        private int _pendCount;
+        private int _pendStart;
+        private bool _hasPend;
+        // The folded call's inputs: the stashed run plus one row.
+        private int[] _foldTokens;
+        private float[] _foldH;
+
         public DraftHeadSpeculator(IDraftHead head, int vocabSize, int featureSize, int maxDraftTokens)
         {
             _head = head ?? throw new ArgumentNullException(nameof(head));
@@ -56,6 +71,7 @@ namespace TensorSharp.Runtime.Speculative
             _vocab = vocabSize;
             _featureSize = featureSize;
             MaxDraftTokens = maxDraftTokens;
+            _fold = head.SupportsFusedCatchUpStep;
             _logits = new float[vocabSize];
             _hA = new float[featureSize];
             _hB = new float[featureSize];
@@ -80,8 +96,51 @@ namespace TensorSharp.Runtime.Speculative
             float[] hIn = ctx.CarryHidden;
             float[] hOut = _hA;
             int tokIn = ctx.LastToken;
+            int first = 0;
 
-            for (int i = 0; i < ctx.MaxTokens; i++)
+            // A stashed catch-up whose rows run right up to this step's position
+            // folds into draft step 0: one head call replays the verified run AND
+            // produces the first draft. Any other position means some path put a
+            // step in between, so replay it on its own and draft normally.
+            if (_hasPend)
+            {
+                if (_pendStart + _pendCount != ctx.Position)
+                {
+                    FlushPending();
+                }
+                else
+                {
+                    int n = _pendCount + 1;
+                    // EXACTLY n: the head takes its row count from tokens.Length, so a
+                    // buffer left long by an earlier, longer step would replay stale
+                    // trailing tokens as if they were verified rows.
+                    if (_foldTokens == null || _foldTokens.Length != n)
+                        _foldTokens = new int[n];
+                    if (_foldH == null || _foldH.Length < (long)n * _featureSize)
+                        _foldH = new float[(long)n * _featureSize];
+                    Array.Copy(_pendTokens, _foldTokens, _pendCount);
+                    _foldTokens[_pendCount] = ctx.LastToken;
+                    Array.Copy(_pendH, _foldH, (long)_pendCount * _featureSize);
+                    Array.Copy(ctx.CarryHidden, 0, _foldH, (long)_pendCount * _featureSize, _featureSize);
+                    _hasPend = false;
+
+                    _head.DraftCatchUpAndStep(_foldTokens, _foldH, _pendStart, _logits, hOut);
+                    if (ctx.MaxTokens < 1)
+                        return 0;
+                    ctx.AdjustLogits?.Invoke(_logits, draftOut);
+                    int d0 = ArgmaxWithTopKConfidence(_logits, _vocab, out float p0);
+                    if (p0 < MinDraftProb)
+                        return 0;
+                    draftOut.Add(d0);
+                    tokIn = d0;
+                    float[] nx = ReferenceEquals(hOut, _hA) ? _hB : _hA;
+                    hIn = hOut;
+                    hOut = nx;
+                    first = 1;
+                }
+            }
+
+            for (int i = first; i < ctx.MaxTokens; i++)
             {
                 _head.DraftStep(tokIn, hIn, ctx.Position + i, _logits, hOut);
                 // Penalty-aligned drafting: argmax the SAME distribution
@@ -105,11 +164,42 @@ namespace TensorSharp.Runtime.Speculative
         }
 
         public void Commit(int[] tokens, float[] hRows, int startPos)
-            => _head.DraftCatchUp(tokens, hRows, startPos);
+        {
+            if (!_fold || hRows == null)
+            {
+                _head.DraftCatchUp(tokens, hRows, startPos);
+                return;
+            }
+            // Two commits with no Propose between them (a governor-declined step
+            // straight after a speculative one) must not lose the first.
+            FlushPending();
+            int n = tokens.Length;
+            if (_pendTokens == null || _pendTokens.Length < n)
+                _pendTokens = new int[n];
+            if (_pendH == null || _pendH.Length < (long)n * _featureSize)
+                _pendH = new float[(long)n * _featureSize];
+            Array.Copy(tokens, _pendTokens, n);
+            Array.Copy(hRows, _pendH, (long)n * _featureSize);
+            _pendCount = n;
+            _pendStart = startPos;
+            _hasPend = true;
+        }
 
-        public void Reset() { }
+        /// <summary>Replay a stashed catch-up on its own, for when it cannot be
+        /// folded into the next draft (or there is no next draft).</summary>
+        private void FlushPending()
+        {
+            if (!_hasPend)
+                return;
+            _hasPend = false;
+            var toks = new int[_pendCount];
+            Array.Copy(_pendTokens, toks, _pendCount);
+            _head.DraftCatchUp(toks, _pendH, _pendStart);
+        }
 
-        public void Dispose() { }
+        public void Reset() => FlushPending();
+
+        public void Dispose() => _hasPend = false;
 
         /// <summary>
         /// Argmax plus the top-1 probability computed over the top-10 logits

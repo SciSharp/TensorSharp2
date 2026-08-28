@@ -534,18 +534,27 @@ namespace TensorSharp.Server.Hosting
 
             for (int i = 0; i < args.Length; i++)
             {
-                // Path to a BLOCK drafter GGUF that has to be resident before
-                // the model's layer split runs (DeepSeek V4's DSpark). Unlike
+                // Path to a BLOCK drafter GGUF that has to be resident before the
+                // model's layer split runs: DeepSeek V4's DSpark, and the DFlash /
+                // DFlash2 drafters for Muse-Glimmer and Qwen 3.8. Unlike
                 // --spec-draft-model this one is handed to the model factory, so
-                // it is carried as the same env var the CLI's --draft-model
-                // reads and picked up again by a runtime model switch. It stays
+                // it is carried as the same env vars the CLI's --draft-model reads
+                // and picked up again by a runtime model switch. It stays
                 // server-local because the CLI passes its own --draft-model
                 // straight to ModelBase.Create instead.
+                //
+                // All THREE are set, because each architecture reads its own and
+                // only the loaded model reads any of them. Setting just the DSpark
+                // one - which is what this did - meant --draft-model was silently
+                // ignored on the server for every DFlash target, the flag's most
+                // common use.
                 if (SpeculativeCliFlags.TryReadOption(args, ref i, "--draft-model", out string dsparkOpt))
                 {
                     if (string.IsNullOrWhiteSpace(dsparkOpt) || !File.Exists(dsparkOpt))
                         throw new ArgumentException($"--draft-model file not found: '{dsparkOpt}'.");
                     Environment.SetEnvironmentVariable("TS_DSV4_DSPARK", dsparkOpt);
+                    Environment.SetEnvironmentVariable("TS_QWEN35_DFLASH", dsparkOpt);
+                    Environment.SetEnvironmentVariable("TS_MUSE_GLIMMER_DFLASH", dsparkOpt);
                     changed = true;
                 }
             }
@@ -1183,18 +1192,23 @@ namespace TensorSharp.Server.Hosting
                 {
                     continue;
                 }
-                // MTP speculative-decoding flags are consumed by
-                // ApplySpeculativeCliFlags(args) in a separate earlier pass.
-                // Recognise + skip them here so they don't trip the
-                // unknown-arg trap below.
-                if (string.Equals(args[i], "--mtp-spec", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(args[i], "--no-mtp-spec", StringComparison.OrdinalIgnoreCase))
+                // Speculative-decoding flags are consumed by
+                // ApplySpeculativeCliFlags(args) in a separate earlier pass, which
+                // READS argv without removing anything. Recognise + skip them here
+                // so they don't trip the unknown-arg trap below.
+                //
+                // Driven off SpeculativeCliFlags' own tables rather than a second
+                // hand-written list: the two lists used to be maintained
+                // separately, so when the flags were renamed --mtp-* -> --spec*
+                // the applier learned the new spellings and this trap did not.
+                // Every documented --spec* flag then made the server refuse to
+                // start with "Unknown option '--spec-draft'". A copy of a list is
+                // a drift bug; consume the source of truth.
+                if (MatchesAny(args[i], SpeculativeCliFlags.SwitchFlags))
                 {
                     continue;
                 }
-                if (TryReadOption(args, ref i, "--mtp-draft", out _)
-                    || TryReadOption(args, ref i, "--mtp-pmin", out _)
-                    || TryReadOption(args, ref i, "--mtp-draft-model", out _)
+                if (TryReadAnyOption(args, ref i, SpeculativeCliFlags.ValueFlags)
                     || TryReadOption(args, ref i, "--draft-model", out _))
                 {
                     continue;
@@ -1274,8 +1288,12 @@ namespace TensorSharp.Server.Hosting
                 "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
                 "--continuous-batching", "--no-continuous-batching",
                 "--paged-batching", "--no-paged-batching", "--prefill-chunk-size",
-                "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
+                // Speculative flags come from SpeculativeCliFlags' tables below
+                // (appended after this literal) so a new spelling is suggestible
+                // the moment it is accepted.
                 "--draft-model",
+                "--redis-url", "--paged-kv-redis-url", "--paged-kv-redis-ttl",
+                "--n-cpu-moe", "--cpu-moe", "--cpu-moe-threads",
                 "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
                 "--video-vae", "--video-text-encoder", "--video-te", "--video-dit2", "--audio-vae",
                 "--video-width", "--video-height", "--video-steps", "--video-mode",
@@ -1290,12 +1308,48 @@ namespace TensorSharp.Server.Hosting
             int bestDist = int.MaxValue;
             foreach (var flag in knownFlags)
             {
+                int d0 = LevenshteinDistance(typo, flag);
+                if (d0 < bestDist) { bestDist = d0; best = flag; }
+            }
+            foreach (var flag in SpeculativeCliFlags.SwitchFlags)
+            {
+                int d1 = LevenshteinDistance(typo, flag);
+                if (d1 < bestDist) { bestDist = d1; best = flag; }
+            }
+            foreach (var flag in SpeculativeCliFlags.ValueFlags)
+            {
                 int d = LevenshteinDistance(typo, flag);
                 if (d < bestDist) { bestDist = d; best = flag; }
             }
             // Only suggest if it's a near-miss (≤ 2 edits) — beyond that the
             // suggestion is more confusing than helpful.
             return bestDist <= 2 ? best : null;
+        }
+
+        /// <summary>True when <paramref name="arg"/> is exactly one of
+        /// <paramref name="flags"/> (case-insensitive). Used to consume the
+        /// valueless switches an earlier applier pass already handled.</summary>
+        private static bool MatchesAny(string arg, string[] flags)
+        {
+            foreach (var flag in flags)
+            {
+                if (string.Equals(arg, flag, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>Consume the first of <paramref name="flags"/> that matches at
+        /// <paramref name="index"/>, in the order given (longest names first, so
+        /// <c>--spec-draft</c> can never eat <c>--spec-draft-model</c>'s value).</summary>
+        private static bool TryReadAnyOption(string[] args, ref int index, string[] flags)
+        {
+            foreach (var flag in flags)
+            {
+                if (TryReadOption(args, ref index, flag, out _))
+                    return true;
+            }
+            return false;
         }
 
         private static int LevenshteinDistance(string a, string b)

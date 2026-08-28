@@ -134,7 +134,7 @@ namespace TensorSharp.Models
                             && _layerStackedGate[l] != null && _layerStackedUp[l] != null && _layerStackedDown[l] != null
                             && HasW(_ffnGateShexpQW[l], _ffnGateShexpF32[l]) && HasW(_ffnUpShexpQW[l], _ffnUpShexpF32[l])
                             && HasW(_ffnDownShexpQW[l], _ffnDownShexpF32[l]) && _ffnGateInpShexpVec[l] != null)
-                        : (HasW(_ffnGateUpQW[l], _ffnGateUpF32[l]) && HasW(_ffnDownQW[l], _ffnDownF32[l]));
+                        : (HasDenseFfnWeights(l) && HasW(_ffnDownQW[l], _ffnDownF32[l]));
                     bool ok = _attnNormW[l] != null && _postAttnNormW[l] != null && ffnOk;
                     if (ok && !_isRecurrent[l])
                         ok = (HasW(_attnQkvQW[l], _attnQkvF32[l])
@@ -226,11 +226,9 @@ namespace TensorSharp.Models
                 a.IsMoe = isMoe ? 1 : 0;
                 if (!isMoe)
                 {
-                    var gu = ResolveW(_ffnGateUpQW[l], _ffnGateUpF32[l]);
                     var dn = ResolveW(_ffnDownQW[l], _ffnDownF32[l]);
-                    a.GuW = gu.Item1; a.GuType = gu.Item2; a.GuNe0 = gu.Item3; a.GuNe1 = gu.Item4; a.GuBytes = gu.Item5;
                     a.DownW = dn.Item1; a.DownType = dn.Item2; a.DownNe0 = dn.Item3; a.DownNe1 = dn.Item4; a.DownBytes = dn.Item5;
-                    a.FfDense = (int)(gu.Item4 / 2);
+                    FillDenseFfnArgs(ref a, l);
                 }
                 else
                 {

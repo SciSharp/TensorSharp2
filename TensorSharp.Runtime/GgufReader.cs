@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -62,6 +62,11 @@ namespace TensorSharp.Runtime
         public Dictionary<string, object> Metadata { get; } = new();
         public Dictionary<string, GgufTensorInfo> Tensors { get; } = new();
         public long DataOffset { get; private set; }
+
+        /// <summary>Unaligned end of the KV + tensor table; a shard with no
+        /// tensor data of its own may legitimately end here, before the
+        /// alignment padding that <see cref="DataOffset"/> assumes.</summary>
+        private long _tableEnd;
 
         private FileStream _stream;
         private string _path;
@@ -388,6 +393,7 @@ namespace TensorSharp.Runtime
             int alignment = 32;
             if (Metadata.TryGetValue("general.alignment", out var a))
                 alignment = Convert.ToInt32(a);
+            _tableEnd = pos;
             DataOffset = pos + (alignment - pos % alignment) % alignment;
         }
 
@@ -400,7 +406,12 @@ namespace TensorSharp.Runtime
         /// </summary>
         public long GetRequiredLength(out string? lastTensorName)
         {
-            long required = DataOffset;
+            // Split GGUFs often front-load a metadata-only first shard: every
+            // tensor in its table lives in a sibling file, so the file ends
+            // right after the table and the alignment padding DataOffset
+            // assumes never exists. Only demand bytes past the table when a
+            // tensor actually claims them.
+            long required = _tableEnd;
             lastTensorName = null;
             foreach (var t in Tensors.Values)
             {
@@ -523,6 +534,31 @@ namespace TensorSharp.Runtime
         {
             if (!Metadata.TryGetValue(key, out var v)) return null;
             if (v is bool[] ba) return ba;
+            return null;
+        }
+
+        /// <summary>
+        /// A UINT64 metadata array. Used by the qwen4exp PLE n-gram hash, whose
+        /// multipliers and per-head vocabulary sizes are 64-bit by construction -
+        /// the hash multiplies token ids by ~2^44 constants and takes the result
+        /// modulo a ~20 M row count, so nothing narrower carries it.
+        /// </summary>
+        public ulong[]? GetUint64Array(string key)
+        {
+            if (!Metadata.TryGetValue(key, out var v)) return null;
+            if (v is ulong[] ua) return ua;
+            if (v is uint[] u32)
+            {
+                var result = new ulong[u32.Length];
+                for (int i = 0; i < u32.Length; i++) result[i] = u32[i];
+                return result;
+            }
+            if (v is long[] i64)
+            {
+                var result = new ulong[i64.Length];
+                for (int i = 0; i < i64.Length; i++) result[i] = (ulong)i64[i];
+                return result;
+            }
             return null;
         }
 

@@ -55,6 +55,43 @@ namespace TensorSharp.Models
             if (draftPath == null)
                 return true;
 
+            if (!File.Exists(draftPath))
+            {
+                error = $"Draft-head model file not found: {draftPath}";
+                return false;
+            }
+
+            // A DFlash / DFlash2 drafter is architecture-agnostic on this side: any
+            // target that can tap the residuals its encoder reads can host one, and
+            // the file says which it is. --draft-model may already have attached it
+            // during construction, in which case there is nothing to do.
+            if (IsDFlashDrafter(draftPath))
+            {
+                if (model == null)
+                {
+                    error = "No model is loaded to attach a DFlash drafter to.";
+                    return false;
+                }
+                if (model.HasDFlash)
+                    return true;
+                try
+                {
+                    model.LoadDFlashDraftWeights(draftPath);
+                }
+                catch (Exception ex)
+                {
+                    error = $"Failed to load DFlash drafter '{Path.GetFileName(draftPath)}': {ex.Message}";
+                    return false;
+                }
+                if (!model.HasDFlash)
+                {
+                    error = $"DFlash drafter '{Path.GetFileName(draftPath)}' loaded but is incomplete "
+                            + "(required draft tensors missing).";
+                    return false;
+                }
+                return true;
+            }
+
             if (model is not Gemma4Model gemma4)
             {
                 // A draft GGUF was named but this architecture does not consume a
@@ -63,12 +100,6 @@ namespace TensorSharp.Models
                 // their flag was ignored.
                 error = $"--spec-draft-model was given but the loaded model architecture "
                         + $"'{model?.Config?.Architecture ?? "unknown"}' does not use a separate draft GGUF.";
-                return false;
-            }
-
-            if (!File.Exists(draftPath))
-            {
-                error = $"Draft-head model file not found: {draftPath}";
                 return false;
             }
 
@@ -89,6 +120,23 @@ namespace TensorSharp.Models
                 return false;
             }
             return true;
+        }
+
+        /// <summary>True when the file at <paramref name="path"/> declares itself a
+        /// DFlash drafter. Read from the GGUF rather than inferred from the name:
+        /// the same flag also names MTP-only assistant files.</summary>
+        private static bool IsDFlashDrafter(string path)
+        {
+            try
+            {
+                using var probe = new GgufFile(path);
+                return string.Equals(probe.GetString("general.architecture"),
+                    DFlashConfig.ArchName, StringComparison.Ordinal);
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 }
