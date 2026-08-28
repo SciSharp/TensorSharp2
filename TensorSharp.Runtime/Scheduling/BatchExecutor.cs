@@ -641,6 +641,12 @@ namespace TensorSharp.Runtime.Scheduling
             return results;
         }
 
+        // Continuous-batching routing trace, off unless TS_CB_DEBUG=1. Prints
+        // which path each step took, the scheduled work, and the current owner -
+        // the context a per-sequence cache bug is impossible to read without.
+        private static readonly bool _cbDebug =
+            string.Equals(Environment.GetEnvironmentVariable("TS_CB_DEBUG"), "1", StringComparison.Ordinal);
+
         /// <summary>Run every scheduled sequence through the model's fused
         /// single-graph <see cref="IModelArchitecture.Forward"/> with its own
         /// per-request KV cache (bound via
@@ -662,6 +668,14 @@ namespace TensorSharp.Runtime.Scheduling
             int n = output.ScheduledWork.Count;
             var results = new List<SequenceStepResult>(n);
             if (n == 0) return results;
+            if (_cbDebug)
+            {
+                var ids = new List<string>(n);
+                foreach (var w in output.ScheduledWork)
+                    ids.Add($"{w.Sequence.RequestId}:{(w.IsPrefill ? "P" : "D")}@{w.Sequence.NumComputedTokens}");
+                Console.Error.WriteLine($"[cb] FUSED step n={n} owner={_currentOwner?.RequestId ?? "<none>"}" +
+                    $" ownerStatus={(_currentOwner != null ? _currentOwner.Status.ToString() : "-")} work=[{string.Join(",", ids)}]");
+            }
 
             // Transition from the single-stream (N==1) path: if a prior owner's
             // K/V is still live in the model's primary cache, hand it to that
@@ -837,6 +851,14 @@ namespace TensorSharp.Runtime.Scheduling
             var results = new List<SequenceStepResult>(1);
             if (output.ScheduledWork.Count == 0)
                 return results;
+            if (_cbDebug)
+            {
+                var ids = new List<string>();
+                foreach (var w in output.ScheduledWork)
+                    ids.Add($"{w.Sequence.RequestId}:{(w.IsPrefill ? "P" : "D")}@{w.Sequence.NumComputedTokens}");
+                Console.Error.WriteLine($"[cb] SOLO step n={output.ScheduledWork.Count} owner={_currentOwner?.RequestId ?? "<none>"}" +
+                    $" work=[{string.Join(",", ids)}]");
+            }
 
             // If a per-sequence-fused episode preceded this single-stream step,
             // the model's active KV cache may be a per-request holder. Reinstate

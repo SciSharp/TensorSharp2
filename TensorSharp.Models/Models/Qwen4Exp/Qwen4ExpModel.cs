@@ -96,8 +96,8 @@ namespace TensorSharp.Models
         private float _attnScale;
 
         public Qwen4ExpModel(string ggufPath, BackendType backend, int tpDegree = 1,
-            ITensorParallelGroup tpGroup = null)
-            : base(ggufPath, backend, tpDegree, tpGroup)
+            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1)
+            : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree)
         {
             Config = new ModelConfig { Architecture = ArchitectureId };
             ParseBaseConfig();
@@ -116,12 +116,197 @@ namespace TensorSharp.Models
 
             LoadWeights();
             VerifyQwen4ExpTensors();
+            // The layer -> GPU map has to exist BEFORE the preload: that is what
+            // decides which device each weight is uploaded to, and the preload frees
+            // the host copy immediately afterwards so there is no second chance.
+            BuildLayerDeviceMap();
             PrepareCudaQuantizedWeightsForInference();
 
             int maxContextLength = ResolveConfiguredContextLength();
             int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
             InitCaches(initialCacheLength, maxContextLength);
         }
+
+        // ---- layer split ------------------------------------------------------
+        //
+        // Which GPU owns each layer. All zeros on a single-GPU run, which is every
+        // run that does not pass --tp N.
+        private int[] _layerDevice;
+
+        /// <summary>Assign each layer to a GPU as a contiguous run, in pipeline
+        /// order, balancing the bytes that actually become device-resident.
+        ///
+        /// Rank 0 also carries the token embedding, the final mixer + LM head and the
+        /// vision tower, so it is charged those bytes up front and takes
+        /// correspondingly fewer layers rather than an equal share.
+        ///
+        /// See <see cref="PackLayersOntoDevices"/> for why the runs are contiguous.
+        /// </summary>
+        private void BuildLayerDeviceMap()
+        {
+            int n = Config.NumLayers;
+            _layerDevice = new int[n];
+            if (LayerSplitDegree <= 1)
+                return;
+
+            long[] layerBytes = new long[n];
+            long sharedBytes = 0;   // rides on device 0 (embedding, PLE gather source, vision)
+            long headBytes = 0;     // rides on the LAST device (final mixer + LM head)
+            foreach (var kv in _quantWeights)
+            {
+                // Only weights that actually take VRAM count. per_layer_token_embd is
+                // the one that matters: ~24 GB of PLE table that is served by a host
+                // gather and never uploaded, so counting it would push nearly every
+                // layer onto the second GPU to "balance" bytes that are not there.
+                // The stacked experts ARE counted even though they are vetoed from the
+                // eager preload - the span binds them lazily and they are the bulk of
+                // each layer.
+                if (!ShouldPreloadCudaQuantWeightToDevice(kv.Key)
+                    && !_stackedExpertMemberNames.Contains(kv.Key))
+                    continue;
+                // Charge the head group to the device that will actually hold it
+                // (PreloadRankForWeight sends it to the last one), not to device 0.
+                if (IsHeadSpanWeight(kv.Key)) { headBytes += kv.Value.RawBytes; continue; }
+                AccumulateWeightBytes(kv.Key, kv.Value.RawBytes, layerBytes, ref sharedBytes);
+            }
+            foreach (var kv in _weights)
+            {
+                if (IsHeadSpanWeight(kv.Key)) { headBytes += kv.Value.Storage.ByteLength; continue; }
+                AccumulateWeightBytes(kv.Key, kv.Value.Storage.ByteLength, layerBytes, ref sharedBytes);
+            }
+
+            _layerDevice = PackLayersOntoDevices(layerBytes, sharedBytes, headBytes, LayerSplitDegree);
+
+            var counts = new int[LayerSplitDegree];
+            var bytes = new long[LayerSplitDegree];
+            for (int l = 0; l < n; l++) { counts[_layerDevice[l]]++; bytes[_layerDevice[l]] += layerBytes[l]; }
+            bytes[0] += sharedBytes;
+            bytes[LayerSplitDegree - 1] += headBytes;
+            var parts = new System.Collections.Generic.List<string>(LayerSplitDegree);
+            for (int d = 0; d < LayerSplitDegree; d++)
+                parts.Add($"gpu{d}={counts[d]} layers/{bytes[d] / (1024 * 1024)} MB");
+            Console.WriteLine($"  Layer split across {LayerSplitDegree} GPUs: {string.Join(", ", parts)}");
+        }
+
+        /// <summary>
+        /// Assign each layer to a device as a CONTIGUOUS, MONOTONIC run, balancing
+        /// device-resident bytes. Device 0 starts already holding
+        /// <paramref name="sharedBytes"/> (the embedding and the vision tower) and the
+        /// LAST device starts holding <paramref name="headBytes"/> (the final
+        /// hyper-connection mixer and the LM head, which ride the last span), so each
+        /// takes correspondingly fewer layers than an equal share.
+        ///
+        /// Contiguous and monotonic is a correctness property, not tidiness: each
+        /// device boundary inside a token is a span cut and a residual hand-off, so
+        /// an interleaved assignment would add a seam per interleave, and a
+        /// non-monotonic one would need the residual to travel backwards.
+        /// </summary>
+        internal static int[] PackLayersOntoDevices(long[] layerBytes, long sharedBytes,
+            long headBytes, int deviceCount)
+        {
+            int n = layerBytes.Length;
+            var map = new int[n];
+            if (deviceCount <= 1 || n == 0)
+                return map;
+
+            long total = sharedBytes + headBytes;
+            foreach (long b in layerBytes) total += b;
+            long perDevice = total / deviceCount;
+
+            int dev = 0;
+            long used = sharedBytes;
+            for (int l = 0; l < n; l++)
+            {
+                // Never advance on an empty device: with fewer layers than devices
+                // (or a huge sharedBytes) that would leave a device with no layers
+                // and still produce a seam.
+                bool anyOnThisDevice = l > 0 && map[l - 1] == dev;
+                int layersLeft = n - l;
+                int devicesLeft = deviceCount - dev;
+                if (dev + 1 < deviceCount
+                    && (anyOnThisDevice || dev == 0)
+                    && used + layerBytes[l] > perDevice
+                    && layersLeft > devicesLeft - 1)
+                {
+                    dev++;
+                    // The last device also holds the final mixer + LM head.
+                    used = dev == deviceCount - 1 ? headBytes : 0;
+                }
+                map[l] = dev;
+                used += layerBytes[l];
+            }
+            return map;
+        }
+
+        /// <summary>Attribute one tensor's bytes to its layer, or to the shared
+        /// (non-layer) pool that rides on device 0.</summary>
+        private static void AccumulateWeightBytes(string name, long bytes, long[] layerBytes, ref long sharedBytes)
+        {
+            if (name != null && name.StartsWith("blk.", StringComparison.Ordinal))
+            {
+                int dot = name.IndexOf('.', 4);
+                if (dot > 4 && int.TryParse(name.AsSpan(4, dot - 4), out int il)
+                    && il >= 0 && il < layerBytes.Length)
+                {
+                    layerBytes[il] += bytes;
+                    return;
+                }
+            }
+            sharedBytes += bytes;
+        }
+
+        /// <inheritdoc/>
+        protected override int PreloadRankForWeight(string weightName)
+        {
+            if (_layerDevice == null || weightName == null) return 0;
+            if (weightName.StartsWith("blk.", StringComparison.Ordinal))
+            {
+                int dot = weightName.IndexOf('.', 4);
+                if (dot <= 4 || !int.TryParse(weightName.AsSpan(4, dot - 4), out int il)) return 0;
+                if (il < 0 || il >= _layerDevice.Length) return 0;
+                return _layerDevice[il];
+            }
+
+            // The final hyper-connection mixer and the LM head are built into the
+            // LAST span (EnsureHeadArgs -> output_hc_down/up, output_hc_norm, and
+            // output.weight or the tied token_embd), so they must be resident on the
+            // last layer's GPU. Getting this wrong is not a slow path: the preload
+            // frees the host copy right after uploading, so a head bound on the wrong
+            // rank reads freed memory and the process dies in kernel warmup.
+            if (IsHeadSpanWeight(weightName))
+                return _layerDevice[_layerDevice.Length - 1];
+            return 0;
+        }
+
+        /// <summary>Weights the head span binds, and therefore weights that live on
+        /// the last device under a layer split.</summary>
+        private bool IsHeadSpanWeight(string weightName)
+        {
+            if (weightName.StartsWith("output", StringComparison.Ordinal))
+                return true;
+            // Tied head: with no output.weight the head matmuls against token_embd.
+            return string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal)
+                && !_quantWeights.ContainsKey("output.weight")
+                && !_weights.ContainsKey("output.weight");
+        }
+
+        /// <summary>
+        /// Keep the host copy of every non-layer weight while a layer split is
+        /// active. They are small next to the model, and it turns "this weight was
+        /// uploaded to the wrong GPU" from a segfault on freed memory into a
+        /// re-upload - worth the RAM as a second lock on the placement above.
+        /// </summary>
+        protected override bool ShouldRetainCudaHostQuantWeight(string weightName)
+        {
+            if (LayerSplitDegree > 1 && weightName != null
+                && !weightName.StartsWith("blk.", StringComparison.Ordinal))
+                return true;
+            return base.ShouldRetainCudaHostQuantWeight(weightName);
+        }
+
+        /// <summary>GPU that runs layer <paramref name="il"/>. 0 without a split.</summary>
+        internal int DeviceForLayer(int il)
+            => _layerDevice != null && il >= 0 && il < _layerDevice.Length ? _layerDevice[il] : 0;
 
         private static int CountTrue(bool[] a)
         {

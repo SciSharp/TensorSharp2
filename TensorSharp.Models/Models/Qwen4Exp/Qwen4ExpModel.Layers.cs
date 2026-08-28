@@ -300,15 +300,6 @@ namespace TensorSharp.Models
             int headDim = Config.HeadDim;
             int totalLen = startPos + seqLen;
 
-            if (UsesQsa(il) && !_qsaBudgetWarned && totalLen > _indexerTopK + _compressRatios[il] - 1)
-            {
-                _qsaBudgetWarned = true;
-                Console.WriteLine(
-                    $"[qwen4exp] context {totalLen} exceeds the QSA budget " +
-                    $"({_indexerTopK} + {_compressRatios[il]} - 1); running dense attention. " +
-                    "Output stays close but is no longer bit-exact against the reference.");
-            }
-
             long ta0 = Stopwatch.GetTimestamp();
             Tensor qgFull = LinearForward(cur, $"blk.{il}.attn_q.weight");  // [T, nHead*2*headDim]
             var q = new Tensor(_allocator, DType.Float32, seqLen, nHead * headDim);
@@ -489,6 +480,36 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Say once, per model, that the context has passed the size at which the
+        /// (unimplemented) sparse-attention indexer would start selecting rather
+        /// than keeping every cell. Every path runs dense attention either way, so
+        /// this is a note about reference fidelity, not a behaviour switch.
+        ///
+        /// It lives on the common forward entry point deliberately. It used to be
+        /// printed from the op-by-op AttentionLayer, which the fused paths reached
+        /// only by DECLINING the whole token - so printing the warning cost a
+        /// mid-sequence path switch that reset the GDN and PLE recurrent state and
+        /// wrecked the generation. A diagnostic must never be the reason a code
+        /// path is taken.
+        /// </summary>
+        private void WarnIfQsaBudgetExceeded(int totalLen)
+        {
+            if (_qsaBudgetWarned || _compressRatios == null) return;
+            for (int il = 0; il < Config.NumLayers; il++)
+            {
+                if (!UsesQsa(il)) continue;
+                int budget = _indexerTopK + _compressRatios[il] - 1;
+                if (totalLen <= budget) continue;
+                _qsaBudgetWarned = true;
+                Console.WriteLine(
+                    $"[qwen4exp] context {totalLen} exceeds the QSA budget " +
+                    $"({_indexerTopK} + {_compressRatios[il]} - 1); running dense attention. " +
+                    "Output stays close but is no longer bit-exact against the reference.");
+                return;
+            }
+        }
+
+        /// <summary>
         /// Partial rotary over the first <c>rope.dimension_count</c> of each head.
         /// The file asks for IMRoPE, which interleaves the t/h/w position components
         /// across pairs; for text every component is the same position, so it reduces
@@ -504,6 +525,13 @@ namespace TensorSharp.Models
             {
                 int half = _ropeDimCount / 2;
                 float* p = GetFloatPtr(data);
+                // Same frequency scale the GGML path (below) and both fused kernels
+                // pass. Omitting it here made this fast path rotate on a different
+                // convention from every other path the moment a GGUF declares
+                // rope.scaling.factor != 1, so K rows written before and after a
+                // fallback would disagree. No-op for factor == 1 (today's qwen4exp
+                // GGUFs), which is why it went unnoticed.
+                float freqScale = 1.0f / Config.RopeScale;
                 for (int t = 0; t < seqLen; t++)
                 {
                     int pos = startPos + t;
@@ -513,7 +541,7 @@ namespace TensorSharp.Models
                         float* x = row + (long)h * headDim;
                         for (int i = 0; i < half; i++)
                         {
-                            float theta = pos / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDimCount);
+                            float theta = freqScale * pos / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDimCount);
                             float cos = MathF.Cos(theta), sin = MathF.Sin(theta);
                             float a = x[i], b = x[i + half];
                             x[i] = a * cos - b * sin;

@@ -53,6 +53,35 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Speculation algorithm (<c>--spec-type</c>).</summary>
         public const string TypeEnvVar = SpeculationEnvVars.Type;
 
+        /// <summary>
+        /// Every valueless switch <see cref="Apply"/> consumes, current spelling
+        /// and historical alias alike.
+        ///
+        /// This exists because the flags are applied in a pass SEPARATE from the
+        /// host's own argument parse, and that pass does not REMOVE what it
+        /// consumes: TensorSharp.Server then walks the same argv and throws
+        /// "Unknown option" for anything it does not recognise. Two hand-written
+        /// lists of the same flag names is a drift bug waiting to happen, and it
+        /// happened - the server knew only the legacy <c>--mtp-*</c> spellings, so
+        /// every documented <c>--spec*</c> flag made it refuse to start. Hosts MUST
+        /// consume these tables rather than re-typing the names.
+        /// </summary>
+        public static readonly string[] SwitchFlags =
+        {
+            "--spec", "--no-spec", "--mtp-spec", "--no-mtp-spec",
+        };
+
+        /// <summary>Every <c>--flag VALUE</c> option <see cref="Apply"/> consumes.
+        /// Longer names come first so a prefix match can never swallow a longer
+        /// flag's value. See <see cref="SwitchFlags"/> for why this table exists.</summary>
+        public static readonly string[] ValueFlags =
+        {
+            "--spec-draft-model", "--mtp-draft-model",
+            "--spec-draft", "--mtp-draft",
+            "--spec-type", "--mtp-type",
+            "--spec-pmin", "--mtp-pmin",
+        };
+
         /// <summary>Largest accepted draft window; see
         /// <see cref="SpeculationOptions.MaxAllowedDraftTokens"/>.</summary>
         public const int MaxDraftTokens = SpeculationOptions.MaxAllowedDraftTokens;

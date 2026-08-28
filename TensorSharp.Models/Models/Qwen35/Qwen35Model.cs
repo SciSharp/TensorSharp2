@@ -1280,6 +1280,14 @@ namespace TensorSharp.Models
 
         public override bool SupportsKVCacheTruncation => false;
 
+        /// <summary>Qwen 3.5/3.8 implement the split FFN: BuildLayerKeys populates
+        /// _ffnGateSplitQW/_ffnUpSplitQW when the fused tensor is absent,
+        /// FFNCachedSplitGateUp runs the managed path, and all three fused native
+        /// graphs branch on <c>gu_w == nullptr</c> to emit two matmuls. Every
+        /// unsloth "UD" quant of this family needs it - about half their layers
+        /// store ffn_gate and ffn_up in different IQ types.</summary>
+        protected override bool SupportsSplitGateUpFfn => true;
+
         // Per-block snapshot for Qwen 3.5 (mix of attention layers and GDN
         // recurrent layers). Each block bundles:
         //   * For every attention layer L: K bytes for [start,start+B), V bytes

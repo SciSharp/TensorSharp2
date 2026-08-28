@@ -763,8 +763,9 @@ namespace TensorSharp.Models
                 cacheSize[l] = cacheLen;
                 cacheK[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
                 cacheV[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
-                InitializeCacheTensor(cacheK[l]);
-                InitializeCacheTensor(cacheV[l]);
+                // Zeroing happens once for the whole set below (ZeroKvCacheArrays),
+                // which also covers the backends ModelBase.InitializeCacheTensor
+                // skips - so no per-tensor init here.
                 // Q8_0 has fractional bytes/elem (1.0625) - go through ByteLengthFor
                 // so block-quantized layouts are accounted for correctly.
                 long perLayerElems = (long)kvHeads * cacheLen * hd;
@@ -777,6 +778,54 @@ namespace TensorSharp.Models
                 cacheV[kv.Key] = cacheV[kv.Value];
                 cacheSize[kv.Key] = cacheSize[kv.Value];
             }
+
+            // Every freshly-allocated cache set MUST start finite. The fused
+            // decode kernels read a FIXED 256-padded attention window over the
+            // cache; rows past the written length are masked (-inf) but are
+            // still multiplied/added, so uninitialised VRAM (NaN/Inf) there
+            // poisons the softmax and every logit becomes NaN - argmax then
+            // returns token 0 (<pad>) forever.
+            // InitializeCacheTensor above skips the fill on GgmlCuda/Mlx, so do
+            // it here, in the ONE place every cache set is born. It used to live
+            // in CreateFreshHolder only, which is why the replacement primary
+            // cache minted by AdoptPrimaryCacheToFused came up uninitialised and
+            // the first single-stream request after any concurrent episode
+            // decoded nothing but <pad>.
+            ZeroKvCacheArrays(cacheK, cacheV);
+        }
+
+        /// <summary>Zero every distinct tensor in a K/V cache array pair.
+        /// Donor-aliased layers share tensors, so fill each object once.</summary>
+        private void ZeroKvCacheArrays(Tensor[] cacheK, Tensor[] cacheV)
+        {
+            if (cacheK == null || cacheV == null)
+                return;
+            var zeroed = new HashSet<Tensor>();
+            for (int l = 0; l < cacheK.Length; l++)
+            {
+                if (cacheK[l] != null && zeroed.Add(cacheK[l])) InitGemma4CacheTensor(cacheK[l]);
+                if (cacheV[l] != null && zeroed.Add(cacheV[l])) InitGemma4CacheTensor(cacheV[l]);
+            }
+        }
+
+        /// <summary>
+        /// Zero one freshly-allocated Gemma 4 KV cache tensor.
+        ///
+        /// UNCONDITIONAL, unlike ModelBase.InitializeCacheTensor, which skips the
+        /// fill on GgmlCuda/Mlx. Gemma 4's fused decode graph reads a FIXED
+        /// 256-padded attention window: rows past the written length are masked
+        /// with -inf, which cancels a FINITE score but turns a non-finite one into
+        /// NaN - and one NaN takes the whole softmax row, then every logit, then
+        /// argmax returns token 0 (&lt;pad&gt;) forever. Pool blocks are recycled
+        /// without clearing, so on those backends the padding was live activation
+        /// garbage. Every cache allocation in this model must come through here:
+        /// the grow path and both tensor-parallel paths allocate their own tensors
+        /// and would otherwise reintroduce the same defect on a long conversation.
+        /// </summary>
+        private void InitGemma4CacheTensor(Tensor tensor)
+        {
+            if (tensor == null) return;
+            Ops.Fill(tensor, 0f);
         }
 
         // Grow the global-attention layers' KV cache to fit requiredSeqLen
@@ -819,8 +868,11 @@ namespace TensorSharp.Models
                 int hd = HeadDimForLayer(l);
                 var newK = new Tensor(_allocator, kvDtype, kvHeads, newCapacity, hd);
                 var newV = new Tensor(_allocator, kvDtype, kvHeads, newCapacity, hd);
-                InitializeCacheTensor(newK);
-                InitializeCacheTensor(newV);
+                // Zeroed, not just allocated: only rows [0, _cacheSeqLen) are copied
+                // in below, and the flash window reads past them. See
+                // InitGemma4CacheTensor.
+                InitGemma4CacheTensor(newK);
+                InitGemma4CacheTensor(newV);
 
                 if (_cacheSeqLen > 0)
                 {

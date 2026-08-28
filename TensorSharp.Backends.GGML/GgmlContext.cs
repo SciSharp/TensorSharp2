@@ -17,6 +17,17 @@ namespace TensorSharp.GGML
         internal GgmlMemoryPool MemoryPool { get; }
 
         public GgmlContext(int[] deviceIds, GgmlBackendType backendType)
+            : this(deviceIds, backendType, enableCollectives: true)
+        {
+        }
+
+        /// <param name="enableCollectives">
+        /// False for a LAYER SPLIT: bring up one backend per GPU but create no
+        /// cross-device collective. Each GPU runs a contiguous run of layers and
+        /// the only thing that crosses a boundary is the residual, handed over
+        /// through host memory, so there is nothing to AllReduce.
+        /// </param>
+        public GgmlContext(int[] deviceIds, GgmlBackendType backendType, bool enableCollectives)
         {
             if (deviceIds == null || deviceIds.Length == 0)
             {
@@ -32,20 +43,30 @@ namespace TensorSharp.GGML
 
             if (deviceIds.Length > 1)
             {
-                // Tensor parallelism: bring up one ggml backend per GPU. Ops then
-                // select a rank with GgmlNative.SetActiveDevice; tensors carry
-                // their rank through GgmlAllocator.DeviceId.
+                // Several GPUs: bring up one ggml backend per GPU. Ops then select a
+                // rank with GgmlNative.SetActiveDevice; tensors carry their rank
+                // through GgmlAllocator.DeviceId. Used both by tensor parallelism
+                // (every GPU holds a shard of every weight, collectives on) and by a
+                // layer split (each GPU holds a run of whole layers, collectives off).
                 if (backendType != GgmlBackendType.Cuda && backendType != GgmlBackendType.Vulkan)
                 {
                     throw new NotSupportedException(
-                        $"The GGML {backendType} backend exposes a single device; tensor parallelism requires the CUDA or Vulkan backend.");
+                        $"The GGML {backendType} backend exposes a single device; multi-GPU requires the CUDA or Vulkan backend.");
                 }
                 // The native side needs to know whether the ranks will be driven
                 // concurrently: that decides whether ggml-cuda's graph capture
                 // (which is process-wide and breaks under concurrent CUDA calls)
                 // has to be turned off for the run.
-                GgmlNative.TensorParallelInit(backendType, DeviceIds, GgmlTensorParallelGroup.ParallelRanks);
-                HasDeviceAllReduce = GgmlNative.TensorParallelHasDeviceAllReduce();
+                if (enableCollectives)
+                {
+                    GgmlNative.TensorParallelInit(backendType, DeviceIds, GgmlTensorParallelGroup.ParallelRanks);
+                    HasDeviceAllReduce = GgmlNative.TensorParallelHasDeviceAllReduce();
+                }
+                else
+                {
+                    GgmlNative.MultiDeviceInit(backendType, DeviceIds);
+                    HasDeviceAllReduce = false;
+                }
             }
             OpRegistry.RegisterAssembly(Assembly.GetExecutingAssembly());
 

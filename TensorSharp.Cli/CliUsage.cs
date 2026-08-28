@@ -126,7 +126,9 @@ namespace TensorSharp.Cli
                     "Split the model across N GPUs on this machine (tensor parallelism): each GPU holds 1/N of " +
                     "every weight and the shards cooperate on every token. Use it when a model does not fit on one " +
                     "GPU. Range: 1 to the number of local GPUs. Applies to the cuda, ggml_cuda, and ggml_vulkan " +
-                    "backends. Default: 1 — no splitting (TENSORSHARP_TP_DEGREE env var overrides).",
+                    "backends. " +
+                    "Multi-GPU is implemented PER ARCHITECTURE, not per backend, and in two forms. Architectures that shard weights run true tensor parallelism. qwen4exp (Qwen3.8-Flash-Next) shards nothing, so --tp N runs it as a LAYER SPLIT instead - each GPU holds a contiguous run of whole layers, which is the same and only multi-GPU mode llama.cpp offers for it. That is a CAPACITY feature: it lets a model, context or resident-weight set that one GPU cannot hold fit across several, and is not expected to raise tok/s. The startup line says which mode actually ran. An architecture that supports neither says so on stderr and runs on one GPU rather than silently leaving the others idle. " +
+                    "Default: 1 — no splitting (TENSORSHARP_TP_DEGREE env var overrides).",
                     "--backend ggml_cuda --tp 2"),
                 new OptionHelp("--tp-node-id <N>",
                     "This node's 0-based ID for multi-node (distributed) tensor parallelism over TCP. Node 0 is " +

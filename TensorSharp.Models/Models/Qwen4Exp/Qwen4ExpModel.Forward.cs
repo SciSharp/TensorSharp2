@@ -147,7 +147,16 @@ namespace TensorSharp.Models
         private void GrowCache(ref Tensor cache, int heads, int newLen, int dim, DType dtype)
         {
             var grown = new Tensor(_allocator, dtype, heads, newLen, dim);
-            InitializeCacheTensor(grown);
+            // Zero UNCONDITIONALLY. InitializeCacheTensor skips the fill on
+            // GgmlCuda/Mlx, and the native span kernel's own memset is guarded by
+            // `position == 0`, which a mid-sequence grow never satisfies - so the
+            // rows past _cacheSeqLen would keep whatever the memory pool handed
+            // back. The flash window is padded to a 256 stride past n_kv and those
+            // rows ARE read: a masked column contributes nothing only if its K row
+            // is finite, and an Inf there plus the -inf mask is NaN, which takes
+            // the whole softmax row. Fires on any conversation past the initial
+            // 8192-token capacity - e.g. a --max-tokens 20000 answer.
+            Ops.Fill(grown, 0f);
             if (_cacheSeqLen > 0)
             {
                 using var src = cache.Narrow(1, 0, _cacheSeqLen);
@@ -255,6 +264,7 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
             EnsureCacheCapacity(startPos + seqLen);
+            WarnIfQsaBudgetExceeded(startPos + seqLen);
 
             long tEmb = Stopwatch.GetTimestamp();
             Tensor embd = Embedding(tokens);           // [T, n_embd]
@@ -280,6 +290,19 @@ namespace TensorSharp.Models
             long tSpan = Stopwatch.GetTimestamp();
             bool spanDone = TryFusedTokenSpans(res, tokens, seqLen, startPos);
             if (spanDone) Q4eSpanTicks += Stopwatch.GetTimestamp() - tSpan;
+            if (!spanDone && LayerSplitDegree > 1)
+            {
+                // The op-by-op fallback allocates from _allocator (rank 0) and reads
+                // the HOST recurrent-state arrays. Under a layer split most layers'
+                // weights, KV device copies and GDN/PLE state live on another GPU, so
+                // running it would silently compute against the wrong device's state -
+                // the same class of failure as the mid-sequence QSA fallback that used
+                // to collapse generation. Refuse instead.
+                throw new NotSupportedException(
+                    "qwen4exp: the token-span path declined while a layer split is active. "
+                    + "The per-layer fallback is single-GPU only, so it cannot run here. "
+                    + "Re-run without --tp to use the fallback.");
+            }
             if (!spanDone && _pendingMRoPEPositions != null)
             {
                 // The fallback paths rotate with scalar positions only; running an
@@ -875,11 +898,10 @@ namespace TensorSharp.Models
         {
             if (!_fusedAttnEnabled || _fusedAttnUnsupported || !IsGgmlBackend)
                 return false;
-            // QSA is exact only at or below its budget; past that this would silently
-            // become dense, so leave it to the op-by-op path that warns.
+            // No QSA-budget guard here either - it computes the same dense
+            // attention the fallback would, and declining mid-sequence loses the
+            // device-resident recurrent state. See TryFusedTokenSpans.
             int totalLen = startPos + seqLen;
-            if (UsesQsa(il) && totalLen > _indexerTopK + _compressRatios[il] - 1)
-                return false;
 
             try
             {
@@ -1102,14 +1124,25 @@ namespace TensorSharp.Models
             }
 
 
-            // QSA is exact only at or below its budget; one layer past it and the
-            // whole token goes to the per-layer path, which knows how to warn.
+            // NOTE: there used to be a "past the QSA budget, decline the whole
+            // token" guard here. It was worse than useless.
+            //
+            // QSA is not implemented (see AttentionLayer's doc comment): both this
+            // path and the per-layer fallback compute DENSE attention, above the
+            // budget and below it. So the guard changed no arithmetic - it existed
+            // only to route the token to the code that printed the one-shot
+            // warning, which now happens in ForwardCoreInner instead.
+            //
+            // What it DID do was switch code paths in the middle of a live
+            // sequence, and this architecture cannot survive that: the span kernel
+            // keeps the GDN conv/ssm state and the PLE n-gram conv history in
+            // DEVICE buffers written in place, while the per-layer fallback reads
+            // and writes the HOST arrays those buffers were seeded from at startup.
+            // Falling back mid-sequence therefore silently restarts every recurrent
+            // stream from its startup contents. Symptom: generation is fine for
+            // ~1940 tokens and then collapses into one repeated token forever, the
+            // moment the context crosses indexer_top_k + compress_ratio - 1.
             int totalLen = startPos + seqLen;
-            for (int il = 0; il < Config.NumLayers; il++)
-            {
-                if (!_isRecurrent[il] && UsesQsa(il) && totalLen > _indexerTopK + _compressRatios[il] - 1)
-                    return false;
-            }
 
             try
             {
@@ -1136,6 +1169,26 @@ namespace TensorSharp.Models
                 _spanLogitsValid = false;
                 bool fuseHead = EnsureHeadArgs();
                 bool fusePle = EnsurePleArgs();
+
+                // Both of the remaining per-layer cuts run OUTSIDE a span, and only a
+                // span carries the device: the per-layer attention kernel and the host
+                // PleLayer would execute on whatever rank the thread happens to hold
+                // (always 0) while their layer's weights, KV device copy and recurrent
+                // state live on another GPU. Neither is reachable in a default run -
+                // the attention cut needs TS_Q4E_SPAN_ATTN=0 and the PLE cut needs the
+                // PLE descriptors to fail - so refuse the combination rather than add
+                // an untested placement path.
+                if (LayerSplitDegree > 1 && (!_spanAttnEnabled || !fusePle))
+                {
+                    _tokenGraphUnsupported = true;
+                    throw new NotSupportedException(
+                        "qwen4exp: a layer split needs every layer inside a token span, but "
+                        + (!_spanAttnEnabled
+                            ? "TS_Q4E_SPAN_ATTN=0 cuts attention out of the span"
+                            : "the PLE block could not be built into the span")
+                        + ". These per-layer paths are single-GPU only. Re-run without --tp, "
+                        + "or without TS_Q4E_SPAN_ATTN=0.");
+                }
 
                 // Image prompts carry a (T,H,W) IMRoPE position table; the span
                 // kernel takes it as-is and text forwards pass nothing.
@@ -1175,7 +1228,14 @@ namespace TensorSharp.Models
                         // the PLE block rides inside the span, which is the default.
                         // So does every attention layer unless TS_Q4E_SPAN_ATTN=1.
                         bool attnCut = il < Config.NumLayers && !_isRecurrent[il] && !_spanAttnEnabled;
-                        bool cut = il == Config.NumLayers || (_isPle[il] && !fusePle) || attnCut;
+                        // LAYER SPLIT: a span runs entirely on one GPU, so the token
+                        // is also cut wherever the owning device changes. The residual
+                        // crosses the seam through the host buffer it is already
+                        // passed in - the same hand-off a PLE cut uses - so a seam
+                        // costs one 40 KB round trip per decode token and nothing else.
+                        bool deviceCut = il < Config.NumLayers && il > begin
+                            && DeviceForLayer(il) != DeviceForLayer(begin);
+                        bool cut = il == Config.NumLayers || (_isPle[il] && !fusePle) || attnCut || deviceCut;
                         if (!cut) continue;
                         if (il > begin)
                         {
@@ -1220,7 +1280,8 @@ namespace TensorSharp.Models
                                 head: headPtr, logitsOut: logitsPtr,
                                 ple: plePtr, pleLayer: pleLayerArg, pleEmb: pleEmbPtr,
                                 mropePos: mropePtr, mropeSections: sectPtr,
-                                ropePosition: useMrope ? -1 : startPos - _mropeCacheGap);
+                                ropePosition: useMrope ? -1 : startPos - _mropeCacheGap,
+                                device: DeviceForLayer(begin));
                             if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {
@@ -1244,7 +1305,12 @@ namespace TensorSharp.Models
                             spanIdx++;
                             InvalidateTensorDeviceCache(res);
                         }
-                        if (il < Config.NumLayers && _isPle[il])
+                        // `&& !fusePle` MUST match the cut condition above. Without it,
+                        // ANY other reason to cut at a PLE layer - a device boundary, or
+                        // attnCut - ran the HOST PleLayer even though the PLE block is
+                        // also built into the spans, so PLE executed twice and its
+                        // n-gram conv history advanced twice for one token.
+                        if (il < Config.NumLayers && _isPle[il] && !fusePle)
                         {
                             long tPle = Stopwatch.GetTimestamp();
                             PleLayer(res, tokens, seqLen, startPos, il);
@@ -1272,6 +1338,15 @@ namespace TensorSharp.Models
                             DriverTrace(res, seqLen, $"attn{il} T={seqLen} pos={startPos}");
                             begin = il;
                             beginFfnOnly = true;
+                        }
+                        else if (deviceCut)
+                        {
+                            // Pure layer-split seam: no host work here at all. The span
+                            // just ended wrote the residual back to its host buffer and
+                            // the InvalidateTensorDeviceCache above dropped the device
+                            // copy, so the next span re-uploads it onto ITS gpu.
+                            begin = il;
+                            beginFfnOnly = false;
                         }
                     }
                 }
@@ -1417,7 +1492,11 @@ namespace TensorSharp.Models
         private unsafe bool ResidualToDevice(Tensor res, int seqLen)
         {
             if (_resOnDevice) return true;
-            if (!_resResidentEnabled || !IsGgmlBackend) return false;
+            // Never under a layer split: g_q4e_res is per-device, so a residual left
+            // resident on one GPU is invisible to the next span on another. The
+            // fallback that calls this is already refused under a split; this is the
+            // second lock on the same door.
+            if (!_resResidentEnabled || !IsGgmlBackend || LayerSplitDegree > 1) return false;
             long bytes = (long)seqLen * _hcDim * sizeof(float);
             _resOnDevice = GgmlBasicOps.Qwen4ExpResUpload((IntPtr)GetFloatPtr(res), bytes);
             return _resOnDevice;

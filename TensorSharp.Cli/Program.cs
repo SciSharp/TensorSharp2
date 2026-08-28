@@ -1771,6 +1771,18 @@ namespace TensorSharp.Cli
             if (!pinned.HasFlag(SamplingFields.TopP)) cfg.TopP = 0.95f;
             if (!pinned.HasFlag(SamplingFields.MinP)) cfg.MinP = 0.05f;
             if (!pinned.HasFlag(SamplingFields.PenaltyLastN)) cfg.PenaltyLastN = 64;
+            // NOTE: RepetitionPenalty is deliberately NOT defaulted here. The chat
+            // config is seeded from SamplingConfig.Greedy, which sets it to 1.0
+            // (disabled), and PenaltyLastN=64 above therefore penalises nothing -
+            // which looks like an oversight but is exactly llama.cpp's default pair
+            // (common/common.h: penalty_last_n=64, penalty_repeat=1.0), and matching
+            // that chain is this method's stated contract. A 1.1 default was tried
+            // while chasing an endless-repetition report on Qwen3.8-Flash-Next; the
+            // real cause turned out to be a mid-sequence fused-path fallback that
+            // reset the recurrent state (see Qwen4ExpModel.WarnIfQsaBudgetExceeded),
+            // and once that was fixed the seed that looped no longer did. Operators
+            // who want a penalty pass --repeat-penalty; a GGUF can also ask for one
+            // via general.sampling.penalty_repeat, applied just below.
 
             // 2. The model's own recommendation wins over our generic defaults.
             string fromModel = model?.Config?.RecommendedSampling?.ApplyTo(cfg, pinned) ?? string.Empty;

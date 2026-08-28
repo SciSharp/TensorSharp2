@@ -153,11 +153,6 @@ namespace
         }
     };
 
-    Qwen4ExpFfnCache g_q4e_ffn[kQwen4ExpMaxSlots];
-    Qwen4ExpFfnCache g_q4e_gdn[kQwen4ExpMaxSlots];
-    Qwen4ExpFfnCache g_q4e_attn[kQwen4ExpMaxSlots];
-    Qwen4ExpFfnCache g_q4e_span[kQwen4ExpSpanSlots];
-
     // The PLE conv history: one persistent device buffer (one PLE layer in the
     // shipped checkpoint). ready=false re-seeds from the host on the next build.
     // ---- per-sequence recurrent-state store -------------------------------
@@ -176,7 +171,46 @@ namespace
         std::size_t bytes = 0;
         bool ready = false;
     };
-    std::unordered_map<const void*, Q4eSeqStateEntry> g_q4e_seq_state;
+    // ---- per-device executor state ---------------------------------------
+    //
+    // A layer split puts a contiguous run of layers on each GPU, so the same
+    // process drives several devices within one token. Every field below either
+    // IS device memory or bakes a device pointer into a persisted graph, so a
+    // single shared copy would hand device 1 device 0's buffers.
+    //
+    // Indexed by tsg::g_active_rank, which ScopedRank sets around each span.
+    struct Q4eDeviceState
+    {
+        Qwen4ExpFfnCache ffn[kQwen4ExpMaxSlots];
+        Qwen4ExpFfnCache gdn[kQwen4ExpMaxSlots];
+        Qwen4ExpFfnCache attn[kQwen4ExpMaxSlots];
+        Qwen4ExpFfnCache span[kQwen4ExpSpanSlots];
+
+        // GDN conv+ssm state and the PLE conv history, keyed by the HOST SEED
+        // POINTER from the descriptors. Per device as well as per key: with a
+        // layer split, layer L's recurrent state must live on layer L's GPU, and
+        // the same holder's seed pointers are used for layers on both.
+        std::unordered_map<const void*, Q4eSeqStateEntry> seq_state;
+
+        // The 4-wide residual held on the device across a span.
+        ggml_backend_buffer_t res_buf = nullptr;
+        std::size_t res_capacity = 0;
+        ggml_context* res_ctx = nullptr;
+        ggml_tensor* res = nullptr;
+    };
+
+    Q4eDeviceState g_q4e_devs[tsg::TSG_MAX_DEVICES];
+    inline Q4eDeviceState& q4e_dev() { return g_q4e_devs[tsg::g_active_rank]; }
+
+#define g_q4e_ffn            (q4e_dev().ffn)
+#define g_q4e_gdn            (q4e_dev().gdn)
+#define g_q4e_attn           (q4e_dev().attn)
+#define g_q4e_span           (q4e_dev().span)
+#define g_q4e_seq_state      (q4e_dev().seq_state)
+#define g_q4e_res_buf        (q4e_dev().res_buf)
+#define g_q4e_res_capacity   (q4e_dev().res_capacity)
+#define g_q4e_res_ctx        (q4e_dev().res_ctx)
+#define g_q4e_res            (q4e_dev().res)
 
     Q4eSeqStateEntry* q4e_seq_state(const void* key, std::size_t bytes)
     {
@@ -303,7 +337,11 @@ namespace
                 return false;
             }
             if (needs_upload)
-                ggml_backend_tensor_set(cb.tensor, cb.data, 0, cb.bytes);
+            {
+                // Same redirect as Q4eBinder::flush: for a quantized weight cb.data
+                // is a CacheKey (a GCHandle value), not memory.
+                ggml_backend_tensor_set(cb.tensor, resolve_upload_source(cb.data), 0, cb.bytes);
+            }
         }
         return true;
     }
@@ -456,12 +494,19 @@ namespace
     //
     // Used by the per-layer fallback's residency experiment; the token span does not
     // need it - inside one graph the residual never exists on the host at all.
-    ggml_backend_buffer_t g_q4e_res_buf = nullptr;
-    std::size_t g_q4e_res_capacity = 0;
-    ggml_context* g_q4e_res_ctx = nullptr;
-    ggml_tensor* g_q4e_res = nullptr;
+    // Clamp a caller-supplied device index to an initialized rank. -1 (or an
+    // out-of-range value from a host that predates the layer split) means "the
+    // current rank", which is 0 on every single-GPU run.
+    int q4e_resolve_device(int device)
+    {
+        if (device < 0) return tsg::g_active_rank;
+        const int ndev = tsg::g_device_count.load(std::memory_order_acquire);
+        if (device >= ndev || device >= tsg::TSG_MAX_DEVICES) return tsg::g_active_rank;
+        return device;
+    }
 
     // Ensure the shared residual tensor exists and is at least `bytes` big.
+    // Per device: see Q4eDeviceState.
     bool q4e_res_ensure(std::size_t bytes)
     {
         if (g_q4e_res != nullptr && g_q4e_res_capacity >= bytes)
@@ -549,8 +594,18 @@ namespace
 
         void flush()
         {
+            // resolve_upload_source, not the raw pointer. For a QUANTIZED weight the
+            // "host pointer" C# passes is a CacheKey - a GCHandle value, not memory -
+            // and the redirect turns it back into the real bytes. Every other fused
+            // executor in this repo does this (dflash, qwen35, gemma4, gptoss,
+            // muse_glimmer); qwen4exp got away without it only because rank 0 always
+            // had every weight preloaded, so needs_upload was never true here.
+            // A layer split makes a misplaced weight reachable, and without this the
+            // symptom is a cudaMemcpy from a handle value. It also counts the
+            // redirect (reported by TS_GGML_LOG_VRAM=1), so a misplacement shows up
+            // as a number instead of a crash.
             for (const Q4eHostBinding& hb : upload_list)
-                ggml_backend_tensor_set(hb.tensor, hb.data, 0, hb.bytes);
+                ggml_backend_tensor_set(hb.tensor, resolve_upload_source(hb.data), 0, hb.bytes);
             upload_list.clear();
         }
     };
@@ -1636,7 +1691,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
     float eps, int cache_slot, int first_ffn_only,
     const TSGgmlQwen4ExpHeadArgs* head, void* logits_out,
     const TSGgmlQwen4ExpPleArgs* ple, int ple_layer, const void* ple_emb,
-    const int* mrope_pos, const int* mrope_sections, int rope_position)
+    const int* mrope_pos, const int* mrope_sections, int rope_position,
+    int device)
 {
     try
     {
@@ -1647,6 +1703,11 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             set_last_error("qwen4exp token span: bad args.");
             return 0;
         }
+        // LAYER SPLIT: run this span's layers on their own GPU. Everything the
+        // span touches - the persisted graph slot, the resident weight copies,
+        // the KV device copies, the GDN/PLE state buffers, the residual buffer -
+        // is selected by the active rank, so the scope is the whole mechanism.
+        tsg::ScopedRank q4e_rank(q4e_resolve_device(device));
         if (!ensure_backend()) return 0;
         if ((head != nullptr) != (logits_out != nullptr))
         {
@@ -2251,17 +2312,26 @@ TSG_EXPORT int TSGgml_Qwen4ExpResDownload(void* data, long long bytes)
 
 TSG_EXPORT void TSGgml_Qwen4ExpResetFfnCache()
 {
-    for (int i = 0; i < kQwen4ExpMaxSlots; ++i)
+    // Sweep every initialized device. Under a layer split the token's layers are
+    // spread across GPUs, each with its own graph slots and residual buffer;
+    // resetting only the active rank would leave live graphs elsewhere pointing
+    // at state the caller believes it has dropped.
+    const int ndev = tsg::g_device_count.load(std::memory_order_acquire);
+    for (int d = 0; d < ndev && d < tsg::TSG_MAX_DEVICES; ++d)
     {
-        g_q4e_ffn[i].reset();
-        g_q4e_gdn[i].reset();
-        g_q4e_attn[i].reset();
+        tsg::ScopedRank rank(d);
+        for (int i = 0; i < kQwen4ExpMaxSlots; ++i)
+        {
+            g_q4e_ffn[i].reset();
+            g_q4e_gdn[i].reset();
+            g_q4e_attn[i].reset();
+        }
+        for (int i = 0; i < kQwen4ExpSpanSlots; ++i)
+            g_q4e_span[i].reset();
+        if (g_q4e_res_ctx) { ggml_free(g_q4e_res_ctx); g_q4e_res_ctx = nullptr; }
+        if (g_q4e_res_buf) { ggml_backend_buffer_free(g_q4e_res_buf); g_q4e_res_buf = nullptr; }
+        g_q4e_res = nullptr; g_q4e_res_capacity = 0;
     }
-    for (int i = 0; i < kQwen4ExpSpanSlots; ++i)
-        g_q4e_span[i].reset();
-    if (g_q4e_res_ctx) { ggml_free(g_q4e_res_ctx); g_q4e_res_ctx = nullptr; }
-    if (g_q4e_res_buf) { ggml_backend_buffer_free(g_q4e_res_buf); g_q4e_res_buf = nullptr; }
-    g_q4e_res = nullptr; g_q4e_res_capacity = 0;
 }
 
 /// Mark one sequence-state entry (keyed by its host seed pointer) as needing a
@@ -2270,8 +2340,13 @@ TSG_EXPORT void TSGgml_Qwen4ExpResetFfnCache()
 /// host copies are freshly zeroed.
 TSG_EXPORT void TSGgml_Qwen4ExpInvalidateSeqState(const void* key)
 {
-    auto it = g_q4e_seq_state.find(key);
-    if (it != g_q4e_seq_state.end()) it->second.ready = false;
+    const int ndev = tsg::g_device_count.load(std::memory_order_acquire);
+    for (int d = 0; d < ndev && d < tsg::TSG_MAX_DEVICES; ++d)
+    {
+        tsg::ScopedRank rank(d);
+        auto it = g_q4e_seq_state.find(key);
+        if (it != g_q4e_seq_state.end()) it->second.ready = false;
+    }
 }
 
 /// Free EVERY sequence-state entry and drop every cached graph. Called on
@@ -2279,9 +2354,14 @@ TSG_EXPORT void TSGgml_Qwen4ExpInvalidateSeqState(const void* key)
 /// with stale entries keyed on recycled host addresses.
 TSG_EXPORT void TSGgml_Qwen4ExpReleaseAllSeqState()
 {
-    for (auto& kv : g_q4e_seq_state)
-        if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf);
-    g_q4e_seq_state.clear();
+    const int ndev = tsg::g_device_count.load(std::memory_order_acquire);
+    for (int d = 0; d < ndev && d < tsg::TSG_MAX_DEVICES; ++d)
+    {
+        tsg::ScopedRank rank(d);
+        for (auto& kv : g_q4e_seq_state)
+            if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf);
+        g_q4e_seq_state.clear();
+    }
     TSGgml_Qwen4ExpResetFfnCache();
 }
 
@@ -2292,13 +2372,18 @@ TSG_EXPORT void TSGgml_Qwen4ExpReleaseAllSeqState()
 TSG_EXPORT void TSGgml_Qwen4ExpReleaseSeqState(const void* const* keys, int n)
 {
     bool freed = false;
-    for (int i = 0; i < n; ++i)
+    const int ndev = tsg::g_device_count.load(std::memory_order_acquire);
+    for (int d = 0; d < ndev && d < tsg::TSG_MAX_DEVICES; ++d)
     {
-        auto it = g_q4e_seq_state.find(keys[i]);
-        if (it == g_q4e_seq_state.end()) continue;
-        if (it->second.buf) ggml_backend_buffer_free(it->second.buf);
-        g_q4e_seq_state.erase(it);
-        freed = true;
+        tsg::ScopedRank rank(d);
+        for (int i = 0; i < n; ++i)
+        {
+            auto it = g_q4e_seq_state.find(keys[i]);
+            if (it == g_q4e_seq_state.end()) continue;
+            if (it->second.buf) ggml_backend_buffer_free(it->second.buf);
+            g_q4e_seq_state.erase(it);
+            freed = true;
+        }
     }
     if (freed)
         TSGgml_Qwen4ExpResetFfnCache();

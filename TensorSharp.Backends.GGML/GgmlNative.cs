@@ -4027,7 +4027,8 @@ internal enum GgmlIndexReductionOp
             float eps, int cacheSlot, int firstFfnOnly,
             IntPtr head, IntPtr logitsOut,
             IntPtr ple, int pleLayer, IntPtr pleEmb,
-            IntPtr mropePos, IntPtr mropeSections, int ropePosition);
+            IntPtr mropePos, IntPtr mropeSections, int ropePosition,
+            int device);
 
         public static bool Qwen4ExpTokenSpan(
             IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
@@ -4041,7 +4042,7 @@ internal enum GgmlIndexReductionOp
             float eps, int cacheSlot, bool firstFfnOnly,
             IntPtr head, IntPtr logitsOut,
             IntPtr ple, int pleLayer, IntPtr pleEmb,
-            IntPtr mropePos, IntPtr mropeSections, int ropePosition)
+            IntPtr mropePos, IntPtr mropeSections, int ropePosition, int device)
         {
             return TSGgml_Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
                 resData, maskData, nEmbd, hc, hcLowRank, nTokens,
@@ -4050,7 +4051,7 @@ internal enum GgmlIndexReductionOp
                 nRot, ropeBase, ropeFreqScale, attnScale,
                 nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
                 firstFfnOnly ? 1 : 0, head, logitsOut, ple, pleLayer, pleEmb,
-                mropePos, mropeSections, ropePosition) != 0;
+                mropePos, mropeSections, ropePosition, device) != 0;
         }
 
         [LibraryImport(DllName)]

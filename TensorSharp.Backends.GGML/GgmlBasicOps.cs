@@ -3040,7 +3040,10 @@ namespace TensorSharp.GGML
             IntPtr head = default, IntPtr logitsOut = default,
             IntPtr ple = default, int pleLayer = -1, IntPtr pleEmb = default,
             IntPtr mropePos = default, IntPtr mropeSections = default,
-            int ropePosition = -1)
+            int ropePosition = -1,
+            // GPU this span's layers live on (layer split). -1 / 0 = the current
+            // rank, which is the only rank on a single-GPU run.
+            int device = 0)
         {
             return GgmlNative.Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
                 resData, maskData, nEmbd, hc, hcLowRank, nTokens,
@@ -3048,7 +3051,8 @@ namespace TensorSharp.GGML
                 headDim, nHead, nHeadKv, kvCapacity, nKv, position,
                 nRot, ropeBase, ropeFreqScale, attnScale,
                 nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot, firstFfnOnly,
-                head, logitsOut, ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition);
+                head, logitsOut, ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition,
+                device);
         }
 
         public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();
