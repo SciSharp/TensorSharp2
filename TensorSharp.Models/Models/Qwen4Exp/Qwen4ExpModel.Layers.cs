@@ -70,6 +70,22 @@ namespace TensorSharp.Models
             // The kernel reads [T, H, D]; `gated` is the same memory laid out [T, H*D].
             using Tensor gated3 = gated.View(seqLen, _numVHeads, _headVDim);
             long tp2 = Stopwatch.GetTimestamp();
+            if (!IsGgmlBackend)
+            {
+                // Pure-C# backend: there is no native kernel to call. Without this
+                // qwen4exp aborted on its first GDN layer with "Native GGML
+                // gated_delta_net_chunked failed", so the architecture had no
+                // managed backend at all.
+                GatedDeltaNetRecurrenceManaged(il, seqLen, gated3);
+                Q4eGdnKernelTicks += Stopwatch.GetTimestamp() - tp2;
+                qkv.Dispose(); z.Dispose(); betaT.Dispose(); alphaT.Dispose();
+                InvalidateTensorDeviceCache(gated);
+                long tp3m = Stopwatch.GetTimestamp();
+                Tensor outProjM = LinearForward(gated, $"blk.{il}.ssm_out.weight");
+                Q4eGdnOutTicks += Stopwatch.GetTimestamp() - tp3m;
+                gated.Dispose();
+                return outProjM;
+            }
             GgmlBasicOps.GatedDeltaNetChunked(
                 qv, kv, vv, zv, av, bv, _gdnStateT[il], gated3,
                 (IntPtr)GetFloatPtr(_weights[$"blk.{il}.ssm_dt.bias"]),
@@ -93,6 +109,107 @@ namespace TensorSharp.Models
             Q4eGdnOutTicks += Stopwatch.GetTimestamp() - tp3;
             gated.Dispose();
             return outProj;
+        }
+
+        /// <summary>
+        /// The gated delta rule, in managed code, for backends with no native kernel.
+        ///
+        /// PrepareGdnInputs has already done the parts the native kernel documents as
+        /// host-side AND the parts it does itself: conv1d + SiLU, the per-head L2 norm
+        /// of Q/K, the K-head tiling, the 1/sqrt(D) scale on Q, the alpha gate
+        /// (softplus(alpha + dt_bias) * ssm_a, with ssm_a pre-negated so it decays) and
+        /// the sigmoid on beta. So all that is left is the recurrence:
+        ///
+        ///     S      *= exp(gate)
+        ///     delta   = (v - S k) * beta
+        ///     S      += delta k^T
+        ///     core    = S q
+        ///     out     = rmsnorm(core) * ssm_norm_w * sigmoid(z)
+        ///
+        /// qwen4exp gates with SIGMOID where Qwen 3.5 uses SiLU - the same one-flag
+        /// difference the native kernel takes as gate_mode.
+        ///
+        /// Heads are independent, so they run in parallel; the sequence is not, so t
+        /// stays serial.
+        /// </summary>
+        private unsafe void GatedDeltaNetRecurrenceManaged(int il, int seqLen, Tensor gatedOut)
+        {
+            int headK = _headKDim;
+            int headV = _headVDim;
+            int heads = _numVHeads;
+            int statePerHead = headV * headK;
+            float eps = Config.Eps;
+
+            float* q = GetFloatPtr(_gdnQBuf);
+            float* k = GetFloatPtr(_gdnKBuf);
+            float* v = GetFloatPtr(_gdnVBuf);
+            float* z = GetFloatPtr(_gdnZBuf);
+            float* a = GetFloatPtr(_gdnAlphaBuf);
+            float* b = GetFloatPtr(_gdnBetaBuf);
+            float* state = GetFloatPtr(_gdnStateT[il]);
+            float* ssmNorm = GetFloatPtr(_weights[$"blk.{il}.ssm_norm.weight"]);
+            float* outP = GetFloatPtr(gatedOut);
+
+            // One delta/core scratch row per head so the parallel loop never shares.
+            EnsureGdnRecurrenceScratch(heads * headV);
+            fixed (float* deltaAll = _gdnDelta, coreAll = _gdnCore)
+            {
+                float* deltaBase = deltaAll;
+                float* coreBase = coreAll;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    float* qT = q + (long)t * heads * headK;
+                    float* kT = k + (long)t * heads * headK;
+                    float* vT = v + (long)t * heads * headV;
+                    float* zT = z + (long)t * heads * headV;
+                    float* aT = a + (long)t * heads;
+                    float* bT = b + (long)t * heads;
+                    float* oT = outP + (long)t * heads * headV;
+
+                    System.Threading.Tasks.Parallel.For(0, heads, h =>
+                    {
+                        float* s = state + (long)h * statePerHead;
+                        float* qh = qT + (long)h * headK;
+                        float* kh = kT + (long)h * headK;
+                        float* vh = vT + (long)h * headV;
+                        float* zh = zT + (long)h * headV;
+                        float* oh = oT + (long)h * headV;
+                        float* delta = deltaBase + (long)h * headV;
+                        float* core = coreBase + (long)h * headV;
+
+                        VecScale(s, MathF.Exp(aT[h]), statePerHead);
+                        float beta = bT[h];
+
+                        for (int row = 0; row < headV; row++)
+                            delta[row] = (vh[row] - VecDot(s + (long)row * headK, kh, headK)) * beta;
+
+                        for (int row = 0; row < headV; row++)
+                        {
+                            float* sRow = s + (long)row * headK;
+                            VecScaleAdd(sRow, kh, delta[row], headK);
+                            core[row] = VecDot(sRow, qh, headK);
+                        }
+
+                        float rmsInv = 1.0f / MathF.Sqrt((VecSumSq(core, headV) / headV) + eps);
+                        for (int i = 0; i < headV; i++)
+                        {
+                            float gate = 1.0f / (1.0f + MathF.Exp(-zh[i]));   // sigmoid, not SiLU
+                            oh[i] = core[i] * rmsInv * ssmNorm[i] * gate;
+                        }
+                    });
+                }
+            }
+
+            InvalidateTensorDeviceCache(_gdnStateT[il]);
+        }
+
+        private void EnsureGdnRecurrenceScratch(int needed)
+        {
+            if (_gdnDelta == null || _gdnDelta.Length < needed)
+            {
+                _gdnDelta = new float[needed];
+                _gdnCore = new float[needed];
+            }
         }
 
         private const int GdnChunkSize = 64;

@@ -60,8 +60,6 @@ namespace TensorSharp
         public static Tensor Addmm(Tensor result, float beta, Tensor src, float alpha, Tensor m1, Tensor m2) { return (Tensor)OpRegistry.Invoke("addmm", result, beta, src, alpha, m1, m2); }
 
         public static Tensor AddmmBatch(Tensor result, float beta, Tensor src, float alpha, Tensor m1, Tensor m2) { return (Tensor)OpRegistry.Invoke("addmmbatch", result, beta, src, alpha, m1, m2); }
-        public static Tensor MulmatID(Tensor result, Tensor expertWeights, Tensor input, Tensor ids) { return (Tensor)OpRegistry.Invoke("mulmatid", result, expertWeights, input, ids); }
-        public static Tensor AddID(Tensor result, Tensor src, Tensor bias, Tensor ids) { return (Tensor)OpRegistry.Invoke("addid", result, src, bias, ids); }
 
         public static Tensor Abs(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("abs", result, src); }
         public static Tensor Neg(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("neg", result, src); }
@@ -90,34 +88,23 @@ namespace TensorSharp
         public static Tensor GELUMul(Tensor result, Tensor gate, Tensor up) { return (Tensor)OpRegistry.Invoke("GELUMul", result, gate, up); }
         public static Tensor SigmoidMul(Tensor result, Tensor x, Tensor gate) { return (Tensor)OpRegistry.Invoke("SigmoidMul", result, x, gate); }
 
-        public static Tensor SiLUD(Tensor result, Tensor srcW, Tensor resG) { return (Tensor)OpRegistry.Invoke("SiLUD", result, srcW, resG); }
-
-        public static Tensor AddSiLUD(Tensor result, Tensor srcG, Tensor srcW, Tensor resG) { return (Tensor)OpRegistry.Invoke("AddSiLUD", result, srcG, srcW, resG); }
 
 
 
-        public static Tensor Float2Half(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("float2half", result, src); }
-        public static Tensor Half2Float(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("half2float", result, src); }
+
 
 
         public static Tensor Relu(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("relu", result, src); }
 
-        public static Tensor ReluD(Tensor result, Tensor w, Tensor g) { return (Tensor)OpRegistry.Invoke("relud", result, w, g); }
-
-        public static Tensor AddReluD(Tensor result, Tensor t, Tensor w, Tensor g) { return (Tensor)OpRegistry.Invoke("addrelud", result, t, w, g); }
 
 
 
-        public static Tensor LeakyReLU(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("LeakyReLU", result, src); }
-
-        public static Tensor LeakyReLUD(Tensor result, Tensor w, Tensor g) { return (Tensor)OpRegistry.Invoke("LeakyReLUD", result, w, g); }
-
-        public static Tensor AddLeakyReLUD(Tensor result, Tensor t, Tensor w, Tensor g) { return (Tensor)OpRegistry.Invoke("AddLeakyReLUD", result, t, w, g); }
 
 
-        public static Tensor Sqrt(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("sqrt", result, src); }
 
-        public static Tensor Rsqrt(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("rsqrt", result, src); }
+
+
+
 
         public static Tensor Exp(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("exp", result, src); }
         public static Tensor Log(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("log", result, src); }
@@ -128,7 +115,6 @@ namespace TensorSharp
         public static Tensor Trunc(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("trunc", result, src); }
         public static Tensor Frac(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("frac", result, src); }
 
-        public static Tensor Sin(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("sin", result, src); }
         public static Tensor Cos(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("cos", result, src); }
         public static Tensor Tan(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("tan", result, src); }
 
@@ -142,18 +128,12 @@ namespace TensorSharp
 
         public static Tensor Sigmoid(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("sigmoid", result, src); }
 
-        public static Tensor AddSigmoidD(Tensor result, Tensor t, Tensor resW, Tensor resG) { return (Tensor)OpRegistry.Invoke("addsigmoidD", result, t, resW, resG); }
-
-        public static Tensor AddTanhD(Tensor result, Tensor t, Tensor resW, Tensor resG) { return (Tensor)OpRegistry.Invoke("addtanhD", result, t, resW, resG); }
 
 
-        public static Tensor SigmoidD(Tensor result, Tensor resW, Tensor resG) { return (Tensor)OpRegistry.Invoke("sigmoidD", result, resW, resG); }
-
-        public static Tensor TanhD(Tensor result, Tensor resW, Tensor resG) { return (Tensor)OpRegistry.Invoke("tanhD", result, resW, resG); }
 
 
-        public static Tensor AddTanh(Tensor result, Tensor x, Tensor y) { return (Tensor)OpRegistry.Invoke("addtanh", result, x, y); }
-        public static Tensor AddTanh3(Tensor result, Tensor x, Tensor y, Tensor z) { return (Tensor)OpRegistry.Invoke("addtanh3", result, x, y, z); }
+
+
 
         public static Tensor MulMulAdd(Tensor result, Tensor x, Tensor y, Tensor z, Tensor w) { return (Tensor)OpRegistry.Invoke("mulmuladd", result, x, y, z, w); }
 
@@ -164,7 +144,6 @@ namespace TensorSharp
 
 
 
-        public static Tensor MaskFill(Tensor result, Tensor t, Tensor mask, float defValue) { return (Tensor)OpRegistry.Invoke("maskfill", result, t, mask, defValue); }
 
         public static Tensor Atan2(Tensor result, Tensor srcY, Tensor srcX) { return (Tensor)OpRegistry.Invoke("atan2", result, srcY, srcX); }
         public static Tensor Pow(Tensor result, Tensor src, float value) { return (Tensor)OpRegistry.Invoke("pow", result, src, value); }
@@ -178,7 +157,6 @@ namespace TensorSharp
         public static Tensor Mul(Tensor result, Tensor lhs, float rhs) { return (Tensor)OpRegistry.Invoke("mulv", result, lhs, rhs); }
         public static Tensor Div(Tensor result, Tensor lhs, float rhs) { return (Tensor)OpRegistry.Invoke("divv", result, lhs, rhs); }
         public static Tensor Div(Tensor result, float lhs, Tensor rhs) { return (Tensor)OpRegistry.Invoke("rdivv", result, lhs, rhs); }
-        public static Tensor Mod(Tensor result, Tensor lhs, float rhs) { return (Tensor)OpRegistry.Invoke("modv", result, lhs, rhs); }
 
         public static Tensor GreaterThan(Tensor result, Tensor lhs, float rhs) { return (Tensor)OpRegistry.Invoke("gtValue", result, lhs, rhs); }
         public static Tensor LessThan(Tensor result, Tensor lhs, float rhs) { return (Tensor)OpRegistry.Invoke("ltValue", result, lhs, rhs); }
@@ -191,10 +169,8 @@ namespace TensorSharp
         public static Tensor Sub(Tensor result, Tensor lhs, Tensor rhs) { return (Tensor)OpRegistry.Invoke("subt", result, lhs, rhs); }
         public static Tensor Mul(Tensor result, Tensor lhs, Tensor rhs) { return (Tensor)OpRegistry.Invoke("mult", result, lhs, rhs); }
         public static Tensor Div(Tensor result, Tensor lhs, Tensor rhs) { return (Tensor)OpRegistry.Invoke("divt", result, lhs, rhs); }
-        public static Tensor Mod(Tensor result, Tensor lhs, Tensor rhs) { return (Tensor)OpRegistry.Invoke("modt", result, lhs, rhs); }
 
 
-        public static Tensor AtomicAdd(Tensor result, Tensor rhs) { return (Tensor)OpRegistry.Invoke("atomicadd", result, rhs); }
 
         public static Tensor GreaterThan(Tensor result, Tensor lhs, Tensor rhs) { return (Tensor)OpRegistry.Invoke("gtTensor", result, lhs, rhs); }
         public static Tensor LessThan(Tensor result, Tensor lhs, Tensor rhs) { return (Tensor)OpRegistry.Invoke("ltTensor", result, lhs, rhs); }
@@ -216,13 +192,10 @@ namespace TensorSharp
         public static Tensor Std(Tensor result, Tensor src, int dimension, bool normByN) { return (Tensor)OpRegistry.Invoke("std", result, src, dimension, normByN); }
         public static Tensor Var(Tensor result, Tensor src, int dimension, bool normByN) { return (Tensor)OpRegistry.Invoke("var", result, src, dimension, normByN); }
 
-        public static bool IsCorrupted(Tensor src) { return (bool)OpRegistry.Invoke("iscorrupted", src); }
         public static Tensor Softmax(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("softmax", result, src); }
-        public static Tensor SoftmaxGrad(Tensor grad, Tensor adj, Tensor val, bool addGrad = true) { return (Tensor)OpRegistry.Invoke("softmaxgrad", grad, adj, val, addGrad); }
 
 
         public static Tensor IndexSelect(Tensor result, Tensor src, Tensor indice, bool isAdd = false) { return (Tensor)OpRegistry.Invoke("indexselect", result, src, indice, isAdd); }
-        public static Tensor IndexSelectGrad(Tensor grad, Tensor adj, Tensor indice) { return (Tensor)OpRegistry.Invoke("indexselectgrad", grad, adj, indice); }
 
         /// <summary>
         /// Repeat each slice along <paramref name="dim"/> <paramref name="repeats"/> times consecutively.
@@ -238,83 +211,34 @@ namespace TensorSharp
         /// </summary>
         public static void AddCausalMask(Tensor tensor, int seqLen, int startPos, float maskedValue) { OpRegistry.Invoke("add_causal_mask", tensor, seqLen, startPos, maskedValue); }
 
-        public static Tensor Rows(Tensor result, Tensor src, Tensor indices) { return IndexSelect(result, src, indices, false); }
-        public static Tensor SetRows(Tensor result, Tensor src, Tensor indices) { return Scatter(result, src, 0, indices); }
 
 
         public static Tensor RoPE(Tensor result, Tensor src, int seqLen, int rowOffset) { return (Tensor)OpRegistry.Invoke("rope", result, src, seqLen, rowOffset); }
-        public static Tensor RoPEGrad(Tensor grad, Tensor adj, int seqLen, int rowOffset) { return (Tensor)OpRegistry.Invoke("ropegrad", grad, adj, seqLen, rowOffset); }
         public static Tensor RoPEEx(Tensor result, Tensor src, Tensor positions, int ropeDim, int mode, int originalContextLength, float freqBase, float freqScale, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f, bool addToResult = false, bool invertPositions = false)
         {
             return (Tensor)OpRegistry.Invoke("rope_ex", result, src, positions, ropeDim, mode, originalContextLength, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow, addToResult, invertPositions);
         }
 
 
-        public static Tensor BuildSrcTgtMask(Tensor result, Tensor srcOriginalLengths, Tensor tgtOriginalLengths, int srcPaddedSeqLength, int tgtPaddedSeqLength, float value, float maskedValue)
-        {
-            return (Tensor)OpRegistry.Invoke("buildsrctgtmask", result, srcOriginalLengths, tgtOriginalLengths, srcPaddedSeqLength, tgtPaddedSeqLength, value, maskedValue);
-        }
-
-        public static Tensor BuildSelfMask(Tensor result, Tensor originalLengths, int paddedSeqLength, float value, float maskedValue)
-        {
-            return (Tensor)OpRegistry.Invoke("buildselfmask", result, originalLengths, paddedSeqLength, value, maskedValue);
-        }
-
-        public static Tensor BuildSelfTriMask(Tensor result, Tensor originalLengths, int paddedSeqLength, float value, float maskedValue)
-        {
-            return (Tensor)OpRegistry.Invoke("buildselftrimask", result, originalLengths, paddedSeqLength, value, maskedValue);
-        }
-
-        public static Tensor BuildTriMask(Tensor result, float value, float maskedValue)
-        {
-            return (Tensor)OpRegistry.Invoke("buildtrimask", result, value, maskedValue);
-        }
 
 
-        public static Tensor TopK(Tensor outVal, Tensor outIdx, Tensor inVal, int k)
-        {
-            return (Tensor)OpRegistry.Invoke("topK", outVal, outIdx, inVal, k);
-        }
+
+
+
 
         public static Tensor LayerNorm(Tensor result, Tensor src, Tensor alpha, Tensor beta, float eps = 1e-09f) { return (Tensor)OpRegistry.Invoke("layernorm", result, src, alpha, beta, eps); }
-        public static Tensor LayerNormGrad(Tensor outGrad, Tensor alphaGrad, Tensor betaGrad, Tensor inGrad, Tensor y, Tensor x, Tensor alpha, Tensor beta, float eps = 1e-09f) 
-        { 
-            return (Tensor)OpRegistry.Invoke("layernormgrad", outGrad, alphaGrad, betaGrad, inGrad, y, x, alpha, beta, eps);
-        }
 
-        public static Tensor FlashAttention(Tensor O, Tensor L, Tensor Q, Tensor K, Tensor V, int q_start_offset = 0)
-        {
-            return (Tensor)OpRegistry.Invoke("flashattention", O, L, Q, K, V, q_start_offset);
-        }
 
         public static Tensor ScaledDotProductAttention(Tensor result, Tensor query, Tensor key, Tensor value, Tensor mask, float scale)
         {
             return (Tensor)OpRegistry.Invoke("scaled_dot_product_attention", result, query, key, value, mask, scale);
         }
 
-        public static void FlashAttentionGrad(Tensor Q, Tensor K, Tensor V, Tensor O, Tensor dO, Tensor L, Tensor dQ, Tensor dK, Tensor dV)
-        {
-            OpRegistry.Invoke("flashattentiongrad", Q, K, V, O, dO, L, dQ, dK, dV);
-        }
 
         public static Tensor RMSNorm(Tensor result, Tensor src, Tensor alpha, Tensor beta, float eps = 1e-09f) { return (Tensor)OpRegistry.Invoke("rmsnorm", result, src, alpha, beta, eps); }
-        public static Tensor RMSNormGrad(Tensor outGrad, Tensor alphaGrad, Tensor betaGrad, Tensor inGrad, Tensor y, Tensor x, Tensor alpha, Tensor beta, float eps = 1e-09f)
-        {
-            return (Tensor)OpRegistry.Invoke("rmsnormgrad", outGrad, alphaGrad, betaGrad, inGrad, y, x, alpha, beta, eps);
-        }
 
-        public static Tensor AddLayerNorm(Tensor result, Tensor src1, Tensor src2, Tensor alpha, Tensor beta, float eps = 1e-09f) { return (Tensor)OpRegistry.Invoke("addlayernorm", result, src1, src2, alpha, beta, eps); }
-        public static Tensor AddLayerNormGrad(Tensor out1Grad, Tensor out2Grad, Tensor alphaGrad, Tensor betaGrad, Tensor inGrad, Tensor y, Tensor x1, Tensor x2, Tensor alpha, Tensor beta, float eps = 1e-09f) { return (Tensor)OpRegistry.Invoke("addlayernormgrad", out1Grad, out2Grad, alphaGrad, betaGrad, inGrad, y, x1, x2, alpha, beta, eps); }
 
-        public static Tensor Adam(Tensor weight, Tensor gradient, Tensor v, Tensor m, float gradNormFactor, float step_size, float clipval, float regc, float decay_rate_v, float decay_rate_m, int iter, float eps)
-        {
-            return (Tensor)OpRegistry.Invoke("adam", weight, gradient, v, m, gradNormFactor, step_size, clipval, regc, decay_rate_v, decay_rate_m, iter, eps);
-        }
 
-        public static Tensor RMSProp(Tensor weight, Tensor gradient, Tensor cache, float gradNormFactor, float step_size, float clipval, float regc, float decay_rate, float eps)
-        {
-            return (Tensor)OpRegistry.Invoke("rmsprop", weight, gradient, cache, gradNormFactor, step_size, clipval, regc, decay_rate, eps);
-        }
 
         public static Tensor SumAll(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("sumall", result, src); }
         public static Tensor ProdAll(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("prodall", result, src); }
@@ -348,7 +272,8 @@ namespace TensorSharp
         public static Tensor ScatterFill(Tensor result, float value, int dim, Tensor indices) { return (Tensor)OpRegistry.Invoke("scatter_fill", result, value, dim, indices); }
 
 
-        public static int? GetSeed(RandomGenerator src)
+
+        private static int? GetSeed(RandomGenerator src)
         {
             return src == null ? (int?)null : src.NextSeed();
         }

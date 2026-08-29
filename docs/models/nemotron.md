@@ -319,8 +319,12 @@ Parakeet-style log-mel spectrogram extraction (mirrors ollama's
 The chat template emits a `<so_embedding>` token for each uploaded audio
 file so the model "sees" the modality, but real audio inference is gated on
 a Parakeet audio mmproj that is not shipped with the public Nemotron-H or
-Nemotron Omni GGUFs in this distribution. The CLI still preprocesses the
-audio file for verification.
+Nemotron Omni GGUFs in this distribution. The clip is still decoded and turned
+into its log-mel spectrogram for verification, and the operator is told once
+per session why no audio inference will run. That happens in
+`ModelMultimodalInjector` alongside the rest of the architecture's media
+handling, so the CLI, the interactive REPL and the server all behave the same;
+it used to live only in the CLI, which meant the server ignored audio silently.
 
 ## 5. Parameters and settings
 

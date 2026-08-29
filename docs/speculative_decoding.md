@@ -128,6 +128,28 @@ to be tuned or switched off per deployment.
 `SpeculatorRegistry` maps a name to a factory. It is the only place that knows
 which algorithms exist.
 
+### Arming after a reused KV prefix
+
+A sequence can begin from a KV prefix it never processed itself — the block-hash
+prefix cache handed it over, or it is simply the next turn of a chat. The executor
+used to refuse to arm speculation on any such sequence, because a learned
+per-position draft head (NextN/MTP) chains its state token by token and a gap makes
+every later proposal garbage. That is true of those heads, but it was applied to
+every algorithm, and it cost the feature its whole point in ordinary use: from the
+SECOND turn onward a Web UI conversation always adopts a prefix, so speculation
+silently never armed and a DFlash drafter looked like it helped on turn one and did
+nothing afterwards.
+
+Which algorithms survive a gap is now the algorithm's own call —
+`ISpeculator.CanArmAfterPrefixReuse`, default `false`. `BlockDraftSpeculator` and
+`NGramSpeculator` opt in: n-gram mines the emitted token history, which is complete
+whatever the KV cache did, and a block drafter reads its own sliding KV ring, which
+refills from the freshly forwarded suffix and from every committed token, so an
+adopted prefix costs it a shorter drafting context for a block or two and nothing
+after that. Every draft is still verified by the trunk either way, so a stale
+speculator can only cost throughput, never a wrong token. Measured in the server
+chat path: 1.02x → 1.85x.
+
 ## Adding a new speculation algorithm
 
 Write the class and register it. No model, executor or scheduler code changes.

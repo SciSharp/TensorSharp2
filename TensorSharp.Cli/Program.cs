@@ -23,6 +23,7 @@ using TensorSharp;
 using TensorSharp.Cli.Logging;
 using TensorSharp.Cpu;
 using TensorSharp.Cuda;
+using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
@@ -703,93 +704,26 @@ namespace TensorSharp.Cli
                     "Loading mmproj projector from {MmProj}", mmProjPath);
                 model.MultimodalInjector.LoadProjectors(mmProjPath);
             }
-            else if (imagePath != null && model.Config.Architecture == "gemma3")
+            else if (imagePath != null || audioPath != null || videoPath != null)
             {
-                string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "mmproj-gemma3-4b-f16.gguf");
-                if (File.Exists(autoMmproj))
+                // No --mmproj: look for the family's companion projector beside the
+                // model. Whether to look at all is a capability question (can this model
+                // consume image or audio embeddings?), and WHICH file to look for is the
+                // architecture's own business - both answered without naming a single
+                // architecture here. A text-only model declares neither capability and
+                // falls straight through.
+                bool wantsVision = imagePath != null && model is IVisionCapableModel;
+                bool wantsAudio = (audioPath != null || videoPath != null) && model is IAudioCapableModel;
+                if (wantsVision || wantsAudio)
                 {
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Auto-loading vision encoder: {MmProj}", autoMmproj);
-                    model.MultimodalInjector.LoadProjectors(autoMmproj);
-                }
-            }
-            else if (imagePath != null && model.Config.Architecture == "mistral3")
-            {
-                string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "mistral3-mmproj.gguf");
-                if (File.Exists(autoMmproj))
-                {
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Auto-loading Mistral3 vision encoder: {MmProj}", autoMmproj);
-                    model.MultimodalInjector.LoadProjectors(autoMmproj);
-                }
-            }
-            else if ((imagePath != null || audioPath != null || videoPath != null)
-                     && model.Config.Architecture == "gemma4")
-            {
-                string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "gemma-4-mmproj-F16.gguf");
-                if (File.Exists(autoMmproj))
-                {
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Auto-loading multimodal encoder: {MmProj}", autoMmproj);
-                    model.MultimodalInjector.LoadProjectors(autoMmproj);
-                }
-            }
-            else if (imagePath != null &&
-                     (model.Config.Architecture == "qwen4exp" || model.Config.Architecture == "glm5next"))
-            {
-                // Any mmproj companion beside the model (the published file is
-                // mmproj-BF16.gguf).
-                string modelDir = Path.GetDirectoryName(modelPath);
-                string autoMmproj = null;
-                if (modelDir != null && Directory.Exists(modelDir))
-                {
-                    foreach (string candidate in Directory.GetFiles(modelDir, "*mmproj*.gguf"))
-                    { autoMmproj = candidate; break; }
-                }
-                if (autoMmproj != null)
-                {
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Auto-loading vision encoder: {MmProj}", autoMmproj);
-                    model.MultimodalInjector.LoadProjectors(autoMmproj);
-                }
-            }
-            else if (imagePath != null &&
-                     (model.Config.Architecture == "qwen35" ||
-                      model.Config.Architecture == "qwen35moe" ||
-                      model.Config.Architecture == "qwen3next"))
-            {
-                string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "Qwen3.5-mmproj-F16.gguf");
-                if (File.Exists(autoMmproj))
-                {
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Auto-loading vision encoder: {MmProj}", autoMmproj);
-                    model.MultimodalInjector.LoadProjectors(autoMmproj);
-                }
-            }
-            else if ((imagePath != null || audioPath != null || videoPath != null) &&
-                     (model.Config.Architecture == "nemotron_h_omni" ||
-                      model.Config.Architecture == "nemotron_h" ||
-                      model.Config.Architecture == "nemotron_h_moe"))
-            {
-                string modelDir = Path.GetDirectoryName(modelPath);
-                // Look for any mmproj-suffixed companion file in the same directory.
-                string autoMmproj = null;
-                if (modelDir != null && Directory.Exists(modelDir))
-                {
-                    foreach (string candidate in Directory.GetFiles(modelDir, "*mmproj*.gguf"))
+                    string autoMmproj = ModelArchitectureRegistry.FindCompanionProjector(
+                        model.Config.Architecture, modelPath);
+                    if (autoMmproj != null)
                     {
-                        if (candidate.IndexOf("Nemotron", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            autoMmproj = candidate;
-                            break;
-                        }
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "Auto-loading multimodal encoder: {MmProj}", autoMmproj);
+                        model.MultimodalInjector.LoadProjectors(autoMmproj);
                     }
-                }
-                if (autoMmproj != null && File.Exists(autoMmproj))
-                {
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Auto-loading Nemotron vision encoder: {MmProj}", autoMmproj);
-                    model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
 
@@ -2043,615 +1977,48 @@ namespace TensorSharp.Cli
 
             var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
 
-            if (imagePaths != null && imagePaths.Count > 0)
+            if ((imagePaths != null && imagePaths.Count > 0) ||
+                (audioPaths != null && audioPaths.Count > 0))
             {
-                string arch = model.Config.Architecture;
+                // ONE multimodal path, shared with the server and the batching engine:
+                // the injector owns placeholder expansion, encoder caching and the
+                // embedding hand-off, and asks each architecture for its own prompt
+                // format through IMultimodalPromptExpander.
+                //
+                // The CLI used to carry a second, per-architecture copy of all of that -
+                // ~600 lines that had drifted from the injector (Gemma 3 only ever
+                // encoded imagePaths[0]; Gemma 4 audio re-derived its own mel path) and
+                // that every new vision model had to be added to twice. qwen4exp and
+                // glm-dsa already routed through the injector; the rest now do too.
+                bool wantsVision = imagePaths != null && imagePaths.Count > 0;
+                bool wantsAudio = audioPaths != null && audioPaths.Count > 0;
 
-                if (arch == "gemma3")
-                {
-                    var proc = new Gemma3ImageProcessor();
-                    int startId = model.Tokenizer.LookupToken("<start_of_image>");
-                    if (startId < 0) startId = Gemma3ImageProcessor.StartOfImageToken;
-                    int endId = Gemma3ImageProcessor.EndOfImageToken;
-                    int nlnlId = Gemma3ImageProcessor.NewlineNewlineToken;
-                    int padId = Gemma3ImageProcessor.PadToken;
-
-                    inputTokens = ChatTemplate.ExpandGemma3ImageTokens(inputTokens,
-                        startId, endId, nlnlId, padId, proc.TokensPerImage);
-
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Gemma3 vision: tokensPerImage={TokensPerImage} start={Start} end={End} totalTokens={TotalTokens}",
-                        proc.TokensPerImage, startId, endId, inputTokens.Count);
-
-                    if (model is Gemma3Model g3 && g3.VisionEncoder != null)
-                    {
-                        _log.LogDebug(LogEventIds.HostConfiguration,
-                            "Processing image through Gemma3 vision encoder");
-                        float[] pixels = proc.ProcessImage(imagePaths[0]);
-                        var visionEmbeddings = g3.VisionEncoder.Encode(pixels);
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "Gemma3 vision embeddings: {EmbeddingShape}",
-                            $"{visionEmbeddings.Sizes[0]}x{visionEmbeddings.Sizes[1]}");
-
-                        int imageTokenStart = -1;
-                        for (int i = 0; i < inputTokens.Count; i++)
-                        {
-                            if (inputTokens[i] == startId && i + 1 < inputTokens.Count && inputTokens[i + 1] == padId)
-                            {
-                                imageTokenStart = i + 1;
-                                break;
-                            }
-                        }
-
-                        if (imageTokenStart >= 0)
-                        {
-                            g3.SetVisionEmbeddings(visionEmbeddings, imageTokenStart);
-                            _log.LogInformation(LogEventIds.HostConfiguration,
-                                "Gemma3 vision embeddings injection position={Position}", imageTokenStart);
-                        }
-                        else
-                        {
-                            _log.LogWarning(LogEventIds.HostConfiguration,
-                                "Gemma3 vision: could not find image placeholder position");
-                            visionEmbeddings.Dispose();
-                        }
-                    }
-                    else
-                    {
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                    }
-                }
-                else if (arch == "gemma4")
-                {
-                    int imageStartId = model.Tokenizer.LookupToken("<|image>");
-                    int imageEndId = model.Tokenizer.LookupToken("<image|>");
-                    if (imageStartId < 0) imageStartId = 255999;
-                    if (imageEndId < 0) imageEndId = 256000;
-
-                    if (model is Gemma4Model g4 && g4.VisionEncoder != null)
-                    {
-                        // The gemma4uv unified embedder declares its own
-                        // image_mean / image_std (mean=0, std=1 -> [0,1]); the
-                        // gemma4v SigLIP path keeps the legacy [-1,1] map. Match
-                        // the server's ModelMultimodalInjector here so the CLI
-                        // preprocesses identically.
-                        var proc = g4.VisionEncoder.IsUnified
-                            ? new Gemma4ImageProcessor(imageMean: g4.VisionEncoder.ImageMean,
-                                imageStd: g4.VisionEncoder.ImageStd)
-                            : new Gemma4ImageProcessor();
-                        var allVisionEmbeddings = new List<TensorSharp.Tensor>();
-
-                        foreach (var imgP in imagePaths)
-                        {
-                            var (pixels, imgW, imgH) = proc.ProcessImage(imgP);
-                            var visionEmb = g4.VisionEncoder.Encode(pixels, imgW, imgH);
-                            _log.LogInformation(LogEventIds.HostConfiguration,
-                                "Gemma4 vision frame: source={Source} resolution={Width}x{Height} embeddings={EmbeddingShape}",
-                                imgP, imgW, imgH, $"{visionEmb.Sizes[0]}x{visionEmb.Sizes[1]}");
-                            allVisionEmbeddings.Add(visionEmb);
-                        }
-
-                        // Expand each <|image> token and register embeddings for injection.
-                        // Search forward past already-expanded tokens by tracking a search start.
-                        int searchFrom = 0;
-                        for (int imgIdx = 0; imgIdx < allVisionEmbeddings.Count; imgIdx++)
-                        {
-                            var visionEmbeddings = allVisionEmbeddings[imgIdx];
-                            int numVisionTokens = (int)visionEmbeddings.Sizes[0];
-
-                            int imageTokenPos = -1;
-                            for (int i = searchFrom; i < inputTokens.Count; i++)
-                            {
-                                if (inputTokens[i] == imageStartId)
-                                {
-                                    imageTokenPos = i;
-                                    break;
-                                }
-                            }
-
-                            if (imageTokenPos >= 0)
-                            {
-                                var expanded = new List<int>();
-                                for (int i = 0; i < imageTokenPos; i++)
-                                    expanded.Add(inputTokens[i]);
-                                expanded.Add(imageStartId);
-                                for (int i = 0; i < numVisionTokens; i++)
-                                    expanded.Add(0);
-                                expanded.Add(imageEndId);
-                                for (int i = imageTokenPos + 1; i < inputTokens.Count; i++)
-                                    expanded.Add(inputTokens[i]);
-                                inputTokens = expanded;
-
-                                int insertPos = imageTokenPos + 1;
-                                g4.SetVisionEmbeddings(visionEmbeddings, insertPos);
-                                _log.LogInformation(LogEventIds.HostConfiguration,
-                                    "Gemma4 vision frame {FrameIndex}: {VisionTokens} tokens at position {InsertPos}",
-                                    imgIdx, numVisionTokens, insertPos);
-
-                                searchFrom = imageTokenPos + 1 + numVisionTokens + 1;
-                            }
-                            else
-                            {
-                                _log.LogWarning(LogEventIds.HostConfiguration,
-                                    "Gemma4 vision: no more <|image> tokens for frame {FrameIndex}", imgIdx);
-                                visionEmbeddings.Dispose();
-                            }
-                        }
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "Total tokens after Gemma4 image expansion: {TotalTokens}", inputTokens.Count);
-                    }
-                    else if (imagePaths.Count > 0)
-                    {
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                    }
-                }
-                else if (arch == "muse-glimmer" || arch == "muse_glimmer")
-                {
-                    // The chat template renders an image part as a single <|patch|>.
-                    // llama.cpp's mtmd wraps the image chunk in <|image_start|> ... <|image_end|>,
-                    // so each <|patch|> expands to [start, N filler rows, end] and the filler
-                    // rows are overwritten by the projected vision embeddings.
-                    int patchId = model.Tokenizer.LookupToken("<|patch|>");
-                    int imageStartId = model.Tokenizer.LookupToken("<|image_start|>");
-                    int imageEndId = model.Tokenizer.LookupToken("<|image_end|>");
-
-                    if (model is MuseGlimmerModel mg && mg.VisionEncoder != null)
-                    {
-                        if (patchId < 0 || imageStartId < 0 || imageEndId < 0)
-                        {
-                            _log.LogWarning(LogEventIds.HostConfiguration,
-                                "Muse-Glimmer vision: missing marker token(s) patch={Patch} start={Start} end={End}",
-                                patchId, imageStartId, imageEndId);
-                        }
-                        else
-                        {
-                            var proc = mg.VisionEncoder.ImageProcessor;
-                            int searchFrom = 0;
-
-                            foreach (var imgP in imagePaths)
-                            {
-                                var (pixels, imgW, imgH) = proc.ProcessImage(imgP);
-                                var visionEmb = mg.VisionEncoder.Encode(pixels, imgW, imgH);
-                                int numVisionTokens = (int)visionEmb.Sizes[0];
-
-                                _log.LogInformation(LogEventIds.HostConfiguration,
-                                    "Muse-Glimmer vision: source={Source} resized={Width}x{Height} grid={GridW}x{GridH} tokens={Tokens}",
-                                    imgP, imgW, imgH,
-                                    imgW / proc.PatchSize / proc.MergeSize,
-                                    imgH / proc.PatchSize / proc.MergeSize,
-                                    numVisionTokens);
-
-                                int patchPos = -1;
-                                for (int i = searchFrom; i < inputTokens.Count; i++)
-                                {
-                                    if (inputTokens[i] == patchId) { patchPos = i; break; }
-                                }
-
-                                if (patchPos < 0)
-                                {
-                                    _log.LogWarning(LogEventIds.HostConfiguration,
-                                        "Muse-Glimmer vision: no more <|patch|> placeholders for {Source}", imgP);
-                                    visionEmb.Dispose();
-                                    continue;
-                                }
-
-                                var expanded = new List<int>(inputTokens.Count + numVisionTokens + 1);
-                                for (int i = 0; i < patchPos; i++)
-                                    expanded.Add(inputTokens[i]);
-                                expanded.Add(imageStartId);
-                                for (int i = 0; i < numVisionTokens; i++)
-                                    expanded.Add(patchId);
-                                expanded.Add(imageEndId);
-                                for (int i = patchPos + 1; i < inputTokens.Count; i++)
-                                    expanded.Add(inputTokens[i]);
-                                inputTokens = expanded;
-
-                                int insertPos = patchPos + 1;
-                                mg.SetVisionEmbeddings(visionEmb, insertPos);
-                                searchFrom = insertPos + numVisionTokens + 1;
-                            }
-
-                            _log.LogInformation(LogEventIds.HostConfiguration,
-                                "Total tokens after Muse-Glimmer image expansion: {TotalTokens}", inputTokens.Count);
-                        }
-                    }
-                    else if (imagePaths.Count > 0)
-                    {
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                    }
-                }
-                else if (arch == "nemotron_h_omni" || arch == "nemotron_h" || arch == "nemotron_h_moe")
-                {
-                    int imageTokenId = model.Tokenizer.LookupToken("<image>");
-                    int imageStartId = model.Tokenizer.LookupToken("<img>");
-                    int imageEndId = model.Tokenizer.LookupToken("</img>");
-                    if (imageTokenId < 0) imageTokenId = 18;
-                    if (imageStartId < 0) imageStartId = 19;
-                    if (imageEndId < 0) imageEndId = 20;
-
-                    if (model is NemotronModel nem && nem.VisionEncoder != null)
-                    {
-                        var allEmbeddings = new List<TensorSharp.Tensor>();
-                        var perImageTileCounts = new List<int[]>();
-
-                        foreach (var imgP in imagePaths)
-                        {
-                            // VIDEO_MAX_FRAMES already handled upstream by extracting frames.
-                            var tiles = nem.ImageProcessor.ProcessImage(imgP);
-                            var tileTokens = new int[tiles.Count];
-                            var tileEmbeddings = new TensorSharp.Tensor[tiles.Count];
-
-                            for (int t = 0; t < tiles.Count; t++)
-                            {
-                                var tile = tiles[t];
-                                var emb = nem.VisionEncoder.Encode(tile.Pixels, tile.Width, tile.Height);
-                                tileEmbeddings[t] = emb;
-                                tileTokens[t] = (int)emb.Sizes[0];
-                                _log.LogInformation(LogEventIds.HostConfiguration,
-                                    "Nemotron vision tile {Index}: source={Width}x{Height} embeddings={EmbeddingShape}",
-                                    t, tile.Width, tile.Height, $"{emb.Sizes[0]}x{emb.Sizes[1]}");
-                            }
-
-                            perImageTileCounts.Add(tileTokens);
-                            allEmbeddings.AddRange(tileEmbeddings);
-                        }
-
-                        // Each <image> token in the prompt corresponds to ONE image (chat
-                        // template inserts a single <image> per visual). Replace each
-                        // <image> with: <img> + (sum of tile token counts) image tokens
-                        // + </img>, and queue the embeddings for in-place injection.
-                        int searchFrom = 0;
-                        int injectedImages = 0;
-                        for (int imgIdx = 0; imgIdx < imagePaths.Count; imgIdx++)
-                        {
-                            int imageTokenPos = -1;
-                            for (int i = searchFrom; i < inputTokens.Count; i++)
-                            {
-                                if (inputTokens[i] == imageTokenId)
-                                {
-                                    imageTokenPos = i;
-                                    break;
-                                }
-                            }
-                            if (imageTokenPos < 0)
-                            {
-                                _log.LogWarning(LogEventIds.HostConfiguration,
-                                    "Nemotron vision: no more <image> tokens for image {Index}", imgIdx);
-                                break;
-                            }
-
-                            int totalImageTokens = 0;
-                            foreach (int t in perImageTileCounts[imgIdx]) totalImageTokens += t;
-
-                            var expanded = new List<int>(inputTokens.Count + totalImageTokens + 2);
-                            for (int i = 0; i < imageTokenPos; i++) expanded.Add(inputTokens[i]);
-                            expanded.Add(imageStartId);
-                            int injectStart = expanded.Count;
-                            for (int i = 0; i < totalImageTokens; i++) expanded.Add(imageTokenId);
-                            expanded.Add(imageEndId);
-                            for (int i = imageTokenPos + 1; i < inputTokens.Count; i++) expanded.Add(inputTokens[i]);
-                            inputTokens = expanded;
-
-                            // Each tile's embeddings get injected at consecutive offsets.
-                            int tileOffset = injectStart;
-                            int tileBase = injectedImages;
-                            for (int t = 0; t < perImageTileCounts[imgIdx].Length; t++)
-                            {
-                                nem.SetVisionEmbeddings(allEmbeddings[tileBase + t], tileOffset);
-                                tileOffset += perImageTileCounts[imgIdx][t];
-                            }
-                            injectedImages += perImageTileCounts[imgIdx].Length;
-
-                            searchFrom = injectStart + totalImageTokens + 1;
-                            _log.LogInformation(LogEventIds.HostConfiguration,
-                                "Nemotron vision image {Index}: tiles={Tiles} totalTokens={Tokens} insertPos={Pos}",
-                                imgIdx, perImageTileCounts[imgIdx].Length, totalImageTokens, injectStart);
-                        }
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "Total tokens after Nemotron image expansion: {TotalTokens}", inputTokens.Count);
-                    }
-                    else if (imagePaths.Count > 0)
-                    {
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                    }
-                }
-                else if (arch == "mistral3")
-                {
-                    if (model is Mistral3Model m3 && m3.VisionEncoder != null)
-                    {
-                        var proc = new Mistral3ImageProcessor(
-                            m3.VisionEncoder.ImageSize,
-                            m3.VisionEncoder.PatchSize);
-
-                        int imgTokenId = Mistral3ImageProcessor.ImgTokenId;
-                        int imgBreakId = Mistral3ImageProcessor.ImgBreakTokenId;
-                        int imgEndId = Mistral3ImageProcessor.ImgEndTokenId;
-
-                        foreach (var imgP in imagePaths)
-                        {
-                            var (pixels, imgW, imgH) = proc.ProcessImage(imgP);
-                            var visionEmb = m3.VisionEncoder.Encode(pixels, imgW, imgH);
-                            int numRows = imgH / m3.VisionEncoder.PatchSize / m3.VisionEncoder.SpatialMergeSize;
-                            int numCols = imgW / m3.VisionEncoder.PatchSize / m3.VisionEncoder.SpatialMergeSize;
-
-                            int tokenPosition = -1;
-                            for (int i = 0; i < inputTokens.Count; i++)
-                            {
-                                if (inputTokens[i] == imgTokenId)
-                                {
-                                    tokenPosition = i;
-                                    break;
-                                }
-                            }
-
-                            if (tokenPosition >= 0)
-                            {
-                                var expanded = new List<int>();
-                                for (int i = 0; i < tokenPosition; i++)
-                                    expanded.Add(inputTokens[i]);
-
-                                for (int row = 0; row < numRows; row++)
-                                {
-                                    for (int col = 0; col < numCols; col++)
-                                        expanded.Add(imgTokenId);
-                                    expanded.Add(row == numRows - 1 ? imgEndId : imgBreakId);
-                                }
-
-                                for (int i = tokenPosition + 1; i < inputTokens.Count; i++)
-                                    expanded.Add(inputTokens[i]);
-
-                                m3.SetVisionEmbeddings(visionEmb, tokenPosition);
-                                inputTokens = expanded;
-                                _log.LogInformation(LogEventIds.HostConfiguration,
-                                    "Mistral3 vision: rows={Rows} cols={Cols} totalTokens={TotalTokens} position={Position}",
-                                    numRows, numCols, numRows * numCols + numRows, tokenPosition);
-                            }
-                            else
-                            {
-                                visionEmb.Dispose();
-                                _log.LogWarning(LogEventIds.HostConfiguration,
-                                    "Mistral3 vision: no [IMG] token found in prompt");
-                            }
-                        }
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "Total tokens after Mistral3 image expansion: {TotalTokens}", inputTokens.Count);
-                    }
-                    else
-                    {
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                    }
-                }
-                else if (model is Qwen4ExpModel q4eVision)
-                {
-                    // The injector owns the whole qwen4exp pipeline: image-pad
-                    // expansion, embedding cache and the (T,H,W) IMRoPE table the
-                    // token-span kernel rotates image positions with.
-                    if (q4eVision.VisionEncoder != null)
-                    {
-                        var mmHistory = new List<ChatMessage>
-                        {
-                            new ChatMessage { Role = "user", Content = rawText ?? "", ImagePaths = imagePaths }
-                        };
-                        inputTokens = model.MultimodalInjector.ProcessPromptTokens(mmHistory, inputTokens);
-                        model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "qwen4exp vision: prompt expanded to {Tokens} tokens for {Images} image(s)",
-                            inputTokens.Count, imagePaths.Count);
-                    }
-                    else
-                    {
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                    }
-                }
-                else if (model is GlmDsaModel glmVision)
-                {
-                    // The injector owns the glm5next pipeline: <|image|> expansion
-                    // and the embedding-override spans the native executor applies.
-                    if (glmVision.VisionEncoder != null)
-                    {
-                        var mmHistory = new List<ChatMessage>
-                        {
-                            new ChatMessage { Role = "user", Content = rawText ?? "", ImagePaths = imagePaths }
-                        };
-                        inputTokens = model.MultimodalInjector.ProcessPromptTokens(mmHistory, inputTokens);
-                        model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "glm5next vision: prompt expanded to {Tokens} tokens for {Images} image(s)",
-                            inputTokens.Count, imagePaths.Count);
-                    }
-                    else
-                    {
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                    }
-                }
-                else
-                {
-                    int imagePadId = model.Tokenizer.LookupToken("<|image_pad|>");
-                    if (imagePadId < 0)
-                    {
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "<|image_pad|> token not found in vocabulary");
-                    }
-                    else
-                    {
-                        int patchSize = 14;
-                        int mergeSize = 2;
-                        if (model is Qwen35Model q35m && q35m.VisionEncoder != null)
-                        {
-                            patchSize = q35m.VisionEncoder.PatchSize;
-                            mergeSize = q35m.VisionEncoder.SpatialMergeSize;
-                        }
-                        var processor = new Qwen35ImageProcessor(patchSize, mergeSize);
-
-                        var tokenCounts = new int[imagePaths.Count];
-                        for (int i = 0; i < imagePaths.Count; i++)
-                        {
-                            var (width, height) = Qwen35ImageProcessor.ReadImageDimensions(imagePaths[i]);
-                            tokenCounts[i] = processor.ComputeImageTokenCount(height, width);
-                            var (gridH, gridW) = processor.GetPatchGrid(height, width);
-                            var (resizedH, resizedW) = processor.SmartResize(height, width);
-                            _log.LogInformation(LogEventIds.HostConfiguration,
-                                "Image {Index}: source={Source}x{SourceH} resized={ResizedW}x{ResizedH} grid={GridW}x{GridH} visionTokens={VisionTokens} merged={MergedW}x{MergedH}",
-                                i, width, height, resizedW, resizedH, gridW, gridH, tokenCounts[i],
-                                gridW / processor.MergeSize, gridH / processor.MergeSize);
-                        }
-
-                        inputTokens = ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts);
-
-                        int visionStartId = model.Tokenizer.LookupToken("<|vision_start|>");
-                        int visionEndId = model.Tokenizer.LookupToken("<|vision_end|>");
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "Vision token IDs: start={Start} pad={Pad} end={End}",
-                            visionStartId, imagePadId, visionEndId);
-
-                        if (model is Qwen35Model q35 && q35.VisionEncoder != null)
-                        {
-                            var (pixels, resH, resW) = processor.ProcessImage(imagePaths[0]);
-                            var visionEmbeddings = q35.VisionEncoder.Encode(pixels, resH, resW);
-                            _log.LogInformation(LogEventIds.HostConfiguration,
-                                "Qwen3.5 vision embeddings: resolution={Width}x{Height} shape={EmbeddingShape}",
-                                resW, resH, $"{visionEmbeddings.Sizes[0]}x{visionEmbeddings.Sizes[1]}");
-
-                            int imageTokenStart = -1;
-                            for (int i = 0; i < inputTokens.Count; i++)
-                            {
-                                if (inputTokens[i] == imagePadId)
-                                {
-                                    imageTokenStart = i;
-                                    break;
-                                }
-                            }
-
-                            if (imageTokenStart >= 0)
-                            {
-                                q35.SetVisionEmbeddings(visionEmbeddings, imageTokenStart);
-                                _log.LogInformation(LogEventIds.HostConfiguration,
-                                    "Qwen3.5 vision embeddings injection position={Position}", imageTokenStart);
-                            }
-                            else
-                            {
-                                _log.LogWarning(LogEventIds.HostConfiguration,
-                                    "Qwen3.5 vision: could not find image placeholder position");
-                                visionEmbeddings.Dispose();
-                            }
-                        }
-                        else if (!model.HasVisionEncoder())
-                        {
-                            _log.LogWarning(LogEventIds.HostConfiguration,
-                                "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                        }
-                    }
-                }
-            }
-
-            // Audio processing for Nemotron Omni: requires an audio mmproj to be loaded.
-            // The current GGUF distribution we tested with does not embed the parakeet
-            // weights; in that case we still preprocess the audio to verify the pipeline
-            // and warn the user that no inference will run on the embeddings.
-            if (audioPaths != null && audioPaths.Count > 0 &&
-                (model.Config.Architecture == "nemotron_h_omni" ||
-                 model.Config.Architecture == "nemotron_h" ||
-                 model.Config.Architecture == "nemotron_h_moe"))
-            {
-                try
-                {
-                    float[] samples = NemotronAudioPreprocessor.DecodeAudioFile(audioPaths[0]);
-                    var (mel, frames, validFrames) = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(samples);
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Nemotron audio decoded: durationSec={DurationSec:F1} frames={Frames} validFrames={ValidFrames} melShape={Bins}x{Frames2}",
-                        (double)samples.Length / NemotronAudioPreprocessor.SampleRate, frames, validFrames,
-                        NemotronAudioPreprocessor.MelBins, frames);
-
-                    _log.LogWarning(LogEventIds.HostConfiguration,
-                        "Nemotron audio inference is NOT supported by this mmproj (no Parakeet weights present). " +
-                        "The audio file was preprocessed for verification only. Pass an audio mmproj to enable real inference.");
-                }
-                catch (Exception ex)
+                if (wantsVision && !model.HasVisionEncoder())
                 {
                     _log.LogWarning(LogEventIds.HostConfiguration,
-                        "Nemotron audio preprocessing failed: {Error}", ex.Message);
+                        "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
                 }
-            }
-
-            // Audio processing for Gemma4
-            if (audioPaths != null && audioPaths.Count > 0 && model.Config.Architecture == "gemma4")
-            {
-                int audioStartId = model.Tokenizer.LookupToken("<|audio>");
-                int audioEndId = model.Tokenizer.LookupToken("<audio|>");
-
-                if (model is Gemma4Model g4a && g4a.AudioEncoder != null)
+                if (wantsAudio && model is not IAudioCapableModel)
                 {
-                    float[] samples = Gemma4AudioPreprocessor.DecodeAudioFile(audioPaths[0]);
+                    _log.LogWarning(LogEventIds.HostConfiguration,
+                        "This model has no audio path; the audio input will be ignored.");
+                }
+
+                int tokensBefore = inputTokens.Count;
+                inputTokens = model.MultimodalInjector.ProcessPromptTokens(messages, inputTokens);
+                model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
+
+                if (inputTokens.Count != tokensBefore)
+                {
                     _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Audio decoded: samples={Samples} durationSec={DurationSec:F1}",
-                        samples.Length, (double)samples.Length / 16000);
-
-                    if (samples.Length % 128 != 0)
-                    {
-                        int padded = samples.Length + (128 - samples.Length % 128);
-                        Array.Resize(ref samples, padded);
-                    }
-
-                    var (melData, numFrames) = Gemma4AudioPreprocessor.ComputeMelSpectrogram(samples);
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Mel spectrogram computed: frames={Frames}", numFrames);
-
-                    if (melData != null && numFrames > 0)
-                    {
-                        var audioEmbeddings = g4a.AudioEncoder.Encode(melData, numFrames);
-                        int numAudioTokens = (int)audioEmbeddings.Sizes[0];
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "Audio embeddings shape={EmbeddingShape}",
-                            $"{audioEmbeddings.Sizes[0]}x{audioEmbeddings.Sizes[1]}");
-
-                        int audioTokenPos = -1;
-                        for (int i = 0; i < inputTokens.Count; i++)
-                        {
-                            if (inputTokens[i] == audioStartId)
-                            {
-                                audioTokenPos = i;
-                                break;
-                            }
-                        }
-
-                        if (audioTokenPos >= 0)
-                        {
-                            var expanded = new List<int>();
-                            for (int i = 0; i < audioTokenPos; i++)
-                                expanded.Add(inputTokens[i]);
-                            expanded.Add(audioStartId);
-                            for (int i = 0; i < numAudioTokens; i++)
-                                expanded.Add(0);
-                            expanded.Add(audioEndId);
-                            for (int i = audioTokenPos + 1; i < inputTokens.Count; i++)
-                                expanded.Add(inputTokens[i]);
-                            inputTokens = expanded;
-
-                            int insertPos = audioTokenPos + 1;
-                            g4a.SetAudioEmbeddings(audioEmbeddings, insertPos);
-                            _log.LogInformation(LogEventIds.HostConfiguration,
-                                "Gemma4 audio: tokens={Tokens} position={Position} totalTokensAfter={TotalTokens}",
-                                numAudioTokens, insertPos, inputTokens.Count);
-                        }
-                        else
-                        {
-                            _log.LogWarning(LogEventIds.HostConfiguration,
-                                "Gemma4 audio: could not find <|audio> token in prompt");
-                            audioEmbeddings.Dispose();
-                        }
-                    }
+                        "Multimodal prompt expanded {Before} -> {After} tokens for {Images} image(s), {Audios} audio clip(s)",
+                        tokensBefore, inputTokens.Count, imagePaths?.Count ?? 0, audioPaths?.Count ?? 0);
                 }
                 else
                 {
                     _log.LogWarning(LogEventIds.HostConfiguration,
-                        "No audio encoder loaded. Use --mmproj to specify the multimodal GGUF.");
+                        "Multimodal input was supplied but the prompt did not expand - the rendered prompt " +
+                        "may carry no media placeholder for this architecture.");
                 }
             }
 

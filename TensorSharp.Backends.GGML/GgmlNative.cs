@@ -1451,14 +1451,6 @@ internal enum GgmlBinaryScalarOp
     ReverseDiv = 6,
 }
 
-internal enum GgmlActivationGradOp
-{
-    Relu = 1,
-    Sigmoid = 2,
-    Tanh = 3,
-    SiLU = 4,
-}
-
 internal enum GgmlNormOp
 {
     LayerNorm = 1,
@@ -1622,10 +1614,6 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial IntPtr TSGgml_GetLastError();
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_IsMetalAvailable();
 
         [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -1998,26 +1986,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_MulMatIdF32(
-            GgmlTensorView3D result,
-            GgmlTensorView3D expertWeights,
-            GgmlTensorView3D input,
-            GgmlContiguousTensor ids,
-            int idsRows,
-            int idsCols);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_AddIdF32(
-            GgmlTensorView3D result,
-            GgmlTensorView3D src,
-            GgmlTensorView2D bias,
-            GgmlContiguousTensor ids,
-            int idsRows,
-            int idsCols);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_ReduceLastDimF32(
             int op,
             GgmlTensorView4D result,
@@ -2126,26 +2094,6 @@ internal enum GgmlIndexReductionOp
             GgmlTensorView4D result,
             GgmlTensorView4D adj,
             GgmlTensorView4D val,
-            int addGrad);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_CrossEntropyLossF32(
-            out float lossValue,
-            GgmlTensorView4D probs,
-            GgmlContiguousTensor targetIndices,
-            float smooth,
-            float labelSmooth);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_CrossEntropyLossBackwardF32(
-            GgmlTensorView4D grad,
-            GgmlTensorView4D probs,
-            GgmlContiguousTensor targetIndices,
-            float lossGradient,
-            float smooth,
-            float labelSmooth,
             int addGrad);
 
         [LibraryImport(DllName)]
@@ -2297,6 +2245,40 @@ internal enum GgmlIndexReductionOp
             int numHeads, int numKvHeads, int headDim,
             int maxSeqLen, int position,
             float scale, int kvCacheType);
+
+        // Device-resident paged K/V pool. The pool tensors live on the backend
+        // for the model's lifetime; only this step's new rows (scatter) and the
+        // per-sequence row-index vectors (attention) cross the bus.
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr TSGgml_PagedKvPoolCreate(
+            int numLayers, int numBlocks, int blockSize, int numKvHeads, int headDim);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void TSGgml_PagedKvPoolFree(IntPtr handle);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial long TSGgml_PagedKvPoolBytes(IntPtr handle);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_PagedKvPoolGrow(IntPtr handle, int newNumBlocks);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_PagedKvPoolScatter(
+            IntPtr handle, int layer, IntPtr kData, IntPtr vData,
+            IntPtr slotMapping, int numTokens);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_PagedKvPoolAttention(
+            IntPtr handle, int layer, IntPtr qData, IntPtr outData,
+            IntPtr queryStartLoc, IntPtr seqLens, IntPtr positions,
+            IntPtr blockTableFlat, IntPtr blockTableOffsets,
+            int numSeqs, int numTokens, int numHeads, int slidingWindow, float scale);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -4355,16 +4337,6 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_ActivationGradF32(
-            int op,
-            GgmlTensorView4D result,
-            GgmlTensorView4D src,
-            GgmlTensorView4D grad,
-            GgmlTensorView4D accumulation,
-            int hasAccumulation);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_NormF32(
             int op,
             GgmlTensorView4D result,
@@ -4372,19 +4344,6 @@ internal enum GgmlIndexReductionOp
             GgmlTensorView4D gamma,
             GgmlTensorView4D beta,
             int hasBeta,
-            float eps);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_NormGradF32(
-            int op,
-            GgmlTensorView4D result,
-            GgmlTensorView4D gradGamma,
-            GgmlTensorView4D gradBeta,
-            GgmlTensorView4D adj,
-            GgmlTensorView4D x,
-            GgmlTensorView4D gamma,
-            int hasGradBeta,
             float eps);
 
         [LibraryImport(DllName)]
@@ -4973,16 +4932,6 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_AddmmBatchF32(result, src, m1, m2, beta, alpha), "addmmbatch");
         }
 
-        public static void MulMatId(GgmlTensorView3D result, GgmlTensorView3D expertWeights, GgmlTensorView3D input, GgmlContiguousTensor ids, int idsRows, int idsCols)
-        {
-            CheckResult(TSGgml_MulMatIdF32(result, expertWeights, input, ids, idsRows, idsCols), "mulmatid");
-        }
-
-        public static void AddId(GgmlTensorView3D result, GgmlTensorView3D src, GgmlTensorView2D bias, GgmlContiguousTensor ids, int idsRows, int idsCols)
-        {
-            CheckResult(TSGgml_AddIdF32(result, src, bias, ids, idsRows, idsCols), "addid");
-        }
-
         public static void ReduceLastDim(GgmlReductionOp op, GgmlTensorView4D result, GgmlTensorView4D src)
         {
             CheckResult(TSGgml_ReduceLastDimF32((int)op, result, src), op.ToString());
@@ -5102,17 +5051,6 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_SoftmaxGradF32(result, adj, val, addGrad ? 1 : 0), "softmaxgrad");
         }
 
-        public static float CrossEntropyLoss(GgmlTensorView4D probs, GgmlContiguousTensor targetIndices, float smooth, float labelSmooth)
-        {
-            CheckResult(TSGgml_CrossEntropyLossF32(out float lossValue, probs, targetIndices, smooth, labelSmooth), "crossentropyloss");
-            return lossValue;
-        }
-
-        public static void CrossEntropyLossBackward(GgmlTensorView4D grad, GgmlTensorView4D probs, GgmlContiguousTensor targetIndices, float lossGradient, float smooth, float labelSmooth, bool addGrad)
-        {
-            CheckResult(TSGgml_CrossEntropyLossBackwardF32(grad, probs, targetIndices, lossGradient, smooth, labelSmooth, addGrad ? 1 : 0), "crossentropyloss_backward");
-        }
-
         public static void Adam(
             GgmlContiguousTensor weight,
             GgmlContiguousTensor gradient,
@@ -5160,19 +5098,9 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_BinaryScalarF32((int)op, result, src, scalar), op.ToString());
         }
 
-        public static void ActivationGrad(GgmlActivationGradOp op, GgmlTensorView4D result, GgmlTensorView4D src, GgmlTensorView4D grad, GgmlTensorView4D accumulation, bool hasAccumulation)
-        {
-            CheckResult(TSGgml_ActivationGradF32((int)op, result, src, grad, accumulation, hasAccumulation ? 1 : 0), $"{op}Grad");
-        }
-
         public static void Norm(GgmlNormOp op, GgmlTensorView4D result, GgmlTensorView4D src, GgmlTensorView4D gamma, GgmlTensorView4D beta, bool hasBeta, float eps)
         {
             CheckResult(TSGgml_NormF32((int)op, result, src, gamma, beta, hasBeta ? 1 : 0, eps), op.ToString());
-        }
-
-        public static void NormGrad(GgmlNormOp op, GgmlTensorView4D result, GgmlTensorView4D gradGamma, GgmlTensorView4D gradBeta, GgmlTensorView4D adj, GgmlTensorView4D x, GgmlTensorView4D gamma, bool hasGradBeta, float eps)
-        {
-            CheckResult(TSGgml_NormGradF32((int)op, result, gradGamma, gradBeta, adj, x, gamma, hasGradBeta ? 1 : 0, eps), $"{op}Grad");
         }
 
         public static void IndexSelect(GgmlTensorView2D result, GgmlTensorView2D src, GgmlContiguousTensor indices, bool addToResult)
@@ -5401,6 +5329,66 @@ internal enum GgmlIndexReductionOp
         /// <param name="positions">[numTokens] absolute position per query token (drives the causal mask).</param>
         /// <param name="blockTableFlat">Concatenated per-sequence block tables.</param>
         /// <param name="blockTableOffsets">[numSeqs] offset of each seq's table inside blockTableFlat.</param>
+        /// <summary>Allocate the device-resident paged K/V pool. Returns
+        /// IntPtr.Zero when the backend could not allocate it (out of VRAM),
+        /// which callers treat as "stay on the host pool".</summary>
+        public static IntPtr PagedKvPoolCreate(
+            int numLayers, int numBlocks, int blockSize, int numKvHeads, int headDim)
+            => TSGgml_PagedKvPoolCreate(numLayers, numBlocks, blockSize, numKvHeads, headDim);
+
+        public static void PagedKvPoolFree(IntPtr handle)
+        {
+            if (handle != IntPtr.Zero) TSGgml_PagedKvPoolFree(handle);
+        }
+
+        public static long PagedKvPoolBytes(IntPtr handle)
+            => handle == IntPtr.Zero ? 0 : TSGgml_PagedKvPoolBytes(handle);
+
+        /// <summary>Grow the pool to hold at least newNumBlocks blocks, copying
+        /// what is already written on device. False means the pool kept its old
+        /// size (typically out of VRAM) and the caller must not write past it.</summary>
+        public static bool PagedKvPoolGrow(IntPtr handle, int newNumBlocks)
+            => handle != IntPtr.Zero && TSGgml_PagedKvPoolGrow(handle, newNumBlocks) != 0;
+
+        /// <summary>Write this step's K/V into the pool at the mapped slots.</summary>
+        public static unsafe void PagedKvPoolScatter(
+            IntPtr handle, int layer, float[] kData, float[] vData, int[] slotMapping, int numTokens)
+        {
+            fixed (float* k = kData)
+            fixed (float* v = vData)
+            fixed (int* sm = slotMapping)
+            {
+                CheckResult(TSGgml_PagedKvPoolScatter(
+                    handle, layer, (IntPtr)k, (IntPtr)v, (IntPtr)sm, numTokens),
+                    "paged_kv_pool_scatter");
+            }
+        }
+
+        /// <summary>Batch flash attention against the device-resident pool. The
+        /// sequence history is gathered on device via ggml_get_rows, so no K/V
+        /// is uploaded per layer.</summary>
+        public static unsafe void PagedKvPoolAttention(
+            IntPtr handle, int layer, float[] qData, float[] outData,
+            int[] queryStartLoc, int[] seqLens, int[] positions,
+            int[] blockTableFlat, int[] blockTableOffsets,
+            int numSeqs, int numTokens, int numHeads, float scale, int slidingWindow = 0)
+        {
+            fixed (float* q = qData)
+            fixed (float* o = outData)
+            fixed (int* qsl = queryStartLoc)
+            fixed (int* sl = seqLens)
+            fixed (int* pos = positions)
+            fixed (int* btf = blockTableFlat)
+            fixed (int* bto = blockTableOffsets)
+            {
+                CheckResult(TSGgml_PagedKvPoolAttention(
+                    handle, layer, (IntPtr)q, (IntPtr)o,
+                    (IntPtr)qsl, (IntPtr)sl, (IntPtr)pos, (IntPtr)btf, (IntPtr)bto,
+                    numSeqs, numTokens, numHeads, slidingWindow, scale),
+                    "paged_kv_pool_attention");
+            }
+        }
+
         public static unsafe void PagedAttentionForward(
             float[] qData,
             float[] pagedKData,

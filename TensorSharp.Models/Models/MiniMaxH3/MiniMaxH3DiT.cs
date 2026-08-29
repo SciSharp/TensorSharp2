@@ -15,6 +15,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using TensorSharp;
 using TensorSharp.GGML;
 using TensorSharp.Runtime;
 
@@ -36,11 +37,16 @@ namespace TensorSharp.Models.MiniMaxH3
         private H3Lin _finalAdaLn, _finalVideoOut, _finalAudioOut;
         private IntPtr _refinerFinalNorm, _finalNorm;
         private readonly float[] _curveTable;   // [grid][timeEmbedDim]
+        // Non-null on the backends with no ggml graph to call (BackendType.Cpu):
+        // the same DiT expressed against the shared direct primitives.
+        private readonly MiniMaxH3DirectDiT _direct;
         private bool _disposed;
 
         public MiniMaxH3Config Config { get; }
 
-        public MiniMaxH3DiT(string ggufPath)
+        public MiniMaxH3DiT(string ggufPath) : this(ggufPath, BackendType.GgmlCuda, null) { }
+
+        public MiniMaxH3DiT(string ggufPath, BackendType backend, IAllocator allocator)
         {
             _gguf = new GgufFile(ggufPath);
             Config = MiniMaxH3Config.Detect(_gguf.Tensors);
@@ -99,7 +105,16 @@ namespace TensorSharp.Models.MiniMaxH3
                     "which is not implemented; the released checkpoints ship the curve table.");
             // Stored as [timeEmbedDim, grid] in ne order -> [grid][dim] here.
             _curveTable = ReadVectorF32(p + "adaln_t_table");
+
+            // Backends with no ggml graph to call run the same DiT through the
+            // shared direct primitives instead.
+            if (allocator != null && !IsGgmlBackendType(backend))
+                _direct = new MiniMaxH3DirectDiT(_gguf, Config, allocator);
         }
+
+        private static bool IsGgmlBackendType(BackendType b) =>
+            b is BackendType.GgmlCuda or BackendType.GgmlCpu
+              or BackendType.GgmlMetal or BackendType.GgmlVulkan;
 
         // ---- weights --------------------------------------------------------
 
@@ -305,6 +320,14 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             if (layout is null) throw new ArgumentNullException(nameof(layout));
 
+            // TS_H3_DIT_LAYERS truncates the trunk for BOTH the GGML and managed
+            // paths, which turns a velocity comparison into an error-vs-depth curve.
+            // A reimplementation that is merely less noisy than ggml shows a smooth
+            // curve; a real bug shows a step at the layer that introduces it.
+            if (int.TryParse(Environment.GetEnvironmentVariable("TS_H3_DIT_LAYERS"),
+                             out int layerOverride) && layerOverride > 0)
+                blockLimit = layerOverride;
+
             var segments = new List<H3DitSegment>(layout.ModulationSpans.Count);
             foreach (var span in layout.ModulationSpans)
             {
@@ -338,6 +361,27 @@ namespace TensorSharp.Models.MiniMaxH3
             var (cos, sin) = BuildRope(layout.Positions);
             var videoOut = new float[(long)videoCount * Config.VideoPatchDim];
             var audioOut = new float[(long)audioCount * Config.AudioLatentChannels];
+
+            if (_direct != null)
+            {
+                // Pure-managed path: the identical graph, with no native call.
+                return _direct.Forward(
+                    videoInput, conditionCount, videoCount,
+                    audioLatent, audioCount,
+                    conditionAudioCount > 0 ? conditionAudio : null, conditionAudioCount,
+                    conditionChunks,
+                    textCount > 0 ? textHidden : null, textCount,
+                    timeEmbed, layout.Timesteps.Length,
+                    cos, sin,
+                    segArray,
+                    layout.TokenCount,
+                    layout.AudioSpan.Start, layout.VideoSpan.Start,
+                    layout.AudioSpan.Row * 2, layout.VideoSpan.Row * 2,
+                    -1f,
+                    -MiniMaxH3Scheduler.ShiftSlope(
+                        MiniMaxH3Scheduler.ClampSigma(sigma), videoShift, audioShift),
+                    blockLimit > 0 ? Math.Min(blockLimit, _blocks.Length) : _blocks.Length);
+            }
 
             var pins = new List<GCHandle>();
             IntPtr Pin(Array a)
@@ -440,6 +484,7 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             if (_disposed) return;
             _disposed = true;
+            _direct?.Dispose();
             if (_blocksPin.IsAllocated) _blocksPin.Free();
             if (_refinerPin.IsAllocated) _refinerPin.Free();
             foreach (IntPtr ptr in _bound)

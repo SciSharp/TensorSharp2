@@ -51,6 +51,10 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly H3Conv1d[] _convs;
         private readonly H3Act1d[] _acts;
         private readonly int[] _rates;
+        // Non-null on the backends with no ggml graph to call (BackendType.Cpu).
+        private readonly MiniMaxH3DirectAudioVae _direct;
+        private MiniMaxH3DirectAudioVaeEncoder _directEnc;
+        private readonly bool _useDirect;
         private GCHandle _convsPin, _actsPin, _ratesPin;
         private H3Conv1d _decInProj, _convPre, _convPost;
         private H3AudioEncBlock[] _encBlocks;
@@ -65,8 +69,11 @@ namespace TensorSharp.Models.MiniMaxH3
         public float[] LatentsStd { get; }
         public int NumStages => Rates.Length;
 
-        public MiniMaxH3AudioVae(string path)
+        public MiniMaxH3AudioVae(string path) : this(path, BackendType.GgmlCuda, false) { }
+
+        public MiniMaxH3AudioVae(string path, BackendType backend, bool useDirect)
         {
+            _useDirect = useDirect;
             _model = SafetensorsModel.Open(path);
             if (!_model.HasTensor("dec_in_proj.weight"))
                 throw new InvalidOperationException(
@@ -108,6 +115,177 @@ namespace TensorSharp.Models.MiniMaxH3
 
             LatentsMean = _model.HasTensor("latents_mean") ? _model.ReadFloat32("latents_mean") : null;
             LatentsStd = _model.HasTensor("latents_std") ? _model.ReadFloat32("latents_std") : null;
+
+            // Backends with no ggml graph to call decode through the managed vocoder.
+            if (_useDirect) _direct = BuildDirect();
+        }
+
+        // ---- direct (managed) decoder ---------------------------------------
+
+        /// <summary>Rebuild the decoder weights as managed float arrays for the
+        /// backends with no ggml graph to call. Same tensors, same order, same
+        /// padding/dilation arithmetic as the pinned-pointer path above.</summary>
+        /// <summary>One managed 1-D conv descriptor. Shared by the decoder and the
+        /// encoder builders so the two cannot drift in how they read a kernel.</summary>
+        private MiniMaxH3DirectAudioVae.Conv ReadConv(string prefix, int padding, int dilation = 1,
+                                                      bool transposed = false, int stride = 1)
+        {
+            string weight = prefix + ".weight";
+            var info = _model.TensorOwners[weight].GetInfo(weight);
+            return new MiniMaxH3DirectAudioVae.Conv
+            {
+                W = _model.ReadFloat32(weight),
+                B = _model.HasTensor(prefix + ".bias") ? _model.ReadFloat32(prefix + ".bias") : null,
+                Oc = (int)info.Shape[0],
+                Ic = (int)info.Shape[1],
+                K = (int)info.Shape[2],
+                Stride = stride,
+                Pad = padding,
+                Dilation = dilation,
+                Transposed = transposed,
+            };
+        }
+
+        /// <summary>
+        /// Build the managed encoder on first use. Mirrors EnsureEncoder tensor for
+        /// tensor: the encoder stores Snake alpha LINEARLY (the decoder stores it in
+        /// log scale), the DAC downsample convention is kernel 2*stride with padding
+        /// ceil(stride/2), and the QKV bias is assembled on the host as
+        /// concat(q_bias, zeros, v_bias) because the checkpoint has no key bias.
+        /// </summary>
+        private MiniMaxH3DirectAudioVaeEncoder BuildDirectEncoder()
+        {
+            MiniMaxH3DirectAudioVaeEncoder.Snake ReadSnake(string prefix)
+                => new(_model.ReadFloat32(prefix + ".alpha"));
+
+            MiniMaxH3DirectAudioVaeEncoder.Lin ReadLin(string prefix)
+            {
+                string weight = prefix + ".weight";
+                var info = _model.TensorOwners[weight].GetInfo(weight);
+                return new MiniMaxH3DirectAudioVaeEncoder.Lin
+                {
+                    W = _model.ReadFloat32(weight),
+                    B = _model.HasTensor(prefix + ".bias") ? _model.ReadFloat32(prefix + ".bias") : null,
+                    Ne0 = (int)info.Shape[1],
+                    Ne1 = (int)info.Shape[0],
+                };
+            }
+
+            MiniMaxH3DirectAudioVaeEncoder.ResUnit ReadUnit(string prefix, int dilation) => new()
+            {
+                Act1 = ReadSnake($"{prefix}.0"),
+                // k7 dilated, padded to keep the length: (7*d - d)/2 = 3d.
+                Conv1 = ReadConv($"{prefix}.1", padding: 3 * dilation, dilation: dilation),
+                Act2 = ReadSnake($"{prefix}.2"),
+                Conv2 = ReadConv($"{prefix}.3", padding: 0),
+            };
+
+            var blocks = new MiniMaxH3DirectAudioVaeEncoder.Block[EncoderStrides.Length];
+            for (int i = 0; i < EncoderStrides.Length; i++)
+            {
+                string bp = $"encoder.block.{i + 1}.block";
+                int stride = EncoderStrides[i];
+                blocks[i] = new MiniMaxH3DirectAudioVaeEncoder.Block
+                {
+                    Units = new[]
+                    {
+                        ReadUnit($"{bp}.0.block", EncoderDilations[0]),
+                        ReadUnit($"{bp}.1.block", EncoderDilations[1]),
+                        ReadUnit($"{bp}.2.block", EncoderDilations[2]),
+                    },
+                    Act = ReadSnake($"{bp}.3"),
+                    // DAC convention: kernel = 2*stride, padding = ceil(stride/2).
+                    Down = ReadConv($"{bp}.4", padding: (stride + 1) / 2, stride: stride),
+                };
+            }
+
+            float[] q = _model.ReadFloat32("pre_block.attn.q_bias");
+            float[] v = _model.ReadFloat32("pre_block.attn.v_bias");
+            var qkvBias = new float[3 * TrunkChannels];
+            Array.Copy(q, 0, qkvBias, 0, q.Length);
+            // the middle third stays zero: there is no key bias in the checkpoint
+            Array.Copy(v, 0, qkvBias, 2 * TrunkChannels, v.Length);
+
+            var pre = new MiniMaxH3DirectAudioVaeEncoder.AttnBlock
+            {
+                Norm1W = _model.ReadFloat32("pre_block.norm1.weight"),
+                Norm1B = _model.ReadFloat32("pre_block.norm1.bias"),
+                Norm3W = _model.ReadFloat32("pre_block.norm3.weight"),
+                Norm3B = _model.ReadFloat32("pre_block.norm3.bias"),
+                Norm2W = _model.ReadFloat32("pre_block.norm2.weight"),
+                Norm2B = _model.ReadFloat32("pre_block.norm2.bias"),
+                MlpNormW = _model.ReadFloat32("pre_block.mlp.norm.weight"),
+                MlpNormB = _model.ReadFloat32("pre_block.mlp.norm.bias"),
+                Qkv = ReadLin("pre_block.attn.qkv"),
+                QkvBias = qkvBias,
+                AttnProj = ReadLin("pre_block.attn.proj"),
+                Proj = ReadLin("pre_block.proj"),
+                W0 = ReadLin("pre_block.mlp.w0"),
+                W1 = ReadLin("pre_block.mlp.w1"),
+                W2 = ReadLin("pre_block.mlp.w2"),
+                Heads = AttnHeads,
+            };
+
+            return new MiniMaxH3DirectAudioVaeEncoder(
+                ReadConv("encoder.block.0", padding: 3),
+                blocks,
+                ReadSnake("encoder.block.6"),
+                ReadConv("encoder.block.7", padding: 1),
+                pre,
+                ReadConv("mean_proj", padding: 0),
+                LatentChannels, TrunkChannels, 1e-5f);
+        }
+
+        private MiniMaxH3DirectAudioVae BuildDirect()
+        {
+            MiniMaxH3DirectAudioVae.Act ReadAct(string prefix)
+            {
+                // alpha/beta are stored in log scale (snake_logscale); exponentiate
+                // here and fold in the divide-by-zero guard, exactly as the GGML
+                // path does on the host.
+                float[] alpha = _model.ReadFloat32(prefix + ".act.alpha");
+                float[] beta = _model.ReadFloat32(prefix + ".act.beta");
+                for (int i = 0; i < alpha.Length; i++) alpha[i] = MathF.Exp(alpha[i]);
+                for (int i = 0; i < beta.Length; i++) beta[i] = MathF.Exp(beta[i]) + 1e-9f;
+                float[] up = _model.ReadFloat32(prefix + ".upsample.filter");
+                Array.Reverse(up);   // zero-stuff + convolve needs the reversed filter
+                return new MiniMaxH3DirectAudioVae.Act
+                {
+                    Alpha = alpha,
+                    Beta = beta,
+                    UpFilter = up,
+                    DownFilter = _model.ReadFloat32(prefix + ".downsample.lowpass.filter"),
+                    Channels = alpha.Length,
+                    Kernel = ActivationKernel,
+                };
+            }
+
+            var convs = new List<MiniMaxH3DirectAudioVae.Conv>();
+            var acts = new List<MiniMaxH3DirectAudioVae.Act>();
+            for (int s = 0; s < Rates.Length; s++)
+                convs.Add(ReadConv($"decoder.ups.{s}.0", padding: 0, transposed: true));
+            for (int s = 0; s < Rates.Length; s++)
+                for (int a = 0; a < AmpsPerStage; a++)
+                {
+                    int rb = s * AmpsPerStage + a;
+                    int k = ResblockKernels[a];
+                    for (int dl = 0; dl < 3; dl++)
+                        convs.Add(ReadConv($"decoder.resblocks.{rb}.convs1.{dl}",
+                            padding: (k * Dilations[dl] - Dilations[dl]) / 2,
+                            dilation: Dilations[dl]));
+                    for (int dl = 0; dl < 3; dl++)
+                        convs.Add(ReadConv($"decoder.resblocks.{rb}.convs2.{dl}",
+                            padding: (k - 1) / 2));
+                    for (int ai = 0; ai < 6; ai++)
+                        acts.Add(ReadAct($"decoder.resblocks.{rb}.activations.{ai}"));
+                }
+            acts.Add(ReadAct("decoder.activation_post"));
+
+            return new MiniMaxH3DirectAudioVae(
+                ReadConv("dec_in_proj", padding: 0),
+                ReadConv("decoder.conv_pre", padding: 3),
+                ReadConv("decoder.conv_post", padding: 3),
+                convs.ToArray(), acts.ToArray(), (int[])Rates.Clone(), AmpsPerStage);
         }
 
         // ---- weights --------------------------------------------------------
@@ -331,6 +509,13 @@ namespace TensorSharp.Models.MiniMaxH3
             var wave = new float[usable];
             Array.Copy(samples, wave, usable);
 
+            if (_useDirect)
+            {
+                // Pure-managed path: the identical encoder, with no native call.
+                _directEnc ??= BuildDirectEncoder();
+                return _directEnc.Encode(wave, frames);
+            }
+
             var outp = new float[(long)frames * LatentChannels];
             var wPin = GCHandle.Alloc(wave, GCHandleType.Pinned);
             var oPin = GCHandle.Alloc(outp, GCHandleType.Pinned);
@@ -412,6 +597,12 @@ namespace TensorSharp.Models.MiniMaxH3
                     nameof(latent));
 
             int samples = SamplesFor(latentFrames);
+            if (_direct != null)
+            {
+                // Pure-managed path: the identical vocoder, with no native call.
+                return _direct.Decode(latent, LatentChannels, latentFrames, samples);
+            }
+
             var outp = new float[samples];
             var zPin = GCHandle.Alloc(latent, GCHandleType.Pinned);
             var oPin = GCHandle.Alloc(outp, GCHandleType.Pinned);

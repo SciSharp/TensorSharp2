@@ -16,6 +16,7 @@
 // the patch flattening, the bilinear resample of the learned 48x48 position grid,
 // and the 2-D RoPE tables.
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TensorSharp.GGML;
@@ -72,6 +73,8 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly float[] _posEmbedTable;   // [2304][dim]
         private GCHandle _blocksPin, _mergersPin, _layersPin;
         private H3Lin _patchEmbed;
+        // Non-null on the backends with no ggml graph to call (BackendType.Cpu).
+        private readonly MiniMaxH3DirectVisionEncoder _direct;
         private bool _disposed;
 
         public int Dim { get; }
@@ -81,7 +84,9 @@ namespace TensorSharp.Models.MiniMaxH3
         public int NumBlocks => _blocks.Length;
         public int PatchDim => 3 * TemporalPatch * PatchSize * PatchSize;
 
-        public MiniMaxH3VisionEncoder(GgufFile gguf)
+        public MiniMaxH3VisionEncoder(GgufFile gguf) : this(gguf, BackendType.GgmlCuda, null) { }
+
+        public MiniMaxH3VisionEncoder(GgufFile gguf, BackendType backend, IAllocator allocator)
         {
             _gguf = gguf ?? throw new ArgumentNullException(nameof(gguf));
             if (!gguf.Tensors.ContainsKey("visual.patch_embed.proj.weight"))
@@ -123,6 +128,13 @@ namespace TensorSharp.Models.MiniMaxH3
                              : throw new NotSupportedException(
                                  $"unexpected vision depth {n}; DeepStack taps are only defined for 24 or 27.");
             _layersPin = GCHandle.Alloc(_deepstackLayers, GCHandleType.Pinned);
+
+            // Backends with no ggml graph to call run the same tower through the
+            // shared direct primitives instead.
+            if (allocator != null && backend is not (BackendType.GgmlCuda or BackendType.GgmlCpu
+                    or BackendType.GgmlMetal or BackendType.GgmlVulkan))
+                _direct = new MiniMaxH3DirectVisionEncoder(
+                    gguf, Dim, Heads, OutDim, PatchDim, SpatialMerge, _deepstackLayers, Eps, allocator);
 
             // [0] is the final merger, which normalizes BEFORE the merge at width dim;
             // the DeepStack mergers normalize AFTER it at width dim*4.
@@ -377,7 +389,16 @@ namespace TensorSharp.Models.MiniMaxH3
             float[] pos = BuildPositionEmbeddings(gridH, gridW);
             var (cos, sin) = BuildRope(gridH, gridW);
             int outputs = 1 + _deepstackLayers.Length;
-            var flat = new float[(long)merged * outputs * OutDim];
+            float[] flat;
+
+            if (_direct != null)
+            {
+                // Pure-managed path: the identical tower, with no native call.
+                flat = _direct.Encode(patches, pos, cos, sin, tokens);
+            }
+            else
+            {
+            flat = new float[(long)merged * outputs * OutDim];
 
             var pPin = GCHandle.Alloc(patches, GCHandleType.Pinned);
             var ePin = GCHandle.Alloc(pos, GCHandleType.Pinned);
@@ -413,6 +434,18 @@ namespace TensorSharp.Models.MiniMaxH3
                     throw new InvalidOperationException("MiniMax-H3 vision encode failed.");
             }
             finally { pPin.Free(); ePin.Free(); cPin.Free(); sPin.Free(); oPin.Free(); }
+            }
+
+            // TS_H3_DUMP_VIS writes the tower output for BOTH paths, so the managed
+            // tower can be compared against GGML on ONE forward instead of through a
+            // denoise that amplifies whatever it differed by.
+            string dumpPath = Environment.GetEnvironmentVariable("TS_H3_DUMP_VIS");
+            if (!string.IsNullOrEmpty(dumpPath))
+            {
+                using var fs = new FileStream(dumpPath, FileMode.Create, FileAccess.Write);
+                using var bw = new BinaryWriter(fs);
+                foreach (float v in flat) bw.Write(v);
+            }
 
             long span = (long)merged * OutDim;
             var mergedOut = new float[span];
@@ -437,6 +470,7 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             if (_disposed) return;
             _disposed = true;
+            _direct?.Dispose();
             foreach (IntPtr ptr in _bound)
                 if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
             _bound.Clear();

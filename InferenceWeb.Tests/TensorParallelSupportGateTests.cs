@@ -16,18 +16,38 @@
 // away for an architecture that CAN use it - just not by sharding. qwen4exp now
 // resolves --tp N to a LAYER SPLIT (each GPU holds a contiguous run of whole
 // layers), which is the same and only multi-GPU mode llama.cpp offers for it.
+//
+// The mode now lives on each architecture's own descriptor rather than in two
+// name tables inside ModelBase, so the last two facts the tables used to be
+// checked for - "every entry explains itself" and "every layer-split arch is
+// also declared non-tensor-parallel" - are structural invariants of
+// ModelArchitectureDescriptor.Validate() instead, asserted here over the whole
+// registered set.
 using System;
+using System.Linq;
 using TensorSharp;
+using TensorSharp.Models.Architecture;
 using Xunit;
 
 namespace InferenceWeb.Tests;
 
 public class TensorParallelSupportGateTests
 {
-    private static int Resolve(string arch, BackendType backend, int tpDegree,
+    private static ModelArchitectureDescriptor Arch(string id)
+    {
+        Assert.True(ModelArchitectureRegistry.TryGet(id, out var descriptor),
+            $"architecture '{id}' is not registered");
+        return descriptor;
+    }
+
+    private static int Resolve(ModelArchitectureDescriptor arch, BackendType backend, int tpDegree,
         ref ITensorParallelGroup group, out int layerSplit)
         => TensorSharp.Models.ModelBase.ResolveTensorParallelSupport(
             arch, backend, tpDegree, ref group, out layerSplit);
+
+    private static int Resolve(string arch, BackendType backend, int tpDegree,
+        ref ITensorParallelGroup group, out int layerSplit)
+        => Resolve(Arch(arch), backend, tpDegree, ref group, out layerSplit);
 
     [Fact]
     public void LayerSplitArchitecture_ResolvesToASplit_NotTensorParallelism()
@@ -91,38 +111,65 @@ public class TensorParallelSupportGateTests
     }
 
     [Fact]
-    public void UnknownArchitecture_IsNotBlocked()
+    public void ArchitectureThatDeclaresNothing_IsNotBlocked()
     {
-        // The table is a deny-list of known-unsupported architectures, not an
-        // allow-list: a new arch must not be refused just for being absent.
+        // The gate is opt-in per architecture, not an allow-list: a family that says
+        // nothing about multi-GPU gets plain tensor parallelism, unchanged.
+        var brandNew = new ModelArchitectureDescriptor
+        {
+            Id = "brand-new-arch",
+            Aliases = new[] { "brand-new-arch" },
+            Factory = _ => throw new NotSupportedException("not constructed by this test"),
+        };
         ITensorParallelGroup group = null;
-        Assert.Equal(2, Resolve("brand-new-arch", BackendType.GgmlCuda, 2, ref group, out _));
+        Assert.Equal(2, Resolve(brandNew, BackendType.GgmlCuda, 2, ref group, out int layerSplit));
+        Assert.Equal(1, layerSplit);
     }
 
     [Fact]
-    public void EveryEntryExplainsItself()
+    public void EveryDegradedArchitectureExplainsItself()
     {
-        // The message is the whole value of the gate - it is what tells the
-        // operator why the second GPU is idle. An empty one is a bug.
-        Assert.NotEmpty(TensorSharp.Models.ModelBase.ArchitecturesWithoutTensorParallel);
-        foreach (var kv in TensorSharp.Models.ModelBase.ArchitecturesWithoutTensorParallel)
+        // The message is the whole value of the gate - it is what tells the operator
+        // why the second GPU is idle, or why it holds whole layers instead of shards.
+        foreach (var arch in ModelArchitectureRegistry.All.Where(a => a.MultiGpu != MultiGpuMode.TensorParallel))
         {
-            Assert.False(string.IsNullOrWhiteSpace(kv.Value), $"'{kv.Key}' has no explanation.");
-            Assert.Contains(kv.Key, kv.Value, StringComparison.OrdinalIgnoreCase);
+            Assert.False(string.IsNullOrWhiteSpace(arch.MultiGpuLimitation), $"'{arch.Id}' has no explanation.");
+            Assert.Contains(arch.Id, arch.MultiGpuLimitation, StringComparison.OrdinalIgnoreCase);
         }
     }
 
     [Fact]
-    public void EveryLayerSplitArchitectureIsAlsoDeclaredNonTensorParallel()
+    public void DeclaringADegradedModeWithoutAReasonIsRejectedAtRegistration()
     {
-        // The split list is consulted only after the no-TP list matches. An arch in
-        // one and not the other would silently never split.
-        foreach (string arch in TensorSharp.Models.ModelBase.ArchitecturesWithLayerSplit)
+        // Validate() is what makes "every entry explains itself" true by construction,
+        // so a family cannot land a silent degrade the way the old name tables allowed.
+        var silent = new ModelArchitectureDescriptor
         {
-            Assert.True(TensorSharp.Models.ModelBase.ArchitecturesWithoutTensorParallel.ContainsKey(arch),
-                $"'{arch}' can layer-split but is not listed as lacking tensor parallelism, so the "
-                + "split branch is unreachable for it.");
+            Id = "silent-arch",
+            Aliases = new[] { "silent-arch" },
+            Factory = _ => throw new NotSupportedException(),
+            MultiGpu = MultiGpuMode.LayerSplit,
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => ModelArchitectureRegistry.Register(silent));
+        Assert.Contains("MultiGpuLimitation", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EveryBuiltInArchitectureIsWellFormed()
+    {
+        var all = ModelArchitectureRegistry.All;
+        Assert.NotEmpty(all);
+        foreach (var arch in all)
+        {
+            Assert.NotNull(arch.Factory);
+            Assert.Contains(arch.Id, arch.Aliases, StringComparer.OrdinalIgnoreCase);
+            foreach (string alias in arch.Aliases)
+                Assert.Same(arch, Arch(alias));
         }
+
+        // Aliases are the routing key; two families claiming one would silently shadow.
+        var aliases = all.SelectMany(a => a.Aliases).Select(a => a.ToLowerInvariant()).ToList();
+        Assert.Equal(aliases.Count, aliases.Distinct().Count());
     }
 
     /// <summary>Minimal live group: the gate only reads whether one exists.</summary>

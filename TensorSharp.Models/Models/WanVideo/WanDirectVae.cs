@@ -21,12 +21,13 @@ using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Cuda;
+using TensorSharp.Models.Direct;
 
 namespace TensorSharp.Models.WanVideo
 {
     internal sealed class WanDirectVae : WanVaeBase
     {
-        private readonly WanDirectContext _ctx;
+        private readonly DirectContext _ctx;
         private readonly WanVaeWeights _w;
 
         private sealed class ConvT
@@ -38,7 +39,7 @@ namespace TensorSharp.Models.WanVideo
         }
         private sealed class NormT { public Tensor Gamma; public int C; }
         private sealed class ResT { public NormT N0, N3; public ConvT C2, C6, Shortcut; }
-        private sealed class AttnT { public NormT Norm; public WanDirectLinear Qkv, Proj; public int C; }
+        private sealed class AttnT { public NormT Norm; public DirectLinear Qkv, Proj; public int C; }
         private sealed class UpT { public ConvT TimeConv, SConv; }
         private sealed class DownT { public ConvT SConv, TConv; }
 
@@ -70,7 +71,7 @@ namespace TensorSharp.Models.WanVideo
         // above ~0.3 MP to bound the working set.
         protected override long TilePixelThreshold => 300_000;
 
-        public WanDirectVae(WanDirectContext ctx, string vaePath)
+        public WanDirectVae(DirectContext ctx, string vaePath)
         {
             _ctx = ctx;
             _w = WanVaeWeights.Load(vaePath);
@@ -100,8 +101,8 @@ namespace TensorSharp.Models.WanVideo
         private AttnT Attn(WanVaeAttnWeights a) => new AttnT
         {
             Norm = Norm(a.Norm),
-            Qkv = WanDirectLinear.FromFloats(_ctx, a.QkvW, a.C, 3L * a.C, a.QkvB),
-            Proj = WanDirectLinear.FromFloats(_ctx, a.ProjW, a.C, a.C, a.ProjB),
+            Qkv = DirectLinear.FromFloats(_ctx, a.QkvW, a.C, 3L * a.C, a.QkvB),
+            Proj = DirectLinear.FromFloats(_ctx, a.ProjW, a.C, a.C, a.ProjB),
             C = a.C,
         };
 
@@ -183,20 +184,20 @@ namespace TensorSharp.Models.WanVideo
                             using var col = src.View(h * w, c.Ic);
                             using var band = col.Narrow(0, y0 * ow, rows * ow);
                             if (_ctx.IsCuda) Ops.Addmm(dst, j == 0 ? 0f : 1f, dst, 1f, band, c.TapsT[j]);
-                            else WanDirectOps.CpuGemmABt(band, c.Taps[j], dst, 1f, j == 0 ? 0f : 1f);
+                            else DirectOps.CpuGemmABt(band, c.Taps[j], dst, 1f, j == 0 ? 0f : 1f);
                         }
                         else
                         {
                             using var col = _ctx.NewF32(rows * ow, k);
                             Im2Col(col, src, c.Ic, h, w, c.K, oh, ow, pad, stride, y0, rows);
                             if (_ctx.IsCuda) Ops.Addmm(dst, j == 0 ? 0f : 1f, dst, 1f, col, c.TapsT[j]);
-                            else WanDirectOps.CpuGemmABt(col, c.Taps[j], dst, 1f, j == 0 ? 0f : 1f);
+                            else DirectOps.CpuGemmABt(col, c.Taps[j], dst, 1f, j == 0 ? 0f : 1f);
                         }
                         src.Dispose();
                     }
                 }
                 if (c.Bias != null)
-                    WanDirectOps.AddBiasRows(_ctx, o2, c.Bias);
+                    DirectOps.AddBiasRows(_ctx, o2, c.Bias);
             }
             return outT;
         }
@@ -311,7 +312,7 @@ namespace TensorSharp.Models.WanVideo
             sizes[0] = t + n;
             var outT = _ctx.NewF32(sizes);
             using (var front = outT.Narrow(0, 0, n))
-                WanDirectOps.Zero(_ctx, front);
+                DirectOps.Zero(_ctx, front);
             using var dst = outT.Narrow(0, n, t);
             Ops.Copy(dst, x);
             return outT;
@@ -366,7 +367,7 @@ namespace TensorSharp.Models.WanVideo
                 using var k = Ops.NewContiguous(kv);
                 using var vv = qkv.Narrow(1, 2L * C, C);
                 using var v = Ops.NewContiguous(vv);
-                using var attn = WanDirectOps.Attention(_ctx, q, k, v, 1, C, scale);
+                using var attn = DirectOps.Attention(_ctx, q, k, v, 1, C, scale);
                 using var o = a.Proj.Forward(attn);
                 Ops.Add(o, o, f2);
                 Ops.Copy(f2, o);
@@ -575,7 +576,7 @@ namespace TensorSharp.Models.WanVideo
                     using var z1 = z2.Narrow(0, i, 1);
                     using var chunkPix = DecodeChunk(z1);       // [tOut, H, W, 3]
                     int tOut = (int)chunkPix.Sizes[0];
-                    float[] host = WanDirectOps.ToArray(chunkPix);
+                    float[] host = DirectOps.ToArray(chunkPix);
                     long hwPix = (long)H * W;
                     Parallel.For(0, tOut, f =>
                     {
@@ -767,7 +768,7 @@ namespace TensorSharp.Models.WanVideo
                     using var muC = EncodeChunk(xc);            // [tOut, lh, lw, z]
                     int tOut = (int)muC.Sizes[0];
                     long lh = muC.Sizes[1], lw = muC.Sizes[2];
-                    float[] host = WanDirectOps.ToArray(muC);
+                    float[] host = DirectOps.ToArray(muC);
                     long lhw = lh * lw;
                     // channels-last -> native [lw, lh, z, lt] (= planar [lt, z, lh, lw])
                     Parallel.For(0, tOut, f =>

@@ -162,7 +162,7 @@ tensor API 开启时 VAE 依然**正确**：在支持 tensor API 的设备上，
 | A14B I2V Q4_K_M | **17.1s** / 30.2s（1.77×） | 135s / 19s | 约 9 步 → 40 步默认配方下开启 tensor API **快约 33%**（约 13.7 vs 20.5 分钟） |
 | TI2V-5B Q8_0 | **1.6s** / 2.9s（1.8×） | 179s / 13s | 约 128 步 → 永不划算 |
 
-因此默认按 DiT 规模选择（ModelBase.cs 的 `ApplyArchitectureNativeTunables`）：A14B/14B 级模型（`patch_embedding` 输出维度 ≥ 5120）**启用**，更小的模型**禁用**。待上游修复 tensor-API `mul_mm` 后，可全面启用并移除直接卷积隔离方案。
+因此默认按 DiT 规模选择（`WanVideoArchitecture.ApplyNativeTunables`）：A14B/14B 级模型（`patch_embedding` 输出维度 ≥ 5120）**启用**，更小的模型**禁用**。待上游修复 tensor-API `mul_mm` 后，可全面启用并移除直接卷积隔离方案。
 
 | 环境变量 | 作用 |
 |---|---|
@@ -383,7 +383,7 @@ TensorSharp 采用分层系统结构：
 
 2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析、分页 KV 缓存（`Runtime/Paged/*`）、连续批处理调度器 / 引擎（`Runtime/Scheduling/*`）、`IKvBlockCodec` 接口及其 `TurboQuantKvCodec` 2-bit / Q4 / Q8 实现，以及 `IModelArchitecture`、`IBatchedPagedModel`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IKVCachePolicy`、`IBackendExecutionPlan` 等抽象。
 
-3. **TensorSharp.Models** 实现 `ModelBase` 以及全部 14 个具体模型架构和多模态辅助组件——11 个文本家族（DeepSeek V4 Flash、GLM 5.x、Gemma 3、Gemma 4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6 系列、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer）与 3 个媒体输出家族（Qwen-Image-Edit、MiniMax-H3、Wan 2.1/2.2）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-Edit（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像编辑通过 `EditImage()` 进行，由它编排 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。视频家族更进一步：`MiniMaxH3Model` 与 `WanVideoModel` 的 `ForwardCore()` 都直接抛异常，生成统一走 `GenerateVideo(prompt, VideoGenerationParams)`，其背后是 `Models/Video/` 里共享的 `IVideoGenerationModel` 接缝——CLI 与服务端因此只用一条路径驱动两者（以及日后新增的模型），而不必逐个判断具体模型类型。MiniMax-H3 在同一个打包 latent 里**同时**去噪视频与 32 kHz 立体声音频，共有七张原生整网络计算图（DiT、Qwen3-VL 文本编码器、视觉塔、视频与音频 VAE 的编码与解码）；Wan 2.1/2.2 则是仅视频的家族，其 DiT、UMT5-XXL 编码器与因果 3D VAE 同样以整图方式运行。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构——MiniMax-H3 例外：其公开发布的 GGUF 完全不带元数据，只能依据张量识别（`ModelBase.cs` 的 `LooksLikeMiniMaxH3`）。
+3. **TensorSharp.Models** 实现 `ModelBase` 以及全部 14 个具体模型架构和多模态辅助组件——11 个文本家族（DeepSeek V4 Flash、GLM 5.x、Gemma 3、Gemma 4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6 系列、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer）与 3 个媒体输出家族（Qwen-Image-Edit、MiniMax-H3、Wan 2.1/2.2）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-Edit（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像编辑通过 `EditImage()` 进行，由它编排 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。视频家族更进一步：`MiniMaxH3Model` 与 `WanVideoModel` 的 `ForwardCore()` 都直接抛异常，生成统一走 `GenerateVideo(prompt, VideoGenerationParams)`，其背后是 `Models/Video/` 里共享的 `IVideoGenerationModel` 接缝——CLI 与服务端因此只用一条路径驱动两者（以及日后新增的模型），而不必逐个判断具体模型类型。MiniMax-H3 在同一个打包 latent 里**同时**去噪视频与 32 kHz 立体声音频，共有七张原生整网络计算图（DiT、Qwen3-VL 文本编码器、视觉塔、视频与音频 VAE 的编码与解码）；Wan 2.1/2.2 则是仅视频的家族，其 DiT、UMT5-XXL 编码器与因果 3D VAE 同样以整图方式运行。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构——MiniMax-H3 例外：其公开发布的 GGUF 完全不带元数据，只能依据张量识别（`LooksLikeMiniMaxH3`，经由 `MiniMaxH3Architecture.DetectFromTensors` 接入）。
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。除原生量化 matmul（Q4_K_M、Q8_0 等，无需反量化到 FP32）外，还提供分页注意力（`TSGgml_PagedAttentionForward`，含 / 不含注意力 sinks 两种版本）以及架构特定的批处理内核（Mamba2、GatedDeltaNet）。
 
@@ -394,6 +394,54 @@ TensorSharp 采用分层系统结构：
 7. **TensorSharp.Server** 是 HTTP / 应用层，提供兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理；其中 `InferenceEngineHost` 持有自回归模型的连续批处理引擎，`DiffusionBatchScheduler` 处理 DiffusionGemma 的 Web UI 轮次，旧的队列状态接口保留作为向后兼容。
 
 8. **TensorSharp.Cli** 是控制台 / 应用层，用于本地 prompt 运行、多模态实验、prompt 检查、JSONL 批处理、交互式 REPL 与内置的 prefill / decode 基准。
+
+### 新增模型、模态或对话格式
+
+一个架构需要声明的全部信息都集中在三张表里：新增一个模型家族只需要改动它自己的
+目录，外加每张表一行——加载器、调度规划器、CLI 与服务端都不需要动。
+
+**1. 架构插件。** 在模型旁边写 `Models/<Family>/<Family>Architecture.cs`：
+
+```csharp
+internal static class MyFamilyArchitecture
+{
+    public static ModelArchitectureDescriptor Descriptor { get; } = new()
+    {
+        Id = "myfamily",
+        DisplayName = "My Family",
+        Aliases = new[] { "myfamily", "myfamily_moe" },   // general.architecture 取值
+        Factory = c => new MyFamilyModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+        // 以下均可选，都有默认值：
+        //   MultiGpu / MultiGpuLimitation   如何使用多卡，以及为什么不能张量并行
+        //   ProjectorFileHints              自动发现的 mmproj 伴随文件名
+        //   DetectFromTensors               针对不带架构元数据的 GGUF
+        //   ApplyNativeTunables             加载前需要设置的进程级 ggml 开关
+    };
+}
+```
+
+然后在 `Architecture/BuiltInArchitectures.cs` 里加一行。`ModelBase.Create` 通过
+`ModelArchitectureRegistry` 解析，不再有 switch 需要扩展；而且
+`ModelArchitectureDescriptor.Validate()` 会拒绝“声明了降级的多卡模式却不说明原因”
+的描述符。
+
+**2. 模态是能力接口，不是类型判断。** 能看图的模型实现 `IVisionCapableModel`
+（加载视觉塔、接收一段 embedding）与 `IMultimodalPromptExpander`（展开自己的占位
+符）；音频再加 `IAudioCapableModel` / `IAudioEncoderLoader`；按轴旋转位置编码再加
+`IMRoPEPositionSink`。`ModelMultimodalInjector` 拥有全部通用逻辑——按请求分桶、
+span 记账、前缀裁剪、截断、切片——并且不再出现任何模型类型名。CLI、交互式 REPL 与
+服务端都驱动同一个 injector，因此一次接好的模态在所有入口都能用。
+
+**3. 对话格式是一个 `ChatProtocol`。** 提示词框架、是否绕过 GGUF 自带的 Jinja
+模板、媒体占位符 token、输出解析器、该解析器是否必须运行、结构化输出语法从何处开始
+生效、KV cache 的生成后缀，以及视频抽帧上限——这些统一为 `ChatProtocolRegistry`
+里的**一条**记录。它们过去分散为 `ChatTemplate`、`OutputParser`、
+`KVCachePromptRenderer` 与服务端里大约二十多处按架构名的比较，漏掉任何一处都会静默
+出错（未解析的回复会把推理标签当答案流式吐给客户端；缺失的媒体占位符会让图片被丢弃；
+缺失的生成后缀会让多轮前缀复用率归零，而回答本身看起来仍然正确）。
+
+运行期路由保持不变，仍由能力接口驱动：`ExecutionCapabilities.FromModel` 每步读取一次
+`IBatchedPagedModel`、`ISpeculativeTarget` 等接口。上述三张表都不在逐 token 的热路径上。
 
 ### 性能优化
 

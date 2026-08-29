@@ -177,79 +177,6 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
-        [RegisterOpStorageType("mulmatid", typeof(CpuStorage))]
-        public Tensor MulmatID(Tensor result, Tensor expertWeights, Tensor input, Tensor ids)
-        {
-            if (expertWeights.DimensionCount != 3 || input.DimensionCount != 3 || ids.DimensionCount != 2)
-            {
-                throw new NotSupportedException("mulmatid expects expertWeights/input to be 3D and ids to be 2D.");
-            }
-
-            long tokens = input.Sizes[0];
-            long expertUsed = ids.Sizes[1];
-            long rows = expertWeights.Sizes[1];
-            long cols = expertWeights.Sizes[2];
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, expertWeights.Allocator, DType.Float32, false, tokens, expertUsed, rows);
-
-            bool useIntIds = ids.ElementType == DType.Int32;
-            int[] idsInt = useIntIds ? ids.GetElementsAsInt((int)ids.ElementCount()) : Array.Empty<int>();
-            for (int token = 0; token < tokens; token++)
-            {
-                for (int expertSlot = 0; expertSlot < expertUsed; expertSlot++)
-                {
-                    int expertId = useIntIds
-                        ? idsInt[token * (int)expertUsed + expertSlot]
-                        : (int)ids.GetElementAsFloat(token, expertSlot);
-
-                    int inputExpertSlot = expertSlot % (int)input.Sizes[1];
-                    for (int row = 0; row < rows; row++)
-                    {
-                        float acc = 0.0f;
-                        for (int col = 0; col < cols; col++)
-                        {
-                            acc += expertWeights.GetElementAsFloat(expertId, row, col) * input.GetElementAsFloat(token, inputExpertSlot, col);
-                        }
-
-                        writeTarget.SetElementAsFloat(acc, token, expertSlot, row);
-                    }
-                }
-            }
-
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("addid", typeof(CpuStorage))]
-        public Tensor AddID(Tensor result, Tensor src, Tensor bias, Tensor ids)
-        {
-            if (src.DimensionCount != 3 || bias.DimensionCount != 2 || ids.DimensionCount != 2)
-            {
-                throw new NotSupportedException("addid expects src to be 3D, bias to be 2D, and ids to be 2D.");
-            }
-
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
-            Ops.Copy(writeTarget, src);
-
-            bool useIntIds = ids.ElementType == DType.Int32;
-            int[] idsInt = useIntIds ? ids.GetElementsAsInt((int)ids.ElementCount()) : Array.Empty<int>();
-            for (int token = 0; token < src.Sizes[0]; token++)
-            {
-                for (int expertSlot = 0; expertSlot < src.Sizes[1]; expertSlot++)
-                {
-                    int expertId = useIntIds
-                        ? idsInt[token * (int)ids.Sizes[1] + expertSlot]
-                        : (int)ids.GetElementAsFloat(token, expertSlot);
-
-                    for (int row = 0; row < src.Sizes[2]; row++)
-                    {
-                        float updated = writeTarget.GetElementAsFloat(token, expertSlot, row) + bias.GetElementAsFloat(expertId, row);
-                        writeTarget.SetElementAsFloat(updated, token, expertSlot, row);
-                    }
-                }
-            }
-
-            return writeTarget;
-        }
-
 
 
         private static bool UseCpuOpsNative => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
@@ -280,24 +207,6 @@ namespace TensorSharp.Cpu
 
 
         private readonly MethodInfo sqrt_func = NativeWrapper.GetMethod("TS_Sqrt");
-        [RegisterOpStorageType("sqrt", typeof(CpuStorage))]
-        public Tensor Sqrt(Tensor result, Tensor src)
-        {
-            if (UseCpuOpsNative) return NativeWrapper.InvokeNullableResultElementwise(sqrt_func, result, src);
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
-            TensorApplyCPU.Sqrt(writeTarget, src);
-            return writeTarget;
-        }
-
-
-        [RegisterOpStorageType("rsqrt", typeof(CpuStorage))]
-        public Tensor Rsqrt(Tensor result, Tensor src)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
-            TensorApplyCPU.Rsqrt(writeTarget, src);
-
-            return writeTarget;
-        }
 
         [RegisterOpStorageType("exp", typeof(CpuStorage))]
         public Tensor Exp(Tensor result, Tensor src) 
@@ -353,9 +262,6 @@ namespace TensorSharp.Cpu
 
 
         private readonly MethodInfo sin_func = NativeWrapper.GetMethod("TS_Sin");
-        [RegisterOpStorageType("sin", typeof(CpuStorage))]
-        public Tensor Sin(Tensor result, Tensor src) { return NativeWrapper.InvokeNullableResultElementwise(sin_func, result, src); }
-
         private readonly MethodInfo cos_func = NativeWrapper.GetMethod("TS_Cos");
         [RegisterOpStorageType("cos", typeof(CpuStorage))]
         public Tensor Cos(Tensor result, Tensor src) { return NativeWrapper.InvokeNullableResultElementwise(cos_func, result, src); }
@@ -406,44 +312,11 @@ namespace TensorSharp.Cpu
         }
 
 
-        [RegisterOpStorageType("tanhD", typeof(CpuStorage))]
-        public Tensor TanhD(Tensor result, Tensor resW, Tensor resG)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, resW, false, resW.Sizes);
-            TensorApplyCPU.TanhD(writeTarget, resW, resG);
 
-            return writeTarget;
-        }
-
-
-        [RegisterOpStorageType("sigmoidD", typeof(CpuStorage))]
-        public Tensor SigmoidD(Tensor result, Tensor resW, Tensor resG)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, resW, false, resW.Sizes);
-            TensorApplyCPU.SigmoidD(writeTarget, resW, resG);
-
-            return writeTarget;
-        }
-
-
-        [RegisterOpStorageType("addsigmoidD", typeof(CpuStorage))]
-        public Tensor AddSigmoidD(Tensor result, Tensor t, Tensor resW, Tensor resG)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, resW, false, resW.Sizes);
-            TensorApplyCPU.AddSigmoidD(writeTarget, t, resW, resG);
-
-            return writeTarget;
-        }
 
 
         private readonly MethodInfo add3_func = NativeWrapper.GetMethod("TS_Add3");
-        [RegisterOpStorageType("add3", typeof(CpuStorage))]
-        public Tensor Add3(Tensor result, Tensor x, Tensor y, Tensor z) { return NativeWrapper.InvokeNullableResultElementwise(add3_func, result, x, y, z); }
-
         private readonly MethodInfo add4_func = NativeWrapper.GetMethod("TS_Add4");
-        [RegisterOpStorageType("add4", typeof(CpuStorage))]
-        public Tensor Add4(Tensor result, Tensor x, Tensor y, Tensor z, Tensor w) { return NativeWrapper.InvokeNullableResultElementwise(add4_func, result, x, y, z, w); }
-
 
         [RegisterOpStorageType("addmul", typeof(CpuStorage))]
         public Tensor AddMul(Tensor result, Tensor x, Tensor y, Tensor z)
@@ -463,82 +336,9 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
-        [RegisterOpStorageType("buildsrctgtmask", typeof(CpuStorage))]
-        public Tensor BuildSrcTgtMask(Tensor result, Tensor srcOriginalLengths, Tensor tgtOriginalLengths, int srcPaddedSeqLen, int tgtPaddedSeqLen, float value, float maskedValue)
-        {
-
-            int ndim = result.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(result.Sizes, result.Strides);
-            long cols = result.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-
-            TensorApplyCPU.BuildSrcTgtMask(result, srcOriginalLengths, tgtOriginalLengths, (int)rows, (int)cols, tgtPaddedSeqLen, value, maskedValue);
-            return result;
-        }
 
 
 
-        [RegisterOpStorageType("buildselfmask", typeof(CpuStorage))]
-        public Tensor BuildSelfMask(Tensor result, Tensor originalLengths, int paddedSeqLen, float value, float maskedValue)
-        {
-            int ndim = result.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(result.Sizes, result.Strides);
-            long cols = result.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-
-            TensorApplyCPU.BuildSelfMask(result, originalLengths, (int)rows, (int)cols, paddedSeqLen, value, maskedValue);
-            return result;
-        }
-
-
-        [RegisterOpStorageType("buildselftrimask", typeof(CpuStorage))]
-        public Tensor BuildSelfTriMask(Tensor result, Tensor originalLengths, int paddedSeqLen, float value, float maskedValue)
-        {
-            int ndim = result.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(result.Sizes, result.Strides);
-            long cols = result.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-
-            TensorApplyCPU.BuildSelfTriMask(result, originalLengths, (int)rows, (int)cols, paddedSeqLen, value, maskedValue);
-            return result;
-        }
-
-
-        [RegisterOpStorageType("buildtrimask", typeof(CpuStorage))]
-        public Tensor BuildTriMask(Tensor result, float value, float maskedValue)
-        {
-            int ndim = result.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(result.Sizes, result.Strides);
-            long cols = result.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-
-            TensorApplyCPU.BuildTriMask(result, (int)rows, (int)cols, value, maskedValue);
-            return result;
-        }
 
 
         [RegisterOpStorageType("addmulv", typeof(CpuStorage))]
@@ -551,9 +351,6 @@ namespace TensorSharp.Cpu
         }
 
         private readonly MethodInfo maskfill_func = NativeWrapper.GetMethod("TS_MaskFill");
-        [RegisterOpStorageType("maskfill", typeof(CpuStorage))]
-        public Tensor MaskFill(Tensor result, Tensor t, Tensor mask, float defValue) { return NativeWrapper.InvokeNullableResultElementwise(maskfill_func, result, t, mask, defValue); }
-
 
         private readonly MethodInfo atan2_func = NativeWrapper.GetMethod("TS_Atan2");
         [RegisterOpStorageType("atan2", typeof(CpuStorage))]
@@ -601,29 +398,8 @@ namespace TensorSharp.Cpu
         }
 
 
-        [RegisterOpStorageType("addtanh", typeof(CpuStorage))]
-        public Tensor AddTanh(Tensor result, Tensor srcX, Tensor srcY)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, srcX, false, srcX.Sizes);
-            TensorApplyCPU.AddTanh(writeTarget, srcX, srcY);
-
-            return writeTarget;
-        }
-
 
         private readonly MethodInfo addtanh3_func = NativeWrapper.GetMethod("TS_AddTanh3");
-        [RegisterOpStorageType("addtanh3", typeof(CpuStorage))]
-        public Tensor AddTanh3(Tensor result, Tensor srcX, Tensor srcY, Tensor srcZ) { return NativeWrapper.InvokeNullableResultElementwise(addtanh3_func, result, srcX, srcY, srcZ); }
-
-
-        [RegisterOpStorageType("addtanhD", typeof(CpuStorage))]
-        public Tensor AddTanhD(Tensor result, Tensor srcX, Tensor srcY, Tensor srcZ)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, srcX, false, srcX.Sizes);
-            TensorApplyCPU.AddTanhD(writeTarget, srcX, srcY, srcZ);
-
-            return writeTarget;
-        }
 
         [RegisterOpStorageType("SiLU", typeof(CpuStorage))]
         public Tensor SiLU(Tensor result, Tensor srcW)
@@ -674,70 +450,7 @@ namespace TensorSharp.Cpu
         }
 
 
-        [RegisterOpStorageType("AddSiLUD", typeof(CpuStorage))]
-        public Tensor AddSiLUD(Tensor result, Tensor srcG, Tensor srcW, Tensor resG)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, srcW, false, srcW.Sizes);
-            TensorApplyCPU.AddSiLUD(writeTarget, srcG, srcW, resG);
 
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("SiLUD", typeof(CpuStorage))]
-        public Tensor SiLUD(Tensor result, Tensor srcW, Tensor resG)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, srcW, false, srcW.Sizes);
-            TensorApplyCPU.SiLUD(writeTarget, srcW, resG);
-
-            return writeTarget;
-        }
-
-
-        [RegisterOpStorageType("LeakyReLU", typeof(CpuStorage))]
-        public Tensor LeakyReLU(Tensor result, Tensor srcW)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, srcW, false, srcW.Sizes);
-            TensorApplyCPU.LeakyReLU(writeTarget, srcW);
-
-            return writeTarget;
-        }
-
-
-        [RegisterOpStorageType("AddLeakyReLUD", typeof(CpuStorage))]
-        public Tensor AddLeakyReLUD(Tensor result, Tensor srcG, Tensor srcW, Tensor resG)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, srcW, false, srcW.Sizes);
-            TensorApplyCPU.AddLeakyReLUD(writeTarget, srcG, srcW, resG);
-
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("LeakyReLUD", typeof(CpuStorage))]
-        public Tensor LeakyReLUD(Tensor result, Tensor srcW, Tensor resG)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, srcW, false, srcW.Sizes);
-            TensorApplyCPU.LeakyReLUD(writeTarget, srcW, resG);
-
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("addrelud", typeof(CpuStorage))]
-        public Tensor AddReluD(Tensor result, Tensor src, Tensor w, Tensor g) 
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, w, false, w.Sizes);
-            TensorApplyCPU.AddReluD(writeTarget, src, w, g);
-
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("relud", typeof(CpuStorage))]
-        public Tensor ReluD(Tensor result, Tensor w, Tensor g)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, w, false, w.Sizes);
-            TensorApplyCPU.ReluD(writeTarget, w, g);
-
-            return writeTarget;
-        }
 
         [RegisterOpStorageType("addv", typeof(CpuStorage))]
         public Tensor Add(Tensor result, Tensor lhs, float rhs)
@@ -790,9 +503,6 @@ namespace TensorSharp.Cpu
         public Tensor Div(Tensor result, float lhs, Tensor rhs) { return NativeWrapper.InvokeNullableResultElementwise(rdiv_func, result, rhs, lhs); }
 
         private readonly MethodInfo mod_func = NativeWrapper.GetMethod("TS_Mod");
-        [RegisterOpStorageType("modv", typeof(CpuStorage))]
-        public Tensor Mod(Tensor result, Tensor lhs, float rhs) { return NativeWrapper.InvokeNullableResultElementwise(mod_func, result, lhs, rhs); }
-
 
         private readonly MethodInfo gtValue_func = NativeWrapper.GetMethod("TS_gtValue");
         [RegisterOpStorageType("gtValue", typeof(CpuStorage))]
@@ -828,13 +538,6 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
-        [RegisterOpStorageType("atomicadd", typeof(CpuStorage))]
-        public Tensor AtomicAdd(Tensor result, Tensor rhs)
-        {
-            TensorApplyCPU.Add(result, result, rhs);
-            return result;
-        }
-
         [RegisterOpStorageType("subt", typeof(CpuStorage))]
         public Tensor Sub(Tensor result, Tensor lhs, Tensor rhs)
         {
@@ -861,9 +564,6 @@ namespace TensorSharp.Cpu
         }
 
         private readonly MethodInfo cmod_func = NativeWrapper.GetMethod("TS_CMod");
-        [RegisterOpStorageType("modt", typeof(CpuStorage))]
-        public Tensor Mod(Tensor result, Tensor lhs, Tensor rhs) { return NativeWrapper.InvokeNullableResultElementwise(cmod_func, result, lhs, rhs); }
-
 
         private readonly MethodInfo gtTensor_func = NativeWrapper.GetMethod("TS_gtTensor");
         [RegisterOpStorageType("gtTensor", typeof(CpuStorage))]
@@ -1033,23 +733,6 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
-        [RegisterOpStorageType("layernormgrad", typeof(CpuStorage))]
-        public Tensor LayerNormGrad(Tensor result, Tensor gradGamma_, Tensor gradBeta_, Tensor adj_, Tensor y_, Tensor x_, Tensor gamma_, Tensor beta_, float eps)
-        {
-            try
-            {
-                Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, adj_, false, adj_.Sizes);
-                TensorApplyCPU.LayerNormGrad(writeTarget, gradGamma_, gradBeta_, adj_, y_, x_, gamma_, beta_, (int)adj_.Sizes[0], (int)adj_.Sizes[1], eps);
-
-                return writeTarget;
-            }
-            catch (Exception err)
-            {
-                Logger.WriteLine(Logger.Level.err, ConsoleColor.Red, $"{nameof(LayerNormGrad)} exception: '{err.Message}', CallStack:'{err.StackTrace}'");
-                throw;
-            }
-        }
-
         [RegisterOpStorageType("rmsnorm", typeof(CpuStorage))]
         public Tensor RMSNorm(Tensor result, Tensor src, Tensor gamma_, Tensor beta_, float eps)
         {
@@ -1058,41 +741,8 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
-        [RegisterOpStorageType("rmsnormgrad", typeof(CpuStorage))]
-        public Tensor RMSNormGrad(Tensor result, Tensor gradGamma_, Tensor gradBeta_, Tensor adj_, Tensor y_, Tensor x_, Tensor gamma_, Tensor beta_, float eps)
-        {
-            try
-            {
-                Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, adj_, false, adj_.Sizes);
-                TensorApplyCPU.RMSNormGrad(writeTarget, gradGamma_, gradBeta_, adj_, y_, x_, gamma_, beta_, (int)adj_.Sizes[0], (int)adj_.Sizes[1], eps);
-
-                return writeTarget;
-            }
-            catch (Exception err)
-            {
-                Logger.WriteLine(Logger.Level.err, ConsoleColor.Red, $"{nameof(RMSNormGrad)} exception: '{err.Message}', CallStack:'{err.StackTrace}'");
-                throw;
-            }
-        }
-
         private readonly MethodInfo addlayerNorm_func = NativeWrapper.GetMethod("TS_AddLayerNorm");
-        [RegisterOpStorageType("addlayernorm", typeof(CpuStorage))]
-        public Tensor AddLayerNorm(Tensor result, Tensor src1, Tensor src2, Tensor gamma_, Tensor beta_, float eps)
-        {
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src1, false, src1.Sizes);
-            NativeWrapper.InvokeTypeMatch(addlayerNorm_func, writeTarget, src1, src2, gamma_, beta_, eps, (int)src1.Sizes[0], (int)src1.Sizes[1]);
-            return writeTarget;
-        }
-
         private readonly MethodInfo addlayerNormGrad_func = NativeWrapper.GetMethod("TS_AddLayerNormGrad");
-        [RegisterOpStorageType("addlayernormgrad", typeof(CpuStorage))]
-        public void AddLayerNormGrad(Tensor result1, Tensor result2, Tensor gradGamma_, Tensor gradBeta_, Tensor adj_, Tensor y_, Tensor x1_, Tensor x2_, Tensor gamma_, Tensor beta_, float eps)
-        {
-            Tensor writeTarget1 = TensorResultBuilder.GetWriteTarget(result1, adj_, false, adj_.Sizes);
-            Tensor writeTarget2 = TensorResultBuilder.GetWriteTarget(result2, adj_, false, adj_.Sizes);
-            NativeWrapper.InvokeTypeMatch(addlayerNormGrad_func, writeTarget1, writeTarget2, gradGamma_, gradBeta_, adj_, y_, x1_, x2_, gamma_, beta_, (int)adj_.Sizes[0], (int)adj_.Sizes[1], eps);
-        }
-
         [RegisterOpStorageType("indexselect", typeof(CpuStorage))]
         public Tensor IndexSelect(Tensor result, Tensor src, Tensor indice, bool isAdd)
         {
@@ -1113,28 +763,6 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
-
-        [RegisterOpStorageType("indexselectgrad", typeof(CpuStorage))]
-        public Tensor IndexSelectGrad(Tensor grad, Tensor adj, Tensor indice)
-        {
-            if (grad == null)
-            {
-                throw new ArgumentNullException($"Tensor grad should not be null.");
-            }
-
-            int ndim = adj.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(adj.Sizes, adj.Strides);
-            long cols = adj.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-            TensorApplyCPU.IndexSelectGrad(grad, adj, indice, (int)rows, (int)cols);
-            return grad;
-        }
 
         [RegisterOpStorageType("repeat_interleave", typeof(CpuStorage))]
         public Tensor RepeatInterleave(Tensor result, Tensor src, int repeats, int dim)
@@ -1196,23 +824,6 @@ namespace TensorSharp.Cpu
             }
         }
 
-        [RegisterOpStorageType("topK", typeof(CpuStorage))]
-        public void TopK(Tensor outVal, Tensor outIdx, Tensor src, int k)
-        {
-            int ndim = src.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(src.Sizes, src.Strides);
-            long cols = src.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-
-            TensorApplyCPU.TopK(outVal, outIdx, src, k, (int)rows, (int)cols);
-        }
-
         [RegisterOpStorageType("rope", typeof(CpuStorage))]
         public Tensor RoPE(Tensor result, Tensor src, int seqLen, int rowOffset)
         {
@@ -1266,43 +877,6 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
-        [RegisterOpStorageType("ropegrad", typeof(CpuStorage))]
-        public Tensor RoPEGrad(Tensor grad_, Tensor adj_, int seqLen, int rowOffset)
-        {
-            int ndim = adj_.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(adj_.Sizes, adj_.Strides);
-            long cols = adj_.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(grad_, adj_, true, adj_.Sizes);
-            TensorApplyCPU.RoPEGrad(writeTarget, adj_, (int)rows, (int)cols, seqLen, rowOffset);
-
-
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("iscorrupted", typeof(CpuStorage))]
-        public bool IsCorrupted(Tensor src)
-        {
-            int ndim = src.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(src.Sizes, src.Strides);
-            long cols = src.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-            return TensorApplyCPU.IsCorrupted(src, (int)rows, (int)cols);
-        }
-
 
         [RegisterOpStorageType("softmax", typeof(CpuStorage))]
         public Tensor Softmax(Tensor result, Tensor src)
@@ -1323,43 +897,8 @@ namespace TensorSharp.Cpu
             return writeTarget;
         }
 
-        [RegisterOpStorageType("softmaxgrad", typeof(CpuStorage))]
-        public Tensor SoftmaxGrad(Tensor grad_, Tensor adj_, Tensor val_, bool addGrad = true)
-        {
-            int ndim = adj_.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(adj_.Sizes, adj_.Strides);
-            long cols = adj_.Sizes[ndim - 1];
-
-            if (storageSize % cols != 0)
-            {
-                throw new Exception($"Invalid tensor storage size = '{storageSize}', and cols = '{cols}'");
-            }
-
-            long rows = storageSize / cols;
-
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(grad_, adj_, true, adj_.Sizes);
-            TensorApplyCPU.SoftmaxGrad(writeTarget, adj_, val_, (int)rows, (int)cols, addGrad);
-
-
-            return writeTarget;
-        }
-
 
         private readonly MethodInfo rmsProp_func = NativeWrapper.GetMethod("TS_RMSProp");
-        [RegisterOpStorageType("rmsprop", typeof(CpuStorage))]
-        public Tensor RMSProp(Tensor tw, Tensor tg, Tensor tc, float gradNormFactor, float step_size, float clipval, float regc, float decay_rate, float eps)
-        {
-            NativeWrapper.InvokeTypeMatch(rmsProp_func, tw, tg, tc, (int)tw.Sizes[0], (int)tw.Sizes[1], gradNormFactor, step_size, clipval, regc, decay_rate, eps);
-            return tw;
-        }
-
-        [RegisterOpStorageType("adam", typeof(CpuStorage))]
-        public Tensor Adam(Tensor tw, Tensor tg, Tensor tv, Tensor tm, float gradNormFactor, float step_size, float clipval, float regc, float decay_rate_v, float decay_rate_m, int iter, float eps)
-        {
-            TensorApplyCPU.Adam(tw, tg, tv, tm, (int)tw.Sizes[0], (int)tw.Sizes[1], gradNormFactor, step_size, clipval, regc, decay_rate_v, decay_rate_m, iter, eps);
-            return tw;
-        }
-
         private readonly MethodInfo normall_func = NativeWrapper.GetMethod("TS_NormAll");
         [RegisterOpStorageType("normall", typeof(CpuStorage))]
         public Tensor NormAll(Tensor result, Tensor src, float value)

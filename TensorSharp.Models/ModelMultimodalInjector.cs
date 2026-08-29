@@ -11,6 +11,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using TensorSharp;
+using TensorSharp.Models.Architecture;
 
 namespace TensorSharp.Models
 {
@@ -137,34 +138,8 @@ namespace TensorSharp.Models
             if (string.IsNullOrWhiteSpace(mmProjPath))
                 return;
 
-            switch (_model)
-            {
-                case Gemma4Model g4:
-                    g4.LoadVisionEncoder(mmProjPath);
-                    g4.LoadAudioEncoder(mmProjPath);
-                    break;
-                case Gemma3Model g3:
-                    g3.LoadVisionEncoder(mmProjPath);
-                    break;
-                case Qwen35Model q35:
-                    q35.LoadVisionEncoder(mmProjPath);
-                    break;
-                case Qwen4ExpModel q4e:
-                    q4e.LoadVisionEncoder(mmProjPath);
-                    break;
-                case GlmDsaModel glm:
-                    glm.LoadVisionEncoder(mmProjPath);
-                    break;
-                case Mistral3Model m3:
-                    m3.LoadVisionEncoder(mmProjPath);
-                    break;
-                case NemotronModel nem:
-                    nem.LoadVisionEncoder(mmProjPath);
-                    break;
-                case MuseGlimmerModel mg:
-                    mg.LoadVisionEncoder(mmProjPath);
-                    break;
-            }
+            (_model as IVisionCapableModel)?.LoadVisionEncoder(mmProjPath);
+            (_model as IAudioEncoderLoader)?.LoadAudioEncoder(mmProjPath);
         }
 
         public List<int> ProcessPromptTokens(List<ChatMessage> history, List<int> inputTokens, string requestId = null)
@@ -180,24 +155,9 @@ namespace TensorSharp.Models
             if (history == null || history.Count == 0 || inputTokens == null || inputTokens.Count == 0)
                 return inputTokens;
 
-            if (_model is Gemma4Model g4)
-                return ProcessGemma4History(g4, history, inputTokens);
-            if (_model is Gemma3Model g3)
-                return ProcessGemma3History(g3, history, inputTokens);
-            if (_model is Qwen35Model q35)
-                return ProcessQwen35History(q35, history, inputTokens);
-            if (_model is Qwen4ExpModel q4e)
-                return ProcessQwenVLHistory(q4e.VisionEncoder, history, inputTokens);
-            if (_model is GlmDsaModel glm)
-                return ProcessGlmNextHistory(glm, history, inputTokens);
-            if (_model is Mistral3Model m3)
-                return ProcessMistral3History(m3, history, inputTokens);
-            if (_model is NemotronModel nem)
-                return ProcessNemotronHistory(nem, history, inputTokens);
-            if (_model is MuseGlimmerModel mg)
-                return ProcessMuseGlimmerHistory(mg, history, inputTokens);
-
-            return inputTokens;
+            return _model is IMultimodalPromptExpander expander
+                ? expander.ExpandMultimodalPrompt(this, history, inputTokens)
+                : inputTokens;
         }
 
         public int ClampReusablePrefix(int reusablePrefixTokenCount, string requestId = null)
@@ -259,14 +219,9 @@ namespace TensorSharp.Models
             // rotations to image-region rotary dims. Text-only requests skip
             // this (TryGet returns null) and the model uses scalar positions.
             int[] mropeSlice = TryGetMRoPEPositionsForSlice(requestId, promptStartToken, tokenCount);
-            if (mropeSlice != null && _model is Qwen35Model q35)
+            if (mropeSlice != null && _model is IMRoPEPositionSink mrope)
             {
-                q35.SetMRoPEPositions(mropeSlice);
-                queued = true;
-            }
-            else if (mropeSlice != null && _model is Qwen4ExpModel q4m)
-            {
-                q4m.SetMRoPEPositions(mropeSlice);
+                mrope.SetMRoPEPositions(mropeSlice);
                 queued = true;
             }
             return queued;
@@ -340,7 +295,7 @@ namespace TensorSharp.Models
             }
         }
 
-        private List<int> ProcessGemma4History(Gemma4Model model, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessGemma4History(Gemma4Model model, List<ChatMessage> history, List<int> inputTokens)
         {
             int imageStartId = _model.Tokenizer.LookupToken("<|image>");
             int imageEndId = _model.Tokenizer.LookupToken("<image|>");
@@ -415,7 +370,7 @@ namespace TensorSharp.Models
         /// mtmd chunking for PROJECTOR_TYPE_MUSE_GLIMMER (img_beg "&lt;|image_start|&gt;",
         /// img_end "&lt;|image_end|&gt;").
         /// </summary>
-        private List<int> ProcessMuseGlimmerHistory(MuseGlimmerModel model, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessMuseGlimmerHistory(MuseGlimmerModel model, List<ChatMessage> history, List<int> inputTokens)
         {
             if (model.VisionEncoder == null)
                 return inputTokens;
@@ -466,7 +421,7 @@ namespace TensorSharp.Models
             });
         }
 
-        private List<int> ProcessGemma3History(Gemma3Model model, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessGemma3History(Gemma3Model model, List<ChatMessage> history, List<int> inputTokens)
         {
             if (model.VisionEncoder == null)
                 return inputTokens;
@@ -510,7 +465,7 @@ namespace TensorSharp.Models
             return inputTokens;
         }
 
-        private List<int> ProcessQwen35History(Qwen35Model model, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessQwen35History(Qwen35Model model, List<ChatMessage> history, List<int> inputTokens)
             => ProcessQwenVLHistory(model.VisionEncoder, history, inputTokens);
 
         /// <summary>
@@ -518,7 +473,7 @@ namespace TensorSharp.Models
         /// use the same qwen3vl_merger tower, image-pad expansion and (T,H,W) IMRoPE
         /// position assignment.
         /// </summary>
-        private List<int> ProcessQwenVLHistory(Qwen35VisionEncoder encoder, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessQwenVLHistory(Qwen35VisionEncoder encoder, List<ChatMessage> history, List<int> inputTokens)
         {
             if (encoder == null)
                 return inputTokens;
@@ -633,7 +588,7 @@ namespace TensorSharp.Models
             return inputTokens;
         }
 
-        private List<int> ProcessMistral3History(Mistral3Model model, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessMistral3History(Mistral3Model model, List<ChatMessage> history, List<int> inputTokens)
         {
             if (model.VisionEncoder == null)
                 return inputTokens;
@@ -687,7 +642,7 @@ namespace TensorSharp.Models
             return inputTokens;
         }
 
-        private List<int> ProcessNemotronHistory(NemotronModel model, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessNemotronHistory(NemotronModel model, List<ChatMessage> history, List<int> inputTokens)
         {
             if (model.VisionEncoder == null)
                 return inputTokens;
@@ -731,10 +686,48 @@ namespace TensorSharp.Models
                 // Audio path: the chat template emits a `<so_embedding>` per uploaded
                 // audio file so the model "sees" the modality, but real inference is
                 // gated on a Parakeet audio mmproj that this distribution does not ship.
-                // The test data still gets preprocessed in the CLI for verification.
+                // The clip is still decoded and turned into its log-mel spectrogram so
+                // the frontend is exercised and the operator is told, once, why no audio
+                // inference will happen. (This used to live in the CLI, which meant the
+                // server silently ignored audio entirely; it belongs with the rest of
+                // the architecture's media handling.)
+                if (message.AudioPaths != null && message.AudioPaths.Count > 0)
+                    PreprocessNemotronAudioForVerification(message.AudioPaths[0]);
             }
 
             return inputTokens;
+        }
+
+        private bool _warnedNemotronAudioUnsupported;
+
+        /// <summary>
+        /// Decode one audio clip and compute its Parakeet-style log-mel spectrogram,
+        /// then say plainly that no audio inference will run. Nemotron-H Omni's audio
+        /// tower needs a Parakeet <c>mmproj</c> that the public GGUFs do not ship, so
+        /// this exercises the frontend and refuses to pretend the modality worked.
+        /// Warns at most once per injector so a long conversation is not spammed.
+        /// </summary>
+        private void PreprocessNemotronAudioForVerification(string audioPath)
+        {
+            if (string.IsNullOrEmpty(audioPath))
+                return;
+
+            try
+            {
+                float[] samples = NemotronAudioPreprocessor.DecodeAudioFile(audioPath);
+                var (_, frames, validFrames) = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(samples);
+                if (_warnedNemotronAudioUnsupported)
+                    return;
+                _warnedNemotronAudioUnsupported = true;
+                Console.Error.WriteLine(
+                    $"WARNING: Nemotron audio decoded ({(double)samples.Length / NemotronAudioPreprocessor.SampleRate:F1}s, " +
+                    $"{validFrames}/{frames} mel frames) but NOT used: audio inference needs a Parakeet audio mmproj " +
+                    "that the public Nemotron GGUFs do not ship. The clip was preprocessed for verification only.");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"WARNING: Nemotron audio preprocessing failed: {ex.Message}");
+            }
         }
 
         private CachedEmbedding GetOrCreateNemotronVisionEmbedding(NemotronModel model, string imagePath)
@@ -860,7 +853,7 @@ namespace TensorSharp.Models
         /// no MRoPE position table is built - image tokens occupy ordinary
         /// sequential positions.
         /// </summary>
-        private List<int> ProcessGlmNextHistory(GlmDsaModel model, List<ChatMessage> history, List<int> inputTokens)
+        internal List<int> ProcessGlmNextHistory(GlmDsaModel model, List<ChatMessage> history, List<int> inputTokens)
         {
             var encoder = model.VisionEncoder;
             if (encoder == null)
@@ -961,101 +954,7 @@ namespace TensorSharp.Models
 
         private bool QueuePreparedVisionEmbeddings(List<PreparedEmbeddingSpan> bucket, int reusablePrefixTokenCount)
         {
-            if (bucket.Count == 0)
-                return false;
-
-            bool queued = false;
-
-            switch (_model)
-            {
-                case Gemma4Model g4:
-                    foreach (var span in bucket)
-                    {
-                        if (span.EndPosition <= reusablePrefixTokenCount)
-                            continue;
-
-                        g4.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
-                        queued = true;
-                    }
-                    break;
-                case Gemma3Model g3:
-                    foreach (var span in bucket)
-                    {
-                        if (span.EndPosition <= reusablePrefixTokenCount)
-                            continue;
-
-                        g3.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
-                        queued = true;
-                    }
-                    break;
-                case Qwen35Model q35:
-                    foreach (var span in bucket)
-                    {
-                        if (span.EndPosition <= reusablePrefixTokenCount)
-                            continue;
-
-                        q35.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
-                        queued = true;
-                    }
-                    break;
-                case Qwen4ExpModel q4pv:
-                    foreach (var span in bucket)
-                    {
-                        if (span.EndPosition <= reusablePrefixTokenCount)
-                            continue;
-
-                        q4pv.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
-                        queued = true;
-                    }
-                    break;
-                case GlmDsaModel glmv:
-                    foreach (var span in bucket)
-                    {
-                        if (span.EndPosition <= reusablePrefixTokenCount)
-                            continue;
-
-                        glmv.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
-                        queued = true;
-                    }
-                    break;
-                case Mistral3Model m3:
-                    foreach (var span in bucket)
-                    {
-                        if (span.EndPosition <= reusablePrefixTokenCount)
-                            continue;
-
-                        m3.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
-                        queued = true;
-                    }
-                    break;
-                case NemotronModel nem:
-                    foreach (var span in bucket)
-                    {
-                        if (span.EndPosition <= reusablePrefixTokenCount)
-                            continue;
-
-                        nem.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
-                        queued = true;
-                    }
-                    break;
-                case MuseGlimmerModel mg:
-                    foreach (var span in bucket)
-                    {
-                        if (span.EndPosition <= reusablePrefixTokenCount)
-                            continue;
-
-                        mg.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
-                        queued = true;
-                    }
-                    break;
-            }
-
-            return queued;
-        }
-
-        private bool QueuePreparedAudioEmbeddings(List<PreparedEmbeddingSpan> bucket, int reusablePrefixTokenCount)
-        {
-            if (bucket.Count == 0 || _model is not Gemma4Model g4)
+            if (bucket.Count == 0 || _model is not IVisionCapableModel sink)
                 return false;
 
             bool queued = false;
@@ -1064,7 +963,27 @@ namespace TensorSharp.Models
                 if (span.EndPosition <= reusablePrefixTokenCount)
                     continue;
 
-                g4.SetAudioEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
+                sink.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings),
+                    span.InsertPosition - reusablePrefixTokenCount);
+                queued = true;
+            }
+
+            return queued;
+        }
+
+        private bool QueuePreparedAudioEmbeddings(List<PreparedEmbeddingSpan> bucket, int reusablePrefixTokenCount)
+        {
+            if (bucket.Count == 0 || _model is not IAudioCapableModel sink)
+                return false;
+
+            bool queued = false;
+            foreach (var span in bucket)
+            {
+                if (span.EndPosition <= reusablePrefixTokenCount)
+                    continue;
+
+                sink.SetAudioEmbeddings(CloneTensor(span.CacheEntry.Embeddings),
+                    span.InsertPosition - reusablePrefixTokenCount);
                 queued = true;
             }
 
@@ -1073,109 +992,7 @@ namespace TensorSharp.Models
 
         private bool QueuePreparedVisionEmbeddingsForSlice(List<PreparedEmbeddingSpan> bucket, int promptStartToken, int promptEndToken)
         {
-            if (bucket.Count == 0)
-                return false;
-
-            bool queued = false;
-
-            switch (_model)
-            {
-                case Gemma4Model g4:
-                    foreach (var span in bucket)
-                    {
-                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
-                                out Tensor embeddings, out int insertPosition))
-                            continue;
-
-                        g4.SetVisionEmbeddings(embeddings, insertPosition);
-                        queued = true;
-                    }
-                    break;
-                case Gemma3Model g3:
-                    foreach (var span in bucket)
-                    {
-                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
-                                out Tensor embeddings, out int insertPosition))
-                            continue;
-
-                        g3.SetVisionEmbeddings(embeddings, insertPosition);
-                        queued = true;
-                    }
-                    break;
-                case Qwen35Model q35:
-                    foreach (var span in bucket)
-                    {
-                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
-                                out Tensor embeddings, out int insertPosition))
-                            continue;
-
-                        q35.SetVisionEmbeddings(embeddings, insertPosition);
-                        queued = true;
-                    }
-                    break;
-                case Qwen4ExpModel q4v:
-                    foreach (var span in bucket)
-                    {
-                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
-                                out Tensor embeddings, out int insertPosition))
-                            continue;
-
-                        q4v.SetVisionEmbeddings(embeddings, insertPosition);
-                        queued = true;
-                    }
-                    break;
-                case GlmDsaModel glmsv:
-                    foreach (var span in bucket)
-                    {
-                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
-                                out Tensor embeddings, out int insertPosition))
-                            continue;
-
-                        glmsv.SetVisionEmbeddings(embeddings, insertPosition);
-                        queued = true;
-                    }
-                    break;
-                case Mistral3Model m3:
-                    foreach (var span in bucket)
-                    {
-                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
-                                out Tensor embeddings, out int insertPosition))
-                            continue;
-
-                        m3.SetVisionEmbeddings(embeddings, insertPosition);
-                        queued = true;
-                    }
-                    break;
-                case NemotronModel nem:
-                    foreach (var span in bucket)
-                    {
-                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
-                                out Tensor embeddings, out int insertPosition))
-                            continue;
-
-                        nem.SetVisionEmbeddings(embeddings, insertPosition);
-                        queued = true;
-                    }
-                    break;
-                case MuseGlimmerModel mg:
-                    foreach (var span in bucket)
-                    {
-                        if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
-                                out Tensor embeddings, out int insertPosition))
-                            continue;
-
-                        mg.SetVisionEmbeddings(embeddings, insertPosition);
-                        queued = true;
-                    }
-                    break;
-            }
-
-            return queued;
-        }
-
-        private bool QueuePreparedAudioEmbeddingsForSlice(List<PreparedEmbeddingSpan> bucket, int promptStartToken, int promptEndToken)
-        {
-            if (bucket.Count == 0 || _model is not Gemma4Model g4)
+            if (bucket.Count == 0 || _model is not IVisionCapableModel sink)
                 return false;
 
             bool queued = false;
@@ -1185,7 +1002,26 @@ namespace TensorSharp.Models
                         out Tensor embeddings, out int insertPosition))
                     continue;
 
-                g4.SetAudioEmbeddings(embeddings, insertPosition);
+                sink.SetVisionEmbeddings(embeddings, insertPosition);
+                queued = true;
+            }
+
+            return queued;
+        }
+
+        private bool QueuePreparedAudioEmbeddingsForSlice(List<PreparedEmbeddingSpan> bucket, int promptStartToken, int promptEndToken)
+        {
+            if (bucket.Count == 0 || _model is not IAudioCapableModel sink)
+                return false;
+
+            bool queued = false;
+            foreach (var span in bucket)
+            {
+                if (!TryCloneOverlappingEmbeddingRows(span, promptStartToken, promptEndToken,
+                        out Tensor embeddings, out int insertPosition))
+                    continue;
+
+                sink.SetAudioEmbeddings(embeddings, insertPosition);
                 queued = true;
             }
 

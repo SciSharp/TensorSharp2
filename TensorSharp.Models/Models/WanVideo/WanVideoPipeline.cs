@@ -22,6 +22,7 @@ using TensorSharp.GGML;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.Video;
 using TensorSharp.Runtime;
+using TensorSharp.Models.Direct;
 
 namespace TensorSharp.Models.WanVideo
 {
@@ -48,7 +49,7 @@ namespace TensorSharp.Models.WanVideo
 
         private readonly WanVideoModel _model;
         private readonly bool _direct;   // BackendType.Cuda / Cpu: direct tensor path
-        private WanDirectContext _dctx;
+        private DirectContext _dctx;
         private IWanTextEncoder _te;
         private IWanDit _dit;       // single-model variants (and the A14B high-noise expert)
         private IWanDit _ditLow;    // A14B low-noise expert
@@ -60,7 +61,7 @@ namespace TensorSharp.Models.WanVideo
             _direct = model.Backend is BackendType.Cuda or BackendType.Cpu;
         }
 
-        private WanDirectContext Dctx => _dctx ??= new WanDirectContext(_model.DirectAllocator);
+        private DirectContext Dctx => _dctx ??= new DirectContext(_model.DirectAllocator);
         private IWanTextEncoder Te => _te ??= _direct
             ? new WanDirectT5(Dctx, _model.TePath)
             : new WanTextEncoder(_model.TePath);

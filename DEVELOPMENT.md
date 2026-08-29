@@ -162,7 +162,7 @@ When the tensor API is on, the VAE stays **correct** by routing its convolutions
 | A14B I2V Q4_K_M | **17.1s** / 30.2s (1.77×) | 135s / 19s | ~9 steps → the 40-step recipe is **~33% faster** with the tensor API (~13.7 vs ~20.5 min) |
 | TI2V-5B Q8_0 | **1.6s** / 2.9s (1.8×) | 179s / 13s | ~128 steps → never wins |
 
-The default therefore follows the DiT class (`ApplyArchitectureNativeTunables` in ModelBase.cs): tensor API **enabled** for A14B/14B-class models (`patch_embedding` output dim ≥ 5120), **disabled** for smaller ones. When upstream fixes the tensor-API `mul_mm`, enable it everywhere and drop the direct-conv carve-out.
+The default therefore follows the DiT class (`WanVideoArchitecture.ApplyNativeTunables`): tensor API **enabled** for A14B/14B-class models (`patch_embedding` output dim ≥ 5120), **disabled** for smaller ones. When upstream fixes the tensor-API `mul_mm`, enable it everywhere and drop the direct-conv carve-out.
 
 | Environment variable | Effect |
 |---|---|
@@ -399,7 +399,7 @@ TensorSharp is structured as a layered system:
 
 2. **TensorSharp.Runtime** owns runtime-facing contracts and services: GGUF parsing, tokenization (SentencePiece / BPE), chat template rendering, configurable token sampling, output parsing, paged KV cache (`Runtime/Paged/*`), the continuous-batching scheduler / engine (`Runtime/Scheduling/*`), the `IKvBlockCodec` interface plus the `TurboQuantKvCodec` 2-bit / Q4 / Q8 implementation, and reusable contracts such as `IModelArchitecture`, `IBatchedPagedModel`, `IPromptRenderer`, `IOutputProtocolParser`, `IMultimodalInjector`, `IKVCachePolicy`, and `IBackendExecutionPlan`.
 
-3. **TensorSharp.Models** implements `ModelBase` plus the fourteen concrete architectures and their multimodal helpers — eleven text families (DeepSeek V4 Flash, GLM 5.x, Gemma 3, Gemma 4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, Muse-Glimmer) and three media-out families (Qwen-Image-Edit, MiniMax-H3, Wan 2.1/2.2). Autoregressive architectures ship the legacy per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Qwen-Image-Edit (`QwenImageModel`) is likewise not autoregressive — `Forward()` throws and image editing runs through `EditImage()`, which orchestrates the MMDiT diffusion transformer, the Qwen-Image VAE, and the Qwen2.5-VL text encoder. The video families go one step further out: `MiniMaxH3Model` and `WanVideoModel` both throw from `ForwardCore()` and generate through `GenerateVideo(prompt, VideoGenerationParams)` behind the shared `IVideoGenerationModel` seam in `Models/Video/`, so the CLI and the server drive either one — and anything added later — through a single path instead of type-testing the concrete model. MiniMax-H3 denoises video and 32 kHz stereo audio *together* in one packed latent and drives seven native whole-network graphs (DiT, Qwen3-VL text encoder, vision tower, video and audio VAE encode + decode); Wan 2.1/2.2 is the video-only family and runs its DiT, UMT5-XXL encoder and causal 3D VAE the same way. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata — except MiniMax-H3, whose published GGUFs carry no metadata at all and which is therefore detected from its tensors (`LooksLikeMiniMaxH3`, `ModelBase.cs`).
+3. **TensorSharp.Models** implements `ModelBase` plus the fourteen concrete architectures and their multimodal helpers — eleven text families (DeepSeek V4 Flash, GLM 5.x, Gemma 3, Gemma 4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, Muse-Glimmer) and three media-out families (Qwen-Image-Edit, MiniMax-H3, Wan 2.1/2.2). Autoregressive architectures ship the legacy per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Qwen-Image-Edit (`QwenImageModel`) is likewise not autoregressive — `Forward()` throws and image editing runs through `EditImage()`, which orchestrates the MMDiT diffusion transformer, the Qwen-Image VAE, and the Qwen2.5-VL text encoder. The video families go one step further out: `MiniMaxH3Model` and `WanVideoModel` both throw from `ForwardCore()` and generate through `GenerateVideo(prompt, VideoGenerationParams)` behind the shared `IVideoGenerationModel` seam in `Models/Video/`, so the CLI and the server drive either one — and anything added later — through a single path instead of type-testing the concrete model. MiniMax-H3 denoises video and 32 kHz stereo audio *together* in one packed latent and drives seven native whole-network graphs (DiT, Qwen3-VL text encoder, vision tower, video and audio VAE encode + decode); Wan 2.1/2.2 is the video-only family and runs its DiT, UMT5-XXL encoder and causal 3D VAE the same way. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata — except MiniMax-H3, whose published GGUFs carry no metadata at all and which is therefore detected from its tensors (`LooksLikeMiniMaxH3`, wired through `MiniMaxH3Architecture.DetectFromTensors`).
 
 4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32, plus paged-attention (`TSGgml_PagedAttentionForward`, with and without attention sinks) and architecture-specific batched kernels (Mamba2, GatedDeltaNet).
 
@@ -410,6 +410,63 @@ TensorSharp is structured as a layered system:
 7. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, an `InferenceEngineHost` that owns the per-model continuous-batching engine for autoregressive models, a `DiffusionBatchScheduler` for DiffusionGemma Web UI turns, and a thin queue-status surface for backward compatibility.
 
 8. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, JSONL batch workflows, the interactive REPL, and the built-in prefill / decode benchmarks.
+
+### Adding a model, a modality, or a chat format
+
+Everything an architecture needs to declare about itself lives in three tables,
+so adding a family touches its own directory plus one line per table -- and
+nothing else in the loader, planner, CLI or server.
+
+**1. The architecture plug-in.** Write `Models/<Family>/<Family>Architecture.cs`
+next to the model:
+
+```csharp
+internal static class MyFamilyArchitecture
+{
+    public static ModelArchitectureDescriptor Descriptor { get; } = new()
+    {
+        Id = "myfamily",
+        DisplayName = "My Family",
+        Aliases = new[] { "myfamily", "myfamily_moe" },   // general.architecture values
+        Factory = c => new MyFamilyModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+        // Optional, all defaulted:
+        //   MultiGpu / MultiGpuLimitation   how it uses more than one GPU, and why not
+        //   ProjectorFileHints              mmproj companion names to auto-discover
+        //   DetectFromTensors               for GGUFs that declare no architecture
+        //   ApplyNativeTunables             process-wide ggml switches to set before load
+    };
+}
+```
+
+Then add one line to `Architecture/BuiltInArchitectures.cs`. `ModelBase.Create`
+resolves through `ModelArchitectureRegistry`; there is no switch to extend, and
+`ModelArchitectureDescriptor.Validate()` refuses a descriptor that declares a
+degraded multi-GPU mode without saying why.
+
+**2. Modalities are capability interfaces, not type tests.** A model that can see
+implements `IVisionCapableModel` (load the tower, receive an embedding span) and
+`IMultimodalPromptExpander` (expand its own placeholders). Audio adds
+`IAudioCapableModel` / `IAudioEncoderLoader`; per-axis rotary positions add
+`IMRoPEPositionSink`. `ModelMultimodalInjector` owns everything generic --
+per-request buckets, span bookkeeping, prefix clamping, trimming, slicing -- and
+never names a model type. The CLI, the interactive REPL and the server all drive
+that one injector, so a modality wired once works everywhere.
+
+**3. The chat format is a `ChatProtocol`.** Prompt framing, whether to bypass the
+GGUF's Jinja template, media placeholder tokens, the output parser, whether that
+parser is mandatory, where a structured-output grammar may arm, the KV-cache
+generation suffix, and video-frame capping are ONE entry in
+`ChatProtocolRegistry`. These used to be roughly two dozen separate
+architecture-name comparisons across `ChatTemplate`, `OutputParser`,
+`KVCachePromptRenderer` and the server; forgetting one of them failed quietly
+(an unparsed reply streams its own reasoning tags to the client; a missing media
+placeholder discards the image; a missing generation suffix drops multi-turn
+prefix reuse to zero while still answering correctly).
+
+Runtime routing is unchanged and still capability-driven:
+`ExecutionCapabilities.FromModel` reads `IBatchedPagedModel`,
+`ISpeculativeTarget` and friends once per step. None of the three tables above is
+consulted on a per-token path.
 
 ### Performance Optimizations
 

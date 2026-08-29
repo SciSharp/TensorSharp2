@@ -27,8 +27,23 @@ public class ManagedQuantizedOpsTests
                  })
             Assert.True(ModelBase.ShouldStoreWeightQuantized(BackendType.Cpu, Weight(t)), $"{t} should be CPU-quantized");
 
+        // IQ1_S / IQ1_M joined the matrix so Qwen3.8-Flash-Next's UD-IQ1_S and
+        // GLM-5.3-Flash's UD-IQ1_M can run on the pure-C# backend at all: without
+        // managed storage their expert tensors were dequantized to F32 at load,
+        // which left _stackedExpertWeights empty and made Qwen4Exp abort with
+        // "GGUF is missing 34 expected tensor(s): blk.0.ffn_gate_exps.weight".
+        foreach (var t in new[] { GgmlTensorType.IQ1_S, GgmlTensorType.IQ1_M })
+            Assert.True(ModelBase.ShouldStoreWeightQuantized(BackendType.Cpu, Weight(t)), $"{t} should be CPU-quantized");
+
+        // IQ2_XS / IQ4_XS joined for GLM-5.3-Flash's UD-Q2_K_XL, which is 82 IQ2_XS
+        // tensors plus 3 IQ4_XS ones. Without managed storage the loader expanded
+        // them to F32 -- 765 GB for that model -- and --backend cpu never finished
+        // loading rather than failing with a message.
+        foreach (var t in new[] { GgmlTensorType.IQ2_XS, GgmlTensorType.IQ4_XS })
+            Assert.True(ModelBase.ShouldStoreWeightQuantized(BackendType.Cpu, Weight(t)), $"{t} should be CPU-quantized");
+
         // A type the managed backend still does not implement stays out of the matrix.
-        Assert.False(ModelBase.ShouldStoreWeightQuantized(BackendType.Cpu, Weight(GgmlTensorType.IQ1_S)));
+        Assert.False(ModelBase.ShouldStoreWeightQuantized(BackendType.Cpu, Weight(GgmlTensorType.TQ1_0)));
     }
 
     [Fact]
@@ -154,6 +169,106 @@ public class ManagedQuantizedOpsTests
         Assert.True(anyNonZero, "dequantized block was entirely zero - the fixture is not exercising the codebook");
     }
 
+    [Theory]
+    [InlineData((int)GgmlTensorType.IQ1_S, 50)]
+    [InlineData((int)GgmlTensorType.IQ1_M, 56)]
+    public void ManagedIq1_MatchesNativeGgmlDequantizer(int typeId, int expectedBlockBytes)
+    {
+        // The 1-bit i-quants are what Unsloth ships for the biggest models
+        // (Qwen3.8-Flash-Next UD-IQ1_S, GLM-5.3-Flash UD-IQ1_M). Ground truth is
+        // ggml's own dequantize_row_iq1_s / _iq1_m, and the subtle part is the
+        // +/-IQ1S_DELTA offset applied to every grid lane - drop it and the
+        // weights are quietly biased rather than obviously wrong.
+        var type = (GgmlTensorType)typeId;
+        const int blocks = 7;
+        const int elems = blocks * 256;
+        int blockBytes = (int)GgufFile.GetTypeSize(type);
+        Assert.Equal(expectedBlockBytes, blockBytes);
+        Assert.Equal(256, GgufFile.GetBlockSize(type));
+        Assert.Equal(blocks * blockBytes, NativeDequant.RowSize(typeId, elems));
+
+        byte[] raw = new byte[blocks * blockBytes];
+        uint state = 0x9E3779B9u;
+        for (int i = 0; i < raw.Length; i++)
+        {
+            state = state * 1664525u + 1013904223u;
+            raw[i] = (byte)(state >> 24);
+        }
+        // IQ1_S carries a per-block fp16 scale; IQ1_M reassembles its scale from
+        // nibbles spread across the four scale uint16s, so leave those random.
+        if (type == GgmlTensorType.IQ1_S)
+        {
+            for (int b = 0; b < blocks; b++)
+                WriteHalf(raw, b * blockBytes, 0.25f + 0.125f * b);
+        }
+
+        var managed = new float[elems];
+        ManagedQuantizedOps.DequantizeToFloat32(typeId, raw, 0, managed, 0, elems);
+
+        var native = new float[elems];
+        TensorSharp.GGML.GgmlGgufTensorDequant.DequantizeToFloat32(typeId, raw, 0, native, 0, elems);
+
+        bool anyNonZero = false;
+        for (int i = 0; i < elems; i++)
+        {
+            if (native[i] != 0f) anyNonZero = true;
+            Assert.True(Math.Abs(native[i] - managed[i]) <= 1e-5f * Math.Max(1f, Math.Abs(native[i])),
+                $"{type} element {i}: native {native[i]}, managed {managed[i]}");
+        }
+        Assert.True(anyNonZero, $"{type}: dequantized block was entirely zero - the fixture is not exercising the codebook");
+    }
+
+    [Theory]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 74)]
+    [InlineData((int)GgmlTensorType.IQ4_XS, 136)]
+    public void ManagedIqXs_MatchesNativeGgmlDequantizer(int typeId, int expectedBlockBytes)
+    {
+        // GLM-5.3-Flash UD-Q2_K_XL is 82 IQ2_XS tensors plus 3 IQ4_XS ones, and
+        // neither had a managed path: on --backend cpu the loader fell through to
+        // expanding them to F32, which for that model is 765 GB of weights and a
+        // load that never finishes. Ground truth is ggml's own
+        // dequantize_row_iq2_xs / _iq4_xs.
+        //
+        // The two traps: IQ2_XS indexes a 512-entry grid with 9 bits and takes its
+        // sign byte from the TOP 7 (IQ2_XXS uses a byte index and a different
+        // grid), and IQ4_XS splits each 6-bit scale across scales_l and scales_h
+        // and biases it by 32.
+        var type = (GgmlTensorType)typeId;
+        const int blocks = 7;
+        const int elems = blocks * 256;
+        int blockBytes = (int)GgufFile.GetTypeSize(type);
+        Assert.Equal(expectedBlockBytes, blockBytes);
+        Assert.Equal(256, GgufFile.GetBlockSize(type));
+        Assert.Equal(blocks * blockBytes, NativeDequant.RowSize(typeId, elems));
+
+        byte[] raw = new byte[blocks * blockBytes];
+        uint state = 0x9E3779B9u;
+        for (int i = 0; i < raw.Length; i++)
+        {
+            state = state * 1664525u + 1013904223u;
+            raw[i] = (byte)(state >> 24);
+        }
+        // Both carry the fp16 block scale at offset 0; keep it finite so the
+        // comparison is about the codebook rather than about inf/NaN.
+        for (int b = 0; b < blocks; b++)
+            WriteHalf(raw, b * blockBytes, 0.25f + 0.125f * b);
+
+        var managed = new float[elems];
+        ManagedQuantizedOps.DequantizeToFloat32(typeId, raw, 0, managed, 0, elems);
+
+        var native = new float[elems];
+        TensorSharp.GGML.GgmlGgufTensorDequant.DequantizeToFloat32(typeId, raw, 0, native, 0, elems);
+
+        bool anyNonZero = false;
+        for (int i = 0; i < elems; i++)
+        {
+            if (native[i] != 0f) anyNonZero = true;
+            Assert.True(Math.Abs(native[i] - managed[i]) <= 1e-5f * Math.Max(1f, Math.Abs(native[i])),
+                $"{type} element {i}: native {native[i]}, managed {managed[i]}");
+        }
+        Assert.True(anyNonZero, $"{type}: dequantized block was entirely zero - the fixture is not exercising the codebook");
+    }
+
     [Fact]
     public void NativeDequant_RowSizeSupportsIq2Xxs()
     {
@@ -243,6 +358,59 @@ public class ManagedQuantizedOpsTests
         Assert.Equal(Dot(dequantized, inputs, 0, 256), actual[0], 5);
         Assert.Equal(Dot(dequantized, inputs, 256, 256), actual[1], 5);
         Assert.Equal(Dot(dequantized, inputs, 512, 256), actual[2], 5);
+    }
+
+    [Theory]
+    [InlineData((int)GgmlTensorType.IQ2_XS, 74)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 98)]
+    public void DotRowBatch_DirectIQuantKernelMatchesDequantizedDot(int typeId, int blockBytes)
+    {
+        // These two types ARE the MoE of GLM-5.3-Flash UD-Q2_K_XL. Before they had
+        // direct kernels every expert matmul dequantized the weight row to F32
+        // first -- a ~12x expansion on a 2-bit weight, and 91% of decode time.
+        // A wrong grid index, sign selector or scale nibble does not produce a
+        // small error here, it produces a different number entirely, so comparing
+        // against the dequantized dot is a sharp check even at a loose tolerance
+        // (the direct path quantizes the ACTIVATION to Q8_K, so it is not exact).
+        var type = (GgmlTensorType)typeId;
+        const int n = 256 * 2;
+        const int rows = 3;
+        Assert.Equal(blockBytes, (int)GgufFile.GetTypeSize(type));
+
+        byte[] raw = new byte[(n / 256) * blockBytes];
+        uint state = 0x12345678u;
+        for (int i = 0; i < raw.Length; i++)
+        {
+            state = state * 1664525u + 1013904223u;
+            raw[i] = (byte)(state >> 24);
+        }
+        for (int b = 0; b < n / 256; b++)
+            WriteHalf(raw, b * blockBytes, 0.5f + 0.25f * b);
+
+        float[] inputs = new float[n * rows];
+        for (int r = 0; r < rows; r++)
+            for (int i = 0; i < n; i++)
+                inputs[r * n + i] = (r + 1) * 0.05f * ((i % 23) - 11);
+
+        float[] actual = new float[rows];
+        ManagedQuantizedOps.DotRowBatchToFloat32(typeId, raw, 0, inputs, 0, n, rows, n, actual, 0);
+
+        float[] dequantized = new float[n];
+        NativeDequant.DequantizeToFloat32(typeId, raw, 0, dequantized, 0, n);
+
+        // RELATIVE tolerance against a dot that must itself be large enough to be
+        // meaningful. An earlier version of this test allowed 0.02 ABSOLUTE on
+        // small dots, which let a missing 0.125 folded scale - an 8x error that
+        // produced pure garbage in a real model - pass as green.
+        for (int r = 0; r < rows; r++)
+        {
+            double expected = Dot(dequantized, inputs, r * n, n);
+            Assert.True(Math.Abs(expected) > 1.0,
+                $"{type} row {r}: reference dot {expected} is too small to discriminate; fix the fixture");
+            double relative = Math.Abs(expected - actual[r]) / Math.Abs(expected);
+            Assert.True(relative <= 0.02,
+                $"{type} row {r}: dequantized dot {expected}, direct kernel {actual[r]} (relative {relative:P2})");
+        }
     }
 
     [Fact]

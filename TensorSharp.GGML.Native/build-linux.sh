@@ -61,6 +61,44 @@ have_vulkan_build_toolchain() {
     return 1
 }
 
+# Is a Vulkan DRIVER actually registered on this machine? A loader alone proves
+# nothing (every NVIDIA install ships one); an ICD manifest means some driver
+# claims to implement Vulkan, which is the honest signal for "building the
+# backend here is worth the seconds it costs".
+have_vulkan_runtime_driver() {
+    local dir
+    for dir in /usr/share/vulkan/icd.d /etc/vulkan/icd.d /usr/local/share/vulkan/icd.d; do
+        [[ -d "${dir}" ]] || continue
+        compgen -G "${dir}/*.json" >/dev/null 2>&1 && return 0
+    done
+    [[ -n "${VK_ICD_FILENAMES:-}" || -n "${VK_DRIVER_FILES:-}" ]] && return 0
+    return 1
+}
+
+# The GLVND gap: with an ICD registered and the loader present, instance
+# creation still fails with ErrorIncompatibleDriver when libEGL is absent,
+# because the NVIDIA Vulkan ICD dlopen()s it. The build succeeds and the
+# backend is dead at runtime, which is the worst way to find out - so check
+# here and say exactly what is missing.
+vulkan_runtime_libs_present() {
+    local dir name
+    for dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64 /usr/lib /usr/local/lib; do
+        for name in libEGL.so.1 libEGL.so; do
+            [[ -e "${dir}/${name}" ]] && return 0
+        done
+    done
+    return 1
+}
+
+warn_if_vulkan_runtime_incomplete() {
+    have_vulkan_runtime_driver || return 0
+    vulkan_runtime_libs_present && return 0
+    echo "warning: a Vulkan ICD is registered but libEGL was not found. The NVIDIA Vulkan" >&2
+    echo "         driver dlopen()s it, so ggml-vulkan will build fine and then fail at" >&2
+    echo "         startup with 'vk::createInstance: ErrorIncompatibleDriver'." >&2
+    echo "         Install the GLVND runtime, e.g.: apt-get install -y libegl1 libgl1 libglvnd0" >&2
+}
+
 find_vulkan_loader_library() {
     local candidates=()
     if command -v ldconfig >/dev/null 2>&1; then
@@ -132,11 +170,41 @@ prepare_vulkan_toolchain() {
         return 1
     fi
 
+    # Point CMake at whichever copy actually exists. The provisioner now prefers
+    # distro packages and stages nothing when the system is already complete, so
+    # hinting unconditionally at the staged directory handed CMake a
+    # non-existent include path ("Imported target Vulkan::Vulkan includes
+    # non-existent path .../vulkan-toolchain/Vulkan-Headers/include").
+    local include_dir=""
+    local d
+    for d in "${toolchain_dir}/Vulkan-Headers/include" /usr/include /usr/local/include; do
+        if [[ -f "${d}/vulkan/vulkan.h" ]]; then
+            include_dir="${d}"
+            break
+        fi
+    done
+    if [[ -z "${include_dir}" ]]; then
+        echo "warning: Vulkan headers not found after provisioning the toolchain." >&2
+        return 1
+    fi
+
+    local spirv_dir=""
+    for d in "${toolchain_dir}/spirv-headers-install/share/cmake/SPIRV-Headers"              /usr/share/cmake/SPIRV-Headers /usr/lib/cmake/SPIRV-Headers              /usr/local/share/cmake/SPIRV-Headers /usr/local/lib/cmake/SPIRV-Headers              /usr/lib/x86_64-linux-gnu/cmake/SPIRV-Headers              /usr/lib/aarch64-linux-gnu/cmake/SPIRV-Headers; do
+        if [[ -f "${d}/SPIRV-HeadersConfig.cmake" ]]; then
+            spirv_dir="${d}"
+            break
+        fi
+    done
+    if [[ -z "${spirv_dir}" ]]; then
+        echo "warning: SPIRV-Headers CMake package not found after provisioning." >&2
+        return 1
+    fi
+
     VULKAN_CMAKE_ARGS=(
-        "-DVulkan_INCLUDE_DIR=${toolchain_dir}/Vulkan-Headers/include"
+        "-DVulkan_INCLUDE_DIR=${include_dir}"
         "-DVulkan_LIBRARY=${loader}"
         "-DVulkan_GLSLC_EXECUTABLE=${glslc_path}"
-        "-DSPIRV-Headers_DIR=${toolchain_dir}/spirv-headers-install/share/cmake/SPIRV-Headers"
+        "-DSPIRV-Headers_DIR=${spirv_dir}"
     )
     return 0
 }
@@ -286,7 +354,16 @@ elif [[ "$(read_cached_backend_setting TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT)"
     fi
 fi
 if [[ -z "${ENABLE_VULKAN}" ]]; then
+    # Auto-enable when the build toolchain is already here, OR when a Vulkan
+    # driver is actually registered and we can provision the toolchain quickly.
+    # eng/fetch-vulkan-toolchain.sh now tries the distro packages first, so the
+    # second case costs seconds rather than a shaderc source build - which is
+    # what used to make auto-enabling on driver-presence a bad trade.
     if have_vulkan_build_toolchain; then
+        ENABLE_VULKAN=ON
+    elif have_vulkan_runtime_driver; then
+        echo "A Vulkan driver is registered on this machine but its build toolchain is not"
+        echo "installed; provisioning it (set TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF to skip)."
         ENABLE_VULKAN=ON
     else
         ENABLE_VULKAN=OFF
@@ -334,6 +411,8 @@ if [[ ! "${BUILD_PARALLEL_LEVEL}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 BUILD_PARALLEL_ARGS=(--parallel "${BUILD_PARALLEL_LEVEL}")
+
+if [[ "${ENABLE_VULKAN}" == "ON" ]]; then warn_if_vulkan_runtime_incomplete; fi
 
 echo "Configuring TensorSharp.GGML.Native (CUDA=${ENABLE_CUDA}, CUDA_ARCHITECTURES=${CUDA_ARCH_SUMMARY}, VULKAN=${ENABLE_VULKAN}, TESTS=${BUILD_TESTS}, PARALLEL=${BUILD_PARALLEL_LEVEL})"
 

@@ -115,28 +115,41 @@ namespace TensorSharp.Models
             qrNorm.Dispose();
             Trace("q", layer, q);
 
-            Tensor qNopeH, qPeH;
+            // glm5next is NoPE MLA (rope.dimension_count = 0): there is no rope
+            // half anywhere, _headDimNope == _headDimK, and the compressed latent
+            // IS the whole cache row. Splitting anyway narrows a zero-width slice.
+            // Mirrors the `hp.n_rot == 0` branches in ggml_ops_glm_dsa.cpp.
+            bool nopeOnly = _ropeDim == 0;
+
+            Tensor qNopeH, qPeH = null;
             using (var q3 = q.View(seqLen, nHead, _headDimK))
             {
                 using (var nopeView = q3.Narrow(2, 0, _headDimNope))
                 using (var t = nopeView.Transpose(0, 1))
                     qNopeH = Ops.NewContiguous(t);                          // [H, T, nope]
-                using (var peView = q3.Narrow(2, _headDimNope, _ropeDim))
-                    qPeH = Ops.NewContiguous(peView);                       // [T, H, rope]
+                if (!nopeOnly)
+                    using (var peView = q3.Narrow(2, _headDimNope, _ropeDim))
+                        qPeH = Ops.NewContiguous(peView);                   // [T, H, rope]
             }
             q.Dispose();
 
-            var posQ = EnsurePositions(seqLen, startPos, nHead, ref _cachedPosQ);
-            using (var qPeRope = qPeH.View(1, seqLen, nHead, _ropeDim))
-                Ops.RoPEEx(qPeRope, qPeRope, posQ, _ropeDim, 0, Config.OriginalContextLength,
-                    Config.RopeBase, 1.0f / Config.RopeScale, 0.0f, 1.0f, 0.0f, 0.0f);
+            if (!nopeOnly)
+            {
+                var posQ = EnsurePositions(seqLen, startPos, nHead, ref _cachedPosQ);
+                using (var qPeRope = qPeH.View(1, seqLen, nHead, _ropeDim))
+                    Ops.RoPEEx(qPeRope, qPeRope, posQ, _ropeDim, 0, Config.OriginalContextLength,
+                        Config.RopeBase, 1.0f / Config.RopeScale, 0.0f, 1.0f, 0.0f, 0.0f);
+            }
 
             // [T, H, rope] -> [H, T, rope] so it shares the query-head-major layout
             // of q_absorbed and both can drive one 2D GEMM against the cache.
-            Tensor qPeHeadMajor;
-            using (var t = qPeH.Transpose(0, 1))
-                qPeHeadMajor = Ops.NewContiguous(t);
-            qPeH.Dispose();
+            Tensor qPeHeadMajor = null;
+            if (!nopeOnly)
+            {
+                using (var t = qPeH.Transpose(0, 1))
+                    qPeHeadMajor = Ops.NewContiguous(t);
+                qPeH.Dispose();
+            }
 
             // q_absorbed[h] = q_nope[h] @ wk_b[h]^T : [H, T, nope] x [H, nope, kv_lora]
             var qAbs = new Tensor(_allocator, DType.Float32, nHead, seqLen, _kvLoraRank);
@@ -152,23 +165,33 @@ namespace TensorSharp.Models
             using (var cmprView = kvPe.Narrow(1, 0, _kvLoraRank))
             using (var cmpr = Ops.NewContiguous(cmprView))
                 kvCmpr = Ops.RMSNorm(null, cmpr, _weights[wn[WN_KV_A_NORM]], null, Config.Eps);
-            using (var peView = kvPe.Narrow(1, _kvLoraRank, _ropeDim))
-                kPe = Ops.NewContiguous(peView);
+            kPe = null;
+            if (!nopeOnly)
+            {
+                using (var peView = kvPe.Narrow(1, _kvLoraRank, _ropeDim))
+                    kPe = Ops.NewContiguous(peView);
+            }
             kvPe.Dispose();
 
-            var posK = EnsurePositions(seqLen, startPos, 1, ref _cachedPosK);
-            using (var kPeRope = kPe.View(1, seqLen, 1, _ropeDim))
-                Ops.RoPEEx(kPeRope, kPeRope, posK, _ropeDim, 0, Config.OriginalContextLength,
-                    Config.RopeBase, 1.0f / Config.RopeScale, 0.0f, 1.0f, 0.0f, 0.0f);
+            if (!nopeOnly)
+            {
+                var posK = EnsurePositions(seqLen, startPos, 1, ref _cachedPosK);
+                using (var kPeRope = kPe.View(1, seqLen, 1, _ropeDim))
+                    Ops.RoPEEx(kPeRope, kPeRope, posK, _ropeDim, 0, Config.OriginalContextLength,
+                        Config.RopeBase, 1.0f / Config.RopeScale, 0.0f, 1.0f, 0.0f, 0.0f);
+            }
 
             using (var dstCmpr = _kvCache[layer].Narrow(0, startPos, seqLen))
                 Ops.Copy(dstCmpr, kvCmpr);
-            using (var dstPe = _kPeCache[layer].Narrow(0, startPos, seqLen))
-                Ops.Copy(dstPe, kPe);
+            if (!nopeOnly)
+            {
+                using (var dstPe = _kPeCache[layer].Narrow(0, startPos, seqLen))
+                    Ops.Copy(dstPe, kPe);
+            }
             Trace("kv_cmpr", layer, kvCmpr);
-            Trace("k_pe", layer, kPe);
+            if (kPe != null) Trace("k_pe", layer, kPe);
             kvCmpr.Dispose();
-            kPe.Dispose();
+            kPe?.Dispose();
 
             // ---- attention ----------------------------------------------------
             long t0 = Stopwatch.GetTimestamp();
@@ -179,12 +202,15 @@ namespace TensorSharp.Models
             using (var kvActiveT = kvActive.Transpose())
             using (var qAbs2d = qAbs.View(rowsQ, _kvLoraRank))
                 Ops.Addmm(scores, 0, scores, _kqScale, qAbs2d, kvActiveT);
-            using (var peActive = _kPeCache[layer].Narrow(0, 0, kvLen))
-            using (var peActiveT = peActive.Transpose())
-            using (var qPe2d = qPeHeadMajor.View(rowsQ, _ropeDim))
-                Ops.Addmm(scores, 1.0f, scores, _kqScale, qPe2d, peActiveT);
+            if (!nopeOnly)
+            {
+                using (var peActive = _kPeCache[layer].Narrow(0, 0, kvLen))
+                using (var peActiveT = peActive.Transpose())
+                using (var qPe2d = qPeHeadMajor.View(rowsQ, _ropeDim))
+                    Ops.Addmm(scores, 1.0f, scores, _kqScale, qPe2d, peActiveT);
+            }
             qAbs.Dispose();
-            qPeHeadMajor.Dispose();
+            qPeHeadMajor?.Dispose();
 
             using (var scores3 = scores.View(nHead, seqLen, kvLen))
                 ApplyAttentionMaskAndSoftmax(scores3, seqLen, startPos, kvLen, topK, topKPerToken);
@@ -249,10 +275,16 @@ namespace TensorSharp.Models
                                          _weights[wn[WN_IDX_K_NORM_B]], IndexerNormEps);
             k.Dispose();
 
-            var posK = EnsurePositions(seqLen, startPos, 1, ref _cachedPosK);
-            using (var rope = kNorm.View(1, seqLen, 1, _indexerHeadDim))
-                Ops.RoPEEx(rope, rope, posK, _ropeDim, 0, Config.OriginalContextLength,
-                    Config.RopeBase, 1.0f / Config.RopeScale, 0.0f, 1.0f, 0.0f, 0.0f);
+            // The native indexer ropes unconditionally with hp.n_rot, which is a
+            // no-op at n_rot == 0 (glm5next); skipping it outright is the same
+            // thing without depending on RoPEEx's zero-width behaviour.
+            if (_ropeDim > 0)
+            {
+                var posK = EnsurePositions(seqLen, startPos, 1, ref _cachedPosK);
+                using (var rope = kNorm.View(1, seqLen, 1, _indexerHeadDim))
+                    Ops.RoPEEx(rope, rope, posK, _ropeDim, 0, Config.OriginalContextLength,
+                        Config.RopeBase, 1.0f / Config.RopeScale, 0.0f, 1.0f, 0.0f, 0.0f);
+            }
             return kNorm;
         }
 
@@ -287,10 +319,13 @@ namespace TensorSharp.Models
             k.Dispose();
 
             Tensor q = LinearForward(qrNorm, wn[WN_IDX_Q_B]);                     // [T, H*D]
-            var posIdx = EnsurePositions(seqLen, startPos, H, ref _cachedPosIdx);
-            using (var rope = q.View(1, seqLen, H, D))
-                Ops.RoPEEx(rope, rope, posIdx, _ropeDim, 0, Config.OriginalContextLength,
-                    Config.RopeBase, 1.0f / Config.RopeScale, 0.0f, 1.0f, 0.0f, 0.0f);
+            if (_ropeDim > 0)
+            {
+                var posIdx = EnsurePositions(seqLen, startPos, H, ref _cachedPosIdx);
+                using (var rope = q.View(1, seqLen, H, D))
+                    Ops.RoPEEx(rope, rope, posIdx, _ropeDim, 0, Config.OriginalContextLength,
+                        Config.RopeBase, 1.0f / Config.RopeScale, 0.0f, 1.0f, 0.0f, 0.0f);
+            }
 
             Tensor w = LinearForward(input, wn[WN_IDX_PROJ]);                     // [T, H]
             // Pre-scaled exactly as upstream, so the scale never touches the big

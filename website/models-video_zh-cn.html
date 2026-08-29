@@ -121,6 +121,26 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_
   </div>
   <div class="callout note"><div class="ic">💡</div><p><strong>试过并被否掉的做法</strong>，同样在这台 RTX 3080 Laptop 上实测，免得有人再走一遍。文本编码器分层分组确实消掉了编码器自己的溢出（峰值 16 041 → 12 981 MiB），而且逐位相同，但它<strong>慢 3 s</strong>：这段主干是对十个 token 的提示词做一次性 prefill，每个权重只读一次，溢出的约 1.3 GB 只需过一次 PCIe，而分组仍然要搬完全部 17 GB，还额外增加分配/失效的开销——因此默认关闭，放在 <code>TS_H3_TE_GROUP</code> 后面。把 prefault 与文本条件重叠（<code>TS_H3_PREFAULT=2</code>）比与上传流水化更差，因为编码器自己的 17 GB 也要过同一个页缓存，会把刚放进去的页挤掉。多流 prefault 在这里同样是负收益——640×384 三次取最好：1 个流 63.9 s、4 个流 64.9 s、16 个流 66.6 s，仅编码器拆卸一项就从 2.2 s 涨到 4.0 s——因为它不像加载器自己的预热那样独占机器，而是与它正在预热的工作并发。给<em>视频 VAE</em> 做 prefault 是纯亏：多花 1.9 s 读取，解码却没有变化（9.4 s 对 9.1 s），因为那个 VAE 是算力瓶颈而不是缺页瓶颈。关掉 CUDA graph 没有区别（65.6 s 对 65.8 s），<code>TS_GGML_ASYNC_COMPUTE=1</code> 也没有（67.4 s 对 66.2 s），它管的是图提交而不是权重上传。用 <code>ffmpeg</code> 替换系统的 H.264 编码器则更慢，98.2 s。</p></div>
 
+  <h3 id="h3-cpu">纯 C# 的 CPU 路径</h3>
+  <p><code>--backend cpu</code> 让 H3 <strong>完全不用 ggml</strong> 跑起来，走的是 <code>MiniMaxH3Direct{DiT, TextEncoder, VideoVae, AudioVae, VisionEncoder, VideoVaeEncoder3D, AudioVaeEncoder}</code>，底层是与 Wan 网络共用的 <code>Direct{Context, Linear, Ops}</code> 原语——H3 是唯一一个还没有纯托管 CPU 路径的生成模型。所有条件模式都可用：<strong>t2v、i2v、fl2v，以及参考图像、参考片段与参考音轨</strong>。一切都在主机上以 F32 运行，因此它是为了正确性、可移植性和没有加速卡的机器，而不是为了速度。</p>
+  <p>在完全相同的输入下与 GGML 路径对比——256×160、5 帧、单步、固定 <code>--diffusion-seed</code>。表中的<em>对照组</em>是 GGML 跟<strong>它自己</strong>比：它自己的 flash 内核对上显式 softmax 回退（<code>TS_H3_NO_FLASH=1</code>）——正是它让其余数字变得可读。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>路径</th><th>托管 vs GGML（余弦）</th><th>对照组（余弦）</th><th>成片 PSNR</th></tr></thead>
+    <tbody>
+      <tr><td>单独的文本编码器（64 层，32B Q4_K_M）</td><td>0.99999899</td><td>—</td><td>—</td></tr>
+      <tr><td>t2v</td><td>0.998740</td><td>0.997032</td><td>31.95 dB（对照组 28.17 dB）</td></tr>
+      <tr><td>i2v（3-D VAE 编码）</td><td>0.999897</td><td>—</td><td>34.87 dB</td></tr>
+      <tr><td>参考音频（音频 VAE 编码）</td><td>0.999410</td><td>—</td><td>35.27 dB</td></tr>
+      <tr><td>参考图像（视觉塔）</td><td>0.998554</td><td>0.999275</td><td>28.80 dB（对照组 30.80 dB）</td></tr>
+      <tr><td>单独的视觉塔输出</td><td>0.999919</td><td>0.999952</td><td>—</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>读懂这张表：t2v、i2v 与参考音频跟 GGML 的一致程度，比 GGML 自己两个注意力内核之间的一致程度<em>还高</em>。<strong>视觉塔是例外</strong>——它的残差大约是<strong>对照组的 1.4 倍</strong>，而不是低于对照组。在 737k 个元素上余弦达到 0.9999，说明这座塔在结构上是对的，但残差目前没有解释；关掉 flash 反而让一致性<em>更差</em>，所以 F16 的 K/V 转换并不是原因。这不能算“对齐”；在把对精度敏感的参考图像条件交给托管路径之前，值得先知道这一点。</p>
+  <p>DiT 与 GGML 并非逐位相同，也不可能相同，因为去噪器会放大极小的差异。<code>TS_H3_DIT_LAYERS</code> 会在<em>两条</em>路径上同时截断主干，把对比变成一条曲线：前 25 层两者的差异约为 1e-5，之后开始放大，而且是<strong>非单调</strong>的——深度 40 处为 1.15e-3，44 处为 1.5e-4，50 处为 1.26e-3。正是这个形状排除了 bug：如果某一层引入了错误，那么它之后的每个深度上曲线都不会下降。</p>
+  <p>同一段片子上，它对 <code>ggml_cpu</code> 的速度是互有胜负而非一律更慢：t2v 69 s 对 14 s，i2v 70 s 对 176 s，参考音频 63 s 对 71 s，参考图像 112 s 对 20 s。视觉塔是托管路径上最贵的一段。<code>TS_H3_DUMP_TE</code>、<code>TS_H3_DUMP_VEL_V</code>、<code>TS_H3_DUMP_VEL_A</code> 与 <code>TS_H3_DUMP_VIS</code> 会把这些张量写到磁盘，以便在一次前向上对比两条路径——不要改用成片对比，因为采样器会把第一步的差异放大。另外注意：<code>--seed</code> 是<em>采样</em>种子，视频生成的噪声取自 <code>--diffusion-seed</code>，不固定它就对比两次运行，实际上是在对比不同的噪声。</p>
+
   <h3 id="h3-server">部署到服务端</h3>
   <p>在服务端，尺寸是<strong>启动参数</strong>，因为浏览器不会自己发尺寸：<code>--video-width 640 --video-height 384 --video-steps 20</code> 是文档给出的起点（<code>--width</code> / <code>--height</code> 是别名；只给其中一个时，H3 会从条件图像的宽高比推出另一个）。<code>--video-mode</code> 用于给只提供一种模式的部署固定条件模式；不写它，则每条请求各自推断，通常这才是你想要的。<code>--video-frames</code>、<code>--fps</code>、<code>--video-vae</code>、<code>--video-text-encoder</code> 与 <code>--audio-vae</code> 补齐其余部分。服务端完全没有 <code>--cfg</code>，这也是随仓库提供的配置既不设步数也不设引导的原因。</p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \

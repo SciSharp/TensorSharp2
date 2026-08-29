@@ -2058,50 +2058,31 @@ namespace TensorSharp.Runtime
 
     public static class OutputParserFactory
     {
+        /// <summary>
+        /// Parser for a family's raw stream. Which parser, whether it is mandatory and
+        /// where a grammar may arm are all declared together in
+        /// <see cref="ChatProtocolRegistry"/>, beside that family's prompt renderer -
+        /// they are four faces of one text protocol, and splitting them across separate
+        /// name chains is how a family used to end up half-added.
+        /// </summary>
         public static IOutputParser Create(string architecture)
-        {
-            return architecture switch
-            {
-                "gemma4" => new Gemma4OutputParser(),
-                "qwen3" => new Qwen3OutputParser(),
-                "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe" => new Qwen35OutputParser(),
-                "gptoss" or "gpt-oss" => new HarmonyOutputParser(),
-                "muse-glimmer" => new MuseGlimmerOutputParser(),
-                "deepseek4" => new DeepSeek4OutputParser(),
-                "glm-dsa" or "glm_dsa" or "glm5next" => new GlmDsaOutputParser(),
-                "nemotron_h" or "nemotron_h_moe" => new Qwen3OutputParser(),
-                _ => new PassthroughOutputParser()
-            };
-        }
+            => ChatProtocolRegistry.For(architecture)?.CreateOutputParser?.Invoke()
+               ?? new PassthroughOutputParser();
 
         /// <summary>
-        /// Text after which a structured-output grammar may start enforcing, or
-        /// null when the model's very first token is already part of the answer.
-        ///
-        /// GPT-OSS opens every reply with a harmony channel header and reasons in
-        /// the <c>analysis</c> channel before answering in <c>final</c>. A grammar
-        /// armed from token 0 forbids that header, so the model is pushed straight
-        /// into a JSON object having done no reasoning and fills the schema with
-        /// placeholders. Arming on the final channel's header instead lets it
-        /// think and constrains only the answer. See
-        /// <c>GrammarConstraint.ActivateAfter</c>.
+        /// Text after which a structured-output grammar may start enforcing, or null
+        /// when the model's very first token is already part of the answer.
         /// </summary>
         public static string? GrammarActivationTrigger(string architecture)
-            => architecture is "gptoss" or "gpt-oss" ? "final<|message|>" : null;
+            => ChatProtocolRegistry.For(architecture)?.GrammarActivationTrigger;
 
+        /// <summary>
+        /// True when the reply is unreadable without its parser: the framing tokens and
+        /// the whole chain of thought would otherwise stream to the client as if they
+        /// were the answer.
+        /// </summary>
         public static bool IsAlwaysRequired(string architecture)
-        {
-            // DeepSeek V4 joins this set because its reasoning block and its DSML
-            // tool calls both arrive as plain text: without the parser the
-            // </think> marker and the whole <｜DSML｜tool_calls> block would be
-            // streamed to the client as if they were the answer.
-            // Muse-Glimmer likewise: every assistant message is wrapped in
-            // <|start|>...<|message|>...<|eom|>/<|eot|> framing and its reasoning
-            // arrives on the "to=self" channel, so an unparsed stream shows the
-            // raw tags and the whole chain of thought as if it were the answer.
-            return architecture is "gptoss" or "gpt-oss" or "gemma4" or "deepseek4" or "muse-glimmer"
-                                or "glm-dsa" or "glm_dsa" or "glm5next";
-        }
+            => ChatProtocolRegistry.For(architecture)?.OutputParserAlwaysRequired ?? false;
     }
 }
 

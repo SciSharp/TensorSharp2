@@ -46,6 +46,9 @@ public class Gemma4BatchedForwardTests
     {
         var model = await TryLoadGemma4();
         if (model == null) return;
+
+        string prevFusedPrefill = Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL");
+        string prevForceUnfused = Environment.GetEnvironmentVariable("TS_GEMMA4_FORCE_UNFUSED");
         try
         {
             // Use a prompt the model has a CONFIDENT continuation for, so the
@@ -129,6 +132,12 @@ public class Gemma4BatchedForwardTests
         }
         finally
         {
+            // These two overrides used to leak out of the test: collections run serially
+            // in one process (TestAssemblyConfig), so every test scheduled after this one
+            // silently inherited "no fused prefill, force unfused Gemma 4" and measured or
+            // compared a path it never asked for.
+            Environment.SetEnvironmentVariable("TS_FUSED_LAYER_PREFILL", prevFusedPrefill);
+            Environment.SetEnvironmentVariable("TS_GEMMA4_FORCE_UNFUSED", prevForceUnfused);
             model.Dispose();
         }
     }

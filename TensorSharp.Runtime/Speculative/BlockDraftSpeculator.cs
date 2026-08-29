@@ -64,6 +64,15 @@ namespace TensorSharp.Runtime.Speculative
 
         public string Name => SpeculatorRegistry.Block;
 
+        /// <summary>
+        /// A block drafter reads its own sliding KV ring, which is refilled by the
+        /// freshly forwarded suffix and by every token the trunk commits, so an adopted
+        /// prefix costs it a shorter drafting context for the first block or two and
+        /// nothing after that. Refusing to arm here is what made DFlash look useless
+        /// from a chat's second turn onward.
+        /// </summary>
+        public bool CanArmAfterPrefixReuse => true;
+
         public string Describe() => $"block({BlockSize})";
 
         public int MaxDraftTokens { get; }

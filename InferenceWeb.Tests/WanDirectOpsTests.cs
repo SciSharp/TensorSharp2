@@ -2,14 +2,15 @@ using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.Models.WanVideo;
+using TensorSharp.Models.Direct;
 
 namespace InferenceWeb.Tests;
 
-// Numeric tests for the direct-backend Wan primitives (WanDirectOps /
+// Numeric tests for the direct-backend Wan primitives (DirectOps /
 // CudaWanOps): the managed parallel GEMM kernels, the generic attention
 // fallback, rowwise modulate/gate/bias ops and interleaved RoPE — each against
 // a naive reference, and the CUDA kernels against the CPU implementations.
-public class WanDirectOpsTests
+public class DirectOpsTests
 {
     private static float[] Rand(int n, int seed)
     {
@@ -39,7 +40,7 @@ public class WanDirectOpsTests
         using var at = Tensor.FromArray(alloc, a); using var atv = at.View(m, k);
         using var bt = Tensor.FromArray(alloc, b); using var btv = bt.View(n, k);
         using var ct = new Tensor(alloc, DType.Float32, m, n);
-        WanDirectOps.CpuGemmABt(atv, btv, ct, 0.5f, 0f);
+        DirectOps.CpuGemmABt(atv, btv, ct, 0.5f, 0f);
 
         var expect = new float[m * n];
         for (int i = 0; i < m; i++)
@@ -61,7 +62,7 @@ public class WanDirectOpsTests
         using var at = Tensor.FromArray(alloc, a); using var atv = at.View(m, k);
         using var bt = Tensor.FromArray(alloc, b); using var btv = bt.View(k, n);
         using var ct = Tensor.FromArray(alloc, (float[])c0.Clone()); using var ctv = ct.View(m, n);
-        WanDirectOps.CpuGemmAB(atv, btv, ctv, 1f, 1f);
+        DirectOps.CpuGemmAB(atv, btv, ctv, 1f, 1f);
 
         var expect = new float[m * n];
         for (int i = 0; i < m; i++)
@@ -113,7 +114,7 @@ public class WanDirectOpsTests
     public void CpuAttention_MatchesNaive(int heads, int hd, int sq, int sk, bool withBias)
     {
         var alloc = new CpuAllocator(BlasEnum.DotNet);
-        var ctx = new WanDirectContext(alloc);
+        var ctx = new DirectContext(alloc);
         float[] q = Rand(sq * heads * hd, 10), k = Rand(sk * heads * hd, 11), v = Rand(sk * heads * hd, 12);
         float[] bias = withBias ? Rand(heads * sq * sk, 13) : null;
         float scale = 1f / MathF.Sqrt(hd);
@@ -122,7 +123,7 @@ public class WanDirectOpsTests
         using var kt = ctx.FromFloats(k, sk, heads * hd);
         using var vt = ctx.FromFloats(v, sk, heads * hd);
         using var bt = bias != null ? ctx.FromFloats(bias, heads, sq, sk) : null;
-        using var ot = WanDirectOps.Attention(ctx, qt, kt, vt, heads, hd, scale, bt);
+        using var ot = DirectOps.Attention(ctx, qt, kt, vt, heads, hd, scale, bt);
 
         AssertClose(NaiveAttention(q, k, v, bias, heads, hd, sq, sk, scale),
                     ot.GetElementsAsFloat(sq * heads * hd), 2e-4f);
@@ -144,7 +145,7 @@ public class WanDirectOpsTests
         float scale = 1f / MathF.Sqrt(hd);
 
         using var alloc = new CudaAllocator();
-        using var ctx = new WanDirectContext(alloc);
+        using var ctx = new DirectContext(alloc);
         using var qt = ctx.FromFloats(q, sq, heads * hd);
         using var kt = ctx.FromFloats(k, sk, heads * hd);
         using var vt = ctx.FromFloats(v, sk, heads * hd);
@@ -166,7 +167,7 @@ public class WanDirectOpsTests
     {
         const int seq = 6, heads = 2, hd = 8, dim = heads * hd;
         var alloc = new CpuAllocator(BlasEnum.DotNet);
-        var ctx = new WanDirectContext(alloc);
+        var ctx = new DirectContext(alloc);
         float[] x = Rand(seq * dim, 20), cos = Rand(seq * hd, 21), sin = Rand(seq * hd, 22);
         // pair-duplicate the tables (WanRope layout)
         for (int t = 0; t < seq; t++)
@@ -179,7 +180,7 @@ public class WanDirectOpsTests
         using var xt = ctx.FromFloats((float[])x.Clone(), seq, dim);
         using var ct = ctx.FromFloats(cos, seq, hd);
         using var st = ctx.FromFloats(sin, seq, hd);
-        WanDirectOps.RopeInterleaved(ctx, xt, ct, st, heads, hd);
+        DirectOps.RopeInterleaved(ctx, xt, ct, st, heads, hd);
         var got = xt.GetElementsAsFloat(seq * dim);
         for (int t = 0; t < seq; t++)
             for (int h = 0; h < heads; h++)
@@ -198,7 +199,7 @@ public class WanDirectOpsTests
         using var mt = ctx.FromFloats((float[])x.Clone(), seq, dim);
         using var sh = ctx.FromFloats(shift, dim);
         using var sc = ctx.FromFloats(scaleV, dim);
-        WanDirectOps.ModulateRows(ctx, mt, mt, sh, sc, 1, seq - 1);
+        DirectOps.ModulateRows(ctx, mt, mt, sh, sc, 1, seq - 1);
         var mgot = mt.GetElementsAsFloat(seq * dim);
         for (int i = 0; i < seq * dim; i++)
         {
@@ -211,7 +212,7 @@ public class WanDirectOpsTests
         using var gt = ctx.FromFloats((float[])x.Clone(), seq, dim);
         using var vt = ctx.FromFloats(vv, seq, dim);
         using var ga = ctx.FromFloats(gate, dim);
-        WanDirectOps.GateAddRows(ctx, gt, vt, ga, 0, seq);
+        DirectOps.GateAddRows(ctx, gt, vt, ga, 0, seq);
         var ggot = gt.GetElementsAsFloat(seq * dim);
         for (int i = 0; i < seq * dim; i++)
             Assert.True(Math.Abs(ggot[i] - (x[i] + vv[i] * gate[i % dim])) < 1e-5f, $"gate mismatch at {i}");
@@ -229,17 +230,17 @@ public class WanDirectOpsTests
             return;
         const int seq = 14040, heads = 12, hd = 128;
         using var alloc = new CudaAllocator();
-        var ctx = new WanDirectContext(alloc);
+        var ctx = new DirectContext(alloc);
         using var q = ctx.FromFloats(Rand(seq * heads * hd, 50), seq, heads * hd);
         using var k = ctx.FromFloats(Rand(seq * heads * hd, 51), seq, heads * hd);
         using var v = ctx.FromFloats(Rand(seq * heads * hd, 52), seq, heads * hd);
         float scale = 1f / MathF.Sqrt(hd);
-        using (var warm = WanDirectOps.Attention(ctx, q, k, v, heads, hd, scale)) warm.GetElementsAsFloat(1);
+        using (var warm = DirectOps.Attention(ctx, q, k, v, heads, hd, scale)) warm.GetElementsAsFloat(1);
         var sw = System.Diagnostics.Stopwatch.StartNew();
         const int iters = 5;
         for (int i = 0; i < iters; i++)
         {
-            using var o = WanDirectOps.Attention(ctx, q, k, v, heads, hd, scale);
+            using var o = DirectOps.Attention(ctx, q, k, v, heads, hd, scale);
             o.GetElementsAsFloat(1);
         }
         sw.Stop();
@@ -255,20 +256,20 @@ public class WanDirectOpsTests
         const int heads = 2, hd = 128, sq = 300, sk = 70;
         var cpuAlloc = new CpuAllocator(BlasEnum.DotNet);
         using var cudaAlloc = new CudaAllocator();
-        var cpuCtx = new WanDirectContext(cpuAlloc);
-        var cudaCtx = new WanDirectContext(cudaAlloc);
+        var cpuCtx = new DirectContext(cpuAlloc);
+        var cudaCtx = new DirectContext(cudaAlloc);
 
         float[] q = Rand(sq * heads * hd, 30), k = Rand(sk * heads * hd, 31), v = Rand(sk * heads * hd, 32);
         float[] bias = Rand(heads * sq * sk, 33);
         float scale = 1f / MathF.Sqrt(hd);
 
-        float[] Run(WanDirectContext ctx)
+        float[] Run(DirectContext ctx)
         {
             using var qt = ctx.FromFloats(q, sq, heads * hd);
             using var kt = ctx.FromFloats(k, sk, heads * hd);
             using var vt = ctx.FromFloats(v, sk, heads * hd);
             using var bt = ctx.FromFloats(bias, heads, sq, sk);
-            using var ot = WanDirectOps.Attention(ctx, qt, kt, vt, heads, hd, scale, bt);
+            using var ot = DirectOps.Attention(ctx, qt, kt, vt, heads, hd, scale, bt);
             return ot.GetElementsAsFloat(sq * heads * hd);
         }
         AssertClose(Run(cpuCtx), Run(cudaCtx), 5e-4f);
@@ -278,25 +279,25 @@ public class WanDirectOpsTests
         float[] x = Rand(seq * dim, 34), cos = Rand(seq * hd, 35), sin = Rand(seq * hd, 36);
         float[] shift = Rand(dim, 37), scaleV = Rand(dim, 38), gate = Rand(dim, 39), vv = Rand(seq * dim, 40);
 
-        float[] RunSmall(WanDirectContext ctx)
+        float[] RunSmall(DirectContext ctx)
         {
             using var xt = ctx.FromFloats((float[])x.Clone(), seq, dim);
             using var ct = ctx.FromFloats(cos, seq, hd);
             using var st = ctx.FromFloats(sin, seq, hd);
-            WanDirectOps.RopeInterleaved(ctx, xt, ct, st, heads, hd);
+            DirectOps.RopeInterleaved(ctx, xt, ct, st, heads, hd);
             using var sh = ctx.FromFloats(shift, dim);
             using var sc = ctx.FromFloats(scaleV, dim);
-            WanDirectOps.ModulateRows(ctx, xt, xt, sh, sc, 2, seq - 2);
+            DirectOps.ModulateRows(ctx, xt, xt, sh, sc, 2, seq - 2);
             using var ga = ctx.FromFloats(gate, dim);
             using var vt = ctx.FromFloats(vv, seq, dim);
-            WanDirectOps.GateAddRows(ctx, xt, vt, ga, 0, seq);
+            DirectOps.GateAddRows(ctx, xt, vt, ga, 0, seq);
             return xt.GetElementsAsFloat(seq * dim);
         }
         AssertClose(RunSmall(cpuCtx), RunSmall(cudaCtx), 1e-4f);
 
         using (var z = cudaCtx.NewF32(17, 9))
         {
-            WanDirectOps.Zero(cudaCtx, z);
+            DirectOps.Zero(cudaCtx, z);
             foreach (float f in z.GetElementsAsFloat(17 * 9)) Assert.Equal(0f, f);
         }
 

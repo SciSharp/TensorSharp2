@@ -116,9 +116,9 @@ namespace TensorSharp.Models.MiniMaxH3
             return null;
         }
 
-        internal MiniMaxH3TextEncoder CreateTextEncoder() => new(_tePath);
-        internal MiniMaxH3DiT CreateDiT() => new(_ditPath);
-        internal MiniMaxH3VideoVae CreateVideoVae() => new(_vaePath);
+        internal MiniMaxH3TextEncoder CreateTextEncoder() => new(_tePath, null, Backend, _allocator);
+        internal MiniMaxH3DiT CreateDiT() => new(_ditPath, Backend, _allocator);
+        internal MiniMaxH3VideoVae CreateVideoVae() => new(_vaePath, Backend, _allocator);
 
         /// <summary>Pull a weight file through the OS file cache in one sequential pass.
         ///
@@ -210,7 +210,15 @@ namespace TensorSharp.Models.MiniMaxH3
             catch (UnauthorizedAccessException) { return 0; }
         }
         internal MiniMaxH3AudioVae CreateAudioVae() =>
-            _audioVaePath != null ? new MiniMaxH3AudioVae(_audioVaePath) : null;
+            _audioVaePath != null
+                ? new MiniMaxH3AudioVae(_audioVaePath, Backend, UsesDirectBackend)
+                : null;
+        /// <summary>True on the backends with no ggml graph to call, which run the
+        /// generator through the managed direct implementations instead.</summary>
+        internal bool UsesDirectBackend =>
+            _allocator != null && Backend is not (BackendType.GgmlCuda or BackendType.GgmlCpu
+                or BackendType.GgmlMetal or BackendType.GgmlVulkan);
+
         internal string AudioVaePath => _audioVaePath;
 
         /// <summary>Generate a clip. MiniMax-H3 is CFG-distilled, so guidance must be

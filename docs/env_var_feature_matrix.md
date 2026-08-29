@@ -108,6 +108,19 @@ per-model `TS_*_BATCHED` opt-outs surface as the model's declared
 | `TS_MLX_DEVICE_KV_COPY` | MLX | On-device KV scatter | ON | `0`, `1` | no |
 | `TS_MLX_QWEN35_GDN_PACKED_KERNELS` | Qwen 3.5 / 3.6 family on MLX | Packed GDN kernels | OFF | `0`, `1` | yes |
 
+## Out-of-Matrix Pure-C# CPU Backend Knobs
+
+These tune the persistent worker pool and the quantized-weight handling
+behind `--backend cpu`. They are real runtime knobs but are not registered
+in `EnvVarMatrix.All` and are not swept by the default TestMatrix config.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_CPU_THREADS` | `cpu` backend (100% pure C#) | Width of the persistent worker pool that runs the managed matmuls. Default is HALF the usable CPUs, deliberately not all of them: the rest of the CPU path still uses the ThreadPool, and pool workers spin between jobs, so taking every core starves that other work. Measured on a 122-CPU quota, two interleaved runs per cell (prefill / decode tok/s): pool off 21.7,21.0 / 2.0,2.4; 32 threads 24.9,24.1 / 4.9,5.0; 48 threads 25.6,28.5 / 5.4,6.0; 61 threads 24.2,24.9 / 6.3,5.9; 122 threads 13.5 / 4.8. At 122 only prefill regresses - decode still beats the pool-off baseline | every core at <=8 CPUs, else max(8, usable/2) | not registered | no |
+| `TS_CPU_POOL` | `cpu` backend | `0` reverts to the pre-pool behaviour - ThreadPool `Parallel.For` with thread-count-scaled chunks - so the two can be A/B-ed in one binary | ON | not registered | no |
+| `TS_CPU_SPIN` | `cpu` backend | Spin iterations a pool worker takes before parking. Parking is the expensive part at this width (waking N workers costs more than the ~60 us of work being handed out), so the default spins long enough that the steady state never parks: at 256 the same model measured 0.1 tok/s against 7.0 at 4096 | `4096` | not registered | no |
+| `TS_CPU_TASK_BYTES` / `TS_CPU_TASKS_PER_WORKER` | `cpu` backend | Chunking of a managed matmul: weight bytes per work item, and the cap on work items per worker. Sized from the WORK rather than the thread count - the old thread-count-scaled rule built 1024 tiny tasks per matmul at 122 threads and stopped scaling past 8 | `131072` / `4` | not registered | no |
+
 ## Out-of-Matrix DiffusionGemma Knobs
 
 These variables are real runtime knobs, but they are not registered in
@@ -287,6 +300,8 @@ These variables are real runtime knobs, but they are not registered in
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
 | `TS_PDF_MAX_PAGES` | PDF document input (CLI `--pdf`, server `/api/upload`) | Cap on the number of PDF pages read for text extraction and page-image rendering | `0` (all pages) | not registered | no |
+| `TS_DIRECT_QUANT_WEIGHTS` | `cpu` backend, direct video networks (Wan, MiniMax-H3) | `0` expands every quantized weight to F32 once at load and runs a plain GEMM, instead of keeping it in its GGUF storage type and multiplying it straight out of there. The expansion costs 4x the weight memory and reads 4x the bytes on every forward; it is kept so the two can be A/B-ed for numeric drift in one binary | ON (weights stay quantized) | not registered | no |
+| `TS_DUMP_LOGITS` | all models, all backends | Path the FIRST real forward's logits are written to, once, as raw float32. It deliberately SKIPS the warm-up forwards: `WarmUpKernels` drives its own throwaway decode and prefill before the real prompt, so dumping those would compare two executors on a meaningless token rather than on the model. Lets two backends be compared by logit vector instead of by generated text, where greedy decoding turns a near-tie into a visibly different sentence | unset (no dump) | not registered | no |
 | `TS_FUSED_QKNORM_ROPE` | Qwen 3.5 / 3.6 text-only prefill on the direct `cuda` backend | Fused QK-Norm + NeoX-RoPE CUDA kernel; `0` falls back to separate norm + RoPE ops (multimodal MRoPE and other backends always use the separate path) | ON | not registered | no |
 | `TS_CUDA_QMM_F16GEMM` | direct `cuda` backend, quantized matmuls with ≥ `TS_CUDA_QMM_F16GEMM_MIN_ROWS` activation rows | Dequantize the weight once to F16 and run a tensor-core cuBLAS GEMM (ggml-style prefill route) instead of the block-tile quant kernels; `0` reverts to the quant kernels | ON | not registered | no |
 | `TS_CUDA_QMM_F16GEMM_MIN_ROWS` | direct `cuda` backend | Activation-row threshold for the F16 GEMM route | `32` | not registered | no |

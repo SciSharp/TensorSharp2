@@ -87,49 +87,14 @@ namespace TensorSharp.Runtime
             if (string.IsNullOrEmpty(architecture))
                 return string.Empty;
 
-            // Gemma 4 thinking-disabled adds an empty <|channel>thought<channel|> block
-            // to the generation prompt so the model skips reasoning. The standard chat
-            // template doesn't re-emit this for past assistant messages, but we need it
-            // to match what's in the KV cache.
-            if (architecture == "gemma4" && !enableThinking)
-                return "<|channel>thought\n<channel|>";
-
-            // Qwen 3.5 family (including Qwen 3.6 which reports as "qwen35moe") with
-            // thinking ENABLED uses a Jinja template that emits `<think>\n` after the
-            // assistant role marker as part of the generation prompt. The same template
-            // does NOT re-emit `<think>...</think>` framing for PAST assistant messages
-            // (it only does so for the most-recent query's assistant turn). Without an
-            // injection here, the cache's `<think>` token (forwarded in turn N as part
-            // of the generation prompt) has no counterpart in turn N+1's render of the
-            // same assistant turn, causing every multi-turn request from the WebUI to
-            // reset the cache.
-            if (IsQwen35FamilyArch(architecture) && enableThinking)
-                return "<think>\n";
-
-            // qwen4exp appends `<think>` to the generation prompt UNCONDITIONALLY -
-            // the model always reasons - so the cache always holds it, whatever the
-            // thinking flag says. (The trailing newline is trimmed away again at
-            // interior boundaries when the renderer's own TrimEnd behaviour calls
-            // for it, mirroring the generation prompt.)
-            if (architecture == "qwen4exp")
-                return "<think>\n";
-
-            // GLM-5.3-Flash (glm5next) likewise ALWAYS opens a <think> block in the
-            // generation prompt (its template has no thinking-off shape), with no
-            // newline after it. Re-rendered history goes through the template's
-            // empty-<think></think> branch, which the strip above removes; this
-            // restores the half the cache actually holds.
-            if (architecture == "glm5next")
-                return "<think>";
-
-            // Qwen 3.5 family with thinking DISABLED is rendered through the hardcoded
-            // RenderQwen35 path, which DOES emit `<think>\n\n</think>\n\n` for past
-            // assistant messages already - so no injection is needed.
-
-            // All other supported architectures (Qwen3, GptOss / Harmony, Gemma3,
-            // Mistral3, Nemotron, ...) emit consistent framing for past and current-turn
-            // assistant messages and need no injection.
-            return string.Empty;
+            // WHICH suffix, per family, is declared once in ChatProtocolRegistry beside
+            // that family's renderer and output parser - it is a property of the chat
+            // format, and it used to be a chain of name comparisons here that a new
+            // family had to be remembered into. Families whose template frames past and
+            // current-turn assistant messages identically (Qwen3, Harmony, Gemma 3,
+            // Mistral 3, Nemotron, ...) declare nothing and get an empty suffix.
+            return ChatProtocolRegistry.For(architecture)?.AssistantGenerationSuffix?.Invoke(enableThinking)
+                   ?? string.Empty;
         }
 
         /// <summary>
@@ -152,11 +117,7 @@ namespace TensorSharp.Runtime
         /// <c>&lt;|start|&gt;assistant</c> + raw tokens.
         /// </summary>
         internal static string GetTemplateAssistantHeaderAnchor(string architecture)
-        {
-            if (architecture is "muse-glimmer" or "muse_glimmer")
-                return "<|start|>assistant";
-            return null;
-        }
+            => ChatProtocolRegistry.For(architecture)?.TemplateAssistantHeaderAnchor;
 
         /// <summary>
         /// Delete the text the template emitted between <paramref name="anchor"/> and each
@@ -197,16 +158,6 @@ namespace TensorSharp.Runtime
                 searchPos = sentinelEnd + 1;
             }
             return sb.ToString();
-        }
-
-        private static bool IsQwen35FamilyArch(string architecture)
-        {
-            return architecture == "qwen35"
-                || architecture == "qwen35moe"
-                || architecture == "qwen3next"
-                || architecture == "qwen3vl"
-                || architecture == "qwen3vlmoe"
-                || architecture == "qwen4exp";
         }
 
         /// <summary>
@@ -307,8 +258,11 @@ namespace TensorSharp.Runtime
             // at the first assistant boundary, so the re-rendered prefix diverges there
             // and every multi-turn request re-prefills the whole conversation. Drop it
             // before injecting the suffix that reproduces what the cache actually saw.
-            if (enableThinking || architecture == "qwen4exp" || architecture == "glm5next")
+            if (ChatProtocolRegistry.For(architecture)?.EmitsEmptyThinkBlockForPastTurns?.Invoke(enableThinking)
+                ?? enableThinking)
+            {
                 text = StripEmptyThinkBlockBeforePlaceholders(text);
+            }
 
             string suffix = GetAssistantGenerationSuffix(architecture, enableThinking);
             if (!string.IsNullOrEmpty(suffix))

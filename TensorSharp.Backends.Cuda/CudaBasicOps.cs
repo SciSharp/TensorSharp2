@@ -53,18 +53,6 @@ namespace TensorSharp.Cuda
             return CudaCpuFallback.InvokeTensor("addmmbatch", result, result, beta, src, alpha, m1, m2);
         }
 
-        [RegisterOpStorageType("mulmatid", typeof(CudaStorage))]
-        public static Tensor MulmatID(Tensor result, Tensor expertWeights, Tensor input, Tensor ids)
-        {
-            return CudaCpuFallback.InvokeTensor("mulmatid", result, result, expertWeights, input, ids);
-        }
-
-        [RegisterOpStorageType("addid", typeof(CudaStorage))]
-        public static Tensor AddID(Tensor result, Tensor src, Tensor bias, Tensor ids)
-        {
-            return CudaCpuFallback.InvokeTensor("addid", result, result, src, bias, ids);
-        }
-
         [RegisterOpStorageType("abs", typeof(CudaStorage))]
         public static Tensor Abs(Tensor result, Tensor src) => Unary("abs", result, src);
 
@@ -73,12 +61,6 @@ namespace TensorSharp.Cuda
 
         [RegisterOpStorageType("sign", typeof(CudaStorage))]
         public static Tensor Sign(Tensor result, Tensor src) => Unary("sign", result, src);
-
-        [RegisterOpStorageType("sqrt", typeof(CudaStorage))]
-        public static Tensor Sqrt(Tensor result, Tensor src) => Unary("sqrt", result, src);
-
-        [RegisterOpStorageType("rsqrt", typeof(CudaStorage))]
-        public static Tensor Rsqrt(Tensor result, Tensor src) => Unary("rsqrt", result, src);
 
         [RegisterOpStorageType("exp", typeof(CudaStorage))]
         public static Tensor Exp(Tensor result, Tensor src) => Unary("exp", result, src);
@@ -106,9 +88,6 @@ namespace TensorSharp.Cuda
 
         [RegisterOpStorageType("relu", typeof(CudaStorage))]
         public static Tensor Relu(Tensor result, Tensor src) => Unary("relu", result, src, CudaUnaryOp.Relu);
-
-        [RegisterOpStorageType("sin", typeof(CudaStorage))]
-        public static Tensor Sin(Tensor result, Tensor src) => Unary("sin", result, src);
 
         [RegisterOpStorageType("cos", typeof(CudaStorage))]
         public static Tensor Cos(Tensor result, Tensor src) => Unary("cos", result, src);
@@ -167,9 +146,6 @@ namespace TensorSharp.Cuda
             return Scalar("rdivv", result, rhs, lhs, CudaScalarOp.ReverseDiv);
         }
 
-        [RegisterOpStorageType("modv", typeof(CudaStorage))]
-        public static Tensor ModValue(Tensor result, Tensor lhs, float rhs) => ScalarFallback("modv", result, lhs, rhs);
-
         [RegisterOpStorageType("addt", typeof(CudaStorage))]
         public static Tensor AddTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("addt", result, lhs, rhs, CudaBinaryOp.Add);
 
@@ -210,9 +186,6 @@ namespace TensorSharp.Cuda
             }
             return true;
         }
-
-        [RegisterOpStorageType("modt", typeof(CudaStorage))]
-        public static Tensor ModTensor(Tensor result, Tensor lhs, Tensor rhs) => BinaryFallback("modt", result, lhs, rhs);
 
         [RegisterOpStorageType("addmul", typeof(CudaStorage))]
         public static Tensor AddMul(Tensor result, Tensor x, Tensor y, Tensor z)
@@ -342,12 +315,6 @@ namespace TensorSharp.Cuda
             return CudaCpuFallback.InvokeTensor("softmax", writeTarget, writeTarget, src);
         }
 
-        [RegisterOpStorageType("softmaxgrad", typeof(CudaStorage))]
-        public static Tensor SoftmaxGrad(Tensor grad, Tensor adj, Tensor val, bool addGrad)
-        {
-            return CudaCpuFallback.InvokeTensor("softmaxgrad", grad, grad, adj, val, addGrad);
-        }
-
         [RegisterOpStorageType("scaled_dot_product_attention", typeof(CudaStorage))]
         public static Tensor ScaledDotProductAttention(Tensor result, Tensor query, Tensor key, Tensor value, Tensor mask, float scale)
         {
@@ -367,12 +334,6 @@ namespace TensorSharp.Cuda
                 return writeTarget;
 
             return CudaCpuFallback.InvokeTensor("indexselect", writeTarget, writeTarget, src, indice, isAdd);
-        }
-
-        [RegisterOpStorageType("indexselectgrad", typeof(CudaStorage))]
-        public static Tensor IndexSelectGrad(Tensor grad, Tensor adj, Tensor indice)
-        {
-            return CudaCpuFallback.InvokeTensor("indexselectgrad", grad, grad, adj, indice);
         }
 
         [RegisterOpStorageType("repeat_interleave", typeof(CudaStorage))]
@@ -407,12 +368,6 @@ namespace TensorSharp.Cuda
             CudaCpuFallback.InvokeVoid("add_causal_mask", tensor, tensor, seqLen, startPos, maskedValue);
         }
 
-        [RegisterOpStorageType("topK", typeof(CudaStorage))]
-        public static Tensor TopK(Tensor outVal, Tensor outIdx, Tensor inVal, int k)
-        {
-            return CudaCpuFallback.InvokeTensor("topK", outVal, outVal, outIdx, inVal, k);
-        }
-
         [RegisterOpStorageType("rope", typeof(CudaStorage))]
         public static Tensor RoPE(Tensor result, Tensor src, int seqLen, int rowOffset)
         {
@@ -421,12 +376,6 @@ namespace TensorSharp.Cuda
                 return writeTarget;
 
             return CudaCpuFallback.InvokeTensor("rope", writeTarget, writeTarget, src, seqLen, rowOffset);
-        }
-
-        [RegisterOpStorageType("ropegrad", typeof(CudaStorage))]
-        public static Tensor RoPEGrad(Tensor grad, Tensor adj, int seqLen, int rowOffset)
-        {
-            return CudaCpuFallback.InvokeTensor("ropegrad", grad, grad, adj, seqLen, rowOffset);
         }
 
         [RegisterOpStorageType("rope_ex", typeof(CudaStorage))]
@@ -504,12 +453,6 @@ namespace TensorSharp.Cuda
             return CudaCpuFallback.InvokeTensor("rmsnorm", writeTarget, writeTarget, src, alpha, beta, eps);
         }
 
-        [RegisterOpStorageType("addlayernorm", typeof(CudaStorage))]
-        public static Tensor AddLayerNorm(Tensor result, Tensor src1, Tensor src2, Tensor alpha, Tensor beta, float eps)
-        {
-            return CudaCpuFallback.InvokeTensor("addlayernorm", result, result, src1, src2, alpha, beta, eps);
-        }
-
         [RegisterOpStorageType("gather", typeof(CudaStorage))]
         public static Tensor Gather(Tensor result, Tensor src, int dim, Tensor indices)
         {
@@ -532,24 +475,6 @@ namespace TensorSharp.Cuda
         public static Tensor ScatterFill(Tensor result, float value, int dim, Tensor indices)
         {
             return CudaCpuFallback.InvokeTensor("scatter_fill", result, result, value, dim, indices);
-        }
-
-        [RegisterOpStorageType("float2half", typeof(CudaStorage))]
-        public static Tensor Float2Half(Tensor result, Tensor src)
-        {
-            return CudaCpuFallback.InvokeTensor("float2half", result, result, src);
-        }
-
-        [RegisterOpStorageType("half2float", typeof(CudaStorage))]
-        public static Tensor Half2Float(Tensor result, Tensor src)
-        {
-            return CudaCpuFallback.InvokeTensor("half2float", result, result, src);
-        }
-
-        [RegisterOpStorageType("atomicadd", typeof(CudaStorage))]
-        public static Tensor AtomicAdd(Tensor result, Tensor rhs)
-        {
-            return CudaCpuFallback.InvokeTensor("atomicadd", result, result, rhs);
         }
 
         private static Tensor Unary(string opName, Tensor result, Tensor src)

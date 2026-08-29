@@ -57,6 +57,11 @@ namespace TensorSharp.Models.MiniMaxH3
         private GCHandle _blocksPin;
         private H3Lin _postQuant, _xEmbedder, _projOut;
         private IntPtr _registerTokens, _normOutW, _normOutB;
+        // Non-null on the backends with no ggml graph to call (BackendType.Cpu).
+        private readonly MiniMaxH3DirectVideoVae _direct;
+        private MiniMaxH3DirectVideoVaeEncoder3D _directEnc3D;
+        private readonly IAllocator _allocator;
+        private readonly bool _useDirect;
         private bool _disposed;
 
         /// <summary>Per-channel latent statistics shipped inside the safetensors file.
@@ -67,7 +72,9 @@ namespace TensorSharp.Models.MiniMaxH3
         public int NumBlocks => _blocks.Length;
         public int PatchDim => OutChannels * PatchTemporal * PatchSpatial * PatchSpatial;
 
-        public MiniMaxH3VideoVae(string path)
+        public MiniMaxH3VideoVae(string path) : this(path, BackendType.GgmlCuda, null) { }
+
+        public MiniMaxH3VideoVae(string path, BackendType backend, IAllocator allocator)
         {
             _model = SafetensorsModel.Open(path);
 
@@ -101,6 +108,24 @@ namespace TensorSharp.Models.MiniMaxH3
                 };
             }
             _blocksPin = GCHandle.Alloc(_blocks, GCHandleType.Pinned);
+
+            // Backends with no ggml graph to call decode through the shared direct
+            // primitives instead.
+            _allocator = allocator;
+            _useDirect = allocator != null && backend is not (BackendType.GgmlCuda
+                or BackendType.GgmlCpu or BackendType.GgmlMetal or BackendType.GgmlVulkan);
+            if (_useDirect)
+            {
+                _direct = new MiniMaxH3DirectVideoVae(
+                    allocator,
+                    ReadF32,
+                    name =>
+                    {
+                        var info = _model.TensorOwners[name].GetInfo(name);
+                        return (info.Shape[0], info.Shape[1]);
+                    },
+                    n, Dim, Heads, HeadDim, FfnInner, RotDim, NumRegisterTokens, Eps);
+            }
 
             LatentsMean = ReadF32("latents_mean");
             LatentsStd = ReadF32("latents_std");
@@ -233,6 +258,13 @@ namespace TensorSharp.Models.MiniMaxH3
 
             int suffix = NumRegisterTokens + 1;
             var (cos, sin) = BuildRope(latentT, latentH, latentW, suffix);
+
+            if (_direct != null)
+            {
+                // Pure-managed path: the identical ViT, with no native call.
+                return _direct.DecodeTokens(latent, tokens, LatentChannels, cos, sin, PatchDim);
+            }
+
             var output = new float[(long)tokens * PatchDim];
 
             var latentPin = GCHandle.Alloc(latent, GCHandleType.Pinned);
@@ -931,6 +963,26 @@ namespace TensorSharp.Models.MiniMaxH3
             return new RgbImage(width, height, px);
         }
 
+        /// <summary>Build the managed causal 3-D encoder on first use, mirroring the
+        /// stride tables and group/eps constants the GGML descriptor is given.</summary>
+        private void EnsureDirectEncoder3D()
+        {
+            if (_directEnc3D != null) return;
+            EnsureEncoder3D();
+            _directEnc3D = new MiniMaxH3DirectVideoVaeEncoder3D(
+                _allocator,
+                ReadF32,
+                // MUST return null rather than throw for an absent tensor: the loader
+                // uses it to detect optional weights (a residual block only carries
+                // nin_shortcut when its channel count changes), and indexing the
+                // dictionary directly turns "not present" into a KeyNotFoundException.
+                name => _model.HasTensor(name)
+                    ? _model.TensorOwners[name].GetInfo(name).Shape
+                    : null,
+                (int[])TimeDown.Clone(), (int[])SpaceDown.Clone(), TimeDown.Length,
+                LatentChannels, 32, 1e-6f);
+        }
+
         private float[] EncodeChunkWhole(IReadOnlyList<RgbImage> frames)
         {
             if (frames is not { Count: > 0 }) throw new ArgumentException("no frames", nameof(frames));
@@ -966,6 +1018,15 @@ namespace TensorSharp.Models.MiniMaxH3
             }
 
             var outp = new float[(long)lw * lh * latentT * LatentChannels];
+
+            if (_useDirect)
+            {
+                // Pure-managed path: the identical causal 3-D encoder, no native call.
+                EnsureDirectEncoder3D();
+                _directEnc3D.Encode(video, width, height, t, latentT, outp);
+            }
+            else
+            {
             var vPin = GCHandle.Alloc(video, GCHandleType.Pinned);
             var oPin = GCHandle.Alloc(outp, GCHandleType.Pinned);
             try
@@ -994,6 +1055,7 @@ namespace TensorSharp.Models.MiniMaxH3
                     throw new InvalidOperationException("MiniMax-H3 3-D video encode failed.");
             }
             finally { vPin.Free(); oPin.Free(); }
+            }
 
             // Native emits [W, H, C, T]; the token layout wants the channel contiguous.
             var tokens = new float[outp.LongLength];
@@ -1075,6 +1137,7 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             if (_disposed) return;
             _disposed = true;
+            _direct?.Dispose();
             if (_blocksPin.IsAllocated) _blocksPin.Free();
             if (_encLevelsPin.IsAllocated) _encLevelsPin.Free();
             foreach (IntPtr ptr in _bound)

@@ -45,27 +45,6 @@ namespace TensorSharp
         public abstract void DoRegister(object instance, MethodInfo method, IEnumerable<OpConstraint> paramConstraints);
     }
 
-    /// <summary>
-    /// Register a method where the only constraint is that the argument counts match.
-    /// </summary>
-    [AttributeUsage(AttributeTargets.Method)]
-    public class RegisterOpArgCount : RegisterOp
-    {
-        public RegisterOpArgCount(string opName) : base(opName)
-        {
-        }
-
-        public override void DoRegister(object instance, MethodInfo method, IEnumerable<OpConstraint> paramConstraints)
-        {
-            List<OpConstraint> constraints = new List<OpConstraint>();
-            constraints.AddRange(paramConstraints);
-            constraints.Add(new ArgCountConstraint(method.GetParameters().Length));
-
-            OpRegistry.Register(OpName, args => InvokeRegisteredMethod(instance, method, args), constraints);
-        }
-    }
-
-
     [AttributeUsage(AttributeTargets.Method)]
     public class RegisterOpStorageType : RegisterOp
     {
@@ -108,19 +87,4 @@ namespace TensorSharp
         public abstract IEnumerable<OpConstraint> GetConstraints(ParameterInfo parameter, object instance);
     }
 
-    [AttributeUsage(AttributeTargets.Parameter)]
-    public class OpArgStorageType : ArgConstraintAttribute
-    {
-        private readonly Type storageType;
-
-        public OpArgStorageType(Type storageType)
-        {
-            this.storageType = storageType;
-        }
-
-        public override IEnumerable<OpConstraint> GetConstraints(ParameterInfo parameter, object instance)
-        {
-            yield return new ArgStorageTypeConstraint(parameter.Position, storageType);
-        }
-    }
 }

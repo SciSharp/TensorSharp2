@@ -3344,52 +3344,6 @@ if (kind == 0) {
             });
         }
 
-        /// <summary>
-        /// Registers the MLX default GPU device for the calling thread.
-        /// MLX's per-thread state (notably the GPU stream registry used by
-        /// mlx_async_eval / mlx_get_default_stream) is keyed by the thread
-        /// that invokes <c>mlx_set_default_device</c>, so any thread that
-        /// wants to issue MLX calls directly (rather than marshalling them
-        /// onto the dedicated MlxWorker thread) must call this first.
-        /// Idempotent and thread-safe — repeated calls from the same thread
-        /// are no-ops. Returns true if the calling thread is now registered.
-        /// </summary>
-        public static bool TryRegisterCurrentThread()
-        {
-            if (initializedDevice < 0)
-                return false;
-            MlxDevice device = default;
-            MlxStream stream = default;
-            bool deviceOwned = false;
-            bool streamOwned = false;
-            try
-            {
-                device = mlx_device_new_type(MlxGpu, initializedDevice);
-                deviceOwned = device.Ctx != IntPtr.Zero;
-                if (!deviceOwned)
-                    return false;
-                if (mlx_set_default_device(device) != 0)
-                    return false;
-                // Forcing the default-stream creation on this thread is what
-                // makes mlx_async_eval / mlx_eval succeed without "There is
-                // no Stream(gpu, 0) in current thread". Without this MLX
-                // registers the device but defers stream creation until the
-                // first stream-bound call, which then trips the thread check.
-                if (mlx_get_default_stream(out stream, device) != 0)
-                    return false;
-                streamOwned = stream.Ctx != IntPtr.Zero;
-                return true;
-            }
-            catch { return false; }
-            finally
-            {
-                if (streamOwned)
-                    _ = mlx_stream_free(stream);
-                if (deviceOwned)
-                    _ = mlx_device_free(device);
-            }
-        }
-
         public static MlxMemorySnapshot GetMemorySnapshot()
         {
             return MlxWorker.Shared.Invoke(() =>
@@ -3962,31 +3916,6 @@ if (kind == 0) {
             });
         }
 
-        /// <summary>
-        /// Element count of an MLX array (cheap getter, no graph build).
-        /// </summary>
-        internal static long ArraySize(MlxArray array)
-        {
-            if (!array.IsValid) return 0;
-            return (long)mlx_array_size_native(array);
-        }
-
-        /// <summary>
-        /// True iff the array's data is row-contiguous (no strides / offset).
-        /// Used by <see cref="MlxStorage.ReplaceDeviceArray"/> to decide
-        /// whether the storage can adopt the incoming array as-is or has to
-        /// flatten it through <c>mlx_reshape</c> first. Wraps the unstable
-        /// <c>_mlx_array_is_row_contiguous</c> entry point; if the C call
-        /// fails we conservatively return false so the caller reshapes.
-        /// </summary>
-        internal static bool ArrayIsContiguous(MlxArray array)
-        {
-            if (!array.IsValid) return false;
-            if (mlx_array_is_row_contiguous_native(out bool result, array) != 0)
-                return false;
-            return result;
-        }
-
         internal static MlxArray Contiguous(MlxArray array)
         {
             return MlxWorker.Shared.Invoke(() =>
@@ -4092,19 +4021,6 @@ if (kind == 0) {
         // `lhsIndices` and the (head, expert, ...) rows of `b` are gathered by
         // `rhsIndices` before the matmul. Either indices array may be null.
         // Used for MoE routing / speculative decoding.
-        internal static MlxArray GatherMM(MlxArray a, MlxArray b, MlxArray lhsIndices, MlxArray rhsIndices, bool sortedIndices)
-        {
-            if (!a.IsValid || !b.IsValid)
-                throw new ArgumentException("MLX gather_mm inputs must be valid arrays.");
-
-            return MlxWorker.Shared.Invoke(() =>
-            {
-                MlxArray result;
-                Check(mlx_gather_mm(out result, a, b, lhsIndices, rhsIndices, sortedIndices, DefaultStream()), "running MLX gather_mm");
-                return result;
-            });
-        }
-
         // gather_qmm: fused gather + quantized matmul. Avoids the
         // materialize-and-route overhead for MoE: instead of dequantizing
         // each expert separately or gathering input rows then quantized-
@@ -9371,14 +9287,6 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         [LibraryImport(LibraryName, EntryPoint = "mlx_array_free")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_array_free(MlxArray array);
-
-        [LibraryImport(LibraryName, EntryPoint = "mlx_array_size")]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial nuint mlx_array_size_native(MlxArray array);
-
-        [LibraryImport(LibraryName, EntryPoint = "_mlx_array_is_row_contiguous")]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int mlx_array_is_row_contiguous_native([MarshalAs(UnmanagedType.I1)] out bool result, MlxArray array);
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_astype")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

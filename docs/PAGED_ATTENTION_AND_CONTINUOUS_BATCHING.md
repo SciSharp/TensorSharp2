@@ -8,19 +8,61 @@ continuous batching. The server now routes inference through this engine by
 default; the old single-request FIFO queue object remains only as a no-op
 compatibility shim for queue-status/event shapes.
 
+Read it as an implementation reference, not a performance claim. The paged K/V
+pool is host-resident, and measurement shows that no current path turns
+concurrency into aggregate throughput; what works today is correct, fair
+concurrent serving. See
+[Measured Concurrency Behavior](#measured-concurrency-behavior).
+
 ## Current Status
 
 | Area | Status |
 |---|---|
 | Server engine | `TensorSharp.Server` owns one `InferenceEngineHost` per loaded model. `ChatGenerationPipeline` submits rendered prompts to the engine and streams tokens from `InferenceRequestHandle`. |
 | Scheduler | `ContinuousBatchScheduler` admits waiting requests, preempts running work when block pressure requires it, applies a per-step token budget, and shares full prefix blocks by hash. |
-| KV storage | `BlockPool`, `BlockTable`, `PagedKvStorage`, and `BlockHashIndex` hold fixed-size physical blocks with ref counts, LRU free ordering, and content-addressed lookup. |
+| KV storage | `BlockPool`, `BlockTable`, `PagedKvStorage`, and `BlockHashIndex` hold fixed-size physical blocks with ref counts, LRU free ordering, and content-addressed lookup. The block bytes live in **managed host memory**. |
 | Batched execution | Models that implement `IBatchedPagedModel.ForwardBatch` pack all scheduled sequences into one model call with explicit `positions`, `slotMapping`, `queryStartLoc`, and per-sequence block tables. |
 | Fallback execution | Path selection is centralized in `ExecutionPlanner`: model+backend capabilities (`ExecutionCapabilities`), operator overrides (`ExecutionOptions`), and per-step request features produce an `ExecutionPlan` (selected path, fallback chain, rejection reasons). A model may still decline a specific batch with `NotSupportedException`; the step then falls to the plan's next candidate, ending in the per-sequence KV-swap path. |
 | Native attention | `TSGgml_PagedAttentionForward` gathers paged K/V in C++ and dispatches `ggml_flash_attn_ext`; GPT OSS uses `TSGgml_PagedAttentionForwardWithSinks`. |
 | Speculative decoding | Optional MTP / NextN draft heads accelerate solo (non-concurrent) sequences. `BatchExecutor` drives the shared `SpeculativeExecution` draft / verify / rollback core for models that implement `IBatchedSpeculativeTarget` (Qwen 3.6 embedded NextN; Gemma 4 separate `gemma4-assistant` draft GGUF). Off by default; server `--mtp-spec`. See [Speculative decoding (MTP / NextN)](#speculative-decoding-mtp--nextn). |
+| Throughput under concurrency | **No current path scales with concurrency.** The `BatchedPaged` route saturates at roughly **69 tok/s** however many sequences are in flight, because the paged KV cache is host-resident. Per-sequence slots and iteration-level scheduling do work. See [Measured Concurrency Behavior](#measured-concurrency-behavior). |
+| Device-resident paged pool | **Built, not wired.** `TSGgml_PagedKvPool*` (`TensorSharp.GGML.Native/ggml_ops_paged_kv_pool.cpp`) and its managed wrapper `DevicePagedKvCache` (`TensorSharp.Models/Paged/DevicePagedKvCache.cs`) exist, but no model or executor calls them. It is not a shipped feature. |
 | Queue API | `InferenceQueue` is a no-op shim. `/api/queue/status` and queue-position event shapes are retained for clients that expect the fields, not because requests are serialized there. |
 | Diffusion models | DiffusionGemma does not enter this autoregressive `ForwardBatch` contract. CLI generation uses `DiffusionGemmaSampler`; the Web UI uses `DiffusionBatchScheduler` to batch denoising work at block boundaries. |
+
+## Measured Concurrency Behavior
+
+The mechanisms described on this page exist and are correct. The throughput they
+were built for is not there yet, and nothing below should be read as promising
+it.
+
+- **No current path turns concurrency into aggregate throughput.** Measured on
+  gemma-4-E4B / 1x Blackwell through the server's chat endpoint, the
+  `BatchedPaged` route saturates at roughly **69 tok/s** no matter how many
+  sequences are in flight.
+- **The cause is where the K/V lives.** `PagedKvStorage` is managed host memory,
+  so the batched path gathers a sequence's history out of host memory and pushes
+  it across the bus for every layer of every step. Even the native kernels
+  zero-copy only Q and OUT — `ggml_ops_paged_attention.cpp` says as much: "K and
+  V are still passed as host scratch arrays (the caller gathers …)". That is
+  about a **7.7x per-token penalty** against per-sequence fused decode, and it
+  grows with total history.
+- **The default concurrent path is not the batched one.** On models that declare
+  `SupportsPerSequenceFusedForward`, `ExecutionPlanner` selects `PerSequenceFused`
+  at N >= 2. That runs N separate fused forwards — correct and fast per request,
+  but the weight read is never amortized across the batch, which is the thing
+  continuous batching exists to do.
+- **What does work.** Iteration-level scheduling, block-hash prefix sharing,
+  preemption, per-sequence native slots and per-request fused holders. Concurrent
+  requests are served correctly and fairly; it is aggregate tokens/second that
+  does not improve with N.
+- **Built but not wired.** A device-resident paged K/V pool exists
+  (`TensorSharp.GGML.Native/ggml_ops_paged_kv_pool.cpp`, wrapped by
+  `TensorSharp.Models/Paged/DevicePagedKvCache.cs`): the pool is backend tensors,
+  a step's K/V is written with `ggml_set_rows`, and a sequence's history is
+  gathered on device with `ggml_get_rows` inside the attention graph. **No model
+  or executor calls it.** It is not a shipped feature, and it does not change any
+  number above.
 
 ## Layered Architecture
 
@@ -47,13 +89,14 @@ InferenceEngine
         |      - prefix block adoption
         |
         +--> BatchExecutor
-               - calls ForwardBatch when available
-               - otherwise swaps per-sequence KV blocks
+               - runs the path ExecutionPlanner selected
+               - per-sequence fused, batched ForwardBatch,
+                 or the per-sequence KV-swap fallback
                - samples decode tokens
                - captures newly full blocks
         |
         v
-BlockPool + PagedKvStorage + BlockHashIndex
+BlockPool + PagedKvStorage + BlockHashIndex   (managed host memory)
 ```
 
 ### Core Components
@@ -68,6 +111,7 @@ BlockPool + PagedKvStorage + BlockHashIndex
 | `PagedKvBatchOps` | `TensorSharp.Runtime/Paged/PagedKvBatchOps.cs` | Batched K/V scatter and last-token gather helpers. |
 | `ManagedPagedAttention` | `TensorSharp.Runtime/Paged/ManagedPagedAttention.cs` | Pure C# correctness fallback for paged attention. |
 | `TensorPagedAttention` | `TensorSharp.Models/Paged/TensorPagedAttention.cs` | Tensor-op paged attention fallback. |
+| `DevicePagedKvCache` | `TensorSharp.Models/Paged/DevicePagedKvCache.cs` | Device-resident paged K/V pool over `TSGgml_PagedKvPool*`. **Built, not wired into any model** — nothing constructs it today. |
 | `SequenceState` | `TensorSharp.Runtime/Scheduling/SequenceState.cs` | Mutable per-request status, tokens, blocks, logits, and sampling state. |
 | `ContinuousBatchScheduler` | `TensorSharp.Runtime/Scheduling/ContinuousBatchScheduler.cs` | Iteration-level scheduler with prefix caching and preemption. |
 | `BatchExecutor` | `TensorSharp.Runtime/Scheduling/BatchExecutor.cs` | Executes the planned step, samples, and captures KV blocks. |
@@ -166,9 +210,15 @@ Key points:
 
 ### Batched Path
 
-The batched path is the fast multi-request path. It avoids K/V ownership swaps
-and amortizes linear projections across all scheduled tokens. Most current
-batched ports use native paged attention for GGML backends:
+The batched path packs every scheduled sequence into one forward: it avoids K/V
+ownership swaps and amortizes linear projections across all scheduled tokens. It
+is the only path that amortizes the weight read across a batch, but its K/V pool
+is host-resident, so that amortization does not currently show up as throughput
+(see [Measured Concurrency Behavior](#measured-concurrency-behavior)). On models
+that declare a per-sequence fused forward the planner takes `PerSequenceFused` at
+N >= 2 instead, so `BatchedPaged` serves models without one — or an explicit
+`TS_PER_SEQ_FUSED=0` A/B. Most current batched ports use native paged attention
+for GGML backends:
 
 | Kernel | Scope | Notes |
 |---|---|---|
@@ -305,8 +355,12 @@ dominates memory.
 - Build one native GGML graph for an entire attention batch instead of one
   small graph per sequence. This should reduce launch/compile overhead on many
   short sequences.
-- Move the K/V gather from CPU memcpy to GPU-side `ggml_get_rows` or equivalent
-  indexed gathers where backend support makes it worthwhile.
+- Wire the device-resident paged K/V pool into a model. It is already built
+  (`ggml_ops_paged_kv_pool.cpp` plus `DevicePagedKvCache`) and replaces the host
+  gather with `ggml_set_rows` writes and on-device `ggml_get_rows` reads, but
+  nothing allocates its paged K/V there, so the batched path keeps its
+  host-resident cache and its measured ceiling. This is the prerequisite for
+  concurrency buying any throughput at all.
 - Complete Gemma 4 batched coverage for MoE variants, multimodal pending
   embeddings, and block-quantized KV cache.
 - Decide whether DiffusionGemma scheduler metrics should be surfaced through

@@ -70,7 +70,11 @@ namespace TensorSharp.Models
                 GgmlTensorType.Q5_K => true,
                 GgmlTensorType.Q6_K => true,
                 GgmlTensorType.IQ4_NL => true,
+                GgmlTensorType.IQ1_S => true,
+                GgmlTensorType.IQ1_M => true,
                 GgmlTensorType.IQ2_XXS => true,
+                GgmlTensorType.IQ2_XS => true,
+                GgmlTensorType.IQ4_XS => true,
                 GgmlTensorType.IQ2_S => true,
                 GgmlTensorType.IQ3_XXS => true,
                 GgmlTensorType.IQ3_S => true,
@@ -298,7 +302,7 @@ namespace TensorSharp.Models
             int outDim = checked((int)ne1);
             long rowBytes = RowSize(ggmlType, ne0);
             byte* weightBase = (byte*)weights.ToPointer();
-            int dop = options?.MaxDegreeOfParallelism > 0 ? options.MaxDegreeOfParallelism : Environment.ProcessorCount;
+            int dop = ResolveDop(options);
 
             void RunRange(int start, int end, float* w)
                 => DequantMatMulColumns(ggmlType, weightBase, rowBytes, inDim, outDim,
@@ -319,12 +323,13 @@ namespace TensorSharp.Models
                 return;
             }
 
-            // Blocked column ranges, not one task per column: a single dequant+dot
-            // column is ~microseconds, so per-column tasks are dominated by
-            // scheduler overhead and stop scaling after a handful of cores.
-            int colBlock = Math.Max(4, outDim / (dop * 8));
+            // Work-proportional chunks (see ParallelColumnBlock): a single
+            // dequant+dot column is ~microseconds, so per-column tasks are
+            // dominated by scheduler overhead and stop scaling after a handful
+            // of cores.
+            int colBlock = ParallelColumnBlock(outDim, rowBytes, rowCount, dop);
             int nBlocks = (outDim + colBlock - 1) / colBlock;
-            Parallel.For(0, nBlocks, options ?? new ParallelOptions(), b =>
+            RunParallelBlocks(nBlocks, options, b =>
             {
                 float[] scratch = ArrayPool<float>.Shared.Rent(inDim);
                 try
@@ -337,6 +342,91 @@ namespace TensorSharp.Models
                     ArrayPool<float>.Shared.Return(scratch);
                 }
             });
+        }
+
+        // ------------------------------------------------------------------
+        // Fork/join granularity for the managed matmuls.
+        //
+        // Task COUNT, not task size, decides whether adding cores helps. The
+        // old rule (colBlock = outDim / (dop * 8)) made the number of work
+        // items grow WITH the thread count, so a 122-core box built 1024
+        // four-column tasks per matmul where an 8-core box built 64. A decoded
+        // token runs a few hundred matmuls, so that is ~300k work-item
+        // dispatches per token, and measured decode peaked at 8 threads and
+        // then went backwards:
+        //
+        //     threads   1     8    32    64   122
+        //     tok/s    0.5   2.3   2.4   1.9   1.9
+        //
+        // Size the chunk from the WORK instead: hand each task a slice of
+        // weight bytes big enough to dwarf the dispatch, and let the task
+        // count fall out of that, capped by the pool. Prefill amortizes far
+        // more arithmetic over the same bytes, so its floor scales down with
+        // the row count and it keeps using every core.
+        // ------------------------------------------------------------------
+        private static readonly long MinBytesPerParallelTask =
+            EnvLong("TS_CPU_TASK_BYTES", 128 * 1024);
+        private static readonly long MinBytesPerParallelTaskFloor =
+            Math.Min(MinBytesPerParallelTask, EnvLong("TS_CPU_TASK_BYTES_MIN", 16 * 1024));
+        private static readonly int TasksPerWorker = (int)EnvLong("TS_CPU_TASKS_PER_WORKER", 4);
+
+        // Escape hatch back to the pre-pool behaviour (ThreadPool Parallel.For with
+        // thread-count-scaled chunks), so the two can be A/B-ed in one binary and
+        // so a host that cannot afford dedicated spinning threads can opt out.
+        private static readonly bool PoolEnabled =
+            Environment.GetEnvironmentVariable("TS_CPU_POOL") != "0";
+
+        /// <summary>
+        /// Run blocked work on the persistent CPU pool. A caller that explicitly
+        /// caps the degree of parallelism below the pool size (tests do, to make
+        /// a run single-threaded) is honoured through Parallel.For instead, since
+        /// the pool is shared and always runs at full width.
+        /// </summary>
+        private static void RunParallelBlocks(int nBlocks, ParallelOptions options, Action<int> body)
+        {
+            if (nBlocks <= 0) return;
+            if (nBlocks == 1) { body(0); return; }
+
+            int cap = options?.MaxDegreeOfParallelism ?? -1;
+            if (!PoolEnabled || (cap > 0 && cap < CpuWorkerPool.Shared.ThreadCount))
+            {
+                Parallel.For(0, nBlocks, options ?? new ParallelOptions(), body);
+                return;
+            }
+            CpuWorkerPool.Shared.For(nBlocks, body);
+        }
+
+        /// <summary>Worker count a matmul should size its chunks for.</summary>
+        private static int ResolveDop(ParallelOptions options)
+        {
+            int cap = options?.MaxDegreeOfParallelism ?? -1;
+            if (cap > 0) return cap;
+            return PoolEnabled ? CpuWorkerPool.Shared.ThreadCount : Environment.ProcessorCount;
+        }
+
+        private static long EnvLong(string name, long fallback)
+            => long.TryParse(Environment.GetEnvironmentVariable(name), out long v) && v > 0
+                ? v
+                : fallback;
+
+        /// <summary>Columns per parallel task: enough weight bytes per task to
+        /// amortize the dispatch, and never more tasks than workers.</summary>
+        private static int ParallelColumnBlock(long outDim, long rowBytes, int rowCount, int dop)
+        {
+            if (dop <= 1 || outDim <= 1) return (int)Math.Max(1, outDim);
+            // Pre-pool rule, kept behind the same switch so an A/B changes both
+            // halves of the change together.
+            if (!PoolEnabled) return (int)Math.Max(4, outDim / ((long)dop * 8));
+            long perTask = Math.Max(
+                MinBytesPerParallelTaskFloor,
+                MinBytesPerParallelTask / Math.Clamp(rowCount, 1, 8));
+            // Cap at a few tasks per worker, not exactly one: with one task per
+            // worker a single straggler doubles the matmul, and small-core
+            // configurations measured slower than the old rule until this slack
+            // was restored.
+            long tasks = Math.Clamp(
+                outDim * Math.Max(1, rowBytes) / perTask, 1, (long)dop * TasksPerWorker);
+            return (int)Math.Max(1, (outDim + tasks - 1) / tasks);
         }
 
         // Core of the pure-C# quantized linear (shared by AddmmQuantManaged and the
@@ -464,7 +554,7 @@ namespace TensorSharp.Models
             if (totalActivationBytes > int.MaxValue)
                 return false;
 
-            int dop = options?.MaxDegreeOfParallelism > 0 ? options.MaxDegreeOfParallelism : Environment.ProcessorCount;
+            int dop = ResolveDop(options);
             byte[] rented = ArrayPool<byte>.Shared.Rent((int)totalActivationBytes);
             try
             {
@@ -486,9 +576,10 @@ namespace TensorSharp.Models
                     {
                         long totalCols = 0;
                         for (int j = 0; j < n; j++) totalCols += jobs[j].OutDim;
-                        // Aim for a few chunks per worker: fewer and the tail
-                        // straggles, more and the per-chunk bookkeeping shows up.
-                        colBlock = (int)Math.Max(8, totalCols / Math.Max(1, dop * 8));
+                        // The jobs share one weight row size, so the flattened
+                        // column space can use the same work-proportional rule.
+                        colBlock = ParallelColumnBlock(
+                            totalCols, RowSize(ggmlType, inDim), (int)Math.Min(totalRows, int.MaxValue), dop);
                     }
                     int totalBlocks = 0;
                     for (int j = 0; j < n; j++)
@@ -541,7 +632,7 @@ namespace TensorSharp.Models
                     }
 
                     if (totalBlocks > 1 && dop > 1)
-                        Parallel.For(0, totalBlocks, options ?? new ParallelOptions(), RunBlock);
+                        RunParallelBlocks(totalBlocks, options, RunBlock);
                     else
                         for (int b = 0; b < totalBlocks; b++) RunBlock(b);
                 }
@@ -589,7 +680,7 @@ namespace TensorSharp.Models
             {
                 fixed (byte* activationBase = rented)
                 {
-                    int dop = options?.MaxDegreeOfParallelism > 0 ? options.MaxDegreeOfParallelism : Environment.ProcessorCount;
+                    int dop = ResolveDop(options);
                     if (rowCount >= 8 && dop > 1)
                     {
                         // Prefill batches quantize thousands of activation rows;
@@ -600,7 +691,7 @@ namespace TensorSharp.Models
                         int width = (int)ne0;
                         int stride = inputRowStride;
                         var kind = activationKind;
-                        Parallel.For(0, rowCount, options ?? new ParallelOptions(), row =>
+                        RunParallelBlocks(rowCount, options, row =>
                             QuantizeActivation((float*)inAddr + (long)row * stride,
                                 (byte*)actAddr + (long)row * actBytes, width, kind));
                     }
@@ -646,9 +737,9 @@ namespace TensorSharp.Models
                         // Blocked ranges: per-column tasks make the scheduler
                         // overhead comparable to the ~0.5-2us dot itself and cap
                         // scaling at a handful of cores.
-                        int colBlock = Math.Max(8, outDim / (dop * 8));
+                        int colBlock = ParallelColumnBlock(outDim, weightRowBytes, rowCount, dop);
                         int nBlocks = (outDim + colBlock - 1) / colBlock;
-                        Parallel.For(0, nBlocks, options ?? new ParallelOptions(), b =>
+                        RunParallelBlocks(nBlocks, options, b =>
                             ComputeColumnRange(b * colBlock, Math.Min(outDim, b * colBlock + colBlock)));
                     }
                     else
@@ -768,6 +859,8 @@ namespace TensorSharp.Models
                 case GgmlTensorType.Q5_K:
                 case GgmlTensorType.Q6_K:
                 case GgmlTensorType.IQ3_S:
+                case GgmlTensorType.IQ2_XS:
+                case GgmlTensorType.IQ3_XXS:
                     if (elementCount % QK_K != 0)
                         return false;
                     activationKind = ActivationQuantKind.Q8_K;
@@ -818,6 +911,8 @@ namespace TensorSharp.Models
                 GgmlTensorType.Q5_K => VecDotQ5_KQ8_K(weightRow, activationRow, elementCount / QK_K),
                 GgmlTensorType.Q6_K => VecDotQ6_KQ8_K(weightRow, activationRow, elementCount / QK_K),
                 GgmlTensorType.IQ3_S => VecDotIq3SQ8K(weightRow, activationRow, elementCount / QK_K),
+                GgmlTensorType.IQ2_XS => VecDotIq2XsQ8K(weightRow, activationRow, elementCount / QK_K),
+                GgmlTensorType.IQ3_XXS => VecDotIq3XxsQ8K(weightRow, activationRow, elementCount / QK_K),
                 GgmlTensorType.MXFP4 => VecDotMxfp4Q8_0(weightRow, activationRow, elementCount / QK_MXFP4),
                 _ => throw new NotSupportedException($"Direct managed quantized matmul does not support {type}."),
             };
@@ -887,8 +982,20 @@ namespace TensorSharp.Models
                 case GgmlTensorType.IQ4_NL:
                     DequantizeIq4Nl(src, dst, numElements);
                     return;
+                case GgmlTensorType.IQ1_S:
+                    DequantizeIq1S(src, dst, numElements);
+                    return;
+                case GgmlTensorType.IQ1_M:
+                    DequantizeIq1M(src, dst, numElements);
+                    return;
                 case GgmlTensorType.IQ2_XXS:
                     DequantizeIq2Xxs(src, dst, numElements);
+                    return;
+                case GgmlTensorType.IQ2_XS:
+                    DequantizeIq2Xs(src, dst, numElements);
+                    return;
+                case GgmlTensorType.IQ4_XS:
+                    DequantizeIq4Xs(src, dst, numElements);
                     return;
                 case GgmlTensorType.IQ2_S:
                     DequantizeIq2S(src, dst, numElements);
@@ -1340,6 +1447,117 @@ namespace TensorSharp.Models
             }
         }
 
+        // IQ1_S: 1.5625 bpw codebook quant. Ported verbatim from ggml
+        // dequantize_row_iq1_s. Block: d(fp16) | qs[QK_K/8] | qh[QK_K/16 as uint16]
+        // = 2 + 32 + 16 = 50 bytes. The grid entry is eight int8 lanes, and every
+        // lane is offset by +/-IQ1S_DELTA chosen by the block's sign bit - that
+        // delta is what distinguishes IQ1 from the other codebook quants, and
+        // dropping it silently biases every weight.
+        private const float Iq1SDelta = 0.125f;
+
+        private static unsafe void DequantizeIq1S(byte* src, float* dst, long numElements)
+        {
+            if (numElements % QK_K != 0)
+                throw new NotSupportedException($"IQ1_S requires {QK_K}-element alignment, got {numElements}.");
+
+            int blockBytes = 2 + QK_K / 8 + (QK_K / 32) * 2;   // 2 + 32 + 16 = 50
+            int nb = (int)(numElements / QK_K);
+            fixed (ulong* grid = IQuantGrids.iq1s_grid)
+            {
+                for (int i = 0; i < nb; i++)
+                {
+                    byte* block = src + (long)i * blockBytes;
+                    float d = HalfToSingle(ReadUInt16(block));
+                    byte* qs = block + 2;
+                    byte* qhBytes = qs + QK_K / 8;
+                    float* y = dst + (long)i * QK_K;
+
+                    for (int ib = 0; ib < QK_K / 32; ++ib)
+                    {
+                        ushort qh = ReadUInt16(qhBytes + ib * 2);
+                        float dl = d * (2 * ((qh >> 12) & 7) + 1);
+                        float delta = (qh & 0x8000) != 0 ? -Iq1SDelta : Iq1SDelta;
+                        for (int l = 0; l < 4; ++l)
+                        {
+                            sbyte* g = (sbyte*)(grid + (qs[l] | (((qh >> (3 * l)) & 7) << 8)));
+                            for (int j = 0; j < 8; ++j)
+                                y[j] = dl * (g[j] + delta);
+                            y += 8;
+                        }
+                        qs += 4;
+                    }
+                }
+            }
+        }
+
+        // IQ1_M: 1.75 bpw. Ported verbatim from ggml dequantize_row_iq1_m.
+        // Block: qs[QK_K/8] | qh[QK_K/16] | scales[QK_K/32] = 32 + 16 + 8 = 56 bytes.
+        // There is no per-block fp16 `d` field: the super-block scale is scattered
+        // four nibbles at a time across the four scale uint16s and reassembled below.
+        private static unsafe void DequantizeIq1M(byte* src, float* dst, long numElements)
+        {
+            if (numElements % QK_K != 0)
+                throw new NotSupportedException($"IQ1_M requires {QK_K}-element alignment, got {numElements}.");
+
+            int blockBytes = QK_K / 8 + QK_K / 16 + QK_K / 32;   // 32 + 16 + 8 = 56
+            int nb = (int)(numElements / QK_K);
+            float* delta = stackalloc float[4];
+            ushort* idx = stackalloc ushort[4];
+            fixed (ulong* grid = IQuantGrids.iq1s_grid)
+            {
+                for (int i = 0; i < nb; i++)
+                {
+                    byte* block = src + (long)i * blockBytes;
+                    byte* qs = block;
+                    byte* qh = qs + QK_K / 8;
+                    byte* scalesBytes = qh + QK_K / 16;
+
+                    ushort sc0 = ReadUInt16(scalesBytes);
+                    ushort sc1 = ReadUInt16(scalesBytes + 2);
+                    ushort sc2 = ReadUInt16(scalesBytes + 4);
+                    ushort sc3 = ReadUInt16(scalesBytes + 6);
+                    ushort scaleU16 = (ushort)((sc0 >> 12) | ((sc1 >> 8) & 0x00f0)
+                                             | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+                    float d = HalfToSingle(scaleU16);
+
+                    float* y = dst + (long)i * QK_K;
+                    for (int ib = 0; ib < QK_K / 32; ++ib)
+                    {
+                        ushort sc = ib / 2 == 0 ? sc0 : ib / 2 == 1 ? sc1 : ib / 2 == 2 ? sc2 : sc3;
+                        int shift = 6 * (ib % 2);
+                        float dl1 = d * (2 * ((sc >> (shift + 0)) & 0x7) + 1);
+                        float dl2 = d * (2 * ((sc >> (shift + 3)) & 0x7) + 1);
+
+                        idx[0] = (ushort)(qs[0] | ((qh[0] << 8) & 0x700));
+                        idx[1] = (ushort)(qs[1] | ((qh[0] << 4) & 0x700));
+                        idx[2] = (ushort)(qs[2] | ((qh[1] << 8) & 0x700));
+                        idx[3] = (ushort)(qs[3] | ((qh[1] << 4) & 0x700));
+                        delta[0] = (qh[0] & 0x08) != 0 ? -Iq1SDelta : Iq1SDelta;
+                        delta[1] = (qh[0] & 0x80) != 0 ? -Iq1SDelta : Iq1SDelta;
+                        delta[2] = (qh[1] & 0x08) != 0 ? -Iq1SDelta : Iq1SDelta;
+                        delta[3] = (qh[1] & 0x80) != 0 ? -Iq1SDelta : Iq1SDelta;
+
+                        for (int l = 0; l < 2; ++l)
+                        {
+                            sbyte* g = (sbyte*)(grid + idx[l]);
+                            for (int j = 0; j < 8; ++j)
+                                y[j] = dl1 * (g[j] + delta[l]);
+                            y += 8;
+                        }
+                        for (int l = 2; l < 4; ++l)
+                        {
+                            sbyte* g = (sbyte*)(grid + idx[l]);
+                            for (int j = 0; j < 8; ++j)
+                                y[j] = dl2 * (g[j] + delta[l]);
+                            y += 8;
+                        }
+                        qs += 4;
+                        qh += 2;
+                    }
+                }
+            }
+        }
+
         // IQ2_XXS: 2.0625 bpw codebook quant. Ported verbatim from ggml dequantize_row_iq2_xxs.
         // block layout: d(fp16) | qs[32] (uint16) = 66 bytes. grid/sign tables in IQuantGrids.
         private static unsafe void DequantizeIq2Xxs(byte* src, float* dst, long numElements)
@@ -1376,6 +1594,82 @@ namespace TensorSharp.Models
                             y += 8;
                         }
                     }
+                }
+            }
+        }
+
+        // IQ2_XS: 2.3125 bpw codebook quant. Ported verbatim from ggml
+        // dequantize_row_iq2_xs. Block: d(fp16) | qs[32] (uint16) | scales[8] = 74
+        // bytes. Unlike IQ2_XXS the grid index is 9 bits (q2 & 511) and the sign
+        // byte comes from the TOP 7 bits (q2 >> 9), with the scale read from a
+        // separate per-16 nibble rather than packed into the second aux word.
+        private static unsafe void DequantizeIq2Xs(byte* src, float* dst, long numElements)
+        {
+            if (numElements % QK_K != 0)
+                throw new NotSupportedException($"IQ2_XS requires {QK_K}-element alignment, got {numElements}.");
+
+            int blockBytes = 2 + (QK_K / 8) * 2 + QK_K / 32;   // 2 + 64 + 8 = 74
+            int nb = (int)(numElements / QK_K);
+            fixed (ulong* grid = IQuantGrids.iq2xs_grid)
+            fixed (byte* ksigns = IQuantGrids.ksigns_iq2xs)
+            fixed (byte* kmask = IQuantGrids.kmask_iq2xs)
+            {
+                for (int i = 0; i < nb; i++)
+                {
+                    byte* block = src + i * blockBytes;
+                    float dscale = HalfToSingle(ReadUInt16(block));
+                    byte* q2 = block + 2;
+                    byte* sc = block + 2 + (QK_K / 8) * 2;
+                    float* y = dst + i * QK_K;
+                    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32)
+                    {
+                        float db0 = dscale * (0.5f + (sc[ib32] & 0xf)) * 0.25f;
+                        float db1 = dscale * (0.5f + (uint)(sc[ib32] >> 4)) * 0.25f;
+                        for (int l = 0; l < 4; ++l)
+                        {
+                            ushort q = ReadUInt16(q2 + 2 * (4 * ib32 + l));
+                            byte* g = (byte*)(grid + (q & 511));
+                            byte signs = ksigns[q >> 9];
+                            float db = l / 2 == 0 ? db0 : db1;
+                            for (int j = 0; j < 8; ++j)
+                                y[j] = db * g[j] * ((signs & kmask[j]) != 0 ? -1f : 1f);
+                            y += 8;
+                        }
+                    }
+                }
+            }
+        }
+
+        // IQ4_XS: 4.25 bpw. Ported verbatim from ggml dequantize_row_iq4_xs.
+        // Block: d(fp16) | scales_h(uint16) | scales_l[4] | qs[128] = 136 bytes.
+        // The 6-bit per-32 scale is split across two tables - low nibble in
+        // scales_l, high 2 bits in scales_h - and is biased by 32.
+        private static unsafe void DequantizeIq4Xs(byte* src, float* dst, long numElements)
+        {
+            if (numElements % QK_K != 0)
+                throw new NotSupportedException($"IQ4_XS requires {QK_K}-element alignment, got {numElements}.");
+
+            int blockBytes = 2 + 2 + QK_K / 64 + QK_K / 2;   // 2 + 2 + 4 + 128 = 136
+            int nb = (int)(numElements / QK_K);
+            for (int i = 0; i < nb; i++)
+            {
+                byte* block = src + i * blockBytes;
+                float dscale = HalfToSingle(ReadUInt16(block));
+                ushort h = ReadUInt16(block + 2);
+                byte* scalesL = block + 4;
+                byte* qs = block + 4 + QK_K / 64;
+                float* y = dst + i * QK_K;
+                for (int ib = 0; ib < QK_K / 32; ++ib)
+                {
+                    int ls = ((scalesL[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((h >> (2 * ib)) & 3) << 4);
+                    float dl = dscale * (ls - 32);
+                    for (int j = 0; j < 16; ++j)
+                    {
+                        y[j] = dl * Iq4NlValues[qs[j] & 0x0F];
+                        y[j + 16] = dl * Iq4NlValues[qs[j] >> 4];
+                    }
+                    y += 32;
+                    qs += 16;
                 }
             }
         }
@@ -1713,7 +2007,7 @@ namespace TensorSharp.Models
         private static unsafe float VecDotQ4_0Q8_0(byte* q4, byte* q8, int blockCount)
         {
             if (Avx512F.IsSupported && Avx512BW.IsSupported)
-                return VecDotQ4_0Q8_0Avx512(q4, q8, blockCount);
+                return VecDotQ4_0Q8_0Avx512Wide(q4, q8, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ4_0Q8_0Avx2(q4, q8, blockCount);
 
@@ -1753,6 +2047,105 @@ namespace TensorSharp.Models
             Vector128<byte> low = Sse2.And(packed, mask);
             Vector128<byte> high = Sse2.And(Sse2.ShiftRightLogical(packed.AsUInt16(), 4).AsByte(), mask);
             return Avx2.Subtract(Vector256.Create(low, high).AsSByte(), offset8);
+        }
+
+        // ------------------------------------------------------------------
+        // Q4_0 x Q8_0, two blocks per iteration.
+        //
+        // Q4_0 and Q4_K store the SAME 0.5625 bytes per weight, yet Q4_0 measured
+        // 2.7 GB/s against Q4_K's 18.2 on a Xeon 6952P. The cause is iteration
+        // count, not instruction choice: a Q4_0 block covers 32 weights where a
+        // Q4_K super-block covers 256, so the same matmul runs 8x as many block
+        // iterations and the per-block work (two fp16 scale converts, a scalar
+        // broadcast, a horizontal-ready accumulate) dominates. The previous
+        // AVX512 path made that worse by widening both operands to int16 and
+        // doing MultiplyLow + MultiplyAddAdjacent - three ops per 32 weights, on
+        // registers that were half empty.
+        //
+        // This does 64 weights per iteration with VPMADDUBSW on full 512-bit
+        // registers, and folds BOTH blocks' scales into one FMA (lanes 0..7 are
+        // block A, 8..15 block B, which is exactly how maddubs + madd land).
+        //
+        // The zero point is arithmetic rather than an unpack to signed bytes:
+        // nibbles are 0..15 and the weight is (n - 8), so
+        //     sum((n - 8) * x) == sum(n * x) - 8 * sum(x)
+        // which keeps the left operand in the unsigned form VPMADDUBSW needs.
+        // Saturation is not a concern: |sum| per int16 lane is at most
+        // 15 * 128 * 2 = 3840.
+        // ------------------------------------------------------------------
+
+        /// <summary>Two Q4_0 blocks' 32 packed nibble bytes -> 64 unsigned nibbles,
+        /// each block in ggml's [low0..low15, high0..high15] order.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe Vector512<byte> UnpackQ40NibblePair(byte* qsA, byte* qsB)
+        {
+            Vector128<byte> mask = Vector128.Create((byte)0x0F);
+
+            Vector128<byte> packedA = Unsafe.ReadUnaligned<Vector128<byte>>(qsA);
+            Vector256<byte> a = Vector256.Create(
+                Sse2.And(packedA, mask),
+                Sse2.And(Sse2.ShiftRightLogical(packedA.AsUInt16(), 4).AsByte(), mask));
+
+            Vector128<byte> packedB = Unsafe.ReadUnaligned<Vector128<byte>>(qsB);
+            Vector256<byte> b = Vector256.Create(
+                Sse2.And(packedB, mask),
+                Sse2.And(Sse2.ShiftRightLogical(packedB.AsUInt16(), 4).AsByte(), mask));
+
+            return Vector512.Create(a, b);
+        }
+
+        private static unsafe float VecDotQ4_0Q8_0Avx512Wide(byte* q4, byte* q8, int blockCount)
+        {
+            Vector512<float> acc = Vector512<float>.Zero;
+            Vector512<byte> onesB = Vector512.Create((byte)1);
+            Vector512<short> onesS = Vector512.Create((short)1);
+            Vector512<int> eight = Vector512.Create(8);
+
+            int block = 0;
+            int pairEnd = blockCount & ~1;
+            for (; block < pairEnd; block += 2)
+            {
+                byte* wA = q4 + block * Q4_0BlockBytes;
+                byte* wB = wA + Q4_0BlockBytes;
+                byte* xA = q8 + block * Q8_0BlockBytes;
+                byte* xB = xA + Q8_0BlockBytes;
+
+                Vector512<byte> nib = UnpackQ40NibblePair(wA + 2, wB + 2);
+                Vector512<sbyte> act = Vector512.Create(
+                    Unsafe.ReadUnaligned<Vector256<sbyte>>(xA + 2),
+                    Unsafe.ReadUnaligned<Vector256<sbyte>>(xB + 2));
+
+                Vector512<int> dot = Avx512BW.MultiplyAddAdjacent(
+                    Avx512BW.MultiplyAddAdjacent(nib, act), onesS);
+                Vector512<int> sumX = Avx512BW.MultiplyAddAdjacent(
+                    Avx512BW.MultiplyAddAdjacent(onesB, act), onesS);
+                Vector512<int> isum = Avx512F.Subtract(dot, Avx512F.MultiplyLow(eight, sumX));
+
+                float sA = HalfToSingle(ReadUInt16(wA)) * HalfToSingle(ReadUInt16(xA));
+                float sB = HalfToSingle(ReadUInt16(wB)) * HalfToSingle(ReadUInt16(xB));
+                Vector512<float> scale = Vector512.Create(Vector256.Create(sA), Vector256.Create(sB));
+
+                acc = Avx512F.FusedMultiplyAdd(scale, Avx512F.ConvertToVector512Single(isum), acc);
+            }
+
+            float tail = 0.0f;
+            for (; block < blockCount; block++)
+            {
+                byte* wb = q4 + block * Q4_0BlockBytes;
+                byte* xb = q8 + block * Q8_0BlockBytes;
+                float scale = HalfToSingle(ReadUInt16(wb)) * HalfToSingle(ReadUInt16(xb));
+                byte* qs = wb + 2;
+                sbyte* qx = (sbyte*)(xb + 2);
+                int isum = 0;
+                for (int i = 0; i < QK4_0 / 2; i++)
+                {
+                    isum += ((qs[i] & 0x0F) - 8) * qx[i];
+                    isum += ((qs[i] >> 4) - 8) * qx[i + QK4_0 / 2];
+                }
+                tail += scale * isum;
+            }
+
+            return HorizontalSum(acc) + tail;
         }
 
         private static unsafe float VecDotQ4_0Q8_0Avx512(byte* q4, byte* q8, int blockCount)
@@ -2435,6 +2828,242 @@ namespace TensorSharp.Models
 
         private const int Iq3SBlockBytes = 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64; // 110
 
+        // ------------------------------------------------------------------
+        // Direct i-quant x Q8_K dots for IQ2_XS and IQ3_XXS.
+        //
+        // Without these both types fall to the generic path, which dequantizes
+        // every weight ROW into an F32 scratch and then dots it. That is correct
+        // but it expands a 2-bit weight ~12x before touching it, and these two
+        // types ARE the MoE of GLM-5.3-Flash UD-Q2_K_XL (82 IQ2_XS tensors plus
+        // 41 IQ3_XXS). A decoded token there runs ~1080 expert matmuls, so the
+        // expansion dominated: 91% of decode time sat outside the instrumented
+        // ops. Ported from ggml_vec_dot_iq2_xs_q8_K / _iq3_xxs_q8_K.
+        // ------------------------------------------------------------------
+
+        private static unsafe float VecDotIq2XsQ8K(byte* iq2, byte* q8k, int superBlockCount)
+        {
+            if (Avx2.IsSupported)
+                return VecDotIq2XsQ8KAvx2(iq2, q8k, superBlockCount);
+            return VecDotIq2XsQ8KScalar(iq2, q8k, superBlockCount);
+        }
+
+        private static unsafe float VecDotIq2XsQ8KScalar(byte* iq2, byte* q8k, int superBlockCount)
+        {
+            const int blockBytes = 2 + (QK_K / 8) * 2 + QK_K / 32;   // 74
+            float sumf = 0.0f;
+            fixed (ulong* grid = IQuantGrids.iq2xs_grid)
+            fixed (byte* ksigns = IQuantGrids.ksigns_iq2xs)
+            fixed (byte* kmask = IQuantGrids.kmask_iq2xs)
+            {
+                for (int i = 0; i < superBlockCount; i++)
+                {
+                    byte* x = iq2 + i * blockBytes;
+                    byte* y = q8k + i * Q8_KBlockBytes;
+                    float d = HalfToSingle(ReadUInt16(x)) * ReadSingle(y);
+                    byte* q2 = x + 2;
+                    byte* sc = x + 2 + (QK_K / 8) * 2;
+                    sbyte* q8 = (sbyte*)(y + 4);
+
+                    int bsum = 0;
+                    for (int ib32 = 0; ib32 < QK_K / 32; ib32++)
+                    {
+                        // Two 4-bit scales per 32 lanes, each stored as 2*s + 1.
+                        int ls1 = 1 + 2 * (sc[ib32] & 0xf);
+                        int ls2 = 1 + 2 * (sc[ib32] >> 4);
+                        int sumi1 = 0, sumi2 = 0;
+                        for (int l = 0; l < 2; l++)
+                        {
+                            ushort q = ReadUInt16(q2 + 2 * l);
+                            byte* g = (byte*)(grid + (q & 511));
+                            byte signs = ksigns[q >> 9];
+                            for (int j = 0; j < 8; j++)
+                                sumi1 += q8[j] * g[j] * ((signs & kmask[j]) != 0 ? -1 : 1);
+                            q8 += 8;
+                        }
+                        for (int l = 2; l < 4; l++)
+                        {
+                            ushort q = ReadUInt16(q2 + 2 * l);
+                            byte* g = (byte*)(grid + (q & 511));
+                            byte signs = ksigns[q >> 9];
+                            for (int j = 0; j < 8; j++)
+                                sumi2 += q8[j] * g[j] * ((signs & kmask[j]) != 0 ? -1 : 1);
+                            q8 += 8;
+                        }
+                        bsum += ls1 * sumi1 + ls2 * sumi2;
+                        q2 += 8;
+                    }
+                    sumf += d * bsum;
+                }
+            }
+            // ggml folds a constant into the result rather than into each scale:
+            // the per-32 scale is stored as 2*s+1 where the dequantizer uses
+            // (0.5+s)*0.25, so the accumulated sum is 8x too large. Dropping this
+            // does NOT fail loudly - it produces fluent-looking garbage.
+            return 0.125f * sumf;
+        }
+
+        private static unsafe float VecDotIq3XxsQ8K(byte* iq3, byte* q8k, int superBlockCount)
+        {
+            if (Avx2.IsSupported)
+                return VecDotIq3XxsQ8KAvx2(iq3, q8k, superBlockCount);
+            return VecDotIq3XxsQ8KScalar(iq3, q8k, superBlockCount);
+        }
+
+        private static unsafe float VecDotIq3XxsQ8KScalar(byte* iq3, byte* q8k, int superBlockCount)
+        {
+            const int blockBytes = 2 + 3 * QK_K / 8;                  // 98
+            float sumf = 0.0f;
+            fixed (uint* grid = IQuantGrids.iq3xxs_grid)
+            fixed (byte* ksigns = IQuantGrids.ksigns_iq2xs)
+            fixed (byte* kmask = IQuantGrids.kmask_iq2xs)
+            {
+                for (int i = 0; i < superBlockCount; i++)
+                {
+                    byte* x = iq3 + i * blockBytes;
+                    byte* y = q8k + i * Q8_KBlockBytes;
+                    float d = HalfToSingle(ReadUInt16(x)) * ReadSingle(y);
+                    byte* q3 = x + 2;                    // grid indices, QK_K/4 bytes
+                    byte* gas = x + 2 + QK_K / 4;        // the per-32 aux words
+                    sbyte* q8 = (sbyte*)(y + 4);
+
+                    int bsum = 0;
+                    for (int ib32 = 0; ib32 < QK_K / 32; ib32++)
+                    {
+                        uint aux32 = ReadUInt32(gas);
+                        gas += 4;
+                        // The scale rides in the TOP nibble of the aux word, and
+                        // the same word carries the four 7-bit sign selectors.
+                        int ls = 2 * (int)(aux32 >> 28) + 1;
+                        int sumi = 0;
+                        for (int l = 0; l < 4; l++)
+                        {
+                            byte* g1 = (byte*)(grid + q3[2 * l + 0]);
+                            byte* g2 = (byte*)(grid + q3[2 * l + 1]);
+                            byte signs = ksigns[(aux32 >> (7 * l)) & 127];
+                            for (int j = 0; j < 4; j++)
+                            {
+                                sumi += g1[j] * q8[j] * ((signs & kmask[j]) != 0 ? -1 : 1);
+                                sumi += g2[j] * q8[j + 4] * ((signs & kmask[j + 4]) != 0 ? -1 : 1);
+                            }
+                            q8 += 8;
+                        }
+                        q3 += 8;
+                        bsum += sumi * ls;
+                    }
+                    sumf += d * bsum;
+                }
+            }
+            return 0.25f * sumf;   // same folded constant as IQ2_XS, 4x here
+        }
+
+
+        // AVX2 forms of the two i-quant dots above. One ib32 (32 weights) fits a
+        // single 256-bit lane: four 8-byte grid entries make the unsigned operand,
+        // the 7-bit sign selectors expand through Iq3SignTab into a +/-1 byte mask
+        // that flips the ACTIVATION (VPSIGNB) rather than the codebook, and
+        // VPMADDUBSW then reduces to 16 shorts. Saturation is not a concern: a
+        // grid byte times an int8 activation is at most ~30*127, and two of those
+        // stay well inside int16.
+        private static unsafe float VecDotIq2XsQ8KAvx2(byte* iq2, byte* q8k, int superBlockCount)
+        {
+            const int blockBytes = 2 + (QK_K / 8) * 2 + QK_K / 32;   // 74
+            float sumf = 0.0f;
+            fixed (ulong* grid = IQuantGrids.iq2xs_grid)
+            fixed (byte* ksigns = IQuantGrids.ksigns_iq2xs)
+            fixed (ulong* signTab = Iq3SignTab)
+            {
+                for (int i = 0; i < superBlockCount; i++)
+                {
+                    byte* x = iq2 + i * blockBytes;
+                    byte* y = q8k + i * Q8_KBlockBytes;
+                    float d = HalfToSingle(ReadUInt16(x)) * ReadSingle(y);
+                    byte* q2 = x + 2;
+                    byte* sc = x + 2 + (QK_K / 8) * 2;
+                    sbyte* q8 = (sbyte*)(y + 4);
+
+                    Vector256<int> acc = Vector256<int>.Zero;
+                    for (int ib32 = 0; ib32 < QK_K / 32; ib32++)
+                    {
+                        ushort a0 = ReadUInt16(q2 + 0), a1 = ReadUInt16(q2 + 2);
+                        ushort a2 = ReadUInt16(q2 + 4), a3 = ReadUInt16(q2 + 6);
+
+                        var codes = Vector256.Create(
+                            grid[a0 & 511], grid[a1 & 511], grid[a2 & 511], grid[a3 & 511]).AsByte();
+                        var signs = Vector256.Create(
+                            signTab[ksigns[a0 >> 9]], signTab[ksigns[a1 >> 9]],
+                            signTab[ksigns[a2 >> 9]], signTab[ksigns[a3 >> 9]]).AsSByte();
+
+                        var act = Avx.LoadVector256(q8).AsSByte();
+                        var signed = Avx2.Sign(act, signs);
+                        Vector256<short> dot = Avx2.MultiplyAddAdjacent(codes, signed);
+
+                        short ls1 = (short)(1 + 2 * (sc[ib32] & 0xf));
+                        short ls2 = (short)(1 + 2 * (sc[ib32] >> 4));
+                        var scales = Vector256.Create(
+                            ls1, ls1, ls1, ls1, ls1, ls1, ls1, ls1,
+                            ls2, ls2, ls2, ls2, ls2, ls2, ls2, ls2);
+                        acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(dot, scales));
+
+                        q2 += 8;
+                        q8 += 32;
+                    }
+                    sumf += d * HorizontalSumInt(acc);
+                }
+            }
+            return 0.125f * sumf;
+        }
+
+        private static unsafe float VecDotIq3XxsQ8KAvx2(byte* iq3, byte* q8k, int superBlockCount)
+        {
+            const int blockBytes = 2 + 3 * QK_K / 8;                  // 98
+            float sumf = 0.0f;
+            fixed (uint* grid = IQuantGrids.iq3xxs_grid)
+            fixed (byte* ksigns = IQuantGrids.ksigns_iq2xs)
+            fixed (ulong* signTab = Iq3SignTab)
+            {
+                for (int i = 0; i < superBlockCount; i++)
+                {
+                    byte* x = iq3 + i * blockBytes;
+                    byte* y = q8k + i * Q8_KBlockBytes;
+                    float d = HalfToSingle(ReadUInt16(x)) * ReadSingle(y);
+                    byte* q3 = x + 2;
+                    byte* gas = x + 2 + QK_K / 4;
+                    sbyte* q8 = (sbyte*)(y + 4);
+
+                    Vector256<int> acc = Vector256<int>.Zero;
+                    for (int ib32 = 0; ib32 < QK_K / 32; ib32++)
+                    {
+                        uint aux32 = ReadUInt32(gas);
+                        gas += 4;
+
+                        // Eight 4-byte grid entries, in the same order the scalar
+                        // loop walks them (q3[0..7]).
+                        var codes = Vector256.Create(
+                            grid[q3[0]], grid[q3[1]], grid[q3[2]], grid[q3[3]],
+                            grid[q3[4]], grid[q3[5]], grid[q3[6]], grid[q3[7]]).AsByte();
+                        var signs = Vector256.Create(
+                            signTab[ksigns[aux32 & 127]],
+                            signTab[ksigns[(aux32 >> 7) & 127]],
+                            signTab[ksigns[(aux32 >> 14) & 127]],
+                            signTab[ksigns[(aux32 >> 21) & 127]]).AsSByte();
+
+                        var act = Avx.LoadVector256(q8).AsSByte();
+                        var signed = Avx2.Sign(act, signs);
+                        Vector256<short> dot = Avx2.MultiplyAddAdjacent(codes, signed);
+
+                        short ls = (short)(2 * (int)(aux32 >> 28) + 1);
+                        var scales = Vector256.Create(ls);
+                        acc = Avx2.Add(acc, Avx2.MultiplyAddAdjacent(dot, scales));
+
+                        q3 += 8;
+                        q8 += 32;
+                    }
+                    sumf += d * HorizontalSumInt(acc);
+                }
+            }
+            return 0.25f * sumf;
+        }
+
         private static unsafe float VecDotIq3SQ8K(byte* iq3, byte* q8k, int superBlockCount)
         {
             if (Avx2.IsSupported)
@@ -2696,6 +3325,10 @@ namespace TensorSharp.Models
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        /// <summary>Sum the eight int32 lanes of an AVX2 accumulator.</summary>
+        private static int HorizontalSumInt(Vector256<int> v)
+            => HorizontalSum128(Sse2.Add(v.GetLower(), v.GetUpper()));
+
         private static int HorizontalSum128(Vector128<int> v)
         {
             Vector128<int> hi = Sse2.Add(v, Sse2.Shuffle(v, 0x4E)); // [2,3,0,1]
