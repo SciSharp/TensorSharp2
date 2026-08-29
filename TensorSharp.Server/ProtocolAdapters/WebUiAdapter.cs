@@ -312,7 +312,27 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             if (mediaType == "video")
             {
-                var frames = MediaHelper.ExtractVideoFrames(savePath);
+                // Frames go into the upload directory, named after this upload's GUID, for
+                // the same reason the saved video does: the Web UI refers to an attachment
+                // by its bare file name, and that name is resolved against the upload root
+                // (ChatMessageParser.ResolveAttachmentPaths) and served as /uploads/<name>.
+                // Frames written anywhere else resolve to nothing at chat time and 404 as
+                // thumbnails, and the GUID keeps two clips from both claiming frame_0001.png.
+                List<string> frames;
+                try
+                {
+                    frames = await Task.Run(() => MediaHelper.ExtractVideoFrames(
+                        savePath, _options.UploadDirectory,
+                        Path.GetFileNameWithoutExtension(safeFileName)));
+                }
+                catch (Exception ex)
+                {
+                    uploadLogger.LogWarning(LogEventIds.UploadRejected,
+                        "Video frame extraction failed: name={FileName} savedPath={SavedPath} error={Error}",
+                        file.FileName, savePath, ex.Message);
+                    return Results.BadRequest(new { ok = false, error = "Could not read the video: " + ex.Message });
+                }
+
                 _uploads.RecordFiles(frames);
                 return Results.Json(new
                 {

@@ -36,6 +36,20 @@ namespace InferenceWeb.Tests
         public static string MlxSkip =>
             MlxAvailable.Value ? null : "Requires the MLX native backend.";
 
+        // Video tests synthesise their own clip rather than carry a binary fixture, so
+        // they need an OpenCV build that can ENCODE. The slim runtimes ship videoio
+        // without every encoder; probe once by actually writing a tiny clip.
+        private static readonly Lazy<bool> VideoWritable = new(() =>
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "ts-video-gate-" + Guid.NewGuid().ToString("N"));
+            try { return VideoFixture.TryWrite(Path.Combine(dir, "probe.mp4"), frames: 4) != null; }
+            catch { return false; }
+            finally { try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ } }
+        });
+
+        public static string VideoSkip =>
+            VideoWritable.Value ? null : "Requires an OpenCV build that can encode video.";
+
         /// <summary>
         /// Skip reason for weight-gated tests, or null to run. The env var may
         /// name a file or a directory; with <paramref name="ggufContains"/> the
@@ -142,6 +156,29 @@ namespace InferenceWeb.Tests
         public string RequiresValue => "Mlx";
 
         public MlxTheoryAttribute() => Skip = TestGates.MlxSkip;
+    }
+
+    /// <summary>
+    /// [Fact] that needs to synthesise a video clip: skips visibly when this
+    /// machine's OpenCV cannot encode one, and carries Requires=Video.
+    /// </summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class VideoFactAttribute : FactAttribute, ITraitAttribute
+    {
+        public string RequiresValue => "Video";
+
+        public VideoFactAttribute() => Skip = TestGates.VideoSkip;
+    }
+
+    /// <summary>[Theory] variant of <see cref="VideoFactAttribute"/>.</summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class VideoTheoryAttribute : TheoryAttribute, ITraitAttribute
+    {
+        public string RequiresValue => "Video";
+
+        public VideoTheoryAttribute() => Skip = TestGates.VideoSkip;
     }
 
     /// <summary>
