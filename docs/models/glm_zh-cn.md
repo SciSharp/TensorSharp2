@@ -37,7 +37,61 @@ head 尺寸，而不是 576 宽的缓存行。
 - **`--backend cpu`（100% 托管）和 `--backend cuda`** 走
   `TensorSharp.Models/Models/GlmDsa/*` 里的逐算子路径，建立在共享的 `Ops` /
   `ManagedQuantizedOps` / `CudaQuantizedOps` 之上。它同时也是原生执行器的参考
-  实现；在 GGML 后端上用 `TS_GLM_NATIVE=0` 可以切到它做 A/B 对比。
+  实现；在 GGML 后端上用 `TS_GLM_NATIVE=0` 可以切到它做 A/B 对比。GLM-5.3-Flash
+  在这条路径上也能运行，但**正确性可以，性能一般**——详见下文。
+
+### `--backend cpu` 上的 GLM-5.3-Flash
+
+要把 `glm5next` 跑到纯 C# 后端上，一共修了四处问题，其中三处是静默失败或干脆跑不完，
+而不是干净地报错：
+
+- **NoPE MLA。** GLM-5.3 的 `rope.dimension_count = 0`：任何地方都没有 rope 分量，
+  `n_nope == n_embd_head_k`，压缩后的 latent 本身就是整行缓存。GLM-5.2 的路径会把每个
+  head 拆成 NoPE 段与 RoPE 段，于是切出了一个零宽切片并抛异常。现在
+  `GlmDsaModel.Attention` 与 `ggml_ops_glm_dsa.cpp` 中的 `hp.n_rot == 0` 分支保持一致：
+  query 与 key 都不再有 pe 分量，不分配 `_kPeCache`，注意力**和** DSA 索引器都不做 rope，
+  打分只剩被吸收的那一项。
+- **MLA 权重吸收检查**原本要求 45 个主干层每层都有 `attn_k_b` / `attn_v_b`。glm5next
+  只在 12 个全注意力层上带这两个张量（从第 3 层开始），因此一个完好的 checkpoint 会在
+  第 0 层被拒绝。该要求现在只作用于全注意力层。
+- **`IQ2_XS` 与 `IQ4_XS` 此前没有托管支持**，加载器只能把它们展开成 F32——对这个模型
+  就是 765 GB。加载不是失败，而是永远跑不完。现在两者都有托管反量化实现（与 ggml 自身
+  逐位对比验证），并有直接的 `x Q8_K` 点积内核。
+- **`BackendType.Cpu` 是唯一没有出现在 `CanUseFileMappedQuantizedWeights` 里的后端**，
+  因此只有它会把每个量化张量复制进新分配的匿名内存，而不是直接做文件映射。
+
+现在加载会打印 `Quantized: 103255 MB (103255 MB file-backed), F32: 983 MB`，
+约 48 秒完成，其中大部分是页缓存预取。
+
+**性能。** 在 122 CPU 的机器上，22 token 提示、输出 16 token：
+
+| | prefill | decode |
+|---|---|---|
+| `cpu`，标量 i-quant 点积 | 0.9 | 0.4 |
+| `cpu`，AVX2 i-quant 点积 | **3.1** | **1.6** |
+| `ggml_cpu`，同文件同机器 | 17.7 | 3.9 |
+
+约 89% 的时间花在 MoE 专家路径上——每个 token 要做 8 专家 x 3 矩阵 x 45 层的小矩阵乘法。
+这部分不在 `Linear` 计时桶里，所以内置的耗时分解会把它显示成 “Other”。直接的
+`IQ2_XS` / `IQ3_XXS` 点积去掉了 F32 展开；把它们向量化
+（`VecDotIq2XsQ8KAvx2`、`VecDotIq3XxsQ8KAvx2`，一个 ib32 占一个 256 位通道，符号用
+VPSIGNB 施加在**激活**而非码本上）才补上了剩下的大部分差距。目前 prefill 仍比
+`ggml_cpu` 慢约 5.7 倍，decode 慢约 2.4 倍。
+
+**质量：接近，且 token 差异来自近似平局而非缺陷。** 直接比较 **prefill** 的 logits
+（用 `TS_DUMP_LOGITS`，它会跳过预热的那几次前向——拿预热结果去比等于在一个无意义的
+token 上比较两个执行器）：
+
+- 在 154880 词表上余弦相似度 **0.9567**；
+- 原生 argmax 为 `1986`（18.71），`16360` 为 18.60——两者只差 0.11；
+- 托管路径把两者的顺序调了个个儿，原生的首选在托管侧排**第 2**。
+
+这就是贪心解码文本不同（`Simple arithmetic question, user wants a brief answer.</think>2+2 = `
+对 `This is a simple arithmetic question. The user wants a brief answer. 2`）而推理内容
+一致的原因。在 2 bit 下，逐算子执行器与融合执行器会因为很小的数值差异选到不同的专家，
+这与 `TS_BATCHED_FUSED_DECODE` 默认关闭是同一个效应。0.96 的余弦与这个解释相符，但并不
+构成证明：它低于更高精度 checkpoint 应有的 ~0.999，而机器上没有更高精度的 GLM-5.3 GGUF
+可作对照。请把托管路径当作用于 A/B 的参考实现，而不是逐位对齐的实现。
 
 分片 GGUF 由 `GgufFile` 自己处理（`split.count` / `-00001-of-000NN`），因此仓库里
 任何模型现在都可以跨多个文件存放。

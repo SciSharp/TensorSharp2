@@ -66,12 +66,21 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly long _trunkBytes;
         private GCHandle _layersPin;
         private readonly GgufTensorInfo _embed;
+        // Non-null on the backends with no ggml graph to call (BackendType.Cpu).
+        private readonly MiniMaxH3DirectTextEncoder _direct;
+        // Carried so the vision tower, built lazily below, gets the same routing.
+        private readonly BackendType _backendType;
+        private readonly IAllocator _allocatorForVision;
         private bool _disposed;
 
         public MiniMaxH3TextEncoderConfig Config { get; }
         public BpeTokenizer Tokenizer { get; }
 
         public MiniMaxH3TextEncoder(string ggufPath, string tokenizerDir = null)
+            : this(ggufPath, tokenizerDir, BackendType.GgmlCuda, null) { }
+
+        public MiniMaxH3TextEncoder(string ggufPath, string tokenizerDir,
+                                    BackendType backend, IAllocator allocator)
         {
             _gguf = new GgufFile(ggufPath);
             try { _trunkBytes = new FileInfo(ggufPath).Length; } catch (IOException) { }
@@ -104,6 +113,14 @@ namespace TensorSharp.Models.MiniMaxH3
                 };
             }
             _layersPin = GCHandle.Alloc(_layers, GCHandleType.Pinned);
+
+            // Backends with no ggml graph to call run the same trunk through the
+            // shared direct primitives instead.
+            _backendType = backend;
+            _allocatorForVision = allocator;
+            if (allocator != null && backend is not (BackendType.GgmlCuda or BackendType.GgmlCpu
+                    or BackendType.GgmlMetal or BackendType.GgmlVulkan))
+                _direct = new MiniMaxH3DirectTextEncoder(_gguf, Config, allocator);
 
             Tokenizer = LoadTokenizer(tokenizerDir ?? Path.GetDirectoryName(Path.GetFullPath(ggufPath)));
         }
@@ -467,6 +484,19 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>Run the trunk. Returns the raw hidden states of the last layer,
         /// [seq][hidden], with no final normalization applied — that is exactly what
         /// the DiT's condition_proj expects.</summary>
+        /// <summary>Write the trunk output to TS_H3_DUMP_TE when set, so the managed
+        /// and GGML paths can be compared directly instead of through a chaotic
+        /// multi-step denoise. Off unless the variable is set.</summary>
+        private static float[] Dump(float[] hidden)
+        {
+            string path = Environment.GetEnvironmentVariable("TS_H3_DUMP_TE");
+            if (string.IsNullOrEmpty(path)) return hidden;
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            using var bw = new BinaryWriter(fs);
+            foreach (float v in hidden) bw.Write(v);
+            return hidden;
+        }
+
         public float[] Encode(IReadOnlyList<int> tokens, int layerLimit = 0) =>
             Encode(tokens, null, layerLimit);
 
@@ -519,6 +549,12 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 (cos, sin) = BuildRope(seq, Config.HeadDim, Config.RopeTheta);
             }
+            if (_direct != null)
+            {
+                // Pure-managed path: the identical trunk, with no native call.
+                return Dump(_direct.Encode(embeddings, seq, cos, sin, deepstack, numDeepstack, layers));
+            }
+
             var outp = new float[(long)seq * hidden];
 
             var ePin = GCHandle.Alloc(embeddings, GCHandleType.Pinned);
@@ -593,7 +629,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 ePin.Free(); cPin.Free(); sPin.Free(); oPin.Free();
                 if (dPin.IsAllocated) dPin.Free();
             }
-            return outp;
+            return Dump(outp);
         }
 
         /// <summary>True when this checkpoint carries the Qwen3-VL vision tower, which
@@ -602,7 +638,8 @@ namespace TensorSharp.Models.MiniMaxH3
 
         /// <summary>The vision tower, built on first use and sharing this file's mapping.
         /// Throws when the checkpoint has none — check <see cref="HasVision"/> first.</summary>
-        public MiniMaxH3VisionEncoder Vision => _vision ??= new MiniMaxH3VisionEncoder(_gguf);
+        public MiniMaxH3VisionEncoder Vision =>
+            _vision ??= new MiniMaxH3VisionEncoder(_gguf, _backendType, _allocatorForVision);
 
         /// <summary>Tokenize a prompt. There is NO chat template: the raw text is
         /// encoded as-is with no BOS/EOS.</summary>
@@ -673,6 +710,7 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             if (_disposed) return;
             _disposed = true;
+            _direct?.Dispose();
             if (_layersPin.IsAllocated) _layersPin.Free();
             foreach (IntPtr ptr in _bound)
                 if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);

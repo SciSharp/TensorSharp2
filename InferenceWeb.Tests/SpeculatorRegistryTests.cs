@@ -171,6 +171,51 @@ public class SpeculatorRegistryTests
 
     /// <summary>Minimal speculative target: the registry only reads its config
     /// and its draft-head kind.</summary>
+    // ---- prefix-reuse arming -------------------------------------------------
+    //
+    // The executor refuses to arm speculation on a sequence that adopted a KV
+    // prefix, because a learned per-position draft head chains its state token by
+    // token and a gap ruins it. That refusal used to apply to EVERY algorithm, and
+    // since every turn after the first in a chat adopts a prefix, DFlash measured
+    // as "no faster than plain" from turn two onward (41.6 vs 40.9 tok/s on
+    // Muse-Glimmer; 75.5 once the gate consulted the algorithm - acceptance on the
+    // reusing turn was the HIGHEST of the session, 79%).
+    //
+    // Whether a gap is survivable is the algorithm's own property, so it lives on
+    // ISpeculator. These pin which way each algorithm answers.
+
+    [Fact]
+    public void BlockDrafter_CanArmAfterPrefixReuse()
+    {
+        var model = new StubTarget { Kind = DraftHeadKind.Block, BlockSize = 5 };
+        var spec = SpeculatorRegistry.Create(model, Opts(SpeculatorRegistry.Auto), out _);
+        Assert.IsType<BlockDraftSpeculator>(spec);
+        Assert.True(spec.CanArmAfterPrefixReuse,
+            "A block drafter reads its own sliding KV ring and refills it from the forwarded "
+            + "suffix, so an adopted prefix costs it context for a block or two, not correctness.");
+    }
+
+    [Fact]
+    public void NGram_CanArmAfterPrefixReuse()
+    {
+        var model = new StubTarget { Kind = DraftHeadKind.None };
+        var spec = SpeculatorRegistry.Create(model, Opts(SpeculatorRegistry.NGram), out _);
+        Assert.IsType<NGramSpeculator>(spec);
+        Assert.True(spec.CanArmAfterPrefixReuse,
+            "n-gram mines the emitted token history, which is complete whatever the KV cache did.");
+    }
+
+    [Fact]
+    public void PerTokenDraftHead_DoesNotArmAfterPrefixReuse()
+    {
+        // The one algorithm the original blanket refusal was actually protecting.
+        var model = new StubTarget { Kind = DraftHeadKind.PerToken };
+        var spec = SpeculatorRegistry.Create(model, Opts(SpeculatorRegistry.Auto), out _);
+        Assert.IsType<DraftHeadSpeculator>(spec);
+        Assert.False(spec.CanArmAfterPrefixReuse,
+            "A NextN/MTP head chains per-position state; a skipped span makes every later "
+            + "proposal garbage, so it must stay on the plain path after prefix adoption.");
+    }
     private sealed class StubTarget : ISpeculativeTarget, IDraftHead
     {
         public DraftHeadKind Kind { get; set; }
@@ -198,4 +243,5 @@ public class SpeculatorRegistryTests
         public void SpecRestoreRecurrentState() { }
         public void SpecRewindCache(int length) { }
     }
+
 }

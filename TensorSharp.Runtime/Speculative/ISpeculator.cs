@@ -127,6 +127,32 @@ namespace TensorSharp.Runtime.Speculative
         bool HandlesOwnPrefill { get; }
 
         /// <summary>
+        /// True when this algorithm can arm on a sequence that ADOPTED a KV prefix it
+        /// never processed itself - the cache came from another request (prefix cache)
+        /// or an earlier turn, so trunk positions exist that this speculator did not
+        /// see.
+        ///
+        /// The executor refuses to arm on such a sequence by default, because a learned
+        /// per-position draft head (NextN / MTP) chains its state token by token and a
+        /// gap makes every subsequent proposal garbage. That default was costing every
+        /// other algorithm the whole feature in normal chat use: from the SECOND turn
+        /// on, a Web UI conversation always adopts a prefix, so speculation silently
+        /// never armed and the operator saw a drafter that helped on turn one and did
+        /// nothing afterwards.
+        ///
+        /// An algorithm may return true when a gap costs it ACCEPTANCE but not
+        /// correctness and it recovers on its own:
+        ///   * n-gram mines the emitted token history, which is complete regardless of
+        ///     what the KV cache did;
+        ///   * a BLOCK drafter (DFlash / DFlash2) reads its own sliding KV ring, which
+        ///     refills from the freshly forwarded suffix and from every committed
+        ///     token, so at worst its first few blocks draft from a short context.
+        /// Every draft is verified by the trunk either way, so a stale speculator can
+        /// only cost throughput - never a wrong token.
+        /// </summary>
+        bool CanArmAfterPrefixReuse => false;
+
+        /// <summary>
         /// Propose up to <see cref="DraftContext.MaxTokens"/> continuation
         /// tokens, appended in order to <paramref name="draftOut"/> (which the
         /// caller has already cleared). Returning 0 is always legal and simply

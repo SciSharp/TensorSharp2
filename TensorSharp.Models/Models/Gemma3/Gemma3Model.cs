@@ -582,6 +582,32 @@ namespace TensorSharp.Models
             Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
             int attendStart, int totalSeqLen, float scale)
         {
+            // The cache is only F32 on some backends. On the pure-C# `cpu` backend
+            // (and anywhere --kv-cache-dtype asks for it) it is F16 or block
+            // quantized, and walking it as a flat float buffer threw
+            // "Requires a Float32 tensor, but found Float16" out of GetFloatPtr -
+            // Gemma 3 could not run on the cpu backend at all. Dequantize the
+            // active window into compact F32 and re-enter, which is what
+            // ModelBase.AttentionDecodePureCS does for the non-windowed case. The
+            // compact copy's Sizes[1] == totalSeqLen doubles as its row stride, so
+            // the maxSeqLen read below stays correct.
+            if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
+            {
+                using Tensor kF32 = ExpandKVHeadsF16(kCache, 1, totalSeqLen);
+                using Tensor vF32 = ExpandKVHeadsF16(vCache, 1, totalSeqLen);
+                AttentionDecodeWithWindow(q, kF32, vF32, result, numHeads, numKVHeads,
+                    keyDim, valDim, attendStart, totalSeqLen, scale);
+                return;
+            }
+            if (IsBlockQuantCacheDType(kCache.ElementType) && vCache.ElementType == kCache.ElementType)
+            {
+                using Tensor kF32 = ExpandKVHeadsBlockQuant(kCache, 1, totalSeqLen);
+                using Tensor vF32 = ExpandKVHeadsBlockQuant(vCache, 1, totalSeqLen);
+                AttentionDecodeWithWindow(q, kF32, vF32, result, numHeads, numKVHeads,
+                    keyDim, valDim, attendStart, totalSeqLen, scale);
+                return;
+            }
+
             float* qPtr = GetFloatPtr(q);
             float* kPtr = GetFloatPtr(kCache);
             float* vPtr = GetFloatPtr(vCache);

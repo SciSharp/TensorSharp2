@@ -10,119 +10,122 @@
 
 using System.Reflection;
 
+using TensorSharp.Models.Architecture;
+
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Structural guard for <see cref="ModelMultimodalInjector"/>.
+/// Structural guard for the multimodal hand-off.
 ///
-/// The injector routes every stage of the multimodal hand-off through a
-/// <c>switch (_model)</c> over concrete model types. Adding a new vision model means
-/// touching FOUR of those switches, and missing one fails SILENTLY: the encoder still
-/// runs, the prompt still grows by N image rows, but nothing ever calls the model's
-/// <c>SetVisionEmbeddings</c>, so those rows keep the embedding of the filler token and
-/// the model answers as if it never saw the image.
+/// The failure this exists for: a vision model whose encoder runs and whose prompt
+/// grows by N image rows, but which is never handed the embeddings - so those rows keep
+/// the embedding of the filler token and the model answers as if it never saw the
+/// image. That is exactly what happened to Muse-Glimmer: <c>LoadProjectors</c> and its
+/// prompt expansion were both wired up, but neither queue stage had a
+/// <c>MuseGlimmerModel</c> case. Asked "这是什么图片" about a banner, the model replied
+/// that it had been given "a huge block of characters, all 'o' repeated".
 ///
-/// That is exactly what happened to Muse-Glimmer: <c>LoadProjectors</c> and
-/// <c>ProcessMuseGlimmerHistory</c> were both wired up, but neither
-/// <c>QueuePreparedVisionEmbeddings</c> nor <c>QueuePreparedVisionEmbeddingsForSlice</c>
-/// had a <c>MuseGlimmerModel</c> case. Asked "这是什么图片" about a banner, the model
-/// replied that it had been given "a huge block of characters, all 'o' repeated".
-///
-/// Rather than re-test that end to end (which needs a 10 GB model plus a 2 GB mmproj),
-/// this reads the IL of the four switches and asserts they cover the same set of model
-/// types. It is a fast, model-free tripwire for the whole class of bug.
+/// The injector used to route every stage through its own <c>switch (_model)</c> over
+/// concrete model types, so a new model had to be added to FOUR of them and missing one
+/// failed silently; this file used to scan the IL of those switches and compare their
+/// coverage. Those switches are gone: loading and queueing now go through
+/// <see cref="IVisionCapableModel"/> / <see cref="IAudioCapableModel"/>, which a model
+/// implements once and cannot implement by halves. What remains to guard is the seam
+/// between the capability interfaces themselves - a model that expands image
+/// placeholders but forgot to declare that it can receive the embeddings would fail the
+/// same silent way.
 /// </summary>
 public class ModelMultimodalInjectorCoverageTests
 {
     private static readonly BindingFlags AnyMethod =
         BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
 
-    /// <summary>
-    /// Concrete <see cref="ModelBase"/>-derived types a method's IL performs an
-    /// <c>isinst</c>/<c>castclass</c> against — i.e. the model types its
-    /// <c>switch (_model)</c> handles.
-    /// </summary>
-    private static HashSet<Type> ModelTypesReferencedBy(string methodName)
-    {
-        MethodInfo method = typeof(ModelMultimodalInjector).GetMethod(methodName, AnyMethod)
-            ?? throw new InvalidOperationException(
-                $"ModelMultimodalInjector.{methodName} not found — did the injector get refactored?");
+    private static readonly Type PromptExpander =
+        typeof(ModelBase).Assembly.GetType("TensorSharp.Models.Architecture.IMultimodalPromptExpander")
+        ?? throw new InvalidOperationException("IMultimodalPromptExpander not found — did the seam get renamed?");
 
-        byte[] il = method.GetMethodBody()?.GetILAsByteArray()
-            ?? throw new InvalidOperationException($"{methodName} has no IL body.");
-
-        Module module = method.Module;
-        var found = new HashSet<Type>();
-
-        // isinst = 0x75, castclass = 0x74; both are followed by a 4-byte metadata token.
-        // Scanning for the opcode byte alone would produce false positives from operand
-        // bytes, so every candidate token is resolved and simply ignored when it does not
-        // name a ModelBase subclass.
-        for (int i = 0; i + 4 < il.Length; i++)
-        {
-            if (il[i] != 0x75 && il[i] != 0x74)
-                continue;
-            int token = BitConverter.ToInt32(il, i + 1);
-            Type? resolved;
-            try
-            {
-                resolved = module.ResolveType(token);
-            }
-            catch
-            {
-                continue;
-            }
-            if (resolved != null && typeof(ModelBase).IsAssignableFrom(resolved) && !resolved.IsAbstract)
-                found.Add(resolved);
-        }
-
-        return found;
-    }
+    private static IEnumerable<Type> ConcreteModels =>
+        typeof(ModelBase).Assembly.GetTypes()
+            .Where(t => typeof(ModelBase).IsAssignableFrom(t) && !t.IsAbstract);
 
     /// <summary>
-    /// Every model that gets a projector loaded must also be able to receive the
-    /// embeddings that projector produces, through BOTH queue paths: the whole-prompt
-    /// one and the per-prefill-slice one the continuous-batching executor uses.
+    /// A model that expands its own media placeholders MUST also declare that it can
+    /// receive the embeddings those placeholders stand for. Expanding without receiving
+    /// is the silent-image bug.
     /// </summary>
-    [Theory]
-    [InlineData("QueuePreparedVisionEmbeddings")]
-    [InlineData("QueuePreparedVisionEmbeddingsForSlice")]
-    public void EveryModelWithAProjector_CanAlsoReceiveItsVisionEmbeddings(string queueMethod)
+    [Fact]
+    public void EveryModelThatExpandsImagePlaceholders_CanAlsoReceiveTheEmbeddings()
     {
-        HashSet<Type> loaders = ModelTypesReferencedBy("LoadProjectors");
-        HashSet<Type> receivers = ModelTypesReferencedBy(queueMethod);
+        var expanders = ConcreteModels.Where(t => PromptExpander.IsAssignableFrom(t)).ToList();
+        Assert.NotEmpty(expanders);
 
-        Assert.NotEmpty(loaders);
-
-        // A model may legitimately load an AUDIO-only projector, so only require a
-        // vision receiver for models that actually declare a vision encoder hook.
-        var missing = loaders
-            .Where(t => t.GetMethod("SetVisionEmbeddings", AnyMethod) != null)
-            .Where(t => !receivers.Contains(t))
+        var missing = expanders
+            .Where(t => !typeof(IVisionCapableModel).IsAssignableFrom(t)
+                        && !typeof(IAudioCapableModel).IsAssignableFrom(t))
             .Select(t => t.Name)
             .OrderBy(n => n)
             .ToList();
 
         Assert.True(missing.Count == 0,
-            $"ModelMultimodalInjector.{queueMethod} has no case for: {string.Join(", ", missing)}. " +
-            "Those models will run their vision encoder and then silently drop the embeddings, " +
-            "leaving the image rows as filler-token embeddings.");
+            $"These models expand media placeholders but declare no way to receive embeddings: " +
+            $"{string.Join(", ", missing)}. They would run their encoder and then silently drop the " +
+            "result, leaving the image rows as filler-token embeddings.");
+    }
+
+    /// <summary>
+    /// The converse, and the reason the old IL scan existed: a model that CAN receive
+    /// vision embeddings (it has the method) must declare the interface, or the injector
+    /// - which now only ever sees the interface - will never call it.
+    /// </summary>
+    [Fact]
+    public void EveryModelWithAVisionHook_DeclaresTheVisionInterface()
+    {
+        var undeclared = ConcreteModels
+            .Where(t => t.GetMethod("SetVisionEmbeddings", AnyMethod) != null)
+            .Where(t => !typeof(IVisionCapableModel).IsAssignableFrom(t))
+            .Select(t => t.Name)
+            .OrderBy(n => n)
+            .ToList();
+
+        Assert.True(undeclared.Count == 0,
+            $"These models have a SetVisionEmbeddings hook but do not implement IVisionCapableModel, " +
+            $"so nothing will ever call it: {string.Join(", ", undeclared)}.");
+    }
+
+    /// <summary>Same, for the audio hand-off.</summary>
+    [Fact]
+    public void EveryModelWithAnAudioHook_DeclaresTheAudioInterface()
+    {
+        var undeclared = ConcreteModels
+            .Where(t => t.GetMethod("SetAudioEmbeddings", AnyMethod) != null)
+            .Where(t => !typeof(IAudioCapableModel).IsAssignableFrom(t))
+            .Select(t => t.Name)
+            .OrderBy(n => n)
+            .ToList();
+
+        Assert.True(undeclared.Count == 0,
+            $"These models have a SetAudioEmbeddings hook but do not implement IAudioCapableModel: " +
+            $"{string.Join(", ", undeclared)}.");
+    }
+
+    /// <summary>A vision tower nobody can load is a tower nobody can use.</summary>
+    [Fact]
+    public void EveryVisionCapableModel_CanLoadItsProjector()
+    {
+        foreach (Type model in ConcreteModels.Where(t => typeof(IVisionCapableModel).IsAssignableFrom(t)))
+        {
+            Assert.True(model.GetMethod("LoadVisionEncoder", AnyMethod) != null,
+                $"{model.Name} implements IVisionCapableModel but has no LoadVisionEncoder.");
+        }
     }
 
     /// <summary>Muse-Glimmer specifically — the model this guard was written for.</summary>
     [Fact]
-    public void MuseGlimmer_IsCoveredByEveryVisionStage()
+    public void MuseGlimmer_DeclaresTheWholeVisionContract()
     {
-        foreach (string stage in new[]
-                 {
-                     "LoadProjectors",
-                     "ProcessPromptTokens",
-                     "QueuePreparedVisionEmbeddings",
-                     "QueuePreparedVisionEmbeddingsForSlice",
-                 })
-        {
-            Assert.True(ModelTypesReferencedBy(stage).Contains(typeof(MuseGlimmerModel)),
-                $"ModelMultimodalInjector.{stage} does not handle MuseGlimmerModel.");
-        }
+        Assert.True(typeof(IVisionCapableModel).IsAssignableFrom(typeof(MuseGlimmerModel)),
+            "MuseGlimmerModel does not declare IVisionCapableModel, so its images are silently dropped.");
+        Assert.True(PromptExpander.IsAssignableFrom(typeof(MuseGlimmerModel)),
+            "MuseGlimmerModel does not declare its prompt expansion, so its image tokens never expand.");
     }
 }

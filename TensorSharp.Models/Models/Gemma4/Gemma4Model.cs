@@ -1203,16 +1203,17 @@ namespace TensorSharp.Models
 
             EnsureCacheCapacity(startPos + seqLen);
 
-            // The tests' batched-vs-legacy comparison sets TS_GEMMA4_FORCE_UNFUSED=1
-            // to make the legacy path fully deterministic (no fused layer prefill,
-            // no fused decode).
-            bool _g4ForceUnfused =
-                System.Environment.GetEnvironmentVariable("TS_GEMMA4_FORCE_UNFUSED") == "1";
+            // The batched-vs-legacy comparison sets TS_GEMMA4_FORCE_UNFUSED=1 to make the
+            // legacy path fully deterministic (no fused layer prefill, no fused decode).
+            // This used to answer that by WRITING TS_FUSED_LAYER_PREFILL=0 into the
+            // process environment from inside a forward pass and never restoring it, so
+            // one Gemma 4 model asked to run unfused permanently disabled fused layer
+            // prefill for every other model in the process - including other
+            // architectures, and including after this model was disposed. It is a
+            // per-instance decision, so keep it on the instance.
+            bool _g4ForceUnfused = ForceUnfused;
             if (_g4ForceUnfused)
-            {
-                System.Environment.SetEnvironmentVariable("TS_FUSED_LAYER_PREFILL", "0");
                 useFusedDecode = false;
-            }
 
             long t0 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
@@ -1386,7 +1387,7 @@ namespace TensorSharp.Models
                 // W positions only, breaking attention for queries near the
                 // start of the chunk. Pre-allocating the dict here means the
                 // donor's TransformerBlock will populate it on its way out.
-                bool useFusedLayerPrefill = Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL") != "0";
+                bool useFusedLayerPrefill = UseFusedLayerPrefill;
                 bool useFusedLayerGraph = CanUseFusedLayerGraph(seqLen, exceptPositions, useFusedLayerPrefill);
 
                 if (_swaKVDonorLayers.Count > 0 && (seqLen > 1 || useFusedLayerGraph))
@@ -1996,7 +1997,7 @@ namespace TensorSharp.Models
                 if (useWholeModelPrefill || useWholeModelMoEPrefill)
                     EnsureKvCacheHostSynchronized();
 
-                bool useFusedLayerPrefill = Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL") != "0";
+                bool useFusedLayerPrefill = UseFusedLayerPrefill;
                 bool useFusedLayerGraph = CanUseFusedLayerGraph(seqLen, exceptPositions, useFusedLayerPrefill);
 
                 if (_swaKVDonorLayers.Count > 0 && (seqLen > 1 || useFusedLayerGraph))
@@ -4275,6 +4276,21 @@ namespace TensorSharp.Models
                    _tpQuantWeights.ContainsKey(downKey3D) || _tpQuantWeights.ContainsKey(downKey0) ||
                    _tpWeights.ContainsKey(downKey3D) || _tpWeights.ContainsKey(downKey0);
         }
+
+        /// <summary>
+        /// Force the fully unfused (and therefore fully deterministic) path for this
+        /// model instance: no fused layer prefill, no fused decode. Read per forward
+        /// because the batched-vs-legacy comparison flips it between two calls on the
+        /// same instance; it is one environment read per forward, off the per-token
+        /// kernel path.
+        /// </summary>
+        private static bool ForceUnfused =>
+            Environment.GetEnvironmentVariable("TS_GEMMA4_FORCE_UNFUSED") == "1";
+
+        /// <summary>Fused layer prefill, unless this instance was forced unfused or the
+        /// operator disabled it with TS_FUSED_LAYER_PREFILL=0.</summary>
+        private static bool UseFusedLayerPrefill =>
+            !ForceUnfused && Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL") != "0";
 
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos,
             bool isShared, Tensor perLayerInput, HashSet<int> exceptPositions = null)

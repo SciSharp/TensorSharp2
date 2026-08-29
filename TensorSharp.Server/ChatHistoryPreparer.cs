@@ -162,7 +162,10 @@ namespace TensorSharp.Server
         {
             int maxVideoFrames = MediaHelper.GetConfiguredMaxVideoFrames();
             // maxVideoFrames <= 0 means "no cap" (pure time-based extraction); leave history untouched.
-            if (arch != "gemma4" || maxVideoFrames <= 0 || !msg.IsVideo || msg.ImagePaths == null || msg.ImagePaths.Count <= maxVideoFrames)
+            // Whether a family expands a video into per-frame images (and so needs the
+            // cap) is declared with the rest of its chat protocol, not matched on here.
+            bool capsFrames = ChatProtocolRegistry.For(arch)?.CapsVideoFrames ?? false;
+            if (!capsFrames || maxVideoFrames <= 0 || !msg.IsVideo || msg.ImagePaths == null || msg.ImagePaths.Count <= maxVideoFrames)
                 return msg;
 
             var sampled = MediaHelper.SelectEvenlySpacedIndices(msg.ImagePaths.Count, maxVideoFrames)

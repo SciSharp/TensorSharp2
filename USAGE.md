@@ -13,7 +13,7 @@
 | GGML CUDA | `--backend ggml_cuda` | NVIDIA inference through ggml | GPU-accelerated via GGML CUDA on Windows or Linux. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
 | GGML Vulkan | `--backend ggml_vulkan` | Vendor-neutral GPU inference through ggml | GPU-accelerated via GGML Vulkan on Windows or Linux — runs on AMD, Intel, and NVIDIA GPUs with a Vulkan 1.3 driver, using cooperative-matrix shaders (KHR coopmat / NV coopmat2) where the driver supports them. Weights are device-resident like GGML CUDA and the same fused whole-model decode/prefill graphs are used. Enabled automatically at native build time when the machine has a Vulkan runtime (loader installed); the build downloads a portable Vulkan toolchain (headers, glslc, SPIRV-Headers, and on Windows a loader import lib) via `eng/fetch-vulkan-toolchain.ps1` / `eng/fetch-vulkan-toolchain.sh` when no Vulkan SDK or distro dev packages are installed. Opt out with `--no-vulkan` (or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`). |
 | GGML CPU | `--backend ggml_cpu` | Native CPU kernels | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
-| Pure C# CPU | `--backend cpu` | Portability and debugging | Portable CPU inference with no native dependencies. |
+| Pure C# CPU | `--backend cpu` | Portability and debugging | Portable CPU inference with no native dependencies. The managed matmuls run on a persistent spin-then-park worker pool sized at half the usable cores by default (`TS_CPU_THREADS` and the other `TS_CPU_*` knobs below), and on the direct video networks (Wan, MiniMax-H3) a quantized weight is multiplied straight out of its GGUF storage type instead of being expanded to F32 at load (`TS_DIRECT_QUANT_WEIGHTS=0` restores the expansion). |
 
 **DeepSeek V4 Flash is the exception to the table above.** Its 284B compressed-sparse-attention MoE stack runs through one of three dedicated whole-model executors rather than the generic per-op path: a direct-CUDA engine (`--backend cuda`), the native ggml executor (`--backend ggml_cuda` / `ggml_vulkan`), and a 100% pure-C# CPU executor (`--backend cpu`) that serves quantized weights straight from the memory-mapped GGUF shards. All three layer-split the weights across every visible GPU (or, on CPU, stream them from the mapped shards), so a model far larger than one card still runs. See the [DeepSeek V4 card](docs/models/deepseek4.md).
 
@@ -286,7 +286,7 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--repeat-penalty <f>` | Repetition penalty (1.0 = none) |
 | `--presence-penalty <f>` | Presence penalty (0 = disabled) |
 | `--frequency-penalty <f>` | Frequency penalty (0 = disabled) |
-| `--seed <N>` | Random seed (-1 = non-deterministic) |
+| `--seed <N>` | Random seed for **text** sampling (-1 = non-deterministic). Image and video generation take their noise from `--diffusion-seed` instead. |
 | `--stop <string>` | Stop sequence (can be repeated) |
 | `--dump-prompt` | Render the prompt + tokenization and exit (no generation) |
 | `--benchmark` | Run a synthetic prefill/decode throughput benchmark |
@@ -301,7 +301,7 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--correct-prefill <N>` | Prompt length used by `--test-chunked-prefill` |
 | `--correct-decode <N>` | Decode length used by `--test-chunked-prefill` |
 | `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-Edit, the FlowMatch-Euler step count — omit for auto (30, or the step count of a loaded Lightning LoRA). |
-| `--diffusion-seed <N>` | DiffusionGemma deterministic sampler seed (default: 0) |
+| `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler (default: 0), Qwen-Image-Edit, and video generation (Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
 | `--image <path>` | Input image for Qwen-Image-Edit (also the image input for multimodal chat). Required to trigger image-edit mode on a `qwen_image` DiT GGUF. |
 | `--prompt <text>` | Qwen-Image-Edit edit instruction (falls back to `--input` file contents if omitted). |
@@ -872,7 +872,10 @@ scene comes back well rendered with the subject missing.
 | model quant | — | `-Q8_0` denoiser over `-Q4_K` if memory allows. |
 
 `--cfg` is not a quality lever (H3 only accepts 1.0) and `--negative-prompt` does
-nothing, because there is no unconditional pass.
+nothing, because there is no unconditional pass. Note that the seed here is
+`--diffusion-seed`, not `--seed`: `--seed` is the text sampling seed and leaves the
+clip alone, and without `--diffusion-seed` every run draws a fresh random one — so
+two runs meant to be compared need it set explicitly.
 
 **On the server, size is a startup flag.** The browser sends the prompt plus whatever
 conditioning the hosted checkpoint advertises — a first frame, a last frame, or up to
@@ -946,6 +949,17 @@ encoder that may not be installed. Combine them with:
 ```bash
 ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4
 ```
+
+**`--backend cpu` runs the whole thing with no ggml.** Prompt encoding, denoising,
+video VAE decode and the audio vocoder all have pure-C# implementations, and so do the
+vision tower, the causal 3-D video VAE encoder and the audio VAE encoder — so `t2v`,
+`i2v`, `fl2v` and reference images, clips and soundtracks all work there. Everything
+runs at F32 on the host, so it is for correctness, portability and machines with no
+accelerator rather than for speed; a 256x160x5f single-step `t2v` measured 69 s against
+14 s on `ggml_cpu`, while the same `i2v` measured 70 s against 176 s (a single
+sample -- do not read too much into that direction). Agreement with
+the GGML path and the one stage whose residual is larger than GGML's own internal
+spread (the vision tower) are written up in the model card.
 
 Full detail, including the architecture and the verification numbers:
 [docs/models/minimax-h3.md](docs/models/minimax-h3.md).
@@ -1636,6 +1650,8 @@ The full list, including the debug and A/B knobs, is in the
 | Text-encoder trunk run in layer groups, each group's device copy released | OFF | `TS_H3_TE_GROUP=N` layers per group — removes the encoder's own spill (peak 16 041 → 12 981 MiB) and is bit-identical, but measured ~3 s slower on a 16 GB RTX 3080 Laptop: a one-shot prefill reads each weight once, so grouping moves all 17 GB anyway and adds allocate/invalidate churn | — |
 | Per-stage timing breakdown (encoder open / trunk / teardown, prefault, each denoise step, VAE open / decode) | OFF | `TS_H3_PHASE=1` | — |
 | Per-step latent / velocity magnitudes | OFF | `TS_H3_TRACE=1` | — |
+| Execution path | seven native whole-network ggml graphs | — | `--backend cpu` runs the same pipeline in pure C# instead (t2v, i2v, fl2v and reference conditioning) |
+| Managed-vs-GGML parity diagnostics | OFF | `TS_H3_DUMP_TE`, `TS_H3_DUMP_VEL_V`, `TS_H3_DUMP_VEL_A`, `TS_H3_DUMP_VIS` write those tensors to disk so ONE forward can be compared across the two paths; `TS_H3_DIT_LAYERS=N` truncates the trunk on BOTH paths, turning the comparison into an error-vs-depth curve; `TS_H3_NO_FLASH=1` runs GGML's explicit-softmax attention instead of its flash kernel | — |
 | Companion network + tokenizer overrides | resolved next to the denoiser | `TS_VIDEO_TEXT_ENCODER`, `TS_VIDEO_VAE`, `TS_VIDEO_AUDIO_VAE`, `TS_VIDEO_TOKENIZER` | `--video-te`, `--video-vae`, `--audio-vae` |
 
 #### Tensor parallelism & distributed inference
@@ -1665,6 +1681,7 @@ The full list, including the debug and A/B knobs, is in the
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
 | Default compute backend | `ggml_metal` (macOS), `ggml_cpu` (Windows/Linux) | `BACKEND` | `--backend` |
+| First-forward logit dump (backend A/B) | OFF | `TS_DUMP_LOGITS=<path>` writes the first REAL forward's logits there once, as raw float32, and deliberately skips the warm-up forwards (`WarmUpKernels` runs its own throwaway decode and prefill first, so dumping those compares two executors on a meaningless token). Lets two backends be compared by logit vector instead of by generated text, where greedy decoding turns a near-tie into a visibly different sentence | — |
 | MLX backend library lookup | probe app dir | `TENSORSHARP_MLX_LIBRARY` (full path to `libmlxc`), `TENSORSHARP_MLX_LIBRARY_DIR` (directory) | — |
 | MLX pipelined greedy decode (CLI only) | ON when eligible | `TS_MLX_PIPELINED_DECODE=0` disables | — |
 | MLX `mlock(2)` of GGUF mmap so weights stay resident | ON | `TS_MLX_MLOCK_GGUF=0` to disable | — |
@@ -1674,6 +1691,26 @@ The full list, including the debug and A/B knobs, is in the
 | MLX on-device MoE router top-K + softmax | ON when prerequisites are met | `TS_MLX_DEVICE_ROUTER=0` disables | — |
 | MLX layer-boundary `async_eval` cadence | Gemma 4: every 4 layers; Qwen / Nemotron: every 16 layers | `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS=N` or `TS_MLX_EVAL_EVERY_N_LAYERS=N` (`0` = disabled where supported) | — |
 | MLX allocator caps (memory / cache / wired buffer) | host-derived | `TS_MLX_MEMORY_LIMIT_MB`, `TS_MLX_CACHE_LIMIT_MB`, `TS_MLX_WIRED_LIMIT_MB` | — |
+
+#### Pure C# CPU backend (`--backend cpu`)
+
+The managed matmuls run on a persistent spin-then-park worker pool instead of a
+`Parallel.For` per matmul. It deliberately does **not** take every core: the rest of
+the CPU path still uses the ThreadPool, and pool workers spin between jobs, so
+spinning on every core starves that other work. Measured on gemma-4-E4B-it-Q8_0 with
+a 122-CPU allocation (prefill / decode tok/s, two interleaved runs per
+cell): pool off 21.7,21.0 / 2.0,2.4; 32 threads 24.9,24.1 / 4.9,5.0; 48 threads
+25.6,28.5 / 5.4,6.0; 61 threads 24.2,24.9 / 6.3,5.9; 122 threads 13.5 / 4.8 — so
+roughly +15% prefill and 2.8x decode at the default width. At 122 only prefill
+regresses; decode still beats the pool-off baseline.
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Worker-pool width | every core up to 8 CPUs; half above that, never below 8 | `TS_CPU_THREADS=N` | — |
+| Worker pool at all | ON | `TS_CPU_POOL=0` reverts to the ThreadPool `Parallel.For` behaviour, so the two can be A/B-ed in one binary | — |
+| Spin iterations before a worker parks | `4096` | `TS_CPU_SPIN=N` — parking is the expensive part at this width, so the default spins long enough that the steady state never parks | — |
+| Work-item sizing for a managed matmul | `131072` weight bytes per item, at most `4` items per worker | `TS_CPU_TASK_BYTES`, `TS_CPU_TASKS_PER_WORKER` — sized from the work rather than the thread count | — |
+| Quantized weights on the direct video networks (Wan, MiniMax-H3) | kept in their GGUF storage type and multiplied there | `TS_DIRECT_QUANT_WEIGHTS=0` expands every quantized weight to F32 once at load and runs a plain GEMM instead (the previous behaviour; 4x the weight memory). On Wan at 256x160x5f, one step, the in-place path measured 80.9 s against 121.4 s | — |
 
 #### Sampling defaults (server-only)
 

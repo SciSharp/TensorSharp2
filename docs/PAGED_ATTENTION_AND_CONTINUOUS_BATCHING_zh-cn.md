@@ -6,19 +6,52 @@
 以及迭代级连续批处理的实现参考。服务端默认通过这套引擎执行推理；旧的
 单请求 FIFO 队列对象只作为队列状态 / 事件形状的 no-op 兼容 shim 保留。
 
+请把本文当作实现参考，而不是性能承诺：分页 K/V 池目前驻留在主机内存，实测表明
+当前没有任何一条路径能把并发转化为总吞吐；真正可用的是正确、公平的并发服务。
+参见[并发实测表现](#并发实测表现)。
+
 ## 当前状态
 
 | 范围 | 状态 |
 |---|---|
 | 服务端引擎 | `TensorSharp.Server` 为当前加载模型持有一个 `InferenceEngineHost`。`ChatGenerationPipeline` 将渲染后的 prompt 提交给引擎，并从 `InferenceRequestHandle` 流式读取 token。 |
 | 调度器 | `ContinuousBatchScheduler` 负责接纳等待请求、在块压力下抢占运行中的序列、应用每步 token 预算，并按内容哈希共享完整前缀块。 |
-| KV 存储 | `BlockPool`、`BlockTable`、`PagedKvStorage`、`BlockHashIndex` 持有固定大小物理块，包含引用计数、LRU 空闲顺序与内容寻址查找。 |
+| KV 存储 | `BlockPool`、`BlockTable`、`PagedKvStorage`、`BlockHashIndex` 持有固定大小物理块，包含引用计数、LRU 空闲顺序与内容寻址查找。块字节存放在**托管主机内存**中。 |
 | 批处理执行 | 实现 `IBatchedPagedModel.ForwardBatch` 的模型会把本轮所有序列打包到一次模型调用中，显式传入 `positions`、`slotMapping`、`queryStartLoc` 与每序列 block table。 |
 | 回退执行 | 路径选择集中在 `ExecutionPlanner`：模型+后端能力（`ExecutionCapabilities`）、运维覆盖（`ExecutionOptions`）与每步请求特征共同产出 `ExecutionPlan`（选中路径、回退链、被拒原因）。模型仍可对某个具体 batch 抛出 `NotSupportedException`，该步会落入计划中的下一个候选，最终止于按序列 KV-swap 路径。 |
 | 原生注意力 | `TSGgml_PagedAttentionForward` 在 C++ 中聚合分页 K/V 并派发 `ggml_flash_attn_ext`；GPT OSS 使用 `TSGgml_PagedAttentionForwardWithSinks`。 |
 | 投机解码 | 可选的 MTP / NextN 草稿头加速单序列（无并发）请求。`BatchExecutor` 为实现了 `IBatchedSpeculativeTarget` 的模型（Qwen 3.6 内嵌 NextN；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）驱动共享的 `SpeculativeExecution` 起草 / 验证 / 回滚核心。默认关闭；服务端 `--mtp-spec`。详见 [投机解码（MTP / NextN）](#投机解码mtp--nextn)。 |
+| 并发吞吐 | **当前没有任何路径能随并发扩展。** 无论同时有多少序列在跑，`BatchedPaged` 路径都会在约 **69 tok/s** 处饱和，因为分页 KV cache 驻留在主机内存。按序列 slot 与迭代级调度本身确实有效。参见[并发实测表现](#并发实测表现)。 |
+| 设备驻留分页池 | **已实现，但未接入。** `TSGgml_PagedKvPool*`（`TensorSharp.GGML.Native/ggml_ops_paged_kv_pool.cpp`）与其托管封装 `DevicePagedKvCache`（`TensorSharp.Models/Paged/DevicePagedKvCache.cs`）都已存在，但没有任何模型或 executor 调用它们，因此它还不是已交付的功能。 |
 | 队列 API | `InferenceQueue` 是 no-op 兼容层。`/api/queue/status` 与队列位置事件形状保留给依赖这些字段的客户端，不再承担请求串行化。 |
 | 扩散模型 | DiffusionGemma 不进入这套自回归 `ForwardBatch` 契约。CLI 生成使用 `DiffusionGemmaSampler`；Web UI 使用 `DiffusionBatchScheduler` 在 block 边界批处理去噪工作。 |
+
+## 并发实测表现
+
+本文描述的机制都存在且正确，但它们原本要换取的吞吐还没有兑现；下文任何内容都
+不应被读成对吞吐的承诺。
+
+- **当前没有任何路径能把并发转化为总吞吐。** 在 gemma-4-E4B / 1x Blackwell 上
+  通过服务端 chat 接口实测，无论同时有多少序列在跑，`BatchedPaged` 路径都会在
+  约 **69 tok/s** 处饱和。
+- **原因在于 K/V 放在哪里。** `PagedKvStorage` 是托管主机内存，因此批处理路径在
+  每一步的每一层都要把序列历史从主机内存聚合出来并推过总线。即便是原生内核也
+  只对 Q 与 OUT 做零拷贝——`ggml_ops_paged_attention.cpp` 里就写着 "K and V are
+  still passed as host scratch arrays (the caller gathers …)"。相对按序列 fused
+  decode，这大约是 **7.7 倍的每 token 开销**，而且随总历史长度增长。
+- **默认的并发路径并不是批处理路径。** 对声明了 `SupportsPerSequenceFusedForward`
+  的模型，`ExecutionPlanner` 在 N >= 2 时选择 `PerSequenceFused`，也就是跑 N 次
+  独立的 fused 前向：单请求既正确又快，但权重读取从未在整批上摊薄——而这正是
+  连续批处理存在的意义。
+- **确实有效的部分。** 迭代级调度、块哈希前缀共享、抢占、按序列原生 slot 与
+  per-request fused holder。并发请求能被正确且公平地服务；没有随 N 提升的是合计
+  tok/s。
+- **已实现但未接入。** 设备驻留的分页 K/V 池已经存在
+  （`TensorSharp.GGML.Native/ggml_ops_paged_kv_pool.cpp`，托管封装为
+  `TensorSharp.Models/Paged/DevicePagedKvCache.cs`）：池本身是后端张量，一步的
+  K/V 用 `ggml_set_rows` 写入，序列历史在注意力图内用 `ggml_get_rows` 在设备侧
+  聚合。**但没有任何模型或 executor 调用它。** 它还不是已交付的功能，也没有改变
+  上面任何一个数字。
 
 ## 分层架构
 
@@ -45,13 +78,14 @@ InferenceEngine
         |      - 前缀块采纳
         |
         +--> BatchExecutor
-               - 可用时调用 ForwardBatch
-               - 否则按序列交换 KV 块
+               - 执行 ExecutionPlanner 选中的路径
+               - 按序列 fused / 批处理 ForwardBatch /
+                 按序列 KV-swap 回退
                - 采样 decode token
                - 捕获新写满的 KV 块
         |
         v
-BlockPool + PagedKvStorage + BlockHashIndex
+BlockPool + PagedKvStorage + BlockHashIndex   (托管主机内存)
 ```
 
 ### 核心组件
@@ -66,6 +100,7 @@ BlockPool + PagedKvStorage + BlockHashIndex
 | `PagedKvBatchOps` | `TensorSharp.Runtime/Paged/PagedKvBatchOps.cs` | 批处理 K/V scatter 与每序列最后 token gather。 |
 | `ManagedPagedAttention` | `TensorSharp.Runtime/Paged/ManagedPagedAttention.cs` | 纯 C# 分页注意力正确性回退。 |
 | `TensorPagedAttention` | `TensorSharp.Models/Paged/TensorPagedAttention.cs` | 基于 Tensor 算子的分页注意力回退。 |
+| `DevicePagedKvCache` | `TensorSharp.Models/Paged/DevicePagedKvCache.cs` | 基于 `TSGgml_PagedKvPool*` 的设备驻留分页 K/V 池。**已实现，但未接入任何模型**——目前没有任何地方构造它。 |
 | `SequenceState` | `TensorSharp.Runtime/Scheduling/SequenceState.cs` | 每请求的状态、token、块、logits 与采样信息。 |
 | `ContinuousBatchScheduler` | `TensorSharp.Runtime/Scheduling/ContinuousBatchScheduler.cs` | 带前缀缓存与抢占的迭代级调度器。 |
 | `BatchExecutor` | `TensorSharp.Runtime/Scheduling/BatchExecutor.cs` | 执行计划中的步骤、采样并捕获 KV 块。 |
@@ -156,8 +191,13 @@ ExecutionPlan
 
 ### 批处理路径
 
-批处理路径是多请求推理的快路径。它避免了 K/V 所有权交换，并在所有调度 token
-上摊薄线性投影开销。当前大多数批处理移植在 GGML 后端使用原生分页注意力：
+批处理路径把本轮所有序列打包进一次前向：它避免了 K/V 所有权交换，并在所有调度
+token 上摊薄线性投影开销。它是唯一能在整批上摊薄权重读取的路径，但它的 K/V 池
+驻留在主机内存，所以这份摊薄目前并没有变成吞吐（见
+[并发实测表现](#并发实测表现)）。对声明了按序列 fused 前向的模型，planner 在
+N >= 2 时改选 `PerSequenceFused`，因此 `BatchedPaged` 实际服务的是没有 fused
+前向的模型——或显式设置 `TS_PER_SEQ_FUSED=0` 做 A/B 时。当前大多数批处理移植在
+GGML 后端使用原生分页注意力：
 
 | 内核 | 范围 | 说明 |
 |---|---|---|
@@ -280,7 +320,10 @@ flash-attention 路径，`q4_0`（约为 f32 的 1/7）面向 KV cache 主导内
 ## 后续工作
 
 - 为整批注意力构建一个原生 GGML 图，而不是每个序列一个小图。这会降低大量短序列场景下的 launch / compile 开销。
-- 在后端支持且收益明确时，将 K/V 聚合从 CPU memcpy 迁移到 GPU 侧 `ggml_get_rows` 或等价 indexed gather。
+- 把设备驻留的分页 K/V 池接入某个模型。池本身已经实现（`ggml_ops_paged_kv_pool.cpp`
+  加 `DevicePagedKvCache`），用 `ggml_set_rows` 写入与设备侧 `ggml_get_rows` 读取
+  取代主机聚合，但还没有任何模型把分页 K/V 分配到那里，所以批处理路径仍然保持
+  主机驻留的 cache 与实测上限。这是并发能换来任何吞吐的前提。
 - 补齐 Gemma 4 对 MoE 变体、多模态待注入 embedding、块量化 KV cache 的批处理覆盖。
 - 根据实际运维需要，决定是否把 DiffusionGemma scheduler 指标接入
   `/api/queue/status` 或单独的 diffusion 端点。

@@ -518,37 +518,18 @@ namespace TensorSharp.Runtime
             bool addGenerationPrompt = true, string? architecture = null,
             List<ToolFunction>? tools = null, bool enableThinking = false)
         {
-            if (IsQwen35Family(architecture) && !enableThinking)
+            // Several families ship a template built on Jinja features the lightweight
+            // engine renders inconsistently (recursive macros, namespaces, tojson, dict
+            // walkers), and their formats are simple enough to render directly. Which
+            // ones, and under what condition, is declared once per family in
+            // ChatProtocolRegistry rather than as a chain of name comparisons here.
+            var protocol = ChatProtocolRegistry.For(architecture);
+            if (protocol?.PreferOwnRenderer != null
+                && protocol.PreferOwnRenderer(new ChatRenderRequest(
+                    messages, addGenerationPrompt, architecture, tools, enableThinking)))
+            {
                 return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
-
-            if (architecture == "mistral3")
-                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
-
-            if (architecture == "nemotron_h" || architecture == "nemotron_h_moe" || architecture == "nemotron_h_omni")
-                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
-
-            // DeepSeek V4: the GGUF-embedded (Unsloth) template leans on Jinja
-            // features the lightweight engine handles inconsistently (nested
-            // namespaces, from_json, dict.items()); the format itself is simple,
-            // so always use the purpose-built renderer.
-            if (architecture == "deepseek4")
-                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
-
-            // gpt-oss / Harmony: the embedded template relies on advanced Jinja
-            // features (recursive macros, namespace(), strftime_now, list slicing)
-            // that the lightweight engine does not fully support — especially on the
-            // tool-rendering path. Use the purpose-built hardcoded renderer instead so
-            // tool declarations and tool-call framing are always correct.
-            if (architecture == "gptoss" || architecture == "gpt-oss")
-                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
-
-            // GLM-5.x: the shipped template is built out of macros, namespaces,
-            // `tojson`, and a `visible_text` walker over structured content — the
-            // exact feature set the lightweight Jinja engine renders inconsistently.
-            // The format itself is a handful of sentinel tokens, so use the
-            // purpose-built renderer and keep tool framing correct.
-            if (IsGlmDsa(architecture))
-                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+            }
 
             if (!string.IsNullOrWhiteSpace(template))
             {
@@ -643,44 +624,15 @@ namespace TensorSharp.Runtime
             bool addGenerationPrompt, string? architecture,
             List<ToolFunction>? tools = null, bool enableThinking = false)
         {
-            if (architecture == "gemma3")
-                return RenderGemma3(messages, addGenerationPrompt);
+            var request = new ChatRenderRequest(messages, addGenerationPrompt, architecture, tools, enableThinking);
+            var render = ChatProtocolRegistry.For(architecture)?.Render;
 
-            if (architecture == "gemma4")
-                return RenderGemma4(messages, addGenerationPrompt, tools, enableThinking);
-
-            if (architecture == "gptoss" || architecture == "gpt-oss")
-                return RenderHarmony(messages, addGenerationPrompt, tools, enableThinking);
-
-            if (architecture == "qwen35" || architecture == "qwen35moe" || architecture == "qwen3next" ||
-                architecture == "qwen3vl" || architecture == "qwen3vlmoe")
-            {
-                return RenderQwen35(messages, addGenerationPrompt, enableThinking, tools);
-            }
-
-            if (architecture == "nemotron_h" || architecture == "nemotron_h_moe" || architecture == "nemotron_h_omni")
-                return RenderNemotron(messages, addGenerationPrompt, tools, enableThinking);
-
-            if (architecture == "mistral3")
-                return RenderMistral3(messages, addGenerationPrompt);
-
-            if (architecture == "deepseek4")
-                return RenderDeepSeek4(messages, addGenerationPrompt, enableThinking, tools);
-
-            if (IsGlmDsa(architecture))
-                return RenderGlmDsa(messages, addGenerationPrompt, enableThinking, tools);
-
-            if (IsGlm5Next(architecture))
-                return RenderGlm5Next(messages, addGenerationPrompt, enableThinking, tools);
-
-            return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
+            // No purpose-built renderer: generic ChatML, which is also what an
+            // unrecognised architecture gets.
+            return render != null
+                ? render(request)
+                : RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
         }
-
-        internal static bool IsGlmDsa(string? architecture)
-            => architecture == "glm-dsa" || architecture == "glm_dsa";
-
-        internal static bool IsGlm5Next(string? architecture)
-            => architecture == "glm5next";
 
         private const string GlmToolsHeader =
             "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" +
@@ -1147,54 +1099,12 @@ namespace TensorSharp.Runtime
                     continue;
                 }
 
+                // Which placeholder tokens a family's template expects is declared
+                // once, beside its renderer and its output parser, in
+                // ChatProtocolRegistry. A text-only protocol declares none and the
+                // message content is passed through unchanged.
                 var sb = new StringBuilder();
-                if (architecture == "gemma4")
-                {
-                    if (msg.IsVideo && msg.ImagePaths != null)
-                        sb.Append("<|video>");
-                    if (msg.ImagePaths != null)
-                        foreach (var _ in msg.ImagePaths) sb.Append("<|image>");
-                    if (msg.AudioPaths != null)
-                        foreach (var _ in msg.AudioPaths) sb.Append("<|audio>");
-                }
-                else if (architecture == "gemma3")
-                {
-                    if (msg.ImagePaths != null)
-                        foreach (var _ in msg.ImagePaths) sb.Append("<start_of_image>");
-                }
-                else if (architecture is "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe" or "qwen4exp")
-                {
-                    if (msg.ImagePaths != null)
-                        foreach (var _ in msg.ImagePaths)
-                            sb.Append("<|vision_start|><|image_pad|><|vision_end|>");
-                }
-                else if (architecture == "mistral3")
-                {
-                    if (msg.ImagePaths != null)
-                        foreach (var _ in msg.ImagePaths)
-                            sb.Append("[IMG]");
-                }
-                else if (architecture == "glm5next")
-                {
-                    // GLM-5.3-Flash: the template's emit_image() macro. The host
-                    // later expands the single <|image|> into N placeholder
-                    // tokens matching the merged patch count.
-                    if (msg.ImagePaths != null)
-                        foreach (var _ in msg.ImagePaths)
-                            sb.Append("<|begin_of_image|><|image|><|end_of_image|>");
-                }
-                else if (architecture is "muse-glimmer" or "muse_glimmer")
-                {
-                    // The GGUF Jinja template renders an image content part as a
-                    // single <|patch|> and a video part as <|video|>. The host
-                    // (CLI / ModelMultimodalInjector) later expands each <|patch|>
-                    // into <|image_start|> + N filler rows + <|image_end|>, matching
-                    // llama.cpp's mtmd chunking for PROJECTOR_TYPE_MUSE_GLIMMER.
-                    if (msg.IsVideo && msg.ImagePaths != null)
-                        sb.Append("<|video|>");
-                    else if (msg.ImagePaths != null)
-                        foreach (var _ in msg.ImagePaths) sb.Append("<|patch|>");
-                }
+                ChatProtocolRegistry.For(architecture)?.AppendMediaPlaceholders?.Invoke(msg, sb);
 
                 sb.Append(msg.Content ?? "");
 

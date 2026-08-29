@@ -66,6 +66,85 @@ download() {
     fi
 }
 
+# --- system package manager --------------------------------------------------
+#
+# Before downloading anything, try the distro's own packages. On this machine's
+# first Vulkan build the portable path was the ONLY path, and it failed: the
+# shaderc CI tarball download died and the build degraded to no-Vulkan even
+# though `apt-get install glslc libvulkan-dev spirv-headers` would have worked
+# in seconds. Distro packages are also the only way to get a glslc whose SPIR-V
+# version matches the system loader.
+#
+# Opt out with TENSORSHARP_GGML_NO_SYSTEM_VULKAN=1 (air-gapped builders, or a
+# machine where the packaged glslc is too old and the portable one is wanted).
+sudo_if_needed() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -n "$@" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+}
+
+# Package sets per manager: build toolchain first, then the RUNTIME pieces the
+# ICD needs. A build that links fine and then dies at
+# vk::createInstance: ErrorIncompatibleDriver is the GLVND gap - the NVIDIA
+# Vulkan ICD cannot load without libEGL/libGL, and nothing about the BUILD
+# reveals that, so provision both together.
+try_system_vulkan_packages() {
+    is_truthy "${TENSORSHARP_GGML_NO_SYSTEM_VULKAN:-}" && return 1
+
+    local build_pkgs=() runtime_pkgs=()
+    if command -v apt-get >/dev/null 2>&1; then
+        build_pkgs=(libvulkan-dev glslc spirv-headers glslang-tools)
+        runtime_pkgs=(libvulkan1 libegl1 libgl1 libglvnd0)
+        # A stale index is the usual reason this fails with "no installation
+        # candidate" on a container image; refresh once, quietly.
+        sudo_if_needed apt-get update -qq >/dev/null 2>&1 || true
+        sudo_if_needed env DEBIAN_FRONTEND=noninteractive apt-get install -y             "${build_pkgs[@]}" "${runtime_pkgs[@]}" >/dev/null 2>&1 || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo_if_needed dnf install -y vulkan-headers vulkan-loader-devel glslc             spirv-headers libglvnd-egl libglvnd-glx >/dev/null 2>&1 || return 1
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo_if_needed pacman -S --noconfirm --needed vulkan-headers vulkan-icd-loader             shaderc spirv-headers libglvnd >/dev/null 2>&1 || return 1
+    elif command -v zypper >/dev/null 2>&1; then
+        sudo_if_needed zypper --non-interactive install vulkan-devel glslc             spirv-headers libglvnd >/dev/null 2>&1 || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        sudo_if_needed apk add --no-cache vulkan-headers vulkan-loader-dev shaderc             spirv-headers >/dev/null 2>&1 || return 1
+    else
+        return 1
+    fi
+
+    have_glslc && [[ -f /usr/include/vulkan/vulkan.h || -f /usr/local/include/vulkan/vulkan.h ]]
+}
+
+# Does the SYSTEM already satisfy everything ggml-vulkan needs to build - headers,
+# glslc, and the SPIRV-Headers CMake package find_package() looks for? When so,
+# nothing has to be downloaded or staged at all.
+system_toolchain_complete() {
+    have_glslc || return 1
+    local d
+    for d in /usr/include /usr/local/include; do
+        [[ -f "${d}/vulkan/vulkan.h" ]] || continue
+        local c
+        for c in /usr/share/cmake /usr/lib/cmake /usr/local/share/cmake /usr/local/lib/cmake                  /usr/lib/x86_64-linux-gnu/cmake /usr/lib/aarch64-linux-gnu/cmake; do
+            [[ -f "${c}/SPIRV-Headers/SPIRV-HeadersConfig.cmake" ]] && return 0
+        done
+    done
+    return 1
+}
+
+if ! vulkan_sdk_complete && ! toolchain_complete && ! system_toolchain_complete; then
+    if try_system_vulkan_packages; then
+        echo "vulkan-toolchain: provisioned from system packages (glslc + Vulkan headers)"
+    fi
+fi
+
+if ! vulkan_sdk_complete && system_toolchain_complete; then
+    echo "vulkan-toolchain: system already provides glslc, Vulkan headers and SPIRV-Headers; nothing to stage"
+    exit 0
+fi
+
 if vulkan_sdk_complete; then
     echo "vulkan-toolchain: using installed Vulkan SDK at ${VULKAN_SDK}"
     exit 0

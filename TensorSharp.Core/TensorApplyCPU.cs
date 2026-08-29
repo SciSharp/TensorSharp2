@@ -1534,27 +1534,7 @@ namespace TensorSharp
 		}
 
 
-		unsafe static public void AddSigmoidD(Tensor result, Tensor t, Tensor resW, Tensor resG)
-		{
-			unsafe void func(float* r, float* x, float* y, float* z)
-			{
-				*r = addSigmoidD(*x, *y, *z);
-			}
 
-			Apply4(result, t, resW, resG, func);
-		}
-
-
-
-		unsafe static public void SigmoidD(Tensor result, Tensor resW, Tensor resG)
-		{
-			unsafe void func(float* r, float* x, float* y)
-			{
-				*r = sigmoidD(*x, *y);
-			}
-
-			Apply3(result, resW, resG, func);
-		}
 
 
 
@@ -1621,58 +1601,8 @@ namespace TensorSharp
             Apply2(result, src, func);
         }
 
-        unsafe static public void TanhD(Tensor result, Tensor resW, Tensor resG)
-		{
-			unsafe void func(float* r, float* x, float* y)
-			{
-				*r = tanhD(*x, *y);
-			}
-
-			Apply3(result, resW, resG, func);
-		}
 
 
-
-		unsafe static public void AddTanh(Tensor result, Tensor srcX, Tensor srcY)
-		{
-			unsafe void func(float* r, float* x, float* y)
-			{
-				*r = addtanh(*x, *y);
-			}
-
-			Apply3(result, srcX, srcY, func);
-		}
-
-
-		unsafe static public void AddTanhD(Tensor result, Tensor srcX, Tensor srcY, Tensor srcZ)
-		{
-			unsafe void func(float* r, float* x, float* y, float* z)
-			{
-				*r = addtanhD(*x, *y, *z);
-
-			}
-			Apply4(result, srcX, srcY, srcZ, func);
-		}
-
-		unsafe static public void ReluD(Tensor result, Tensor srcW, Tensor resG)
-		{
-			unsafe void func(float* r, float* y, float* x)
-			{
-				*r = relud(*y, *x);
-			}
-
-			Apply3(result, srcW, resG, func);
-		}
-
-		unsafe static public void AddReluD(Tensor result, Tensor srcX, Tensor srcW, Tensor srcG)
-		{
-			unsafe void func(float* r, float*x, float* w, float* g)
-			{
-				*r = addrelud(*x, *w, *g);
-			}
-
-			Apply4(result, srcX, srcW, srcG, func);
-		}
 
 		unsafe static public void SiLU(Tensor result, Tensor src)
 		{
@@ -1955,32 +1885,6 @@ namespace TensorSharp
 		}
 
 
-		unsafe static public void BuildSelfMask(Tensor result, Tensor originalLengths, int rows, int cols, int paddedSeqLen, float value, float maskedValue)
-		{
-			float* ptResult = (float*)CpuNativeHelpers.GetBufferStart(result);
-			float* ptOriginalLengths = (float*)CpuNativeHelpers.GetBufferStart(originalLengths);
-
-			for (int j = 0; j < rows; j++)
-			{
-				float* resultRow = ptResult + j * cols;
-				int batchIdx = j / paddedSeqLen;
-				int seqIdxInBatch = j % paddedSeqLen;
-
-				for (int id = 0; id < cols; id++)
-				{
-					int originalLength = (int)ptOriginalLengths[batchIdx];
-					if (id < originalLength && seqIdxInBatch < originalLength)
-					{
-						resultRow[id] = value;
-					}
-					else
-					{
-						resultRow[id] = maskedValue;
-					}
-				}
-			}
-		}
-
 
 
 		unsafe static public void RepeatInterleave(float* dst, float* src, int sliceCount, int repeats, int sliceSize)
@@ -2048,87 +1952,9 @@ namespace TensorSharp
         }
 	}
 
-		unsafe static public void BuildTriMask(Tensor result, int rows, int cols, float value, float maskedValue)
-		{
-			float* ptResult = (float*)CpuNativeHelpers.GetBufferStart(result);
-
-			for (int j = 0; j < rows; j++)
-			{
-				float* resultRow = ptResult + j * cols;
-				for (int id = 0; id < cols; id++)
-				{
-
-					if (id <= j)
-					{
-						resultRow[id] = value;
-					}
-					else
-					{
-						resultRow[id] = maskedValue;
-					}
-				}
-			}
-		}
 
 
 
-		unsafe static public void BuildSelfTriMask(Tensor result, Tensor originalLengths, int rows, int cols, int paddedSeqLen, float value, float maskedValue)
-		{
-			float* ptResult = (float*)CpuNativeHelpers.GetBufferStart(result);
-			float* ptOriginalLengths = (float*)CpuNativeHelpers.GetBufferStart(originalLengths);
-
-			for (int j = 0; j < rows; j++)
-			{
-				float* resultRow = ptResult + j * cols;
-				int batchIdx = j / paddedSeqLen;
-				int seqIdxInBatch = j % paddedSeqLen;
-
-				for (int id = 0; id < cols; id++)
-				{
-					int originalLength = (int)ptOriginalLengths[batchIdx];
-					if (id < originalLength && seqIdxInBatch < originalLength && id <= seqIdxInBatch)
-					{
-						resultRow[id] = value;
-					}
-					else
-					{
-						resultRow[id] = maskedValue;
-					}
-
-				}
-			}
-		}
-
-
-
-		unsafe static public void BuildSrcTgtMask(Tensor result, Tensor srcOriginalLengths, Tensor tgtOriginalLengths, int rows, int cols, int tgtPaddedSeqLen, float value, float maskedValue)
-		{
-			float* ptResult = (float*)CpuNativeHelpers.GetBufferStart(result);
-			float* ptSrcOriginalLengths = (float*)CpuNativeHelpers.GetBufferStart(srcOriginalLengths);
-			float* ptTgtOriginalLengths = (float*)CpuNativeHelpers.GetBufferStart(tgtOriginalLengths);
-
-			for (int j = 0; j < rows; j++)
-			{
-				float* resultRow = ptResult + j * cols;
-				int batchIdx = j / tgtPaddedSeqLen;
-				int seqIdxInBatch = j % tgtPaddedSeqLen;
-
-				for (int id = 0; id < cols; id++)
-				{
-					int srcOriginalLength = (int)ptSrcOriginalLengths[batchIdx];
-					int tgtOriginalLength = (int)ptTgtOriginalLengths[batchIdx];
-
-					if (id < srcOriginalLength && seqIdxInBatch < tgtOriginalLength)
-					{
-						resultRow[id] = value;
-					}
-					else
-					{
-						resultRow[id] = maskedValue;
-					}
-				}
-			}
-		}
 
 
 		unsafe static public void replace_smaller(float* array, float* arrayIdx, int k, float data, float idx)
@@ -2211,15 +2037,6 @@ namespace TensorSharp
 				}
 			}
 		}
-
-        unsafe static private int ReadPosition(Tensor positions, int index)
-        {
-            return positions.ElementType switch
-            {
-                DType.Int32 => ((int*)CpuNativeHelpers.GetBufferStart(positions))[index],
-                _ => (int)((float*)CpuNativeHelpers.GetBufferStart(positions))[index],
-            };
-        }
 
         unsafe static public void RoPEEx(Tensor tOut, Tensor tIn, Tensor positions, int rows, int cols, int ropeDim, int mode, float freqBase, float freqScale,
             int nCtxOrig = 0, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f)
@@ -2402,24 +2219,6 @@ namespace TensorSharp
 				}
 			}
 		}
-
-		unsafe static public bool IsCorrupted(Tensor tIn, int rows, int cols)
-		{
-            float* pIn = (float*)CpuNativeHelpers.GetBufferStart(tIn);
-
-            for (int j = 0; j < rows; ++j)
-            {
-                float* sp = pIn + j * cols;
-                for (int i = 0; i < cols; ++i)
-                {
-					if (float.IsFinite(sp[i]) == false)
-					{
-						return true;
-					}
-                }
-            }
-			return false;
-        }
 
 		unsafe static public void Softmax(Tensor tOut, Tensor tIn, int rows, int cols)
 		{
@@ -2912,205 +2711,6 @@ namespace TensorSharp
 
 		}
 
-        unsafe static public void LayerNormGrad(Tensor gradX_,
-			Tensor gradGamma_,
-			Tensor gradBeta_,
-			Tensor adj_,
-			Tensor y_,
-			Tensor x_,
-			Tensor gamma_,
-			Tensor beta_,
-			int rows,
-			int cols,
-			float eps)
-		{
-			float* gradX = (float*)CpuNativeHelpers.GetBufferStart(gradX_);
-			float* gradGamma = (float*)CpuNativeHelpers.GetBufferStart(gradGamma_);
-			float* gradBeta = gradBeta_ != null ? (float*)CpuNativeHelpers.GetBufferStart(gradBeta_) : null;
-			float* adj = (float*)CpuNativeHelpers.GetBufferStart(adj_);
-			float* y = (float*)CpuNativeHelpers.GetBufferStart(y_);
-			float* x = (float*)CpuNativeHelpers.GetBufferStart(x_);
-			float* gamma = (float*)CpuNativeHelpers.GetBufferStart(gamma_);
-			float* beta = beta_ != null ? (float*)CpuNativeHelpers.GetBufferStart(beta_) : null;
-
-			if (beta != null)
-			{
-				for (int j = 0; j < rows; ++j)
-				{
-					float* xRow = x + j * cols;
-					float* yRow = y + j * cols;
-					float* adjRow = adj + j * cols;
-					float* gradXRow = gradX + j * cols;
-
-					float sum_x = 0.0f;
-					float sum_adj = 0.0f;
-					float sum_adj_x = 0.0f;
-					float sum_sqr = 0.0f;
-
-					for (int i = 0; i < cols; ++i)
-					{
-						sum_x += xRow[i];
-						sum_adj_x += adjRow[i] * (yRow[i] - (beta != null ? beta[i] : 0.0f)) / gamma[i];
-						sum_adj += adjRow[i];
-					}
-
-					float mean = sum_x / cols;
-					for (int i = 0; i < cols; ++i)
-					{
-						float ex = xRow[i] - mean;
-						sum_sqr += ex * ex;
-					}
-
-					float sigma = (float)Math.Sqrt(eps + sum_sqr / cols);
-					for (int i = 0; i < cols; ++i)
-					{
-						float grad_x = 0.0f;
-						float x_hat = (yRow[i] - beta[i]) / gamma[i];
-						grad_x += cols * adjRow[i];
-						grad_x -= sum_adj;
-						grad_x -= sum_adj_x * x_hat;
-						grad_x /= cols * sigma;
-
-						gradXRow[i] += gamma[i] * grad_x;
-						gradGamma[i] += adjRow[i] * x_hat;
-						gradBeta[i] += adjRow[i];
-					}
-				}
-			}
-			else
-			{
-				for (int j = 0; j < rows; ++j)
-				{
-					float* xRow = x + j * cols;
-					float* yRow = y + j * cols;
-					float* adjRow = adj + j * cols;
-					float* gradXRow = gradX + j * cols;
-
-					float sum_x = 0.0f;
-					float sum_adj = 0.0f;
-					float sum_adj_x = 0.0f;
-					float sum_sqr = 0.0f;
-
-					for (int i = 0; i < cols; ++i)
-					{
-						sum_x += xRow[i];
-						sum_adj_x += adjRow[i] * (yRow[i] - (beta != null ? beta[i] : 0.0f)) / gamma[i];
-						sum_adj += adjRow[i];
-					}
-
-					float mean = sum_x / cols;
-
-					for (int i = 0; i < cols; ++i)
-					{
-						float ex = xRow[i] - mean;
-						sum_sqr += ex * ex;
-					}
-
-					float sigma = (float)Math.Sqrt(eps + sum_sqr / cols);
-
-					for (int i = 0; i < cols; ++i)
-					{
-						float grad_x = 0.0f;
-						float x_hat = yRow[i] / gamma[i];
-						grad_x += cols * adjRow[i];
-						grad_x -= sum_adj;
-						grad_x -= sum_adj_x * x_hat;
-						grad_x /= cols * sigma;
-
-						gradXRow[i] += gamma[i] * grad_x;
-						gradGamma[i] += adjRow[i] * x_hat;
-					}
-				}
-			}
-		}
-
-
-		unsafe static public void RMSNormGrad(Tensor gradX_,
-			Tensor gradGamma_,
-			Tensor gradBeta_,
-			Tensor adj_,
-			Tensor y_,
-			Tensor x_,
-			Tensor gamma_,
-			Tensor beta_,
-			int rows,
-			int cols,
-			float eps)
-		{
-			float* gradX = (float*)CpuNativeHelpers.GetBufferStart(gradX_);
-			float* gradGamma = (float*)CpuNativeHelpers.GetBufferStart(gradGamma_);
-			float* gradBeta = (gradBeta_ != null) ? (float*)CpuNativeHelpers.GetBufferStart(gradBeta_) : null;
-            float* adj = (float*)CpuNativeHelpers.GetBufferStart(adj_);
-			float* y = (float*)CpuNativeHelpers.GetBufferStart(y_);
-			float* x = (float*)CpuNativeHelpers.GetBufferStart(x_);
-			float* gamma = (float*)CpuNativeHelpers.GetBufferStart(gamma_);
-            float* beta = (beta_ != null) ? (float*)CpuNativeHelpers.GetBufferStart(beta_) : null;
-			bool bias = (beta_ != null);
-
-            float N = cols;
-			for (int j = 0; j < rows; j++)
-			{
-				float* xRow = x + j * cols;
-				float* yRow = y + j * cols;
-				float* adjRow = adj + j * cols;
-
-				float sum_adj_r = (float)0.0f;
-				float sum_sqr = (float)0.0f;
-
-				for (int id = 0; id < cols; id++)
-				{
-
-					float xv = xRow[id];
-					float yv = yRow[id];
-					float betav = bias ? beta[id] : 0.0f;
-					float gammav = (float)gamma[id];
-					float adjv = adjRow[id];
-					float rv = (yv - betav) / gammav; // go back to RMSNorm(x) from scaled and shifted version for accumulation
-
-					sum_adj_r += adjv * rv;
-					sum_sqr += xv * xv;
-
-				}
-
-				float rms = (float)Math.Sqrt(sum_sqr / N + eps);
-
-				// Jacobian of RMS norm
-				// J = [ \frac{1}{N * rms} (N\delta_{ij} - RN_i RN_j) ]_{ij}
-				// J * a = dC/dx_i = ( N a_i - RN_i \sum_j RN_j a_j ) / (N * rms)
-
-				for (int id = 0; id < cols; id++)
-				{
-
-					float xv = xRow[id];
-					float gammav = (float)gamma[id];
-					float adjv = adjRow[id];
-					float rmsNorm = xv / rms;
-
-					float gradNorm = N * adjv - rmsNorm * sum_adj_r;
-					gradNorm /= N * rms;
-
-					float gradXv = gammav * gradNorm;
-
-					// Keep RMSN gradient between [-1000, 1000] for TensorOps, this currently used for making values fit into fp16. This wil also clip inf. 
-					// @TODO: to be fixed and removed.
-					float sign = Math.Sign(gradXv); //functional::Ops<AccType>::sgn(gradXv);
-					float cutoff = (float)1000.0f; // @TODO: expose this somehow as an option? or better: make obsolete.
-					gradXv = Math.Abs(gradXv) > cutoff ? sign * cutoff : gradXv; // if gradXv is NaN the value return is NaN too because NaN > value is false.
-
-					// @TODO: frankly, this is embarrasing and should rather be removed or optional? It does help for low precision computation though. Maybe turn into option?
-					gradXv = float.IsNaN(gradXv) ? 0.0f : gradXv; // turn NaN into 0.
-
-					float* gradXRow = gradX + j * cols;
-					gradXRow[id] += (float)(gradXv);
-
-					gradGamma[id] += (float)(adjv * rmsNorm);
-					if (bias)
-					{
-						gradBeta[id] += adjRow[id];
-					}
-                }
-			}
-		}
 
 
         unsafe static public void Adam(Tensor tw, Tensor tg, Tensor tv, Tensor tm, int rows, int cols, float gradNormFactor, float step_size, float clipval, float regc, float decay_rate_v, float decay_rate_m, int iter, float eps)

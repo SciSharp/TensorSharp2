@@ -142,141 +142,6 @@ namespace TensorSharp.GGML
             return expected == t.ElementCount();
         }
 
-        [RegisterOpStorageType("buildtrimask", typeof(GgmlStorage))]
-        public static unsafe Tensor BuildTriMask(Tensor result, float value, float maskedValue)
-        {
-            ValidateMaskResultTensor(result, "buildtrimask");
-            GetFlatRowsCols(result, "buildtrimask", out int rows, out int cols);
-
-            float* resultPtr = (float*)GetBufferStart(result);
-            for (int row = 0; row < rows; ++row)
-            {
-                float* resultRow = resultPtr + row * cols;
-                for (int col = 0; col < cols; ++col)
-                {
-                    resultRow[col] = col <= row ? value : maskedValue;
-                }
-            }
-
-            return result;
-        }
-
-        [RegisterOpStorageType("buildselfmask", typeof(GgmlStorage))]
-        public static unsafe Tensor BuildSelfMask(Tensor result, Tensor originalLengths, int paddedSeqLen, float value, float maskedValue)
-        {
-            ValidateMaskResultTensor(result, "buildselfmask");
-            ValidateMaskLengthsTensor(originalLengths, nameof(originalLengths), "buildselfmask");
-            GetFlatRowsCols(result, "buildselfmask", out int rows, out int cols);
-
-            if (paddedSeqLen <= 0 || (rows % paddedSeqLen) != 0)
-            {
-                throw new InvalidOperationException("buildselfmask expects rows to be divisible by paddedSeqLen.");
-            }
-
-            int batchSize = rows / paddedSeqLen;
-            if (originalLengths.ElementCount() != batchSize)
-            {
-                throw new InvalidOperationException("buildselfmask expects one original length per batch item.");
-            }
-
-            float* resultPtr = (float*)GetBufferStart(result);
-            float* originalLengthsPtr = (float*)GetBufferStart(originalLengths);
-            for (int row = 0; row < rows; ++row)
-            {
-                float* resultRow = resultPtr + row * cols;
-                int batchIdx = row / paddedSeqLen;
-                int seqIdxInBatch = row % paddedSeqLen;
-                int originalLength = (int)originalLengthsPtr[batchIdx];
-
-                for (int col = 0; col < cols; ++col)
-                {
-                    resultRow[col] = (col < originalLength && seqIdxInBatch < originalLength) ? value : maskedValue;
-                }
-            }
-
-            return result;
-        }
-
-        [RegisterOpStorageType("buildselftrimask", typeof(GgmlStorage))]
-        public static unsafe Tensor BuildSelfTriMask(Tensor result, Tensor originalLengths, int paddedSeqLen, float value, float maskedValue)
-        {
-            ValidateMaskResultTensor(result, "buildselftrimask");
-            ValidateMaskLengthsTensor(originalLengths, nameof(originalLengths), "buildselftrimask");
-            GetFlatRowsCols(result, "buildselftrimask", out int rows, out int cols);
-
-            if (paddedSeqLen <= 0 || (rows % paddedSeqLen) != 0)
-            {
-                throw new InvalidOperationException("buildselftrimask expects rows to be divisible by paddedSeqLen.");
-            }
-
-            int batchSize = rows / paddedSeqLen;
-            if (originalLengths.ElementCount() != batchSize)
-            {
-                throw new InvalidOperationException("buildselftrimask expects one original length per batch item.");
-            }
-
-            float* resultPtr = (float*)GetBufferStart(result);
-            float* originalLengthsPtr = (float*)GetBufferStart(originalLengths);
-            for (int row = 0; row < rows; ++row)
-            {
-                float* resultRow = resultPtr + row * cols;
-                int batchIdx = row / paddedSeqLen;
-                int seqIdxInBatch = row % paddedSeqLen;
-                int originalLength = (int)originalLengthsPtr[batchIdx];
-
-                for (int col = 0; col < cols; ++col)
-                {
-                    resultRow[col] = (col < originalLength && seqIdxInBatch < originalLength && col <= seqIdxInBatch) ? value : maskedValue;
-                }
-            }
-
-            return result;
-        }
-
-        [RegisterOpStorageType("buildsrctgtmask", typeof(GgmlStorage))]
-        public static unsafe Tensor BuildSrcTgtMask(Tensor result, Tensor srcOriginalLengths, Tensor tgtOriginalLengths, int srcPaddedSeqLen, int tgtPaddedSeqLen, float value, float maskedValue)
-        {
-            ValidateMaskResultTensor(result, "buildsrctgtmask");
-            ValidateMaskLengthsTensor(srcOriginalLengths, nameof(srcOriginalLengths), "buildsrctgtmask");
-            ValidateMaskLengthsTensor(tgtOriginalLengths, nameof(tgtOriginalLengths), "buildsrctgtmask");
-            GetFlatRowsCols(result, "buildsrctgtmask", out int rows, out int cols);
-
-            if (tgtPaddedSeqLen <= 0 || (rows % tgtPaddedSeqLen) != 0)
-            {
-                throw new InvalidOperationException("buildsrctgtmask expects rows to be divisible by tgtPaddedSeqLen.");
-            }
-
-            int batchSize = rows / tgtPaddedSeqLen;
-            if (srcOriginalLengths.ElementCount() != batchSize || tgtOriginalLengths.ElementCount() != batchSize)
-            {
-                throw new InvalidOperationException("buildsrctgtmask expects source and target length tensors to match batch size.");
-            }
-
-            if (cols != srcPaddedSeqLen)
-            {
-                throw new InvalidOperationException("buildsrctgtmask expects the result last dimension to equal srcPaddedSeqLen.");
-            }
-
-            float* resultPtr = (float*)GetBufferStart(result);
-            float* srcOriginalLengthsPtr = (float*)GetBufferStart(srcOriginalLengths);
-            float* tgtOriginalLengthsPtr = (float*)GetBufferStart(tgtOriginalLengths);
-            for (int row = 0; row < rows; ++row)
-            {
-                float* resultRow = resultPtr + row * cols;
-                int batchIdx = row / tgtPaddedSeqLen;
-                int seqIdxInBatch = row % tgtPaddedSeqLen;
-                int srcOriginalLength = (int)srcOriginalLengthsPtr[batchIdx];
-                int tgtOriginalLength = (int)tgtOriginalLengthsPtr[batchIdx];
-
-                for (int col = 0; col < cols; ++col)
-                {
-                    resultRow[col] = (col < srcOriginalLength && seqIdxInBatch < tgtOriginalLength) ? value : maskedValue;
-                }
-            }
-
-            return result;
-        }
-
         // Detects the common 2D contiguous float32 layout that lets us
         // bypass TensorDimIterState. result/src/indices must all be 2D
         // contiguous and indices/result must share shape (the public API
@@ -1975,6 +1840,35 @@ namespace TensorSharp.GGML
         /// sequence block table (concatenated flat ints + per-seq offsets).
         /// One Metal/CUDA kernel per sequence per layer.
         /// </summary>
+        /// <summary>Allocate the device-resident paged K/V pool, or
+        /// <see cref="IntPtr.Zero"/> when the backend cannot (no GGML backend,
+        /// out of VRAM). Callers treat Zero as "keep the host pool".</summary>
+        public static IntPtr PagedKvPoolCreate(
+            int numLayers, int numBlocks, int blockSize, int numKvHeads, int headDim)
+            => GgmlNative.PagedKvPoolCreate(numLayers, numBlocks, blockSize, numKvHeads, headDim);
+
+        public static void PagedKvPoolFree(IntPtr handle) => GgmlNative.PagedKvPoolFree(handle);
+
+        public static long PagedKvPoolBytes(IntPtr handle) => GgmlNative.PagedKvPoolBytes(handle);
+
+        public static bool PagedKvPoolGrow(IntPtr handle, int newNumBlocks)
+            => GgmlNative.PagedKvPoolGrow(handle, newNumBlocks);
+
+        /// <summary>Write one step's K/V into the pool at the mapped slots.</summary>
+        public static void PagedKvPoolScatter(
+            IntPtr handle, int layer, float[] kData, float[] vData, int[] slotMapping, int numTokens)
+            => GgmlNative.PagedKvPoolScatter(handle, layer, kData, vData, slotMapping, numTokens);
+
+        /// <summary>Batched flash attention against the device-resident pool.</summary>
+        public static void PagedKvPoolAttention(
+            IntPtr handle, int layer, float[] qData, float[] outData,
+            int[] queryStartLoc, int[] seqLens, int[] positions,
+            int[] blockTableFlat, int[] blockTableOffsets,
+            int numSeqs, int numTokens, int numHeads, float scale, int slidingWindow = 0)
+            => GgmlNative.PagedKvPoolAttention(handle, layer, qData, outData,
+                queryStartLoc, seqLens, positions, blockTableFlat, blockTableOffsets,
+                numSeqs, numTokens, numHeads, scale, slidingWindow);
+
         public static void PagedAttentionForward(
             float[] qData,
             float[] pagedKData,
@@ -3563,43 +3457,6 @@ namespace TensorSharp.GGML
             return writeTarget;
         }
 
-        [RegisterOpStorageType("mulmatid", typeof(GgmlStorage))]
-        public static Tensor MulmatID(Tensor result, Tensor expertWeights, Tensor input, Tensor ids)
-        {
-            ValidateMulMatIdArguments(result, expertWeights, input, ids);
-
-            long[] outputSizes = new long[] { input.Sizes[0], ids.Sizes[1], expertWeights.Sizes[1] };
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, expertWeights.Allocator, DType.Float32, false, outputSizes);
-            if (!TryCreateStandardView(writeTarget, out GgmlTensorView3D resultView)
-                || !TryCreateStandardView(expertWeights, out GgmlTensorView3D expertView)
-                || !TryCreateStandardView(input, out GgmlTensorView3D inputView)
-                || !TryCreateContiguousTensor(ids, out GgmlContiguousTensor idsTensor, DType.Float32, DType.Int32))
-            {
-                throw new NotSupportedException("GGML mulmatid requires Float32 standard-layout 3D tensors and a contiguous Float32/Int32 id matrix.");
-            }
-
-            GgmlNative.MulMatId(resultView, expertView, inputView, idsTensor, (int)ids.Sizes[0], (int)ids.Sizes[1]);
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("addid", typeof(GgmlStorage))]
-        public static Tensor AddID(Tensor result, Tensor src, Tensor bias, Tensor ids)
-        {
-            ValidateAddIdArguments(result, src, bias, ids);
-
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
-            if (!TryCreateStandardView(writeTarget, out GgmlTensorView3D resultView)
-                || !TryCreateStandardView(src, out GgmlTensorView3D srcView)
-                || !TryCreateStandardView(bias, out GgmlTensorView2D biasView)
-                || !TryCreateContiguousTensor(ids, out GgmlContiguousTensor idsTensor, DType.Float32, DType.Int32))
-            {
-                throw new NotSupportedException("GGML addid requires Float32 standard-layout source/result tensors, a standard-layout 2D bias matrix, and a contiguous Float32/Int32 id matrix.");
-            }
-
-            GgmlNative.AddId(resultView, srcView, biasView, idsTensor, (int)ids.Sizes[0], (int)ids.Sizes[1]);
-            return writeTarget;
-        }
-
         [RegisterOpStorageType("softmax", typeof(GgmlStorage))]
         public static Tensor Softmax(Tensor result, Tensor src)
         {
@@ -4028,52 +3885,6 @@ namespace TensorSharp.GGML
             return writeTarget;
         }
 
-        [RegisterOpStorageType("softmaxgrad", typeof(GgmlStorage))]
-        public static Tensor SoftmaxGrad(Tensor grad, Tensor adj, Tensor val, bool addGrad = true)
-        {
-            ValidateSoftmaxGradArguments(grad, adj, val);
-
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(grad, adj, false, adj.Sizes);
-            if (!TryCreateStandardView(writeTarget, out GgmlTensorView4D resultView)
-                || !TryCreateStandardView(adj, out GgmlTensorView4D adjView)
-                || !TryCreateStandardView(val, out GgmlTensorView4D valView))
-            {
-                throw new NotSupportedException("GGML softmaxgrad requires Float32 tensors with 1 to 4 dimensions and a row-contiguous layout.");
-            }
-
-            GgmlNative.SoftmaxGrad(resultView, adjView, valView, addGrad);
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("adam", typeof(GgmlStorage))]
-        public static Tensor Adam(
-            Tensor tw,
-            Tensor tg,
-            Tensor tv,
-            Tensor tm,
-            float gradNormFactor,
-            float stepSize,
-            float clipval,
-            float regc,
-            float decayRateV,
-            float decayRateM,
-            int iter,
-            float eps)
-        {
-            ValidateAdamArguments(tw, tg, tv, tm);
-
-            if (!TryCreateContiguousTensor(tw, out GgmlContiguousTensor weight)
-                || !TryCreateContiguousTensor(tg, out GgmlContiguousTensor gradient)
-                || !TryCreateContiguousTensor(tv, out GgmlContiguousTensor v)
-                || !TryCreateContiguousTensor(tm, out GgmlContiguousTensor m))
-            {
-                throw new NotSupportedException("GGML Adam requires contiguous Float32 tensors.");
-            }
-
-            GgmlNative.Adam(weight, gradient, v, m, gradNormFactor, stepSize, clipval, regc, decayRateV, decayRateM, iter, eps);
-            return tw;
-        }
-
         [RegisterOpStorageType("copy", typeof(GgmlStorage))]
         public static unsafe void Copy(Tensor result, Tensor src)
         {
@@ -4253,115 +4064,11 @@ namespace TensorSharp.GGML
         [RegisterOpStorageType("argmax", typeof(GgmlStorage))]
         public static unsafe Tensor Argmax(Tensor result, Tensor src, int dimension) => ExecuteIndexReduction(result, src, dimension, false, "argmax");
 
-        [RegisterOpStorageType("topK", typeof(GgmlStorage))]
-        public static void TopK(Tensor outVal, Tensor outIdx, Tensor src, int k)
-        {
-            ValidateGgmlTensor(src, nameof(src), "topK");
-            ValidateGgmlTensor(outVal, nameof(outVal), "topK");
-            ValidateGgmlTensor(outIdx, nameof(outIdx), "topK");
-
-            if (k <= 0 || k > src.Sizes[^1])
-            {
-                throw new ArgumentOutOfRangeException(nameof(k), "topK requires 0 < k <= last dimension.");
-            }
-
-            int ndim = src.DimensionCount;
-            long storageSize = TensorDimensionHelpers.GetStorageSize(src.Sizes, src.Strides);
-            long cols = src.Sizes[ndim - 1];
-            if (storageSize % cols != 0)
-            {
-                throw new InvalidOperationException("topK expects a tensor that can be flattened into full rows along the last dimension.");
-            }
-
-            long rows = storageSize / cols;
-            if (outVal.Sizes.Length != src.Sizes.Length || outIdx.Sizes.Length != src.Sizes.Length)
-            {
-                throw new InvalidOperationException("topK expects outVal/outIdx to have the same rank as src.");
-            }
-
-            for (int i = 0; i < src.Sizes.Length - 1; i++)
-            {
-                if (outVal.Sizes[i] != src.Sizes[i] || outIdx.Sizes[i] != src.Sizes[i])
-                {
-                    throw new InvalidOperationException("topK expects outVal/outIdx to match src in every dimension except the last.");
-                }
-            }
-
-            if (outVal.Sizes[^1] != k || outIdx.Sizes[^1] != k)
-            {
-                throw new InvalidOperationException("topK expects the last output dimension to equal k.");
-            }
-
-            float[] input = src.GetElementsAsFloat((int)src.ElementCount());
-            float[] values = new float[rows * k];
-            float[] indices = new float[rows * k];
-
-            for (int row = 0; row < rows; row++)
-            {
-                int rowOffset = checked((int)(row * cols));
-                int outOffset = checked((int)(row * k));
-                for (int i = 0; i < k; i++)
-                {
-                    values[outOffset + i] = float.NegativeInfinity;
-                    indices[outOffset + i] = -1.0f;
-                }
-
-                for (int col = 0; col < cols; col++)
-                {
-                    float candidate = input[rowOffset + col];
-                    for (int slot = 0; slot < k; slot++)
-                    {
-                        if (candidate <= values[outOffset + slot])
-                        {
-                            continue;
-                        }
-
-                        for (int shift = k - 1; shift > slot; shift--)
-                        {
-                            values[outOffset + shift] = values[outOffset + shift - 1];
-                            indices[outOffset + shift] = indices[outOffset + shift - 1];
-                        }
-
-                        values[outOffset + slot] = candidate;
-                        indices[outOffset + slot] = col;
-                        break;
-                    }
-                }
-            }
-
-            outVal.CopyFrom(values);
-            outIdx.CopyFrom(indices);
-        }
-
-        [RegisterOpStorageType("iscorrupted", typeof(GgmlStorage))]
-        public static unsafe bool IsCorrupted(Tensor src)
-        {
-            ValidateGgmlTensor(src, nameof(src), "iscorrupted");
-
-            float* buffer = (float*)GetBufferStart(src);
-            TensorIterState iter = new TensorIterState(buffer, src.DimensionCount, src.SizesMemory, src.StridesMemory);
-            do
-            {
-                for (; !iter.ReachedBlockEnd(); iter.BlockStep())
-                {
-                    if (!float.IsFinite(*iter.data))
-                    {
-                        return true;
-                    }
-                }
-            } while (iter.NextBlock());
-
-            return false;
-        }
-
         [RegisterOpStorageType("abs", typeof(GgmlStorage))]
         public static Tensor Abs(Tensor result, Tensor src) => ExecuteUnary(result, src, GgmlUnaryOp.Abs, "abs");
 
         [RegisterOpStorageType("neg", typeof(GgmlStorage))]
         public static Tensor Neg(Tensor result, Tensor src) => ExecuteUnary(result, src, GgmlUnaryOp.Neg, "neg");
-
-        [RegisterOpStorageType("sqrt", typeof(GgmlStorage))]
-        public static Tensor Sqrt(Tensor result, Tensor src) => ExecuteUnary(result, src, GgmlUnaryOp.Sqrt, "sqrt");
 
         [RegisterOpStorageType("exp", typeof(GgmlStorage))]
         public static Tensor Exp(Tensor result, Tensor src) => ExecuteUnary(result, src, GgmlUnaryOp.Exp, "exp");
@@ -4526,30 +4233,6 @@ namespace TensorSharp.GGML
             return writeTarget;
         }
 
-        [RegisterOpStorageType("relud", typeof(GgmlStorage))]
-        public static Tensor ReluD(Tensor result, Tensor w, Tensor g) => ExecuteActivationGrad(result, null, w, g, GgmlActivationGradOp.Relu, "relud");
-
-        [RegisterOpStorageType("addrelud", typeof(GgmlStorage))]
-        public static Tensor AddReluD(Tensor result, Tensor src, Tensor w, Tensor g) => ExecuteActivationGrad(result, src, w, g, GgmlActivationGradOp.Relu, "addrelud");
-
-        [RegisterOpStorageType("sigmoidD", typeof(GgmlStorage))]
-        public static Tensor SigmoidD(Tensor result, Tensor resW, Tensor resG) => ExecuteActivationGrad(result, null, resW, resG, GgmlActivationGradOp.Sigmoid, "sigmoidD");
-
-        [RegisterOpStorageType("addsigmoidD", typeof(GgmlStorage))]
-        public static Tensor AddSigmoidD(Tensor result, Tensor t, Tensor resW, Tensor resG) => ExecuteActivationGrad(result, t, resW, resG, GgmlActivationGradOp.Sigmoid, "addsigmoidD");
-
-        [RegisterOpStorageType("tanhD", typeof(GgmlStorage))]
-        public static Tensor TanhD(Tensor result, Tensor resW, Tensor resG) => ExecuteActivationGrad(result, null, resW, resG, GgmlActivationGradOp.Tanh, "tanhD");
-
-        [RegisterOpStorageType("addtanhD", typeof(GgmlStorage))]
-        public static Tensor AddTanhD(Tensor result, Tensor t, Tensor resW, Tensor resG) => ExecuteActivationGrad(result, t, resW, resG, GgmlActivationGradOp.Tanh, "addtanhD");
-
-        [RegisterOpStorageType("SiLUD", typeof(GgmlStorage))]
-        public static Tensor SiLUD(Tensor result, Tensor srcW, Tensor resG) => ExecuteActivationGrad(result, null, srcW, resG, GgmlActivationGradOp.SiLU, "SiLUD");
-
-        [RegisterOpStorageType("AddSiLUD", typeof(GgmlStorage))]
-        public static Tensor AddSiLUD(Tensor result, Tensor srcG, Tensor srcW, Tensor resG) => ExecuteActivationGrad(result, srcG, srcW, resG, GgmlActivationGradOp.SiLU, "AddSiLUD");
-
         [RegisterOpStorageType("layernorm", typeof(GgmlStorage))]
         public static Tensor LayerNorm(Tensor result, Tensor src, Tensor gamma, Tensor beta, float eps)
             => ExecuteNorm(result, src, gamma, beta, eps, GgmlNormOp.LayerNorm, "layernorm");
@@ -4557,14 +4240,6 @@ namespace TensorSharp.GGML
         [RegisterOpStorageType("rmsnorm", typeof(GgmlStorage))]
         public static Tensor RMSNorm(Tensor result, Tensor src, Tensor gamma, Tensor beta, float eps)
             => ExecuteNorm(result, src, gamma, beta, eps, GgmlNormOp.RmsNorm, "rmsnorm");
-
-        [RegisterOpStorageType("layernormgrad", typeof(GgmlStorage))]
-        public static Tensor LayerNormGrad(Tensor result, Tensor gradGamma, Tensor gradBeta, Tensor adj, Tensor y, Tensor x, Tensor gamma, Tensor beta, float eps)
-            => ExecuteNormGrad(result, gradGamma, gradBeta, adj, y, x, gamma, beta, eps, GgmlNormOp.LayerNorm, "layernormgrad");
-
-        [RegisterOpStorageType("rmsnormgrad", typeof(GgmlStorage))]
-        public static Tensor RMSNormGrad(Tensor result, Tensor gradGamma, Tensor gradBeta, Tensor adj, Tensor y, Tensor x, Tensor gamma, Tensor beta, float eps)
-            => ExecuteNormGrad(result, gradGamma, gradBeta, adj, y, x, gamma, beta, eps, GgmlNormOp.RmsNorm, "rmsnormgrad");
 
         [RegisterOpStorageType("indexselect", typeof(GgmlStorage))]
         public static Tensor IndexSelect(Tensor result, Tensor src, Tensor indice, bool isAdd)
@@ -4581,22 +4256,6 @@ namespace TensorSharp.GGML
 
             GgmlNative.IndexSelect(resultView, srcView, indexTensor, isAdd);
             return writeTarget;
-        }
-
-        [RegisterOpStorageType("indexselectgrad", typeof(GgmlStorage))]
-        public static Tensor IndexSelectGrad(Tensor grad, Tensor adj, Tensor indice)
-        {
-            ValidateIndexSelectGradArguments(grad, adj, indice);
-
-            if (!TryCreateStandardView(grad, out GgmlTensorView2D gradView)
-                || !TryCreateStandardView(adj, out GgmlTensorView2D adjView)
-                || !TryCreateContiguousTensor(indice, out GgmlContiguousTensor indexTensor, DType.Float32, DType.Int32))
-            {
-                throw new NotSupportedException("GGML indexselectgrad requires Float32 row-contiguous gradient/adjoint matrices and a contiguous Float32/Int32 index vector.");
-            }
-
-            GgmlNative.IndexSelectGrad(gradView, adjView, indexTensor);
-            return grad;
         }
 
         [RegisterOpStorageType("repeat_interleave", typeof(GgmlStorage))]
@@ -4690,22 +4349,6 @@ namespace TensorSharp.GGML
             }
 
             GgmlNative.RoPE(resultView, srcView, seqLen, rowOffset);
-            return writeTarget;
-        }
-
-        [RegisterOpStorageType("ropegrad", typeof(GgmlStorage))]
-        public static Tensor RoPEGrad(Tensor grad, Tensor adj, int seqLen, int rowOffset)
-        {
-            ValidateRoPEArguments(grad, adj, seqLen, "ropegrad");
-
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(grad, adj, false, adj.Sizes);
-            if (!TryCreateStandardView(writeTarget, out GgmlTensorView4D resultView)
-                || !TryCreateStandardView(adj, out GgmlTensorView4D adjView))
-            {
-                throw new NotSupportedException("GGML ropegrad requires Float32 tensors with 2 to 4 dimensions and a row-contiguous layout.");
-            }
-
-            GgmlNative.RoPEGrad(resultView, adjView, seqLen, rowOffset);
             return writeTarget;
         }
 
@@ -4891,18 +4534,6 @@ namespace TensorSharp.GGML
             return writeTarget;
         }
 
-        [RegisterOpStorageType("float2half", typeof(GgmlStorage))]
-        public Tensor Float2Half(Tensor result, Tensor src)
-        {
-            throw new NotSupportedException("GGML backends currently support Float32 tensors only. Disable AMP to use this backend.");
-        }
-
-        [RegisterOpStorageType("half2float", typeof(GgmlStorage))]
-        public Tensor Half2Float(Tensor result, Tensor src)
-        {
-            throw new NotSupportedException("GGML backends currently support Float32 tensors only. Disable AMP to use this backend.");
-        }
-
         private static Tensor ExecuteUnary(Tensor result, Tensor src, GgmlUnaryOp op, string opName)
         {
             ValidateUnaryArguments(result, src, opName);
@@ -5039,13 +4670,6 @@ namespace TensorSharp.GGML
             return result;
         }
 
-        [RegisterOpStorageType("atomicadd", typeof(GgmlStorage))]
-        public static Tensor AtomicAdd(Tensor result, Tensor rhs)
-        {
-            ValidateBinaryTensorArguments(result, result, rhs, "atomicadd");
-            return ExecuteAtomicAddHost(result, rhs);
-        }
-
         private static unsafe Tensor ExecuteAtomicAddHost(Tensor result, Tensor rhs)
         {
             TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory);
@@ -5074,24 +4698,6 @@ namespace TensorSharp.GGML
             };
         }
 
-        private static Tensor ExecuteActivationGrad(Tensor result, Tensor accumulation, Tensor src, Tensor grad, GgmlActivationGradOp op, string opName)
-        {
-            ValidateActivationGradArguments(result, accumulation, src, grad, opName);
-
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
-            GgmlTensorView4D accumulationView = default;
-            if (!TryCreateStandardView(writeTarget, out GgmlTensorView4D resultView)
-                || !TryCreateStandardView(src, out GgmlTensorView4D srcView)
-                || !TryCreateStandardView(grad, out GgmlTensorView4D gradView)
-                || (accumulation != null && !TryCreateStandardView(accumulation, out accumulationView)))
-            {
-                throw new NotSupportedException($"GGML {opName} requires Float32 tensors with 1 to 4 dimensions and a row-contiguous layout.");
-            }
-
-            GgmlNative.ActivationGrad(op, resultView, srcView, gradView, accumulationView, accumulation != null);
-            return writeTarget;
-        }
-
         private static Tensor ExecuteNorm(Tensor result, Tensor src, Tensor gamma, Tensor beta, float eps, GgmlNormOp op, string opName)
         {
             ValidateNormArguments(result, src, gamma, beta, opName);
@@ -5107,26 +4713,6 @@ namespace TensorSharp.GGML
             }
 
             GgmlNative.Norm(op, resultView, srcView, gammaView, betaView, beta != null, eps);
-            return writeTarget;
-        }
-
-        private static Tensor ExecuteNormGrad(Tensor result, Tensor gradGamma, Tensor gradBeta, Tensor adj, Tensor y, Tensor x, Tensor gamma, Tensor beta, float eps, GgmlNormOp op, string opName)
-        {
-            ValidateNormGradArguments(result, gradGamma, gradBeta, adj, y, x, gamma, beta, opName);
-
-            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, adj, false, adj.Sizes);
-            GgmlTensorView4D gradBetaView = default;
-            if (!TryCreateStandardView(writeTarget, out GgmlTensorView4D resultView)
-                || !TryCreateStandardView(gradGamma, out GgmlTensorView4D gradGammaView)
-                || !TryCreateStandardView(adj, out GgmlTensorView4D adjView)
-                || !TryCreateStandardView(x, out GgmlTensorView4D xView)
-                || !TryCreateStandardView(gamma, out GgmlTensorView4D gammaView)
-                || (gradBeta != null && !TryCreateStandardView(gradBeta, out gradBetaView)))
-            {
-                throw new NotSupportedException($"GGML {opName} requires Float32 tensors with 2 to 4 dimensions and a row-contiguous layout.");
-            }
-
-            GgmlNative.NormGrad(op, resultView, gradGammaView, gradBetaView, adjView, xView, gammaView, gradBeta != null, eps);
             return writeTarget;
         }
 
@@ -5415,31 +5001,6 @@ namespace TensorSharp.GGML
             return true;
         }
 
-        private static void ValidateMaskResultTensor(Tensor result, string opName)
-        {
-            ValidateGgmlTensor(result, nameof(result), opName);
-
-            if (result.DimensionCount < 1)
-            {
-                throw new InvalidOperationException($"{opName} requires a tensor with at least one dimension.");
-            }
-
-            if (!result.IsContiguous())
-            {
-                throw new NotSupportedException($"{opName} currently requires a contiguous result tensor.");
-            }
-        }
-
-        private static void ValidateMaskLengthsTensor(Tensor tensor, string argumentName, string opName)
-        {
-            ValidateGgmlTensor(tensor, argumentName, opName);
-
-            if (!tensor.IsContiguous())
-            {
-                throw new NotSupportedException($"{opName} currently requires contiguous length tensors.");
-            }
-        }
-
         private static void ValidateGatherArguments(Tensor result, Tensor src, int dim, Tensor indices)
         {
             ValidateGgmlTensor(src, nameof(src), "gather");
@@ -5549,22 +5110,6 @@ namespace TensorSharp.GGML
                 {
                     throw new InvalidOperationException($"{opName} expects result to have the same shape as its tensor inputs.");
                 }
-            }
-        }
-
-        private static void GetFlatRowsCols(Tensor tensor, string opName, out int rows, out int cols)
-        {
-            long colsLong = tensor.Sizes[tensor.DimensionCount - 1];
-            long storageSize = TensorDimensionHelpers.GetStorageSize(tensor.Sizes, tensor.Strides);
-            if (colsLong <= 0 || (storageSize % colsLong) != 0)
-            {
-                throw new InvalidOperationException($"{opName} received an invalid tensor layout.");
-            }
-
-            long rowsLong = storageSize / colsLong;
-            if (!TryGetInt32(rowsLong, out rows) || !TryGetInt32(colsLong, out cols))
-            {
-                throw new NotSupportedException($"{opName} tensor dimensions exceed the GGML mask builder limits.");
             }
         }
 
@@ -5716,79 +5261,6 @@ namespace TensorSharp.GGML
             if (result != null && !(result.Storage is GgmlStorage))
             {
                 throw new ArgumentException("result must be a GGML tensor", nameof(result));
-            }
-        }
-
-        private static void ValidateSoftmaxGradArguments(Tensor grad, Tensor adj, Tensor val)
-        {
-            if (adj.ElementType != DType.Float32 || val.ElementType != DType.Float32 || (grad != null && grad.ElementType != DType.Float32))
-            {
-                throw new InvalidOperationException($"softmaxgrad expects Float32 tensors. grad = '{grad?.ElementType}', adj = '{adj.ElementType}', val = '{val.ElementType}'");
-            }
-
-            if (!(adj.Storage is GgmlStorage))
-            {
-                throw new ArgumentException("adj must be a GGML tensor", nameof(adj));
-            }
-
-            if (!(val.Storage is GgmlStorage))
-            {
-                throw new ArgumentException("val must be a GGML tensor", nameof(val));
-            }
-
-            if (grad != null && !(grad.Storage is GgmlStorage))
-            {
-                throw new ArgumentException("grad must be a GGML tensor", nameof(grad));
-            }
-
-            if (adj.DimensionCount != val.DimensionCount)
-            {
-                throw new InvalidOperationException("adj and val must have the same number of dimensions.");
-            }
-
-            if (!HasSameShape(adj, val))
-            {
-                throw new InvalidOperationException("adj and val must have the same shape.");
-            }
-
-            if (grad != null && !HasSameShape(grad, adj))
-            {
-                throw new InvalidOperationException("grad and adj must have the same shape.");
-            }
-        }
-
-        private static void ValidateAdamArguments(Tensor tw, Tensor tg, Tensor tv, Tensor tm)
-        {
-            if (tw.ElementType != DType.Float32 || tg.ElementType != DType.Float32 || tv.ElementType != DType.Float32 || tm.ElementType != DType.Float32)
-            {
-                throw new InvalidOperationException($"adam expects Float32 tensors. weight = '{tw.ElementType}', gradient = '{tg.ElementType}', v = '{tv.ElementType}', m = '{tm.ElementType}'");
-            }
-
-            if (!(tw.Storage is GgmlStorage))
-            {
-                throw new ArgumentException("weight must be a GGML tensor", nameof(tw));
-            }
-
-            if (!(tg.Storage is GgmlStorage))
-            {
-                throw new ArgumentException("gradient must be a GGML tensor", nameof(tg));
-            }
-
-            if (!(tv.Storage is GgmlStorage))
-            {
-                throw new ArgumentException("v must be a GGML tensor", nameof(tv));
-            }
-
-            if (!(tm.Storage is GgmlStorage))
-            {
-                throw new ArgumentException("m must be a GGML tensor", nameof(tm));
-            }
-
-            if (!HasSameShape(tw, tg)
-                || !HasSameShape(tw, tv)
-                || !HasSameShape(tw, tm))
-            {
-                throw new InvalidOperationException("weight, gradient, v, and m must have the same shape.");
             }
         }
 
@@ -6013,35 +5485,6 @@ namespace TensorSharp.GGML
             }
         }
 
-        private static void ValidateActivationGradArguments(Tensor result, Tensor accumulation, Tensor src, Tensor grad, string opName)
-        {
-            ValidateGgmlTensor(src, nameof(src), opName);
-            ValidateGgmlTensor(grad, nameof(grad), opName);
-
-            if (!HasSameShape(src, grad))
-            {
-                throw new InvalidOperationException($"{opName} expects src and grad to have the same shape.");
-            }
-
-            if (result != null)
-            {
-                ValidateGgmlTensor(result, nameof(result), opName);
-                if (!HasSameShape(result, src))
-                {
-                    throw new InvalidOperationException($"{opName} expects result and src to have the same shape.");
-                }
-            }
-
-            if (accumulation != null)
-            {
-                ValidateGgmlTensor(accumulation, nameof(accumulation), opName);
-                if (!HasSameShape(accumulation, src))
-                {
-                    throw new InvalidOperationException($"{opName} expects accumulation and src to have the same shape.");
-                }
-            }
-        }
-
         private static void ValidateNormArguments(Tensor result, Tensor src, Tensor gamma, Tensor beta, string opName)
         {
             ValidateGgmlTensor(src, nameof(src), opName);
@@ -6072,68 +5515,6 @@ namespace TensorSharp.GGML
                 if (!HasSameShape(result, src))
                 {
                     throw new InvalidOperationException($"{opName} expects result and src to have the same shape.");
-                }
-            }
-        }
-
-        private static void ValidateNormGradArguments(Tensor result, Tensor gradGamma, Tensor gradBeta, Tensor adj, Tensor y, Tensor x, Tensor gamma, Tensor beta, string opName)
-        {
-            ValidateGgmlTensor(adj, nameof(adj), opName);
-            ValidateGgmlTensor(y, nameof(y), opName);
-            ValidateGgmlTensor(x, nameof(x), opName);
-            ValidateGgmlTensor(gamma, nameof(gamma), opName);
-            ValidateGgmlTensor(gradGamma, nameof(gradGamma), opName);
-
-            if (x.DimensionCount < 2 || x.DimensionCount > 4)
-            {
-                throw new NotSupportedException($"{opName} currently supports 2D to 4D tensors only.");
-            }
-
-            if (!HasSameShape(adj, x) || !HasSameShape(y, x))
-            {
-                throw new InvalidOperationException($"{opName} expects adj, y, and x to have the same shape.");
-            }
-
-            if (gamma.ElementCount() != x.Sizes[x.DimensionCount - 1])
-            {
-                throw new InvalidOperationException($"{opName} expects gamma element count to match the last dimension of x.");
-            }
-
-            if (!HasSameShape(gradGamma, gamma))
-            {
-                throw new InvalidOperationException($"{opName} expects gradGamma to have the same shape as gamma.");
-            }
-
-            if (beta != null)
-            {
-                ValidateGgmlTensor(beta, nameof(beta), opName);
-                if (beta.ElementCount() != x.Sizes[x.DimensionCount - 1])
-                {
-                    throw new InvalidOperationException($"{opName} expects beta element count to match the last dimension of x.");
-                }
-
-                if (gradBeta == null)
-                {
-                    throw new ArgumentNullException(nameof(gradBeta), $"{opName} requires gradBeta when beta is provided.");
-                }
-
-                ValidateGgmlTensor(gradBeta, nameof(gradBeta), opName);
-                if (!HasSameShape(gradBeta, beta))
-                {
-                    throw new InvalidOperationException($"{opName} expects gradBeta to have the same shape as beta.");
-                }
-            }
-            else if (gradBeta != null)
-            {
-                throw new InvalidOperationException($"{opName} does not accept gradBeta when beta is null.");
-            }
-
-            if (result != null)
-            {
-                ValidateGgmlTensor(result, nameof(result), opName);
-                if (!HasSameShape(result, x))
-                {
-                    throw new InvalidOperationException($"{opName} expects result and x to have the same shape.");
                 }
             }
         }
@@ -6169,48 +5550,6 @@ namespace TensorSharp.GGML
                 if (result.DimensionCount != 2 || result.Sizes[0] != indice.Sizes[0] || result.Sizes[1] != src.Sizes[1])
                 {
                     throw new InvalidOperationException("indexselect expects result shape [indices, src_cols].");
-                }
-            }
-        }
-
-        private static void ValidateMulMatIdArguments(Tensor result, Tensor expertWeights, Tensor input, Tensor ids)
-        {
-            ValidateGgmlTensor(expertWeights, nameof(expertWeights), "mulmatid");
-            ValidateGgmlTensor(input, nameof(input), "mulmatid");
-            ValidateGgmlIndexTensor(ids, nameof(ids), "mulmatid");
-
-            if (expertWeights.DimensionCount != 3 || input.DimensionCount != 3)
-            {
-                throw new NotSupportedException("mulmatid expects 3D expertWeights and input tensors.");
-            }
-
-            if (ids.DimensionCount != 2)
-            {
-                throw new NotSupportedException("mulmatid expects a 2D id tensor.");
-            }
-
-            if (!ids.IsContiguous())
-            {
-                throw new NotSupportedException("mulmatid expects contiguous ids.");
-            }
-
-            if (expertWeights.Sizes[2] != input.Sizes[2])
-            {
-                throw new InvalidOperationException("mulmatid expects expertWeights/input to match on the inner dimension.");
-            }
-
-            if (ids.Sizes[0] != input.Sizes[0] || ids.Sizes[1] % input.Sizes[1] != 0)
-            {
-                throw new InvalidOperationException("mulmatid expects ids shape [tokens, expert_used] aligned with input shape [tokens, expert_used_or_broadcast, cols].");
-            }
-
-            if (result != null)
-            {
-                ValidateGgmlTensor(result, nameof(result), "mulmatid");
-                long[] expected = new long[] { input.Sizes[0], ids.Sizes[1], expertWeights.Sizes[1] };
-                if (!TensorResultBuilder.ArrayEqual(result.Sizes, expected))
-                {
-                    throw new InvalidOperationException("mulmatid expects result shape [tokens, expert_used, rows].");
                 }
             }
         }
@@ -6263,69 +5602,6 @@ namespace TensorSharp.GGML
                 {
                     throw new InvalidOperationException("scaled_dot_product_attention expects result shape [batch, seq_q, heads, value_dim].");
                 }
-            }
-        }
-
-        private static void ValidateAddIdArguments(Tensor result, Tensor src, Tensor bias, Tensor ids)
-        {
-            ValidateGgmlTensor(src, nameof(src), "addid");
-            ValidateGgmlTensor(bias, nameof(bias), "addid");
-            ValidateGgmlIndexTensor(ids, nameof(ids), "addid");
-
-            if (src.DimensionCount != 3)
-            {
-                throw new NotSupportedException("addid expects a 3D source tensor.");
-            }
-
-            if (bias.DimensionCount != 2 || ids.DimensionCount != 2)
-            {
-                throw new NotSupportedException("addid expects 2D bias and id tensors.");
-            }
-
-            if (!ids.IsContiguous())
-            {
-                throw new NotSupportedException("addid expects contiguous ids.");
-            }
-
-            if (src.Sizes[2] != bias.Sizes[1] || src.Sizes[0] != ids.Sizes[0] || src.Sizes[1] != ids.Sizes[1])
-            {
-                throw new InvalidOperationException("addid expects src shape [tokens, expert_used, rows], bias shape [experts, rows], and ids shape [tokens, expert_used].");
-            }
-
-            if (result != null)
-            {
-                ValidateGgmlTensor(result, nameof(result), "addid");
-                if (!HasSameShape(result, src))
-                {
-                    throw new InvalidOperationException("addid expects result and src to have the same shape.");
-                }
-            }
-        }
-
-        private static void ValidateIndexSelectGradArguments(Tensor grad, Tensor adj, Tensor indice)
-        {
-            ValidateGgmlTensor(grad, nameof(grad), "indexselectgrad");
-            ValidateGgmlTensor(adj, nameof(adj), "indexselectgrad");
-            ValidateGgmlIndexTensor(indice, nameof(indice), "indexselectgrad");
-
-            if (grad.DimensionCount != 2 || adj.DimensionCount != 2)
-            {
-                throw new NotSupportedException("GGML indexselectgrad currently supports 2D gradient and adjoint tensors only.");
-            }
-
-            if (!IsSupportedIndexTensor(indice))
-            {
-                throw new NotSupportedException("GGML indexselectgrad currently supports contiguous 1D or Nx1 index tensors only.");
-            }
-
-            if (!indice.IsContiguous())
-            {
-                throw new NotSupportedException("GGML indexselectgrad requires contiguous indices.");
-            }
-
-            if (adj.Sizes[0] != indice.Sizes[0] || grad.Sizes[1] != adj.Sizes[1])
-            {
-                throw new InvalidOperationException("indexselectgrad expects adj shape [indices, grad_cols].");
             }
         }
 

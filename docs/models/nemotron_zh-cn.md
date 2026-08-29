@@ -256,7 +256,7 @@ Parakeet 风格 log-mel 频谱提取（镜像 ollama 的 `process_audio.go`）�
 - Slaney 风格 mel 滤波器组，128 bins，0..8 kHz。
 - `log(power + 2⁻²⁴)`，对有效（非 padding）帧做 per-mel 均值 / 方差归一化。
 
-聊天模板对每个上传音频文件发出一个 `<so_embedding>` token 让模型「看到」该模态，但真正的音频推理依赖 Parakeet 音频 mmproj —— 当前发行的公开 Nemotron-H 或 Nemotron Omni GGUF 都不带这个。CLI 仍会预处理音频文件以验证管线。
+聊天模板对每个上传音频文件发出一个 `<so_embedding>` token 让模型「看到」该模态，但真正的音频推理依赖 Parakeet 音频 mmproj —— 当前发行的公开 Nemotron-H 或 Nemotron Omni GGUF 都不带这个。音频片段仍会被解码并计算 log-mel 频谱以验证前端管线，并且每个会话只提示一次为什么不会进行音频推理。该逻辑位于 `ModelMultimodalInjector`，与该架构其余媒体处理放在一起，因此 CLI、交互式 REPL 与服务端行为一致；它此前只存在于 CLI 中，导致服务端会静默忽略音频。
 
 ## 5. 参数与配置
 

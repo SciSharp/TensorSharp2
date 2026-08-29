@@ -26,7 +26,7 @@
       <tr><td><strong>Apple Silicon（Mac）</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>macOS 默认。<code>mlx</code> 是另一条 Apple Silicon GPU 路径。</td></tr>
       <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>测试最充分的 NVIDIA 路径。<code>cuda</code> 是用于实验的直接 PTX/cuBLAS 后端 —— 也是支持<a href="distributed_zh-cn.html">多 GPU 张量并行</a>的那一个。</td></tr>
       <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>与厂商无关的 GPU 路径（ggml-vulkan，驱动支持时启用 cooperative-matrix 加速）。当主机存在 Vulkan 运行时时会在原生构建时自动启用；用 <code>--no-vulkan</code> 退出。</td></tr>
-      <tr><td><strong>无 GPU / 可移植 / 调试</strong></td><td>纯 C# CPU</td><td><code>cpu</code></td><td>无原生依赖。要更快的 CPU 推理请用 <code>ggml_cpu</code>（原生内核）。</td></tr>
+      <tr><td><strong>无 GPU / 可移植 / 调试</strong></td><td>纯 C# CPU</td><td><code>cpu</code></td><td>无原生依赖，且托管 matmul 现在跑在多核工作线程池上。要更快的 CPU 推理请用 <code>ggml_cpu</code>（原生内核）。</td></tr>
     </tbody>
   </table>
   </div>
@@ -70,6 +70,11 @@
     <li><strong>纯 C# CPU</strong>（<code>cpu</code>）—— 无原生依赖的可移植推理，使用托管 GEMM 快路径与融合 SIMD 内核。适合调试与最大可移植性。</li>
     <li><strong>GGML CPU</strong>（<code>ggml_cpu</code>）—— 原生 GGML CPU 内核，量化权重从 GGUF 文件零拷贝映射。在多数 CPU 上比纯 C# 更快。</li>
   </ul>
+  <p><strong>纯 C# 路径现在是多核的。</strong>托管 matmul 不再走每次 matmul 一遍的 <code>Parallel.For</code>，而是交给常驻的自旋-再挂起工作线程池（<code>TensorSharp.Models/CpuWorkerPool.cs</code>），工作项也按实际工作量而非线程数切分。在 gemma-4-E4B-it-Q8_0、122 CPU 配额下，通过 <code>TS_CPU_POOL</code> 在同一个二进制里交替 A/B 实测：相比旧路径 prefill 约 +15%、decode 约 2.8×。线程池<em>刻意</em>不占满所有核心 —— 默认宽度是可用 CPU 的一半，因为自旋的 worker 会饿死仍在用 ThreadPool 的其余 CPU 路径（占满全部核心时同一模型反而更慢）。可用 <code>TS_CPU_THREADS</code>、<code>TS_CPU_POOL</code>、<code>TS_CPU_SPIN</code>、<code>TS_CPU_TASK_BYTES</code> 与 <code>TS_CPU_TASKS_PER_WORKER</code> 调节。</p>
+  <p><strong>量化权重现在在这里也是零拷贝映射的。</strong><code>cpu</code> 是最后一个在加载时把每个量化张量复制进新的匿名内存、而不是直接绑定 GGUF 映射的后端 —— GGML 后端一直都是后者。加载器现在会打印它实际拿到的拆分，例如 <code>Quantized: 103255 MB (103255 MB file-backed), F32: 983 MB</code>。任何此前需要复制权重的模型都会加载得更快，越大的量化检查点收益越明显：GLM-5.3-Flash UD-Q2_K_XL 从一次永远无法完成的加载（常驻集 412 GB 且仍在增长）变成约 48 s，其中大部分是页缓存预取。</p>
+  <p><strong>托管 i-quant 的覆盖面更宽了。</strong><code>IQ2_XS</code> 与 <code>IQ4_XS</code> 有了托管反量化实现（与 ggml 自己的 <code>dequantize_row_*</code> 对拍过），并进入了 CPU 量化存储矩阵，因此它们在加载时会保持量化，而不再展开成 F32 —— 正是这种展开让 GLM-5.3-Flash 的 2-bit 检查点要求 765 GB。<code>IQ2_XS</code> × <code>Q8_K</code> 与 <code>IQ3_XXS</code> × <code>Q8_K</code> 也有了直接点积内核以及 AVX2 路径（<code>VecDotIq2XsQ8KAvx2</code>、<code>VecDotIq3XxsQ8KAvx2</code>），不必再回落到通用的「反量化整行到暂存区」路径。这两项改动对 <code>--backend cpu</code> 上的任何模型都生效。如果你要再加一个这样的内核，请注意：ggml 是把一个常数折叠进某些 i-quant 点积的<em>结果</em>里（<code>IQ2_XS</code> 为 0.125，<code>IQ3_XXS</code> 为 0.25，<code>IQ3_S</code> 为 1.0），而不是折进每个块的 scale —— 漏掉它就是 8× 的误差，而且不会崩溃，只会产出看起来通顺的垃圾。</p>
+  <p><strong>每个模型家族都有纯 C# 路径。</strong>MiniMax-H3 是最后一个没有的：它此前每个阶段都是无条件的原生 ggml 调用，而现在 <code>--backend cpu</code> 上的 t2v、i2v、fl2v 与参考条件（静图、片段、音轨）都走托管的 DiT、文本编码器、VAE 与视觉塔。输出与 GGML 路径贴合得很紧 —— t2v、i2v 与 ref-audio 的吻合程度甚至高于 GGML 自家 flash 内核与其显式 softmax 回退之间的吻合程度 —— 唯一的例外是视觉塔，其残差比该对照更大，原因尚未查明。速度是有得有失、并非一律更慢：同一段片段上，i2v 为 70 s、<code>ggml_cpu</code> 为 176 s，ref-audio 为 63 s 对 71 s；但 t2v 为 69 s 对 14 s、ref-image 为 112 s 对 20 s —— 视觉塔是托管路径里最贵的一段。→ <a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3</a></p>
+  <p>非 ggml 的各家族共用同一套原语：<code>Direct{Context,Linear,Ops}</code>（<code>TensorSharp.Models/Direct/DirectOps.cs</code>）同时支撑 Wan 视频网络与 MiniMax-H3 的 <code>cpu</code> 与 <code>cuda</code> 路径，其按行循环也走同一个工作线程池。在 CPU 上 <code>DirectLinear</code> 不再于加载时把量化权重展开成 F32，而是保留 GGUF 的存储类型直接参与乘法：一段小型 Wan 渲染（256×160、5 帧、1 步、<code>--backend cpu</code>）实测 80.9 s 对 121.4 s，权重内存少 4×，而且相对原生 <code>ggml_cpu</code> 渲染反而<em>略更接近</em>（43.51 dB 对 43.39 dB）。F16/BF16/F32 权重仍走普通 GEMM；<code>TS_DIRECT_QUANT_WEIGHTS=0</code> 可恢复旧行为。</p>
 
   <h3 id="deepseek4">DeepSeek V4 与 GLM 5.x：专属整模型执行器</h3>
   <p>有两个架构不走通用的逐算子前向。<code>deepseek4</code> 那套 284B 的压缩稀疏注意力 MoE 结构由三套专属的整模型执行器之一运行：</p>
@@ -86,6 +91,7 @@
     <li><strong><code>--backend cpu</code>（100% 托管、零原生依赖）与 <code>--backend cuda</code></strong> —— <code>TensorSharp.Models/Models/GlmDsa</code> 里的逐算子路径，同时也是原生执行器对拍所依据的参考实现；在 GGML 后端上设 <code>TS_GLM_NATIVE=0</code> 即可切过去做 A/B。MLX 不支持这一系列。</li>
   </ul>
   <p><strong>GLM-5.3-Flash</strong>（<code>glm5next</code>）走的是同一个原生执行器与同一个 <code>GlmDsaModel</code>，按层切分方式也相同；它会拒绝 <code>--tp</code> 而不是去切分权重，NextN/MTP 推测解码目前也尚未为它实现。</p>
+  <p><strong>GLM-5.3-Flash 也能跑在 <code>--backend cpu</code> 上</strong> —— 同一条托管逐算子路径，零原生依赖。它在文本上可用，但应当被当作用于对拍的参考实现，而不是快路径：同一份文件上，prefill 约比 <code>ggml_cpu</code> 慢 5.7×、decode 约慢 2.4×；其 prefill logits 与 <code>ggml_cpu</code> 的余弦相似度为 0.9567（词表宽 154880）—— 已经很接近，但这并<em>不</em>等于已经证明逐位一致，当排名前两位的 logit 接近打平时，贪心解码出的文本就会分叉。<code>TS_DUMP_LOGITS</code> 会把第一次真实前向的 logits 写到文件里，正是为这种对比准备的。细节见仓库中的 <code>docs/models/glm_zh-cn.md</code> 卡片。</p>
   <p>由于 1M token 的 MLA 缓存约 93 GiB，自报的上下文被当作上限处理：权重落盘后，加载器会测量实际空闲的显存并按能装下的大小定上下文，同时打印它的选择（3 卡按层切分为 342,272 token）。设 <code>MAX_CONTEXT</code> 则把某个长度变成硬性要求。参见 <a href="models-text_zh-cn.html#glm">GLM 5.x</a>。</p>
 
   <div class="callout note"><div class="ic">🔎</div><p>服务器会在 <code>GET /api/models</code>（<code>supportedBackends</code>）中报告主机上实际可用的后端。如果缺少 CUDA 或 MLX 后端，说明主机在启动时未检测到可用的驱动 / 运行时。如果缺少 <code>ggml_vulkan</code>，说明原生桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。</p></div>

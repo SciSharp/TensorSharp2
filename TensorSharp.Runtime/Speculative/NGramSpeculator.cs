@@ -102,6 +102,10 @@ namespace TensorSharp.Runtime.Speculative
 
         public string Name => SpeculatorRegistry.NGram;
 
+        /// <summary>n-gram mines the emitted token history, which is complete no matter
+        /// what the KV cache did, so an adopted prefix changes nothing for it.</summary>
+        public bool CanArmAfterPrefixReuse => true;
+
         public string Describe() => $"ngram(n={_minNgram}..{_maxNgram})";
 
         /// <summary>Shortest suffix that may match.</summary>

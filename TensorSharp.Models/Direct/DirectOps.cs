@@ -27,10 +27,10 @@ using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.Runtime;
 
-namespace TensorSharp.Models.WanVideo
+namespace TensorSharp.Models.Direct
 {
-    /// <summary>Shared allocator context for the direct Wan implementations.</summary>
-    internal sealed class WanDirectContext : IDisposable
+    /// <summary>Shared allocator context for the direct model implementations.</summary>
+    internal sealed class DirectContext : IDisposable
     {
         public IAllocator Allocator { get; }
         public bool IsCuda { get; }
@@ -39,7 +39,7 @@ namespace TensorSharp.Models.WanVideo
         private readonly Dictionary<long, Tensor> _ones = new();
         private readonly List<Tensor> _owned = new();
 
-        public WanDirectContext(IAllocator allocator)
+        public DirectContext(IAllocator allocator)
         {
             Allocator = allocator;
             CudaAllocator = allocator as CudaAllocator;
@@ -93,9 +93,9 @@ namespace TensorSharp.Models.WanVideo
     /// by the stable host pointer); on CPU it is dequantized once into an F32
     /// tensor whose transposed view feeds the BLAS matmul.
     /// </summary>
-    internal sealed class WanDirectLinear : IDisposable
+    internal sealed class DirectLinear : IDisposable
     {
-        private readonly WanDirectContext _ctx;
+        private readonly DirectContext _ctx;
         private readonly IntPtr _host;        // stable host bytes (GGUF mmap or owned dequant/copy)
         private readonly IntPtr _ownedHost;   // non-null when we allocated _host
         private readonly int _type;           // ggml type of _host
@@ -115,7 +115,26 @@ namespace TensorSharp.Models.WanVideo
         // native wan_mm / qi_mm.
         private const float MmScale = 1024.0f;
 
-        private WanDirectLinear(WanDirectContext ctx, IntPtr host, IntPtr ownedHost, int type,
+        /// <summary>
+        /// On CPU, keep a QUANTIZED weight in its GGUF storage type and let the
+        /// managed quantized matmul read it directly, instead of expanding it to
+        /// F32 once at load. The expansion costs 4x the memory and reads 4x the
+        /// bytes on every forward; MiniMax-H3 alone would need ~130 GB for its 32B
+        /// Q4_K text encoder. F16/BF16/F32 weights keep the plain GEMM, which is
+        /// what every existing direct model (the Wan VAE especially) already uses.
+        /// </summary>
+        internal bool UseManagedQuantOnCpu =>
+            QuantWeightsOnCpu &&
+            _host != IntPtr.Zero &&
+            ManagedQuantizedOps.SupportsCpuQuantizedStorage((GgmlTensorType)_type);
+
+        /// <summary>TS_DIRECT_QUANT_WEIGHTS=0 restores the previous behaviour (expand
+        /// every quantized weight to F32 once at load and run a plain GEMM), so the
+        /// two can be compared for numeric drift in one binary.</summary>
+        private static readonly bool QuantWeightsOnCpu =
+            Environment.GetEnvironmentVariable("TS_DIRECT_QUANT_WEIGHTS") != "0";
+
+        private DirectLinear(DirectContext ctx, IntPtr host, IntPtr ownedHost, int type,
                                 long ne0, long ne1, long bytes, Tensor bias, bool prescale)
         {
             _ctx = ctx; _host = host; _ownedHost = ownedHost; _type = type;
@@ -123,7 +142,7 @@ namespace TensorSharp.Models.WanVideo
         }
 
         /// <summary>Load from a GGUF tensor (weights [ne1, ne0] in GGUF row-major).</summary>
-        public static WanDirectLinear FromGguf(WanDirectContext ctx, GgufFile gguf, string weightName,
+        public static DirectLinear FromGguf(DirectContext ctx, GgufFile gguf, string weightName,
                                                string biasName = null, bool prescale = false)
         {
             var info = gguf.Tensors[weightName];
@@ -136,18 +155,18 @@ namespace TensorSharp.Models.WanVideo
 
             Tensor bias = null;
             if (biasName != null && gguf.Tensors.ContainsKey(biasName))
-                bias = ctx.Own(ctx.FromFloats(WanDirectOps.DequantTensor(gguf, biasName), (long)gguf.Tensors[biasName].NumElements));
+                bias = ctx.Own(ctx.FromFloats(DirectOps.DequantTensor(gguf, biasName), (long)gguf.Tensors[biasName].NumElements));
 
-            var lin = new WanDirectLinear(ctx, p, IntPtr.Zero, (int)info.Type, ne0, ne1, bytes, bias,
+            var lin = new DirectLinear(ctx, p, IntPtr.Zero, (int)info.Type, ne0, ne1, bytes, bias,
                                           prescale && GgufFile.GetBlockSize(info.Type) > 1);
-            if (!ctx.IsCuda)
-                lin.SetCpuWeight(WanDirectOps.DequantTensor(gguf, weightName), ne0, ne1);
+            if (!ctx.IsCuda && !lin.UseManagedQuantOnCpu)
+                lin.SetCpuWeight(DirectOps.DequantTensor(gguf, weightName), ne0, ne1);
             return lin;
         }
 
         /// <summary>Load the 5D patch-embedding conv as the flattened
         /// [ic*kh*kw, oc] matmul weight (same bytes; see WanDiT.PatchW5D).</summary>
-        public static WanDirectLinear FromGgufPatch(WanDirectContext ctx, GgufFile gguf, string weightName, string biasName)
+        public static DirectLinear FromGgufPatch(DirectContext ctx, GgufFile gguf, string weightName, string biasName)
         {
             var info = gguf.Tensors[weightName];
             long ne0 = 1;
@@ -163,15 +182,15 @@ namespace TensorSharp.Models.WanVideo
                 throw new System.IO.InvalidDataException($"GGUF tensor '{weightName}' has no data pointer.");
             Tensor bias = null;
             if (biasName != null && gguf.Tensors.ContainsKey(biasName))
-                bias = ctx.Own(ctx.FromFloats(WanDirectOps.DequantTensor(gguf, biasName), (long)gguf.Tensors[biasName].NumElements));
-            var lin = new WanDirectLinear(ctx, p, IntPtr.Zero, (int)info.Type, ne0, ne1, bytes, bias, false);
-            if (!ctx.IsCuda)
-                lin.SetCpuWeight(WanDirectOps.DequantTensor(gguf, weightName), ne0, ne1);
+                bias = ctx.Own(ctx.FromFloats(DirectOps.DequantTensor(gguf, biasName), (long)gguf.Tensors[biasName].NumElements));
+            var lin = new DirectLinear(ctx, p, IntPtr.Zero, (int)info.Type, ne0, ne1, bytes, bias, false);
+            if (!ctx.IsCuda && !lin.UseManagedQuantOnCpu)
+                lin.SetCpuWeight(DirectOps.DequantTensor(gguf, weightName), ne0, ne1);
             return lin;
         }
 
         /// <summary>Load from a managed F32 array (weight [ne1, ne0] row-major, e.g. VAE safetensors).</summary>
-        public static WanDirectLinear FromFloats(WanDirectContext ctx, float[] weight, long ne0, long ne1, float[] bias)
+        public static DirectLinear FromFloats(DirectContext ctx, float[] weight, long ne0, long ne1, float[] bias)
         {
             Tensor biasT = bias != null ? ctx.Own(ctx.FromFloats(bias, bias.LongLength)) : null;
             if (ctx.IsCuda)
@@ -180,9 +199,9 @@ namespace TensorSharp.Models.WanVideo
                 long bytes = weight.LongLength * sizeof(float);
                 IntPtr host = Marshal.AllocHGlobal((IntPtr)bytes);
                 Marshal.Copy(weight, 0, host, weight.Length);
-                return new WanDirectLinear(ctx, host, host, 0 /*F32*/, ne0, ne1, bytes, biasT, false);
+                return new DirectLinear(ctx, host, host, 0 /*F32*/, ne0, ne1, bytes, biasT, false);
             }
-            var lin = new WanDirectLinear(ctx, IntPtr.Zero, IntPtr.Zero, 0, ne0, ne1, 0, biasT, false);
+            var lin = new DirectLinear(ctx, IntPtr.Zero, IntPtr.Zero, 0, ne0, ne1, 0, biasT, false);
             lin._wCpu = ctx.Own(ctx.FromFloats(weight, ne1, ne0));
             lin._wCpuT = lin._wCpu.Transpose();
             return lin;
@@ -217,11 +236,23 @@ namespace TensorSharp.Models.WanVideo
                     scaled.Dispose();
                 }
             }
+            else if (_wCpu == null)
+            {
+                unsafe
+                {
+                    float* xp = (float*)CpuNativeHelpers.GetBufferStart(x);
+                    float* rp = (float*)CpuNativeHelpers.GetBufferStart(r);
+                    ManagedQuantizedOps.AddmmQuantizedToFloat32(
+                        _type, _host, InDim, OutDim,
+                        xp, checked((int)InDim), checked((int)x.Sizes[0]),
+                        rp, checked((int)OutDim));
+                }
+            }
             else
             {
-                WanDirectOps.CpuGemmABt(x, _wCpu, r, 1f, 0f);
+                DirectOps.CpuGemmABt(x, _wCpu, r, 1f, 0f);
             }
-            if (_bias != null) WanDirectOps.AddBiasRows(_ctx, r, _bias);
+            if (_bias != null) DirectOps.AddBiasRows(_ctx, r, _bias);
             return r;
         }
 
@@ -235,9 +266,35 @@ namespace TensorSharp.Models.WanVideo
         }
     }
 
-    /// <summary>Backend-dispatched primitives shared by the direct Wan networks.</summary>
-    internal static class WanDirectOps
+    /// <summary>Backend-dispatched primitives shared by the direct networks.</summary>
+    internal static class DirectOps
     {
+        /// <summary>
+        /// Row-parallel loop on the persistent CPU pool rather than the ThreadPool.
+        /// These loops are the whole managed cost of the direct path and a single
+        /// call is often only tens of microseconds of work per core, which is the
+        /// regime where a Parallel.For fork/join costs more than the work it
+        /// distributes - see CpuWorkerPool for the measurements. Rows are handed
+        /// out in contiguous chunks, a few per worker, so the tail still balances.
+        /// </summary>
+        internal static void RowsParallel(long rows, Action<long> body)
+        {
+            if (rows <= 0) return;
+            int threads = CpuWorkerPool.Shared.ThreadCount;
+            if (rows == 1 || threads <= 1)
+            {
+                for (long i = 0; i < rows; i++) body(i);
+                return;
+            }
+            long chunk = Math.Max(1, (rows + threads * 4L - 1) / (threads * 4L));
+            int blocks = checked((int)((rows + chunk - 1) / chunk));
+            CpuWorkerPool.Shared.For(blocks, b =>
+            {
+                long start = b * chunk, end = Math.Min(rows, start + chunk);
+                for (long i = start; i < end; i++) body(i);
+            });
+        }
+
         // ---- weight loading helpers ------------------------------------------------
 
         /// <summary>Dequantize a whole GGUF tensor to a managed F32 array
@@ -309,7 +366,7 @@ namespace TensorSharp.Models.WanVideo
             float* pb = (float*)CpuNativeHelpers.GetBufferStart(b);
             float* pc = (float*)CpuNativeHelpers.GetBufferStart(c);
             int vw = System.Numerics.Vector<float>.Count;
-            Parallel.For(0, m, i =>
+            RowsParallel(m, i =>
             {
                 float* ar = pa + i * aStride;
                 float* cr = pc + i * cStride;
@@ -338,7 +395,7 @@ namespace TensorSharp.Models.WanVideo
             float* pb = (float*)CpuNativeHelpers.GetBufferStart(b);
             float* pc = (float*)CpuNativeHelpers.GetBufferStart(c);
             int vw = System.Numerics.Vector<float>.Count;
-            Parallel.For(0, m, i =>
+            RowsParallel(m, i =>
             {
                 float* ar = pa + i * aStride;
                 float* cr = pc + i * cStride;
@@ -365,7 +422,7 @@ namespace TensorSharp.Models.WanVideo
         // ---- rowwise vector ops ----------------------------------------------------
 
         /// <summary>t[r, c] += bias[c] for every row.</summary>
-        public static void AddBiasRows(WanDirectContext ctx, Tensor t, Tensor bias)
+        public static void AddBiasRows(DirectContext ctx, Tensor t, Tensor bias)
         {
             if (ctx.IsCuda)
             {
@@ -381,7 +438,7 @@ namespace TensorSharp.Models.WanVideo
             long rows = t.Sizes[0], cols = t.Sizes[1];
             float* p = (float*)CpuNativeHelpers.GetBufferStart(t);
             float* b = (float*)CpuNativeHelpers.GetBufferStart(bias);
-            Parallel.For(0, rows, r =>
+            RowsParallel(rows, r =>
             {
                 float* row = p + r * cols;
                 for (long c = 0; c < cols; c++) row[c] += b[c];
@@ -390,7 +447,7 @@ namespace TensorSharp.Models.WanVideo
 
         /// <summary>AdaLN modulation y[r, c] = x[r, c] * (1 + scale[c]) + shift[c] over
         /// rows [rowFrom, rowFrom + rowCount). x and y may alias.</summary>
-        public static void ModulateRows(WanDirectContext ctx, Tensor y, Tensor x, Tensor shift, Tensor scale,
+        public static void ModulateRows(DirectContext ctx, Tensor y, Tensor x, Tensor shift, Tensor scale,
                                         long rowFrom, long rowCount)
         {
             long cols = x.Sizes[1];
@@ -406,8 +463,9 @@ namespace TensorSharp.Models.WanVideo
                 float* py = (float*)CpuNativeHelpers.GetBufferStart(y);
                 float* ps = (float*)CpuNativeHelpers.GetBufferStart(shift);
                 float* pc = (float*)CpuNativeHelpers.GetBufferStart(scale);
-                Parallel.For(rowFrom, rowFrom + rowCount, r =>
+                RowsParallel(rowCount, rr =>
                 {
+                    long r = rowFrom + rr;
                     float* rx = px + r * cols;
                     float* ry = py + r * cols;
                     for (long c = 0; c < cols; c++) ry[c] = rx[c] * (1f + pc[c]) + ps[c];
@@ -416,7 +474,7 @@ namespace TensorSharp.Models.WanVideo
         }
 
         /// <summary>Gated residual x[r, c] += v[r, c] * gate[c] over rows [rowFrom, rowFrom+rowCount).</summary>
-        public static void GateAddRows(WanDirectContext ctx, Tensor x, Tensor v, Tensor gate,
+        public static void GateAddRows(DirectContext ctx, Tensor x, Tensor v, Tensor gate,
                                        long rowFrom, long rowCount)
         {
             long cols = x.Sizes[1];
@@ -431,8 +489,9 @@ namespace TensorSharp.Models.WanVideo
                 float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
                 float* pv = (float*)CpuNativeHelpers.GetBufferStart(v);
                 float* pg = (float*)CpuNativeHelpers.GetBufferStart(gate);
-                Parallel.For(rowFrom, rowFrom + rowCount, r =>
+                RowsParallel(rowCount, rr =>
                 {
+                    long r = rowFrom + rr;
                     float* rx = px + r * cols;
                     float* rv = pv + r * cols;
                     for (long c = 0; c < cols; c++) rx[c] += rv[c] * pg[c];
@@ -442,7 +501,7 @@ namespace TensorSharp.Models.WanVideo
 
         /// <summary>Scale rows by a per-column vector: x[r, c] *= gain[c] (RMS/LayerNorm gains
         /// are folded into the norm ops; this covers the odd cases).</summary>
-        public static void MulColsRows(WanDirectContext ctx, Tensor x, Tensor gain)
+        public static void MulColsRows(DirectContext ctx, Tensor x, Tensor gain)
         {
             if (ctx.IsCuda)
             {
@@ -455,7 +514,7 @@ namespace TensorSharp.Models.WanVideo
                 long rows = x.Sizes[0], cols = x.Sizes[1];
                 float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
                 float* pg = (float*)CpuNativeHelpers.GetBufferStart(gain);
-                Parallel.For(0, rows, r =>
+                RowsParallel(rows, r =>
                 {
                     float* rx = px + r * cols;
                     for (long c = 0; c < cols; c++) rx[c] *= pg[c];
@@ -466,7 +525,7 @@ namespace TensorSharp.Models.WanVideo
         // ---- norms -------------------------------------------------------------------
 
         /// <summary>LayerNorm over the last dim; gamma/beta optional (non-affine when null).</summary>
-        public static Tensor LayerNorm(WanDirectContext ctx, Tensor x, Tensor gamma, Tensor beta, float eps)
+        public static Tensor LayerNorm(DirectContext ctx, Tensor x, Tensor gamma, Tensor beta, float eps)
         {
             var r = ctx.NewF32(x.Sizes[0], x.Sizes[1]);
             Ops.LayerNorm(r, x, gamma ?? ctx.Ones(x.Sizes[1]), beta, eps);
@@ -474,7 +533,7 @@ namespace TensorSharp.Models.WanVideo
         }
 
         /// <summary>RMS norm over the last dim with gain.</summary>
-        public static Tensor RmsNorm(WanDirectContext ctx, Tensor x, Tensor gain, float eps)
+        public static Tensor RmsNorm(DirectContext ctx, Tensor x, Tensor gain, float eps)
         {
             var r = ctx.NewF32(x.Sizes[0], x.Sizes[1]);
             Ops.RMSNorm(r, x, gain, null, eps);
@@ -488,7 +547,7 @@ namespace TensorSharp.Models.WanVideo
         /// pair-duplicated cos/sin tables [seq, headDim] (WanRope layout:
         /// cos[t, 2p] == cos[t, 2p+1]).
         /// </summary>
-        public static void RopeInterleaved(WanDirectContext ctx, Tensor x, Tensor cos, Tensor sin,
+        public static void RopeInterleaved(DirectContext ctx, Tensor x, Tensor cos, Tensor sin,
                                            int heads, int headDim)
         {
             int seq = checked((int)x.Sizes[0]);
@@ -504,7 +563,7 @@ namespace TensorSharp.Models.WanVideo
                 float* pc = (float*)CpuNativeHelpers.GetBufferStart(cos);
                 float* ps = (float*)CpuNativeHelpers.GetBufferStart(sin);
                 int half = headDim / 2;
-                Parallel.For(0, (long)seq * heads, th =>
+                RowsParallel((long)seq * heads, th =>
                 {
                     long t = th / heads;
                     float* row = px + th * headDim;
@@ -530,7 +589,7 @@ namespace TensorSharp.Models.WanVideo
         /// [sq, heads*hd]. CUDA uses the streaming ts_wan_attn kernel; the
         /// fallback runs chunked per-head GEMM+softmax through Ops.
         /// </summary>
-        public static Tensor Attention(WanDirectContext ctx, Tensor q, Tensor k, Tensor v,
+        public static Tensor Attention(DirectContext ctx, Tensor q, Tensor k, Tensor v,
                                        int heads, int headDim, float scale, Tensor bias = null)
         {
             int sq = checked((int)q.Sizes[0]);
@@ -564,7 +623,7 @@ namespace TensorSharp.Models.WanVideo
         // Chunked per-head GEMM+softmax path (cuBLAS on CUDA, the parallel SIMD
         // kernels on CPU). Bigger chunks on CUDA: fewer launches, and the pool
         // absorbs the score scratch.
-        private static void GenericAttention(WanDirectContext ctx, Tensor outT, Tensor q, Tensor k, Tensor v,
+        private static void GenericAttention(DirectContext ctx, Tensor outT, Tensor q, Tensor k, Tensor v,
                                              Tensor bias, int heads, int sq, int sk, int headDim, float scale)
         {
             long budget = ctx.IsCuda ? 64L << 20 : 16L << 20;   // score elements per chunk
@@ -606,21 +665,21 @@ namespace TensorSharp.Models.WanVideo
         // ---- misc ----------------------------------------------------------------------
 
         /// <summary>Zero-fill a contiguous F32 tensor on its own device.</summary>
-        public static void Zero(WanDirectContext ctx, Tensor t)
+        public static void Zero(DirectContext ctx, Tensor t)
         {
             if (ctx.IsCuda && CudaWanOps.TryZero(t)) return;
             Ops.Fill(t, 0f);
         }
 
         /// <summary>GELU (tanh approximation, matches ggml_gelu).</summary>
-        public static Tensor Gelu(WanDirectContext ctx, Tensor x)
+        public static Tensor Gelu(DirectContext ctx, Tensor x)
         {
             var r = ctx.NewF32(x.Sizes);
             Ops.GELU(r, x);
             return r;
         }
 
-        public static Tensor Silu(WanDirectContext ctx, Tensor x)
+        public static Tensor Silu(DirectContext ctx, Tensor x)
         {
             var r = ctx.NewF32(x.Sizes);
             Ops.SiLU(r, x);

@@ -13,7 +13,7 @@
 | GGML CUDA | `--backend ggml_cuda` | 通过 ggml 使用 NVIDIA 推理 | 通过 GGML CUDA 在 Windows 或 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
 | GGML Vulkan | `--backend ggml_vulkan` | 通过 ggml 的厂商无关 GPU 推理 | 通过 GGML Vulkan 在 Windows 或 Linux 上加速——支持带 Vulkan 1.3 驱动的 AMD、Intel 与 NVIDIA GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。机器有 Vulkan 运行时（已安装 loader）时原生构建会自动启用；未安装 Vulkan SDK 或发行版开发包时，构建会通过 `eng/fetch-vulkan-toolchain.ps1` / `eng/fetch-vulkan-toolchain.sh` 自动下载便携工具链（headers、glslc、SPIRV-Headers，Windows 上还有 loader 导入库）。用 `--no-vulkan`（或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`）退出。 |
 | GGML CPU | `--backend ggml_cpu` | 原生 CPU 内核 | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
-| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 无原生依赖的可移植 CPU 推理。 |
+| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 无原生依赖的可移植 CPU 推理。托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，默认宽度是可用核心数的一半（`TS_CPU_THREADS` 及下文其余 `TS_CPU_*` 开关）；在 direct 视频网络（Wan、MiniMax-H3）上，量化权重直接以 GGUF 存储类型参与乘法，而不再在加载时展开成 F32（`TS_DIRECT_QUANT_WEIGHTS=0` 恢复展开）。 |
 
 **DeepSeek V4 Flash 是上表的例外。** 它那套 284B 的压缩稀疏注意力 MoE 结构不走通用的逐算子路径，而是使用三套专属的整模型执行器之一：Direct CUDA 引擎（`--backend cuda`）、原生 ggml 执行器（`--backend ggml_cuda` / `ggml_vulkan`），以及 100% 纯 C# 的 CPU 执行器（`--backend cpu`，直接从内存映射的 GGUF 分片提供量化权重）。三者都会把权重按层切分到所有可见 GPU（CPU 路径则从映射分片流式读取），因此远大于单卡显存的模型依然跑得起来。详见 [DeepSeek V4 卡片](docs/models/deepseek4_zh-cn.md)。
 
@@ -268,7 +268,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--repeat-penalty <f>` | 重复惩罚（1.0 = 无） |
 | `--presence-penalty <f>` | 存在惩罚（0 = 关闭） |
 | `--frequency-penalty <f>` | 频率惩罚（0 = 关闭） |
-| `--seed <N>` | 随机种子（-1 = 非确定性） |
+| `--seed <N>` | **文本**采样的随机种子（-1 = 非确定性）。图像与视频生成的噪声改由 `--diffusion-seed` 决定。 |
 | `--stop <string>` | 停止序列（可重复指定） |
 | `--dump-prompt` | 仅渲染 prompt 与分词后退出（不进行推理） |
 | `--benchmark` | 运行合成的 prefill / decode 吞吐基准 |
@@ -283,7 +283,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--correct-prefill <N>` | `--test-chunked-prefill` 使用的 prompt 长度 |
 | `--correct-decode <N>` | `--test-chunked-prefill` 使用的 decode 长度 |
 | `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-Edit 则是 FlowMatch-Euler 步数——省略时自动选择（30，或已加载 Lightning LoRA 的步数）。 |
-| `--diffusion-seed <N>` | DiffusionGemma 确定性采样种子（默认：0） |
+| `--diffusion-seed <N>` | 扩散路径的噪声种子：DiffusionGemma 的确定性采样器（默认：0）、Qwen-Image-Edit，以及视频生成（Wan、MiniMax-H3）——视频不传时每次运行都会取一个新的随机种子。决定一段视频长什么样的是这个种子，`--seed` 是文本采样种子，对它没有影响。 |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
 | `--image <path>` | Qwen-Image-Edit 的输入图像（也是多模态聊天的图像输入）。在 `qwen_image` DiT GGUF 上触发图像编辑模式所必需。 |
 | `--prompt <text>` | Qwen-Image-Edit 编辑指令（省略时回退到 `--input` 文件内容）。 |
@@ -813,6 +813,8 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 | 量化等级 | — | 显存允许就用 `-Q8_0` 去噪器而不是 `-Q4_K`。 |
 
 `--cfg` 不是质量参数（H3 只接受 1.0），`--negative-prompt` 也不起作用，因为没有无条件分支。
+注意这里的种子是 `--diffusion-seed` 而不是 `--seed`：`--seed` 是文本采样种子，不影响视频；
+而不传 `--diffusion-seed` 时每次运行都会取一个新的随机种子——所以要做对照的两次运行必须显式设置它。
 
 **在服务端，尺寸是启动参数。** 浏览器发送的是提示词，加上所托管检查点通过
 `/api/models` 声明支持的那些条件输入——首帧、末帧，或最多 `maxReferenceImages` 个
@@ -877,6 +879,13 @@ flow-matching 速度场解码出来的文件，长度、帧率、音轨时长全
 ```bash
 ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4
 ```
+
+**`--backend cpu` 上完全不用 ggml 也能跑完整条流程。** 提示词编码、去噪、视频 VAE 解码
+与音频声码器都有纯 C# 实现，视觉塔、因果 3-D 视频 VAE 编码器与音频 VAE 编码器同样如此——
+因此 `t2v`、`i2v`、`fl2v` 以及参考图 / 参考视频 / 参考音频在那里都能用。所有计算都在主机上
+以 F32 进行，所以它面向的是正确性、可移植性和没有加速器的机器，而不是速度：256x160x5f 的
+单步 `t2v` 实测 69 秒，`ggml_cpu` 为 14 秒；而同一个 `i2v` 实测 70 秒，`ggml_cpu` 为 176 秒（单次采样，不要过度解读这个方向）。
+它与 GGML 路径的一致性，以及唯一一个残差大于 GGML 自身内部差异的阶段（视觉塔），都记在模型卡片里。
 
 完整说明见 [docs/models/minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md)。
 
@@ -1428,8 +1437,13 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 | 每步最多起草 token 数 | `8` | `TS_SPEC_DRAFT`（旧写法 `TS_MTP_DRAFT`） | `--spec-draft N` |
 | 草稿置信度门限 | 按算法（`0.75` / `0.35` / `0`） | `TS_SPEC_PMIN`（旧写法 `TS_MTP_PMIN`） | `--spec-pmin X` |
 | Gemma 4 独立草稿 GGUF（`gemma4-assistant`） | 无 | `TS_SPEC_DRAFT_MODEL`（旧写法 `TS_MTP_DRAFT_MODEL`） | `--spec-draft-model <path>` |
-| Muse-Glimmer DFlash 草稿器 GGUF | 无 | `TS_MUSE_GLIMMER_DFLASH` | `--draft-model <path>` |
-| Muse-Glimmer 融合 DFlash 计算图（ggml） | 开启 | `TS_DFLASH_FUSED=0` 回退到逐算子草稿器 | — |
+| Muse-Glimmer DFlash / DFlash2 草稿器 GGUF | 无 | `TS_MUSE_GLIMMER_DFLASH` | `--draft-model <path>` |
+| Qwen 3.5 / 3.8 DFlash2 草稿器 GGUF | 无 | `TS_QWEN35_DFLASH` | `--draft-model <path>` |
+| 融合 DFlash 计算图（ggml） | 开启 | `TS_DFLASH_FUSED=0` 回退到逐算子草稿器 | — |
+| DFlash 投机 prefill 分块 | `1024`（受草稿器环形缓冲与主干窗口限制） | `TS_DFLASH_PREFILL_CHUNK` | — |
+| DFlash2 候选选择器 | 检查点带有时开启 | `TS_DFLASH_SELECTOR=0` 改为按逐位置 argmax 起草（仅用于归因分析） | — |
+| DFlash2 分组卷积 | 检查点带有时开启 | `TS_DFLASH_CONV=0` 去掉它（同上，仅用于归因分析） | — |
+| Qwen 3.5/3.8 递归状态快照 | 开启 | `TS_Q35_VERIFY_SNAPSHOTS=0` 回退为先恢复验证前的状态副本、再对已接受前缀重新前向（更慢；见 [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md)） | — |
 | Gemma 4 融合验证 / 草稿内核（ggml） | 开启 | `TS_GMTP_NO_FUSED=1` 回退到逐算子 | — |
 | Gemma 4 部分接受时的稠密快速回滚 | 开启 | `TS_GMTP_NO_FAST_ROLLBACK=1` 恢复保留前缀回滚 | — |
 | Gemma 4 验证主干路径 | 线性（单序列） | `TS_GMTP_BATCHED_TRUNK=1` 走批量分页主干 | — |
@@ -1462,6 +1476,8 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 | 文本编码器主干分组运行，每组用完即释放其设备副本 | 关闭 | `TS_H3_TE_GROUP=N` 指定每组层数 —— 能消掉编码器自身的溢出（峰值 16 041 → 12 981 MiB）且逐位一致，但在 16 GB RTX 3080 Laptop 上实测慢约 3 秒：一次性 prefill 每个权重只读一遍，分组照样要搬完 17 GB，还多出分配/失效的开销 | — |
 | 分阶段耗时（编码器打开 / 主干 / 拆卸、预读、每个去噪步、VAE 打开 / 解码） | 关闭 | `TS_H3_PHASE=1` | — |
 | 每步的潜变量 / 速度幅值 | 关闭 | `TS_H3_TRACE=1` | — |
+| 执行路径 | 七张原生整网络 ggml 计算图 | — | `--backend cpu` 改用纯 C# 跑同一条流程（t2v、i2v、fl2v 与参考条件） |
+| 托管路径与 GGML 的对拍诊断 | 关闭 | `TS_H3_DUMP_TE`、`TS_H3_DUMP_VEL_V`、`TS_H3_DUMP_VEL_A`、`TS_H3_DUMP_VIS` 把这些张量写到磁盘，使两条路径可以在**同一次**前向上比较；`TS_H3_DIT_LAYERS=N` 在**两条路径上**同时截断主干，把比较变成误差随深度的曲线；`TS_H3_NO_FLASH=1` 让 GGML 走显式 softmax 注意力而不是它的 flash 内核 | — |
 | 伴随网络与分词器覆盖 | 在去噪器同目录解析 | `TS_VIDEO_TEXT_ENCODER`、`TS_VIDEO_VAE`、`TS_VIDEO_AUDIO_VAE`、`TS_VIDEO_TOKENIZER` | `--video-te`、`--video-vae`、`--audio-vae` |
 
 #### 张量并行与分布式推理
@@ -1491,6 +1507,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
 | 默认计算后端 | `ggml_metal`（macOS）、`ggml_cpu`（Windows/Linux） | `BACKEND` | `--backend` |
+| 首次前向 logits 导出（后端 A/B） | 关闭 | `TS_DUMP_LOGITS=<路径>` 把**第一次真实前向**的 logits 以原始 float32 一次性写入该路径，并刻意跳过预热前向（`WarmUpKernels` 会先跑一次丢弃用的 decode 和 prefill，导出那几次等于在一个无意义的 token 上比较两个执行器）。这样就能用 logit 向量而不是生成文本来比较两个后端——贪心解码会把一次几乎打平的比分变成一句明显不同的话 | — |
 | MLX 后端库查找 | 优先探测应用目录 | `TENSORSHARP_MLX_LIBRARY`（`libmlxc` 完整路径）、`TENSORSHARP_MLX_LIBRARY_DIR`（目录） | — |
 | MLX 流水化贪心 decode（仅 CLI） | 满足条件时启用 | `TS_MLX_PIPELINED_DECODE=0` 关闭 | — |
 | 使用 `mlock(2)` 钉住 GGUF mmap，使权重常驻 | 启用 | `TS_MLX_MLOCK_GGUF=0` 关闭 | — |
@@ -1500,6 +1517,23 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --back
 | MLX 设备端 MoE router top-K + softmax | 满足条件时启用 | `TS_MLX_DEVICE_ROUTER=0` 关闭 | — |
 | MLX 解码层边界 `async_eval` 间隔 | Gemma 4：每 4 层；Qwen / Nemotron：每 16 层 | `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS=N` 或 `TS_MLX_EVAL_EVERY_N_LAYERS=N`（支持处 `0` = 关闭） | — |
 | MLX 分配器上限（内存 / 缓存 / wired buffer） | 按宿主机派生 | `TS_MLX_MEMORY_LIMIT_MB`、`TS_MLX_CACHE_LIMIT_MB`、`TS_MLX_WIRED_LIMIT_MB` | — |
+
+#### 纯 C# CPU 后端（`--backend cpu`）
+
+托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，而不是每次矩阵乘一个 `Parallel.For`。
+它**刻意不占满**所有核心：CPU 路径的其余部分仍然使用 ThreadPool，而池内线程在两次任务之间
+自旋，占满每个核心会把那部分工作饿死。在 122 个 CPU 的配额上用 gemma-4-E4B-it-Q8_0 实测
+（prefill / decode tok/s，每格为两次交替运行）：关闭池 21.7,21.0 / 2.0,2.4；32 线程 24.9,24.1 / 4.9,5.0；48 线程 25.6,28.5 / 5.4,6.0；
+61 线程 24.2,24.9 / 6.3,5.9；122 线程 13.5 / 4.8——即默认宽度下 prefill 约 +15%，decode 约
+2.8 倍。122 线程时只有 prefill 回退，解码仍优于关闭池的基线。
+
+| 功能 | 默认 | 环境变量 | CLI 等价参数 |
+|---|---|---|---|
+| 工作线程池宽度 | 8 核及以下取全部核心；8 核以上取一半，且不低于 8 | `TS_CPU_THREADS=N` | — |
+| 是否启用工作线程池 | 启用 | `TS_CPU_POOL=0` 回退到旧的 ThreadPool `Parallel.For` 行为，便于在同一个二进制里做 A/B | — |
+| 工作线程挂起前的自旋次数 | `4096` | `TS_CPU_SPIN=N` —— 在这个宽度下挂起才是最贵的部分，所以默认自旋次数足够多，使稳态下根本不会挂起 | — |
+| 单次托管矩阵乘的任务切分 | 每个工作项 `131072` 字节权重，每个线程最多 `4` 个工作项 | `TS_CPU_TASK_BYTES`、`TS_CPU_TASKS_PER_WORKER` —— 按**工作量**而不是线程数来切 | — |
+| direct 视频网络（Wan、MiniMax-H3）上的量化权重 | 保持 GGUF 存储类型，直接参与乘法 | `TS_DIRECT_QUANT_WEIGHTS=0` 改回加载时一次性展开成 F32 再做普通 GEMM（旧行为，权重内存为 4 倍）。Wan 在 256x160x5f、单步下，就地路径实测 80.9 秒，展开路径 121.4 秒 | — |
 
 #### 采样默认值（仅服务端）
 

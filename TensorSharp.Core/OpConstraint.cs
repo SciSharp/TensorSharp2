@@ -28,23 +28,6 @@ namespace TensorSharp
         }
     }
 
-    public class ArgTypeConstraint : OpConstraint
-    {
-        private readonly int argIndex;
-        private readonly Type requiredType;
-
-        public ArgTypeConstraint(int argIndex, Type requiredType)
-        {
-            this.argIndex = argIndex;
-            this.requiredType = requiredType;
-        }
-
-        public override bool SatisfiedFor(object[] args)
-        {
-            return requiredType.IsAssignableFrom(args[argIndex].GetType());
-        }
-    }
-
     public class ArgStorageTypeConstraint : OpConstraint
     {
         private readonly int argIndex;

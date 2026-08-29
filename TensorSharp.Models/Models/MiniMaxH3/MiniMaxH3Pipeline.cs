@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using TensorSharp.GGML;
 using TensorSharp.Runtime;
@@ -447,6 +448,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 // clip down; check them before it is integrated into the latent.
                 RequireFinite(vVel, "video velocity", step, steps, layout.TokenCount);
                 RequireFinite(aVel, "audio velocity", step, steps, layout.TokenCount);
+                if (step == 0) DumpVelocity(vVel, aVel);
 
                 MiniMaxH3Scheduler.EulerStep(videoPatches, vVel, sigma, sigmas[step + 1]);
                 MiniMaxH3Scheduler.EulerStep(audioLatent, aVel, sigma, sigmas[step + 1]);
@@ -999,6 +1001,24 @@ namespace TensorSharp.Models.MiniMaxH3
         /// reaches infinity, and without this the only symptom is the finished file.</summary>
         private static readonly bool TraceEnabled =
             Environment.GetEnvironmentVariable("TS_H3_TRACE") == "1";
+
+        /// <summary>Write the first step velocities to TS_H3_DUMP_VEL_{V,A} when set.
+        /// One DiT forward on identical inputs is the only non-chaotic way to compare
+        /// two implementations of the denoiser; a finished clip is not, because the
+        /// sampler amplifies whatever difference the first step had. Off unless set.</summary>
+        private static void DumpVelocity(float[] video, float[] audio)
+        {
+            Write(Environment.GetEnvironmentVariable("TS_H3_DUMP_VEL_V"), video);
+            Write(Environment.GetEnvironmentVariable("TS_H3_DUMP_VEL_A"), audio);
+
+            static void Write(string path, float[] values)
+            {
+                if (string.IsNullOrEmpty(path)) return;
+                using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+                using var bw = new BinaryWriter(fs);
+                foreach (float v in values) bw.Write(v);
+            }
+        }
 
         private static double Rms(float[] v)
         {

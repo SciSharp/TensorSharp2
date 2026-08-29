@@ -186,10 +186,10 @@ namespace TensorSharp.Models
                 return;
             }
 
-            if (arch == "glm5next")
-                throw new NotSupportedException(
-                    "glm5next (GLM-5.3-Flash) runs through the native GGML executor only; " +
-                    "use a GGML backend (there is no managed per-op fallback for the KDA/mHC layers yet).");
+            // glm5next now has a managed per-op path (GlmDsaModel.Glm5Next.cs): KDA
+            // linear attention and Sinkhorn hyper-connections both run in C#, so the
+            // pure-C# `cpu` backend serves this family too.
+            ParseGlm5NextConfig(arch, _numTrunkLayers);
 
             LoadWeights();
             BuildLayerNames();
@@ -421,6 +421,16 @@ namespace TensorSharp.Models
 
             for (int l = 0; l < _numTrunkLayers; l++)
             {
+                // glm5next is KDA-recurrent on most of its trunk and only its
+                // full-attention layers carry MLA at all, so the absorbed tensors
+                // exist on roughly a quarter of them (GLM-5.3-Flash: 12 of 45,
+                // starting at layer 3). Demanding them everywhere is right for
+                // GLM-5.2, where every layer is MLA, but rejects a perfectly good
+                // 5.3 checkpoint at layer 0. _layerIsRecurrent is null for the
+                // non-glm5next families, which keeps their behaviour unchanged.
+                if (_layerIsRecurrent != null && l < _layerIsRecurrent.Length && _layerIsRecurrent[l])
+                    continue;
+
                 if (_wkB[l] == null || _wvB[l] == null)
                     throw new InvalidDataException_GlmDsa(
                         $"layer {l} is missing attn_k_b / attn_v_b. This build requires the MLA-absorbed " +
@@ -493,8 +503,13 @@ namespace TensorSharp.Models
             {
                 _kvCache[l] = new Tensor(_allocator, DType.Float32, initialSeqLen, _kvLoraRank);
                 InitializeCacheTensor(_kvCache[l]);
-                _kPeCache[l] = new Tensor(_allocator, DType.Float32, initialSeqLen, _ropeDim);
-                InitializeCacheTensor(_kPeCache[l]);
+                // NoPE MLA (glm5next) has no rope half, so there is no pe row to
+                // cache -- allocating it would be a zero-width tensor.
+                if (_ropeDim > 0)
+                {
+                    _kPeCache[l] = new Tensor(_allocator, DType.Float32, initialSeqLen, _ropeDim);
+                    InitializeCacheTensor(_kPeCache[l]);
+                }
                 if (l < _numTrunkLayers && _indexerFull[l])
                 {
                     _indexerCache[l] = new Tensor(_allocator, DType.Float32, initialSeqLen, _indexerHeadDim);
@@ -519,7 +534,8 @@ namespace TensorSharp.Models
             for (int l = 0; l < NumCacheLayers; l++)
             {
                 GrowCache(ref _kvCache[l], newCapacity, _kvLoraRank);
-                GrowCache(ref _kPeCache[l], newCapacity, _ropeDim);
+                if (_kPeCache[l] != null)
+                    GrowCache(ref _kPeCache[l], newCapacity, _ropeDim);
                 if (_indexerCache[l] != null)
                     GrowCache(ref _indexerCache[l], newCapacity, _indexerHeadDim);
             }
@@ -573,6 +589,11 @@ namespace TensorSharp.Models
                 return;
             }
 
+            // glm5next carries recurrent KDA state alongside the attention cache;
+            // leaving it behind would silently condition the next sequence on this
+            // one, which no amount of KV clearing would show up as.
+            ResetKdaState();
+
             _cacheSeqLen = 0;
             _sharedTopKCount = 0;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
@@ -595,6 +616,8 @@ namespace TensorSharp.Models
         {
             if (UsesNativeExecutor)
                 return ForwardNative(tokens);
+            if (IsGlm5Next)
+                return ForwardCoreGlm5Next(tokens);
 
             _forwardSw.Start();
             int seqLen = tokens.Length;

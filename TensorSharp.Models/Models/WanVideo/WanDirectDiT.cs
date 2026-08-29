@@ -15,12 +15,13 @@ using System;
 using System.IO;
 using TensorSharp;
 using TensorSharp.Runtime;
+using TensorSharp.Models.Direct;
 
 namespace TensorSharp.Models.WanVideo
 {
     internal sealed class WanDirectDiT : IWanDit
     {
-        private readonly WanDirectContext _ctx;
+        private readonly DirectContext _ctx;
         private readonly GgufFile _gguf;
         private const float Eps = 1e-6f;
 
@@ -36,16 +37,16 @@ namespace TensorSharp.Models.WanVideo
         private sealed class Block
         {
             public Tensor Mod;                 // [1, 6*dim]
-            public WanDirectLinear SQ, SK, SV, SO;
+            public DirectLinear SQ, SK, SV, SO;
             public Tensor SNormQ, SNormK;      // [dim] RMS gains
             public Tensor Norm3W, Norm3B;
-            public WanDirectLinear XQ, XK, XV, XO;
+            public DirectLinear XQ, XK, XV, XO;
             public Tensor XNormQ, XNormK;
-            public WanDirectLinear Ffn0, Ffn2;
+            public DirectLinear Ffn0, Ffn2;
         }
 
         private bool _loaded;
-        private WanDirectLinear _patch, _text0, _text2, _time0, _time2, _tproj, _head;
+        private DirectLinear _patch, _text0, _text2, _time0, _time2, _tproj, _head;
         private Tensor _headMod;               // [2, dim]
         private Block[] _blocks;
 
@@ -86,7 +87,7 @@ namespace TensorSharp.Models.WanVideo
             _phaseMs.Clear();
         }
 
-        public WanDirectDiT(WanDirectContext ctx, GgufFile ditGguf)
+        public WanDirectDiT(DirectContext ctx, GgufFile ditGguf)
         {
             _ctx = ctx;
             _gguf = ditGguf;
@@ -118,18 +119,18 @@ namespace TensorSharp.Models.WanVideo
         }
 
         private Tensor F32(string name, params long[] sizes)
-            => _ctx.Own(_ctx.FromFloats(WanDirectOps.DequantTensor(_gguf, name), sizes));
+            => _ctx.Own(_ctx.FromFloats(DirectOps.DequantTensor(_gguf, name), sizes));
 
         private void EnsureWeights()
         {
             if (_loaded) return;
-            _patch = WanDirectLinear.FromGgufPatch(_ctx, _gguf, "patch_embedding.weight", "patch_embedding.bias");
-            _text0 = WanDirectLinear.FromGguf(_ctx, _gguf, "text_embedding.0.weight", "text_embedding.0.bias");
-            _text2 = WanDirectLinear.FromGguf(_ctx, _gguf, "text_embedding.2.weight", "text_embedding.2.bias");
-            _time0 = WanDirectLinear.FromGguf(_ctx, _gguf, "time_embedding.0.weight", "time_embedding.0.bias");
-            _time2 = WanDirectLinear.FromGguf(_ctx, _gguf, "time_embedding.2.weight", "time_embedding.2.bias");
-            _tproj = WanDirectLinear.FromGguf(_ctx, _gguf, "time_projection.1.weight", "time_projection.1.bias");
-            _head = WanDirectLinear.FromGguf(_ctx, _gguf, "head.head.weight", "head.head.bias");
+            _patch = DirectLinear.FromGgufPatch(_ctx, _gguf, "patch_embedding.weight", "patch_embedding.bias");
+            _text0 = DirectLinear.FromGguf(_ctx, _gguf, "text_embedding.0.weight", "text_embedding.0.bias");
+            _text2 = DirectLinear.FromGguf(_ctx, _gguf, "text_embedding.2.weight", "text_embedding.2.bias");
+            _time0 = DirectLinear.FromGguf(_ctx, _gguf, "time_embedding.0.weight", "time_embedding.0.bias");
+            _time2 = DirectLinear.FromGguf(_ctx, _gguf, "time_embedding.2.weight", "time_embedding.2.bias");
+            _tproj = DirectLinear.FromGguf(_ctx, _gguf, "time_projection.1.weight", "time_projection.1.bias");
+            _head = DirectLinear.FromGguf(_ctx, _gguf, "head.head.weight", "head.head.bias");
             _headMod = F32("head.modulation", 2, Dim);
 
             _blocks = new Block[Layers];
@@ -139,22 +140,22 @@ namespace TensorSharp.Models.WanVideo
                 _blocks[l] = new Block
                 {
                     Mod = F32($"{p}modulation", 1, 6L * Dim),
-                    SQ = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}self_attn.q.weight", $"{p}self_attn.q.bias"),
-                    SK = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}self_attn.k.weight", $"{p}self_attn.k.bias"),
-                    SV = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}self_attn.v.weight", $"{p}self_attn.v.bias"),
-                    SO = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}self_attn.o.weight", $"{p}self_attn.o.bias"),
+                    SQ = DirectLinear.FromGguf(_ctx, _gguf, $"{p}self_attn.q.weight", $"{p}self_attn.q.bias"),
+                    SK = DirectLinear.FromGguf(_ctx, _gguf, $"{p}self_attn.k.weight", $"{p}self_attn.k.bias"),
+                    SV = DirectLinear.FromGguf(_ctx, _gguf, $"{p}self_attn.v.weight", $"{p}self_attn.v.bias"),
+                    SO = DirectLinear.FromGguf(_ctx, _gguf, $"{p}self_attn.o.weight", $"{p}self_attn.o.bias"),
                     SNormQ = F32($"{p}self_attn.norm_q.weight", Dim),
                     SNormK = F32($"{p}self_attn.norm_k.weight", Dim),
                     Norm3W = F32($"{p}norm3.weight", Dim),
                     Norm3B = F32($"{p}norm3.bias", Dim),
-                    XQ = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}cross_attn.q.weight", $"{p}cross_attn.q.bias"),
-                    XK = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}cross_attn.k.weight", $"{p}cross_attn.k.bias"),
-                    XV = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}cross_attn.v.weight", $"{p}cross_attn.v.bias"),
-                    XO = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}cross_attn.o.weight", $"{p}cross_attn.o.bias"),
+                    XQ = DirectLinear.FromGguf(_ctx, _gguf, $"{p}cross_attn.q.weight", $"{p}cross_attn.q.bias"),
+                    XK = DirectLinear.FromGguf(_ctx, _gguf, $"{p}cross_attn.k.weight", $"{p}cross_attn.k.bias"),
+                    XV = DirectLinear.FromGguf(_ctx, _gguf, $"{p}cross_attn.v.weight", $"{p}cross_attn.v.bias"),
+                    XO = DirectLinear.FromGguf(_ctx, _gguf, $"{p}cross_attn.o.weight", $"{p}cross_attn.o.bias"),
                     XNormQ = F32($"{p}cross_attn.norm_q.weight", Dim),
                     XNormK = F32($"{p}cross_attn.norm_k.weight", Dim),
-                    Ffn0 = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}ffn.0.weight", $"{p}ffn.0.bias"),
-                    Ffn2 = WanDirectLinear.FromGguf(_ctx, _gguf, $"{p}ffn.2.weight", $"{p}ffn.2.bias"),
+                    Ffn0 = DirectLinear.FromGguf(_ctx, _gguf, $"{p}ffn.0.weight", $"{p}ffn.0.bias"),
+                    Ffn2 = DirectLinear.FromGguf(_ctx, _gguf, $"{p}ffn.2.weight", $"{p}ffn.2.bias"),
                 };
             }
             _loaded = true;
@@ -167,9 +168,9 @@ namespace TensorSharp.Models.WanVideo
             WanDiT.FillSinusoid(tsin, timestep);
             using var tsinT = _ctx.FromFloats(tsin, 1, WanDiT.FreqDim);
             using var e = _time0.Forward(tsinT);
-            using var eS = WanDirectOps.Silu(_ctx, e);
+            using var eS = DirectOps.Silu(_ctx, e);
             var e2d = _time2.Forward(eS);
-            using var e2dS = WanDirectOps.Silu(_ctx, e2d);
+            using var e2dS = DirectOps.Silu(_ctx, e2d);
             var e0 = _tproj.Forward(e2dS);
             return (e2d, e0);
         }
@@ -181,12 +182,12 @@ namespace TensorSharp.Models.WanVideo
         {
             if (s0 > 0)
             {
-                WanDirectOps.ModulateRows(_ctx, y, x, shiftB, scaleB, 0, s0);
-                WanDirectOps.ModulateRows(_ctx, y, x, shiftA, scaleA, s0, seq - s0);
+                DirectOps.ModulateRows(_ctx, y, x, shiftB, scaleB, 0, s0);
+                DirectOps.ModulateRows(_ctx, y, x, shiftA, scaleA, s0, seq - s0);
             }
             else
             {
-                WanDirectOps.ModulateRows(_ctx, y, x, shiftA, scaleA, 0, seq);
+                DirectOps.ModulateRows(_ctx, y, x, shiftA, scaleA, 0, seq);
             }
         }
 
@@ -194,12 +195,12 @@ namespace TensorSharp.Models.WanVideo
         {
             if (s0 > 0)
             {
-                WanDirectOps.GateAddRows(_ctx, x, v, gateB, 0, s0);
-                WanDirectOps.GateAddRows(_ctx, x, v, gateA, s0, seq - s0);
+                DirectOps.GateAddRows(_ctx, x, v, gateB, 0, s0);
+                DirectOps.GateAddRows(_ctx, x, v, gateA, s0, seq - s0);
             }
             else
             {
-                WanDirectOps.GateAddRows(_ctx, x, v, gateA, 0, seq);
+                DirectOps.GateAddRows(_ctx, x, v, gateA, 0, seq);
             }
         }
 
@@ -231,7 +232,7 @@ namespace TensorSharp.Models.WanVideo
             Tensor txt;
             using (var ctxT = _ctx.FromFloats(context, cl, WanDiT.TextDim))
             using (var t0 = _text0.Forward(ctxT))
-            using (var tg = WanDirectOps.Gelu(_ctx, t0))
+            using (var tg = DirectOps.Gelu(_ctx, t0))
                 txt = _text2.Forward(tg);                             // [cl, dim]
 
             for (int l = 0; l < Layers; l++)
@@ -254,20 +255,20 @@ namespace TensorSharp.Models.WanVideo
 
                 // --- self-attention sub-layer ---
                 Phase("misc");
-                using (var n1 = WanDirectOps.LayerNorm(_ctx, x, null, null, Eps))
+                using (var n1 = DirectOps.LayerNorm(_ctx, x, null, null, Eps))
                 {
                     SegModulate(n1, n1, eShiftA, eScaleA, eShiftAB, eScaleAB, seq, s0);
                     Phase("norm-mod");
                     using var qLin = b.SQ.Forward(n1);
-                    using var q = WanDirectOps.RmsNorm(_ctx, qLin, b.SNormQ, Eps);
+                    using var q = DirectOps.RmsNorm(_ctx, qLin, b.SNormQ, Eps);
                     using var kLin = b.SK.Forward(n1);
-                    using var k = WanDirectOps.RmsNorm(_ctx, kLin, b.SNormK, Eps);
+                    using var k = DirectOps.RmsNorm(_ctx, kLin, b.SNormK, Eps);
                     using var v = b.SV.Forward(n1);
                     Phase("qkv-proj");
-                    WanDirectOps.RopeInterleaved(_ctx, q, _cosT, _sinT, heads, hd);
-                    WanDirectOps.RopeInterleaved(_ctx, k, _cosT, _sinT, heads, hd);
+                    DirectOps.RopeInterleaved(_ctx, q, _cosT, _sinT, heads, hd);
+                    DirectOps.RopeInterleaved(_ctx, k, _cosT, _sinT, heads, hd);
                     Phase("rope");
-                    using var attn = WanDirectOps.Attention(_ctx, q, k, v, heads, hd, scale);
+                    using var attn = DirectOps.Attention(_ctx, q, k, v, heads, hd, scale);
                     Phase("self-attn");
                     using var o = b.SO.Forward(attn);
                     SegGateAdd(x, o, eGateA, eGateAB, seq, s0);
@@ -275,15 +276,15 @@ namespace TensorSharp.Models.WanVideo
                 }
 
                 // --- cross-attention sub-layer (affine LayerNorm, no gating) ---
-                using (var n3 = WanDirectOps.LayerNorm(_ctx, x, b.Norm3W, b.Norm3B, Eps))
+                using (var n3 = DirectOps.LayerNorm(_ctx, x, b.Norm3W, b.Norm3B, Eps))
                 using (var xqLin = b.XQ.Forward(n3))
-                using (var xq = WanDirectOps.RmsNorm(_ctx, xqLin, b.XNormQ, Eps))
+                using (var xq = DirectOps.RmsNorm(_ctx, xqLin, b.XNormQ, Eps))
                 using (var xkLin = b.XK.Forward(txt))
-                using (var xk = WanDirectOps.RmsNorm(_ctx, xkLin, b.XNormK, Eps))
+                using (var xk = DirectOps.RmsNorm(_ctx, xkLin, b.XNormK, Eps))
                 using (var xv = b.XV.Forward(txt))
                 {
                     Phase("xproj");
-                    using var xattn = WanDirectOps.Attention(_ctx, xq, xk, xv, heads, hd, scale);
+                    using var xattn = DirectOps.Attention(_ctx, xq, xk, xv, heads, hd, scale);
                     Phase("cross-attn");
                     using var xo = b.XO.Forward(xattn);
                     Ops.Add(x, x, xo);
@@ -291,12 +292,12 @@ namespace TensorSharp.Models.WanVideo
                 }
 
                 // --- FFN sub-layer ---
-                using (var n2 = WanDirectOps.LayerNorm(_ctx, x, null, null, Eps))
+                using (var n2 = DirectOps.LayerNorm(_ctx, x, null, null, Eps))
                 {
                     SegModulate(n2, n2, eShiftM, eScaleM, eShiftMB, eScaleMB, seq, s0);
                     Phase("norm-mod");
                     using var h = b.Ffn0.Forward(n2);
-                    using var hg = WanDirectOps.Gelu(_ctx, h);
+                    using var hg = DirectOps.Gelu(_ctx, h);
                     using var mlp = b.Ffn2.Forward(hg);
                     SegGateAdd(x, mlp, eGateM, eGateMB, seq, s0);
                     Phase("ffn");
@@ -316,11 +317,11 @@ namespace TensorSharp.Models.WanVideo
                 using var hScale = HeadScale(e2d);
                 using var hShiftB = s0 > 0 ? HeadShift(e2dB) : null;
                 using var hScaleB = s0 > 0 ? HeadScale(e2dB) : null;
-                using var hn = WanDirectOps.LayerNorm(_ctx, x, null, null, Eps);
+                using var hn = DirectOps.LayerNorm(_ctx, x, null, null, Eps);
                 SegModulate(hn, hn, hShift, hScale, hShiftB, hScaleB, seq, s0);
                 using var outT = _head.Forward(hn);
                 Phase("head");
-                outTokens = WanDirectOps.ToArray(outT);
+                outTokens = DirectOps.ToArray(outT);
                 Phase("download");
             }
             PhaseReport();

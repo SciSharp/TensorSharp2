@@ -140,12 +140,6 @@ namespace TensorSharp.MLX
         [RegisterOpStorageType("neg", typeof(MlxStorage))]
         public static Tensor Neg(Tensor result, Tensor src) => Unary("neg", result, src, MlxNative.MlxUnaryOp.Neg);
 
-        [RegisterOpStorageType("sqrt", typeof(MlxStorage))]
-        public static Tensor Sqrt(Tensor result, Tensor src) => Unary("sqrt", result, src, MlxNative.MlxUnaryOp.Sqrt);
-
-        [RegisterOpStorageType("rsqrt", typeof(MlxStorage))]
-        public static Tensor Rsqrt(Tensor result, Tensor src) => Unary("rsqrt", result, src, MlxNative.MlxUnaryOp.Rsqrt);
-
         [RegisterOpStorageType("exp", typeof(MlxStorage))]
         public static Tensor Exp(Tensor result, Tensor src) => Unary("exp", result, src, MlxNative.MlxUnaryOp.Exp);
 
@@ -160,9 +154,6 @@ namespace TensorSharp.MLX
 
         [RegisterOpStorageType("ceil", typeof(MlxStorage))]
         public static Tensor Ceil(Tensor result, Tensor src) => Unary("ceil", result, src, MlxNative.MlxUnaryOp.Ceil);
-
-        [RegisterOpStorageType("sin", typeof(MlxStorage))]
-        public static Tensor Sin(Tensor result, Tensor src) => Unary("sin", result, src, MlxNative.MlxUnaryOp.Sin);
 
         [RegisterOpStorageType("cos", typeof(MlxStorage))]
         public static Tensor Cos(Tensor result, Tensor src) => Unary("cos", result, src, MlxNative.MlxUnaryOp.Cos);

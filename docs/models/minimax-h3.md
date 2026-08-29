@@ -33,6 +33,82 @@ That writes `fox.mp4` plus `fox.wav` with the generated soundtrack.
 | Joint stereo audio | working |
 | Video VAE encode + decode | working, tiled |
 | Clips past 22 frames | working (the VAE decodes 5 latent frames at a time) |
+| `--backend cpu` (100% pure C#) | working: t2v, i2v, fl2v and reference conditioning |
+
+### The pure-C# backend
+
+`--backend cpu` runs H3 with no ggml at all, through
+`MiniMaxH3Direct{DiT,TextEncoder,VideoVae,AudioVae}` on the shared
+`TensorSharp.Models/Direct` primitives. That covers the whole text-to-video path:
+prompt encoding, denoising, video VAE decode and the audio vocoder.
+
+The vision tower, the causal 3-D video VAE encoder and the audio VAE encoder are
+ported too, so every conditioning route works: `i2v`, `fl2v`, and reference
+images, clips and soundtracks. Everything runs at F32 on the host, so expect it to be slower than `ggml_cuda`;
+it is there for correctness, portability and machines with no accelerator. A
+256x160x5f single-step t2v measured 69 s against 14 s on `ggml_cpu`; the same
+i2v measured 70 s against 176 s, because the managed 3-D encode costs far less
+than the GGML one (single sample - do not read too much into the direction).
+
+Measured against the GGML path on identical inputs (256x160, 5 frames, one step,
+fixed `--diffusion-seed`):
+
+| stage | cosine | relative RMS |
+|---|---|---|
+| text encoder (64 layers, 32B Q4_K_M) | 0.99999899 | 0.147% |
+| DiT, audio velocity | 0.9994631 | 3.31% |
+| DiT, video velocity | 0.9975865 | 7.60% |
+| i2v (vision tower + 3-D VAE encode + DiT) | 0.9998974 | - |
+| ref-audio (audio VAE encode + DiT) | 0.9994101 | 4.32% |
+| ref-image (vision tower + DiT) | 0.9985535 | - |
+| vision tower output, on its own | 0.9999189 | 1.28% |
+
+The vision tower is the one stage whose residual is LARGER than GGML's own
+internal spread rather than smaller: measured on the tower output directly, the
+managed path sits at 1.28% relative against GGML's flash kernel and 1.40% against
+its explicit-softmax fallback, while those two GGML kernels differ from each other
+by 0.99%. Turning flash off makes the managed agreement slightly WORSE, so the F16
+K/V cast does not explain it. At cosine 0.9999 over 737k elements the tower is
+structurally right - a wrong tower does not land near 1 - but the residual is
+roughly 1.4x the control rather than below it, and it has not been chased further.
+It is worth knowing before trusting reference-image conditioning to the managed
+path for anything precision-sensitive.
+
+On the finished render, measured as PSNR against the GGML path: t2v 31.95 dB,
+i2v 34.87 dB, reference-audio 35.27 dB. The control that makes those numbers
+readable is GGML against ITSELF - its flash kernel vs `TS_H3_NO_FLASH=1` renders
+at 28.17 dB, i.e. every managed route agrees with GGML more closely than GGML's
+two attention kernels agree with each other.
+
+The trunk is not bit-identical to GGML and cannot be, because the denoiser
+amplifies tiny differences. `TS_H3_DIT_LAYERS` truncates the trunk on BOTH paths,
+which turns the velocity comparison into an error-vs-depth curve:
+
+| trunk depth | 1 | 10 | 25 | 30 | 35 | 40 | 44 | 47 | 50 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 - cosine | 1.4e-6 | 3.8e-6 | 9.4e-6 | 2.8e-5 | 2.8e-4 | 1.15e-3 | 1.5e-4 | 2.0e-4 | 1.26e-3 |
+
+Through 25 layers the two agree to ~1e-5, i.e. the implementation is right. Past
+that the difference amplifies, and NON-MONOTONICALLY - it is larger at depth 40
+than at 44. That shape is what rules out a bug: an error introduced at some layer
+would leave the curve non-decreasing for every depth beyond it. The second half of
+this trunk simply has high gain.
+
+For scale, GGML disagrees with ITSELF by more than it disagrees with the managed
+path. At full depth, `h3_attend`'s flash kernel against its own explicit-softmax
+fallback (`TS_H3_NO_FLASH=1`) gives 1 - cosine = 2.97e-3, against 1.26e-3 for
+managed-vs-either. The text encoder, which is shallower in effect and has no such
+kernel on either side, agrees to 1e-6 - that is what says the shared machinery
+(quantized matmul, RMSNorm, rotate-half RoPE, GQA attention, SwiGLU) is right.
+
+`TS_H3_DUMP_TE`, `TS_H3_DUMP_VEL_V` and `TS_H3_DUMP_VEL_A` write those tensors to
+disk so the two paths can be compared on ONE forward, and `TS_H3_DIT_LAYERS`
+truncates the trunk so that comparison becomes a curve. Do not compare finished
+clips: the sampler amplifies whatever the first step differed by, so a few-step
+render says nothing about whether an implementation is correct. Note also that
+`--seed` is the SAMPLING seed; video generation draws its noise from
+`--diffusion-seed`, and comparing two runs without it silently compares different
+noise.
 
 ### Long clips and the FP16 attention ceiling
 

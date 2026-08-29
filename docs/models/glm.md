@@ -43,6 +43,71 @@ Two implementations, both reproducing llama.cpp's `src/models/glm-dsa.cpp`:
   implementation the native executor is checked against; `TS_GLM_NATIVE=0`
   selects it on a GGML backend for an A/B.
 
+  GLM-5.3-Flash (`glm5next`) runs here too, but it is **correct rather than
+  fast** -- see below.
+
+### GLM-5.3-Flash on `--backend cpu`
+
+Getting `glm5next` onto the pure-C# backend took four fixes, all of which were
+silent or fatal rather than merely slow:
+
+- **NoPE MLA.** GLM-5.3 sets `rope.dimension_count = 0`: there is no rope half
+  anywhere, `n_nope == n_embd_head_k`, and the compressed latent IS the whole
+  cache row. The GLM-5.2 path splits every head into a NoPE and a RoPE part, so
+  it narrowed a zero-width slice and threw. `GlmDsaModel.Attention` now mirrors
+  the `hp.n_rot == 0` branches in `ggml_ops_glm_dsa.cpp`: no pe half on the query
+  or the key, no `_kPeCache` row, no rope on either the attention or the DSA
+  indexer, and the score is the absorbed term alone.
+- **The MLA-absorbed layout check** demanded `attn_k_b` / `attn_v_b` on every
+  trunk layer. GLM-5.3 is KDA-recurrent on most of its trunk and carries them on
+  only 12 of 45 layers, starting at layer 3, so a valid checkpoint was rejected
+  at layer 0. The requirement is now scoped to the full-attention layers.
+- **`IQ2_XS` and `IQ4_XS` had no managed support**, so the loader expanded them
+  to F32 -- 765 GB for this model. Loading never finished; it just grew. Both now
+  have managed dequantizers (checked against ggml's own) and direct
+  `x Q8_K` dot kernels.
+- **`BackendType.Cpu` was the only backend missing from
+  `CanUseFileMappedQuantizedWeights`**, so it alone copied every quantized tensor
+  into fresh anonymous memory.
+
+Load now reports `Quantized: 103255 MB (103255 MB file-backed), F32: 983 MB` and
+finishes in ~48 s, most of it the page-cache prefault.
+
+**Performance.** Measured on the 122-CPU box, 22-token prompt, 16 tokens out:
+
+| | prefill | decode |
+|---|---|---|
+| `cpu`, scalar i-quant dots | 0.9 | 0.4 |
+| `cpu`, AVX2 i-quant dots | **3.1** | **1.6** |
+| `ggml_cpu`, same file and box | 17.7 | 3.9 |
+
+Roughly 89% of the time is the MoE expert path -- 8 experts x 3 matrices x 45
+layers of small matmuls per token -- and it sits outside the `Linear` timing
+bucket, so the built-in breakdown makes it look like "Other". The direct
+`IQ2_XS` / `IQ3_XXS` dots removed the F32 expansion; vectorizing them
+(`VecDotIq2XsQ8KAvx2`, `VecDotIq3XxsQ8KAvx2`, one ib32 per 256-bit lane, signs
+applied to the ACTIVATION with VPSIGNB) is what closed most of the remaining gap.
+Still ~5.7x off `ggml_cpu` on prefill and ~2.4x on decode.
+
+**Quality: close, and the token difference is a near-tie rather than a defect.**
+Comparing the PREFILL logits directly (`TS_DUMP_LOGITS`, which skips the warmup
+forwards -- comparing those instead measures two executors on a throwaway token
+and is meaningless):
+
+- cosine **0.9567** over the 154880-wide vocabulary;
+- native argmax `1986` at 18.71 with `16360` at 18.60 -- 0.11 apart;
+- the managed path ranks them the other way and puts native's pick at **rank 2**.
+
+That is why the greedy text differs (`Simple arithmetic question, user wants a
+brief answer.</think>2+2 = ` against `This is a simple arithmetic question. The
+user wants a brief answer. 2`) while the reasoning is the same. At 2 bits the
+per-op and fused executors pick different experts from small numerical
+differences, the same effect that keeps `TS_BATCHED_FUSED_DECODE` off by default.
+A cosine of 0.96 is consistent with that but does not prove it: it is lower than
+the ~0.999 a higher-precision checkpoint would be expected to give, and no
+higher-precision GLM-5.3 GGUF was available to use as a control. Treat the
+managed path as a reference implementation to A/B against, not as bit-parity.
+
 Split GGUFs are handled by `GgufFile` itself (`split.count` / `-00001-of-000NN`),
 so every model in the repo can now be stored across several files.
 

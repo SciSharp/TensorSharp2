@@ -1101,21 +1101,39 @@ namespace TensorSharp.Runtime.Scheduling
                 return null;
             }
 
-            // (Re-)arm at a fresh full prefill from position 0 with a clean
-            // cache. A prefix-cache or live-cache adoption skips trunk
-            // positions the MTP head never saw, so those admissions stay on
-            // the plain path. Replaces any stale context (including this
-            // sequence's own, e.g. after preemption + re-prefill).
-            if (work.IsPrefill && prevComputed == 0 && spec.CacheSeqLen == 0)
+            // (Re-)arm on a prefill whose trunk cache agrees with what the
+            // scheduler says is already computed. That covers the fresh
+            // position-0 case AND an admission that ADOPTED a KV prefix (prefix
+            // cache, or the previous turn of a chat).
+            //
+            // Prefix adoption used to be refused outright, because it skips trunk
+            // positions a learned per-position draft head never saw. That is true
+            // of NextN/MTP heads and stays true - they decline below - but it was
+            // applied to every algorithm, and in a Web UI conversation EVERY turn
+            // after the first adopts a prefix. So speculation armed on turn one,
+            // never again, and DFlash measured as "no faster than plain" for the
+            // rest of the session. Which algorithms survive a gap is now the
+            // algorithm's own call (ISpeculator.CanArmAfterPrefixReuse).
+            //
+            // Replaces any stale context (including this sequence's own, e.g.
+            // after preemption + re-prefill).
+            if (work.IsPrefill && spec.CacheSeqLen == prevComputed)
             {
                 var exec = TryArmSpeculation(spec, seq, trunk: null, trunkLabel: "linear");
                 if (exec == null)
                     return null;
+                if (prevComputed > 0 && !exec.Speculator.CanArmAfterPrefixReuse)
+                {
+                    // This algorithm chains per-position state; a gap makes every
+                    // proposal garbage. Serve the request on the plain path.
+                    exec.Dispose();
+                    return null;
+                }
                 _specCtx = new SpecSeqContext
                 {
                     Seq = seq,
                     Exec = exec,
-                    NextPosition = 0,
+                    NextPosition = prevComputed,
                 };
                 seq.SpecStats = exec.Stats;
             }
