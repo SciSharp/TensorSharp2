@@ -1487,36 +1487,38 @@ async function clearChat() {
   renderEmptyState();
 }
 
+let uploadQueue = Promise.resolve();
+let pendingUploadCount = 0;
+
 async function handleFileSelect(event) {
   const files = Array.from(event.target.files);
   if (files.length === 0) return;
   event.target.value = '';
-  // Upload sequentially so pendingAttachments keeps the user's selection order
-  // (the order defines "Picture 1", "Picture 2", ... for multi-image edits).
-  for (const file of files) {
-    await uploadOneFile(file);
-  }
+  pendingUploadCount++;
+  // Keep separate selections in pick order as well as files inside each batch.
+  uploadQueue = uploadQueue.then(() => uploadFiles(files)).finally(() => { pendingUploadCount--; });
+  await uploadQueue;
 }
 
-async function uploadOneFile(file) {
+async function uploadFiles(files) {
   const formData = new FormData();
-  formData.append('file', file);
+  // Multipart order defines "Picture 1", "Picture 2", ... for multi-image edits.
+  files.forEach(file => formData.append('file', file, file.name));
 
   try {
     const res = await fetch('/api/upload', { method: 'POST', body: formData });
     const data = await res.json();
-    if (data.ok) {
-      pendingAttachments.push(data);
-      renderAttachments();
-      if (data.warning) {
-        alert(data.warning);
-      } else if (data.renderedAsImages && data.frameUrls) {
-        // A complete scanned / image-only PDF was recovered as page images.
-        // The attachment tile's badge keeps the page count visible.
-      }
-    } else {
-      alert('Upload failed: ' + data.error);
+    if (!res.ok || !data || !data.ok) {
+      throw new Error((data && data.error) || 'Upload failed');
     }
+    // A one-file response retains its original shape; batches return ordered files.
+    const uploaded = Array.isArray(data.files) ? data.files : [data];
+    if (uploaded.length !== files.length || uploaded.some(file => !file || !file.ok || !file.file)) {
+      throw new Error('The server did not return every uploaded file. Please try again.');
+    }
+    pendingAttachments.push(...uploaded);
+    renderAttachments();
+    uploaded.forEach(file => { if (file.warning) alert(file.warning); });
   } catch (e) {
     alert('Upload error: ' + e.message);
   }
@@ -2298,6 +2300,10 @@ function renderArtifactLinks(el, text) {
 
 async function sendMessage() {
   if (isGenerating) return;
+  if (pendingUploadCount) {
+    alert('Please wait for file uploads to finish, then send again.');
+    return;
+  }
   const text = messageInput.value.trim();
   if (!text && pendingAttachments.length === 0) return;
   if (!currentLoadedModel) {

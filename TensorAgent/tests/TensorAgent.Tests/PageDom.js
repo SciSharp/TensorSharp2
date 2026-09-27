@@ -155,6 +155,13 @@
   var routes = {};
   var calls = [];
 
+  // Keep multipart entries ordered so upload tests inspect the actual submitted
+  // names and file objects, without pretending a multipart body is JSON.
+  function FormData() { this.parts = []; }
+  FormData.prototype.append = function (name, value, fileName) {
+    this.parts.push({ name: name, value: value, fileName: fileName });
+  };
+
   /** WebKit's failure to reach the server at all: a TypeError, not a response. */
   function networkError(message) {
     return new TypeError(message == null || message === true ? 'Load failed' : String(message));
@@ -292,6 +299,7 @@
     var signal = init && init.signal ? init.signal : null;
     var record = { url: String(url), path: path, method: (init && init.method) || 'GET', body: null };
     if (init && typeof init.body === 'string') { try { record.body = JSON.parse(init.body); } catch (e) { record.body = init.body; } }
+    if (init && init.body instanceof FormData) record.parts = init.body.parts.slice();
     calls.push(record);
     // A request whose signal has already fired never leaves the page. It is still
     // recorded above: that the page tried is exactly what a test may want to see.
@@ -324,6 +332,7 @@
   var globals = {
     document: document,
     fetch: fetch,
+    FormData: FormData,
     atob: atob,
     // The shim's own TextDecoder wants bytes; this stream yields the text a
     // decoded chunk would already be, so decode is the identity here.

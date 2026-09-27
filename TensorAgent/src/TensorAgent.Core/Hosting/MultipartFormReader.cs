@@ -50,72 +50,96 @@ public sealed class MultipartForm : IDisposable
 /// </summary>
 public static class MultipartFormReader
 {
-    public static async Task<MultipartForm> ReadAsync(Stream body, string contentType, CancellationToken ct, string? spoolDirectory = null)
+    public static Task<MultipartForm> ReadAsync(Stream body, string contentType, CancellationToken ct, string? spoolDirectory = null) =>
+        ReadAsync(body, contentType, ct, long.MaxValue, int.MaxValue, spoolDirectory);
+
+    internal static async Task<MultipartForm> ReadAsync(Stream body, string contentType, CancellationToken ct,
+        long maxBodyBytes, int maxFiles, string? spoolDirectory = null)
     {
         string? boundary = GetBoundary(contentType);
-        if (boundary is null)
-            throw new InvalidDataException("multipart/form-data without a boundary");
+        if (string.IsNullOrEmpty(boundary) || boundary.Length > 128)
+            throw new InvalidDataException("multipart/form-data has a missing or invalid boundary");
 
         byte[] delimiter = Encoding.ASCII.GetBytes("\r\n--" + boundary);
         byte[] first = Encoding.ASCII.GetBytes("--" + boundary);
         var form = new MultipartForm();
         spoolDirectory ??= Path.GetTempPath();
 
-        var reader = new BufferedReader(body);
-        // Skip the preamble up to the first boundary line.
-        if (!await reader.SkipPastAsync(first, ct).ConfigureAwait(false))
-            return form;
-        while (true)
+        string? currentTemp = null;
+        try
         {
-            // After a boundary: either "--" (final) or CRLF then headers.
-            byte[] tail = await reader.ReadExactAsync(2, ct).ConfigureAwait(false);
-            if (tail.Length < 2 || (tail[0] == '-' && tail[1] == '-'))
-                break;
-            // tail should be CRLF; tolerate stray LF.
-            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var reader = new BufferedReader(body, maxBodyBytes);
+            // Skip the preamble up to the first boundary line.
+            if (!await reader.SkipPastAsync(first, ct).ConfigureAwait(false))
+                return form;
             while (true)
             {
-                string? line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
-                if (line is null)
-                    return form;
-                if (line.Length == 0)
+                // After a boundary: either "--" (final) or CRLF then headers.
+                byte[] tail = await reader.ReadExactAsync(2, ct).ConfigureAwait(false);
+                if (tail.Length < 2)
+                    throw new InvalidDataException("multipart body ended before the closing boundary");
+                if (tail[0] == '-' && tail[1] == '-')
                     break;
-                int colon = line.IndexOf(':');
-                if (colon > 0)
-                    headers[line[..colon].Trim()] = line[(colon + 1)..].Trim();
-            }
-
-            string disposition = headers.TryGetValue("Content-Disposition", out string? d) ? d : string.Empty;
-            string name = ParseParam(disposition, "name") ?? string.Empty;
-            string? fileName = ParseParam(disposition, "filename");
-            string partType = headers.TryGetValue("Content-Type", out string? t) ? t : "application/octet-stream";
-
-            if (fileName is null)
-            {
-                using var ms = new MemoryStream();
-                await reader.CopyUntilAsync(delimiter, ms, ct).ConfigureAwait(false);
-                form.Fields[name] = Encoding.UTF8.GetString(ms.ToArray());
-            }
-            else
-            {
-                string temp = Path.Combine(spoolDirectory, "upload-" + Guid.NewGuid().ToString("N") + ".part");
-                long length;
-                await using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true))
+                if (tail[0] != '\r' || tail[1] != '\n')
+                    throw new InvalidDataException("multipart boundary has an invalid terminator");
+                var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                while (true)
                 {
-                    await reader.CopyUntilAsync(delimiter, fs, ct).ConfigureAwait(false);
-                    length = fs.Length;
+                    string? line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
+                    if (line is null)
+                        throw new InvalidDataException("multipart headers ended unexpectedly");
+                    if (line.Length == 0)
+                        break;
+                    int colon = line.IndexOf(':');
+                    if (colon > 0)
+                        headers[line[..colon].Trim()] = line[(colon + 1)..].Trim();
                 }
-                form.Files.Add(new MultipartFile
+
+                string disposition = headers.TryGetValue("Content-Disposition", out string? d) ? d : string.Empty;
+                string name = ParseParam(disposition, "name") ?? string.Empty;
+                string? fileName = ParseParam(disposition, "filename");
+                string partType = headers.TryGetValue("Content-Type", out string? t) ? t : "application/octet-stream";
+
+                if (fileName is null)
                 {
-                    FieldName = name,
-                    FileName = Path.GetFileName(fileName),
-                    ContentType = partType,
-                    TempPath = temp,
-                    Length = length,
-                });
+                    using var ms = new MemoryStream();
+                    await reader.CopyUntilAsync(delimiter, ms, ct).ConfigureAwait(false);
+                    form.Fields[name] = Encoding.UTF8.GetString(ms.ToArray());
+                }
+                else
+                {
+                    if (form.Files.Count >= maxFiles)
+                        throw new InvalidDataException($"At most {maxFiles} files can be uploaded in one request.");
+                    string temp = Path.Combine(spoolDirectory, "upload-" + Guid.NewGuid().ToString("N") + ".part");
+                    currentTemp = temp;
+                    long length;
+                    await using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true))
+                    {
+                        await reader.CopyUntilAsync(delimiter, fs, ct).ConfigureAwait(false);
+                        length = fs.Length;
+                    }
+                    form.Files.Add(new MultipartFile
+                    {
+                        FieldName = name,
+                        FileName = Path.GetFileName(fileName),
+                        ContentType = partType,
+                        TempPath = temp,
+                        Length = length,
+                    });
+                    currentTemp = null;
+                }
             }
+            return form;
         }
-        return form;
+        catch
+        {
+            form.Dispose();
+            if (currentTemp != null)
+            {
+                try { File.Delete(currentTemp); } catch { }
+            }
+            throw;
+        }
     }
 
     private static string? GetBoundary(string contentType)
@@ -141,11 +165,12 @@ public static class MultipartFormReader
     }
 
     /// <summary>Byte-level reader with delimiter search over a rolling buffer.</summary>
-    private sealed class BufferedReader(Stream stream)
+    private sealed class BufferedReader(Stream stream, long maxBodyBytes)
     {
         private readonly byte[] _buf = new byte[1 << 16];
         private int _start, _end;
         private bool _eof;
+        private long _readBytes;
 
         private async Task<bool> FillAsync(CancellationToken ct)
         {
@@ -160,6 +185,9 @@ public static class MultipartFormReader
                 return true;
             int n = await stream.ReadAsync(_buf.AsMemory(_end, _buf.Length - _end), ct).ConfigureAwait(false);
             if (n == 0) { _eof = true; return false; }
+            if (n > maxBodyBytes - _readBytes)
+                throw new TensorSharp.Server.Hosting.UploadLimitExceededException("Upload exceeds the request size limit.", 413);
+            _readBytes += n;
             _end += n;
             return true;
         }
@@ -223,6 +251,8 @@ public static class MultipartFormReader
                         return line;
                     }
                 }
+                if (_end - _start == _buf.Length)
+                    throw new InvalidDataException("multipart header is too long");
                 if (!await FillAsync(ct).ConfigureAwait(false))
                 {
                     if (_end == _start) return null;

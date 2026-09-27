@@ -1,0 +1,3 @@
+Support adjustment requests:
+Request R-17 has category Amber and an amount of 750 credits.
+Request R-18 has category Violet and an amount of 50 credits.

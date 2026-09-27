@@ -1,0 +1,30 @@
+{
+  "model": "jev-latest",
+  "state": "Evaluate each named source independently and compare the two requests.",
+  "files": [
+    {
+      "name": "ticket.txt",
+      "data": "UGxlYXNlIHJlZnVuZCB0aGUgZHVwbGljYXRlIHBheW1lbnQuIEkgYW0gY2FsbSBhbmQgbm90IHVwc2V0LiBUaGlzIGlzIG5vdCB1cmdlbnQ7IHRoZXJlIGlzIG5vIGh1cnJ5Lgo="
+    },
+    {
+      "name": "outage.txt",
+      "data": "VGhlIHNlcnZpY2UgaXMgZG93biB3aXRoIGEgc29mdHdhcmUgZXJyb3IuIEZpeCBpdCBpbW1lZGlhdGVseS4gSSBhbSBleHRyZW1lbHkgYW5ncnkuCg=="
+    }
+  ],
+  "questions": {
+    "ticket_urgent": {
+      "type": "noul",
+      "instructions": "Does the customer in ticket.txt request immediate action?"
+    },
+    "outage_urgent": {
+      "type": "noul",
+      "instructions": "Does the customer in outage.txt request immediate action?"
+    },
+    "same_urgency": {
+      "type": "noul",
+      "instructions": "Do both customers request the same urgency?"
+    }
+  },
+  "samples": 1,
+  "seed": 42
+}

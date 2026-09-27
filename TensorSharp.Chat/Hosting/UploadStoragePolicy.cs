@@ -43,6 +43,9 @@ namespace TensorSharp.Server.Hosting
         /// <summary>Largest single client-originated file accepted, in bytes.</summary>
         public long MaxFileBytes { get; }
 
+        /// <summary>Total file bytes accepted in one batch; multipart framing also counts toward the HTTP request limit.</summary>
+        public long MaxBatchBytes => Math.Max(DefaultMaxFileBytes, MaxFileBytes);
+
         /// <summary>Total budget for the directory in bytes; 0 disables the quota.</summary>
         public long QuotaBytes { get; }
 
@@ -64,6 +67,44 @@ namespace TensorSharp.Server.Hosting
         /// </summary>
         public bool TryReserveClientWrite(long bytes, out string error, out int statusCode)
         {
+            if (!ValidateClientWrite(bytes, out error, out statusCode))
+                return false;
+
+            return TryReserveValidatedWrite(bytes, out error, out statusCode);
+        }
+
+        /// <summary>Validate and atomically reserve an entire batch before any files are written.</summary>
+        public bool TryReserveClientBatchWrite(IReadOnlyList<long> lengths, out long reservedBytes, out string error, out int statusCode)
+        {
+            ArgumentNullException.ThrowIfNull(lengths);
+            reservedBytes = 0;
+            long total = 0;
+            foreach (long bytes in lengths)
+            {
+                if (!ValidateClientWrite(bytes, out error, out statusCode))
+                    return false;
+                if (bytes > MaxBatchBytes - total)
+                {
+                    error = "The combined uploaded files exceed this server's request size limit.";
+                    statusCode = 413;
+                    return false;
+                }
+                total += bytes;
+            }
+            if (!TryReserveValidatedWrite(total, out error, out statusCode))
+                return false;
+            reservedBytes = total;
+            return true;
+        }
+
+        private bool ValidateClientWrite(long bytes, out string error, out int statusCode)
+        {
+            if (bytes < 0)
+            {
+                error = "File length must not be negative.";
+                statusCode = 400;
+                return false;
+            }
             if (bytes > MaxFileBytes)
             {
                 error = string.Format(CultureInfo.InvariantCulture,
@@ -73,6 +114,13 @@ namespace TensorSharp.Server.Hosting
                 return false;
             }
 
+            error = null;
+            statusCode = 0;
+            return true;
+        }
+
+        private bool TryReserveValidatedWrite(long bytes, out string error, out int statusCode)
+        {
             if (!TryReserve(bytes))
             {
                 error = QuotaExhaustedMessage;
@@ -179,7 +227,7 @@ namespace TensorSharp.Server.Hosting
             while (true)
             {
                 long used = Interlocked.Read(ref _usedBytes);
-                if (used + bytes > QuotaBytes)
+                if (bytes > QuotaBytes - used)
                     return false;
                 if (Interlocked.CompareExchange(ref _usedBytes, used + bytes, used) == used)
                     return true;

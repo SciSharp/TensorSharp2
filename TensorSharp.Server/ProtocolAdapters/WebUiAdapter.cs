@@ -150,25 +150,30 @@ public sealed class WebUiAdapter
             return Results.Json(new { error = "Expected multipart form data" }, statusCode: 400);
         }
 
-        RaiseUploadRequestBodyLimit(req.HttpContext, _uploads.MaxFileBytes);
-        var form = await req.ReadFormAsync().ConfigureAwait(false);
-        var file = form.Files.Count == 0 ? null : form.Files[0];
-        if (file == null)
-        {
-            uploadLogger.LogWarning(LogEventIds.UploadRejected,
-                "Upload rejected: no file in request");
-            return Results.Json(new { error = "No file uploaded" }, statusCode: 400);
-        }
-
         try
         {
-            Stream content = file.OpenReadStream();
-            await using (content)
-                return Results.Json(await _service.UploadAsync(content, file.FileName, file.Length, req.HttpContext.RequestAborted).ConfigureAwait(false));
+            RaiseUploadRequestBodyLimit(req.HttpContext, _uploads.MaxFileBytes);
+            var form = await req.ReadFormAsync(new Microsoft.AspNetCore.Http.Features.FormOptions
+            {
+                MultipartBodyLengthLimit = ServerOptionsBuilder.ResolveUploadRequestBodyBytes(_uploads.MaxFileBytes),
+            }, req.HttpContext.RequestAborted).ConfigureAwait(false);
+            var files = form.Files.Select(file =>
+                new WebUiUploadFile(file.FileName, file.Length, file.OpenReadStream)).ToArray();
+            return Results.Json(await _service.UploadFilesAsync(files, req.HttpContext.RequestAborted).ConfigureAwait(false));
         }
         catch (WebUiRequestRejectedException ex)
         {
             return Rejected(ex);
+        }
+        catch (InvalidDataException ex)
+        {
+            uploadLogger.LogWarning(LogEventIds.UploadRejected, ex, "Upload rejected: invalid multipart form data");
+            return Results.Json(new { error = "Invalid multipart form data or upload exceeds the request size limit." }, statusCode: 400);
+        }
+        catch (BadHttpRequestException ex)
+        {
+            return Results.Json(new { error = ex.StatusCode == 413 ? "Upload exceeds the request size limit." : "Invalid upload request." },
+                statusCode: ex.StatusCode);
         }
     }
 
