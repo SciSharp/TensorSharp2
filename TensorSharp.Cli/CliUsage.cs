@@ -313,16 +313,23 @@ namespace TensorSharp.Cli
                     "List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit. No model needed.",
                     "--list-gpus"),
             }),
-            ("Tensor parallelism (multi-GPU)", new[]
+            ("Model placement (multi-GPU)", new[]
             {
                 new OptionHelp("--tp <N>",
-                    "Split the model across N GPUs on this machine (tensor parallelism): each GPU holds 1/N of " +
-                    "every weight and the shards cooperate on every token. Use it when a model does not fit on one " +
-                    "GPU. Range: 1 to the number of local GPUs. Applies to the cuda, ggml_cuda, and ggml_vulkan " +
-                    "backends. " +
-                    "Multi-GPU is implemented PER ARCHITECTURE, not per backend, and in two forms. Architectures that shard weights run true tensor parallelism. qwen4exp (Qwen3.8-Flash-Next) shards nothing, so --tp N runs it as a LAYER SPLIT instead - each GPU holds a contiguous run of whole layers, which is the same and only multi-GPU mode llama.cpp offers for it. That is a CAPACITY feature: it lets a model, context or resident-weight set that one GPU cannot hold fit across several, and is not expected to raise tok/s. The startup line says which mode actually ran. An architecture that supports neither says so on stderr and runs on one GPU rather than silently leaving the others idle. " +
-                    "Default: 1 — no splitting (TENSORSHARP_TP_DEGREE env var overrides).",
+                    "Use tensor parallelism across N local GPUs: shard supported weight tensors and combine " +
+                    "their results on every token. Applies to supported architectures on cuda, ggml_cuda, and " +
+                    "ggml_vulkan. Unsupported architectures/backends are refused; this option never selects a layer split. " +
+                    "Use --layer-split for whole-layer placement. Cannot combine degrees above 1. " +
+                    "Default: TENSORSHARP_TP_DEGREE or 1; the CLI overrides the environment.",
                     "--backend ggml_cuda --tp 2"),
+                new OptionHelp("--layer-split <N>",
+                    "Place contiguous runs of whole layers across N GPUs on this machine. This increases capacity; " +
+                    "it does not shard weight tensors or promise faster decoding. Requires an architecture with " +
+                    "layer placement on the chosen backend (ggml_cuda/ggml_vulkan, or cuda for supported families). Unsupported combinations " +
+                    "are refused. Cannot combine with --tp above 1 or with --tp-node-id/--tp-peers; multi-node " +
+                    "layer splitting is not supported. Default: TENSORSHARP_LAYER_SPLIT_DEGREE or 1; the CLI " +
+                    "overrides the environment. Existing layer-split commands using --tp must migrate to this option.",
+                    "--backend ggml_cuda --layer-split 2"),
                 new OptionHelp("--tp-node-id <N>",
                     "This node's 0-based ID for multi-node (distributed) tensor parallelism over TCP. Node 0 is " +
                     "the driver that owns sampling and prints the output; every other node runs a worker loop that " +
@@ -385,22 +392,24 @@ namespace TensorSharp.Cli
             {
                 new OptionHelp("--spec | --no-spec",
                     "Enable/disable speculative decoding: a drafter proposes the next few tokens and the trunk " +
-                    "verifies them in ONE batched forward. Every emitted token still comes from a trunk row, so " +
-                    "this is a speed path only - the output is what plain decoding would have produced. Needed " +
+                    "verifies batches of predictions. Every emitted token is sampled from a verified trunk row. Needed " +
                     "for a drafter EMBEDDED in the checkpoint (the NextN head of Qwen 3.6, Qwen 3.8 27B, GLM-5.2 " +
-                    "and GLM-5.3) and for --spec-type ngram: it must be passed BEFORE the model loads because it " +
-                    "is what tells glm-dsa to page its ~3 GiB NextN layer into VRAM (which also leaves less room " +
-                    "for the context), so it stays an explicit choice. A drafter named on --draft-model engages " +
+                    "and GLM-5.3 non-Flash) " +
+                    "and for --spec-type ngram. Pass it BEFORE the model loads: selecting an embedded " +
+                    "glm-dsa head pages its ~3 GiB NextN layer into VRAM, leaving less context room; " +
+                    "ngram needs no draft-head weights. A drafter named on --draft-model engages " +
                     "by itself. Engages on --input, --input-jsonl, --multi-turn-jsonl and --interactive. Not " +
                     "available under --tp N>1 on a checkpoint whose draft block borrows the trunk's LM head, " +
-                    "which includes GLM-5.2 and GLM-5.3. Default: off; env TS_SPEC " +
+                    "which includes GLM-5.2 and GLM-5.3 non-Flash. GLM-5.3 Flash's native NextN/MTP head is not implemented; " +
+                    "use --spec --spec-type ngram for its supported speculation path. Default: off; env TS_SPEC " +
                     "(glm-dsa also honours TS_GLM_MTP=1/0, which overrides it).",
                     "--model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf --backend ggml_cuda --spec --chat"),
                 new OptionHelp("--spec-type <name>",
                     "Which speculation ALGORITHM to draft with. It only chooses the algorithm - it does not turn " +
                     "speculation on, so pair it with --spec. 'auto' (default) uses whatever drafter the " +
                     "checkpoint carries: a per-token NextN/MTP head (embedded in Qwen 3.6, Qwen 3.8 27B, GLM-5.2 " +
-                    "and GLM-5.3; Gemma 4's separate assistant GGUF; Qwen 3.8 Flash Next's shared MTP GGUF) or a " +
+                    "and GLM-5.3 non-Flash; " +
+                    "Gemma 4's separate assistant GGUF; Qwen 3.8 Flash Next's shared MTP GGUF) or a " +
                     "block drafter (DeepSeek V4 DSpark, DFlash / DFlash2 on Muse-Glimmer and Qwen 3.8). " +
                     "'draft-head' and 'block' pin one of those explicitly. 'ngram' needs NO trained weights at " +
                     "all - it drafts by finding where the last few tokens occurred earlier in the context and " +
@@ -436,7 +445,7 @@ namespace TensorSharp.Cli
                     "how it loads (a block drafter is fused before the layer split, a per-token head attaches " +
                     "after) - never its file name, and never a second flag. Naming the file IS the request: " +
                     "speculation turns on with it, no --spec needed, and an explicit --no-spec vetoes it. " +
-                    "Qwen 3.6, Qwen 3.8 27B, GLM-5.2 and GLM-5.3 embed their NextN drafter in the trunk and use " +
+                    "Qwen 3.6, Qwen 3.8 27B, GLM-5.2 and GLM-5.3 non-Flash embed their supported NextN drafter in the trunk and use " +
                     "--spec instead. Every " +
                     "emitted token is still drawn from a trunk row - with argmax under a greedy config, with " +
                     "your sampler otherwise - so output is unchanged either way. Default: none; env " +
@@ -946,7 +955,7 @@ namespace TensorSharp.Cli
             writer.WriteLine("  TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --chat --think");
             writer.WriteLine("  TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf --image photo.jpg");
             writer.WriteLine("  TensorSharp.Cli --model diffusiongemma-26B-A4B-it-Q4_K_M.gguf --mmproj diffusiongemma-vision/model-00011-of-00011.safetensors --image photo.jpg    (vision tower straight from the HF shard)");
-            writer.WriteLine("  TensorSharp.Cli --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2 --chat    (split across 2 GPUs)");
+            writer.WriteLine("  TensorSharp.Cli --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2 --chat    (tensor parallelism across 2 GPUs)");
             writer.WriteLine("  TensorSharp.Cli --model DeepSeek-V4-Flash-00001-of-00005.gguf --backend ggml_cuda --draft-model DSpark-drafter.gguf --temperature 0 --chat    (block speculative decoding)");
             writer.WriteLine("  TensorSharp.Cli --config config/qwen-image-2.1.json --prompt \"A small orange cat beside a blue vase\" --width 1024 --height 1024 --output generated.png");
             writer.WriteLine("  TensorSharp.Cli --config config/qwen-image-2.1.json --image generated.png --prompt \"Change the blue vase to a red vase\" --output edited.png");

@@ -69,6 +69,16 @@ namespace TensorSharp.Models
         /// chunk nearly doubles prefill weight traffic per token.</summary>
         public int SpecPrefillChunkSize => _cudaExec != null ? _cudaExec.UBatch : _nativeUBatch;
 
+        // The verify must fit one native micro-batch and V4.1's cache rings padded
+        // for its loaded drafter. N-gram and explicit wide windows share that
+        // constraint, even though the DSpark algorithm already caps its proposals.
+        public int SpecMaxDraftTokens => ResolveSpecMaxDraftTokens(
+            Config.Architecture == "deepseek41",
+            _cudaExec != null ? _cudaExec.UBatch : _nativeUBatch, DraftBlockSize);
+
+        internal static int ResolveSpecMaxDraftTokens(bool isV41, int ubatch, int draftBlockSize)
+            => ubatch <= 1 ? 0 : isV41 ? Math.Min(ubatch - 1, Math.Max(0, draftBlockSize)) : ubatch - 1;
+
         /// <summary>Both engines replay the drafter key ring from their own
         /// on-device features, so prefill needs no per-row readback.</summary>
         public bool DraftSelfCatchUp => true;

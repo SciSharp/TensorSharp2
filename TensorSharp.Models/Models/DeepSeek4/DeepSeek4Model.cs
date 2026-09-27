@@ -40,8 +40,8 @@ namespace TensorSharp.Models
         protected object NativeSync => _sync;
 
         public DeepSeek4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            string draftModelPath = null)
-            : base(ggufPath, NormalizeBackend(backend), 1, null)
+            string draftModelPath = null, int layerSplitDegree = 1)
+            : base(ggufPath, ValidateParallelism(backend, tpDegree, tpGroup, layerSplitDegree), 1, null)
         {
             string arch = _gguf.GetString("general.architecture") ?? "deepseek4";
             bool isV41 = string.Equals(arch, "deepseek41", StringComparison.Ordinal);
@@ -51,7 +51,8 @@ namespace TensorSharp.Models
                 // constructor opened: nobody disposes an object whose constructor threw.
                 try
                 {
-                    DeepSeek41Architecture.ValidateLoad(ggufPath, backend, ResolveDsparkPath(draftModelPath), tpDegree, tpGroup);
+                    DeepSeek41Architecture.ValidateLoad(ggufPath, backend, ResolveDsparkPath(draftModelPath),
+                        Math.Max(tpDegree, layerSplitDegree), tpGroup);
                 }
                 catch
                 {
@@ -101,6 +102,16 @@ namespace TensorSharp.Models
             }
             ParseTokenizer();
 
+            int requestedGpuCount = Math.Max(tpDegree, layerSplitDegree);
+            if (requestedGpuCount > 1)
+            {
+                int available = backend == BackendType.Cuda ? Cuda.CudaDevice.GetDeviceCount() :
+                    GgmlBasicOps.GetGpuDeviceCount(backend == BackendType.GgmlCuda
+                        ? GgmlBackendType.Cuda : GgmlBackendType.Vulkan);
+                if (available < requestedGpuCount)
+                    throw new InvalidOperationException($"Requested {requestedGpuCount} GPU(s) but {backend} sees only {available}.");
+            }
+
             int maxContext = ResolveConfiguredContextLength();
             // The GGUF advertises 1M context; cache rows scale with n_ctx, so keep a
             // practical default unless the operator asks for more via MAX_CONTEXT.
@@ -119,7 +130,7 @@ namespace TensorSharp.Models
                 // Direct-CUDA whole-model executor: quantized weights resident in
                 // device memory, layer-split across the visible GPUs, driver-API
                 // kernels only (no ggml).
-                int nGpu = ParseEnvInt("TS_DSV4_NGPU", tpDegree > 1 ? tpDegree : 0); // 0 = all visible GPUs
+                int nGpu = ResolveNativeGpuCount(Math.Max(tpDegree, layerSplitDegree));
                 string dspark = ResolveDsparkPath(draftModelPath);
                 Console.WriteLine($"Model: {arch} (direct-CUDA whole-model executor), Layers={Config.NumLayers}, " +
                     $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}" +
@@ -139,7 +150,7 @@ namespace TensorSharp.Models
             else
             {
                 int nThreads = ParseEnvInt("TS_DSV4_THREADS", Math.Min(Environment.ProcessorCount, 32));
-                int nGpu = ParseEnvInt("TS_DSV4_NGPU", tpDegree > 1 ? tpDegree : 0); // 0 = all visible GPUs
+                int nGpu = ResolveNativeGpuCount(Math.Max(tpDegree, layerSplitDegree));
                 string dspark = backend == BackendType.GgmlCuda || (isV41 && backend == BackendType.GgmlCpu)
                     ? ResolveDsparkPath(draftModelPath) : null;
                 if (dspark == null)
@@ -260,6 +271,46 @@ namespace TensorSharp.Models
                 $"[dsv4] a DSpark drafter was configured but the {backend} backend has no speculative " +
                 "path for DeepSeek V4 (it is implemented in the direct-CUDA and ggml_cuda engines); " +
                 "decoding without it.");
+        }
+
+        private static BackendType ValidateParallelism(BackendType backend, int tpDegree,
+            ITensorParallelGroup tpGroup, int layerSplitDegree)
+        {
+            if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
+            if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
+            if (tpGroup != null)
+                throw new NotSupportedException("DeepSeek V4/V4.1 use single-process native executors; remove --tp-node-id/--tp-peers.");
+            if (tpDegree > 1 && layerSplitDegree > 1)
+                throw new ArgumentException("--layer-split and --tp cannot be combined.");
+            if (layerSplitDegree > 1 && backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+                throw new NotSupportedException($"DeepSeek --layer-split is unavailable on {backend}.");
+            if (tpDegree > 1 && (backend != BackendType.GgmlCuda ||
+                DeepSeek41Architecture.ResolveRoutedMoeTensorParallelRanks(tpDegree) != tpDegree))
+                throw new NotSupportedException("--tp requires DeepSeek V4.1 routed-MoE tensor parallelism on ggml_cuda with TS_DSV41_TP equal to --tp. Use --layer-split N for whole-layer placement.");
+            if (layerSplitDegree > 1 && DeepSeek41Architecture.ResolveRoutedMoeTensorParallelRanks(layerSplitDegree) != 0)
+                throw new ArgumentException("--layer-split selects whole-layer placement only; unset TS_DSV41_TP or set it to 0.");
+            // The pure C# executor does not use native GPU placement settings.
+            // Keep their validation on the GGML and direct-CUDA paths only.
+            if (backend != BackendType.Cpu)
+                ResolveNativeGpuCount(Math.Max(tpDegree, layerSplitDegree));
+            return NormalizeBackend(backend);
+        }
+
+        internal static int ResolveNativeGpuCount(int requestedDegree)
+        {
+            // Match the native DeepSeek executor's eight-rank capacity at the
+            // common model entry point instead of silently capping requests.
+            if (requestedDegree > 8)
+                throw new NotSupportedException("The DeepSeek executor supports at most 8 GPUs; reduce --tp or --layer-split.");
+            string raw = Environment.GetEnvironmentVariable("TS_DSV4_NGPU");
+            if (string.IsNullOrWhiteSpace(raw)) return requestedDegree;
+            if (!int.TryParse(raw, out int count) || count < 0)
+                throw new ArgumentException("TS_DSV4_NGPU must be a nonnegative integer (0 selects all visible GPUs).");
+            if (count > 8)
+                throw new NotSupportedException("TS_DSV4_NGPU exceeds the executor's limit of 8 GPUs.");
+            if (requestedDegree > 1 && count != requestedDegree)
+                throw new ArgumentException($"TS_DSV4_NGPU={count} conflicts with the explicitly requested {requestedDegree} GPUs; unset it or use the same count.");
+            return count;
         }
 
         private static BackendType NormalizeBackend(BackendType backend)

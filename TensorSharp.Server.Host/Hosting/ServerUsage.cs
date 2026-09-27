@@ -151,25 +151,33 @@ namespace TensorSharp.Server.Host.Hosting
                     "List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit.",
                     "--list-gpus"),
             }),
-            ("Tensor parallelism (multi-GPU serving)", new[]
+            ("Model placement (multi-GPU serving)", new[]
             {
                 new OptionHelp("--tp <N>",
-                    "Split the model across N GPUs on this machine (tensor parallelism): each GPU holds 1/N of every " +
-                    "weight and the shards cooperate on every token. Use it when a model does not fit on one GPU. " +
-                    "Range: 1 to the number of local GPUs. Applies to the cuda, ggml_cuda, and ggml_vulkan backends. " +
-                    "Multi-GPU is implemented PER ARCHITECTURE, not per backend, and in two forms. Architectures that shard weights run true tensor parallelism. qwen4exp (Qwen3.8-Flash-Next) shards nothing, so --tp N runs it as a LAYER SPLIT instead - each GPU holds a contiguous run of whole layers, which is the same and only multi-GPU mode llama.cpp offers for it. That is a CAPACITY feature: it lets a model, context or resident-weight set that one GPU cannot hold fit across several, and is not expected to raise tok/s. The startup line says which mode actually ran. An architecture that supports neither says so on stderr and runs on one GPU rather than silently leaving the others idle. " +
-                    "Default: 1 — no splitting (TENSORSHARP_TP_DEGREE env var overrides).",
-                    "--model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2"),
+                    "Use tensor parallelism across N local GPUs: shard supported weight tensors and combine " +
+                    "their results on every token. Applies to supported architectures on cuda, ggml_cuda, and " +
+                    "ggml_vulkan. Unsupported architectures/backends are refused; this option never selects a layer split. " +
+                    "Use --layer-split for whole-layer placement. Cannot combine degrees above 1. " +
+                    "Default: TENSORSHARP_TP_DEGREE or 1; the CLI overrides the environment.",
+                    "--backend ggml_cuda --tp 2"),
+                new OptionHelp("--layer-split <N>",
+                    "Place contiguous runs of whole layers across N GPUs on this machine. This increases capacity; " +
+                    "it does not shard weight tensors or promise faster decoding. Requires an architecture with " +
+                    "layer placement on the chosen backend (ggml_cuda/ggml_vulkan, or cuda for supported families). Unsupported combinations " +
+                    "are refused. Cannot combine with --tp above 1 or with --tp-node-id/--tp-peers; multi-node " +
+                    "layer splitting is not supported. Default: TENSORSHARP_LAYER_SPLIT_DEGREE or 1; the CLI " +
+                    "overrides the environment. Existing layer-split commands using --tp must migrate to this option.",
+                    "--backend ggml_cuda --layer-split 2"),
                 new OptionHelp("--tp-node-id <N>",
                     "This node's 0-based ID for multi-node (distributed) tensor parallelism over TCP. The server can " +
                     "only be node 0 — the driver that owns sampling and serves HTTP; start every other node as a " +
                     "worker with TensorSharp.Cli using the same model, backend, and --tp-peers list. Requires " +
-                    "--tp-peers. Default: none — single-node (TENSORSHARP_TP_NODE_ID env var overrides).",
+                    "--tp-peers. Default: none — single-node (TENSORSHARP_TP_NODE_ID supplies the default).",
                     "--tp 2 --tp-node-id 0 --tp-peers 192.168.1.10:9500,192.168.1.11:9500"),
                 new OptionHelp("--tp-peers <list>",
                     "Comma-separated host:port list of ALL nodes in the distributed TP cluster, ordered by node ID; " +
                     "every node passes the identical list. Requires --tp-node-id. Default: none " +
-                    "(TENSORSHARP_TP_PEERS env var overrides).",
+                    "(TENSORSHARP_TP_PEERS supplies the default).",
                     "--tp-peers 192.168.1.10:9500,192.168.1.11:9500"),
             }),
             ("Generation defaults (pinned values also override requests — see --sampling-precedence)", new[]
@@ -314,10 +322,10 @@ namespace TensorSharp.Server.Host.Hosting
             {
                 new OptionHelp("--spec | --no-spec",
                     "Enable/disable speculative decoding: a drafter proposes the next few tokens and the trunk " +
-                    "verifies them in one batched forward. Every emitted token still comes from a trunk row, so " +
-                    "the output is what standard decoding would have produced. Needed for a drafter EMBEDDED in " +
-                    "the checkpoint (the NextN block of Qwen 3.6, Qwen 3.8 27B, GLM-5.2 and GLM-5.3) - it pages " +
-                    "extra weights into VRAM, so it stays an explicit choice - and for --spec-type ngram; a " +
+                    "verifies batches of predictions. Every emitted token is sampled from a verified trunk row. " +
+                    "Needed for a drafter EMBEDDED in the checkpoint (the NextN block of Qwen 3.6, Qwen 3.8 27B, " +
+                    "GLM-5.2 and GLM-5.3 non-Flash), which pages extra weights into VRAM, and for --spec-type ngram, " +
+                    "which needs no draft-head weights. GLM-5.3 Flash supports ngram; its NextN head is not implemented. A " +
                     "drafter named on --draft-model engages by itself. Engages for solo (non-concurrent) " +
                     "sequences. Nemotron-H refuses every speculator: under --spec it serves plain decoding and " +
                     "says so once, and a --draft-model makes its startup load fail. Default: off.",
@@ -862,7 +870,7 @@ namespace TensorSharp.Server.Host.Hosting
             writer.WriteLine("  TensorSharp.Server.Host --model C:\\models\\gemma-4-E4B-it-Q8_0.gguf --backend ggml_cpu");
             writer.WriteLine("  TensorSharp.Server.Host --model gemma-4-E4B-it-Q8_0.gguf --mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda");
             writer.WriteLine("  TensorSharp.Server.Host --model diffusiongemma-26B-A4B-it-Q4_K_M.gguf --mmproj diffusiongemma-vision/model-00011-of-00011.safetensors --backend ggml_metal    (vision tower straight from the HF shard)");
-            writer.WriteLine("  TensorSharp.Server.Host --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2    (split across 2 GPUs)");
+            writer.WriteLine("  TensorSharp.Server.Host --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2    (tensor parallelism across 2 GPUs)");
             writer.WriteLine("  TensorSharp.Server.Host --config config/qwen-image-2.1.json    (Qwen-Image-2.1 generation and editing)");
             writer.WriteLine("  TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda --video-frames 121 --fps 24");
             writer.WriteLine("  TensorSharp.Server.Host --backend ggml_cpu    (model-less status process; inference unavailable)");

@@ -98,8 +98,8 @@ def build_plan(inventory, candidate_sha256, base, inventory_path, inventory_sha2
         scope = ('Specialized translation model: token stability only; authored translation quality belongs to the HTTP lane.'
                  if name == 'hunyuan-dense' else 'GPU compute placement; permanent weight residency is separate and remains unknown without explicit diagnostics.')
         if name == 'qwen38':
-            scope = 'Qwen4Exp shared GPU-degree selector performs whole-layer splitting; tensor parallelism is unsupported.'
-        cell(name, f'gpu{degree}-f16', scope)
+            scope = 'Qwen4Exp explicit whole-layer splitting; tensor parallelism is unsupported.'
+        cell(name, f'layer{degree}-f16' if name == 'qwen38' and degree > 1 else f'gpu{degree}-f16', scope)
         if minimum <= 1:
             cell(name, 'gpu1-q8_0', 'Requested Q8 KV; require effective cache type or explicit unsupported verdict.')
             cell(name, 'gpu1-q4_0', 'Requested Q4 KV; require effective cache type or explicit unsupported verdict.')
@@ -128,7 +128,7 @@ def build_plan(inventory, candidate_sha256, base, inventory_path, inventory_sha2
             rows = str(base / 'results/native-complete/deepseek4-dspark/candidate.json')
             item.update(status='capacity-review-required',
                 comparison='candidate plain-versus-draft only; original native baseline is not a qualified DeepSeek precision reference',
-                env={'CUDA_VISIBLE_DEVICES': '0,1,2', 'TENSORSHARP_TP_DEGREE': '1', 'TS_DSV4_NGPU': '3'},
+                env={'CUDA_VISIBLE_DEVICES': '0,1,2', 'TENSORSHARP_TP_DEGREE': '1', 'TENSORSHARP_LAYER_SPLIT_DEGREE': '3'},
                 candidate_app=str(base / 'results/native-qualified-app/candidate'),
                 invocation_after_review=[str(base / 'dotnet/dotnet'), str(base / 'results/native-qualified-app/candidate/AgentTurnBench.dll'),
                     '--model', primary['path'], '--backend', 'ggml_cuda', '--kv', 'f16', '--draft-model', draft['path'],

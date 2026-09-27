@@ -140,7 +140,7 @@ namespace TensorSharp.Models
         // ---- layer split ------------------------------------------------------
         //
         // Which GPU owns each layer. All zeros on a single-GPU run, which is every
-        // run that does not pass --tp N.
+        // run that does not pass --layer-split N.
         private int[] _layerDevice;
 
         /// <summary>Assign each layer to a GPU as a contiguous run, in pipeline

@@ -147,6 +147,12 @@ namespace TensorSharp.Runtime.Speculative
                 return null;
             }
 
+            if (target.SpecMaxDraftTokens <= 0)
+            {
+                declineReason = "the loaded target has no capacity for a speculative verification window; serving plain decoding.";
+                return null;
+            }
+
             string? name = string.IsNullOrWhiteSpace(options.SpeculatorName)
                 ? Auto
                 : options.SpeculatorName.Trim();
@@ -223,7 +229,7 @@ namespace TensorSharp.Runtime.Speculative
             int preferred = target.SpecPreferredDraftWindow;
             if (!options.MaxDraftTokensExplicit && preferred > 0)
                 window = Math.Min(window, preferred);
-            return window;
+            return Math.Min(window, target.SpecMaxDraftTokens);
         }
 
         private static int ResolveNGramDraftWindow(ISpeculativeTarget target, SpeculationOptions options)
@@ -236,7 +242,8 @@ namespace TensorSharp.Runtime.Speculative
                 // unchanged shared default when the model recommends doing so.
                 if (options.MaxDraftTokens != SpeculationOptions.DefaultMaxDraftTokens)
                     preferred = Math.Min(Math.Max(1, options.MaxDraftTokens), preferred);
-                return Math.Clamp(preferred, 1, SpeculationOptions.MaxAllowedDraftTokens);
+                return Math.Min(Math.Clamp(preferred, 1, SpeculationOptions.MaxAllowedDraftTokens),
+                    target.SpecMaxDraftTokens);
             }
             return ResolveDraftWindow(target, options);
         }

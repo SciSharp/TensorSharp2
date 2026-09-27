@@ -106,8 +106,9 @@ namespace TensorSharp.GGML
         public int Degree => DeviceIds.Length;
 
         /// <summary>
-        /// True when cross-GPU AllReduce runs entirely on the devices (NCCL or
-        /// P2P via ggml's CUDA comm backend) rather than through host memory.
+        /// True when the backend collective passes its execution probe. This
+        /// includes NCCL, P2P and ggml's pinned-host pipeline; it does not prove
+        /// that transport stays on the GPUs. Native diagnostics report the route.
         /// </summary>
         public bool HasDeviceAllReduce { get; }
 

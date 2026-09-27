@@ -31,14 +31,21 @@ PROFILES = {
     'gpu3-f16': {'backend': 'ggml_cuda', 'gpus': 3, 'kv': 'f16'},
     'gpu4-f16': {'backend': 'ggml_cuda', 'gpus': 4, 'kv': 'f16'},
     'gpu7-f16': {'backend': 'ggml_cuda', 'gpus': 7, 'kv': 'f16'},
-    'layer3-f16': {'backend': 'ggml_cuda', 'gpus': 3, 'kv': 'f16', 'tp': 1, 'native_layer_split': True},
-    'layer4-f16': {'backend': 'ggml_cuda', 'gpus': 4, 'kv': 'f16', 'tp': 1, 'native_layer_split': True},
-    'layer7-f16': {'backend': 'ggml_cuda', 'gpus': 7, 'kv': 'f16', 'tp': 1, 'native_layer_split': True},
+    'layer2-f16': {'backend': 'ggml_cuda', 'gpus': 2, 'kv': 'f16', 'layer_split': True},
+    'layer3-f16': {'backend': 'ggml_cuda', 'gpus': 3, 'kv': 'f16', 'layer_split': True},
+    'layer4-f16': {'backend': 'ggml_cuda', 'gpus': 4, 'kv': 'f16', 'layer_split': True},
+    'layer7-f16': {'backend': 'ggml_cuda', 'gpus': 7, 'kv': 'f16', 'layer_split': True},
     'cpu-f16': {'backend': 'ggml_cpu', 'gpus': 0, 'kv': 'f16', 'long': 512, 'new': 16},
     'cpu-moe4': {'backend': 'ggml_cuda', 'gpus': 1, 'kv': 'f16', 'env': {'TS_N_CPU_MOE': '4'}},
 }
 MOE_MODELS = {'gptoss20b', 'qwen36-moe-mtp', 'nemotron35', 'nemotron-omni',
               'qwen38', 'glm52', 'glm53', 'glm53-flash', 'gemma4-26b-qat', 'gemma4-26b', 'qwen35-35b'}
+
+
+def placement_environment(profile):
+    degree = str(max(1, profile['gpus']))
+    return {'TENSORSHARP_TP_DEGREE': '1' if profile.get('layer_split') else degree,
+            'TENSORSHARP_LAYER_SPLIT_DEGREE': degree if profile.get('layer_split') else '1'}
 
 
 def save(path, data):
@@ -358,8 +365,10 @@ def main():
         for profile_name in requested_profiles:
             profile = PROFILES[profile_name]
             unsupported = None
-            if profile.get('native_layer_split') and not model['id'].startswith('glm'):
-                unsupported = 'Native automatic whole-layer profile currently applies to GLM; Qwen4Exp uses the shared GPU-degree layer selector'
+            if profile.get('layer_split') and not (model['id'].startswith('glm') or model['id'] == 'qwen38'):
+                unsupported = 'This catalog layer-split profile applies to GLM and Qwen4Exp'
+            if model['id'] == 'qwen38' and profile['gpus'] > 1 and not profile.get('layer_split'):
+                unsupported = 'Qwen4Exp does not implement tensor parallelism; select an explicit layer profile'
             if profile['gpus'] and model['bytes'] > profile['gpus'] * 42 * 1024**3:
                 plan['comparisons'].append({'model': model['id'], 'profile': profile_name, 'status': 'unavailable', 'executed': False, 'qualified': False,
                     'reason': 'Capacity review required: weights exceed the conservative 42GiB per assigned A40 estimate; this is not proof of hardware infeasibility',
@@ -380,12 +389,15 @@ def main():
                                             'status': 'unavailable', 'executed': False, 'qualified': False, 'reason': 'Insufficient assigned GPUs'})
                 continue
             run_env = dict(env)
-            for key in ('TENSORSHARP_TP_DEGREE', 'TS_N_CPU_MOE', 'TS_CPU_MOE',
+            for key in ('TENSORSHARP_TP_DEGREE', 'TENSORSHARP_LAYER_SPLIT_DEGREE',
+                        'TENSORSHARP_TP_NODE_ID', 'TENSORSHARP_TP_PEERS',
+                        'TENSORSHARP_TP_DEVICES', 'TENSORSHARP_LAYER_SPLIT_DEVICES',
+                        'TS_GLM_NGPU', 'TS_DSV4_NGPU', 'TS_N_CPU_MOE', 'TS_CPU_MOE',
                         'TS_SPEC', 'TS_SPEC_DRAFT_MODEL', 'TS_MTP_DRAFT_MODEL'):
                 run_env.pop(key, None)
             run_env.update({'CUDA_VISIBLE_DEVICES': ','.join(gpu_ids[:profile['gpus']]),
-                            'TENSORSHARP_TP_DEGREE': str(profile.get('tp', max(1, profile['gpus']))),
                             'TS_CPU_MOE_THREADS': '16', 'OMP_NUM_THREADS': '16'})
+            run_env.update(placement_environment(profile))
             run_env.update(profile.get('env', {}))
             if args.enable_native_speculation:
                 run_env['TS_SPEC'] = '1'
@@ -432,7 +444,7 @@ def main():
                                  executed=True, checkpoint_sha256=model['checkpoint_sha256'],
                                  draft_model_sha256=plan.get('draft_model_sha256'),
                                  output=str(output), environment={key: run_env[key] for key in
-                                     ('CUDA_VISIBLE_DEVICES', 'TENSORSHARP_TP_DEGREE', 'TS_CPU_MOE_THREADS', 'OMP_NUM_THREADS', 'TS_N_CPU_MOE', 'TS_SPEC') if key in run_env})
+                                     ('CUDA_VISIBLE_DEVICES', 'TENSORSHARP_TP_DEGREE', 'TENSORSHARP_LAYER_SPLIT_DEGREE', 'TS_CPU_MOE_THREADS', 'OMP_NUM_THREADS', 'TS_N_CPU_MOE', 'TS_SPEC') if key in run_env})
                     log_text = output.with_suffix('.log').read_text(errors='replace')
                     entry['placement_gate'] = placement_evidence(log_text, model['id'], profile)
                     placement_qualified &= entry['placement_gate']['status'] == 'passed'

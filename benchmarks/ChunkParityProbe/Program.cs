@@ -30,7 +30,7 @@
 // --repeat-first reruns the reference chunking once more (a determinism control:
 // the same chunking must reproduce itself bit for bit). The prompt text is encoded
 // as-is (no chat template), so pass already-templated text for a chat model.
-// Layer split / TP comes from TENSORSHARP_TP_DEGREE as for every other bench.
+// Layer split uses TENSORSHARP_LAYER_SPLIT_DEGREE; tensor parallelism uses TENSORSHARP_TP_DEGREE.
 //
 // --verify-widths 2,3,4 [--verify-tokens 32] [--verify-reps 3] adds a
 // speculative-verify parity pass: after prefilling with the reference chunking it

@@ -45,6 +45,9 @@
 // ---------------------------------------------------------------------------
 
 #include "ggml_ops_internal.h"
+#include "dsv4_file_warm.h"
+#include "ggml_ops_precision_policy.h"
+#include "glm_file_strip.h"
 
 #include "gguf.h"
 #include "ggml-impl.h" // ggml_graph_view for segmented TP execution
@@ -432,6 +435,7 @@ struct graph_build_result
     ggml_tensor * h_nextn = nullptr;
     int64_t nt = 0;
     int64_t n_kv = 0;
+    std::vector<int64_t> decode_row_kv;
     int64_t n_out = 0;
     bool sparse = false;
     bool want_logits = true;
@@ -1074,6 +1078,7 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
     {
         std::vector<FILE *> files(shards.paths.size(), nullptr);
         std::vector<uint8_t> staging;
+        std::vector<uint8_t> source_slab;
         while (!failed.load(std::memory_order_relaxed))
         {
             size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
@@ -1105,18 +1110,8 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
             }
             else
             {
-                // Row-parallel slice: gather one strip out of every source row.
-                const size_t rows = j.len / j.row_len;
-                for (size_t r = 0; r < rows && ok; r++)
-                {
-                    const size_t off = j.file_off + r * j.src_row;
-#if defined(_WIN32)
-                    _fseeki64(f, (long long) off, SEEK_SET);
-#else
-                    fseeko(f, (off_t) off, SEEK_SET);
-#endif
-                    ok = fread(staging.data() + r * j.row_len, 1, j.row_len, f) == j.row_len;
-                }
+                ok = tsg_glm::read_file_strips(f, j.file_off, j.src_row, j.row_len,
+                                             j.len, staging.data(), source_slab);
             }
             if (!ok)
             {
@@ -1700,7 +1695,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         // The glm5next NextN block is a full DSA decoder layer wrapped in its
         // own hyper-connections; llama.cpp asserts its graph unimplemented and
         // this executor does not build it yet either.
-        fprintf(stderr, "[glm] glm5next NextN/MTP speculation is not implemented; serving standard decode\n");
+        fprintf(stderr, "[glm] glm5next NextN/MTP draft heads are not implemented; ngram speculation remains available\n");
     }
     if (load_mtp && !hp.g5n)
     {
@@ -2476,6 +2471,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         if (!(e && atoi(e) == 0))
         {
             ggml_context * hctx = m->w_ctx[n_gpu];
+            std::vector<tsg_dsv4::file_warm_range> mapped_ranges;
             for (ggml_tensor * t = ggml_get_first_tensor(hctx); t; t = ggml_get_next_tensor(hctx, t))
             {
                 auto it = pending_by_tensor.find(t);
@@ -2487,8 +2483,12 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 if (!buf) continue;
                 char * base = (char *) m->mmap_addrs[pw.shard];
                 if (ggml_backend_tensor_alloc(buf, t, base + pw.file_off) != GGML_STATUS_SUCCESS) continue;
-                m->mmap_weight_bytes += ggml_nbytes(t);
+                mapped_ranges.push_back({ pw.shard, pw.file_off, ggml_nbytes(t), t->data });
             }
+            // TP ranks can hold separate tensor views of the same mapped host
+            // experts. Memory allowance applies to unique file pages, not views.
+            for (const auto & range : tsg_dsv4::merge_file_warm_ranges(std::move(mapped_ranges)))
+                m->mmap_weight_bytes += range.bytes;
             if (m->mmap_weight_bytes > 0)
                 fprintf(stderr, "[glm] host experts served from the GGUF mapping (%.1f GiB, no private copy)\n",
                         m->mmap_weight_bytes / 1073741824.0);
@@ -2577,32 +2577,45 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             if (allow == 0 || m->mmap_weight_bytes + headroom <= allow)
             {
                 const auto t_warm = std::chrono::steady_clock::now();
-                std::vector<std::pair<const volatile char *, size_t>> ranges;
+                std::vector<tsg_dsv4::file_warm_range> ranges;
                 ggml_context * hctx = m->w_ctx[n_gpu];
                 for (ggml_tensor * t = ggml_get_first_tensor(hctx); t; t = ggml_get_next_tensor(hctx, t))
                 {
                     if (t->buffer == nullptr ||
                         std::find(m->mmap_bufs.begin(), m->mmap_bufs.end(), t->buffer) == m->mmap_bufs.end())
                         continue;
-                    ranges.emplace_back((const volatile char *) t->data, ggml_nbytes(t));
-                }
-                std::atomic<size_t> cursor(0);
-                auto warm = [&]()
-                {
-                    for (;;)
+                    const auto pending = pending_by_tensor.find(t);
+                    if (pending == pending_by_tensor.end())
                     {
-                        const size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
-                        if (i >= ranges.size()) break;
-                        const volatile char * p = ranges[i].first;
-                        for (size_t off = 0; off < ranges[i].second; off += 4096) (void) p[off];
+                        fprintf(stderr, "[glm] missing file range for mapped host tensor %s\n", t->name);
+                        return nullptr;
                     }
-                };
-                std::vector<std::thread> pool;
-                for (int i = 0; i < load_threads; i++) pool.emplace_back(warm);
-                for (auto & th : pool) th.join();
-                fprintf(stderr, "[glm] prefaulted %.1f GiB of mmapped host experts in %.1fs\n",
+                    const pending_weight & pw = *pending->second;
+                    ranges.push_back({ pw.shard, pw.file_off, ggml_nbytes(t), t->data });
+                }
+                // Faulting one mapped page at a time serializes small reads on
+                // network filesystems. Reuse the bounded sequential reader;
+                // populate only after pread has brought each block into cache.
+                tsg_dsv4::file_warm_options options;
+                options.threads = load_threads;
+                options.populate = true;
+                const auto result = tsg_dsv4::warm_file_ranges(shards.paths, ranges, options);
+                if (!result.ok)
+                {
+                    fprintf(stderr, "[glm] prefaulting mapped host experts failed: %s\n", result.error.c_str());
+                    return nullptr;
+                }
+                fprintf(stderr, "[glm] prefaulted %.1f GiB of mmapped host experts in %.1fs "
+                                "(pread, %d threads: %.1f GiB read, %.1f GiB already resident)\n",
                         m->mmap_weight_bytes / 1073741824.0,
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count());
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(),
+                        result.threads, result.bytes_read / 1073741824.0, result.bytes_resident / 1073741824.0);
+            }
+            else
+            {
+                fprintf(stderr, "[glm] skipping host-expert prefault: %.1f GiB mapped + 8 GiB headroom "
+                                "exceeds %.1f GiB memory allowance\n",
+                        m->mmap_weight_bytes / 1073741824.0, allow / 1073741824.0);
             }
         }
     }
@@ -2867,12 +2880,13 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         // requested, and "(+1 MTP)" on a run with no draft head is exactly the
         // kind of log line that costs an hour.
         const char * mtp_state = m->has_mtp ? " +1 NextN/MTP draft block"
-                               : (hp.n_layer_nextn > 0 ? " (NextN block present but not loaded; --spec loads it)"
+                               : (hp.n_layer_nextn > 0 ? (hp.g5n ? " (NextN block present; glm5next draft heads are not implemented)"
+                                                               : " (NextN block present but not loaded; --spec loads it)")
                                                        : "");
-        fprintf(stderr, "[glm] glm-dsa: %d trunk layers%s, n_embd=%d, %d heads, MLA(q_lora=%d, kv_lora=%d, "
+        fprintf(stderr, "[glm] %s: %d trunk layers%s, n_embd=%d, %d heads, MLA(q_lora=%d, kv_lora=%d, "
                 "head_k=%d, head_v=%d, rope=%d), %d experts top-%d (ff=%d), dense_lead=%d, indexer %dx%d top-%d on "
                 "%d/%d layers, vocab=%d\n",
-                hp.n_layer, mtp_state, hp.n_embd, hp.n_head, hp.q_lora_rank, hp.kv_lora_rank,
+                hp.g5n ? "glm5next" : "glm-dsa", hp.n_layer, mtp_state, hp.n_embd, hp.n_head, hp.q_lora_rank, hp.kv_lora_rank,
                 hp.n_embd_head_k, hp.n_embd_head_v, hp.n_rot, hp.n_expert, hp.n_expert_used, hp.n_ff_exp,
                 hp.n_dense_lead, hp.indexer_n_head, hp.indexer_head_size, hp.indexer_top_k,
                 (int) std::count(hp.indexer_full.begin(), hp.indexer_full.end(), (uint8_t) 1), hp.n_layer, hp.n_vocab);
@@ -2945,6 +2959,70 @@ struct graph_builder
     /// parallelism, the layer's home device under a layer split.
     int device_of(int il, int r) const { return m.tp > 1 ? m.rank_device(r) : m.layers[il].device; }
 
+    // A verify window must commit the same arithmetic as single-token decode.
+    // On the real IQ1_S glm5next model the first four-row verify changed logits
+    // by 0.56 before any rollback, and accepted rows carried that error forward.
+    // Keep narrow projections on one-column reductions (broadcast channels for
+    // ordinary weights), and routed experts on the one-token expert kernel.
+    // Wider prefill graphs keep their throughput kernels.
+    bool decode_rows() const { return hp.g5n && nt > 1 && nt <= TSG_PRECISION_DECODE_COLUMNS; }
+
+    ggml_tensor * decode_mul_mat(ggml_context * c, ggml_tensor * w, ggml_tensor * x)
+    {
+        if (!decode_rows() || x->ne[1] != nt || x->ne[3] != 1)
+            return ggml_mul_mat(c, w, x);
+        // Computed hyper-connection matrices use dimension 1 for streams,
+        // not tokens. Do not confuse an equal stream count with a verify width.
+        const ggml_tensor * base = w;
+        while (base->view_src) base = base->view_src;
+        if (base->op != GGML_OP_NONE) return ggml_mul_mat(c, w, x);
+        if (!ggml_is_contiguous(x)) x = ggml_cont(c, x);
+        const bool fp = w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_BF16;
+        if (x->ne[2] == 1 && w->ne[2] == 1 && w->ne[3] == 1 &&
+            ((fp && w->ne[0] % 2 == 0) || ggml_is_quantized(w->type)))
+        {
+            ggml_tensor * y = ggml_mul_mat(c, w, ggml_reshape_3d(c, x, x->ne[0], 1, nt));
+            return ggml_reshape_2d(c, y, y->ne[0], nt);
+        }
+        ggml_tensor * result = nullptr;
+        for (int64_t r = 0; r < nt; ++r)
+        {
+            ggml_tensor * row = ggml_cont(c, ggml_view_3d(c, x, x->ne[0], 1, x->ne[2],
+                x->nb[1], x->nb[2], (size_t) r * x->nb[1]));
+            row = ggml_mul_mat(c, w, row);
+            result = result ? ggml_concat(c, result, row, 1) : row;
+        }
+        return result;
+    }
+
+    ggml_tensor * decode_mul_mat_id(ggml_context * c, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids)
+    {
+        if (!decode_rows() || x->ne[2] != nt || x->ne[3] != 1 || ids->ne[1] != nt)
+            return ggml_mul_mat_id(c, w, x, ids);
+        ggml_tensor * result = nullptr;
+        for (int64_t r = 0; r < nt; ++r)
+        {
+            ggml_tensor * row = ggml_cont(c, ggml_view_3d(c, x, x->ne[0], x->ne[1], 1,
+                x->nb[1], x->nb[2], (size_t) r * x->nb[2]));
+            ggml_tensor * selected = ggml_view_2d(c, ids, ids->ne[0], 1, ids->nb[1], (size_t) r * ids->nb[1]);
+            row = ggml_mul_mat_id(c, w, row, selected);
+            result = result ? ggml_concat(c, result, row, 2) : row;
+        }
+        return result;
+    }
+
+    // Precision belongs on the actual matmuls, below the layout-only wrappers.
+    static void decode_prec_set_acc(ggml_tensor * t, ggml_prec precision)
+    {
+        while (t->view_src) t = t->view_src;
+        if (t->op == GGML_OP_CONCAT)
+        {
+            decode_prec_set_acc(t->src[0], precision);
+            decode_prec_set_acc(t->src[1], precision);
+        }
+        else ggml_prec_set_acc(t, precision);
+    }
+
     /// Sum of one partial per rank. With a single rank this is the identity, so
     /// the layer-split path pays nothing for it.
     ggml_tensor * reduce_ranks(ggml_tensor ** parts, int n)
@@ -2993,13 +3071,13 @@ struct graph_builder
         const int64_t H = hp.indexer_n_head;
         const int64_t N = nt;
 
-        ggml_tensor * k = ggml_mul_mat(ctx, LW.idx_attn_k, cur);           // [D, N]
+        ggml_tensor * k = decode_mul_mat(ctx, LW.idx_attn_k, cur);           // [D, N]
         k = ggml_norm(ctx, k, 0.0f);
         k = ggml_mul(ctx, k, LW.idx_k_norm_w);
         k = ggml_add(ctx, k, LW.idx_k_norm_b);
         k = ggml_reshape_3d(ctx, k, D, 1, N);
         k = rope(k, pos);
-        if (m.hadamard[dev]) k = ggml_mul_mat(ctx, m.hadamard[dev], k);
+        if (m.hadamard[dev]) k = decode_mul_mat(ctx, m.hadamard[dev], k);
         k = ggml_cont(ctx, k);
 
         for (int64_t i = 0; i < N; i++)
@@ -3012,13 +3090,13 @@ struct graph_builder
 
         if (!score_now) return;
 
-        ggml_tensor * q = ggml_mul_mat(ctx, LW.idx_attn_q_b, qr);          // [D*H, N]
+        ggml_tensor * q = decode_mul_mat(ctx, LW.idx_attn_q_b, qr);          // [D*H, N]
         q = ggml_reshape_3d(ctx, q, D, H, N);
         q = rope(q, pos);
-        if (m.hadamard[dev]) q = ggml_mul_mat(ctx, m.hadamard[dev], q);
+        if (m.hadamard[dev]) q = decode_mul_mat(ctx, m.hadamard[dev], q);
         q = ggml_cont(ctx, q);
 
-        ggml_tensor * w = ggml_mul_mat(ctx, LW.idx_proj, cur);             // [H, N]
+        ggml_tensor * w = decode_mul_mat(ctx, LW.idx_proj, cur);             // [H, N]
         w = ggml_scale(ctx, w, 1.0f / sqrtf((float) (D * H)));
 
         for (int64_t i = 0; i < N; i++)
@@ -3042,8 +3120,8 @@ struct graph_builder
             {
                 ggml_tensor * qp = ggml_permute(ctx, qi, 0, 2, 1, 3);      // [D, 1, H]
                 ggml_tensor * kp = ggml_permute(ctx, k_all, 0, 2, 1, 3);   // [D, n_kv, 1]
-                ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);              // [n_kv, 1, H]
-                ggml_prec_set_acc(kq, GGML_PREC_F32);
+                ggml_tensor * kq = decode_mul_mat(ctx, kp, qp);              // [n_kv, 1, H]
+                decode_prec_set_acc(kq, GGML_PREC_F32);
                 kq = ggml_cont(ctx, ggml_permute(ctx, kq, 2, 1, 0, 3));    // [H, 1, n_kv]
                 ggml_tensor * sc = ggml_relu(ctx, kq);
                 sc = ggml_mul(ctx, sc, wi);
@@ -3068,8 +3146,8 @@ struct graph_builder
         const int64_t n_head = hp.n_head;
         const int64_t N = nt;
 
-        ggml_tensor * q = ggml_mul_mat(ctx, LW.wq_b, qr);
-        ggml_tensor * kv_pe = ggml_mul_mat(ctx, LW.wkv_a_mqa, cur);
+        ggml_tensor * q = decode_mul_mat(ctx, LW.wq_b, qr);
+        ggml_tensor * kv_pe = decode_mul_mat(ctx, LW.wkv_a_mqa, cur);
 
         ggml_tensor * Qcur = nullptr;
         ggml_tensor * Kcur = nullptr;
@@ -3079,7 +3157,7 @@ struct graph_builder
             ggml_tensor * kv_cmpr = rms(kv_pe, LW.kv_a_norm);
             ggml_tensor * q3 = ggml_reshape_3d(ctx, q, hp.n_embd_head_k, n_head, N);
             ggml_tensor * q_nope_p = ggml_permute(ctx, q3, 0, 2, 1, 3);
-            ggml_tensor * q_abs = ggml_mul_mat(ctx, LW.wk_b, q_nope_p);          // [kv_lora, N, n_head]
+            ggml_tensor * q_abs = decode_mul_mat(ctx, LW.wk_b, q_nope_p);          // [kv_lora, N, n_head]
             Qcur = ggml_cont(ctx, ggml_permute(ctx, q_abs, 0, 2, 1, 3));         // [kv_lora, n_head, N]
             Kcur = ggml_cont(ctx, ggml_reshape_3d(ctx, kv_cmpr, hp.kv_lora_rank, 1, N));
         }
@@ -3103,7 +3181,7 @@ struct graph_builder
         kv_cmpr = rms(kv_cmpr, LW.kv_a_norm);
 
         ggml_tensor * q_nope_p = ggml_permute(ctx, q_nope, 0, 2, 1, 3);
-        ggml_tensor * q_abs = ggml_mul_mat(ctx, LW.wk_b, q_nope_p);              // [kv_lora, N, n_head]
+        ggml_tensor * q_abs = decode_mul_mat(ctx, LW.wk_b, q_nope_p);              // [kv_lora, N, n_head]
         q_abs = ggml_permute(ctx, q_abs, 0, 2, 1, 3);                           // [kv_lora, n_head, N]
 
         Qcur = ggml_cont(ctx, ggml_concat(ctx, q_abs, q_pe, 0));                // [n_kv_row, n_head, N]
@@ -3136,22 +3214,22 @@ struct graph_builder
             else
             {
                 ggml_tensor * qp = ggml_permute(ctx, Qi, 0, 2, 1, 3);
-                ggml_tensor * kq = ggml_mul_mat(ctx, K, qp);                    // [n_kv, 1, n_head]
-                ggml_prec_set_acc(kq, GGML_PREC_F32);
+                ggml_tensor * kq = decode_mul_mat(ctx, K, qp);                    // [n_kv, 1, n_head]
+                decode_prec_set_acc(kq, GGML_PREC_F32);
                 kq = ggml_soft_max_ext(ctx, kq, masks[(size_t) i], hp.kq_scale(), 0.0f);
                 ggml_tensor * vp = ggml_cont(ctx, ggml_transpose(ctx, V));
-                out = ggml_mul_mat(ctx, vp, kq);                                // [kv_lora, 1, n_head]
-                ggml_prec_set_acc(out, GGML_PREC_F32);
+                out = decode_mul_mat(ctx, vp, kq);                                // [kv_lora, 1, n_head]
+                decode_prec_set_acc(out, GGML_PREC_F32);
             }
             out = ggml_cont(ctx, out);
             cat = cat ? ggml_concat(ctx, cat, out, 1) : out;                    // grow along the token axis
         }
 
         // One V decompression and one output projection for the whole batch.
-        ggml_tensor * kqv = ggml_mul_mat(ctx, LW.wv_b, cat);                    // [head_v, N, n_head]
+        ggml_tensor * kqv = decode_mul_mat(ctx, LW.wv_b, cat);                    // [head_v, N, n_head]
         kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                               // [head_v, n_head, N]
         ggml_tensor * flat = ggml_cont_2d(ctx, kqv, (int64_t) hp.n_embd_head_v * n_head, N);
-        return ggml_mul_mat(ctx, LW.wo, flat);
+        return decode_mul_mat(ctx, LW.wo, flat);
     }
 
 
@@ -3175,9 +3253,9 @@ struct graph_builder
         const int64_t dc = hp.d_conv;
         const int64_t N = nt;
 
-        ggml_tensor * qp = ggml_mul_mat(ctx, LW.kda_wq, cur);
-        ggml_tensor * kp = ggml_mul_mat(ctx, LW.kda_wk, cur);
-        ggml_tensor * vp = ggml_mul_mat(ctx, LW.kda_wv, cur);
+        ggml_tensor * qp = decode_mul_mat(ctx, LW.kda_wq, cur);
+        ggml_tensor * kp = decode_mul_mat(ctx, LW.kda_wk, cur);
+        ggml_tensor * vp = decode_mul_mat(ctx, LW.kda_wv, cur);
         ggml_tensor * qkv = ggml_concat(ctx, ggml_concat(ctx, qp, kp, 0), vp, 0);   // [3*d_inner, N]
 
         ggml_tensor * conv_w = ggml_concat(ctx,
@@ -3186,10 +3264,10 @@ struct graph_builder
                     ggml_reshape_2d(ctx, LW.kda_conv_k, dc, d_inner), 1),
                 ggml_reshape_2d(ctx, LW.kda_conv_v, dc, d_inner), 1);               // [dc, 3*d_inner]
 
-        ggml_tensor * g_pre = ggml_mul_mat(ctx, LW.kda_f_b, ggml_mul_mat(ctx, LW.kda_f_a, cur));
+        ggml_tensor * g_pre = decode_mul_mat(ctx, LW.kda_f_b, decode_mul_mat(ctx, LW.kda_f_a, cur));
         g_pre = ggml_add(ctx, g_pre, LW.kda_dt_b);                                  // [d_inner, N]
-        ggml_tensor * beta_all = ggml_sigmoid(ctx, ggml_mul_mat(ctx, LW.kda_beta, cur));   // [H, N]
-        ggml_tensor * gate_all = ggml_mul_mat(ctx, LW.kda_g_b, ggml_mul_mat(ctx, LW.kda_g_a, cur)); // [d_inner, N]
+        ggml_tensor * beta_all = ggml_sigmoid(ctx, decode_mul_mat(ctx, LW.kda_beta, cur));   // [H, N]
+        ggml_tensor * gate_all = decode_mul_mat(ctx, LW.kda_g_b, decode_mul_mat(ctx, LW.kda_g_a, cur)); // [d_inner, N]
 
         ggml_tensor * cat = nullptr;
         for (int64_t i = 0; i < N; i++)
@@ -3254,7 +3332,7 @@ struct graph_builder
             cat = cat ? ggml_concat(ctx, cat, out_i, 1) : out_i;                    // [d_inner, N]
         }
 
-        return ggml_mul_mat(ctx, LW.kda_wo, cat);                                   // [n_embd, N]
+        return decode_mul_mat(ctx, LW.kda_wo, cat);                                   // [n_embd, N]
     }
 
     /// Pooled indexer for a batch of single tokens: shared projections, then a
@@ -3271,20 +3349,20 @@ struct graph_builder
         const int64_t r = hp.indexer_kpool;
         const int64_t N = nt;
 
-        ggml_tensor * ik = ggml_mul_mat(ctx, LW.idx_attn_k, cur);                   // [D, N]
+        ggml_tensor * ik = decode_mul_mat(ctx, LW.idx_attn_k, cur);                   // [D, N]
         ik = ggml_norm(ctx, ik, hp.norm_eps);
         ik = ggml_mul(ctx, ik, LW.idx_k_norm_w);
         ik = ggml_add(ctx, ik, LW.idx_k_norm_b);
-        ggml_tensor * gate = ggml_mul_mat(ctx, LW.idx_comp_gate, cur);              // [D, N]
+        ggml_tensor * gate = decode_mul_mat(ctx, LW.idx_comp_gate, cur);              // [D, N]
         ggml_tensor * packed = ggml_concat(ctx,
                 ggml_reshape_3d(ctx, ik, D, 1, N),
                 ggml_reshape_3d(ctx, gate, D, 1, N), 1);                            // [D, 2, N]
         packed = ggml_cont(ctx, packed);
 
-        ggml_tensor * iq = ggml_mul_mat(ctx, LW.idx_attn_q_b, qr);                  // [D*H, N]
+        ggml_tensor * iq = decode_mul_mat(ctx, LW.idx_attn_q_b, qr);                  // [D*H, N]
         iq = ggml_reshape_3d(ctx, iq, D, H, N);
-        ggml_tensor * w = ggml_mul_mat(ctx, LW.idx_proj, cur);                      // [H, N]
-        ggml_prec_set_acc(w, GGML_PREC_F32);
+        ggml_tensor * w = decode_mul_mat(ctx, LW.idx_proj, cur);                      // [H, N]
+        decode_prec_set_acc(w, GGML_PREC_F32);
         w = ggml_scale(ctx, w, 1.0f / sqrtf((float) (D * H)));
 
         ggml_tensor * ape = ggml_cont(ctx, ggml_transpose(ctx, LW.idx_comp_ape));   // [r, D]
@@ -3330,7 +3408,7 @@ struct graph_builder
             else
             {
                 ggml_tensor * qp2 = ggml_permute(ctx, qi, 0, 2, 1, 3);              // [D, 1, H]
-                ggml_tensor * kq = ggml_mul_mat(ctx, pool_k, qp2);                  // [n_pools, 1, H]
+                ggml_tensor * kq = decode_mul_mat(ctx, pool_k, qp2);                  // [n_pools, 1, H]
                 kq = ggml_cont(ctx, ggml_permute(ctx, kq, 2, 1, 0, 3));             // [H, 1, n_pools]
                 ggml_tensor * sc = ggml_relu(ctx, kq);
                 sc = ggml_mul(ctx, sc, wi);
@@ -3455,7 +3533,7 @@ struct graph_builder
             }
             else
             {
-                ggml_tensor * qr = rms(ggml_mul_mat(ctx, LW.wq_a, cur), LW.q_a_norm);
+                ggml_tensor * qr = rms(decode_mul_mat(ctx, LW.wq_a, cur), LW.q_a_norm);
                 build_indexer_g5n_bd(il, cur, qr, top_k);
                 for (int64_t i = 0; i < N; i++)
                 {
@@ -3496,7 +3574,7 @@ struct graph_builder
         ggml_tensor * x3 = ggml_reshape_3d(ctx, flat, hp.n_embd, hcm, N);
         ggml_tensor * cur = hc_mean(x3);
         cur = rms(cur, m.output_norm);
-        cur = ggml_mul_mat(ctx, m.output, cur);                                      // [vocab, N]
+        cur = decode_mul_mat(ctx, m.output, cur);                                      // [vocab, N]
         ggml_set_output(cur);
         ggml_set_name(cur, "logits");
         res.logits = cur;
@@ -3553,7 +3631,7 @@ struct graph_builder
 
             ggml_tensor * residual = inpL;
             ggml_tensor * cur = rms(inpL, L.w[0].attn_norm);
-            ggml_tensor * qr = rms(ggml_mul_mat(ctx, L.w[0].wq_a, cur), L.w[0].q_a_norm);
+            ggml_tensor * qr = rms(decode_mul_mat(ctx, L.w[0].wq_a, cur), L.w[0].q_a_norm);
 
             if (L.indexer_full)
             {
@@ -3595,7 +3673,7 @@ struct graph_builder
         }
 
         ggml_tensor * cur = rms(inpL, m.output_norm);
-        cur = ggml_mul_mat(ctx, m.output, cur);                                 // [vocab, N]
+        cur = decode_mul_mat(ctx, m.output, cur);                                 // [vocab, N]
         ggml_set_output(cur);
         ggml_set_name(cur, "logits");
         res.logits = cur;
@@ -3699,13 +3777,13 @@ struct graph_builder
         const int64_t D = hp.indexer_head_size;
         const int64_t H = hp.indexer_n_head;
 
-        ggml_tensor * k = ggml_mul_mat(ctx, LW.idx_attn_k, cur);           // [D, nt]
+        ggml_tensor * k = decode_mul_mat(ctx, LW.idx_attn_k, cur);           // [D, nt]
         k = ggml_norm(ctx, k, 0.0f);                                       // f_norm_eps is 0 for glm-dsa
         k = ggml_mul(ctx, k, LW.idx_k_norm_w);
         k = ggml_add(ctx, k, LW.idx_k_norm_b);
         k = ggml_reshape_3d(ctx, k, D, 1, nt);
         k = rope(k, pos);
-        if (m.hadamard[dev]) k = ggml_mul_mat(ctx, m.hadamard[dev], k);
+        if (m.hadamard[dev]) k = decode_mul_mat(ctx, m.hadamard[dev], k);
 
         // Append this ubatch's indexer keys. The destination rows arrive as a
         // graph INPUT rather than a baked view offset, so one cached graph
@@ -3716,15 +3794,15 @@ struct graph_builder
         if (!score_now)
             return nullptr;
 
-        ggml_tensor * q = ggml_mul_mat(ctx, LW.idx_attn_q_b, qr);          // [D*H, nt]
+        ggml_tensor * q = decode_mul_mat(ctx, LW.idx_attn_q_b, qr);          // [D*H, nt]
         q = ggml_reshape_3d(ctx, q, D, H, nt);
         q = rope(q, pos);
-        if (m.hadamard[dev]) q = ggml_mul_mat(ctx, m.hadamard[dev], q);
+        if (m.hadamard[dev]) q = decode_mul_mat(ctx, m.hadamard[dev], q);
 
         ggml_tensor * k_all = ggml_view_3d(ctx, slot.idx_k[rank][il], D, 1, n_kv,
                                            slot.idx_k[rank][il]->nb[1], slot.idx_k[rank][il]->nb[1], 0);
 
-        ggml_tensor * w = ggml_mul_mat(ctx, LW.idx_proj, cur);             // [H, nt]
+        ggml_tensor * w = decode_mul_mat(ctx, LW.idx_proj, cur);             // [H, nt]
         // Pre-scaled so the scale never touches the big [n_kv, nt] score tensor.
         w = ggml_scale(ctx, w, 1.0f / sqrtf((float) (D * H)));
 
@@ -3737,12 +3815,12 @@ struct graph_builder
         {
             ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);           // [D, nt, H]
             ggml_tensor * kp = ggml_permute(ctx, k_all, 0, 2, 1, 3);       // [D, n_kv, 1]
-            ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);                  // [n_kv, nt, H]
+            ggml_tensor * kq = decode_mul_mat(ctx, kp, qp);                  // [n_kv, nt, H]
             // F32 accumulation: the cache is F16, and without this ggml would
             // convert the query to F16 and dot in half precision. The fused
             // kernel converts the KEY up to F32 instead, and matching it is what
             // keeps the top-k selection identical at long context.
-            ggml_prec_set_acc(kq, GGML_PREC_F32);
+            decode_prec_set_acc(kq, GGML_PREC_F32);
             kq = ggml_cont(ctx, ggml_permute(ctx, kq, 2, 1, 0, 3));        // [H, nt, n_kv]
             ggml_tensor * s = ggml_relu(ctx, kq);
             s = ggml_mul(ctx, s, w);                                       // broadcast over n_kv
@@ -3813,8 +3891,8 @@ struct graph_builder
         const int64_t n_head = (m.tp > 1 && m.tp_heads()) ? (L.head_first[rank + 1] - L.head_first[rank])
                                                           : hp.n_head;
 
-        ggml_tensor * q = ggml_mul_mat(ctx, LW.wq_b, qr);                       // [n_head*head_k, nt]
-        ggml_tensor * kv_pe = ggml_mul_mat(ctx, LW.wkv_a_mqa, cur);              // [kv_lora + rope, nt]
+        ggml_tensor * q = decode_mul_mat(ctx, LW.wq_b, qr);                       // [n_head*head_k, nt]
+        ggml_tensor * kv_pe = decode_mul_mat(ctx, LW.wkv_a_mqa, cur);              // [kv_lora + rope, nt]
 
         ggml_tensor * Qcur = nullptr;
         ggml_tensor * Kcur = nullptr;
@@ -3826,7 +3904,7 @@ struct graph_builder
             ggml_tensor * kv_cmpr = rms(kv_pe, LW.kv_a_norm);
             ggml_tensor * q3 = ggml_reshape_3d(ctx, q, hp.n_embd_head_k, n_head, nt);
             ggml_tensor * q_nope_p = ggml_permute(ctx, q3, 0, 2, 1, 3);          // [head_k, nt, n_head]
-            ggml_tensor * q_abs = ggml_mul_mat(ctx, LW.wk_b, q_nope_p);          // [kv_lora, nt, n_head]
+            ggml_tensor * q_abs = decode_mul_mat(ctx, LW.wk_b, q_nope_p);          // [kv_lora, nt, n_head]
             Qcur = ggml_cont(ctx, ggml_permute(ctx, q_abs, 0, 2, 1, 3));         // [kv_lora, n_head, nt]
             Kcur = ggml_reshape_3d(ctx, kv_cmpr, hp.kv_lora_rank, 1, nt);
         }
@@ -3852,7 +3930,7 @@ struct graph_builder
         // q_absorbed[h] = wk_b[h]^T q_nope[h] : the per-head K decompression,
         // folded into the query so 64 heads share one 576-wide key head.
         ggml_tensor * q_nope_p = ggml_permute(ctx, q_nope, 0, 2, 1, 3);         // [nope, nt, n_head]
-        ggml_tensor * q_abs = ggml_mul_mat(ctx, LW.wk_b, q_nope_p);              // [kv_lora, nt, n_head]
+        ggml_tensor * q_abs = decode_mul_mat(ctx, LW.wk_b, q_nope_p);              // [kv_lora, nt, n_head]
         q_abs = ggml_permute(ctx, q_abs, 0, 2, 1, 3);                           // [kv_lora, n_head, nt]
 
         // rope goes last so an in-place context shift stays possible
@@ -3871,7 +3949,43 @@ struct graph_builder
         ggml_tensor * V = ggml_view_3d(ctx, kv, hp.kv_lora_rank, n_kv, 1, kv->nb[1], kv->nb[1] * n_kv, 0);
 
         ggml_tensor * cur_attn = nullptr;
-        if (m.flash_attn)
+        if (decode_rows())
+        {
+            // Every row sees the same padded key extent as an ordinary decode
+            // at its own position. The extents participate in the graph key.
+            for (int64_t r = 0; r < nt; ++r)
+            {
+                const int64_t nk = std::min<int64_t>(pad_to(p0 + r + 1, 256), m.n_ctx);
+                ggml_tensor * kr = ggml_view_3d(ctx, kv, hp.n_kv_row, nk, 1, kv->nb[1], kv->nb[1] * nk, 0);
+                ggml_tensor * vr = ggml_view_3d(ctx, kv, hp.kv_lora_rank, nk, 1, kv->nb[1], kv->nb[1] * nk, 0);
+                ggml_tensor * qr = ggml_cont(ctx, ggml_view_3d(ctx, Qcur, hp.n_kv_row, n_head, 1,
+                    Qcur->nb[1], Qcur->nb[2], (size_t) r * Qcur->nb[2]));
+                ggml_tensor * mr = ggml_cont(ctx, ggml_view_2d(ctx, mask, nk, 1, mask->nb[1], (size_t) r * mask->nb[1]));
+                ggml_tensor * out;
+                if (m.flash_attn)
+                {
+                    ggml_tensor * qf = ggml_permute(ctx, qr, 0, 2, 1, 3);
+                    out = tsg_flash_attn_ext_guarded(ctx, m.backends[device_of(il, rank)], "GLM decode-row verify",
+                        qf, kr, vr, mr, hp.kq_scale(), 0.0f, 0.0f, nullptr, GGML_PREC_F32);
+                    out = ggml_permute(ctx, out, 0, 2, 1, 3);
+                }
+                else
+                {
+                    ggml_tensor * qp = ggml_permute(ctx, qr, 0, 2, 1, 3);
+                    ggml_tensor * kq = ggml_mul_mat(ctx, kr, qp);
+                    ggml_prec_set_acc(kq, GGML_PREC_F32);
+                    kq = ggml_soft_max_ext(ctx, kq, mr, hp.kq_scale(), 0.0f);
+                    ggml_tensor * vp = ggml_cont(ctx, ggml_transpose(ctx, vr));
+                    out = ggml_mul_mat(ctx, vp, kq);
+                    ggml_prec_set_acc(out, GGML_PREC_F32);
+                }
+                out = ggml_mul_mat(ctx, LW.wv_b, out);
+                out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+                out = ggml_reshape_2d(ctx, out, (int64_t) hp.n_embd_head_v * n_head, 1);
+                cur_attn = cur_attn ? ggml_concat(ctx, cur_attn, out, 1) : out;
+            }
+        }
+        else if (m.flash_attn)
         {
             ggml_tensor * qf = ggml_permute(ctx, Qcur, 0, 2, 1, 3);             // [n_kv_row, nt, n_head]
             ggml_tensor * fa = tsg_flash_attn_ext_guarded(ctx, m.backends[device_of(il, rank)], "GLM-DSA forward", qf, K, V, mask, hp.kq_scale(), 0.0f, 0.0f,
@@ -3879,7 +3993,7 @@ struct graph_builder
             // [kv_lora, n_head, nt] -> [kv_lora, nt, n_head] so wv_b's per-head
             // matmul runs as a matrix-matrix product with nt in dimension 1.
             fa = ggml_permute(ctx, fa, 0, 2, 1, 3);
-            fa = ggml_mul_mat(ctx, LW.wv_b, fa);                                 // [head_v, nt, n_head]
+            fa = decode_mul_mat(ctx, LW.wv_b, fa);                                 // [head_v, nt, n_head]
             fa = ggml_cont(ctx, ggml_permute(ctx, fa, 0, 2, 1, 3));             // [head_v, n_head, nt]
             cur_attn = ggml_reshape_2d(ctx, fa, (int64_t) hp.n_embd_head_v * n_head, nt);
         }
@@ -3888,21 +4002,21 @@ struct graph_builder
             // K and V already come out of the cache in the layout mul_mat wants
             // ([n_embd, n_kv, n_head_kv]); only the query needs permuting.
             ggml_tensor * qp = ggml_permute(ctx, Qcur, 0, 2, 1, 3);             // [n_kv_row, nt, n_head]
-            ggml_tensor * kq = ggml_mul_mat(ctx, K, qp);                        // [n_kv, nt, n_head]
-            ggml_prec_set_acc(kq, GGML_PREC_F32);
+            ggml_tensor * kq = decode_mul_mat(ctx, K, qp);                        // [n_kv, nt, n_head]
+            decode_prec_set_acc(kq, GGML_PREC_F32);
             kq = ggml_soft_max_ext(ctx, kq, mask, hp.kq_scale(), 0.0f);
 
             ggml_tensor * vp = ggml_cont(ctx, ggml_transpose(ctx, V));          // [n_kv, kv_lora, 1]
-            ggml_tensor * kqv = ggml_mul_mat(ctx, vp, kq);                      // [kv_lora, nt, n_head]
+            ggml_tensor * kqv = decode_mul_mat(ctx, vp, kq);                      // [kv_lora, nt, n_head]
             // V is F16; without this the F32 softmax weights would be rounded to
             // half before the context product.
-            ggml_prec_set_acc(kqv, GGML_PREC_F32);
-            kqv = ggml_mul_mat(ctx, LW.wv_b, kqv);                               // [head_v, nt, n_head]
+            decode_prec_set_acc(kqv, GGML_PREC_F32);
+            kqv = decode_mul_mat(ctx, LW.wv_b, kqv);                               // [head_v, nt, n_head]
             kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                           // [head_v, n_head, nt]
             cur_attn = ggml_cont_2d(ctx, kqv, (int64_t) hp.n_embd_head_v * n_head, nt);
         }
 
-        return ggml_mul_mat(ctx, LW.wo, cur_attn);
+        return decode_mul_mat(ctx, LW.wo, cur_attn);
     }
 
     // ---- FFN --------------------------------------------------------------
@@ -3923,20 +4037,20 @@ struct graph_builder
     ggml_tensor * build_dense_ffn(int il, int rank, ggml_tensor * cur)
     {
         const glm_layer_weights & LW = m.layers[il].w[rank];
-        ggml_tensor * gate = ggml_mul_mat(ctx, LW.ffn_gate, cur);
-        ggml_tensor * up = ggml_mul_mat(ctx, LW.ffn_up, cur);
+        ggml_tensor * gate = decode_mul_mat(ctx, LW.ffn_gate, cur);
+        ggml_tensor * up = decode_mul_mat(ctx, LW.ffn_up, cur);
         ggml_tensor * h = swiglu(gate, up);
-        return ggml_mul_mat(ctx, LW.ffn_down, h);
+        return decode_mul_mat(ctx, LW.ffn_down, h);
     }
 
     ggml_tensor * build_shexp(int il, int rank, ggml_tensor * cur)
     {
         const glm_layer_weights & LW = m.layers[il].w[rank];
         if (!LW.ffn_gate_shexp) return nullptr;
-        ggml_tensor * gate = ggml_mul_mat(ctx, LW.ffn_gate_shexp, cur);
-        ggml_tensor * up = ggml_mul_mat(ctx, LW.ffn_up_shexp, cur);
+        ggml_tensor * gate = decode_mul_mat(ctx, LW.ffn_gate_shexp, cur);
+        ggml_tensor * up = decode_mul_mat(ctx, LW.ffn_up_shexp, cur);
         ggml_tensor * h = swiglu(gate, up);
-        return ggml_mul_mat(ctx, LW.ffn_down_shexp, h);
+        return decode_mul_mat(ctx, LW.ffn_down_shexp, h);
     }
 
     /// Routed-expert FFN for one rank. Returns this rank's PARTIAL sum; the
@@ -3950,8 +4064,8 @@ struct graph_builder
 
         // Routing is replicated: every rank sees the same logits and picks the
         // same global top-k, so no collective is needed to agree on it.
-        ggml_tensor * logits = ggml_mul_mat(ctx, LW.ffn_gate_inp, cur);    // [n_expert, nt]
-        ggml_prec_set_acc(logits, GGML_PREC_F32);
+        ggml_tensor * logits = decode_mul_mat(ctx, LW.ffn_gate_inp, cur);    // [n_expert, nt]
+        decode_prec_set_acc(logits, GGML_PREC_F32);
 
         ggml_tensor * probs = hp.expert_gating_func == 2
             ? ggml_sigmoid(ctx, logits)
@@ -3985,10 +4099,12 @@ struct graph_builder
 
         ggml_tensor * cur3 = ggml_reshape_3d(ctx, cur, hp.n_embd, 1, nt);
 
-        ggml_tensor * up = ggml_mul_mat_id(ctx, LW.ffn_up_exps, cur3, selected);    // [n_ff_exp, n_used, nt]
-        ggml_tensor * gate = ggml_mul_mat_id(ctx, LW.ffn_gate_exps, cur3, selected);
+        ggml_tensor * up = decode_mul_mat_id(ctx, LW.ffn_up_exps, cur3, selected);    // [n_ff_exp, n_used, nt]
+        ggml_tensor * gate = decode_mul_mat_id(ctx, LW.ffn_gate_exps, cur3, selected);
         ggml_tensor * h = swiglu(gate, up);
-        ggml_tensor * experts = ggml_mul_mat_id(ctx, LW.ffn_down_exps, h, selected); // [n_embd, n_used, nt]
+        ggml_tensor * experts = decode_mul_mat_id(ctx, LW.ffn_down_exps, h, selected); // [n_embd, n_used, nt]
+        if (hp.g5n && nt <= TSG_PRECISION_DECODE_COLUMNS)
+            ggml_set_output(experts); // keep the weighted-reduction fusion's input from aliasing its output
 
         trace("moe_sel", il, rank, selected);
         trace("moe_probs", il, rank, probs);
@@ -4058,7 +4174,7 @@ struct graph_builder
         const int64_t n = x->ne[2];
         ggml_tensor * xt = hc_streams_first(x);                       // [hc, n_embd, n]
         ggml_tensor * w3 = ggml_reshape_3d(ctx, w, hcm, 1, n);        // [hc, 1, n]
-        ggml_tensor * out = ggml_mul_mat(ctx, xt, w3);                // [n_embd, 1, n]
+        ggml_tensor * out = decode_mul_mat(ctx, xt, w3);                // [n_embd, 1, n]
         return ggml_reshape_2d(ctx, out, x->ne[0], n);
     }
 
@@ -4071,7 +4187,7 @@ struct graph_builder
 
         ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc_dim, n);
         ggml_tensor * flat_norm = ggml_rms_norm(ctx, flat, hp.rms_eps);
-        ggml_tensor * mixes = ggml_mul_mat(ctx, fn, flat_norm);       // [(2+hc)*hc, n]
+        ggml_tensor * mixes = decode_mul_mat(ctx, fn, flat_norm);       // [(2+hc)*hc, n]
 
         ggml_tensor * scale_pre = view_row_1d(hc_scale, 1, 0);
         ggml_tensor * scale_post = view_row_1d(hc_scale, 1, 1);
@@ -4106,11 +4222,11 @@ struct graph_builder
         // contracted dimension is 1.
         ggml_tensor * x1 = ggml_reshape_3d(ctx, x, 1, n_embd, n);
         ggml_tensor * p1 = ggml_reshape_3d(ctx, post, 1, hcm, n);
-        ggml_tensor * outer = ggml_mul_mat(ctx, x1, p1);              // [n_embd, hc, n]
+        ggml_tensor * outer = decode_mul_mat(ctx, x1, p1);              // [n_embd, hc, n]
 
         ggml_tensor * rt = hc_streams_first(residual);                // [hc(src), n_embd, n]
         ggml_tensor * ct = ggml_cont(ctx, ggml_permute(ctx, comb, 1, 0, 2, 3));   // [hc(src), hc(dst), n]
-        ggml_tensor * mixed = ggml_mul_mat(ctx, rt, ct);              // [n_embd, hc(dst), n]
+        ggml_tensor * mixed = decode_mul_mat(ctx, rt, ct);              // [n_embd, hc(dst), n]
 
         return ggml_add(ctx, outer, mixed);
     }
@@ -4147,9 +4263,9 @@ struct graph_builder
         const int64_t d_inner = hd * H;
         const int64_t dc = hp.d_conv;
 
-        ggml_tensor * qp = ggml_mul_mat(ctx, LW.kda_wq, cur);
-        ggml_tensor * kp = ggml_mul_mat(ctx, LW.kda_wk, cur);
-        ggml_tensor * vp = ggml_mul_mat(ctx, LW.kda_wv, cur);
+        ggml_tensor * qp = decode_mul_mat(ctx, LW.kda_wq, cur);
+        ggml_tensor * kp = decode_mul_mat(ctx, LW.kda_wk, cur);
+        ggml_tensor * vp = decode_mul_mat(ctx, LW.kda_wv, cur);
         ggml_tensor * qkv = ggml_concat(ctx, ggml_concat(ctx, qp, kp, 0), vp, 0);   // [3*d_inner, nt]
         trace("kda_qkv", il, rank, qkv);
 
@@ -4191,7 +4307,7 @@ struct graph_builder
 
         // forget gate: g = lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias)),
         // per channel; ssm_a holds -exp(A_log), so exp(A_log)*y == -(y * ssm_a).
-        ggml_tensor * g = ggml_mul_mat(ctx, LW.kda_f_b, ggml_mul_mat(ctx, LW.kda_f_a, cur));
+        ggml_tensor * g = decode_mul_mat(ctx, LW.kda_f_b, decode_mul_mat(ctx, LW.kda_f_a, cur));
         g = ggml_add(ctx, g, LW.kda_dt_b);
         g = ggml_reshape_3d(ctx, g, hd, H, nt);
         g = ggml_mul(ctx, g, ggml_reshape_3d(ctx, LW.kda_a, 1, H, 1));
@@ -4200,7 +4316,7 @@ struct graph_builder
         ggml_tensor * g4 = ggml_reshape_4d(ctx, g, hd, H, nt, 1);
         trace("kda_gate", il, rank, g4);
 
-        ggml_tensor * beta = ggml_sigmoid(ctx, ggml_mul_mat(ctx, LW.kda_beta, cur));
+        ggml_tensor * beta = ggml_sigmoid(ctx, decode_mul_mat(ctx, LW.kda_beta, cur));
         ggml_tensor * b4 = ggml_reshape_4d(ctx, beta, 1, H, nt, 1);
 
         ggml_tensor * state = slot.kda_ssm[rank][(size_t) il];                       // [hd, hd, H]
@@ -4219,14 +4335,14 @@ struct graph_builder
 
         // low-rank output gate; RMS over hd with one weight shared by every
         // head, then a plain sigmoid gate (not FusedRMSNormGated's SiLU).
-        ggml_tensor * gate = ggml_mul_mat(ctx, LW.kda_g_b, ggml_mul_mat(ctx, LW.kda_g_a, cur));
+        ggml_tensor * gate = decode_mul_mat(ctx, LW.kda_g_b, decode_mul_mat(ctx, LW.kda_g_a, cur));
         gate = ggml_reshape_3d(ctx, gate, hd, H, nt);
         ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_cont(ctx, core), hp.rms_eps), LW.kda_o_norm);
         ggml_tensor * gated = ggml_mul(ctx, normed, ggml_sigmoid(ctx, gate));
         trace("kda_normed", il, rank, gated);
 
         ggml_tensor * out2 = ggml_reshape_2d(ctx, ggml_cont(ctx, gated), d_inner, nt);
-        ggml_tensor * proj = ggml_mul_mat(ctx, LW.kda_wo, out2);
+        ggml_tensor * proj = decode_mul_mat(ctx, LW.kda_wo, out2);
         trace("kda_out", il, rank, proj);
         return proj;
     }
@@ -4253,7 +4369,7 @@ struct graph_builder
         const int64_t r = hp.indexer_kpool;
 
         // a genuine LayerNorm: weight AND bias, at eps 1e-6 (from the GGUF).
-        ggml_tensor * ik = ggml_mul_mat(ctx, LW.idx_attn_k, cur);          // [D, nt]
+        ggml_tensor * ik = decode_mul_mat(ctx, LW.idx_attn_k, cur);          // [D, nt]
         ik = ggml_norm(ctx, ik, hp.norm_eps);
         ik = ggml_mul(ctx, ik, LW.idx_k_norm_w);
         ik = ggml_add(ctx, ik, LW.idx_k_norm_b);
@@ -4262,7 +4378,7 @@ struct graph_builder
         // the pooling gate is a SECOND, INDEPENDENT projection of the hidden
         // state; it must be cached beside the key because a pool is only built
         // once its members have left the batch.
-        ggml_tensor * gate = ggml_mul_mat(ctx, LW.idx_comp_gate, cur);     // [D, nt]
+        ggml_tensor * gate = decode_mul_mat(ctx, LW.idx_comp_gate, cur);     // [D, nt]
 
         ggml_tensor * packed = ggml_concat(ctx,
                 ggml_reshape_3d(ctx, ik, D, 1, nt),
@@ -4302,14 +4418,14 @@ struct graph_builder
         pool_k = ggml_reshape_2d(ctx, ggml_cont(ctx, pool_k), D, n_pools);
         trace("indexer_pool_k", il, rank, pool_k);
 
-        ggml_tensor * q = ggml_mul_mat(ctx, LW.idx_attn_q_b, qr);           // [D*H, nt]
+        ggml_tensor * q = decode_mul_mat(ctx, LW.idx_attn_q_b, qr);           // [D*H, nt]
         q = ggml_reshape_3d(ctx, q, D, H, nt);
 
         // sign-unconstrained head weights, both scale constants folded in on
         // the small tensor. F32 is not cosmetic: a bf16 head gate moves logits
         // by ~1e-2, enough to swap near-tied pools under a hard top-k cut.
-        ggml_tensor * w = ggml_mul_mat(ctx, LW.idx_proj, cur);              // [H, nt]
-        ggml_prec_set_acc(w, GGML_PREC_F32);
+        ggml_tensor * w = decode_mul_mat(ctx, LW.idx_proj, cur);              // [H, nt]
+        decode_prec_set_acc(w, GGML_PREC_F32);
         w = ggml_scale(ctx, w, 1.0f / sqrtf((float) (D * H)));
 
         ggml_tensor * score = nullptr;
@@ -4323,7 +4439,7 @@ struct graph_builder
         else
         {
             ggml_tensor * qp2 = ggml_permute(ctx, q, 0, 2, 1, 3);           // [D, nt, H]
-            ggml_tensor * kq = ggml_mul_mat(ctx, pool_k, qp2);              // [n_pools, nt, H]
+            ggml_tensor * kq = decode_mul_mat(ctx, pool_k, qp2);              // [n_pools, nt, H]
             // the ReLU sits BETWEEN the per-head dot product and the head
             // weighting; the weights are sign-free, so moving it is a
             // different function.
@@ -4466,7 +4582,7 @@ struct graph_builder
             }
             else
             {
-                ggml_tensor * qr = rms(ggml_mul_mat(ctx, W.wq_a, cur), W.q_a_norm);
+                ggml_tensor * qr = rms(decode_mul_mat(ctx, W.wq_a, cur), W.q_a_norm);
                 ggml_tensor * mask = inp.kq_mask[dev];
                 if (L.indexer_full)
                 {
@@ -4525,7 +4641,7 @@ struct graph_builder
         ggml_tensor * x3 = ggml_reshape_3d(ctx, selr, hp.n_embd, hcm, res.n_out);
         ggml_tensor * out = hc_mean(x3);
         out = rms(out, m.output_norm);
-        out = ggml_mul_mat(ctx, m.output, out);
+        out = decode_mul_mat(ctx, m.output, out);
         ggml_set_output(out);
         ggml_set_name(out, "logits");
         res.logits = out;
@@ -4648,7 +4764,7 @@ struct graph_builder
                 }
                 else
                 {
-                    ggml_tensor * qr = rms(ggml_mul_mat(ctx, RW.wq_a, cur), RW.q_a_norm);
+                    ggml_tensor * qr = rms(decode_mul_mat(ctx, RW.wq_a, cur), RW.q_a_norm);
                     trace("qr", il, rank, qr);
                     ggml_tensor * mask = inp.kq_mask[rank_dev];
                     if (L.indexer_full)
@@ -4735,7 +4851,7 @@ struct graph_builder
             if (!res.want_logits)
                 return;
             ggml_tensor * hsel = ggml_get_rows(ctx, hn, inp.out_ids);
-            hsel = ggml_mul_mat(ctx, m.output, hsel);
+            hsel = decode_mul_mat(ctx, m.output, hsel);
             ggml_set_output(hsel);
             ggml_set_name(hsel, "logits");
             res.logits = hsel;
@@ -4752,7 +4868,7 @@ struct graph_builder
         // unweighted mean over the streams, then the ordinary norm + head.
         ggml_tensor * cur = hc_mean(x3);
         cur = rms(cur, m.output_norm);
-        cur = ggml_mul_mat(ctx, m.output, cur);
+        cur = decode_mul_mat(ctx, m.output, cur);
         ggml_set_output(cur);
         ggml_set_name(cur, "logits");
         res.logits = cur;
@@ -4852,7 +4968,7 @@ struct graph_builder
             {
                 const int dev = device_of(il, r);
                 ggml_tensor * cur = rms(inpL, L.w[r].attn_norm);
-                ggml_tensor * qr = rms(ggml_mul_mat(ctx, L.w[r].wq_a, cur), L.w[r].q_a_norm);
+                ggml_tensor * qr = rms(decode_mul_mat(ctx, L.w[r].wq_a, cur), L.w[r].q_a_norm);
 
                 trace("attn_norm", il, r, cur);
                 trace("qr", il, r, qr);
@@ -4930,7 +5046,7 @@ struct graph_builder
         {
             ggml_tensor * cur = ggml_get_rows(ctx, inpL, inp.out_ids);
             cur = rms(cur, m.output_norm);
-            cur = ggml_mul_mat(ctx, m.output, cur);
+            cur = decode_mul_mat(ctx, m.output, cur);
             ggml_set_output(cur);
             ggml_set_name(cur, "logits");
             res.logits = cur;
@@ -4950,7 +5066,7 @@ struct graph_builder
         ggml_build_forward_expand(gf, hn);
 
         ggml_tensor * cur = ggml_get_rows(ctx, hn, inp.out_ids);
-        cur = ggml_mul_mat(ctx, m.output, cur);
+        cur = decode_mul_mat(ctx, m.output, cur);
         ggml_set_output(cur);
         ggml_set_name(cur, "logits");
         res.logits = cur;
@@ -5004,7 +5120,7 @@ struct graph_builder
         ggml_tensor * e_norm = rms(tok, W0.nextn_enorm);
         ggml_tensor * h_norm = rms(inp.h_in[dev0], W0.nextn_hnorm);
         ggml_tensor * cat = ggml_concat(ctx, e_norm, h_norm, 0);        // [2*n_embd, nt]
-        ggml_tensor * inpSA = ggml_mul_mat(ctx, W0.nextn_eh_proj, cat); // [n_embd, nt]
+        ggml_tensor * inpSA = decode_mul_mat(ctx, W0.nextn_eh_proj, cat); // [n_embd, nt]
 
         // ---- attention: every rank runs its own heads ---------------------
         ggml_tensor * part[MAX_GPUS] = {};
@@ -5013,7 +5129,7 @@ struct graph_builder
         {
             const int dev = device_of(il, r);
             ggml_tensor * cur = rms(inpSA, L.w[r].attn_norm);
-            ggml_tensor * qr = rms(ggml_mul_mat(ctx, L.w[r].wq_a, cur), L.w[r].q_a_norm);
+            ggml_tensor * qr = rms(decode_mul_mat(ctx, L.w[r].wq_a, cur), L.w[r].q_a_norm);
             part[r] = build_attention(il, r, cur, qr, inp.pos[dev], inp.kq_mask[dev], inp.kv_idxs[dev]);
         }
         ggml_tensor * ffn_inp = ggml_add(ctx, inpSA, reduce_ranks(part, n_attn));
@@ -5053,7 +5169,7 @@ struct graph_builder
         {
             ggml_tensor * head_w = W0.nextn_head ? W0.nextn_head : m.output;
             ggml_tensor * sel = ggml_get_rows(ctx, hn, inp.out_ids);
-            ggml_tensor * logits = ggml_mul_mat(ctx, head_w, sel);
+            ggml_tensor * logits = decode_mul_mat(ctx, head_w, sel);
             ggml_set_output(logits);
             ggml_set_name(logits, "logits");
             res.logits = logits;
@@ -5357,6 +5473,9 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
                                           bool want_h = false, int kind = 0, int64_t n_ovr = 0)
 {
     const int64_t n_kv = plan_n_kv(m, p0 + nt);
+    std::vector<int64_t> decode_row_kv;
+    if (m.hp.g5n && nt > 1 && nt <= TSG_PRECISION_DECODE_COLUMNS)
+        for (int64_t r = 0; r < nt; ++r) decode_row_kv.push_back(plan_n_kv(m, p0 + r + 1));
     static const bool topk_enabled = []() { const char * e = getenv("TS_GLM_TOPK"); return !(e && atoi(e) == 0); }();
     // The draft block attends densely, so the indexer's sparsity never applies
     // to it and must not enter its cache key.
@@ -5372,7 +5491,7 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         graph_build_result * e = it->get();
         if (e->nt == nt && e->n_kv == n_kv && e->n_out == n_out && e->want_logits == want_logits &&
             e->sparse == sparse && e->slot_id == slot.id && e->want_h == want_h && e->kind == kind &&
-            e->n_ovr == n_ovr)
+            e->n_ovr == n_ovr && e->decode_row_kv == decode_row_kv)
         {
             auto entry = std::move(*it);
             m.graph_cache.erase(it);
@@ -5388,6 +5507,7 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         auto p = std::unique_ptr<graph_build_result>(new graph_build_result());
         p->nt = nt;
         p->n_kv = n_kv;
+        p->decode_row_kv = decode_row_kv;
         p->n_out = n_out;
         p->sparse = sparse;
         p->want_logits = want_logits;
@@ -5404,6 +5524,8 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
     // room for the scheduler's own copies without making the hash set
     // pointlessly large.
     size_t nodes_per_layer = 256;
+    if (m.hp.g5n && nt > 1 && nt <= TSG_PRECISION_DECODE_COLUMNS)
+        nodes_per_layer *= (size_t) nt;
     if (const char * e = getenv("TS_GLM_NODES_PER_LAYER")) { int v = atoi(e); if (v > 0) nodes_per_layer = (size_t) v; }
     // The draft block is one layer; give it the same per-layer budget plus the
     // fixed 1024 so its (much smaller) graph never has to share the trunk's.
@@ -6189,7 +6311,15 @@ TSG_EXPORT int TSGgml_GlmSpecForward(void * handle, const int32_t * tokens, int 
     glm_model * m = (glm_model *) handle;
     if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
 
-    const int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
+    int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
+    // A fresh recurrent snapshot identifies a verification (or the accepted
+    // prefix replay after restore). Explicit --spec-draft values may exceed
+    // the decode arithmetic width. Split those windows into bounded graphs,
+    // retaining every hidden/logit row and the original rollback snapshot.
+    // Prefill has no snapshot at its current position and keeps its ubatch.
+    if (m->hp.g5n && m->kda_snap.valid && m->kda_snap.slot_id == m->active_slot->id &&
+        m->kda_snap.n_past == m->active_slot->n_past)
+        ub = std::min(ub, (int) TSG_PRECISION_DECODE_COLUMNS);
     const int64_t n_embd = m->hp.n_embd;
     const int64_t n_vocab = m->hp.n_vocab;
     int done = 0;

@@ -156,8 +156,10 @@ namespace TensorSharp.Models
         private const int WN_NEXTN_SHARED_HEAD_HEAD = 26;
         private const int WN_COUNT = 27;
 
-        public GlmDsaModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
-            : base(ggufPath, NormalizeBackend(backend), tpDegree, tpGroup)
+        public GlmDsaModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            int layerSplitDegree = 1)
+            : base(ggufPath, ValidateParallelism(backend, tpDegree, tpGroup, layerSplitDegree),
+                NativeRequested(backend) ? 1 : tpDegree, tpGroup)
         {
             string arch = _gguf.GetString("general.architecture") ?? "glm-dsa";
             Config = new ModelConfig { Architecture = arch };
@@ -182,7 +184,7 @@ namespace TensorSharp.Models
             {
                 // The whole model lives in the native executor: no managed weight
                 // tensors, no managed caches.
-                InitNativeExecutor(ggufPath, backend, tpDegree, maxContextLength);
+                InitNativeExecutor(ggufPath, backend, tpDegree, layerSplitDegree, maxContextLength);
                 return;
             }
 

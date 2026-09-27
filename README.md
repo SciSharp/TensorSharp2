@@ -91,10 +91,15 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 
 Tensor parallelism splits one model across N GPUs. It runs on the direct
 `cuda` backend and on the GGML CUDA / Vulkan backends (`--backend ggml_cuda`,
-`ggml_vulkan`). Qwen 3.8 Flash Next and DeepSeek V4 / V4.1 use the same flag for a
-layer split instead: one contiguous run of whole layers per GPU. GLM 5.x also
-layer-splits by default when the flag is omitted, while `--tp N` selects its
-native local tensor-parallel path on the GGML GPU backends. For Qwen-Image-2.1,
+`ggml_vulkan`). Use `--tp N` only for tensor parallelism. Use the separate
+`--layer-split N` option for whole-layer placement on Qwen 3.8 Flash Next,
+DeepSeek V4 / V4.1, and GLM 5.x: one contiguous run of whole layers per GPU.
+The modes are mutually exclusive, and unsupported requests fail at startup.
+Layer splitting is local to one node; it cannot use `--tp-node-id` / `--tp-peers`.
+Existing layer-split commands must replace `--tp N` with `--layer-split N`
+(or `TENSORSHARP_LAYER_SPLIT_DEGREE=N`). With neither mode configured, inference uses one device. GLM 5.x accepts
+`--layer-split N` for whole-layer placement and `--tp N` for its native local
+tensor-parallel path on the GGML GPU backends. For Qwen-Image-2.1,
 `--tp N` shards only the diffusion transformer; its text/vision encoders and VAE
 stay on the first GPU. Install the CUDA toolkit first, then:
 
@@ -239,9 +244,9 @@ See the [performance guide and detailed fast lanes](docs/PROJECT_STATUS.md#make-
 | Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tools | MTP spec | Card |
 |---|---|---|---|---|---|---|---|
 | BERT / XLM-R embeddings | `bert` | Snowflake Arctic Embed L v2.0, all-MiniLM-L6-v2 | Text → vectors | — | — | — | [Embedding guide](docs/embeddings.md) |
-| DeepSeek V4.1 Flash | `deepseek41` | DeepSeek-V4.1-Flash (40 layers, 384 routed experts at top-6 plus one shared expert, four residual streams with delayed hyper-connection mixing, Engram n-gram features, 1M declared context) | Text; image and video with the prepared vision companion (`--mmproj`), audio refused | Yes | Yes (spaced DSML, grammar-constrained) | Experimental: loads a `deepseek41-dspark` drafter (`--draft-model`) on `ggml_cuda`/`ggml_cpu`; validated only on synthetic fixtures, no trained drafter measured (V4 drafters are rejected) | [deepseek41.md](docs/models/deepseek41.md) |
+| DeepSeek V4.1 Flash | `deepseek41` | DeepSeek-V4.1-Flash (40 layers, 384 routed experts at top-6 plus one shared expert, four residual streams with delayed hyper-connection mixing, Engram n-gram features, 1M declared context) | Text; image and video with the prepared vision companion (`--mmproj`), audio refused | Yes | Yes (spaced DSML, grammar-constrained) | Experimental: loads a `deepseek41-dspark` drafter (`--draft-model`) on `ggml_cuda`/`ggml_cpu`; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified (V4 drafters are rejected) | [deepseek41.md](docs/models/deepseek41.md) |
 | DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash (284B MoE, 256 experts, compressed sparse attention, 1M context) | Text only | Yes | Yes (DSML) | Yes (DSpark block drafter, separate GGUF) | [deepseek4.md](docs/models/deepseek4.md) |
-| GLM 5.x | `glm-dsa`, `glm_dsa`, `glm5next` | GLM-5.2 (744B-A40B MoE, 256 experts, MLA + DeepSeek Sparse Attention, 1M context), [GLM-5.3](docs/models/glm.md#glm-53-glm-dsa) (the same 79-block `glm-dsa` shape as 5.2 — 78 trunk blocks plus one NextN, 256 routed experts at top-8 with one shared expert, MLA with the lightning indexer, rope base 8e6 — so it loads on the GLM-5.2 path with no new code and no new flag; text only), GLM-5.3-Flash (320B MoE, 288 experts, KDA linear attention + NoPE MLA with a pooled indexer) | Text only (5.2 and 5.3), Image (5.3-Flash) | Yes | Yes (XML tool calls) | Yes on GLM-5.2 and GLM-5.3 (embedded NextN block; on 5.3 speculation engages on the default layer split, no `--tp`) | [glm.md](docs/models/glm.md) |
+| GLM 5.x | `glm-dsa`, `glm_dsa`, `glm5next` | GLM-5.2 (744B-A40B MoE, 256 experts, MLA + DeepSeek Sparse Attention, 1M context), [GLM-5.3](docs/models/glm.md#glm-53-glm-dsa) (the same 79-block `glm-dsa` shape as 5.2 — 78 trunk blocks plus one NextN, 256 routed experts at top-8 with one shared expert, MLA with the lightning indexer, rope base 8e6 — so it loads on the GLM-5.2 path with no new code and no new flag; text only), GLM-5.3-Flash (320B MoE, 288 experts, KDA linear attention + NoPE MLA with a pooled indexer) | Text only (5.2 and 5.3), Image (5.3-Flash) | Yes | Yes (XML tool calls) | Yes on GLM-5.2 and GLM-5.3 (embedded NextN block; on 5.3 speculation engages on a single device or explicit `--layer-split N`, without active TP) | [glm.md](docs/models/glm.md) |
 | Qwen 3.8 Flash Next | `qwen4exp` | Qwen3.8-Flash-Next (hybrid MoE, 512 experts / 10 used, GatedDeltaNet on 36 of 48 layers interleaved with QSA-indexed full attention, PLE n-gram block, ×4 hyper-connections) | Image, video (`video_url`) | Yes | Yes (Qwen XML / JSON tool calls) | Yes (shared MTP head, separate GGUF via `--draft-model`; GGML backends) | [qwen38-flash-next.md](docs/models/qwen38-flash-next.md) |
 | Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-12B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes | Yes (separate draft GGUF) | [gemma4.md](docs/models/gemma4.md) |
 | Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5/3.6-35B-A3B (MoE), Qwen3.8-27B (dense hybrid) | Image | Yes | Yes | Yes: embedded NextN on Qwen 3.6 and Qwen 3.8 27B (`--spec`); DFlash2 block drafter on Qwen 3.8 27B (separate GGUF, `--draft-model`) | [qwen35.md](docs/models/qwen35.md) |

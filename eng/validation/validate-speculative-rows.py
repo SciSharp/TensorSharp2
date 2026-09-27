@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Require actual learned-drafter execution; preserve strict greedy divergence."""
+"""Require active speculative execution and strict plain/speculative greedy parity."""
 import argparse
 import importlib.util
 import json
 from pathlib import Path
 
 
-def validate(rows, require_parity=True):
+def validate(rows, require_parity=True, scenario='spec', label='draft head (auto)', plain_label='plain greedy'):
     indexed = {}
     for row in rows:
         key = (row['Scenario'], row['Label'])
         if key in indexed:
             raise ValueError('Duplicate speculative scenario/label: ' + str(key))
         indexed[key] = row
-    plain = indexed.get(('spec', 'plain greedy'))
-    learned = indexed.get(('spec', 'draft head (auto)'))
+    plain = indexed.get((scenario, plain_label))
+    learned = indexed.get((scenario, label))
     result = {'status': 'failed', 'failures': [], 'greedy_parity_required': require_parity,
-              'scope': 'Learned drafter solo execution; separate ngram/tool/concurrency rows are not learned-drafter coverage.'}
+              'scenario': scenario, 'speculative_label': label, 'plain_label': plain_label,
+              'scope': 'Only the selected algorithm and scenario; ngram is not learned-drafter coverage.'}
     if plain is None or learned is None:
-        result['failures'].append('Plain or learned-drafter row is missing; attachment/fallback cannot count as coverage')
+        result['failures'].append('Plain or speculative row is missing; attachment/fallback cannot count as coverage')
         return result
     result['counters'] = {name: learned.get(name) for name in ('Drafted', 'Accepted', 'VerifySteps', 'PlainSteps', 'Rollbacks')}
     for name, value in result['counters'].items():
@@ -26,7 +27,7 @@ def validate(rows, require_parity=True):
             result['failures'].append(f'Missing or invalid nonnegative integer {name}: {value!r}')
     for name in ('Drafted', 'Accepted', 'VerifySteps'):
         if type(result['counters'][name]) is not int or result['counters'][name] <= 0:
-            result['failures'].append(f'Learned drafter did not exercise {name}')
+            result['failures'].append(f'Speculative decoder did not exercise {name}')
     if (type(result['counters']['Accepted']) is int and type(result['counters']['Drafted']) is int
             and result['counters']['Accepted'] > result['counters']['Drafted']):
         result['failures'].append('Accepted exceeds Drafted')
@@ -42,7 +43,7 @@ def validate(rows, require_parity=True):
                   first_divergence=None if left == right else first,
                   plain_tokens=len(left), learned_tokens=len(right))
     if require_parity and not equal:
-        result['failures'].append('Learned-drafter greedy output differs from sequential plain output; no numerical tolerance or truncation applied')
+        result['failures'].append('Speculative greedy output differs from sequential plain output; no numerical tolerance or truncation applied')
     result['status'] = 'failed' if result['failures'] else 'passed'
     return result
 
@@ -51,12 +52,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--rows', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--scenario', default='spec')
+    parser.add_argument('--label', default='draft head (auto)')
+    parser.add_argument('--plain-label', default='plain greedy')
     args = parser.parse_args()
     spec = importlib.util.spec_from_file_location('bench_compare', Path(__file__).resolve().parents[2] / 'benchmarks/AgentTurnBench/compare.py')
     comparator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(comparator)
     rows = comparator.load_rows(args.rows)
-    report = validate(list(rows.values()))
+    report = validate(list(rows.values()), scenario=args.scenario, label=args.label, plain_label=args.plain_label)
     report['rows'] = str(args.rows)
     args.output.write_text(json.dumps(report, indent=2)+'\n')
     print(report['status'], '; '.join(report['failures']))

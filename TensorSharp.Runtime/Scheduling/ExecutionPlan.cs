@@ -73,6 +73,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// multimodal embeddings.</summary>
         public bool SoloHasPendingMultimodal { get; init; }
 
+        /// <summary>Solo step only: the prompt is already fully computed. Prepared
+        /// media spans remain available for retries but need no decode injection.</summary>
+        public bool SoloIsDecode { get; init; }
+
         /// <summary>Solo step only: the sequence's K/V history lives in paged
         /// storage (it must not be served from the linear cache).</summary>
         public bool SoloKvInPagedStorage { get; init; }

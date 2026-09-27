@@ -47,10 +47,10 @@ namespace TensorSharp.Runtime.Speculative
     /// loop needs from the trunk, and nothing about how tokens are drafted.
     ///
     /// Two capabilities together make verification possible:
-    ///   * <see cref="SpecForward"/> runs K+1 tokens as ONE batch and returns
-    ///     per-row logits (so a whole draft window is checked for roughly the
-    ///     cost of one decode step) plus, optionally, the per-row hidden state
-    ///     a learned drafter chains from;
+    ///   * <see cref="SpecForward"/> verifies K+1 tokens and returns per-row
+    ///     logits plus, optionally, the per-row hidden state a learned drafter
+    ///     chains from. The target may divide the window into smaller batches
+    ///     to preserve its decoding arithmetic; speed depends on that executor;
     ///   * the rollback trio (<see cref="SpecSnapshotRecurrentState"/> /
     ///     <see cref="SpecRestoreRecurrentState"/> / <see cref="SpecRewindCache"/>)
     ///     undoes the rejected tail of that batch.
@@ -102,9 +102,19 @@ namespace TensorSharp.Runtime.Speculative
         int SpecPrefillChunkSize => 0;
 
         /// <summary>
+        /// Hard limit on drafted tokens in one verification window. Verification
+        /// also forwards its pending anchor, so its width is this limit plus one.
+        /// Unlike the preferred windows below, this cache/backend correctness
+        /// bound also applies to explicit --spec-draft values and custom algorithms.
+        /// Zero permits only plain steps; the default imposes no additional limit.
+        /// Prompt prefill is governed separately by <see cref="SpecPrefillChunkSize"/>.
+        /// </summary>
+        int SpecMaxDraftTokens => int.MaxValue;
+
+        /// <summary>
         /// Draft window this trunk would rather have by DEFAULT, or 0 for "no
-        /// preference". It narrows the default only; an operator who passed
-        /// <c>--spec-draft</c> gets exactly what they asked for.
+        /// preference". It narrows the default only; an explicit
+        /// <c>--spec-draft</c> overrides it within <see cref="SpecMaxDraftTokens"/>.
         ///
         /// This exists because the cost of a wide window is a property of the
         /// TRUNK, not of the drafter. On a model with recurrent state a verify
@@ -121,7 +131,8 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>
         /// Optional default specifically for weight-free n-gram drafting. A positive
         /// value may exceed the shared default when a wider verification batch uses
-        /// a faster backend kernel. Explicit --spec-draft still wins; zero keeps
+        /// a faster backend kernel. Explicit --spec-draft still wins within
+        /// <see cref="SpecMaxDraftTokens"/>; zero keeps
         /// the general trunk preference. Learned drafters keep their own policy.
         /// </summary>
         int SpecPreferredNGramDraftWindow => 0;
@@ -148,6 +159,16 @@ namespace TensorSharp.Runtime.Speculative
         /// device buffers (Qwen 3.5's GatedDeltaNet) must leave this false.
         /// </summary>
         bool SpecPlainStepUsesForward => false;
+
+        /// <summary>
+        /// The linear <see cref="SpecForward"/> path consumes queued image/audio
+        /// embeddings and their position metadata exactly as ordinary Forward does.
+        /// The scheduler may then capture the entire multimodal prefill for a learned
+        /// head that cannot resume after a gap. Batched speculative trunks retain
+        /// their separate multimodal restriction. Opt in only when both embedding
+        /// injection and the draft head's positions are supported.
+        /// </summary>
+        bool SpecSupportsMultimodalPrefill => false;
 
         /// <summary>
         /// True when the model's own decode (<see cref="SpecPlainStepUsesForward"/>) and

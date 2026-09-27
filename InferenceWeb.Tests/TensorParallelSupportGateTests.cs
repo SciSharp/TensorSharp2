@@ -5,24 +5,9 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// How `--tp N` is resolved per architecture.
-//
-// Two regressions live here. First: `--tp 2` on an architecture with no
-// tensor-parallel implementation used to be accepted in full silence - a real
-// multi-GPU context and NCCL group were built, the banner announced "Tensor
-// parallelism: 2 GPUs", and then every weight was uploaded through rank 0 and
-// the model ran on GPU 0, because sharding is opt-in per model class and
-// qwen4exp never opted in. Second: refusing outright then threw the second GPU
-// away for an architecture that CAN use it - just not by sharding. qwen4exp now
-// resolves --tp N to a LAYER SPLIT (each GPU holds a contiguous run of whole
-// layers), which is the same and only multi-GPU mode llama.cpp offers for it.
-//
-// The mode now lives on each architecture's own descriptor rather than in two
-// name tables inside ModelBase, so the last two facts the tables used to be
-// checked for - "every entry explains itself" and "every layer-split arch is
-// also declared non-tensor-parallel" - are structural invariants of
-// ModelArchitectureDescriptor.Validate() instead, asserted here over the whole
-// registered set.
+// Explicit tensor-parallel and layer-placement requests are checked against
+// each architecture's descriptor. Unsupported requests must fail, never turn
+// into a different execution mode or silently leave extra GPUs idle.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -52,10 +37,14 @@ public class TensorParallelSupportGateTests
         => Resolve(Arch(arch), backend, tpDegree, ref group, out layerSplit);
 
     [Fact]
-    public void LayerSplitArchitecture_ResolvesToASplit_NotTensorParallelism()
+    public void LayerSplitArchitecture_RequiresExplicitLayerSplit()
     {
         ITensorParallelGroup group = null;
-        int tp = Resolve("qwen4exp", BackendType.GgmlCuda, 2, ref group, out int layerSplit);
+        var error = Assert.Throws<NotSupportedException>(() =>
+            Resolve("qwen4exp", BackendType.GgmlCuda, 2, ref group, out _));
+        Assert.Contains("--layer-split", error.Message);
+        int tp = TensorSharp.Models.ModelBase.ResolveTensorParallelSupport(
+            Arch("qwen4exp"), BackendType.GgmlCuda, 1, ref group, out int layerSplit, 2);
 
         // No tensor-parallel group: IsTensorParallel gates weight sharding and the
         // AllReduce machinery, none of which a layer split uses.
@@ -68,12 +57,9 @@ public class TensorParallelSupportGateTests
     [Fact]
     public void LayerSplit_OnlyOnBackendsThatHaveSeveralDevices()
     {
-        // ggml_cpu exposes one device; there is nothing to split across, so this
-        // must fall back to the loud single-GPU degrade rather than claim a split.
         ITensorParallelGroup group = null;
-        int tp = Resolve("qwen4exp", BackendType.GgmlCpu, 2, ref group, out int layerSplit);
-        Assert.Equal(1, tp);
-        Assert.Equal(1, layerSplit);
+        Assert.Throws<NotSupportedException>(() => TensorSharp.Models.ModelBase.ResolveTensorParallelSupport(
+            Arch("qwen4exp"), BackendType.GgmlCpu, 1, ref group, out _, 2));
     }
 
     [Fact]
@@ -94,7 +80,6 @@ public class TensorParallelSupportGateTests
     [InlineData("muse-glimmer")]
     [InlineData("glm-dsa")]
     [InlineData("glm5next")]
-    [InlineData("deepseek4")]   // multi-GPU through its own executor, not the TP group
     public void TpCapableArchitectures_AreUntouched(string arch)
     {
         ITensorParallelGroup group = null;

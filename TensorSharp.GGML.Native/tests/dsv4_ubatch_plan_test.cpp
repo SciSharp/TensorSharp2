@@ -385,8 +385,41 @@ static void check_q4km_seven_a40()
     }
 }
 
+static void check_endpoint_only_devices()
+{
+    split_costs c;
+    c.layer_bytes = {40, 40};
+    c.layer_exps_bytes = {20, 20};
+    c.layer_engram_bytes = {0, 0};
+    c.layer_cache_bytes = {5, 5};
+    c.fixed_bytes = {10, 60};  // embedding; output, DSpark weights and rings
+    c.dev_budget = {100, 60};
+    std::vector<int> placement(2, -1);
+    expect(pack(c, false, 1, 0, &placement) && placement == std::vector<int>({0, 0}),
+        "layer split permits output/drafter-only last device");
+    c.dev_budget[1] = 59;
+    expect(!pack(c, false, 1, 0, nullptr), "unused last device must fit fixed residents without TP");
+    c.dev_budget = {10, 150};
+    expect(pack(c, false, 1, 0, &placement) && placement == std::vector<int>({1, 1}),
+        "embedding-only first device still permits a valid trunk split");
+    c.dev_budget[0] = 9;
+    expect(!pack(c, false, 1, 0, nullptr), "unused first device must fit its embedding");
+
+    c.tp_ranks = 2;
+    c.tp_bytes = {{10, 10}, {10, 10}};
+    c.dev_budget = {80, 80};
+    expect(pack(c, false, 1, 0, &placement) && placement == std::vector<int>({0, 0}),
+        "TP permits all trunk layers on rank0 while pricing strips and head on rank1");
+    c.dev_budget[1] = 79;
+    expect(!pack(c, false, 1, 0, nullptr), "head-only TP rank still pays every expert strip");
+    c.dev_budget = {100, 70};
+    expect(pack(c, false, 1, 1, &placement), "CPU-offloaded TP layer releases both rank strips");
+    expect(!pack(c, false, .99, 1, nullptr), "balanced fraction accounts for endpoint residents");
+}
+
 int main()
 {
+    check_endpoint_only_devices();
     check_candidate_lists();
     check_synthetic_choices();
     check_engram_rules();

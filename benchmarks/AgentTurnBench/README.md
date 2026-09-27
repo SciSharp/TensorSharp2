@@ -9,6 +9,39 @@ engine steps, tokens per prefill step, TTFT, prefill and decode rates, and under
 speculation the drafted / accepted / verify / plain counters. Every speculative
 stream is compared against plain greedy token for token.
 
+Timing fields distinguish model computation from token delivery:
+
+- `PrefillComputeMs` and `DecodeComputeMs` use the engine completion's accumulated
+  forward times, including speculative drafting, verification and accepted-prefix
+  replay. They exclude scheduler waiting, media preparation, cache bookkeeping and
+  client consumption. Shared batched forwards are apportioned equally among their
+  sequences; concurrent rows sum the per-request compute times and counts.
+- `PrefillComputeTokens` is completion prompt tokens minus prefix-cache reuse;
+  `PrefillComputeTps` divides that count by prefill compute seconds.
+  `DecodeComputeTokens` is the engine completion output count, **including terminal
+  EOS**. `DecodeComputeTps` divides that count by decode compute seconds. This count
+  differs from visible `OutTokens` and the API's `eval_count`, which exclude EOS.
+  Failed requests have no compute fields; rates are absent when their denominator
+  is zero. A concurrent row has no compute fields if any request failed.
+- `TotalMs` is submission-to-completion wall time and `TtftMs` is time to the first
+  delivered token. Legacy individual-row `PrefillTps` is `Fresh / (TtftMs / 1000)`;
+  `DecodeTps` is `(OutTokens - 1) / ((TotalMs - TtftMs) / 1000)` when defined.
+  A speculative first step can deliver several tokens together, so that decode
+  formula removes only one token from the burst while excluding the entire first
+  step's time. It must not be interpreted as measured decode compute throughput.
+  Concurrent `DecodeTps` instead counts deliveries strictly after every request's
+  first delivery over the remaining wave wall time.
+
+Use the compute fields together with `TotalMs` for new performance comparisons,
+and retain `TokenTimesMs` to assess delivery latency. Existing delivery fields and
+the comparator's legacy thresholds remain unchanged for older result files.
+The `image` scenario renders and prepares/encodes its image before submitting each
+request. Consequently **both `TtftMs` and `TotalMs` exclude image preparation and
+encoding for every candidate**, including the first candidate and later candidates
+that may reuse an encoded-image cache. They measure engine execution after the
+prepared prompt is ready. Use HTTP client wall time for end-to-end image latency;
+do not attribute differences in these Agent image timings to encoder cache reuse.
+
 | scenario | what it sends |
 | --- | --- |
 | `short` | a tiny prompt with a one-line system prompt |
@@ -18,7 +51,19 @@ stream is compared against plain greedy token for token.
 | `spec` | plain greedy vs n-gram vs the checkpoint's own drafter, then the tool rounds under n-gram |
 | `json` | grammar-constrained JSON, plain vs n-gram |
 | `conc` | N concurrent requests on one engine, then a solo request after them |
-| `image` | a turn carrying an image plus a code snippet to repeat, plain vs n-gram; needs `--mmproj <gguf> --image <file>`, is skipped without them, and is not in the default scenario list |
+| `image` | a turn carrying an image plus a code snippet to repeat, plain vs n-gram and the checkpoint's attached drafter; needs `--mmproj <gguf> --image <file>`, is skipped without them, and is not in the default scenario list |
+
+Use `--layer-split N` for whole-layer placement or `--tp N` for tensor parallelism
+on one node. The two modes cannot both exceed one; unsupported architectures
+refuse the requested mode. Distributed placement is measured through the CLI/server.
+`--spec-only` omits the extra tool rounds from the `spec` scenario, keeping its
+plain, n-gram and attached-drafter comparisons.
+`--image-new N` sets the image scenario's output budget (default 160 tokens).
+`--image-file N` sets the code snippet's approximate token count (default 200).
+`--spec-candidates ngram,auto` selects the algorithms compared with the plain
+control in `spec` and `image`. By default both run when a head is attached;
+explicit `auto` requires an attached head. Use `--spec-candidates auto --spec-only`
+for a plain-versus-learned comparison without the ngram or extra tool rounds.
 
 `--spec-engine ngram|auto` enables speculation on ordinary scenario engines.
 The explicitly labeled plain controls in `spec`, `json`, `newchat` and `image`

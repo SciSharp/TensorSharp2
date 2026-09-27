@@ -147,12 +147,19 @@ class PlacementTests(unittest.TestCase):
     def test_layer_split_is_not_tensor_parallel_and_empty_device_does_not_count(self):
         log = 'Backend: GgmlCuda\nLayer split across 2 GPUs: gpu0=20 layers/100 MB, gpu1=20 layers/100 MB\n'
         tp = evidence.placement_evidence(log, 'qwen35-9b', runner.PROFILES['gpu2-f16'])
-        layer = evidence.placement_evidence(log, 'qwen38', runner.PROFILES['gpu2-f16'])
+        layer = evidence.placement_evidence(log, 'qwen38', runner.PROFILES['layer2-f16'])
         self.assertTrue(tp['contradictions'])
         self.assertEqual('layer-split', layer['requested_mode'])
         self.assertEqual({0: 20, 1: 20}, layer['layer_counts_by_device'])
-        empty = evidence.placement_evidence(log.replace('gpu1=20', 'gpu1=0'), 'qwen38', runner.PROFILES['gpu2-f16'])
+        empty = evidence.placement_evidence(log.replace('gpu1=20', 'gpu1=0'), 'qwen38', runner.PROFILES['layer2-f16'])
         self.assertTrue(any('every assigned GPU' in item for item in empty['missing_evidence']))
+
+    def test_profiles_select_exclusive_modes_without_architecture_aliases(self):
+        for profile, tp, layer in (('gpu2-f16', '2', '1'), ('layer2-f16', '1', '2'), ('cpu-f16', '1', '1')):
+            with self.subTest(profile=profile):
+                self.assertEqual({'TENSORSHARP_TP_DEGREE': tp, 'TENSORSHARP_LAYER_SPLIT_DEGREE': layer},
+                                 runner.placement_environment(runner.PROFILES[profile]))
+        self.assertEqual('tensor-parallel', evidence.expected_placement('qwen38', runner.PROFILES['gpu2-f16']))
 
     def test_partial_device_preload_is_not_all_layer_residency(self):
         log = ('Backend: GgmlCuda\nggml_cuda_init: found 1 CUDA devices\n'
@@ -196,6 +203,18 @@ class DrafterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             drafts.validate(draft_rows() + [draft_rows()[1]])
 
+    def test_selected_image_ngram_requires_engagement_and_plain_image_parity(self):
+        rows = draft_rows()
+        for row, label in zip(rows, ('plain + image', 'ngram + image')):
+            row.update(Scenario='image', Label=label)
+        options = dict(scenario='image', label='ngram + image', plain_label='plain + image')
+        self.assertEqual('passed', drafts.validate(rows, **options)['status'])
+        self.assertEqual('failed', drafts.validate(rows)['status'])
+        for edit in ({'VerifySteps': 0}, {'Tokens': [11, 22, 34]}):
+            changed = copy.deepcopy(rows)
+            changed[1].update(edit)
+            self.assertEqual('failed', drafts.validate(changed, **options)['status'])
+
     def test_later_inactive_pass_is_not_hidden_by_first_row_median(self):
         samples = [draft_rows(), draft_rows()]
         samples[1][1]['VerifySteps'] = 0
@@ -210,8 +229,27 @@ class DrafterTests(unittest.TestCase):
 class PlanTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.inventory_path = SCRIPTS.parents[1] / 'docs/validation/ggml-no-patch-2026-09-15/download-inventory-complete.json'
-        cls.inventory = json.loads(cls.inventory_path.read_text())
+        # Synthetic planning fixture: unit tests must not depend on ignored logs
+        # from a particular remote download session. None of these are real hashes
+        # or validation evidence, and build_plan never opens the weight paths.
+        cls.inventory_path = Path(__file__)
+        targets = ('gemma4-e4b', 'gemma4-26b', 'gemma4-12b', 'gemma4-26b-qat',
+                   'nemotron35', 'muse-glimmer', 'qwen38-27b-nvfp4', 'deepseek4',
+                   'glm52', 'glm53', 'glm53-flash', 'qwen36-moe-mtp',
+                   'hunyuan-dense', 'gptoss20b', 'qwen38')
+        companions = ('gemma4-e4b-draft', 'gemma4-26b-draft', 'gemma4-12b-qat-draft',
+                      'gemma4-26b-qat-draft', 'nemotron35-dspark', 'muse-dflash2',
+                      'qwen38-27b-dflash2', 'deepseek4-dspark')
+        models = []
+        for name in (*targets, *companions):
+            size = (50 if name == 'qwen38' else 1) * 1024**3
+            repository = 'fixture/' + name
+            models.append({'id': name, 'repo': repository, 'status': 'downloaded-and-verified',
+                'modalities': ['text'] if name in targets else ['draft'], 'files': [{
+                    'path': '/synthetic/' + name + '/model.gguf', 'bytes': size, 'size': size,
+                    'download_verified_sha256': 'c' * 64, 'repository': repository,
+                    'revision': 'synthetic-fixture', 'publisher_digest_kind': 'synthetic-fixture'}]})
+        cls.inventory = {'models': models, 'verification_scope': 'Synthetic unit fixture only'}
 
     def make(self, inventory=None):
         return plans.build_plan(inventory or self.inventory, 'a' * 64, '/workspace/release',
@@ -245,7 +283,8 @@ class PlanTests(unittest.TestCase):
         cells = {(row['model'], row['profile']) for row in self.make()['comparisons']}
         self.assertNotIn(('muse-glimmer', 'cpu-moe4'), cells)
         self.assertNotIn(('hunyuan-dense', 'gpu2-f16'), cells)
-        self.assertIn(('qwen38', 'gpu2-f16'), cells)
+        self.assertIn(('qwen38', 'layer2-f16'), cells)
+        self.assertNotIn(('qwen38', 'gpu2-f16'), cells)
         self.assertNotIn('muse-glimmer', runner.MOE_MODELS)
 
     def test_ambiguous_inventory_or_missing_publisher_digest_rejected(self):

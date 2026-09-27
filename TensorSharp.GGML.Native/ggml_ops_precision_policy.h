@@ -41,6 +41,9 @@
 // this many tokens builds each row from the kernels its one-token graph would
 // run (float projections on the broadcast axis, experts and attention one row
 // at a time), so a verify block commits exactly what plain decoding would.
+// GLM 5.3 Flash uses the same row construction. Captured speculative windows
+// wider than this bound are split into several graphs, including accepted
+// prefix replay, while prompt prefill retains its configured micro-batch.
 constexpr int64_t TSG_PRECISION_DECODE_COLUMNS = 8;
 
 // Smallest attention key extent (raw ring plus visible compressed rows) at

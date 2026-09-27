@@ -218,7 +218,8 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 1; }
         }
 
-        /// <summary>True when AllReduce runs on-device (NCCL / P2P) rather than through host memory.</summary>
+        /// <summary>True when a backend collective is available, including a pinned-host
+        /// pipeline. The native startup diagnostics identify the actual transport.</summary>
         public static bool TensorParallelHasDeviceAllReduce()
         {
             try { return TSGgml_TensorParallelHasDeviceAllReduce() != 0; }

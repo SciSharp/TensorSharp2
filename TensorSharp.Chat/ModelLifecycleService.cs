@@ -31,7 +31,7 @@ namespace TensorSharp.Server
         }
 
         /// <summary>Test seam: <paramref name="createModel"/> stands in for
-        /// <see cref="ModelBase.Create(string, BackendType, int, ITensorParallelGroup, string)"/>.</summary>
+        /// <see cref="ModelBase.Create(string, BackendType, int, ITensorParallelGroup, string, int)"/>.</summary>
         internal ModelLifecycleService(ILogger logger, Func<string, BackendType, ITensorParallelGroup, string, ModelBase> createModel)
         {
             _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
@@ -234,6 +234,10 @@ namespace TensorSharp.Server
                 // (an iOS app has no peers and no CUDA). The Server and CLI hand in a
                 // factory that reads TENSORSHARP_TP_* and builds the on-node group to
                 // match the backend; with no factory the load is single-node.
+                if (TensorParallelGroupFactory != null &&
+                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) &&
+                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
+                    ModelBase.ValidateDistributedTensorParallelism(modelPath, _backend);
                 tpGroup = TensorParallelGroupFactory?.Invoke(_backend);
 
                 // Block drafters go to the factory rather than being attached

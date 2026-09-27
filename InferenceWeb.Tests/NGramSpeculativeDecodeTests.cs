@@ -72,6 +72,109 @@ public class NGramSpeculativeDecodeTests
         Assert.Equal(0, model.HiddenStateRequests);
     }
 
+    [Theory]
+    [InlineData(8, false, true, true)]
+    [InlineData(64, false, true, true)]
+    [InlineData(64, true, true, true)]
+    [InlineData(64, true, false, true)]
+    [InlineData(8, false, true, false)]
+    public void HardTargetLimitBoundsExplicitAndDirectAlgorithmsAcrossRollback(
+        int requestedDrafts, bool directAlgorithm, bool persistsAcceptedKv, bool explicitRequest)
+    {
+        var plainModel = new PeriodicTrunk(period: 7) { MismatchPosition = 35 };
+        List<int> plain = PlainGreedy(plainModel, promptLen: 12, count: 96);
+        var model = new PeriodicTrunk(period: 7)
+        {
+            SpecMaxDraftTokens = 5,
+            SpecPreferredNGramDraftWindow = 64,
+            SpecVerifyPersistsAcceptedKv = persistsAcceptedKv,
+            MismatchPosition = 35,
+        };
+        ISpeculator algorithm = directAlgorithm ? new NGramSpeculator(requestedDrafts)
+            : SpeculatorRegistry.Create(model, new SpeculationOptions
+            {
+                Enabled = true,
+                SpeculatorName = SpeculatorRegistry.NGram,
+                MaxDraftTokens = requestedDrafts,
+                MaxDraftTokensExplicit = explicitRequest,
+            }, out _)!;
+        Assert.NotNull(algorithm);
+        if (!directAlgorithm) Assert.Equal(5, algorithm.MaxDraftTokens);
+        using var execution = new SpeculativeExecution(model, algorithm) { AdaptiveSpeculation = false };
+
+        List<int> actual = SpeculativeGreedy(model, execution, promptLen: 12, count: 96);
+
+        Assert.Equal(5, execution.MaxDraftTokens);
+        Assert.Equal(plain, actual);
+        Assert.Equal(plainModel.CommittedTokens, model.CommittedTokens);
+        Assert.Contains(6, model.VerifyWidths);
+        Assert.All(model.VerifyWidths, width => Assert.InRange(width, 2, 6));
+        Assert.True(execution.Stats.TokensAccepted > 0);
+        Assert.True(execution.Stats.RollbackSteps > 0);
+        if (persistsAcceptedKv) Assert.Empty(model.ReplayWidths);
+        else
+        {
+            Assert.NotEmpty(model.ReplayWidths);
+            Assert.All(model.ReplayWidths, width => Assert.InRange(width, 1, 5));
+        }
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void ZeroVerificationCapacityDeclinesRegistryAndDirectExecutionRunsPlainly()
+    {
+        var model = new PeriodicTrunk(period: 7) { SpecMaxDraftTokens = 0 };
+        Assert.Null(SpeculatorRegistry.Create(model, new SpeculationOptions
+        {
+            Enabled = true, SpeculatorName = SpeculatorRegistry.NGram,
+            MaxDraftTokens = 64, MaxDraftTokensExplicit = true,
+        }, out string decline));
+        Assert.Contains("no capacity", decline);
+        using var execution = new SpeculativeExecution(model, new NGramSpeculator(64))
+        {
+            AdaptiveSpeculation = false,
+        };
+        Assert.Equal(PlainGreedy(new PeriodicTrunk(period: 7), 12, 40),
+            SpeculativeGreedy(model, execution, 12, 40));
+        Assert.Equal(0, execution.MaxDraftTokens);
+        Assert.Empty(model.VerifyWidths);
+    }
+
+    [Fact]
+    public void AlgorithmExceedingRequestedWindowIsRejectedBeforeTrunkMutation()
+    {
+        var model = new PeriodicTrunk(period: 7) { SpecMaxDraftTokens = 5 };
+        using var execution = new SpeculativeExecution(model, new OversizedSpeculator())
+        {
+            AdaptiveSpeculation = false,
+        };
+        int pending = Argmax(execution.PrefillStep(Enumerable.Range(1, 12).ToArray(), 0));
+        int[] committed = model.CommittedTokens.ToArray();
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            execution.DecodeStep(pending, 12, 64, Argmax));
+        Assert.Contains("limited to 5 drafts", error.Message);
+        Assert.Empty(model.VerifyWidths);
+        Assert.Equal(committed, model.CommittedTokens);
+    }
+
+    private sealed class OversizedSpeculator : ISpeculator
+    {
+        public string Name => "oversized-test";
+        public int MaxDraftTokens => 64;
+        public float MinDraftProb { get; set; }
+        public float DefaultMinDraftProb => 0;
+        public bool NeedsHiddenState => false;
+        public bool HandlesOwnPrefill => false;
+        public int Propose(in DraftContext context, List<int> draftOut)
+        {
+            for (int i = 0; i <= context.MaxTokens; ++i) draftOut.Add(1);
+            return draftOut.Count;
+        }
+        public void Commit(int[] tokens, float[] hRows, int startPos) { }
+        public void Reset() { }
+        public void Dispose() { }
+    }
+
     private static SpeculativeExecution NewNGramExec(PeriodicTrunk model, int maxDraftTokens)
     {
         var speculator = SpeculatorRegistry.Create(
@@ -121,7 +224,7 @@ public class NGramSpeculativeDecodeTests
         while (output.Count < count)
         {
             var accepted = new List<int>();
-            var outcome = exec.DecodeStep(last, pos, count - output.Count,
+            var outcome = exec.DecodeStep(last, pos, count - output.Count - 1,
                 drawNext: Argmax, onDraftAccepted: accepted.Add);
 
             if (!outcome.UsedSpeculation)
@@ -169,9 +272,17 @@ public class NGramSpeculativeDecodeTests
 
         public List<string> ProtocolViolations { get; } = new();
         public int HiddenStateRequests { get; private set; }
+        public int SpecMaxDraftTokens { get; init; } = int.MaxValue;
+        public int SpecPreferredNGramDraftWindow { get; init; }
+        public bool SpecVerifyPersistsAcceptedKv { get; init; }
+        public int? MismatchPosition { get; init; }
+        public IReadOnlyList<int> CommittedTokens => _trunk;
+        public List<int> VerifyWidths { get; } = new();
+        public List<int> ReplayWidths { get; } = new();
+        private bool _replaying;
 
         /// <summary>The trunk's argmax for the row of the token at position p.</summary>
-        private int Next(int p) => _period > 0
+        private int Next(int p) => p == MismatchPosition ? 50 : _period > 0
             ? 3 + (p % _period)
             : 3 + ((p * 13 + 7) % (VocabSize - 4));
 
@@ -198,6 +309,16 @@ public class NGramSpeculativeDecodeTests
 
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            if (allLogitsRows)
+            {
+                VerifyWidths.Add(tokens.Length);
+                Assert.True(tokens.Length - 1 <= SpecMaxDraftTokens, "Verification exceeded the target's cache capacity.");
+            }
+            else if (_replaying)
+            {
+                ReplayWidths.Add(tokens.Length);
+                _replaying = false;
+            }
             if (hAllOut != null)
                 HiddenStateRequests++;
             int start = _trunk.Count;
@@ -219,7 +340,7 @@ public class NGramSpeculativeDecodeTests
 
         public void SpecEnsureCapacity(int requiredSeqLen) { }
         public void SpecSnapshotRecurrentState() { }
-        public void SpecRestoreRecurrentState() { }
+        public void SpecRestoreRecurrentState() => _replaying = true;
 
         public void SpecRewindCache(int length)
         {

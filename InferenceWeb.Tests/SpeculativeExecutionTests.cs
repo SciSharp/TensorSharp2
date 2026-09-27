@@ -541,13 +541,37 @@ public class SpeculativeExecutionTests
         Assert.Empty(model.ProtocolViolations);
     }
 
-    /// <summary>A media turn's injector: pending until the plain prefill has queued
-    /// the whole prompt's slices, exactly the signal the planner reads.</summary>
+    [Fact]
+    public void EngineSpec_MediaCapableTrunk_QueuesEveryChunkAndKeepsLearnedHeadArmed()
+    {
+        const int promptLen = 200;
+        const int maxNew = 40;
+        var injector = new FakeInjector { PromptTokens = promptLen };
+        var model = new FakeSpeculativeModel
+        {
+            Injector = injector,
+            SpecSupportsMultimodalPrefill = true,
+        };
+        var seq = RunEngineRequest(model, promptLen, maxNew, specEnabled: true,
+            soloPrefillChunk: 64, speculator: SpeculatorRegistry.DraftHead);
+
+        Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
+        Assert.Equal(4, injector.SlicesQueued);
+        Assert.True(injector.HasPendingEmbeddings(seq.RequestId), "prepared spans must remain available for replay");
+        Assert.NotNull(seq.SpecStats);
+        Assert.True(seq.SpecStats.TokensDrafted > 0);
+        Assert.True(seq.SpecStats.TokensAccepted > 0);
+        Assert.True(seq.SpecStats.VerifySteps > 0);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    /// <summary>Like the real injector, retains prepared spans after prefill for
+    /// retries. Each media prefill forward must have its matching slice queued.</summary>
     private sealed class FakeInjector : IMultimodalInjector
     {
         public int PromptTokens { get; set; }
         public int SlicesQueued { get; private set; }
-        private int _queuedThrough;
+        private (int Start, int Count)? _queuedSlice;
 
         public void LoadProjectors(string mmProjPath) { }
         public List<int> ProcessPromptTokens(List<ChatMessage> history, List<int> inputTokens, string requestId = null) => inputTokens;
@@ -555,13 +579,19 @@ public class SpeculativeExecutionTests
         public bool QueuePromptEmbeddingsForSlice(int promptStartToken, int tokenCount, string requestId = null)
         {
             SlicesQueued++;
-            _queuedThrough = Math.Max(_queuedThrough, promptStartToken + tokenCount);
+            _queuedSlice = (promptStartToken, tokenCount);
             return true;
+        }
+        public void ConsumeSlice(int start, int count)
+        {
+            if (start >= PromptTokens) return;
+            Assert.Equal(((int Start, int Count)?)(start, count), _queuedSlice);
+            _queuedSlice = null;
         }
         public int ClampReusablePrefix(int reusablePrefixTokenCount, string requestId = null) => reusablePrefixTokenCount;
         public int ClampTrimStart(int trimStartTokenCount, string requestId = null) => trimStartTokenCount;
         public void TrimPreparedPrompt(int trimStartTokenCount, string requestId = null) { }
-        public bool HasPendingEmbeddings(string requestId) => _queuedThrough < PromptTokens;
+        public bool HasPendingEmbeddings(string requestId) => PromptTokens > 0;
         public void ClearPreparedPromptState(string requestId) { }
     }
 
@@ -737,7 +767,9 @@ public class SpeculativeExecutionTests
         var seq = new SequenceState("mtp-req", Enumerable.Range(1, promptLen).ToList(),
             maxNewTokens, BlockSize, greedy);
         var handle = engine.SubmitRequest(seq);
-        handle.Completion.GetAwaiter().GetResult();
+        var completion = handle.Completion.GetAwaiter().GetResult();
+        Assert.True(completion.PrefillElapsedTicks > 0, "The engine must time all prompt chunks even when speculation is armed.");
+        Assert.True(completion.DecodeElapsedTicks > 0, "Plain and multi-token speculative decode steps must report compute time.");
         beforeDispose?.Invoke();
         return seq;
     }
@@ -1181,6 +1213,7 @@ public class SpeculativeExecutionTests
         /// <see cref="Forward"/> (see <see cref="ISpeculativeTarget.SpecPlainStepUsesForward"/>).</summary>
         public bool PlainStepUsesForward { get; set; }
         public bool SpecPlainStepUsesForward => PlainStepUsesForward;
+        public bool SpecSupportsMultimodalPrefill { get; set; }
         /// <summary>Whether the fake's per-token head keeps no per-position state
         /// (see <see cref="IDraftHead.DraftHeadResumesAfterGap"/>).</summary>
         public bool ResumesAfterGap { get; set; }
@@ -1192,6 +1225,7 @@ public class SpeculativeExecutionTests
             // Plain path (MTP disabled / disarmed): same truth stream.
             var logits = new float[VocabSize];
             int startPos = _trunk.Count;
+            (Injector as FakeInjector)?.ConsumeSlice(startPos, tokens.Length);
             _trunk.AddRange(tokens);
             _recurrentState = _trunk.Count;
             logits[ExpectedNext(startPos + tokens.Length - 1)] = 10f;
@@ -1212,6 +1246,7 @@ public class SpeculativeExecutionTests
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             LinearSpecForwardCalls++;
+            (Injector as FakeInjector)?.ConsumeSlice(_trunk.Count, tokens.Length);
             ForwardCore(tokens, hAllOut, logitsOut, allLogitsRows);
         }
 

@@ -1,5 +1,7 @@
 # DeepSeek V4 Flash（`deepseek4`）
 
+> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。下面的历史命令与测量早于这项默认值变更；多 GPU 启动请加 `--layer-split N`。显式旧变量 `TS_DSV4_NGPU=0` 仍表示全部可见 GPU 自动放置；使用明确并行度时请取消该变量，或设为相同卡数。按层切分仅限单节点。
+
 [← 返回模型索引](README_zh-cn.md) | [English](deepseek4.md)
 
 DeepSeek V4 Flash 是一个 284B 参数的 MoE 模型（256 个路由专家，top-6 + 1 个共享
@@ -14,8 +16,8 @@ DeepSeek V4 有三套整模型执行器：
 
 - **`--backend cuda`**：一个 **Direct CUDA 整模型引擎**
   （`TensorSharp.Backends.Cuda/Dsv4/Dsv4CudaEngine.cs`），完全不依赖 ggml。
-  量化权重从 GGUF 分片直接流式写入按设备的竞技场，并按层切分到所有可见 GPU，
-  因此大于单卡显存的模型可以由多张卡共同承载。
+  量化权重从 GGUF 分片直接流式写入按设备的竞技场；`--layer-split N` 将整层放到
+  N 张本地 GPU，因此大于单卡显存的模型可以由多张卡共同承载。默认单设备。
 - **GPU 后端**（`--backend ggml_cuda` / `ggml_vulkan`）：下文描述的原生 ggml
   执行器。ggml 只为 CPU 与 CUDA 提供了 DeepSeek-V4 的四个架构专属算子（三个
   hyper-connection 算子与 lightning indexer）。在其他任何后端上，`hc_pre` / `hc_post`
@@ -46,11 +48,9 @@ MoE 内核——才留在 DeepSeek V4 的文件里。
 
 原生整模型执行器（`TensorSharp.GGML.Native/ggml_ops_deepseek4.cpp`）：
 
-- 直接加载（分片的）GGUF，并把权重**按层切分到所有可见 CUDA GPU** 上——大于
-  单卡显存的模型由所有卡共同承载（128 GiB 的 IQ4_XS 构建需要 2×80GB）。这是
-  **默认行为，不需要任何开关**：把 DSV4 放到多张卡上的并不是 `--tp`，它也不会在
-  层内部做切分。在这个系列上 `--tp N` 只是把按层切分限制在 N 张卡，作用与
-  `TS_DSV4_NGPU` 相同；两者都设置时以 `TS_DSV4_NGPU` 为准。
+- 直接加载（分片的）GGUF。`--layer-split N` 把整层分配到 N 张本地 GPU，
+  以承载大于单卡显存的模型（128 GiB 的 IQ4_XS 构建需要 2×80GB）。未配置时默认单设备。
+  旧变量 `TS_DSV4_NGPU=0` 显式选择全部可见 GPU；若同时设置新参数，两者卡数必须一致。
 - 在设备上持有全部 DSV4 KV 状态：原始 SWA 环、CSA/HCA 压缩 K 缓存、lightning
   indexer 缓存，以及压缩器状态环。
 - 通过 `ggml_backend_sched` 把 prefill/decode 的每个 ubatch 作为单张 ggml 计算图
@@ -144,16 +144,16 @@ token 的验证批要把 B 行的专家都过一遍主机 MoE：
 ## 用法
 
 ```bash
-# --model 指向分片 GGUF 的第一片
+# --model 指向分片 GGUF 的第一片；此 IQ4_XS 示例需要 2×80 GB GPU
 TensorSharp.Cli --model DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf \
-    --backend ggml_cuda --chat
+    --backend ggml_cuda --layer-split 2 --chat
 ```
 
 ```bash
 # Direct CUDA 引擎（不用 ggml）：权重流式写入按设备的竞技场，
-# 并按层切分到所有可见设备
+# 并按层切分到 2 张本地 GPU（此 IQ4_XS 示例需要 2×80 GB）
 TensorSharp.Cli --model DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf \
-    --backend cuda --chat
+    --backend cuda --layer-split 2 --chat
 ```
 
 多轮对话跨轮复用 KV 缓存（纯追加）；如果提示词回退了历史，则自动重新 prefill
@@ -193,7 +193,7 @@ TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
 # 交互式聊天，4 张 GPU
 TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --backend ggml_cuda --draft-model DSpark-drafter-Q2K-Q8-0731.gguf \
-    --interactive --think --tp 4 --max-tokens 20000
+    --interactive --think --layer-split 4 --max-tokens 20000
 ```
 
 在 CLI 上，验证会用本次运行所配置的采样器抽取每一行——`--temperature 0` 下是
@@ -209,7 +209,7 @@ argmax，否则就是对话采样器——因此投机可与 REPL 中的 `/temp`
 
 ```bash
 TensorSharp.Server.Host --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
-    --backend ggml_cuda --tp 4 \
+    --backend ggml_cuda --layer-split 4 \
     --draft-model DSpark-drafter-Q2K-Q8-0731.gguf
 ```
 
@@ -223,7 +223,7 @@ TensorSharp.Server.Host --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
 `PerSequenceFused; rejected: SpecPerSequence: multi-sequence step`，并由 DSV4 的
 per-sequence slot 以正常 decode 速度服务这一批。并发是安全的，只是不再投机。
 
-4×A40 实测（`--tp 4`，300 token 的 OpenAI chat completion）：
+4×A40 实测（`--layer-split 4`，300 token 的 OpenAI chat completion）：
 
 | 配置 | tok/s |
 |---|---|
@@ -317,7 +317,7 @@ checkpoint 中的路由专家以 FP4 加每 32 个元素一个 E8M0 scale 存储
 多轮 decode 获益最大（样例对话第三轮达到 2.2×，接受率 93%）：延续既有上下文的
 轮次，正是草稿器最有把握的地方。
 
-同一台机器，`--interactive --think --tp 4` 配 7 GB 的 Q2K-Q8 0731 草稿器，五轮
+同一台机器，`--interactive --think --layer-split 4` 配 7 GB 的 Q2K-Q8 0731 草稿器，五轮
 对话：短回答、长篇解释、追问总结，然后是一份 10K token 的文档与关于它的两个问题。
 
 | 轮次 | 基线 | + DSpark | 接受率 |

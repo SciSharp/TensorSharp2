@@ -51,7 +51,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_GPTOSS_BATCHED_ARENA` | `ggml_cuda` / `ggml_vulkan` 上的 GPT OSS | `0` 把批量 decode 的 slot-stable arena 换成按序列窗口的计算图（不支持持久计算图的后端总是走这条路径） | 启用 | 未注册 | 否 |
 | `TS_RETAINED_FUSED_CACHE` | 具有可保留 request-owned fused holder 的模型（Gemma 4；Qwen 3.5/3.6/3.8；Qwen 3.8 Flash Next，另有自己的 `TS_Q4E_RETAINED_CACHE`；DeepSeek V4.1 仅在 `TS_DSV41_RETAINED_CACHE=1` 时）；在 Radix 前缀缓存下还包括原生执行器上的 GLM 5.x（交出一个原生 slot） | 保留已完成请求的 holder，用于精确前缀续接；Qwen holder 同时包含 attention K/V 与匹配的 GatedDeltaNet 递归状态 | 启用 | 未注册 | 否 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 具有可保留 request-owned fused holder 的模型 | 保留 holder 的 LRU 预算（限制 VRAM；适用时包含递归状态）。在 Radix 前缀缓存下，它是保留的按会话终态（end state）的预算 | `4` | 不适用 | 否 |
-| `TS_PREFIX_CHECKPOINTS` | GGML 后端上的 Gemma 4；`ggml_cuda` / `ggml_metal` / `mlx` 上的 Qwen 3.5/3.6/3.8，即它运行按请求 holder 的后端（TP 下不支持）；GGML token-span 路径上的 Qwen 3.8 Flash Next（包括 `--tp N` 按层切分时）。需要开启 `TS_PER_SEQ_FUSED`，legacy 模式下还需要 `TS_RETAINED_FUSED_CACHE` | 在每个会话共享的提示前缀（系统提示、工具、技能）结束处对模型完整状态做检查点，新会话从其副本继续，只需重新预填自己的消息 | 开 | 未注册 | 否 |
+| `TS_PREFIX_CHECKPOINTS` | GGML 后端上的 Gemma 4；`ggml_cuda` / `ggml_metal` / `mlx` 上的 Qwen 3.5/3.6/3.8，即它运行按请求 holder 的后端（TP 下不支持）；GGML token-span 路径上的 Qwen 3.8 Flash Next（包括 `--layer-split N` 按层切分时）。需要开启 `TS_PER_SEQ_FUSED`，legacy 模式下还需要 `TS_RETAINED_FUSED_CACHE` | 在每个会话共享的提示前缀（系统提示、工具、技能）结束处对模型完整状态做检查点，新会话从其副本继续，只需重新预填自己的消息 | 开 | 未注册 | 否 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | 同上 | 同时保留多少个不同共享前缀的检查点（每个占用一份前缀的 K/V，Qwen 还包含递归状态）。在 Radix 前缀缓存下，它是公共检查点的预算；一个提示在每个边界（系统指令、完整共享前缀）各发布一个检查点，因此 4 可覆盖同时预热两种思考模式的主机 | `4` | 不适用 | 否 |
 | `TS_KV_INITIAL_TOKENS` | 通过 `ModelBase.ResolveInitialCacheAllocationLength` 确定缓存大小的模型家族（Qwen 3.5/3.6、Gemma 4、GPT-OSS 等 ModelBase 家族；不含自行确定大小的 DeepSeek V4 / GLM 5.x） | 缓存创建时（加载时的主缓存、每个 per-request holder）在任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口，否则为后端默认值）。缓存仍按需增长。内存受限设备把它设小，因为每个保留的 holder 都按此大小付费，主机副本与设备镜像各一份 | `0` | 不适用 | 否 |
 | `TS_KV_GENERATION_RESERVE_MAX` | 全部 | 请求预先保留的 K/V 中生成部分的上限（prompt + max_new_tokens）；回复上限不小于窗口时否则每个请求都会保留整个窗口。超过上限后缓存按需增长。`0` = 不限制 | `0` | 不适用 | 否 |
@@ -193,7 +193,7 @@ TestMatrix 配置中 sweep。
 这些变量控制 `TensorSharp.Cli` 与 `TensorSharp.Server` 中可选的投机解码路径
 （Qwen 3.6、Qwen 3.8 27B、GLM 5.2 与 GLM-5.3 内嵌的 NextN 块；Gemma 4 独立的 `gemma4-assistant`
 草稿 GGUF；Qwen 3.8 Flash Next 的共享 MTP 头 GGUF；DeepSeek V4 DSpark，以及用于 Muse-Glimmer 与
-Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1 DSpark 路径，只在合成夹具上验证过；
+Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1 DSpark 路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证；
 以及无需权重的 n-gram 投机器）。投机仅对单序列（无并发）请求生效，且只在模型声明有收益时启用，这由各
 模型自己决定：Qwen 3.5/3.6/3.8 与 GLM 5.2 / GLM-5.3 在所有后端上，GLM-5.3-Flash（仅 n-gram）在其 KDA
 回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其 GGML token 计算图路径上，DeepSeek V4 / V4.1 与 Muse-Glimmer 只在加载了各自草稿器时。Nemotron-H
@@ -268,12 +268,12 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 
 | 变量 | 适用范围 | 作用 | 默认值 | 在矩阵中 |
 |---|---|---|---|---|
-| `TS_DSV4_NGPU` | V4 与 V4.1 | 按层切分把整层铺到几张 GPU 上——对这两个架构来说，`--tp N` 设置的就是它。`0` 表示使用所有可见设备 | `0`（全部可见） | 否 |
+| `TS_DSV4_NGPU` | V4 与 V4.1 | 按层切分把整层铺到几张 GPU 上——对这两个架构来说，`--layer-split N` 设置的就是它。`0` 表示使用所有可见设备 | `1`（显式 `0`：全部可见） | 否 |
 | `TS_DSV4_UBATCH` | V4 与 V4.1 | Prefill 微批宽度。不设置时，V4.1 在 ggml GPU 后端上由原生加载器在 1024、512、256 中选择：取所需路由专家 CPU 层数不多于 256（或显式 `--n-cpu-moe`）的最宽者，并记录为 `[dsv4] prefill ubatch: N (auto; ...)`。驻留 GPU 的路由专家层每个分块的耗时在各宽度下相近，因此越宽每个 prefill token 越便宜。任何显式的正整数都原样使用并关闭自动选择；`256` 恢复此前固定的 V4.1 默认值 | V4.1：ggml GPU 后端上自动，CPU 执行器与 direct CUDA 为 `256`；V4：`1024`（纯 C# 执行器为 `512`） | 否 |
 | `TS_DSV4_THREADS` | V4 与 V4.1 | 纯 GPU 加载时的原生线程池。CPU 专家卸载改用探测到的可用并行度，由 `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` 设定。在纯 C# 的 `--backend cpu` 执行器上，它设定的是该执行器自己的工作线程池，默认取 `ProcessorCount` 而不是 min(核数, 32) | min(核数, 32) | 否 |
 | `TS_DSV4_PERF` | V4 与 V4.1 | `1` 打印分阶段耗时 | 关 | 否 |
 | `TS_DSV4_VRAM_RESERVE_MB` / `TS_DSV4_GRAPH_CACHE` / `TS_DSV4_LOAD_THREADS` / `TS_DSV4_LOAD_CHUNK_MB` / `TS_DSV4_MOE_MMAP` | V4 与 V4.1 | 放置余量、计算图缓存深度、权重加载并行度，以及驻留主机的专家是否直接在 GGUF 映射上就地相乘 | 见各卡片 | 否 |
-| `TS_DSV4_DSPARK` | V4 与 V4.1 | DSpark 草稿 GGUF，未给出 `--draft-model` 时使用。V4.1 只接受 `deepseek41-dspark` 草稿器（V4 的草稿器会被拒绝），且只在 `ggml_cuda` / `ggml_cpu` 上；该路径是实验性的，只在合成夹具上验证过，没有测量过训练好的 V4.1 草稿器 | 未设置 | 否 |
+| `TS_DSV4_DSPARK` | V4 与 V4.1 | DSpark 草稿 GGUF，未给出 `--draft-model` 时使用。V4.1 只接受 `deepseek41-dspark` 草稿器（V4 的草稿器会被拒绝），且只在 `ggml_cuda` / `ggml_cpu` 上；该路径是实验性的，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证 | 未设置 | 否 |
 | `TS_DSV41_RETAINED_CACHE` / `TS_DSV41_RETAINED_CACHE_MB` | V4.1，原生执行器 | `1` 显式启用：保留已结束会话的原生槽位，并在下一轮精确延续它时重新绑定（加载了 DSpark 草稿器时不启用）；MB 值是保留槽位的预算，`0` 或无效值会拒绝保留 | 关 / `2048` | 否 |
 | `TS_DSV41_TP` | V4.1 | `0` 关闭；`2`–`8` 打开**实验性 routed-MoE 张量并行**，且必须与 `--tp` / `TS_DSV4_NGPU` 选中的 GPU 数一致。gate/up 沿 FFN 中间维切分，down 沿输入维切分，partial 经主机中转的 F32 缓冲归约。首次完整 Q2_K 实测比按层切分更慢 | `0` | 否 |
 | `TS_DSV41_ENGRAM_DEVICE` | V4.1 | `1` 要求 Engram 表驻留 GPU，放不下就失败；`0` 强制主机映射，需要与 CPU oracle 逐位一致时也用它。不设置则自动且保守：只要不会因此逼出路由专家的 CPU 卸载，就放在 GPU 上 | 自动（放得下就驻留 GPU） | 否 |
@@ -303,7 +303,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | 变量 | 适用范围 | 作用 | 基线 | 扫描取值 | 在矩阵中 |
 |---|---|---|---|---|---|
 | `TS_GLM_NATIVE` | GLM 5.x | `0` 在 GGML 后端上改走托管逐算子路径而非原生整模型图——正是用来对照两条路径是否一致的 A/B | `1`（原生） | `0`, `1` | 否 |
-| `TS_GLM_NGPU` | GGML 上的 GLM 5.x | 按层切分把主干层摊到多少张 GPU 上 | `0`（全部可见 GPU） | `1`, `2`, `3` | 否 |
+| `TS_GLM_NGPU` | GGML 上的 GLM 5.x | 按层切分把主干层摊到多少张 GPU 上 | `1`（显式 `0`：全部可见 GPU） | `1`, `2`, `3` | 否 |
 | `TS_GLM_UBATCH` | GLM 5.x | Prefill 微批。显存允许时 `2048` 在长提示上更快：3x RTX PRO 6000 上 pp2048 为 1145.8，对比 918.9 t/s | `1024` | `512`, `1024`, `2048` | 否 |
 | `TS_GLM_THREADS` | `ggml_cpu` 上的 GLM 5.x | CPU 后端线程数；开启 `--n-cpu-moe` / `--cpu-moe` 或没有 GPU 时改为全部可用 CPU，`--cpu-moe-threads`（其后是继承来的 `TS_CPU_MOE_THREADS`）可覆盖两者 | min(核数, 32) | — | 否 |
 | `TS_GLM_FA` | GLM 5.x | `0` 关闭 flash attention，退回显式的 `soft_max` 链路 | `1`（flash） | `0`, `1` | 否 |
@@ -335,6 +335,8 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
 | `TENSORSHARP_TP_DEGREE` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 把模型切分到本机多少张 GPU（Megatron-LM 列/行并行） | `1`（单 GPU） | 未注册 | 否 |
+| `TENSORSHARP_LAYER_SPLIT_DEGREE` | 支持按层切分的架构 | 本地整层放置的 GPU 数，等价于 `--layer-split N`；与 TP 参数互斥 | `1` | 未注册 | 否 |
+| `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器 | 逗号分隔的设备序号，例如 `0,2`；独立于 `TENSORSHARP_TP_DEVICES`；原生 GLM/DeepSeek 使用 `CUDA_VISIBLE_DEVICES` | `0..N-1` | 未注册 | 否 |
 | `TENSORSHARP_TP_DEVICES` | GGML 后端上的本地 TP | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`） | `0..tp-1` | 未注册 | 否 |
 | `TENSORSHARP_TP_NODE_ID` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 多节点分布式 TP 中本节点的 0 起始编号；必须与 `TENSORSHARP_TP_PEERS` 一起设置 | 未设置（关闭） | 未注册 | 否 |
 | `TENSORSHARP_TP_PEERS` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔）；必须与 `TENSORSHARP_TP_NODE_ID` 一起设置 | 未设置（关闭） | 未注册 | 否 |
@@ -350,7 +352,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_GLM_TP_SHARD` | GGML 上 TP 下的 GLM 5.x | 切分哪一半：`1` 注意力头，`2` 路由专家，`3` 两者都切。路由专家是在每个专家内部按行切分，而不是按专家 id 分配，因为 `ggml_mul_mat_id` 要求同一 token 选中的专家 id 互不相同 | `3`（两者） | `1`, `2`, `3` | 否 |
 | `TS_GLM_TP_OVERSUBSCRIBE` | GGML 上 TP 下的 GLM 5.x | `1` 允许多个 rank 共享一张 GPU，用于在单卡机器上验证切分的正确性 | `0`（一 rank 一卡） | `0`, `1` | 否 |
 | `TS_GLM_TP_FUSED` | GGML 上 GLM-5.3-Flash 的本地 TP | `0` 强制使用组合调度器诊断回退，而不是并发提交按 rank 分段计算图。CPU MoE、张量 tracing、部分 `TS_GLM_TP_SHARD` 切分、rank 超额共享 GPU，或后端缺少原生超连接内核时也会自动回退 | 自动（满足条件时分段） | `0`, `1` | 否 |
-| `TS_Q4E_LAYER_SPLIT` | `--tp N` 下按层切分的 Qwen 3.8 Flash Next（`qwen4exp`） | 直接指定每张 GPU 分到的层数（逗号分隔，例如 `20,28`），取代自动的显存均衡；给出无法满足的值时会直接抛错，而不是静默忽略。这个架构上的 `--tp N` 是按层切分而非张量并行——`qwen4exp` 不切分任何权重 | 自动（按各设备空闲显存装箱） | 未注册 | 否 |
+| `TS_Q4E_LAYER_SPLIT` | `--layer-split N` 下按层切分的 Qwen 3.8 Flash Next（`qwen4exp`） | 直接指定每张 GPU 分到的层数（逗号分隔，例如 `20,28`），取代自动的显存均衡；给出无法满足的值时会直接抛错，而不是静默忽略。这个架构上的 `--layer-split N` 是按层切分而非张量并行——`qwen4exp` 不切分任何权重 | 自动（按各设备空闲显存装箱） | 未注册 | 否 |
 | `TS_Q4E_RETAINED_CACHE` | 完整 GGML token-span 路径上的 Qwen 3.8 Flash Next（`qwen4exp`） | `0` 关闭保留会话复用与共享前缀检查点（仅精确前缀） | 开 | 未注册 | 否 |
 | `TS_Q4E_RETAINED_CACHE_MB` | Qwen 3.8 Flash Next（`qwen4exp`）保留复用 | 保留会话与共享前缀检查点共用的预算（MiB），受实测内存余量限制。在默认的 Radix 前缀缓存下由树负责淘汰，放不下的 holder 会被拒绝（只报告一次）；`TS_PREFIX_CACHE_MODE=legacy` 时先驱逐最早保留的会话。`0` 或无法解析的值拒绝所有保留 | `4096` | 未注册 | 否 |
 | `GGML_CUDA_ALLREDUCE` | 本地 TP，`ggml_cuda` | `nccl` / `internal` / `none` —— 直接透传给 ggml 的集合通信选择；显式设置同时会跳过启动前探测 | 自动（构建时能找到 NCCL 且通过探测就用 NCCL） | 未注册 | 否 |

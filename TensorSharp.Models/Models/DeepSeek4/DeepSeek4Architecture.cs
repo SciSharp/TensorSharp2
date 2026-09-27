@@ -14,13 +14,14 @@ namespace TensorSharp.Models
     {
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
-            // Deliberately TensorParallel as far as the shared gate is concerned:
-            // DeepSeek V4 drives several GPUs through its OWN executor, sized by
-            // TS_DSV4_NGPU, and the gate must not interfere with that.
             Id = "deepseek4",
             DisplayName = "DeepSeek V4 (Flash)",
             Aliases = new[] { "deepseek4" },
-            Factory = c => new DeepSeek4Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath),
+            Factory = c => new DeepSeek4Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup,
+                c.DraftModelPath, c.LayerSplitDegree),
+            MultiGpu = MultiGpuMode.LayerSplit,
+            MultiGpuLimitation = "deepseek4 (DeepSeek V4) places whole layers across local GPUs; it does not implement tensor parallelism.",
+            LayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda },
         };
 
         /// <summary>

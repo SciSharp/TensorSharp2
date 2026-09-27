@@ -1,5 +1,7 @@
 # DeepSeek V4.1 Flash（`deepseek41`）
 
+> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。下面的历史命令与测量早于这项默认值变更；多 GPU 启动请加 `--layer-split N`。显式旧变量 `TS_DSV4_NGPU=0` 仍表示全部可见 GPU 自动放置；使用明确并行度时请取消该变量，或设为相同卡数。按层切分仅限单节点。
+
 [← 返回模型索引](README_zh-cn.md) | [English](deepseek41.md)
 
 TensorSharp 为 V4.1 提供了**运行在 `ggml_cuda` 上的专用推理计算图**，并带有可选的
@@ -19,18 +21,36 @@ TensorSharp 为 V4.1 提供了**运行在 `ggml_cuda` 上的专用推理计算�
 上下文长度为 1,048,576 token。V4.1 与 V4 的差异会影响每一次前向，把 GGUF 的架构名
 改成 `deepseek4` 是无效的。
 
-## 下载 Q2_K 检查点
+## 下载修复后的 Q2_K/Q5_K 检查点
 
-使用 [vcruz305/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/main)
-发布的七分片 Q2_K 版本。下方命令固定到该仓库当前的 revision
-`58d8ac86298fdf85a2440defee08b1abcad32e45`。七个分片放在同一目录，并把第一个分片
-交给 TensorSharp。Q2_K 包含混合的 Q2_K/Q3_K 张量，约需 246.35 GiB 磁盘空间。
+新下载请使用
+[smalinin/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/tree/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5)
+的 `Q2_K-Q5/`，固定 revision 为 `d1de55c19f95172c882906cc83c0e55932d26a63`。
+十个分片放在同一目录，并把第一个分片交给 TensorSharp。文件共 **335,382,014,624 字节
+（312.349 GiB）**：主干与专家混合使用 Q2_K/Q3_K，Engram 表为 Q5_K，80 个 mHC
+矩阵保留 F32，四个 Engram 门控张量保留 BF16。
+
+原始 `vcruz305` 七分片 Q2_K 把这 84 个敏感张量也量化成了 Q2_K，因此不再推荐用于
+质量验证。[发布者的修复报告](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/blob/2c525d63b9ba5319185c93637f00d70fea55b44f/Q2_K/Q2_REPAIR_REPORT.md)
+说明了受影响的张量。给旧分片补充 Engram 元数据不能修复张量精度。
+
+已检查修复版全部 1,046 个张量的名称与形状、敏感张量的存储类型，以及分词器/Engram
+元数据的一致性。下载的十个分片均已通过完整文件 SHA-256 校验。`ggml_cuda` 上
+`--layer-split 2` 与实验性路由专家 TP（`--tp 2` 配合 `TS_DSV41_TP=2`）的有限普通/DSpark
+HTTP 检查均已通过。四个服务各完成三个文本检查与一个图像 OCR/颜色检查，均以 EOS
+结束并正常退出。另行进行的普通/DSpark 文本与图像配对检查，在两种模式下均逐一匹配全部
+24 个 token ID 与 `max_tokens` 结束原因，DSpark 实际参与解码且进程正常退出。这些有限
+续写与 HTTP 的 EOS 检查分开记录。两个图像配对中 DSpark 都更慢。简短的重复文本预热对照
+也已完成：每种模式一次预热、三次计时，每对输入 69 token、输出 24 token，token ID 与
+结束原因完全一致，DSpark 实际参与解码且进程正常退出。
+**这些小样本、受磁盘换页限制的检查不构成通用质量、性能、提速、跨节点执行或完整模型 TP 验证。**
+下方历史结果不能作为这套量化的验证结果。本地证据保存在
+`docs/validation/model-matrix-20260927/deepseek41/`（不提交）。每次重新下载仍须按下方
+哈希校验文件。
 
 **GGUF 已包含 Engram。** TensorSharp 直接读取 GGUF 元数据中的 token 映射、哈希乘数、
 桶质数与偏移以及 padding ID，并使用同一检查点中的 Engram 权重张量。文本推理无需生成
-Engram、无需单独的 Engram 文件，也无需另行下载分词器或配置文件。发布者已将
-[这些常量加入 Q2_K 的第一个分片](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/commit/259692f97dad8bf9c59726f5e401f986898ca551)；
-升级旧下载时请使用当前版本。
+Engram、无需单独的 Engram 文件，也无需另行下载分词器或配置文件。
 
 加载器会对照 Engram 张量维度校验内嵌布局，并拒绝缺失或无效的常量；不再回退读取旧的
 附属文件，也不再提供 Engram 路径覆盖。Engram 表的设备放置与页预热仍作用于学习到的
@@ -41,21 +61,44 @@ Engram、无需单独的 Engram 文件，也无需另行下载分词器或配置
 ```bash
 python3 -m venv /workspace/dsv41-tools
 /workspace/dsv41-tools/bin/python -m pip install huggingface_hub
-/workspace/dsv41-tools/bin/hf download vcruz305/DeepSeek-V4.1-Flash-GGUF \
-  --revision 58d8ac86298fdf85a2440defee08b1abcad32e45 \
-  --include "DeepSeek-V4.1-Flash-Q2_K-*.gguf" \
-  --local-dir /workspace/models/deepseek41-q2
+/workspace/dsv41-tools/bin/hf download smalinin/DeepSeek-V4.1-Flash-GGUF \
+  --revision d1de55c19f95172c882906cc83c0e55932d26a63 \
+  --include "Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-*.gguf" \
+  --local-dir /workspace/models/deepseek41-q2-q5
 ```
 
-同一仓库也提供内嵌 Engram 常量的十一个 Q4_K_M 分片（约 415 GiB）。把 include 模式改为
-`DeepSeek-V4.1-Flash-Q4_K_M-*.gguf` 并使用该量化的第一个分片即可。Q4_K_M 的两张
-Engram 表各约 51.5 GiB。在八张 46 GB 显卡上，这些表保留在主机内存映射中，部分路由
-专家需要卸载到 CPU。量化报告 `docs/validation/deepseek41-quants/README.md`（本地验证记录，未提交到 Git）保留了该放置方式的历史测试。
+`hf download` 会保留 `Q2_K-Q5/` 子目录。推理前须校验每个完整文件；以下 SHA-256
+来自固定 revision 的发布者 LFS 标识。此操作会读取全部 312.349 GiB，请在计时测试之外执行：
 
-本卡片中的早期结果与整文件 SHA-256 记录 `docs/validation/deepseek41/checkpoint-sha256.json`（本地验证记录，未提交到 Git）
-对应旧 revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5` 及其旧版第一个分片。
-未经重新验证，不应把这些哈希或性能结果视为当前文件的结果。新的验证记录应包含仓库 revision
-及所有分片的哈希。
+```bash
+(cd /workspace/models/deepseek41-q2-q5/Q2_K-Q5 && sha256sum --check - <<'SHA256'
+8126b49dfcfde02cb3db24b6f98d56b031f0a34eaca2509fc7b2b9d362cf0ac8  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf
+22bb293aee509a348ce32a739e006fa41f2348c6bcfafa3be76a3ee079eadf96  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00002-of-00010.gguf
+db894848b4f14d42c39e18faa907c737cd4850f2fcb9deff9d5ebd86f580aaf7  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00003-of-00010.gguf
+655a3400f2c092d6e3c11b8b18bf319b29563e59b960337115266574321953e3  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00004-of-00010.gguf
+4b9378c6819d1130517e8719026b34e5257f1f73bd1d50cf6f30243982100bac  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00005-of-00010.gguf
+04f161084d82032c65247c02e6169784a757be7db9e068b0baba6833125b6bb8  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00006-of-00010.gguf
+b1b1bf3cfbbc7388ce49b5ced69c42a13c7c5c5d3d609ac86902897a08d3c88a  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00007-of-00010.gguf
+fae7f35123ae3557034a541507bb9fc24fb62c2e16ff8441c32e8e0477743d5d  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00008-of-00010.gguf
+781fd69e9dd17c09676865830523a2d077a97544d6a004429aab95d2570f8534  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00009-of-00010.gguf
+fa5affb1f971cd6e7effad5684b73780472b486a46330cd7c5776f87c38fea97  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00010-of-00010.gguf
+SHA256
+)
+```
+
+任一哈希不匹配时不要继续推理。`eng/dsv41-verify-download.py` 是原七分片布局的历史
+校验器，不能校验这套十分片文件。两张 Q5_K Engram 表共约 125.889 GiB；在 RAM 限额
+57.74 GiB 的主机上，即使不计 CPU 专家也无法全部驻留。此类主机应使用
+`TS_DSV41_ENGRAM_DEVICE=0 TS_DSV41_ENGRAM_WARM=0`，并记录分页开销。CPU 专家
+卸载层数须依据实际设备容量选择，同时为可选草稿器与视觉编码器预留空间。
+
+**历史基准的来源：** 本卡片中的早期结果与整文件 SHA-256 记录
+`docs/validation/deepseek41/checkpoint-sha256.json`（本地验证记录，未提交到 Git）对应
+原 `vcruz305` 发布的 revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5` 及其旧版
+第一个分片。较晚的七分片示例使用 `58d8ac86298fdf85a2440defee08b1abcad32e45`；
+旧 Q4_K_M 的放置记录也须单独看待。保留的历史启动命令指向这些旧文件，而非修复版。
+不能把它们的哈希、246.35 GiB 大小、约 60 GiB Engram 预热、质量结果或吞吐率归给
+Q2_K-Q5。每次新验证都须记录 revision 与全部分片哈希。
 
 ## 准备可选的视觉伴随文件
 
@@ -66,8 +109,8 @@ Engram 表各约 51.5 GiB。在八张 46 GB 显卡上，这些表保留在主机
 ```bash
 /workspace/dsv41-tools/bin/python -m pip install numpy==2.0.2 gguf
 /workspace/dsv41-tools/bin/python eng/dsv41-prepare-vision.py \
-  /workspace/models/deepseek41-q2 \
-  --parent-model /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  /workspace/models/deepseek41-q2-q5/Q2_K-Q5 \
+  --parent-model /workspace/models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
   --repository deepseek-ai/DeepSeek-V4.1-Flash \
   --revision dba1be0a40aa45a94ad051997016db3960a90277
 ```
@@ -81,7 +124,7 @@ Engram 表各约 51.5 GiB。在八张 46 GB 显卡上，这些表保留在主机
 伴随文件溯源记录 `docs/validation/deepseek41/vision-companion.json`（本地验证记录，未提交到 Git）
 包含全部 306 个张量、来源 revision、字节范围与输出摘要。
 原生加载器在挂载前会检查父模型的分词器指纹与模型维度。要启用图像，在下文的服务命令
-中加上 `--mmproj /workspace/models/deepseek41-q2/deepseek41.vision.gguf`。
+中加上 `--mmproj /workspace/models/deepseek41-q2-q5/Q2_K-Q5/deepseek41.vision.gguf`。
 没有挂载伴随文件时，图像能力保持关闭。
 
 视觉部分默认使用稠密 F32 注意力，与官方视觉塔的注意力算术一致。在 Ampere 及更新的
@@ -134,11 +177,56 @@ WebM 或 MOV 采样。例如，消息的 content 数组里可以包含：
 错误的音频部分，都返回 JSON 400 且不产生 SSE。更早的 CPU-offload 主机的八项图像检查
 另行保留。
 
+## 准备可选的 DSpark 伴随文件
+
+V4.1 需要 `deepseek41-dspark` 产物，不能使用 V4 草稿模型。以下官方 revision 将 DSpark
+放在分片 44–46 中（7,933,129,808 字节），无需下载原始文本模型：
+
+```bash
+/workspace/dsv41-tools/bin/hf download deepseek-ai/DeepSeek-V4.1-Flash \
+  --revision dba1be0a40aa45a94ad051997016db3960a90277 \
+  --include config.json model.safetensors.index.json \
+    model-00044-of-00048.safetensors model-00045-of-00048.safetensors \
+    model-00046-of-00048.safetensors \
+  --local-dir /workspace/models/deepseek41-source/DeepSeek-V4.1-Flash
+
+(cd /workspace/models/deepseek41-source/DeepSeek-V4.1-Flash && sha256sum --check - <<'SHA256'
+8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879  config.json
+74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8  model.safetensors.index.json
+9a6b39fb88a2510487a8efaef77aa7864e8061f6b62c95a0f010e9dd538f3b05  model-00044-of-00048.safetensors
+0cc9d5f6ca3a2158ccc63ce2c70c76aeda8177d54913340481af566680329eb5  model-00045-of-00048.safetensors
+e625902027b9d23d416f8818c665fab4704e0b96dc1bc778321601b700475a9d  model-00046-of-00048.safetensors
+SHA256
+)
+```
+
+五项校验全部通过后，再转换伴随文件：
+
+```bash
+/workspace/dsv41-tools/bin/python -m pip install numpy==2.0.2
+mkdir -p /workspace/models/deepseek41-dspark
+/workspace/dsv41-tools/bin/python eng/dsv4-dspark-to-gguf.py \
+  --checkpoint /workspace/models/deepseek41-source/DeepSeek-V4.1-Flash \
+  --expert-type mxfp4 \
+  --out /workspace/models/deepseek41-dspark/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+```
+
+已审计的转换产物包含 81 个张量（包括三个视觉路由偏置），大小为 7,940,628,416 字节。
+来源标识与转换校验已经完成。真实 DSpark 草稿器已在 `ggml_cuda` 双 GPU 按层切分与
+实验性路由专家 TP 下通过初步文本/图像 HTTP 检查，图像回答完整结束，服务正常退出。
+大量磁盘换页下的通用质量与吞吐仍未获验证。另行进行的 24-token 文本/图像配对检查，
+在两种模式下均匹配普通解码的 token ID 与 `max_tokens` 结束原因，DSpark 实际参与解码
+且进程正常退出；这些结果仅涵盖有限续写，不声明提速、跨节点执行或完整模型 TP 通过。
+在使用修复版十个文本分片的启动命令中，加上
+`--draft-model /workspace/models/deepseek41-dspark/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --spec`。
+对比普通解码时仍加载同一伴随文件，改用 `--no-spec`。草稿器驻留在输出头所在 GPU，
+会影响设备放置；视觉编码器还需要额外空间。
+
 ## 运行已实现的路径
 
 需要安装 .NET 10 SDK、CMake、C++ 编译器，以及 `PATH` 上带 `nvcc` 的 CUDA 工具链。
-从仓库根目录构建。下面的命令针对被请求的 A40 VM（CUDA 架构 8.6）；换其他 GPU 时
-两处架构值都要改：
+从仓库根目录构建。此示例使用 A40 的 CUDA 架构 8.6；换其他 GPU 时，两处架构值都要改。
+命令指向修复后的下载；仍须在实际硬件上验证容量与推理行为：
 
 ```bash
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON \
@@ -149,25 +237,26 @@ dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release \
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   TS_CPU_MOE_THREADS=32 TS_DSV41_TP=0 TS_DSV4_UBATCH=256 \
-  TS_DSV41_ENGRAM_WARM=1 \
+  TS_DSV41_ENGRAM_WARM=0 \
   TS_DSV41_COMPACT_RAW_GATHER=0 KV_CACHE_DTYPE=f16 \
   TS_SCHED_MAX_RUNNING_SEQS=4 TS_SCHED_MAX_BATCHED_TOKENS=4096 \
   TS_SCHED_PREFILL_CHUNK=256 TS_SCHED_SOLO_PREFILL_CHUNK=8192 \
   dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
-  --backend ggml_cuda --tp 8 --port 5000
+  --model /workspace/models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
+  --backend ggml_cuda --layer-split 8 --port 5000
 ```
 
-宿主构建会把原生库复制到服务端 DLL 旁边。上面这条启动命令使用的是保守基准矩阵的微批
-与调度器设置；验证报告里的优化配置用的是另一组参数。稀疏 prefill attention 不需要任何
+宿主构建会把原生库复制到服务端 DLL 旁边。上面是显式指定微批与调度器设置的启动示例，
+并非修复版检查点的实测配置；验证报告中的历史配置使用不同权重，部分参数也不同。
+稀疏 prefill attention 不需要任何
 开关：它在这条路径上默认开启，`TS_DSV41_SPARSE_FA=0` 可将其关闭。`TS_DSV4_UBATCH=256`
-固定为该矩阵实测的宽度；不设置则由加载器自行选择（见[后端](#后端)）。`TS_CPU_MOE_THREADS` 要按可用的
+固定该示例的宽度；不设置则由加载器自行选择（见[后端](#后端)）。`TS_CPU_MOE_THREADS` 要按可用的
 CPU 配额来选，并为每次运行记录下来。即便是纯 GPU 放置也要在启动环境里设置它：原生的
 CPU 图工作与主机侧归约仍会影响延迟。当前 CLI 也接受 `--cpu-moe-threads N`；两者都给
 时请填相同的值，因为原生加载器优先采用为正的环境变量值。
 
-若要改用最终实测的八卡 A40 层放置配置，可在准备好视觉伴随文件后使用下面这条可选命令。
-它显式设置了优化参数；上面的保守示例与各项默认值保持不变：
+**仅用于复现历史记录：** 以下八卡 A40 启动命令保留了原七分片检查点的路径与实测设置，
+不是推荐的新下载方案，也不是 Q2_K-Q5 的测量结果：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
@@ -180,7 +269,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --model /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
   --mmproj /workspace/models/deepseek41-q2/deepseek41.vision.gguf \
-  --backend ggml_cuda --tp 8 --n-cpu-moe 0 --cpu-moe-threads 32 \
+  --backend ggml_cuda --layer-split 8 --n-cpu-moe 0 --cpu-moe-threads 32 \
   --host 127.0.0.1 --port 5000 --max-tokens 2048
 ```
 
@@ -200,12 +289,12 @@ V4.1 支持（`3347b06b`）上记录的，当时还没有 TensorSharp 自有的 
 为默认的 32。那台原始主机没有暴露线程池宽度的读取接口，所以 32 并非在那里直接测得。
 请把这个基线与后续显式设置线程数的实验区分开。
 
-对这个架构，`--tp 8` 表示**用八张 GPU 做按层切分**。启动诊断会说明采用的放置模式。
+`--layer-split 8` 表示**用八张 GPU 做按层切分**。启动诊断会说明采用的放置模式。`--tp` 仅用于张量并行；单独使用会被拒绝，需与相同度数的 `TS_DSV41_TP=N` 配合启用实验性 routed-MoE TP。`--layer-split` 则不能与非零 `TS_DSV41_TP` 组合。
 TensorSharp 默认按可用显存分配整层。
 `TS_DSV4_NGPU` 覆盖 GPU 数量。用 `CUDA_VISIBLE_DEVICES` 精确指定本次运行使用的设备。
 显式设置 `TS_DSV4_NGPU=0` 表示自动选择可见设备，并把 rank 数校验推迟到原生加载器。
 
-`TS_DSV41_TP=8` 会在这八张 GPU 上额外启用实验性的 **routed-MoE 张量并行**。该设置接受
+`--tp 8` 配合 `TS_DSV41_TP=8` 会在这八张 GPU 上额外启用实验性的 **routed-MoE 张量并行**。该设置接受
 `0`（关闭）或 `2` 到 `8` 的 rank 数，且必须等于 `--tp` 或 `TS_DSV4_NGPU` 选中的 GPU 数。
 自动选择 GPU 时，原生加载器会在枚举可见设备之后再校验数量。取值非法或数量不匹配都会
 报错。
@@ -220,7 +309,7 @@ TensorSharp 默认按可用显存分配整层。
 独立数值 fixture 在 2/4/8 张 GPU 上均通过，包括量化专家分片与整模型 oracle 检查。这些
 小规模 fixture 并不能说明完整的 Q2_K 检查点能装进两张或四张 A40。本卡片的 VM 示例用的
 是八张；更少的卡数需要足够的 CPU 专家卸载才能装下。
-当 Q2_K 的 Engram 表使用主机映射时，同步预热会在就绪之前占用约 60 GiB 主机页缓存；
+当历史七分片 Q2_K 的 Engram 表使用主机映射时，同步预热会在就绪之前占用约 60 GiB 主机页缓存；
 驻留 GPU 的表跳过这一步。冷加载与预热时间要与热态吞吐分开记录。
 
 在 CUDA 上，Q2_K 与 Q4_K 的 gate/up 分片走 TensorSharp 自有的量化分片 kernel
@@ -253,7 +342,7 @@ TensorSharp 默认按可用显存分配整层。
 
 ```bash
 /workspace/dsv41-tools/bin/python eng/dsv41-warm-experts.py \
-  /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  /workspace/models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
   --layers 4 \
   --report cpu-expert-warming.json
 ```
@@ -665,7 +754,7 @@ op-offload 规则永远不会把这些权重流式送到 GPU：跨总线的只�
 `routed-expert placement: all 40 layer(s) on the explicitly selected CPU device`。
 
 **这是一条正确性与可移植性通道，不是服务通道。**每解码一个 token，都要在 40 层里
-各读出 384 个路由专家中的 6 个，来源是 246 GiB 的 Q2_K 检查点，而且跑在通用核心上。
+各读出所选检查点 384 个路由专家中的 6 个，而且跑在通用核心上。
 那些参考内核每个节点只跑一个 worker（V4.1 的 quantize、candidate-score 与
 candidate-mask 内核是例外），而[每张 GPU 一个后端](#每张-gpu-一个后端)里那个包裹式
 后端是 CUDA 对象，在这里根本没有编译进来，所以那一节的数字在这里一个都不适用。
@@ -688,7 +777,7 @@ CPU 路径确实有一致性证据，但它是逐算子的，而不是整检查�
 
 ```bash
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model /models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --model /models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
   --backend ggml_cpu --port 5000
 ```
 
@@ -706,7 +795,7 @@ CPU 后端与 CUDA 一样，直接读取内嵌的 Engram 元数据。下载当�
   检查点之前被拒绝，而不是被忽略。
 - `TS_DSV4_NGPU` 选择枚举多少张 GPU。这里没有 GPU 可枚举，所以加载器根本不会读它；
   它既不是错误，也不是拿到多于一个 CPU 设备的办法。
-- `--tp N` 找不到第二个设备来切分层，因此多 GPU 门控会把它降级为单设备并给出警告。
+- CPU 后端会拒绝 `--tp N` 与 `--layer-split N` 的多 GPU 请求。
   那条警告是为 GPU 主机写的，写的是 "Running on ONE GPU"；在这个后端上请读作"一个
   CPU 设备"。
 - Engram 表保持主机映射：上文描述的 GPU 驻留放置需要有设备可放。因此
@@ -868,8 +957,11 @@ V4.1 没有发布任何委派相关的实测结果。
   `TS_BATCHED_FUSED_DECODE=0` 时，仍走逐槽前向调用。
 - V4.1 的 DSpark 投机解码属于实验性功能。加载器只在 `ggml_cuda` 与 `ggml_cpu` 上接受
   `deepseek41-dspark` 草稿器（`--draft-model` / `TS_DSV4_DSPARK`），在其他执行器上拒绝，
-  V4 的草稿模型也会被拒绝。它只在合成 fixture 上验证过（`DeepSeek41DsparkIntegrationTests`），
-  没有实测过任何训练好的 V4.1 草稿器，因此没有接受率或吞吐数据。加载草稿器期间，按 token
+  V4 的草稿模型也会被拒绝。合成测试（`DeepSeek41DsparkIntegrationTests`）以及真实草稿器在
+  `ggml_cuda` 双 GPU 按层切分与实验性路由专家 TP 下的初步文本/图像 HTTP 检查已通过；
+  大量磁盘换页下的通用质量与吞吐仍未获验证。另行进行的 24-token 文本/图像配对检查，
+  在两种模式下均匹配普通解码的 token ID 与 `max_tokens` 结束原因，DSpark 实际参与解码
+  且进程正常退出。加载草稿器期间，按 token
   批量 decode 与保留缓存都不生效。没有草稿器时，`--spec`（包括 `--spec-type ngram`）
   只提供普通解码。
 - K/V cache 在每个执行器上都是 F16，`KV_CACHE_DTYPE=q8_0` / `q4_0` 会在**加载时被拒绝**

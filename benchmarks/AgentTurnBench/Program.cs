@@ -43,6 +43,7 @@ using TensorSharp.Runtime;
 using TensorSharp.Runtime.Grammar;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
+using TensorSharp.Distributed;
 
 namespace AgentTurnBench;
 
@@ -74,9 +75,16 @@ internal static class Program
         // join the model at construction; only Gemma 4's assistant head attaches after.
         if (o.DraftModel != null)
             Environment.SetEnvironmentVariable(SpeculationEnvVars.DraftModel, o.DraftModel);
-        using ModelBase model = ModelBase.Create(o.Model, backend, draftModelPath: o.DraftModel);
+        using ModelBase model = ModelBase.Create(o.Model, backend, o.Parallelism.TpDegree,
+            draftModelPath: o.DraftModel, layerSplitDegree: o.Parallelism.LayerSplitDegree);
         if (o.DraftModel != null && !SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(model, out string err))
             Console.Error.WriteLine($"[agent-turn-bench] draft head NOT attached: {err}");
+        if (o.SpecCandidates?.Contains("auto") == true &&
+            !(model.HasDFlash || (model is IDraftHead head && head.HasDraftHead)))
+        {
+            Console.Error.WriteLine("--spec-candidates auto requires an attached draft head.");
+            return 2;
+        }
         if (o.MmProj != null)
             model.MultimodalInjector.LoadProjectors(o.MmProj);
         model.WarmUpKernels();
@@ -182,7 +190,12 @@ internal sealed class Options
     public int New = 32;
     public int SpecNew = 192;
     public int SpecFile = 600;
+    public int ImageNew = 160;
+    public int ImageFile = 200;
     public bool SpecMinimalSystem;
+    public bool SpecOnly;
+    public List<string> SpecCandidates;
+    public ModelParallelismOptions Parallelism;
     public bool SpecDiagnostic;
     /// <summary>--spec-diagnostic drafter: "ngram" (default) or "auto" (the checkpoint's own head).</summary>
     public string SpecDiagSpeculator = "ngram";
@@ -220,10 +233,12 @@ internal sealed class Options
     public static Options Parse(string[] args)
     {
         var o = new Options();
+        var placement = new List<string>();
         try
         {
             for (int i = 0; i < args.Length; i++)
             {
+                if (ModelParallelismOptions.TryCollect(args, ref i, placement)) continue;
                 string Next() => i + 1 < args.Length ? args[++i] : throw new ArgumentException($"{args[i]} needs a value");
                 switch (args[i])
                 {
@@ -240,7 +255,13 @@ internal sealed class Options
                     case "--new": o.New = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-new": o.SpecNew = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-file": o.SpecFile = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--image-new": o.ImageNew = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--image-file": o.ImageFile = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-minimal-system": o.SpecMinimalSystem = true; break;
+                    case "--spec-only": o.SpecOnly = true; break;
+                    case "--spec-candidates":
+                        o.SpecCandidates = Next().Split(',', StringSplitOptions.TrimEntries).ToList();
+                        break;
                     case "--spec-diagnostic": o.SpecDiagnostic = true; break;
                     case "--spec-diagnostic-speculator": o.SpecDiagSpeculator = Next(); break;
                     case "--spec-diagnostic-prompt": o.SpecDiagPrompt = Next(); break;
@@ -270,8 +291,17 @@ internal sealed class Options
             if (!File.Exists(o.Model)) throw new ArgumentException($"model not found: {o.Model}");
             if (o.Warmup < 0) throw new ArgumentException("--warmup must be nonnegative");
             if (o.MeasurePasses < 1) throw new ArgumentException("--measure-passes must be positive");
+            if (o.ImageNew < 1) throw new ArgumentException("--image-new must be positive");
+            if (o.ImageFile < 1) throw new ArgumentException("--image-file must be positive");
+            if (o.SpecCandidates != null && (o.SpecCandidates.Any(s => s is not ("ngram" or "auto")) ||
+                o.SpecCandidates.Distinct().Count() != o.SpecCandidates.Count))
+                throw new ArgumentException("--spec-candidates requires unique values from ngram,auto.");
             if (o.ConcGate && o.ConcStaggerMs > 0)
                 throw new ArgumentException("--conc-gate submits a round at once and cannot be combined with --conc-stagger");
+            o.Parallelism = ModelParallelismOptions.Parse(placement.ToArray());
+            if (o.Parallelism.Distributed != null)
+                throw new ArgumentException("AgentTurnBench supports local placement only; use the CLI/server for distributed tensor parallelism.");
+            o.Parallelism.ApplyEnvironment();
         }
         catch (ArgumentException ex)
         {
@@ -292,6 +322,16 @@ internal sealed record Row(
     public List<int> Tokens { get; init; } = new();
     // Actual delivery times from submission, for individual requests only.
     public List<double> TokenTimesMs { get; init; }
+    // Worker forward timings, independent of delivery/TTFT. Missing on failure.
+    public double? PrefillComputeMs { get; init; }
+    public double? DecodeComputeMs { get; init; }
+    public int? PrefillComputeTokens { get; init; }
+    // The completion count includes terminal EOS; OutTokens is visible output only.
+    public int? DecodeComputeTokens { get; init; }
+    public double? PrefillComputeTps => PrefillComputeMs is > 0
+        ? PrefillComputeTokens * 1000.0 / PrefillComputeMs : null;
+    public double? DecodeComputeTps => DecodeComputeMs is > 0
+        ? DecodeComputeTokens * 1000.0 / DecodeComputeMs : null;
     public long StartedUnixMilliseconds { get; init; }
     public List<RequestTimeline> RequestTimelines { get; init; }
     public ConcurrentDecodeMetrics ConcurrentDecode { get; init; }
@@ -453,11 +493,11 @@ internal sealed class Bench
         using (var engine = NewEngine(SpeculationOptions.Disabled))
             plain = await RunAsync(engine, "spec", "plain greedy", prompt, _o.SpecNew, SamplingConfig.Greedy, expectBatched: true);
 
-        var candidates = new List<(string label, SpeculationOptions opts)>
-        {
-            ("ngram", SpecOptions(SpeculatorRegistry.NGram)),
-        };
-        if (_model.HasDFlash || (_model is IDraftHead h && h.HasDraftHead))
+        var candidates = new List<(string label, SpeculationOptions opts)>();
+        if (_o.SpecCandidates == null || _o.SpecCandidates.Contains("ngram"))
+            candidates.Add(("ngram", SpecOptions(SpeculatorRegistry.NGram)));
+        if ((_o.SpecCandidates == null || _o.SpecCandidates.Contains("auto")) &&
+            (_model.HasDFlash || (_model is IDraftHead h && h.HasDraftHead)))
             candidates.Add(("draft head (auto)", SpecOptions(SpeculatorRegistry.Auto)));
 
         foreach (var (label, opts) in candidates)
@@ -472,8 +512,11 @@ internal sealed class Bench
         // The tool-round shape under n-gram speculation: the drafter must re-arm after the
         // reused prefix (every turn after the first reuses cache) and the verify windows
         // must go through as batches.
-        Console.WriteLine("    -- tool rounds under ngram speculation --");
-        await ToolAsync(SpecOptions(SpeculatorRegistry.NGram), "spec+tool");
+        if (!_o.SpecOnly)
+        {
+            Console.WriteLine("    -- tool rounds under ngram speculation --");
+            await ToolAsync(SpecOptions(SpeculatorRegistry.NGram), "spec+tool");
+        }
     }
 
     private async Task JsonAsync()
@@ -545,6 +588,7 @@ internal sealed class Bench
             double aggregate = decode.TokensPerSecond;
             var timelines = runs.Select(ToTimeline).ToList();
             var speculation = RequestSpeculationCounters.Sum(timelines.Select(r => r.Speculation));
+            bool allComputeMeasured = runs.All(r => r.PrefillElapsedTicks.HasValue && r.DecodeElapsedTicks.HasValue);
             string note = $"decode aggregate {aggregate:0.0} tok/s from {decode.TokensAfterLastFirst} deliveries strictly after the last first token; " +
                           $"window {decode.WindowMs:0} ms; last first-token wave offset {decode.LastFirstTokenOffsetMs:0} ms; " +
                           $"wall {waveMs:0} ms; max individual request ttft {maxTtft:0} ms; established={decode.Established}";
@@ -560,6 +604,10 @@ internal sealed class Bench
                 RequestTimelines = timelines,
                 ConcurrentDecode = decode,
                 ArrivalOrderFixed = _o.ConcGate,
+                PrefillComputeMs = allComputeMeasured ? ComputeMilliseconds(runs.Sum(r => r.PrefillElapsedTicks.Value)) : null,
+                DecodeComputeMs = allComputeMeasured ? ComputeMilliseconds(runs.Sum(r => r.DecodeElapsedTicks.Value)) : null,
+                PrefillComputeTokens = allComputeMeasured ? runs.Sum(r => r.PrefillComputeTokens.Value) : null,
+                DecodeComputeTokens = allComputeMeasured ? runs.Sum(r => r.DecodeComputeTokens.Value) : null,
             };
             Add(row);
             foreach (Run r in runs)
@@ -593,7 +641,7 @@ internal sealed class Bench
             Console.WriteLine("    skipped: needs --image <file> and --mmproj <gguf>");
             return;
         }
-        string file = Corpus.CodeText(_model.Tokenizer, 200);
+        string file = Corpus.CodeText(_model.Tokenizer, _o.ImageFile);
         var history = new List<ChatMessage>
         {
             new() { Role = "system", Content = Corpus.MinimalSystemPrompt },
@@ -605,7 +653,16 @@ internal sealed class Bench
             },
         };
         Row plain = null;
-        foreach (var (label, spec) in new[] { ("plain + image", SpeculationOptions.Disabled), ("ngram + image", SpecOptions(SpeculatorRegistry.NGram)) })
+        var candidates = new List<(string label, SpeculationOptions opts)>
+        {
+            ("plain + image", SpeculationOptions.Disabled),
+        };
+        if (_o.SpecCandidates == null || _o.SpecCandidates.Contains("ngram"))
+            candidates.Add(("ngram + image", SpecOptions(SpeculatorRegistry.NGram)));
+        if ((_o.SpecCandidates == null || _o.SpecCandidates.Contains("auto")) &&
+            (_model.HasDFlash || (_model is IDraftHead h && h.HasDraftHead)))
+            candidates.Add(("draft head (auto) + image", SpecOptions(SpeculatorRegistry.Auto)));
+        foreach (var (label, spec) in candidates)
         {
             using var engine = NewEngine(spec);
             // The injector keeps the prepared embeddings per request id, and the
@@ -614,7 +671,7 @@ internal sealed class Bench
             string id = $"image-{_rows.Count}";
             List<int> tokens = RenderHistory(history, out _);
             tokens = _model.MultimodalInjector.ProcessPromptTokens(history, tokens, id);
-            Row row = await RunAsync(engine, "image", label, tokens, 160, SamplingConfig.Greedy, expectBatched: true, requestId: id);
+            Row row = await RunAsync(engine, "image", label, tokens, _o.ImageNew, SamplingConfig.Greedy, expectBatched: true, requestId: id);
             if (plain == null)
                 plain = row;
             else
@@ -654,6 +711,10 @@ internal sealed class Bench
         public double SubmissionOffsetMs;
         public double TtftMs;
         public double TotalMs;
+        public long? PrefillElapsedTicks;
+        public long? DecodeElapsedTicks;
+        public int? PrefillComputeTokens;
+        public int? DecodeComputeTokens;
         public int Reused;
         public string Finish;
         public string Error;
@@ -683,6 +744,10 @@ internal sealed class Bench
             InferenceCompletion done = await handle.Completion;
             run.Reused = done.PrefixCacheReusedTokens;
             run.Finish = done.FinishReason;
+            run.PrefillElapsedTicks = done.PrefillElapsedTicks;
+            run.DecodeElapsedTicks = done.DecodeElapsedTicks;
+            run.PrefillComputeTokens = done.PromptTokenCount - done.PrefixCacheReusedTokens;
+            run.DecodeComputeTokens = done.OutputTokenCount;
         }
         catch (Exception ex)
         {
@@ -700,6 +765,8 @@ internal sealed class Bench
             run.Stats?.VerifySteps ?? 0, run.Stats?.PlainSteps ?? 0, run.Stats?.RollbackSteps ?? 0,
             run.Stats?.ParkedSteps ?? 0, run.Stats?.GovernorWins ?? 0, run.Stats?.GovernorLosses ?? 0,
             run.Stats?.GovernorParkedSteps ?? 0));
+
+    private static double? ComputeMilliseconds(long? ticks) => ticks * (1000.0 / Stopwatch.Frequency);
 
     private async Task<Row> RunAsync(InferenceEngine engine, string scenario, string label, List<int> prompt, int maxNew,
         SamplingConfig cfg, bool expectBatched, int sharedPrefix = 0, string requestId = null)
@@ -747,8 +814,14 @@ internal sealed class Bench
             decodeTps, run.Tokens.Count, run.TotalMs, run.Finish,
             run.Stats?.TokensDrafted ?? 0, run.Stats?.TokensAccepted ?? 0, run.Stats?.VerifySteps ?? 0,
             run.Stats?.PlainSteps ?? 0, run.Stats?.RollbackSteps ?? 0, string.Join(" | ", notes))
-        { Tokens = run.Tokens, TokenTimesMs = run.TokenTimesMs, StartedUnixMilliseconds = run.StartedUnixMilliseconds,
-          RequestTimelines = new List<RequestTimeline> { ToTimeline(run) } };
+        {
+            Tokens = run.Tokens, TokenTimesMs = run.TokenTimesMs, StartedUnixMilliseconds = run.StartedUnixMilliseconds,
+            RequestTimelines = new List<RequestTimeline> { ToTimeline(run) },
+            PrefillComputeMs = ComputeMilliseconds(run.PrefillElapsedTicks),
+            DecodeComputeMs = ComputeMilliseconds(run.DecodeElapsedTicks),
+            PrefillComputeTokens = run.PrefillComputeTokens,
+            DecodeComputeTokens = run.DecodeComputeTokens,
+        };
         Add(row);
         return row;
     }
@@ -761,7 +834,11 @@ internal sealed class Bench
             : string.Empty;
         Console.WriteLine($"    {row.Label}: prompt {row.Prompt} reused {row.Reused} fresh {row.Fresh} | steps {row.Steps} " +
                           $"(prefill {row.PrefillSteps} x {row.TokensPerPrefillStep:0} tok) | ttft {row.TtftMs:0} ms " +
-                          $"prefill {row.PrefillTps:0} tok/s decode {row.DecodeTps:0.0} tok/s | {row.OutTokens} tokens ({row.Finish}){spec}");
+                          $"delivery prefill {row.PrefillTps:0} tok/s decode {row.DecodeTps:0.0} tok/s | {row.OutTokens} tokens ({row.Finish}){spec}");
+        if (row.PrefillComputeMs is double promptMs && row.DecodeComputeMs is double decodeMs)
+            Console.WriteLine($"      compute: prefill {promptMs:0.0} ms / {row.PrefillComputeTokens} tokens ({row.PrefillComputeTps:0.00} tok/s); " +
+                              $"decode {decodeMs:0.0} ms / {row.DecodeComputeTokens} tokens including EOS ({row.DecodeComputeTps:0.00} tok/s); " +
+                              $"total wall {row.TotalMs:0.0} ms");
         if (row.Tokens != null && row.Tokens.Count > 0)
             Console.WriteLine($"      text: {Shorten(_model.Tokenizer.Decode(row.Tokens), 110)}");
         if (!string.IsNullOrEmpty(row.Note))
@@ -864,7 +941,7 @@ internal sealed class Bench
     public void PrintTable()
     {
         Console.WriteLine();
-        Console.WriteLine("| scenario | request | prompt | reused | fresh | steps | prefill steps | tok/prefill step | ttft ms | prefill tok/s | decode tok/s | out | drafted | accepted | verify | plain | note |");
+        Console.WriteLine("| scenario | request | prompt | reused | fresh | steps | prefill steps | tok/prefill step | ttft ms | delivery prefill tok/s | delivery decode tok/s | out | drafted | accepted | verify | plain | note |");
         Console.WriteLine("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |");
         foreach (Row r in _rows)
         {
@@ -885,8 +962,11 @@ internal sealed class Bench
         {
             r.Scenario, r.Label, r.Prompt, r.Reused, r.Fresh, r.Steps, r.PrefillSteps, r.TokensPerPrefillStep,
             r.TtftMs, r.PrefillTps, r.DecodeTps, r.OutTokens, r.TotalMs, r.Finish,
+            r.PrefillComputeMs, r.DecodeComputeMs, r.PrefillComputeTokens, r.DecodeComputeTokens,
+            r.PrefillComputeTps, r.DecodeComputeTps,
             r.Drafted, r.Accepted, r.VerifySteps, r.PlainSteps, r.Rollbacks, Note = r.AllNotes,
-            r.Tokens, r.TokenCounts, r.TokenTimesMs, r.StartedUnixMilliseconds, r.RequestTimelines, r.ConcurrentDecode,
+            r.Tokens, Text = _model.Tokenizer.Decode(r.Tokens),
+            r.TokenCounts, r.TokenTimesMs, r.StartedUnixMilliseconds, r.RequestTimelines, r.ConcurrentDecode,
             r.ArrivalOrderFixed,
         }), opts));
         Console.WriteLine($"[agent-turn-bench] rows written to {path}");

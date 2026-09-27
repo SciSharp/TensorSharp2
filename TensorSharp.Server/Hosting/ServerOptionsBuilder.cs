@@ -44,6 +44,7 @@ public static class ServerOptionsBuilder
         // Program.cs checks the same table before this is called; checking here too
         // keeps every caller of Build on the same message.
         TensorSharp.Runtime.RemovedCliFlags.RejectRemoved(args);
+        var parallelismArgs = new List<string>();
 
         ParseArgs(args,
             out string? configuredModel,
@@ -61,7 +62,9 @@ public static class ServerOptionsBuilder
             out ListenOverrides configuredListen,
             out UploadLimitOverrides configuredUploads,
             out bool configuredNoWebUi,
-            out bool configuredNoPrefixCache);
+            out bool configuredNoPrefixCache,
+            parallelismArgs);
+        TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray());
 
         if (!string.IsNullOrWhiteSpace(configuredMmProj) && string.IsNullOrWhiteSpace(configuredModel))
             throw new ArgumentException("--mmproj requires --model.");
@@ -648,86 +651,16 @@ public static class ServerOptionsBuilder
         return applied;
     }
 
-    /// <summary>
-    /// Translate the tensor-parallelism flags (<c>--tp N</c> /
-    /// <c>--tp-node-id N</c> / <c>--tp-peers host:port,...</c>) into the
-    /// <c>TENSORSHARP_TP_*</c> env vars the model loader already reads:
-    /// <c>ModelBase.Create</c> picks up the local degree and
-    /// <c>DistributedTpConfig.TryFromEnvironment</c> picks up the multi-node
-    /// pair when the startup model is loaded. Mirrors the CLI's flags so a
-    /// single command line drives multi-GPU serving without env vars. Must
-    /// run before <see cref="StartupModelLoader"/> so the very first model
-    /// load is sharded. Returns true when at least one flag was applied so
-    /// the caller can emit a startup-log line.
-    /// </summary>
+    /// <summary>Apply the shared, validated tensor-parallel or layer-split configuration.</summary>
     public static bool ApplyTensorParallelCliFlags(string[] args)
     {
-        if (args == null || args.Length == 0)
-            return false;
-
-        bool changed = false;
-        bool nodeIdSeen = false;
-        bool peersSeen = false;
-        for (int i = 0; i < args.Length; i++)
-        {
-            if (TryReadOption(args, ref i, "--tp", out string? tpOpt))
-            {
-                if (!int.TryParse(tpOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out int tpDegree) || tpDegree < 1)
-                    throw new ArgumentException($"Invalid value for --tp: '{tpOpt}'. Expected the number of local GPUs to split the model across (an integer >= 1).");
-                Environment.SetEnvironmentVariable("TENSORSHARP_TP_DEGREE", tpDegree.ToString(CultureInfo.InvariantCulture));
-                changed = true;
-                continue;
-            }
-            if (TryReadOption(args, ref i, "--tp-node-id", out string? nodeIdOpt))
-            {
-                if (!int.TryParse(nodeIdOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out int nodeId) || nodeId < 0)
-                    throw new ArgumentException($"Invalid value for --tp-node-id: '{nodeIdOpt}'. Expected this node's 0-based ID within the distributed TP cluster.");
-                Environment.SetEnvironmentVariable("TENSORSHARP_TP_NODE_ID", nodeId.ToString(CultureInfo.InvariantCulture));
-                nodeIdSeen = true;
-                changed = true;
-                continue;
-            }
-            if (TryReadOption(args, ref i, "--tp-peers", out string? peersOpt))
-            {
-                // Validate the host:port list now so a malformed endpoint
-                // fails at startup with the flag name, not later inside the
-                // model load with a bare parse error.
-                try
-                {
-                    TensorSharp.Distributed.DistributedTpConfig.ParsePeers(peersOpt);
-                }
-                catch (Exception ex) when (ex is ArgumentException or FormatException)
-                {
-                    throw new ArgumentException(
-                        $"Invalid value for --tp-peers: '{peersOpt}'. Expected a comma-separated host:port list " +
-                        $"(e.g. 192.168.1.10:9500,192.168.1.11:9500). {ex.Message}");
-                }
-                Environment.SetEnvironmentVariable("TENSORSHARP_TP_PEERS", peersOpt);
-                peersSeen = true;
-                changed = true;
-                continue;
-            }
-        }
-
-        // Distributed mode needs BOTH the node id and the peer list;
-        // DistributedTpConfig silently stays single-node when either is
-        // missing, so a half-configured pair would run without TP and the
-        // operator would only notice via slow/OOM inference. Fail fast
-        // instead. Checked against the resulting env state so one half may
-        // legitimately come from the environment.
-        if (nodeIdSeen || peersSeen)
-        {
-            bool haveNodeId = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID"));
-            bool havePeers = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS"));
-            if (haveNodeId != havePeers)
-            {
-                throw new ArgumentException(haveNodeId
-                    ? "--tp-node-id requires --tp-peers (comma-separated host:port list of all nodes in the cluster)."
-                    : "--tp-peers requires --tp-node-id (this node's 0-based ID within the cluster).");
-            }
-        }
-
-        return changed;
+        var parallelismArgs = new List<string>();
+        // Use the host's existing operand consumption rather than scanning values
+        // as options. Unknown flags are left to Build's normal diagnostic pass.
+        ParseArgs(args ?? Array.Empty<string>(), out _, out _, out _, out _, out _, out _, out _,
+            out _, out _, out _, out _, out _, out _, out _, out _, out _,
+            parallelismArgs, ignoreUnknownOptions: true);
+        return TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray()).ApplyEnvironment();
     }
 
     /// <summary>
@@ -1255,7 +1188,9 @@ public static class ServerOptionsBuilder
         out ListenOverrides configuredListen,
         out UploadLimitOverrides configuredUploads,
         out bool configuredNoWebUi,
-        out bool configuredNoPrefixCache)
+        out bool configuredNoPrefixCache,
+        List<string>? parallelismArgs = null,
+        bool ignoreUnknownOptions = false)
     {
         configuredModel = null;
         configuredMmProj = null;
@@ -1598,13 +1533,9 @@ public static class ServerOptionsBuilder
             {
                 continue;
             }
-            // Tensor-parallelism flags are consumed by
-            // ApplyTensorParallelCliFlags(args) in a separate earlier pass;
-            // skip them (and their values) here so they don't trip the
-            // unknown-arg trap below.
-            if (TryReadOption(args, ref i, "--tp", out _)
-                || TryReadOption(args, ref i, "--tp-node-id", out _)
-                || TryReadOption(args, ref i, "--tp-peers", out _))
+            // Collect at option boundaries after other options have consumed
+            // their operands; --stop "--layer-split=2" is literal stop text.
+            if (TensorSharp.Distributed.ModelParallelismOptions.TryCollect(args, ref i, parallelismArgs))
             {
                 continue;
             }
@@ -1689,6 +1620,9 @@ public static class ServerOptionsBuilder
             {
                 continue;
             }
+
+            if (ignoreUnknownOptions)
+                continue;
 
             // Anything else that starts with `--` is an unknown flag and we
             // refuse to start. Previously these were silently dropped, so a

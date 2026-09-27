@@ -8,8 +8,10 @@
 // the CPU backend (`ggml_cpu`) and - when TS_TEST_GLM_CUDA=1 - the native
 // executor on CUDA (`ggml_cuda`):
 //
-//   0. (the `ggml_cuda` rows are opt-in: TS_TEST_GLM_CUDA=1 with the default
-//      cpu backend pin, because the GLM executor picks its CUDA devices itself)
+//   0. The `ggml_cuda` rows are opt-in: TS_TEST_GLM_CUDA=1 and
+//      TS_TEST_GGML_BACKEND=cuda, in a separate process from the ggml_cpu rows.
+//      The public model factory also creates a managed allocator for vision,
+//      so its process-wide backend pin must agree with the requested backend.
 //   1. the speculative loop with the weight-free n-gram drafter emits exactly
 //      the plain greedy stream, with drafts proposed and windows partially
 //      rejected, so the rollback actually ran (the prompt is built from the

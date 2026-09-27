@@ -18,11 +18,15 @@ namespace TensorSharp.Models
             Aliases = new[] { "deepseek41" },
             MultiGpu = MultiGpuMode.LayerSplit,
             MultiGpuLimitation = "DeepSeek V4.1 (deepseek41) uses a single-process native executor with layer placement and optional routed-MoE tensor parallelism; full attention tensor parallelism and distributed groups are not implemented.",
+            SupportsNativeTensorParallel = (degree, backend) => backend == BackendType.GgmlCuda &&
+                degree > 1 && ResolveRoutedMoeTensorParallelRanks(degree) == degree,
             DescribeMultiGpuPlacement = DescribePlacement,
-            ApplyNativeTunables = c => ValidateLoad(c.GgufPath, c.Backend, c.DraftModelPath, c.TpDegree, c.TpGroup),
+            LayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.Cuda },
+            ApplyNativeTunables = c => ValidateLoad(c.GgufPath, c.Backend, c.DraftModelPath,
+                Math.Max(c.TpDegree, c.LayerSplitDegree), c.TpGroup),
             ProjectorFileHints = new[] { "deepseek41.vision.gguf" },
             Factory = c => new DeepSeek41Model(c.GgufPath, c.Backend,
-                Math.Max(c.TpDegree, c.LayerSplitDegree), c.TpGroup, c.DraftModelPath),
+                c.TpDegree, c.TpGroup, c.DraftModelPath, c.LayerSplitDegree),
         };
 
         internal static void ValidateLoad(string ggufPath, BackendType backend, string draftModelPath,
@@ -159,7 +163,7 @@ namespace TensorSharp.Models
             if (ranks > 0 && selectedGpuCount > 0 && ranks != selectedGpuCount)
                 throw new ArgumentException(
                     $"TS_DSV41_TP={ranks} must equal the selected GPU count ({selectedGpuCount}); " +
-                    "set --tp and TS_DSV4_NGPU consistently. TS_DSV4_NGPU overrides --tp.");
+                    "set TS_DSV41_TP and TS_DSV4_NGPU consistently. --layer-split selects whole-layer placement only.");
             return ranks;
         }
 

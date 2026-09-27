@@ -308,9 +308,10 @@ namespace TensorSharp.Runtime
         /// </summary>
         void TrimPreparedPrompt(int trimStartTokenCount, string? requestId = null);
 
-        /// <summary>True if the request has any prepared (not-yet-fully-consumed) embeddings.
-        /// The engine uses this to force the per-seq forward path for multimodal sequences,
-        /// because the batched paged path doesn't currently know how to inject embeddings.</summary>
+        /// <summary>True if the request has prepared embeddings. They remain available
+        /// after prefill for replay or retry, until ClearPreparedPromptState is called.
+        /// Prefill needs a path that injects these embeddings; decode does not inject
+        /// them again. The batched paged path may have further media restrictions.</summary>
         bool HasPendingEmbeddings(string requestId);
 
         /// <summary>The media spans prepared for <paramref name="requestId"/>, in prompt

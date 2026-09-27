@@ -89,8 +89,12 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 
 张量并行把一个模型切分到 N 张 GPU 上，可运行在 Direct `cuda` 后端以及 GGML CUDA /
 Vulkan 后端（`--backend ggml_cuda`、`ggml_vulkan`）。Qwen 3.8 Flash Next 与
-DeepSeek V4 / V4.1 会把同一参数用于按层切分：每张 GPU 拿一段连续的完整层。GLM 5.x
-不传参数时也默认按层切分，而 GGML GPU 后端上的 `--tp N` 会选择其原生本地张量并行路径。
+DeepSeek V4 / V4.1 的按层切分改用独立的 `--layer-split N` 参数：每张 GPU 拿一段连续的完整层。
+`--tp N` 仅表示张量并行，两种模式互斥；不支持的请求会在启动时失败。
+按层切分仅支持单节点，不能与 `--tp-node-id` / `--tp-peers` 组合。
+现有按层切分命令需将 `--tp N` 改为 `--layer-split N`，或设置
+`TENSORSHARP_LAYER_SPLIT_DEGREE=N`。未配置两种模式时默认使用单设备。GLM 5.x 的 `--layer-split N` 选择整层放置，
+GGML GPU 后端上的 `--tp N` 则选择原生本地张量并行路径。
 对 Qwen-Image-2.1，`--tp N` 只切分扩散 Transformer（DiT），文本 / 视觉编码器与 VAE 留在第一张 GPU 上。请先安装 CUDA 工具包，然后：
 
 ```bash
@@ -226,9 +230,9 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 | 架构 | GGUF 架构标识 | 示例模型 | 多模态 | 思维链 | 工具调用 | MTP 投机 | 卡片 |
 |---|---|---|---|---|---|---|---|
 | BERT / XLM-R 嵌入 | `bert` | Snowflake Arctic Embed L v2.0、all-MiniLM-L6-v2 | 文本 → 向量 | — | — | — | [嵌入指南](docs/embeddings_zh-cn.md) |
-| DeepSeek V4.1 Flash | `deepseek41` | DeepSeek-V4.1-Flash（40 层，384 个路由专家 top-6 加一个共享专家，四条残差流与延迟 hyper-connection 混合，Engram n-gram 特征，声明 1M 上下文） | 文本；配合准备好的视觉伴随文件（`--mmproj`）支持图像与视频，音频请求被拒绝 | 支持 | 支持（带空格的 DSML，受语法约束） | 实验性：可在 `ggml_cuda`/`ggml_cpu` 上通过 `--draft-model` 加载 `deepseek41-dspark` 草稿模型；仅在合成夹具上验证，尚无训练好的草稿模型实测（V4 的草稿模型会被拒绝） | [deepseek41](docs/models/deepseek41_zh-cn.md) |
+| DeepSeek V4.1 Flash | `deepseek41` | DeepSeek-V4.1-Flash（40 层，384 个路由专家 top-6 加一个共享专家，四条残差流与延迟 hyper-connection 混合，Engram n-gram 特征，声明 1M 上下文） | 文本；配合准备好的视觉伴随文件（`--mmproj`）支持图像与视频，音频请求被拒绝 | 支持 | 支持（带空格的 DSML，受语法约束） | 实验性：可在 `ggml_cuda`/`ggml_cpu` 上通过 `--draft-model` 加载 `deepseek41-dspark` 草稿模型；训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证（V4 的草稿模型会被拒绝） | [deepseek41](docs/models/deepseek41_zh-cn.md) |
 | DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash（284B MoE，256 专家，压缩稀疏注意力，1M 上下文） | 仅文本 | 支持 | 支持（DSML） | 支持（DSpark 块级草稿，独立 GGUF） | [deepseek4](docs/models/deepseek4_zh-cn.md) |
-| GLM 5.x | `glm-dsa`、`glm_dsa`、`glm5next` | GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文）、[GLM-5.3](docs/models/glm_zh-cn.md#glm-53glm-dsa)（与 5.2 完全相同的 79 层 `glm-dsa` 形态——78 层主干加 1 个 NextN，256 个路由专家 top-8 外加 1 个共享专家，带 lightning indexer 的 MLA，rope base 8e6——因此直接走 GLM-5.2 的加载路径，既不需要新代码也不需要新开关；仅文本）、GLM-5.3-Flash（320B MoE，288 专家，KDA 线性注意力 + NoPE MLA 与池化索引器） | 仅文本（5.2 与 5.3）、图像（5.3-Flash） | 支持 | 支持（XML 工具调用） | GLM-5.2 与 GLM-5.3 支持（内嵌 NextN 块；5.3 上投机在默认的按层切分下生效，即不传 `--tp` 时） | [glm](docs/models/glm_zh-cn.md) |
+| GLM 5.x | `glm-dsa`、`glm_dsa`、`glm5next` | GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文）、[GLM-5.3](docs/models/glm_zh-cn.md#glm-53glm-dsa)（与 5.2 完全相同的 79 层 `glm-dsa` 形态——78 层主干加 1 个 NextN，256 个路由专家 top-8 外加 1 个共享专家，带 lightning indexer 的 MLA，rope base 8e6——因此直接走 GLM-5.2 的加载路径，既不需要新代码也不需要新开关；仅文本）、GLM-5.3-Flash（320B MoE，288 专家，KDA 线性注意力 + NoPE MLA 与池化索引器） | 仅文本（5.2 与 5.3）、图像（5.3-Flash） | 支持 | 支持（XML 工具调用） | GLM-5.2 与 GLM-5.3 支持（内嵌 NextN 块；5.3 上投机在单设备或显式 `--layer-split N` 模式下生效，不启用张量并行） | [glm](docs/models/glm_zh-cn.md) |
 | Qwen 3.8 Flash Next | `qwen4exp` | Qwen3.8-Flash-Next（混合 MoE，512 专家 / 激活 10 个，48 层中 36 层为 GatedDeltaNet 并与 QSA 索引的全注意力层交错，PLE n-gram 块，×4 超连接） | 图像、视频（`video_url`） | 支持 | 支持（Qwen XML / JSON 工具调用） | 支持（共享 MTP 头，独立 GGUF，经 `--draft-model` 加载；需 GGML 后端） | [qwen38-flash-next](docs/models/qwen38-flash-next_zh-cn.md) |
 | Gemma 4 | `gemma4` | gemma-4-E4B、gemma-4-12B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 | 支持（独立草稿 GGUF） | [gemma4](docs/models/gemma4_zh-cn.md) |
 | Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5/3.6-35B-A3B（MoE）、Qwen3.8-27B（稠密混合） | 图像 | 支持 | 支持 | 支持：Qwen 3.6 与 Qwen 3.8 27B 内嵌 NextN（`--spec`）；Qwen 3.8 27B 另可经 `--draft-model` 加载 DFlash2 块级草稿（独立 GGUF） | [qwen35](docs/models/qwen35_zh-cn.md) |

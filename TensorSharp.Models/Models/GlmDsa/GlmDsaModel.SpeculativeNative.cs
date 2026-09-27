@@ -45,7 +45,13 @@ namespace TensorSharp.Models
             string glm = Environment.GetEnvironmentVariable("TS_GLM_MTP");
             if (!string.IsNullOrEmpty(glm))
                 return glm != "0";
-            return SpeculationOptions.FromEnvironment().Enabled;
+            var options = SpeculationOptions.FromEnvironment();
+            // N-gram drafting uses the trunk's verify/rollback path and no
+            // learned weights. Loading NextN would consume VRAM for a block
+            // that the selected algorithm cannot call (or print a misleading
+            // standard-decode fallback notice on glm5next).
+            return options.Enabled && !string.Equals(options.SpeculatorName,
+                SpeculatorRegistry.NGram, StringComparison.OrdinalIgnoreCase);
         }
 
         private void SpecForwardNative(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)

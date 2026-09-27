@@ -210,9 +210,11 @@ inline bool pack(const split_costs & c, bool engram_device, double frac, int n_c
     {
         for (int il = n_cpu; il < c.n_layer(); ++il)
             for (int d = 0; d < c.tp_ranks; ++d) fixed[(size_t) d] += c.tp_bytes[(size_t) il][(size_t) d];
-        for (int d = 0; d < n_gpu; ++d)
-            if (fixed[(size_t) d] > (size_t) (c.dev_budget[(size_t) d] * frac)) return false;
     }
+    // Embedding/output/drafter residents and TP strips exist even on devices
+    // with no trunk layers. Validate every selected device in every mode.
+    for (int d = 0; d < n_gpu; ++d)
+        if (fixed[(size_t) d] > (size_t) (c.dev_budget[(size_t) d] * frac)) return false;
     int dev = 0;
     size_t used = fixed[0];
     for (int il = 0; il < c.n_layer(); il++)

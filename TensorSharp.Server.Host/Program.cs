@@ -231,7 +231,7 @@ bool moeCpuOffloadFlagsApplied = ServerOptionsBuilder.ApplyMoeCpuOffloadCliFlags
 // which Vulkan device the ggml_vulkan backend initializes on. Must run before
 // the startup model is loaded (the device is fixed at first backend init).
 bool gpuDeviceFlagApplied = ServerOptionsBuilder.ApplyGpuDeviceCliFlag(args);
-// Translate --tp / --tp-node-id / --tp-peers into the TENSORSHARP_TP_* env vars
+// Translate --tp / --layer-split and distributed options into the model placement env vars
 // the model loader reads (ModelBase.Create for the local degree,
 // DistributedTpConfig for the multi-node pair). Must run before the startup
 // model is loaded so the very first load is sharded across the GPUs.
@@ -476,8 +476,9 @@ if (gpuDeviceFlagApplied)
 if (tensorParallelFlagsApplied)
 {
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "Tensor parallelism configured via CLI: degree={TpDegree} nodeId={TpNodeId} peers={TpPeers}",
+        "Model placement configured via CLI: tensorParallelDegree={TpDegree} layerSplitDegree={LayerSplitDegree} nodeId={TpNodeId} peers={TpPeers}",
         Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE") ?? "1",
+        Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE") ?? "1",
         Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID") ?? "(single-node)",
         Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS") ?? "(none)");
 }
@@ -732,14 +733,13 @@ StartupBanner.Emit(startupLogger, hostingOptions, hostingOptions.ListenUrls);
 // Tear down the process-global GGML backend after the host stops. On macOS
 // the ggml-metal device's C++ static destructor asserts that its resource
 // set is empty; if g_backend (and its MTLBuffer wrappers) outlive the .NET
-// host the assertion aborts the process during exit. ApplicationStopped
-// fires after all hosted services have shut down, so all in-flight
-// inference is already complete. The shutdown call is idempotent and a
+// host the assertion aborts the process during exit. ApplicationStopped is
+// too early: DI still owns models whose native draft heads need the backend
+// while being disposed. Release the host and its services first. Shutdown is idempotent and a
 // no-op when no GGML backend was ever initialised. Also hooked onto
 // ProcessExit as a safety net for non-graceful exits.
 if (!hostingOptions.UsesManagedEmbeddingBackend)
 {
-    app.Lifetime.ApplicationStopped.Register(static () => GgmlBasicOps.Shutdown());
     AppDomain.CurrentDomain.ProcessExit += static (_, _) => GgmlBasicOps.Shutdown();
 }
 
@@ -747,4 +747,13 @@ if (!hostingOptions.UsesManagedEmbeddingBackend)
 // then PORT / HOST / ASPNETCORE_URLS, then http://0.0.0.0:5000). Passing it to
 // Run() overrides anything the host builder configured, so ASPNETCORE_URLS is
 // folded into that resolution rather than being silently discarded here.
-app.Run(hostingOptions.ListenUrls);
+try
+{
+    await app.RunAsync(hostingOptions.ListenUrls);
+}
+finally
+{
+    await app.DisposeAsync();
+    if (!hostingOptions.UsesManagedEmbeddingBackend)
+        GgmlBasicOps.Shutdown();
+}

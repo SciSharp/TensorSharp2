@@ -168,6 +168,21 @@ kernel 按批宽度选择：`SharedPrefixChunking_…` 在 CUDA 上把差异上�
 
 ## 共享 MTP 头的投机解码
 
+图像请求也可使用学习得到的草稿头：调度器在每个投机 prefill 块之前排入对应的图像
+embedding，并保留其 MRoPE 位置。prefill 后为重试保留的图像片段不再阻止投机 decode。
+这仍要求单独请求从位置 0 开始 prefill；下述保留前缀与并发请求限制仍然适用。
+
+2026-09-27 另以 UD-IQ1_S、两张 RTX PRO 4000 Blackwell、`--layer-split 2`、
+上下文 1024、常驻共享 Q8_0 MTP 头及 BF16 视觉伴随文件验证。一次预热后，三轮实测的
+文本/图像输出均与普通贪心逐 token 一致，MTP 与 ngram 都有实际起草。文本在 64 token
+上限停止；图像回答在 204 个可见 token 后以 EOS 完成，数字与颜色描述正确。MTP 的逐轮
+配对 decode 工作线程计算时间加速比中位数为文本 1.215 倍、图像 1.292 倍。图像请求计时
+不包含同步图像准备与编码；这些短文本复制检查不代表通用质量或完整媒体请求延迟。
+另外，普通/MTP HTTP 两种模式各通过 24/24 文本请求与 3/3 图像场景，包含附件顺序与
+历史图像。该配置因余量不足拒绝保留缓存，因此后续轮次重新 prefill。本地证据：
+`docs/validation/model-matrix-20260927/qwen38/SUMMARY.md`（不提交）。该架构仍不支持
+真正的张量并行或跨节点执行。
+
 `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` 挂上逐 token 的 MTP 块（仅限 GGML 后端；该头必须是单个 GGUF 文件，并在模型加载时挂上）；它只为从位置 0 开始
 prefill 的单独请求做投机（与其他序列共享的步，以及延续保留 holder 或共享前缀克隆的轮次，都按普通
 方式解码——草稿头有自己的 K/V，无法跨越它从未重放过的位置起草）。在 UD-Q2_K_XL、三 GPU 按层切分
@@ -217,11 +232,11 @@ KV 状态相同，logits 仍与逐 token decode 不同。启用 CPU 路径后严
 
 ## 多 GPU
 
-`qwen4exp` 上的 `--tp N` 跑的是**按层切分**：每张 GPU 持有一段连续的完整层。它不是
+`qwen4exp` 上的 `--layer-split N` 跑的是**按层切分**：每张 GPU 持有一段连续的完整层。它不是
 张量并行——`qwen4exp` 不切分任何权重——而且这也正是 llama.cpp 为该架构提供的
 （唯一）多 GPU 模式（`-sm row` 直接拒绝加载）。它是**容量**特性，不是速度特性：
 单卡装不下时靠它把模型装下。按层切分仅在 `ggml_cuda` 与 `ggml_vulkan` 上可用；其他后端会
-忽略 `--tp N` 并打印警告、只在单个设备上运行；分布式的 `--tp-node-id`/`--tp-peers` 组会被拒绝。
+拒绝 `--layer-split N`；此架构也会拒绝 `--tp N`（张量并行），旧的按层切分命令需迁移到 `--layer-split N`。分布式的 `--tp-node-id`/`--tp-peers` 组会被拒绝。
 
 实测：2× A100-80GB，Qwen3.8-Flash-Next-UD-Q2_K_XL（73.4 GiB）：
 
@@ -247,15 +262,16 @@ GPU 0 上。
 一是已发布的 Q8_0 分片里**完全没有** `nextn` / `mtp` 张量，因此 `mtp_supported`
 为 false，`--mtp on` 的格子会带着理由被跳过，而不是悄悄按普通解码跑掉。
 
-二是**本模型只能跑在会传 `--tp N` 的那一列上**。原因就在上一节：切分度来自 `--tp`，
-所以在不传 `--tp` 的后端列上，TensorSharp 只会建单设备上下文，175.3 GiB 会全部压到
+二是**本模型只能跑在会传 `--layer-split N` 的那一列上**。原因就在上一节：切分度来自 `--layer-split`，
+所以在不传 `--layer-split` 的后端列上，TensorSharp 只会建单设备上下文，175.3 GiB 会全部压到
 一张卡上。因此配置里给了它 `min_tp`（4，仅按权重算出的下限——8 才是这台 8×A40 机器
-应当使用的度数），在不传 `--tp` 的那一列上，这些格子会被记为
-`needs --tp 4 (does not fit 1 GPU(s))` 的跳过，而不是留给它去 OOM。跑法：
+应当使用的度数），在不传 `--layer-split` 的那一列上，这些格子会被记为
+`needs --tp 4 (does not fit 1 GPU(s))` 的跳过，而不是留给它去 OOM。这里的 `--tp` 是
+基准工具保留的 GPU 数量选择参数；所选后端列向 TensorSharp 传入的是 `--layer-split`。跑法：
 
 ```
 python run_matrix.py --config benchmark_config_glm53_qwen38.json \
-    --models qwen38-flash-next --backends ggml_cuda_tp
+    --models qwen38-flash-next --backends ggml_cuda_split
 ```
 
 那一列会让 llama.cpp 用 `--split-mode layer` 切在同样这些 GPU 上，于是参照列两边是

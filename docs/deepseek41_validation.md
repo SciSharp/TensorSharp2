@@ -168,10 +168,11 @@ with `eng/dsv41-verify-download.py CHECKPOINT_DIRECTORY --report REPORT.json`;
 this reads every model byte and should run outside throughput measurements.
 
 The [matrix config](../benchmarks/engine_comparison/benchmark_config_deepseek41.json)
-provides server lifecycle and placement plans. Its `--tp` number denotes **GPU
-count** in the explicitly named `ggml_cuda_layer` and
-`ggml_cuda_layer_cpu_moe4` profiles. Those are contiguous layer placement,
-not tensor parallelism. `ggml_cuda_true_tp` explicitly sets `TS_DSV41_TP` to
+provides server lifecycle and placement plans. The harness retains `--tp` as
+its **GPU-count sweep**; the explicitly named `ggml_cuda_layer` and
+`ggml_cuda_layer_cpu_moe4` profiles launch the inference server with
+`--layer-split N`. Those are contiguous whole-layer placement, not tensor
+parallelism. The server reserves `--tp N` for tensor parallelism only. `ggml_cuda_true_tp` explicitly sets `TS_DSV41_TP` to
 the requested rank count: every routed expert's gate/up matrices use column
 shards and its down matrix uses matching row shards. Ranks execute concurrently;
 the current reduction stages F32 partial outputs through the host. Attention

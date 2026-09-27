@@ -297,7 +297,7 @@ logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输�
 | 算法 | 草稿器 |
 |---|---|
 | `draft-head` | 逐 token 草稿头。主干 GGUF 中内嵌的 NextN / MTP（`{arch}.nextn_predict_layers`：Qwen 3.6、Qwen 3.8 27B、GLM 5.2、GLM-5.3）；通过 `--draft-model` 加载的 Gemma 4 独立 EAGLE 风格 `gemma4-assistant` GGUF，其草稿层读取**目标**最后一个 local / global 层的 KV（自身无 K/V）；通过 `--draft-model` 加载的 Qwen 3.8 Flash Next 共享 MTP 头 GGUF，它保留自己的 K/V，因此只对从位置 0 开始 prefill 的请求投机。 |
-| `block` | 通过 `--draft-model` 加载的块级草稿器：DeepSeek V4 DSpark，以及用于 Muse-Glimmer 与 Qwen 3.5 家族的 DFlash / DFlash2。DeepSeek V4.1 DSpark 是实验性的：`ggml_cuda` / `ggml_cpu` 上的 `deepseek41-dspark` 草稿器，只在合成夹具上验证过。 |
+| `block` | 通过 `--draft-model` 加载的块级草稿器：DeepSeek V4 DSpark，以及用于 Muse-Glimmer 与 Qwen 3.5 家族的 DFlash / DFlash2。DeepSeek V4.1 DSpark 是实验性的：`ggml_cuda` / `ggml_cpu` 上的 `deepseek41-dspark` 草稿器，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。 |
 | `ngram` | 无需权重：在序列自身的 token 上做后缀匹配。 |
 
 草稿被拒时，Qwen 3.5 家族主干恢复其 GatedDeltaNet 递归状态（GGML 融合验证为每一行保留快照，
@@ -329,7 +329,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 | Hunyuan Dense | 默认 `ForwardBatch` 路径，使用 F32 分页缓冲。块量化（`q8_0` / `q4_0`）KV cache 会保留 KV 快照换入路径，该路径能精确处理这些 dtype。 | `TS_HUNYUAN_BATCHED=0` 强制走快照路径。 |
 | Muse-Glimmer | 没有 `ForwardBatch`（它不是 `IBatchedPagedModel`）：并发请求走按序列 KV 换入回退路径，把每个序列的 K/V 快照到主机内存，`--tp` 下同样如此。属于 Radix 页面家族（主机 slab 页面）。只在加载了 DFlash 草稿器（`--draft-model`）时投机。 | 没有批处理开关；`TS_MUSE_GLIMMER_*` 是内核 A/B 开关（见 [Muse-Glimmer 模型卡](models/muse-glimmer_zh-cn.md#7-环境变量)）。 |
 | DeepSeek V4 / V4.1 | 没有 `ForwardBatch`：压缩注意力缓存没有分页布局。并发由原生执行器的序列 slot 承担（纯 C# `cpu` 与直连 CUDA `cuda` 执行器保持串行）。默认启用的 token 批量融合 decode 每步只读一遍权重，最多 16 个序列，更多时分窗口执行；加载了 DSpark 草稿器时不启用。V4.1 可以把已结束会话的 slot 保留给它的下一轮（需显式开启）。 | `TS_BATCHED_FUSED_DECODE=0`；`TS_DSV41_RETAINED_CACHE=1` 在 V4.1 上启用 slot 保留，预算由 `TS_DSV41_RETAINED_CACHE_MB`（默认 2048）决定。 |
-| Qwen 3.8 Flash Next（`qwen4exp`） | 没有 `ForwardBatch`：并发通过 GGML 融合 span 路径上的按序列状态 holder 实现，逐个序列 decode（没有 token 批量融合 decode）。已结束的会话会被保留，共享提示前缀会被做成检查点并克隆到新会话中，仅限精确前缀。`--tp N` 是按层切分（qwen4exp 没有张量并行模式），保留与检查点在按层切分下都可用。共享 MTP 头（`--draft-model`）只对从位置 0 开始 prefill 的单序列请求投机。 | `TS_Q4E_RETAINED_CACHE=0` 关闭保留与检查点；`TS_Q4E_RETAINED_CACHE_MB`（默认 4096）是二者共用的预算。 |
+| Qwen 3.8 Flash Next（`qwen4exp`） | 没有 `ForwardBatch`：并发通过 GGML 融合 span 路径上的按序列状态 holder 实现，逐个序列 decode（没有 token 批量融合 decode）。已结束的会话会被保留，共享提示前缀会被做成检查点并克隆到新会话中，仅限精确前缀。`--layer-split N` 是按层切分（qwen4exp 没有张量并行模式），保留与检查点在按层切分下都可用。共享 MTP 头（`--draft-model`）只对从位置 0 开始 prefill 的单序列请求投机。 | `TS_Q4E_RETAINED_CACHE=0` 关闭保留与检查点；`TS_Q4E_RETAINED_CACHE_MB`（默认 4096）是二者共用的预算。 |
 | DiffusionGemma | 独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求，并可选择批处理活跃 canvas。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`、`DIFFUSION_BATCHED_FORWARD`；`DIFFUSION_NO_FUSED_DECODE=1` 关闭 GGML 融合整模型 diffusion decode。 |
 
 ### Radix 前缀缓存
@@ -489,7 +489,7 @@ legacy 模式下为 `the model's live KV cache of this conversation`、
 | `TS_QWEN35_BATCHED_ARENA` / `TS_GPTOSS_BATCHED_ARENA` | `1` | `0` 关闭 Qwen 3.5 家族批量 decode 的 slot-stable arena（该步改为每个序列各跑一次融合前向），或 GPT OSS 的 arena（改用按序列窗口的批量计算图）。 |
 | `TS_RETAINED_FUSED_CACHE` | `1` | 对声明支持的模型，保留已完成请求的 request-owned fused holder，用于精确前缀续接；`0` 关闭（限 VRAM / A/B）。支持的 holder 包括 Gemma 4 K/V、Qwen 3.5/3.6/3.8 的 attention K/V 与 GDN 递归状态、Qwen 3.8 Flash Next 的按序列 holder，以及 `TS_DSV41_RETAINED_CACHE=1` 时 DeepSeek V4.1 的原生 slot；在 Radix 树下它还控制 GLM 5.x 交出的原生 slot。 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | `4` | 保留 fused holder 的 LRU 预算（每个 holder 都会占用模型完整的 per-request 续接状态）；在 Radix 树下，是保留的按会话终态的预算。 |
-| `TS_PREFIX_CHECKPOINTS` | `1` | 在共享提示前缀结束处（由 chat 层在请求上标记的边界）对模型完整状态做检查点，并让每个新会话从其副本开始（GGML 后端上的 Gemma 4；`ggml_cuda` / `ggml_metal` 上的 Qwen 3.5/3.6/3.8，非 TP；GGML token-span 路径上的 Qwen 3.8 Flash Next，包括 `--tp N` 按层切分时）。`0` 关闭。 |
+| `TS_PREFIX_CHECKPOINTS` | `1` | 在共享提示前缀结束处（由 chat 层在请求上标记的边界）对模型完整状态做检查点，并让每个新会话从其副本开始（GGML 后端上的 Gemma 4；`ggml_cuda` / `ggml_metal` 上的 Qwen 3.5/3.6/3.8，非 TP；GGML token-span 路径上的 Qwen 3.8 Flash Next，包括 `--layer-split N` 按层切分时）。`0` 关闭。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | `2` | 同时保留多少个不同共享前缀的检查点（LRU）；在 Radix 树下，是公共检查点的预算。 |
 | `TS_MM_EMBEDDING_CACHE_MB` | `512` | 视觉/音频嵌入缓存的字节预算，缓存以媒体内容（SHA-256）为键；超出后淘汰没有被已准备提示引用的最近最少使用条目。 |
 | `TS_KV_INITIAL_TOKENS` | `0` | 缓存创建时、任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口）。缓存仍按需增长。 |

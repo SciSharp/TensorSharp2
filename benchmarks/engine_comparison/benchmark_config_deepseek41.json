@@ -91,7 +91,8 @@
           "TS_SCHED_PREFILL_CHUNK": "256",
           "TS_SCHED_SOLO_PREFILL_CHUNK": "8192",
           "KV_CACHE_DTYPE": "f16"
-        }
+        },
+        "tp_arg": "--layer-split"
       },
       "llamacpp": {
         "ngl": 999,
@@ -123,7 +124,8 @@
           "TS_SCHED_PREFILL_CHUNK": "256",
           "TS_SCHED_SOLO_PREFILL_CHUNK": "8192",
           "KV_CACHE_DTYPE": "f16"
-        }
+        },
+        "tp_arg": "--layer-split"
       },
       "llamacpp": {
         "ngl": 999,

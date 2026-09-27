@@ -248,6 +248,14 @@ namespace TensorSharp.Runtime.Scheduling
         /// logs it when the request finishes.</summary>
         public SpeculationStats? SpecStats { get; internal set; }
 
+        // Successful cache-recovery forwards run outside the scheduled step's
+        // timer, sometimes while preparing a batch that later declines. Keep
+        // their phase times on the request so completion includes them once even
+        // if that preparation produces no result for this sequence. Worker-only
+        // counters; cache resets and preemption must not erase performed work.
+        internal long ReplayPrefillElapsedTicks { get; set; }
+        internal long ReplayDecodeElapsedTicks { get; set; }
+
         /// <summary>True when this sequence reuses the model's LIVE KV cache
         /// directly (its prompt extends exactly the tokens still resident in the
         /// model's cache from the previous request on the same session), instead of

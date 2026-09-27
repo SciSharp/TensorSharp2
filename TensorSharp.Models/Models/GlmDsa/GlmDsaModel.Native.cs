@@ -34,14 +34,53 @@ namespace TensorSharp.Models
             backend == BackendType.GgmlMetal || backend == BackendType.GgmlCpu;
 
         /// <summary>
-        /// The base constructor must not build a second GPU context for a backend
-        /// the native executor is going to own, and it must not try to page a
-        /// 226 GiB checkpoint through the managed weight loader. Coerce those
-        /// backends to the lightweight GGML CPU allocator; the native side picks
-        /// its own devices from the backend the operator actually asked for.
+        /// Validate before the base constructor initializes its single-rank allocator.
+        /// Keep the requested backend: the process-wide GGML backend may already be
+        /// pinned by host startup or test discovery, and initializing CPU after CUDA
+        /// is an error. The native executor owns multi-GPU placement; the managed
+        /// base never creates a second TP group or loads the native executor's weights.
         /// </summary>
-        private static BackendType NormalizeBackend(BackendType backend)
-            => NativeRequested(backend) ? BackendType.GgmlCpu : backend;
+        private static BackendType ValidateParallelism(BackendType backend, int tpDegree,
+            ITensorParallelGroup tpGroup, int layerSplitDegree)
+        {
+            if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
+            if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
+            if (layerSplitDegree > 1 && (tpDegree > 1 || tpGroup != null))
+                throw new ArgumentException("--layer-split and --tp cannot be combined.");
+            if (layerSplitDegree > 1 && (!NativeRequested(backend) ||
+                backend is not (BackendType.GgmlCuda or BackendType.GgmlVulkan)))
+                throw new NotSupportedException("GLM --layer-split requires the native ggml_cuda or ggml_vulkan executor; remove TS_GLM_NATIVE=0.");
+            if (NativeRequested(backend) && tpGroup != null)
+                throw new NotSupportedException("GLM native tensor parallelism is local/single-process only; remove --tp-node-id/--tp-peers.");
+            string shardOverride = Environment.GetEnvironmentVariable("TS_GLM_TP_SHARD");
+            if (NativeRequested(backend) && tpDegree > 1 && shardOverride != null &&
+                (!int.TryParse(shardOverride, out int shards) || (shards & 3) == 0))
+                throw new ArgumentException("--tp requires weight sharding; TS_GLM_TP_SHARD must enable at least one sharded projection. Unset it or choose a nonzero shard mask.");
+            // Native tuning must not constrain the independent managed executors.
+            // Validate native counts before initializing a backend or opening the GGUF.
+            if (NativeRequested(backend))
+                ResolveNativeGpuCount(tpDegree, layerSplitDegree);
+            return backend;
+        }
+
+        internal static int ResolveNativeGpuCount(int tpDegree, int layerSplitDegree)
+        {
+            int requested = Math.Max(tpDegree, layerSplitDegree);
+            // Matches MAX_GPUS in TensorSharp's native GLM executor. Its device
+            // scan treats the request as a cap, so refuse an unrepresentable count.
+            if (requested > 8)
+                throw new NotSupportedException("The native GLM executor supports at most 8 GPUs; reduce --tp or --layer-split.");
+            string raw = Environment.GetEnvironmentVariable("TS_GLM_NGPU");
+            if (string.IsNullOrWhiteSpace(raw))
+                return requested;
+            if (!int.TryParse(raw, out int count) || count < 0)
+                throw new ArgumentException("TS_GLM_NGPU must be a nonnegative integer (0 selects all visible GPUs).");
+            if (count > 8)
+                throw new NotSupportedException("TS_GLM_NGPU exceeds the native executor's limit of 8 GPUs.");
+            if (requested > 1 && count != requested)
+                throw new ArgumentException($"TS_GLM_NGPU={count} conflicts with the explicitly requested {requested} GPUs; unset it or use the same count.");
+            return count;
+        }
 
         private static bool NativeRequested(BackendType backend)
         {
@@ -85,12 +124,19 @@ namespace TensorSharp.Models
             return int.TryParse(raw, out int v) && v > 0 ? v : fallback;
         }
 
-        private void InitNativeExecutor(string ggufPath, BackendType backend, int tpDegree, int maxContext)
+        private void InitNativeExecutor(string ggufPath, BackendType backend, int tpDegree, int layerSplitDegree, int maxContext)
         {
-            // --tp N means tensor parallelism across N ranks; without it every
-            // visible GPU takes a contiguous run of layers.
+            // --tp shards weights; --layer-split only changes whole-layer placement.
             int tp = tpDegree > 1 ? tpDegree : 1;
-            int nGpu = ParseEnvInt("TS_GLM_NGPU", tp > 1 ? tp : 0);   // 0 = every visible GPU
+            int nGpu = ResolveNativeGpuCount(tpDegree, layerSplitDegree);
+            int requested = Math.Max(tpDegree, layerSplitDegree);
+            if (requested > 1 && backend is BackendType.GgmlCuda or BackendType.GgmlVulkan)
+            {
+                var kind = backend == BackendType.GgmlCuda ? GgmlBackendType.Cuda : GgmlBackendType.Vulkan;
+                int available = GgmlBasicOps.GetGpuDeviceCount(kind);
+                if (available < requested)
+                    throw new InvalidOperationException($"Requested {requested} GPU(s) but the GGML {kind} backend sees only {available}.");
+            }
             // 1024, not llama.cpp's 512: the MoE expert GEMMs pad their tiles to
             // the number of rows routed to each expert, and with 256 experts at
             // top-8 a 512-token chunk leaves only ~16 rows per expert, so half the

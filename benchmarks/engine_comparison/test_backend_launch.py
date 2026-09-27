@@ -42,6 +42,23 @@ def llama_command(cpu_moe=None, **kwargs):
 
 
 class BackendLaunchTests(unittest.TestCase):
+    def test_layer_split_degree_reaches_server_without_tensor_parallel_flag(self):
+        spec = engines.config.BackendSpec(
+            backend_id="test_split", display="layer split", kind="gpu",
+            ts_backend="ggml_cuda", ts_tp=True, ts_tp_arg="--layer-split")
+        model = SimpleNamespace(gguf=Path("/tmp/model.gguf"), mmproj=None,
+                                is_diffusion=False)
+        server = engines.TensorSharpServer(model, "test_split", Path("/tmp/unused.log"), tp=4)
+        with patch.object(engines, "_port_open", return_value=False), \
+             patch.object(engines.config, "BACKENDS", {"test_split": spec}), \
+             patch.object(engines.config, "TENSORSHARP_SERVER_DLL", Path("/tmp/server.dll")), \
+             patch.object(engines.config, "tp_device_env", return_value={}), \
+             patch.object(server, "_spawn") as spawn:
+            server.start()
+        command = spawn.call_args[0][0]
+        self.assertEqual(command[command.index("--layer-split") + 1], "4")
+        self.assertNotIn("--tp", command)
+
     def test_explicit_tensor_shard_count_matches_requested_gpu_count(self):
         spec = engines.config.BackendSpec(
             backend_id="test_tp", display="test", kind="gpu", ts_backend="ggml_cuda",

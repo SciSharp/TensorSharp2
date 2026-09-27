@@ -550,6 +550,12 @@ struct dsv4_model
     int n_gpu = 0;
     int n_backends = 0;
 
+    // Fixed residents are budgeted independently of the contiguous trunk split.
+    // Either endpoint may own no trunk layers. Keep load and graph routing in
+    // agreement with the planner even in that case (notably MoE TP).
+    int input_device() const { return 0; }
+    int output_device() const { return n_gpu - 1; }
+
     // fused-op backends (one per GPU, wrapping that GPU's CUDA backend)
     ggml_backend_t ts_backends[MAX_GPUS] = {};
     // What ggml_backend_sched is given for each device: the wrapper for a GPU
@@ -2585,8 +2591,8 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             }
         }
         std::vector<size_t> fixed_bytes((size_t) n_gpu, 0);
-        fixed_bytes[0] += embd_bytes;
-        fixed_bytes[(size_t) n_gpu - 1] += head_bytes;
+        fixed_bytes[m->input_device()] += embd_bytes;
+        fixed_bytes[(size_t) m->output_device()] += head_bytes;
 
         // V4.1: prefer placing each Engram table on the GPU that owns its
         // layer. The lookup then becomes a device get_rows over the quantized
@@ -2663,7 +2669,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             c.tp_ranks = tp_ranks;
             c.fixed_bytes = fixed_bytes;
             if (m->ds.loaded)
-                c.fixed_bytes[(size_t) n_gpu - 1] += (size_t) m->ds.n_stages *
+                c.fixed_bytes[(size_t) m->output_device()] += (size_t) m->ds.n_stages *
                     ((size_t) hp.n_embd_head * ring * sizeof(ggml_fp16_t) + 256) * (m->rewind_cp ? 2 : 1);
             reserve = tsg_dsv4_plan::estimate_reserve(ubatch, m->n_ctx, hp.v41, hp.n_embd, hp.hc_mult, CSA_RATIO,
                 reserve_override_mb);
@@ -2671,6 +2677,23 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             c.dev_budget.resize((size_t) n_gpu);
             for (int d = 0; d < n_gpu; d++)
                 c.dev_budget[(size_t) d] = dev_free[(size_t) d] > held ? dev_free[(size_t) d] - held : 0;
+#if defined(TSG_GGML_TEST_HOOKS)
+            // Deterministic tiny-fixture coverage of endpoint-only devices.
+            // Only lower an actual budget; retain normal packing and capacity
+            // checks instead of overriding the resulting layer placement.
+            if (const char * layout = std::getenv("TS_DSV4_TEST_ENDPOINT_LAYOUT"))
+            {
+                const int d = strcmp(layout, "empty-first") == 0 ? m->input_device()
+                    : strcmp(layout, "empty-last") == 0 ? m->output_device() : -1;
+                if (d < 0 || n_gpu < 2 || n_cpu_moe_req < 0)
+                    throw std::runtime_error("endpoint fixture requires empty-first/empty-last, multiple devices and explicit CPU-MoE count");
+                size_t resident = c.fixed_bytes[(size_t) d];
+                if (tp_ranks)
+                    for (int il = std::min(n_cpu_moe_req, hp.n_layer); il < hp.n_layer; ++il)
+                        resident += c.tp_bytes[(size_t) il][(size_t) d];
+                c.dev_budget[(size_t) d] = std::min(c.dev_budget[(size_t) d], resident);
+            }
+#endif
             return c;
         };
 
@@ -2780,26 +2803,16 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         }
 
         std::vector<int> devs((size_t) hp.n_layer, 0);
-        if (tsg_dsv4_plan::pack(split, engram_device, hi, n_cpu_moe, &devs))
+        if (!tsg_dsv4_plan::pack(split, engram_device, hi, n_cpu_moe, &devs))
         {
-            for (int il = 0; il < hp.n_layer; il++)
-                m->layers[il].device = devs[il];
+            // hi starts with an accepted plan and changes only after a
+            // successful pack. Never replace that capacity proof with a
+            // placement that ignores fixed residents, caches or offload.
+            tsg::report_load_refusal("[dsv4] internal placement error: accepted device budget could not be packed\n");
+            return nullptr;
         }
-        else
-        {
-            // Fewer layers than devices, or a fixed resident so large that a
-            // device cannot take any layer: the balanced split would leave the
-            // output head stranded on a device the pipeline never reaches, so
-            // fall back to spreading by cumulative bytes.
-            size_t acc = 0;
-            for (int il = 0; il < hp.n_layer; il++)
-            {
-                int dev = (int) ((acc * n_gpu) / (total_bytes + 1));
-                if (dev >= n_gpu) dev = n_gpu - 1;
-                m->layers[il].device = dev;
-                acc += layer_bytes[il];
-            }
-        }
+        for (int il = 0; il < hp.n_layer; il++)
+            m->layers[il].device = devs[il];
 
         for (int il = 0; il < n_cpu_moe && il < hp.n_layer; il++)
             m->layers[il].cpu_moe = true;
@@ -2829,8 +2842,8 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         m->c_ctx[d] = ggml_init(cp);
     }
 
-    const int dev_first = m->layers[0].device;
-    const int dev_last = m->layers[hp.n_layer - 1].device;
+    const int dev_first = m->input_device();
+    const int dev_last = m->output_device();
 
     if (tp_ranks)
     {
@@ -5076,7 +5089,9 @@ struct graph_builder
 
         bool dev_used[MAX_GPUS + 1] = {};
         for (int il = 0; il < hp.n_layer; il++) dev_used[m.layers[il].device] = true;
-        const int dev_last = m.layers[hp.n_layer - 1].device;
+        dev_used[m.input_device()] = true;
+        if (m.ds.loaded) dev_used[m.ds.dev] = true;
+        const int dev_last = m.output_device();
 
         auto make_slot_plan_inputs = [&](plan_inputs & pi, const comp_plan & plan,
                                          const char * tag, size_t slot, int d)
@@ -5156,7 +5171,8 @@ struct graph_builder
 
         const int64_t hc = hp.hc_mult;
         ggml_tensor * delayed_pre = nullptr;
-        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.layers[0].device]);
+        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.input_device()]);
+        pin(emb, m.input_device());
         ggml_tensor * inpL = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, emb, hp.n_embd, 1, N), hp.n_embd, hc, N, 1);
 
         for (int il = 0; il < hp.n_layer; il++)
@@ -5164,7 +5180,7 @@ struct graph_builder
             const dsv4_layer & L = m.layers[il];
             const int dev = L.device;
 
-            if (il > 0 && L.device != m.layers[il - 1].device)
+            if (L.device != (il > 0 ? m.layers[il - 1].device : m.input_device()))
                 pin(inpL, L.device);
 
             inpL = build_engram(il, inpL);
@@ -5195,8 +5211,11 @@ struct graph_builder
         ggml_tensor * flat = ggml_get_rows(ctx, ggml_reshape_2d(ctx, inpL, hp.n_embd * hc, N), inp.out_ids);
         inpL = ggml_reshape_3d(ctx, flat, hp.n_embd, hc, N);
         ggml_tensor * cur = build_hc_pre_op(inpL, ggml_get_rows(ctx, ggml_cont(ctx, delayed_pre), inp.out_ids));
+        pin(cur, dev_last);
         cur = rms(cur, m.output_norm);
+        pin(cur, dev_last);
         cur = ggml_mul_mat(ctx, m.output, cur);
+        pin(cur, dev_last);
         ggml_set_output(cur);
         ggml_set_name(cur, "logits");
         res.logits = cur;
@@ -5222,7 +5241,9 @@ struct graph_builder
 
         bool dev_used[MAX_GPUS + 1] = {};
         for (int il = 0; il < hp.n_layer; il++) dev_used[m.layers[il].device] = true;
-        const int dev_last = m.layers[hp.n_layer - 1].device;
+        dev_used[m.input_device()] = true;
+        if (m.ds.loaded) dev_used[m.ds.dev] = true;
+        const int dev_last = m.output_device();
 
         for (int d = 0; d <= m.n_gpu; d++)
         {
@@ -5271,7 +5292,8 @@ struct graph_builder
         inp.out_ids = new_input_i32(N, "inp_out_ids", dev_last);
 
         const int64_t hc = hp.hc_mult;
-        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.layers[0].device]);
+        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.input_device()]);
+        pin(emb, m.input_device());
         ggml_tensor * inpL = ggml_reshape_3d(ctx, emb, hp.n_embd, 1, N);
         inpL = ggml_repeat_4d(ctx, inpL, hp.n_embd, hc, N, 1);
 
@@ -5280,7 +5302,7 @@ struct graph_builder
             const dsv4_layer & L = m.layers[il];
             const int dev = L.device;
 
-            if (il > 0 && L.device != m.layers[il - 1].device)
+            if (L.device != (il > 0 ? m.layers[il - 1].device : m.input_device()))
                 pin(inpL, L.device);
 
             ggml_tensor * residual = inpL;
@@ -5312,8 +5334,11 @@ struct graph_builder
         inpL = ggml_reshape_3d(ctx, flat, hp.n_embd, hc, N);
 
         ggml_tensor * cur = build_hc_head(inpL);
+        pin(cur, dev_last);
         cur = rms(cur, m.output_norm);
+        pin(cur, dev_last);
         cur = ggml_mul_mat(ctx, m.output, cur);
+        pin(cur, dev_last);
         ggml_set_output(cur);
         ggml_set_name(cur, "logits");
         res.logits = cur;
@@ -5329,7 +5354,9 @@ struct graph_builder
         // devices that host at least one layer
         bool dev_used[MAX_GPUS + 1] = {};
         for (int il = 0; il < hp.n_layer; il++) dev_used[m.layers[il].device] = true;
-        const int dev_last = m.layers[hp.n_layer - 1].device;
+        dev_used[m.input_device()] = true;
+        if (m.ds.loaded) dev_used[m.ds.dev] = true;
+        const int dev_last = m.output_device();
 
         auto make_plan_inputs = [&](plan_inputs & pi, const comp_plan & plan, ggml_type mask_type, const char * tag, int d)
         {
@@ -5428,10 +5455,11 @@ struct graph_builder
         const int64_t hc = hp.hc_mult;
         ggml_tensor * delayed_pre = nullptr;
 
-        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.layers[0].device]);   // [n_embd, nt]
+        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[m.input_device()]);   // [n_embd, nt]
+        pin(emb, m.input_device());
         if (res.image_tokens)
         {
-            const int dev = m.layers[0].device;
+            const int dev = m.input_device();
             inp.image_embeddings = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, res.image_tokens);
             ggml_set_input(inp.image_embeddings);
             ggml_set_name(inp.image_embeddings, "inp_image_embeddings");
@@ -5455,7 +5483,7 @@ struct graph_builder
             // layer's elementwise ops between GPUs (x-derived sources vote for
             // the old device, weight views for the new one), costing ~6 extra
             // graph splits per eval.
-            if (il > 0 && L.device != m.layers[il - 1].device)
+            if (L.device != (il > 0 ? m.layers[il - 1].device : m.input_device()))
                 pin(inpL, L.device);
 
             if (hp.v41) inpL = build_engram(il, inpL);
@@ -5515,8 +5543,11 @@ struct graph_builder
         ggml_tensor * cur = hp.v41
             ? build_hc_pre_op(inpL, ggml_get_rows(ctx, ggml_cont(ctx, delayed_pre), inp.out_ids))
             : build_hc_head(inpL);
+        pin(cur, dev_last);
         cur = rms(cur, m.output_norm);
+        pin(cur, dev_last);
         cur = ggml_mul_mat(ctx, m.output, cur);
+        pin(cur, dev_last);
         ggml_set_output(cur);
         ggml_set_name(cur, "logits");
         trace_v41(cur, hp.n_layer, "logits");
@@ -6844,6 +6875,33 @@ TSG_TEST_EXPORT int TSGgml_Dsv4TestLayerDevice(void * handle, int layer)
     auto * m = static_cast<tsg_dsv4::dsv4_model *>(handle);
     if (!m || layer < 0 || layer >= m->hp.n_layer) return -1;
     return m->layers[layer].device;
+}
+
+// Read the allocated weights, graph and drafter ring, not only planner intent.
+TSG_TEST_EXPORT int TSGgml_Dsv4TestEndpointPlacement(void * handle, char * description, int capacity)
+{
+    auto * m = static_cast<tsg_dsv4::dsv4_model *>(handle);
+    if (!m || !description || capacity <= 0 || m->graph_cache.empty()) return -1;
+    const int first = m->input_device(), last = m->output_device();
+    auto & graph = *m->graph_cache.front();
+    const auto placed = [&](ggml_tensor * tensor, int device) {
+        return tensor && tensor->buffer
+            && ggml_backend_buffer_get_type(tensor->buffer) == ggml_backend_get_default_buffer_type(m->backends[device])
+            && ggml_backend_sched_get_tensor_backend(graph.sched, tensor) == m->dev_backends[device];
+    };
+    bool ok = m->tok_embd->buffer == m->w_buf[first]
+        && m->output_norm->buffer == m->w_buf[last] && m->output->buffer == m->w_buf[last]
+        && placed(graph.logits, last) && placed(graph.inp.tokens[first], first)
+        && placed(graph.inp.out_ids, last);
+    if (graph.inp.image_embeddings)
+        ok = ok && placed(graph.inp.image_embeddings, first) && placed(graph.inp.image_indices, first);
+    if (m->ds.loaded)
+        ok = ok && m->ds.dev == last && m->ds.main_proj->buffer == m->w_buf[last]
+            && m->active_slot->ds_k[0]->buffer == m->active_slot->buf[last]
+            && placed(graph.inp.pos[last], last) && placed(graph.inp.raw_idxs[last], last);
+    snprintf(description, (size_t) capacity, "embedding=%d output=%d drafter=%d trunk=%d..%d",
+        first, last, m->ds.loaded ? m->ds.dev : -1, m->layers.front().device, m->layers[m->hp.n_layer - 1].device);
+    return ok ? 1 : 0;
 }
 
 TSG_TEST_EXPORT int TSGgml_Dsv4TestDsparkReadRing(void * handle, int stage, int count, float * output)

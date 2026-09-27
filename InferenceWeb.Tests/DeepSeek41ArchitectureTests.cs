@@ -98,7 +98,7 @@ public class DeepSeek41ArchitectureTests : IDisposable
         Assert.Equal(MultiGpuMode.LayerSplit, v41.MultiGpu);
         Assert.Contains("not implemented", v41.MultiGpuLimitation);
         TensorSharp.ITensorParallelGroup group = null;
-        Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(v41, BackendType.GgmlCuda, 4, ref group, out int split));
+        Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(v41, BackendType.GgmlCuda, 1, ref group, out int split, 4));
         Assert.Equal(4, split);
         Assert.Contains("LAYER SPLIT", v41.DescribeMultiGpuPlacement(4));
     }
@@ -513,9 +513,9 @@ public class DeepSeek41ArchitectureTests : IDisposable
     {
         _env.Set("TS_DSV41_TP", "4");
         TensorSharp.ITensorParallelGroup group = null;
-        Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(DeepSeek41Architecture.Descriptor,
+        Assert.Equal(4, ModelBase.ResolveTensorParallelSupport(DeepSeek41Architecture.Descriptor,
             BackendType.GgmlCuda, 4, ref group, out int split));
-        Assert.Equal(4, split);
+        Assert.Equal(1, split);
         Assert.Null(group);
     }
 }

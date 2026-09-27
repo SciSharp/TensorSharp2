@@ -33,9 +33,11 @@ public static class DistributedTensorParallel
     /// </summary>
     public static ITensorParallelGroup? CreateGroup(BackendType backend)
     {
-        var distConfig = DistributedTpConfig.TryFromEnvironment(localDegree: GetLocalTpDegree());
+        var distConfig = ModelParallelismOptions.Parse(Array.Empty<string>()).Distributed;
         if (distConfig == null)
             return null;
+        if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+            throw new ArgumentException("Distributed --tp requires cuda, ggml_cuda, or ggml_vulkan.");
 
         // The on-node group has to match the backend: direct CUDA
         // drives CudaAllocators, the ggml backends drive per-rank
@@ -48,11 +50,4 @@ public static class DistributedTensorParallel
                 distConfig.LocalDegree, distConfig.NodeId, distConfig.PeerEndpoints);
     }
 
-    private static int GetLocalTpDegree()
-    {
-        string? envTp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
-        if (int.TryParse(envTp, out int degree) && degree > 1)
-            return degree;
-        return 1;
-    }
 }

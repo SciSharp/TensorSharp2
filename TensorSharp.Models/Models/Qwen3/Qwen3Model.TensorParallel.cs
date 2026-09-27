@@ -31,6 +31,10 @@ namespace TensorSharp.Models
 
         private void InitTpKVCache(int initialSeqLen, int maxSeqLen)
         {
+            // The TP cache grows independently of the single-device cache. Keep
+            // its configured limit so warmup and long prompts can grow past the
+            // initial allocation instead of being rejected against the default 0.
+            _maxContextLength = maxSeqLen;
             int tp = TpDegree;
             int numKVHeadsPerGpu = Config.NumKVHeads / GlobalTpDegree;
             int headDim = Config.HeadDim;

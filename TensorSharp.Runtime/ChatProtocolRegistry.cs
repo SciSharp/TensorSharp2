@@ -389,7 +389,8 @@ namespace TensorSharp.Runtime
                 // branch; stripping that restores the half the cache actually holds.
                 AssistantGenerationSuffix = _ => "<think>",
                 EmitsEmptyThinkBlockForPastTurns = _ => true,
-                Render = r => ChatTemplate.RenderGlm5Next(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools),
+                Render = r => ChatTemplate.RenderGlm5Next(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools, r.ReasoningEffort),
+                RendersReasoningEffort = true,
                 AppendMediaPlaceholders = (msg, sb) =>
                 {
                     // The template's emit_image() macro. The host later expands the

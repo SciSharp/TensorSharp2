@@ -77,12 +77,14 @@ internal static class GlmDsaSyntheticModelBuilder
     /// tests and the speculative rollback tests. The dimensions are deliberately
     /// tiny, but preserve the production partitioning constraint: a 16-wide KDA
     /// head in a Q8_0 output projection must travel in two-head groups because
-    /// Q8_0 has 32-element blocks. Every block is a KDA (recurrent) layer with a
-    /// dense FFN; <paramref name="numLayers"/> of them, so a per-layer state
-    /// snapshot has more than one layer to get wrong.
+    /// Q8_0 has 32-element blocks. By default every block is a KDA (recurrent)
+    /// layer with a dense FFN. Optional mixed MLA attention and routed experts
+    /// exercise verification, indexing, and quantized projection parity.
     /// </summary>
     public static string WriteGlm5NextTpFixture(
-        string path, int numHeads, bool quantizeAttentionOutput, int numLayers = 1)
+        string path, int numHeads, bool quantizeAttentionOutput, int numLayers = 1,
+        bool mixedAttention = false, bool routedExperts = false, bool quantizeExperts = false,
+        int contextLength = 256, int indexerTopK = 4)
     {
         const int hidden = 64;
         const int ffn = 64;
@@ -97,6 +99,12 @@ internal static class GlmDsaSyntheticModelBuilder
             throw new ArgumentOutOfRangeException(nameof(numHeads));
         if (numLayers <= 0)
             throw new ArgumentOutOfRangeException(nameof(numLayers));
+        if (contextLength <= 0 || indexerTopK <= 0 || indexerTopK % 4 != 0)
+            throw new ArgumentException("Context must be positive and pooled indexer top-k must be a positive multiple of four.");
+        if (mixedAttention && numLayers < 2)
+            throw new ArgumentException("Mixed attention requires at least one KDA and one MLA layer.");
+        if (quantizeExperts && !routedExperts)
+            throw new ArgumentException("Quantized experts require routedExperts.");
         if (quantizeAttentionOutput && dInner % Q8Block != 0)
             throw new ArgumentException("The Q8_0 fixture's KDA width must contain whole quantization blocks.",
                 nameof(numHeads));
@@ -147,17 +155,72 @@ internal static class GlmDsaSyntheticModelBuilder
             tensors.Add(attentionOutput);
         }
 
+        // Optional verification fixture: preserve the existing all-KDA/dense
+        // defaults byte-for-byte while exercising the production mixed layout.
+        var kvHeads = new uint[numLayers];
+        const int expertFfn = 64; // TP2 leaves a whole Q8_0 block per rank.
+        for (int l = 0; l < numLayers; l++)
+        {
+            string p = $"blk.{l}.";
+            if (mixedAttention && l % 2 == 1)
+            {
+                kvHeads[l] = 1;
+                tensors.RemoveAll(t => t.Name.StartsWith(p + "ssm_", StringComparison.Ordinal)
+                    || t.Name == p + "attn_q.weight" || t.Name == p + "attn_k.weight"
+                    || t.Name == p + "attn_v.weight" || t.Name == p + "attn_output.weight");
+                tensors.AddRange(new[]
+                {
+                    Gen(p + "attn_q_a.weight", 0.02f, hidden, lowRank),
+                    Gen(p + "attn_q_a_norm.weight", 0.2f, lowRank),
+                    Gen(p + "attn_q_b.weight", 0.02f, lowRank, numHeads * lowRank),
+                    Gen(p + "attn_kv_a_mqa.weight", 0.02f, hidden, lowRank),
+                    Gen(p + "attn_kv_a_norm.weight", 0.2f, lowRank),
+                    Gen(p + "attn_k_b.weight", 0.02f, lowRank, lowRank, numHeads),
+                    Gen(p + "attn_v_b.weight", 0.02f, lowRank, lowRank, numHeads),
+                    Gen(p + "indexer.attn_q_b.weight", 0.02f, lowRank, 64),
+                    Gen(p + "indexer.attn_k.weight", 0.02f, hidden, 64),
+                    Gen(p + "indexer.k_norm.weight", 0.2f, 64),
+                    Gen(p + "indexer.k_norm.bias", 0.02f, 64),
+                    Gen(p + "indexer.proj.weight", 0.02f, hidden, 1),
+                    Gen(p + "indexer_compressor_gate.weight", 0.02f, hidden, 64),
+                    Gen(p + "indexer_compressor_ape.weight", 0.02f, 64, 4),
+                });
+                var output = Gen(p + "attn_output.weight", 0.02f, numHeads * lowRank, hidden);
+                if (quantizeAttentionOutput) output.Type = GgmlType.Q8_0;
+                tensors.Add(output);
+            }
+            if (routedExperts)
+            {
+                tensors.RemoveAll(t => t.Name == p + "ffn_gate.weight"
+                    || t.Name == p + "ffn_up.weight" || t.Name == p + "ffn_down.weight");
+                tensors.AddRange(new[]
+                {
+                    Gen(p + "ffn_gate_inp.weight", 0.2f, hidden, 4),
+                    Gen(p + "exp_probs_b.bias", 0.02f, 4),
+                    Gen(p + "ffn_gate_exps.weight", 0.02f, hidden, expertFfn, 4),
+                    Gen(p + "ffn_up_exps.weight", 0.02f, hidden, expertFfn, 4),
+                    Gen(p + "ffn_down_exps.weight", 0.02f, expertFfn, hidden, 4),
+                    Gen(p + "ffn_gate_shexp.weight", 0.02f, hidden, expertFfn),
+                    Gen(p + "ffn_up_shexp.weight", 0.02f, hidden, expertFfn),
+                    Gen(p + "ffn_down_shexp.weight", 0.02f, expertFfn, hidden),
+                });
+            }
+        }
+        if (quantizeExperts)
+            foreach (var tensor in tensors)
+                if (tensor.Name.EndsWith("_exps.weight", StringComparison.Ordinal)) tensor.Type = GgmlType.Q8_0;
+
         const string a = "glm5next";
         var kv = new List<KvEntry>
         {
             new KvStr  { Key = "general.architecture", V = a },
             new KvStr  { Key = "general.name", V = "tiny-glm5next-tp" },
             new KvU32  { Key = $"{a}.block_count", V = (uint)numLayers },
-            new KvU32  { Key = $"{a}.context_length", V = 256 },
+            new KvU32  { Key = $"{a}.context_length", V = (uint)contextLength },
             new KvU32  { Key = $"{a}.embedding_length", V = hidden },
             new KvU32  { Key = $"{a}.feed_forward_length", V = ffn },
             new KvU32  { Key = $"{a}.attention.head_count", V = (uint)numHeads },
-            new KvU32Arr { Key = $"{a}.attention.head_count_kv", V = new uint[numLayers] },
+            new KvU32Arr { Key = $"{a}.attention.head_count_kv", V = kvHeads },
             new KvF32  { Key = $"{a}.rope.freq_base", V = 10000.0f },
             new KvF32  { Key = $"{a}.attention.layer_norm_rms_epsilon", V = 1e-6f },
             new KvF32  { Key = $"{a}.attention.layer_norm_epsilon", V = 1e-6f },
@@ -169,18 +232,18 @@ internal static class GlmDsaSyntheticModelBuilder
             new KvU32  { Key = $"{a}.attention.value_length_mla", V = lowRank },
             new KvU32  { Key = $"{a}.rope.dimension_count", V = 0 },
 
-            // These are required model-level fields even though this fixture's
-            // blocks are dense rather than routed-MoE or MLA.
-            new KvU32  { Key = $"{a}.leading_dense_block_count", V = (uint)numLayers },
+            // These model-level fields are also required by the default
+            // all-KDA/dense fixture.
+            new KvU32  { Key = $"{a}.leading_dense_block_count", V = routedExperts ? 0u : (uint)numLayers },
             new KvU32  { Key = $"{a}.expert_count", V = 4 },
             new KvU32  { Key = $"{a}.expert_used_count", V = 2 },
-            new KvU32  { Key = $"{a}.expert_feed_forward_length", V = 32 },
+            new KvU32  { Key = $"{a}.expert_feed_forward_length", V = (uint)(routedExperts ? expertFfn : 32) },
             new KvU32  { Key = $"{a}.expert_group_count", V = 1 },
             new KvU32  { Key = $"{a}.expert_group_used_count", V = 1 },
             new KvU32  { Key = $"{a}.expert_gating_func", V = 2 },
             new KvU32  { Key = $"{a}.attention.indexer.head_count", V = 1 },
             new KvU32  { Key = $"{a}.attention.indexer.key_length", V = 64 },
-            new KvU32  { Key = $"{a}.attention.indexer.top_k", V = 4 },
+            new KvU32  { Key = $"{a}.attention.indexer.top_k", V = (uint)indexerTopK },
             new KvU32  { Key = $"{a}.attention.indexer.kpool", V = 4 },
 
             new KvU32  { Key = $"{a}.kda.head_dim", V = headDim },
@@ -205,7 +268,7 @@ internal static class GlmDsaSyntheticModelBuilder
         kv.Add(new KvU32 { Key = "tokenizer.ggml.eos_token_id", V = 'Z' });
         kv.Add(new KvBool { Key = "tokenizer.ggml.add_bos_token", V = false });
         kv.Add(new KvBool { Key = "tokenizer.ggml.add_eos_token", V = false });
-        kv.Add(new KvU32 { Key = "general.file_type", V = quantizeAttentionOutput ? 7u : 0u });
+        kv.Add(new KvU32 { Key = "general.file_type", V = quantizeAttentionOutput || quantizeExperts ? 7u : 0u });
         kv.Add(new KvU32 { Key = "general.quantization_version", V = 2 });
 
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);

@@ -1,5 +1,7 @@
 # GLM-5.x (`glm-dsa`, `glm5next`)
 
+> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Older commands and measurements below predate that default: migrate multi-GPU launches by adding `--layer-split N`. An explicit legacy `TS_GLM_NGPU=0` still selects automatic placement over visible GPUs; unset it when using an explicit degree, or set it to that same count. Layer split is single-node only.
+
 [← back to model index](README.md) | [中文](glm_zh-cn.md)
 
 GLM-5.2 is a 744B-parameter MoE (256 routed experts, top-8, plus one shared
@@ -34,8 +36,10 @@ Two implementations, both reproducing llama.cpp's `src/models/glm-dsa.cpp`:
 - **GGML backends (`--backend ggml_cuda` / `ggml_vulkan` / `ggml_cpu` / `ggml_metal`)**
   run the **native whole-model executor**
   (`TensorSharp.GGML.Native/ggml_ops_glm_dsa.cpp`). It loads the split GGUF
-  itself, layer-splits the weights across every visible GPU (226 GiB does not
-  fit one card), owns the MLA and indexer caches on-device, and submits ONE
+  itself and, on CUDA or Vulkan, accepts `--layer-split N` to place whole
+  layers across N local GPUs (226 GiB does not fit one card). With neither
+  parallel mode configured, it uses one device. It owns the MLA and indexer
+  caches on-device and submits ONE
   ggml graph per ubatch through `ggml_backend_sched`, with a shape-keyed LRU
   graph cache so steady-state decode replays one allocated (and, on CUDA,
   captured) graph.
@@ -118,12 +122,12 @@ so every model in the repo can now be stored across several files.
 
 ### Tensor parallelism
 
-**Without `--tp`, a multi-GPU box already uses every card**: the loader measures
-each device's free VRAM and bin-packs the 78 layers across them, so device 0 runs
-layers 0..k, hands the hidden state on, and so on. That is the default and there
-is no flag for it — a 226 GiB checkpoint fits no other way. `TS_GLM_NGPU` caps how
-many devices it uses, and if even the full set is not enough the load is refused
-with the exact `--n-cpu-moe N` that would make it fit.
+**Use `--layer-split N` for whole-layer placement across N local GPUs.**
+The loader measures device VRAM and assigns layers to balance their memory
+footprints. With no placement setting the default is one device; legacy
+`TS_GLM_NGPU=0` explicitly requests every visible GPU. An override must match
+an explicit degree. If the selected devices cannot hold the model, loading
+is refused with the `--n-cpu-moe N` needed to fit it.
 
 `--tp N` (or `TENSORSHARP_TP_DEGREE`) is the other mode: it runs every layer on
 every one of N GPUs and splits the weights *inside* each layer, so decode reads
@@ -438,7 +442,7 @@ reader threads across the six shards.
 ### Tensor parallelism, measured
 
 Same 3 GPUs, GLM-5.2-UD-IQ2_XXS, `--tp 3` (heads + expert rows) against the
-default layer split:
+layer-split mode:
 
 | test | layer split | `--tp 3` |
 |---|---:|---:|
@@ -464,10 +468,10 @@ split itself is the same either way.
 ## Running it
 
 ```bash
-# 3 GPUs, layer split (the default: every visible GPU); --input reads the prompt from a file
+# 3 GPUs, explicit whole-layer placement; --input reads the prompt from a file
 echo "Explain MLA in one paragraph." > prompt.txt
 dotnet run --project TensorSharp.Cli -- --model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
-    --backend ggml_cuda --input prompt.txt
+    --backend ggml_cuda --layer-split 3 --input prompt.txt
 
 # Fewer GPUs, or a specific count
 TS_GLM_NGPU=2 dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda
@@ -482,7 +486,7 @@ dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --n-cpu-
 
 Offload is a way to fit a checkpoint that does not fit, not a speed knob — when
 the model already fits, moving experts to the host only adds bus round trips.
-Same 3 GPUs, same run: default layer split pp2048 **915.9** / tg64 **43.9** tok/s,
+Same 3 GPUs, same run: layer-split mode pp2048 **915.9** / tg64 **43.9** tok/s,
 `--n-cpu-moe 30` **94.7** / **16.4**, `--tp 3` **505.6** / **17.6**. Reach for
 `--n-cpu-moe` when the alternative is not running at all.
 
@@ -509,7 +513,7 @@ context is ~93 GiB of KV — a whole card's worth on top of the weights — befo
 counted. So the advertised number is treated as a **ceiling**, not a request:
 the loader sizes the context from the VRAM actually left after the weights land
 (minus what the DSA masks and the LM head need for one `n_ubatch` graph) and
-says what it picked. On the default layer split across the three cards above that
+says what it picked. On the layer-split mode across the three cards above that
 pick is 342,272 tokens, and `--n-cpu-moe 30` raises it to 646,400. The line below
 comes from a `--tp 3` run, where every rank holds a full-length cache and the
 pick therefore drops much further:
@@ -627,8 +631,9 @@ Two differences matter in practice, both read off the published GGUF:
         column-parallel under --tp 8; serving standard decode
   ```
 
-  So speculation is engaged on the **default layer split** (no `--tp`, every
-  visible GPU). Check the load banner before believing a `--spec` run drafted
+  So speculation is engaged with **single-device or layer-split placement**
+  (`--layer-split N` for N local GPUs, with no active tensor parallelism).
+  Check the load banner before believing a `--spec` run drafted
   anything, and check the one the executor you are actually running prints: on
   the GGML backends that is the native executor, whose banner reads
 
@@ -709,7 +714,7 @@ the head unmoved (`GlmTruncateRefusalTests`).
 
 ### Native local tensor parallelism
 
-Omitting `--tp` keeps the automatic layer split across every visible GPU.
+Use `--layer-split N` for whole-layer placement across N local GPUs.
 On the GGML GPU backends, `--tp N` instead runs GLM-5.3-Flash through the
 native executor's local, single-process tensor-parallel plan:
 
@@ -736,10 +741,11 @@ expert once on rank 0. `TS_GLM_TP_FUSED=0` forces the fallback for diagnostics.
 
 ### What runs today
 
-- **Layer split across every visible GPU** (the default): ~99 GiB of
-  UD-Q2_K_XL loads across 2×96 GB in ~17 s warm.
+- **Layer split across N local GPUs**: pass `--layer-split N`. The historical
+  2×96 GB measurement loaded ~99 GiB of UD-Q2_K_XL in ~17 s warm; use
+  `--layer-split 2` for that placement today.
 - **Native local tensor parallelism**: pass `--tp N` on a GGML GPU backend;
-  omitting the flag keeps the default layer split.
+  with neither parallel mode configured, the default is one device.
 - **`--cpu-moe` / `--n-cpu-moe N`** host-resident experts: works (measured
   ~35–40 t/s decode with the first 10 layers' experts on the host).
 - **Serving**: per-sequence native slots plus the fused batched decode (see
@@ -775,8 +781,11 @@ trunk use:
    that owns it (`TSGgml_GlmKdaStateCapture`; ~150 MB, device-to-device, one
    arena per model because a step snapshots and restores within itself) and
    remembers the position;
-2. the verify is one trunk graph over `[last, d1..dK]` with the LM head on every
-   row (`TSGgml_GlmSpecForward`, unchanged);
+2. the verify processes `[last, d1..dK]` with the LM head on every row
+   (`TSGgml_GlmSpecForward`). Native verification uses single-token projection,
+   expert and attention arithmetic, with each row's own padded key extent.
+   Captured windows wider than eight rows are split into bounded graphs;
+   prompt prefill keeps its configured micro-batch;
 3. on a partial rejection the snapshot is copied back and the slot rewound to
    the captured position (`TSGgml_GlmKdaStateRestore`), and the runtime
    re-forwards the accepted prefix, so the state equals a plain decode of exactly
@@ -806,9 +815,26 @@ greedy with drafts proposed and windows partially rejected; a drafter that is
 wrong at the end of every window still yields the plain stream; after the
 rollbacks the next token's logits equal a plain decode's over the whole
 vocabulary; the verify rows equal the sequential decode's; and the managed and
-native `SpecForward` agree row for row, hidden states included. No speculation
-run on the real GLM-5.3-Flash checkpoint exists yet, so there is no throughput
-verdict for it.
+native `SpecForward` agree row for row, hidden states included. The trained
+IQ1_S checkpoint exposed a separate verification-width rounding error: its
+first four-row verify changed logits before any rollback. The corrected
+native path matches all 72 teacher-forced logit vectors exactly, including
+four rollbacks, on two RTX PRO 4000 Blackwell GPUs with 29 CPU expert layers.
+This targeted numerical check does not establish a general quality or
+throughput advantage. Generated evidence is kept in
+`docs/validation/model-matrix-20260927/` (not committed).
+
+The same Flash IQ1_S checkpoint subsequently passed active ngram/plain token
+parity for text and complete image answers under both `--layer-split 2` and
+`--tp 2`. Four plain/ngram HTTP processes across those modes passed 12/12 text
+requests and 6/6 image scenarios (seven image turns), with clean shutdowns.
+Matched native CLI checks at context 2048, 28 CPU expert layers, 20 threads and
+ubatch 32 measured median decode rates of 4.14 tokens/s for layer split and
+3.90 for TP (128-token prefill, 32-token decode, three passes). CPU offload uses
+the combined TP scheduler; this does not exercise the segmented NCCL path or
+show a TP speedup. These targeted quantized-model checks do not qualify learned
+NextN, multi-node execution, or non-Flash GLM-5.3. Local evidence:
+`docs/validation/model-matrix-20260927/glm53/SUMMARY.md` (not committed).
 
 Failures at the C ABI are contained rather than propagated. A capture that
 throws (arena allocation, a backend copy) returns failure and leaves the live
@@ -850,8 +876,10 @@ own top-2 margin at a flip point is ~0.13 logits with the same candidate set).
 
 ### Chat format
 
-GLM-5.3-Flash's template always reasons: the `<|system|>Reasoning Effort: Max`
-line is unconditional, the generation prompt always opens `<think>`, and past
+GLM-5.3-Flash's template always reasons. Its system preamble accepts
+`reasoning_effort: "low"` or `"high"` as `Reasoning Effort: Low` or `High`;
+omitted effort and `"medium"` use `Max`, matching the published template.
+The generation prompt always opens `<think>`, and past
 turns keep their reasoning (`clear_thinking` defaults to false). Because the
 prompt cannot turn reasoning off, `"think": false` only decides what the client
 sees: the reply is parsed as reasoning up to `</think>` and only what follows is
@@ -881,13 +909,13 @@ step fused, token-for-token equal to serial decode.
 [`benchmark_config_glm53_qwen38.json`](../../benchmarks/engine_comparison/benchmark_config_glm53_qwen38.json)
 registers `glm53` and `glm53-flash` (alongside Qwen3.8-Flash-Next) against
 pinned Hugging Face revisions, with the observed shard sizes and the modality /
-MTP facts above recorded per entry. Its default backend passes no `--tp` and
+MTP facts above recorded per entry. Its automatic layer backend explicitly sets `TS_GLM_NGPU=0`, passes no `--tp`, and
 pins no `CUDA_VISIBLE_DEVICES`, which for these two models means the native glm
 executor claims every visible GPU and places whole layers on them - the only
 placement in which a 236 GiB checkpoint loads, and the only one in which
 GLM-5.3's NextN block loads. That is a property of this family's executor, not
 of the harness: the config's third model (`qwen4exp`) is spread by the *shared*
-loader and therefore needs an explicit `--tp N`, so it sits on a second backend
+loader and therefore needs explicit `--layer-split N`, so it sits on the `ggml_cuda_split` backend
 column and its default cells are recorded as skips. The llama.cpp column is
 available for `glm53` only: the llama.cpp build on that host (ggml 0.23.0) has
 `glm-dsa` in its arch table and `src/models/glm-dsa.cpp`, but the string

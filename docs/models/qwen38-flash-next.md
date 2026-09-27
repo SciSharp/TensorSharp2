@@ -255,6 +255,27 @@ measured difference
 
 ## Speculative decoding with the shared MTP head
 
+Image requests can also use the learned head: the scheduler queues each image
+embedding slice before speculative prefill and preserves its MRoPE positions.
+Prepared image spans remain available for retries after prefill and no longer
+block speculative decode. This still requires a solo request prefilling from
+position 0; retained-prefix and concurrent-request restrictions below remain.
+
+A separate 2026-09-27 UD-IQ1_S check on two RTX PRO 4000 Blackwell GPUs used
+`--layer-split 2`, context 1024 and a resident shared Q8_0 MTP head plus BF16
+projector. After one warmup, all three measured text/image passes matched plain
+greedy token-for-token with active MTP and ngram drafting. Text was bounded at
+64 tokens; the image answer completed at EOS after 204 visible tokens and
+correctly described the number and color. Median paired worker decode-time
+speedups were 1.215x for text and 1.292x for image with MTP. Image request timers
+exclude synchronous image preparation and encoding; these short copy-heavy
+checks are not broad quality or end-to-end media-latency benchmarks. Separate
+plain/MTP HTTP checks passed 24/24 text requests and 3/3 image scenarios per mode,
+including attachment order and image history. This configuration refused retained
+cache admission for lack of headroom, so those follow-ups re-prefilled. Local
+evidence: `docs/validation/model-matrix-20260927/qwen38/SUMMARY.md` (not committed).
+True TP and multi-node execution remain unsupported for this architecture.
+
 `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` attaches the per-token
 MTP block (GGML backends only, and the head must be a single GGUF file, attached
 when the model loads); it speculates for a solo request that prefilled from position 0
@@ -329,14 +350,15 @@ Evidence and the per-assertion diagnosis:
 
 ## Multi-GPU
 
-`--tp N` on `qwen4exp` runs a **layer split**: each GPU holds a contiguous run
+`--layer-split N` on `qwen4exp` runs a **layer split**: each GPU holds a contiguous run
 of whole layers. It is not tensor parallelism — `qwen4exp` shards no weights —
 and it is the same (and only) multi-GPU mode llama.cpp offers this architecture
 (`-sm row` refuses to load it). It is a capacity feature, not a speed feature:
 it is how you fit the model when one card cannot hold it. The layer split is
-available on `ggml_cuda` and `ggml_vulkan`; on other backends `--tp N` is
-ignored with a warning and the model runs on a single device, and distributed
-`--tp-node-id`/`--tp-peers` groups are refused.
+available on `ggml_cuda` and `ggml_vulkan`; unsupported backends and distributed
+`--tp-node-id`/`--tp-peers` groups are refused. `--tp N` requests tensor parallelism
+only and is rejected for this architecture; migrate old layer-split commands
+to `--layer-split N` or `TENSORSHARP_LAYER_SPLIT_DEGREE=N`.
 
 Measured on 2× A100-80GB, Qwen3.8-Flash-Next-UD-Q2_K_XL (73.4 GiB):
 
@@ -367,17 +389,19 @@ The published Q8_0 shards carry **no** `nextn`/`mtp` tensors at all, so
 `mtp_supported` is false and `--mtp on` cells are gated out with a reason
 rather than quietly serving standard decode.
 
-And **this model only runs on the column that passes `--tp N`**. The section
-above is the reason: the split degree comes from `--tp`, so on a backend column
+And **this model only runs on the column that passes `--layer-split N`**. The section
+above is the reason: the split degree comes from `--layer-split`, so on a backend column
 that passes none, TensorSharp builds a single-device context and all 175.3 GiB
 land on one card. The config therefore gives it a `min_tp` (4, the weights-only
 floor — 8 is the degree the 8×A40 box is meant to use) and the harness records
-its cells on the no-`--tp` column as skips reading
-`needs --tp 4 (does not fit 1 GPU(s))` instead of letting them OOM. Run it as:
+its cells on the no-`--layer-split` column as skips reading
+`needs --tp 4 (does not fit 1 GPU(s))` instead of letting them OOM. In this
+harness message, `--tp` is the legacy GPU-count selector; the selected column
+passes `--layer-split` to TensorSharp. Run it as:
 
 ```
 python run_matrix.py --config benchmark_config_glm53_qwen38.json \
-    --models qwen38-flash-next --backends ggml_cuda_tp
+    --models qwen38-flash-next --backends ggml_cuda_split
 ```
 
 That column tells llama.cpp `--split-mode layer` over the same GPUs, so the

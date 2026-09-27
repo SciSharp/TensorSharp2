@@ -126,7 +126,7 @@
     </tbody>
   </table>
   </div>
-  <p>Decode 在 1% 以内打平，而 TensorSharp 加载这份 236.4 GiB 的权重快 <strong>2.9×</strong>。诚实的差距在首 token 时延：41.9 s 对 29.0 s，约<strong>慢 1.4×</strong>，这也是那轮对比中最值得动手的一处。llama.cpp 的 prefill 单元是故意留空的：那次运行早于客户端在流里索取 usage，因此它没有自己的提示 token 计数，也就没有可记录的 tok/s 数字。两个引擎跑的都是整层切分放置（TensorSharp 用 <code>--tp 1</code> 选它）；<code>--tp 8</code> 在这个模型上意味着真正的张量并行、每个 rank 都跑每一层，需要<strong>每个 rank 41.7 GiB</strong>，装不进 46 GB 的卡 —— 它是一个被接受的模式，加载时会把这笔算术连同办法一起打印出来，但并不是一份已实测的配置。方法、模型来源与该矩阵的其余部分：<code>docs/validation/cross-engine-2026-09/README.md</code>（本地验证记录，未提交到 Git）。</p>
+  <p>Decode 在 1% 以内打平，而 TensorSharp 加载这份 236.4 GiB 的权重快 <strong>2.9×</strong>。诚实的差距在首 token 时延：41.9 s 对 29.0 s，约<strong>慢 1.4×</strong>，这也是那轮对比中最值得动手的一处。llama.cpp 的 prefill 单元是故意留空的：那次运行早于客户端在流里索取 usage，因此它没有自己的提示 token 计数，也就没有可记录的 tok/s 数字。两个引擎跑的都是整层切分放置；当前 TensorSharp 用 <code>--layer-split 8</code> 在八张 GPU 上选择该放置方式。<code>--tp 8</code> 在这个模型上意味着真正的张量并行、每个 rank 都跑每一层，需要<strong>每个 rank 41.7 GiB</strong>，装不进 46 GB 的卡 —— 它是一个被接受的模式，加载时会把这笔算术连同办法一起打印出来，但并不是一份已实测的配置。方法、模型来源与该矩阵的其余部分：<code>docs/validation/cross-engine-2026-09/README.md</code>（本地验证记录，未提交到 Git）。</p>
 
   <h2 id="qwen-image21">Qwen-Image-2.1：LoRA 插件与前缀缓存</h2>
   <p>2026-09-25 对 <strong><code>stable-diffusion.cpp</code></strong> <code>19bbbca</code> 手工执行的图像对比，两个引擎都基于未修改的 ggml <code>353b63b</code>。每次运行都是 1024×1024 文生图，提示词相同、种子 42、CFG 1、Euler，并使用同一个 F32 sigma 向量，每个引擎各自在全新进程中运行；每种配置跑两次、两个引擎轮流先跑，表中为中位数。每步秒数取稳态步，不含第一步。不使用步数蒸馏 LoRA 时，6 步本来就会得到模糊图像（模型默认 40 步），因此「无 LoRA」一行只衡量速度，不衡量质量。</p>
