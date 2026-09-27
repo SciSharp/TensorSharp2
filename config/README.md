@@ -37,8 +37,12 @@ So passing `--model` or `--mmproj` yourself skips the file's own
 multimodal config text-only without fetching its projector.
 
 You can pass `--config` more than once; a later file's entry replaces an earlier
-one's the same way (and the command line still wins over all of them). The
-repeatable options — `--stop`, `--skills-dir`, `--skill`, `--lora`,
+one's the same way (and the command line still wins over all of them).
+`--skills-dir` follows this precedence for its full list of roots: command-line
+roots replace all configured roots, or the last file that sets `skills-dir`
+replaces earlier files' roots. Repeated command-line flags or an array within
+the winning config file retain all their values in order. The other
+repeatable options — `--stop`, `--skill`, `--lora`,
 `--lora-scale`, `--lora-config`, `--image`, `--ref-image`, `--ref-video`,
 `--ref-audio` and `--ref-video-audio` — keep every file's values and add the
 command line's after them instead, and a download entry under one of them still
@@ -372,8 +376,8 @@ Notes (the files repeat most of these as comments):
   `playwright` browser-automation wrapper, which needs Node.js/`npx` on the host;
   see [the Playwright guide](../docs/playwright_agent.md)) and one JS template
   (`algorithmic-art`). A path that does not exist is a fatal startup error.
-  `--skills-dir` is repeatable, so one given on the command line adds a root
-  rather than replacing this one; move this one with `TENSORSHARP_SKILLS`.
+  Command-line `--skills-dir` values replace the configured roots; repeat the flag
+  to supply multiple roots. `TENSORSHARP_SKILLS` can also move the configured root.
 - **`"temperature"` must be pinned, or the two hosts disagree.** These GGUFs carry
   `general.sampling.temp = 1.0`, which the CLI's chat path overlays onto any field
   left unset while the server ignores it and falls to its built-in 0.8.

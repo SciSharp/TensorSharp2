@@ -123,8 +123,11 @@ Changes merged after the `v2026.09.01` tag that alter what an existing setup doe
   every download entry in `config/*.json` pins a full commit. A single-valued
   option set on the command line (or in a later `--config` file) drops the file's
   entry before it is resolved, so passing your own `--model`, or `--mmproj none`,
-  skips that download, with one `[config]` line on stderr; repeatable options such
-  as `--stop`, `--lora` and `--skills-dir` add to the file's values instead. On the
+  skips that download, with one `[config]` line on stderr. `--skills-dir` follows
+  the same precedence: command-line roots replace all configured roots, and a
+  later config file's roots replace those from earlier files; repeated roots or
+  an array within the winning source are preserved. Other repeatable options such
+  as `--stop` and `--lora` add to the file's values instead. On the
   server this also makes a command-line `--gpu-device` or `--kv-cache-dtype` win
   over the file, which it did not before. See the
   [config guide](../config/README.md#auto-download).

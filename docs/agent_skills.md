@@ -998,7 +998,12 @@ front of the prompt.
 
 The server (`TensorSharp.Server.Host`) accepts exactly the same spellings, and a config-file key
 *is* a CLI flag (`"skills-dir": ["/srv/skills"]`), so one config file drives
-either host. A root that does not exist is a startup error naming the flag —
+either host. Command-line `--skills-dir` values replace all roots from config
+files; if multiple config files set `skills-dir`, the last file's roots replace
+those from earlier files. Repeated command-line flags or array entries within
+the winning config file are preserved in order. Replaced roots are not validated,
+so a local override can replace paths configured for another machine.
+A root that does not exist is a startup error naming the flag —
 a mistyped path fails before a model loads, not on the first request. Roots are
 scanned in precedence order with the install directory first (on the server,
 the `skills` directory next to the binary, which therefore outranks the

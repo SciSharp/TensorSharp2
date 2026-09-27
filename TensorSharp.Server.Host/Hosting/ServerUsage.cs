@@ -503,7 +503,9 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--skills-dir <path>",
                     "Directory to scan for skills. A root may hold one skill (it contains SKILL.md) or many, " +
                     "nested up to three levels, so a checkout of a skills repository works as-is. Repeat the " +
-                    "flag for several; on a name clash the root scanned first wins. The server ALWAYS scans " +
+                    "flag for several; command-line roots replace all roots from config files. A later config " +
+                    "file's roots replace those from earlier files. On a name clash the root scanned first wins. " +
+                    "The server ALWAYS scans " +
                     "skills/ next to the binary first - it is where POST /api/skills installs uploads - even " +
                     "when roots are given here, so an uploaded skill shadows a same-named one in any other " +
                     "root. After it come the roots given here, in order, or by default every existing " +
@@ -725,8 +727,10 @@ namespace TensorSharp.Server.Host.Hosting
                     "Read options from a JSON file whose keys are the same long option names listed here (with or " +
                     "without the leading --). A single-valued option passed on the command line replaces the " +
                     "file's entry, and when the flag is repeated a later file's entry replaces an earlier one's; " +
-                    "the replaced entry is never resolved, so its download is skipped. Repeatable options " +
-                    "(--stop, --skills-dir, --skill, --lora, --lora-scale, --lora-config, --image and the --ref-* " +
+                    "the replaced entry is never resolved, so its download is skipped. --skills-dir follows " +
+                    "the same precedence, replacing the full list of roots while preserving repeated values " +
+                    "within the winning source. Other repeatable options " +
+                    "(--stop, --skill, --lora, --lora-scale, --lora-config, --image and the --ref-* " +
                     "inputs) add to the file's values instead. String/number values map to '--key value', " +
                     "true maps to the bare '--key' switch, and an array maps to a repeated flag (e.g. \"stop\": [..]). " +
                     "A \"variables\" object lets values share ${name} references; a file option may instead be an " +

@@ -17,7 +17,7 @@
   // a different mix of quant types from the earlier upload the speculative-decoding
   // numbers below were measured on; the embedded NextN head is still there.
   "variables": {
-    "modelRoot": "${TENSORSHARP_MODELS:-/Users/zhongkaifu/work/models}",
+    "modelRoot": "${TENSORSHARP_MODELS:-/works/models}",
     "root": "${modelRoot}/Qwen",
     "repo": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502",
     "skillsRoot": "${TENSORSHARP_SKILLS:-/Users/zhongkaifu/work/TensorSharp/TensorAgent/skills}"
@@ -66,8 +66,8 @@
   // ~11 GB inside Metal's working set for a KV cache that costs roughly
   // 128 KiB/token at f16 -- long agent contexts run out of room, not speed.
   "model": {
-    "path": "${root}/Qwen3.8-27B-UD-Q4_K_XL.gguf",
-    "urls": ["${repo}/Qwen3.8-27B-UD-Q4_K_XL.gguf"],
+    "path": "${root}/Qwen3.8-27B-UD-IQ3_XXS.gguf",
+    "urls": ["${repo}/Qwen3.8-27B-UD-IQ3_XXS.gguf"],
     "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"
   },
 

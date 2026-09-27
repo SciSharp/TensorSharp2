@@ -86,7 +86,8 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   与 DiffusionGemma 配置现在把每个模型文件写成带 Hugging Face URL 与 SHA-256 的下载条目，`config/*.json` 中的每个
   下载条目都固定到完整的 commit。命令行（或后出现的 `--config` 文件）设置了的单值参数，会在解析之前丢弃文件中的
   对应条目，因此自己传入 `--model` 或 `--mmproj none` 就会跳过这次下载，并在 stderr 上打印一行 `[config]`；
-  `--stop`、`--lora`、`--skills-dir` 这类可重复参数则追加到文件的值之后。在服务端，这也让命令行上的
+  `--skills-dir` 采用相同的优先级：命令行根目录替换所有配置的根目录，后出现的配置文件中的根目录替换先前文件的根目录，
+  同时保留最终生效来源中的重复参数或数组值。`--stop`、`--lora` 等其他可重复参数则追加到文件的值之后。在服务端，这也让命令行上的
   `--gpu-device` 或 `--kv-cache-dtype` 优先于文件中的值（以前并非如此）。见
   [配置说明](../config/README.md#auto-download)。
 - **CLI 的拼写与服务端一致。** `--penalty-last-n` 已移除：CLI 的惩罚窗口改为 `--repeat-last-n`，与服务端及请求字段
