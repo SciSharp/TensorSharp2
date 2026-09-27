@@ -280,6 +280,154 @@ public sealed class WebUiPageTests : IDisposable
     }
 
     [Fact]
+    public void SelectedFilesUploadTogetherInOrderAndAllReachTheChatRequest()
+    {
+        JsonElement result = Run("""
+            R['/api/upload'] = { ok: true, files: [
+              { ok: true, file: 'first.png', fileName: 'photo.png', mediaType: 'image', url: '/uploads/first.png' },
+              { ok: true, file: 'second.txt', fileName: 'notes.txt', mediaType: 'text', textContent: 'SECOND-FILE-EVIDENCE' },
+              { ok: true, file: 'third.csv', fileName: 'table.csv', mediaType: 'text', fileBacked: true }
+            ] };
+            """, """
+            var input = __page.byId['file-input'];
+            input.files = [{ name: 'photo.png' }, { name: 'notes.txt' }, { name: 'table.csv' }];
+            input.value = 'selected';
+            input.dispatch('change', { target: input });
+            return settle(10).then(function () {
+              var chips = __page.byId['chips'].querySelectorAll('.nm').map(function (n) { return n.textContent; });
+              __page.byId['text'].value = 'Compare all three files';
+              __page.byId['send'].dispatch('click');
+              return settle(10).then(function () {
+                return { uploads: __page.requests('/api/upload'), selected: input.value, chips: chips,
+                         sent: __page.requests('/api/chat').map(function (c) { return c.body; }) };
+              });
+            });
+            """);
+
+        JsonElement upload = Assert.Single(result.GetProperty("uploads").EnumerateArray());
+        Assert.Equal("POST", upload.GetProperty("method").GetString());
+        JsonElement[] parts = upload.GetProperty("parts").EnumerateArray().ToArray();
+        Assert.Equal(new[] { "photo.png", "notes.txt", "table.csv" },
+            parts.Select(part => part.GetProperty("fileName").GetString()));
+        Assert.All(parts, part => Assert.Equal("file", part.GetProperty("name").GetString()));
+        Assert.Equal(string.Empty, result.GetProperty("selected").GetString());
+        Assert.Equal(new[] { "photo.png", "notes.txt", "table.csv" }, Strings(result, "chips"));
+        JsonElement sent = Assert.Single(result.GetProperty("sent").EnumerateArray());
+        JsonElement message = sent.GetProperty("messages")[0];
+        Assert.Equal(new[] { "first.png" }, Strings(message, "imagePaths"));
+        Assert.Equal(new[] { "second.txt", "third.csv" }, Strings(message, "textFilePaths"));
+        Assert.Equal(new[] { "notes.txt", "table.csv" }, Strings(message, "textFileNames"));
+        Assert.Contains("SECOND-FILE-EVIDENCE", message.GetProperty("content").GetString(), StringComparison.Ordinal);
+        Assert.Equal(new[] { "first.png", "second.txt", "third.csv" },
+            message.GetProperty("attachments").EnumerateArray().Select(a => a.GetProperty("file").GetString()));
+        Assert.True(message.GetProperty("attachments")[2].GetProperty("fileBacked").GetBoolean());
+    }
+
+    [Fact]
+    public void SendingDuringQueuedUploadsKeepsTheDraftUntilEverySelectionIsAttached()
+    {
+        JsonElement result = Run("""
+            var uploadGates = [], nextReply = 0;
+            var replies = [
+              { ok: true, files: [
+                { ok: true, file: 'one.txt', fileName: 'one.txt', mediaType: 'text', textContent: 'ONE' },
+                { ok: true, file: 'two.txt', fileName: 'two.txt', mediaType: 'text', textContent: 'TWO' }
+              ] },
+              { ok: true, file: 'three.txt', fileName: 'three.txt', mediaType: 'text', textContent: 'THREE' }
+            ];
+            R['/api/upload'] = function () { return replies[nextReply++]; };
+            var originalFetch = fetch;
+            fetch = function (url, init) {
+              if (url !== '/api/upload') return originalFetch(url, init);
+              return new Promise(function (resolve) {
+                uploadGates.push(function () { originalFetch(url, init).then(resolve); });
+              });
+            };
+            """, """
+            var input = __page.byId['file-input'];
+            input.files = [{ name: 'one.txt' }, { name: 'two.txt' }];
+            input.dispatch('change', { target: input });
+            input.files = [{ name: 'three.txt' }];
+            input.dispatch('change', { target: input });
+            __page.byId['text'].value = 'Use every selected file';
+            __page.byId['send'].dispatch('click');
+            var before = { sent: __page.requests('/api/chat').length, draft: __page.byId['text'].value };
+            return settle(10).then(function () {
+              before.started = uploadGates.length;
+              uploadGates[0]();
+              return settle(10);
+            }).then(function () {
+              __page.byId['send'].dispatch('click');
+              var between = { sent: __page.requests('/api/chat').length, count: window.TensorAgent.attachmentCount() };
+              uploadGates[1]();
+              return settle(10).then(function () {
+                __page.byId['send'].dispatch('click');
+                return settle(10).then(function () {
+                  return { before: before, between: between, notices: __page.notices(),
+                           sent: __page.requests('/api/chat').map(function (c) { return c.body; }) };
+                });
+              });
+            });
+            """);
+
+        Assert.Equal(0, result.GetProperty("before").GetProperty("sent").GetInt32());
+        Assert.Equal("Use every selected file", result.GetProperty("before").GetProperty("draft").GetString());
+        Assert.Equal(1, result.GetProperty("before").GetProperty("started").GetInt32());
+        Assert.Equal(0, result.GetProperty("between").GetProperty("sent").GetInt32());
+        Assert.Equal(2, result.GetProperty("between").GetProperty("count").GetInt32());
+        Assert.Contains(Strings(result, "notices"), text => text.Contains("wait for file uploads", StringComparison.Ordinal));
+        JsonElement sent = Assert.Single(result.GetProperty("sent").EnumerateArray());
+        Assert.Equal(new[] { "one.txt", "two.txt", "three.txt" }, Strings(sent.GetProperty("messages")[0], "textFilePaths"));
+    }
+
+    [Fact]
+    public void OneSelectedFileAcceptsTheExistingUploadResponse()
+    {
+        JsonElement result = Run("""
+            R['/api/upload'] = { ok: true, file: 'one.txt', fileName: 'notes.txt', mediaType: 'text',
+                                 textContent: 'evidence', warning: 'Read the warning' };
+            """, """
+            var input = __page.byId['file-input'];
+            input.files = [{ name: 'notes.txt' }];
+            input.dispatch('change', { target: input });
+            return settle(10).then(function () {
+              return { uploads: __page.requests('/api/upload'), count: window.TensorAgent.attachmentCount(),
+                       notices: __page.notices(), errors: __page.errorNotices() };
+            });
+            """);
+
+        Assert.Single(result.GetProperty("uploads").EnumerateArray());
+        Assert.Equal(1, result.GetProperty("count").GetInt32());
+        Assert.Contains("Read the warning", Strings(result, "notices"));
+        Assert.Empty(Strings(result, "errors"));
+    }
+
+    [Theory]
+    [InlineData("{ __status: 413, body: { error: 'File too large' } }", "File too large")]
+    [InlineData("{ __reject: 'Load failed' }", "Load failed")]
+    [InlineData("{ ok: true, file: 'only.txt' }", "did not return every uploaded file")]
+    [InlineData("{ ok: true, files: [{ ok: true, file: 'one.txt' }, { ok: false, error: 'bad file' }] }", "did not return every uploaded file")]
+    public void FailedOrIncompleteBatchNeverAttachesAPartialSelection(string reply, string expectedError)
+    {
+        JsonElement result = Run("R['/api/upload'] = " + reply + ";", """
+            window.TensorAgent.addAttachment({ ok: true, file: 'existing.txt', fileName: 'existing.txt', mediaType: 'text' });
+            var input = __page.byId['file-input'];
+            input.files = [{ name: 'one.txt' }, { name: 'two.txt' }];
+            input.dispatch('change', { target: input });
+            return settle(10).then(function () {
+              return { uploads: __page.requests('/api/upload').length, count: window.TensorAgent.attachmentCount(),
+                       chips: __page.byId['chips'].querySelectorAll('.nm').map(function (n) { return n.textContent; }),
+                       errors: __page.errorNotices() };
+            });
+            """);
+
+        Assert.Equal(1, result.GetProperty("uploads").GetInt32());
+        Assert.Equal(1, result.GetProperty("count").GetInt32());
+        Assert.Equal(new[] { "existing.txt" }, Strings(result, "chips"));
+        Assert.Contains(expectedError, Assert.Single(Strings(result, "errors")), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void AnImageStaysInTheComposerWhenTheLoadedModelHasNoVisionProjector()
     {
         JsonElement result = Run("""

@@ -1056,6 +1056,10 @@
 
   function sendMessage() {
     if (state.generating) { note('send-is-stop', state.turn); stop(); return; }
+    if (pendingUploadCount) {
+      notice('Please wait for file uploads to finish, then send again.');
+      return;
+    }
     if (state.visionChecking) { note('send-refused', 'vision check in flight'); return; }
     if (shareDiscarding) {
       note('send-refused', 'share discard in flight');
@@ -1988,20 +1992,41 @@
     });
   }
 
-  function upload(file) {
+  var uploadQueue = Promise.resolve();
+  var pendingUploadCount = 0;
+
+  function upload(files) {
+    if (!files.length) return Promise.resolve();
     var fd = new FormData();
-    fd.append('file', file, file.name);
+    files.forEach(function (file) { fd.append('file', file, file.name); });
     return fetch('/api/upload', { method: 'POST', body: fd })
-      .then(function (r) { return r.json(); })
-      .then(function (a) {
-        if (!a || !a.ok) { notice((a && a.error) || 'Upload failed', 'error'); return; }
-        state.attachments.push(a); paintChips();
-      });
+      .then(function (r) {
+        return r.json().then(function (data) {
+          if (!r.ok || !data || !data.ok) throw new Error((data && data.error) || 'Upload failed');
+          return data;
+        });
+      })
+      .then(function (data) {
+        var uploaded = Array.isArray(data.files) ? data.files : [data];
+        if (uploaded.length !== files.length || uploaded.some(function (a) { return !a || !a.ok || !a.file; })) {
+          throw new Error('The server did not return every uploaded file. Please try again.');
+        }
+        // The server returns multipart order, including mixed media and documents.
+        Array.prototype.push.apply(state.attachments, uploaded);
+        paintChips();
+        uploaded.forEach(function (a) { if (a.warning) notice(a.warning); });
+      })
+      .catch(function (e) { notice('Upload error: ' + ((e && e.message) || e), 'error'); });
   }
 
   $('file-input').addEventListener('change', function (e) {
-    Array.prototype.forEach.call(e.target.files || [], upload);
+    var files = Array.prototype.slice.call(e.target.files || []);
     e.target.value = '';
+    if (!files.length) return;
+    pendingUploadCount++;
+    uploadQueue = uploadQueue.then(function () { return upload(files); })
+      .finally(function () { pendingUploadCount--; });
+    return uploadQueue;
   });
 
   // ---- sheets --------------------------------------------------------------

@@ -349,6 +349,8 @@ python docs/examples/jev-attachments.py docs/examples/jev-incident.txt --field d
 
 # Upload first; only the returned filename is sent in the Jev request.
 python docs/examples/jev-attachments.py report.pdf --upload --field documents
+# Upload several supporting files together, then evaluate them in one request.
+python docs/examples/jev-attachments.py policy.txt request.txt --upload --question "Does the request satisfy the attached policy?"
 python docs/examples/jev-attachments.py crossing.mp4 --upload --field videos --question "Is a green traffic light visible?"
 python docs/examples/jev-attachments.py incident.wav --upload --field audios --question "Does the speaker report an active service outage?"
 ```
@@ -358,6 +360,105 @@ then put the returned `file` value in the JSON
 request. `/api/upload` accepts multipart; `/v1/systemone` continues to accept JSON
 only. Uploading avoids base64 overhead and the Jev body limit, but does not bypass
 attachment, context or storage limits.
+
+For several files, repeat the multipart `file` field in **one upload request**:
+
+```bash
+curl http://127.0.0.1:5000/api/upload \
+  -F 'file=@policy.txt' -F 'file=@request.txt'
+```
+
+One file retains the existing `{ "ok": true, "file": "...", ... }` response.
+Two or more return `{ "ok": true, "files": [{ "ok": true, "file": "...", ... }, ...] }`
+in multipart order. Each entry includes the same metadata as a single upload.
+Put every returned filename in the next decision request:
+
+```json
+{
+  "model": "jev-latest",
+  "state": "Evaluate the request using the supplied policy.",
+  "files": [
+    { "file": "UPLOAD_1.txt", "name": "policy.txt" },
+    { "file": "UPLOAD_2.txt", "name": "request.txt" }
+  ],
+  "questions": {
+    "eligible": { "type": "noul", "instructions": "Does request.txt satisfy policy.txt?" }
+  },
+  "samples": 1
+}
+```
+
+The Web UI and TensorAgent batch a file selection this way. Uploads accept at most
+32 files per call; Jev's separate limit remains **8 attachments per decision request**.
+The aggregate upload cap is the greater of 500 MiB and the configured per-file cap,
+with the existing HTTP body limit also applying to multipart framing. Per-file
+limits and storage quota still apply. A rejected batch returns an error and removes
+files already stored by that batch; existing uploads remain available. Attachments
+retain their names and array order in the model's evidence. Across arrays, processing
+order is `files`, `documents`, `videos`, then `audios`; use one `files` array when
+ordering different media kinds together matters. The
+[two-file example](../examples/jev-multiple-files.json) is ready to post with inline data.
+
+Compare separate uploads with a single batch, including real inference:
+
+```bash
+python eng/jev-attachments-benchmark.py --endpoint http://127.0.0.1:5000 \
+  --cases multi-tickets,multi-tickets-reversed,multi-cross-file,multi-eight,multi-text-image \
+  --modes inline,upload,upload-batch --concurrency 1,2 --repeats 3
+```
+
+These synthetic cases check source-specific answers, a cross-file policy decision,
+reversed inputs, eight files, and mixed text/image evidence. Reports retain each
+upload's HTTP response and timing, full decision diagnostics, and omitted coverage.
+They are a regression screen, not general model accuracy or a production latency guarantee.
+
+For upload throughput independently of inference, run
+`python eng/multiple-upload-benchmark.py --endpoint http://127.0.0.1:5000 --same-basename`.
+It alternates separate and batched uploads of 1, 2 and 8 CSV files at 64 KiB and
+1 MiB each, then verifies every downloaded file's bytes. Download verification and
+multipart construction are excluded from upload timing. This transport benchmark
+does not submit the large CSV files to Jev; its text/context limits still apply.
+
+### Multiple data types in one request
+
+These ready-to-post examples combine structured `state` with different media arrays
+in a single Jev request. All attachment bytes are embedded as base64, so each JSON
+file is self-contained:
+
+| Example | Inputs in the same request | Decisions illustrated |
+|---|---|---|
+| [Text policy + image](../examples/jev-multimodal-image.json) | Structured state, `signal-policy.txt` in `documents`, and a PNG in `images` | Identify the green lamp and apply the attached warehouse policy, which requires the barrier to stay closed for green. |
+| [PDF + video](../examples/jev-multimodal-video.json) | Structured state, `ticket.pdf` in `documents`, and `signal.mp4` in `videos` | Route the PDF's non-urgent refund request to billing and identify the green lamp in the video frames. |
+| [PDF + image + video + audio](../examples/jev-multimodal-audio.json) | Structured state, PDF in `documents`, PNG in `files`, MP4 in `videos`, and WAV in `audios` | Keep source-specific evidence separate: the PDF describes a non-urgent refund, while the audio reports an urgent technical outage. The image and video show a green lamp. |
+
+Run these commands from the repository root:
+
+```bash
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-multimodal-image.json
+
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-multimodal-video.json
+
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-multimodal-audio.json
+```
+
+All three need the vision tower. The video and audio examples also need a working
+media decoder for the MP4. Before running the audio example, configure
+`TS_JEV_TRANSCRIPTION_URL` as described in [Configure audio transcription](#configure-audio-transcription).
+Audio contributes its speech transcript; video contributes sampled frames without
+its soundtrack. The questions name the relevant attachments to distinguish each
+source's evidence.
+
+The original fixture bytes, readable text, hashes and media provenance are in
+[`InferenceWeb.Tests/Fixtures/JevAttachments`](../../InferenceWeb.Tests/Fixtures/JevAttachments/manifest.json).
+The video repeats a static image and the audio uses synthetic speech. These examples
+demonstrate combining inputs; they do not measure temporal video understanding or
+speech recognition accuracy.
 
 ### What the model receives
 

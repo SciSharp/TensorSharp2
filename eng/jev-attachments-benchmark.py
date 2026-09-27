@@ -72,12 +72,20 @@ def load_fixtures(path):
 
 
 def upload(url, path, timeout, key):
+    return upload_many(url, [path], timeout, key)
+
+
+def upload_many(url, paths, timeout, key):
     boundary = "JevAttachment" + uuid.uuid4().hex
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    # All filenames come from the checked, local fixture manifest.
-    require(not any(char in path.name for char in '\r\n"'), "Unsafe multipart filename")
-    data = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
-            f'Content-Type: {mime}\r\n\r\n').encode() + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    parts = []
+    for path in paths:
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        # All filenames come from the checked, local fixture manifest.
+        require(not any(char in path.name for char in '\r\n"\\'), "Unsafe multipart filename")
+        parts.extend([(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+                       f'Content-Type: {mime}\r\n\r\n').encode(), path.read_bytes(), b"\r\n"])
+    parts.append(f"--{boundary}--\r\n".encode())
+    data = b"".join(parts)
     headers = {"Content-Type": "multipart/form-data; boundary=" + boundary}
     if key:
         headers["Authorization"] = "Bearer " + key
@@ -107,7 +115,12 @@ def validate_diagnostics(case, response):
     attachments = diagnostics.get("attachments")
     require(isinstance(attachments, list) and len(attachments) == len(case["attachments"]),
             "Missing attachment diagnostics or attachments were dropped")
-    for expected, actual in zip(case["attachments"], attachments):
+    # The parser groups arrays in this documented field order, regardless of
+    # JSON property order. Within each array it preserves attachment order.
+    fields = ("files", "documents", "videos", "audios")
+    ordered = sorted(case["attachments"], key=lambda item: fields.index(item["field"]))
+    for expected, actual in zip(ordered, attachments):
+        require(actual.get("name") == Path(expected["path"]).name, "Attachment name/order differs from fixture")
         require(actual.get("kind") == expected["kind"], "Attachment kind differs from fixture")
         if expected["kind"] in ("text", "pdf", "document", "audio"):
             require(isinstance(actual.get("textCharacters"), int) and actual["textCharacters"] > 0,
@@ -132,10 +145,25 @@ def run_case(args, case, mode, repetition, references=None):
            "upload_ms": 0, "request_ms": None, "preprocessing_ms": None, "inference_ms": None,
            "decisions": [], "uploads": []}
     try:
-        for attachment in case["attachments"]:
+        batch = []
+        if mode == "upload-batch" and case["attachments"]:
+            result = upload_many(args.upload_url, [args.fixtures.parent / item["path"] for item in case["attachments"]],
+                                 args.timeout, args.api_key)
+            row["uploads"].append(result)
+            row["upload_ms"] = result["elapsed_ms"]
+            require(result["status"] == 200 and isinstance(result["body"], dict) and result["body"].get("ok") is True,
+                    f"Batch upload failed: HTTP {result['status']}")
+            batch = result["body"].get("files", [result["body"]])
+            require(isinstance(batch, list) and len(batch) == len(case["attachments"]),
+                    "Batch upload dropped attachments")
+            require(all(isinstance(item, dict) and item.get("ok") is True and isinstance(item.get("file"), str)
+                        and item["file"] for item in batch), "Batch upload returned invalid references")
+        for index, attachment in enumerate(case["attachments"]):
             path = args.fixtures.parent / attachment["path"]
             if mode == "reference":
                 item = {"file": references[attachment["path"]], "name": path.name}
+            elif mode == "upload-batch":
+                item = {"file": batch[index]["file"], "name": path.name}
             elif mode == "upload":
                 result = upload(args.upload_url, path, args.timeout, args.api_key)
                 row["uploads"].append(result)
@@ -237,7 +265,7 @@ def parse_args():
     parser.add_argument("--api-key-env")
     parser.add_argument("--fixtures", type=Path, default=FIXTURES)
     parser.add_argument("--cases", help="Comma-separated fixture IDs; omitted cases are recorded as skipped")
-    parser.add_argument("--modes", default="inline,upload", help="Comma-separated inline, data-url, upload")
+    parser.add_argument("--modes", default="inline,upload,upload-batch", help="Comma-separated inline, data-url, upload (one HTTP call per file), upload-batch (one call for all files)")
     parser.add_argument("--concurrency", type=lambda v: BENCH.csv_ints(v, 1), default=[1])
     parser.add_argument("--repeats", type=BENCH.positive, default=3)
     parser.add_argument("--warmup", type=int, default=1)
@@ -250,7 +278,7 @@ def parse_args():
     args.upload_url = args.systemone_url.removesuffix("/v1/systemone") + "/api/upload"
     args.api_key = os.environ[args.api_key_env] if args.api_key_env else None
     args.modes = args.modes.split(",")
-    require(args.modes and set(args.modes) <= {"inline", "data-url", "upload"} and len(args.modes) == len(set(args.modes)), "Invalid or duplicate mode")
+    require(args.modes and set(args.modes) <= {"inline", "data-url", "upload", "upload-batch"} and len(args.modes) == len(set(args.modes)), "Invalid or duplicate mode")
     require(args.warmup >= 0 and args.timeout > 0, "warmup must be >= 0 and timeout > 0")
     require(args.max_p95_ms is None or args.max_p95_ms > 0, "Latency budget must be positive")
     return args

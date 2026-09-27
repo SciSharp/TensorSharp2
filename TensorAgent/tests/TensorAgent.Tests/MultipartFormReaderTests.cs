@@ -104,6 +104,44 @@ public sealed class MultipartFormReaderTests
         Assert.Empty(form.Fields);
     }
 
+    [Theory]
+    [InlineData("limit")]
+    [InlineData("count")]
+    [InlineData("truncated")]
+    [InlineData("boundary")]
+    public async Task FailedBatchParsingDeletesBothCompleteAndPartialSpoolFiles(string failure)
+    {
+        string spool = Path.Combine(Path.GetTempPath(), "tensoragent-batch-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(spool);
+        try
+        {
+            using var multipart = new MultipartFormDataContent();
+            multipart.Add(new StringContent("first"), "files", "one.txt");
+            multipart.Add(new StringContent(new string('x', 2000)), "files", "two.txt");
+            byte[] bytes = await multipart.ReadAsByteArrayAsync();
+            if (failure == "truncated") bytes = bytes[..^100];
+            if (failure == "boundary")
+            {
+                string boundary = multipart.Headers.ContentType!.Parameters.Single(p => p.Name == "boundary").Value!.Trim('"');
+                string text = Encoding.UTF8.GetString(bytes);
+                bytes = Encoding.UTF8.GetBytes(text.Replace($"\r\n--{boundary}\r\n", $"\r\n--{boundary}XY\r\n", StringComparison.Ordinal));
+            }
+            using var stream = new ChoppyStream(bytes, 31);
+            Exception ex = await Assert.ThrowsAnyAsync<Exception>(() => MultipartFormReader.ReadAsync(
+                stream, multipart.Headers.ContentType!.ToString(), CancellationToken.None,
+                failure == "limit" ? 500 : 10000, failure == "count" ? 1 : 32, spool));
+            if (failure == "limit")
+                Assert.Equal(413, Assert.IsType<TensorSharp.Server.Hosting.UploadLimitExceededException>(ex).StatusCode);
+            else
+                Assert.IsType<InvalidDataException>(ex);
+            Assert.Empty(Directory.GetFiles(spool));
+        }
+        finally
+        {
+            Directory.Delete(spool, recursive: true);
+        }
+    }
+
     /// <summary>Bytes that are not compressible into a pattern the search could shortcut.</summary>
     private static byte[] Photo(int length)
     {

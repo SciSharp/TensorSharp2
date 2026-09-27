@@ -285,6 +285,8 @@ python docs/examples/jev-attachments.py docs/examples/jev-incident.txt --field d
 
 # 先上传，再把服务端返回的文件名放入 Jev 请求。
 python docs/examples/jev-attachments.py report.pdf --upload --field documents
+# 一次上传多个支持文件，再放进同一个判定请求。
+python docs/examples/jev-attachments.py policy.txt request.txt --upload --question "Does the request satisfy the attached policy?"
 python docs/examples/jev-attachments.py crossing.mp4 --upload --field videos --question "Is a green traffic light visible?"
 python docs/examples/jev-attachments.py incident.wav --upload --field audios --question "Does the speaker report an active service outage?"
 ```
@@ -292,6 +294,75 @@ python docs/examples/jev-attachments.py incident.wav --upload --field audios --q
 手动上传可用 `curl -F "file=@report.pdf" http://127.0.0.1:5000/api/upload`，然后将响应中的 `file`
 值放进 JSON 请求。`/api/upload` 接受 multipart；`/v1/systemone` 仍只接受 JSON。先上传可以避免
 base64 开销与 Jev 请求体上限，但不会绕过附件、上下文或存储限制。
+
+一次上传多个文件时重复 multipart 的 `file` 字段：
+
+```bash
+curl http://127.0.0.1:5000/api/upload -F 'file=@policy.txt' -F 'file=@request.txt'
+```
+
+单文件响应仍为 `{ "ok": true, "file": "...", ... }`；多文件响应为
+`{ "ok": true, "files": [{ "ok": true, "file": "...", ... }, ...] }`，顺序与上传一致。
+每项保留单文件上传的元数据。把所有返回的 `file` 值放入同一个 Jev 请求的 `files` 数组，
+例如 `[{"file":"UPLOAD_1.txt","name":"policy.txt"},{"file":"UPLOAD_2.txt","name":"request.txt"}]`。
+Web UI、TensorAgent 和示例 Python 客户端都会把一次选择的文件合并上传。
+
+每次上传最多 32 个文件，但每个 Jev 判定请求仍然最多 **8 个附件**。
+上传文件总字节上限为 500 MiB 与服务端单文件上限中的较大值；multipart 封装还受原有 HTTP 请求体上限约束。
+单文件大小及存储配额仍然适用。批次失败会清理本批次已写入的文件，不影响之前上传的文件。
+每个数组内保留附件名与顺序；跨数组依次处理 `files`、`documents`、`videos`、`audios`。
+混合媒体需要特定顺序时使用同一个 `files` 数组。[双文件示例](../examples/jev-multiple-files.json)可直接内联提交。
+
+比较逐文件上传与批量上传的真实端到端延迟：
+
+```bash
+python eng/jev-attachments-benchmark.py --endpoint http://127.0.0.1:5000 \
+  --cases multi-tickets,multi-tickets-reversed,multi-cross-file,multi-eight,multi-text-image \
+  --modes inline,upload,upload-batch --concurrency 1,2 --repeats 3
+```
+
+这些合成用例检查附件来源、跨文件政策判定、反向顺序、八个文件和文本加图像输入。
+报告保留上传和推理耗时、响应、诊断及未覆盖的场景；它们是回归检查，不代表一般模型准确率或生产延迟保证。
+
+单独测量上传吞吐量可运行
+`python eng/multiple-upload-benchmark.py --endpoint http://127.0.0.1:5000 --same-basename`。
+工具交替进行逐文件与批量上传，覆盖 1、2、8 个文件和每文件 64 KiB、1 MiB，并下载校验全部字节。
+下载校验及 multipart 构造不计入上传耗时；大 CSV 只用于传输测量，不提交给 Jev，文本和上下文限制仍然适用。
+
+### 在一个请求中组合多种数据类型
+
+以下可直接提交的示例在同一个 Jev 请求中，将结构化 `state` 与不同媒体数组组合使用。
+每个 JSON 文件都包含完整的 base64 附件数据：
+
+| 示例 | 同一请求中的输入 | 展示的判定 |
+|---|---|---|
+| [文本政策 + 图像](../examples/jev-multimodal-image.json) | 结构化状态、`documents` 中的 `signal-policy.txt`、`images` 中的 PNG | 识别亮起的绿灯，并按所附仓库政策保持挡杆关闭。 |
+| [PDF + 视频](../examples/jev-multimodal-video.json) | 结构化状态、`documents` 中的 `ticket.pdf`、`videos` 中的 `signal.mp4` | 将 PDF 中不紧急的退款请求分配给账单团队，并识别视频帧中的绿灯。 |
+| [PDF + 图像 + 视频 + 音频](../examples/jev-multimodal-audio.json) | 结构化状态、`documents` 中的 PDF、`files` 中的 PNG、`videos` 中的 MP4、`audios` 中的 WAV | 区分各来源的证据：PDF 描述不紧急的退款，音频报告紧急技术故障；图像和视频都显示绿灯。 |
+
+在仓库根目录下运行：
+
+```bash
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-multimodal-image.json
+
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-multimodal-video.json
+
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-multimodal-audio.json
+```
+
+三个示例都需要视觉塔；视频和音频示例还需要能够解码 MP4 的媒体解码器。运行音频示例前，
+请按[配置音频转录](#配置音频转录)设置 `TS_JEV_TRANSCRIPTION_URL`。音频提供语音转录文本；
+视频提供抽样帧，不读取其音轨。问题明确指定所需附件，帮助区分不同来源的陈述。
+
+原始附件、可读文本、文件哈希和媒体来源位于
+[`InferenceWeb.Tests/Fixtures/JevAttachments`](../../InferenceWeb.Tests/Fixtures/JevAttachments/manifest.json)。
+视频重复同一张静态图像，音频使用合成语音。这些示例展示如何组合输入，不用于衡量视频时序理解或语音识别准确率。
 
 ### 模型实际读取什么
 

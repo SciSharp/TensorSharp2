@@ -822,6 +822,203 @@ public class WebUiChatServiceTests : IDisposable
         Assert.Empty(Directory.GetFiles(_baseDir));
     }
 
+    [Fact]
+    public async Task UploadBatch_PreservesOrderDuplicateNamesAndPerFileContracts()
+    {
+        Fixture f = Build();
+        WebUiUploadFile[] files =
+        [
+            new("notes.txt", 5, () => new MemoryStream(Encoding.UTF8.GetBytes("first"))),
+            new("notes.txt", 6, () => new MemoryStream(Encoding.UTF8.GetBytes("second"))),
+            new("table.csv", 4, () => new MemoryStream(Encoding.UTF8.GetBytes("a,b\n"))),
+        ];
+
+        using var doc = JsonDocument.Parse(JsonSerializer.Serialize(
+            await f.Service.UploadFilesAsync(files, CancellationToken.None)));
+        JsonElement[] replies = doc.RootElement.GetProperty("files").EnumerateArray().ToArray();
+        Assert.True(doc.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal(3, replies.Length);
+        Assert.Equal(new[] { "notes.txt", "notes.txt", "table.csv" }, replies.Select(r => r.GetProperty("fileName").GetString()));
+        Assert.Equal("first", replies[0].GetProperty("textContent").GetString());
+        Assert.Equal("second", replies[1].GetProperty("textContent").GetString());
+        Assert.True(replies[2].GetProperty("fileBacked").GetBoolean());
+        Assert.Equal(3, replies.Select(r => r.GetProperty("file").GetString()).Distinct().Count());
+        Assert.Equal(15, f.Uploads.UsedBytes);
+        Assert.Equal(3, Directory.GetFiles(_baseDir).Length);
+    }
+
+    [Fact]
+    public async Task UploadBatch_OneFileRetainsTheSingleFileContract()
+    {
+        Fixture f = Build();
+        using var doc = JsonDocument.Parse(JsonSerializer.Serialize(await f.Service.UploadFilesAsync(
+            [new("one.txt", 1, () => new MemoryStream(new byte[] { 65 }))], CancellationToken.None)));
+        Assert.Equal("A", doc.RootElement.GetProperty("textContent").GetString());
+        Assert.False(doc.RootElement.TryGetProperty("files", out _));
+    }
+
+    [Theory]
+    [InlineData("invalid.exe", 2, 400)]
+    [InlineData("big.txt", 5, 413)]
+    [InlineData("negative.txt", -1, 400)]
+    public async Task UploadBatch_ValidatesEveryPartBeforeOpeningAnyStream(string name, long length, int expectedStatus)
+    {
+        Fixture f = Build(new UploadStoragePolicy(_baseDir, maxFileBytes: 4));
+        bool opened = false;
+        Stream Open() { opened = true; return new MemoryStream(new byte[] { 65 }); }
+        var ex = await Assert.ThrowsAsync<WebUiRequestRejectedException>(() => f.Service.UploadFilesAsync(
+            [new("valid.txt", 1, Open), new(name, length, Open)], CancellationToken.None));
+        Assert.Equal(expectedStatus, ex.StatusCode);
+        Assert.False(opened);
+        Assert.Equal(0, f.Uploads.UsedBytes);
+        Assert.Empty(Directory.GetFiles(_baseDir));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(WebUiChatService.MaxUploadFiles + 1)]
+    public async Task UploadBatch_RejectsEmptyOrTooManyFilesBeforeOpeningStreams(int count)
+    {
+        Fixture f = Build();
+        var files = Enumerable.Range(0, count).Select(i => new WebUiUploadFile("part.txt", 0,
+            () => throw new InvalidOperationException("Must not open"))).ToArray();
+        var ex = await Assert.ThrowsAsync<WebUiRequestRejectedException>(
+            () => f.Service.UploadFilesAsync(files, CancellationToken.None));
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(0, f.Uploads.UsedBytes);
+    }
+
+    [Fact]
+    public async Task UploadBatch_ReservesTheWholeQuotaBeforeOpeningStreams()
+    {
+        Fixture f = Build(new UploadStoragePolicy(_baseDir, quotaBytes: 3));
+        Stream Open() => throw new InvalidOperationException("Must not open");
+        var ex = await Assert.ThrowsAsync<WebUiRequestRejectedException>(() => f.Service.UploadFilesAsync(
+            [new("a.txt", 2, Open), new("b.txt", 2, Open)], CancellationToken.None));
+        Assert.Equal(507, ex.StatusCode);
+        Assert.Equal(0, f.Uploads.UsedBytes);
+        Assert.Empty(Directory.GetFiles(_baseDir));
+    }
+
+    [Fact]
+    public async Task UploadBatch_EnforcesAggregateSizeEvenWhenEachFileFits()
+    {
+        Fixture f = Build();
+        Stream Open() => throw new InvalidOperationException("Must not open");
+        var ex = await Assert.ThrowsAsync<WebUiRequestRejectedException>(() => f.Service.UploadFilesAsync(
+            [new("a.csv", f.Uploads.MaxFileBytes, Open), new("b.csv", 1, Open)], CancellationToken.None));
+        Assert.Equal(413, ex.StatusCode);
+        Assert.Equal(0, f.Uploads.UsedBytes);
+    }
+
+    [Fact]
+    public async Task UploadBatch_LaterStreamOpenFailureRollsBackEarlierFilesAndReservations()
+    {
+        Fixture f = Build(new UploadStoragePolicy(_baseDir, quotaBytes: 100));
+        var ex = await Assert.ThrowsAsync<IOException>(() => f.Service.UploadFilesAsync(
+            [new("a.csv", 3, () => new MemoryStream(new byte[3])),
+             new("b.txt", 5, () => throw new IOException("read failed")),
+             new("c.txt", 2, () => new MemoryStream(new byte[2]))], CancellationToken.None));
+        Assert.Equal("read failed", ex.Message);
+        Assert.Equal(0, f.Uploads.UsedBytes);
+        Assert.Empty(Directory.GetFiles(_baseDir));
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    public async Task UploadBatch_LengthMismatchRollsBackAllFiles(int actualLength)
+    {
+        Fixture f = Build();
+        var ex = await Assert.ThrowsAsync<WebUiRequestRejectedException>(() => f.Service.UploadFilesAsync(
+            [new("a.csv", 3, () => new MemoryStream(new byte[3])),
+             new("b.csv", 3, () => new MemoryStream(new byte[actualLength]))], CancellationToken.None));
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(0, f.Uploads.UsedBytes);
+        Assert.Empty(Directory.GetFiles(_baseDir));
+    }
+
+    [Fact]
+    public async Task UploadBatch_DecoderFailureRollsBackTheBatchAndPreservesExistingFiles()
+    {
+        string existing = Path.Combine(_baseDir, "existing.txt");
+        await File.WriteAllTextAsync(existing, "keep");
+        Fixture f = Build();
+        var ex = await Assert.ThrowsAsync<WebUiRequestRejectedException>(() => f.Service.UploadFilesAsync(
+            [new("a.csv", 3, () => new MemoryStream(new byte[3])),
+             new("broken.pdf", 3, () => new MemoryStream(new byte[3]))], CancellationToken.None));
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(4, f.Uploads.UsedBytes);
+        Assert.Equal(existing, Assert.Single(Directory.GetFiles(_baseDir)));
+        Assert.Equal("keep", await File.ReadAllTextAsync(existing));
+    }
+
+    [Fact]
+    public async Task UploadBatch_StreamDisposalFailureRollsBackTheCurrentSuccessfulFile()
+    {
+        Fixture f = Build();
+        await Assert.ThrowsAsync<IOException>(() => f.Service.UploadFilesAsync(
+            [new("a.csv", 3, () => new MemoryStream(new byte[3])),
+             new("b.csv", 3, () => new DisposalFailureStream(new byte[3]))], CancellationToken.None));
+        Assert.Equal(0, f.Uploads.UsedBytes);
+        Assert.Empty(Directory.GetFiles(_baseDir));
+    }
+
+    private sealed class DisposalFailureStream(byte[] bytes) : MemoryStream(bytes)
+    {
+        public override ValueTask DisposeAsync()
+        {
+            base.Dispose();
+            return ValueTask.FromException(new IOException("Cannot dispose stream"));
+        }
+    }
+
+    [Fact]
+    public async Task UploadBatch_CancellationRollsBackEarlierFiles()
+    {
+        Fixture f = Build();
+        using var cts = new CancellationTokenSource();
+        Stream Cancel() { cts.Cancel(); return new MemoryStream(new byte[3]); }
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => f.Service.UploadFilesAsync(
+            [new("a.csv", 3, () => new MemoryStream(new byte[3])), new("b.csv", 3, Cancel)], cts.Token));
+        Assert.Equal(0, f.Uploads.UsedBytes);
+        Assert.Empty(Directory.GetFiles(_baseDir));
+    }
+
+    [Fact]
+    public async Task UploadAdapter_ReadsEveryMultipartFilePartInOrder()
+    {
+        Fixture f = Build();
+        var adapter = new WebUiAdapter(f.Model, new InferenceQueue(), f.Sessions, f.Options, f.Uploads,
+            f.Skills, null, null, null, NullLoggerFactory.Instance);
+        using var multipart = new System.Net.Http.MultipartFormDataContent();
+        multipart.Add(new System.Net.Http.StringContent("alpha"), "files", "a.txt");
+        multipart.Add(new System.Net.Http.StringContent("beta"), "different-field", "b.txt");
+        var context = new Microsoft.AspNetCore.Http.DefaultHttpContext();
+        context.Request.ContentType = multipart.Headers.ContentType!.ToString();
+        using var body = new MemoryStream(await multipart.ReadAsByteArrayAsync());
+        context.Request.Body = body;
+        var result = Assert.IsAssignableFrom<Microsoft.AspNetCore.Http.IValueHttpResult>(await adapter.UploadAsync(context.Request));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(result.Value));
+        JsonElement files = json.RootElement.GetProperty("files");
+        Assert.Equal(new[] { "alpha", "beta" }, files.EnumerateArray().Select(f => f.GetProperty("textContent").GetString()));
+        Assert.Equal(9, f.Uploads.UsedBytes);
+    }
+
+    [Fact]
+    public async Task UploadAdapter_MalformedMultipartReturns400()
+    {
+        Fixture f = Build();
+        var adapter = new WebUiAdapter(f.Model, new InferenceQueue(), f.Sessions, f.Options, f.Uploads,
+            f.Skills, null, null, null, NullLoggerFactory.Instance);
+        var context = new Microsoft.AspNetCore.Http.DefaultHttpContext();
+        context.Request.ContentType = "multipart/form-data";
+        context.Request.Body = new MemoryStream(Encoding.UTF8.GetBytes("broken"));
+        var result = Assert.IsAssignableFrom<Microsoft.AspNetCore.Http.IStatusCodeHttpResult>(await adapter.UploadAsync(context.Request));
+        Assert.Equal(400, result.StatusCode);
+        Assert.Empty(Directory.GetFiles(_baseDir));
+    }
+
     // ---- refusals shared with the image / video routes --------------------------
 
     [Fact]

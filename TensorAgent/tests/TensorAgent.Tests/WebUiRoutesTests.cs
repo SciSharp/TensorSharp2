@@ -102,6 +102,52 @@ public sealed class WebUiRoutesTests : IDisposable
         Assert.Contains(response.Headers.GetValues("Set-Cookie"), v => v.Contains(_server.Token, StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task UploadBatch_ReturnsEveryFileAndServesItsExactContent()
+    {
+        using var multipart = new MultipartFormDataContent();
+        multipart.Add(new StringContent("first source"), "files", "source.txt");
+        multipart.Add(new StringContent("second source"), "files", "source.txt");
+        using HttpResponseMessage response = await _client.PostAsync("/api/upload", multipart);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement body = await BodyOf(response);
+        Assert.True(body.GetProperty("ok").GetBoolean());
+        JsonElement[] files = body.GetProperty("files").EnumerateArray().ToArray();
+        Assert.Equal(2, files.Length);
+        Assert.Equal("first source", files[0].GetProperty("textContent").GetString());
+        Assert.Equal("second source", files[1].GetProperty("textContent").GetString());
+        Assert.NotEqual(files[0].GetProperty("file").GetString(), files[1].GetProperty("file").GetString());
+        foreach (JsonElement file in files)
+        {
+            Assert.Equal("source.txt", file.GetProperty("fileName").GetString());
+            Assert.Equal(file.GetProperty("textContent").GetString(), await _client.GetStringAsync(file.GetProperty("url").GetString()));
+        }
+    }
+
+    [Fact]
+    public async Task UploadSingle_RetainsExistingResponse()
+    {
+        using var multipart = new MultipartFormDataContent();
+        multipart.Add(new StringContent("one source"), "file", "source.txt");
+        using HttpResponseMessage response = await _client.PostAsync("/api/upload", multipart);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement body = await BodyOf(response);
+        Assert.Equal("one source", body.GetProperty("textContent").GetString());
+        Assert.False(body.TryGetProperty("files", out _));
+    }
+
+    [Fact]
+    public async Task UploadBatch_RejectsTheWholeRequestWhenALaterExtensionIsInvalid()
+    {
+        using var multipart = new MultipartFormDataContent();
+        multipart.Add(new StringContent("valid source"), "files", "source.txt");
+        multipart.Add(new ByteArrayContent(new byte[] { 1, 2, 3 }), "files", "program.exe");
+        using HttpResponseMessage response = await _client.PostAsync("/api/upload", multipart);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains(".exe", (await BodyOf(response)).GetProperty("error").GetString());
+        Assert.Empty(Directory.GetFiles(_root, "*.txt"));
+    }
+
     // ---- the shared Web UI surface --------------------------------------------------
 
     [Fact]

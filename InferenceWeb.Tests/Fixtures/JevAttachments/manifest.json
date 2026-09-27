@@ -5,7 +5,8 @@
     "documents": "Original synthetic support tickets. PDF has a real text layer; DOCX/XLSX/PPTX are minimal OpenXML packages with one paragraph/cell/slide. No macros or external links.",
     "signal.png": "Existing original docs/examples/jev-traffic-light.json image, green lamp illuminated.",
     "signal.mp4": "12 identical copies of signal.png encoded by OpenCV 5.0.0 mp4v at 6 fps; a 2 second visual ingestion check, not temporal reasoning.",
-    "ticket.wav": "macOS say Samantha at rate 150; afconvert to 16 kHz mono PCM16. Original transcript: The service is down with a software error. Fix it immediately. I am extremely angry."
+    "ticket.wav": "macOS say Samantha at rate 150; afconvert to 16 kHz mono PCM16. Original transcript: The service is down with a software error. Fix it immediately. I am extremely angry.",
+    "multiple-files": "Original synthetic review policy and requests, and a custom warehouse signal policy. Multi-file cases check source attribution, request ordering, cross-file decisions, mixed text/image evidence and the eight-attachment bound. These are small ingestion checks, not representative reasoning accuracy."
   },
   "files": {
     "signal.mp4": {
@@ -55,6 +56,18 @@
     "ticket.pptx": {
       "sha256": "b674e5cb91fa83ebfd06ac591266673fad35d6f2a40d1abe2e5eb80baa3c0eef",
       "bytes": 1654
+    },
+    "review-policy.txt": {
+      "sha256": "730df7ee0c64698382106c26218d6087b7f4d1cb6302a4c046de00fcbfac5b79",
+      "bytes": 288
+    },
+    "review-requests.txt": {
+      "sha256": "662848bfc828d7b98be26cc46fcfdd6cda39eb7bd243af93da800dc02d666d29",
+      "bytes": 153
+    },
+    "signal-policy.txt": {
+      "sha256": "5feed24904c36d7c31ffad6f8d6b5ccfd35f7fde5a0fa405fe046f288709d2dc",
+      "bytes": 283
     }
   },
   "cases": [
@@ -661,6 +674,352 @@
       },
       "state": {
         "message": "I want to buy a new subscription and need pricing. I am frustrated but polite. There is no hurry."
+      }
+    },
+    {
+      "id": "multi-tickets",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "ticket.txt",
+          "kind": "text"
+        },
+        {
+          "field": "files",
+          "path": "outage.txt",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "ticket_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.txt? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "outage_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in outage.txt? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "ticket_urgent": {
+          "type": "noul",
+          "instructions": "Does the customer in ticket.txt explicitly request immediate action? Use only that named attachment.",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "outage_urgent": {
+          "type": "noul",
+          "instructions": "Does the customer in outage.txt explicitly request immediate action? Use only that named attachment.",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "same_team": {
+          "type": "noul",
+          "instructions": "Compare ticket.txt and outage.txt. Should both customer requests be handled by the same department?",
+          "criteria": {
+            "true": "The two requests require the same department.",
+            "false": "The two requests require different departments."
+          }
+        }
+      },
+      "expected": {
+        "ticket_team": "billing",
+        "outage_team": "technical",
+        "ticket_urgent": false,
+        "outage_urgent": true,
+        "same_team": false
+      }
+    },
+    {
+      "id": "multi-tickets-reversed",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "outage.txt",
+          "kind": "text"
+        },
+        {
+          "field": "files",
+          "path": "ticket.txt",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "ticket_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.txt? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "outage_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in outage.txt? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "ticket_urgent": {
+          "type": "noul",
+          "instructions": "Does the customer in ticket.txt explicitly request immediate action? Use only that named attachment.",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "outage_urgent": {
+          "type": "noul",
+          "instructions": "Does the customer in outage.txt explicitly request immediate action? Use only that named attachment.",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "same_team": {
+          "type": "noul",
+          "instructions": "Compare ticket.txt and outage.txt. Should both customer requests be handled by the same department?",
+          "criteria": {
+            "true": "The two requests require the same department.",
+            "false": "The two requests require different departments."
+          }
+        }
+      },
+      "expected": {
+        "ticket_team": "billing",
+        "outage_team": "technical",
+        "ticket_urgent": false,
+        "outage_urgent": true,
+        "same_team": false
+      }
+    },
+    {
+      "id": "multi-cross-file",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "documents",
+          "path": "review-policy.txt",
+          "kind": "text"
+        },
+        {
+          "field": "documents",
+          "path": "review-requests.txt",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "review_r17": {
+          "type": "noul",
+          "instructions": "Apply the category-specific thresholds in review-policy.txt to the details of request R-17 in review-requests.txt. Does R-17 require supervisor review?"
+        },
+        "review_r18": {
+          "type": "noul",
+          "instructions": "Apply the category-specific thresholds in review-policy.txt to the details of request R-18 in review-requests.txt. Does R-18 require supervisor review?"
+        },
+        "review_queue": {
+          "type": "choice",
+          "instructions": "Using review-policy.txt and review-requests.txt together, which requests must enter the supervisor review queue?",
+          "criteria": {
+            "r17_only": "Only request R-17",
+            "r18_only": "Only request R-18",
+            "both": "Both R-17 and R-18",
+            "neither": "Neither request"
+          }
+        }
+      },
+      "expected": {
+        "review_r17": true,
+        "review_r18": false,
+        "review_queue": "r17_only"
+      }
+    },
+    {
+      "id": "multi-text-image",
+      "requires": [
+        "vision"
+      ],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "signal-policy.txt",
+          "kind": "text"
+        },
+        {
+          "field": "files",
+          "path": "signal.png",
+          "kind": "image"
+        }
+      ],
+      "questions": {
+        "signal": {
+          "type": "choice",
+          "instructions": "Which traffic-light lamp is brightly illuminated in signal.png?",
+          "criteria": {
+            "red": "The red lamp is lit",
+            "yellow": "The yellow lamp is lit",
+            "green": "The green lamp is lit"
+          }
+        },
+        "barrier": {
+          "type": "choice",
+          "instructions": "Apply the custom warehouse mapping in signal-policy.txt to the illuminated lamp in signal.png. What must the controller do with the barrier?",
+          "criteria": {
+            "open": "Open the barrier",
+            "closed": "Keep the barrier closed"
+          }
+        }
+      },
+      "expected": {
+        "signal": "green",
+        "barrier": "closed"
+      }
+    },
+    {
+      "id": "multi-eight",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "ticket.txt",
+          "kind": "text"
+        },
+        {
+          "field": "files",
+          "path": "ticket.csv",
+          "kind": "text"
+        },
+        {
+          "field": "files",
+          "path": "ticket.json",
+          "kind": "text"
+        },
+        {
+          "field": "files",
+          "path": "ticket.html",
+          "kind": "text"
+        },
+        {
+          "field": "files",
+          "path": "ticket.docx",
+          "kind": "document"
+        },
+        {
+          "field": "files",
+          "path": "ticket.xlsx",
+          "kind": "document"
+        },
+        {
+          "field": "files",
+          "path": "ticket.pptx",
+          "kind": "document"
+        },
+        {
+          "field": "files",
+          "path": "outage.txt",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "source_1_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.txt? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "source_2_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.csv? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "source_3_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.json? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "source_4_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.html? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "source_5_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.docx? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "source_6_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.xlsx? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "source_7_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.pptx? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "source_8_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in outage.txt? Use only that named attachment.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        }
+      },
+      "expected": {
+        "source_1_team": "billing",
+        "source_2_team": "billing",
+        "source_3_team": "billing",
+        "source_4_team": "billing",
+        "source_5_team": "billing",
+        "source_6_team": "billing",
+        "source_7_team": "billing",
+        "source_8_team": "technical"
       }
     }
   ]

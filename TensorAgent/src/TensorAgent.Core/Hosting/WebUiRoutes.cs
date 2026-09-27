@@ -214,16 +214,28 @@ public static class WebUiRoutes
         // ---- uploads and generation --------------------------------------------
         server.MapPost("/api/upload", async (request, ct) =>
         {
-            using MultipartForm form = await request.ReadFormAsync(ct);
-            MultipartFile? file = form.Files.FirstOrDefault();
-            if (file is null)
-                return LoopbackResponse.Json(new { error = "no file was uploaded" }, 400);
-            await using FileStream content = File.OpenRead(file.TempPath);
-            // The name is resolved before the service sees it, because the service
-            // classifies an upload by its extension alone and iOS's photo picker sends
-            // a name that has none. See UploadNaming.
-            return Json(await Guarded(() => chat.UploadAsync(
-                content, UploadNaming.ResolveFileName(file), file.Length, ct)));
+            if (!request.HasFormContentType)
+                return LoopbackResponse.Json(new { error = "Expected multipart form data" }, 400);
+            try
+            {
+                if (request.Raw.ContentLength64 > chat.MaxUploadBatchBytes)
+                    return LoopbackResponse.Json(new { error = "Upload exceeds the request size limit." }, 413);
+                using MultipartForm form = await MultipartFormReader.ReadAsync(request.Raw.InputStream,
+                    request.Raw.ContentType ?? string.Empty, ct, chat.MaxUploadBatchBytes, WebUiChatService.MaxUploadFiles);
+                // iOS photo pickers may omit extensions; retain MIME-based naming
+                // for every part before shared validation and batch admission.
+                WebUiUploadFile[] files = form.Files.Select(file => new WebUiUploadFile(
+                    UploadNaming.ResolveFileName(file), file.Length, file.OpenRead)).ToArray();
+                return Json(await Guarded(() => chat.UploadFilesAsync(files, ct)));
+            }
+            catch (InvalidDataException)
+            {
+                return LoopbackResponse.Json(new { error = "Invalid multipart form data or too many files." }, 400);
+            }
+            catch (UploadLimitExceededException ex)
+            {
+                return LoopbackResponse.Json(new { error = ex.Message }, ex.StatusCode);
+            }
         });
         // The desktop server mounts the upload directory as static files; here it is a
         // route, and it has to exist for the same reason: the page renders an

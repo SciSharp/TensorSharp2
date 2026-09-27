@@ -1,0 +1,4 @@
+Supervisor review policy for support adjustments:
+Category Amber requires supervisor review when the amount is greater than 500 credits.
+Category Violet requires supervisor review when the amount is greater than 100 credits.
+All other requests may be processed without supervisor review.

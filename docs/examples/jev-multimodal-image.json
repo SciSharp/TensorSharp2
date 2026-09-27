@@ -1,0 +1,44 @@
+{
+  "model": "jev-latest",
+  "state": {
+    "task": "Apply the attached warehouse policy to the pictured signal.",
+    "site": {
+      "id": "test-bay-4",
+      "kind": "warehouse"
+    },
+    "evidence": {
+      "image": "Current signal snapshot",
+      "signal-policy.txt": "Controller rules for this test bay"
+    }
+  },
+  "documents": [
+    {
+      "name": "signal-policy.txt",
+      "data": "V2FyZWhvdXNlIHRlc3QtYmF5IGNvbnRyb2xsZXIgcG9saWN5OgpUaGlzIGNvbnRyb2xsZXIgdXNlcyBhIGN1c3RvbSBtYXBwaW5nLCBub3Qgbm9ybWFsIHJvYWQgdHJhZmZpYyBjb252ZW50aW9ucy4KSWYgdGhlIGlsbHVtaW5hdGVkIGxhbXAgaXMgZ3JlZW4sIGtlZXAgdGhlIGJhcnJpZXIgQ0xPU0VELgpJZiB0aGUgaWxsdW1pbmF0ZWQgbGFtcCBpcyByZWQsIE9QRU4gdGhlIGJhcnJpZXIuCklmIHRoZSBpbGx1bWluYXRlZCBsYW1wIGlzIHllbGxvdywga2VlcCB0aGUgYmFycmllciBDTE9TRUQuCg=="
+    }
+  ],
+  "images": [
+    "data:image/png;base64,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"
+  ],
+  "questions": {
+    "signal": {
+      "type": "choice",
+      "instructions": "Which traffic-light lamp is brightly illuminated in the supplied image?",
+      "criteria": {
+        "red": "The red lamp is lit",
+        "yellow": "The yellow lamp is lit",
+        "green": "The green lamp is lit"
+      }
+    },
+    "barrier": {
+      "type": "choice",
+      "instructions": "Apply the custom warehouse mapping in signal-policy.txt to the illuminated lamp in the supplied image. What must the controller do with the barrier?",
+      "criteria": {
+        "open": "Open the barrier",
+        "closed": "Keep the barrier closed"
+      }
+    }
+  },
+  "samples": 1,
+  "seed": 42
+}

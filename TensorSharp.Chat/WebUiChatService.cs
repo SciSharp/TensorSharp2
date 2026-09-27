@@ -477,6 +477,86 @@ namespace TensorSharp.Chat
 
         // ---- Upload ----------------------------------------------------------
 
+        /// <summary>Maximum number of file parts in one multipart upload.</summary>
+        public const int MaxUploadFiles = 32;
+
+        internal long MaxUploadBatchBytes => _uploads.MaxBatchBytes;
+
+        /// <summary>
+        /// Validate and store all parts in order. One part preserves the established
+        /// single-file reply; multiple parts return { ok, files }. A failed batch
+        /// rolls back successful parts and returns unused storage reservations.
+        /// </summary>
+        public async Task<object> UploadFilesAsync(
+            IReadOnlyList<WebUiUploadFile> files, CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(files);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (files.Count == 0)
+                throw new WebUiRequestRejectedException(400, new { error = "No file uploaded" });
+            if (files.Count > MaxUploadFiles)
+                throw new WebUiRequestRejectedException(400, new { error = $"At most {MaxUploadFiles} files can be uploaded in one request." });
+
+            // Snapshot the descriptors before validation: callers must not be able to
+            // change metadata after admission or while an earlier stream is copied.
+            WebUiUploadFile[] parts = files.ToArray();
+            var lengths = new long[parts.Length];
+            for (int i = 0; i < parts.Length; i++)
+            {
+                WebUiUploadFile part = parts[i];
+                if (part?.OpenReadStream == null)
+                    throw new ArgumentException("Every upload must provide a stream factory.", nameof(files));
+                ClassifyUpload(part.FileName);
+                lengths[i] = part.Length;
+            }
+            if (!_uploads.TryReserveClientBatchWrite(lengths, out long remainingReservation, out string error, out int statusCode))
+                throw new WebUiRequestRejectedException(statusCode, new { error });
+
+            var replies = new List<object>(parts.Length);
+            try
+            {
+                foreach (WebUiUploadFile part in parts)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await using Stream content = part.OpenReadStream()
+                        ?? throw new InvalidOperationException("The upload stream factory returned null.");
+                    // UploadCoreAsync owns this reservation from this point onward,
+                    // including returning it when copying or decoding fails.
+                    remainingReservation -= part.Length;
+                    replies.Add(await UploadCoreAsync(content, part.FileName, part.Length,
+                        cancellationToken, null, null, reservationHeld: true).ConfigureAwait(false));
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                return replies.Count == 1 ? replies[0] : new { ok = true, files = replies };
+            }
+            catch
+            {
+                _uploads.Release(remainingReservation);
+                foreach (object reply in replies)
+                    DiscardUpload(reply);
+                throw;
+            }
+        }
+
+        private (string Extension, string MediaType) ClassifyUpload(string originalFileName)
+        {
+            string ext = Path.GetExtension(originalFileName ?? string.Empty).ToLowerInvariant();
+            string mediaType = UploadContentPolicy.Classify(ext);
+            if (mediaType == "unknown")
+            {
+                _loggerFactory.CreateLogger("TensorSharp.Server.Upload").LogWarning(LogEventIds.UploadRejected,
+                    "Upload rejected: unsupported extension {Extension} (name={FileName})",
+                    ext.Length == 0 ? "(none)" : ext, originalFileName);
+                throw new WebUiRequestRejectedException(400, new
+                {
+                    error = ext.Length == 0
+                        ? "Files without an extension are not supported. Upload an image, video, audio, PDF, or plain-text/code file."
+                        : $"Unsupported file type '{ext}'. Upload an image, video, audio, PDF, or plain-text/code file.",
+                });
+            }
+            return (ext, mediaType);
+        }
+
         /// <summary>
         /// <c>POST /api/upload</c>, once the transport has found the file part: the
         /// bytes, the client's file name (only its extension and its echo in the reply
@@ -507,34 +587,29 @@ namespace TensorSharp.Chat
         /// and text can be kept to a phone-safe inline excerpt while the full file
         /// remains staged for file tools.
         /// </summary>
-        public async Task<object> UploadAsync(
+        public Task<object> UploadAsync(
             Stream content,
             string originalFileName,
             long length,
             CancellationToken cancellationToken,
             string stableStorageKey,
-            int? maxInlineTextChars)
+            int? maxInlineTextChars) =>
+            UploadCoreAsync(content, originalFileName, length, cancellationToken,
+                stableStorageKey, maxInlineTextChars, reservationHeld: false);
+
+        private async Task<object> UploadCoreAsync(
+            Stream content,
+            string originalFileName,
+            long length,
+            CancellationToken cancellationToken,
+            string stableStorageKey,
+            int? maxInlineTextChars,
+            bool reservationHeld)
         {
             if (content == null) throw new ArgumentNullException(nameof(content));
             var uploadLogger = _loggerFactory.CreateLogger("TensorSharp.Server.Upload");
 
-            string ext = Path.GetExtension(originalFileName ?? string.Empty).ToLowerInvariant();
-            // Classify before anything touches disk: an upload with an extension
-            // outside the allow-list is rejected without ever being written, so
-            // /uploads can only ever hold files the serve-side policy covers.
-            string mediaType = UploadContentPolicy.Classify(ext);
-            if (mediaType == "unknown")
-            {
-                uploadLogger.LogWarning(LogEventIds.UploadRejected,
-                    "Upload rejected: unsupported extension {Extension} (name={FileName})",
-                    ext.Length == 0 ? "(none)" : ext, originalFileName);
-                throw new WebUiRequestRejectedException(400, new
-                {
-                    error = ext.Length == 0
-                        ? "Files without an extension are not supported. Upload an image, video, audio, PDF, or plain-text/code file."
-                        : $"Unsupported file type '{ext}'. Upload an image, video, audio, PDF, or plain-text/code file.",
-                });
-            }
+            (string ext, string mediaType) = ClassifyUpload(originalFileName);
 
             if (stableStorageKey != null && !IsStorageKey(stableStorageKey))
                 throw new ArgumentException("A stable upload storage key must be 32 lowercase hexadecimal characters.", nameof(stableStorageKey));
@@ -549,7 +624,7 @@ namespace TensorSharp.Chat
             if (stableStorageKey != null && !DeleteAccountedUploadFamily(storageKey))
                 throw new IOException("An earlier staged copy of this shared file is still in use.");
 
-            if (!_uploads.TryReserveClientWrite(length, out string limitError, out int limitStatus))
+            if (!reservationHeld && !_uploads.TryReserveClientWrite(length, out string limitError, out int limitStatus))
             {
                 uploadLogger.LogWarning(LogEventIds.UploadRejected,
                     "Upload rejected: {Reason} (name={FileName} bytes={Length})", limitError, originalFileName, length);
@@ -561,8 +636,9 @@ namespace TensorSharp.Chat
 
             try
             {
-                using (var stream = File.Create(savePath))
-                    await content.CopyToAsync(stream, cancellationToken);
+                await using var stream = new FileStream(savePath, FileMode.CreateNew, FileAccess.Write,
+                    FileShare.None, bufferSize: 65536, useAsync: true);
+                await CopyUploadAsync(content, stream, length, cancellationToken).ConfigureAwait(false);
             }
             catch
             {
@@ -927,6 +1003,29 @@ namespace TensorSharp.Chat
                 DiscardStoredFiles(new StoredUploadState(storedFiles));
                 DeleteUnaccountedUploadFamily(safeFileName);
                 throw;
+            }
+        }
+
+        private static async Task CopyUploadAsync(Stream content, Stream destination, long length, CancellationToken ct)
+        {
+            byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(65536);
+            try
+            {
+                long copied = 0;
+                int read;
+                while ((read = await content.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false)) != 0)
+                {
+                    if (read > length - copied)
+                        throw new WebUiRequestRejectedException(400, new { error = "Uploaded content does not match its declared length." });
+                    await destination.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                    copied += read;
+                }
+                if (copied != length)
+                    throw new WebUiRequestRejectedException(400, new { error = "Uploaded content does not match its declared length." });
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
             }
         }
 

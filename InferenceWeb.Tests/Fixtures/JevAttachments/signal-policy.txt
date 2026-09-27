@@ -1,0 +1,5 @@
+Warehouse test-bay controller policy:
+This controller uses a custom mapping, not normal road traffic conventions.
+If the illuminated lamp is green, keep the barrier CLOSED.
+If the illuminated lamp is red, OPEN the barrier.
+If the illuminated lamp is yellow, keep the barrier CLOSED.

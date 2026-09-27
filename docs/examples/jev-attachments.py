@@ -18,27 +18,40 @@ def post(url, data, content_type, timeout):
         return json.load(response)
 
 
-def attachment(path, args):
-    if path.stat().st_size > 32 * 1024 * 1024:
-        raise ValueError(f"{path}: Jev accepts at most 32 MiB per attachment")
-    data = path.read_bytes()
+def attachments(paths, args):
+    sizes = [path.stat().st_size for path in paths]
+    if any(size <= 0 or size > 32 * 1024 * 1024 for size in sizes):
+        raise ValueError("Jev accepts 1 byte to 32 MiB per attachment")
+    if sum(sizes) > 64 * 1024 * 1024:
+        raise ValueError("Jev accepts at most 64 MiB of attachments per request")
     if not args.upload:
-        return {"name": path.name, "data": base64.b64encode(data).decode("ascii")}
+        return [{"name": path.name, "data": base64.b64encode(path.read_bytes()).decode("ascii")} for path in paths]
 
+    # Send the entire selection in one multipart request. The returned list is
+    # in the same order even when two local files have the same basename.
     boundary = "jev-" + uuid.uuid4().hex
-    # Reject header delimiters in a local name before constructing multipart data.
-    if any(c in path.name for c in '\r\n"\\'):
-        raise ValueError(f"{path}: rename the file before uploading it")
-    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    header = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
-        f"Content-Type: {content_type}\r\n\r\n"
-    ).encode("utf-8")
-    body = header + data + f"\r\n--{boundary}--\r\n".encode("ascii")
+    parts = []
+    for path in paths:
+        if any(c in path.name for c in '\r\n"\\'):
+            raise ValueError(f"{path}: rename the file before uploading it")
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+        parts.extend([header, path.read_bytes(), b"\r\n"])
+    parts.append(f"--{boundary}--\r\n".encode("ascii"))
+    body = b"".join(parts)
     uploaded = post(args.endpoint + "/api/upload", body,
                     f"multipart/form-data; boundary={boundary}", args.timeout)
-    return {"file": uploaded["file"], "name": path.name}
+    files = uploaded.get("files", [uploaded])
+    if uploaded.get("ok") is not True or not isinstance(files, list) or len(files) != len(paths):
+        raise ValueError("Upload did not return every requested file")
+    if any(not isinstance(item, dict) or item.get("ok") is not True or not isinstance(item.get("file"), str)
+           or not item["file"] for item in files):
+        raise ValueError("Upload returned an invalid file reference")
+    return [{"file": item["file"], "name": path.name} for path, item in zip(paths, files)]
 
 
 def main():
@@ -46,7 +59,7 @@ def main():
     parser.add_argument("paths", metavar="FILE", nargs="+", type=Path)
     parser.add_argument("--endpoint", default="http://127.0.0.1:5000")
     parser.add_argument("--upload", action="store_true",
-                        help="upload first, then submit bare server file references")
+                        help="upload all files together, then submit bare server file references")
     parser.add_argument("--field", choices=("files", "documents", "videos", "audios"),
                         default="files", help="files detects the kind from the extension")
     parser.add_argument("--state", default="Review the attached evidence.")
@@ -60,7 +73,7 @@ def main():
         body = {
             "model": "jev-latest",
             "state": args.state,
-            args.field: [attachment(path, args) for path in args.paths],
+            args.field: attachments(args.paths, args),
             "questions": {"match": {"type": "noul", "instructions": args.question}},
             "samples": 1,
             "seed": 42,

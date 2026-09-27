@@ -2,6 +2,8 @@
 """Harness correctness tests. HTTP fixtures are not model-quality evidence."""
 import base64
 import copy
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
@@ -15,6 +17,9 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location("jev_attachments_benchmark", Path(__file__).parents[1] / "jev-attachments-benchmark.py")
 bench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bench)
+CLIENT_SPEC = importlib.util.spec_from_file_location("jev_attachment_client", bench.ROOT / "docs/examples/jev-attachments.py")
+client = importlib.util.module_from_spec(CLIENT_SPEC)
+CLIENT_SPEC.loader.exec_module(client)
 
 
 class FixtureServer(BaseHTTPRequestHandler):
@@ -28,7 +33,10 @@ class FixtureServer(BaseHTTPRequestHandler):
         raw = self.rfile.read(int(self.headers["Content-Length"]))
         if self.path == "/api/upload":
             self.uploads.append(raw)
-            response = {"ok": True, "file": "generated-ticket.txt"}
+            message = BytesParser(policy=email_policy).parsebytes(
+                ("Content-Type: " + self.headers["Content-Type"] + "\r\n\r\n").encode() + raw)
+            files = [{"ok": True, "file": "generated-" + part.get_filename()} for part in message.iter_parts()]
+            response = files[0] if len(files) == 1 else {"ok": True, "files": files}
         else:
             payload = json.loads(raw)
             self.payloads.append(payload)
@@ -36,8 +44,10 @@ class FixtureServer(BaseHTTPRequestHandler):
                 "type": "choice", "choice": "billing", "confidence": 1,
                 "probabilities": {"billing": 1, "technical": 0}}},
                 "usage": {"input_tokens": 16, "output_tokens": 3},
-                "diagnostics": {"attachments": [{"name": "ticket.txt", "kind": "text", "textCharacters": 101,
-                                                 "imageCount": 0, "cacheHit": False}],
+                "diagnostics": {"attachments": [{"name": item["name"], "kind": "text", "textCharacters": 101,
+                                                 "imageCount": 0, "cacheHit": False}
+                                                for field in ("files", "documents", "videos", "audios")
+                                                for item in payload.get(field, [])],
                                 "timing": {"preprocessing_ms": 1, "inference_ms": 2, "total_ms": 3}}}
         data = json.dumps(response).encode()
         self.send_response(200)
@@ -108,6 +118,51 @@ class AttachmentBenchmarkTests(unittest.TestCase):
         row = bench.run_case(self.args, self.case, "inline", 0)
         self.assertEqual("failed", row["status"])
         self.assertIn("differs from gold", row["error"])
+
+    def test_batch_upload_sends_all_files_once_and_retains_source_order(self):
+        self.case["attachments"].append({"field": "files", "path": "outage.txt", "kind": "text"})
+        before = len(FixtureServer.uploads)
+        row = bench.run_case(self.args, self.case, "upload-batch", 0)
+        self.assertEqual("passed", row["status"], row)
+        self.assertEqual(before + 1, len(FixtureServer.uploads))
+        self.assertEqual(1, len(row["uploads"]))
+        self.assertEqual(["generated-ticket.txt", "generated-outage.txt"],
+                         [item["file"] for item in FixtureServer.payloads[-1]["files"]])
+        for name in ("ticket.txt", "outage.txt"):
+            self.assertIn((bench.FIXTURES.parent / name).read_bytes(), FixtureServer.uploads[-1])
+
+    def test_legacy_server_dropping_later_files_cannot_pass_batch_benchmark(self):
+        self.case["attachments"].append({"field": "files", "path": "outage.txt", "kind": "text"})
+        with patch.object(bench, "upload_many", return_value={"status": 200, "body": {"ok": True, "file": "only-first.txt"}, "elapsed_ms": 1}):
+            row = bench.run_case(self.args, self.case, "upload-batch", 0)
+        self.assertEqual("failed", row["status"])
+        self.assertIn("dropped attachments", row["error"])
+
+    def test_example_client_batches_files_and_rejects_incomplete_reply(self):
+        args = SimpleNamespace(upload=True, endpoint=self.args.upload_url.removesuffix("/api/upload"), timeout=5)
+        paths = [bench.FIXTURES.parent / name for name in ("ticket.txt", "outage.txt")]
+        before = len(FixtureServer.uploads)
+        result = client.attachments(paths, args)
+        self.assertEqual(before + 1, len(FixtureServer.uploads))
+        self.assertEqual([{"file": "generated-" + path.name, "name": path.name} for path in paths], result)
+        with patch.object(client, "post", return_value={"ok": True, "file": "only-first.txt"}):
+            with self.assertRaisesRegex(ValueError, "every requested file"):
+                client.attachments(paths, args)
+
+    def test_batch_mode_keeps_single_file_compatible(self):
+        row = bench.run_case(self.args, self.case, "upload-batch", 0)
+        self.assertEqual("passed", row["status"], row)
+
+    def test_diagnostic_source_names_and_field_group_order_are_checked(self):
+        case = {"attachments": [{"field": "documents", "path": "a.txt", "kind": "text"},
+                                 {"field": "files", "path": "b.txt", "kind": "text"}]}
+        body = {"diagnostics": {"attachments": [{"name": name, "kind": "text", "textCharacters": 1}
+                                                for name in ("b.txt", "a.txt")],
+                                "timing": {"preprocessing_ms": 1, "inference_ms": 2, "total_ms": 3}}}
+        bench.validate_diagnostics(case, body)
+        body["diagnostics"]["attachments"].reverse()
+        with self.assertRaisesRegex(ValueError, "name/order"):
+            bench.validate_diagnostics(case, body)
 
     def test_unavailable_is_not_a_pass_and_has_no_success_timings(self):
         with patch.object(bench.BENCH, "post", return_value={"status": 503, "body": {"error": "ASR unavailable"}, "elapsed_ms": 12}):
