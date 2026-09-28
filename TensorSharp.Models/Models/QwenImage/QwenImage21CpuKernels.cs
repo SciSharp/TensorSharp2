@@ -640,8 +640,11 @@ internal static unsafe class QwenImage21CpuKernels
     // Depth of one pass of the dot tiles: a 6-row activation panel (24 KB) stays in L1 while
     // the tile walks a task's weight columns, whose 1024-deep slices (128 KB for 32 columns)
     // stream from L2. Without it the panel (6 x 16 KB at 4096 wide) fell out of L1 for every
-    // column tile and the L2 traffic, not the FMAs, bounded the product.
-    private const int DepthBlock = 1024;
+    // column tile and the L2 traffic, not the FMAs, bounded the product. Measured at 1047 rows:
+    // 512 is ~20% slower (twice the horizontal sums), 2048 on par. TS_QWEN21_CPU_DEPTH
+    // overrides it (a multiple of 16) for tuning.
+    private static readonly int DepthBlock =
+        int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN21_CPU_DEPTH"), out int depth) && depth >= 16 ? depth / 16 * 16 : 1024;
 
     /// <summary>c[i, j] = dot(a[i, :k], b[j, :k]) for i &lt; m, j &lt; n (c is overwritten).
     /// The dot form suits a long k: a LoRA shrink (k = 4096..12288, n = its rank) or an output
