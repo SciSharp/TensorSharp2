@@ -254,12 +254,13 @@ namespace TensorSharp.Models
         public int VocabSize => Config.VocabSize;
         public bool SelfConditioningEnabled { get => _scEnabled; set => _scEnabled = value; }
         /// <summary>Whether prompt-KV caching is active: the sampler calls <see cref="PrefillPrompt"/>
-        /// once per block then <see cref="DecodeCanvas"/> per step. Only available on the device-glue
-        /// (GPU) backends; the setter is a no-op on CPU backends.</summary>
+        /// once per block then <see cref="DecodeCanvas"/> per step. Available on the device-glue (GPU)
+        /// backends and on the pure-C# CPU backend (host glue, DiffusionGemmaModel.Cpu.cs); the setter is
+        /// a no-op on the remaining backends (ggml_cpu).</summary>
         public bool SupportsPromptKvCache
         {
             get => _pkvEnabled;
-            set => _pkvEnabled = value && _useDeviceGlue;
+            set => _pkvEnabled = value && (_useDeviceGlue || UsesHostPromptKv);
         }
 
         /// <summary>Whether the per-step argmax/entropy/multinomial/top-K sampling runs on-device (CUDA),
@@ -323,8 +324,9 @@ namespace TensorSharp.Models
 
             _useDeviceGlue = _backend is BackendType.GgmlMetal or BackendType.GgmlCuda
                 or BackendType.Mlx or BackendType.Cuda;
-            // Prompt-KV caching needs the device-resident attention path (it stores/concats K/V tensors).
-            _pkvEnabled = _useDeviceGlue && Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV") != "1";
+            // Prompt-KV caching: the device-resident attention path stores/concats K/V tensors; the pure-C#
+            // CPU backend keeps host K/V and decodes canvas-only (DiffusionGemmaModel.Cpu.cs).
+            _pkvEnabled = (_useDeviceGlue || UsesHostPromptKv) && Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV") != "1";
 
             // Metal lazy-sync (async compute) is unsafe for this model, exactly as it is for Gemma 4
             // (see Gemma4Model's SetAsyncCompute(false) and the hazard note there). GgmlContext enables
@@ -651,6 +653,15 @@ namespace TensorSharp.Models
             _swForward.Start();
             int C = tokens.Length - promptLen;
             using Tensor hidden = ForwardCanvasHidden(tokens, promptLen, scPrevLogits, scUse, prevTempInv);
+            if (CpuFastPaths && !CpuLegacyAll)
+            {
+                float[] cpuLogits = CpuLmHead(hidden, 0, C, pooled: true);
+                if (cpuLogits != null)
+                {
+                    _swForward.Stop();
+                    return cpuLogits;
+                }
+            }
             using Tensor canvasHidden = RMSNormOp(hidden, "output_norm.weight");
 
             long ts = Stopwatch.GetTimestamp();
@@ -814,6 +825,11 @@ namespace TensorSharp.Models
 
         private Tensor DenseMlp(Tensor input, string prefix, int N)
         {
+            if (CpuFastPaths && !CpuLegacyProj)
+            {
+                Tensor fused = CpuDenseMlp(input, prefix, N);
+                if (fused != null) return fused;
+            }
             using var normed = RMSNormOp(input, $"{prefix}.ffn_norm.weight");
             using Tensor gate = LinearForward(normed, $"{prefix}.ffn_gate.weight");
             using (Tensor up = LinearForward(normed, $"{prefix}.ffn_up.weight"))
@@ -831,6 +847,10 @@ namespace TensorSharp.Models
         // ===================================================================================
         private Tensor Attention(Tensor input, int layer, string prefix, int N, int P)
         {
+            // Pure-C# backend: fused Q/K/V dispatch + fused norm/RoPE + the tiled SIMD attention.
+            if (CpuFastPaths && !CpuLegacyAttn)
+                return CpuUnifiedAttention(input, layer, prefix, N, P);
+
             bool local = _isLocal[layer];
             int hd = _headDim[layer];
             int qHeads = Config.NumHeads;
@@ -1131,6 +1151,9 @@ namespace TensorSharp.Models
         private int PrefillPromptInto(int[] promptTokens, Tensor[] outK, Tensor[] outV,
             CancellationToken cancellationToken = default)
         {
+            if (UsesHostPromptKv)
+                return PrefillPromptIntoCpu(promptTokens, outK, outV, cancellationToken);
+
             int P = promptTokens.Length;
             int D = Config.HiddenSize;
             float eps = Config.Eps;
@@ -1225,6 +1248,17 @@ namespace TensorSharp.Models
             int C = canvasTokens.Length;
             Tensor hidden = DecodeCanvasHidden(pk, pv, P, canvasTokens, scPrevLogits, scUse, prevTempInv);
 
+            if (UsesHostPromptKv)
+            {
+                float[] cpuLogits = CpuLmHead(hidden, 0, C, pooled: true);
+                if (cpuLogits != null)
+                {
+                    hidden.Dispose();
+                    _swForward.Stop();
+                    return cpuLogits;
+                }
+            }
+
             // Fused lm_head tail (output_norm + lm_head + softcap in one dispatch) - separate small graph,
             // correct, and cheaper than the per-op RMSNorm + AddmmQuant + softcap + readback chain.
             if (IsGgmlBackend && !_fusedLmHeadTailDisabled && _fusedLmHeadTailOk)
@@ -1267,6 +1301,9 @@ namespace TensorSharp.Models
             int[] canvasTokens, float[] scPrevLogits, float scUse, float prevTempInv,
             CancellationToken cancellationToken = default)
         {
+            if (UsesHostPromptKv)
+                return CpuDecodeHidden(pk, pv, P, canvasTokens, scPrevLogits, scUse, prevTempInv, cancellationToken);
+
             int C = canvasTokens.Length;
             int D = Config.HiddenSize;
             float eps = Config.Eps;
@@ -1506,6 +1543,9 @@ namespace TensorSharp.Models
         public unsafe float[][] DecodeCanvasBatched(DiffusionSeqState[] seqs, int[][] canvases,
             float[][] scPrev, float[] scUse, float[] prevTempInv)
         {
+            if (UsesHostPromptKv)
+                return CpuDecodeCanvasBatched(seqs, canvases, scPrev, scUse, prevTempInv);
+
             int B = seqs.Length;
             int C = _canvasLength;
             int D = Config.HiddenSize;
@@ -2151,6 +2191,14 @@ namespace TensorSharp.Models
                 TryMoEMlx(moeInput, output, selectedExperts, routingWeights, layer, prefix, N, D))
                 return output;
 
+            // Pure-C# backend: every expert's projections batched into two dispatches.
+            if (CpuFastPaths && !CpuLegacyMoe &&
+                CpuMoEFfn(moeInput, output, selectedExperts, routingWeights, layer, N, D))
+            {
+                _tMoeFfn += Stopwatch.GetTimestamp() - tf;
+                return output;
+            }
+
             // Host fallback (direct cuda + any backend the above paths reject): correct everywhere
             // (storage marks host writes dirty so the device re-reads), at the cost of per-layer syncs.
             Ops.Fill(output, 0f);
@@ -2488,9 +2536,12 @@ namespace TensorSharp.Models
 
             int E = _numExperts;
             int K = _numExpertsUsed;
-            float[] scoresArr;
-            using (var scores = LinearForward(normed, $"{prefix}.ffn_gate_inp.weight"))  // [N, numExperts]
+            float[] scoresArr = CpuFastPaths && !CpuLegacyRouter ? CpuRouterScores(normed, prefix, N) : null;
+            if (scoresArr == null)
+            {
+                using var scores = LinearForward(normed, $"{prefix}.ffn_gate_inp.weight");  // [N, numExperts]
                 scoresArr = scores.GetElementsAsFloat(N * E);   // one read-only device->host copy
+            }
 
             var routingWeights = new float[N * K];
             var selectedExperts = new int[N * K];
@@ -2605,7 +2656,7 @@ namespace TensorSharp.Models
 
             // gather the C*K selected embedding rows, then per-position weighted sum as a batched matmul:
             // soft[c] = probs[c, 1, K] @ rows[c, K, D] -> [c, 1, D]. Fully on-device.
-            using Tensor rows = Embedding(topTokens);          // [C*K, D]
+            using Tensor rows = CpuEmbeddingRows(topTokens);   // [C*K, D] (Embedding() off the pure-C# backend)
             using var rows3 = rows.View(C, K, D);
             using var probsT = CreateFloatTensor(topProbs, C, 1, K);
             using var soft = new Tensor(_allocator, DType.Float32, C, 1, D);
@@ -2757,6 +2808,9 @@ namespace TensorSharp.Models
             Console.WriteLine($"    embed={_tEmbed * f:F0}ms  attn={_tAttn * f:F0}ms  denseMLP={_tDense * f:F0}ms  " +
                 $"MoE={_tMoe * f:F0}ms (route={_tMoeRoute * f:F0}ms ffn={_tMoeFfn * f:F0}ms)  " +
                 $"lm_head={_tLmHead * f:F0}ms  selfCond={_tSc * f:F0}ms (topK_host={_tScTopK * f:F0}ms device={_tScDevice * f:F0}ms)");
+            if (CpuFastPaths)
+                Console.WriteLine($"    cpu: qkv+norm+rope={_tCpuQkv * f:F0}ms attnCore={_tCpuAttnCore * f:F0}ms " +
+                    $"moe gate_up={_tCpuMoeGateUp * f:F0}ms down={_tCpuMoeDown * f:F0}ms");
         }
 
         public override void Dispose()

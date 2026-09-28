@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using TensorSharp.Cuda;
 using TensorSharp.GGML;
@@ -53,7 +54,10 @@ namespace TensorSharp.Models
             ValidateStructuredRequest(promptTokens, seedCanvas, positions, tokenIds,
                 VocabSize, CanvasLength, MaxContextLength);
             cancellationToken.ThrowIfCancellationRequested();
-            using Tensor hidden = StructuredCanvasHidden(promptTokens, seedCanvas, cancellationToken);
+            // The selected-label read looks at a few canvas rows only; a backend that can skip the other
+            // rows' last-layer work returns just these (compact), in ascending order.
+            int[] keep = fullVocabulary ? null : positions.Distinct().Order().ToArray();
+            using Tensor hidden = StructuredCanvasHidden(promptTokens, seedCanvas, cancellationToken, keep, out bool compact);
             cancellationToken.ThrowIfCancellationRequested();
 
             float[][] rows;
@@ -91,7 +95,7 @@ namespace TensorSharp.Models
                 using var selected = new Tensor(_allocator, DType.Float32, positions.Length, Config.HiddenSize);
                 for (int r = 0; r < positions.Length; r++)
                 {
-                    using Tensor source = hidden.Narrow(0, positions[r], 1);
+                    using Tensor source = hidden.Narrow(0, compact ? Array.BinarySearch(keep, positions[r]) : positions[r], 1);
                     using Tensor target = selected.Narrow(0, r, 1);
                     Ops.Copy(target, source);
                 }
@@ -123,11 +127,15 @@ namespace TensorSharp.Models
             return rows;
         }
 
-        private Tensor StructuredCanvasHidden(int[] promptTokens, int[] canvas, CancellationToken cancellationToken)
+        private Tensor StructuredCanvasHidden(int[] promptTokens, int[] canvas, CancellationToken cancellationToken,
+            int[] keepRows, out bool compact)
         {
+            compact = false;
             // Raw CUDA/MLX's inherited cached global-RoPE path does not include startPos.
             // Their unified forward supplies full absolute positions and is the correct fallback.
-            if (!IsGgmlBackend || !SupportsPromptKvCache)
+            // The pure-C# CPU host prompt-KV path rotates canvas rows at absolute positions P+i, so it
+            // reuses the prompt's K/V across repeated reads (Jev auto sampling re-reads one prompt).
+            if (!SupportsPromptKvCache || (!IsGgmlBackend && !UsesHostPromptKv))
             {
                 var tokens = new int[checked(promptTokens.Length + canvas.Length)];
                 promptTokens.CopyTo(tokens, 0);
@@ -158,6 +166,12 @@ namespace TensorSharp.Models
                 }
             }
             cancellationToken.ThrowIfCancellationRequested();
+            if (UsesHostPromptKv && keepRows != null && keepRows.Length > 0 && keepRows.Length < canvas.Length)
+            {
+                compact = true;
+                return CpuDecodeHidden(_structuredPrompt.PromptK, _structuredPrompt.PromptV,
+                    _structuredPrompt.PromptLen, canvas, null, 0f, 1f, cancellationToken, keepRows);
+            }
             return DecodeCanvasHidden(_structuredPrompt.PromptK, _structuredPrompt.PromptV,
                 _structuredPrompt.PromptLen, canvas, null, 0f, 1f, cancellationToken);
         }

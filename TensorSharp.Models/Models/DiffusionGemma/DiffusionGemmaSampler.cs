@@ -558,7 +558,12 @@ namespace TensorSharp.Models
                         else
                         {
                             Array.Copy(canvas[a], 0, unifiedTokens[a], promptLen[a], C);
-                            lg = _model.ForwardCanvas(unifiedTokens[a], promptLen[a], scBuffer[a], scUse, prevTempInv[a]);
+                            // The scheduler parks a request's image spans on ITS sequence state, and the
+                            // unified forward re-embeds the whole prompt every step, so scope the spans to
+                            // this forward exactly as PrefillSeq does - otherwise the image rows would be
+                            // forwarded as their filler token ids on the non-prompt-KV backends.
+                            using (_model.UseSequenceVision(seqs[a]))
+                                lg = _model.ForwardCanvas(unifiedTokens[a], promptLen[a], scBuffer[a], scUse, prevTempInv[a]);
                         }
                         if (scBuffer[a] != null) Array.Copy(lg, scBuffer[a], (long)C * vocab);
                         bool seqFinished = DenoiseStep(lg, tempInv, rng[a], run.Params,

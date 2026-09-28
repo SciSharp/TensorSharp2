@@ -10,7 +10,8 @@ string? modelPath = null, outputPath = null;
 string backendName = "ggmlcuda";
 int iterations = 3, warmup = 1;
 int prefixWords = 0;
-bool compareAttention = false, chatDiagnostic = false;
+bool compareAttention = false, chatDiagnostic = false, compareUnified = false, profile = false;
+int repeatReads = 0;
 int[] widths = [16, 64, 256];
 for (int i = 0; i < args.Length; i++)
 {
@@ -23,14 +24,17 @@ for (int i = 0; i < args.Length; i++)
         case "--prefix-words": prefixWords = int.Parse(args[++i]); break;
         case "--compare-attention": compareAttention = true; break;
         case "--chat-diagnostic": chatDiagnostic = true; break;
+        case "--compare-unified": compareUnified = true; break;
+        case "--repeat-reads": repeatReads = int.Parse(args[++i]); break;
+        case "--profile": profile = true; break;
         case "--widths": widths = args[++i].Split(',').Select(int.Parse).ToArray(); break;
         case "--output": outputPath = args[++i]; break;
         default: throw new ArgumentException($"Unknown argument: {args[i]}");
     }
 }
-if (string.IsNullOrWhiteSpace(modelPath) || iterations < 1 || warmup < 0 || prefixWords < 0
-    || (chatDiagnostic && compareAttention))
-    throw new ArgumentException("Usage: JevProbe --model model.gguf --backend ggmlcuda --iterations 3 --warmup 1 --widths 16,64,256 [--compare-attention --prefix-words 2048 | --chat-diagnostic] --output artifacts/jev/projection.json");
+if (string.IsNullOrWhiteSpace(modelPath) || iterations < 1 || warmup < 0 || prefixWords < 0 || repeatReads < 0
+    || (chatDiagnostic && compareAttention) || (compareUnified && (compareAttention || chatDiagnostic)))
+    throw new ArgumentException("Usage: JevProbe --model model.gguf --backend ggmlcuda --iterations 3 --warmup 1 --widths 16,64,256 [--compare-attention --prefix-words 2048 | --chat-diagnostic | --compare-unified | --repeat-reads 4] [--profile] --output artifacts/jev/projection.json");
 BackendType backend = backendName.Replace("_", "").ToLowerInvariant() switch
 {
     "cpu" => BackendType.Cpu, "cuda" => BackendType.Cuda, "mlx" => BackendType.Mlx,
@@ -44,7 +48,12 @@ using var shutdown = new ProbeShutdown(backend is BackendType.GgmlCpu or Backend
     or BackendType.GgmlMetal or BackendType.GgmlVulkan);
 using var model = (DiffusionGemmaModel)ModelBase.Create(Path.GetFullPath(modelPath), backend);
 loadTimer.Stop();
-if (chatDiagnostic) return RunChatDiagnostic(model, backend, outputPath, started);
+if (chatDiagnostic)
+{
+    int chatResult = RunChatDiagnostic(model, backend, outputPath, started);
+    if (profile) model.PrintForwardTiming();
+    return chatResult;
+}
 string text = "Classify: I love this product and would buy it again.\nReturn a: A for positive, B for negative, C for neutral. Return b: A for a purchase recommendation, B otherwise.";
 if (prefixWords > 0) text = string.Concat(Enumerable.Repeat("irrelevant ", prefixWords)) + "\n" + text;
 var renderer = new GgufPromptRenderer();
@@ -111,6 +120,18 @@ if (compareAttention)
         return comparison.passed ? 0 : 1;
     }
     finally { Environment.SetEnvironmentVariable("DIFFUSION_FUSED_PREFILL_ATTN", saved); }
+}
+if (repeatReads > 0)
+{
+    int code = RunRepeatedReads(model, prompt, labelIds, widths, repeatReads, iterations, backend, outputPath, started, modelPath!);
+    if (profile) model.PrintForwardTiming();
+    return code;
+}
+if (compareUnified)
+{
+    int code = RunUnifiedComparison(model, prompt, labelIds, widths, backend, outputPath, started, modelPath!);
+    if (profile) model.PrintForwardTiming();
+    return code;
 }
 var cases = new List<object>();
 double maxError = 0;
@@ -208,7 +229,116 @@ var report = new
     cases
 };
 WriteReport(report, outputPath);
+if (profile) model.PrintForwardTiming();
 return report.passed ? 0 : 1;
+
+// Jev auto sampling re-reads ONE prompt with freshly seeded canvases (JevCompiler.Canvas puts a
+// random token at every answer position). The first read of a prompt pays its prefill; with
+// prompt-KV caching every later read only runs the canvas. Rounds are separated by
+// ClearStructuredCache so each one starts cold.
+static int RunRepeatedReads(DiffusionGemmaModel model, int[] prompt, int[] labelIds, int[] widths, int reads, int rounds,
+    BackendType backend, string? outputPath, DateTimeOffset started, string modelPath)
+{
+    var samples = new List<object>();
+    foreach (int width in widths)
+    {
+        int[] template = BuildTemplate(model, labelIds, fieldCount: 1, out int[] positions);
+        if (template.Length > width) throw new ArgumentException($"Width {width} cannot hold the template ({template.Length} tokens).");
+        int[][] labels = [labelIds];
+        var firstMs = new List<double>();
+        var laterMs = new List<double>();
+        for (int round = 0; round < rounds; round++)
+        {
+            model.ClearStructuredCache();
+            for (int read = 0; read < reads; read++)
+            {
+                var canvas = new int[width];
+                template.CopyTo(canvas, 0);
+                var random = new Random(1234 + read * 7919);
+                foreach (int pos in positions) canvas[pos] = random.Next(model.VocabSize);
+                // The printed stage profile (--profile) covers the later reads of the last round only.
+                if (round == rounds - 1 && read == 1) model.ResetForwardTiming();
+                var timer = Stopwatch.StartNew();
+                model.ReadStructured(prompt, canvas, positions, labels);
+                (read == 0 ? firstMs : laterMs).Add(timer.Elapsed.TotalMilliseconds);
+            }
+        }
+        double first = Median(firstMs), later = laterMs.Count > 0 ? Median(laterMs) : double.NaN;
+        samples.Add(new { canvasWidth = width, promptTokens = prompt.Length, reads, rounds, firstReadMs = firstMs,
+            laterReadMs = laterMs, firstMedianMs = first, laterMedianMs = later, firstOverLater = first / later,
+            totalMedianMsPerPrompt = first + (reads - 1) * later });
+        Console.WriteLine($"width={width}: first read {first:F1} ms, later reads {later:F1} ms (x{first / later:F2}), " +
+            $"{reads} reads of one prompt = {first + (reads - 1) * later:F0} ms");
+    }
+    WriteReport(new
+    {
+        startedUtc = started, completedUtc = DateTimeOffset.UtcNow, mode = "repeat-reads", model = Path.GetFullPath(modelPath),
+        backend = backend.ToString(), promptKvCache = model.SupportsPromptKvCache, samples,
+    }, outputPath);
+    return 0;
+}
+
+// Prompt-KV reads against the unified [prompt|canvas] forward on the SAME backend and model instance.
+static int RunUnifiedComparison(DiffusionGemmaModel model, int[] prompt, int[] labelIds, int[] widths,
+    BackendType backend, string? outputPath, DateTimeOffset started, string modelPath)
+{
+    if (!model.SupportsPromptKvCache)
+        throw new ArgumentException("The unified comparison needs prompt-KV caching (not disabled, and supported by the backend).");
+    var samples = new List<object>();
+    double worst = 0;
+    foreach (int width in widths)
+    {
+        foreach (int fieldCount in new[] { 1, 2 })
+        {
+            int[] template = BuildTemplate(model, labelIds, fieldCount, out int[] positions);
+            if (template.Length > width) continue;
+            var canvas = new int[width];
+            template.CopyTo(canvas, 0);
+            int[][] labels = positions.Select((_, f) => f == 0 ? labelIds : new[] { labelIds[1], labelIds[0] }).ToArray();
+            model.ClearStructuredCache();
+            var timer = Stopwatch.StartNew();
+            float[][] cached = model.ReadStructured(prompt, canvas, positions, labels);
+            double cachedMs = timer.Elapsed.TotalMilliseconds;
+            model.SupportsPromptKvCache = false;
+            float[][] unified;
+            try
+            {
+                timer.Restart();
+                unified = model.ReadStructured(prompt, canvas, positions, labels);
+            }
+            finally { model.SupportsPromptKvCache = true; }
+            double unifiedMs = timer.Elapsed.TotalMilliseconds;
+            double diff = Difference(cached, unified);
+            worst = Math.Max(worst, diff);
+            samples.Add(new { canvasWidth = width, fields = fieldCount, promptTokens = prompt.Length,
+                cachedColdMs = cachedMs, unifiedMs, maxProbabilityDifference = diff, cached, unified });
+            Console.WriteLine($"width={width} fields={fieldCount}: prompt-KV vs unified max |dp| = {diff:G6}");
+        }
+    }
+    bool passed = worst <= 1e-4;
+    WriteReport(new
+    {
+        startedUtc = started, completedUtc = DateTimeOffset.UtcNow, mode = "compare-unified", model = Path.GetFullPath(modelPath),
+        backend = backend.ToString(), maxProbabilityDifference = worst, passed, samples,
+    }, outputPath);
+    return passed ? 0 : 1;
+}
+
+static int[] BuildTemplate(DiffusionGemmaModel model, int[] labelIds, int fieldCount, out int[] positions)
+{
+    var template = model.Tokenizer.Encode("<|channel>thought\n<channel|>", false).ToList();
+    var pos = new List<int>();
+    for (int f = 0; f < fieldCount; f++)
+    {
+        template.AddRange(model.Tokenizer.Encode($"{(char)('a' + f)}: ", false));
+        pos.Add(template.Count);
+        template.Add(labelIds[0]);
+        template.AddRange(model.Tokenizer.Encode("\n", false));
+    }
+    template.AddRange(model.Tokenizer.Encode("<turn|>", false));
+    positions = pos.ToArray();
+    return template.ToArray();
+}
 
 static void WriteReport(object report, string? outputPath)
 {
