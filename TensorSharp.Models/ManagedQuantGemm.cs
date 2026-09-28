@@ -14,6 +14,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
+using TensorSharp.Cpu;
 
 namespace TensorSharp.Models
 {
@@ -48,8 +49,9 @@ namespace TensorSharp.Models
     // scalar Q5_0 dot and scalar F16/BF16 dequant that were vectorized with it.
     // TS_CPU_DISABLE_AVX512=1 runs every AVX-512 path of ManagedQuantizedOps
     // (GEMM kernels, quantizer, per-row Q4_0/Q8_0 dots, MaxAbs) in its AVX2
-    // form, so the AVX2 path can be tested on an AVX-512 machine. Hosts without
-    // AVX2+FMA (and ARM64) keep the per-row path.
+    // form, so the AVX2 path can be tested on an AVX-512 machine; the ISA flags
+    // come from TensorSharp.Cpu.CpuIsa, shared with every other managed CPU
+    // kernel. Hosts without AVX2+FMA (and ARM64) keep the per-row path.
     //
     // These kernels are reached by every caller of the managed matmul, not only
     // the pure-C# backend: the DSV4 CUDA executor's host-MoE offload
@@ -90,8 +92,6 @@ namespace TensorSharp.Models
 
         private static readonly bool QGemmEnabled =
             Environment.GetEnvironmentVariable("TS_CPU_QGEMM") != "0";
-        private static readonly bool CpuAvx512Disabled =
-            Environment.GetEnvironmentVariable("TS_CPU_DISABLE_AVX512") == "1";
         // Smallest row count that takes the GEMM: one, for every type. Each
         // output of the GEMM goes through the same operations whatever the
         // height of the tile it lands in, so a row's result is independent of
@@ -135,16 +135,14 @@ namespace TensorSharp.Models
         private static double _qgemmVerifyWorst;
         private static readonly object QGemmVerifyLock = new object();
 
-        internal static bool QGemmAvx2Supported => Avx2.IsSupported && Fma.IsSupported;
+        internal static bool QGemmAvx2Supported => CpuIsa.HasAvx2Fma;
 
-        internal static bool QGemmAvx512Supported =>
-            QGemmAvx2Supported && Avx512F.IsSupported && Avx512BW.IsSupported && Avx512DQ.IsSupported
-            && Vector512.IsHardwareAccelerated;
+        internal static bool QGemmAvx512Supported => QGemmAvx2Supported && CpuIsa.HasAvx512;
 
         /// <summary>Concrete kernel set for a request: Legacy when the GEMM is
         /// switched off or the ISA is missing.</summary>
         internal static QGemmIsa ResolveQGemmIsa(QGemmIsa requested)
-            => ResolveQGemmIsa(requested, QGemmEnabled, CpuAvx512Disabled, QGemmAvx2Supported, QGemmAvx512Supported);
+            => ResolveQGemmIsa(requested, QGemmEnabled, CpuIsa.Avx512DisabledByEnv, QGemmAvx2Supported, QGemmAvx512Supported);
 
         /// <summary>The routing rule itself, with the switches and the host's ISA
         /// as arguments (tests check it without touching process state).
@@ -710,7 +708,7 @@ namespace TensorSharp.Models
         {
             if (!QGemmEnabled)
                 QuantizeInt8Groups16Scalar(x, invScale, q, n, groupSums);
-            else if (Avx512F.IsSupported && Avx512BW.IsSupported && !CpuAvx512Disabled)
+            else if (CpuIsa.Avx512)
                 QuantizeInt8Groups16Avx512(x, invScale, q, n, groupSums);
             else if (Avx2.IsSupported)
                 QuantizeInt8Groups16Avx2(x, invScale, q, n, groupSums);
@@ -718,15 +716,19 @@ namespace TensorSharp.Models
                 QuantizeInt8Groups16Scalar(x, invScale, q, n, groupSums);
         }
 
-        /// <summary>The GEMM's quantizer: the SIMD variant of its kernel set (the
-        /// GEMM only runs where AVX2 is present).</summary>
+        /// <summary>The GEMM's quantizer: the SIMD variant of its kernel set. The GEMM
+        /// itself only runs where AVX2 is present, but the layout is also built through
+        /// the test hook below on hosts without it (ARM64, DOTNET_EnableAVX2=0), which
+        /// take the scalar loop - every variant produces the same bits.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe void QuantizeInt8Groups16Simd(float* x, float invScale, sbyte* q, int n, int* groupSums, bool avx512)
         {
             if (avx512)
                 QuantizeInt8Groups16Avx512(x, invScale, q, n, groupSums);
-            else
+            else if (Avx2.IsSupported)
                 QuantizeInt8Groups16Avx2(x, invScale, q, n, groupSums);
+            else
+                QuantizeInt8Groups16Scalar(x, invScale, q, n, groupSums);
         }
 
         // The scalar reference converts with C#'s (int) cast, which saturates:
@@ -806,7 +808,9 @@ namespace TensorSharp.Models
             return family == QGemmFamily.None ? 0 : QGemmActRowBytes(family, inDim);
         }
 
-        /// <summary>Quantize one row into the GEMM layout (see QuantizeRowQGemm).</summary>
+        /// <summary>Quantize one row into the GEMM layout (see QuantizeRowQGemm), with the
+        /// AVX-512 quantizer when <paramref name="avx512"/> and the host has it, else AVX2,
+        /// else scalar.</summary>
         internal static unsafe void QGemmQuantizeActivationRow(GgmlTensorType type, float* src, byte* dst, int inDim,
             bool avx512 = true)
             => QuantizeRowQGemm(type, GetQGemmFamily(type, inDim), src, dst, inDim, avx512 && QGemmAvx512Supported);

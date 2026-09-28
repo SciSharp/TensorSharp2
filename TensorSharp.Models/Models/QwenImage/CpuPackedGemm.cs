@@ -22,11 +22,13 @@
 //
 // This client part has one 512-bit FMA port, so AVX-512 and AVX2 have the same peak here;
 // AVX-512 wins on fewer instructions and a larger C tile (less B traffic per FMA).
-// TS_CPU_DISABLE_AVX512=1 selects the AVX2 kernel so it can be A/B'd on AVX-512 hardware.
+// TS_CPU_DISABLE_AVX512=1 selects the AVX2 kernel so it can be A/B'd on AVX-512 hardware
+// (the ISA flags are TensorSharp.Cpu.CpuIsa's, shared with every managed CPU kernel).
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using TensorSharp.Cpu;
 
 namespace TensorSharp.Models.QwenImage
 {
@@ -83,16 +85,15 @@ namespace TensorSharp.Models.QwenImage
 
         internal static CpuGemmIsa DetectIsa()
         {
-            bool no512 = Environment.GetEnvironmentVariable("TS_CPU_DISABLE_AVX512") == "1";
-            if (!no512 && Avx512F.IsSupported && Vector512.IsHardwareAccelerated) return CpuGemmIsa.Avx512;
-            if (Avx2.IsSupported && Fma.IsSupported) return CpuGemmIsa.Avx2;
+            if (CpuIsa.Avx512) return CpuGemmIsa.Avx512;
+            if (CpuIsa.Avx2Fma) return CpuGemmIsa.Avx2;
             return CpuGemmIsa.Portable;
         }
 
         internal static bool IsaSupported(CpuGemmIsa isa) => isa switch
         {
-            CpuGemmIsa.Avx512 => Avx512F.IsSupported && Vector512.IsHardwareAccelerated,
-            CpuGemmIsa.Avx2 => Avx2.IsSupported && Fma.IsSupported,
+            CpuGemmIsa.Avx512 => CpuIsa.HasAvx512,
+            CpuGemmIsa.Avx2 => CpuIsa.HasAvx2Fma,
             _ => true,
         };
 
@@ -108,19 +109,18 @@ namespace TensorSharp.Models.QwenImage
         internal static int KcBlock { get; set; } = Math.Clamp(EnvInt("TS_CPU_GEMM_KC", 256), 16, 4096);
         private static readonly int NtBlock = Math.Clamp(EnvInt("TS_CPU_GEMM_NT", 256), 32, 2048);
 
-        // Worker pools. By default the kernels run on CpuWorkerPool.Shared (cores/2 here), like
-        // the rest of the pure-C# backend. A caller whose whole pipeline is these kernels (the
-        // VAE: convolutions plus its own elementwise passes) can pass WidePool, one thread per
-        // logical processor: the conv GEMMs are FMA-bound, and two SMT threads per core keep the
-        // single 512-bit FMA port busier (512x512 decode 7.9 -> 7.0 s on the 8-core/16-thread
-        // i7-11800H). Mixed with ThreadPool work (text encoder, vision tower) the extra spinning
-        // workers cost more than they give (TE 1.6 -> 1.8 s, vision 0.72 -> 0.97 s), so those
-        // stay on the shared pool. Default width: every logical CPU, at most 64;
-        // TS_CPU_GEMM_THREADS overrides it within the pool's own limit (1..512).
-        private static readonly Lazy<CpuWorkerPool> s_widePool = new(() => new CpuWorkerPool(
-            Math.Clamp(EnvInt("TS_CPU_GEMM_THREADS", Math.Min(Environment.ProcessorCount, 64)), 1, 512)));
-
-        internal static CpuWorkerPool WidePool => s_widePool.Value;
+        // Worker sets. By default the kernels run on CpuWorkers.Shared (the shared pool, cores/2
+        // here), like the rest of the pure-C# backend. A caller whose whole pipeline is these
+        // kernels (the VAE: convolutions plus its own elementwise passes) can pass WidePool, one
+        // thread per logical processor: the conv GEMMs are FMA-bound, and two SMT threads per
+        // core keep the single 512-bit FMA port busier (512x512 decode 7.9 -> 7.0 s on the
+        // 8-core/16-thread i7-11800H). Mixed with ThreadPool work (text encoder, vision tower)
+        // the extra spinning workers cost more than they give (TE 1.6 -> 1.8 s, vision 0.72 ->
+        // 0.97 s), so those stay on the shared pool. Default width: every logical CPU, at most
+        // 64; TS_CPU_GEMM_THREADS overrides it within the pool's own limit (1..512). Under
+        // TS_CPU_POOL=0 both are Parallel.For (the wide one capped at that same width).
+        internal static CpuWorkers WidePool { get; } = CpuWorkers.Dedicated(
+            Math.Clamp(EnvInt("TS_CPU_GEMM_THREADS", Math.Min(Environment.ProcessorCount, 64)), 1, 512));
 
         // Times the driver packed all of B once and shared it between row blocks (a test hook:
         // the path only runs at shapes a unit test has to aim for).
@@ -136,7 +136,7 @@ namespace TensorSharp.Models.QwenImage
         /// (into <paramref name="reuse"/>'s storage when it is large enough; see PackedPanels).
         /// With <paramref name="serial"/> the pack runs on the calling thread (a pool task).</summary>
         internal static PackedPanels PackA(float* src, int m, int k, long strideM, long strideK, CpuGemmIsa isa,
-            CpuWorkerPool pool = null, PackedPanels reuse = null, bool serial = false)
+            CpuWorkers pool = null, PackedPanels reuse = null, bool serial = false)
         {
             var packed = new PackedPanels(m, k, Mr(isa), isa, reuse);
             int mr = packed.Panel;
@@ -176,7 +176,7 @@ namespace TensorSharp.Models.QwenImage
         /// <summary>Pack B[k, n] (element (j, i) at src[j*strideK + i*strideN]) into NR-column panels
         /// over the full K, for a B operand that is reused across calls (a linear layer's W^T).</summary>
         internal static PackedPanels PackB(float* src, int k, int n, long strideK, long strideN, CpuGemmIsa isa,
-            CpuWorkerPool pool = null)
+            CpuWorkers pool = null)
         {
             var packed = new PackedPanels(n, k, Nr(isa), isa);
             int nr = packed.Panel;
@@ -201,10 +201,10 @@ namespace TensorSharp.Models.QwenImage
         /// </summary>
         internal static void Gemm<TSource>(PackedPanels a, TSource b, int n, float* c, long ldc,
             float* biasM = null, float* biasN = null, bool accumulate = false,
-            int panel0 = 0, int panelCount = -1, CpuWorkerPool pool = null, bool serial = false)
+            int panel0 = 0, int panelCount = -1, CpuWorkers pool = null, bool serial = false)
             where TSource : struct, IGemmPanelSource
         {
-            pool ??= CpuWorkerPool.Shared;
+            pool ??= CpuWorkers.Shared;
             CpuGemmIsa isa = a.Isa;
             int mr = a.Panel, nr = Nr(isa), k = a.K, m = a.Rows;
             if (panelCount < 0) panelCount = a.Panels - panel0;
@@ -288,7 +288,7 @@ namespace TensorSharp.Models.QwenImage
 
         private static void Run<TSource>(PackedPanels a, TSource b, int n, float* c, long ldc, float* biasM, float* biasN,
             bool accumulate, int panel0, int panelCount, int ntPanels, int mBlocks, int mbPanels, int tasks, int kc, bool parallel,
-            CpuWorkerPool pool) where TSource : struct, IGemmPanelSource
+            CpuWorkers pool) where TSource : struct, IGemmPanelSource
         {
             CpuGemmIsa isa = a.Isa;
             int mr = a.Panel, nr = Nr(isa), k = a.K, m = a.Rows;
@@ -604,10 +604,10 @@ namespace TensorSharp.Models.QwenImage
             return (float*)t_scratch;
         }
 
-        internal static void ForEach(int count, bool parallel, Action<int> body, CpuWorkerPool pool = null)
+        internal static void ForEach(int count, bool parallel, Action<int> body, CpuWorkers pool = null)
         {
             if (!parallel || count <= 1) { for (int i = 0; i < count; i++) body(i); return; }
-            (pool ?? CpuWorkerPool.Shared).For(count, body);
+            (pool ?? CpuWorkers.Shared).For(count, body);
         }
     }
 

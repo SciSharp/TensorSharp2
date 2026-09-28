@@ -46,8 +46,7 @@ public sealed class QwenImageResolutionTests : IDisposable
 
     [Theory]
     [InlineData(BackendType.Cpu)]
-    [InlineData(BackendType.GgmlCpu)]
-    public void AutomaticSizeOnAHostCpuBackendIsOneMegapixel(BackendType backend)
+    public void AutomaticSizeOnTheCpuBackendIsOneMegapixel(BackendType backend)
     {
         // Hours per image at 2048x2048 on a CPU; the automatic size there is the 1 MP area.
         Assert.Equal((1024, 1024), QwenImage21Pipeline.ResolveDimensions(new QwenImageParams(), null, backend));
@@ -62,11 +61,14 @@ public sealed class QwenImageResolutionTests : IDisposable
         Assert.Equal((1184, 896), QwenImage21Pipeline.ResolveDimensions(new QwenImageParams(), reference, backend));
     }
 
+    // ggml_cpu keeps the native area it always had: the 1 MP default belongs to the pure-C#
+    // cpu backend it was introduced with.
     [Theory]
+    [InlineData(BackendType.GgmlCpu)]
     [InlineData(BackendType.GgmlCuda)]
     [InlineData(BackendType.GgmlMetal)]
     [InlineData(BackendType.GgmlVulkan)]
-    public void AutomaticSizeOnAGpuBackendStaysNative(BackendType backend)
+    public void AutomaticSizeOnOtherBackendsStaysNative(BackendType backend)
     {
         Assert.Equal((2048, 2048), QwenImage21Pipeline.ResolveDimensions(new QwenImageParams(), null, backend));
         Assert.False(QwenImage21Pipeline.UsesHostCpuAutomaticSize(new QwenImageParams(), backend));

@@ -17,6 +17,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
+using TensorSharp.Cpu;
 
 namespace TensorSharp.Models
 {
@@ -446,8 +447,8 @@ namespace TensorSharp.Models
         // Escape hatch back to the pre-pool behaviour (ThreadPool Parallel.For with
         // thread-count-scaled chunks), so the two can be A/B-ed in one binary and
         // so a host that cannot afford dedicated spinning threads can opt out.
-        private static readonly bool PoolEnabled =
-            Environment.GetEnvironmentVariable("TS_CPU_POOL") != "0";
+        // TS_CPU_POOL=0, read once for every managed CPU kernel (CpuWorkers).
+        private static readonly bool PoolEnabled = CpuWorkers.PoolEnabled;
 
         /// <summary>
         /// Run blocked work on the persistent CPU pool. A caller that explicitly
@@ -2253,7 +2254,7 @@ namespace TensorSharp.Models
 
         private static unsafe float MaxAbs(float* src, int length)
         {
-            if (Avx512F.IsSupported && !CpuAvx512Disabled && length >= 16)
+            if (CpuIsa.Avx512 && length >= 16)
             {
                 Vector512<float> max = Vector512<float>.Zero;
                 int i = 0;
@@ -2292,7 +2293,7 @@ namespace TensorSharp.Models
 
         private static unsafe float VecDotQ4_0Q8_0(byte* q4, byte* q8, int blockCount)
         {
-            if (Avx512F.IsSupported && Avx512BW.IsSupported && !CpuAvx512Disabled)
+            if (CpuIsa.Avx512)
                 return VecDotQ4_0Q8_0Avx512Wide(q4, q8, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ4_0Q8_0Avx2(q4, q8, blockCount);
@@ -2636,7 +2637,7 @@ namespace TensorSharp.Models
 
         private static unsafe float VecDotQ8_0Q8_0(byte* q8w, byte* q8x, int blockCount)
         {
-            if (Avx512F.IsSupported && Avx512BW.IsSupported && !CpuAvx512Disabled)
+            if (CpuIsa.Avx512)
                 return VecDotQ8_0Q8_0Avx512(q8w, q8x, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ8_0Q8_0Avx2(q8w, q8x, blockCount);

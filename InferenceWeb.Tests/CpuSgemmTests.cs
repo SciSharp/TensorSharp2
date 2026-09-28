@@ -395,7 +395,7 @@ public unsafe class CpuSgemmTests
     {
         Assert.True(CpuSgemm.IsSupported(CpuSgemm.KernelKind.Portable));
         Assert.True(CpuSgemm.IsSupported(CpuSgemm.ActiveKernel));
-        if (CpuSgemm.Avx512DisabledByEnv)
+        if (CpuIsa.Avx512DisabledByEnv)
             Assert.True(CpuSgemm.ActiveKernel <= CpuSgemm.KernelKind.Avx2);
     }
 }

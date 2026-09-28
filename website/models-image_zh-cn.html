@@ -79,17 +79,17 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/qw
   <p>可从 <a href="cli_zh-cn.html#imagegen">CLI</a>（<code>--prompt</code>，编辑时再加 <code>--image</code>）、<a href="server_zh-cn.html#webui">Web UI</a>（不带附件的提示词会生成图像；附加一张或多张图像即可编辑，并有实时去噪预览）、<a href="http-api_zh-cn.html#image-api">HTTP API</a>（<code>/api/image-generate</code> 与 <code>/api/image-edit</code>，各有 <code>/stream</code> 变体），或在进程内从 <a href="code-api_zh-cn.html#imagegen">C# 通过 <code>QwenImageModel.GenerateImage()</code> / <code>EditImage()</code></a> 运行。由于扩散流水线共享可变的工作状态，图像操作会串行执行。完整细节见仓库的 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwenimage21_zh-cn.md" target="_blank" rel="noopener">Qwen-Image-2.1 卡片</a>（验证记录见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwenimage21.md" target="_blank" rel="noopener">英文版</a>）。</p>
 
   <h3 id="cpu-backend">在 CPU 上运行（<code>--backend cpu</code>）</h3>
-  <p><code>--backend cpu</code> 用托管 C# 运行整条流水线，不调用任何 GGML：Transformer（F32 激活乘以反量化的权重分块、分块 flash attention、不合并的 LoRA）、位于主机内存的前缀 KV 缓存、基于 packed F32 GEMM 的 Qwen3-VL 文本编码器与视觉编码器，以及以隐式 im2col packed 卷积实现、在每个逻辑 CPU 一个线程的线程池上运行的 VAE。这个后端会拒绝 <code>--tp</code>。在 i7-11800H（8 核 16 线程、AVX-512、32 GB）上实测，文生图，种子 42：</p>
+  <p><code>--backend cpu</code> 用托管 C# 运行整条流水线，不调用任何 GGML：Transformer（像 ggml-cpu 那样使用 8 位激活、在多行整数 GEMM 上计算；分块 flash attention；不合并的 LoRA）、位于主机内存的前缀 KV 缓存、同样基于整数 GEMM 的 Qwen3-VL 文本编码器与基于 packed F32 GEMM 的视觉编码器，以及以隐式 im2col packed 卷积实现、在每个逻辑 CPU 一个线程的线程池上运行的 VAE。在这个后端上，未指定尺寸的请求输出 1024×1024（1 百万像素）；<code>ggml_cpu</code> 与 GPU 后端保持 2048×2048。这个后端会拒绝 <code>--tp</code>。在 i7-11800H（8 核 16 线程、AVX-512、32 GB）上实测，文生图，种子 42：</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>运行</th><th><code>cpu</code></th><th><code>ggml_cpu</code></th><th>与 <code>ggml_cpu</code> 图像对比</th></tr></thead>
     <tbody>
-      <tr><td>256×256、2 步</td><td>24.6 s（VAE 解码 2.8 s）</td><td>36.1 s（VAE 解码 11.2 s）</td><td>PSNR 42.0 dB</td></tr>
-      <tr><td>512×512、Pruna 5 步 LoRA</td><td>169.6 s（每步约 31 s，VAE 解码 7.8 s）</td><td>295.7 s（VAE 解码 50.3 s）</td><td>PSNR 31.4 dB，SSIM 0.96</td></tr>
+      <tr><td>256×256、2 步</td><td>16.9–17.1 s（VAE 解码 2.8–2.9 s）</td><td>36.1–36.4 s（VAE 解码 10.8–11.2 s）</td><td>PSNR 37.7 dB，SSIM 0.984</td></tr>
+      <tr><td>512×512、Pruna 5 步 LoRA</td><td>118 s（每步 17.6–21.7 s）</td><td>295.7 s（VAE 解码 50.3 s）</td><td>PSNR 32.9 dB，SSIM 0.972</td></tr>
     </tbody>
   </table>
   </div>
-  <p>两者图像不同，是因为 ggml-cpu 在每个投影前把激活舍入到 8 位，而托管 Transformer 不这样做；512×512 的两张图画面一致。在 CPU 上，内存是限制所在：在同一进程中用 VAE 对一张 1024×1024 图像编码再解码时，峰值为 14.8 GB；默认的 2048×2048 尚未在这个后端上跑过，因此请传入 <code>--width</code> / <code>--height</code>。内核开关（<code>TS_QWEN21_CPU_*</code>、<code>TS_QWEN_VAE_CPU</code>、<code>TS_QWEN_TE_CPU_*</code>、<code>TS_CPU_GEMM_THREADS</code>）见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwenimage21_zh-cn.md#纯-c-cpu-后端--backend-cpu" target="_blank" rel="noopener">模型卡</a>。</p>
+  <p>两者图像不同，是因为托管 Transformer 的求和顺序与 ggml-cpu 不同，并且在 ggml-cpu 使用 F16 GELU 表的地方保持 F32。<code>TS_QWEN21_CPU_MATMUL=f32</code>（F32 激活乘以反量化的权重分块，之前的默认值）更慢（上面两次运行分别为 20.4 s 与 169.6 s），数值更稳定。另有两次更大的运行是用这个 F32 Transformer 测的：1024×1024、Pruna LoRA 用时 756 s，<code>ggml_cpu</code> 为 1101 s；512×512 编辑为 224 s 对 353 s。在 CPU 上，内存是限制所在：估计峰值放不下的尺寸会在开始任何工作之前被拒绝（<code>TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0</code> 可跳过）；1024×1024 的 Pruna 生成提交内存峰值为 3.7 GiB，2048×2048 的 VAE 编码加解码为 10.5 GiB。内核开关（<code>TS_QWEN21_CPU_*</code>、<code>TS_QWEN_VAE_CPU</code>、<code>TS_QWEN_TE_CPU_*</code>、<code>TS_CPU_GEMM_THREADS</code>）见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwenimage21_zh-cn.md#纯-c-cpu-后端--backend-cpu" target="_blank" rel="noopener">模型卡</a>。</p>
 
   <h3 id="prefix-kv-cache">前缀 KV 缓存</h3>
   <p>文本与参考图 token 用 <code>t = 0</code> 调制，并且从不关注正在生成的图像，因此它们的 K 和 V 在每个去噪步都相同。TensorSharp 实现了官方的前缀 KV 缓存：第一步运行整个序列，把每个块前缀部分的 K 和 V 存到设备上；之后每一步只计算目标图像的 token。它<strong>默认开启</strong>（<code>TS_QWEN21_PREFIX_CACHE=0</code> 关闭），存的正是注意力读取的类型——Metal 与 CUDA flash attention 为 F16，其他为 F32——因此在默认存储下输出 PNG 与不用缓存时逐字节相同。CFG 运行为每个分支各保留一份缓存，所有缓存都在 VAE 解码前释放。代价是内存：F16 下每个前缀 token、每个分支 512 KiB，每张约 1 百万像素的参考图约 2 GiB。一份缓存最多使用设备报告的空闲内存的一半（<code>TS_QWEN21_PREFIX_CACHE_MAX_MIB</code> 可进一步限制），放不下时会被拒绝并给出警告；<code>TS_QWEN21_PREFIX_CACHE_TYPE=q8_0</code> 或 <code>q8_0_v</code> 以 8 位存储，节省内存，但每步慢 5–13%，输出也会有少量舍入。</p>

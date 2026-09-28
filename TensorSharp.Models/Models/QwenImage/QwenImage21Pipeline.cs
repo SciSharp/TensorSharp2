@@ -55,7 +55,7 @@ namespace TensorSharp.Models.QwenImage
             }
             Console.WriteLine($"Qwen-Image-2.1: {width}x{height}, {steps} steps, CFG {cfg}, seed {p.Seed}, {inputs.Length} reference(s)");
             if (UsesHostCpuAutomaticSize(p, _model.Backend))
-                Console.WriteLine($"  automatic size on the {BackendName(_model.Backend)} backend: {width}x{height} (about " +
+                Console.WriteLine($"  automatic size on the cpu backend: {width}x{height} (about " +
                     $"{HostCpuAutomaticArea / (1024 * 1024)} MP). The native 2048x2048 area has four times the tokens and takes " +
                     "about 5x longer per step on a CPU; pass --width/--height (width/height in an API request) for another size.");
             if (recipe is { HasSchedule: true })
@@ -275,20 +275,19 @@ namespace TensorSharp.Models.QwenImage
         private static string _defaultSizeWarnedFor;
 
         /// <summary>
-        /// The automatic output area on a host-CPU backend (cpu, ggml_cpu): 1024x1024, the area the
-        /// references are conditioned at. The native 2048x2048 area has 16384 image tokens against
-        /// 4096, so a denoising step takes about 5x as long (attention grows with the square): many
-        /// minutes per step on a CPU, hours per image at the default 40 steps. Explicit sizes, an
-        /// explicit area and the server's --width/--height are unaffected.
+        /// The automatic output area on the pure-C# cpu backend: 1024x1024, the area the references
+        /// are conditioned at. The native 2048x2048 area has 16384 image tokens against 4096, so a
+        /// denoising step takes about 5x as long (attention grows with the square): many minutes
+        /// per step on a CPU, hours per image at the default 40 steps. Explicit sizes, an explicit
+        /// area and the server's --width/--height are unaffected. ggml_cpu keeps the native area,
+        /// as it always has: only the backend this default was introduced with changes behaviour.
         /// </summary>
         internal const long HostCpuAutomaticArea = 1024L * 1024;
 
-        internal static bool IsHostCpu(BackendType backend) => backend is BackendType.Cpu or BackendType.GgmlCpu;
-
-        private static string BackendName(BackendType backend) => backend == BackendType.GgmlCpu ? "ggml_cpu" : "cpu";
+        internal static bool IsHostCpu(BackendType backend) => backend == BackendType.Cpu;
 
         /// <summary>Output geometry. <paramref name="backend"/> selects the automatic area: the
-        /// native 2048x2048 one, or <see cref="HostCpuAutomaticArea"/> on a host-CPU backend (null
+        /// native 2048x2048 one, or <see cref="HostCpuAutomaticArea"/> on the cpu backend (null
         /// keeps the native area).</summary>
         internal static (int Width, int Height) ResolveDimensions(QwenImageParams p, RgbImage reference, BackendType? backend = null)
         {
@@ -329,7 +328,7 @@ namespace TensorSharp.Models.QwenImage
 
             string configuration = rawWidth + "x" + rawHeight;
             const string automatic = "requests that name no size keep the automatic size " +
-                "(the native 2048x2048 area, 1024x1024 on the cpu and ggml_cpu backends, following the first reference " +
+                "(the native 2048x2048 area, 1024x1024 on the cpu backend, following the first reference " +
                 "image's aspect ratio on an edit).";
             if (hasWidth != hasHeight)
             {

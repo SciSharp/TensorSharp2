@@ -87,8 +87,10 @@ second prediction and conditions it on `--negative-prompt` (for example
 empty prompt). Negative prompts have no effect at CFG 1.
 
 Omitting dimensions selects **2048×2048 for generation**, or approximately the
-same pixel area with the first reference's aspect ratio for editing. Set width
-and height together, in multiples of 32, to override this. The model supports
+same pixel area with the first reference's aspect ratio for editing. On the
+pure-C# `cpu` backend the automatic area is 1 MP instead (1024×1024), because a
+2048×2048 step takes about 5x as long there; `ggml_cpu` and the GPU backends keep
+2048×2048. Set width and height together, in multiples of 32, to override this. The model supports
 [native 2K aspect ratios](https://github.com/QwenLM/Qwen-Image-2.1#supported-aspect-ratios).
 Reference images are conditioned at approximately 1 megapixel each, or the
 output area if smaller; increasing the output to 2K does not also quadruple each
@@ -210,7 +212,10 @@ plug-ins and the prefix KV cache. No GGML graph is built and the pipeline makes 
 call into the native GgmlOps library; the CLI also skips its GGML teardown at exit on
 this backend unless something else in the process loaded the library. Weights are
 read from the memory-mapped GGUF and safetensors files in their stored types.
-Previously the model refused `cpu` and needed a GGML backend.
+Previously the model refused `cpu` and needed a GGML backend. Outside the model
+compute two native pieces remain, as before: image files are read and written
+through Magick.NET on desktop, and the server probes the GGML and CUDA backends
+at startup.
 
 ```bash
 TENSORSHARP_MODELS="$PWD/models" dotnet run --project TensorSharp.Cli -c Release --no-build -- \
@@ -220,34 +225,42 @@ TENSORSHARP_MODELS="$PWD/models" dotnet run --project TensorSharp.Cli -c Release
   --width 512 --height 512 --diffusion-seed 42 --output cat-cpu.png
 ```
 
-The server takes the same `--backend cpu`. Set `--width` and `--height` on a CPU:
-the 2048×2048 default was not run on this backend (see the limitations below).
+The server takes the same `--backend cpu`. On this backend a request that names no
+size renders at the 1 MP automatic area (1024×1024, or that area at the first
+reference's aspect ratio for an edit) rather than 2048×2048, whose transformer
+steps take about 5x as long; explicit sizes, an explicit `targetArea` and the
+server's `--width` / `--height` are unaffected, and the run prints the size it
+chose. `ggml_cpu` keeps the native 2048×2048 default.
 
 What runs where:
 
 - **Transformer** (`QwenImage21ManagedDiT`): the operations of the native graph,
-  in the same order and from the same weight descriptors. The projections multiply
-  F32 activations by dequantized weight tiles, where ggml-cpu quantizes the
-  activations to 8 bits; attention is a tiled flash attention; LoRA factors
-  (stacked shrinks, DoRA row scales) are applied unmerged as on the GGML backends.
-  `TS_QWEN21_CPU_MATMUL=q8` selects 8-bit activations through the managed
-  quantized matmul instead.
+  in the same order and from the same weight descriptors. The quantized
+  projections quantize their activations to Q8_K / Q8_0, as ggml-cpu does, and run
+  the managed multi-row integer GEMM; attention is a tiled flash attention; LoRA
+  factors (stacked shrinks, DoRA row scales) are applied unmerged as on the GGML
+  backends. `TS_QWEN21_CPU_MATMUL=f32`, the default before, multiplies F32
+  activations by dequantized weight tiles instead: slower, but numerically steadier.
 - **Prefix KV cache**: a managed cache in host memory with the same types
   (`auto`/`f32` store what attention reads, so cached steps reproduce uncached
   ones bit for bit; `f16`, `q8_0`, `q8_0_v`) and the same rule: at most half of the
   free physical memory, and `TS_QWEN21_PREFIX_CACHE_MAX_MIB`.
-- **Text encoder**: every projection runs a packed F32 GEMM on dequantized Q4_K /
-  Q6_K tiles (exact F32 activations), with a managed causal grouped-query
-  attention.
+- **Text encoder**: the projections run the same multi-row integer GEMM (8-bit
+  activations; `TS_QWEN_TE_CPU_MATMUL=f32` selects a packed F32 GEMM on
+  dequantized Q4_K / Q6_K tiles), with a managed causal grouped-query attention.
 - **Vision encoder** (editing): packed-GEMM linear layers and a managed multi-head
-  attention.
+  attention. Each linear weight's F32 copy is released once it is packed, so the
+  tower holds one copy of its weights: encoding a 512×512 reference peaked at
+  3.2 GB of commit in the stage benchmark, against 5.4 GB with both copies, with
+  bit-identical output.
 - **VAE**: every convolution is an implicit-im2col packed SGEMM against weights
   packed once per layer, the decoder's 2x upsample is folded into the convolution
   that reads it, and it runs on a pool with one thread per logical CPU
-  (`TS_CPU_GEMM_THREADS`).
+  (`TS_CPU_GEMM_THREADS`; `Parallel.For` at that width under `TS_CPU_POOL=0`).
 
-All of these have AVX-512 and AVX2 kernels (`TS_CPU_DISABLE_AVX512=1` selects the
-AVX2 ones) and a portable fallback; the environment variable matrix lists
+All of these have AVX-512 and AVX2 kernels, chosen by one instruction-set decision
+for the whole backend (`TS_CPU_DISABLE_AVX512=1` selects the AVX2 ones), and a
+portable fallback; the environment variable matrix lists
 [every switch](../env_var_feature_matrix.md#out-of-matrix-qwen-image-21-knobs),
 including the `0` / `scalar` settings that restore each previous stage.
 
@@ -255,35 +268,43 @@ including the `0` / `scalar` settings that restore each previous stage.
 
 i7-11800H (8 cores / 16 threads, AVX-512), 32 GB, Windows. DiT
 `qwen_image_2.1_Q4_K_M.gguf`, text encoder `Qwen3VL-8B-Instruct-Q4_K_M.gguf`,
-VAE BF16; text-to-image, CFG 1, seed 42, one run each. `ggml_cpu` was
-measured on the same machine with the build before this change; its path is native
-and was not modified. PSNR / SSIM compare the `cpu` image with the `ggml_cpu` one.
+VAE BF16; text-to-image, CFG 1, seed 42, with the default integer (Q8) projections.
+`ggml_cpu` runs native code these changes did not touch. PSNR / SSIM compare the
+`cpu` image with the `ggml_cpu` one.
 
 | Run | Stage | `cpu` | `ggml_cpu` |
 |---|---|---:|---:|
-| 256×256, 2 steps | text and vision encode | 4.2 s | 4.2 s |
-| | step 1 / step 2 (prefix cached) | 10.1 / 7.4 s | 12.1 / 8.7 s |
-| | VAE decode | 2.8 s | 11.2 s |
-| | total | **24.6 s** | 36.1 s |
-| | PSNR / SSIM | 42.0 dB / 0.984 | reference |
-| 512×512, Pruna 5-step LoRA | text and vision encode | 3.4 s | 3.3 s |
-| | steady step (prefix cached) | 30.7–31.6 s | 43.9–61.4 s |
-| | denoise, 5 steps | 158.4 s | 242.1 s |
-| | VAE decode | 7.8 s | 50.3 s |
-| | total | **169.6 s** | 295.7 s |
-| | PSNR / SSIM | 31.4 dB / 0.96 | reference |
+| 256×256, 2 steps (two runs) | text and vision encode | 3.1 s | 4.1–4.2 s |
+| | denoise, 2 steps | 11.0–11.1 s | 20.8–21.4 s |
+| | VAE decode | 2.8–2.9 s | 10.8–11.2 s |
+| | total | **16.9–17.1 s** | 36.1–36.4 s |
+| | PSNR / SSIM | 37.7 dB / 0.984 | reference |
+| 512×512, Pruna 5-step LoRA | steady step (prefix cached) | 17.6–21.7 s | 43.9–61.4 s |
+| | total | **118 s** | 295.7 s |
+| | PSNR / SSIM | 32.9 dB / 0.972 | reference |
+
+With `TS_QWEN21_CPU_MATMUL=f32` (F32 activations against dequantized weight
+tiles, the default before) the same 256×256 run took 20.4 s at 42.0 dB / 0.984,
+and the 512×512 one 169.6 s (steps of 30.7–31.6 s) at 31.4 dB / 0.96. The text
+encoder alone takes 0.76–0.88 s for the 37-token default prompt with the integer
+projections, against 1.8–1.9 s with `TS_QWEN_TE_CPU_MATMUL=f32` and about 1.4 s on
+`ggml_cpu`. Two larger runs were measured with the F32 transformer, before the
+integer route became the default: a 1024×1024 Pruna 5-step generation took 756 s
+on `cpu` against 1101 s on `ggml_cpu`, and a 512×512 edit 224 s against 353 s.
 
 The two backends do not produce the same pixels, and neither is the reference:
-ggml-cpu rounds the activations to 8 bits before every projection, and the managed
-transformer does not. On single forwards (`benchmarks/QwenImageDiTBench`, 256×256)
-the managed velocity has cosine 0.99994 to ggml-cpu at sigma 1 and 0.9978 at
-sigma 0.02, while a 1e-4 relative change of the timestep alone moves ggml-cpu's own
-velocity by 4.7e-2 (cosine 0.9989). The 512×512 images were compared visually and
-show the same picture. Editing on `cpu` is covered by unit tests of the managed
-transformer (edit layouts, several references) and by stage benchmarks
-(`benchmarks/QwenImageStagesBench`); no end-to-end edit timing was recorded. In the
-stage benchmark a 1024×1024 reference image took 12–13 s through the vision
-encoder, and a 256×256 one 0.72 s against 5.0 s on `ggml_cpu`.
+the managed transformer quantizes the activations as ggml-cpu does but sums in
+another order and keeps F32 where ggml-cpu uses its F16 GELU table and
+BF16-rounded inputs (`TS_QWEN21_CPU_GELU_FP16` / `TS_QWEN21_CPU_ROUND_ACTIVATIONS`
+reproduce those), and each re-quantization can flip a rounding. On single
+forwards (`benchmarks/QwenImageDiTBench`, 256×256) the managed velocity has cosine
+0.99993 to ggml-cpu at sigma 1 and 0.99938 at sigma 0.02 (0.99994 and 0.9978 with
+the F32 route), while a 1e-4 relative change of the timestep alone moves
+ggml-cpu's own velocity by 4.7e-2 (cosine 0.9989). Editing on `cpu` is also covered by
+unit tests of the managed transformer (edit layouts, several references) and by
+stage benchmarks (`benchmarks/QwenImageStagesBench`). In the stage benchmark a
+1024×1024 reference image took 12–13 s through the vision encoder, and a 256×256
+one 0.72 s against 5.0 s on `ggml_cpu`.
 
 ### Limitations on `cpu`
 
@@ -292,14 +313,17 @@ encoder, and a 256×256 one 0.72 s against 5.0 s on `ggml_cpu`.
   pipeline runs in one process.
 - **Memory.** The DiT and text-encoder weights are file-mapped (4.2 GB for the
   Q4_K_M DiT, 5.0 GB for the Q4_K_M text encoder), but activations, the prefix
-  cache and the VAE feature maps are ordinary process memory. Encoding and then
-  decoding a 1024×1024 image with the VAE in one process peaked at 14.8 GB.
-  2048×2048, the default size, has not been run on this backend and is not
-  verified to fit a 32 GB machine; pass `--width` and `--height` explicitly.
-- **Speed.** At 512×512 one step takes about 31 s on the 8-core laptop above, and a
-  2K square has 16 times the image tokens of 512×512, with attention growing
-  faster than that. Use a step-distillation LoRA and a small size for anything
-  interactive.
+  cache and the VAE feature maps are ordinary process memory. The VAE releases
+  each feature map after its last read: a 1024×1024 Pruna 5-step generation
+  peaked at 3.7 GiB of commit (8.0 GiB of working set), and a 2048×2048 VAE encode
+  plus decode at 10.5 GiB of commit. Before any work, a size whose estimated peak
+  exceeds the machine's memory is refused with the largest square size that fits
+  (`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` overrides), and one that exceeds the memory
+  free right now gets a warning.
+- **Speed.** At 512×512 one step takes 17.6–21.7 s on the 8-core laptop above,
+  and a 2K square has 16 times the image tokens of 512×512, with attention growing
+  faster than that; that is why the automatic size on this backend is 1024×1024.
+  Use a step-distillation LoRA and a small size for anything interactive.
 - The GGML-only switches (`TS_QWEN21_GRAPH_REUSE`, `TS_QWEN21_FLASH`,
   `TS_QWEN21_PAD_MASK`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no
   effect on `cpu`.

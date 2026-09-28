@@ -26,7 +26,7 @@ namespace TensorSharp.Cpu
     /// once all have completed, rethrowing a failure (an AggregateException is
     /// fine); nested or concurrent calls must be safe (running inline is fine).
     /// </summary>
-    public static class CpuParallel
+    internal static class CpuParallel
     {
         private sealed class Runner
         {

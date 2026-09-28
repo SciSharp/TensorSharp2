@@ -25,12 +25,12 @@ namespace TensorSharp.Models
     ///
     /// The pool is created lazily on the first parallel Core call, so merely
     /// loading this assembly (GGML/CUDA backends) starts no threads.
-    /// TS_CPU_POOL=0 keeps Core on Parallel.For, same knob as the quantized path.
+    /// TS_CPU_POOL=0 keeps Core on Parallel.For, same knob as the quantized path
+    /// and every other managed kernel (<see cref="CpuWorkers"/>).
     /// </summary>
     internal static class CpuParallelBinding
     {
-        internal static readonly bool Enabled =
-            Environment.GetEnvironmentVariable("TS_CPU_POOL") != "0";
+        internal static readonly bool Enabled = CpuWorkers.PoolEnabled;
 
 #pragma warning disable CA2255 // intentional: bind before any model code runs a Core op
         [ModuleInitializer]

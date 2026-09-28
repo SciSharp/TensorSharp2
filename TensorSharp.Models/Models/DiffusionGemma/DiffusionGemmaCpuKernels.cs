@@ -66,12 +66,9 @@ namespace TensorSharp.Models
     /// </summary>
     internal static unsafe class DiffusionGemmaCpuKernels
     {
-        internal static readonly bool Avx512Disabled =
-            Environment.GetEnvironmentVariable("TS_CPU_DISABLE_AVX512") == "1";
-
         internal static readonly DiffusionAttnKernel DefaultAttention =
             Environment.GetEnvironmentVariable("DIFFUSION_CPU_ATTN_FAST") != "1" ? DiffusionAttnKernel.Exact
-            : Vector512.IsHardwareAccelerated && Avx512F.IsSupported && !Avx512Disabled ? DiffusionAttnKernel.Fma512
+            : TensorSharp.Cpu.CpuIsa.Avx512 ? DiffusionAttnKernel.Fma512
             : DiffusionAttnKernel.Fma;
 
         private const int MicroQ = 4;   // queries per attention micro-block (share each K/V row load)

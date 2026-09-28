@@ -40,7 +40,7 @@ namespace TensorSharp.Models.QwenImage
 
         // The managed VAE runs nothing but these kernels, so it takes the wide pool (see
         // CpuPackedGemm); next to device convolutions the host passes keep the shared pool.
-        internal static CpuWorkerPool CpuPool => FastCpu ? CpuPackedGemm.WidePool : CpuWorkerPool.Shared;
+        internal static CpuWorkers CpuPool => FastCpu ? CpuPackedGemm.WidePool : CpuWorkers.Shared;
 
         // Weights that reach Conv2d as raw arrays (tests, callers without a VaeWeights) are
         // packed once per array identity; VaeWeights-owned layers use VaeWeights.PackedKernel.
