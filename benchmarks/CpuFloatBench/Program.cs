@@ -475,7 +475,10 @@ internal static unsafe class Program
     {
         Console.WriteLine($"qwen-te: {gguf}  env TS_CPU_SGEMM={Env("TS_CPU_SGEMM")} TS_CPU_SIMD_ELEMENTWISE={Env("TS_CPU_SIMD_ELEMENTWISE")} TS_CPU_POOL={Env("TS_CPU_POOL")}");
         var load = Stopwatch.StartNew();
-        using var te = new TensorSharp.Models.QwenImage.QwenImageTextEncoder(gguf, TensorSharp.Runtime.BackendType.Cpu);
+        // TE_BACKEND=ggml_cpu produces the native reference dump (needs GgmlOps next to the exe).
+        var backend = Env("TE_BACKEND") == "ggml_cpu" ? TensorSharp.Runtime.BackendType.GgmlCpu : TensorSharp.Runtime.BackendType.Cpu;
+        Console.WriteLine($"  backend {backend}");
+        using var te = new TensorSharp.Models.QwenImage.QwenImageTextEncoder(gguf, backend);
         Console.WriteLine($"  load {load.Elapsed.TotalSeconds:F1} s");
         string prompt = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n" +
                         "<|im_start|>user\nA small orange cat beside a blue ceramic vase, soft daylight, detailed photograph<|im_end|>\n<|im_start|>assistant\n";
