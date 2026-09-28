@@ -1109,7 +1109,8 @@ public static class ServerOptionsBuilder
             warnings.Add(
                 $"{given} was given without {missing}: the Qwen-Image-2.1 default image size needs both, so "
                 + $"{given} is ignored for images, and image requests that name neither a size nor an area keep "
-                + $"the automatic size (a 2048x2048 area). Pass {missing} as well to set it (video requests still use "
+                + $"the automatic size (a 2048x2048 area; 1024x1024 on the cpu and ggml_cpu backends). Pass {missing} as well "
+                + $"to set it (video requests still use "
                 + $"{given} on its own).");
             return warnings;
         }

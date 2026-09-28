@@ -31,9 +31,13 @@ namespace TensorSharp.Models.QwenImage
         public Feature(int c, int h, int w, float[] d) { C = c; H = h; W = w; D = d; }
         public int Idx(int c, int y, int x) => (c * H + y) * W + x;
         /// <summary>A feature whose every element the caller overwrites: skips the zeroing pass
-        /// (hundreds of MB per decoder map at 1024 px and above).</summary>
-        public static Feature Uninitialized(int c, int h, int w) =>
-            new(c, h, w, GC.AllocateUninitializedArray<float>(checked(c * h * w)));
+        /// (hundreds of MB per decoder map at 1024 px and above), and inside a managed encode or
+        /// decode recycles a released map of the same size (<see cref="VaeFeaturePool"/>).</summary>
+        public static Feature Uninitialized(int c, int h, int w)
+        {
+            int length = checked(c * h * w);
+            return new(c, h, w, VaeFeaturePool.Current is { } pool ? pool.Rent(length) : GC.AllocateUninitializedArray<float>(length));
+        }
     }
 
     internal static unsafe partial class VaeReferenceMath
@@ -269,9 +273,16 @@ namespace TensorSharp.Models.QwenImage
             var xn = RmsNormChannel(x, w.Get(prefix + ".norm.gamma"));
             if (FastCpu)
             {
+                // Each map is released to the decode's pool once read (the caller hands x over).
                 var qkvFast = ConvLayer(w, prefix + ".to_qkv", xn, 3 * C, C, 1, 1, 1, 1, 0, 0, 0, 0);
+                VaeFeaturePool.Release(xn);
                 var attended = AttentionCpu(qkvFast.D, C, H, W);
-                return AddInPlace(ConvLayer(w, prefix + ".proj", attended, C, C, 1, 1, 1, 1, 0, 0, 0, 0), identity);
+                VaeFeaturePool.Release(qkvFast);
+                var projected = ConvLayer(w, prefix + ".proj", attended, C, C, 1, 1, 1, 1, 0, 0, 0, 0);
+                VaeFeaturePool.Release(attended);
+                AddInPlace(projected, identity);
+                VaeFeaturePool.Release(identity);
+                return projected;
             }
             // to_qkv: 1x1 conv C -> 3C
             var qkv = Conv2d(xn, w.Get(prefix + ".to_qkv.weight"), 3 * C, C, 1, 1,
