@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>CpuFloatBench</AssemblyName>
+    <Description>Microbenchmark for the pure-C# CPU float kernels: F32 GEMM (Ops.Addmm/AddmmBatch, DirectOps), elementwise/norm/softmax ops and the CPU attention path. GFLOPS / GB/s plus a sampled accuracy check; old vs new via TS_CPU_SGEMM=0, TS_CPU_SIMD_ELEMENTWISE=0, TS_CPU_POOL=0.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\TensorSharp.Models\TensorSharp.Models.csproj" />
+  </ItemGroup>
+</Project>

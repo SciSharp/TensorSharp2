@@ -42,3 +42,7 @@ using System.Runtime.InteropServices;
 // [assembly: AssemblyVersion("1.0.*")]
 [assembly: AssemblyVersion("2.3.2.0")]
 [assembly: AssemblyFileVersion("2.3.2.0")]
+
+// Kernel-selection knobs (CpuSgemm.ActiveKernel, CpuKernels.Use512) are internal.
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("InferenceWeb.Tests")]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("CpuFloatBench")]
