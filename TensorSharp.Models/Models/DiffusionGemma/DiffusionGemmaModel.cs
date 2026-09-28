@@ -97,8 +97,12 @@ namespace TensorSharp.Models
         // ---- prompt-KV caching (PKV) — the headline llama.cpp/vLLM diffusion-gemma optimization ----
         // The prompt's per-layer K/V do not depend on the canvas (prompt is causal and never attends to
         // the canvas), so they are identical across every denoising step. PrefillPrompt computes them
-        // once per block and stores them here (head-first [kvHeads, P, hd]); DecodeCanvas then processes
-        // only the canvas each step and prepends the cached prompt K/V. GPU path only.
+        // once per block and stores them here; DecodeCanvas then processes only the canvas each step and
+        // prepends the cached prompt K/V. Two layouts, chosen by backend and never mixed: the device-glue
+        // (GPU) backends keep head-first [kvHeads, P, hd]; the pure-C# cpu backend keeps token-major
+        // [rows, kvHeads*hd] after norm+RoPE, where a local layer keeps only the last min(P, swa-1)
+        // rows (all a canvas query can see) while the prompt length stays P
+        // (DiffusionGemmaModel.Cpu.cs). ggml_cpu has no prompt-KV cache.
         private Tensor[] _promptK, _promptV;
         private int _promptLen = -1;
         private bool _pkvEnabled;
@@ -256,7 +260,7 @@ namespace TensorSharp.Models
         /// <summary>Whether prompt-KV caching is active: the sampler calls <see cref="PrefillPrompt"/>
         /// once per block then <see cref="DecodeCanvas"/> per step. Available on the device-glue (GPU)
         /// backends and on the pure-C# CPU backend (host glue, DiffusionGemmaModel.Cpu.cs); the setter is
-        /// a no-op on the remaining backends (ggml_cpu).</summary>
+        /// a no-op on the remaining backends (ggml_cpu, and cpu under DIFFUSION_CPU_LEGACY=1).</summary>
         public bool SupportsPromptKvCache
         {
             get => _pkvEnabled;
@@ -1098,7 +1102,8 @@ namespace TensorSharp.Models
         //  then processes only the canvas each denoising step, reading the cached prompt K/V. This is the
         //  canonical llama.cpp/vLLM diffusion-gemma optimization — it removes the prompt's projection /
         //  attention / dense-MLP / MoE-matmul work from every step (computed once instead of S times),
-        //  which is a large saving for long prompts (system prompt + chat history). GPU path only.
+        //  which is a large saving for long prompts (system prompt + chat history). Device-glue (GPU)
+        //  backends below; the pure-C# cpu backend has its own host implementation (DiffusionGemmaModel.Cpu.cs).
         // ===================================================================================
 
         /// <summary>Project + per-head-norm + RoPE (positions startPos..startPos+seqLen-1) and reshape Q/K/V
@@ -1145,7 +1150,9 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Core prompt prefill: run the prompt through every layer once and store each layer's
-        /// prompt K/V (head-first [kvHeads, P, hd]) into <paramref name="outK"/>/<paramref name="outV"/>.
+        /// prompt K/V into <paramref name="outK"/>/<paramref name="outV"/> (head-first [kvHeads, P, hd] on
+        /// the device-glue backends; token-major and SWA-trimmed on the cpu backend, see
+        /// <see cref="PrefillPromptIntoCpu"/>).
         /// Shared by the single-request (<see cref="PrefillPrompt"/>) and batched (<see cref="PrefillSeq"/>)
         /// paths. The caller owns/releases the K/V tensors. Returns the prompt length P.</summary>
         private int PrefillPromptInto(int[] promptTokens, Tensor[] outK, Tensor[] outV,
@@ -1487,7 +1494,7 @@ namespace TensorSharp.Models
         //  (canvas token i of sequence b lives at absolute position P_b+i) are supplied via an explicit
         //  positions tensor. Uses the per-op device path (the fused single-graph decode kernel is for the
         //  single-canvas case); B==1 still takes the fused fast path via DecodeCanvasSeq.
-        //  GGML/device-glue backends only.
+        //  Device-glue backends here; the pure-C# cpu backend batches on the host (CpuDecodeCanvasBatched).
         // ===================================================================================
 
         /// <summary>Allocate a fresh per-sequence decode state (its own prompt K/V store). The caller must
@@ -2845,7 +2852,9 @@ namespace TensorSharp.Models
     }
 
     /// <summary>Per-sequence decode state for batched (multi-request) diffusion generation: each in-flight
-    /// request owns its own prompt K/V store (head-first [kvHeads, P, hd] per layer) so several canvases can
+    /// request owns its own prompt K/V store (per layer: head-first [kvHeads, P, hd] on the device-glue
+    /// backends, token-major [rows, kvHeads*hd] on the cpu backend, where local layers keep only the
+    /// sliding-window tail of the prompt) so several canvases can
     /// be denoised together in one batched forward without sharing the model's instance-field K/V cache.
     /// Created via <see cref="DiffusionGemmaModel.CreateSeqState"/>; freed via
     /// <see cref="DiffusionGemmaModel.DisposeSeqState"/>.</summary>

@@ -17,6 +17,15 @@ public sealed class DiffusionGemmaCpuForwardTests(Xunit.Abstractions.ITestOutput
         => (DiffusionGemmaModel)ModelBase.Create(
             TestGates.FindGguf(Environment.GetEnvironmentVariable(EnvModelDir), GgufPattern), BackendType.Cpu);
 
+    // Runs the unified [prompt|canvas] forward, then restores whatever prompt-KV setting the model had.
+    private static T WithoutPromptKv<T>(DiffusionGemmaModel model, Func<T> run)
+    {
+        bool saved = model.SupportsPromptKvCache;
+        model.SupportsPromptKvCache = false;
+        try { return run(); }
+        finally { model.SupportsPromptKvCache = saved; }
+    }
+
     private static int[] Render(DiffusionGemmaModel model, string text)
         => model.Tokenizer.Encode(new GgufPromptRenderer().Render(model.Config.ChatTemplate,
             [new ChatMessage { Role = "user", Content = text }], addGenerationPrompt: true,
@@ -37,10 +46,7 @@ public sealed class DiffusionGemmaCpuForwardTests(Xunit.Abstractions.ITestOutput
             model.ClearStructuredCache();
             float[][] cached = model.ReadStructured(prompt, canvas, positions, rows);
             float[][] cachedAgain = model.ReadStructured(prompt, canvas, positions, rows);   // reuses the prompt K/V
-            model.SupportsPromptKvCache = false;
-            float[][] unified;
-            try { unified = model.ReadStructured(prompt, canvas, positions, rows); }
-            finally { model.SupportsPromptKvCache = true; }
+            float[][] unified = WithoutPromptKv(model, () => model.ReadStructured(prompt, canvas, positions, rows));
             output.WriteLine($"width={width}: cached=[{string.Join(",", cached[0])}] unified=[{string.Join(",", unified[0])}]");
             for (int r = 0; r < rows.Length; r++)
             {
@@ -48,6 +54,38 @@ public sealed class DiffusionGemmaCpuForwardTests(Xunit.Abstractions.ITestOutput
                 Assert.Equal(cached[r], cachedAgain[r]);
             }
         }
+    }
+
+    // A prompt longer than the sliding window: the prefill keeps only the last (swa-1) prompt rows of
+    // each local layer and the canvas decode addresses them from row 0 (UniformLo), while global
+    // layers keep all P rows. An off-by-one there shifts which prompt keys the canvas sees without
+    // failing anything else, so the cached read must still be the unified forward bit for bit.
+    // ~1.1k prompt tokens and a 7-token canvas keep it to a few minutes on the cpu backend.
+    [ModelFact(EnvModelDir, GgufPattern)]
+    public void StructuredRead_PromptKv_LongPromptPastSlidingWindow_IsBitwiseTheUnifiedForward()
+    {
+        using var model = Load();
+        Assert.True(model.SupportsPromptKvCache, "prompt-KV caching should be on by default on the cpu backend");
+        const int swa = 1024;   // diffusiongemma-26B-A4B's sliding window
+        const string question = "\nClassify the final note: I love this product. Answer A for positive, B for negative.";
+        var filler = new System.Text.StringBuilder();
+        int[] prompt = Render(model, question);
+        for (int i = 0; prompt.Length < swa + 64; i++)   // just past the window: the cost is linear in P
+        {
+            for (int j = 0; j < 8; j++) filler.Append($"note {i * 8 + j}: the shipment was logged. ");
+            prompt = Render(model, filler + question);
+        }
+        output.WriteLine($"prompt tokens: {prompt.Length}");
+        Assert.InRange(prompt.Length, swa + 64, 2 * swa);
+        int[] labels = new[] { "A", "B", "C" }.Select(l => model.Tokenizer.Encode(l, false).Single()).ToArray();
+        int[] canvas = [labels[0], model.MaskTokenId, labels[1], model.MaskTokenId, labels[2], model.MaskTokenId, labels[0]];
+        int[] positions = [1, 5];
+        int[][] rows = [labels, [labels[1], labels[0]]];
+        model.ClearStructuredCache();
+        float[][] cached = model.ReadStructured(prompt, canvas, positions, rows);
+        float[][] unified = WithoutPromptKv(model, () => model.ReadStructured(prompt, canvas, positions, rows));
+        output.WriteLine($"cached=[{string.Join(",", cached[0])}] unified=[{string.Join(",", unified[0])}]");
+        for (int r = 0; r < rows.Length; r++) Assert.Equal(unified[r], cached[r]);
     }
 
     // DecodeCanvasBatched on the cpu backend runs every sequence's canvas rows through one forward;
@@ -93,10 +131,7 @@ public sealed class DiffusionGemmaCpuForwardTests(Xunit.Abstractions.ITestOutput
         var stepsCached = new List<int[]>();
         var stepsUnified = new List<int[]>();
         List<int> cached = sampler.Generate(prompt, p, (_, _, _, canvas) => stepsCached.Add(canvas));
-        model.SupportsPromptKvCache = false;
-        List<int> unified;
-        try { unified = sampler.Generate(prompt, p, (_, _, _, canvas) => stepsUnified.Add(canvas)); }
-        finally { model.SupportsPromptKvCache = true; }
+        List<int> unified = WithoutPromptKv(model, () => sampler.Generate(prompt, p, (_, _, _, canvas) => stepsUnified.Add(canvas)));
         Assert.Equal(stepsUnified.Count, stepsCached.Count);
         for (int s = 0; s < stepsCached.Count; s++) Assert.Equal(stepsUnified[s], stepsCached[s]);
         Assert.Equal(unified, cached);

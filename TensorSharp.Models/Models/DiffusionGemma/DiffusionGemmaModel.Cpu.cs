@@ -25,8 +25,13 @@ namespace TensorSharp.Models
     {
         // ---- A/B escape hatches (read once) ------------------------------------------------------
         // DIFFUSION_NO_PKV=1 (shared with the GPU backends) turns prompt-KV caching off, so every read
-        // and every denoising step runs the unified [prompt|canvas] forward again. The switches below
-        // restore the pre-existing CPU implementation of one stage each; DIFFUSION_CPU_LEGACY=1 does all.
+        // and every denoising step runs the unified [prompt|canvas] forward again.
+        // DIFFUSION_CPU_LEGACY=1 is the whole pre-existing CPU path in one switch: no prompt-KV cache
+        // (the old path had none) and the old implementation of every stage below.
+        // The per-stage switches restore one stage each. _MOE, _ROUTER and _PROJ apply on every path.
+        // _ATTN applies to the unified forward only: the prompt-KV prefill and canvas decode (the
+        // default) always run the fused norm+RoPE and the blocked attention kernel, whose default
+        // arithmetic is the old kernel's, so an attention A/B also needs DIFFUSION_NO_PKV=1.
         private static readonly bool CpuLegacyAll = Environment.GetEnvironmentVariable("DIFFUSION_CPU_LEGACY") == "1";
         private static readonly bool CpuLegacyMoe = CpuLegacyAll || Environment.GetEnvironmentVariable("DIFFUSION_CPU_LEGACY_MOE") == "1";
         private static readonly bool CpuLegacyProj = CpuLegacyAll || Environment.GetEnvironmentVariable("DIFFUSION_CPU_LEGACY_PROJ") == "1";
@@ -42,8 +47,9 @@ namespace TensorSharp.Models
             int.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_CPU_MOE_CHUNK"), out int moeChunk) && moeChunk > 0 ? moeChunk : 512;
 
         /// <summary>True on the pure-C# CPU backend: prompt-KV caching runs on the host glue below
-        /// (the device-glue backends keep their own implementation in DiffusionGemmaModel.cs).</summary>
-        private bool UsesHostPromptKv => _backend == BackendType.Cpu;
+        /// (the device-glue backends keep their own implementation in DiffusionGemmaModel.cs).
+        /// Off under DIFFUSION_CPU_LEGACY=1, which reproduces the old CPU path.</summary>
+        private bool UsesHostPromptKv => _backend == BackendType.Cpu && !CpuLegacyAll;
 
         private bool CpuFastPaths => _backend == BackendType.Cpu;
 
@@ -59,10 +65,13 @@ namespace TensorSharp.Models
         // stage timers for PrintForwardTiming (Stopwatch ticks)
         private long _tCpuQkv, _tCpuAttnCore, _tCpuMoeGateUp, _tCpuMoeDown;
 
-        /// <summary>Zero the stage timers <see cref="PrintForwardTiming"/> reports (probes use it to
-        /// profile warm reads without the first read's prefill).</summary>
-        public void ResetForwardTiming()
+        /// <summary>Zero the stage timers <see cref="PrintForwardTiming"/> reports, and the base model's
+        /// forward counters with them (probes use it to profile warm reads without the first read's
+        /// prefill). A separate name: ModelBase.ResetForwardTiming is not virtual, so hiding it would
+        /// reset one set of counters or the other depending on the caller's static type.</summary>
+        public void ResetDiffusionStageTiming()
         {
+            ResetForwardTiming();
             _swForward.Reset();
             _tEmbed = _tAttn = _tMoe = _tDense = _tLmHead = _tSc = _tMoeRoute = _tMoeFfn = _tScTopK = _tScDevice = 0;
             _tCpuQkv = _tCpuAttnCore = _tCpuMoeGateUp = _tCpuMoeDown = 0;
@@ -110,34 +119,54 @@ namespace TensorSharp.Models
         //  Projections
         // =========================================================================================
 
-        /// <summary>Several projections of the SAME input in as few dispatches as possible: outputs whose
-        /// weights share a quant type run as one <see cref="ManagedQuantizedOps.TryAddmmQuantizedBatch"/>
-        /// (activations quantized once, one pool fork/join), which is what the Q/K/V and gate/up pairs
-        /// need. Per row the arithmetic is that of separate linears. Anything the batch declines takes
-        /// the ordinary managed linear. Outputs are [rows, Ne1]; a null output is skipped.</summary>
-        private unsafe void CpuLinearMulti(Tensor input, string[] names, Tensor[] outputs)
+        /// <summary>Several projections of the SAME input in as few dispatches as possible (see
+        /// <see cref="LinearMultiQuantized"/>); a null output is skipped, and anything the batch cannot
+        /// take runs the ordinary <see cref="LinearForward"/>, which validates its shapes.</summary>
+        private void CpuLinearMulti(Tensor input, string[] names, Tensor[] outputs)
         {
-            int rows = (int)input.Sizes[0];
-            int inDim = (int)input.Sizes[1];
-            float* inPtr = GetFloatPtr(input);
-            var done = new bool[names.Length];
-            for (int i = 0; i < names.Length; i++)
+            var weights = new QuantizedWeight[names.Length];
+            if (!CpuLegacyProj)
+                for (int i = 0; i < names.Length; i++)
+                    if (names[i] != null && _quantWeights.TryGetValue(names[i], out QuantizedWeight qw))
+                        weights[i] = qw;
+            LinearMultiQuantized(input, weights, outputs, i => LinearInto(input, names[i], outputs[i]));
+        }
+
+        /// <summary>Outputs whose weights share a quant type run as one
+        /// <see cref="ManagedQuantizedOps.TryAddmmQuantizedBatch"/> (activations quantized once, one pool
+        /// fork/join), which is what the Q/K/V and gate/up pairs need. Per row the arithmetic is that of
+        /// separate linears. An output whose weight is missing, has no host copy or does not fit - Ne0
+        /// is not the input width, or the output is not a contiguous F32 [rows, Ne1] (a malformed
+        /// checkpoint; the batch would write past it) - and every output of a batch the kernels
+        /// decline goes to <paramref name="fallback"/>, which must fill it. Every non-null output is
+        /// either written or handed to the fallback.</summary>
+        internal static unsafe void LinearMultiQuantized(Tensor input, QuantizedWeight[] weights, Tensor[] outputs,
+            Action<int> fallback)
+        {
+            int n = outputs.Length;
+            bool inputOk = input.DimensionCount == 2 && input.ElementType == DType.Float32 && input.IsContiguous();
+            int rows = inputOk ? (int)input.Sizes[0] : 0;
+            int inDim = inputOk ? (int)input.Sizes[1] : 0;
+            float* inPtr = inputOk ? GetFloatPtr(input) : null;
+            var done = new bool[n];
+            var jobs = new ManagedQuantizedOps.QuantMatMulJob[n];
+            var members = new int[n];
+            for (int i = 0; i < n; i++)
             {
                 if (done[i] || outputs[i] == null) continue;
-                if (!_quantWeights.TryGetValue(names[i], out QuantizedWeight first) || !first.HasHostData || CpuLegacyProj)
+                QuantizedWeight first = weights[i];
+                if (!inputOk || !FitsBatchedLinear(first, rows, inDim, outputs[i]))
                 {
-                    LinearInto(input, names[i], outputs[i]);
+                    fallback(i);
                     done[i] = true;
                     continue;
                 }
                 int count = 0;
-                var jobs = new ManagedQuantizedOps.QuantMatMulJob[names.Length];
-                var members = new int[names.Length];
-                for (int j = i; j < names.Length; j++)
+                for (int j = i; j < n; j++)
                 {
                     if (done[j] || outputs[j] == null) continue;
-                    if (!_quantWeights.TryGetValue(names[j], out QuantizedWeight qw) || !qw.HasHostData
-                        || qw.GgmlType != first.GgmlType || qw.Ne0 != inDim)
+                    QuantizedWeight qw = weights[j];
+                    if (!FitsBatchedLinear(qw, rows, inDim, outputs[j]) || qw.GgmlType != first.GgmlType)
                         continue;
                     jobs[count] = new ManagedQuantizedOps.QuantMatMulJob(qw.Data, (IntPtr)inPtr,
                         (IntPtr)GetFloatPtr(outputs[j]), (int)qw.Ne1, rows, (int)qw.Ne1);
@@ -148,13 +177,17 @@ namespace TensorSharp.Models
                 for (int m = 0; m < count; m++)
                 {
                     int j = members[m];
-                    QuantizedWeight qw = _quantWeights[names[j]];
-                    if (!batched) AddmmQuantManaged(outputs[j], input, qw);
-                    if (qw.Scale != 1.0f) Ops.Mul(outputs[j], outputs[j], qw.Scale);
+                    if (!batched) fallback(j);
+                    else if (weights[j].Scale != 1.0f) Ops.Mul(outputs[j], outputs[j], weights[j].Scale);
                     done[j] = true;
                 }
             }
         }
+
+        internal static bool FitsBatchedLinear(QuantizedWeight qw, int rows, int inDim, Tensor output)
+            => qw != null && qw.HasHostData && qw.Ne0 == inDim && qw.Ne1 > 0 && qw.Ne1 <= int.MaxValue
+               && output.DimensionCount == 2 && output.ElementType == DType.Float32 && output.IsContiguous()
+               && output.Sizes[0] == rows && output.Sizes[1] == qw.Ne1;
 
         /// <summary><see cref="ModelBase.LinearForward"/> into a caller-owned output.</summary>
         private void LinearInto(Tensor input, string name, Tensor output)
@@ -603,11 +636,12 @@ namespace TensorSharp.Models
         /// Returns null when the embedding is not a host quantized weight (caller uses the Ops chain).</summary>
         private unsafe float[] CpuLmHead(Tensor hidden, int rowOffset, int rows, bool pooled)
         {
-            if (!_quantWeights.TryGetValue("token_embd.weight", out QuantizedWeight head) || !head.HasHostData)
-                return null;
-            long ts = Stopwatch.GetTimestamp();
             int D = Config.HiddenSize;
             int vocab = Config.VocabSize;
+            if (!_quantWeights.TryGetValue("token_embd.weight", out QuantizedWeight head) || !head.HasHostData
+                || head.Ne0 != D || head.Ne1 != vocab || hidden.Sizes[1] != D)
+                return null;
+            long ts = Stopwatch.GetTimestamp();
             long total = (long)rows * vocab;
             float[] logits = pooled ? GrowPinnedExact(ref _cpuLogits, total) : new float[total];
             using (Tensor slice = hidden.Narrow(0, rowOffset, rows))
@@ -702,8 +736,9 @@ namespace TensorSharp.Models
         private unsafe Tensor CpuDenseMlp(Tensor input, string prefix, int N)
         {
             string gateName = $"{prefix}.ffn_gate.weight", upName = $"{prefix}.ffn_up.weight";
+            // Anything unexpected takes the reference chain, whose linears validate the shapes.
             if (!_quantWeights.TryGetValue(gateName, out QuantizedWeight gw) || !_quantWeights.TryGetValue(upName, out QuantizedWeight uw)
-                || gw.Ne1 != uw.Ne1)
+                || gw.Ne1 != uw.Ne1 || gw.Ne0 != input.Sizes[1] || uw.Ne0 != input.Sizes[1] || gw.Ne1 > int.MaxValue)
                 return null;
             int ff = (int)gw.Ne1;
             using var normed = RMSNormOp(input, $"{prefix}.ffn_norm.weight");

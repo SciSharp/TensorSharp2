@@ -43,9 +43,9 @@ namespace TensorSharp.Models
         /// <summary>Bit for bit the legacy per-pair kernel (TensorComputePrimitives.Dot, scalar
         /// MathF.Exp, in-order sum, multiply-then-add value accumulation) - only blocked and parallel.</summary>
         Exact,
-        /// <summary><see cref="Vector{T}"/> FMA tiles (AVX2 / AdvSimd).</summary>
+        /// <summary><see cref="Vector{T}"/> FMA tiles (AVX2 / AdvSimd) and a vectorized softmax.</summary>
         Fma,
-        /// <summary>Vector512 FMA tiles (AVX-512).</summary>
+        /// <summary>Vector512 FMA tiles (AVX-512) and a vectorized softmax.</summary>
         Fma512,
     }
 
@@ -61,8 +61,8 @@ namespace TensorSharp.Models
     /// replaces, which is what makes the new CPU forward bitwise-checkable against the old one. The
     /// attention is a fraction of a percent of a forward at Jev/chat prompt lengths, so the exact
     /// kernel is the default; <c>DIFFUSION_CPU_ATTN_FAST=1</c> selects FMA tiles (Vector512 when the
-    /// hardware accelerates it; <c>TS_CPU_DISABLE_AVX512=1</c> keeps them at Vector&lt;T&gt;) for long
-    /// prompts, where attention grows quadratically.
+    /// hardware accelerates it; <c>TS_CPU_DISABLE_AVX512=1</c> keeps them at Vector&lt;T&gt;) and a
+    /// vectorized softmax for long prompts, where attention grows quadratically.
     /// </summary>
     internal static unsafe class DiffusionGemmaCpuKernels
     {
@@ -311,7 +311,7 @@ namespace TensorSharp.Models
                     {
                         float* row = s + (long)i * L;
                         if (i >= n) { new Span<float>(row, L).Clear(); continue; }
-                        SoftmaxInterval(row, L, lo4[i] - lo, hi4[i] - lo);
+                        SoftmaxInterval(row, L, lo4[i] - lo, hi4[i] - lo, kernel != DiffusionAttnKernel.Exact);
                     }
                     WeightedValues(s, L, lo, lenA, vA, vB, kvStride, hd, op, n, kernel);
                 }
@@ -459,12 +459,29 @@ namespace TensorSharp.Models
                         r[qi * 4 + x] += qp[qi][i] * kp[x][i];
         }
 
-        /// <summary>In place: row[j] = softmax over [a, b) and exactly 0 elsewhere - the legacy
-        /// kernel's max, scalar MathF.Exp(s - max), in-order sum and (e * 1/sum).</summary>
-        private static void SoftmaxInterval(float* row, int L, int a, int b)
+        /// <summary>In place: row[j] = softmax over [a, b) and exactly 0 elsewhere. The exact kernel
+        /// keeps the legacy max, scalar MathF.Exp(s - max), in-order sum and (e * 1/sum); the FMA
+        /// kernels use the vectorized TensorPrimitives max/exp/sum (a few ulp and a re-associated sum),
+        /// since at long prompts the ~P^2/2 scalar exps per head become the attention's largest cost.</summary>
+        private static void SoftmaxInterval(float* row, int L, int a, int b, bool vectorized)
         {
             for (int j = 0; j < a; j++) row[j] = 0f;
             for (int j = b; j < L; j++) row[j] = 0f;
+            if (vectorized)
+            {
+                // Max, the subtraction, exp and the scaling are element-wise (their results depend
+                // only on the values and the interval length). The sum is not: TensorPrimitives.Sum
+                // groups its loads by buffer alignment, which would make a query's weights depend
+                // on where its interval sits in the micro-block's scratch row, i.e. on which queries
+                // share the block - and the prompt-KV decode must reproduce the unified forward.
+                var span = new Span<float>(row + a, b - a);
+                float vmax = TensorPrimitives.Max(span);
+                TensorPrimitives.Subtract(span, vmax, span);
+                TensorPrimitives.Exp(span, span);
+                float vsum = SumFromStart(row + a, b - a);
+                TensorPrimitives.Multiply(span, vsum > 0f ? 1f / vsum : 0f, span);
+                return;
+            }
             float max = float.NegativeInfinity;
             for (int j = a; j < b; j++) if (row[j] > max) max = row[j];
             float sum = 0f;
@@ -476,6 +493,19 @@ namespace TensorSharp.Models
             }
             float inv = sum > 0f ? 1f / sum : 0f;
             for (int j = a; j < b; j++) row[j] *= inv;
+        }
+
+        /// <summary>Vector sum in a fixed order from <paramref name="p"/> itself (one accumulator per
+        /// lane, lane sum, scalar tail), whatever the address.</summary>
+        private static float SumFromStart(float* p, int n)
+        {
+            int vLen = Vector<float>.Count;
+            Vector<float> acc = Vector<float>.Zero;
+            int i = 0;
+            for (; i <= n - vLen; i += vLen) acc += Ld(p + i);
+            float sum = Vector.Sum(acc);
+            for (; i < n; i++) sum += p[i];
+            return sum;
         }
 
         /// <summary>o_i = sum_j p[i][j] * V_j for the (up to) four queries of a micro-block, keys in order.

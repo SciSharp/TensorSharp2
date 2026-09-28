@@ -2,11 +2,15 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 //
 // Kernel-level contracts of the DiffusionGemma pure-C# (cpu backend) forward. The model is so
-// sensitive to last-bit differences (Q8 activation quantization + top-8 routing) that end-to-end
-// comparisons against the legacy CPU path only work bitwise, so every kernel that replaces an
-// existing Ops chain or legacy loop is held to BITWISE equality with it here. The opt-in FMA
-// attention tiles (DIFFUSION_CPU_ATTN_FAST=1) are held to a float64 reference instead, on both the
-// Vector<T> (AVX2 / AdvSimd) and, where the hardware has it, the AVX-512 path.
+// sensitive to last-bit differences (Q8 activation quantization + top-8 routing) that its kernels
+// pin their float arithmetic, so each one is held to BITWISE equality with a reference loop written
+// out here (the arithmetic of the Ops chain or legacy loop it replaced, as of this change) and to a
+// float64 reference for the math itself. The references are local on purpose: Ops.RMSNorm,
+// Ops.GELUMul and the F32 GEMM are free to change their own arithmetic without these kernels
+// following. The opt-in FMA attention tiles (DIFFUSION_CPU_ATTN_FAST=1) are held to float64 only,
+// on both the Vector<T> (AVX2 / AdvSimd) and, where the hardware has it, the AVX-512 path.
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -17,8 +21,6 @@ namespace InferenceWeb.Tests;
 
 public sealed unsafe class DiffusionGemmaCpuKernelTests
 {
-    private readonly IAllocator _alloc = new CpuAllocator(BlasEnum.DotNet);
-
     public static IEnumerable<object[]> AttentionKernels()
     {
         // passed as int: xUnit test methods are public and the kernel enum is internal
@@ -36,13 +38,6 @@ public sealed unsafe class DiffusionGemmaCpuKernelTests
         return a;
     }
 
-    private Tensor TensorFrom(float[] data, params long[] sizes)
-    {
-        var t = new Tensor(_alloc, DType.Float32, sizes);
-        t.SetElementsAsFloat(data);
-        return t;
-    }
-
     private static void AssertSameBits(float[] expected, float[] actual)
     {
         Assert.Equal(expected.Length, actual.Length);
@@ -51,13 +46,28 @@ public sealed unsafe class DiffusionGemmaCpuKernelTests
                 $"element {i}: expected {expected[i]:R}, got {actual[i]:R}");
     }
 
-    // ---- fused per-head RMSNorm + NeoX RoPE == Ops.RMSNorm then the scalar RoPE, bit for bit ----
+    // one Vector<float> accumulator of x*x (multiply, then add) and its lane sum; returns where the
+    // scalar tail starts
+    private static float VectorSumOfSquares(float* x, int n, out int tail)
+    {
+        int vLen = Vector<float>.Count, i = 0;
+        Vector<float> acc = Vector<float>.Zero;
+        for (; i <= n - vLen; i += vLen)
+        {
+            Vector<float> v = Unsafe.ReadUnaligned<Vector<float>>(x + i);
+            acc += v * v;
+        }
+        tail = i;
+        return Vector.Sum(acc);
+    }
+
+    // ---- fused per-head RMSNorm + NeoX RoPE: the (pre-SIMD) Ops.RMSNorm arithmetic, then the scalar RoPE ----
     [Theory]
     [InlineData(8, 256, true, true)]
     [InlineData(2, 512, true, true)]
     [InlineData(8, 256, false, false)]
     [InlineData(3, 40, true, true)]      // head dim that is not a vector multiple
-    public void HeadNormRope_MatchesOpsRmsNormThenScalarRope_Bitwise(int heads, int hd, bool weighted, bool rope)
+    public void HeadNormRope_MatchesReferenceArithmetic_Bitwise(int heads, int hd, bool weighted, bool rope)
     {
         const float eps = 1e-6f;
         int rows = 5, half = hd / 2;
@@ -73,24 +83,38 @@ public sealed unsafe class DiffusionGemmaCpuKernelTests
                 sin[p * half + j] = MathF.Sin(angle);
             }
 
-        // reference: Ops.RMSNorm over [rows*heads, hd] (ones for the unweighted norm, as the model does)
-        using var refT = TensorFrom(x, rows * heads, hd);
-        using var gamma = TensorFrom(w ?? Enumerable.Repeat(1f, hd).ToArray(), hd);
-        Ops.RMSNorm(refT, refT, gamma, null, eps);
-        float[] expected = refT.GetElementsAsFloat(rows * heads * hd);
-        if (rope)
-        {
+        // reference: sum of squares (vector accumulator + in-order tail), x * (1/sqrt(mean + eps)), then
+        // * gamma (ones for the unweighted norm, as the model does), then (x0*c - x1*s, x0*s + x1*c)
+        var expected = new float[x.Length];
+        var exact = new double[x.Length];
+        fixed (float* xp = x)
             for (int r = 0; r < rows; r++)
                 for (int h = 0; h < heads; h++)
+                {
+                    int b = (r * heads + h) * hd;
+                    float sq = VectorSumOfSquares(xp + b, hd, out int t);
+                    for (; t < hd; t++) sq += x[b + t] * x[b + t];
+                    float inv = 1.0f / MathF.Sqrt(sq / hd + eps);
+                    double sqD = 0;
+                    for (int i = 0; i < hd; i++) sqD += (double)x[b + i] * x[b + i];
+                    double invD = 1.0 / Math.Sqrt(sqD / hd + eps);
+                    for (int i = 0; i < hd; i++)
+                    {
+                        expected[b + i] = x[b + i] * inv * (w != null ? w[i] : 1f);
+                        exact[b + i] = x[b + i] * invD * (w != null ? w[i] : 1.0);
+                    }
+                    if (!rope) continue;
                     for (int j = 0; j < half; j++)
                     {
-                        int b = (r * heads + h) * hd;
-                        float c = cos[r * half + j], s = sin[r * half + j];
+                        float c = cos[r * half + j], sn = sin[r * half + j];
                         float x0 = expected[b + j], x1 = expected[b + j + half];
-                        expected[b + j] = x0 * c - x1 * s;
-                        expected[b + j + half] = x0 * s + x1 * c;
+                        expected[b + j] = x0 * c - x1 * sn;
+                        expected[b + j + half] = x0 * sn + x1 * c;
+                        double d0 = exact[b + j], d1 = exact[b + j + half];
+                        exact[b + j] = d0 * c - d1 * sn;
+                        exact[b + j + half] = d0 * sn + d1 * c;
                     }
-        }
+                }
 
         var actual = (float[])x.Clone();
         fixed (float* a = actual) fixed (float* wp = w) fixed (float* cp = cos) fixed (float* sp = sin)
@@ -98,20 +122,26 @@ public sealed unsafe class DiffusionGemmaCpuKernelTests
                 DiffusionGemmaCpuKernels.HeadNormRopeRow(a + r * heads * hd, a + r * heads * hd, heads, hd, wp, eps,
                     rope ? cp + r * half : null, rope ? sp + r * half : null);
         AssertSameBits(expected, actual);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - exact[i]) <= 1e-5 * Math.Max(1.0, Math.Abs(exact[i])), $"element {i}: {actual[i]} vs {exact[i]}");
     }
 
-    // ---- GELU(gate)*up == Ops.GELUMul, bit for bit ----
+    // ---- GELU(gate)*up: the tanh approximation with a double-precision tanh, bit for bit ----
     [Fact]
-    public void GeluMul_MatchesOpsGeluMul_Bitwise()
+    public void GeluMul_MatchesDoubleTanhFormula_Bitwise()
     {
         int n = 4099;
         float[] gate = Random(n, 3, 8f), up = Random(n, 4, 3f);
         gate[0] = 0f; gate[1] = -0f; gate[2] = 40f; gate[3] = -40f; gate[4] = 1e-30f;
-        using var g = TensorFrom(gate, n);
-        using var u = TensorFrom(up, n);
-        using var r = new Tensor(_alloc, DType.Float32, n);
-        Ops.GELUMul(r, g, u);
-        float[] expected = r.GetElementsAsFloat(n);
+        var expected = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float g = gate[i];
+            expected[i] = 0.5f * g * (1.0f + (float)Math.Tanh(0.7978845608f * (g + 0.044715f * g * g * g))) * up[i];
+            double gd = g;
+            double exact = 0.5 * gd * (1.0 + Math.Tanh(Math.Sqrt(2.0 / Math.PI) * (gd + 0.044715 * gd * gd * gd))) * up[i];
+            Assert.True(Math.Abs(expected[i] - exact) <= 1e-5 * Math.Max(1.0, Math.Abs(exact)), $"element {i}");
+        }
         var actual = new float[n];
         fixed (float* gp = gate) fixed (float* upp = up) fixed (float* ap = actual)
             DiffusionGemmaCpuKernels.GeluMulRow(gp, upp, ap, n);
@@ -147,24 +177,31 @@ public sealed unsafe class DiffusionGemmaCpuKernelTests
         AssertSameBits(expected, actual);
     }
 
-    // ---- router dot == the legacy linear (Ops.Addmm against the transposed F32 router weight) ----
+    // ---- router dot: the 4x4 F32 GEMM kernel's arithmetic, for every row, and close to float64 ----
     [Fact]
-    public void RouterDot_MatchesLegacyF32Linear_ForFullRowBlocks_Bitwise()
+    public void RouterDot_MatchesReferenceArithmetic_Bitwise()
     {
-        const int rows = 8, experts = 128, dim = 2816;   // 8 rows: two full 4-row GEMM blocks
+        const int rows = 7, experts = 128, dim = 2816 + 3;   // odd row count and a scalar tail
         float[] x = Random(rows * dim, 40, 2f), w = Random(experts * dim, 41, 0.1f);
-        using var input = TensorFrom(x, rows, dim);
-        using var weight = TensorFrom(w, experts, dim);
-        using var result = new Tensor(_alloc, DType.Float32, rows, experts);
-        using (var wT = weight.Transpose())
-            Ops.Addmm(result, 0, result, 1.0f, input, wT);
-        float[] expected = result.GetElementsAsFloat(rows * experts);
-        var actual = new float[rows * experts];
         fixed (float* xp = x) fixed (float* wp = w)
             for (int r = 0; r < rows; r++)
                 for (int e = 0; e < experts; e++)
-                    actual[r * experts + e] = DiffusionGemmaCpuKernels.RouterDot(xp + r * dim, wp + e * dim, dim);
-        AssertSameBits(expected, actual);
+                {
+                    float* a = xp + r * dim, b = wp + e * dim;
+                    // one Vector<float> accumulator of a*b (multiply, then add), lane sum, in-order scalar tail
+                    int vLen = Vector<float>.Count, i = 0;
+                    Vector<float> acc = Vector<float>.Zero;
+                    for (; i <= dim - vLen; i += vLen)
+                        acc += Unsafe.ReadUnaligned<Vector<float>>(a + i) * Unsafe.ReadUnaligned<Vector<float>>(b + i);
+                    float expected = Vector.Sum(acc);
+                    for (; i < dim; i++) expected += a[i] * b[i];
+                    double exact = 0;
+                    for (int k = 0; k < dim; k++) exact += (double)a[k] * b[k];
+
+                    float actual = DiffusionGemmaCpuKernels.RouterDot(a, b, dim);
+                    Assert.Equal(BitConverter.SingleToInt32Bits(expected), BitConverter.SingleToInt32Bits(actual));
+                    Assert.True(Math.Abs(actual - exact) <= 1e-4, $"row {r} expert {e}: {actual} vs {exact}");
+                }
     }
 
     // ---- attention ----

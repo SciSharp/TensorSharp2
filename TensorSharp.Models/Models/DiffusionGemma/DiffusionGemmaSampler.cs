@@ -399,9 +399,10 @@ namespace TensorSharp.Models
             var prevTempInv = new float[A];
             int Smax = 1;
 
-            // Prompt-KV caching (device-glue backends): prefill each sequence's prefix K/V once, then each
-            // step decodes only its canvas. CPU backends have no prompt-KV store, so each step runs the
-            // unified [prefix|canvas] forward per sequence instead — the same fallback DenoiseBlock uses.
+            // Prompt-KV caching (device-glue backends and the pure-C# cpu backend): prefill each sequence's
+            // prefix K/V once, then each step decodes only its canvas. Backends without a prompt-KV store
+            // (ggml_cpu, or DIFFUSION_NO_PKV=1) run the unified [prefix|canvas] forward per sequence
+            // instead — the same fallback DenoiseBlock uses.
             bool usePkv = _model.SupportsPromptKvCache;
             var unifiedTokens = usePkv ? null : new int[A][];   // per-seq [prefix|canvas] buffer
             var promptLen = usePkv ? null : new int[A];
@@ -518,8 +519,9 @@ namespace TensorSharp.Models
                     // DEFAULT: decode each live sequence with the fast FUSED single-canvas kernel, then sample
                     // immediately (the kernel returns the model's shared readback buffer, so its logits must be
                     // consumed before the next sequence's decode overwrites it). Time-slices the GPU across the
-                    // active requests at full fused speed. Without prompt-KV (CPU backends) each sequence runs
-                    // the unified [prefix|canvas] forward instead, which has the same shared-buffer contract.
+                    // active requests at full fused speed. Without prompt-KV (ggml_cpu, DIFFUSION_NO_PKV=1) each
+                    // sequence runs the unified [prefix|canvas] forward instead, which has the same
+                    // shared-buffer contract.
                     for (int j = 0; j < L; j++)
                     {
                         int a = live[j];
