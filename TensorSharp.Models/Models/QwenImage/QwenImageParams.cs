@@ -31,8 +31,12 @@ namespace TensorSharp.Models.QwenImage
 
         /// <summary>
         /// Target output area in pixels (aspect ratio follows the input image).
-        /// 0 = the model's native 2048² area. Dimensions are snapped to multiples of 32.
-        /// An explicit positive area takes precedence over the model default.
+        /// 0 = the model's native 2048² area, except on the host-CPU backends (cpu, ggml_cpu),
+        /// where the automatic area is 1024² (see QwenImage21Pipeline.HostCpuAutomaticArea).
+        /// Dimensions are snapped to multiples of 32.
+        /// An explicit positive area takes precedence over the model default; a request that
+        /// passes exactly the native 2048² area cannot be told from an automatic one (the
+        /// server resolves omitted areas to it), so ask for 2048² on a CPU with width/height.
         /// </summary>
         public long TargetArea { get; set; } = 0;
 

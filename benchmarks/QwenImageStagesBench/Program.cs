@@ -19,6 +19,7 @@ static void Usage()
 {
     Console.Error.WriteLine("conv [avx512|avx2|portable|all] [reps=3] [--scalar]       VAE conv layers: packed GEMM vs scalar");
     Console.Error.WriteLine("vae <vae.safetensors> <cpu|scalar|ggml_cpu> <decode|encode|roundtrip> <W> <H> <outPrefix> [--image png] [--reps N]");
+    Console.Error.WriteLine("    [--latent file.f32] [--no-pool]   decode input (default: seeded noise); --no-pool: TS_QWEN_VAE_POOL=0 (A/B)");
     Console.Error.WriteLine("text <Qwen3VL.gguf> <cpu|ggml_cpu> <out.f32> [--prompt text] [--reps N] [--f64-linear]");
     Console.Error.WriteLine("     --f64-linear (cpu): every projection summed in double over exact weights - the parity reference");
     Console.Error.WriteLine("vision <mmproj.gguf> <cpu|ggml_cpu> <outPrefix> [--image png] [--size WxH] [--reps N]");
@@ -73,6 +74,9 @@ static object Stats(float[] expected, float[] actual, bool image)
 }
 
 static long PeakMb() { using var p = Process.GetCurrentProcess(); p.Refresh(); return p.PeakWorkingSet64 >> 20; }
+// Peak commit charge (private bytes; Windows PeakPagefileUsage): what the process actually had to
+// allocate, without the file-mapped weight pages that PeakWorkingSet64 also counts.
+static long PeakPrivateMb() { using var p = Process.GetCurrentProcess(); p.Refresh(); return p.PeakPagedMemorySize64 >> 20; }
 
 static RgbImage Gradient(int width, int height)
 {
@@ -127,6 +131,7 @@ switch (args[0])
         VaeReferenceMath.UseScalarCpu = backend == "scalar";
         VaeReferenceMath.UseGpuConv = ggml;
         VaeReferenceMath.UseFusedGraph21 = false;   // QwenImage21Vae's default on GgmlCpu: per-conv device path
+        if (args.Contains("--no-pool")) VaeFeaturePool.Enabled = false;
         if (ggml) GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cpu);
         using var file = new SafetensorsFile(args[1]);
         var weights = VaeWeights.Load(new QwenImage21VaeTensorStore(file));
@@ -164,11 +169,13 @@ switch (args[0])
                         Console.WriteLine(JsonSerializer.Serialize(new { roundtripVsInput = Stats(Rgba(source), Rgba(decoded), true) }));
                 }
             }
-            timings.Add(new { rep, encodeSeconds, decodeSeconds });
+            long workingSetMb, privateMb;
+            using (var self = Process.GetCurrentProcess()) { self.Refresh(); workingSetMb = self.WorkingSet64 >> 20; privateMb = self.PrivateMemorySize64 >> 20; }
+            timings.Add(new { rep, encodeSeconds, decodeSeconds, workingSetMb, privateMb });
             Console.WriteLine(JsonSerializer.Serialize(timings[^1]));
         }
         json = JsonSerializer.Serialize(new { scenario = "vae", backend, mode, width, height, isa = CpuPackedGemm.Isa.ToString(),
-            timings, peakWorkingSetMb = PeakMb(), output = prefix });
+            timings, peakWorkingSetMb = PeakMb(), peakPrivateMb = PeakPrivateMb(), pool = VaeFeaturePool.Enabled, output = prefix });
         Console.WriteLine(json);
         if (ggml) { GgmlBasicOps.ReleaseReuseComputeBuffers(); GgmlBasicOps.ClearHostBufferCache(); GgmlBasicOps.Shutdown(); }
         return 0;

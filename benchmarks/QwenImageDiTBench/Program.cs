@@ -8,6 +8,8 @@
 //   (copy a GgmlOps.dll of the same revision next to the exe for ggml_cpu)
 //   QwenImageDiTBench --dit <qwen_image_2.1 gguf> [--size 256] [--lora <plugin.json>] [--edit]
 //                     [--backends cpu,ggml_cpu] [--prompt "..."] [--random-cond] [--quick] [--label name]
+//                     [--timing]   (only the extract and cached forwards: the per-step cost at a large size,
+//                                   where every uncached forward costs another step)
 //   QwenImageDiTBench --kernels [--size 512]   (attention / LoRA-product throughput per kernel width)
 //   QwenImageDiTBench --pipeline [--size 128] [--steps N] [--lora <plugin.json>]
 //                     (text encode + denoise + VAE through QwenImageModel on the cpu backend,
@@ -132,21 +134,25 @@ foreach (string backendName in options.Backends)
             Log($"[{backendName}] {name,-12} sigma={sigma:F7} path={path,-8} {ms,10:F0} ms");
             return (v, ms, path);
         }
-        runs["full0"] = Predict("full s0", Perturbed(latents0), sigmas[0], null, 0);
-        if (latents1 == null)
+        if (!options.Timing) runs["full0"] = Predict("full s0", Perturbed(latents0), sigmas[0], null, 0);
+        void StepLatents(float[] velocity)
         {
+            if (latents1 != null) return;
             latents1 = (float[])latents0.Clone();
-            for (int i = 0; i < latents1.Length; i++) latents1[i] += (sigmas[1] - sigmas[0]) * runs["full0"].V[i];
+            for (int i = 0; i < latents1.Length; i++) latents1[i] += (sigmas[1] - sigmas[0]) * velocity[i];
         }
+        if (runs.TryGetValue("full0", out var full0)) StepLatents(full0.V);
         using (var cache = QwenImage21DiT.CreatePrefixCache(text, slots, references, "1", options.CacheType))
         {
             runs["extract0"] = Predict("extract s0", Perturbed(latents0), sigmas[0], cache, 0);
+            // --timing: the extract forward is the uncached prediction (bit for bit on cpu).
+            StepLatents(runs["extract0"].V);
             for (int rep = 0; rep < options.Reps; rep++)
                 runs[rep == 0 ? "cached1" : $"cached1.{rep}"] = Predict("cached s1", Perturbed(latents1), sigmas[1], cache, 1);
             var info = cache.Info;
             Log($"[{backendName}] prefix cache: state {info.State}, {info.Tokens} tokens, {info.Bytes / 1048576.0:F1} MiB (K type {info.KeyType}, V type {info.ValueType})");
         }
-        if (!options.Quick) runs["full1"] = Predict("full s1", Perturbed(latents1), sigmas[1], null, 1);
+        if (!options.Quick && !options.Timing) runs["full1"] = Predict("full s1", Perturbed(latents1), sigmas[1], null, 1);
     }
     finally
     {
@@ -178,7 +184,7 @@ string Row(string what, float[] a, float[] b)
 foreach (var (backendName, runs) in results)
 {
     Log($"within {backendName}:");
-    Log(Row("extract s0 vs full s0", runs["extract0"].V, runs["full0"].V));
+    if (runs.ContainsKey("full0")) Log(Row("extract s0 vs full s0", runs["extract0"].V, runs["full0"].V));
     if (runs.ContainsKey("full1")) Log(Row("cached s1 vs full s1", runs["cached1"].V, runs["full1"].V));
 }
 var names = results.Keys.ToList();
@@ -261,7 +267,7 @@ sealed class Options
     public string Dit = "C:/Works/models/qwen-image-2.1/qwen_image_2.1_Q4_K_M.gguf";
     public int Size = 256;
     public string Lora;
-    public bool Edit, RandomCond, Quick, Kernels, ProbeMatmul, Pipeline;
+    public bool Edit, RandomCond, Quick, Timing, Kernels, ProbeMatmul, Pipeline;
     public int Steps;
     public string Perturb = "latents";
     public float PerturbScale = 1e-6f;
@@ -287,6 +293,7 @@ sealed class Options
                 case "--edit": o.Edit = true; break;
                 case "--random-cond": o.RandomCond = true; break;
                 case "--quick": o.Quick = true; break;
+                case "--timing": o.Timing = true; break;
                 case "--kernels": o.Kernels = true; break;
                 case "--probe-matmul": o.ProbeMatmul = true; break;
                 case "--pipeline": o.Pipeline = true; break;

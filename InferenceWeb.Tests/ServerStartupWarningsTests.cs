@@ -193,7 +193,7 @@ public class ServerStartupWarningsTests : IDisposable
             new[] { given, "1024" }));
 
         Assert.StartsWith($"{given} was given without {missing}", warning, StringComparison.Ordinal);
-        Assert.Contains("automatic size (a 2048x2048 area)", warning, StringComparison.Ordinal);
+        Assert.Contains("automatic size (a 2048x2048 area; 1024x1024 on the cpu and ggml_cpu backends)", warning, StringComparison.Ordinal);
     }
 
     [Fact]

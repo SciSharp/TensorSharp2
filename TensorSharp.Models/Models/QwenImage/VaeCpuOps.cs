@@ -112,12 +112,15 @@ namespace TensorSharp.Models.QwenImage
         /// exact in double (24-bit x 24-bit mantissas), sums are added in channel order, sqrt and
         /// division are correctly rounded, and the output keeps the ((x*inv)*scale)*gamma order.
         /// With <paramref name="silu"/> the SiLU is applied in the same pass (vectorized exp).
+        /// With <paramref name="inPlace"/> the result overwrites (and is) <paramref name="x"/>: a
+        /// tile reads all of its pixels' channels for the sums before it writes any of them, and
+        /// each element is read before it is written, so the values are the same bits.
         /// </summary>
-        internal static Feature RmsNormChannelFast(Feature x, float[] gamma, bool silu)
+        internal static Feature RmsNormChannelFast(Feature x, float[] gamma, bool silu, bool inPlace = false)
         {
             long t0 = VaeCpuProfile.Start();
             int C = x.C, hw = x.H * x.W;
-            var outp = Feature.Uninitialized(C, x.H, x.W);
+            var outp = inPlace ? x : Feature.Uninitialized(C, x.H, x.W);
             float scale = MathF.Sqrt(C);
             int tiles = (hw + NormTile - 1) / NormTile;
             fixed (float* xp0 = x.D, op0 = outp.D, gp0 = gamma)
