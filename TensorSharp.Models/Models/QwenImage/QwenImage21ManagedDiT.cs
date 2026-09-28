@@ -14,21 +14,22 @@ namespace TensorSharp.Models.QwenImage;
 /// ggml_ops_qwen_image21.cpp computed op by op with the same formulas, in the same order,
 /// from the same file-mapped weights and descriptors (<see cref="QwenImage21ForwardArgs"/>,
 /// <see cref="QwenImage21Block"/>, <see cref="QwenImage21Adapter"/>). Nothing here calls
-/// native code: everything runs in <see cref="QwenImage21CpuKernels"/> (or, with
-/// TS_QWEN21_CPU_MATMUL=q8, the projections in <see cref="ManagedQuantizedOps"/>).
+/// native code: everything runs in <see cref="QwenImage21CpuKernels"/> and, for the quantized
+/// projections, the managed integer GEMM in <see cref="ManagedQuantizedOps"/>.
 /// </summary>
 /// <remarks>
 /// <para><b>Layout.</b> Activations are token-major [rows, dim] with head h at columns
 /// h * headDim, i.e. ggml's [dim, rows] tensors. For attention K is transposed per head and
 /// V copied per head, so every tile the kernels stream is contiguous.</para>
-/// <para><b>Numerics.</b> The projections keep the activations in F32 against dequantized
-/// weights, where ggml-cpu quantizes them to Q8_K per projection (see <see cref="F32Matmul"/>
-/// for why that is the default), so this evaluates the stored weights more closely and does
-/// not reproduce ggml-cpu's rounding. Measured at 256x256 (QwenImageDiTBench): cosine
-/// 0.99994 to ggml-cpu at sigma 1 and 0.9978 at sigma 0.02. ggml-cpu itself is not stable
-/// to that level: a 1e-4 relative timestep change, which moves this forward by relL2 5e-5
-/// at sigma 0.02, moves ggml-cpu's velocity by 4.7e-2 (cosine 0.9989), and by 1.2e-2 at
-/// sigma 1 (--perturb sigma).</para>
+/// <para><b>Numerics.</b> By default the quantized projections quantize their activations to
+/// Q8_K/Q8_0 per projection, as ggml-cpu does (see <see cref="F32Matmul"/>). The opt-in F32
+/// route keeps them in F32 against dequantized weights, which evaluates the stored weights
+/// more closely without reproducing ggml-cpu's rounding. Measured at 256x256
+/// (QwenImageDiTBench, F32 route): cosine 0.99994 to ggml-cpu at sigma 1 and 0.9978 at
+/// sigma 0.02; the Q8 route gives 0.99993 and 0.99938. ggml-cpu itself is not stable to that
+/// level: a 1e-4 relative timestep change, which moves the F32 forward by relL2 5e-5 at
+/// sigma 0.02, moves ggml-cpu's velocity by 4.7e-2 (cosine 0.9989), and by 1.2e-2 at sigma 1
+/// (--perturb sigma).</para>
 /// <para><b>Prefix cache.</b> Text and reference tokens are modulated at t=0 and never attend
 /// to the target, so their per-layer K/V are step independent. An "extract" forward stores
 /// them in a <see cref="QwenImage21ManagedPrefix"/>; a "cached" forward then computes only
@@ -62,17 +63,18 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
     // in F32; TS_QWEN21_CPU_ROUND_ACTIVATIONS=1 reproduces the rounding for A/B parity.
     private static readonly bool RoundActivations = Environment.GetEnvironmentVariable("TS_QWEN21_CPU_ROUND_ACTIVATIONS") == "1";
     /// <summary>
-    /// Projections multiply F32 activations by dequantized weight tiles
-    /// (<see cref="QwenImage21CpuKernels.GemmDequantNT"/>) instead of quantizing the activations
-    /// to Q8_K/Q8_0 for an integer dot as ggml and <see cref="ManagedQuantizedOps"/> do.
-    /// Measured on this transformer (i7-11800H, 279 rows): 300-500 GFLOPS against 66-106 for
-    /// the managed integer dot, and numerically stable where the integer dot is not: a 1e-6
-    /// relative change of the input latents moved the managed Q8_K pipeline's velocity (128x128) by 2.5e-2
-    /// relative L2 (every activation re-quantization can flip a rounding, 224 times per
-    /// forward) but the F32 one by 1e-5. TS_QWEN21_CPU_MATMUL=q8 selects the integer dot.
+    /// Quantized projections quantize the activations to Q8_K/Q8_0 and run the multi-row
+    /// integer GEMM in <see cref="ManagedQuantizedOps"/>, as ggml-cpu does. With the multi-row
+    /// kernels that is the faster route (i7-11800H, cached step: 4.0 s vs 7.2-9.0 s at 256x256,
+    /// 17.6-21.7 s vs 29-38 s at 512x512), and its 512x512 Pruna-5 image is closer to ggml_cpu's
+    /// (PSNR 32.9 vs 31.4 dB). TS_QWEN21_CPU_MATMUL=f32 multiplies F32 activations by dequantized
+    /// weight tiles (<see cref="QwenImage21CpuKernels.GemmDequantNT"/>) instead: slower, but
+    /// numerically steadier - a 1e-6 relative change of the input latents moves the Q8_K
+    /// pipeline's velocity by ~2.5e-2 relative L2 (every re-quantization can flip a rounding;
+    /// ggml-cpu's own pipeline moves by ~1e-2) and the F32 one by ~1e-5.
     /// </summary>
     internal static bool F32Matmul { get; set; } =
-        !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN21_CPU_MATMUL")?.Trim(), "q8", StringComparison.OrdinalIgnoreCase);
+        string.Equals(Environment.GetEnvironmentVariable("TS_QWEN21_CPU_MATMUL")?.Trim(), "f32", StringComparison.OrdinalIgnoreCase);
     // Attention reads each head's values from a head-major copy (GatherValues);
     // TS_QWEN21_CPU_GATHER_V=0 reads the token-major V in place.
     internal static bool GatherV { get; set; } = Environment.GetEnvironmentVariable("TS_QWEN21_CPU_GATHER_V") != "0";

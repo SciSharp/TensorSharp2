@@ -463,14 +463,20 @@ namespace TensorSharp.Models.QwenImage
             return result;
         }
 
-        // Pure-C# backend: every projection runs on the packed F32 GEMM, reading the quantized
-        // weight through QuantRowsPanelSource (each tile dequantized once per forward, with
-        // exact F32 activations). The generic path (ManagedQuantizedOps) instead quantizes the
-        // activations to 8 bits and re-decodes every weight block for each activation row.
-        // TS_QWEN_TE_CPU_GEMM=0 restores it, and the scalar SiLU with it, so that
-        // TS_QWEN_TE_CPU_GEMM=0 TS_QWEN_TE_CPU_ATTN=0 reproduce the previous per-op path bit for
-        // bit (the RoPE tables and the per-token QK norm are bit-identical to what they replaced).
+        // Pure-C# backend projections. By default they go through LinearForward to the
+        // multi-row integer GEMM in ManagedQuantizedOps (activations quantized to 8 bits, as
+        // ggml-cpu does): 0.76-0.88 s for the 37-token default prompt on an i7-11800H, against
+        // 1.8-1.9 s for the packed F32 GEMM and ~1.4 s on ggml_cpu. TS_QWEN_TE_CPU_MATMUL=f32
+        // selects the packed F32 GEMM instead, reading the quantized weight through
+        // QuantRowsPanelSource (each tile dequantized once per forward, with exact F32
+        // activations: 1e-6 relative to a double-precision reference per projection, against
+        // ~4e-3 for the 8-bit route). TS_QWEN_TE_CPU_GEMM=0 turns both the packed GEMM and the
+        // vectorized SiLU off, so that TS_QWEN_TE_CPU_GEMM=0 TS_QWEN_TE_CPU_ATTN=0 reproduce the
+        // previous per-op path bit for bit (the RoPE tables and the per-token QK norm are
+        // bit-identical to what they replaced).
         private static readonly bool CpuGemmOn = Environment.GetEnvironmentVariable("TS_QWEN_TE_CPU_GEMM") != "0";
+        private static readonly bool F32MatmulOn = CpuGemmOn && string.Equals(
+            Environment.GetEnvironmentVariable("TS_QWEN_TE_CPU_MATMUL")?.Trim(), "f32", StringComparison.OrdinalIgnoreCase);
 
         // Parity reference for the harness (QwenImageStagesBench text --f64-linear), never set in
         // production: every projection the packed GEMM would run is instead summed in double over
@@ -492,7 +498,7 @@ namespace TensorSharp.Models.QwenImage
 
         private unsafe Tensor LinearCore(Tensor input, string weightName)
         {
-            if (_backend != BackendType.Cpu || !CpuGemmOn || !input.IsContiguous() ||
+            if (_backend != BackendType.Cpu || !(F32MatmulOn || ReferenceF64Linear) || !input.IsContiguous() ||
                 !_quantWeights.TryGetValue(weightName, out var qw) || !qw.HasHostData ||
                 !QuantRowsPanelSource.Supports(qw.GgmlType, qw.Ne0) || input.Sizes[1] != qw.Ne0)
                 return LinearForward(input, weightName);

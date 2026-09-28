@@ -84,20 +84,25 @@ Log($"Qwen-Image-2.1 DiT bench: {Path.GetFileName(options.Dit)}, {options.Size}x
     $"text {textSeq} tokens{(options.Edit ? " incl. 64 vision slots + a 16x16 reference" : "")}, " +
     $"LoRA {(options.Lora == null ? "none" : Path.GetFileName(options.Lora))}, kernels {QwenImage21CpuKernels.Width * 32}-bit, " +
     $"pool {QwenImage21CpuKernels.Workers} threads");
+bool defaultF32Matmul = QwenImage21ManagedDiT.F32Matmul;
 foreach (string backendName in options.Backends)
 {
-    // cpu: the pure-C# forward (F32 activations into dequantized weights); cpu_q8: its
-    // Q8_K/Q8_0 integer-dot variant (TS_QWEN21_CPU_MATMUL=q8). A trailing '~' perturbs the
-    // latents or the timestep (--perturb) to measure a pipeline's noise floor.
+    // cpu: the pure-C# forward with its default projections (Q8_K/Q8_0 integer GEMM, or
+    // whatever TS_QWEN21_CPU_MATMUL selects); cpu_q8 / cpu_f32 pin the integer GEMM / the F32
+    // activations into dequantized weight tiles. A trailing '~' perturbs the latents or the
+    // timestep (--perturb) to measure a pipeline's noise floor.
     bool perturb = backendName.EndsWith('~');
     bool perturbSigma = perturb && options.Perturb == "sigma";
-    var backend = backendName.TrimEnd('~') switch
+    string baseName = backendName.TrimEnd('~');
+    var backend = baseName switch
     {
-        "cpu" or "cpu_q8" => BackendType.Cpu,
+        "cpu" or "cpu_q8" or "cpu_f32" => BackendType.Cpu,
         "ggml_cpu" => BackendType.GgmlCpu,
-        _ => throw new ArgumentException($"Unsupported backend '{backendName}' (cpu, cpu_q8 or ggml_cpu, optionally with a trailing ~)."),
+        _ => throw new ArgumentException($"Unsupported backend '{backendName}' (cpu, cpu_q8, cpu_f32 or ggml_cpu, optionally with a trailing ~)."),
     };
-    QwenImage21ManagedDiT.F32Matmul = !backendName.StartsWith("cpu_q8", StringComparison.Ordinal);
+    if (baseName == "cpu_q8") QwenImage21ManagedDiT.F32Matmul = false;
+    else if (baseName == "cpu_f32") QwenImage21ManagedDiT.F32Matmul = true;
+    else if (baseName == "cpu") QwenImage21ManagedDiT.F32Matmul = defaultF32Matmul;
     float[] Perturbed(float[] x)
     {
         if (!perturb || perturbSigma) return x;
