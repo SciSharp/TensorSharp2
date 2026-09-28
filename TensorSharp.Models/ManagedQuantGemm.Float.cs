@@ -23,14 +23,23 @@ namespace TensorSharp.Models
     // DequantMatMulColumns dequantizes one weight row and dots it with four
     // activation rows at a time, which re-reads each activation panel once per
     // output column and keeps one weight vector per four FMAs. Here four weight
-    // rows are dequantized into an L2-resident F32 panel once per row block,
-    // and a 4x4 (AVX-512) or 2x4 (AVX2) register tile of dot products runs over
-    // it - four FMAs per activation load and four per weight load. Activations
-    // stay F32, so this is the same math as before (F32 weights x F32
-    // activations), only summed in a different order.
+    // rows are dequantized into an L2-resident F32 panel, and a 4x4 (AVX-512)
+    // or 2x4 (AVX2) register tile of dot products runs over it - four FMAs per
+    // activation load and four per weight load. Activations stay F32, so this
+    // is the same math as before (F32 weights x F32 activations), only summed
+    // in a different order.
     //
-    // Dequantization is always the managed implementation here (bit-exact with
-    // ggml's), so the pure-C# backend never reaches native code on this path.
+    // Row blocks: for F16/BF16 (a shift or a vcvtph2ps per value) the panel is
+    // rebuilt once per L2-sized row block. For the types that only have a
+    // scalar dequantizer (Q3_K, IQ*, ...) that rebuild costs more than the
+    // blocking saves - Q3_K 256x12288x4096 took 1.2 s that way against 0.22 s
+    // for DequantMatMulColumns - so their panel is built ONCE and every row
+    // runs against it (0.09 s), never dequantizing more than
+    // DequantMatMulColumns did. F32 weights are used in place.
+    //
+    // The dequant goes through NativeDequant like DequantMatMulColumns': managed
+    // (bit-exact with ggml's) on the pure-C# backend, which sets PreferManaged,
+    // and the native ggml dequant on the other backends' host fallbacks.
     // A/B: TS_CPU_FGEMM=0 (or TS_CPU_QGEMM=0) restores DequantMatMulColumns.
     // ------------------------------------------------------------------
     internal static partial class ManagedQuantizedOps
@@ -76,11 +85,15 @@ namespace TensorSharp.Models
             bool avx512 = isa == QGemmIsa.Avx512;
             int dop = ResolveDop(options);
             int groups = (outDim + FGemmCols - 1) / FGemmCols;
+            bool inPlace = type == GgmlTensorType.F32;
+            bool cheapConvert = inPlace || type is GgmlTensorType.F16 or GgmlTensorType.BF16;
 
-            // Row blocks keep the activation panel in L2 next to the 4-row weight panel.
+            // Row blocks keep the activation panel in L2 next to the 4-row weight
+            // panel - only where rebuilding the panel per row block is cheap.
+            // (Full-size blocks, remainder last: see PlanQGemm.)
             int rowsPerBlock = rowCount;
             long blockRows = QGemmRowBlockBytes / Math.Max(1L, (long)inDim * sizeof(float));
-            if (blockRows < rowCount)
+            if (cheapConvert && blockRows < rowCount)
                 rowsPerBlock = (int)Math.Max(4, blockRows & ~3L);
             int rowBlocks = (rowCount + rowsPerBlock - 1) / rowsPerBlock;
             long macs = (long)rowCount * outDim * inDim;
@@ -97,14 +110,19 @@ namespace TensorSharp.Models
                 int rb = t / colBlockCount;
                 int g0 = cb * groupsPerBlock, g1 = Math.Min(groups, g0 + groupsPerBlock);
                 int r0 = rb * rowsPerBlock, r1 = Math.Min(rowCount, r0 + rowsPerBlock);
-                float* panel = FGemmScratch(FGemmCols * inDim);
+                float* scratch = inPlace ? null : FGemmScratch(FGemmCols * inDim);
                 int tileRows = avx512 ? 4 : 2;
                 for (int g = g0; g < g1; g++)
                 {
                     int c0 = g * FGemmCols;
                     int cols = Math.Min(FGemmCols, outDim - c0);
-                    for (int c = 0; c < cols; c++)
-                        DequantizeToFloat32(type, (byte*)w + (c0 + c) * rowBytes, panel + (long)c * inDim, inDim);
+                    float* panel = scratch;
+                    if (inPlace)
+                        panel = (float*)((byte*)w + c0 * rowBytes);   // rows are inDim floats apart
+                    else
+                        for (int c = 0; c < cols; c++)
+                            NativeDequant.DequantizeToFloat32Native(ggmlType, (nint)((byte*)w + (c0 + c) * rowBytes),
+                                (nint)(panel + (long)c * inDim), inDim);
                     for (int r = r0; r < r1; r += tileRows)
                     {
                         int rows = Math.Min(tileRows, r1 - r);

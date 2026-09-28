@@ -152,13 +152,15 @@ namespace TensorSharp.Models
         // the EVEX compressed displacement of the AVX512F 64x4 forms
         // (Avx512F.BroadcastVector256ToVector512(long*/double*)), so [p + 32]
         // loads from p + 64. The Q0 kernels address blocks at constant offsets
-        // (x + 32/64/96) and read the wrong activations through it.
+        // (x + 32/64/96) and read the wrong activations through it; the kernel
+        // tests caught it, and ManagedQuantGemmTests.BroadcastHelpers_* pins
+        // these two helpers at constant displacements.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe Vector512<sbyte> Bcast256x2(byte* p)
+        internal static unsafe Vector512<sbyte> Bcast256x2(byte* p)
             => Avx512DQ.BroadcastVector256ToVector512((int*)p).AsSByte();
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe Vector512<float> Bcast256x2F(byte* p)
+        internal static unsafe Vector512<float> Bcast256x2F(byte* p)
             => Avx512DQ.BroadcastVector256ToVector512((float*)p);
 
         /// <summary>acc += maddwd(maddubs(w, x), scale): one 32-element chunk of

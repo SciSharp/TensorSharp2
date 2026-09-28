@@ -43,9 +43,21 @@ namespace TensorSharp.Models
     // (row, column) pair - float scales, and for Q4_K/Q5_K the d8 * bsum
     // products that carry the K-quant min term.
     //
-    // A/B: TS_CPU_QGEMM=0 restores the per-row path for everything this file
-    // handles; TS_CPU_DISABLE_AVX512=1 forces the AVX2 kernels on an AVX-512
-    // machine. Hosts without AVX2+FMA (and ARM64) keep the per-row path.
+    // A/B: TS_CPU_QGEMM=0 restores the pre-GEMM managed matmul as a whole: the
+    // per-row path, DequantMatMulColumns, and the scalar activation quantizer,
+    // scalar Q5_0 dot and scalar F16/BF16 dequant that were vectorized with it.
+    // TS_CPU_DISABLE_AVX512=1 runs every AVX-512 path of ManagedQuantizedOps
+    // (GEMM kernels, quantizer, per-row Q4_0/Q8_0 dots, MaxAbs) in its AVX2
+    // form, so the AVX2 path can be tested on an AVX-512 machine. Hosts without
+    // AVX2+FMA (and ARM64) keep the per-row path.
+    //
+    // These kernels are reached by every caller of the managed matmul, not only
+    // the pure-C# backend: the DSV4 CUDA executor's host-MoE offload
+    // (TryAddmmQuantizedBatch) and the CUDA/MLX "no device kernel" fallback
+    // (ModelBase.AddmmQuantManaged) run them too. That is intended - they are
+    // the same managed code, faster, and within ~3e-6 of the per-row path - but
+    // the float panel keeps dequantizing through NativeDequant there, as
+    // DequantMatMulColumns did (see ManagedQuantGemm.Float.cs).
     // ------------------------------------------------------------------
     internal static partial class ManagedQuantizedOps
     {
@@ -78,21 +90,34 @@ namespace TensorSharp.Models
 
         private static readonly bool QGemmEnabled =
             Environment.GetEnvironmentVariable("TS_CPU_QGEMM") != "0";
-        private static readonly bool QGemmAvx512Disabled =
+        private static readonly bool CpuAvx512Disabled =
             Environment.GetEnvironmentVariable("TS_CPU_DISABLE_AVX512") == "1";
-        // Smallest row count that takes the GEMM (TS_CPU_QGEMM_MIN_ROWS overrides
-        // it for every type). Even one row gains where the per-row dot spends
-        // more on decoding than on reading: DRAM-bound 4096x14336 matvecs measured
-        // Q4_K 1.4-1.6x, Q6_K 1.7-1.8x, Q5_K 1.3x, Q5_0 1.3-1.7x, BF16 1.5x faster
-        // through the GEMM. Q4_0/Q8_0 single rows were a wash (0.96-1.24x), so they
-        // keep the per-row kernels.
+        // Smallest row count that takes the GEMM: one, for every type. Each
+        // output of the GEMM goes through the same operations whatever the
+        // height of the tile it lands in, so a row's result is independent of
+        // how many rows share the call - decode vs speculative verify vs
+        // continuous batching, a dense call vs an MoE batch job - only if single
+        // rows take the GEMM too; the per-row dot sums in another order. It
+        // costs nothing measurable at M = 1: DRAM-bound matvecs (CpuQuantBench
+        // gemm decode, weights rotated past the L3) ran 1.0-2.1x the per-row
+        // speed for the K-quants, 1.1-1.5x for Q4_0, 1.0-1.7x for Q5_0,
+        // 1.0-1.1x for BF16 and 0.93-1.10x for Q8_0; cache-resident MoE-sized
+        // rows 1.1-1.6x for Q4_0 and 0.6-1.5x for Q8_0 (8 of 10 samples above
+        // 1). Single runs on the 8-core laptop that measured this vary ~15%.
+        //
+        // TS_CPU_QGEMM_MIN_ROWS=N (diagnostic) sends calls and batch jobs with
+        // fewer rows to the per-row path, which gives up that invariance.
         private static readonly int QGemmMinRowsOverride = (int)Math.Clamp(EnvLong("TS_CPU_QGEMM_MIN_ROWS", 0), 0, int.MaxValue);
 
         private static int QGemmMinRows(GgmlTensorType type)
-        {
-            if (QGemmMinRowsOverride > 0) return QGemmMinRowsOverride;
-            return type is GgmlTensorType.Q4_0 or GgmlTensorType.Q8_0 ? 2 : 1;
-        }
+            => QGemmMinRowsOverride > 0 ? QGemmMinRowsOverride : 1;
+
+        /// <summary>True when every row count of every GEMM type (and of the
+        /// float panel's) takes the GEMM - the condition for the batch-size
+        /// invariance above. TS_CPU_QGEMM=0, TS_CPU_FGEMM=0, a
+        /// TS_CPU_QGEMM_MIN_ROWS above one or a host without AVX2 give it up.</summary>
+        internal static bool QGemmRoutingIsBatchInvariant =>
+            QGemmMinRowsOverride <= 1 && FGemmEnabled && ResolveQGemmIsa(QGemmIsa.Auto) != QGemmIsa.Legacy;
         // Minimum multiply-accumulates per parallel task. ~1M MACs is ~50 us on
         // one core here - big enough to bury the pool dispatch, small enough that
         // an MoE expert (4 rows x 2816 x 1408 = 16M MACs) still fans out.
@@ -119,18 +144,25 @@ namespace TensorSharp.Models
         /// <summary>Concrete kernel set for a request: Legacy when the GEMM is
         /// switched off or the ISA is missing.</summary>
         internal static QGemmIsa ResolveQGemmIsa(QGemmIsa requested)
+            => ResolveQGemmIsa(requested, QGemmEnabled, CpuAvx512Disabled, QGemmAvx2Supported, QGemmAvx512Supported);
+
+        /// <summary>The routing rule itself, with the switches and the host's ISA
+        /// as arguments (tests check it without touching process state).
+        /// Explicit Avx2/Avx512 requests ignore the switches.</summary>
+        internal static QGemmIsa ResolveQGemmIsa(
+            QGemmIsa requested, bool enabled, bool avx512Disabled, bool avx2Supported, bool avx512Supported)
         {
             switch (requested)
             {
                 case QGemmIsa.Legacy:
                     return QGemmIsa.Legacy;
                 case QGemmIsa.Avx512:
-                    return QGemmAvx512Supported ? QGemmIsa.Avx512 : QGemmAvx2Supported ? QGemmIsa.Avx2 : QGemmIsa.Legacy;
+                    return avx512Supported ? QGemmIsa.Avx512 : avx2Supported ? QGemmIsa.Avx2 : QGemmIsa.Legacy;
                 case QGemmIsa.Avx2:
-                    return QGemmAvx2Supported ? QGemmIsa.Avx2 : QGemmIsa.Legacy;
+                    return avx2Supported ? QGemmIsa.Avx2 : QGemmIsa.Legacy;
                 default:
-                    if (!QGemmEnabled || !QGemmAvx2Supported) return QGemmIsa.Legacy;
-                    return QGemmAvx512Supported && !QGemmAvx512Disabled ? QGemmIsa.Avx512 : QGemmIsa.Avx2;
+                    if (!enabled || !avx2Supported) return QGemmIsa.Legacy;
+                    return avx512Supported && !avx512Disabled ? QGemmIsa.Avx512 : QGemmIsa.Avx2;
             }
         }
 
@@ -227,12 +259,12 @@ namespace TensorSharp.Models
                 fixed (byte* rentedBase = rented)
                 {
                     byte* act = (byte*)(((nint)rentedBase + 63) & ~(nint)63);
-                    QuantizeRowsQGemm(type, family, input, inputRowStride, rowCount, inDim, act, actStride, options, dop);
+                    bool avx512 = isa == QGemmIsa.Avx512;
+                    QuantizeRowsQGemm(type, family, input, inputRowStride, rowCount, inDim, act, actStride, options, dop, avx512);
 
                     int rowBytes = (int)RowSize(ggmlType, inDim);
                     QGemmPlan plan = PlanQGemm(rowCount, inDim, outDim, rowBytes, actStride, dop);
                     nint w = weights, a = (nint)act, o = (nint)output;
-                    bool avx512 = isa == QGemmIsa.Avx512;
                     int outStride = outputRowStride;
                     void RunTask(int t)
                     {
@@ -344,6 +376,11 @@ namespace TensorSharp.Models
         private static QGemmPlan PlanQGemm(int rowCount, int inDim, int outDim, long weightRowBytes, int actStride, int dop)
         {
             int pairs = (outDim + 1) / 2;
+            // Full-size row blocks with a short remainder block LAST: the pool
+            // hands tasks out in index order, so the remainder's small tasks
+            // fill the gaps the big ones leave (largest-first scheduling). An
+            // even split (M = 256, K = 4096: 88/88/80 rows instead of
+            // 112/112/32) measured 1-5% slower.
             int rowsPerBlock = rowCount;
             long blockRows = QGemmRowBlockBytes / Math.Max(1, actStride);
             if (blockRows < rowCount)
@@ -440,10 +477,17 @@ namespace TensorSharp.Models
                 fixed (byte* rentedBase = rented)
                 {
                     byte* act = (byte*)(((nint)rentedBase + 63) & ~(nint)63);
+                    bool avx512 = isa == QGemmIsa.Avx512;
                     if (dop > 1 && totalRows >= 8 && totalRows * inDim >= 64 * 1024)
                     {
                         // A prefill-sized MoE batch gathers thousands of rows; quantize
                         // them in parallel, flattened across the distinct input blocks.
+                        // That is a second dispatch (the compute needs every row
+                        // quantized first), which on the spinning pool costs
+                        // microseconds against milliseconds of serial quantization
+                        // (1055 routed rows x 2816 took 1.6 ms, CpuQuantBench batch).
+                        // Decode-sized batches stay under the threshold and keep
+                        // one dispatch.
                         var rowSrc = new nint[totalRows];
                         for (int b = 0; b < nBlocks; b++)
                             for (int row = 0; row < blockRows[b]; row++)
@@ -456,7 +500,7 @@ namespace TensorSharp.Models
                         {
                             long r1 = Math.Min(rowSrc.Length, (long)(t + 1) * rowsPerTask);
                             for (long r = (long)t * rowsPerTask; r < r1; r++)
-                                QuantizeRowQGemm(type, family, (float*)rowSrc[r], (byte*)dstBase + r * actStride, width);
+                                QuantizeRowQGemm(type, family, (float*)rowSrc[r], (byte*)dstBase + r * actStride, width, avx512);
                         });
                     }
                     else
@@ -466,7 +510,7 @@ namespace TensorSharp.Models
                             float* src = (float*)blockInput[b];
                             byte* dst = act + blockOffset[b] * actStride;
                             for (int row = 0; row < blockRows[b]; row++)
-                                QuantizeRowQGemm(type, family, src + (long)row * inputRowStride, dst + (long)row * actStride, inDim);
+                                QuantizeRowQGemm(type, family, src + (long)row * inputRowStride, dst + (long)row * actStride, inDim, avx512);
                         }
                     }
 
@@ -513,7 +557,6 @@ namespace TensorSharp.Models
                         actOff[j] = blockOffset[actOf[j]] * actStride;
                     }
                     nint actAddr = (nint)act;
-                    bool avx512 = isa == QGemmIsa.Avx512;
                     int scratchBytes = QGemmPairScratchBytes(family, inDim);
 
                     void RunTask(int t)
@@ -548,7 +591,7 @@ namespace TensorSharp.Models
 
         private static unsafe void QuantizeRowsQGemm(
             GgmlTensorType type, QGemmFamily family, float* input, int inputRowStride, int rowCount, int inDim,
-            byte* act, int actStride, ParallelOptions options, int dop)
+            byte* act, int actStride, ParallelOptions options, int dop, bool avx512)
         {
             // Rows are independent; hand them out in chunks sized by elements so a
             // 4096-row prefill is a few dozen tasks, not thousands.
@@ -564,21 +607,24 @@ namespace TensorSharp.Models
                     int r0 = t * rowsPerTask, r1 = Math.Min(rowCount, r0 + rowsPerTask);
                     for (int r = r0; r < r1; r++)
                         QuantizeRowQGemm(type, family, (float*)src + (long)r * inputRowStride,
-                            (byte*)dst + (long)r * actStride, inDim);
+                            (byte*)dst + (long)r * actStride, inDim, avx512);
                 });
                 return;
             }
             for (int r = 0; r < rowCount; r++)
-                QuantizeRowQGemm(type, family, input + (long)r * inputRowStride, act + (long)r * actStride, inDim);
+                QuantizeRowQGemm(type, family, input + (long)r * inputRowStride, act + (long)r * actStride, inDim, avx512);
         }
 
         /// <summary>
         /// Quantize one activation row into the GEMM layout. The int8 values and
         /// scales are bit-identical to QuantizeF32ToQ8_K / QuantizeF32ToQ8_0
         /// (same max-abs scale, same round-half-to-even, same +-127 clamp).
+        /// <paramref name="avx512"/> is the kernel set the GEMM runs, so an AVX2
+        /// GEMM (TS_CPU_DISABLE_AVX512=1, or an explicit Avx2 request) quantizes
+        /// with AVX2 as well.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private static unsafe void QuantizeRowQGemm(GgmlTensorType type, QGemmFamily family, float* src, byte* dst, int inDim)
+        private static unsafe void QuantizeRowQGemm(GgmlTensorType type, QGemmFamily family, float* src, byte* dst, int inDim, bool avx512)
         {
             sbyte* qs = (sbyte*)dst;
             if (IsKFamily(family))
@@ -602,7 +648,7 @@ namespace TensorSharp.Models
                         continue;
                     }
 
-                    QuantizeInt8Groups16(x, 1.0f / scale, q, QK_K, groupSums);
+                    QuantizeInt8Groups16Simd(x, 1.0f / scale, q, QK_K, groupSums, avx512);
                     if (family == QGemmFamily.KMin)
                     {
                         float* bsF = (float*)a;
@@ -645,7 +691,7 @@ namespace TensorSharp.Models
                     continue;
                 }
 
-                QuantizeInt8Groups16(x, 1.0f / scale, q, QK8_0, groupSums2);
+                QuantizeInt8Groups16Simd(x, 1.0f / scale, q, QK8_0, groupSums2, avx512);
                 sxAdj[b] = zeroShare * (groupSums2[0] + groupSums2[1]);
             }
         }
@@ -653,15 +699,18 @@ namespace TensorSharp.Models
         /// <summary>
         /// <c>q[i] = clamp(round_half_even(x[i] * invScale), -127, 127)</c> for
         /// <paramref name="n"/> (a multiple of 16) values, plus the sum of each
-        /// 16-value group. Bit-identical to the scalar
-        /// <c>ClampToInt8(MathF.Round(x * invScale))</c>: the product is the same
-        /// IEEE multiply, vroundps/vrndscaleps round half to even like
-        /// MathF.Round, and the rounded value converts to int32 exactly.
+        /// 16-value group, for the per-row quantizers (QuantizeF32ToQ8_0/_K, which
+        /// the Q8_0 KV-cache writer shares). Bit-identical to the scalar
+        /// <c>ClampToInt8(MathF.Round(x * invScale))</c> for every input, NaN
+        /// and infinities included (see the SIMD variants). TS_CPU_QGEMM=0 runs
+        /// the scalar loop itself.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe void QuantizeInt8Groups16(float* x, float invScale, sbyte* q, int n, int* groupSums)
         {
-            if (Avx512F.IsSupported && Avx512BW.IsSupported && !QGemmAvx512Disabled)
+            if (!QGemmEnabled)
+                QuantizeInt8Groups16Scalar(x, invScale, q, n, groupSums);
+            else if (Avx512F.IsSupported && Avx512BW.IsSupported && !CpuAvx512Disabled)
                 QuantizeInt8Groups16Avx512(x, invScale, q, n, groupSums);
             else if (Avx2.IsSupported)
                 QuantizeInt8Groups16Avx2(x, invScale, q, n, groupSums);
@@ -669,16 +718,39 @@ namespace TensorSharp.Models
                 QuantizeInt8Groups16Scalar(x, invScale, q, n, groupSums);
         }
 
+        /// <summary>The GEMM's quantizer: the SIMD variant of its kernel set (the
+        /// GEMM only runs where AVX2 is present).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void QuantizeInt8Groups16Simd(float* x, float invScale, sbyte* q, int n, int* groupSums, bool avx512)
+        {
+            if (avx512)
+                QuantizeInt8Groups16Avx512(x, invScale, q, n, groupSums);
+            else
+                QuantizeInt8Groups16Avx2(x, invScale, q, n, groupSums);
+        }
+
+        // The scalar reference converts with C#'s (int) cast, which saturates:
+        // NaN -> 0, +-Inf and anything past the int range -> int.MaxValue /
+        // int.MinValue, then clamped to +-127. vcvtps2dq returns int.MinValue for
+        // all of those (-127 after an integer clamp), which differs for NaN and
+        // +Inf. Both occur only in degenerate blocks - a NaN activation, or a
+        // block whose max|x| is below ~3.7e-37 so that 1/scale overflows to +Inf
+        // (and 0 * Inf is NaN) - but vectorizing must not change what the
+        // per-row path computes. So NaN lanes are zeroed and the clamp is done in
+        // float BEFORE the conversion: +-127 are integers and rounding is
+        // monotonic, so round(clamp(v)) == clamp(round(v)) for every finite v.
+
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         internal static unsafe void QuantizeInt8Groups16Avx512(float* x, float invScale, sbyte* q, int n, int* groupSums)
         {
             Vector512<float> inv = Vector512.Create(invScale);
-            Vector512<int> lo = Vector512.Create(-127), hi = Vector512.Create(127);
+            Vector512<float> lo = Vector512.Create(-127f), hi = Vector512.Create(127f);
             for (int i = 0, g = 0; i < n; i += 16, g++)
             {
                 Vector512<float> v = Avx512F.Multiply(Avx512F.LoadVector512(x + i), inv);
+                v &= Vector512.Equals(v, v);                        // NaN -> +0
+                v = Avx512F.Min(Avx512F.Max(v, lo), hi);
                 Vector512<int> r = Avx512F.ConvertToVector512Int32(Avx512F.RoundScale(v, 0));
-                r = Avx512F.Min(Avx512F.Max(r, lo), hi);
                 Avx512F.ConvertToVector128SByte(r).Store(q + i);
                 groupSums[g] = Vector512.Sum(r);
             }
@@ -688,15 +760,17 @@ namespace TensorSharp.Models
         internal static unsafe void QuantizeInt8Groups16Avx2(float* x, float invScale, sbyte* q, int n, int* groupSums)
         {
             Vector256<float> inv = Vector256.Create(invScale);
-            Vector256<int> lo = Vector256.Create(-127), hi = Vector256.Create(127);
+            Vector256<float> lo = Vector256.Create(-127f), hi = Vector256.Create(127f);
             for (int i = 0, g = 0; i < n; i += 16, g++)
             {
-                Vector256<int> r0 = Avx.ConvertToVector256Int32(
-                    Avx.RoundToNearestInteger(Avx.Multiply(Avx.LoadVector256(x + i), inv)));
-                Vector256<int> r1 = Avx.ConvertToVector256Int32(
-                    Avx.RoundToNearestInteger(Avx.Multiply(Avx.LoadVector256(x + i + 8), inv)));
-                r0 = Avx2.Min(Avx2.Max(r0, lo), hi);
-                r1 = Avx2.Min(Avx2.Max(r1, lo), hi);
+                Vector256<float> v0 = Avx.Multiply(Avx.LoadVector256(x + i), inv);
+                Vector256<float> v1 = Avx.Multiply(Avx.LoadVector256(x + i + 8), inv);
+                v0 = Avx.And(v0, Avx.CompareOrdered(v0, v0));      // NaN -> +0
+                v1 = Avx.And(v1, Avx.CompareOrdered(v1, v1));
+                v0 = Avx.Min(Avx.Max(v0, lo), hi);
+                v1 = Avx.Min(Avx.Max(v1, lo), hi);
+                Vector256<int> r0 = Avx.ConvertToVector256Int32(Avx.RoundToNearestInteger(v0));
+                Vector256<int> r1 = Avx.ConvertToVector256Int32(Avx.RoundToNearestInteger(v1));
                 // int32 -> int16 -> int8 packs work per 128-bit lane:
                 // [r0.lo r1.lo | r0.hi r1.hi] -> bytes need a dword permute.
                 Vector256<short> s = Avx2.PackSignedSaturate(r0, r1);
@@ -733,7 +807,8 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Quantize one row into the GEMM layout (see QuantizeRowQGemm).</summary>
-        internal static unsafe void QGemmQuantizeActivationRow(GgmlTensorType type, float* src, byte* dst, int inDim)
-            => QuantizeRowQGemm(type, GetQGemmFamily(type, inDim), src, dst, inDim);
+        internal static unsafe void QGemmQuantizeActivationRow(GgmlTensorType type, float* src, byte* dst, int inDim,
+            bool avx512 = true)
+            => QuantizeRowQGemm(type, GetQGemmFamily(type, inDim), src, dst, inDim, avx512 && QGemmAvx512Supported);
     }
 }

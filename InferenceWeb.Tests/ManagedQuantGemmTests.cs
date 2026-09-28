@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using Xunit.Abstractions;
 using QGemmIsa = TensorSharp.Models.ManagedQuantizedOps.QGemmIsa;
@@ -43,6 +45,17 @@ public class ManagedQuantGemmTests
         foreach (var type in new[] { GgmlTensorType.Q8_0, GgmlTensorType.Q5_0 })
             foreach (int rows in new[] { 4, 70 })
                 yield return new object[] { type, rows, 4096, 21 };
+        // K = 12288 (the Qwen-Image DiT's MLP down projection): the pair scratch
+        // (48 super-blocks) outgrows the L1 and the rows split into L2 blocks.
+        foreach (var type in new[] { GgmlTensorType.Q4_K, GgmlTensorType.Q5_K, GgmlTensorType.Q6_K,
+                                     GgmlTensorType.Q8_0, GgmlTensorType.Q5_0, GgmlTensorType.Q4_0 })
+            foreach (int rows in new[] { 1, 8, 70 })
+                yield return new object[] { type, rows, 12288, 5 };
+        // Q0 four-block groups with 0 and 3 leftover blocks (K/32 = 4, 7, 128).
+        foreach (var type in new[] { GgmlTensorType.Q4_0, GgmlTensorType.Q5_0, GgmlTensorType.Q8_0 })
+            foreach (int k in new[] { 128, 224, 4096 })
+                foreach (int rows in new[] { 1, 4, 9 })
+                    yield return new object[] { type, rows, k, 7 };
         // single-column and two-column outputs (pair tail / no tail)
         foreach (var type in new[] { GgmlTensorType.Q4_K, GgmlTensorType.Q6_K, GgmlTensorType.Q8_0, GgmlTensorType.Q5_0 })
             foreach (int n in new[] { 1, 2 })
@@ -246,7 +259,16 @@ public class ManagedQuantGemmTests
         float[] x = new float[n];
         for (int i = 0; i < n; i++)
             x[i] = i % 5 == 0 ? (i % 2 == 0 ? 0.5f : -0.5f) * (i % 7) : (float)(rng.NextDouble() - 0.5) * 300f;
-        foreach (float inv in new[] { 1f, 0.25f, 1f / 3f, 0.4231f })
+        // Non-finite and out-of-int-range products: the scalar (int) cast
+        // saturates (NaN -> 0, +Inf -> +127), raw vcvtps2dq would give -127.
+        float[] special = { float.NaN, float.PositiveInfinity, float.NegativeInfinity, 1e30f, -1e30f, 3e9f, -3e9f,
+                            0f, -0f, 1e-45f, -1e-45f, 1e-38f, 127.5f, -127.5f, 126.5f, 128f };
+        for (int i = 0; i < special.Length; i++)
+            for (int rep = 0; rep < 8; rep++)
+                x[1024 + rep * 97 + i] = special[i];
+        // 1/scale overflows to +Inf when a block's max|x| is below ~3.7e-37,
+        // which makes 0 * inv a NaN as well.
+        foreach (float inv in new[] { 1f, 0.25f, 1f / 3f, 0.4231f, float.PositiveInfinity, float.MaxValue })
         {
             sbyte[] qs = new sbyte[n], q2 = new sbyte[n], q5 = new sbyte[n];
             int[] ss = new int[n / 16], s2 = new int[n / 16], s5 = new int[n / 16];
@@ -268,6 +290,229 @@ public class ManagedQuantGemmTests
                     Assert.Equal(ss, s5);
                 }
             }
+            // the scalar reference itself: NaN -> 0, +Inf -> 127, -Inf -> -127
+            Assert.Equal(0, qs[1024]);
+            Assert.Equal(127, qs[1025]);
+            Assert.Equal(-127, qs[1026]);
+        }
+    }
+
+    /// <summary>A degenerate block (max|x| ~ 1e-39, so 1/scale is +Inf) goes
+    /// through the per-row and GEMM quantizers identically.</summary>
+    [Theory]
+    [InlineData(GgmlTensorType.Q4_K, 512)]
+    [InlineData(GgmlTensorType.Q6_K, 512)]
+    [InlineData(GgmlTensorType.Q8_0, 64)]
+    [InlineData(GgmlTensorType.Q4_0, 64)]
+    public unsafe void QGemmActivationLayout_TinyScaleBlockMatchesPerRowQuantization(GgmlTensorType type, int k)
+    {
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = i % 3 == 0 ? 0f : (i % 2 == 0 ? 1e-39f : -2e-39f);
+        Assert.True(ManagedQuantizedOps.TryGetActivationPlan(type, k, out int stdBytes));
+        byte[] std = new byte[stdBytes];
+        byte[] gemm = new byte[ManagedQuantizedOps.QGemmActivationRowBytes(type, k)];
+        bool kFamily = type is GgmlTensorType.Q4_K or GgmlTensorType.Q6_K;
+        int block = kFamily ? 256 : 32, header = kFamily ? 4 : 2, blockBytes = kFamily ? 292 : 34;
+        foreach (bool avx512 in new[] { true, false })
+        {
+            fixed (float* xp = x)
+            fixed (byte* sp = std)
+            fixed (byte* gp = gemm)
+            {
+                ManagedQuantizedOps.QuantizeActivationRow(type, xp, sp, k);
+                ManagedQuantizedOps.QGemmQuantizeActivationRow(type, xp, gp, k, avx512);
+            }
+            for (int b = 0; b < k / block; b++)
+                for (int i = 0; i < block; i++)
+                {
+                    sbyte expected = (sbyte)std[b * blockBytes + header + i];
+                    Assert.Equal(expected, (sbyte)gemm[b * block + i]);
+                    if (x[b * block + i] == 0f) Assert.Equal(0, expected);   // 0 * Inf is NaN -> 0
+                    else Assert.Equal(x[b * block + i] > 0 ? 127 : -127, expected);
+                }
+        }
+    }
+
+    public static IEnumerable<object[]> InvarianceCases()
+    {
+        foreach (var type in new[] { GgmlTensorType.Q4_K, GgmlTensorType.Q5_K, GgmlTensorType.Q6_K })
+            yield return new object[] { type, 2816 };
+        foreach (var type in new[] { GgmlTensorType.Q4_0, GgmlTensorType.Q5_0, GgmlTensorType.Q8_0 })
+            yield return new object[] { type, 704 };
+        foreach (var type in new[] { GgmlTensorType.BF16, GgmlTensorType.F16, GgmlTensorType.F32 })
+            yield return new object[] { type, 520 };
+    }
+
+    /// <summary>
+    /// With the default routing a row's output must not depend on how many rows
+    /// share the call - decode (M = 1) vs a speculative verify batch vs
+    /// continuous batching, or a dense call vs a one-row MoE batch job. The
+    /// GEMM sums every output the same way at any tile height, and single rows
+    /// take it for every type, so this is bit-exact.
+    /// </summary>
+    [QGemmDefaultRoutingTheory]
+    [MemberData(nameof(InvarianceCases))]
+    public unsafe void AutoRouting_RowResultIsIndependentOfBatchSize(GgmlTensorType type, int k)
+    {
+        const int rows = 11, n = 37;
+        var rng = new Random(606 + (int)type);
+        byte[] weights = BuildRandomWeights(rng, type, n, k);
+        float[] input = BuildInput(rng, rows, k, k);
+        float[] all = RunAddmm(type, weights, k, n, input, k, rows, n, QGemmIsa.Auto);
+
+        for (int r = 0; r < rows; r++)
+        {
+            float[] one = RunAddmm(type, weights, k, n, input.AsSpan(r * k, k).ToArray(), k, 1, n, QGemmIsa.Auto);
+            Assert.Equal(all.AsSpan(r * n, n).ToArray(), one);
+        }
+        float[] middle = RunAddmm(type, weights, k, n, input.AsSpan(4 * k, 5 * k).ToArray(), k, 5, n, QGemmIsa.Auto);
+        Assert.Equal(all.AsSpan(4 * n, 5 * n).ToArray(), middle);
+
+        if (!ManagedQuantizedOps.TryGetActivationPlan(type, k, out _))
+            return;   // float types have no MoE batch entry
+        // Every row as its own one-row batch job (top-k routing of single tokens).
+        float[] batched = new float[rows * n];
+        fixed (byte* w = weights)
+        fixed (float* x = input)
+        fixed (float* o = batched)
+        {
+            var jobs = new ManagedQuantizedOps.QuantMatMulJob[rows];
+            for (int r = 0; r < rows; r++)
+                jobs[r] = new ManagedQuantizedOps.QuantMatMulJob((IntPtr)w, (IntPtr)(x + r * k), (IntPtr)(o + r * n), n, 1, n);
+            Assert.True(ManagedQuantizedOps.TryAddmmQuantizedBatch((int)type, k, k, jobs, null, QGemmIsa.Auto));
+        }
+        Assert.Equal(all, batched);
+    }
+
+    /// <summary>
+    /// TS_CPU_QGEMM_MIN_ROWS sends small calls to the per-row path; the MoE batch
+    /// applies the same threshold per job, so each job still matches the dense
+    /// call with its row count bit for bit.
+    /// </summary>
+    [Theory]
+    [InlineData(GgmlTensorType.Q4_K, 512)]
+    [InlineData(GgmlTensorType.Q8_0, 704)]
+    [InlineData(GgmlTensorType.Q4_0, 224)]
+    public unsafe void QGemmBatch_MinRowsSplitMatchesDenseRoutingPerJob(GgmlTensorType type, int k)
+    {
+        const int minRows = 4;
+        var rng = new Random(313 + (int)type);
+        int[] jobRows = { 1, 3, 4, 9, 0, 2, 5 };
+        int jobs = jobRows.Length, n = 19;
+        var weights = new byte[jobs][];
+        var inputs = new float[jobs][];
+        for (int j = 0; j < jobs; j++)
+        {
+            weights[j] = BuildRandomWeights(rng, type, n, k);
+            inputs[j] = BuildInput(rng, Math.Max(1, jobRows[j]), k, k);
+        }
+        QGemmIsa gemmIsa = ManagedQuantizedOps.ResolveQGemmIsa(QGemmIsa.Auto);
+        var outputs = new float[jobs][];
+        var handles = new List<GCHandle>();
+        try
+        {
+            var batch = new ManagedQuantizedOps.QuantMatMulJob[jobs];
+            for (int j = 0; j < jobs; j++)
+            {
+                outputs[j] = new float[Math.Max(1, jobRows[j]) * n];
+                var hw = GCHandle.Alloc(weights[j], GCHandleType.Pinned);
+                var hi = GCHandle.Alloc(inputs[j], GCHandleType.Pinned);
+                var ho = GCHandle.Alloc(outputs[j], GCHandleType.Pinned);
+                handles.Add(hw); handles.Add(hi); handles.Add(ho);
+                batch[j] = new ManagedQuantizedOps.QuantMatMulJob(hw.AddrOfPinnedObject(), hi.AddrOfPinnedObject(),
+                    ho.AddrOfPinnedObject(), n, jobRows[j], n);
+            }
+            Assert.True(ManagedQuantizedOps.TryAddmmQuantizedBatch((int)type, k, k, batch, null, QGemmIsa.Auto, minRows));
+        }
+        finally
+        {
+            foreach (var h in handles) h.Free();
+        }
+
+        for (int j = 0; j < jobs; j++)
+        {
+            if (jobRows[j] == 0) continue;
+            QGemmIsa isa = jobRows[j] < minRows ? QGemmIsa.Legacy : gemmIsa;
+            float[] expected = RunAddmm(type, weights[j], k, n, inputs[j], k, jobRows[j], n, isa);
+            Assert.Equal(expected, outputs[j]);
+        }
+    }
+
+    [Fact]
+    public void ResolveQGemmIsa_HonoursSwitchesAndHostIsa()
+    {
+        static QGemmIsa R(QGemmIsa req, bool enabled, bool noAvx512, bool avx2, bool avx512)
+            => ManagedQuantizedOps.ResolveQGemmIsa(req, enabled, noAvx512, avx2, avx512);
+
+        Assert.Equal(QGemmIsa.Avx512, R(QGemmIsa.Auto, true, false, true, true));
+        Assert.Equal(QGemmIsa.Avx2, R(QGemmIsa.Auto, true, true, true, true));      // TS_CPU_DISABLE_AVX512=1
+        Assert.Equal(QGemmIsa.Legacy, R(QGemmIsa.Auto, false, false, true, true));  // TS_CPU_QGEMM=0
+        Assert.Equal(QGemmIsa.Avx2, R(QGemmIsa.Auto, true, false, true, false));    // AVX2-only host
+        Assert.Equal(QGemmIsa.Legacy, R(QGemmIsa.Auto, true, false, false, false)); // ARM64 / no AVX2
+        // explicit requests (tests, benchmarks) ignore the switches, not the host
+        Assert.Equal(QGemmIsa.Avx512, R(QGemmIsa.Avx512, false, true, true, true));
+        Assert.Equal(QGemmIsa.Avx2, R(QGemmIsa.Avx512, true, false, true, false));
+        Assert.Equal(QGemmIsa.Legacy, R(QGemmIsa.Avx2, true, false, false, false));
+        Assert.Equal(QGemmIsa.Legacy, R(QGemmIsa.Legacy, true, false, true, true));
+    }
+
+    // .NET 10.0.8 encodes Avx512F.BroadcastVector256ToVector512(long*/double*)
+    // with a constant displacement as base + 2 * disp. The kernels' broadcast
+    // helpers use the AVX512DQ forms instead; these probes fold constant
+    // displacements into the helpers' memory operands, as the Q0 kernels do.
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static unsafe Vector512<sbyte> Bcast32(byte* p) => ManagedQuantizedOps.Bcast256x2(p + 32);
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static unsafe Vector512<sbyte> Bcast64(byte* p) => ManagedQuantizedOps.Bcast256x2(p + 64);
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static unsafe Vector512<sbyte> Bcast96(byte* p) => ManagedQuantizedOps.Bcast256x2(p + 96);
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static unsafe Vector512<float> BcastF32(byte* p) => ManagedQuantizedOps.Bcast256x2F(p + 32);
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static unsafe Vector512<float> BcastF96(byte* p) => ManagedQuantizedOps.Bcast256x2F(p + 96);
+
+    [Avx512Fact]
+    public unsafe void BroadcastHelpers_LoadTheAddressedBytesAtConstantDisplacements()
+    {
+        byte* buf = (byte*)NativeMemory.AlignedAlloc(512, 64);
+        try
+        {
+            for (int i = 0; i < 512; i++) buf[i] = (byte)i;
+            foreach (var (v, at) in new[] { (Bcast32(buf), 32), (Bcast64(buf), 64), (Bcast96(buf), 96) })
+                for (int i = 0; i < 64; i++)
+                    Assert.Equal((byte)(at + i % 32), (byte)v.GetElement(i));
+            foreach (var (v, at) in new[] { (BcastF32(buf), 32), (BcastF96(buf), 96) })
+                for (int i = 0; i < 16; i++)
+                    Assert.Equal(BitConverter.ToSingle(new[] { (byte)(at + i % 8 * 4), (byte)(at + i % 8 * 4 + 1),
+                        (byte)(at + i % 8 * 4 + 2), (byte)(at + i % 8 * 4 + 3) }), v.GetElement(i));
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(buf);
+        }
+    }
+
+    /// <summary>The float panel reads F32 weights in place (no dequant copy);
+    /// check it against a float64 reference.</summary>
+    [Fact]
+    public void FloatPanel_UsesInPlaceF32Weights()
+    {
+        var rng = new Random(8);
+        const int k = 96, n = 9, rows = 6;
+        byte[] weights = BuildRandomWeights(rng, GgmlTensorType.F32, n, k);
+        float[] input = BuildInput(rng, rows, k, k);
+        float[] expected = new float[rows * n];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < n; c++)
+            {
+                double s = 0;
+                for (int i = 0; i < k; i++) s += (double)BitConverter.ToSingle(weights, (c * k + i) * 4) * input[r * k + i];
+                expected[r * n + c] = (float)s;
+            }
+        foreach (var isa in AvailableGemmIsas().Append(QGemmIsa.Auto))
+        {
+            float[] actual = RunAddmm(GgmlTensorType.F32, weights, k, n, input, k, rows, n, isa);
+            Assert.True(MaxAbsDiff(expected, actual) <= 1e-5f * (MaxAbs(expected) + 1e-6f), $"F32 {isa}");
         }
     }
 
@@ -284,6 +529,10 @@ public class ManagedQuantGemmTests
         }
         yield return new object[] { GgmlTensorType.BF16, 70, 256, 1 };
         yield return new object[] { GgmlTensorType.BF16, 70, 256, 6 };
+        // K = 12288: F16/BF16 rebuild the panel per L2-sized row block,
+        // the dequant-only types build it once for all rows.
+        foreach (var type in new[] { GgmlTensorType.BF16, GgmlTensorType.F16, GgmlTensorType.Q3_K, GgmlTensorType.IQ4_XS })
+            yield return new object[] { type, 70, 12288, 5 };
     }
 
     [Theory]
@@ -501,5 +750,27 @@ public class ManagedQuantGemmTests
         for (int r = 0; r < rows; r++)
             for (int c = n; c < outStride; c++)
                 Assert.True(float.IsNaN(output[r * outStride + c]), $"output padding row {r} col {c} was written");
+    }
+}
+
+/// <summary>Theory that runs only under the default GEMM routing: batch-size
+/// invariance is what that routing promises, and TS_CPU_QGEMM=0,
+/// TS_CPU_FGEMM=0, TS_CPU_QGEMM_MIN_ROWS or a host without AVX2 give it up.</summary>
+public sealed class QGemmDefaultRoutingTheoryAttribute : TheoryAttribute
+{
+    public QGemmDefaultRoutingTheoryAttribute()
+    {
+        if (!ManagedQuantizedOps.QGemmRoutingIsBatchInvariant)
+            Skip = "The GEMM routing is not the default (TS_CPU_QGEMM / TS_CPU_FGEMM / TS_CPU_QGEMM_MIN_ROWS, or no AVX2).";
+    }
+}
+
+/// <summary>Fact that needs the AVX-512 GEMM kernels' instruction sets.</summary>
+public sealed class Avx512FactAttribute : FactAttribute
+{
+    public Avx512FactAttribute()
+    {
+        if (!ManagedQuantizedOps.QGemmAvx512Supported)
+            Skip = "Requires AVX-512 F/BW/DQ.";
     }
 }
