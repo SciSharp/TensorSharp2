@@ -593,8 +593,109 @@ namespace TensorSharp.Cpu
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool AllFloat32(Tensor a, Tensor b, Tensor c)
+        {
+            return a.ElementType == DType.Float32 && b.ElementType == DType.Float32 && c.ElementType == DType.Float32;
+        }
+
+        /// <summary>
+        /// Packed SGEMM route (CpuSgemm) for any 2D float view: A and B take their strides as
+        /// they are (row/column major, narrowed rows, transposed views), C needs one unit stride.
+        /// A column-major C is computed as C^T = B^T A^T with the operands' strides swapped.
+        /// </summary>
+        private static unsafe bool TryPackedGemm(float alpha, Tensor a, Tensor b, float beta, Tensor c)
+        {
+            if (!CpuSgemm.Enabled || !UsesManagedBlas(a, b, c) || !AllFloat32(a, b, c) ||
+                a.DimensionCount != 2 || b.DimensionCount != 2 || c.DimensionCount != 2)
+            {
+                return false;
+            }
+
+            if (c.Sizes[0] > int.MaxValue || c.Sizes[1] > int.MaxValue || a.Sizes[1] > int.MaxValue)
+            {
+                return false;
+            }
+
+            int m = (int)c.Sizes[0];
+            int n = (int)c.Sizes[1];
+            int k = (int)a.Sizes[1];
+            float* aPtr = (float*)CpuNativeHelpers.GetBufferStart(a);
+            float* bPtr = (float*)CpuNativeHelpers.GetBufferStart(b);
+            float* cPtr = (float*)CpuNativeHelpers.GetBufferStart(c);
+
+            if (c.Strides[1] == 1 || n == 1)
+            {
+                CpuSgemm.Gemm(m, n, k, alpha,
+                    aPtr, a.Strides[0], a.Strides[1],
+                    bPtr, b.Strides[0], b.Strides[1],
+                    beta, cPtr, c.Strides[0]);
+                return true;
+            }
+
+            if (c.Strides[0] == 1 || m == 1)
+            {
+                CpuSgemm.Gemm(n, m, k, alpha,
+                    bPtr, b.Strides[1], b.Strides[0],
+                    aPtr, a.Strides[1], a.Strides[0],
+                    beta, cPtr, c.Strides[1]);
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>Batched form of <see cref="TryPackedGemm"/> ([batch, M, K] x [batch, K, N]).</summary>
+        private static unsafe bool TryPackedGemmBatch(float alpha, Tensor a, Tensor b, float beta, Tensor c)
+        {
+            if (!CpuSgemm.Enabled || !UsesManagedBlas(a, b, c) || !AllFloat32(a, b, c) ||
+                a.DimensionCount != 3 || b.DimensionCount != 3 || c.DimensionCount != 3 ||
+                a.Sizes[0] != c.Sizes[0] || b.Sizes[0] != c.Sizes[0])
+            {
+                return false;
+            }
+
+            if (c.Sizes[0] > int.MaxValue || c.Sizes[1] > int.MaxValue || c.Sizes[2] > int.MaxValue || a.Sizes[2] > int.MaxValue)
+            {
+                return false;
+            }
+
+            int batch = (int)c.Sizes[0];
+            int m = (int)c.Sizes[1];
+            int n = (int)c.Sizes[2];
+            int k = (int)a.Sizes[2];
+            float* aPtr = (float*)CpuNativeHelpers.GetBufferStart(a);
+            float* bPtr = (float*)CpuNativeHelpers.GetBufferStart(b);
+            float* cPtr = (float*)CpuNativeHelpers.GetBufferStart(c);
+
+            if (c.Strides[2] == 1 || n == 1)
+            {
+                CpuSgemm.GemmBatched(batch, m, n, k, alpha,
+                    aPtr, a.Strides[0], a.Strides[1], a.Strides[2],
+                    bPtr, b.Strides[0], b.Strides[1], b.Strides[2],
+                    beta, cPtr, c.Strides[0], c.Strides[1]);
+                return true;
+            }
+
+            if (c.Strides[1] == 1 || m == 1)
+            {
+                CpuSgemm.GemmBatched(batch, n, m, k, alpha,
+                    bPtr, b.Strides[0], b.Strides[2], b.Strides[1],
+                    aPtr, a.Strides[0], a.Strides[2], a.Strides[1],
+                    beta, cPtr, c.Strides[0], c.Strides[2]);
+                return true;
+            }
+
+            return false;
+        }
+
         private static unsafe bool TryManagedGemm(float alpha, Tensor a, Tensor b, float beta, Tensor c)
         {
+            if (TryPackedGemm(alpha, a, b, beta, c))
+            {
+                return true;
+            }
+
             if (!UsesManagedBlas(a, b, c) || !IsRowMajorContiguous2D(a) || !IsRowMajorContiguous2D(c))
             {
                 return false;
@@ -752,6 +853,11 @@ namespace TensorSharp.Cpu
 
         private static unsafe bool TryManagedGemmBatch(float alpha, Tensor a, Tensor b, float beta, Tensor c)
         {
+            if (TryPackedGemmBatch(alpha, a, b, beta, c))
+            {
+                return true;
+            }
+
             if (!UsesManagedBlas(a, b, c) || !IsRowMajorContiguous3D(a) || !IsRowMajorContiguous3D(c))
             {
                 return false;

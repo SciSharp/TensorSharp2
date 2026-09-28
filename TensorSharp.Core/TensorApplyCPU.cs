@@ -22,6 +22,7 @@ using System.Buffers;
 using System.Numerics;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using System.Xml;
 using System.Threading.Tasks;
 using TensorSharp.Cpu;
@@ -828,6 +829,11 @@ namespace TensorSharp
                 return;
             }
 
+			if (TryCopyStridedSimd(result, src))
+			{
+				return;
+			}
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && src.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -852,6 +858,113 @@ namespace TensorSharp
 			}
 		}
 
+
+		/// <summary>
+		/// Strided F32 copy between same-shaped views (head split/merge, narrowed rows, permutes).
+		/// Dimensions both operands can walk as one are collapsed first, so a [seq, heads, hd] ->
+		/// [heads, seq, hd] permute becomes a loop of hd-float row copies; the outer index space
+		/// is split on CpuParallel by element count. The generic iterator this replaces paid a
+		/// delegate call per 8 elements (or per element when the last dim is not a multiple of 8).
+		/// </summary>
+		unsafe static bool TryCopyStridedSimd(Tensor result, Tensor src)
+		{
+			if (!CpuKernels.Enabled || result.ElementType != DType.Float32 || src.ElementType != DType.Float32 ||
+				result.DimensionCount != src.DimensionCount)
+			{
+				return false;
+			}
+
+			int dims = result.DimensionCount;
+			for (int d = 0; d < dims; d++)
+			{
+				if (result.Sizes[d] != src.Sizes[d])
+					return false;
+			}
+
+			long[] size = new long[Math.Max(1, dims)];
+			long[] rs = new long[Math.Max(1, dims)];
+			long[] ss = new long[Math.Max(1, dims)];
+			int nd = 0;
+			for (int d = 0; d < dims; d++)
+			{
+				long sz = result.Sizes[d];
+				if (sz == 1)
+					continue;
+				if (sz == 0)
+					return true;
+
+				long r = result.Strides[d], s = src.Strides[d];
+				if (nd > 0 && rs[nd - 1] == r * sz && ss[nd - 1] == s * sz)
+				{
+					size[nd - 1] *= sz;
+					rs[nd - 1] = r;
+					ss[nd - 1] = s;
+				}
+				else
+				{
+					size[nd] = sz;
+					rs[nd] = r;
+					ss[nd] = s;
+					nd++;
+				}
+			}
+
+			float* rBase = (float*)CpuNativeHelpers.GetBufferStart(result);
+			float* sBase = (float*)CpuNativeHelpers.GetBufferStart(src);
+			if (nd == 0)
+			{
+				*rBase = *sBase;
+				return true;
+			}
+
+			long inner = size[nd - 1];
+			long rInner = rs[nd - 1], sInner = ss[nd - 1];
+			int outerDims = nd - 1;
+			long outer = 1;
+			for (int d = 0; d < outerDims; d++)
+				outer *= size[d];
+
+			CpuParallel.ForRange(outer, Math.Max(1, (64 * 1024) / inner), [MethodImpl(MethodImplOptions.AggressiveOptimization)] (start, end) =>
+			{
+				long[] idx = new long[Math.Max(1, outerDims)];
+				long ro = 0, so = 0, rem = start;
+				for (int d = outerDims - 1; d >= 0; d--)
+				{
+					idx[d] = rem % size[d];
+					rem /= size[d];
+					ro += idx[d] * rs[d];
+					so += idx[d] * ss[d];
+				}
+
+				for (long o = start; o < end; o++)
+				{
+					float* rp = rBase + ro;
+					float* sp = sBase + so;
+					if (rInner == 1 && sInner == 1)
+					{
+						Buffer.MemoryCopy(sp, rp, inner * sizeof(float), inner * sizeof(float));
+					}
+					else
+					{
+						for (long i = 0; i < inner; i++)
+							rp[i * rInner] = sp[i * sInner];
+					}
+
+					for (int d = outerDims - 1; d >= 0; d--)
+					{
+						ro += rs[d];
+						so += ss[d];
+						if (++idx[d] < size[d])
+							break;
+						ro -= size[d] * rs[d];
+						so -= size[d] * ss[d];
+						idx[d] = 0;
+					}
+				}
+			});
+
+			return true;
+		}
 
 		unsafe public static void Sum(Tensor result, Tensor src, int dimension)
 		{
@@ -968,6 +1081,12 @@ namespace TensorSharp
 
 			int colCount = (int)cols;
 			int rows = lhsLength / colCount;
+			if (CpuKernels.Enabled)
+			{
+				CpuKernels.BinaryRowBroadcast(ToKernelOp(op), resultPtr, lhsPtr, rhsPtr, rows, colCount);
+				return true;
+			}
+
 			int simdWidth = Vector<float>.Count;
 			System.Threading.Tasks.Parallel.For(0, rows, r =>
 			{
@@ -1002,8 +1121,55 @@ namespace TensorSharp
 			return true;
 		}
 
+		private static CpuKernels.BinaryOp ToKernelOp(RowBroadcastOp op) => op switch
+		{
+			RowBroadcastOp.Add => CpuKernels.BinaryOp.Add,
+			RowBroadcastOp.Sub => CpuKernels.BinaryOp.Sub,
+			RowBroadcastOp.Mul => CpuKernels.BinaryOp.Mul,
+			_ => CpuKernels.BinaryOp.Div,
+		};
+
+		/// <summary>
+		/// SIMD + parallel tensor-tensor path (CpuKernels): equal-length contiguous operands, or the
+		/// x[rows, cols] OP row[cols] broadcast. False leaves the caller on its previous loops.
+		/// </summary>
+		unsafe static bool TryBinarySimd(Tensor result, Tensor lhs, Tensor rhs, RowBroadcastOp op)
+		{
+			if (!CpuKernels.Enabled)
+				return false;
+
+			if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+				TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
+				TryGetContiguousFloat(rhs, out float* rhsPtr, out int rhsLength) &&
+				length == lhsLength && length == rhsLength)
+			{
+				CpuKernels.Binary(ToKernelOp(op), resultPtr, lhsPtr, rhsPtr, length);
+				return true;
+			}
+
+			return TryRowBroadcast(result, lhs, rhs, op);
+		}
+
+		/// <summary>SIMD + parallel tensor-scalar path; scalarOnLeft computes value OP src.</summary>
+		unsafe static bool TryScalarSimd(Tensor result, Tensor src, float value, CpuKernels.BinaryOp op, bool scalarOnLeft = false)
+		{
+			if (CpuKernels.Enabled &&
+				TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+				TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+				length == srcLength)
+			{
+				CpuKernels.BinaryScalar(op, resultPtr, srcPtr, value, length, scalarOnLeft);
+				return true;
+			}
+
+			return false;
+		}
+
 		unsafe public static void Add(Tensor result, Tensor lhs, Tensor rhs)
 		{
+			if (TryBinarySimd(result, lhs, rhs, RowBroadcastOp.Add))
+				return;
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
                 TryGetContiguousFloat(rhs, out float* rhsPtr, out int rhsLength) &&
@@ -1061,6 +1227,9 @@ namespace TensorSharp
 
 		unsafe public static void Sub(Tensor result, Tensor lhs, Tensor rhs)
 		{
+			if (TryBinarySimd(result, lhs, rhs, RowBroadcastOp.Sub))
+				return;
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
                 TryGetContiguousFloat(rhs, out float* rhsPtr, out int rhsLength) &&
@@ -1118,6 +1287,9 @@ namespace TensorSharp
 
 		unsafe public static void Add(Tensor result, Tensor src, float value)
 		{
+			if (TryScalarSimd(result, src, value, CpuKernels.BinaryOp.Add))
+				return;
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
@@ -1181,6 +1353,9 @@ namespace TensorSharp
 
 		unsafe public static void RSub(Tensor result, float value, Tensor src)
 		{
+			if (TryScalarSimd(result, src, value, CpuKernels.BinaryOp.Sub, scalarOnLeft: true))
+				return;
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
@@ -1232,8 +1407,25 @@ namespace TensorSharp
 
 
 
+		/// <summary>result = value / src (elementwise).</summary>
+		unsafe public static void RDiv(Tensor result, float value, Tensor src)
+		{
+			if (TryScalarSimd(result, src, value, CpuKernels.BinaryOp.Div, scalarOnLeft: true))
+				return;
+
+			unsafe void func(float* r, float* s)
+			{
+				*r = value / *s;
+			}
+
+			Apply2(result, src, func);
+		}
+
 		unsafe public static void Mul(Tensor result, Tensor src, float value)
 		{
+			if (TryScalarSimd(result, src, value, CpuKernels.BinaryOp.Mul))
+				return;
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
@@ -1285,6 +1477,9 @@ namespace TensorSharp
 
 		unsafe public static void Div(Tensor result, Tensor lhs, float rhs)
 		{
+			if (TryScalarSimd(result, lhs, rhs, CpuKernels.BinaryOp.Div))
+				return;
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
                 length == lhsLength)
@@ -1335,6 +1530,9 @@ namespace TensorSharp
 
 		unsafe public static void Mul(Tensor result, Tensor lhs, Tensor rhs)
 		{
+			if (TryBinarySimd(result, lhs, rhs, RowBroadcastOp.Mul))
+				return;
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
                 TryGetContiguousFloat(rhs, out float* rhsPtr, out int rhsLength) &&
@@ -1393,6 +1591,9 @@ namespace TensorSharp
 
 		unsafe public static void Div(Tensor result, Tensor lhs, Tensor rhs)
 		{
+			if (TryBinarySimd(result, lhs, rhs, RowBroadcastOp.Div))
+				return;
+
 			// Row-broadcast (x[rows, cols] / bias[cols]) - see TryRowBroadcast.
 			if (TryRowBroadcast(result, lhs, rhs, RowBroadcastOp.Div))
 				return;
@@ -1515,8 +1716,50 @@ namespace TensorSharp
 
 
 
+		/// <summary>Contiguous equal-length operands for a CpuKernels unary kernel.</summary>
+		unsafe static bool TryUnarySimd(Tensor result, Tensor src, out float* resultPtr, out float* srcPtr, out int length)
+		{
+			srcPtr = null;
+			if (CpuKernels.Enabled &&
+				TryGetContiguousFloat(result, out resultPtr, out length) &&
+				TryGetContiguousFloat(src, out srcPtr, out int srcLength) &&
+				length == srcLength)
+			{
+				return true;
+			}
+
+			resultPtr = null;
+			length = 0;
+			return false;
+		}
+
+		/// <summary>Contiguous equal-length operands for a CpuKernels gated (two-input) kernel.</summary>
+		unsafe static bool TryGatedSimd(Tensor result, Tensor a, Tensor b, out float* resultPtr, out float* aPtr, out float* bPtr, out int length)
+		{
+			aPtr = null;
+			bPtr = null;
+			if (CpuKernels.Enabled &&
+				TryGetContiguousFloat(result, out resultPtr, out length) &&
+				TryGetContiguousFloat(a, out aPtr, out int aLength) &&
+				TryGetContiguousFloat(b, out bPtr, out int bLength) &&
+				length == aLength && length == bLength)
+			{
+				return true;
+			}
+
+			resultPtr = null;
+			length = 0;
+			return false;
+		}
+
 		unsafe static public void Sigmoid(Tensor result, Tensor src)
 		{
+			if (TryUnarySimd(result, src, out float* rSimd, out float* sSimd, out int nSimd))
+			{
+				CpuKernels.Sigmoid(rSimd, sSimd, nSimd);
+				return;
+			}
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
@@ -1541,6 +1784,12 @@ namespace TensorSharp
 
 		unsafe static public void Tanh(Tensor result, Tensor src)
 		{
+			if (TryUnarySimd(result, src, out float* rSimd, out float* sSimd, out int nSimd))
+			{
+				CpuKernels.Tanh(rSimd, sSimd, nSimd);
+				return;
+			}
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
@@ -1586,6 +1835,12 @@ namespace TensorSharp
 
         unsafe static public void Exp(Tensor result, Tensor src)
         {
+            if (TryUnarySimd(result, src, out float* rSimd, out float* sSimd, out int nSimd))
+            {
+                CpuKernels.Exp(rSimd, sSimd, nSimd);
+                return;
+            }
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
@@ -1607,6 +1862,12 @@ namespace TensorSharp
 
 		unsafe static public void SiLU(Tensor result, Tensor src)
 		{
+			if (TryUnarySimd(result, src, out float* rSimd, out float* sSimd, out int nSimd))
+			{
+				CpuKernels.SiLU(rSimd, sSimd, nSimd);
+				return;
+			}
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
@@ -1625,6 +1886,12 @@ namespace TensorSharp
 
 		unsafe static public void GELU(Tensor result, Tensor src)
 		{
+			if (TryUnarySimd(result, src, out float* rSimd, out float* sSimd, out int nSimd))
+			{
+				CpuKernels.Gelu(rSimd, sSimd, nSimd);
+				return;
+			}
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
@@ -1646,6 +1913,12 @@ namespace TensorSharp
 
 		unsafe static public void GELUMul(Tensor result, Tensor gate, Tensor up)
 		{
+			if (TryGatedSimd(result, gate, up, out float* rSimd, out float* gSimd, out float* uSimd, out int nSimd))
+			{
+				CpuKernels.GeluMul(rSimd, gSimd, uSimd, nSimd);
+				return;
+			}
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(gate, out float* gatePtr, out int gateLength) &&
                 TryGetContiguousFloat(up, out float* upPtr, out int upLength) &&
@@ -1668,6 +1941,12 @@ namespace TensorSharp
 
 		unsafe static public void SiLUMul(Tensor result, Tensor gate, Tensor up)
 		{
+			if (TryGatedSimd(result, gate, up, out float* rSimd, out float* gSimd, out float* uSimd, out int nSimd))
+			{
+				CpuKernels.SiLUMul(rSimd, gSimd, uSimd, nSimd);
+				return;
+			}
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(gate, out float* gatePtr, out int gateLength) &&
                 TryGetContiguousFloat(up, out float* upPtr, out int upLength) &&
@@ -1694,6 +1973,12 @@ namespace TensorSharp
 			if (!(limit > 0.0f))
 			{
 				SiLUMul(result, gate, up);
+				return;
+			}
+
+			if (TryGatedSimd(result, gate, up, out float* rSimd, out float* gSimd, out float* uSimd, out int nSimd))
+			{
+				CpuKernels.SiLUMulClamp(rSimd, gSimd, uSimd, nSimd, limit);
 				return;
 			}
 
@@ -1743,6 +2028,12 @@ namespace TensorSharp
 
 		unsafe static public void SigmoidMul(Tensor result, Tensor x, Tensor gate)
 		{
+			if (TryGatedSimd(result, x, gate, out float* rSimd, out float* xSimd, out float* gSimd, out int nSimd))
+			{
+				CpuKernels.SigmoidMul(rSimd, xSimd, gSimd, nSimd);
+				return;
+			}
+
             if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
                 TryGetContiguousFloat(x, out float* xPtr, out int xLength) &&
                 TryGetContiguousFloat(gate, out float* gatePtr, out int gateLength) &&
@@ -1902,7 +2193,14 @@ namespace TensorSharp
                 }
             }
 
-            if (ShouldParallelize(sliceCount, repeats * sliceSize))
+            if (CpuKernels.Enabled)
+            {
+                CpuParallel.ForRange(sliceCount, Math.Max(1, (64 * 1024) / Math.Max(1, (long)repeats * sliceSize)), (s, e) =>
+                {
+                    for (long i = s; i < e; i++) CopySlice((int)i);
+                });
+            }
+            else if (ShouldParallelize(sliceCount, repeats * sliceSize))
             {
                 Parallel.For(0, sliceCount, CopySlice);
             }
@@ -1940,7 +2238,14 @@ namespace TensorSharp
             }
         }
 
-        if (ShouldParallelize(totalRows, cols))
+        if (CpuKernels.Enabled)
+        {
+            CpuParallel.ForRange(totalRows, Math.Max(1, (64 * 1024) / Math.Max(1, cols)), (s, e) =>
+            {
+                for (long row = s; row < e; row++) MaskRow((int)row);
+            });
+        }
+        else if (ShouldParallelize(totalRows, cols))
         {
             Parallel.For(0, totalRows, MaskRow);
         }
@@ -2083,6 +2388,13 @@ namespace TensorSharp
                 int* positionInts = useIntPositions ? (int*)CpuNativeHelpers.GetBufferStart(positions) : null;
                 float* positionFloats = useIntPositions ? null : (float*)CpuNativeHelpers.GetBufferStart(positions);
 
+                if (CpuKernels.Enabled)
+                {
+                    RoPEExRowsSimd(result, src, rows, cols, pairCount, isNeoX, useYarn, invFreqBuffer,
+                        freqScale, corrDimLow, corrDimHigh, extFactor, mscale, positionInts, positionFloats);
+                    return;
+                }
+
                 void ApplyRow(int row)
                 {
                     float* resultRow = result + row * cols;
@@ -2159,6 +2471,95 @@ namespace TensorSharp
             }
         }
 
+        /// <summary>
+        /// RoPEEx rows on CpuParallel. Rows are usually laid out [seq, heads], so consecutive rows
+        /// share a position: the cos/sin table is rebuilt only when the position changes (the
+        /// previous loop paid 2 * pairCount trig calls per row, i.e. per head). The table values
+        /// and the rotation arithmetic are exactly the scalar ones; the NeoX halves rotate as
+        /// vectors, the interleaved layout stays scalar.
+        /// </summary>
+        unsafe static private void RoPEExRowsSimd(float* result, float* src, int rows, int cols, int pairCount, bool isNeoX,
+            bool useYarn, float[] invFreq, float freqScale, float corrDimLow, float corrDimHigh, float extFactor, float mscale,
+            int* positionInts, float* positionFloats)
+        {
+            long rowBytes = (long)cols * sizeof(float);
+            CpuParallel.ForRange(rows, Math.Max(1, (8 * 1024) / Math.Max(1, cols)), [MethodImpl(MethodImplOptions.AggressiveOptimization)] (start, end) =>
+            {
+                float[] cosTable = new float[pairCount];
+                float[] sinTable = new float[pairCount];
+                int lastPosition = 0;
+                bool haveTable = false;
+                fixed (float* cosT = cosTable, sinT = sinTable)
+                {
+                    for (long row = start; row < end; row++)
+                    {
+                        float* resultRow = result + row * cols;
+                        float* srcRow = src + row * cols;
+                        if (resultRow != srcRow)
+                        {
+                            Buffer.MemoryCopy(srcRow, resultRow, rowBytes, rowBytes);
+                        }
+
+                        int position = positionInts != null ? positionInts[row] : (int)positionFloats[row];
+                        if (!haveTable || position != lastPosition)
+                        {
+                            for (int i = 0; i < pairCount; i++)
+                            {
+                                float thetaExtrap = position * invFreq[i];
+                                if (useYarn)
+                                {
+                                    YarnRoPE(thetaExtrap, freqScale, corrDimLow, corrDimHigh, i, extFactor, mscale, out cosT[i], out sinT[i]);
+                                }
+                                else
+                                {
+                                    float angle = thetaExtrap * freqScale;
+                                    cosT[i] = MathF.Cos(angle);
+                                    sinT[i] = MathF.Sin(angle);
+                                }
+                            }
+                            lastPosition = position;
+                            haveTable = true;
+                        }
+
+                        if (isNeoX)
+                        {
+                            int half = pairCount;
+                            int i = 0;
+                            if (Vector256.IsHardwareAccelerated)
+                            {
+                                for (; i + 8 <= half; i += 8)
+                                {
+                                    Vector256<float> left = Vector256.Load(srcRow + i);
+                                    Vector256<float> right = Vector256.Load(srcRow + i + half);
+                                    Vector256<float> c = Vector256.Load(cosT + i);
+                                    Vector256<float> s = Vector256.Load(sinT + i);
+                                    Vector256.Store(left * c - right * s, resultRow + i);
+                                    Vector256.Store(right * c + left * s, resultRow + i + half);
+                                }
+                            }
+                            for (; i < half; i++)
+                            {
+                                float left = srcRow[i];
+                                float right = srcRow[i + half];
+                                resultRow[i] = left * cosT[i] - right * sinT[i];
+                                resultRow[i + half] = right * cosT[i] + left * sinT[i];
+                            }
+                        }
+                        else
+                        {
+                            for (int i = 0, pair = 0; i < pairCount; ++i, pair += 2)
+                            {
+                                float left = srcRow[pair];
+                                float right = srcRow[pair + 1];
+                                resultRow[pair] = left * cosT[i] - right * sinT[i];
+                                resultRow[pair + 1] = right * cosT[i] + left * sinT[i];
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         static private float YarnCorrDim(int nDims, int nCtxOrig, float nRot, float freqBase)
         {
             return nDims * MathF.Log(nCtxOrig / (nRot * 2.0f * MathF.PI)) / (2.0f * MathF.Log(freqBase));
@@ -2223,6 +2624,15 @@ namespace TensorSharp
 
 		unsafe static public void Softmax(Tensor tOut, Tensor tIn, int rows, int cols)
 		{
+			if (CpuKernels.Enabled &&
+				TryGetContiguousRows(tOut, out float* simdOut, out int simdOutRows, out int simdOutCols) &&
+				TryGetContiguousRows(tIn, out float* simdIn, out int simdInRows, out int simdInCols) &&
+				rows == simdOutRows && rows == simdInRows && cols == simdOutCols && cols == simdInCols)
+			{
+				CpuKernels.SoftmaxRows(simdOut, simdIn, rows, cols);
+				return;
+			}
+
             if (TryGetContiguousRows(tOut, out float* contiguousOut, out int outRows, out int outCols) &&
                 TryGetContiguousRows(tIn, out float* contiguousIn, out int inRows, out int inCols) &&
                 rows == outRows && rows == inRows && cols == outCols && cols == inCols)
@@ -2410,7 +2820,14 @@ namespace TensorSharp
                     }
                 }
 
-                if (ShouldParallelize(rows, cols))
+                if (CpuKernels.Enabled)
+                {
+                    CpuParallel.ForRange(rows, Math.Max(1, (64 * 1024) / Math.Max(1, cols)), (s, e) =>
+                    {
+                        for (long row = s; row < e; row++) CopyRow((int)row);
+                    });
+                }
+                else if (ShouldParallelize(rows, cols))
                 {
                     Parallel.For(0, rows, CopyRow);
                 }
@@ -2486,9 +2903,24 @@ namespace TensorSharp
 			int rows,
 			int cols)
 		{
+			if (CpuKernels.Enabled && gamma_ != null &&
+				TryGetContiguousRows(out_, out float* simdOut, out int simdOutRows, out int simdOutCols) &&
+				TryGetContiguousRows(in_, out float* simdIn, out int simdInRows, out int simdInCols) &&
+				TryGetContiguousFloat(gamma_, out float* simdGamma, out int simdGammaLength) &&
+				rows == simdOutRows && rows == simdInRows && cols == simdOutCols && cols == simdInCols &&
+				simdGammaLength == cols)
+			{
+				float* simdBeta = null;
+				if (beta_ == null || (TryGetContiguousFloat(beta_, out simdBeta, out int simdBetaLength) && simdBetaLength == cols))
+				{
+					CpuKernels.LayerNormRows(simdOut, simdIn, simdGamma, simdBeta, rows, cols, eps);
+					return;
+				}
+			}
+
 			float* outPtr = (float*)CpuNativeHelpers.GetBufferStart(out_);
 			float* inPtr = (float*)CpuNativeHelpers.GetBufferStart(in_);
-			float* alpha = (float*)CpuNativeHelpers.GetBufferStart(gamma_);
+			float* alpha = (float*)CpuNativeHelpers.GetBufferStart(gamma_!);
 			float* beta = (beta_ != null) ? (float*)CpuNativeHelpers.GetBufferStart(beta_) : null;
 
 			for (int j = 0; j < rows; ++j)
@@ -2592,6 +3024,12 @@ namespace TensorSharp
                 float* betaPtr = beta_ != null ? (float*)CpuNativeHelpers.GetBufferStart(beta_) : null;
                 bool hasBiasFast = betaPtr != null;
                 bool hasGamma = gammaPtr != null;
+                if (CpuKernels.Enabled)
+                {
+                    // Same semantics as the loops below: without a gain the bias is not applied.
+                    CpuKernels.RmsNormRows(contiguousOut, contiguousIn, gammaPtr, hasGamma ? betaPtr : null, rows, cols, eps);
+                    return;
+                }
                 float colsAsFloat = cols;
                 int vectorSize = Vector<float>.Count;
 
