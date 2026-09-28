@@ -403,7 +403,8 @@ public sealed unsafe class QwenImageCpuKernelTests
         // rows into >= 3 blocks and packs B once for all of them (the path attn_k / attn_v take
         // for a 133+ token prompt); the single-block serial run is the reference.
         int outDim = 64, inDim = 512, seq = 150;
-        using var pool = new CpuWorkerPool(4);
+        using var pool4 = new CpuWorkerPool(4);
+        var pool = CpuWorkers.On(pool4);
         int savedKc = CpuPackedGemm.KcBlock;
         try
         {
@@ -476,12 +477,19 @@ public sealed unsafe class QwenImageCpuKernelTests
         float[] a = Random(rng, (long)m * k), b = Random(rng, (long)k * n);
         using var pool3 = new CpuWorkerPool(3);
         using var pool4 = new CpuWorkerPool(4);
+        // Every kind of worker set: dedicated pools of two widths, the shared pool, the VAE's wide
+        // one, and the Parallel.For fallback TS_CPU_POOL=0 selects (two widths).
+        var workers = new[]
+        {
+            CpuWorkers.On(pool3), CpuWorkers.On(pool4), CpuWorkers.Shared, CpuPackedGemm.WidePool,
+            CpuWorkers.OnThreadPool(3), CpuWorkers.OnThreadPool(Environment.ProcessorCount),
+        };
         fixed (float* xp = x, wp = weight, bp = bias, ap = a, bbp = b)
         {
             var packedW = CpuPackedGemm.PackA(wp, oc, ic * 9, ic * 9, 1, isa);
             var packedA = CpuPackedGemm.PackA(ap, m, k, k, 1, isa);
             nint xL = (nint)xp, bL = (nint)bp, bbL = (nint)bbp;
-            float[] Conv(CpuWorkerPool p, bool serial)
+            float[] Conv(CpuWorkers p, bool serial)
             {
                 var y = new float[oc * h * w];
                 fixed (float* yp = y)
@@ -489,15 +497,15 @@ public sealed unsafe class QwenImageCpuKernelTests
                         biasM: (float*)bL, pool: p, serial: serial);
                 return y;
             }
-            float[] Linear(CpuWorkerPool p, bool serial)
+            float[] Linear(CpuWorkers p, bool serial)
             {
                 var y = new float[m * n];
                 fixed (float* yp = y)
                     CpuPackedGemm.Gemm(packedA, new StridedPanelSource((float*)bbL, n, 1, n), n, yp, n, pool: p, serial: serial);
                 return y;
             }
-            float[] conv = Conv(pool3, serial: true), linear = Linear(pool3, serial: true);
-            foreach (var p in new[] { pool3, pool4, CpuWorkerPool.Shared })
+            float[] conv = Conv(workers[0], serial: true), linear = Linear(workers[0], serial: true);
+            foreach (var p in workers)
             {
                 Assert.Equal(conv, Conv(p, serial: false));
                 Assert.Equal(linear, Linear(p, serial: false));
@@ -604,7 +612,7 @@ public sealed unsafe class QwenImageCpuKernelTests
             WithIsa(isa, () =>
             {
                 fixed (float* pq = q, pk = k, pv = v, po = actual)
-                    CpuFullAttention.Run(pq, pk, pv, po, n, heads, dim, scale, workspace, pool);
+                    CpuFullAttention.Run(pq, pk, pv, po, n, heads, dim, scale, workspace, CpuWorkers.On(pool));
                 return 0;
             });
             AssertClose(expected, actual, 3e-6, 3e-5, $"{isa} vision attention n={n} heads={heads} dim={dim}");

@@ -61,8 +61,19 @@ public class DiffusionGemmaTests
             _output.WriteLine("No diffusion-gemma GGUF available; skipping");
             return null;
         }
-        // Exercise the GPU path on macOS (ggml_metal), CPU elsewhere. TS_TEST_BACKEND overrides
-        // (e.g. ggmlcuda on a Windows/Linux CUDA box), mirroring TS_REPRO_BACKEND elsewhere.
+        BackendType backend = TestBackend();
+        _output.WriteLine($"[diffusion-gemma] loading {Path.GetFileName(modelPath)} on {backend}");
+        _loadedBackend = backend;
+        var model = (DiffusionGemmaModel)ModelBase.Create(modelPath, backend);
+        return model;
+    }
+
+    /// <summary>The backend these tests load: the GPU path on macOS (ggml_metal), ggml_cpu
+    /// elsewhere. TS_TEST_BACKEND overrides it (e.g. ggmlcuda on a Windows/Linux CUDA box, cpu
+    /// for the pure-C# backend), mirroring TS_REPRO_BACKEND elsewhere. Shared with
+    /// <see cref="DiffusionGemmaDeviceKvFactAttribute"/>, which decides skips at discovery.</summary>
+    internal static BackendType TestBackend()
+    {
         BackendType backend = OperatingSystem.IsMacOS() ? BackendType.GgmlMetal : BackendType.GgmlCpu;
         string backendEnv = Environment.GetEnvironmentVariable("TS_TEST_BACKEND");
         if (!string.IsNullOrWhiteSpace(backendEnv))
@@ -78,11 +89,38 @@ public class DiffusionGemmaTests
                 _ => backend,
             };
         }
-        _output.WriteLine($"[diffusion-gemma] loading {Path.GetFileName(modelPath)} on {backend}");
-        _loadedBackend = backend;
-        var model = (DiffusionGemmaModel)ModelBase.Create(modelPath, backend);
-        return model;
+        return backend;
     }
+
+    /// <summary>Why a test of the device side of the prompt-KV cache cannot run on
+    /// <paramref name="backend"/>, or null when it can. That side exists only on the device-glue
+    /// backends (the ones DiffusionGemmaModel enables it for): ggml_cpu has no prompt-KV cache, the
+    /// pure-C# cpu backend keeps its prompt K/V on the host, and DIFFUSION_NO_PKV=1 turns the cache
+    /// off everywhere. Decided at discovery (<see cref="DiffusionGemmaDeviceKvFactAttribute"/>), so
+    /// such a run reports the test as skipped instead of loading the model and passing unchecked.</summary>
+    internal static string DeviceKvSkipReason(BackendType backend, string noPkvEnv)
+    {
+        if (noPkvEnv == "1")
+            return "Device prompt-KV behaviour: DIFFUSION_NO_PKV=1 turns the prompt-KV cache off.";
+        return backend switch
+        {
+            BackendType.GgmlMetal or BackendType.GgmlCuda or BackendType.Mlx or BackendType.Cuda => null,
+            BackendType.Cpu => "Device prompt-KV behaviour: the pure-C# cpu backend keeps prompt K/V on the host (TS_TEST_BACKEND=cpu).",
+            _ => $"Device prompt-KV behaviour: {backend} has no prompt-KV cache (set TS_TEST_BACKEND=ggmlcuda, ggmlmetal, mlx or cuda).",
+        };
+    }
+
+    [Theory]
+    [InlineData(BackendType.GgmlCuda, "", true)]
+    [InlineData(BackendType.GgmlMetal, "", true)]
+    [InlineData(BackendType.Mlx, "", true)]
+    [InlineData(BackendType.Cuda, "", true)]
+    [InlineData(BackendType.GgmlCpu, "", false)]   // the default backend off macOS
+    [InlineData(BackendType.Cpu, "", false)]
+    [InlineData(BackendType.GgmlCuda, "1", false)]
+    [InlineData(BackendType.GgmlCuda, "0", true)]
+    public void DeviceKvTests_RunOnlyWhereTheDeviceCacheExists(BackendType backend, string noPkvEnv, bool runs)
+        => Assert.Equal(runs, DeviceKvSkipReason(backend, noPkvEnv) == null);
 
     private int[] RenderPrompt(DiffusionGemmaModel model, string text)
     {
@@ -469,17 +507,13 @@ public class DiffusionGemmaTests
     // (kIOGPUCommandBufferCallbackErrorOutOfMemory). The fix (ReleasePromptKvTensor) frees the cached
     // device copy before disposing each K/V tensor. This test reallocates the prompt K/V many times and
     // asserts the resident device-copy bytes stay bounded (≈ one prefill's K/V), not growing per prefill.
-    [ModelFact(EnvModelDir, GgufPattern)]
+    [DiffusionGemmaDeviceKvFact(EnvModelDir, GgufPattern)]
     public void PromptKvCache_DeviceCopiesDoNotLeakAcrossPrefills()
     {
         using var model = TryLoad();
         if (model == null) return;
-        // The pure-C# cpu backend caches prompt K/V too, but on the host: there are no device copies.
-        if (!model.SupportsPromptKvCache || _loadedBackend == BackendType.Cpu)
-        {
-            _output.WriteLine("[diffusion-gemma][leak] CPU backend (no device K/V copies); skipping");
-            return;
-        }
+        // The attribute admits only backends whose prompt-KV cache is on (see DeviceKvSkipReason).
+        Assert.True(model.SupportsPromptKvCache, $"prompt-KV cache is off on {_loadedBackend}");
 
         var prompt = RenderPrompt(model, "List three primary colors and briefly explain additive color mixing.");
         int C = model.CanvasLength;
@@ -518,16 +552,12 @@ public class DiffusionGemmaTests
     // every block of every turn leaked its prompt K/V device copies. Asserts generation keeps succeeding
     // and resident device memory stays bounded across turns. Uses a fixed prompt so the per-turn resident
     // footprint is constant (isolates the leak from the natural growth of an accumulating chat history).
-    [ModelFact(EnvModelDir, GgufPattern)]
+    [DiffusionGemmaDeviceKvFact(EnvModelDir, GgufPattern)]
     public void MultiTurn_Generation_DoesNotLeakDeviceMemory()
     {
         using var model = TryLoad();
         if (model == null) return;
-        if (!model.SupportsPromptKvCache || _loadedBackend == BackendType.Cpu)
-        {
-            _output.WriteLine("[diffusion-gemma][leak] CPU backend; skipping multi-turn device-memory test");
-            return;
-        }
+        Assert.True(model.SupportsPromptKvCache, $"prompt-KV cache is off on {_loadedBackend}");
 
         var prompt = RenderPrompt(model, "Describe the video game Final Fantasy VII in two or three sentences.");
         var sampler = new DiffusionGemmaSampler(model);
@@ -729,17 +759,12 @@ public class DiffusionGemmaTests
     // throughput; worse, the per-op batched forward is markedly slower per canvas than the fused kernel, so
     // the fused time-slice wins. This benchmark proves that ordering (so the scheduler default is correct)
     // and reports the numbers. Skipped without a GPU/PKV backend.
-    [ModelFact(EnvModelDir, GgufPattern)]
+    [DiffusionGemmaDeviceKvFact(EnvModelDir, GgufPattern)]
     public void Benchmark_BatchedDecodeThroughput()
     {
         using var model = TryLoad();
         if (model == null) return;
-        // The fused single-canvas kernel this ordering is about exists only on the GPU backends.
-        if (!model.SupportsPromptKvCache || _loadedBackend == BackendType.Cpu)
-        {
-            _output.WriteLine("[diffusion-gemma][bench] CPU backend; skipping throughput benchmark");
-            return;
-        }
+        Assert.True(model.SupportsPromptKvCache, $"prompt-KV cache is off on {_loadedBackend}");
 
         var prompt = RenderPrompt(model, "Explain in two sentences why the sky is blue.");
         int C = model.CanvasLength;
@@ -796,4 +821,23 @@ public class DiffusionGemmaTests
         Assert.True(sliceTwoMs < batchedMs,
             $"fused time-slice for 2 requests ({sliceTwoMs:F0} ms) was not faster than per-op batched ({batchedMs:F0} ms) — the scheduler default may be wrong for this hardware");
     }
+}
+
+/// <summary>
+/// [ModelFact] for a DiffusionGemma test about the device side of the prompt-KV cache (resident
+/// device copies, the fused single-canvas GPU kernel). It runs only on the device-glue backends
+/// with the cache on; elsewhere (ggml_cpu, the default off macOS; the pure-C# cpu backend, which
+/// keeps prompt K/V on the host; DIFFUSION_NO_PKV=1) the test is reported as skipped at discovery
+/// instead of returning early as a pass. See <see cref="DiffusionGemmaTests.DeviceKvSkipReason"/>.
+/// </summary>
+[Xunit.Sdk.TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class DiffusionGemmaDeviceKvFactAttribute : FactAttribute, Xunit.Sdk.ITraitAttribute
+{
+    public string RequiresValue => "Models";
+
+    public DiffusionGemmaDeviceKvFactAttribute(string envVar, string ggufContains = null)
+        => Skip = TestGates.ModelSkip(envVar, ggufContains)
+            ?? DiffusionGemmaTests.DeviceKvSkipReason(DiffusionGemmaTests.TestBackend(),
+                Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV"));
 }

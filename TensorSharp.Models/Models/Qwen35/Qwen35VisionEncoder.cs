@@ -1161,7 +1161,7 @@ namespace TensorSharp.Models
             if (UseCpuLinear)
             {
                 _weights.TryGetValue(biasName, out var cpuBias);
-                return CpuLinear(input, weightName, _weights[weightName], cpuBias);
+                return CpuLinear(input, weightName, null, cpuBias);
             }
             // Derived from the transposed copy, not _weights[weightName]: on the
             // direct-CUDA path the untransposed original is released once the
@@ -1201,17 +1201,39 @@ namespace TensorSharp.Models
         /// y[seq, out] = x[seq, in] W^T + b on the pure-C# backend: the packed SGEMM with W
         /// packed once per weight into NR-column panels (it replaces the transposed F32 copy
         /// the generic path keeps), x packed per call, and the bias folded into the tile init.
+        /// A null <paramref name="weight"/> means the <c>_weights</c> entry <paramref name="key"/>,
+        /// which is released once packed: nothing on this path reads it again, so the encoder
+        /// holds one copy of its linear weights instead of two (the Qwen3-VL-8B F16 mmproj's
+        /// are ~2.3 GB as F32). Such a pack then keeps the ISA it was made with.
         /// </summary>
         private unsafe Tensor CpuLinear(Tensor input, string key, Tensor weight, Tensor bias)
         {
             var isa = QwenImage.CpuPackedGemm.Isa;
-            int outDim = (int)weight.Sizes[0], inDim = (int)weight.Sizes[1];
-            if (!_cpuPackedWeights.TryGetValue(key, out var packed) || packed.Isa != isa)
+            QwenImage.PackedPanels packed;
+            // Locked: once the F32 source is released, a second encode that missed the cache
+            // would find neither the pack nor the weight.
+            lock (_cpuPackedWeights)
             {
-                using var contiguousWeight = weight.IsContiguous() ? null : Ops.NewContiguous(weight);
-                packed = QwenImage.CpuPackedGemm.PackB(GetFloatPtr(contiguousWeight ?? weight), inDim, outDim, 1, inDim, isa);
-                _cpuPackedWeights[key] = packed;
+                // A pack for another ISA (tests switch CpuPackedGemm.Isa) is redone only while its
+                // F32 source still exists.
+                if (!_cpuPackedWeights.TryGetValue(key, out packed) ||
+                    (packed.Isa != isa && (weight != null || _weights.ContainsKey(key))))
+                {
+                    bool release = weight == null;
+                    weight ??= _weights[key];
+                    int n = (int)weight.Sizes[0], k = (int)weight.Sizes[1];
+                    using (var contiguousWeight = weight.IsContiguous() ? null : Ops.NewContiguous(weight))
+                        packed = QwenImage.CpuPackedGemm.PackB(GetFloatPtr(contiguousWeight ?? weight), k, n, 1, k, isa);
+                    _cpuPackedWeights[key] = packed;
+                    if (release)
+                    {
+                        _weights.Remove(key);
+                        weight.Dispose();
+                    }
+                }
             }
+            isa = packed.Isa;
+            int outDim = packed.Rows, inDim = packed.K;
             int seqLen = (int)input.Sizes[0];
             if ((int)input.Sizes[1] != inDim)
                 throw new ArgumentException($"linear {key}: input width {input.Sizes[1]} != weight width {inDim}");

@@ -62,9 +62,11 @@ public class ManagedQuantGemmTests
                 yield return new object[] { type, 9, type == GgmlTensorType.Q8_0 || type == GgmlTensorType.Q5_0 ? 704 : 512, n };
     }
 
+    /// <summary>The per-row path (what every host without AVX2 runs, and the GEMM's
+    /// reference) against the dequantize-then-dot bound, on every host.</summary>
     [Theory]
     [MemberData(nameof(GemmCases))]
-    public unsafe void QGemm_MatchesPerRowPathAndDequantReference(GgmlTensorType type, int rows, int k, int n)
+    public unsafe void PerRowPath_IsWithinTheActivationQuantizationBound(GgmlTensorType type, int rows, int k, int n)
     {
         var rng = new Random(20260927 + (int)type * 131 + rows * 7 + k);
         byte[] weights = BuildRandomWeights(rng, type, n, k);
@@ -73,7 +75,20 @@ public class ManagedQuantGemmTests
 
         float[] legacy = RunAddmm(type, weights, k, n, input, inStride, rows, outStride, QGemmIsa.Legacy);
         AssertWithinActivationQuantBound(type, weights, k, n, input, inStride, rows, outStride, legacy);
+        AssertPaddingUntouched(legacy, rows, n, outStride);
+    }
 
+    [QGemmTheory]
+    [MemberData(nameof(GemmCases))]
+    public unsafe void QGemm_MatchesPerRowPath(GgmlTensorType type, int rows, int k, int n)
+    {
+        // Same inputs as the per-row bound test above, whose reference this compares against.
+        var rng = new Random(20260927 + (int)type * 131 + rows * 7 + k);
+        byte[] weights = BuildRandomWeights(rng, type, n, k);
+        int inStride = k + 5, outStride = n + 3;
+        float[] input = BuildInput(rng, rows, k, inStride);
+
+        float[] legacy = RunAddmm(type, weights, k, n, input, inStride, rows, outStride, QGemmIsa.Legacy);
         float legacyScale = MaxAbs(legacy) + 1e-6f;
         foreach (var isa in AvailableGemmIsas())
         {
@@ -92,7 +107,7 @@ public class ManagedQuantGemmTests
     /// <summary>Every output is computed by one kernel call whose summation
     /// order does not depend on the tile it lands in, so the task partitioning
     /// (single-threaded vs the pool) must not change a single bit.</summary>
-    [Theory]
+    [QGemmTheory]
     [InlineData(GgmlTensorType.Q4_K, 70, 2816, 301)]
     [InlineData(GgmlTensorType.Q6_K, 257, 2816, 64)]
     [InlineData(GgmlTensorType.Q8_0, 70, 2112, 301)]
@@ -535,7 +550,8 @@ public class ManagedQuantGemmTests
             yield return new object[] { type, 70, 12288, 5 };
     }
 
-    [Theory]
+    // Without AVX2 the float panel does not exist and Auto is the column path itself.
+    [QGemmTheory]
     [MemberData(nameof(FloatPanelCases))]
     public unsafe void FloatPanelGemm_MatchesDequantColumnPath(GgmlTensorType type, int rows, int k, int n)
     {
@@ -762,6 +778,18 @@ public sealed class QGemmDefaultRoutingTheoryAttribute : TheoryAttribute
     {
         if (!ManagedQuantizedOps.QGemmRoutingIsBatchInvariant)
             Skip = "The GEMM routing is not the default (TS_CPU_QGEMM / TS_CPU_FGEMM / TS_CPU_QGEMM_MIN_ROWS, or no AVX2).";
+    }
+}
+
+/// <summary>Theory that compares the multi-row GEMM kernels with the per-row path: skipped
+/// (reported, not passed empty) on hosts without AVX2+FMA - ARM64, DOTNET_EnableAVX2=0 -
+/// where no GEMM kernel exists and Auto routes to the per-row path itself.</summary>
+public sealed class QGemmTheoryAttribute : TheoryAttribute
+{
+    public QGemmTheoryAttribute()
+    {
+        if (!ManagedQuantizedOps.QGemmAvx2Supported)
+            Skip = "Requires the AVX2+FMA GEMM kernels (this host runs the per-row path only).";
     }
 }
 

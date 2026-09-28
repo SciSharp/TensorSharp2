@@ -258,8 +258,12 @@ backend ([`DiffusionGemmaModel.Cpu.cs`](../../TensorSharp.Models/Models/Diffusio
   flip. A one-field Jev probability moved by up to ±0.2 between numerically
   equivalent kernels, which is why quality is judged on label decisions below.
 - `DIFFUSION_NO_PKV=1` turns the cache off; `DIFFUSION_CPU_LEGACY=1` restores the
-  whole previous CPU path, and the per-stage switches restore one stage each
-  (table below).
+  previous DiffusionGemma-specific stages, and the per-stage switches restore one
+  stage each (table below). The matmuls, SGEMM and elementwise ops under those
+  stages stay on the backend's new shared kernels, so the previous arithmetic as a
+  whole also needs `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0
+  TS_CPU_SIMD_ELEMENTWISE=0` (see the
+  [environment variable matrix](../env_var_feature_matrix.md#out-of-matrix-pure-c-cpu-backend-knobs)).
 
 Measured on an i7-11800H (8 cores / 16 threads, AVX-512), 32 GB, Windows,
 `diffusiongemma-26B-A4B-it-Q4_K_M.gguf`, with `eng/JevProbe` (structured reads of
@@ -286,7 +290,7 @@ Important toggles:
 | `DIFFUSION_STEPS` | Server-side denoising steps per block, default 48 |
 | `DIFFUSION_MAX_BATCH` | Server diffusion scheduler max active requests, default 2 |
 | `DIFFUSION_NO_PKV=1` | Disable prompt-KV caching on the device-glue backends and `cpu` |
-| `DIFFUSION_CPU_LEGACY=1` | `cpu`: restore the whole previous CPU path (no prompt-KV cache, previous projections, attention, router and MoE) |
+| `DIFFUSION_CPU_LEGACY=1` | `cpu`: restore the previous DiffusionGemma-specific stages (no prompt-KV cache, previous projections, attention, router and MoE); for the previous arithmetic also set `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0` |
 | `DIFFUSION_CPU_LEGACY_MOE` / `_PROJ` / `_ATTN` / `_ROUTER` `=1` | `cpu`: restore one stage. `_ATTN` covers the unified forward only, so an attention A/B also needs `DIFFUSION_NO_PKV=1` |
 | `DIFFUSION_CPU_ATTN_FAST=1` | `cpu`: FMA attention tiles and a vectorized softmax instead of the exact default kernel |
 | `DIFFUSION_CPU_MOE_CHUNK` | `cpu`: tokens per batched-MoE pass, default 512 |

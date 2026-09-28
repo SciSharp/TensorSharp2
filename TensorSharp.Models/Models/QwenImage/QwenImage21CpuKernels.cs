@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
+using TensorSharp.Cpu;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models.QwenImage;
@@ -40,27 +41,16 @@ internal static unsafe class QwenImage21CpuKernels
 
     internal static int DefaultWidth()
     {
-        if (Environment.GetEnvironmentVariable("TS_CPU_DISABLE_AVX512") != "1" &&
-            Vector512.IsHardwareAccelerated && Avx512F.IsSupported)
-            return 16;
-        if (Vector256.IsHardwareAccelerated && Avx2.IsSupported && Fma.IsSupported)
-            return 8;
+        if (CpuIsa.Avx512) return 16;
+        if (CpuIsa.Avx2Fma) return 8;
         return 1;
     }
 
-    // Same escape hatch as ManagedQuantizedOps: TS_CPU_POOL=0 returns to Parallel.For.
-    private static readonly bool PoolEnabled = Environment.GetEnvironmentVariable("TS_CPU_POOL") != "0";
-
-    internal static int Workers => PoolEnabled ? CpuWorkerPool.Shared.ThreadCount : Environment.ProcessorCount;
+    // The shared CPU pool, or Parallel.For under TS_CPU_POOL=0 (see CpuWorkers).
+    internal static int Workers => CpuWorkers.Shared.ThreadCount;
 
     /// <summary>Runs <paramref name="body"/> for every block on the shared CPU pool.</summary>
-    internal static void For(int blocks, Action<int> body)
-    {
-        if (blocks <= 0) return;
-        if (blocks == 1) { body(0); return; }
-        if (!PoolEnabled) { Parallel.For(0, blocks, body); return; }
-        CpuWorkerPool.Shared.For(blocks, body);
-    }
+    internal static void For(int blocks, Action<int> body) => CpuWorkers.Shared.For(blocks, body);
 
     /// <summary>Rows per task of a row-wise pass: a few tasks per worker, and one task when
     /// the whole pass is too small to be worth a dispatch.</summary>

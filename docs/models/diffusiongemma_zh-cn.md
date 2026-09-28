@@ -232,8 +232,10 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 - **注意力**是分块内核，默认算术精确复现旧内核（`DIFFUSION_CPU_ATTN_FAST=1` 改用 FMA 分块）。这个模型对
   最后一个比特的变化异常敏感：每次 matmul 前都会量化激活，每层又要从 128 个专家里选 8 个，路由上的平局
   可能翻转。在数值上等价的不同内核之间，单字段 Jev 概率的变化可达 ±0.2，因此下文按标签判定来评估质量。
-- `DIFFUSION_NO_PKV=1` 关闭缓存；`DIFFUSION_CPU_LEGACY=1` 恢复整条旧的 CPU 路径，按阶段的开关各恢复一个
-  阶段（见下表）。
+- `DIFFUSION_NO_PKV=1` 关闭缓存；`DIFFUSION_CPU_LEGACY=1` 恢复 DiffusionGemma 专有的旧阶段，按阶段的开关
+  各恢复一个阶段（见下表）。这些阶段下面的 matmul、SGEMM 与逐元素算子仍走后端新的共享内核，因此要整体回到
+  之前的算术，还需设置 `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0`（见
+  [环境变量矩阵](../env_var_feature_matrix_zh-cn.md#矩阵外的纯-c-cpu-后端变量)）。
 
 在 i7-11800H（8 核 16 线程、AVX-512）、32 GB、Windows 上，用 `diffusiongemma-26B-A4B-it-Q4_K_M.gguf` 与
 `eng/JevProbe` 实测（对一个 54 token 的提示做结构化读取；"旧构建"指本次 `cpu` 改动之前的构建）：
@@ -256,7 +258,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 | `DIFFUSION_STEPS` | 服务端每个 block 的去噪步数，默认 48 |
 | `DIFFUSION_MAX_BATCH` | 服务端 diffusion scheduler 最大活跃请求数，默认 2 |
 | `DIFFUSION_NO_PKV=1` | 关闭 device-glue 后端与 `cpu` 上的 prompt-KV 缓存 |
-| `DIFFUSION_CPU_LEGACY=1` | `cpu`：恢复整条旧的 CPU 路径（没有 prompt-KV 缓存，投影、注意力、路由与 MoE 都用旧实现） |
+| `DIFFUSION_CPU_LEGACY=1` | `cpu`：恢复 DiffusionGemma 专有的旧阶段（没有 prompt-KV 缓存，投影、注意力、路由与 MoE 都用旧实现）；要回到之前的算术，还需设置 `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0` |
 | `DIFFUSION_CPU_LEGACY_MOE` / `_PROJ` / `_ATTN` / `_ROUTER` `=1` | `cpu`：恢复单个阶段。`_ATTN` 只作用于统一前向，因此注意力的 A/B 还需要 `DIFFUSION_NO_PKV=1` |
 | `DIFFUSION_CPU_ATTN_FAST=1` | `cpu`：用 FMA 注意力分块与向量化 softmax 代替精确的默认内核 |
 | `DIFFUSION_CPU_MOE_CHUNK` | `cpu`：每次批量 MoE 处理的 token 数，默认 512 |

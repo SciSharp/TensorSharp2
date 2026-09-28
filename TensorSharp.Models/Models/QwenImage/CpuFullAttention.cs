@@ -54,10 +54,10 @@ namespace TensorSharp.Models.QwenImage
         /// tokens; q, k, v and out are row-major [n, heads*dim].
         /// </summary>
         internal static void Run(float* q, float* k, float* v, float* output, int n, int heads, int dim, float scale,
-            CpuAttentionWorkspace workspace, CpuWorkerPool pool = null)
+            CpuAttentionWorkspace workspace, CpuWorkers pool = null)
         {
             if (n <= 0) return;
-            pool ??= CpuWorkerPool.Shared;
+            pool ??= CpuWorkers.Shared;
             CpuGemmIsa isa = CpuPackedGemm.Isa;
             long stride = (long)heads * dim;
             if (workspace.K.Length != heads)

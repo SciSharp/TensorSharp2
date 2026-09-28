@@ -270,7 +270,7 @@ switch (args[0])
         for (int i = 0; i < outputs.Length; i++)
             WriteFloats($"{prefix}.{(i == 0 ? "main" : $"deepstack{i - 1}")}.f32", outputs[i]);
         json = JsonSerializer.Serialize(new { scenario = "vision", backend = args[2], width, height, loadSeconds, seconds,
-            outputs = outputs.Length, peakWorkingSetMb = PeakMb(), output = prefix });
+            outputs = outputs.Length, peakWorkingSetMb = PeakMb(), peakPrivateMb = PeakPrivateMb(), output = prefix });
         Console.WriteLine(json);
         if (ggml) { GgmlBasicOps.ReleaseReuseComputeBuffers(); GgmlBasicOps.ClearHostBufferCache(); context.ReleasePooledMemory(); GgmlBasicOps.Shutdown(); }
         return 0;

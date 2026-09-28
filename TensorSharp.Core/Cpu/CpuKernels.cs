@@ -18,8 +18,8 @@ namespace TensorSharp.Cpu
     /// Pointer-level SIMD kernels behind the contiguous fast paths of the CPU elementwise,
     /// normalization and softmax ops (TensorApplyCPU), usable directly by model code.
     ///
-    /// Every kernel is Vector512 where the hardware has it (TS_CPU_DISABLE_AVX512=1 pins
-    /// Vector256), Vector256 otherwise, with a scalar tail; exp-based activations use the BCL's
+    /// Every kernel is Vector512 where <see cref="CpuIsa.Avx512"/> allows it (TS_CPU_DISABLE_AVX512=1
+    /// pins Vector256), Vector256 otherwise, with a scalar tail; exp-based activations use the BCL's
     /// vectorized Vector512/256/128.Exp and tanh uses TensorPrimitives (a few ULP from MathF).
     /// Work is split on <see cref="CpuParallel"/> by element count, never by thread count: a
     /// [70, 2816] residual add stays on the calling thread, a [256, 262144] logit softcap is
@@ -28,13 +28,13 @@ namespace TensorSharp.Cpu
     ///
     /// TS_CPU_SIMD_ELEMENTWISE=0 keeps TensorApplyCPU on its previous loops for A/B runs.
     /// </summary>
-    public static unsafe class CpuKernels
+    internal static unsafe class CpuKernels
     {
         /// <summary>False when TS_CPU_SIMD_ELEMENTWISE=0.</summary>
         public static bool Enabled { get; } = Environment.GetEnvironmentVariable("TS_CPU_SIMD_ELEMENTWISE") != "0";
 
         /// <summary>Use 512-bit vectors (tests pin it off to cover the 256-bit path).</summary>
-        internal static bool Use512 { get; set; } = Vector512.IsHardwareAccelerated && !CpuSgemm.Avx512DisabledByEnv;
+        internal static bool Use512 { get; set; } = CpuIsa.Avx512;
 
         // Elements per parallel block. Streaming ops move ~12 bytes/element, so 64K elements
         // is ~0.75 MB of traffic (tens of microseconds) against a few microseconds to fork;

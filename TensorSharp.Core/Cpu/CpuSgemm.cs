@@ -37,10 +37,10 @@ namespace TensorSharp.Cpu
     ///
     /// Knobs: TS_CPU_SGEMM=0 routes MatrixMultiplication/DirectOps back to their previous
     /// loops; TS_CPU_DISABLE_AVX512=1 forces the AVX2 kernel (so it is testable on an AVX-512
-    /// host); TS_CPU_SGEMM_KC / _MC / _NC override the cache blocking for tuning;
+    /// host; see <see cref="CpuIsa"/>); TS_CPU_SGEMM_KC / _MC / _NC override the cache blocking for tuning;
     /// TS_CPU_SGEMM_DOT_MAXN sets the widest N of the narrow dot path (0 turns it off).
     /// </summary>
-    public static unsafe class CpuSgemm
+    internal static unsafe class CpuSgemm
     {
         /// <summary>Microkernel families. Avx2Wide is the 8x24 ymm tile that needs the 32-register
         /// EVEX file, so it exists only on AVX-512 hardware.</summary>
@@ -48,9 +48,6 @@ namespace TensorSharp.Cpu
 
         /// <summary>False when TS_CPU_SGEMM=0: callers keep their pre-existing GEMM loops.</summary>
         public static bool Enabled { get; } = Environment.GetEnvironmentVariable("TS_CPU_SGEMM") != "0";
-
-        internal static readonly bool Avx512DisabledByEnv =
-            Environment.GetEnvironmentVariable("TS_CPU_DISABLE_AVX512") == "1";
 
         private static KernelKind _kernel = DefaultKernel();
 
@@ -77,9 +74,10 @@ namespace TensorSharp.Cpu
 
         internal static bool IsSupported(KernelKind kind) => kind switch
         {
-            KernelKind.Avx512 => Avx512F.IsSupported && Vector512.IsHardwareAccelerated,
+            KernelKind.Avx512 => CpuIsa.HasAvx512,
+            // ymm-only, so it needs the EVEX register file but not an accelerated Vector512.
             KernelKind.Avx2Wide => Avx512F.VL.IsSupported && Fma.IsSupported,
-            KernelKind.Avx2 => Avx2.IsSupported && Fma.IsSupported,
+            KernelKind.Avx2 => CpuIsa.HasAvx2Fma,
             _ => true,
         };
 
@@ -88,7 +86,7 @@ namespace TensorSharp.Cpu
         /// supported one, or the AVX2 6x16 tile when TS_CPU_DISABLE_AVX512=1 (the path a CPU
         /// without AVX-512 takes).
         /// </summary>
-        private static KernelKind DefaultKernel()
+        internal static KernelKind DefaultKernel()
         {
             KernelKind? pinned = Environment.GetEnvironmentVariable("TS_CPU_SGEMM_KERNEL")?.ToLowerInvariant() switch
             {
@@ -99,13 +97,13 @@ namespace TensorSharp.Cpu
                 _ => null,
             };
             if (pinned.HasValue && IsSupported(pinned.Value) &&
-                !(Avx512DisabledByEnv && pinned.Value >= KernelKind.Avx2Wide))
+                !(CpuIsa.Avx512DisabledByEnv && pinned.Value >= KernelKind.Avx2Wide))
             {
                 return pinned.Value;
             }
 
-            if (!Avx512DisabledByEnv && IsSupported(KernelKind.Avx512)) return KernelKind.Avx512;
-            if (IsSupported(KernelKind.Avx2)) return KernelKind.Avx2;
+            if (CpuIsa.Avx512) return KernelKind.Avx512;
+            if (CpuIsa.Avx2Fma) return KernelKind.Avx2;
             return KernelKind.Portable;
         }
 
@@ -1406,9 +1404,13 @@ namespace TensorSharp.Cpu
                 {
                     if (floats > _capacity)
                     {
-                        if (_ptr != null) NativeMemory.AlignedFree(_ptr);
+                        // Allocate before freeing: if the allocation throws, the holder still
+                        // owns its old buffer (no dangling pointer for the next call or the
+                        // finalizer to free again).
                         long cap = Math.Max(floats, _capacity * 2);
-                        _ptr = (float*)NativeMemory.AlignedAlloc((nuint)(cap * sizeof(float)), 64);
+                        float* grown = (float*)NativeMemory.AlignedAlloc((nuint)(cap * sizeof(float)), 64);
+                        if (_ptr != null) NativeMemory.AlignedFree(_ptr);
+                        _ptr = grown;
                         _capacity = cap;
                     }
                     return _ptr;

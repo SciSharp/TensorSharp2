@@ -367,7 +367,7 @@ namespace TensorSharp.Models.QwenImage
             nint qL = (nint)q, kL = (nint)k, vL = (nint)v, oL = (nint)output;
             const int QueryBlock = 16;
             int blocks = (seq + QueryBlock - 1) / QueryBlock;
-            CpuWorkerPool.Shared.For(heads * blocks, task =>
+            CpuWorkers.Shared.For(heads * blocks, task =>
             {
                 int h = task / blocks, b = task - h * blocks;
                 int kvh = h / group;

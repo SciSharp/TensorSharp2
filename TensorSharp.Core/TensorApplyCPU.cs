@@ -1408,7 +1408,7 @@ namespace TensorSharp
 
 
 		/// <summary>result = value / src (elementwise).</summary>
-		unsafe public static void RDiv(Tensor result, float value, Tensor src)
+		unsafe internal static void RDiv(Tensor result, float value, Tensor src)
 		{
 			if (TryScalarSimd(result, src, value, CpuKernels.BinaryOp.Div, scalarOnLeft: true))
 				return;
