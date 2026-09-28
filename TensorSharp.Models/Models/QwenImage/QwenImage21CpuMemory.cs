@@ -23,7 +23,9 @@ namespace TensorSharp.Models.QwenImage
     /// <para>Measured on an i7-11800H (32 GB, Windows, Q4_K_M transformer, Pruna 5-step LoRA): a
     /// 1024x1024 request peaked at 3.7 GiB of commit (the decode: 2.25 GiB of live maps) and 8.0 GiB
     /// of working set (plus the mapped transformer); a 2048x2048 VAE encode+decode peaked at 10.5 GiB
-    /// of commit, 9.0 GiB of it live maps. The estimate is 4.1 and 10.8 GiB there.</para>
+    /// of commit, 9.0 GiB of it live maps. The estimate is 4.1 and 10.8 GiB there. A 2048x2048
+    /// transformer step peaked at 8.3 GiB of working set (4.4 GiB commit plus the mapped
+    /// transformer); its estimate is 8.4 GiB.</para>
     /// </remarks>
     internal static class QwenImage21CpuMemory
     {
@@ -43,7 +45,7 @@ namespace TensorSharp.Models.QwenImage
 
         /// <summary>Transformer scratch that does not grow with the image (the MLP chunk, the
         /// LoRA and prefix-cache buffers of a typical plug-in, the runtime).</summary>
-        internal const long DenoiseOverheadBytes = 2048L << 20;
+        internal const long DenoiseOverheadBytes = 2560L << 20;
 
         /// <summary>Peak bytes of the managed VAE decode of a <paramref name="width"/> x
         /// <paramref name="height"/> image.</summary>
