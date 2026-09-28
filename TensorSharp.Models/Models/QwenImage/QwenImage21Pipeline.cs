@@ -83,8 +83,7 @@ namespace TensorSharp.Models.QwenImage
                         (negative, negativeLength, negativeSlots) = conditioner.EncodePrompt(p.NegativePrompt ?? "", refs);
                 }
                 Phase("text and vision encode");
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
-                GgmlBasicOps.ClearHostBufferCache();
+                ReleaseComputeBuffers();
 
                 float[] latents = ToTokens(QwenImage21Sampling.Noise(checked(sequence * 64), p.Seed), h, w);
                 // Text and reference tokens are modulated at t=0, so their K/V are the
@@ -145,10 +144,11 @@ namespace TensorSharp.Models.QwenImage
                     negativeCache?.Dispose();
                 }
                 Phase("denoise");
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
-                // Denoising is finished; release resident DiT weights before
-                // allocating the much larger full-resolution VAE feature maps.
-                GgmlBasicOps.ClearHostBufferCache();
+                // Denoising is finished; release resident DiT weights (on the cpu
+                // backend, the transformer's activation scratch) before allocating the
+                // much larger full-resolution VAE feature maps.
+                ReleaseComputeBuffers();
+                _dit?.ReleaseScratch();
                 var output = Vae.Decode(new VaeLatent(64, h, w, ToChannels(latents, h, w)));
                 Phase("VAE decode");
                 Console.WriteLine($"  [qwen21-timing] total: {total.Elapsed.TotalSeconds:F3}s");
@@ -156,9 +156,18 @@ namespace TensorSharp.Models.QwenImage
             }
             finally
             {
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
-                GgmlBasicOps.ClearHostBufferCache();
+                ReleaseComputeBuffers();
+                _dit?.ReleaseScratch();
             }
+        }
+
+        /// <summary>Releases GGML scratch and resident weights between stages. The pure-C# cpu
+        /// backend has neither, and must not call into the native library at all.</summary>
+        private void ReleaseComputeBuffers()
+        {
+            if (!_model.UsesGgml) return;
+            GgmlBasicOps.ReleaseReuseComputeBuffers();
+            GgmlBasicOps.ClearHostBufferCache();
         }
 
         private static void ReportPrefixCache(QwenImage21DiT.PrefixCache cache, string branch, int ranks)
