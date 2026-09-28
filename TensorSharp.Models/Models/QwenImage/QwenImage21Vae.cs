@@ -78,31 +78,53 @@ namespace TensorSharp.Models.QwenImage
         internal static readonly float[] Qwen21Mean = { 0.5126f, 0.7721f, -0.0631f, 1.3506f, -0.7855f, -2.1025f, -0.3458f, 1.3722f, 1.8873f, -1.7177f, -0.6510f, 0.2732f, 0.7562f, -0.6163f, -1.0277f, 3.8363f, 2.0210f, 0.0472f, 0.9320f, 2.0087f, 2.4954f, -0.1391f, -1.4249f, 1.8464f, -0.5236f, 1.2826f, 3.7046f, -1.3035f, 2.7286f, -1.4518f, -1.9036f, -1.9955f, -0.0342f, -1.0265f, -0.7636f, 3.0555f, 0.0746f, -3.0751f, -0.1076f, 1.7376f, -1.0914f, -1.9435f, -0.2784f, -1.3680f, 0.4809f, -0.4433f, 0.3764f, 0.5729f, -2.0595f, 1.0960f, -1.3260f, -2.0211f, -5.0179f, 0.5275f, 4.0162f, 1.8505f, 0.3026f, 1.9373f, 1.4937f, 0.2632f, 0.5547f, -1.7121f, -0.1562f, 0.0304f };
         internal static readonly float[] Qwen21Std = { 3.2001f, 3.2936f, 3.4321f, 3.0091f, 3.1061f, 4.0379f, 4.0705f, 3.7910f, 3.0785f, 3.6500f, 3.9308f, 3.0904f, 2.8778f, 3.7675f, 3.7320f, 5.0756f, 3.2864f, 4.0397f, 3.1317f, 4.0443f, 2.9249f, 3.9454f, 3.0988f, 4.2489f, 3.4896f, 3.8513f, 3.9323f, 3.4719f, 3.7498f, 4.2830f, 3.5694f, 4.2467f, 3.9037f, 3.2947f, 5.0770f, 3.5075f, 3.2700f, 3.4767f, 2.8063f, 5.1125f, 3.5327f, 4.7833f, 3.1286f, 4.1819f, 3.8527f, 3.8312f, 3.5605f, 4.3875f, 3.9624f, 4.0168f, 3.5643f, 4.0550f, 5.5614f, 4.2963f, 4.4080f, 3.4959f, 3.8747f, 3.7608f, 3.5735f, 3.1490f, 3.7662f, 3.6746f, 3.4563f, 3.8161f };
 
-        private static Feature Conv21(VaeWeights w, string prefix, Feature x, int pad)
+        // Causal conv on T=1 (see LastTemporalSlice). The managed fast path convolves with the
+        // layer's packed kernel; with upsample2x it reads x through the decoder's nearest 2x
+        // upsample instead of materializing the 4x larger map.
+        private static Feature Conv21(VaeWeights w, string prefix, Feature x, int pad, bool upsample2x = false)
         {
             var shape = w.Shape(prefix + ".weight");
             int oc = (int)shape[0], ic = (int)shape[1];
             int kh = (int)shape[^2], kw = (int)shape[^1];
             int kd = shape.Length == 5 ? (int)shape[2] : 1;
-            float[] weight = w.Get(prefix + ".weight"), bias = w.Get(prefix + ".bias");
+            float[] bias = w.Get(prefix + ".bias");
             Trace21(prefix + ".input", x.D);
-            Trace21(prefix + ".weight", weight);
-            Trace21(prefix + ".bias", bias);
-            var result = CausalConv3dT1(x, weight, oc, ic, kd, kh, kw, bias, pad);
+            Feature result;
+            if (FastCpu)
+            {
+                if (TraceVae21) Trace21(prefix + ".weight", w.KernelSlice(prefix + ".weight", oc, ic, kd, kh, kw));
+                Trace21(prefix + ".bias", bias);
+                result = Conv2dCpu(x, w.PackedKernel(prefix + ".weight", oc, ic, kd, kh * kw), bias, oc, kh, kw,
+                    1, 1, pad, pad, pad, pad, upsample2x);
+            }
+            else
+            {
+                float[] weight = w.KernelSlice(prefix + ".weight", oc, ic, kd, kh, kw);
+                Trace21(prefix + ".weight", weight);
+                Trace21(prefix + ".bias", bias);
+                result = Conv2d(upsample2x ? NearestUpsample2x(x) : x, weight, oc, ic, kh, kw, bias, 1, 1, pad, pad, pad, pad);
+            }
             Trace21(prefix + ".output", result.D);
             return result;
+        }
+
+        // Norm then SiLU: one fused pass on the managed fast path (vectorized exp), the exact
+        // scalar SiLU elsewhere and whenever tracing needs the pre-activation tensor.
+        private static Feature NormSilu21(VaeWeights w, string gammaName, string traceName, Feature x)
+        {
+            if (FastCpu && !TraceVae21) return RmsNormChannelFast(x, w.Get(gammaName), silu: true);
+            var t = RmsNormChannel(x, w.Get(gammaName));
+            Trace21(traceName, t.D);
+            SiluInPlace(t.D);
+            return t;
         }
 
         private static Feature Residual21(VaeWeights w, string prefix, Feature x)
         {
             var residual = w.Has(prefix + ".shortcut.weight") ? Conv21(w, prefix + ".shortcut", x, 0) : x;
-            var t = RmsNormChannel(x, w.Get(prefix + ".residual.0.gamma"));
-            Trace21(prefix + ".residual.0.output", t.D);
-            SiluInPlace(t.D);
+            var t = NormSilu21(w, prefix + ".residual.0.gamma", prefix + ".residual.0.output", x);
             t = Conv21(w, prefix + ".residual.2", t, 1);
-            t = RmsNormChannel(t, w.Get(prefix + ".residual.3.gamma"));
-            Trace21(prefix + ".residual.3.output", t.D);
-            SiluInPlace(t.D);
+            t = NormSilu21(w, prefix + ".residual.3.gamma", prefix + ".residual.3.output", t);
             t = Conv21(w, prefix + ".residual.6", t, 1);
             var result = AddInPlace(t, residual);
             Trace21(prefix + ".output", result.D);
@@ -123,9 +145,13 @@ namespace TensorSharp.Models.QwenImage
         internal static Feature AverageDown21(Feature x, int outChannels, int timeFactor, int spatialFactor)
         {
             int group = x.C * timeFactor * spatialFactor * spatialFactor / outChannels;
+            long t0 = VaeCpuProfile.Start();
             var y = new Feature(outChannels, x.H / spatialFactor, x.W / spatialFactor);
             int sf2 = spatialFactor * spatialFactor;
-            for (int oc = 0; oc < outChannels; oc++)
+            // Output channels are independent and each keeps its sequential group order, so the
+            // parallel pass is bit-identical to the serial one.
+            CpuPackedGemm.ForEach(outChannels, (long)x.D.Length >= 1 << 16, oc =>
+            {
                 for (int g = 0; g < group; g++)
                 {
                     int packed = oc * group + g;
@@ -134,9 +160,15 @@ namespace TensorSharp.Models.QwenImage
                     if (t != timeFactor - 1) continue;
                     int dy = packed / spatialFactor % spatialFactor, dx = packed % spatialFactor;
                     for (int h = 0; h < y.H; h++)
+                    {
+                        int dst = (oc * y.H + h) * y.W;
+                        int src = (ic * x.H + h * spatialFactor + dy) * x.W + dx;
                         for (int v = 0; v < y.W; v++)
-                            y.D[(oc * y.H + h) * y.W + v] += x.D[(ic * x.H + h * spatialFactor + dy) * x.W + v * spatialFactor + dx] / group;
+                            y.D[dst + v] += x.D[src + v * spatialFactor] / group;
+                    }
                 }
+            }, CpuPool);
+            VaeCpuProfile.Stop(VaeCpuProfile.Resample, t0);
             return y;
         }
 
@@ -144,16 +176,23 @@ namespace TensorSharp.Models.QwenImage
         // the first chunk retains only the final temporal sample.
         internal static Feature DuplicateUp21(Feature x, int outChannels, int timeFactor, int spatialFactor)
         {
+            long t0 = VaeCpuProfile.Start();
             int repeats = outChannels * timeFactor * spatialFactor * spatialFactor / x.C;
-            var y = new Feature(outChannels, x.H * spatialFactor, x.W * spatialFactor);
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int h = 0; h < y.H; h++)
-                    for (int v = 0; v < y.W; v++)
-                    {
-                        int packed = ((oc * timeFactor + timeFactor - 1) * spatialFactor + h % spatialFactor) * spatialFactor + v % spatialFactor;
-                        int ic = packed / repeats;
-                        y.D[(oc * y.H + h) * y.W + v] = x.D[(ic * x.H + h / spatialFactor) * x.W + v / spatialFactor];
-                    }
+            var y = Feature.Uninitialized(outChannels, x.H * spatialFactor, x.W * spatialFactor);
+            CpuPackedGemm.ForEach(outChannels * y.H, (long)y.D.Length >= 1 << 16, row =>
+            {
+                int oc = row / y.H, h = row - oc * y.H;
+                int dst = row * y.W;
+                // Output column v = u*s + j reads input column u of channel ic(j): the source
+                // channel depends only on v % s, so each output row interleaves s input rows.
+                for (int j = 0; j < spatialFactor; j++)
+                {
+                    int packed = ((oc * timeFactor + timeFactor - 1) * spatialFactor + h % spatialFactor) * spatialFactor + j;
+                    int src = (packed / repeats * x.H + h / spatialFactor) * x.W;
+                    for (int u = 0; u < x.W; u++) y.D[dst + u * spatialFactor + j] = x.D[src + u];
+                }
+            }, CpuPool);
+            VaeCpuProfile.Stop(VaeCpuProfile.Resample, t0);
             return y;
         }
 
@@ -186,11 +225,11 @@ namespace TensorSharp.Models.QwenImage
                     x = AddInPlace(x, shortcut);
                 }
                 x = Mid21(w, "encoder.middle", x);
-                x = RmsNormChannel(x, w.Get("encoder.head.0.gamma"));
-                SiluInPlace(x.D);
+                x = NormSilu21(w, "encoder.head.0.gamma", "encoder.head.0.output", x);
                 x = Conv21(w, "encoder.head.2", x, 1);
                 x = Conv21(w, "conv1", x, 0);
             }
+            VaeCpuProfile.Report($"encode {image.Width}x{image.Height}");
             int pixels = x.H * x.W;
             var latent = new float[64 * pixels];
             for (int c = 0; c < 64; c++)
@@ -223,14 +262,14 @@ namespace TensorSharp.Models.QwenImage
                     for (int j = 0; j < 3; j++) x = Residual21(w, prefix + $".{j}", x);
                     if (stage < 4)
                     {
-                        x = Conv21(w, prefix + ".3.resample.1", NearestUpsample2x(x), 1);
+                        x = Conv21(w, prefix + ".3.resample.1", x, 1, upsample2x: true);
                         x = AddInPlace(x, shortcut);
                     }
                 }
-                x = RmsNormChannel(x, w.Get("decoder.head.0.gamma"));
-                SiluInPlace(x.D);
+                x = NormSilu21(w, "decoder.head.0.gamma", "decoder.head.0.output", x);
                 x = Conv21(w, "decoder.head.2", x, 1);
             }
+            VaeCpuProfile.Report($"decode {latent.Width * 16}x{latent.Height * 16}");
             if (Array.Exists(x.D, v => !float.IsFinite(v)))
                 throw new InvalidOperationException("Qwen-Image-2.1 VAE produced non-finite RGBA values.");
             pixels = x.H * x.W;

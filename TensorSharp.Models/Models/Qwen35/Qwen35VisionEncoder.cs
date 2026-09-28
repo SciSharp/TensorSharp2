@@ -31,6 +31,9 @@ namespace TensorSharp.Models
         private readonly IAllocator _allocator;
         private readonly bool _useNativeAttention;
         private readonly bool _qwenImage21;
+        // Pure-C# CPU backend (CpuAllocator): load-time dequant stays managed and the linear
+        // layers run on the packed SGEMM against weights packed once (see CpuLinear).
+        private readonly bool _cpuManaged;
         // Direct-CUDA backend. Tensor data lives in device memory and every raw
         // host pointer checkout (TensorComputePrimitives.GetFloatPointer) forces a
         // synchronous DtoH copy plus a re-upload on the next kernel, so the encoder
@@ -79,6 +82,7 @@ namespace TensorSharp.Models
             _allocator = allocator;
             _useNativeAttention = allocator is GgmlAllocator;
             _cudaDirect = allocator is TensorSharp.Cuda.CudaAllocator;
+            _cpuManaged = allocator is TensorSharp.Cpu.CpuAllocator;
             using var gguf = new GgufFile(mmProjPath);
             if (qwenImage21) QwenImage.QwenImage21CompanionValidation.ValidateVision(gguf);
 
@@ -121,6 +125,10 @@ namespace TensorSharp.Models
 
                 if (info.Type == GgmlTensorType.F32)
                     Buffer.BlockCopy(raw, 0, f32, 0, raw.Length);
+                else if (_cpuManaged)
+                    // The pure-C# backend never calls native dequant, whichever model
+                    // (if any) last set NativeDequant.PreferManaged.
+                    ManagedQuantizedOps.DequantizeToFloat32((int)info.Type, raw, 0, f32, 0, numElements);
                 else
                     NativeDequant.DequantizeToFloat32((int)info.Type, raw, 0, f32, 0, numElements);
 
@@ -359,7 +367,7 @@ namespace TensorSharp.Models
             string biasName = "v.patch_embd.bias";
 
             Tensor weightView2D = GetOrCreatePatchEmbedWeight2D(convWeight, wName, rowStride);
-            Tensor weightT = GetOrCreatePatchEmbedTransposed(weightView2D, wName);
+            Tensor weightT = UseCpuLinear ? null : GetOrCreatePatchEmbedTransposed(weightView2D, wName);
 
             // Build im2col matrix [numPatches, rowStride] in parallel.
             int[] blockOrder = GetOrCreateBlockOrder(gridH, gridW);
@@ -416,6 +424,13 @@ namespace TensorSharp.Models
             }
 
             // result = im2col @ weight^T  (+ bias if present)
+            if (UseCpuLinear)
+            {
+                _weights.TryGetValue(biasName, out var cpuBias);
+                var embedded = CpuLinear(im2col, wName + ".2d", weightView2D, cpuBias);
+                im2col.Dispose();
+                return embedded;
+            }
             int outDim = (int)weightView2D.Sizes[0];
             var result = new Tensor(_allocator, DType.Float32, numPatches, outDim);
             Ops.Addmm(result, 0, result, 1.0f, im2col, weightT);
@@ -1115,6 +1130,11 @@ namespace TensorSharp.Models
 
         private unsafe Tensor LinearForwardWithBias(Tensor input, string weightName, string biasName)
         {
+            if (UseCpuLinear)
+            {
+                _weights.TryGetValue(biasName, out var cpuBias);
+                return CpuLinear(input, weightName, _weights[weightName], cpuBias);
+            }
             // Derived from the transposed copy, not _weights[weightName]: on the
             // direct-CUDA path the untransposed original is released once the
             // transpose exists (see GetOrCreateTransposedWeight).
@@ -1134,6 +1154,41 @@ namespace TensorSharp.Models
             if (_weights.TryGetValue(biasName, out var bias))
                 Ops.Add(result, result, bias);
 
+            return result;
+        }
+
+        // TS_QWEN35_VENC_CPU_GEMM=0 keeps the Ops.Addmm linear on the pure-C# backend (A/B).
+        private static readonly bool s_cpuGemmEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_VENC_CPU_GEMM") != "0";
+        private bool UseCpuLinear => _cpuManaged && s_cpuGemmEnabled;
+        private readonly Dictionary<string, QwenImage.PackedPanels> _cpuPackedWeights = new();
+
+        /// <summary>
+        /// y[seq, out] = x[seq, in] W^T + b on the pure-C# backend: the packed SGEMM with W
+        /// packed once per weight into NR-column panels (it replaces the transposed F32 copy
+        /// the generic path keeps), x packed per call, and the bias folded into the tile init.
+        /// </summary>
+        private unsafe Tensor CpuLinear(Tensor input, string key, Tensor weight, Tensor bias)
+        {
+            var isa = QwenImage.CpuPackedGemm.Isa;
+            int outDim = (int)weight.Sizes[0], inDim = (int)weight.Sizes[1];
+            if (!_cpuPackedWeights.TryGetValue(key, out var packed) || packed.Isa != isa)
+            {
+                using var contiguousWeight = weight.IsContiguous() ? null : Ops.NewContiguous(weight);
+                packed = QwenImage.CpuPackedGemm.PackB(GetFloatPtr(contiguousWeight ?? weight), inDim, outDim, 1, inDim, isa);
+                _cpuPackedWeights[key] = packed;
+            }
+            int seqLen = (int)input.Sizes[0];
+            if ((int)input.Sizes[1] != inDim)
+                throw new ArgumentException($"linear {key}: input width {input.Sizes[1]} != weight width {inDim}");
+            using var contiguousInput = input.IsContiguous() ? null : Ops.NewContiguous(input);
+            var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
+            var a = QwenImage.CpuPackedGemm.PackA(GetFloatPtr(contiguousInput ?? input), seqLen, inDim, inDim, 1, isa);
+            float* biasPtr = bias != null && bias.ElementCount() == outDim ? GetFloatPtr(bias) : null;
+            QwenImage.CpuPackedGemm.Gemm(a, new QwenImage.PrepackedPanelSource(packed), outDim, GetFloatPtr(result), outDim,
+                biasN: biasPtr);
+            if (bias != null && biasPtr == null)
+                Ops.Add(result, result, bias);
             return result;
         }
 
@@ -1381,6 +1436,7 @@ namespace TensorSharp.Models
             _ropeDeviceCache.Clear();
             _ropeCache.Clear();
             _blockOrderCache.Clear();
+            _cpuPackedWeights.Clear();
         }
     }
 }
