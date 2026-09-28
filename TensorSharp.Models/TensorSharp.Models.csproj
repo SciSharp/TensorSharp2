@@ -24,7 +24,8 @@
     <InternalsVisibleTo Include="QwenImage21CompanionProbe" />
     <InternalsVisibleTo Include="CpuQuantBench" />
     <InternalsVisibleTo Include="WanVideoBench" />
-    <InternalsVisibleTo Include="CpuFloatBench" />
+<InternalsVisibleTo Include="CpuFloatBench" />
+    <InternalsVisibleTo Include="QwenImageDiTBench" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
