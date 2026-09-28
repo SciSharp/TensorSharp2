@@ -477,7 +477,8 @@ transformer 前向。输出头只作用于所请求的标签行，而不分配�
 与 `ggml_metal` 使用现有的 DiffusionGemma prompt K/V 与融合 decode 路径，`cpu` 使用它自己的主机 prompt K/V，
 并且最后一层只为所请求的标签行计算；其他后端（包括 `ggml_cpu`、`ggml_vulkan`、`mlx` 与 `cuda`）使用统一的
 prompt 加 canvas 前向。
-模型执行锁使其与普通扩散聊天请求串行访问共享的 GPU 状态。
+模型执行锁使其与普通扩散聊天请求串行访问共享的 GPU 状态；聊天正在去噪时发出的读取会在聊天的下一次前向之前运行，
+而不是等整个 block 结束。
 
 GGML CUDA 默认使用融合的 prompt 注意力，把注意力运算保留在一张原生图内，以减少中间传输与显式的 KV head
 展开。DiffusionGemma 路径保持精确的序列范围与现有的矩阵乘法精度策略。它使用物化的注意力分数，没有 flash

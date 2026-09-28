@@ -74,12 +74,15 @@ public partial class ModelService
             object RunPrepared()
             {
                 bool entered = false;
+                DiffusionComputeTurns turns = model.ComputeTurns;
                 var vision = new JevVisionBinder(new JevDiffusionVisionTarget(model), imagePaths);
                 try
                 {
-                    // The existing chat scheduler owns this same gate for each entire
-                    // denoising block. Structured reads cannot race its shared native buffers.
-                    while (!(entered = Monitor.TryEnter(model.GpuComputeLock, 100))) ct.ThrowIfCancellationRequested();
+                    // Structured reads cannot race the chat scheduler's shared native buffers, so
+                    // they take the same GpuComputeLock. Taking it as a registered turn makes the
+                    // scheduler hand it over before its next forward instead of after its block.
+                    turns.Enter(ct);
+                    entered = true;
                     ct.ThrowIfCancellationRequested();
                     var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
                     int[] Render(string system, string state)
@@ -110,7 +113,7 @@ public partial class ModelService
                     // Disposal frees model-global image spans, so it belongs inside the lock: a span
                     // left installed would be spliced into whatever prompt runs next.
                     vision.Dispose();
-                    if (entered) Monitor.Exit(model.GpuComputeLock);
+                    if (entered) turns.Exit();
                 }
             }
         }, cancellationToken);

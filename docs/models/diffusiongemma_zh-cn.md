@@ -286,6 +286,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 - 流式输出发送 `replace` 事件而不是 token append，因为每一步都会重新修正整个 canvas。
 - 在 `done` 事件前会先发送最终定稿 replacement。
 - 并发请求共享一个后台 diffusion scheduler，并在 block 之间被接纳。
+- Jev 结构化读取或新一轮对话的图像编码不必等聊天的整个 block：scheduler 会在下一次前向之前把模型交出，
+  所以只需等正在进行的那一次前向。block 的输出不变。
 - 在没有 prompt-KV 缓存的后端（`ggml_cpu`、`ggml_vulkan`，以及设置了 `DIFFUSION_NO_PKV=1` 或
   `DIFFUSION_CPU_LEGACY=1` 的 `cpu`）上，scheduler 会让每个序列的每一步走统一的 `[prefix|canvas]`
   前向，而不是 prefill + canvas decode；行为与输出完全一致。

@@ -39,8 +39,10 @@ namespace TensorSharp.Server
     /// The continuous-batching scheduler for DiffusionGemma — the diffusion analog of the autoregressive
     /// <see cref="TensorSharp.Runtime.Scheduling.InferenceEngine"/>. DiffusionGemma is not thread-safe on the
     /// GPU (concurrent GGML compute from two threads aborts the process), so true parallelism is achieved by
-    /// BATCHING within a single compute thread: one background worker owns <c>model.GpuComputeLock</c> and
-    /// denoises every in-flight request's canvas together (one batched forward per step). The weight-bound
+    /// BATCHING within a single compute thread: one background worker owns <c>model.GpuComputeLock</c> for a
+    /// block, stepping aside before any forward for which a Jev read or an image encode is waiting
+    /// (<see cref="DiffusionComputeTurns"/>), and denoises every in-flight request's canvas together (one
+    /// batched forward per step). The weight-bound
     /// work (embedding, dense MLP, 128-expert MoE, lm_head) runs once over all sequences' canvas tokens, so
     /// aggregate throughput scales with the batch size; only the per-sequence attention loops.
     ///
@@ -146,7 +148,10 @@ namespace TensorSharp.Server
                         lock (_model.GpuComputeLock)
                         {
                             QueuePendingMedia(active);
-                            _sampler.RunBlockBatched(runs, stopCt);
+                            // Hand the lock to a waiting Jev read or image encode before each forward
+                            // rather than making it wait out the whole block (up to 48 forwards).
+                            DiffusionComputeTurns turns = _model.ComputeTurns;
+                            _sampler.RunBlockBatched(runs, stopCt, () => turns.Yield());
                         }
                     }
                     catch (Exception ex)

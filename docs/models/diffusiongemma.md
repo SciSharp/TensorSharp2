@@ -320,6 +320,9 @@ When the Web UI hosts a DiffusionGemma GGUF:
 - A final replacement is emitted before the `done` event.
 - Concurrent requests share one background diffusion scheduler and are admitted
   between blocks.
+- A Jev structured read, or the image encode of a new turn, does not wait for a
+  chat's whole block: the scheduler hands the model over before its next forward,
+  so it waits only for the forward in progress. The block's output is unchanged.
 - On backends without prompt-KV caching (`ggml_cpu`, `ggml_vulkan`, and `cpu`
   under `DIFFUSION_NO_PKV=1` or `DIFFUSION_CPU_LEGACY=1`) the scheduler runs
   each sequence's step through the unified `[prefix|canvas]` forward instead of
