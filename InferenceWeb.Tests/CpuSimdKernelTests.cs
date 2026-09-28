@@ -420,6 +420,10 @@ public unsafe class CpuSimdKernelTests
     [InlineData(4, 70, 90, 64, false)]
     [InlineData(3, 300, 300, 40, true)]
     [InlineData(1, 1025, 777, 96, false)]
+    // Enough (head, query-block) items for the pool (>= 16 even at TS_CPU_POOL=0): every block
+    // runs single-threaded GEMMs and the per-row softmax loop, the branch DiT/VAE attention takes.
+    [InlineData(16, 300, 300, 64, false)]
+    [InlineData(24, 64, 80, 32, true)]
     public void DirectOps_CpuAttention_MatchesDoubleReference(int heads, int sq, int sk, int hd, bool withBias)
     {
         using var ctx = new TensorSharp.Models.Direct.DirectContext(_alloc);
@@ -457,6 +461,40 @@ public unsafe class CpuSimdKernelTests
                 AssertNear(acc, got[(i * heads + h) * hd + e], 1e-4, 2e-6, $"attn h={h} i={i} e={e}");
             }
         }
+    }
+
+    [Fact]
+    public void DirectOps_CpuAttention_EmptyQuery_ReturnsEmpty()
+    {
+        using var ctx = new TensorSharp.Models.Direct.DirectContext(_alloc);
+        using var tq = new Tensor(_alloc, DType.Float32, 0, 2 * 32);
+        using Tensor tk = FromArray(RandomArray(71, 5 * 2 * 32), 5, 2 * 32);
+        using Tensor tv = FromArray(RandomArray(72, 5 * 2 * 32), 5, 2 * 32);
+        using Tensor o = TensorSharp.Models.Direct.DirectOps.Attention(ctx, tq, tk, tv, 2, 32, 0.25f);
+        Assert.Equal(new long[] { 0, 64 }, o.Sizes);
+    }
+
+    [Fact]
+    public void DirectOps_CpuAttention_RejectsShapesItWouldReadPast()
+    {
+        // The blocked path indexes Q/K/V/bias with raw pointers: a head-shared [1, sq, sk] bias
+        // with 2 heads, or Q narrower than heads*hd, must throw rather than read out of bounds.
+        using var ctx = new TensorSharp.Models.Direct.DirectContext(_alloc);
+        int heads = 2, sq = 6, sk = 5, hd = 16;
+        using Tensor tq = FromArray(RandomArray(73, sq * heads * hd), sq, heads * hd);
+        using Tensor tk = FromArray(RandomArray(74, sk * heads * hd), sk, heads * hd);
+        using Tensor tv = FromArray(RandomArray(75, sk * heads * hd), sk, heads * hd);
+        using Tensor shared = FromArray(RandomArray(76, sq * sk), 1, sq, sk);
+        Assert.ThrowsAny<ArgumentException>(() =>
+            TensorSharp.Models.Direct.DirectOps.Attention(ctx, tq, tk, tv, heads, hd, 0.25f, shared).Dispose());
+
+        using Tensor narrowQ = FromArray(RandomArray(77, sq * hd), sq, hd);
+        Assert.ThrowsAny<ArgumentException>(() =>
+            TensorSharp.Models.Direct.DirectOps.Attention(ctx, narrowQ, tk, tv, heads, hd, 0.25f).Dispose());
+
+        using Tensor shortV = FromArray(RandomArray(78, (sk - 1) * heads * hd), sk - 1, heads * hd);
+        Assert.ThrowsAny<ArgumentException>(() =>
+            TensorSharp.Models.Direct.DirectOps.Attention(ctx, tq, tk, shortV, heads, hd, 0.25f).Dispose());
     }
 
     // ---------------------------------------------------------------- CpuParallel hook

@@ -32,10 +32,13 @@ namespace TensorSharp.Cpu
     /// arithmetic. Microkernels: AVX-512 8x32 (16 zmm accumulators), AVX2+FMA 6x16 (12 ymm),
     /// and a portable Vector&lt;T&gt; 4x(2*lanes) for everything else (ARM64 included). Skinny
     /// products (M &lt;= 4) skip packing: packing B costs as much as their whole arithmetic.
+    /// Narrow products in the dot layout (small N, A rows and B columns contiguous along K)
+    /// skip it too: a register tile padded out to NR columns would mostly multiply zeros.
     ///
     /// Knobs: TS_CPU_SGEMM=0 routes MatrixMultiplication/DirectOps back to their previous
     /// loops; TS_CPU_DISABLE_AVX512=1 forces the AVX2 kernel (so it is testable on an AVX-512
-    /// host); TS_CPU_SGEMM_KC / _MC / _NC override the cache blocking for tuning.
+    /// host); TS_CPU_SGEMM_KC / _MC / _NC override the cache blocking for tuning;
+    /// TS_CPU_SGEMM_DOT_MAXN sets the widest N of the narrow dot path (0 turns it off).
     /// </summary>
     public static unsafe class CpuSgemm
     {
@@ -116,6 +119,19 @@ namespace TensorSharp.Cpu
         // Arithmetic per parallel tile we aim for at least (keeps dispatch < a few % of the tile).
         private const double MinTileFlops = 1e6;
 
+        // TS_CPU_SGEMM_DOT_MAXN: widest N the narrow dot path takes (0 disables it). Unset, the
+        // per-kernel crossover measured against the packed path is used (DefaultNarrowDotMaxN).
+        private static int _dotMaxNOverride =
+            int.TryParse(Environment.GetEnvironmentVariable("TS_CPU_SGEMM_DOT_MAXN"), out int dm) && dm >= 0 ? dm : -1;
+
+        /// <summary>Widest N routed to the narrow dot path (tests/benchmarks may override it;
+        /// a negative value restores the per-kernel default).</summary>
+        internal static int NarrowDotMaxN
+        {
+            get => _dotMaxNOverride >= 0 ? _dotMaxNOverride : DefaultNarrowDotMaxN(_kernel);
+            set => _dotMaxNOverride = value;
+        }
+
         private static readonly int EnvKc = EnvInt("TS_CPU_SGEMM_KC");
         private static readonly int EnvMc = EnvInt("TS_CPU_SGEMM_MC");
         private static readonly int EnvNc = EnvInt("TS_CPU_SGEMM_NC");
@@ -193,6 +209,14 @@ namespace TensorSharp.Cpu
             double itemFlops = 2.0 * m * n * k;
             double totalFlops = itemFlops * batch;
             int threads = allowParallel ? CpuParallel.DegreeOfParallelism : 1;
+
+            if (m > SkinnyMaxM && aColStride == 1 && bRowStride == 1 && n <= NarrowDotMaxN && k >= DotLanes(_kernel))
+            {
+                NarrowDot(batch, m, n, k, alpha, a, aBatchStride, aRowStride, b, bBatchStride, bColStride,
+                    beta, c, cBatchStride, ldc, threads, totalFlops);
+                return;
+            }
+
             bool skinny = m <= SkinnyMaxM && (bColStride == 1 || (bRowStride == 1 && aColStride == 1));
 
             if (threads <= 1 || totalFlops < ParallelFlopThreshold)
@@ -426,6 +450,10 @@ namespace TensorSharp.Cpu
                 {
                     PackTransposed(kc, src, ars, MR, dst, MR);
                 }
+                else if (acs == 1 && mr == MR && (MR == 4 || MR == 6) && Sse.IsSupported)
+                {
+                    PackRows4or6(kc, src, ars, MR, dst);
+                }
                 else if (ars == 1)
                 {
                     for (int p = 0; p < kc; p++)
@@ -568,6 +596,54 @@ namespace TensorSharp.Cpu
                     float* dp = d + p * width;
                     dp[0] = s0[p]; dp[1] = s1[p]; dp[2] = s2[p]; dp[3] = s3[p];
                     dp[4] = s4[p]; dp[5] = s5[p]; dp[6] = s6[p]; dp[7] = s7[p];
+                }
+            }
+        }
+
+        /// <summary>
+        /// Row-major A panel of 4 or 6 rows (the portable and AVX2 6x16 tiles) -> dst[p*MR + r]
+        /// with SSE 4x4 transposes (+ a 2-row interleave for rows 4-5). The scalar strided loop
+        /// this replaces cost about as much as the arithmetic of an N = 64 product.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void PackRows4or6(int kc, float* src, long lineStride, int MR, float* dst)
+        {
+            float* s0 = src;
+            float* s1 = s0 + lineStride;
+            float* s2 = s1 + lineStride;
+            float* s3 = s2 + lineStride;
+            float* s4 = MR == 6 ? s3 + lineStride : s0;
+            float* s5 = MR == 6 ? s4 + lineStride : s0;
+            int p = 0;
+            for (; p + 4 <= kc; p += 4)
+            {
+                Vector128<float> r0 = Sse.LoadVector128(s0 + p), r1 = Sse.LoadVector128(s1 + p);
+                Vector128<float> r2 = Sse.LoadVector128(s2 + p), r3 = Sse.LoadVector128(s3 + p);
+                Vector128<float> t0 = Sse.UnpackLow(r0, r1), t1 = Sse.UnpackHigh(r0, r1);
+                Vector128<float> t2 = Sse.UnpackLow(r2, r3), t3 = Sse.UnpackHigh(r2, r3);
+                float* d = dst + p * MR;
+                Sse.Store(d, Sse.MoveLowToHigh(t0, t2));             // rows 0-3 at p
+                Sse.Store(d + MR, Sse.MoveHighToLow(t2, t0));        // p + 1
+                Sse.Store(d + 2 * MR, Sse.MoveLowToHigh(t1, t3));    // p + 2
+                Sse.Store(d + 3 * MR, Sse.MoveHighToLow(t3, t1));    // p + 3
+                if (MR == 6)
+                {
+                    Vector128<float> r4 = Sse.LoadVector128(s4 + p), r5 = Sse.LoadVector128(s5 + p);
+                    Vector128<float> lo = Sse.UnpackLow(r4, r5), hi = Sse.UnpackHigh(r4, r5);
+                    Sse.StoreLow(d + 4, lo);                         // rows 4-5 at p
+                    Sse.StoreHigh(d + MR + 4, lo);
+                    Sse.StoreLow(d + 2 * MR + 4, hi);
+                    Sse.StoreHigh(d + 3 * MR + 4, hi);
+                }
+            }
+            for (; p < kc; p++)
+            {
+                float* d = dst + p * MR;
+                d[0] = s0[p]; d[1] = s1[p]; d[2] = s2[p]; d[3] = s3[p];
+                if (MR == 6)
+                {
+                    d[4] = s4[p];
+                    d[5] = s5[p];
                 }
             }
         }
@@ -901,6 +977,293 @@ namespace TensorSharp.Cpu
             }
             Unsafe.WriteUnaligned(c, v0);
             Unsafe.WriteUnaligned(c + w, v1);
+        }
+
+        // ------------------------------------------------------------------------------------
+        //  Narrow dot products: N small, A rows and B columns both contiguous along K (A times a
+        //  transposed B: DirectOps.CpuGemmABt, Addmm against W^T, attention over few keys). The
+        //  packed path pads N up to the register tile (a 3-channel conv_out wastes 29/32 of an
+        //  8x32 tile's FMAs) and packs every A element for only N uses. Here each 4-row block
+        //  runs K-long dot products against 4 columns at a time (2 with 256-bit and portable
+        //  vectors, to fit 16 registers) straight from the operands: A streams from memory once, its 4
+        //  rows stay in L1 across the column groups and B^T (N x K) stays in L2.
+        // ------------------------------------------------------------------------------------
+
+        // B^T (N x K) is re-read from cache by every 4-row block, so K is cut into blocks when it
+        // would outgrow this share of L2. Not otherwise: a K split makes each A row two passes
+        // apart, and that costs DRAM bandwidth (N = 16, K = 2592 split in two ran 17% slower).
+        private const long DotBBudgetBytes = 512 * 1024;
+
+        private static int DotLanes(KernelKind kind) => kind switch
+        {
+            KernelKind.Avx512 => 16,
+            KernelKind.Avx2 or KernelKind.Avx2Wide => 8,
+            _ => Vector<float>.Count,
+        };
+
+        // Crossover with the packed tile, from CpuFloatBench 'narrow' (i7-11800H; M = 300..65536,
+        // K = 288..4096): the zmm dot tile beats the 8x32 tile through N = 64 (mixed at 96), the
+        // 4x2 ymm tile beats 6x16 through N = 64 and the EVEX 8x24 through N = 40, the portable
+        // one on 256-bit vectors through N = 40. With 128-bit vectors (ARM64) the portable
+        // packed tile is only 8 columns wide, so little is padded beyond N = 8; unmeasured there,
+        // the dot path stays below that.
+        private static int DefaultNarrowDotMaxN(KernelKind kind) => kind switch
+        {
+            KernelKind.Avx512 => 64,
+            KernelKind.Avx2Wide => 40,
+            KernelKind.Avx2 => 64,
+            _ => Vector<float>.Count >= 8 ? 40 : 7,
+        };
+
+        private static void NarrowDot(int batch, int m, int n, int k, float alpha,
+            float* a, long aBatchStride, long ars, float* b, long bBatchStride, long bcs,
+            float beta, float* c, long cBatchStride, long ldc, int threads, double totalFlops)
+        {
+            KernelKind kind = _kernel;
+            if (threads <= 1 || totalFlops < ParallelFlopThreshold)
+            {
+                for (int bi = 0; bi < batch; bi++)
+                {
+                    DotRows(kind, m, n, k, alpha, a + bi * aBatchStride, ars, b + bi * bBatchStride, bcs,
+                        beta, c + bi * cBatchStride, ldc);
+                }
+                return;
+            }
+
+            // A few row chunks per thread (the pool hands them out dynamically), each worth at
+            // least MinTileFlops; chunk edges on the 4-row blocks.
+            int rowBlocks = CeilDiv(m, 4);
+            int maxChunks = (int)Math.Max(1, Math.Min(4.0 * threads, totalFlops / MinTileFlops));
+            int chunksPerItem = Math.Clamp(CeilDiv(maxChunks, batch), 1, rowBlocks);
+            int rowsPerChunk = CeilDiv(rowBlocks, chunksPerItem) * 4;
+            chunksPerItem = CeilDiv(m, rowsPerChunk);
+            CpuParallel.For(batch * chunksPerItem, t =>
+            {
+                int bi = t / chunksPerItem;
+                int r0 = (t - bi * chunksPerItem) * rowsPerChunk;
+                DotRows(kind, Math.Min(rowsPerChunk, m - r0), n, k, alpha,
+                    a + bi * aBatchStride + r0 * ars, ars, b + bi * bBatchStride, bcs,
+                    beta, c + bi * cBatchStride + r0 * ldc, ldc);
+            });
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void DotRows(KernelKind kind, int m, int n, int k, float alpha,
+            float* a, long ars, float* b, long bcs, float beta, float* c, long ldc)
+        {
+            int cols = kind == KernelKind.Avx512 ? 4 : 2;
+            // Even K blocks on a 16-element grid, so only the last block has a vector tail. N
+            // within one column group keeps B^T to a few rows, so that case never splits.
+            long bBytes = (long)n * k * sizeof(float);
+            int kBlocks = n > cols && bBytes > DotBBudgetBytes ? (int)((bBytes + DotBBudgetBytes - 1) / DotBBudgetBytes) : 1;
+            int kd = kBlocks == 1 ? k : RoundUp(CeilDiv(k, kBlocks), 16);
+            for (int p0 = 0; p0 < k; p0 += kd)
+            {
+                int len = Math.Min(kd, k - p0);
+                float betaEff = p0 == 0 ? beta : 1f;
+                for (int i = 0; i < m; i += 4)
+                {
+                    int rows = Math.Min(4, m - i);
+                    float* ai = a + i * ars + p0;
+                    float* ci = c + i * ldc;
+                    for (int j = 0; j < n; j += cols)
+                    {
+                        int nc = Math.Min(cols, n - j);
+                        float* bj = b + j * bcs + p0;
+                        if (kind == KernelKind.Avx512) DotTile512(len, ai, ars, rows, bj, bcs, nc, alpha, betaEff, ci + j, ldc);
+                        else if (kind == KernelKind.Portable) DotTilePortable(len, ai, ars, rows, bj, bcs, nc, alpha, betaEff, ci + j, ldc);
+                        else DotTile256(len, ai, ars, rows, bj, bcs, nc, alpha, betaEff, ci + j, ldc);
+                    }
+                }
+            }
+        }
+
+        // The dot tiles below share two tricks. Rows/columns missing from an edge tile alias the
+        // first one and their sums are dropped. A K tail is one more step over the LAST full
+        // vector of the row (it may start in an earlier K block: DotRows only runs with
+        // K >= lanes) with the lanes already summed zeroed in both operands, so an Inf/NaN there
+        // cannot re-enter as 0 * Inf.
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void DotTile512(int k, float* a, long ars, int rows, float* b, long bcs, int cols,
+            float alpha, float beta, float* c, long ldc)
+        {
+            float* a0 = a, a1 = rows > 1 ? a + ars : a, a2 = rows > 2 ? a + 2 * ars : a, a3 = rows > 3 ? a + 3 * ars : a;
+            float* b0 = b, b1 = cols > 1 ? b + bcs : b, b2 = cols > 2 ? b + 2 * bcs : b, b3 = cols > 3 ? b + 3 * bcs : b;
+            Vector512<float> s00 = default, s01 = default, s02 = default, s03 = default;
+            Vector512<float> s10 = default, s11 = default, s12 = default, s13 = default;
+            Vector512<float> s20 = default, s21 = default, s22 = default, s23 = default;
+            Vector512<float> s30 = default, s31 = default, s32 = default, s33 = default;
+            Vector512<float> x0, x1, x2, x3, y;
+
+            int p = 0;
+            for (; p + 16 <= k; p += 16)
+            {
+                x0 = Vector512.Load(a0 + p); x1 = Vector512.Load(a1 + p);
+                x2 = Vector512.Load(a2 + p); x3 = Vector512.Load(a3 + p);
+                y = Vector512.Load(b0 + p);
+                s00 = Avx512F.FusedMultiplyAdd(x0, y, s00); s10 = Avx512F.FusedMultiplyAdd(x1, y, s10);
+                s20 = Avx512F.FusedMultiplyAdd(x2, y, s20); s30 = Avx512F.FusedMultiplyAdd(x3, y, s30);
+                y = Vector512.Load(b1 + p);
+                s01 = Avx512F.FusedMultiplyAdd(x0, y, s01); s11 = Avx512F.FusedMultiplyAdd(x1, y, s11);
+                s21 = Avx512F.FusedMultiplyAdd(x2, y, s21); s31 = Avx512F.FusedMultiplyAdd(x3, y, s31);
+                y = Vector512.Load(b2 + p);
+                s02 = Avx512F.FusedMultiplyAdd(x0, y, s02); s12 = Avx512F.FusedMultiplyAdd(x1, y, s12);
+                s22 = Avx512F.FusedMultiplyAdd(x2, y, s22); s32 = Avx512F.FusedMultiplyAdd(x3, y, s32);
+                y = Vector512.Load(b3 + p);
+                s03 = Avx512F.FusedMultiplyAdd(x0, y, s03); s13 = Avx512F.FusedMultiplyAdd(x1, y, s13);
+                s23 = Avx512F.FusedMultiplyAdd(x2, y, s23); s33 = Avx512F.FusedMultiplyAdd(x3, y, s33);
+            }
+            if (p < k)
+            {
+                Vector512<float> mask = Vector512.GreaterThanOrEqual(Vector512<int>.Indices, Vector512.Create(16 - (k - p))).AsSingle();
+                p = k - 16;
+                x0 = Vector512.Load(a0 + p) & mask; x1 = Vector512.Load(a1 + p) & mask;
+                x2 = Vector512.Load(a2 + p) & mask; x3 = Vector512.Load(a3 + p) & mask;
+                y = Vector512.Load(b0 + p) & mask;
+                s00 = Avx512F.FusedMultiplyAdd(x0, y, s00); s10 = Avx512F.FusedMultiplyAdd(x1, y, s10);
+                s20 = Avx512F.FusedMultiplyAdd(x2, y, s20); s30 = Avx512F.FusedMultiplyAdd(x3, y, s30);
+                y = Vector512.Load(b1 + p) & mask;
+                s01 = Avx512F.FusedMultiplyAdd(x0, y, s01); s11 = Avx512F.FusedMultiplyAdd(x1, y, s11);
+                s21 = Avx512F.FusedMultiplyAdd(x2, y, s21); s31 = Avx512F.FusedMultiplyAdd(x3, y, s31);
+                y = Vector512.Load(b2 + p) & mask;
+                s02 = Avx512F.FusedMultiplyAdd(x0, y, s02); s12 = Avx512F.FusedMultiplyAdd(x1, y, s12);
+                s22 = Avx512F.FusedMultiplyAdd(x2, y, s22); s32 = Avx512F.FusedMultiplyAdd(x3, y, s32);
+                y = Vector512.Load(b3 + p) & mask;
+                s03 = Avx512F.FusedMultiplyAdd(x0, y, s03); s13 = Avx512F.FusedMultiplyAdd(x1, y, s13);
+                s23 = Avx512F.FusedMultiplyAdd(x2, y, s23); s33 = Avx512F.FusedMultiplyAdd(x3, y, s33);
+            }
+
+            StoreDotRow(c, Reduce4(Fold(s00), Fold(s01), Fold(s02), Fold(s03)), cols, alpha, beta);
+            if (rows > 1) StoreDotRow(c + ldc, Reduce4(Fold(s10), Fold(s11), Fold(s12), Fold(s13)), cols, alpha, beta);
+            if (rows > 2) StoreDotRow(c + 2 * ldc, Reduce4(Fold(s20), Fold(s21), Fold(s22), Fold(s23)), cols, alpha, beta);
+            if (rows > 3) StoreDotRow(c + 3 * ldc, Reduce4(Fold(s30), Fold(s31), Fold(s32), Fold(s33)), cols, alpha, beta);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void DotTile256(int k, float* a, long ars, int rows, float* b, long bcs, int cols,
+            float alpha, float beta, float* c, long ldc)
+        {
+            float* a0 = a, a1 = rows > 1 ? a + ars : a, a2 = rows > 2 ? a + 2 * ars : a, a3 = rows > 3 ? a + 3 * ars : a;
+            float* b0 = b, b1 = cols > 1 ? b + bcs : b;
+            Vector256<float> s00 = default, s01 = default, s10 = default, s11 = default;
+            Vector256<float> s20 = default, s21 = default, s30 = default, s31 = default;
+            Vector256<float> x0, x1, x2, x3, y;
+
+            int p = 0;
+            for (; p + 8 <= k; p += 8)
+            {
+                x0 = Vector256.Load(a0 + p); x1 = Vector256.Load(a1 + p);
+                x2 = Vector256.Load(a2 + p); x3 = Vector256.Load(a3 + p);
+                y = Vector256.Load(b0 + p);
+                s00 = Fma.MultiplyAdd(x0, y, s00); s10 = Fma.MultiplyAdd(x1, y, s10);
+                s20 = Fma.MultiplyAdd(x2, y, s20); s30 = Fma.MultiplyAdd(x3, y, s30);
+                y = Vector256.Load(b1 + p);
+                s01 = Fma.MultiplyAdd(x0, y, s01); s11 = Fma.MultiplyAdd(x1, y, s11);
+                s21 = Fma.MultiplyAdd(x2, y, s21); s31 = Fma.MultiplyAdd(x3, y, s31);
+            }
+            if (p < k)
+            {
+                Vector256<float> mask = Vector256.GreaterThanOrEqual(Vector256<int>.Indices, Vector256.Create(8 - (k - p))).AsSingle();
+                p = k - 8;
+                x0 = Vector256.Load(a0 + p) & mask; x1 = Vector256.Load(a1 + p) & mask;
+                x2 = Vector256.Load(a2 + p) & mask; x3 = Vector256.Load(a3 + p) & mask;
+                y = Vector256.Load(b0 + p) & mask;
+                s00 = Fma.MultiplyAdd(x0, y, s00); s10 = Fma.MultiplyAdd(x1, y, s10);
+                s20 = Fma.MultiplyAdd(x2, y, s20); s30 = Fma.MultiplyAdd(x3, y, s30);
+                y = Vector256.Load(b1 + p) & mask;
+                s01 = Fma.MultiplyAdd(x0, y, s01); s11 = Fma.MultiplyAdd(x1, y, s11);
+                s21 = Fma.MultiplyAdd(x2, y, s21); s31 = Fma.MultiplyAdd(x3, y, s31);
+            }
+
+            // Each reduction is [row r col 0, row r col 1, row r+1 col 0, row r+1 col 1].
+            Vector128<float> r01 = Reduce4(s00, s01, s10, s11);
+            Vector128<float> r23 = Reduce4(s20, s21, s30, s31);
+            StoreDotPair(c, r01.GetElement(0), r01.GetElement(1), cols, alpha, beta);
+            if (rows > 1) StoreDotPair(c + ldc, r01.GetElement(2), r01.GetElement(3), cols, alpha, beta);
+            if (rows > 2) StoreDotPair(c + 2 * ldc, r23.GetElement(0), r23.GetElement(1), cols, alpha, beta);
+            if (rows > 3) StoreDotPair(c + 3 * ldc, r23.GetElement(2), r23.GetElement(3), cols, alpha, beta);
+        }
+
+        /// <summary>Vector&lt;T&gt; form of the 4x2 dot tile (ARM64 NEON, pre-AVX2 x64).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void DotTilePortable(int k, float* a, long ars, int rows, float* b, long bcs, int cols,
+            float alpha, float beta, float* c, long ldc)
+        {
+            int w = Vector<float>.Count;
+            float* a0 = a, a1 = rows > 1 ? a + ars : a, a2 = rows > 2 ? a + 2 * ars : a, a3 = rows > 3 ? a + 3 * ars : a;
+            float* b0 = b, b1 = cols > 1 ? b + bcs : b;
+            Vector<float> s00 = default, s01 = default, s10 = default, s11 = default;
+            Vector<float> s20 = default, s21 = default, s30 = default, s31 = default;
+            Vector<float> x0, x1, x2, x3, y;
+
+            int p = 0;
+            for (; p + w <= k; p += w)
+            {
+                x0 = Unsafe.ReadUnaligned<Vector<float>>(a0 + p); x1 = Unsafe.ReadUnaligned<Vector<float>>(a1 + p);
+                x2 = Unsafe.ReadUnaligned<Vector<float>>(a2 + p); x3 = Unsafe.ReadUnaligned<Vector<float>>(a3 + p);
+                y = Unsafe.ReadUnaligned<Vector<float>>(b0 + p);
+                s00 += x0 * y; s10 += x1 * y; s20 += x2 * y; s30 += x3 * y;
+                y = Unsafe.ReadUnaligned<Vector<float>>(b1 + p);
+                s01 += x0 * y; s11 += x1 * y; s21 += x2 * y; s31 += x3 * y;
+            }
+            if (p < k)
+            {
+                Vector<float> mask = Vector.AsVectorSingle(Vector.GreaterThanOrEqual(Vector<int>.Indices, new Vector<int>(w - (k - p))));
+                p = k - w;
+                x0 = Unsafe.ReadUnaligned<Vector<float>>(a0 + p) & mask; x1 = Unsafe.ReadUnaligned<Vector<float>>(a1 + p) & mask;
+                x2 = Unsafe.ReadUnaligned<Vector<float>>(a2 + p) & mask; x3 = Unsafe.ReadUnaligned<Vector<float>>(a3 + p) & mask;
+                y = Unsafe.ReadUnaligned<Vector<float>>(b0 + p) & mask;
+                s00 += x0 * y; s10 += x1 * y; s20 += x2 * y; s30 += x3 * y;
+                y = Unsafe.ReadUnaligned<Vector<float>>(b1 + p) & mask;
+                s01 += x0 * y; s11 += x1 * y; s21 += x2 * y; s31 += x3 * y;
+            }
+
+            StoreDotPair(c, Vector.Sum(s00), Vector.Sum(s01), cols, alpha, beta);
+            if (rows > 1) StoreDotPair(c + ldc, Vector.Sum(s10), Vector.Sum(s11), cols, alpha, beta);
+            if (rows > 2) StoreDotPair(c + 2 * ldc, Vector.Sum(s20), Vector.Sum(s21), cols, alpha, beta);
+            if (rows > 3) StoreDotPair(c + 3 * ldc, Vector.Sum(s30), Vector.Sum(s31), cols, alpha, beta);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> Fold(Vector512<float> v) => v.GetLower() + v.GetUpper();
+
+        /// <summary>[sum v0, sum v1, sum v2, sum v3] in three horizontal adds.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector128<float> Reduce4(Vector256<float> v0, Vector256<float> v1, Vector256<float> v2, Vector256<float> v3)
+        {
+            // hadd(hadd(v0, v1), hadd(v2, v3)) = [v0, v1, v2, v3 summed over lanes 0..3 | over 4..7].
+            Vector256<float> u = Avx.HorizontalAdd(Avx.HorizontalAdd(v0, v1), Avx.HorizontalAdd(v2, v3));
+            return u.GetLower() + u.GetUpper();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void StoreDotRow(float* c, Vector128<float> sums, int cols, float alpha, float beta)
+        {
+            if (cols == 4)
+            {
+                Vector128<float> v = sums * alpha;
+                if (beta != 0f) v += Vector128.Load(c) * beta;
+                v.Store(c);
+                return;
+            }
+            for (int j = 0; j < cols; j++)
+            {
+                float v = alpha * sums.GetElement(j);
+                c[j] = beta == 0f ? v : v + beta * c[j];
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void StoreDotPair(float* c, float d0, float d1, int cols, float alpha, float beta)
+        {
+            float v0 = alpha * d0;
+            c[0] = beta == 0f ? v0 : v0 + beta * c[0];
+            if (cols > 1)
+            {
+                float v1 = alpha * d1;
+                c[1] = beta == 0f ? v1 : v1 + beta * c[1];
+            }
         }
 
         // ------------------------------------------------------------------------------------

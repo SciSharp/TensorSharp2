@@ -107,6 +107,14 @@ public unsafe class CpuSgemmTests
             new[] { 1, 1, 1 }, new[] { 1, 37, 64 }, new[] { 3, 5, 7 }, new[] { 4, 300, 129 },
             new[] { 5, 1, 33 }, new[] { 8, 32, 1 }, new[] { 9, 33, 17 }, new[] { 13, 47, 256 },
             new[] { 31, 17, 300 }, new[] { 70, 90, 128 }, new[] { 129, 65, 513 }, new[] { 200, 200, 120 },
+            // Serial (< 4 MFLOP, one tile) shapes past the MC row block and the NC column block,
+            // so the packed driver's ic > 0 / jc > 0 loops run (in NT too for N = 68, above every
+            // kernel's narrow-dot limit); in NT, N = 40 and N = 5 take the narrow dot path instead
+            // (ragged rows, a K tail, a long unsplit K).
+            new[] { 301, 40, 100 }, new[] { 290, 68, 100 }, new[] { 8, 3000, 64 }, new[] { 37, 5, 4133 },
+            // Parallel narrow products (row chunks of the dot path in NT); the last one's B^T
+            // (40 x 3500 floats) exceeds the dot path's L2 budget, so its K is split in two blocks.
+            new[] { 1001, 3, 1152 }, new[] { 403, 29, 700 }, new[] { 21, 40, 3500 },
         };
         foreach (string kernel in kernels)
             foreach (int[] s in shapes)
@@ -250,6 +258,9 @@ public unsafe class CpuSgemmTests
             yield return new object[] { k[0], 16, 70, 70, 256 };
             yield return new object[] { k[0], 5, 1, 17, 33 };
             yield return new object[] { k[0], 2, 130, 97, 65 };
+            // Narrow score GEMMs (few keys) on the dot path, serial and parallel over the batch.
+            yield return new object[] { k[0], 8, 45, 30, 72 };
+            yield return new object[] { k[0], 12, 200, 40, 136 };
         }
     }
 
@@ -306,6 +317,77 @@ public unsafe class CpuSgemmTests
         Ops.Fill(zeros, 0f);
         DirectOps.CpuGemmAB(x, bKn, c2, 1f, 0f);
         AssertGemm(x, bKn, zeros, c2, 1f, 0f);
+    }
+
+    [Theory]
+    [MemberData(nameof(Kernels))]
+    public void NarrowDot_TailMask_DoesNotTurnInfIntoNaN(string kernel)
+    {
+        using var _ = UseKernel(kernel);
+        // K = 20: the dot path's tail step re-reads the last full vector with the lanes it already
+        // summed zeroed in BOTH operands. Column 13 lies in that re-read window for 256- and
+        // 512-bit vectors, so a +Inf there must stay +Inf (0 * Inf would be NaN).
+        int m = 9, n = 5, k = 20;
+        float[] a = new float[m * k];
+        float[] bT = new float[n * k];
+        var rng = new Random(31);
+        for (int i = 0; i < a.Length; i++) a[i] = (float)rng.NextDouble() + 0.5f;
+        for (int i = 0; i < bT.Length; i++) bT[i] = (float)(rng.NextDouble() * 2 - 1);
+        bT[2 * k + 13] = float.PositiveInfinity;
+        float[] c = new float[m * n];
+        fixed (float* ap = a, bp = bT, cp = c)
+        {
+            CpuSgemm.Gemm(m, n, k, 1f, ap, k, 1, bp, 1, k, 0f, cp, n);
+        }
+        for (int i = 0; i < m; i++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                if (j == 2)
+                {
+                    Assert.Equal(float.PositiveInfinity, c[i * n + j]);
+                    continue;
+                }
+                double acc = 0, mag = 0;
+                for (int p = 0; p < k; p++)
+                {
+                    double prod = (double)a[i * k + p] * bT[j * k + p];
+                    acc += prod;
+                    mag += Math.Abs(prod);
+                }
+                Assert.True(Math.Abs(c[i * n + j] - acc) <= 2e-7 * (k + 16) * mag + 1e-6, $"[{i},{j}] {c[i * n + j]} vs {acc}");
+            }
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(Kernels))]
+    public void NarrowDot_MatchesPackedPath(string kernel)
+    {
+        using var _ = UseKernel(kernel);
+        // Same product through the packed tile (dot path forced off) and the dot path (forced
+        // on, whatever the kernel's default limit): both within the fp64 bound.
+        int m = 157, n = 13, k = 333;
+        using Tensor x = Random(32, m, k);
+        using Tensor w = Random(33, n, k);
+        using Tensor wT = w.Transpose();
+        using Tensor packed = new Tensor(_alloc, DType.Float32, m, n);
+        using Tensor dot = new Tensor(_alloc, DType.Float32, m, n);
+        using var zeros = new Tensor(_alloc, DType.Float32, m, n);
+        Ops.Fill(zeros, 0f);
+        try
+        {
+            CpuSgemm.NarrowDotMaxN = 0;
+            DirectOps.CpuGemmABt(x, w, packed, 1f, 0f);
+            CpuSgemm.NarrowDotMaxN = 64;
+            DirectOps.CpuGemmABt(x, w, dot, 1f, 0f);
+        }
+        finally
+        {
+            CpuSgemm.NarrowDotMaxN = -1;
+        }
+        AssertGemm(x, wT, zeros, packed, 1f, 0f);
+        AssertGemm(x, wT, zeros, dot, 1f, 0f);
     }
 
     [Fact]

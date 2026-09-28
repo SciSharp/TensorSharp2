@@ -7,14 +7,20 @@
 //
 // CpuFloatBench: throughput of the pure-C# CPU float kernels.
 //
-//   CpuFloatBench [all|peak|gemm|skinny|batch|direct|attn|eltwise|kernel|probe]... [--quick] [--no-check]
+//   CpuFloatBench [all|peak|gemm|skinny|batch|direct|attn|eltwise|kernel|probe|narrow|attnlong]... [--quick] [--no-check]
 //   CpuFloatBench shape M N K NN|NT|TN|TT        one Ops.Addmm shape (blocking sweeps)
 //   CpuFloatBench qwen-te <text-encoder.gguf> [dump.bin] [compare.bin]
 //                                                 Qwen-Image text encoder on the cpu backend,
 //                                                 timing + parity against a previous dump
+//   CpuFloatBench gemma4-vision <mmproj.gguf> <image> [dump.bin] [compare.bin]
+//                                                 Gemma4 vision tower on a CpuAllocator, exactly
+//                                                 as the direct `cuda` backend runs it
 //
 // 'kernel' times the raw microkernels on L1-resident panels; 'probe' traces per-call latency of
 // a small transcendental op and the CpuParallel fork/join (warm-up and dispatch diagnostics).
+// 'narrow' sweeps N for tall dot-layout products (packed tile vs narrow dot path, per kernel:
+// the data behind the TS_CPU_SGEMM_DOT_MAXN defaults); 'attnlong' sweeps the CPU attention's
+// query-block floor at long sequences. Neither is part of 'all'.
 //
 // The implementation is picked by environment variables at process start, so an A/B is two
 // runs of the same binary:
@@ -58,6 +64,18 @@ internal static unsafe class Program
                 string cmp = dump != null && i + 3 < args.Length && !args[i + 3].StartsWith("-") ? args[i + 3] : null;
                 QwenTextEncoder(te, dump, cmp);
                 i += 1 + (dump != null ? 1 : 0) + (cmp != null ? 1 : 0);
+                sections.Add("none");
+            }
+            else if (a == "gemma4-vision" && i + 2 < args.Length)
+            {
+                // gemma4-vision <mmproj.gguf> <image> [dump.bin] [compare.bin]: the tower the `cuda`
+                // backend keeps on a CpuAllocator (Gemma4Model.LoadVisionEncoder), i.e. Ops.* on
+                // CpuStorage - old vs new Core kernels are two runs with the TS_CPU_* switches.
+                string mm = args[i + 1], img = args[i + 2];
+                string dump = i + 3 < args.Length && !args[i + 3].StartsWith("-") ? args[i + 3] : null;
+                string cmp = dump != null && i + 4 < args.Length && !args[i + 4].StartsWith("-") ? args[i + 4] : null;
+                Gemma4Vision(mm, img, dump, cmp);
+                i += 2 + (dump != null ? 1 : 0) + (cmp != null ? 1 : 0);
                 sections.Add("none");
             }
             else if (a == "shape" && i + 4 < args.Length)
@@ -117,6 +135,8 @@ internal static unsafe class Program
         if (all || sections.Contains("batch")) BatchSection();
         if (all || sections.Contains("direct")) DirectSection();
         if (all || sections.Contains("attn")) AttentionSection();
+        if (sections.Contains("narrow")) NarrowSection();
+        if (sections.Contains("attnlong")) LongAttentionSection();
         if (all || sections.Contains("eltwise")) EltwiseSection();
         return 0;
     }
@@ -394,7 +414,8 @@ internal static unsafe class Program
         MeasurePeakQuietly();
         var shapes = Quick
             ? new[] { (16384, 384, 3456), (65536, 96, 864) }
-            : new[] { (16384, 384, 3456), (65536, 192, 1728), (262144, 96, 864), (4096, 384, 384), (1024, 12, 384) };
+            : new[] { (16384, 384, 3456), (65536, 192, 1728), (262144, 96, 864), (4096, 384, 384), (1024, 12, 384),
+                      (65536, 3, 2592), (65536, 16, 1152), (65536, 40, 1152) };
         foreach (var (m, n, k) in shapes)
         {
             using Tensor x = Random(6, m, k);
@@ -468,6 +489,119 @@ internal static unsafe class Program
     }
 
     // ------------------------------------------------------------------------------------
+    //  Narrow N sweep: packed register tile vs the narrow dot path, per kernel
+    // ------------------------------------------------------------------------------------
+
+    /// <summary>Best of a few runs after a short warm-up (the GEMM code is always fully JIT-optimized).</summary>
+    private static double TimeBest(Action run, int reps)
+    {
+        run();
+        run();
+        double best = double.MaxValue;
+        for (int r = 0; r < reps; r++)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+            run();
+            best = Math.Min(best, Stopwatch.GetElapsedTime(t0).TotalSeconds);
+        }
+        return best;
+    }
+
+    private static void NarrowSection()
+    {
+        Console.WriteLine();
+        Console.WriteLine("== narrow N (DirectOps.CpuGemmABt: A[M,K] x B[N,K]^T): packed tile vs dot path ==");
+        MeasurePeakQuietly();
+        CpuSgemm.KernelKind saved = CpuSgemm.ActiveKernel;
+        var kinds = Quick
+            ? new[] { saved }
+            : Enum.GetValues<CpuSgemm.KernelKind>().Where(CpuSgemm.IsSupported).Reverse().ToArray();
+        int[] ns = Quick ? new[] { 3, 16, 32, 48, 64 } : new[] { 1, 3, 8, 12, 16, 24, 32, 40, 48, 64, 96 };
+        var shapes = Quick ? new[] { (65536, 1152) } : new[] { (65536, 1152), (65536, 288), (8192, 4096), (300, 2816) };
+        try
+        {
+            foreach (CpuSgemm.KernelKind kind in kinds)
+            {
+                CpuSgemm.ActiveKernel = kind;
+                Console.WriteLine($"  kernel {CpuSgemm.ActiveKernelName} (default dot max N {DefaultDotMaxN()})");
+                foreach (var (m, k) in shapes)
+                {
+                    using Tensor x = Random(31, m, k);
+                    foreach (int n in ns)
+                    {
+                        using Tensor w = Random(32, n, k);
+                        using Tensor c = new Tensor(Alloc, DType.Float32, m, n);
+                        double flop = 2.0 * m * n * k;
+                        int reps = flop > 2e9 ? 3 : 7;
+                        double tPacked = double.MaxValue, tDot = double.MaxValue;
+                        for (int round = 0; round < 2; round++)   // interleaved A/B
+                        {
+                            CpuSgemm.NarrowDotMaxN = 0;
+                            tPacked = Math.Min(tPacked, TimeBest(() => DirectOps.CpuGemmABt(x, w, c, 1f, 0f), reps));
+                            CpuSgemm.NarrowDotMaxN = int.MaxValue;
+                            tDot = Math.Min(tDot, TimeBest(() => DirectOps.CpuGemmABt(x, w, c, 1f, 0f), reps));
+                        }
+                        using Tensor wT = w.Transpose();
+                        double err = SampledError(x, wT, c, 1f);
+                        Console.WriteLine($"    {m,6}x{n,-3}x{k,-5} packed {flop / tPacked / 1e9,7:F1} GFLOPS {tPacked * 1e3,8:F2} ms   dot {flop / tDot / 1e9,7:F1} GFLOPS {tDot * 1e3,8:F2} ms   dot/packed {tPacked / tDot,5:F2}x  (dot err {err:E1})");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            CpuSgemm.ActiveKernel = saved;
+            CpuSgemm.NarrowDotMaxN = -1;
+        }
+    }
+
+    private static int DefaultDotMaxN()
+    {
+        CpuSgemm.NarrowDotMaxN = -1;
+        return CpuSgemm.NarrowDotMaxN;
+    }
+
+    /// <summary>CPU attention at long sequences (DiT/VAE image tokens) across query-block floors:
+    /// every block re-packs its head's K^T and V panels, so fewer, taller blocks amortize that.</summary>
+    private static void LongAttentionSection()
+    {
+        Console.WriteLine();
+        Console.WriteLine("== DirectOps.Attention, long sequences: query-block floor sweep ==");
+        using var ctx = new DirectContext(Alloc);
+        int savedFloor = DirectOps.CpuAttentionMinQBlock;
+        int[] floors = Quick ? new[] { 16, 64 } : new[] { 16, 32, 64, 128 };
+        var shapes = Quick ? new[] { (1, 16384, 128) } : new[] { (24, 4096, 128), (4, 8192, 128), (1, 16384, 128) };
+        try
+        {
+            foreach (var (heads, seq, hd) in shapes)
+            {
+                using Tensor q = Random(41, seq, (long)heads * hd);
+                using Tensor k = Random(42, seq, (long)heads * hd);
+                using Tensor v = Random(43, seq, (long)heads * hd);
+                float scale = 1f / MathF.Sqrt(hd);
+                double flop = 4.0 * heads * seq * seq * hd;
+                var best = new double[floors.Length];
+                Array.Fill(best, double.MaxValue);
+                for (int round = 0; round < 2; round++)   // interleaved across floors
+                {
+                    for (int f = 0; f < floors.Length; f++)
+                    {
+                        DirectOps.CpuAttentionMinQBlock = floors[f];
+                        best[f] = Math.Min(best[f], TimeBest(() => DirectOps.Attention(ctx, q, k, v, heads, hd, scale).Dispose(), 2));
+                    }
+                }
+                var cells = floors.Select((fl, f) => $"floor {fl,3}: {flop / best[f] / 1e9,6:F1} GFLOPS {best[f] * 1e3,8:F1} ms");
+                Console.WriteLine($"  heads={heads,2} seq={seq,5} hd={hd,3}  " + string.Join("   ", cells));
+            }
+        }
+        finally
+        {
+            DirectOps.CpuAttentionMinQBlock = savedFloor;
+        }
+    }
+
+
+    // ------------------------------------------------------------------------------------
     //  Qwen-Image text encoder (Qwen3-VL trunk) on the cpu backend
     // ------------------------------------------------------------------------------------
 
@@ -493,26 +627,77 @@ internal static unsafe class Program
             Console.WriteLine($"  encode {tokens.Length} tokens: {times[^1]:F1} ms");
         }
         Console.WriteLine($"  best {times.Min():F1} ms");
+        DumpAndCompare(hidden, 0, dump, compare);
+    }
+
+    /// <summary>Writes <paramref name="values"/> to <paramref name="dump"/> and compares them with an
+    /// earlier dump: max |diff|, overall cosine and (given a row width) the worst row cosine.</summary>
+    private static void DumpAndCompare(float[] values, int rowWidth, string dump, string compare)
+    {
         if (dump != null)
         {
             using var w = new BinaryWriter(File.Create(dump));
-            w.Write(hidden.Length);
-            foreach (float v in hidden) w.Write(v);
+            w.Write(values.Length);
+            foreach (float v in values) w.Write(v);
         }
         if (compare != null && File.Exists(compare))
         {
             using var rd = new BinaryReader(File.OpenRead(compare));
             int n = rd.ReadInt32();
+            if (n != values.Length)
+            {
+                Console.WriteLine($"  vs {compare}: length {n} != {values.Length}");
+                return;
+            }
             double maxAbs = 0, maxRef = 0, dot = 0, na = 0, nb = 0;
+            double rDot = 0, rNa = 0, rNb = 0, worstRow = 1;
             for (int i = 0; i < n; i++)
             {
                 float refV = rd.ReadSingle();
-                maxAbs = Math.Max(maxAbs, Math.Abs(refV - hidden[i]));
+                maxAbs = Math.Max(maxAbs, Math.Abs(refV - values[i]));
                 maxRef = Math.Max(maxRef, Math.Abs(refV));
-                dot += (double)refV * hidden[i]; na += (double)refV * refV; nb += (double)hidden[i] * hidden[i];
+                dot += (double)refV * values[i]; na += (double)refV * refV; nb += (double)values[i] * values[i];
+                rDot += (double)refV * values[i]; rNa += (double)refV * refV; rNb += (double)values[i] * values[i];
+                if (rowWidth > 0 && (i + 1) % rowWidth == 0)
+                {
+                    worstRow = Math.Min(worstRow, rDot / Math.Sqrt(rNa * rNb + 1e-300));
+                    rDot = rNa = rNb = 0;
+                }
             }
-            Console.WriteLine($"  vs {compare}: max|diff| {maxAbs:E3} (max|ref| {maxRef:F2})  cosine {dot / Math.Sqrt(na * nb):F8}");
+            string rows = rowWidth > 0 ? $"  worst row cosine {worstRow:F8}" : "";
+            Console.WriteLine($"  vs {compare}: max|diff| {maxAbs:E3} (max|ref| {maxRef:F2})  cosine {dot / Math.Sqrt(na * nb):F8}{rows}");
         }
+    }
+
+    // ------------------------------------------------------------------------------------
+    //  Gemma4 vision tower on a CpuAllocator (the direct cuda backend's CPU half)
+    // ------------------------------------------------------------------------------------
+
+    private static void Gemma4Vision(string mmproj, string image, string dump, string compare)
+    {
+        Console.WriteLine($"gemma4-vision: {mmproj}  env TS_CPU_SGEMM={Env("TS_CPU_SGEMM")} TS_CPU_SIMD_ELEMENTWISE={Env("TS_CPU_SIMD_ELEMENTWISE")} TS_CPU_POOL={Env("TS_CPU_POOL")} TS_CPU_DISABLE_AVX512={Env("TS_CPU_DISABLE_AVX512")}");
+        var load = Stopwatch.StartNew();
+        using var enc = new TensorSharp.Models.Gemma4VisionEncoder(mmproj, new CpuAllocator(BlasEnum.DotNet));
+        var proc = enc.IsUnified
+            ? new TensorSharp.Models.Gemma4ImageProcessor(imageMean: enc.ImageMean, imageStd: enc.ImageStd)
+            : new TensorSharp.Models.Gemma4ImageProcessor();
+        var (pixels, w, h) = proc.ProcessImage(image);
+        Console.WriteLine($"  load {load.Elapsed.TotalSeconds:F1} s, image {w}x{h}");
+        float[] output = null;
+        int rowWidth = 0;
+        var times = new List<double>();
+        for (int r = 0; r < 3; r++)
+        {
+            var sw = Stopwatch.StartNew();
+            using Tensor o = enc.Encode(pixels, w, h);
+            using Tensor contig = Ops.NewContiguous(o);
+            output = contig.GetElementsAsFloat((int)contig.ElementCount());
+            times.Add(sw.Elapsed.TotalMilliseconds);
+            rowWidth = (int)contig.Sizes[^1];
+            Console.WriteLine($"  encode -> [{string.Join(",", contig.Sizes.ToArray())}]: {times[^1]:F1} ms");
+        }
+        Console.WriteLine($"  best {times.Min():F1} ms");
+        DumpAndCompare(output, rowWidth, dump, compare);
     }
 
     // ------------------------------------------------------------------------------------

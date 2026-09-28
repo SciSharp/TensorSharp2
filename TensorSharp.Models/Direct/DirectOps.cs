@@ -750,6 +750,10 @@ namespace TensorSharp.Models.Direct
             }
         }
 
+        /// <summary>Fewest query rows per block of <see cref="TryCpuBlockedAttention"/> (tuning;
+        /// CpuFloatBench 'attnlong' sweeps it).</summary>
+        internal static int CpuAttentionMinQBlock { get; set; } = 128;
+
         /// <summary>
         /// CPU attention on the packed SGEMM without per-head copies: Q/K/V head slices are
         /// passed as strided views (row stride heads*hd), and the work is cut into independent
@@ -763,11 +767,29 @@ namespace TensorSharp.Models.Direct
                                                           int heads, int sq, int sk, int hd, float scale)
         {
             if (!CpuSgemm.Enabled || !CpuKernels.Enabled ||
+                q.DimensionCount != 2 || k.DimensionCount != 2 || v.DimensionCount != 2 ||
                 q.Strides[1] != 1 || k.Strides[1] != 1 || v.Strides[1] != 1 || outT.Strides[1] != 1 ||
                 (bias != null && (bias.DimensionCount != 3 || bias.Strides[2] != 1)))
             {
                 return false;
             }
+
+            // Raw pointers below, so extents are checked here: shapes the chunked path's
+            // Narrow/Select would reject (or read past, for V rows != sk) fail fast instead of
+            // reading out of bounds. A broadcast bias (stride 0 over heads or rows) is fine.
+            long width = (long)heads * hd;
+            if (q.Sizes[1] < width || k.Sizes[1] < width || v.Sizes[1] < width || v.Sizes[0] != sk)
+            {
+                throw new ArgumentException(
+                    $"Attention shapes q[{q.Sizes[0]},{q.Sizes[1]}] k[{k.Sizes[0]},{k.Sizes[1]}] v[{v.Sizes[0]},{v.Sizes[1]}] " +
+                    $"do not hold {heads} heads x {hd} with {sk} keys.");
+            }
+            if (bias != null && (bias.Sizes[0] < heads || bias.Sizes[1] < sq || bias.Sizes[2] != sk))
+            {
+                throw new ArgumentException(
+                    $"Attention bias [{bias.Sizes[0]},{bias.Sizes[1]},{bias.Sizes[2]}] does not cover [{heads},{sq},{sk}].");
+            }
+            if (sq == 0 || heads == 0 || hd == 0) return true;   // nothing to write
 
             float* qp = (float*)CpuNativeHelpers.GetBufferStart(q);
             float* kp = (float*)CpuNativeHelpers.GetBufferStart(k);
@@ -777,9 +799,11 @@ namespace TensorSharp.Models.Direct
             long qs = q.Strides[0], ks = k.Strides[0], vs = v.Strides[0], os = outT.Strides[0];
             long bh = bias != null ? bias.Strides[0] : 0, br = bias != null ? bias.Strides[1] : 0;
 
-            // Query rows per block: a <= 1 MB score block (L2), at least 16 rows so the K/V
-            // panel packing each block repeats stays a few percent of its arithmetic.
-            int qBlock = (int)Math.Clamp((256L * 1024) / Math.Max(1, sk), 16, 256);
+            // Query rows per block: a <= 1 MB score block (L2) when the keys allow it, but at least
+            // 128 rows. Every block re-packs its head's K^T and V panels (one packed float per qn
+            // FMAs): against a 16-row floor, 128 measured ~6% faster at 4K keys (24 heads) and
+            // 11-22% at 8K-16K, although the score block then outgrows L2 (8 MB at 16K keys).
+            int qBlock = (int)Math.Clamp((256L * 1024) / Math.Max(1, sk), Math.Clamp(CpuAttentionMinQBlock, 8, 256), 256);
             qBlock = Math.Min(sq, (qBlock + 7) / 8 * 8);
             int qBlocks = (sq + qBlock - 1) / qBlock;
             int items = heads * qBlocks;
