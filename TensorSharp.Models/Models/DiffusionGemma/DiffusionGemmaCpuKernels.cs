@@ -58,7 +58,10 @@ namespace TensorSharp.Models
     /// step) and each layer picks a top-8 of 128 experts. Measured on diffusiongemma-26B-A4B, a
     /// structured read's label probability moved from 0.43 to 0.30-0.74 when only the attention's
     /// float grouping changed. So everything here reproduces the arithmetic of the Ops chain it
-    /// replaces, which is what makes the new CPU forward bitwise-checkable against the old one. The
+    /// replaced as that chain computed before the Core CPU rewrite (TS_CPU_SIMD_ELEMENTWISE /
+    /// TS_CPU_SGEMM / TS_CPU_QGEMM, whose defaults now round differently), which is what makes the new
+    /// CPU forward bitwise-checkable against the old one - with the whole rollback recipe
+    /// (DiffusionGemmaModel.Cpu.cs), not DIFFUSION_CPU_LEGACY=1 alone. The
     /// attention is a fraction of a percent of a forward at Jev/chat prompt lengths, so the exact
     /// kernel is the default; <c>DIFFUSION_CPU_ATTN_FAST=1</c> selects FMA tiles (Vector512 when the
     /// hardware accelerates it; <c>TS_CPU_DISABLE_AVX512=1</c> keeps them at Vector&lt;T&gt;) and a
@@ -87,9 +90,11 @@ namespace TensorSharp.Models
 
         // ------------------------------------------------------------------------------------
         //  Per-head RMSNorm (+ optional NeoX RoPE), one row.
-        //  Bitwise identical to Ops.RMSNorm (same single-accumulator Vector<float> sum of squares,
-        //  same (x*invRms)*gamma product order) followed by ApplyNeoXRoPERaw's
-        //  (x0*c - x1*s, x0*s + x1*c), with no FMA contraction, so one pass replaces three.
+        //  Bitwise identical to the pre-SIMD Ops.RMSNorm - the one TS_CPU_SIMD_ELEMENTWISE=0 still
+        //  runs: a single-accumulator Vector<float> sum of squares and the (x*invRms)*gamma product
+        //  order (the default CpuKernels.RmsNormRow sums in two wider accumulators, so its bits
+        //  differ) - followed by ApplyNeoXRoPERaw's (x0*c - x1*s, x0*s + x1*c), with no FMA
+        //  contraction, so one pass replaces three.
         // ------------------------------------------------------------------------------------
         internal static void HeadNormRopeRow(float* src, float* dst, int heads, int hd, float* weight, float eps,
             float* cos, float* sin)
@@ -161,10 +166,12 @@ namespace TensorSharp.Models
         }
 
         // ------------------------------------------------------------------------------------
-        //  GELU(gate) * up, bit for bit what Ops.GELUMul computes on the CPU backend (TensorApplyCPU:
-        //  the tanh approximation with a double-precision Math.Tanh). Kept scalar on purpose: a
-        //  vectorized float tanh is a few ulp off (see the class remarks). Run over the pool it costs
-        //  well under 1% of a layer; the reference ran on one thread.
+        //  GELU(gate) * up, bit for bit what Ops.GELUMul computed on the CPU backend before the SIMD
+        //  rewrite and still computes under TS_CPU_SIMD_ELEMENTWISE=0 (TensorApplyCPU: the tanh
+        //  approximation with a double-precision Math.Tanh); the default CpuKernels.GeluMul uses a
+        //  vectorized sigmoid form and differs by a few ulp. Kept scalar on purpose: a vectorized
+        //  float tanh is a few ulp off (see the class remarks). Run over the pool it costs well
+        //  under 1% of a layer; the reference ran on one thread.
         // ------------------------------------------------------------------------------------
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static float Gelu(float x)
@@ -213,7 +220,8 @@ namespace TensorSharp.Models
         /// <summary>Router dot with the arithmetic of the managed F32 GEMM's 4x4 row-column kernel
         /// (TensorSharp.Cpu DotContiguousFourByFour: one Vector&lt;float&gt; accumulator of
         /// multiply-then-add, lane sum, scalar tail), which scores every token of a 4-row block in the
-        /// legacy linear. Unlike that GEMM it does not switch kernels for a trailing partial block, so
+        /// legacy linear (the matmul TS_CPU_SGEMM=0 restores; the default packed SGEMM sums in another
+        /// order). Unlike that GEMM it does not switch kernels for a trailing partial block, so
         /// a token's scores never depend on how many rows share the call - the prompt-KV decode needs
         /// that to route each canvas token exactly as the unified forward does.</summary>
         internal static float RouterDot(float* a, float* b, int n)

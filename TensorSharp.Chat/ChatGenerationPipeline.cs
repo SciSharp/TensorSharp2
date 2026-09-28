@@ -950,10 +950,17 @@ namespace TensorSharp.Server
                 }
 
                 // The vision tower runs many GGML ops; take the model-wide compute lock
-                // so it cannot race the scheduler's denoising worker.
-                lock (model.GpuComputeLock)
+                // so it cannot race the scheduler's denoising worker. As a registered turn,
+                // the scheduler hands it over before its next forward rather than after its
+                // whole block.
+                DiffusionComputeTurns turns = model.ComputeTurns;
+                turns.Enter(cancellationToken);
+                try
+                {
                     inputTokens = model.MultimodalInjector.ProcessPromptTokens(
                         renderHistory, inputTokens, mediaRequestId);
+                }
+                finally { turns.Exit(); }
             }
 
             inputTokens = TruncatePromptToContext(

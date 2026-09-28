@@ -380,8 +380,22 @@ namespace TensorSharp.Models
         /// sequence's current prefix, denoises all canvases together (batched forward per step), and commits
         /// each sequence's trimmed block tokens via <see cref="DiffusionSeqRun.CommitBlock"/>. A sequence that
         /// converges early (or whose request is cancelled) freezes its canvas and is dropped from the batch
-        /// for the remaining steps so it doesn't waste GPU work on the slower sequences.</summary>
-        public void RunBlockBatched(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken = default)
+        /// for the remaining steps so it doesn't waste GPU work on the slower sequences.
+        ///
+        /// <para><paramref name="beforeForward"/> runs before every model forward of the block (each
+        /// sequence's prefill, each denoising decode). The server scheduler passes
+        /// <see cref="DiffusionComputeTurns.Yield"/>, so a Jev read or an image encode waiting for the
+        /// compute lock runs there instead of after the whole block. That is output-neutral because, at
+        /// those points, everything the block carries from one forward to the next lives in this method's
+        /// locals (canvases, RNGs, the self-conditioning copies in <c>scBuffer</c> or the device top-K
+        /// buffers, convergence state) and in each sequence's own <see cref="DiffusionSeqState"/>, which
+        /// nothing else writes. The model state another job touches is either keyed caches that are rebuilt
+        /// from their key (masks, RoPE tables, positions; the image-span version is part of the mask key),
+        /// or the pooled logits buffers, which the previous forward's sampling has already consumed. Its
+        /// one hazard is a permanent fallback flag (a fused kernel rejecting the job's layout) - the same
+        /// exposure a job between blocks has always had.</para></summary>
+        public void RunBlockBatched(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken = default,
+            Action beforeForward = null)
         {
             int A = active.Count;
             if (A == 0) return;
@@ -425,6 +439,7 @@ namespace TensorSharp.Models
                 seqs[a] = run.State;
                 if (usePkv)
                 {
+                    beforeForward?.Invoke();
                     _model.PrefillSeq(run.State, run.Prefix.ToArray());
                 }
                 else
@@ -501,6 +516,7 @@ namespace TensorSharp.Models
                         subCanvas[j] = canvas[a];
                         subPrevTempInv[j] = prevTempInv[a];
                     }
+                    beforeForward?.Invoke();
                     float[][] logits = _model.DecodeCanvasBatched(subSeqs, subCanvas, subScPrev, subScUse, subPrevTempInv);
                     for (int j = 0; j < L; j++)
                     {
@@ -524,6 +540,7 @@ namespace TensorSharp.Models
                     // shared-buffer contract.
                     for (int j = 0; j < L; j++)
                     {
+                        beforeForward?.Invoke();
                         int a = live[j];
                         var run = active[a];
                         int S = Math.Max(1, run.Params.MaxDenoisingSteps);
@@ -563,7 +580,9 @@ namespace TensorSharp.Models
                             // The scheduler parks a request's image spans on ITS sequence state, and the
                             // unified forward re-embeds the whole prompt every step, so scope the spans to
                             // this forward exactly as PrefillSeq does - otherwise the image rows would be
-                            // forwarded as their filler token ids on the non-prompt-KV backends.
+                            // forwarded as their filler token ids on the non-prompt-KV backends. For a
+                            // text-only sequence on a model with no retained spans the scope is a no-op, so
+                            // the span version (part of the mask cache key) does not move every step.
                             using (_model.UseSequenceVision(seqs[a]))
                                 lg = _model.ForwardCanvas(unifiedTokens[a], promptLen[a], scBuffer[a], scUse, prevTempInv[a]);
                         }
