@@ -364,7 +364,7 @@ GLM-5.3 on every backend; Gemma 4 on the ggml backends (`ggml_cpu` included) and
 the pure-C# `cuda` backend; Qwen 3.8 Flash Next on its GGML token-graph path;
 GLM-5.3-Flash where its KDA rollback is available; DeepSeek V4 / V4.1 and
 Muse-Glimmer only with their drafter loaded. Nemotron-H refuses it outright (`SpeculationRefusal`). GPT OSS,
-Mistral 3, Qwen 3 / Qwen 2 and Hunyuan Dense implement no speculative trunk and
+Mistral 3 and Hunyuan Dense implement no speculative trunk and
 serve standard decode for every algorithm, n-gram included. Concurrent batches
 never speculate — when more than one sequence is running, every sequence uses the
 normal batched/fallback step. A `--draft-model` that cannot be attached (a
@@ -384,7 +384,6 @@ reused prefix (see
 | GPT OSS | Default batched path. Handles Q/K/V/O bias, YaRN RoPE, sliding-window layers, attention sinks, MXFP4 MoE experts, and native sinks attention. Greedy correctness has been validated against the legacy path; performance remains limited by per-layer graph construction. On GGML backends (not under TP), concurrent decode instead takes the per-request fused holders and a token-batched fused decode, on a slot-stable arena on `ggml_cuda` / `ggml_vulkan`. | `TS_GPTOSS_BATCHED=0`; `TS_GPTOSS_PAGED_ATTN_MANAGED=1`; `TS_GPTOSS_BATCHED_ARENA=0` uses the per-sequence-window batched graph instead of the arena. |
 | Nemotron-H | Default batched path. Attention layers use paged K/V; Mamba2 layers use per-slot conv/SSM state pools; MoE layers use batched expert kernels; prepared image/audio embeddings can be injected into the batched hidden state. | `TS_NEMOTRON_BATCHED=0`; `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step. |
 | GLM 5.x | No `ForwardBatch`: MLA keeps one compressed row per token and the DSA indexer scores against that same contiguous history, so there is no paged-KV layout to batch over. Concurrency runs on native **sequence slots** instead (`TSGgml_GlmSlotAlloc` / `SetActiveSlot` / `SlotFree`) — binding a request switches the active slot without moving KV bytes, and each slot's graphs are cached and captured independently. A default-on batched fused decode (one graph, one token per sequence, weights read once for the batch) is implemented on top: 1.81x aggregate decode at 4 concurrent requests. Batching changes GEMM shapes, and a 2-bit MoE can amplify that into different expert picks. | `TS_BATCHED_FUSED_DECODE=0` disables the batched decode; `TS_GLM_BATCHED_DECODE=0` makes the native side decline it. |
-| Qwen 3 / Qwen 2 (`qwen3`, `qwen2`, e.g. Bonsai 8B) | Default `ForwardBatch` path when the checkpoint has a fused `attn_qkv` projection, including under local (single-process) tensor parallelism; declined for a block-quantized KV cache. On GGML backends (not under TP), concurrent decode runs per-request fused holders one sequence at a time; there is no token-batched fused decode. | `TS_PER_SEQ_FUSED=0` keeps concurrent steps on `ForwardBatch`. |
 | Hunyuan Dense | Default `ForwardBatch` path on F32 paged buffers. A block-quantized (`q8_0` / `q4_0`) KV cache keeps the KV-snapshot swap path, which serves those dtypes exactly. | `TS_HUNYUAN_BATCHED=0` forces the snapshot path. |
 | Muse-Glimmer | No `ForwardBatch` (it is not an `IBatchedPagedModel`): concurrent requests run on the per-sequence KV-swap fallback, which snapshots each sequence's K/V to host memory, also under `--tp`. A Radix page family (host-slab pages). Speculates only while its DFlash drafter is loaded (`--draft-model`). | No batched opt-out; the `TS_MUSE_GLIMMER_*` switches are kernel A/B toggles (see [the Muse-Glimmer card](models/muse-glimmer.md#7-environment-variables)). |
 | DeepSeek V4 / V4.1 | No `ForwardBatch`: the compressed attention caches have no paged layout. Concurrency runs on the native executor's sequence slots (the pure-C# `cpu` and direct-CUDA `cuda` executors stay serial). A default-on token-batched fused decode reads the weights once per step for up to 16 sequences, in windows beyond that; it is declined while a DSpark drafter is loaded. V4.1 can retain a finished conversation's slot for its next turn (opt-in). | `TS_BATCHED_FUSED_DECODE=0`; `TS_DSV41_RETAINED_CACHE=1` enables slot retention on V4.1, budgeted by `TS_DSV41_RETAINED_CACHE_MB` (default 2048). |
@@ -401,7 +400,7 @@ each media span keyed by its content identity, and each node records what state 
 request can resume from there:
 
 - **Pages**: host-slab KV snapshots or the model's own paged blocks, for the
-  families without continuation holders (Qwen 3 / Qwen 2, GPT OSS, Mistral 3,
+  families without continuation holders (GPT OSS, Mistral 3,
   Hunyuan Dense, Muse-Glimmer, Nemotron-H).
 - **End states**: a model-owned continuation state. Gemma 4, the Qwen 3.5 / 3.6 / 3.8
   family (`qwen35`, `qwen35moe`, `qwen3next`) and Qwen 3.8 Flash Next can copy
@@ -425,8 +424,8 @@ resumable boundaries and at explicit cache breakpoints, and always leaves at lea
 one prompt token to compute. The conversation-scope rules below apply unchanged, and
 so does media identity (spans keyed by content; a reuse length never cuts a span).
 Whether reuse continues past a media span comes from each family's prefix-cache
-capabilities: it does on Gemma 4, the Qwen 3.5 / 3.6 / 3.8 family, GPT OSS and
-Qwen 3 / Qwen 2; on the other tree families (Mistral 3, Nemotron-H, Muse-Glimmer,
+capabilities: it does on Gemma 4, the Qwen 3.5 / 3.6 / 3.8 family and GPT OSS;
+on the other tree families (Mistral 3, Nemotron-H, Muse-Glimmer,
 Hunyuan Dense, Qwen 3.8 Flash Next, GLM 5.x, DeepSeek V4 / V4.1) reuse stops at the
 first image, video frame or audio clip. DiffusionGemma and the image/video models
 do not use it.
@@ -520,8 +519,8 @@ A model whose cache cannot be continued past media exactly declares
 `SupportsReuseAcrossMediaSpan = false`, and every reuse path then stops at the first
 media span. No model declares it today, so in legacy mode this rule stops no family;
 the Radix tree takes it from each family's prefix-cache capabilities instead, which
-continue past a media span only on Gemma 4, the Qwen 3.5/3.6/3.8 family, GPT OSS and
-Qwen 3 / Qwen 2 (see [Radix prefix cache](#radix-prefix-cache)). Gemma 4 uses absolute positions. Qwen 3.5/3.6's
+continue past a media span only on Gemma 4, the Qwen 3.5/3.6/3.8 family and GPT OSS
+(see [Radix prefix cache](#radix-prefix-cache)). Gemma 4 uses absolute positions. Qwen 3.5/3.6's
 M-RoPE prompt positions compress after an image, and every token past the position table
 - decode, speculative verify, a text continuation - rotates at its KV index plus the
 sequence's M-RoPE delta, which every holder, checkpoint and checkpoint file (format

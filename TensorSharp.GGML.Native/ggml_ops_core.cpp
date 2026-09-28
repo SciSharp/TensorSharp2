@@ -3098,7 +3098,6 @@ extern "C" void TSGgml_Qwen35ResetDecodeCache();
 extern "C" void TSGgml_Qwen35ResetBatchedDecodeCache();
 extern "C" void TSGgml_Qwen35ResetVerifyCache();
 extern "C" void TSGgml_Qwen35ResetVerifyCacheForHostPointer(const void* host_ptr);
-extern "C" void TSGgml_Qwen3ResetDecodeCache();
 extern "C" void TSGgml_Gemma4ResetBatchedDecodeCache();
 extern "C" void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
 extern "C" void TSGgml_GptOssResetDecodeCache();
@@ -3129,7 +3128,6 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // their captured graphs pointing at freed device memory.
     TSGgml_WanResetForwardCache();
     TSGgml_Qwen35ResetDecodeCache();
-    TSGgml_Qwen3ResetDecodeCache();
     TSGgml_Qwen35ResetBatchedDecodeCache();
     // A process-global host-weight eviction must retire every verify graph/TP
     // plan, but another live Qwen35 model may still own the only current copy of
@@ -3205,7 +3203,6 @@ TSG_EXPORT void TSGgml_Shutdown()
     // pinned staging buffers that reference every rank's backend.
     tp_comm_free();
     TSGgml_Qwen35ResetDecodeCache();
-    TSGgml_Qwen3ResetDecodeCache();
     TSGgml_Qwen35ResetBatchedDecodeCache();
     TSGgml_Qwen35ReleaseVerifyTpGraphs();
     forget_cache_keys();
@@ -3575,7 +3572,6 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     TSGgml_Qwen35ResetDecodeCache();
     TSGgml_Qwen35ResetBatchedDecodeCache();
     TSGgml_Qwen35ResetVerifyCacheForHostPointer(ptr);
-    TSGgml_Qwen3ResetDecodeCache();
 }
 
 TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)

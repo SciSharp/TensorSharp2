@@ -393,7 +393,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 
 ### Chat with Thinking / Reasoning Mode
 
-Thinking-capable architectures (for example Qwen 3, the Qwen 3.5 / 3.6 / 3.8 family including Qwen 3.8 Flash Next, Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4 / V4.1 and GLM 5.x) accept `"think": true` and split chain-of-thought from the visible response:
+Thinking-capable architectures (for example the Qwen 3.5 / 3.6 / 3.8 family including Qwen 3.8 Flash Next, Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4 / V4.1 and GLM 5.x) accept `"think": true` and split chain-of-thought from the visible response:
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \

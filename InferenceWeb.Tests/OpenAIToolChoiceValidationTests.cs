@@ -120,7 +120,7 @@ public sealed class OpenAIToolChoiceValidationTests : IDisposable
     [InlineData(true, "auto")]
     public async Task InternalTools_RemainAvailableWithoutClientDeclarations(bool stream, string? choice)
     {
-        var (context, queue, service, runner) = await Invoke("qwen2", stream, choice == null ? null : JsonSerializer.Serialize(choice), "", codeEnabled: true);
+        var (context, queue, service, runner) = await Invoke("qwen35", stream, choice == null ? null : JsonSerializer.Serialize(choice), "", codeEnabled: true);
         using (service)
         {
             Assert.Null(service.Model);
@@ -139,7 +139,7 @@ public sealed class OpenAIToolChoiceValidationTests : IDisposable
     [InlineData(true, "{\"type\":\"function\",\"function\":{\"name\":\"shell\"}}")]
     public async Task InternalToolCannotSilentlySatisfyExplicitClientContract(bool stream, string choice)
     {
-        var (context, queue, service, runner) = await Invoke("qwen2", stream, choice, "", codeEnabled: true);
+        var (context, queue, service, runner) = await Invoke("qwen35", stream, choice, "", codeEnabled: true);
         using (service)
         {
             Assert.Null(service.Model);

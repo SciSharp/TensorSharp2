@@ -1060,15 +1060,12 @@ CPU 卸载配置另外通过了 28/30 个默认并行质量用例，保留了两
 本地验证记录，未提交到 Git）通过了 39/75 个用例，并且在那一轮中相对其配对参考没有引入新的
 失败；单独的 Unicode JSON 覆盖通过了 15/15。随后重复进行的 JSON 对比
 （`docs/validation/deepseek41/json-performance/completed-r2/README.md`，本地验证记录，
-未提交到 Git）暴露了 Qwen3 在同一请求上的又一次失败，并记录到 Qwen3.5 的首 token 延迟变慢，
+未提交到 Git）暴露了同一请求上的又一次失败，并记录到 Qwen3.5 的首 token 延迟变慢，
 尽管其短回答的 decode 更快。这些结果与前一轮“没有引入新失败”的观察分开记录，并不能证明
 完全不存在回归。
 
-一次匹配分块的对照
-（`docs/validation/deepseek41/existing-model-regressions/qwen3-json-chunks/README.md`）
-在两个构建中都复现了 Qwen3 的响应变化；最初并发时的分块划分没有被记录。Qwen3.5 较短的
-交替对照（`docs/validation/deepseek41/json-performance/qwen35-alternating/README.md`）同样
+Qwen3.5 较短的交替对照（`docs/validation/deepseek41/json-performance/qwen35-alternating/README.md`）同样
 显示最终延迟变慢。之后一次 72 请求的对照
-（`docs/validation/deepseek41/json-performance/qwen35-solo72/README.md`；以上三项均为本地
+（`docs/validation/deepseek41/json-performance/qwen35-solo72/README.md`；以上两项均为本地
 验证记录，未提交到 Git）固定了原生库，所有回答都通过，也没有复现这次变慢。这些诊断没有
 促成任何生产代码修复；不一致的结果及其局限仍记录在验证报告中。

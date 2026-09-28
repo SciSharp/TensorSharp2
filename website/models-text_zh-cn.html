@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>文本与 LLM 模型 — TensorSharp 维基</title>
-  <meta name="description" content="十三种文本架构的下载与运行示例，以及各家族的多模态输入、思考模式与工具调用说明。">
+  <meta name="description" content="十二种文本架构的下载与运行示例，以及各家族的多模态输入、思考模式与工具调用说明。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -197,26 +197,8 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   <p><code>qwen4exp</code> 上的 <code>--layer-split N</code> 是<strong>按层切分</strong>：每张 GPU 持有一段连续的完整层。它不切分任何权重，所以并不是张量并行——而且这也是 llama.cpp 为该架构提供的同一种（且唯一的）多卡模式，它的 <code>-sm row</code> 会直接拒绝加载这个模型。请把它当作容量特性而非速度特性。在 2× A100-80GB、Qwen3.8-Flash-Next-UD-Q2_K_XL（73.4 GiB）上：单卡与双卡的贪心输出<strong>逐字节相同</strong>（SHA-256 一致）；显存是 24.2 GB + 26.2 GB，而不是整个模型压在一张卡上；吞吐没有变化——两种跑法都是 prefill 约 1520–1550 t/s、decode 约 56 t/s。作为对照，llama.cpp 在同一台机器上单卡 pp1536 1094 / tg128 61.2，双卡 <code>-sm layer</code> 1200 / 61.5，同样是 prefill 涨约 10%、decode 不涨。启动时会打印实际走的是哪种模式，以及每张卡分到的层数与字节数；<code>TS_Q4E_LAYER_SPLIT=20,28</code> 可以用显式的每卡层数覆盖自动均衡（相当于 llama.cpp 的 <code>--tensor-split</code>），遇到无法满足的值会直接抛错而不是悄悄忽略——这很有用，因为自动均衡只按权重定价，看不到稍后才加载、并且会落在 GPU 0 上的视觉塔。</p>
   <p><strong>投机解码</strong>使用独立的共享 MTP 头，而不是主干里的张量（已发布的 Q8_0 分片完全不含 <code>nextn</code>/<code>mtp</code> 张量）：在 GGML 后端上用 <code>--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf</code>（2,786,568,256 字节；<code>eng/validation/qwen38_mtp_followup/</code> 中的验证包记录它来自 <code>unsloth/Qwen3.8-Flash-Next-GGUF</code> 的修订版本 <code>38bb39ee</code>）挂上它。它只为从位置 0 开始 prefill 的单独请求起草；延续保留持有者或共享前缀克隆的轮次按普通方式解码。在 UD-Q2_K_XL、三张 A40 按层切分、<code>--spec-draft 3</code> 下实测：192 token 的代码复制流与普通贪心逐字相同，在当前的验证行内核下（每个验证行都与其 decode 步逐位相同）为普通 decode 的 1.69×（83.2 对 49.1 tok/s；2026-09-17 改为逐位一致之前为 1.75–1.96×）；但散文并不划算——512 token 的回答解码为 44–46 tok/s，普通解码为 52。详见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwen38-flash-next_zh-cn.md#共享-mtp-头的投机解码" target="_blank" rel="noopener">模型卡</a>。</p>
 
-  <h3 id="bonsai">Bonsai Q1_0（仅文本，固定修订版本下载）</h3>
-  <p>两个名字相同但架构不同的 <code>Q1_0</code> 文件：<code>Bonsai-8B-Q1_0.gguf</code> 是稠密 Qwen 3 解码器（<code>qwen3</code>），<code>Bonsai-27B-Q1_0.gguf</code> 是带 GatedDeltaNet 层的稠密 Qwen 3.5 混合架构（<code>qwen35</code>）。它们的 GGUF 元数据里既没有发布方 URL 也没有 license，但确切的文件发布在 <code>prism-ml/Bonsai-8B-gguf</code> 与 <code>prism-ml/Bonsai-27B-gguf</code>（发布方卡片声明为 Apache-2.0），TensorSharp 钉住它们的修订版本、确切字节数与 SHA-256。导入前请确认你有权使用该文件；钉住的取值见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai_zh-cn.md" target="_blank" rel="noopener">Bonsai 卡片</a>。</p>
-  <pre data-lang="bash"><code>hf download prism-ml/Bonsai-8B-gguf Bonsai-8B-Q1_0.gguf \
-    --revision 48516770dd04643643e9f9019a2a349cf26c5dbd --local-dir models
-hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf \
-    --revision f10afb355f104535e3e3e98cf7ab7795c72bd292 --local-dir models
-
-# Apple Silicon 上的 Bonsai 8B
-MAX_CONTEXT=16384 KV_CACHE_DTYPE=f16 \
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Bonsai-8B-Q1_0.gguf \
-    --backend ggml_metal --input prompt.txt --max-tokens 256 --temperature 0.5 --top-k 20 --top-p 0.85
-
-# Bonsai 27B；--think 可显示它的推理流
-MAX_CONTEXT=32768 KV_CACHE_DTYPE=f16 \
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Bonsai-27B-Q1_0.gguf \
-    --backend ggml_metal --input prompt.txt --max-tokens 256 --think</code></pre>
-  <p><code>Q1_0</code> 是 GGML 张量类型 41——每 128 个值一块，存一个 F16 scale 加 128 个 1 bit 符号位，即每权重 1.125 bit——GGUF 读取器、原生绑定与托管回退路径都识别它。在 M5 Pro 上以同一文件与 llama.cpp 成对运行：8B <strong>pp128 为 1.05×</strong>、tg128 持平；27B 相对热漂移包夹后的 llama.cpp 基线为 <strong>pp512 1.03×</strong>、<strong>pp2048 1.04×</strong>、<strong>tg128 1.15×</strong>。TensorAgent 在 iOS 上也把两者列为仅导入条目。</p>
-
   <h3 id="bonsai2">Bonsai2 27B（PRISM 三值 Qwen 3.5，文本 + 图像）</h3>
-  <p><code>Ternary-Bonsai-2-27B-PQ2_0.gguf</code> 与 <code>-PTQ1_0.gguf</code> 和 Bonsai 27B 一样声明 <code>general.architecture = qwen35</code>——64 层，其中 48 层 GatedDeltaNet、16 层全注意力——但另外带有 PRISM 带符号 Hadamard 元数据（<code>prism.hadamard.*</code>）以及发布方自定义的张量类型 PQ2_0（142）与 PTQ1_0（143）。TensorSharp 依据这些元数据识别它们，在加载时把权重无损转码为 GGML <code>Q2_0</code>（PQ2_0 约大 6%，PTQ1_0 约大 29%，因此加载后的内存并不等于文件大小），并对投影输入与 embedding 输出施加声明的旋转；不施加这些变换读出的是一个错误的网络。它需要<strong>单设备 GGML 后端</strong>：<code>cpu</code>、<code>cuda</code>、<code>mlx</code> 与 <code>--tp</code> 都会被拒绝，而不是悄悄跳过旋转。配套投影器 <code>Ternary-Bonsai-2-27B-mmproj-BF16.gguf</code> / <code>-mmproj-Q8_0.gguf</code> 提供图像输入——CLI 会在模型旁边查找，服务端只通过 <code>--mmproj</code> 加载。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai2_zh-cn.md" target="_blank" rel="noopener">Bonsai2 卡片</a>列出了本地产物的确切字节数与 SHA-256；仓库没有钉住任何下载来源，TensorAgent 也没有 Bonsai2 条目。</p>
+  <p><code>Ternary-Bonsai-2-27B-PQ2_0.gguf</code> 与 <code>-PTQ1_0.gguf</code> 声明 <code>general.architecture = qwen35</code>——64 层，其中 48 层 GatedDeltaNet、16 层全注意力——并另外带有 PRISM 带符号 Hadamard 元数据（<code>prism.hadamard.*</code>）以及发布方自定义的张量类型 PQ2_0（142）与 PTQ1_0（143）。TensorSharp 依据这些元数据识别它们，在加载时把权重无损转码为 GGML <code>Q2_0</code>（PQ2_0 约大 6%，PTQ1_0 约大 29%，因此加载后的内存并不等于文件大小），并对投影输入与 embedding 输出施加声明的旋转；不施加这些变换读出的是一个错误的网络。它需要<strong>单设备 GGML 后端</strong>：<code>cpu</code>、<code>cuda</code>、<code>mlx</code> 与 <code>--tp</code> 都会被拒绝，而不是悄悄跳过旋转。配套投影器 <code>Ternary-Bonsai-2-27B-mmproj-BF16.gguf</code> / <code>-mmproj-Q8_0.gguf</code> 提供图像输入——CLI 会在模型旁边查找，服务端只通过 <code>--mmproj</code> 加载。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai2_zh-cn.md" target="_blank" rel="noopener">Bonsai2 卡片</a>列出了这些文件的确切字节数与 SHA-256。它们发布在 <code>prism-ml/Ternary-Bonsai-2-27B-gguf</code>（Apache-2.0；钉住的修订版本为 <code>b072e1d</code>），TensorAgent 在 16 GB 设备上把 PTQ1_0 文件（连同可选的 Q8_0 投影器）作为实验性下载提供。</p>
   <pre data-lang="bash"><code># 显式限制上下文，而不是按宣称的 262k 窗口分配
 MAX_CONTEXT=4096 KV_CACHE_DTYPE=f16 \
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model /path/to/Ternary-Bonsai-2-27B-PQ2_0.gguf \
@@ -329,7 +311,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
   <h2 id="toolcalling">工具调用 / 函数调用</h2>
   <p>受支持的模型家族可以调用用户自定义工具，并参与多轮工具调用对话。将工具定义为 JSON，通过 <code>--tools</code>（CLI）或 <code>tools</code> 参数（API）传入。每个受支持架构使用各自的线格式，其输出解析器会将调用提取为结构化 <code>tool_calls</code>：</p>
   <ul>
-    <li><strong>Nemotron-H、Qwen 3（Bonsai 8B）、Qwen 2 / 2.5</strong>（<code>qwen2</code>、<code>qwen2vl</code> 与 <code>qwen2_vl</code> 标签，无思考通道） —— <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Nemotron-H</strong> —— <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
     <li><strong>Qwen 3.5 / 3.6、Qwen 3.8 Flash Next</strong> —— 同样是 <code>&lt;tool_call&gt;</code> 块，但内容为 XML：<code>&lt;function=NAME&gt;&lt;parameter=key&gt;value&lt;/parameter&gt;&lt;/function&gt;</code>（JSON 形式仍被接受）。</li>
     <li><strong>Gemma 4</strong> —— <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
     <li><strong>GPT OSS (Harmony)</strong> —— 工具以 TypeScript 命名空间声明；调用在 commentary 通道发出。</li>

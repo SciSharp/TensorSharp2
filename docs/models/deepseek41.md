@@ -1386,18 +1386,15 @@ local validation evidence, not committed) passed 39/75 cases and introduced no f
 in that run; separate Unicode JSON coverage passed 15/15. The subsequent
 repeated JSON comparison
 (`docs/validation/deepseek41/json-performance/completed-r2/README.md`, local
-validation evidence, not committed) exposed an additional Qwen3 failure for an identical request and recorded slower
+validation evidence, not committed) exposed an additional failure for an identical request and recorded slower
 Qwen3.5 first-token latency despite faster short-answer decode. Those results
 remain separate from the earlier run's zero-introduced-failure observation.
 They do not establish a blanket absence of regressions.
 
-A matched chunk control
-(`docs/validation/deepseek41/existing-model-regressions/qwen3-json-chunks/README.md`)
-reproduced the Qwen3 response change in both builds; the original concurrent
-chunk partitions were not recorded. Qwen3.5's shorter alternating control
+Qwen3.5's shorter alternating control
 (`docs/validation/deepseek41/json-performance/qwen35-alternating/README.md`)
 also showed slower final latency. A later 72-request control
-(`docs/validation/deepseek41/json-performance/qwen35-solo72/README.md`; all three
+(`docs/validation/deepseek41/json-performance/qwen35-solo72/README.md`; both
 are local validation evidence, not committed) held the native library fixed, passed every answer and did not reproduce the
 slowdown. No production fix was made from these diagnostics; the differing
 results and their limits remain in the validation report.

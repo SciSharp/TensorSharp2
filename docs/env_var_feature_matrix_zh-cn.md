@@ -43,7 +43,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_GEMMA4_BATCHED` | Gemma 4 | 批处理分页前向 vs 按序列回退 | 启用 | `0`, `1` | 是 |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | 原生批处理 Mamba2 step | 关闭 | `0`, `1` | 否 |
 | `TS_BATCHED_N1_FAST_PATH` | 全部 | solo 序列走融合 N=1 快速路径 decode；`0` 强制这些步骤走完全批处理路径 | 启用 | `0`, `1` | 是 |
-| `TS_PER_SEQ_FUSED` | fused 能力模型（GGML 后端上的 Gemma 4、GPT OSS、Qwen 3 / Qwen 2 与 Qwen 3.8 Flash Next；`ggml_cuda` / `ggml_metal` 上的 Qwen 3.5/3.6/3.8；各自原生执行器上的 DeepSeek V4 / V4.1 与 GLM 5.x） | 并发（N>=2）序列走 per-request 融合 Forward；`0` 强制逐算子批处理分页路径 | 启用 | 未注册 | 否 |
+| `TS_PER_SEQ_FUSED` | fused 能力模型（GGML 后端上的 Gemma 4、GPT OSS 与 Qwen 3.8 Flash Next；`ggml_cuda` / `ggml_metal` 上的 Qwen 3.5/3.6/3.8；各自原生执行器上的 DeepSeek V4 / V4.1 与 GLM 5.x） | 并发（N>=2）序列走 per-request 融合 Forward；`0` 强制逐算子批处理分页路径 | 启用 | 未注册 | 否 |
 | `TS_BATCHED_FUSED_DECODE` | 具备 token 批量融合 decode 的模型（Gemma 4、Qwen 3.5/3.6/3.8、GPT OSS、GLM 5.x、DeepSeek V4 / V4.1） | per-seq fused 路径内的真正 token 批量融合 decode（一张图跑全部 N 个序列）。在 GLM 5.x 上 4 个并发请求可得合计 1.81× decode；在 DeepSeek V4.1 Flash 的 Q4_K_M 上为 2.0×（24.3 → 48.9 tok/s），上限来自路由——每个 token 各自从 384 个专家里挑 6 个。批处理会改变 GEMM 形状，2 bit MoE 可能把这点差别放大成不同的专家选择；设为 `0` 可做串行路径 A/B。 | 开启 | 未注册 | 否 |
 | `TS_GEMMA4_BATCHED_CAPS` | Gemma 4 token 批量融合 decode | 覆盖原生内核报告的能力位（1 PLE、2 KV donor、4 SWA 回绕、8 按序列的缓存容量，即 `TSGgml_Gemma4ModelDecodeBatchedEx2` 入口）。`0` 强制 v1 门控，E2B/E4B 因此改为轮询 decode；`7` 恢复统一容量的门控。仅用于诊断，启用批处理并不需要它 | 原生探测 | 未注册 | 否 |
 | `TS_BATCHED_FUSED_MOE` | Gemma 4 MoE | `1` 允许 Gemma 4 MoE 检查点走 token 批量融合 decode。默认关闭：它的可捕获计算图加上 KV holder 占满了 16 GB 显卡，在那里也不比轮询快 | 关闭 | 未注册 | 否 |
@@ -58,7 +58,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_KV_HOLDER_POOL_MAX` | 具有 per-request fused holder 的模型（Qwen 3.5/3.6/3.8、Gemma 4、GPT-OSS） | 已释放的 holder 最多可停放多少个以待复用而不是释放；每个停放的 holder 都占用其完整 K/V 分配 | `64` | 不适用 | 否 |
 | `TS_SCHED_DISABLE_BATCHED` | 全部 | 全局按序列 KV-swap 回退 | 关闭 | `0`, `1` | 是 |
 | `TS_SCHED_PREFIX_CACHE` | 全部自回归模型 | `0` 在两种前缀缓存模式下都关闭准入时的全部提示复用。`--no-prefix-cache`（CLI 与服务端）会设置它，并同时跳过共享提示的启动预热，以及服务端的检查点文件 | 启用（`1`） | 未注册 | 否 |
-| `TS_PREFIX_CACHE_MODE` | 具备 Radix 前缀缓存契约的家族（Qwen 3.5/3.6/3.8 含 `qwen3next`、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Qwen 3 / Qwen 2、GPT OSS、Mistral 3、Hunyuan Dense、Muse-Glimmer、Nemotron-H；不含 DiffusionGemma 与图像/视频模型） | `tree` 把页面、保留的终态与公共检查点放在同一棵 radix 索引中；`legacy` 选择旧的块哈希共享，live cache、保留 holder 与检查点各走各的路径，用于诊断。其他取值会被拒绝 | `tree` | 未注册 | 否 |
+| `TS_PREFIX_CACHE_MODE` | 具备 Radix 前缀缓存契约的家族（Qwen 3.5/3.6/3.8 含 `qwen3next`、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、GPT OSS、Mistral 3、Hunyuan Dense、Muse-Glimmer、Nemotron-H；不含 DiffusionGemma 与图像/视频模型） | `tree` 把页面、保留的终态与公共检查点放在同一棵 radix 索引中；`legacy` 选择旧的块哈希共享，live cache、保留 holder 与检查点各走各的路径，用于诊断。其他取值会被拒绝 | `tree` | 未注册 | 否 |
 | `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数、decode 时间片。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `256` / `256` | 未注册 | 否 |
 | `TS_SCHED_STOP_REPETITION` | 全部 | `0` 时陷入循环的生成会一直跑到 token 上限，而不是以 `repetition` 结束原因停止 | 启用（`1`） | 未注册 | 否 |
 
@@ -260,7 +260,7 @@ Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1
 以及无需权重的 n-gram 投机器）。投机仅对单序列（无并发）请求生效，且只在模型声明有收益时启用，这由各
 模型自己决定：Qwen 3.5/3.6/3.8 与 GLM 5.2 / GLM-5.3 在所有后端上，GLM-5.3-Flash（仅 n-gram）在其 KDA
 回滚可用时，Gemma 4 在 ggml 后端与 `cuda` 上，Qwen 3.8 Flash Next 在其 GGML token 计算图路径上，DeepSeek V4 / V4.1 与 Muse-Glimmer 只在加载了各自草稿器时。Nemotron-H
-拒绝一切投机器，GPT OSS、Mistral 3、Qwen 3 / Qwen 2 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
+拒绝一切投机器，GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机主干，连 n-gram 也不会运行。
 它们未注册在 `EnvVarMatrix.All` 中，也不在默认 TestMatrix 配置里扫描——矩阵特性目录目前
 没有投机解码特性，请用显式运行来验证这些变量。
 

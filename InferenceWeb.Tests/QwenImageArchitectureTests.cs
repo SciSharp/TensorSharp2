@@ -84,7 +84,7 @@ public sealed class QwenImageArchitectureTests
     public void ExplicitArchitectureStillTakesPrecedence()
     {
         using var fixture = new TensorHeader(Version21Tensors("", fused: true));
-        Assert.Equal("qwen3", ModelArchitectureRegistry.Resolve("qwen3", fixture.File).Id);
+        Assert.Equal("qwen35", ModelArchitectureRegistry.Resolve("qwen35", fixture.File).Id);
         Assert.Throws<NotSupportedException>(() => ModelArchitectureRegistry.Resolve("unknown-architecture", fixture.File));
     }
 

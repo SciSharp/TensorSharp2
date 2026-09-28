@@ -218,10 +218,6 @@
     <ReferenceNativeSymbol Include="TSGgml_PagedKvPoolScatter" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PreloadQuantizedWeight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen21VisionEncoderF32" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen3DropDecodeCache" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen3ModelDecodeLogits" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen3ModelPrefill" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_Qwen3ResetDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatchedHidden" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDiscardHostPointer" SymbolType="Function" />
@@ -327,8 +323,6 @@
     <ReferenceNativeSymbol Include="TSGgml_TensorParallelMatmul" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_TensorParallelSetGlobalGeometry" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_TranscodeBonsaiToQ2_0" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_TransformerLayerDecode" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_TransformerModelDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_UnaryF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_UnregisterPinnedHostBuffer" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WanDitForward" SymbolType="Function" />

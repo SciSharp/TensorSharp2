@@ -40,7 +40,7 @@ public class ServerUsageAccuracyTests
 
         Assert.DoesNotContain("works on every model", usage, StringComparison.Ordinal);
         Assert.Contains("does not turn speculation on", usage, StringComparison.Ordinal);
-        foreach (string family in new[] { "GPT-OSS", "Mistral 3", "Hunyuan Dense", "Bonsai 8B", "Nemotron-H" })
+        foreach (string family in new[] { "GPT-OSS", "Mistral 3", "Hunyuan Dense", "Nemotron-H" })
             Assert.Contains(family, usage, StringComparison.Ordinal);
     }
 

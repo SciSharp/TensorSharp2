@@ -3,7 +3,7 @@
 [← 返回模型索引](README_zh-cn.md) | [English](bonsai2.md)
 
 Bonsai2 使用稠密 Qwen 3.5 混合架构，并带有 PRISM 的带符号 Hadamard 旋转与自定义的
-低 bit GGUF 编码。它与更早的 [Bonsai Q1_0 模型](bonsai_zh-cn.md)不同。仅仅把它的权重
+低 bit GGUF 编码。仅仅把它的权重
 当作普通的三值数来解释，得到的是一个错误的网络：投影输入与 embedding 输出还必须施加
 元数据声明的变换。
 
@@ -69,8 +69,15 @@ gate/up 权重保留其原始投影的变换。
 
 当前的集成要求单设备 GGML 后端。纯托管 CPU、direct CUDA、MLX 与张量并行配置都会被
 拒绝，而不是悄悄省略旋转。针对具体设备的端到端验证与这一加载资格是两回事；见下文的
-验证流程。Bonsai2 在 TensorAgent 目录中没有条目；该应用里的两个 Bonsai 条目是
-[Q1_0 文件](bonsai_zh-cn.md#tensoragent-旁加载)。
+验证流程。
+
+[TensorAgent](../../TensorAgent/README.md) 把 Bonsai2 列为实验性的 `bonsai-2-27b-ptq1-0`
+目录条目。它从
+[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/b072e1d3b35a0a630cece372c2127528e0994386)
+（Apache-2.0）下载 PTQ1_0 文件，以及作为可选投影器的 Q8_0 mmproj，并校验它们的哈希。该条目只向
+16 GB 设备档位提供：重打包为 Q2_0 后，5.95 GB 的下载会占用约 7.7 GB，再加上 K/V 缓存与计算缓冲区，
+就超出了 12 GB iPhone 所能给出的内存。PQ2_0 持有相同的三值权重，重打包后的大小也大致相同，因此
+该条目选用更小的 PTQ1_0 下载。Bonsai2 在 iOS 上的执行尚未验证。
 
 请显式设置上下文上限，而不是按标称的整个 262k 窗口分配：
 

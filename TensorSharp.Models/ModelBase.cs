@@ -1046,8 +1046,8 @@ namespace TensorSharp.Models
             "<turn|>",
             "<|tool_response>",
             // llama.cpp treats the FIM padding/repository/separator controls as
-            // EOG too. Qwen3/Bonsai exposes the Qwen spellings even though the
-            // GGUF only declares <|im_end|> as eos_token_id.
+            // EOG too. Qwen 3.5-family vocabularies carry the Qwen spellings
+            // even though their GGUFs only declare <|im_end|> as eos_token_id.
             "<|fim_pad|>",
             "<|repo_name|>",
             "<|file_sep|>",

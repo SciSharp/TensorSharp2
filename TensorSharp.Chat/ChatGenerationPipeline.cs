@@ -1355,8 +1355,8 @@ namespace TensorSharp.Server
                 if (tail.EndsWith(suffix, StringComparison.Ordinal))
                     return suffix;
                 // Every Jinja render is TrimEnd()ed, and only some families put the
-                // trailing newline back (Gemma 4, Qwen 3.5). For the rest (Qwen 3,
-                // Bonsai, Qwen3.8-Flash-Next) the prompt ends on `</think>` without the
+                // trailing newline back (Gemma 4, Qwen 3.5). For the rest (such as
+                // Qwen3.8-Flash-Next) the prompt ends on `</think>` without the
                 // suffix's `\n\n`. The framing is still there, so it is the framing that
                 // is recorded; the exact boundary whitespace travels separately as
                 // RawPromptTrailingWhitespace and is restored by the renderer.

@@ -420,7 +420,7 @@ namespace TensorSharp.Cli
                     "model that can verify a draft window in one pass: the Qwen 3.5 family, Gemma 4, GLM-5.x " +
                     "and Qwen 3.8 Flash Next take it without a drafter (Gemma 4 on the ggml_* and cuda " +
                     "backends, Qwen 3.8 Flash Next on ggml_* only); DeepSeek V4 / V4.1 and Muse-Glimmer only " +
-                    "with their drafter loaded; GPT-OSS, Mistral 3, Qwen 3 / Qwen 2 (Bonsai 8B included) and " +
+                    "with their drafter loaded; GPT-OSS, Mistral 3 and " +
                     "Hunyuan Dense have no speculative path, and Nemotron-H refuses every speculator - those " +
                     "decode without speculation. Env: TS_SPEC_TYPE.",
                     "--spec --spec-type ngram --spec-draft 8"),
