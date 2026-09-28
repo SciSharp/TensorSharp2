@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 
 namespace TensorSharp.Models
 {
-    internal static class ManagedQuantizedOps
+    internal static partial class ManagedQuantizedOps
     {
         private const int QK4_0 = 32;
         private const int QK4_1 = 32;
@@ -334,9 +334,26 @@ namespace TensorSharp.Models
             float* output,
             int outputRowStride,
             ParallelOptions options = null)
+            => AddmmQuantizedToFloat32(ggmlType, weights, ne0, ne1, input, inputRowStride, rowCount,
+                output, outputRowStride, options, QGemmIsa.Auto);
+
+        /// <summary><see cref="AddmmQuantizedToFloat32(int, IntPtr, long, long, float*, int, int, float*, int, ParallelOptions)"/>
+        /// with an explicit kernel choice (tests and benchmarks compare paths).</summary>
+        internal static unsafe void AddmmQuantizedToFloat32(
+            int ggmlType,
+            IntPtr weights,
+            long ne0,
+            long ne1,
+            float* input,
+            int inputRowStride,
+            int rowCount,
+            float* output,
+            int outputRowStride,
+            ParallelOptions options,
+            QGemmIsa isa)
         {
             if (TryAddmmQuantizedToFloat32(
-                    ggmlType, weights, ne0, ne1, input, inputRowStride, rowCount, output, outputRowStride, options))
+                    ggmlType, weights, ne0, ne1, input, inputRowStride, rowCount, output, outputRowStride, options, isa))
             {
                 return;
             }
@@ -346,6 +363,19 @@ namespace TensorSharp.Models
             long rowBytes = RowSize(ggmlType, ne0);
             byte* weightBase = (byte*)weights.ToPointer();
             int dop = ResolveDop(options);
+
+            // Register-blocked float GEMM over a dequantized weight panel (see
+            // ManagedQuantGemm.Float.cs). DequantMatMulColumns below remains the
+            // fallback (TS_CPU_FGEMM=0, or no AVX2).
+            if ((rowCount >= QGemmMinRows((GgmlTensorType)ggmlType) || isa != QGemmIsa.Auto) &&
+                TryFloatPanelGemm(ggmlType, weightBase, rowBytes, inDim, outDim,
+                    input, inputRowStride, rowCount, output, outputRowStride, options, isa))
+            {
+                if (QGemmVerify)
+                    VerifyQGemmAgainstLegacy("fgemm", ggmlType, weights, inDim, outDim, input, inputRowStride,
+                        rowCount, output, outputRowStride, floatPanel: true);
+                return;
+            }
 
             void RunRange(int start, int end, float* w)
                 => DequantMatMulColumns(ggmlType, weightBase, rowBytes, inDim, outDim,
@@ -558,12 +588,34 @@ namespace TensorSharp.Models
             int inputRowStride,
             ReadOnlySpan<QuantMatMulJob> jobs,
             ParallelOptions options = null)
+            => TryAddmmQuantizedBatch(ggmlType, inDim, inputRowStride, jobs, options, QGemmIsa.Auto);
+
+        internal static unsafe bool TryAddmmQuantizedBatch(
+            int ggmlType,
+            int inDim,
+            int inputRowStride,
+            ReadOnlySpan<QuantMatMulJob> jobs,
+            ParallelOptions options,
+            QGemmIsa isa)
         {
             if (jobs.Length == 0)
                 return true;
             var type = (GgmlTensorType)ggmlType;
             if (!TryGetDirectMatMulPlan(type, inDim, out ActivationQuantKind activationKind, out int activationRowBytes))
                 return false;
+
+            // The multi-row kernels decode each expert's weight block once for all
+            // of its rows (see ManagedQuantGemm.cs), under the same single dispatch.
+            if (TryQGemmBatch(type, inDim, inputRowStride, jobs, options, isa))
+            {
+                if (QGemmVerify)
+                    foreach (QuantMatMulJob job in jobs)
+                        if (job.RowCount > 0)
+                            VerifyQGemmAgainstLegacy("batch", ggmlType, job.Weights, inDim, job.OutDim,
+                                (float*)job.Input, inputRowStride, job.RowCount, (float*)job.Output,
+                                job.OutputRowStride, floatPanel: false);
+                return true;
+            }
 
             // --- quantize each DISTINCT input block once ---
             int n = jobs.Length;
@@ -699,6 +751,25 @@ namespace TensorSharp.Models
             float* output,
             int outputRowStride,
             ParallelOptions options = null)
+            => TryAddmmQuantizedToFloat32(ggmlType, weights, ne0, ne1, input, inputRowStride, rowCount,
+                output, outputRowStride, options, QGemmIsa.Auto);
+
+        /// <summary><see cref="TryAddmmQuantizedToFloat32(int, IntPtr, long, long, float*, int, int, float*, int, ParallelOptions)"/>
+        /// with an explicit kernel choice: <see cref="QGemmIsa.Legacy"/> is the
+        /// per-row dot path, Avx2/Avx512 force the multi-row GEMM (any row count),
+        /// Auto uses the GEMM from QGemmMinRows(type) rows up.</summary>
+        internal static unsafe bool TryAddmmQuantizedToFloat32(
+            int ggmlType,
+            IntPtr weights,
+            long ne0,
+            long ne1,
+            float* input,
+            int inputRowStride,
+            int rowCount,
+            float* output,
+            int outputRowStride,
+            ParallelOptions options,
+            QGemmIsa isa)
         {
             var type = (GgmlTensorType)ggmlType;
             if (ne0 > int.MaxValue || ne1 > int.MaxValue)
@@ -714,6 +785,19 @@ namespace TensorSharp.Models
             if (outputRowStride < ne1)
                 throw new ArgumentOutOfRangeException(nameof(outputRowStride));
 
+            // Multi-row GEMM (decode each weight block once per row tile); from
+            // one row up for the types where that already beats the per-row dot
+            // (see QGemmMinRows).
+            if ((rowCount >= QGemmMinRows(type) || isa != QGemmIsa.Auto) &&
+                TryQGemm(ggmlType, weights, (int)ne0, (int)ne1, input, inputRowStride, rowCount,
+                    output, outputRowStride, options, isa))
+            {
+                if (QGemmVerify)
+                    VerifyQGemmAgainstLegacy("gemm", ggmlType, weights, (int)ne0, (int)ne1, input, inputRowStride,
+                        rowCount, output, outputRowStride, floatPanel: false);
+                return true;
+            }
+
             long totalActivationBytes = (long)rowCount * activationRowBytes;
             if (totalActivationBytes > int.MaxValue)
                 return false;
@@ -727,16 +811,24 @@ namespace TensorSharp.Models
                     if (rowCount >= 8 && dop > 1)
                     {
                         // Prefill batches quantize thousands of activation rows;
-                        // serially that is a measurable share of the matmul.
+                        // serially that is a measurable share of the matmul. Rows
+                        // go out in chunks: one task per row was thousands of
+                        // dispatches for a 4096-row prefill.
                         nint actAddr = (nint)activationBase;
                         nint inAddr = (nint)input;
                         int actBytes = activationRowBytes;
                         int width = (int)ne0;
                         int stride = inputRowStride;
                         var kind = activationKind;
-                        RunParallelBlocks(rowCount, options, row =>
-                            QuantizeActivation((float*)inAddr + (long)row * stride,
-                                (byte*)actAddr + (long)row * actBytes, width, kind));
+                        int rowsPerTask = Math.Max(1, (rowCount + dop * TasksPerWorker - 1) / (dop * TasksPerWorker));
+                        int quantTasks = (rowCount + rowsPerTask - 1) / rowsPerTask;
+                        RunParallelBlocks(quantTasks, options, t =>
+                        {
+                            int r1 = Math.Min(rowCount, (t + 1) * rowsPerTask);
+                            for (int row = t * rowsPerTask; row < r1; row++)
+                                QuantizeActivation((float*)inAddr + (long)row * stride,
+                                    (byte*)actAddr + (long)row * actBytes, width, kind);
+                        });
                     }
                     else
                     {
@@ -1093,13 +1185,32 @@ namespace TensorSharp.Models
 
         private static unsafe void DequantizeF16(byte* src, float* dst, long numElements)
         {
-            for (long i = 0; i < numElements; i++)
-                dst[i] = HalfToSingle(ReadUInt16(src + i * 2));
+            // TensorPrimitives' Half -> float conversion is vectorized and exact
+            // (every fp16 value is representable in fp32), so this matches the
+            // scalar HalfToSingle loop bit for bit.
+            long i = 0;
+            while (i < numElements)
+            {
+                int n = (int)Math.Min(numElements - i, 1 << 20);
+                TensorPrimitives.ConvertToSingle(
+                    new ReadOnlySpan<System.Half>(src + i * 2, n), new Span<float>(dst + i, n));
+                i += n;
+            }
         }
 
         private static unsafe void DequantizeBf16(byte* src, float* dst, long numElements)
         {
-            for (long i = 0; i < numElements; i++)
+            long i = 0;
+            if (Avx2.IsSupported)
+            {
+                // bf16 is the top half of an fp32: zero-extend and shift.
+                for (; i <= numElements - 8; i += 8)
+                {
+                    Vector256<int> wide = Avx2.ConvertToVector256Int32(Vector128.Load((ushort*)(src + i * 2)));
+                    Avx2.ShiftLeftLogical(wide, 16).AsSingle().Store(dst + i);
+                }
+            }
+            for (; i < numElements; i++)
             {
                 uint bits = (uint)ReadUInt16(src + i * 2) << 16;
                 dst[i] = BitConverter.Int32BitsToSingle((int)bits);
@@ -1920,6 +2031,7 @@ namespace TensorSharp.Models
         private static unsafe void QuantizeF32ToQ8_0(float* src, byte* dst, int elementCount)
         {
             int blockCount = elementCount / QK8_0;
+            int* groupSums = stackalloc int[QK8_0 / 16];
             for (int block = 0; block < blockCount; block++)
             {
                 float* blockSrc = src + block * QK8_0;
@@ -1935,9 +2047,8 @@ namespace TensorSharp.Models
                     continue;
                 }
 
-                float invScale = 1.0f / scale;
-                for (int i = 0; i < QK8_0; i++)
-                    qs[i] = ClampToInt8(MathF.Round(blockSrc[i] * invScale));
+                // Vectorized, bit-identical to ClampToInt8(MathF.Round(x * invScale)).
+                QuantizeInt8Groups16(blockSrc, 1.0f / scale, qs, QK8_0, groupSums);
             }
         }
 
@@ -2018,6 +2129,7 @@ namespace TensorSharp.Models
         private static unsafe void QuantizeF32ToQ8_K(float* src, byte* dst, int elementCount)
         {
             int blockCount = elementCount / QK_K;
+            int* groupSums = stackalloc int[QK_K / 16];
             for (int block = 0; block < blockCount; block++)
             {
                 float* blockSrc = src + block * QK_K;
@@ -2035,20 +2147,10 @@ namespace TensorSharp.Models
                     continue;
                 }
 
-                float invScale = 1.0f / scale;
+                // Vectorized, bit-identical to ClampToInt8(MathF.Round(x * invScale)).
+                QuantizeInt8Groups16(blockSrc, 1.0f / scale, qs, QK_K, groupSums);
                 for (int group = 0; group < QK_K / 16; group++)
-                {
-                    int sum = 0;
-                    int offset = group * 16;
-                    for (int i = 0; i < 16; i++)
-                    {
-                        sbyte q = ClampToInt8(MathF.Round(blockSrc[offset + i] * invScale));
-                        qs[offset + i] = q;
-                        sum += q;
-                    }
-
-                    bsums[group] = (short)sum;
-                }
+                    bsums[group] = (short)groupSums[group];
             }
         }
 
@@ -2345,6 +2447,9 @@ namespace TensorSharp.Models
 
         private static unsafe float VecDotQ5_0Q8_0(byte* q5, byte* q8, int blockCount)
         {
+            if (Avx2.IsSupported && Fma.IsSupported)
+                return VecDotQ5_0Q8_0Avx2(q5, q8, blockCount);
+
             float sum = 0.0f;
             for (int block = 0; block < blockCount; block++)
             {
@@ -2370,6 +2475,49 @@ namespace TensorSharp.Models
             }
 
             return sum;
+        }
+
+        // AVX2 Q5_0 x Q8_0 (the scalar loop above was the only non-SIMD dot on a
+        // hot type: DiffusionGemma's Q4_K_M file stores ffn_down/ffn_down_exps
+        // as Q5_0 in 16 of its 30 layers, and single-token experts land here). The 5th
+        // bit is spread from qh with one vpshufb (byte e <- qh byte e/8) and a
+        // bit mask; the -16 zero point is arithmetic, as in the Q4_0 kernel:
+        // sum((v - 16) * x) = sum(v * x) - 16 * sum(x), keeping v unsigned for
+        // vpmaddubsw (|pair sum| <= 31 * 127 * 2, no saturation).
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static unsafe float VecDotQ5_0Q8_0Avx2(byte* q5, byte* q8, int blockCount)
+        {
+            Vector256<float> acc = Vector256<float>.Zero;
+            Vector256<short> ones16 = Vector256.Create((short)1);
+            Vector256<byte> ones8 = Vector256.Create((byte)1);
+            Vector128<byte> m4 = Vector128.Create((byte)0x0F);
+            Vector256<byte> bit4 = Vector256.Create((byte)0x10);
+            Vector256<byte> spread = Vector256.Create(
+                (byte)0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+            Vector256<byte> bits = Vector256.Create(
+                (byte)1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+                1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128);
+
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* wb = q5 + block * Q5_0BlockBytes;
+                byte* xb = q8 + block * Q8_0BlockBytes;
+                float scale = HalfToSingle(ReadUInt16(wb)) * HalfToSingle(ReadUInt16(xb));
+
+                Vector128<byte> qs = Vector128.Load(wb + 6);
+                Vector256<byte> v = Vector256.Create(qs & m4, Vector128.ShiftRightLogical(qs.AsUInt16(), 4).AsByte() & m4);
+                Vector256<byte> qh = Avx2.Shuffle(Vector256.Create(ReadUInt32(wb + 2)).AsByte(), spread);
+                v = Avx2.Or(v, Avx2.And(Avx2.CompareEqual(Avx2.And(qh, bits), bits), bit4));
+
+                Vector256<sbyte> x = Vector256.Load((sbyte*)(xb + 2));
+                Vector256<int> dot = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(v, x), ones16);
+                Vector256<int> sumX = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(ones8, x), ones16);
+                Vector256<int> isum = Avx2.Subtract(dot, Avx2.ShiftLeftLogical(sumX, 4));
+                acc = Fma.MultiplyAdd(Vector256.Create(scale), Avx.ConvertToVector256Single(isum), acc);
+            }
+
+            return HorizontalSum(acc);
         }
 
         private static unsafe float VecDotQ5_1Q8_1(byte* q5, byte* q8, int blockCount)
