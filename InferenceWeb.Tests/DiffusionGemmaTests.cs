@@ -474,7 +474,8 @@ public class DiffusionGemmaTests
     {
         using var model = TryLoad();
         if (model == null) return;
-        if (!model.SupportsPromptKvCache)
+        // The pure-C# cpu backend caches prompt K/V too, but on the host: there are no device copies.
+        if (!model.SupportsPromptKvCache || _loadedBackend == BackendType.Cpu)
         {
             _output.WriteLine("[diffusion-gemma][leak] CPU backend (no device K/V copies); skipping");
             return;
@@ -522,7 +523,7 @@ public class DiffusionGemmaTests
     {
         using var model = TryLoad();
         if (model == null) return;
-        if (!model.SupportsPromptKvCache)
+        if (!model.SupportsPromptKvCache || _loadedBackend == BackendType.Cpu)
         {
             _output.WriteLine("[diffusion-gemma][leak] CPU backend; skipping multi-turn device-memory test");
             return;
@@ -733,7 +734,8 @@ public class DiffusionGemmaTests
     {
         using var model = TryLoad();
         if (model == null) return;
-        if (!model.SupportsPromptKvCache)
+        // The fused single-canvas kernel this ordering is about exists only on the GPU backends.
+        if (!model.SupportsPromptKvCache || _loadedBackend == BackendType.Cpu)
         {
             _output.WriteLine("[diffusion-gemma][bench] CPU backend; skipping throughput benchmark");
             return;
