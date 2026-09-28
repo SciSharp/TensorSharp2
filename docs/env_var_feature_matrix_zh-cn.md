@@ -149,7 +149,9 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 因此同一台主机不会出现某类内核用 AVX-512、另一类用 AVX2 的情况：CPU 具备 AVX-512 F/BW/DQ 且运行时对
 `Vector512` 做了硬件加速时用 AVX-512（在某些 512 位向量更慢的处理器上，以及 `DOTNET_EnableAVX512=0` 时，
 JIT 不启用它），否则用 AVX2+FMA；没有 AVX2 时用可移植的 Vector128 / 标量代码（包括 ARM64，量化 matmul
-在那里仍走逐行路径）。
+在那里仍走逐行路径）。唯一的例外是托管 matmul 的逐行 Q4_0 / Q8_0 点积（即 `TS_CPU_QGEMM=0` 恢复的路径），
+它们早于这些内核：仍沿用原来的判定，即具备 AVX-512 F/BW，因此在运行时没有对
+`Vector512` 做硬件加速的主机上，它们照旧运行 AVX-512 形式。`TS_CPU_DISABLE_AVX512=1` 也会切换它们。
 
 **测试 AVX2 路径。** `TS_CPU_DISABLE_AVX512=1` 让手写的 AVX-512 内核在 AVX-512 主机上以其 AVX2 形式运行。
 它不会收窄 .NET 运行时本身（`TensorPrimitives`、普通拷贝、`Vector512.IsHardwareAccelerated`）。要模拟只有
@@ -160,7 +162,9 @@ AVX2 的主机，请用 `DOTNET_EnableAVX512=0` 启动进程；.NET 10 会忽略
 
 **回到之前的算术。** 下表每个取 `0` 的开关只恢复一个方面。要回到引入这些内核之前 `cpu` 后端的算术，
 四个都要设置：`TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0`，DiffusionGemma
-另加 `DIFFUSION_CPU_LEGACY=1`；这样设置后，回归测试逐比特复现了之前构建的输出。只设置某一方面的开关
+另加 `DIFFUSION_CPU_LEGACY=1`；这样设置后，在 i7-11800H 上的回归测试逐比特复现了之前构建的输出。
+由于这些开关回退到的逐行点积沿用原来的指令集判定（见上文），在具备 AVX-512 但 `Vector512` 没有硬件加速的
+主机上这一做法同样成立；这种情况没有实际跑过。只设置某一方面的开关
 （`DIFFUSION_CPU_LEGACY=1`、`TS_QWEN_VAE_CPU=scalar` 等）并不够：共享的量化、SGEMM 与逐元素内核仍然是新代码。
 `TS_CPU_POOL` 不在其中——它只改变由哪些线程执行，不改变结果。Qwen-Image-2.1 之前不能在 `cpu` 上运行，
 因此没有可以回到的旧算术。
@@ -171,7 +175,7 @@ GGML 与 CUDA 后端，以列出这台机器能运行什么，与 `--backend` �
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时默认 | 扫描取值 | 默认是否扫描 |
 |---|---|---|---|---|---|
-| `TS_CPU_THREADS` | `cpu` 后端（100% 纯 C#） | 常驻工作线程池的宽度。这个池运行托管 matmul；Core 的 CPU 内核（`CpuStorage` 张量上的 F32 SGEMM、逐元素、norm、softmax、RoPE，经由 `TensorSharp.Models` 在模块加载时装上的 `CpuParallel` 钩子）；DiffusionGemma 与 Qwen-Image-2.1 的 Transformer 内核；以及 Qwen-Image 的文本编码器与视觉塔。Qwen-Image 的 VAE 另有一个更宽的专用池（`TS_CPU_GEMM_THREADS`）。8 个以上 CPU 时默认取可用数的**一半**，刻意不是全部。这个宽度是在线程池只运行量化 matmul、CPU 路径其余部分仍使用 ThreadPool 时调出来的：池内线程在两次任务之间自旋，占满每个核心会把那部分工作饿死。在 122 个 CPU 的配额上实测，每格为两次交替运行（prefill / decode tok/s）：关闭池 21.7,21.0 / 2.0,2.4；32 线程 24.9,24.1 / 4.9,5.0；48 线程 25.6,28.5 / 5.4,6.0；61 线程 24.2,24.9 / 6.3,5.9；122 线程 13.5 / 4.8。122 线程时只有 prefill 回退，解码仍优于关闭池的基线。在所有工作都上池之后重新测量，8 核 16 线程的 i7-11800H 上 16 线程对比默认的 8 线程，各跑两次：Qwen-Image-2.1 256x256、2 步 15.7 / 16.5 s 对 16.9 / 17.1 s（Transformer 步更快，9.2-9.9 s 对 11.0-11.1 s；文本编码器更慢，3.4-3.6 s 对 3.1 s）；DiffusionGemma 对新提示的 Jev 读取平均 1.80 s 对 1.54-1.62 s；对已缓存提示的读取 209-223 ms 对 218-231 ms。没有明显收益，因此默认值不变 | 8 核及以下取全部核心，否则 max(8, 可用数/2) | 未注册 | 否 |
+| `TS_CPU_THREADS` | `cpu` 后端（100% 纯 C#） | 常驻工作线程池的宽度。这个池运行托管 matmul；Core 的 CPU 内核（`CpuStorage` 张量上的 F32 SGEMM、逐元素、norm、softmax、RoPE，经由 `TensorSharp.Models` 在模块加载时装上的 `CpuParallel` 钩子）；DiffusionGemma 与 Qwen-Image-2.1 的 Transformer 内核；以及 Qwen-Image 的文本编码器与视觉塔。Qwen-Image 的 VAE 另有一个更宽的专用池（`TS_CPU_GEMM_THREADS`）。8 个以上 CPU 时默认取可用数的**一半**，刻意不是全部。这个宽度是在线程池只运行量化 matmul、CPU 路径其余部分仍使用 ThreadPool 时调出来的：池内线程在两次任务之间自旋，占满每个核心会把那部分工作饿死。在 122 个 CPU 的配额上实测，每格为两次交替运行（prefill / decode tok/s）：关闭池 21.7,21.0 / 2.0,2.4；32 线程 24.9,24.1 / 4.9,5.0；48 线程 25.6,28.5 / 5.4,6.0；61 线程 24.2,24.9 / 6.3,5.9；122 线程 13.5 / 4.8。122 线程时只有 prefill 回退，解码仍优于关闭池的基线。在所有工作都上池之后重新测量，8 核 16 线程的 i7-11800H 上 16 线程对比默认的 8 线程，各跑两次：Qwen-Image-2.1 256x256、2 步 15.7 / 16.5 s 对 16.9 / 17.1 s（Transformer 步更快，9.2-9.9 s 对 11.0-11.1 s；文本与视觉编码阶段（含加载文本编码器）更慢，3.4-3.6 s 对 3.1 s；单看文本编码器前向（`QwenImageStagesBench`，37 token 的提示），首次调用 1.65-2.26 s 对 1.24-1.26 s，之后 0.72-1.42 s 对 0.68-0.72 s，输出完全相同）；DiffusionGemma 对新提示的 Jev 读取平均 1.80 s 对 1.54-1.62 s；对已缓存提示的读取 209-223 ms 对 218-231 ms。没有明显收益，因此默认值不变 | 8 核及以下取全部核心，否则 max(8, 可用数/2) | 未注册 | 否 |
 | `TS_CPU_POOL` | `cpu` 后端 | `0` 回退到 ThreadPool 的 `Parallel.For`，用于负担不起专用自旋线程的主机，也便于在同一个二进制里做 A/B。它覆盖所有经 `CpuWorkers`、量化 matmul 的 `RunParallelBlocks` 或 Core 的 `CpuParallel` 钩子（跳过其绑定）分派并行任务的托管内核：量化 GEMM 与浮点面板 GEMM、Core 的 CPU 内核、DiffusionGemma 与 Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的 VAE、文本编码器与视觉塔背后的 packed GEMM（VAE 的宽线程池变为宽度上限为 `TS_CPU_GEMM_THREADS` 的 `Parallel.For`）。这些内核的结果与任务切分无关，因此两种方式输出相同。仍在线程池上的：Direct 视频网络的行循环（`DirectOps`、MiniMax-H3 自己的循环）；DeepSeek V4 的执行器有自己的线程（`TS_DSV4_THREADS`） | 启用 | 未注册 | 否 |
 | `TS_CPU_SPIN` | `cpu` 后端 | 池内线程挂起前的自旋次数。在这个宽度下挂起才是最贵的部分（唤醒 N 个线程的开销超过它们要分到的那约 60 微秒工作量），因此默认自旋次数足够多，使稳态下根本不会挂起：同一个模型在 256 时实测 0.1 tok/s，在 4096 时是 7.0 | `4096` | 未注册 | 否 |
 | `TS_CPU_TASK_BYTES` / `TS_CPU_TASKS_PER_WORKER` | `cpu` 后端 | 单次托管 matmul 的切分方式：每个工作项对应多少字节权重，以及每个线程最多分到几个工作项。是按**工作量**而不是线程数来定的——旧的按线程数缩放的规则在 122 线程时会为一次 matmul 造出 1024 个极小任务，并且超过 8 线程后就不再有加速 | `131072` / `4` | 未注册 | 否 |
@@ -198,7 +202,7 @@ TestMatrix 配置中 sweep。
 | `DIFFUSION_MAX_BATCH` | DiffusionGemma Web UI | `DiffusionBatchScheduler` 的最大活跃请求数 | `2` | 未注册 | 否 |
 | `DIFFUSION_BATCHED_FORWARD` | DiffusionGemma | 真正批处理 canvas decode vs 按时间片执行融合单 canvas decode | 关闭 | 未注册 | 否 |
 | `DIFFUSION_NO_PKV` | DiffusionGemma | 关闭 prompt-KV 缓存（device-glue 后端与 `cpu`）：之后每次读取、每个去噪步都走统一的 `[prompt\|canvas]` 前向 | 关闭 | 未注册 | 否 |
-| `DIFFUSION_CPU_LEGACY` | `cpu` 上的 DiffusionGemma | `1` 用一个开关恢复整条旧的纯 C# 路径：没有 prompt-KV 缓存，投影、注意力、路由与 MoE 都用旧实现 | 关闭 | 未注册 | 否 |
+| `DIFFUSION_CPU_LEGACY` | `cpu` 上的 DiffusionGemma | `1` 用一个开关恢复 DiffusionGemma 专有的旧阶段：没有 prompt-KV 缓存，投影、注意力、路由与 MoE 都用旧实现。它们下面的 matmul 仍走新的共享内核；要回到之前的算术，还需设置 `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0`（见上文"回到之前的算术"） | 关闭 | 未注册 | 否 |
 | `DIFFUSION_CPU_LEGACY_MOE` / `_PROJ` / `_ATTN` / `_ROUTER` | `cpu` 上的 DiffusionGemma | 各恢复一个阶段：`_MOE` 恢复逐专家参考循环（连同其路由），`_PROJ` 恢复分开的 Q/K/V 与 gate/up 投影，`_ROUTER` 只恢复路由分数，`_ATTN` 恢复旧注意力。`_ATTN` 只作用于统一前向（prompt prefill 与 canvas decode 始终使用融合的 norm+RoPE 与分块注意力），因此注意力的 A/B 还需要 `DIFFUSION_NO_PKV=1` | 关闭 | 未注册 | 否 |
 | `DIFFUSION_CPU_ATTN_FAST` | `cpu` 上的 DiffusionGemma | `1` 选择 FMA 注意力分块（硬件加速时用 Vector512）与向量化 softmax。默认内核精确复现旧的算术，因为最后一个比特的变化就可能翻转 128 选 8 的专家路由；在 Jev 与聊天的提示长度下，注意力只占一次前向的不到百分之一 | 关闭 | 未注册 | 否 |
 | `DIFFUSION_CPU_MOE_CHUNK` | `cpu` 上的 DiffusionGemma | 每次批量 MoE 处理的 token 数；限制按路由收集的暂存区大小（否则 4k token 的 prefill 要占约 1 GB 的路由行） | `512` | 未注册 | 否 |

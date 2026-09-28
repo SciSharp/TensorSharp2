@@ -2239,8 +2239,8 @@ DiffusionGemma and Qwen-Image-2.1 transformer kernels and the Qwen-Image text
 encoder and vision tower share one set of workers (the Qwen-Image VAE has a wider
 pool of its own, `TS_CPU_GEMM_THREADS`). With all of that on the pool, 16 threads
 instead of the default 8 on an 8-core / 16-thread i7-11800H made the Qwen-Image
-transformer steps faster but its text encoder and DiffusionGemma's new-prompt reads
-slower, so the default width was left as it is.
+transformer steps faster but its text-encoder forward and DiffusionGemma's
+new-prompt reads slower, so the default width was left as it is.
 Quantized weights (Q4_K, Q5_K, Q6_K, Q4_0, Q5_0, Q8_0) go through a multi-row
 int8 GEMM, and F16/BF16/F32 or dequantize-only types through a float-panel GEMM.
 Each of these has a `0` switch that restores the previous code in the same binary
@@ -2251,10 +2251,13 @@ emulate an AVX2-only host, start the process with `DOTNET_EnableAVX512=0`
 (.NET 10 ignores the older `DOTNET_EnableAVX512F=0`). Every kernel takes its
 instruction set from one decision: AVX-512 needs AVX-512 F/BW/DQ with `Vector512`
 accelerated by the runtime, so no kernel family runs AVX-512 while another runs
-AVX2. To return to the arithmetic this backend had before these kernels, set all
-four switches, `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0
-TS_CPU_SIMD_ELEMENTWISE=0`, plus `DIFFUSION_CPU_LEGACY=1` for DiffusionGemma; a
-per-area switch on its own leaves the shared kernels on the new code.
+AVX2. The exception is the older per-row Q4_0 / Q8_0 dots that `TS_CPU_QGEMM=0`
+returns to: they keep their original test (AVX-512 F/BW present), so they run as
+before on hosts whose runtime does not accelerate `Vector512`. To return to the
+arithmetic this backend had before these kernels, set all four switches,
+`TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0`, plus
+`DIFFUSION_CPU_LEGACY=1` for DiffusionGemma; a per-area switch on its own leaves
+the shared kernels on the new code.
 
 Those tok/s are the generic managed per-op path on gemma-4-E4B-it-Q8_0 and
 nothing else. **DeepSeek V4.1 Flash does not run through that path at all — like
@@ -2278,8 +2281,8 @@ full checkpoint here; its compute width comes from `TS_DSV4_THREADS`, not
 | Float-panel GEMM (F16, BF16, F32 and dequantize-only types) | ON | `TS_CPU_FGEMM=0` restores the previous dequantize-and-dot loop | — |
 | Packed F32 SGEMM behind `Ops.Addmm` and the Direct networks | ON (AVX-512 8x32, AVX2 6x16 or portable kernel) | `TS_CPU_SGEMM=0` restores the previous loops; `TS_CPU_SGEMM_KERNEL`, `TS_CPU_SGEMM_KC` / `_MC` / `_NC`, `TS_CPU_SGEMM_DOT_MAXN` for tuning | — |
 | SIMD elementwise, norm, softmax and RoPE kernels | ON | `TS_CPU_SIMD_ELEMENTWISE=0` restores the previous loops | — |
-| AVX-512 kernels | ON when the CPU has AVX-512 F/BW/DQ and the runtime accelerates `Vector512` | `TS_CPU_DISABLE_AVX512=1` runs the AVX2 form of every hand-written kernel; `DOTNET_EnableAVX512=0` (not `DOTNET_EnableAVX512F`) makes the whole runtime AVX2-only | — |
-| DiffusionGemma on `cpu` | prompt-KV caching, batched MoE, fused Q/K/V and gate/up projections | `DIFFUSION_NO_PKV=1` turns the prompt-KV cache off; `DIFFUSION_CPU_LEGACY=1` restores the previous path in one switch (per stage: `DIFFUSION_CPU_LEGACY_MOE`, `_PROJ`, `_ATTN`, `_ROUTER`); `DIFFUSION_CPU_ATTN_FAST=1`, `DIFFUSION_CPU_MOE_CHUNK` | — |
+| AVX-512 kernels | ON when the CPU has AVX-512 F/BW/DQ and the runtime accelerates `Vector512` (the older per-row Q4_0 / Q8_0 dots: when it has AVX-512 F/BW) | `TS_CPU_DISABLE_AVX512=1` runs the AVX2 form of every hand-written kernel; `DOTNET_EnableAVX512=0` (not `DOTNET_EnableAVX512F`) makes the whole runtime AVX2-only | — |
+| DiffusionGemma on `cpu` | prompt-KV caching, batched MoE, fused Q/K/V and gate/up projections | `DIFFUSION_NO_PKV=1` turns the prompt-KV cache off; `DIFFUSION_CPU_LEGACY=1` restores the previous DiffusionGemma-specific stages in one switch (per stage: `DIFFUSION_CPU_LEGACY_MOE`, `_PROJ`, `_ATTN`, `_ROUTER`), while the matmuls under them stay on the new shared kernels — for the previous arithmetic also set `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0`; `DIFFUSION_CPU_ATTN_FAST=1`, `DIFFUSION_CPU_MOE_CHUNK` | — |
 | Qwen-Image-2.1 on `cpu` | managed DiT and text encoder with 8-bit activations on the multi-row integer GEMM, packed-GEMM VAE and vision tower; a request with no size renders at 1024×1024 (1 MP) — `ggml_cpu` and the GPU backends keep 2048×2048 | `TS_QWEN21_CPU_MATMUL=f32` and `TS_QWEN_TE_CPU_MATMUL=f32` keep F32 activations against dequantized weight tiles (slower, numerically steadier); `TS_QWEN_VAE_CPU=scalar`, `TS_QWEN_TE_CPU_GEMM=0`, `TS_QWEN_TE_CPU_ATTN=0`, `TS_QWEN35_VENC_CPU_GEMM=0`, `TS_QWEN35_VENC_CPU_ATTN=0` restore the previous stages; `TS_CPU_GEMM_THREADS` sizes the VAE's own pool (every logical CPU, at most 64); `TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` skips the up-front refusal of a size that cannot fit in memory; `TS_QWEN21_CPU_PROFILE=1`, `TS_QWEN_VAE_PROFILE=1`, `TS_QWEN_TE_PROFILE=1` print stage timings | — |
 | DeepSeek V4.1 Flash's whole-model executor | pure C# (`DeepSeek4CpuExecutor`) — a whole-model executor here rather than the generic per-op path | `TS_DSV4_THREADS=N` sets its compute width (every processor by default), not `TS_CPU_THREADS` | — |
 | Quantized weights on the direct video networks (Wan, MiniMax-H3) | kept in their GGUF storage type and multiplied there | `TS_DIRECT_QUANT_WEIGHTS=0` expands every quantized weight to F32 once at load and runs a plain GEMM instead (the previous behaviour; 4x the weight memory). On Wan at 256x160x5f, one step, the in-place path measured 80.9 s against 121.4 s | — |

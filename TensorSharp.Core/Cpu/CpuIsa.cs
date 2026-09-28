@@ -18,7 +18,8 @@ namespace TensorSharp.Cpu
     /// the Core SGEMM and elementwise kernels, the quantized GEMM and per-row dots, the packed
     /// GEMM of the Qwen-Image VAE/vision/text encoder, the Qwen-Image DiT kernels and the
     /// DiffusionGemma attention all derive their kernel choice from these flags, so one host
-    /// never runs AVX-512 in one of them and AVX2 in another.
+    /// never runs AVX-512 in one of them and AVX2 in another. The one exception is
+    /// <see cref="Avx512PerRowDots"/>, for the per-row quantized dots that predate this class.
     ///
     /// AVX-512 counts as present only when the CPU has F/BW/DQ AND the JIT accelerates
     /// Vector512: .NET reports Vector512 as not accelerated where it prefers 256-bit vectors
@@ -50,5 +51,16 @@ namespace TensorSharp.Cpu
 
         /// <summary>Default kernel choice: AVX2+FMA (true on AVX-512 hosts too).</summary>
         internal static readonly bool Avx2Fma = HasAvx2Fma;
+
+        /// <summary>The per-row Q4_0 / Q8_0 dots and the activation MaxAbs of ManagedQuantizedOps,
+        /// which predate this class, keep the instruction-level test they always had (AVX-512 F/BW
+        /// present, whether or not the JIT accelerates Vector512). Where the runtime prefers 256-bit
+        /// vectors they therefore still run their AVX-512 form, as in the build before these kernels,
+        /// so the rollback switches (TS_CPU_QGEMM=0 ...) reproduce its arithmetic on every host, not
+        /// only where Vector512 is accelerated. Where Vector512 is accelerated this equals
+        /// <see cref="Avx512"/>, and TS_CPU_DISABLE_AVX512 turns it off as well. (MaxAbs used to test
+        /// F alone; a max is exact in any order, so sharing this flag changes none of its results.)</summary>
+        internal static readonly bool Avx512PerRowDots =
+            Avx512F.IsSupported && Avx512BW.IsSupported && !Avx512DisabledByEnv;
     }
 }

@@ -1,5 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using TensorSharp.Cpu;
 using TensorSharp.Models.QwenImage;
@@ -10,8 +12,9 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// The one ISA decision (CpuIsa) and the one fork/join helper (CpuWorkers) the managed CPU
 /// kernels share. Every kernel family must pick AVX-512 exactly when CpuIsa says so, so one
-/// host never mixes kernel widths; and a CpuWorkers set must run every block exactly once and
-/// surface failures, whichever of the pool or Parallel.For backs it.
+/// host never mixes kernel widths (the per-row dots that predate CpuIsa keep their own test, see
+/// below); and a CpuWorkers set must run every block exactly once and surface failures, whichever
+/// of the pool or Parallel.For backs it.
 /// </summary>
 [Collection("CPU kernel selection")]
 public class CpuIsaAndWorkersTests
@@ -35,6 +38,20 @@ public class CpuIsaAndWorkersTests
             Assert.Equal(CpuIsa.Avx512 ? QGemmIsa.Avx512 : QGemmIsa.Avx2, q);
         else
             Assert.True(!CpuIsa.Avx2Fma || Environment.GetEnvironmentVariable("TS_CPU_QGEMM") == "0");
+    }
+
+    [Fact]
+    public void PerRowDotsKeepTheirPreviousInstructionSetTest()
+    {
+        // The per-row Q4_0 / Q8_0 dots (the TS_CPU_QGEMM=0 path) must choose exactly as the
+        // build before CpuIsa did - AVX-512 F/BW present - so the rollback switches reproduce
+        // its bits on a host whose runtime does not accelerate Vector512 (run this class with
+        // DOTNET_PreferredVectorBitWidth=256 to see the two decisions differ).
+        Assert.Equal(Avx512F.IsSupported && Avx512BW.IsSupported && !CpuIsa.Avx512DisabledByEnv,
+            CpuIsa.Avx512PerRowDots);
+        if (CpuIsa.Avx512) Assert.True(CpuIsa.Avx512PerRowDots);
+        if (Vector512.IsHardwareAccelerated && Avx512DQ.IsSupported)
+            Assert.Equal(CpuIsa.Avx512, CpuIsa.Avx512PerRowDots);
     }
 
     public static TheoryData<string> WorkerSets() => new() { "pool", "threadpool", "shared", "wide" };

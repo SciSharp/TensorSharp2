@@ -2254,7 +2254,7 @@ namespace TensorSharp.Models
 
         private static unsafe float MaxAbs(float* src, int length)
         {
-            if (CpuIsa.Avx512 && length >= 16)
+            if (CpuIsa.Avx512PerRowDots && length >= 16)
             {
                 Vector512<float> max = Vector512<float>.Zero;
                 int i = 0;
@@ -2293,7 +2293,7 @@ namespace TensorSharp.Models
 
         private static unsafe float VecDotQ4_0Q8_0(byte* q4, byte* q8, int blockCount)
         {
-            if (CpuIsa.Avx512)
+            if (CpuIsa.Avx512PerRowDots)
                 return VecDotQ4_0Q8_0Avx512Wide(q4, q8, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ4_0Q8_0Avx2(q4, q8, blockCount);
@@ -2637,7 +2637,7 @@ namespace TensorSharp.Models
 
         private static unsafe float VecDotQ8_0Q8_0(byte* q8w, byte* q8x, int blockCount)
         {
-            if (CpuIsa.Avx512)
+            if (CpuIsa.Avx512PerRowDots)
                 return VecDotQ8_0Q8_0Avx512(q8w, q8x, blockCount);
             if (Avx2.IsSupported)
                 return VecDotQ8_0Q8_0Avx2(q8w, q8x, blockCount);

@@ -2001,7 +2001,7 @@ Radix。CLI 的普通生成现在使用共享调度器，其报告的 prefill �
 钩子绑定到它上面，因此 `Ops.Addmm` 背后的 packed F32 SGEMM、SIMD 逐元素 / norm / softmax / RoPE
 内核、DiffusionGemma 与 Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的文本编码器与视觉塔
 共用一组工作线程（Qwen-Image 的 VAE 另有一个更宽的专用池，`TS_CPU_GEMM_THREADS`）。这些都上池之后，
-在 8 核 16 线程的 i7-11800H 上用 16 线程替代默认的 8 线程，Qwen-Image 的 Transformer 步变快，但其文本编码器
+在 8 核 16 线程的 i7-11800H 上用 16 线程替代默认的 8 线程，Qwen-Image 的 Transformer 步变快，但其文本编码器前向
 与 DiffusionGemma 对新提示的读取变慢，因此默认宽度保持不变。量化权重（Q4_K、
 Q5_K、Q6_K、Q4_0、Q5_0、Q8_0）走多行 int8 GEMM，F16/BF16/F32 以及只能反量化的类型走浮点面板 GEMM。
 它们各有一个取 `0` 的开关，可在同一个二进制里恢复旧代码（见下表）；带默认值与实测数据的完整列表见
@@ -2009,6 +2009,8 @@ Q5_K、Q6_K、Q4_0、Q5_0、Q8_0）走多行 int8 GEMM，F16/BF16/F32 以及只�
 AVX2 内核，用 `TS_CPU_DISABLE_AVX512=1`；要模拟只有 AVX2 的主机，用 `DOTNET_EnableAVX512=0` 启动进程
 （.NET 10 会忽略旧的 `DOTNET_EnableAVX512F=0`）。所有内核都从同一个判定取得指令集：AVX-512 要求
 AVX-512 F/BW/DQ 且运行时对 `Vector512` 做了硬件加速，因此不会有一类内核用 AVX-512、另一类用 AVX2。
+例外是 `TS_CPU_QGEMM=0` 所回到的旧逐行 Q4_0 / Q8_0 点积：它们沿用原来的判定（具备 AVX-512 F/BW），
+因此在运行时没有对 `Vector512` 做硬件加速的主机上，它们照旧运行。
 要回到引入这些内核之前这个后端的算术，四个开关都要设置：`TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0
 TS_CPU_SIMD_ELEMENTWISE=0`，DiffusionGemma 另加 `DIFFUSION_CPU_LEGACY=1`；只设置某一方面的开关时，共享内核
 仍然是新代码。
@@ -2032,8 +2034,8 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 | 浮点面板 GEMM（F16、BF16、F32 与只能反量化的类型） | 启用 | `TS_CPU_FGEMM=0` 恢复旧的"反量化再点积"循环 | — |
 | `Ops.Addmm` 与 Direct 网络背后的 packed F32 SGEMM | 启用（AVX-512 8x32、AVX2 6x16 或可移植内核） | `TS_CPU_SGEMM=0` 恢复旧循环；`TS_CPU_SGEMM_KERNEL`、`TS_CPU_SGEMM_KC` / `_MC` / `_NC`、`TS_CPU_SGEMM_DOT_MAXN` 用于调优 | — |
 | SIMD 逐元素、norm、softmax 与 RoPE 内核 | 启用 | `TS_CPU_SIMD_ELEMENTWISE=0` 恢复旧循环 | — |
-| AVX-512 内核 | CPU 支持 AVX-512 F/BW/DQ 且运行时对 `Vector512` 做了硬件加速时启用 | `TS_CPU_DISABLE_AVX512=1` 让所有手写内核以 AVX2 形式运行；`DOTNET_EnableAVX512=0`（不是 `DOTNET_EnableAVX512F`）让整个运行时只用到 AVX2 | — |
-| `cpu` 上的 DiffusionGemma | prompt-KV 缓存、批量 MoE、融合的 Q/K/V 与 gate/up 投影 | `DIFFUSION_NO_PKV=1` 关闭 prompt-KV 缓存；`DIFFUSION_CPU_LEGACY=1` 用一个开关恢复旧路径（按阶段：`DIFFUSION_CPU_LEGACY_MOE`、`_PROJ`、`_ATTN`、`_ROUTER`）；`DIFFUSION_CPU_ATTN_FAST=1`、`DIFFUSION_CPU_MOE_CHUNK` | — |
+| AVX-512 内核 | CPU 支持 AVX-512 F/BW/DQ 且运行时对 `Vector512` 做了硬件加速时启用（旧的逐行 Q4_0 / Q8_0 点积：CPU 支持 AVX-512 F/BW 时启用） | `TS_CPU_DISABLE_AVX512=1` 让所有手写内核以 AVX2 形式运行；`DOTNET_EnableAVX512=0`（不是 `DOTNET_EnableAVX512F`）让整个运行时只用到 AVX2 | — |
+| `cpu` 上的 DiffusionGemma | prompt-KV 缓存、批量 MoE、融合的 Q/K/V 与 gate/up 投影 | `DIFFUSION_NO_PKV=1` 关闭 prompt-KV 缓存；`DIFFUSION_CPU_LEGACY=1` 用一个开关恢复 DiffusionGemma 专有的旧阶段（按阶段：`DIFFUSION_CPU_LEGACY_MOE`、`_PROJ`、`_ATTN`、`_ROUTER`），它们下面的 matmul 仍走新的共享内核——要回到之前的算术，还需设置 `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0`；`DIFFUSION_CPU_ATTN_FAST=1`、`DIFFUSION_CPU_MOE_CHUNK` | — |
 | `cpu` 上的 Qwen-Image-2.1 | 托管 DiT 与文本编码器使用 8 位激活、在多行整数 GEMM 上计算，VAE 与视觉塔走 packed GEMM；未指定尺寸的请求输出 1024×1024（1 百万像素）——`ggml_cpu` 与 GPU 后端保持 2048×2048 | `TS_QWEN21_CPU_MATMUL=f32` 与 `TS_QWEN_TE_CPU_MATMUL=f32` 保留 F32 激活乘以反量化权重分块（更慢，数值更稳定）；`TS_QWEN_VAE_CPU=scalar`、`TS_QWEN_TE_CPU_GEMM=0`、`TS_QWEN_TE_CPU_ATTN=0`、`TS_QWEN35_VENC_CPU_GEMM=0`、`TS_QWEN35_VENC_CPU_ATTN=0` 恢复旧的各阶段；`TS_CPU_GEMM_THREADS` 设置 VAE 专用池的宽度（每个逻辑 CPU 一个线程，最多 64）；`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` 跳过对内存放不下的尺寸的预先拒绝；`TS_QWEN21_CPU_PROFILE=1`、`TS_QWEN_VAE_PROFILE=1`、`TS_QWEN_TE_PROFILE=1` 打印各阶段耗时 | — |
 | DeepSeek V4.1 Flash 的整模型执行器 | 纯 C#（`DeepSeek4CpuExecutor`）——在这个后端上走整模型执行器，而不是通用逐算子路径 | 它的计算宽度由 `TS_DSV4_THREADS=N` 决定（默认取全部处理器），而不是 `TS_CPU_THREADS` | — |
 | direct 视频网络（Wan、MiniMax-H3）上的量化权重 | 保持 GGUF 存储类型，直接参与乘法 | `TS_DIRECT_QUANT_WEIGHTS=0` 改回加载时一次性展开成 F32 再做普通 GEMM（旧行为，权重内存为 4 倍）。Wan 在 256x160x5f、单步下，就地路径实测 80.9 秒，展开路径 121.4 秒 | — |

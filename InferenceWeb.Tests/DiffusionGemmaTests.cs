@@ -92,6 +92,36 @@ public class DiffusionGemmaTests
         return backend;
     }
 
+    /// <summary>Why a test of the device side of the prompt-KV cache cannot run on
+    /// <paramref name="backend"/>, or null when it can. That side exists only on the device-glue
+    /// backends (the ones DiffusionGemmaModel enables it for): ggml_cpu has no prompt-KV cache, the
+    /// pure-C# cpu backend keeps its prompt K/V on the host, and DIFFUSION_NO_PKV=1 turns the cache
+    /// off everywhere. Decided at discovery (<see cref="DiffusionGemmaDeviceKvFactAttribute"/>), so
+    /// such a run reports the test as skipped instead of loading the model and passing unchecked.</summary>
+    internal static string DeviceKvSkipReason(BackendType backend, string noPkvEnv)
+    {
+        if (noPkvEnv == "1")
+            return "Device prompt-KV behaviour: DIFFUSION_NO_PKV=1 turns the prompt-KV cache off.";
+        return backend switch
+        {
+            BackendType.GgmlMetal or BackendType.GgmlCuda or BackendType.Mlx or BackendType.Cuda => null,
+            BackendType.Cpu => "Device prompt-KV behaviour: the pure-C# cpu backend keeps prompt K/V on the host (TS_TEST_BACKEND=cpu).",
+            _ => $"Device prompt-KV behaviour: {backend} has no prompt-KV cache (set TS_TEST_BACKEND=ggmlcuda, ggmlmetal, mlx or cuda).",
+        };
+    }
+
+    [Theory]
+    [InlineData(BackendType.GgmlCuda, "", true)]
+    [InlineData(BackendType.GgmlMetal, "", true)]
+    [InlineData(BackendType.Mlx, "", true)]
+    [InlineData(BackendType.Cuda, "", true)]
+    [InlineData(BackendType.GgmlCpu, "", false)]   // the default backend off macOS
+    [InlineData(BackendType.Cpu, "", false)]
+    [InlineData(BackendType.GgmlCuda, "1", false)]
+    [InlineData(BackendType.GgmlCuda, "0", true)]
+    public void DeviceKvTests_RunOnlyWhereTheDeviceCacheExists(BackendType backend, string noPkvEnv, bool runs)
+        => Assert.Equal(runs, DeviceKvSkipReason(backend, noPkvEnv) == null);
+
     private int[] RenderPrompt(DiffusionGemmaModel model, string text)
     {
         var messages = new System.Collections.Generic.List<ChatMessage>
@@ -482,11 +512,8 @@ public class DiffusionGemmaTests
     {
         using var model = TryLoad();
         if (model == null) return;
-        if (!model.SupportsPromptKvCache)
-        {
-            _output.WriteLine("[diffusion-gemma][leak] CPU backend (no device K/V copies); skipping");
-            return;
-        }
+        // The attribute admits only backends whose prompt-KV cache is on (see DeviceKvSkipReason).
+        Assert.True(model.SupportsPromptKvCache, $"prompt-KV cache is off on {_loadedBackend}");
 
         var prompt = RenderPrompt(model, "List three primary colors and briefly explain additive color mixing.");
         int C = model.CanvasLength;
@@ -530,11 +557,7 @@ public class DiffusionGemmaTests
     {
         using var model = TryLoad();
         if (model == null) return;
-        if (!model.SupportsPromptKvCache)
-        {
-            _output.WriteLine("[diffusion-gemma][leak] CPU backend; skipping multi-turn device-memory test");
-            return;
-        }
+        Assert.True(model.SupportsPromptKvCache, $"prompt-KV cache is off on {_loadedBackend}");
 
         var prompt = RenderPrompt(model, "Describe the video game Final Fantasy VII in two or three sentences.");
         var sampler = new DiffusionGemmaSampler(model);
@@ -741,11 +764,7 @@ public class DiffusionGemmaTests
     {
         using var model = TryLoad();
         if (model == null) return;
-        if (!model.SupportsPromptKvCache)
-        {
-            _output.WriteLine("[diffusion-gemma][bench] CPU backend; skipping throughput benchmark");
-            return;
-        }
+        Assert.True(model.SupportsPromptKvCache, $"prompt-KV cache is off on {_loadedBackend}");
 
         var prompt = RenderPrompt(model, "Explain in two sentences why the sky is blue.");
         int C = model.CanvasLength;
@@ -806,9 +825,10 @@ public class DiffusionGemmaTests
 
 /// <summary>
 /// [ModelFact] for a DiffusionGemma test about the device side of the prompt-KV cache (resident
-/// device copies, the fused single-canvas GPU kernel). The pure-C# cpu backend
-/// (TS_TEST_BACKEND=cpu) keeps its prompt K/V on the host and has no fused kernel, so there the
-/// test is reported as skipped at discovery instead of returning early as a pass.
+/// device copies, the fused single-canvas GPU kernel). It runs only on the device-glue backends
+/// with the cache on; elsewhere (ggml_cpu, the default off macOS; the pure-C# cpu backend, which
+/// keeps prompt K/V on the host; DIFFUSION_NO_PKV=1) the test is reported as skipped at discovery
+/// instead of returning early as a pass. See <see cref="DiffusionGemmaTests.DeviceKvSkipReason"/>.
 /// </summary>
 [Xunit.Sdk.TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
 [AttributeUsage(AttributeTargets.Method)]
@@ -818,7 +838,6 @@ public sealed class DiffusionGemmaDeviceKvFactAttribute : FactAttribute, Xunit.S
 
     public DiffusionGemmaDeviceKvFactAttribute(string envVar, string ggufContains = null)
         => Skip = TestGates.ModelSkip(envVar, ggufContains)
-            ?? (DiffusionGemmaTests.TestBackend() == BackendType.Cpu
-                ? "Device prompt-KV behaviour: the pure-C# cpu backend keeps prompt K/V on the host (TS_TEST_BACKEND=cpu)."
-                : null);
+            ?? DiffusionGemmaTests.DeviceKvSkipReason(DiffusionGemmaTests.TestBackend(),
+                Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV"));
 }
