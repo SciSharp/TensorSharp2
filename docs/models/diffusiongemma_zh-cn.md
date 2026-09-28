@@ -232,8 +232,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 - **注意力**是分块内核，默认算术精确复现旧内核（`DIFFUSION_CPU_ATTN_FAST=1` 改用 FMA 分块）。这个模型对
   最后一个比特的变化异常敏感：每次 matmul 前都会量化激活，每层又要从 128 个专家里选 8 个，路由上的平局
   可能翻转。在数值上等价的不同内核之间，单字段 Jev 概率的变化可达 ±0.2，因此下文按标签判定来评估质量。
-- `DIFFUSION_NO_PKV=1` 关闭缓存；`DIFFUSION_CPU_LEGACY=1` 恢复整条旧的 CPU 路径，按阶段的开关各恢复一个
-  阶段（见下表）。
+- `DIFFUSION_NO_PKV=1` 关闭缓存；`DIFFUSION_CPU_LEGACY=1` 恢复这个模型这一侧的旧 CPU 路径，按阶段的开关各恢复一个
+  阶段（见下表）。它们调用的共享 CPU 内核也已重写，要与旧版本逐位一致还需
+  `TS_CPU_SIMD_ELEMENTWISE=0 TS_CPU_SGEMM=0 TS_CPU_QGEMM=0`。
 
 在 i7-11800H（8 核 16 线程、AVX-512）、32 GB、Windows 上，用 `diffusiongemma-26B-A4B-it-Q4_K_M.gguf` 与
 `eng/JevProbe` 实测（对一个 54 token 的提示做结构化读取；"旧构建"指本次 `cpu` 改动之前的构建）：
@@ -256,7 +257,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 | `DIFFUSION_STEPS` | 服务端每个 block 的去噪步数，默认 48 |
 | `DIFFUSION_MAX_BATCH` | 服务端 diffusion scheduler 最大活跃请求数，默认 2 |
 | `DIFFUSION_NO_PKV=1` | 关闭 device-glue 后端与 `cpu` 上的 prompt-KV 缓存 |
-| `DIFFUSION_CPU_LEGACY=1` | `cpu`：恢复整条旧的 CPU 路径（没有 prompt-KV 缓存，投影、注意力、路由与 MoE 都用旧实现） |
+| `DIFFUSION_CPU_LEGACY=1` | `cpu`：恢复这个模型的旧 CPU 路径（没有 prompt-KV 缓存，投影、注意力、路由与 MoE 都用旧实现）；只有同时设置 `TS_CPU_SIMD_ELEMENTWISE=0 TS_CPU_SGEMM=0 TS_CPU_QGEMM=0` 才与旧版本逐位一致 |
 | `DIFFUSION_CPU_LEGACY_MOE` / `_PROJ` / `_ATTN` / `_ROUTER` `=1` | `cpu`：恢复单个阶段。`_ATTN` 只作用于统一前向，因此注意力的 A/B 还需要 `DIFFUSION_NO_PKV=1` |
 | `DIFFUSION_CPU_ATTN_FAST=1` | `cpu`：用 FMA 注意力分块与向量化 softmax 代替精确的默认内核 |
 | `DIFFUSION_CPU_MOE_CHUNK` | `cpu`：每次批量 MoE 处理的 token 数，默认 512 |
@@ -284,6 +285,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 - 流式输出发送 `replace` 事件而不是 token append，因为每一步都会重新修正整个 canvas。
 - 在 `done` 事件前会先发送最终定稿 replacement。
 - 并发请求共享一个后台 diffusion scheduler，并在 block 之间被接纳。
+- Jev 结构化读取或新一轮对话的图像编码不必等聊天的整个 block：scheduler 会在下一次前向之前把模型交出，
+  所以只需等正在进行的那一次前向。block 的输出不变。
 - 在没有 prompt-KV 缓存的后端（`ggml_cpu`、`ggml_vulkan`，以及设置了 `DIFFUSION_NO_PKV=1` 或
   `DIFFUSION_CPU_LEGACY=1` 的 `cpu`）上，scheduler 会让每个序列的每一步走统一的 `[prefix|canvas]`
   前向，而不是 prefill + canvas decode；行为与输出完全一致。

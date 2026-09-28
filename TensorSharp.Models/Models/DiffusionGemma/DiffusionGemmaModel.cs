@@ -281,10 +281,16 @@ namespace TensorSharp.Models
         /// When the model fits, the logits stay resident, the forward keeps the GPU busy (clock ramped), and
         /// the kernel is a large win (only C ints/floats cross PCIe instead of ~268 MB). Measured on a
         /// VRAM-oversubscribed RTX 3080 Laptop: device sampling was ~33% slower, hence the gate. Override
-        /// the residency gate for experiments with DIFFUSION_DEVICE_SAMPLE_FORCE=1.</summary>
+        /// the residency gate for experiments with DIFFUSION_DEVICE_SAMPLE_FORCE=1.
+        ///
+        /// The sampling tail reads the fused layer graph's output, so it also needs the fused decode
+        /// (DIFFUSION_NO_FUSED_DECODE unset and not latched off). Without that check a block started on
+        /// the device path only to fall back at its first step, having skipped the host
+        /// self-conditioning buffers that the fallback path needs.</summary>
         public bool SupportsDeviceSampling =>
             _deviceSampleEnabled && _deviceSampleOk && _backend == BackendType.GgmlCuda
             && _fusedLmHeadTailOk && !_fusedLmHeadTailDisabled
+            && _fusedDecodeEnabled && _fusedDecodeOk
             && (!_segmentedDecode || _deviceSampleForce);
 
         /// <summary>The number of top-K tokens the device sampler returns for self-conditioning (0 when SC

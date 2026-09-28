@@ -179,7 +179,7 @@ TestMatrix 配置中 sweep。
 | `DIFFUSION_MAX_BATCH` | DiffusionGemma Web UI | `DiffusionBatchScheduler` 的最大活跃请求数 | `2` | 未注册 | 否 |
 | `DIFFUSION_BATCHED_FORWARD` | DiffusionGemma | 真正批处理 canvas decode vs 按时间片执行融合单 canvas decode | 关闭 | 未注册 | 否 |
 | `DIFFUSION_NO_PKV` | DiffusionGemma | 关闭 prompt-KV 缓存（device-glue 后端与 `cpu`）：之后每次读取、每个去噪步都走统一的 `[prompt\|canvas]` 前向 | 关闭 | 未注册 | 否 |
-| `DIFFUSION_CPU_LEGACY` | `cpu` 上的 DiffusionGemma | `1` 用一个开关恢复整条旧的纯 C# 路径：没有 prompt-KV 缓存，投影、注意力、路由与 MoE 都用旧实现 | 关闭 | 未注册 | 否 |
+| `DIFFUSION_CPU_LEGACY` | `cpu` 上的 DiffusionGemma | `1` 用一个开关恢复这个模型这一侧的旧纯 C# 路径：没有 prompt-KV 缓存，投影、注意力、路由与 MoE 都用旧实现。它调用的共享 CPU 内核也已重写，要与旧版本逐位一致还需 `TS_CPU_SIMD_ELEMENTWISE=0 TS_CPU_SGEMM=0 TS_CPU_QGEMM=0` | 关闭 | 未注册 | 否 |
 | `DIFFUSION_CPU_LEGACY_MOE` / `_PROJ` / `_ATTN` / `_ROUTER` | `cpu` 上的 DiffusionGemma | 各恢复一个阶段：`_MOE` 恢复逐专家参考循环（连同其路由），`_PROJ` 恢复分开的 Q/K/V 与 gate/up 投影，`_ROUTER` 只恢复路由分数，`_ATTN` 恢复旧注意力。`_ATTN` 只作用于统一前向（prompt prefill 与 canvas decode 始终使用融合的 norm+RoPE 与分块注意力），因此注意力的 A/B 还需要 `DIFFUSION_NO_PKV=1` | 关闭 | 未注册 | 否 |
 | `DIFFUSION_CPU_ATTN_FAST` | `cpu` 上的 DiffusionGemma | `1` 选择 FMA 注意力分块（硬件加速时用 Vector512）与向量化 softmax。默认内核精确复现旧的算术，因为最后一个比特的变化就可能翻转 128 选 8 的专家路由；在 Jev 与聊天的提示长度下，注意力只占一次前向的不到百分之一 | 关闭 | 未注册 | 否 |
 | `DIFFUSION_CPU_MOE_CHUNK` | `cpu` 上的 DiffusionGemma | 每次批量 MoE 处理的 token 数；限制按路由收集的暂存区大小（否则 4k token 的 prefill 要占约 1 GB 的路由行） | `512` | 未注册 | 否 |

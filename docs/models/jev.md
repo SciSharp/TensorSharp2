@@ -619,7 +619,8 @@ existing DiffusionGemma prompt K/V and fused decode paths, and `cpu` its host
 prompt K/V with a last layer computed only for the requested label rows; other
 backends, `ggml_cpu`, `ggml_vulkan`, `mlx` and `cuda` included, use the unified
 prompt-plus-canvas forward. The model execution lock serializes access to shared
-GPU state with ordinary diffusion chat requests.
+GPU state with ordinary diffusion chat requests; a read issued while a chat is
+denoising runs before the chat's next forward instead of after its whole block.
 
 GGML CUDA uses fused prompt attention by default, keeping attention operations
 inside one native graph to reduce intermediate transfers and explicit KV-head

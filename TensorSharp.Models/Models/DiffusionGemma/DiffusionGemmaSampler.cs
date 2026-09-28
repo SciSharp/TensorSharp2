@@ -391,14 +391,33 @@ namespace TensorSharp.Models
         /// buffers, convergence state) and in each sequence's own <see cref="DiffusionSeqState"/>, which
         /// nothing else writes. The model state another job touches is either keyed caches that are rebuilt
         /// from their key (masks, RoPE tables, positions; the image-span version is part of the mask key),
-        /// or the pooled logits buffers, which the previous forward's sampling has already consumed. Its
-        /// one hazard is a permanent fallback flag (a fused kernel rejecting the job's layout) - the same
-        /// exposure a job between blocks has always had.</para></summary>
+        /// or the pooled logits buffers, which the previous forward's sampling has already consumed. A job
+        /// can also latch one of the model's fallback switches (a fused kernel rejecting the job's layout);
+        /// <see cref="DiffusionBlockHandoff"/> keeps that from the block until it ends, so the block
+        /// finishes on the path it started on, as it would have with the job after it.</para></summary>
         public void RunBlockBatched(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken = default,
             Action beforeForward = null)
         {
+            if (active.Count == 0) return;
+            if (beforeForward == null)
+            {
+                RunBlock(active, stopToken, null);
+                return;
+            }
+            var handoff = new DiffusionBlockHandoff(_model, beforeForward);
+            try
+            {
+                RunBlock(active, stopToken, handoff.BeforeForward);
+            }
+            finally
+            {
+                handoff.EndBlock();
+            }
+        }
+
+        private void RunBlock(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken, Action beforeForward)
+        {
             int A = active.Count;
-            if (A == 0) return;
             int C = _canvasLength;
             int vocab = _vocab;
 
@@ -425,6 +444,7 @@ namespace TensorSharp.Models
             // sampled/top-K directly, so no full [vocab,C] logits cross PCIe. Each sequence keeps its own
             // double-buffered top-K (for self-conditioning), argmax/sampled, mirroring DenoiseBlock.
             bool useDeviceSample = usePkv && _model.SupportsDeviceSampling;
+            bool deviceFellBack = false;
             int K = _model.SelfCondTopK;
             int[][][] dTopTok = useDeviceSample ? new int[A][][] : null;
             float[][][] dTopPrb = useDeviceSample ? new float[A][][] : null;
@@ -566,6 +586,7 @@ namespace TensorSharp.Models
                                 continue;
                             }
                             useDeviceSample = false;   // kernel rejected: fall back to the host path for the rest
+                            deviceFellBack = true;
                             WarnDeviceSampleFallback();
                         }
 
@@ -586,6 +607,11 @@ namespace TensorSharp.Models
                             using (_model.UseSequenceVision(seqs[a]))
                                 lg = _model.ForwardCanvas(unifiedTokens[a], promptLen[a], scBuffer[a], scUse, prevTempInv[a]);
                         }
+                        // A block that started on device sampling has no host self-conditioning buffer (its
+                        // top-K carried SC). After a fall back it starts here, so SC resumes from the next
+                        // step, as in DenoiseBlock, instead of staying off for the rest of the block.
+                        if (deviceFellBack && scBuffer[a] == null && _model.SelfConditioningEnabled)
+                            scBuffer[a] = new float[(long)C * vocab];
                         if (scBuffer[a] != null) Array.Copy(lg, scBuffer[a], (long)C * vocab);
                         bool seqFinished = DenoiseStep(lg, tempInv, rng[a], run.Params,
                             canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u, renoise);
