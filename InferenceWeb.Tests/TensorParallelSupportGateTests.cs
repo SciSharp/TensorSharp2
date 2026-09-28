@@ -10,7 +10,6 @@
 // into a different execution mode or silently leave extra GPUs idle.
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using TensorSharp;
 using TensorSharp.Models.Architecture;
@@ -85,65 +84,6 @@ public class TensorParallelSupportGateTests
         ITensorParallelGroup group = null;
         Assert.Equal(4, Resolve(arch, BackendType.GgmlCuda, 4, ref group, out int layerSplit));
         Assert.Equal(1, layerSplit);
-    }
-
-    [Theory]
-    [InlineData(1, 1, true)]
-    [InlineData(2, 2, true)]
-    [InlineData(1, 2, false)]
-    [InlineData(2, 4, false)]
-    public void Qwen3BatchedTp_RequiresAllRanksToBeLocal(
-        int localDegree, int globalDegree, bool expected)
-    {
-        Assert.Equal(expected,
-            TensorSharp.Models.Qwen3Model.SupportsBatchedTensorParallelGeometry(
-                localDegree, globalDegree));
-    }
-
-    [Fact]
-    public void Qwen3BatchedTp_RequiresEveryProjectionShard()
-    {
-        var shards = new HashSet<string>(StringComparer.Ordinal);
-        foreach (int layer in Enumerable.Range(0, 2))
-        {
-            string prefix = $"blk.{layer}.";
-            shards.Add(prefix + "attn_qkv.weight");
-            shards.Add(prefix + "attn_output.weight");
-            shards.Add(prefix + "ffn_gate_up.weight");
-            shards.Add(prefix + "ffn_down.weight");
-        }
-
-        Assert.True(TensorSharp.Models.Qwen3Model.HasRequiredBatchedTensorParallelWeights(
-            numLayers: 2, shards.Contains));
-
-        // Weight conversion can legally decline one mixed-quant shard. Keep the
-        // batched route disabled in that case instead of failing the first request.
-        shards.Remove("blk.1.attn_qkv.weight");
-        Assert.False(TensorSharp.Models.Qwen3Model.HasRequiredBatchedTensorParallelWeights(
-            numLayers: 2, shards.Contains));
-    }
-
-    [Fact]
-    public void Qwen2FamilyTp_AppliesBiasAndSkipsAbsentQkNorm_InEveryRoute()
-    {
-        string modelDir = Path.Combine(
-            FindRepositoryRoot(), "TensorSharp.Models", "Models", "Qwen3");
-        string plain = File.ReadAllText(Path.Combine(modelDir, "Qwen3Model.TensorParallel.cs"));
-        string batched = File.ReadAllText(Path.Combine(modelDir, "Qwen3Model.BatchedForwardTP.cs"));
-
-        foreach (string route in new[] { plain, batched })
-        {
-            Assert.Contains("ApplyQkvBiasTP(qkvFused, wn[8]);", route);
-            int normGate = route.IndexOf("if (_hasQkNorm)", StringComparison.Ordinal);
-            Assert.True(normGate >= 0, "The Qwen3-only TP Q/K norm gate is missing.");
-            int qNorm = route.IndexOf("ApplyQKNorm", normGate, StringComparison.Ordinal);
-            int kNorm = route.IndexOf("ApplyQKNorm", qNorm + 1, StringComparison.Ordinal);
-            Assert.True(qNorm > normGate && kNorm > qNorm,
-                "Both TP Q/K norms must remain under the Qwen3-only capability gate.");
-        }
-
-        Assert.Contains("ShardConcatenatedBiasColumnParallel(", plain);
-        Assert.Contains("$\"blk.{layer}.attn_qkv.bias\", qDim, kDim, kDim);", plain);
     }
 
     [Fact]
@@ -241,19 +181,6 @@ public class TensorParallelSupportGateTests
         // Aliases are the routing key; two families claiming one would silently shadow.
         var aliases = all.SelectMany(a => a.Aliases).Select(a => a.ToLowerInvariant()).ToList();
         Assert.Equal(aliases.Count, aliases.Distinct().Count());
-    }
-
-    private static string FindRepositoryRoot()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null)
-        {
-            if (File.Exists(Path.Combine(dir.FullName, "TensorSharp.sln"))
-                || File.Exists(Path.Combine(dir.FullName, "TensorSharp.slnx")))
-                return dir.FullName;
-            dir = dir.Parent;
-        }
-        throw new DirectoryNotFoundException("Could not locate the TensorSharp repository root.");
     }
 
     /// <summary>Minimal live group: the gate only reads whether one exists.</summary>

@@ -41,7 +41,7 @@
     </tbody>
   </table>
   </div>
-  <p>应用面向 iPhone 与 iPad（arm64，iOS 17.0 及以上）。它采用 scene 生命周期——用 iOS 27 SDK 构建时必须如此才能启动；已记录的真机运行均在 iOS 26.6.1 上。内置模型目录——Gemma 4 E2B、E4B 与 12B、Qwen3.5 9B，以及仅支持本地导入、标为实验性的 Bonsai 8B 与 27B——只向 12 GB 及以上内存档位的设备提供。以下几点与桌面宿主不同：</p>
+  <p>应用面向 iPhone 与 iPad（arm64，iOS 17.0 及以上）。它采用 scene 生命周期——用 iOS 27 SDK 构建时必须如此才能启动；已记录的真机运行均在 iOS 26.6.1 上。内置模型目录——Gemma 4 E2B、E4B 与 12B、Qwen3.5 9B——向 12 GB 及以上内存档位的设备提供；标为实验性的 Bonsai 2 27B 需要 16 GB 档位（iPad 与 Mac）。以下几点与桌面宿主不同：</p>
   <ul>
     <li><strong>推测解码默认开启</strong>——Gemma 4 E4B 与 12B 在已下载草稿头时使用草稿头，否则在模型支持推测解码时使用 n-gram 查找。修改该设置会从下一条回复起作用于正在运行的引擎。</li>
     <li><strong>子智能体委派默认开启，并有开关</strong>（<a href="#sub-agents">见下文</a>）。设置 &gt; Sandbox &gt;“Sub-agents”可从下一条消息起关闭它，像 <code>--no-multi-agent</code> 一样不再声明协调工具；上限保持宿主默认值，手机页面也不显示子智能体面板。</li>

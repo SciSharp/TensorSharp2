@@ -45,34 +45,37 @@ bound, but nothing on the page calls them — and `/api/image-generate`, the rou
 desktop page uses for text-to-image, is not bound at all. The app's own client is
 appended as one script tag at request time; the page file itself is never forked.
 
-**A built-in model catalog.** Six dense entries chosen to fit a phone, with the
-exact byte size and SHA-256 of every file. Four are downloadable; those downloads
+**A built-in model catalog.** Five dense entries chosen to fit a phone or tablet, with the
+exact byte size and SHA-256 of every file. All five are downloadable; those downloads
 resume from a kept `.part` after an interruption, are verified before use, and
 belong to the APP rather than to the screen that started one — see "Downloads"
-below. The two Bonsai cards are text-only, local-import entries: their GGUFs embed
-no publisher repository or license, so the app offers a file picker instead of
-inventing a download URL and accepts only the exact hash-pinned artifact. Files with
-exactly these hashes are published in the prism-ml Bonsai repositories; the pinned
-revisions and download commands are in [Bonsai](../docs/models/bonsai.md). Download
-one, make it reachable from the Files picker, and import it.
+below. Bonsai 2 27B is the one entry that needs the 16 GB tier (iPads and Macs)
+rather than a 12 GB phone: TensorSharp repacks its PTQ1_0 weights losslessly to
+GGML Q2_0 at load (about 29% more payload), so the 5.95 GB download occupies about
+7.7 GB of anonymous memory, which with the K/V cache and compute buffers exceeds
+the roughly 8.5 GB a 12 GB iPhone grants. The PQ2_0 file (7.21 GB) holds the same
+ternary weights and repacks to about the same size, so the entry downloads the
+smaller PTQ1_0 file. See the [Bonsai2 card](../docs/models/bonsai2.md).
 
 | Model | Modalities | Required artifact(s) | Needs | Source |
 | --- | --- | --- | --- | --- |
 | Gemma 4 E2B (Q8_0) | text, image, audio, video | download: 4,967,497,152-byte main GGUF + 557,368,064-byte projector | 12 GB | `ggml-org/gemma-4-E2B-it-GGUF` |
 | Gemma 4 E4B (IQ4_XS) | text, image, audio, video | download: 4,715,416,704-byte main GGUF + 559,874,816-byte projector; 98,653,280-byte draft optional | 12 GB | `unsloth/gemma-4-E4B-it-GGUF` + `ggml-org/gemma-4-E4B-it-GGUF` (projector and draft) |
 | Gemma 4 12B (UD-IQ2_M) | text; image and video with optional projector | download: 4,213,353,280-byte main GGUF; 175,115,840-byte projector and 465,109,248-byte draft optional | 12 GB | `unsloth/gemma-4-12b-it-GGUF` |
-| Bonsai 8B (Q1_0) | text only | local import: `Bonsai-8B-Q1_0.gguf`, exactly 1,158,654,496 bytes | 12 GB | no publisher repo embedded |
-| Bonsai 27B (Q1_0) | text only | local import: `Bonsai-27B-Q1_0.gguf`, exactly 3,803,452,480 bytes | 12 GB | no publisher repo embedded |
+| Bonsai 2 27B (PTQ1_0) | text; image with optional projector | download: 5,946,648,928-byte main GGUF; 629,246,976-byte projector optional | 16 GB | `prism-ml/Ternary-Bonsai-2-27B-gguf` |
 | Qwen3.5 9B (IQ4_XS) | text; image and video with optional projector | download: 5,168,653,536-byte main GGUF; 918,166,080-byte projector optional | 12 GB | `unsloth/Qwen3.5-9B-GGUF` |
 
 Each entry also carries the context window the app loads it with (8,192 tokens for
-Gemma 4 E2B and E4B, 16,384 for Bonsai 8B, 32,768 for the other three), a K/V cache
+Gemma 4 E2B and E4B, 32,768 for the other three), a K/V cache
 precision that the "KV cache precision" setting overrides, and its model card's
-sampling values. Both Bonsai cards are marked Experimental.
+sampling values (for Bonsai 2 27B, the publisher's thinking-mode recommendation:
+temperature 1.0, top-k 20, top-p 0.95, min-p 0.05). The Bonsai 2 card is marked
+Experimental: Bonsai2 has not been validated on iOS.
 
 The Models page lists every entry, but only one that fits the device's memory tier
 can be loaded: an entry that needs more is shown greyed, marked "Too big" with both
-numbers, rather than hidden. All six need the 12 GB tier or above. For an installed model
+numbers, rather than hidden. Bonsai 2 27B needs the 16 GB tier; the other four need
+the 12 GB tier or above. For an installed model
 whose optional projector is missing, "Add vision" downloads just the projector (and
 the draft head, when the entry lists one that is not there yet); once it is on the
 device, "Enable vision" reloads the selected model with it.
@@ -624,7 +627,8 @@ iCloud; conversations, settings and installed skills go under
 `Library/Application Support`, which is backed up. A five-gigabyte byte-identical
 copy of a public file has no business in a user's iCloud quota. The app's own folder
 in Files and Finder (its `Documents` directory) stays empty, because nothing is read
-from or written to it: a sideloaded model comes in through the Files picker on the
+from or written to it: a model for a sideload-only catalog entry (the catalog supports
+them, though no built-in entry is one) comes in through the Files picker on the
 Models page, which copies it into the store, and a generated file goes out through
 QuickLook or the share sheet.
 
@@ -980,8 +984,7 @@ serves the next request's speed, on the engine's own thread between steps.
 
 Measured on the Mac with the phone's settings and the research-then-slides prompt
 that was killing the app (`--scenarios agentic --network`), footprint at the end of
-the turn: Qwen3.5 9B IQ4_XS 3.7 GB before, 1.7-1.8 GB after; Bonsai 27B Q1_0 9.7 GB
-before, 4.0-5.8 GB after (its recurrent state is 216 MB per resident copy). On the
+the turn: Qwen3.5 9B IQ4_XS 3.7 GB before, 1.7-1.8 GB after. On the
 iPhone 17 Pro Max with the user's own settings, the same prompt runs past 24,000
 tokens of context at a 1.7 GB footprint where it used to die.
 
@@ -996,8 +999,8 @@ retention limits still apply, and memory warnings release idle cache payloads.
 
 Every chat starts from a copy of the model's state at the end of the prompt they all
 share, but in a fresh process that state has to be made first: the warm-up after a
-load prefills it, and on the phone that is 36-48 s for Qwen3.5 9B and 152 s for
-Bonsai 27B, which a first message sent sooner pays in full. The checkpoint is now
+load prefills it, and on the phone that is 36-48 s for Qwen3.5 9B, which a first
+message sent sooner pays in full. The checkpoint is now
 written to `Library/Caches/TensorAgent/prefix-cache/<model id>/` the first time it is
 taken (`PrefixCheckpointFileStore`) and read back by the next load
 (`IPrefixCheckpointStore`, consulted by the engine at admission), so the first
@@ -1008,7 +1011,7 @@ used evicted first; one that no
 longer describes its model is deleted and the prefix is prefilled and saved again.
 Deleting a model deletes its checkpoints. Checkpoints, in memory and on disk, exist
 for the Gemma 4 and `qwen35`-architecture entries (Gemma 4 E2B, E4B and 12B, Qwen3.5
-9B, Bonsai 27B); Bonsai 8B's `qwen3` architecture takes none. The same idea as
+9B, Bonsai 2 27B). The same idea as
 llama.cpp's prompt-cache files, scoped to the one prefix the app cares about.
 `benchmarks/TensorAgentTtftBench --scenarios restore`, run twice against the same `--root`, measures the difference;
 on the Mac (M5 Pro), first message of a launch, no warm-up waited for:
@@ -1016,7 +1019,6 @@ on the Mac (M5 Pro), first message of a launch, no warm-up waited for:
 | Model | Cold launch | Next launch | Checkpoint file |
 | --- | ---: | ---: | ---: |
 | Qwen3.5 9B IQ4_XS | 5.51 s | 0.41 s | 102 MB, restored in 39 ms |
-| Bonsai 27B Q1_0 | 16.43 s | 0.84 s | 253 MB, restored in 127 ms |
 
 On the iPhone 17 Pro Max, Qwen3.5 9B: the first launch wrote 117 MB in 386 ms after a
 54 s cold first message; the next launch restored it in 44-284 ms and the warm-up (a
@@ -1029,8 +1031,7 @@ from it produces the same tokens as a cold prefill, on Metal, for Qwen 3.5 and G
 ### Speculative decoding
 
 Every turn is decoded speculatively unless the "Speculative decoding" switch in
-Settings is off, on every catalog model except Bonsai 8B, whose `qwen3` architecture
-is not a speculative target: a drafter guesses a few tokens ahead and the model
+Settings is off: a drafter guesses a few tokens ahead and the model
 verifies them in one batched forward, so the answer is exactly what plain decoding would have
 produced and it arrives in fewer forwards. The drafter is the model's own draft head
 when the catalog lists one and it is downloaded with the optional files (Gemma 4 E4B
@@ -1042,8 +1043,7 @@ earlier answer. `SpeculationPolicy` hands both to the engine at load time, throu
 the same environment the CLI's `--draft-model` and `--spec` use, and the engine's cost
 governor parks drafting while it measures as a loss. Both catalog families
 speculate on the app's cached-holder path: Gemma 4 with its draft head when the
-optional file is downloaded (n-gram otherwise), Qwen 3.5 (and Bonsai 27B, a `qwen35`
-model) with n-gram. Measured on
+optional file is downloaded (n-gram otherwise), Qwen 3.5 with n-gram. Measured on
 the Mac host with the phone's settings, quoting or echoing text runs 1.6-2.5x plain
 decoding and free prose stays within about 5% (Qwen) to 15% (E4B with the draft
 head) of it. On an iPhone 17 Pro Max (`scripts/bench-spec-device.sh`) quoting runs
@@ -1172,7 +1172,7 @@ checked and these were not:
   figure in "Every conversation shape, on Metal" is from a Mac driving the real app
   host; the phone was not reachable that day. The phone numbers recorded since are
   the warm-up and persisted-checkpoint times in "The first message of a launch"
-  (Qwen3.5 9B; Bonsai 27B warm-up only) and the speculation benchmark in
+  (Qwen3.5 9B) and the speculation benchmark in
   "Speculative decoding"; none covers the per-shape table. The Debug build carries a probe for
   exactly this: launch with `TENSORAGENT_TTFT_CHECK=1` (and `TENSORAGENT_USE_MODEL`)
   and read the four `ttft` lines off `devicectl device process launch --console` —

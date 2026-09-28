@@ -308,7 +308,7 @@ logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输�
 投机只在模型声明有收益（`SpeculationProfitable`）时启用，这由各模型自己决定：Qwen 3.5/3.6/3.8 与
 GLM 5.2 / GLM-5.3 在所有后端上；Gemma 4 在 ggml 后端（含 `ggml_cpu`）与纯 C# `cuda` 后端上；
 Qwen 3.8 Flash Next 在其 GGML token 计算图路径上；GLM-5.3-Flash 在其 KDA 回滚可用时；DeepSeek V4 / V4.1
-与 Muse-Glimmer 只在加载了各自草稿器时。Nemotron-H 直接拒绝投机（`SpeculationRefusal`）。GPT OSS、Mistral 3、Qwen 3 / Qwen 2 与
+与 Muse-Glimmer 只在加载了各自草稿器时。Nemotron-H 直接拒绝投机（`SpeculationRefusal`）。GPT OSS、Mistral 3 与
 Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都走标准 decode。并发批次从不投机——当有多个
 序列在运行时，每个序列都走普通的批处理 / 回退步骤。无法挂载的 `--draft-model`（草稿器不匹配或不完整，
 或模型拒绝投机）会在服务端启动时立即失败（`SpeculationStartupValidation`）。`--spec` 不会关闭 Radix
@@ -325,7 +325,6 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 | GPT OSS | 默认批处理路径。支持 Q/K/V/O bias、YaRN RoPE、滑窗层、attention sinks、MXFP4 MoE expert 与原生 sinks 注意力。已与旧路径做贪心正确性验证；性能仍主要受逐层图构建限制。在 GGML 后端上（非 TP），并发 decode 改走 per-request fused holder 与 token 批量融合 decode，在 `ggml_cuda` / `ggml_vulkan` 上使用 slot-stable arena。 | `TS_GPTOSS_BATCHED=0`；`TS_GPTOSS_PAGED_ATTN_MANAGED=1`；`TS_GPTOSS_BATCHED_ARENA=0` 改用按序列窗口的批量计算图而不是 arena。 |
 | Nemotron-H | 默认批处理路径。Attention 层使用分页 K/V；Mamba2 层使用每槽位 conv/SSM 状态池；MoE 层使用批处理 expert 内核；准备好的图像 / 音频 embedding 可注入到批处理 hidden state。 | `TS_NEMOTRON_BATCHED=0`；`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 step。 |
 | GLM 5.x | 没有 `ForwardBatch`：MLA 每个 token 只存一行压缩表示，DSA indexer 又要对同一段连续历史打分，没有分页 KV 布局可批。并发改由原生**序列 slot** 承担（`TSGgml_GlmSlotAlloc` / `SetActiveSlot` / `SlotFree`）——绑定请求只是切换活动 slot，不搬运 KV 字节，每个 slot 的计算图独立缓存与捕获。在此之上默认启用批量融合 decode（一张图、每序列一个 token，整批只读一遍权重）：4 个并发请求时合计 decode 提速 1.81×。批处理会改变 GEMM 形状，而 2 bit MoE 可能把这点差别放大成不同的专家选择。 | `TS_BATCHED_FUSED_DECODE=0` 关闭批量 decode；`TS_GLM_BATCHED_DECODE=0` 让原生侧拒绝它。 |
-| Qwen 3 / Qwen 2（`qwen3`、`qwen2`，例如 Bonsai 8B） | 检查点带融合的 `attn_qkv` 投影时默认走 `ForwardBatch`，包括本地（单进程）张量并行；块量化 KV cache 时不走。在 GGML 后端上（非 TP），并发 decode 通过 per-request fused holder 逐个序列执行，没有 token 批量融合 decode。 | `TS_PER_SEQ_FUSED=0` 让并发步骤留在 `ForwardBatch` 上。 |
 | Hunyuan Dense | 默认 `ForwardBatch` 路径，使用 F32 分页缓冲。块量化（`q8_0` / `q4_0`）KV cache 会保留 KV 快照换入路径，该路径能精确处理这些 dtype。 | `TS_HUNYUAN_BATCHED=0` 强制走快照路径。 |
 | Muse-Glimmer | 没有 `ForwardBatch`（它不是 `IBatchedPagedModel`）：并发请求走按序列 KV 换入回退路径，把每个序列的 K/V 快照到主机内存，`--tp` 下同样如此。属于 Radix 页面家族（主机 slab 页面）。只在加载了 DFlash 草稿器（`--draft-model`）时投机。 | 没有批处理开关；`TS_MUSE_GLIMMER_*` 是内核 A/B 开关（见 [Muse-Glimmer 模型卡](models/muse-glimmer_zh-cn.md#7-环境变量)）。 |
 | DeepSeek V4 / V4.1 | 没有 `ForwardBatch`：压缩注意力缓存没有分页布局。并发由原生执行器的序列 slot 承担（纯 C# `cpu` 与直连 CUDA `cuda` 执行器保持串行）。默认启用的 token 批量融合 decode 每步只读一遍权重，最多 16 个序列，更多时分窗口执行；加载了 DSpark 草稿器时不启用。V4.1 可以把已结束会话的 slot 保留给它的下一轮（需显式开启）。 | `TS_BATCHED_FUSED_DECODE=0`；`TS_DSV41_RETAINED_CACHE=1` 在 V4.1 上启用 slot 保留，预算由 `TS_DSV41_RETAINED_CACHE_MB`（默认 2048）决定。 |
@@ -339,8 +338,8 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 （`TS_PREFIX_CACHE_MODE=tree`）。请求的 radix 键是它的 prompt token，每个媒体区间以其内容身份为键；每个
 节点记录请求可以从这里续接的状态：
 
-- **页面**：主机 slab 上的 KV 快照或模型自己的分页块，用于没有续接 holder 的家族（Qwen 3 / Qwen 2、
-  GPT OSS、Mistral 3、Hunyuan Dense、Muse-Glimmer、Nemotron-H）。
+- **页面**：主机 slab 上的 KV 快照或模型自己的分页块，用于没有续接 holder 的家族（GPT OSS、
+  Mistral 3、Hunyuan Dense、Muse-Glimmer、Nemotron-H）。
 - **终态（end state）**：模型自己持有的续接状态。Gemma 4、Qwen 3.5 / 3.6 / 3.8 家族（`qwen35`、
   `qwen35moe`、`qwen3next`）与 Qwen 3.8 Flash Next 可以复制它，因此已结束的会话会被保留给下一轮，
   共享公开前缀末尾的状态会被做成检查点并克隆到每个新会话中。前提是它们运行按请求的 fused holder：
@@ -354,7 +353,7 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 渲染出的 token 完全相同（包括工具 schema、聊天模板与思考设置），止于每个模型可续接的边界与显式的缓存断点，
 并且总会留下至少一个 prompt token 去计算。下文的会话作用域规则照常适用，媒体身份也一样（区间以内容为键，
 复用长度不会切断区间）。复用能否越过媒体区间取决于各家族的前缀缓存能力：Gemma 4、Qwen 3.5 / 3.6 / 3.8
-家族、GPT OSS 与 Qwen 3 / Qwen 2 可以越过；其他树家族（Mistral 3、Nemotron-H、Muse-Glimmer、Hunyuan Dense、
+家族与 GPT OSS 可以越过；其他树家族（Mistral 3、Nemotron-H、Muse-Glimmer、Hunyuan Dense、
 Qwen 3.8 Flash Next、GLM 5.x、DeepSeek V4 / V4.1）的复用止于第一张图片、视频帧或音频片段。DiffusionGemma
 与图像/视频模型不使用它。
 
@@ -422,7 +421,7 @@ chat 层的原始 token 拼接遵循同样的身份。每个生成的回合都�
 
 无法精确越过媒体续接缓存的模型声明 `SupportsReuseAcrossMediaSpan = false`，此时所有复用路径都止于
 第一个媒体区间。目前没有模型这样声明，因此在 legacy 模式下这条规则不会拦住任何家族；Radix 树则改从各家族的
-前缀缓存能力中读取，只有 Gemma 4、Qwen 3.5/3.6/3.8 家族、GPT OSS 与 Qwen 3 / Qwen 2 能越过媒体区间续接（见
+前缀缓存能力中读取，只有 Gemma 4、Qwen 3.5/3.6/3.8 家族与 GPT OSS 能越过媒体区间续接（见
 [Radix 前缀缓存](#radix-前缀缓存)）。Gemma 4 使用绝对位置。Qwen 3.5/3.6 的 M-RoPE 提示位置在图片
 之后被压缩，位置表之外的每个 token（decode、投机 verify、文本续接）都按其 KV 下标加上该序列的
 M-RoPE 偏移（delta）旋转，而每个 holder、检查点和检查点文件（格式版本 2）都保存这个 delta；因此后续

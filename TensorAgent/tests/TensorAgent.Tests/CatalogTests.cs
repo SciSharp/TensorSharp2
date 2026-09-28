@@ -13,8 +13,7 @@ public sealed class CatalogTests
             "gemma-4-e2b-q8",
             "gemma-4-e4b-iq4xs",
             "gemma-4-12b-iq2m",
-            "bonsai-8b-q1-0",
-            "bonsai-27b-q1-0",
+            "bonsai-2-27b-ptq1-0",
             "qwen3.5-9b-iq4xs",
         };
 
@@ -108,11 +107,27 @@ public sealed class CatalogTests
     /// and the runtime plus graph scratch. 64 KiB/token is the per-token KV rate measured
     /// for Qwen3.5 9B and is used here as a conservative upper bound.
     /// </para>
+    ///
+    /// <para>
+    /// The exception is a weights file the loader cannot map: Bonsai2's PTQ1_0 / PQ2_0
+    /// packings are repacked losslessly to GGML Q2_0 at load, into anonymous memory that
+    /// is about 29% / 6% larger than the file (<see cref="RepackedWeightBytes"/>).
+    /// </para>
     /// </summary>
     private static double EstimatedAnonymous(CatalogModel model) =>
         0.5e9
         + model.ContextLength * 64.0 * 1024.0
-        + (model.Projector is { Optional: false } p ? 2.0 * p.Bytes : 0);
+        + (model.Projector is { Optional: false } p ? 2.0 * p.Bytes : 0)
+        + RepackedWeightBytes(model);
+
+    /// <summary>Anonymous memory the weights occupy when the loader repacks them instead
+    /// of mapping the GGUF (zero for every mapped format).</summary>
+    private static double RepackedWeightBytes(CatalogModel model) => model.Quantization switch
+    {
+        "PTQ1_0" => 1.29 * model.Weights.Bytes,
+        "PQ2_0" => 1.06 * model.Weights.Bytes,
+        _ => 0,
+    };
 
     /// <summary>
     /// The other half, and the one the weights really answer to: they are not charged to
@@ -168,11 +183,12 @@ public sealed class CatalogTests
     }
 
     [Fact]
-    public void DeviceTiersHideTheCatalogBelowTwelveGbAndExposeItAtTwelveGb()
+    public void DeviceTiersHideTheCatalogBelowTwelveGbAndHoldBonsai2ForSixteenGb()
     {
         Assert.Empty(ModelCatalog.ForDevice(8));
+        // Bonsai 2 27B is the one 16 GB entry: its repacked weights do not fit a 12 GB phone.
         Assert.Equal(
-            ModelCatalog.BuiltIn.Select(m => m.Id),
+            ModelCatalog.BuiltIn.Where(m => m.Id != "bonsai-2-27b-ptq1-0").Select(m => m.Id),
             ModelCatalog.ForDevice(12).Select(m => m.Id));
         Assert.Equal(
             ModelCatalog.BuiltIn.Select(m => m.Id),

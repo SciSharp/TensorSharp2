@@ -132,7 +132,7 @@ public sealed class ProtocolAdapterRequestWorkspaceTests : IDisposable
     [InlineData("deepseek41", "json_schema", 404, false)]
     [InlineData("deepseek41", "json_object", 400, true)]
     [InlineData("deepseek4", "json_object", 400, false)]
-    [InlineData("qwen2", "json_schema", 400, false)]
+    [InlineData("qwen35", "json_schema", 400, false)]
     public async Task ThinkingJson_RequiresProtocolWithDelayedGrammar(string architecture, string format, int status, bool grammarDisabled)
     {
         using var env = new EnvScope();
@@ -375,11 +375,11 @@ public sealed class ProtocolAdapterRequestWorkspaceTests : IDisposable
     [InlineData("deepseek41", "none-unused-schema", false, 404)]
     // An unknown tool_choice is malformed on every family (OpenAI answers 400
     // invalid_request_error), so V4 and V4.1 agree, streaming or not; only the
-    // schema grammar stays architecture-specific (qwen2 below reaches the
+    // schema grammar stays architecture-specific (qwen35 below reaches the
     // hosted-model guard). See OpenAIToolChoiceValidationTests for the rest.
     [InlineData("deepseek4", "unknown-choice", false, 400)]
     [InlineData("deepseek4", "unknown-choice", true, 400)]
-    [InlineData("qwen2", "unsupported-schema", false, 404)]
+    [InlineData("qwen35", "unsupported-schema", false, 404)]
     public async Task DeepSeek41ToolGrammar_ValidatesPoliciesBeforeStreamingOrModelGeneration(
         string architecture, string scenario, bool stream, int expectedStatus)
     {
@@ -458,7 +458,7 @@ public sealed class ProtocolAdapterRequestWorkspaceTests : IDisposable
     /// </summary>
     private sealed class ToolCapableUnloadedModelService : ModelService
     {
-        public string SelectedArchitecture { get; set; } = "qwen2";
+        public string SelectedArchitecture { get; set; } = "qwen35";
         public override string Architecture => SelectedArchitecture;
     }
 

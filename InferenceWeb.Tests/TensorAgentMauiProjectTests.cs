@@ -177,7 +177,7 @@ public class TensorAgentMauiProjectTests
     }
 
     [Fact]
-    public void Head_RetainsBonsaiNativeEntryPointsInRelease()
+    public void Head_RetainsModelNativeEntryPointsInRelease()
     {
         XDocument symbols = XDocument.Load(Path.Combine(MauiDir, "GgmlExportedSymbols.targets"));
         string[] retained = symbols.Descendants(Ns + "ReferenceNativeSymbol")
@@ -187,19 +187,18 @@ public class TensorAgentMauiProjectTests
 
         foreach (string export in new[]
                  {
-                     "TSGgml_Qwen3ModelPrefill",
-                     "TSGgml_Qwen3ModelDecodeLogits",
-                     "TSGgml_Qwen3DropDecodeCache",
-                     "TSGgml_Qwen3ResetDecodeCache",
-                     "TSGgml_TransformerLayerDecode",
-                     "TSGgml_TransformerModelDecode",
                      "TSGgml_Qwen35ArenaDiscardHostPointer",
+                     // Bonsai2's PQ2_0/PTQ1_0 transcode and PRISM Hadamard registration,
+                     // reached by the app's Bonsai 2 27B catalog entry.
+                     "TSGgml_TranscodeBonsaiToQ2_0",
+                     "TSGgml_BonsaiRegisterWeight",
+                     "TSGgml_BonsaiUnregisterWeight",
                  })
         {
             Assert.Contains(export, retained);
         }
 
-        // The failure is architectural rather than Bonsai-specific: an export
+        // The failure is architectural rather than model-specific: an export
         // added to the static archive but omitted here survives Debug/simulator
         // builds and then disappears under the Release device strip step. Keep
         // the manifest identical to the native source exports so the next model

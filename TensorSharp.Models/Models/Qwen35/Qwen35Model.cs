@@ -1839,14 +1839,15 @@ namespace TensorSharp.Models
             string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
             if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
                 return v;
-            // llama.cpp's Metal scheduler uses a 512-token ubatch for the 27B hybrid
-            // geometry. The same width is the throughput sweet spot here: Bonsai-27B
-            // Q1_0 improves pp2048 from ~391 to ~418 tok/s, while the device-state
-            // ping-pong below avoids recurrent-state transfers between chunks. Scope
-            // the default narrowly: smaller/different Qwen3.5 variants have not been
-            // re-benchmarked and retain the memory-budget-derived choice below.
-            // TS_PREFILL_CHUNK remains the explicit override for future devices.
-            if (ShouldUseBonsai27BMetalPrefillChunk(
+            // llama.cpp's Metal scheduler uses a 512-token ubatch for the 27B dense
+            // hybrid geometry (Qwen3.8-27B and derived checkpoints such as Bonsai2
+            // 27B). The same width is the measured throughput sweet spot here, while
+            // the device-state ping-pong below avoids recurrent-state transfers
+            // between chunks. Scope the default narrowly: smaller/different Qwen3.5
+            // variants have not been re-benchmarked and retain the
+            // memory-budget-derived choice below. TS_PREFILL_CHUNK remains the
+            // explicit override for future devices.
+            if (ShouldUseDense27BHybridMetalPrefillChunk(
                     _backend,
                     Config.NumLayers,
                     Config.HiddenSize,
@@ -1900,7 +1901,7 @@ namespace TensorSharp.Models
             return GpuMemoryBudget.FitTokens(spare, bytesPerToken, desired, minTokens: 1024, granularity: 512);
         }
 
-        internal static bool ShouldUseBonsai27BMetalPrefillChunk(
+        internal static bool ShouldUseDense27BHybridMetalPrefillChunk(
             BackendType backend,
             int numLayers,
             int hiddenSize,

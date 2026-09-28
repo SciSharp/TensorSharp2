@@ -670,7 +670,7 @@ content), and none had anything to do with kernel numerics:
   replaced the old one before the copy read it. Any sequence decoding in the
   step that first brought a higher block id (a newcomer's prefill, or the
   single-sequence owner just migrated in) attended over zeros. The grow now
-  builds fresh outer arrays, as the Qwen 3, Qwen 3.5, Gemma 4 and Mistral 3
+  builds fresh outer arrays, as the Qwen 3.5, Gemma 4 and Mistral 3
   ports already did.
 - *Borrowed logits on an ownership swap.* A step that forwards one sequence
   alone lets it borrow the model's reusable logits buffer until it samples.

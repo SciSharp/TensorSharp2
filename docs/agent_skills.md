@@ -921,7 +921,7 @@ protocol registry, so a new family with an unusual renderer gets it right for fr
 
 | Family | Tool declarations rendered? | `role: "tool"` rendered? | What happens |
 |---|---|---|---|
-| Qwen 3.5 / 3.6 / 3.8-27B (`qwen35*`, `qwen3next`, `qwen3vl*`; includes Bonsai 27B and Bonsai2), Qwen 3.8 Flash Next (`qwen4exp`), Qwen 3 / Qwen 2 (`qwen3`, `qwen2`; includes Bonsai 8B), Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4 / V4.1, GLM 5.x | yes | yes | Full progressive disclosure |
+| Qwen 3.5 / 3.6 / 3.8-27B (`qwen35*`, `qwen3next`, `qwen3vl*`; includes Bonsai2), Qwen 3.8 Flash Next (`qwen4exp`), Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4 / V4.1, GLM 5.x | yes | yes | Full progressive disclosure |
 | **Mistral 3**, **Hunyuan Dense** | no | **no** | No tools are offered; selected skill bodies are written into the prompt up front, and any tool result the loop does produce is fed back as a `user` turn rather than a `tool` turn |
 | **DiffusionGemma** | no | n/a | No tools are offered. On the OpenAI, Responses and Ollama routes, selected skill bodies are written into the prompt up front; the Web UI `/api/chat` diffusion path and the CLI's one-shot diffusion run do not apply skills at all. A block-diffusion turn has no tool-call loop, and a request that sends its own `tools` is refused |
 | **Any family without a tool-output parser**, including architectures with no registry entry | withheld | n/a | Selected skill bodies are written into the prompt up front and the catalog is dropped |

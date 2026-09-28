@@ -78,7 +78,7 @@ public sealed class DeepSeek41ImageRequestTests : IDisposable
 
     [Theory]
     [InlineData("deepseek4")]
-    [InlineData("qwen2")]
+    [InlineData("qwen35")]
     public void OtherArchitecturesKeepExistingRemoteImagePolicy(string architecture)
     {
         var uploads = new UploadStoragePolicy(_directory);
@@ -130,7 +130,7 @@ public sealed class DeepSeek41ImageRequestTests : IDisposable
         using var remote = JsonDocument.Parse("""
             [{"role":"user","content":[{"type":"input_image","image_url":"https://example.invalid/image.png"}]}]
             """);
-        var unchanged = Assert.Single(ChatMessageParser.ParseResponsesInput(remote.RootElement, null, uploads, architecture: "qwen2"));
+        var unchanged = Assert.Single(ChatMessageParser.ParseResponsesInput(remote.RootElement, null, uploads, architecture: "qwen35"));
         Assert.Null(unchanged.ImagePaths);
         Assert.Equal(5, uploads.UsedBytes);
     }

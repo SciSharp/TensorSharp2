@@ -240,6 +240,16 @@ public class BpeTokenizerTests
     }
 
     [Fact]
+    public void ResolveEogTokenIds_TreatsQwenFimControlsAsEndOfGeneration()
+    {
+        // Qwen 3.5-family GGUFs declare only <|im_end|> as eos_token_id, but llama.cpp
+        // also stops on the FIM padding/repository/separator controls they carry.
+        string[] vocab = { "ordinary", "<|im_end|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>" };
+
+        Assert.Equal(new[] { 1, 2, 3, 4 }, ModelBase.ResolveEogTokenIds(vocab, eosId: 1));
+    }
+
+    [Fact]
     public void Encode_ParsesNormalTypedEogMarkerAsSpecialToken()
     {
         string[] vocab = { "a", "b", "<|tool_response>" };

@@ -69,7 +69,6 @@ public class SkillPayloadExampleTests : IDisposable
         ("gemma4",   (m, t) => ChatTemplate.RenderGemma4(m, true, tools: t)),
         ("gpt-oss",  (m, t) => ChatTemplate.RenderHarmony(m, true, tools: t)),
         ("qwen35",   (m, t) => ChatTemplate.RenderQwen35(m, true, enableThinking: true, tools: t)),
-        ("qwen2",    (m, t) => ChatTemplate.RenderChatMl(m, true, tools: t)),
         ("nemotron_h_moe", (m, t) => ChatTemplate.RenderNemotron(m, true, tools: t)),
         ("glm-dsa",  (m, t) => ChatTemplate.RenderGlmDsa(m, true, tools: t)),
         ("deepseek4", (m, t) => ChatTemplate.RenderDeepSeek4(m, true, tools: t)),

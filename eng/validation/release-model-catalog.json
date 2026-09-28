@@ -48,9 +48,6 @@
     {"id":"qwen38-27b-dflash2","repo":"z-lab/Qwen3.8-27B-DFlash2-GGUF","patterns":["*Q4_K_M.gguf"],"companion":true},
     {"id":"deepseek4-dspark","repo":"bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF","patterns":["DSpark-drafter-Q2K-Q8-0731.gguf"],"companion":true}
   ],
-  "unprovisioned": [
-    {"id":"bonsai8b","reason":"Local sideload only; MODEL_DOWNLOADS.md supplies no publisher download and no matching local artifact was found."},
-    {"id":"bonsai27b","reason":"Local sideload only; MODEL_DOWNLOADS.md supplies no publisher download and no matching local artifact was found."}
-  ],
+  "unprovisioned": [],
   "coverage_note": "The explicit MTP, DSpark and DFlash companion entries are provisioning scope. Each supported draft mode still requires its own execution result; a verified download is not a speculative-decoding pass."
 }

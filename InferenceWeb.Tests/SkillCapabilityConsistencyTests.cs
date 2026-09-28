@@ -48,8 +48,7 @@ public class SkillCapabilityConsistencyTests
             foreach (string arch in ChatProtocolRegistry.All.SelectMany(p => p.Architectures).Distinct())
                 data.Add(arch);
             // Unregistered, so they take the generic path: two common families and a
-            // name that cannot exist. (qwen2vl used to head this list; it is a
-            // registered protocol now and arrives via the registry sweep above.)
+            // name that cannot exist.
             foreach (string arch in new[] { "llama", "phi3", "not-a-real-architecture" })
                 data.Add(arch);
             return data;
@@ -79,18 +78,6 @@ public class SkillCapabilityConsistencyTests
         // separate question — a renderer we know nothing about is assumed to carry them,
         // and it does not matter either way while no tools are offered.
         Assert.False(SkillCapabilities.For("not-a-real-architecture").ToolsRendered);
-    }
-
-    [Fact]
-    public void Qwen25Family_IsRegistered_WithToolsButNoThinking()
-    {
-        // qwen2vl used to be this suite's example of an unregistered family, and its
-        // chats got no tools at all. It speaks the standard ChatML tool syntax,
-        // so it is registered now — with thinking pinned off, because it has no
-        // <think> channel for the parser to wait on.
-        Assert.True(SkillCapabilities.For("qwen2vl").ToolsRendered);
-        Assert.True(SkillCapabilities.For("qwen2").ToolsRendered);
-        Assert.False(OutputParserFactory.Create("qwen2vl").HasThinkingSupport);
     }
 
     [Fact]

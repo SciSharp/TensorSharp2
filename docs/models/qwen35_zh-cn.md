@@ -9,7 +9,7 @@
 | 模型类 | [`Qwen35Model`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.cs)（旧单序列路径）+ partial [`Qwen35Model.GatedDeltaNet.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.GatedDeltaNet.cs) + [`Qwen35Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs)（`IBatchedPagedModel`） |
 | 视觉编码器 | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | 图像处理器 | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
-| 示例模型 | Qwen3.5-9B（dense hybrid）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE 系列）、Qwen3.6-27B / Qwen3.8-27B（dense）；另有 [Bonsai 27B](bonsai_zh-cn.md)（Q1_0）与 [Bonsai2 27B](bonsai2_zh-cn.md)（PRISM PQ2_0 / PTQ1_0） |
+| 示例模型 | Qwen3.5-9B（dense hybrid）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE 系列）、Qwen3.6-27B / Qwen3.8-27B（dense）；另有 [Bonsai2 27B](bonsai2_zh-cn.md)（PRISM PQ2_0 / PTQ1_0） |
 | 模态 | 文本、图像 |
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是（`<tool_call>{...}</tool_call>`） |

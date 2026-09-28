@@ -87,9 +87,9 @@ public class Qwen35TokenDecodeContractTests
     }
 
     [Fact]
-    public void Bonsai27BMetalPrefillChunk_DefaultIsNarrowlyScopedToExactGeometry()
+    public void Dense27BHybridMetalPrefillChunk_DefaultIsNarrowlyScopedToExactGeometry()
     {
-        Assert.True(Qwen35Model.ShouldUseBonsai27BMetalPrefillChunk(
+        Assert.True(Qwen35Model.ShouldUseDense27BHybridMetalPrefillChunk(
             BackendType.GgmlMetal,
             numLayers: 64,
             hiddenSize: 5120,
@@ -100,7 +100,7 @@ public class Qwen35TokenDecodeContractTests
             numKHeads: 16,
             numVHeads: 48));
 
-        Assert.False(Qwen35Model.ShouldUseBonsai27BMetalPrefillChunk(
+        Assert.False(Qwen35Model.ShouldUseDense27BHybridMetalPrefillChunk(
             BackendType.GgmlCuda,
             numLayers: 64,
             hiddenSize: 5120,
@@ -111,7 +111,7 @@ public class Qwen35TokenDecodeContractTests
             numKHeads: 16,
             numVHeads: 48));
 
-        Assert.False(Qwen35Model.ShouldUseBonsai27BMetalPrefillChunk(
+        Assert.False(Qwen35Model.ShouldUseDense27BHybridMetalPrefillChunk(
             BackendType.GgmlMetal,
             numLayers: 63,
             hiddenSize: 5120,

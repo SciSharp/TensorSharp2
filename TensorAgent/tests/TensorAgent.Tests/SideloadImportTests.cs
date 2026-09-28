@@ -1,14 +1,17 @@
 using System.Security.Cryptography;
 using TensorAgent.Core.Catalog;
-using TensorAgent.Core.Hosting;
-using TensorAgent.Core.Settings;
 
 namespace TensorAgent.Tests;
 
-public sealed class BonsaiCatalogTests : IDisposable
+/// <summary>
+/// The sideload-only card path: an exact, hash-pinned artifact without a publisher URL is
+/// imported from a user-selected local file and verified before the engine can see it.
+/// No built-in entry needs it today, so these tests use a synthetic card.
+/// </summary>
+public sealed class SideloadImportTests : IDisposable
 {
     private readonly string _root = Path.Combine(
-        Path.GetTempPath(), "tensoragent-bonsai-" + Guid.NewGuid().ToString("N"));
+        Path.GetTempPath(), "tensoragent-sideload-" + Guid.NewGuid().ToString("N"));
 
     public void Dispose()
     {
@@ -17,43 +20,8 @@ public sealed class BonsaiCatalogTests : IDisposable
     }
 
     [Fact]
-    public void CatalogPinsBothPublisherlessBonsaiArtifactsForLocalImport()
-    {
-        CatalogModel[] bonsai = ModelCatalog.BuiltIn
-            .Where(model => model.Family == CatalogFamily.Bonsai)
-            .OrderBy(model => model.Weights.Bytes)
-            .ToArray();
-
-        Assert.Collection(bonsai,
-            eight =>
-            {
-                Assert.Equal("bonsai-8b-q1-0", eight.Id);
-                Assert.Equal("Bonsai-8B-Q1_0.gguf", eight.Weights.FileName);
-                Assert.Equal(1_158_654_496, eight.Weights.Bytes);
-                Assert.Equal("284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
-                    eight.Weights.Sha256);
-                Assert.Equal(new CatalogSampling(0.5f, 20, 0.85f, 0.0f), eight.Sampling);
-                Assert.False(eight.SupportsThinking);
-            },
-            twentySeven =>
-            {
-                Assert.Equal("bonsai-27b-q1-0", twentySeven.Id);
-                Assert.Equal("Bonsai-27B-Q1_0.gguf", twentySeven.Weights.FileName);
-                Assert.Equal(3_803_452_480, twentySeven.Weights.Bytes);
-                Assert.Equal("17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0",
-                    twentySeven.Weights.Sha256);
-                Assert.Equal(new CatalogSampling(1.0f, 20, 0.95f, 0.0f), twentySeven.Sampling);
-                Assert.True(twentySeven.SupportsThinking);
-            });
-
-        Assert.All(bonsai, model =>
-        {
-            Assert.True(model.SideloadOnly);
-            Assert.Empty(model.Weights.Url);
-            Assert.Equal("Q1_0", model.Quantization);
-            Assert.Equal("q8_0", model.KvCacheDtype);
-        });
-    }
+    public void NoBuiltInEntryIsSideloadOnly()
+        => Assert.DoesNotContain(ModelCatalog.BuiltIn, model => model.SideloadOnly);
 
     [Fact]
     public async Task ImportStagesAndHashChecksBeforePublishingTheWeights()
@@ -108,51 +76,19 @@ public sealed class BonsaiCatalogTests : IDisposable
         Assert.False(Directory.Exists(store.DirectoryFor(model)));
     }
 
-    [Fact]
-    public void OrphanSweepRetainsTheTwoSideloadDestinations()
-    {
-        var store = new ModelStore(_root);
-        foreach (CatalogModel model in ModelCatalog.BuiltIn.Where(model => model.SideloadOnly))
-        {
-            Directory.CreateDirectory(store.DirectoryFor(model));
-            File.WriteAllText(Path.Combine(store.DirectoryFor(model), "keep.marker"), model.Id);
-        }
-        Directory.CreateDirectory(Path.Combine(_root, "not-in-the-catalog"));
-        File.WriteAllText(Path.Combine(_root, "not-in-the-catalog", "remove.marker"), "orphan");
-
-        store.SweepOrphanedModels();
-
-        Assert.All(ModelCatalog.BuiltIn.Where(model => model.SideloadOnly), model =>
-            Assert.True(File.Exists(Path.Combine(store.DirectoryFor(model), "keep.marker"))));
-        Assert.False(Directory.Exists(Path.Combine(_root, "not-in-the-catalog")));
-    }
-
-    [Theory]
-    [InlineData("bonsai-8b-q1-0", "Bonsai-8B-Q1_0.gguf")]
-    [InlineData("bonsai-27b-q1-0", "Bonsai-27B-Q1_0.gguf")]
-    public void SavedSelectionResolvesToTheCatalogOwnedSideloadPath(string id, string fileName)
-    {
-        var paths = new AgentPaths(Path.Combine(_root, "data"), Path.Combine(_root, "cache"));
-        var settings = new AppSettings { SelectedModelId = id };
-
-        Assert.Equal(
-            Path.Combine(paths.ModelsDirectory, id, fileName),
-            paths.SelectedModelPath(settings));
-    }
-
     private static CatalogModel SideloadCard(byte[] expected) => new()
     {
-        Id = "bonsai-test",
-        DisplayName = "Bonsai test fixture",
-        Family = CatalogFamily.Bonsai,
+        Id = "sideload-test",
+        DisplayName = "Sideload test fixture",
+        Family = CatalogFamily.Qwen35,
         Kind = CatalogArchitectureKind.Dense,
         Parameters = "test",
-        Quantization = "Q1_0",
+        Quantization = "test",
         Files = new[]
         {
             new CatalogFile(
                 CatalogFileRole.Weights,
-                "bonsai-test.gguf",
+                "sideload-test.gguf",
                 string.Empty,
                 expected.LongLength,
                 Convert.ToHexString(SHA256.HashData(expected)).ToLowerInvariant()),

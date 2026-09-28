@@ -53,7 +53,7 @@ public sealed class ExplicitModelParallelismTests : IDisposable
     public void ConflictingModesAndUnsupportedLayerPlacementAreRefused()
     {
         Assert.Throws<ArgumentException>(() => Resolve("glm-dsa", BackendType.GgmlCuda, 2, 2, out _));
-        Assert.Throws<NotSupportedException>(() => Resolve("qwen3", BackendType.GgmlCuda, 1, 2, out _));
+        Assert.Throws<NotSupportedException>(() => Resolve("mistral3", BackendType.GgmlCuda, 1, 2, out _));
     }
 
     [Theory]
@@ -62,7 +62,7 @@ public sealed class ExplicitModelParallelismTests : IDisposable
     [InlineData(BackendType.GgmlMetal)]
     [InlineData(BackendType.Mlx)]
     public void SingleDeviceBackendsDoNotSilentlyAcceptTp(BackendType backend)
-        => Assert.Throws<NotSupportedException>(() => Resolve("qwen3", backend, 2, 1, out _));
+        => Assert.Throws<NotSupportedException>(() => Resolve("mistral3", backend, 2, 1, out _));
 
     [Fact]
     public void NativeDeepSeekExpertTpRetainsExplicitTpDegree()
@@ -195,7 +195,7 @@ public sealed class ExplicitModelParallelismTests : IDisposable
             Assert.Throws<NotSupportedException>(() => ModelBase.ValidateDistributedTensorParallelism(path, BackendType.GgmlCuda));
         }
         finally { File.Delete(path); }
-        Assert.True(ModelArchitectureRegistry.TryGet("qwen3", out var descriptor));
+        Assert.True(ModelArchitectureRegistry.TryGet("mistral3", out var descriptor));
         ModelBase.ValidateDistributedTensorParallelism(descriptor, BackendType.GgmlCuda);
         Assert.Throws<NotSupportedException>(() => ModelBase.ValidateDistributedTensorParallelism(descriptor, BackendType.Cpu));
     }

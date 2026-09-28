@@ -1582,8 +1582,8 @@ namespace TensorSharp.Runtime
 
             // Always defined, whichever way it is set. Templates written against
             // HF's apply_chat_template(enable_thinking=...) test the flag with
-            // `enable_thinking is defined and enable_thinking is false` (Qwen 3 and
-            // 3.5 among them): leaving it out when false took the ELSE branch, which
+            // `enable_thinking is defined and enable_thinking is false` (Qwen 3.5
+            // among them): leaving it out when false took the ELSE branch, which
             // is thinking ON, so a request with thinking off rendered exactly the
             // same prompt as one with it on and the model reasoned anyway. The
             // purpose-built Qwen 3.5 renderer had to be substituted for the off case

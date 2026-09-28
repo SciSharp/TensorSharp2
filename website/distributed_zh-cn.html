@@ -100,7 +100,6 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
     <thead><tr><th>架构</th><th>TP</th><th>策略 / 说明</th></tr></thead>
     <tbody>
       <tr><td>Mistral 3</td><td class="yes">✅</td><td>融合与分离两种 QKV 布局，YaRN RoPE。</td></tr>
-      <tr><td>Qwen 3 / Qwen 2</td><td class="yes">✅</td><td><code>qwen3</code>、<code>qwen2</code> 与 <code>qwen2vl</code> 文件：注意力头与 FFN 中间维按 Megatron 方式切分，每张 GPU 持有自己的那部分 KV 头，因此 KV 缓存也分摊到各设备上。它与 Mistral 3 是仅有的两个在 TP 下也支持批处理前向的架构。</td></tr>
       <tr><td>Gemma 4</td><td class="yes">✅</td><td>稠密与 MoE、逐层 head 维度；多模态嵌入会注入 TP 路径，因此视觉 / 音频提示不会丢失。GGML 上融合的整模 MoE 主干在<em>每个专家内部</em>切分（gate/up 列并行、down 行并行），从而保留全局专家 id —— <code>TS_GEMMA4_TP_FUSED_MOE=0</code> 可回退到逐算子的整专家路径。Direct CUDA 使用逐专家切分。</td></tr>
       <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>GatedDeltaNet 循环层采用块循环 V-head 归属 —— 每个 rank 维护自己的、常驻设备的 delta/conv 状态，循环路径无需跨 rank 通信。GGML 上整个 GDN block 作为一个打包的按 rank 内核运行，MoE 采用专家并行（每个 rank 持有整个专家，shared expert 按 Megatron 切分），LM head 为列并行且完全不需要集合通信。Direct CUDA 使用专家切分。例外是 Bonsai2 经 PRISM 旋转的 <code>qwen35</code> 文件：它们需要单设备 GGML 后端，会拒绝 <code>--tp</code>。</td></tr>
       <tr><td>Qwen 3.8 Flash Next</td><td class="yes">—（仅按层切分）</td><td>机制不同：<code>qwen4exp</code> 不切分任何权重。<code>--layer-split N</code> 给每张 GPU 一段连续的完整层 —— 整 token 的计算图在设备边界处切开，隐状态在卡之间传递 —— 这也是 llama.cpp 为该架构提供的唯一多 GPU 模式（<code>-sm row</code> 拒绝加载它）。贪心输出与单卡运行逐字节一致、吞吐也没有变化，因此它是容量特性；见<a href="#perf-layer-split">按层切分的实测</a>。<code>TS_Q4E_LAYER_SPLIT=20,28</code> 可用明确的每卡层数覆盖自动均衡，遇到无法满足的取值会抛错而不是忽略。</td></tr>
@@ -123,7 +122,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   <ul>
     <li><strong>仅限 GPU 后端。</strong>TP 可运行在 <code>cuda</code>、<code>ggml_cuda</code> 与 <code>ggml_vulkan</code> 上；MLX 与 CPU 后端为单设备。</li>
     <li><strong>整除性。</strong><code>numHeads</code>、<code>numKVHeads</code> 与 <code>intermediateSize</code> 都必须能被 TP 度整除；量化权重的行并行切分还要求 <code>ne0</code> 能被 <code>tp × blockSize</code> 整除。</li>
-    <li><strong>TP 下的批处理前向</strong>目前实现于 Mistral 3 与 Qwen 3。MoE 模型（Gemma 4、Qwen 3.5/3.6、GPT OSS、Nemotron-H）在 TP 激活时回退到按序列前向，因此连续批处理在这些模型上的增益较小。</li>
+    <li><strong>TP 下的批处理前向</strong>目前实现于 Mistral 3。MoE 模型（Gemma 4、Qwen 3.5/3.6、GPT OSS、Nemotron-H）在 TP 激活时回退到按序列前向，因此连续批处理在这些模型上的增益较小。</li>
     <li><strong>本地并行度 ≤ 可见 GPU 数。</strong>请求的 rank 数超过主机设备数时，启动阶段就会直接失败。</li>
     <li><strong>多节点仍走逐算子前向。</strong>融合的整模 TP 计算图是按 rank、单进程的；分布式运行会回退到逐算子执行。</li>
   </ul>
