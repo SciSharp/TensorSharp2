@@ -10,7 +10,10 @@
 // only the KC x NT tile it is about to multiply (block-aligned KC), so a weight element is
 // decoded once per forward instead of once per activation row, and the F32 copy never exists.
 // Q4_K and Q6_K (the Qwen3-VL-8B text encoder's types) decode with AVX2; every other type goes
-// through ManagedQuantizedOps' scalar dequant. Both give the exact scalar-dequant floats.
+// through ManagedQuantizedOps' scalar dequant. Both give the exact scalar-dequant floats, which
+// reach the panel through 8x8 register transposes. Activations stay F32 (no 8-bit rounding),
+// so a projection matches a double-precision reference to ~1e-6 (ManagedQuantizedOps' q8
+// activation path: ~4e-3), at 3-6x its speed for a 37-token prompt.
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;

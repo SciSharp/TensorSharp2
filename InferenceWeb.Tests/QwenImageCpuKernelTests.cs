@@ -162,6 +162,20 @@ public sealed unsafe class QwenImageCpuKernelTests
     }
 
     [Fact]
+    public void KernelWidthDoesNotChangeTheBits()
+    {
+        // Every output accumulates one FMA per k in k order whatever the tile shape, so the
+        // AVX-512 and AVX2 kernels (and any thread count) must agree exactly.
+        if (!CpuPackedGemm.IsaSupported(CpuGemmIsa.Avx512) || !CpuPackedGemm.IsaSupported(CpuGemmIsa.Avx2)) return;
+        var rng = new Random(41);
+        var x = new Feature(40, 21, 35, Random(rng, 40 * 21 * 35));
+        float[] weight = Random(rng, 50 * 40 * 9, 0.2f), bias = Random(rng, 50);
+        Feature Run(CpuGemmIsa isa) => WithIsa(isa, () => VaeReferenceMath.Conv2dCpu(x,
+            VaeReferenceMath.PackConvWeight(weight, 50, 360), bias, 50, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.Equal(Run(CpuGemmIsa.Avx512).D, Run(CpuGemmIsa.Avx2).D);
+    }
+
+    [Fact]
     public void Conv2dDispatchesToThePackedPathAndHonoursTheScalarSwitch()
     {
         var rng = new Random(3);
