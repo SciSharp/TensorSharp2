@@ -2232,6 +2232,19 @@ cell): pool off 21.7,21.0 / 2.0,2.4; 32 threads 24.9,24.1 / 4.9,5.0; 48 threads
 roughly +15% prefill and 2.8x decode at the default width. At 122 only prefill
 regresses; decode still beats the pool-off baseline.
 
+The same pool also runs the Core CPU kernels: `TensorSharp.Models` binds Core's
+`CpuParallel` hook to it at module load, so the packed F32 SGEMM behind
+`Ops.Addmm`, the SIMD elementwise, norm, softmax and RoPE kernels and the
+DiffusionGemma and Qwen-Image-2.1 transformer kernels share one set of workers.
+Quantized weights (Q4_K, Q5_K, Q6_K, Q4_0, Q5_0, Q8_0) go through a multi-row
+int8 GEMM, and F16/BF16/F32 or dequantize-only types through a float-panel GEMM.
+Each of these has a `0` switch that restores the previous code in the same binary
+(table below); the full list with defaults and measurements is in
+[the environment variable matrix](docs/env_var_feature_matrix.md#out-of-matrix-pure-c-cpu-backend-knobs).
+To test the AVX2 kernels on an AVX-512 machine use `TS_CPU_DISABLE_AVX512=1`; to
+emulate an AVX2-only host, start the process with `DOTNET_EnableAVX512=0`
+(.NET 10 ignores the older `DOTNET_EnableAVX512F=0`).
+
 Those tok/s are the generic managed per-op path on gemma-4-E4B-it-Q8_0 and
 nothing else. **DeepSeek V4.1 Flash does not run through that path at all — like
 DeepSeek V4 Flash, it has a whole-model executor of its own on this backend** —
@@ -2246,10 +2259,17 @@ full checkpoint here; its compute width comes from `TS_DSV4_THREADS`, not
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Worker-pool width | every core up to 8 CPUs; half above that, never below 8 | `TS_CPU_THREADS=N` | — |
-| Worker pool at all | ON | `TS_CPU_POOL=0` reverts to the ThreadPool `Parallel.For` behaviour, so the two can be A/B-ed in one binary | — |
+| Worker-pool width (managed matmuls and Core CPU kernels) | every core up to 8 CPUs; half above that, never below 8 | `TS_CPU_THREADS=N` | — |
+| Worker pool at all | ON | `TS_CPU_POOL=0` reverts to the ThreadPool `Parallel.For` behaviour for the quantized matmuls, the Core CPU kernels and the DiffusionGemma / Qwen-Image-2.1 transformer kernels, so the two can be A/B-ed in one binary | — |
 | Spin iterations before a worker parks | `4096` | `TS_CPU_SPIN=N` — parking is the expensive part at this width, so the default spins long enough that the steady state never parks | — |
 | Work-item sizing for a managed matmul | `131072` weight bytes per item, at most `4` items per worker | `TS_CPU_TASK_BYTES`, `TS_CPU_TASKS_PER_WORKER` — sized from the work rather than the thread count | — |
+| Multi-row quantized GEMM (Q4_K, Q5_K, Q6_K, Q4_0, Q5_0, Q8_0) | ON where AVX2+FMA exists | `TS_CPU_QGEMM=0` restores the previous per-row managed matmul; `TS_CPU_QGEMM_VERIFY=1` checks every GEMM against it (slow); `TS_CPU_QGEMM_MIN_ROWS`, `TS_CPU_QGEMM_TASK_MACS`, `TS_CPU_QGEMM_L2_BYTES` for diagnosis and tuning | — |
+| Float-panel GEMM (F16, BF16, F32 and dequantize-only types) | ON | `TS_CPU_FGEMM=0` restores the previous dequantize-and-dot loop | — |
+| Packed F32 SGEMM behind `Ops.Addmm` and the Direct networks | ON (AVX-512 8x32, AVX2 6x16 or portable kernel) | `TS_CPU_SGEMM=0` restores the previous loops; `TS_CPU_SGEMM_KERNEL`, `TS_CPU_SGEMM_KC` / `_MC` / `_NC`, `TS_CPU_SGEMM_DOT_MAXN` for tuning | — |
+| SIMD elementwise, norm, softmax and RoPE kernels | ON | `TS_CPU_SIMD_ELEMENTWISE=0` restores the previous loops | — |
+| AVX-512 kernels | ON when the CPU has AVX-512 | `TS_CPU_DISABLE_AVX512=1` runs the AVX2 form of every hand-written kernel; `DOTNET_EnableAVX512=0` (not `DOTNET_EnableAVX512F`) makes the whole runtime AVX2-only | — |
+| DiffusionGemma on `cpu` | prompt-KV caching, batched MoE, fused Q/K/V and gate/up projections | `DIFFUSION_NO_PKV=1` turns the prompt-KV cache off; `DIFFUSION_CPU_LEGACY=1` restores the previous path in one switch (per stage: `DIFFUSION_CPU_LEGACY_MOE`, `_PROJ`, `_ATTN`, `_ROUTER`); `DIFFUSION_CPU_ATTN_FAST=1`, `DIFFUSION_CPU_MOE_CHUNK` | — |
+| Qwen-Image-2.1 on `cpu` | managed DiT (F32 activations against dequantized weight tiles), packed-GEMM VAE, text encoder and vision tower | `TS_QWEN21_CPU_MATMUL=q8` selects 8-bit activations; `TS_QWEN_VAE_CPU=scalar`, `TS_QWEN_TE_CPU_GEMM=0`, `TS_QWEN_TE_CPU_ATTN=0`, `TS_QWEN35_VENC_CPU_GEMM=0`, `TS_QWEN35_VENC_CPU_ATTN=0` restore the previous stages; `TS_CPU_GEMM_THREADS` sizes the VAE's own pool (every logical CPU, at most 64); `TS_QWEN21_CPU_PROFILE=1`, `TS_QWEN_VAE_PROFILE=1`, `TS_QWEN_TE_PROFILE=1` print stage timings | — |
 | DeepSeek V4.1 Flash's whole-model executor | pure C# (`DeepSeek4CpuExecutor`) — a whole-model executor here rather than the generic per-op path | `TS_DSV4_THREADS=N` sets its compute width (every processor by default), not `TS_CPU_THREADS` | — |
 | Quantized weights on the direct video networks (Wan, MiniMax-H3) | kept in their GGUF storage type and multiplied there | `TS_DIRECT_QUANT_WEIGHTS=0` expands every quantized weight to F32 once at load and runs a plain GEMM instead (the previous behaviour; 4x the weight memory). On Wan at 256x160x5f, one step, the in-place path measured 80.9 s against 121.4 s | — |
 

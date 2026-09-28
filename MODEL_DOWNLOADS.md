@@ -297,7 +297,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 
 **Qwen-Image-2.1** — prompt → image, or prompt + one or more reference images → edited image; needs the DiT, the dedicated 2.1 VAE and the Qwen3-VL-8B text encoder, plus its mmproj for editing ([Abiray/Qwen-Image-2.1-GGUF](https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF))
 
-The shortest route is the ready-made config: it pins revisions and SHA-256 checksums and downloads whatever is missing (four files, about 10.29 GiB) into `$TENSORSHARP_MODELS/qwen-image-2.1/`, or `models/qwen-image-2.1/` when `TENSORSHARP_MODELS` is unset. It selects `ggml_metal`; append `--backend ggml_cuda` on an NVIDIA machine.
+The shortest route is the ready-made config: it pins revisions and SHA-256 checksums and downloads whatever is missing (four files, about 10.29 GiB) into `$TENSORSHARP_MODELS/qwen-image-2.1/`, or `models/qwen-image-2.1/` when `TENSORSHARP_MODELS` is unset. It selects `ggml_metal`; append `--backend ggml_cuda` on an NVIDIA machine, or `--backend cpu` for the pure-C# path (no GPU; see [the card](docs/models/qwenimage21.md#pure-c-cpu-backend---backend-cpu) for its speed and memory).
 
 ```bash
 dotnet run --project TensorSharp.Cli -c Release --no-build -- \

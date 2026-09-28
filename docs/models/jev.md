@@ -50,9 +50,10 @@ dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-d
 ```
 
 The [configuration](../../config/jev-diffusiongemma-q4.json) binds loopback port
-5000 and uses `ggml_cuda`. Override `--backend ggml_cpu` for CPU execution or
-`--backend ggml_metal` on a supported Mac. These are execution options, not claims
-that every backend has been benchmarked. The configuration downloads
+5000 and uses `ggml_cuda`. Override `--backend cpu` (pure C#) or `--backend ggml_cpu`
+for CPU execution, or `--backend ggml_metal` on a supported Mac. These are execution
+options, not claims that every backend has been benchmarked; the CPU measurements
+are under [Running on a CPU](#running-on-a-cpu). The configuration downloads
 `diffusiongemma-26B-A4B-it-Q4_K_M.gguf` from
 `unsloth/diffusiongemma-26B-A4B-it-GGUF` on Hugging Face when the local file is
 missing and reuses it on subsequent launches. It defaults to the repository's
@@ -72,6 +73,41 @@ reserve leaves fewer weights resident but can avoid severe paging on longer
 prompts. Tune `DIFFUSION_VRAM_HEADROOM_MB` for the device and workload; its model
 default is 2048 MiB. The 4096-token admission ceiling is not a guarantee that
 every schema and prompt of that size fits in device memory.
+
+### Running on a CPU
+
+Without a GPU, use `--backend cpu`:
+
+```powershell
+$env:TENSORSHARP_MODELS = 'C:/Works/models'
+$env:MAX_CONTEXT = '4096'
+dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json --backend cpu
+```
+
+`DIFFUSION_VRAM_HEADROOM_MB` has no effect there. The pure-C# backend keeps the
+prompt K/V in host memory, so repeated reads of one prompt (fixed `samples` or
+adaptive extension) skip the prompt's work (a schema split into chunks has one
+prompt per chunk, and the model keeps one prompt cache). The last layer runs only
+for the requested label rows. On `cpu` and `ggml_cpu` the server also skips its
+startup shared-prompt warm-up for this model, so the port opens once the weights
+are loaded.
+
+Measured with `eng/JevProbe` on an i7-11800H (8 cores / 16 threads, AVX-512),
+32 GB, Windows, `diffusiongemma-26B-A4B-it-Q4_K_M.gguf`, a 54-token state:
+
+| Structured read | `cpu` | `cpu`, previous build | `ggml_cpu` |
+|---|---:|---:|---:|
+| width 16, new prompt | 0.92 s | 9.5 s | 1.57 s |
+| width 16, same prompt again | 0.22–0.25 s | 9.5 s | 1.57 s |
+| width 64, new prompt | 1.42 s | not measured | 2.68 s |
+| width 64, same prompt again | 0.63–0.73 s | not measured | 2.68 s |
+
+On the probe's `--quality` set (nine two-question prompts at widths 16 and 64) both
+backends chose all 36 expected labels, with the same top label every time and at
+most 0.049 between their probabilities. These are probe timings without the HTTP
+server, extraction or tokenization; the
+[DiffusionGemma card](diffusiongemma.md#pure-c-cpu-backend---backend-cpu) describes
+the implementation and its switches.
 
 Set `MAX_CONTEXT` before starting the process to limit the combined tokenized
 prompt and answer canvas. Without this
@@ -185,9 +221,10 @@ three levels produce an expected score between 0 and 2.
 Adaptive mode starts with one read and uses `auto_max` total reads if any
 question's conditional entropy exceeds the threshold. Fixed reads are averaged
 as distributions. Use `samples: 1` for a fixed minimum-work request; the example
-sets this explicitly. Multiple reads reuse the same prompt K/V on GGML CUDA and
-Metal when prompt caching is enabled. Only one prompt cache and label projection
-are retained per model; switching state or schema replaces the cache.
+sets this explicitly. Multiple reads reuse the same prompt K/V on GGML CUDA, Metal
+and the pure-C# `cpu` backend when prompt caching is enabled. Only one prompt cache
+and label projection are retained per model; switching state or schema replaces the
+cache.
 
 Requests support up to 64 questions and 2 to 26 alternatives per question.
 Question IDs must be 1 to 128 characters without colons, control characters or
@@ -578,9 +615,10 @@ The answer canvas is sized to the schema, rounded to a 16-token boundary within
 the model's maximum canvas width. Multiple questions share the transformer
 forward. The output head operates on requested label rows instead of allocating
 the full canvas-by-vocabulary logits tensor. `ggml_cuda` and `ggml_metal` use the
-existing DiffusionGemma prompt K/V and fused decode paths; other backends,
-`ggml_vulkan`, `mlx` and `cuda` included, use the unified prompt-plus-canvas
-forward. The model execution lock serializes access to shared
+existing DiffusionGemma prompt K/V and fused decode paths, and `cpu` its host
+prompt K/V with a last layer computed only for the requested label rows; other
+backends, `ggml_cpu`, `ggml_vulkan`, `mlx` and `cuda` included, use the unified
+prompt-plus-canvas forward. The model execution lock serializes access to shared
 GPU state with ordinary diffusion chat requests.
 
 GGML CUDA uses fused prompt attention by default, keeping attention operations
@@ -657,6 +695,11 @@ python eng/jev-extended-smoke.py --endpoint http://127.0.0.1:5000 --image --outp
 
 # Stop the server first: this probe loads its own copy of the weights.
 dotnet run --project eng/JevProbe -c Release -- --model C:/Works/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggmlcuda --iterations 5 --warmup 1 --widths 16,64,256 --output artifacts/jev/projection.json
+
+# CPU: label decisions of cpu against a ggml_cpu reference, and repeated reads of one prompt.
+dotnet run --project eng/JevProbe -c Release -- --model C:/Works/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_cpu --quality --widths 16,64 --output artifacts/jev/quality-ggmlcpu.json
+dotnet run --project eng/JevProbe -c Release -- --model C:/Works/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend cpu --quality --widths 16,64 --reference artifacts/jev/quality-ggmlcpu.json --output artifacts/jev/quality-cpu.json
+dotnet run --project eng/JevProbe -c Release -- --model C:/Works/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend cpu --repeat-reads 4 --widths 16,64 --output artifacts/jev/repeat-cpu.json
 ```
 
 The benchmark's original labeled examples are checked in under

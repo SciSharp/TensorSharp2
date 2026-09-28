@@ -1544,6 +1544,14 @@ namespace TensorSharp.GGML
         public static void Shutdown() => GgmlNative.Shutdown();
 
         /// <summary>
+        /// True once this process has bound the GgmlOps native library, i.e. some code made its
+        /// first P/Invoke into it. Reading it never loads the library (unlike <see cref="Shutdown"/>,
+        /// itself a P/Invoke), so an exit path on a non-GGML backend can skip the teardown when
+        /// no GGML code ran.
+        /// </summary>
+        public static bool IsNativeLibraryLoaded => GgmlNativeLibraryState.IsLoaded;
+
+        /// <summary>
         /// Set an environment variable as the NATIVE library sees it. Managed
         /// <c>Environment.SetEnvironmentVariable</c> does not reach native getenv on
         /// every platform, and some ggml tunables are read once at device probe, so
