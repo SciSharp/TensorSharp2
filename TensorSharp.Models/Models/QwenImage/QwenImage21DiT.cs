@@ -36,6 +36,7 @@ internal sealed partial class QwenImage21DiT : ModelBase
         : base(ggufPath, backend, tpGroup?.Degree ?? 1, tpGroup)
     {
         _lora = lora;
+        _pureCpu = !IsGgmlBackend;
         try
         {
             if (!IsGgmlBackend && backend != BackendType.Cpu)
@@ -88,7 +89,7 @@ internal sealed partial class QwenImage21DiT : ModelBase
             }
             if (_gguf.Tensors.ContainsKey(_prefix + $"transformer_blocks.{Layers}.attn.to_q.weight"))
                 throw new NotSupportedException("Expected a 32-layer Qwen-Image-2.1 transformer.");
-            if (!IsGgmlBackend)
+            if (_pureCpu)
             {
                 _managed = new QwenImage21ManagedDiT(_nativeWeights, _blocks);
                 Console.WriteLine($"Qwen-Image-2.1 DiT: {Layers} layers, {HiddenSize} hidden, {Heads} heads, pure-C# forward " +
@@ -238,8 +239,26 @@ internal sealed partial class QwenImage21DiT : ModelBase
         /// native state to query or release (the cpu backend must never call native code).</summary>
         internal bool UsedNatively { get; set; }
 
+        /// <summary>Calls this cache made into the native library. Both native entry points
+        /// go through <see cref="NativeInfo"/> and <see cref="NativeRelease"/>, so a test can
+        /// assert the cpu backend made none whether or not GgmlOps is loadable (from a repo
+        /// checkout it always is, and a stray call would succeed silently).</summary>
+        internal int NativeCalls { get; private set; }
+
         internal QwenImage21PrefixCacheInfo Info => Managed != null ? Managed.Info
-            : UsedNatively ? GgmlBasicOps.QwenImage21GetPrefixCacheInfo(Key) : default;
+            : UsedNatively ? NativeInfo() : default;
+
+        private QwenImage21PrefixCacheInfo NativeInfo()
+        {
+            NativeCalls++;
+            return GgmlBasicOps.QwenImage21GetPrefixCacheInfo(Key);
+        }
+
+        private void NativeRelease()
+        {
+            NativeCalls++;
+            GgmlBasicOps.QwenImage21ReleasePrefixCache(Key);
+        }
 
         /// <summary>True when a prediction passes the very arrays this cache was made for.
         /// Stored K/V encode that conditioning; other text or references would silently
@@ -254,7 +273,7 @@ internal sealed partial class QwenImage21DiT : ModelBase
             _disposed = true;
             Managed?.Dispose();
             Managed = null;
-            if (UsedNatively) GgmlBasicOps.QwenImage21ReleasePrefixCache(Key);
+            if (UsedNatively) NativeRelease();
         }
     }
 
@@ -338,7 +357,10 @@ internal sealed partial class QwenImage21DiT : ModelBase
             time[256 + i] = 1f;
         }
         var output = new float[targetTokens.Length];
-        if (_managed != null)
+        // Route on the backend, not on _managed (null after Dispose): a disposed cpu
+        // transformer must fail here, never fall through to the native graph.
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_pureCpu)
             PredictManaged(images, textCond, textSeq, time, layout, prefixCache, output);
         else
             PredictNative(images, textCond, textSeq, time, layout, prefixCache, output);
@@ -494,6 +516,7 @@ internal sealed partial class QwenImage21DiT : ModelBase
     protected override void ResetKVCacheCore() { }
     public override void Dispose()
     {
+        _disposed = true;
         _layouts.Clear();
         _managed?.Dispose();
         _managed = null;

@@ -18,7 +18,8 @@ namespace TensorSharp.Models.QwenImage;
 /// <see cref="TensorPrimitives"/> (itself Vector512 where available). The compute-bound
 /// kernels - the projections (<see cref="GemmDequantNT"/>: F32 activations against
 /// dequantized weight tiles), the segmented flash attention and the LoRA shrink/expand
-/// products - come in three widths: AVX-512 (16 lanes), AVX2+FMA (8) and portable scalar.</para>
+/// products - come in three widths: AVX-512 (16 lanes), AVX2+FMA (8) and a portable tier
+/// (TensorPrimitives/Vector128 row operations; AdvSimd on ARM64).</para>
 /// <para>On this generation of client cores a 512-bit FMA issues once per cycle and a 256-bit
 /// one twice, so AVX-512 does not raise the FMA ceiling; it pays through its 32 registers,
 /// which hold a 6x4 dot tile or a 4x64 score/output tile (24 or 16 accumulators) plus its
@@ -26,9 +27,15 @@ namespace TensorSharp.Models.QwenImage;
 /// </remarks>
 internal static unsafe class QwenImage21CpuKernels
 {
-    /// <summary>Lanes of the compute-bound kernels: 16 (AVX-512), 8 (AVX2+FMA) or 1 (scalar).
+    /// <summary>Lanes of the compute-bound kernels: 16 (AVX-512), 8 (AVX2+FMA) or 1 (portable:
+    /// <see cref="TensorPrimitives"/> and Vector128, which is AdvSimd on ARM64).
     /// TS_CPU_DISABLE_AVX512=1 selects the AVX2 kernels on an AVX-512 host so both paths are
-    /// exercised on one machine; tests assign it directly.</summary>
+    /// exercised on one machine; tests assign it directly. It narrows only this file's
+    /// hand-written kernels: TensorPrimitives (the memory-bound row passes, conversions) keeps
+    /// using Vector512. To measure an AVX2-only host, disable AVX-512 in the runtime instead:
+    /// DOTNET_EnableAVX512=0 (.NET 10 ignores the older DOTNET_EnableAVX512F=0), which also
+    /// turns Vector512.IsHardwareAccelerated off; DOTNET_EnableAVX2=0 leaves only Vector128,
+    /// the portable width-1 tier.</summary>
     internal static int Width { get; set; } = DefaultWidth();
 
     internal static int DefaultWidth()
@@ -196,6 +203,15 @@ internal static unsafe class QwenImage21CpuKernels
                     {
                         var x = Vector256.Load(g + i);
                         (x / (one + Vector256.Exp(-x)) * Vector256.Load(u + i)).Store(g + i);
+                    }
+                }
+                else if (Vector128.IsHardwareAccelerated)
+                {
+                    var one = Vector128.Create(1f);
+                    for (; i + 4 <= ff; i += 4)
+                    {
+                        var x = Vector128.Load(g + i);
+                        (x / (one + Vector128.Exp(-x)) * Vector128.Load(u + i)).Store(g + i);
                     }
                 }
                 for (; i < ff; i++) g[i] = g[i] / (1f + MathF.Exp(-g[i])) * u[i];
@@ -539,15 +555,19 @@ internal static unsafe class QwenImage21CpuKernels
         }
     }
 
+    /// <summary>Portable scores: per head dimension, one contiguous 64-key row of the transposed
+    /// keys scaled into the score row (TensorPrimitives vectorizes it; the head dimension
+    /// innermost would stride <paramref name="ktStride"/> floats per step).</summary>
     private static void ScoresScalar(float* q, int qStride, int rows, float* kt, int ktStride, int headDim, float* s)
     {
         for (int i = 0; i < rows; i++)
-            for (int j = 0; j < KeyTile; j++)
-            {
-                float sum = 0f;
-                for (int d = 0; d < headDim; d++) sum += q[(long)i * qStride + d] * kt[(long)d * ktStride + j];
-                s[i * KeyTile + j] = sum;
-            }
+        {
+            var row = new Span<float>(s + i * KeyTile, KeyTile);
+            row.Clear();
+            float* qi = q + (long)i * qStride;
+            for (int d = 0; d < headDim; d++)
+                TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(kt + (long)d * ktStride, KeyTile), qi[d], row, row);
+        }
     }
 
     /// <summary>acc[4 rows] += p[4 rows, kn] * v[kn, headDim], 64 output lanes per pass.
@@ -625,14 +645,15 @@ internal static unsafe class QwenImage21CpuKernels
     private static void ValuesScalar(float* p, int rows, float* v, int vStride, int kn, float* acc, int headDim)
     {
         for (int i = 0; i < rows; i++)
+        {
+            var a = new Span<float>(acc + i * headDim, headDim);
             for (int j = 0; j < kn; j++)
             {
                 float w = p[i * KeyTile + j];
                 if (w == 0f) continue;
-                float* vr = v + (long)j * vStride;
-                float* a = acc + i * headDim;
-                for (int d = 0; d < headDim; d++) a[d] += w * vr[d];
+                TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(v + (long)j * vStride, headDim), w, a, a);
             }
+        }
     }
 
     // ---- float products (projections, LoRA factors, output heads) ---------------------
@@ -674,9 +695,12 @@ internal static unsafe class QwenImage21CpuKernels
     {
         if (width == 1)
         {
+            // Portable: TensorPrimitives.Dot is Vector128 (AdvSimd on ARM64) with several
+            // accumulators, where a scalar loop is one serial dependency chain.
             for (int i = r0; i < r1; i++)
                 for (int j = c0; j < c1; j++)
-                    c[(long)i * ldc + j] = DotScalar(a + (long)i * lda, b + (long)j * ldb, k);
+                    c[(long)i * ldc + j] = TensorPrimitives.Dot(new ReadOnlySpan<float>(a + (long)i * lda, k),
+                        new ReadOnlySpan<float>(b + (long)j * ldb, k));
             return;
         }
         int tileRows = width == 16 ? 6 : 4, tileCols = width == 16 ? 4 : 2;
@@ -730,13 +754,6 @@ internal static unsafe class QwenImage21CpuKernels
             }
             finally { System.Buffers.ArrayPool<float>.Shared.Return(rented); }
         });
-    }
-
-    private static float DotScalar(float* x, float* y, int k)
-    {
-        float sum = 0f;
-        for (int i = 0; i < k; i++) sum += x[i] * y[i];
-        return sum;
     }
 
     /// <summary>6 rows x 4 columns of dots over <paramref name="k"/> (rows and columns past the
@@ -889,12 +906,14 @@ internal static unsafe class QwenImage21CpuKernels
                     }
                     else if (width >= 8)
                         for (; jj + 16 <= valid; jj += 16) OuterTile8(ai, lda, rows, bp + jj, PanelWidth, ci + jj, ldc, r);
-                    for (; jj < valid; jj++)
+                    // The rest (all of it at width 1): contiguous panel rows, same summation order.
+                    if (jj < valid)
                         for (int row = 0; row < rows; row++)
                         {
-                            float sum = ci[(long)row * ldc + jj];
-                            for (int t = 0; t < r; t++) sum += ai[(long)row * lda + t] * bp[(long)t * PanelWidth + jj];
-                            ci[(long)row * ldc + jj] = sum;
+                            var dst = new Span<float>(ci + (long)row * ldc + jj, valid - jj);
+                            for (int t = 0; t < r; t++)
+                                TensorPrimitives.MultiplyAdd(new ReadOnlySpan<float>(bp + (long)t * PanelWidth + jj, valid - jj),
+                                    ai[(long)row * lda + t], dst, dst);
                         }
                 }
             }

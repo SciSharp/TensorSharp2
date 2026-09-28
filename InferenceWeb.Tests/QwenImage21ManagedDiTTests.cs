@@ -507,6 +507,49 @@ public sealed unsafe class QwenImage21ManagedDiTTests
         finally { Environment.SetEnvironmentVariable("TS_QWEN21_PREFIX_CACHE_MAX_MIB", saved); }
     }
 
+    /// <summary>NativeMemory throws on a failed allocation: the request must recompute the
+    /// prefix (the native cache's decline), not fail, and the partial storage must be freed.</summary>
+    [Fact]
+    public void PrefixCacheThatCannotBeAllocatedIsDeclined()
+    {
+        using var m = new Tiny(heads: 2, headDim: 128);
+        using var engine = new QwenImage21ManagedDiT(m.Args, m.Blocks);
+        using var cache = new QwenImage21ManagedPrefix(QwenImage21PrefixCacheType.Auto);
+        var live = new List<IntPtr>();
+        int calls = 0;
+        // Succeed for layer 0's K and V and layer 1's K, then fail.
+        cache.Allocator = bytes =>
+        {
+            if (++calls > 3) throw new OutOfMemoryException("test");
+            var p = (IntPtr)NativeMemory.AlignedAlloc((nuint)bytes, 64);
+            live.Add(p);
+            return p;
+        };
+        var x = Inputs.Create(m, 0.5f);
+        var expected = Run(engine, m, x);
+        var paths = new List<QwenImage21ForwardPath>();
+        Assert.Equal(expected, Run(engine, m, x, cache: cache, paths: paths));
+        Assert.Equal(expected, Run(engine, m, x, cache: cache, paths: paths));
+        Assert.Equal(new[] { QwenImage21ForwardPath.Declined, QwenImage21ForwardPath.Declined }, paths);
+        Assert.Equal(4, calls);   // the second step keeps the decline, it does not retry
+        var info = cache.Info;
+        Assert.Equal(2, info.State);
+        Assert.Equal(30, info.Tokens);
+        Assert.Equal(2L * m.Layers * 30 * m.Dim * 4, info.Bytes);
+    }
+
+    [Fact]
+    public void DisposedTransformerRefusesToRun()
+    {
+        using var m = new Tiny(heads: 2, headDim: 128);
+        var engine = new QwenImage21ManagedDiT(m.Args, m.Blocks);
+        var x = Inputs.Create(m, 0.5f);
+        Run(engine, m, x);
+        engine.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => Run(engine, m, x));
+        engine.Dispose();
+    }
+
     // ---- LoRA ---------------------------------------------------------------------------------
 
     /// <summary>Descriptors laid out as QwenImage21LoraSet packs them: Q/K/V downs back to back
@@ -622,6 +665,26 @@ public sealed unsafe class QwenImage21ManagedDiTTests
         Assert.Equal(Run(engine, m, x, adapter), Run(engine, m, x, adapter, cache));
         (cosine, relMax) = Compare(Reference(m, x, reference, nextHead), Run(engine, m, x, adapter, cache));
         Assert.True(cosine > 0.999999 && relMax < 2e-4, $"cosine {cosine}, rel max {relMax}");
+    }
+
+    /// <summary>ReleaseScratch (called before the VAE decode and after every request) also drops
+    /// the F32 LoRA factors; the next forward rebuilds them from the descriptor and the prefix
+    /// cache, bound to the descriptor rather than to the F32 copy, stays valid.</summary>
+    [Fact]
+    public void ReleasedLoraFactorsAreRebuiltAndTheCacheStillHolds()
+    {
+        using var m = new Tiny(heads: 2, headDim: 128);
+        using var engine = new QwenImage21ManagedDiT(m.Args, m.Blocks);
+        using var cache = new QwenImage21ManagedPrefix(QwenImage21PrefixCacheType.Auto);
+        var (adapter, _) = BuildAdapter(m, withHead: false, out _);
+        var x = Inputs.Create(m, 0.7f);
+        var paths = new List<QwenImage21ForwardPath>();
+        var expected = Run(engine, m, x, adapter, cache, paths);
+        engine.ReleaseScratch();
+        Assert.Equal(expected, Run(engine, m, x, adapter, cache, paths));
+        engine.ReleaseScratch();
+        Assert.Equal(expected, Run(engine, m, x, adapter));
+        Assert.Equal(new[] { QwenImage21ForwardPath.Extract, QwenImage21ForwardPath.Cached }, paths);
     }
 
     [Fact]
@@ -825,15 +888,18 @@ public sealed unsafe class QwenImage21ManagedDiTTests
     [Fact]
     public void ManagedPrefixCacheReportsAndReleasesWithoutNativeCalls()
     {
-        // This test assembly may run without GgmlOps: a native call here would throw.
+        // Counted rather than left to throw: from a repo checkout GgmlOps is always loadable
+        // (the resolver walks up to the repo root), so a stray native call would succeed.
         var cache = QwenImage21DiT.CreatePrefixCache(new float[4], null, null, null, "f16");
         cache.Managed = new QwenImage21ManagedPrefix(cache.Type);
         Assert.Equal(0, cache.Info.State);
         cache.Dispose();
         cache.Dispose();
+        Assert.Equal(0, cache.NativeCalls);
         var unused = QwenImage21DiT.CreatePrefixCache(new float[4], null, null, null, null);
         Assert.Equal(default, unused.Info);
         unused.Dispose();
+        Assert.Equal(0, unused.NativeCalls);
     }
 
     [Fact]
@@ -858,32 +924,41 @@ public sealed unsafe class QwenImage21ManagedDiTTests
     }
 
     /// <summary>The real checkpoint on the cpu backend (64x64, 12 random text rows): finite
-    /// velocities from both matmul modes, and the prefix cache's extract and cached steps equal
-    /// to the uncached prediction bit for bit.</summary>
+    /// velocities from both matmul modes, the prefix cache's extract and cached steps equal
+    /// to the uncached prediction bit for bit without a native prefix-cache call, and a
+    /// disposed transformer that refuses to predict (instead of reaching the native graph).</summary>
     [ModelFact("TENSORSHARP_QWEN21_DIT")]
     public void RealTransformerRunsOnTheCpuBackendWithAnExactPrefixCache()
     {
         bool preferManaged = NativeDequant.PreferManaged, f32 = QwenImage21ManagedDiT.F32Matmul;
         try
         {
-            using var dit = new QwenImage21DiT(Environment.GetEnvironmentVariable("TENSORSHARP_QWEN21_DIT")!, BackendType.Cpu);
-            Assert.True(dit.IsManaged);
+            var dit = new QwenImage21DiT(Environment.GetEnvironmentVariable("TENSORSHARP_QWEN21_DIT")!, BackendType.Cpu);
             var rng = new Random(4);
             var text = Enumerable.Range(0, 12 * 4096).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray();
             var latents = Enumerable.Range(0, 16 * 64).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray();
-            foreach (bool mode in new[] { true, false })
+            try
             {
-                QwenImage21ManagedDiT.F32Matmul = mode;
-                var full = dit.Predict(latents, 4, 4, text, 12, 0.5f);
-                Assert.Contains(full, v => v != 0f);
-                using var cache = QwenImage21DiT.CreatePrefixCache(text, null, null, "1", null);
-                Assert.Equal(full, dit.Predict(latents, 4, 4, text, 12, 0.5f, prefixCache: cache));
-                Assert.Equal(QwenImage21ForwardPath.Extract, cache.LastPath);
-                Assert.Equal(full, dit.Predict(latents, 4, 4, text, 12, 0.5f, prefixCache: cache));
-                Assert.Equal(QwenImage21ForwardPath.Cached, cache.LastPath);
-                Assert.Equal(1, cache.Info.State);
-                Assert.Equal(12, cache.Info.Tokens);
+                Assert.True(dit.IsManaged);
+                foreach (bool mode in new[] { true, false })
+                {
+                    QwenImage21ManagedDiT.F32Matmul = mode;
+                    var full = dit.Predict(latents, 4, 4, text, 12, 0.5f);
+                    Assert.Contains(full, v => v != 0f);
+                    var cache = QwenImage21DiT.CreatePrefixCache(text, null, null, "1", null);
+                    Assert.Equal(full, dit.Predict(latents, 4, 4, text, 12, 0.5f, prefixCache: cache));
+                    Assert.Equal(QwenImage21ForwardPath.Extract, cache.LastPath);
+                    Assert.Equal(full, dit.Predict(latents, 4, 4, text, 12, 0.5f, prefixCache: cache));
+                    Assert.Equal(QwenImage21ForwardPath.Cached, cache.LastPath);
+                    Assert.Equal(1, cache.Info.State);
+                    Assert.Equal(12, cache.Info.Tokens);
+                    cache.Dispose();
+                    Assert.Equal(0, cache.NativeCalls);
+                }
             }
+            finally { dit.Dispose(); }
+            Assert.True(dit.IsManaged);
+            Assert.Throws<ObjectDisposedException>(() => dit.Predict(latents, 4, 4, text, 12, 0.5f));
         }
         finally
         {

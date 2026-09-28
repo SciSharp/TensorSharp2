@@ -9,6 +9,15 @@
 //   QwenImageDiTBench --dit <qwen_image_2.1 gguf> [--size 256] [--lora <plugin.json>] [--edit]
 //                     [--backends cpu,ggml_cpu] [--prompt "..."] [--random-cond] [--quick] [--label name]
 //   QwenImageDiTBench --kernels [--size 512]   (attention / LoRA-product throughput per kernel width)
+//   QwenImageDiTBench --pipeline [--size 128] [--steps N] [--lora <plugin.json>]
+//                     (text encode + denoise + VAE through QwenImageModel on the cpu backend,
+//                      then asserts the native GGML library was never loaded)
+//
+// A trailing '~' on a backend perturbs its inputs to measure that pipeline's own sensitivity:
+// --perturb latents (default) scales the latents by 1 + U(-s, s); --perturb sigma scales the
+// timestep by 1 + s. s is --perturb-scale (default 1e-6). ggml-cpu rounds img_in's input to
+// BF16 (its vec_dot_type), which erases a 1e-6 latent change, so its noise floor needs sigma.
+// Runs whose backends are all cpu* fail (exit 3) if GgmlOps was loaded into the process.
 //
 // Per backend: (1) a full forward at sigma0 without the prefix cache, (2) the extract forward
 // (cache on) at sigma0, (3) a cached forward at sigma1 and (4, unless --quick) a full forward at
@@ -39,6 +48,7 @@ if (options.ProbeMatmul)
     MatmulProbe.Run(options.Dit);
     return 0;
 }
+if (options.Pipeline) return PipelineRun.Run(options);
 int latent = options.Size / 16, sequence = latent * latent;
 
 // ---- conditioning -------------------------------------------------------------------------
@@ -76,8 +86,9 @@ foreach (string backendName in options.Backends)
 {
     // cpu: the pure-C# forward (F32 activations into dequantized weights); cpu_q8: its
     // Q8_K/Q8_0 integer-dot variant (TS_QWEN21_CPU_MATMUL=q8). A trailing '~' perturbs the
-    // latents by a relative 1e-6 to measure a pipeline's noise floor.
+    // latents or the timestep (--perturb) to measure a pipeline's noise floor.
     bool perturb = backendName.EndsWith('~');
+    bool perturbSigma = perturb && options.Perturb == "sigma";
     var backend = backendName.TrimEnd('~') switch
     {
         "cpu" or "cpu_q8" => BackendType.Cpu,
@@ -87,10 +98,14 @@ foreach (string backendName in options.Backends)
     QwenImage21ManagedDiT.F32Matmul = !backendName.StartsWith("cpu_q8", StringComparison.Ordinal);
     float[] Perturbed(float[] x)
     {
-        if (!perturb) return x;
+        if (!perturb || perturbSigma) return x;
         var rng = new Random(77);
-        return x.Select(v => v * (1f + 1e-6f * (float)(rng.NextDouble() * 2 - 1))).ToArray();
+        float s = options.PerturbScale;
+        return x.Select(v => v * (1f + s * (float)(rng.NextDouble() * 2 - 1))).ToArray();
     }
+    // The timestep is clamped to [0, 1] by Predict; 1.0 is perturbed downwards.
+    float Sigma(float sigma) => !perturbSigma ? sigma
+        : sigma * (1f + options.PerturbScale) <= 1f ? sigma * (1f + options.PerturbScale) : sigma * (1f - options.PerturbScale);
     var runs = results[backendName] = new();
     var load = Stopwatch.StartNew();
     QwenImage21LoraSet lora = null;
@@ -109,11 +124,12 @@ foreach (string backendName in options.Backends)
     {
         (float[] V, double Ms, string Path) Predict(string name, float[] x, float sigma, QwenImage21DiT.PrefixCache cache, int step)
         {
+            sigma = Sigma(sigma);
             var timer = Stopwatch.StartNew();
             var v = dit.Predict(x, latent, latent, text, textSeq, sigma, slots, references, refHeights, refWidths, cache, step, bf16);
             double ms = timer.Elapsed.TotalMilliseconds;
             string path = cache?.LastPath.ToString().ToLowerInvariant() ?? "full";
-            Log($"[{backendName}] {name,-12} sigma={sigma:F4} path={path,-8} {ms,10:F0} ms");
+            Log($"[{backendName}] {name,-12} sigma={sigma:F7} path={path,-8} {ms,10:F0} ms");
             return (v, ms, path);
         }
         runs["full0"] = Predict("full s0", Perturbed(latents0), sigmas[0], null, 0);
@@ -176,9 +192,25 @@ for (int a = 0; a < names.Count; a++)
             if (x.ContainsKey(key) && y.ContainsKey(key))
                 Log(Row($"{key} ({x[key].Ms:F0} ms vs {y[key].Ms:F0} ms)", x[key].V, y[key].V));
     }
+// The cpu backend must not enter native GGML code. From a repo checkout GgmlOps is always
+// loadable (the resolver walks up to the repo root), so a stray call would not fail; a loaded
+// module is the evidence.
+bool managedOnly = options.Backends.All(b => b.StartsWith("cpu", StringComparison.Ordinal));
+string native = NativeProbe.LoadedGgml();
+Log($"native GGML library in the process: {native ?? "not loaded"}");
 string label = options.Label ?? $"{options.Size}{(options.Lora != null ? "-lora" : "")}{(options.Edit ? "-edit" : "")}";
 File.WriteAllLines(Path.Combine(options.Out, $"dit-{label}.txt"), lines);
 Console.WriteLine($"Wrote {Path.Combine(options.Out, $"dit-{label}.txt")}");
+if (managedOnly && native != null)
+{
+    if (NativeProbe.BenchUsedGgml)
+        Log("  (not evidence: the bench itself encoded the conditioning on ggml_cpu; rerun with the cached conditioning)");
+    else
+    {
+        Console.Error.WriteLine("FAIL: a cpu-only run loaded the native GGML library.");
+        return 3;
+    }
+}
 return 0;
 
 // ---- helpers --------------------------------------------------------------------------------------
@@ -212,6 +244,7 @@ static (float[] Text, int Length) Conditioning(Options o)
     var timer = Stopwatch.StartNew();
     float[] text;
     int seq;
+    NativeProbe.BenchUsedGgml = true;
     using (var conditioner = new QwenImage21Conditioner(te, null, BackendType.GgmlCpu))
         (text, seq, _) = conditioner.EncodePrompt(o.Prompt, Array.Empty<RgbImage>());
     Console.WriteLine($"Conditioning: {seq} tokens encoded on ggml_cpu in {timer.Elapsed.TotalSeconds:F1}s");
@@ -228,7 +261,10 @@ sealed class Options
     public string Dit = "C:/Works/models/qwen-image-2.1/qwen_image_2.1_Q4_K_M.gguf";
     public int Size = 256;
     public string Lora;
-    public bool Edit, RandomCond, Quick, Kernels, ProbeMatmul;
+    public bool Edit, RandomCond, Quick, Kernels, ProbeMatmul, Pipeline;
+    public int Steps;
+    public string Perturb = "latents";
+    public float PerturbScale = 1e-6f;
     public string[] Backends = { "cpu", "ggml_cpu" };
     public string Prompt = "A small orange cat beside a blue ceramic vase, soft daylight, detailed photograph";
     public string Out = Path.Combine("artifacts", "cpu-perf", "qwen-dit");
@@ -253,6 +289,13 @@ sealed class Options
                 case "--quick": o.Quick = true; break;
                 case "--kernels": o.Kernels = true; break;
                 case "--probe-matmul": o.ProbeMatmul = true; break;
+                case "--pipeline": o.Pipeline = true; break;
+                case "--steps": o.Steps = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                case "--perturb":
+                    o.Perturb = Next();
+                    if (o.Perturb is not ("latents" or "sigma")) throw new ArgumentException("--perturb takes latents or sigma");
+                    break;
+                case "--perturb-scale": o.PerturbScale = float.Parse(Next(), CultureInfo.InvariantCulture); break;
                 case "--backends": o.Backends = Next().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries); break;
                 case "--prompt": o.Prompt = Next(); break;
                 case "--out": o.Out = Next(); break;
@@ -369,6 +412,58 @@ static unsafe class KernelBench
                     $"f32 {f32 * 1e3,7:F1} ms ({flops / f32 / 1e9,5:F0} GFLOPS) | q8 {q8 * 1e3,7:F1} ms ({flops / q8 / 1e9,5:F0} GFLOPS)");
             }
         }
+    }
+}
+
+/// <summary>Whether native GGML code entered the process: the loaded modules, which is the
+/// only reliable evidence from a repo checkout, where GgmlOps is always loadable.</summary>
+static class NativeProbe
+{
+    /// <summary>Set when the bench itself ran something on ggml_cpu (the conditioning).</summary>
+    public static bool BenchUsedGgml;
+
+    /// <summary>The path of a loaded GgmlOps / ggml* module, or null. (The managed
+    /// TensorSharp.Backends.GGML assembly does not match.)</summary>
+    public static string LoadedGgml()
+    {
+        using var process = Process.GetCurrentProcess();
+        foreach (ProcessModule module in process.Modules)
+        {
+            string name = module.ModuleName ?? "";
+            if (name.Contains("GgmlOps", StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("ggml", StringComparison.OrdinalIgnoreCase) || name.StartsWith("libggml", StringComparison.OrdinalIgnoreCase))
+                return module.FileName;
+        }
+        return null;
+    }
+}
+
+/// <summary>--pipeline: one text-to-image request through <see cref="QwenImageModel"/> on the
+/// cpu backend (Qwen3-VL conditioner, DiT and VAE, companions resolved next to the DiT GGUF,
+/// optional --lora plug-ins), then the check that no native GGML module was loaded.</summary>
+static class PipelineRun
+{
+    public static int Run(Options o)
+    {
+        var timer = Stopwatch.StartNew();
+        string png;
+        using (var model = new QwenImageModel(o.Dit, BackendType.Cpu))
+        {
+            if (o.Lora != null) model.SetLoras(new[] { new LoraSpec(o.Lora) });
+            Console.WriteLine($"Loaded in {timer.Elapsed.TotalSeconds:F1}s");
+            var p = new QwenImageParams { Steps = o.Steps, Seed = o.Seed, Width = o.Size, Height = o.Size };
+            timer.Restart();
+            var image = model.GenerateImage(o.Prompt, p);
+            string label = o.Label ?? $"pipeline-{o.Size}{(o.Lora != null ? "-lora" : "")}";
+            png = Path.Combine(o.Out, $"{label}.png");
+            ImageIO.SavePng(png, image);
+            Console.WriteLine($"Generated {image.Width}x{image.Height} in {timer.Elapsed.TotalSeconds:F1}s -> {png}");
+        }
+        string native = NativeProbe.LoadedGgml();
+        Console.WriteLine($"native GGML library in the process: {native ?? "not loaded"}");
+        if (native == null) return 0;
+        Console.Error.WriteLine("FAIL: the cpu pipeline loaded the native GGML library.");
+        return 3;
     }
 }
 

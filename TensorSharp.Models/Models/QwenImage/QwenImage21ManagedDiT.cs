@@ -22,9 +22,13 @@ namespace TensorSharp.Models.QwenImage;
 /// h * headDim, i.e. ggml's [dim, rows] tensors. For attention K is transposed per head and
 /// V copied per head, so every tile the kernels stream is contiguous.</para>
 /// <para><b>Numerics.</b> The projections keep the activations in F32 against dequantized
-/// weights, where ggml-cpu quantizes them to Q8_K per projection; see <see cref="F32Matmul"/>
-/// for why that is the default here, and why no second implementation can match ggml-cpu's
-/// quantized output closer than ggml-cpu matches itself under a 1e-6 input change.</para>
+/// weights, where ggml-cpu quantizes them to Q8_K per projection (see <see cref="F32Matmul"/>
+/// for why that is the default), so this evaluates the stored weights more closely and does
+/// not reproduce ggml-cpu's rounding. Measured at 256x256 (QwenImageDiTBench): cosine
+/// 0.99994 to ggml-cpu at sigma 1 and 0.9978 at sigma 0.02. ggml-cpu itself is not stable
+/// to that level: a 1e-4 relative timestep change, which moves this forward by relL2 5e-5
+/// at sigma 0.02, moves ggml-cpu's velocity by 4.7e-2 (cosine 0.9989), and by 1.2e-2 at
+/// sigma 1 (--perturb sigma).</para>
 /// <para><b>Prefix cache.</b> Text and reference tokens are modulated at t=0 and never attend
 /// to the target, so their per-layer K/V are step independent. An "extract" forward stores
 /// them in a <see cref="QwenImage21ManagedPrefix"/>; a "cached" forward then computes only
@@ -45,6 +49,7 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
     private readonly IntPtr[] _scratch = new IntPtr[(int)Slot.Count];
     private readonly long[] _scratchBytes = new long[(int)Slot.Count];
     private AdapterF32 _adapter;
+    private bool _disposed;
 
     // ggml-cpu's GELU reads an F16 table; the default is the tanh formula in F32 (as CUDA
     // and Metal compute it). TS_QWEN21_CPU_GELU_FP16=1 reproduces ggml-cpu for A/B parity.
@@ -62,7 +67,7 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
     /// to Q8_K/Q8_0 for an integer dot as ggml and <see cref="ManagedQuantizedOps"/> do.
     /// Measured on this transformer (i7-11800H, 279 rows): 300-500 GFLOPS against 66-106 for
     /// the managed integer dot, and numerically stable where the integer dot is not: a 1e-6
-    /// relative change of the input latents moved the Q8_K pipeline's velocity by 2.5e-2
+    /// relative change of the input latents moved the managed Q8_K pipeline's velocity (128x128) by 2.5e-2
     /// relative L2 (every activation re-quantization can flip a rounding, 224 times per
     /// forward) but the F32 one by 1e-5. TS_QWEN21_CPU_MATMUL=q8 selects the integer dot.
     /// </summary>
@@ -128,6 +133,9 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
         Validate(images, imageSeq, text, textSeq, time, cos, sin, segments, prefixSeq, totalSeq, output);
         lock (_gate)
         {
+            // Dispose takes the same lock, so a forward either finishes before the owner
+            // unmaps the weights or sees the flag here.
+            ObjectDisposedException.ThrowIf(_disposed, this);
             var lora = AdapterFor(adapter);
             var path = QwenImage21ForwardPath.Full;
             if (cache != null && prefixSeq > 0)
@@ -256,8 +264,7 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
             QwenImage21CpuKernels.LayerNormScale(joint, h, rows, dim, _eps, scale0T, scale0P, prefixRows);
             stages?.Lap(ref stages.Norm);
             // Q, K and V read one input: a single stacked LoRA shrink serves all three.
-            float* qkv = Shrink(l?.Qkv, h, dim, rows, Slot.ShrinkGroup);
-            stages?.Lap(ref stages.Lora);
+            float* qkv = Shrink(l?.Qkv, h, dim, rows, Slot.ShrinkGroup, stages);
             Project(w.Q, h, dim, rows, q, dim, l?.Q, qkv, stages);
             Project(w.K, h, dim, rows, kRows, dim, l?.K, qkv, stages);
             Project(w.V, h, dim, rows, vRows, dim, l?.V, qkv, stages);
@@ -273,7 +280,7 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
                 cached ? segments.Length - 1 : 0, first, scale);
             stages?.Lap(ref stages.Attention);
             // The attention output projection reuses Q's rows.
-            Project(w.Out, o, dim, rows, q, dim, l?.Out, Shrink(l?.OutGroup, o, dim, rows, Slot.ShrinkGroup), stages);
+            Project(w.Out, o, dim, rows, q, dim, l?.Out, Shrink(l?.OutGroup, o, dim, rows, Slot.ShrinkGroup, stages), stages);
             QwenImage21CpuKernels.GatedAdd(joint, q, dim, rows, dim, gate1T, gate1P, prefixRows);
             QwenImage21CpuKernels.LayerNormScale(joint, h, rows, dim, _eps, scale2T, scale2P, prefixRows);
             stages?.Lap(ref stages.Norm);
@@ -284,18 +291,18 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
                 if (w.Up.Data == IntPtr.Zero)
                 {
                     // The checkpoint's fused [gate | up]; a LoRA on it spans both halves.
-                    Project(w.Gate, x, dim, cn, gu, 2 * _ff, l?.Gate, Shrink(l?.GateUpGroup, x, dim, cn, Slot.ShrinkGroup), stages);
+                    Project(w.Gate, x, dim, cn, gu, 2 * _ff, l?.Gate, Shrink(l?.GateUpGroup, x, dim, cn, Slot.ShrinkGroup, stages), stages);
                 }
                 else
                 {
-                    float* shrunk = Shrink(l?.GateUpGroup, x, dim, cn, Slot.ShrinkGroup);
+                    float* shrunk = Shrink(l?.GateUpGroup, x, dim, cn, Slot.ShrinkGroup, stages);
                     Project(w.Gate, x, dim, cn, gu, 2 * _ff, l?.Gate, shrunk, stages);
                     Project(w.Up, x, dim, cn, gu + _ff, 2 * _ff, l?.Up, shrunk, stages);
                 }
                 QwenImage21CpuKernels.SwiGlu(gu, 2 * _ff, cn, _ff);
                 stages?.Lap(ref stages.Norm);
                 Project(w.Down, gu, 2 * _ff, cn, q + (long)c0 * dim, dim, l?.Down,
-                    Shrink(l?.DownGroup, gu, 2 * _ff, cn, Slot.ShrinkGroup), stages);
+                    Shrink(l?.DownGroup, gu, 2 * _ff, cn, Slot.ShrinkGroup, stages), stages);
             }
             QwenImage21CpuKernels.GatedAdd(joint, q, dim, rows, dim, gate3T, gate3P, prefixRows);
             stages?.Lap(ref stages.Norm);
@@ -385,11 +392,15 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
 
     /// <summary>The stacked down projections of a group over <paramref name="rows"/> inputs,
     /// [rows, group rank], or null without a low-rank term.</summary>
-    private float* Shrink(Group group, float* x, int xStride, int rows, Slot slot)
+    /// <remarks>It runs as an argument of the <see cref="Project"/> it feeds, before that
+    /// projection's first lap, so it laps its own time to the LoRA stage.</remarks>
+    private float* Shrink(Group group, float* x, int xStride, int rows, Slot slot, Stages stages)
     {
         if (group == null || group.Rank == 0 || rows <= 0) return null;
+        stages?.Lap(ref stages.Norm);
         float* result = Get(slot, (long)rows * group.Rank);
         QwenImage21CpuKernels.GemmNT(x, xStride, group.Down, group.In, result, group.Rank, rows, group.Rank, group.In);
+        stages?.Lap(ref stages.Lora);
         return result;
     }
 
@@ -402,34 +413,41 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
             if (_scratch[i] != IntPtr.Zero) NativeMemory.AlignedFree((void*)_scratch[i]);
             _scratch[i] = IntPtr.Zero;
             _scratchBytes[i] = 0;
-            void* p = NativeMemory.AlignedAlloc((nuint)bytes, 64);
-            if (p == null) throw new OutOfMemoryException($"Qwen-Image-2.1 cpu scratch of {bytes} bytes.");
-            _scratch[i] = (IntPtr)p;
+            // NativeMemory throws OutOfMemoryException itself; it never returns null.
+            _scratch[i] = (IntPtr)NativeMemory.AlignedAlloc((nuint)bytes, 64);
             _scratchBytes[i] = bytes;
         }
         return (float*)_scratch[i];
     }
 
-    /// <summary>Frees the activation scratch (kept between denoising steps).</summary>
+    /// <summary>Frees the activation scratch (kept between denoising steps) and the F32 copies
+    /// of the LoRA factors. Both are rebuilt by the next forward; the F32 factors (twice the
+    /// size of the F16 set they come from, ~640 MiB for a rank-64 plug-in) would otherwise stay
+    /// allocated through the VAE decode and between requests.</summary>
     internal void ReleaseScratch()
     {
-        lock (_gate)
-            for (int i = 0; i < _scratch.Length; i++)
-            {
-                if (_scratch[i] != IntPtr.Zero) NativeMemory.AlignedFree((void*)_scratch[i]);
-                _scratch[i] = IntPtr.Zero;
-                _scratchBytes[i] = 0;
-            }
+        lock (_gate) FreeAll();
     }
 
     public void Dispose()
     {
-        ReleaseScratch();
         lock (_gate)
         {
-            _adapter?.Dispose();
-            _adapter = null;
+            _disposed = true;
+            FreeAll();
         }
+    }
+
+    private void FreeAll()
+    {
+        for (int i = 0; i < _scratch.Length; i++)
+        {
+            if (_scratch[i] != IntPtr.Zero) NativeMemory.AlignedFree((void*)_scratch[i]);
+            _scratch[i] = IntPtr.Zero;
+            _scratchBytes[i] = 0;
+        }
+        _adapter?.Dispose();
+        _adapter = null;
     }
 
     // ---- LoRA factors in F32 ----------------------------------------------------------
@@ -466,11 +484,14 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
         internal BlockUpdates[] Blocks;
         private readonly List<IntPtr> _allocations = new();
 
+        internal long Bytes { get; private set; }
+
         internal float* Allocate(long floats)
         {
-            void* p = NativeMemory.AlignedAlloc((nuint)(Math.Max(1, floats) * sizeof(float)), 64);
-            if (p == null) throw new OutOfMemoryException("Qwen-Image-2.1 LoRA factors.");
+            long bytes = Math.Max(1, floats) * sizeof(float);
+            void* p = NativeMemory.AlignedAlloc((nuint)bytes, 64);
             _allocations.Add((IntPtr)p);
+            Bytes += bytes;
             return (float*)p;
         }
 
@@ -492,6 +513,7 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
             throw new ArgumentException("QwenImage21: invalid LoRA adapter descriptor");
         if (a->OutputHead != IntPtr.Zero && ((a->OutputHeadType != 0 && a->OutputHeadType != 1) || HasUpdate(a->ProjOut)))
             throw new ArgumentException("QwenImage21: an output head replaces proj_out and cannot carry a LoRA");
+        long started = Stopwatch.GetTimestamp();
         var result = new AdapterF32 { Source = adapter };
         try
         {
@@ -537,6 +559,9 @@ internal sealed unsafe class QwenImage21ManagedDiT : IDisposable
             result.Dispose();
             throw;
         }
+        if (Profile)
+            Console.WriteLine($"  [qwen21-cpu] LoRA factors widened to F32: {result.Bytes / 1048576.0:F0} MiB in " +
+                $"{Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} ms");
         return _adapter = result;
     }
 
@@ -688,8 +713,7 @@ internal sealed unsafe class QwenImage21ManagedPrefix : IDisposable
         long perLayer = SizeOf(KeyType, elements) + SizeOf(ValueType, elements);
         Bytes = perLayer * layers;
         // The native rule: at most half of what is free, and TS_QWEN21_PREFIX_CACHE_MAX_MIB.
-        var memory = GC.GetGCMemoryInfo();
-        long free = memory.TotalAvailableMemoryBytes > 0 ? Math.Max(0, memory.TotalAvailableMemoryBytes - memory.MemoryLoadBytes) : long.MaxValue;
+        long free = FreeMemoryBytes();
         if (Bytes > free / 2 || !WithinUserCap(Bytes))
         {
             Declined = true;
@@ -708,12 +732,36 @@ internal sealed unsafe class QwenImage21ManagedPrefix : IDisposable
                 _v[i] = Alloc(SizeOf(ValueType, elements));
             }
         }
-        catch
+        catch (OutOfMemoryException)
         {
-            Release();
-            throw;
+            // The free-memory estimate passed but the commit did not. The native cache declines
+            // when its buffer allocation fails and runs the full graph; do the same rather than
+            // fail the request. The binding is kept, so later steps stay declined.
+            FreeStorage();
+            Declined = true;
+            Console.Error.WriteLine($"[qwen21] prefix KV cache declined: {Bytes / (1024.0 * 1024.0):F1} MiB for {prefix} prefix tokens " +
+                "could not be allocated; this request recomputes the prefix every step.");
         }
     }
+
+    /// <summary>Physical memory not in use, from the GC's memory-load sample. The sample is
+    /// taken at a collection and is 0 before the first one, and this path allocates natively
+    /// (the cache, the scratch, the mapped weights), so collections are rare and the last
+    /// sample can be far behind; a forced collection refreshes it first. Measured (.NET 10,
+    /// Windows): a gen-0 collection is enough - it moved the sample from 0 to 19482 MiB with
+    /// 3 GiB of touched native memory, and down by 2923 MiB once that was freed. It runs once
+    /// per request and CFG branch.</summary>
+    private static long FreeMemoryBytes()
+    {
+        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+        var memory = GC.GetGCMemoryInfo();
+        return memory.TotalAvailableMemoryBytes > 0
+            ? Math.Max(0, memory.TotalAvailableMemoryBytes - memory.MemoryLoadBytes) : long.MaxValue;
+    }
+
+    /// <summary>Test hook: allocates this cache's storage in place of NativeMemory.AlignedAlloc
+    /// (it must return memory NativeMemory.AlignedFree releases, or throw).</summary>
+    internal Func<long, IntPtr> Allocator { get; set; }
 
     private static long SizeOf(int type, long elements) =>
         type switch { GgmlF32 => elements * 4, GgmlF16 => elements * 2, _ => elements / 32 * 34 };
@@ -726,12 +774,9 @@ internal sealed unsafe class QwenImage21ManagedPrefix : IDisposable
             double.IsFinite(mib) && mib >= 0 && bytes <= mib * 1024 * 1024;
     }
 
-    private static IntPtr Alloc(long bytes)
-    {
-        void* p = NativeMemory.AlignedAlloc((nuint)Math.Max(1, bytes), 64);
-        if (p == null) throw new OutOfMemoryException($"Qwen-Image-2.1 prefix cache of {bytes} bytes.");
-        return (IntPtr)p;
-    }
+    // NativeMemory throws OutOfMemoryException on failure; it never returns null.
+    private IntPtr Alloc(long bytes) =>
+        Allocator?.Invoke(bytes) ?? (IntPtr)NativeMemory.AlignedAlloc((nuint)Math.Max(1, bytes), 64);
 
     /// <summary>Stores rows [0, Tokens) of this layer's K and V.</summary>
     internal void Store(int layer, float* k, float* v, int dim)
@@ -776,13 +821,18 @@ internal sealed unsafe class QwenImage21ManagedPrefix : IDisposable
         });
     }
 
-    private void Release()
+    private void FreeStorage()
     {
         foreach (var p in _k) if (p != IntPtr.Zero) NativeMemory.AlignedFree((void*)p);
         foreach (var p in _v) if (p != IntPtr.Zero) NativeMemory.AlignedFree((void*)p);
         _k = Array.Empty<IntPtr>();
         _v = Array.Empty<IntPtr>();
         Filled = false;
+    }
+
+    private void Release()
+    {
+        FreeStorage();
         Declined = false;
         _owner = null;
     }
