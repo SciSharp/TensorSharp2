@@ -157,8 +157,9 @@ canvas decodes:
 3. The sampler accepts low-entropy positions, re-noises the rest, and repeats.
 
 Prompt-KV caching is enabled on the device-glue backends (`ggml_metal`,
-`ggml_cuda`, `mlx`, `cuda`); on `cpu`, `ggml_cpu` and `ggml_vulkan` every step
-runs the unified `[prefix|canvas]` forward instead.
+`ggml_cuda`, `mlx`, `cuda`) and on the pure-C# `cpu` backend, which keeps the
+prompt K/V in host memory (§5); on `ggml_cpu` and `ggml_vulkan` every step runs
+the unified `[prefix|canvas]` forward instead.
 
 ## 3. Sampler contract
 
@@ -209,8 +210,8 @@ Diffusion-specific metadata includes:
 
 Current optimized paths include:
 
-- Prompt-KV cache on `ggml_metal`, `ggml_cuda`, `mlx` and `cuda` (not
-  `ggml_vulkan`).
+- Prompt-KV cache on `ggml_metal`, `ggml_cuda`, `mlx`, `cuda` and `cpu` (not
+  `ggml_cpu` or `ggml_vulkan`).
 - Self-conditioning enabled by default; disable with `DIFFUSION_NO_SC=1`.
 - GGML fused decode layer, fused whole-model decode, and fused lm-head tail.
 - CUDA VRAM residency planning: when the model is larger than VRAM, weights are
@@ -229,6 +230,58 @@ Current optimized paths include:
 - MLX K-quant affine repacking for DiffusionGemma's multi-row canvas workload.
 - Block-boundary continuous batching in `TensorSharp.Server` through
   `DiffusionBatchScheduler`.
+- A pure-C# `cpu` path with its own prompt-KV cache and batched kernels, below.
+
+### Pure C# CPU backend (`--backend cpu`)
+
+```bash
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --input prompt.txt --backend cpu \
+  --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0 --diffusion-blocks 1
+```
+
+The server and the [Jev endpoint](jev.md) take the same `--backend cpu`. On this
+backend ([`DiffusionGemmaModel.Cpu.cs`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaModel.Cpu.cs)):
+
+- **Prompt K/V is cached on the host.** `PrefillPrompt` stores each layer's K/V
+  token-major after norm and RoPE; a sliding-window layer keeps only the last
+  rows a canvas query can see. Every denoising step then runs only the canvas,
+  and a Jev read of a prompt it has already prefilled reuses the stored K/V.
+  The scheduler's multi-request decode batches the active canvases on the host.
+- **Projections of the same input share one dispatch** (Q/K/V, and gate/up), and
+  the MoE runs every active expert's gate/up and down projections as two batched
+  dispatches over the multi-row quantized GEMM, in chunks of
+  `DIFFUSION_CPU_MOE_CHUNK` tokens.
+- **Attention** is a blocked kernel whose default arithmetic reproduces the
+  previous one exactly (`DIFFUSION_CPU_ATTN_FAST=1` selects FMA tiles). This model
+  is unusually sensitive to last-bit changes: activations are quantized before
+  every matmul and each layer picks the top 8 of 128 experts, so a routing tie can
+  flip. A one-field Jev probability moved by up to ±0.2 between numerically
+  equivalent kernels, which is why quality is judged on label decisions below.
+- `DIFFUSION_NO_PKV=1` turns the cache off; `DIFFUSION_CPU_LEGACY=1` restores the
+  previous DiffusionGemma-specific stages, and the per-stage switches restore one
+  stage each (table below). The matmuls, SGEMM and elementwise ops under those
+  stages stay on the backend's new shared kernels, so the previous arithmetic as a
+  whole also needs `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0
+  TS_CPU_SIMD_ELEMENTWISE=0` (see the
+  [environment variable matrix](../env_var_feature_matrix.md#out-of-matrix-pure-c-cpu-backend-knobs)).
+
+Measured on an i7-11800H (8 cores / 16 threads, AVX-512), 32 GB, Windows,
+`diffusiongemma-26B-A4B-it-Q4_K_M.gguf`, with `eng/JevProbe` (structured reads of
+a 54-token prompt; the previous build is the one before this `cpu` work):
+
+| Jev structured read | `cpu` | `cpu`, previous build | `ggml_cpu` |
+|---|---:|---:|---:|
+| width 16, first read of a new prompt | 0.92 s | 9.5 s | 1.57 s |
+| width 16, further reads of the same prompt | 0.22–0.25 s | 9.5 s | 1.57 s |
+| width 64, first read of a new prompt | 1.42 s | not measured | 2.68 s |
+| width 64, further reads of the same prompt | 0.63–0.73 s | not measured | 2.68 s |
+
+`ggml_cpu` has no prompt-KV cache, so every read costs the same there. On the
+`--quality` set (nine two-question prompts, each read at widths 16 and 64), `cpu`
+and `ggml_cpu` both chose all 36 expected labels (mean probability 0.9906 and
+0.9886), their top labels agreed on all 36, and the largest probability difference
+was 0.049. Chat generation on `cpu` uses the same kernels and cache, but its speed
+was not measured.
 
 Important toggles:
 
@@ -236,7 +289,11 @@ Important toggles:
 |---|---|
 | `DIFFUSION_STEPS` | Server-side denoising steps per block, default 48 |
 | `DIFFUSION_MAX_BATCH` | Server diffusion scheduler max active requests, default 2 |
-| `DIFFUSION_NO_PKV=1` | Disable prompt-KV caching on device-glue backends |
+| `DIFFUSION_NO_PKV=1` | Disable prompt-KV caching on the device-glue backends and `cpu` |
+| `DIFFUSION_CPU_LEGACY=1` | `cpu`: restore the previous DiffusionGemma-specific stages (no prompt-KV cache, previous projections, attention, router and MoE); for the previous arithmetic also set `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0` |
+| `DIFFUSION_CPU_LEGACY_MOE` / `_PROJ` / `_ATTN` / `_ROUTER` `=1` | `cpu`: restore one stage. `_ATTN` covers the unified forward only, so an attention A/B also needs `DIFFUSION_NO_PKV=1` |
+| `DIFFUSION_CPU_ATTN_FAST=1` | `cpu`: FMA attention tiles and a vectorized softmax instead of the exact default kernel |
+| `DIFFUSION_CPU_MOE_CHUNK` | `cpu`: tokens per batched-MoE pass, default 512 |
 | `DIFFUSION_NO_SC=1` | Disable self-conditioning |
 | `DIFFUSION_SC_TOPK` | Experimental self-conditioning top-K cutoff, default 32 |
 | `DIFFUSION_BATCHED_FORWARD=1` | Use true batched canvas decode instead of time-sliced fused single-canvas decode |
@@ -263,9 +320,19 @@ When the Web UI hosts a DiffusionGemma GGUF:
 - A final replacement is emitted before the `done` event.
 - Concurrent requests share one background diffusion scheduler and are admitted
   between blocks.
-- On backends without prompt-KV caching (`cpu`, `ggml_cpu`, `ggml_vulkan`) the scheduler runs
+- A Jev structured read, or the image encode of a new turn, does not wait for a
+  chat's whole block: the scheduler hands the model over before its next forward,
+  so it waits only for the forward in progress. The block's output is unchanged.
+- On backends without prompt-KV caching (`ggml_cpu`, `ggml_vulkan`, and `cpu`
+  under `DIFFUSION_NO_PKV=1` or `DIFFUSION_CPU_LEGACY=1`) the scheduler runs
   each sequence's step through the unified `[prefix|canvas]` forward instead of
   prefill + canvas decode; behavior and output are identical.
+- On `cpu` and `ggml_cpu` the server skips its startup shared-prompt warm-up for
+  this model. DiffusionGemma keeps nothing across requests, and the warm-up was a
+  full 48-step denoise of a 256-token canvas, once per thinking mode, before the
+  port opened (the first one took 252.8 s on `cpu` before the `cpu` work above).
+  The GPU backends keep it: it builds their prefill, fused-decode and lm-head
+  graphs before the first request.
 - Image turns need the vision tower loaded with `--mmproj`. Each image is
   expanded into its soft-token span before the context check. The encoded spans
   belong to the sequence in the scheduler and are re-applied whenever its prompt
@@ -321,6 +388,18 @@ opt-in on real GGUFs via `TS_TEST_MODEL_DIR`. It covers:
 - Regression guards for repeated-token output and device-memory retention.
 - Batched decode equivalence and two-request generation through the scheduler
   style used by the server.
+
+The `cpu` path has three more suites.
+[`DiffusionGemmaCpuForwardTests`](../../InferenceWeb.Tests/DiffusionGemmaCpuForwardTests.cs)
+(same `TS_TEST_MODEL_DIR` gate) checks on the real GGUF that a prompt-KV read is
+bitwise the unified forward, including a prompt longer than the sliding window,
+that the batched canvas decode is bitwise the per-sequence decode, and that
+generation with the cache matches the unified forward.
+[`DiffusionGemmaCpuKernelTests`](../../InferenceWeb.Tests/DiffusionGemmaCpuKernelTests.cs)
+and [`DiffusionGemmaQuantContractTests`](../../InferenceWeb.Tests/DiffusionGemmaQuantContractTests.cs)
+need no weights: they pin the fused norm/RoPE, GELU, router and attention kernels
+bitwise to the arithmetic they replaced, and that a row's quantized-matmul result
+does not depend on how many rows or which batch it runs with.
 
 [`DiffusionGemmaProtocolTests`](../../InferenceWeb.Tests/DiffusionGemmaProtocolTests.cs)
 needs no weights and pins the channel parsing: a thought block is dropped unless

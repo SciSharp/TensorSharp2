@@ -636,7 +636,8 @@ namespace TensorSharp.Cli
                     "--diffusion-blocks 4"),
                 new OptionHelp("--width <px> / --height <px>",
                     "Image output dimensions; set both together. Qwen-Image-2.1 requires multiples of 32. " +
-                    "Default: 0 — automatic (native 2048x2048 for Qwen-Image-2.1 text-to-image). Use 1024x1024 for faster drafts.",
+                    "Default: 0 — automatic (native 2048x2048 for Qwen-Image-2.1 text-to-image; 1024x1024 on the cpu " +
+                    "backend, where 2048x2048 takes about 5x longer per step). Use 1024x1024 for faster drafts.",
                     "--width 1024 --height 768"),
                 new OptionHelp("--qwen-image-vae <path>",
                     "Qwen-Image-2.1 VAE (safetensors, or a converted GGUF). Default: same-directory scan next to the " +

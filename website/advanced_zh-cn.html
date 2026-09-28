@@ -117,7 +117,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model DeepSeek-
   <ul>
     <li><strong>CLI</strong> —— <code>--diffusion-steps</code>（每块去噪步数）、<code>--diffusion-seed</code> 与 <code>--diffusion-blocks</code>。</li>
     <li><strong>Web UI</strong> —— 流式发送整条消息的 <code>replace</code> 事件，让你实时观看答案去噪，并通过 <code>DiffusionBatchScheduler</code> 在块边界批处理并发扩散请求。</li>
-    <li><strong>优化</strong> —— 在 GPU 后端上，<code>[prompt | canvas]</code> 的提示侧每块预取一次并跨步复用；GGML 后端使用融合的整模型扩散 decode 加上融合的 lm-head 尾部。</li>
+    <li><strong>优化</strong> —— 在 GPU 后端与纯 C# 的 <code>cpu</code> 后端上，<code>[prompt | canvas]</code> 的提示侧每块预取一次并跨步复用；GGML 后端使用融合的整模型扩散 decode 加上融合的 lm-head 尾部。</li>
   </ul>
 
   <h2 id="perf">性能优化</h2>

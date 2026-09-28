@@ -12,8 +12,10 @@ using TensorSharp.Runtime;
 namespace TensorSharp.Models.QwenImage;
 
 /// <summary>Qwen-Image-2.1's single-stream DiT; GGUF projections stay quantized.
-/// Latent tokens are 64-channel VAE pixels, without the original Qwen-Image's 2x2 packing.</summary>
-internal sealed class QwenImage21DiT : ModelBase
+/// Latent tokens are 64-channel VAE pixels, without the original Qwen-Image's 2x2 packing.
+/// GGML backends run it as one native graph; the pure-C# <c>cpu</c> backend runs the same
+/// math in <see cref="QwenImage21ManagedDiT"/> (QwenImage21DiT.Managed.cs).</summary>
+internal sealed partial class QwenImage21DiT : ModelBase
 {
     internal const int HiddenSize = 4096, HeadDim = 128, Heads = 32, Channels = 64, Layers = 32, TextDim = 4096;
     private readonly Dictionary<string, IntPtr> _pointers = new();
@@ -34,9 +36,13 @@ internal sealed class QwenImage21DiT : ModelBase
         : base(ggufPath, backend, tpGroup?.Degree ?? 1, tpGroup)
     {
         _lora = lora;
+        _pureCpu = !IsGgmlBackend;
         try
         {
-            if (!IsGgmlBackend) throw new NotSupportedException("Qwen-Image-2.1 requires a GGML backend (ggml-metal, ggml-cuda, ggml-vulkan or ggml-cpu).");
+            if (!IsGgmlBackend && backend != BackendType.Cpu)
+                throw new NotSupportedException("Qwen-Image-2.1 requires a GGML backend (ggml-metal, ggml-cuda, ggml-vulkan or ggml-cpu) or the pure-C# cpu backend.");
+            if (!IsGgmlBackend && tpGroup != null)
+                throw new NotSupportedException("The pure-C# cpu backend runs Qwen-Image-2.1 in one process; tensor parallelism needs a GGML GPU backend.");
             EnsureQuantBackendAvailable();
             Config = new ModelConfig { Architecture = "qwen_image_2_1", HiddenSize = HiddenSize, NumLayers = Layers };
             _prefix = _gguf.Tensors.ContainsKey("img_in.weight") ? "" : "model.diffusion_model.";
@@ -83,7 +89,14 @@ internal sealed class QwenImage21DiT : ModelBase
             }
             if (_gguf.Tensors.ContainsKey(_prefix + $"transformer_blocks.{Layers}.attn.to_q.weight"))
                 throw new NotSupportedException("Expected a 32-layer Qwen-Image-2.1 transformer.");
-            if (IsTensorParallel)
+            if (_pureCpu)
+            {
+                _managed = new QwenImage21ManagedDiT(_nativeWeights, _blocks);
+                Console.WriteLine($"Qwen-Image-2.1 DiT: {Layers} layers, {HiddenSize} hidden, {Heads} heads, pure-C# forward " +
+                    $"(file-mapped quantized weights, {(QwenImage21ManagedDiT.F32Matmul ? "F32" : "Q8_K/Q8_0")} activations, " +
+                    $"{QwenImage21CpuKernels.Width * 32}-bit kernels).");
+            }
+            else if (IsTensorParallel)
             {
                 _rankBlocks = ShardBlocks(_blocks, TpDegree, _owned);
                 Console.WriteLine($"Qwen-Image-2.1 DiT: {Layers} layers, {HiddenSize} hidden, {Heads} heads sharded over {TpDegree} GPUs " +
@@ -175,6 +188,13 @@ internal sealed class QwenImage21DiT : ModelBase
             return _pointers[name] = ptr;
         ptr = QuantizedWeight.AllocateBuffer(count * sizeof(float));
         _owned.Add(ptr);
+        // The cpu backend never reaches native dequantization, whatever another model in the
+        // process set NativeDequant.PreferManaged to.
+        if (!IsGgmlBackend && _gguf.TryGetTensorDataPointer(info, out IntPtr mapped))
+        {
+            ManagedQuantizedOps.DequantizeToFloat32Native((int)info.Type, mapped, ptr, count);
+            return _pointers[name] = ptr;
+        }
         long bytes = _gguf.GetTensorByteCount(info);
         IntPtr source = QuantizedWeight.AllocateBuffer(bytes);
         try
@@ -212,7 +232,33 @@ internal sealed class QwenImage21DiT : ModelBase
         internal QwenImage21ForwardPath LastPath { get; set; }
         private bool _disposed;
 
-        internal QwenImage21PrefixCacheInfo Info => GgmlBasicOps.QwenImage21GetPrefixCacheInfo(Key);
+        /// <summary>The stored K/V of the pure-C# transformer, created by its first prediction.</summary>
+        internal QwenImage21ManagedPrefix Managed { get; set; }
+
+        /// <summary>Set once a native forward has used <see cref="Key"/>: only then is there
+        /// native state to query or release (the cpu backend must never call native code).</summary>
+        internal bool UsedNatively { get; set; }
+
+        /// <summary>Calls this cache made into the native library. Both native entry points
+        /// go through <see cref="NativeInfo"/> and <see cref="NativeRelease"/>, so a test can
+        /// assert the cpu backend made none whether or not GgmlOps is loadable (from a repo
+        /// checkout it always is, and a stray call would succeed silently).</summary>
+        internal int NativeCalls { get; private set; }
+
+        internal QwenImage21PrefixCacheInfo Info => Managed != null ? Managed.Info
+            : UsedNatively ? NativeInfo() : default;
+
+        private QwenImage21PrefixCacheInfo NativeInfo()
+        {
+            NativeCalls++;
+            return GgmlBasicOps.QwenImage21GetPrefixCacheInfo(Key);
+        }
+
+        private void NativeRelease()
+        {
+            NativeCalls++;
+            GgmlBasicOps.QwenImage21ReleasePrefixCache(Key);
+        }
 
         /// <summary>True when a prediction passes the very arrays this cache was made for.
         /// Stored K/V encode that conditioning; other text or references would silently
@@ -225,7 +271,9 @@ internal sealed class QwenImage21DiT : ModelBase
         {
             if (_disposed) return;
             _disposed = true;
-            GgmlBasicOps.QwenImage21ReleasePrefixCache(Key);
+            Managed?.Dispose();
+            Managed = null;
+            if (UsedNatively) NativeRelease();
         }
     }
 
@@ -309,6 +357,21 @@ internal sealed class QwenImage21DiT : ModelBase
             time[256 + i] = 1f;
         }
         var output = new float[targetTokens.Length];
+        // Route on the backend, not on _managed (null after Dispose): a disposed cpu
+        // transformer must fail here, never fall through to the native graph.
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_pureCpu)
+            PredictManaged(images, textCond, textSeq, time, layout, prefixCache, output);
+        else
+            PredictNative(images, textCond, textSeq, time, layout, prefixCache, output);
+        if (output.Any(v => !float.IsFinite(v)))
+            throw new InvalidOperationException("Qwen-Image-2.1 DiT produced non-finite latent velocities.");
+        return output;
+    }
+
+    private void PredictNative(float[] images, float[] textCond, int textSeq, float[] time,
+        (QwenImage21Segment[] Segments, float[] Cos, float[] Sin, int Prefix) layout, PrefixCache prefixCache, float[] output)
+    {
         var pins = new List<GCHandle>();
         IntPtr Pin<T>(T[] data) where T : struct
         {
@@ -326,6 +389,7 @@ internal sealed class QwenImage21DiT : ModelBase
             args.TotalSeq = layout.Cos.Length / (HeadDim / 2); args.PrefixSeq = layout.Prefix;
             args.NumSegments = layout.Segments.Length;
             args.PrefixCacheKey = prefixCache?.Key ?? 0;
+            if (prefixCache != null) prefixCache.UsedNatively = true;
             args.PrefixCacheType = prefixCache?.Type ?? QwenImage21PrefixCacheType.Auto;
             args.Adapter = _lora?.AdapterFor(0) ?? IntPtr.Zero;
             QwenImage21ForwardPath path;
@@ -347,9 +411,6 @@ internal sealed class QwenImage21DiT : ModelBase
             if (prefixCache != null) prefixCache.LastPath = path;
         }
         finally { foreach (var pin in pins) pin.Free(); }
-        if (output.Any(v => !float.IsFinite(v)))
-            throw new InvalidOperationException("Qwen-Image-2.1 DiT produced non-finite latent velocities.");
-        return output;
     }
 
     /// <summary>Round to the nearest bfloat16 (ties to even), as torch's .to(torch.bfloat16).</summary>
@@ -455,7 +516,10 @@ internal sealed class QwenImage21DiT : ModelBase
     protected override void ResetKVCacheCore() { }
     public override void Dispose()
     {
+        _disposed = true;
         _layouts.Clear();
+        _managed?.Dispose();
+        _managed = null;
         base.Dispose();
         foreach (var ptr in _owned) QuantizedWeight.FreeBuffer(ptr);
         _owned.Clear(); _pointers.Clear();

@@ -40,11 +40,13 @@ namespace TensorSharp.Models
         //
         // Parking early loses because a job has to wake every worker, and 121
         // kernel wakeups cost far more than the ~60 us of work being handed out.
-        // Spinning is not free either - the pool holds a thread per core while the
-        // REST of the CPU path (attention, elementwise ops in the core assembly)
-        // still runs on the ThreadPool, so spinners burn the CPU quota that work
-        // needs. That is what ThreadCount is for: the pool deliberately does NOT
-        // take every core.
+        // Spinning is not free either: spinners burn CPU quota that any work still
+        // on the ThreadPool needs. When this was measured, attention and the Core
+        // elementwise ops ran there; they have since moved onto this pool too (the
+        // Core kernels through CpuParallelBinding, the pure-C# model kernels
+        // through CpuWorkers), and what remains on the ThreadPool is mostly model
+        // glue and the pre-existing per-model loops. ThreadCount is still why the
+        // pool deliberately does NOT take every core (see DefaultThreadCountFor).
         private static readonly int SpinsBeforePark = EnvInt("TS_CPU_SPIN", 4096);
 
         private static int EnvInt(string name, int fallback)
@@ -111,12 +113,16 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// How wide the pool should be. NOT every core: the quantized matmuls this
-        /// pool runs are only part of the CPU path, the rest still uses the
-        /// ThreadPool, and workers spin between jobs. Taking every core made the
-        /// spinners starve that other work and regressed prefill. It also buys
-        /// nothing - past about a quarter of this machine the matmuls stop scaling,
-        /// so the extra threads only add spin.
+        /// How wide the pool should be. NOT every core. The rationale dates from
+        /// when this pool ran only the quantized matmuls and the rest of the CPU
+        /// path used the ThreadPool: workers spin between jobs, and taking every
+        /// core made the spinners starve that other work and regressed prefill.
+        /// It also bought nothing - past about a quarter of a 122-core machine the
+        /// matmuls stop scaling, so the extra threads only add spin. The Core
+        /// kernels (GEMM, elementwise, norms) and the pure-C# model kernels now
+        /// run here as well, which the default has not been re-tuned for: above 8
+        /// logical processors it is half of them (one per core on an SMT part such
+        /// as the 8-core/16-thread i7-11800H). TS_CPU_THREADS overrides it.
         /// </summary>
         internal static int DefaultThreadCountFor(int processors)
             => processors <= 8 ? Math.Max(1, processors) : Math.Max(8, processors / 2);

@@ -23,7 +23,7 @@
 | GGML CUDA | `--backend ggml_cuda` | 通过 ggml 使用 NVIDIA 推理 | 通过 GGML CUDA 在 Windows 或 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
 | GGML Vulkan | `--backend ggml_vulkan` | 通过 ggml 的厂商无关 GPU 推理 | 通过 GGML Vulkan 在 Windows 或 Linux 上加速——支持带 Vulkan 1.3 驱动的 AMD、Intel 与 NVIDIA GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。机器有 Vulkan 运行时（已安装 loader）时原生构建会自动启用；未安装 Vulkan SDK 或发行版开发包时，构建会通过 `eng/fetch-vulkan-toolchain.ps1` / `eng/fetch-vulkan-toolchain.sh` 自动下载便携工具链（headers、glslc、SPIRV-Headers，Windows 上还有 loader 导入库）。用 `--no-vulkan`（或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`）退出。 |
 | GGML CPU | `--backend ggml_cpu` | 原生 CPU 内核 | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
-| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 无原生依赖的可移植 CPU 推理。托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，默认宽度是可用核心数的一半（`TS_CPU_THREADS` 及下文其余 `TS_CPU_*` 开关）；在 direct 视频网络（Wan、MiniMax-H3）上，量化权重直接以 GGUF 存储类型参与乘法，而不再在加载时展开成 F32（`TS_DIRECT_QUANT_WEIGHTS=0` 恢复展开）。DeepSeek V4.1 Flash 与下文的 DeepSeek V4 Flash 一样，在这里也走自己的整模型执行器——100% 纯 C# 的 `DeepSeek4CpuExecutor`，它是正确性与可移植性路径，而非服务路径，其计算宽度来自 `TS_DSV4_THREADS`（这个后端上默认取全部处理器）而不是 `TS_CPU_THREADS`。 |
+| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 可移植的 CPU 推理：模型计算不加载任何原生库（桌面平台上的图像文件读写仍经由 Magick.NET，服务端启动时也会探测 GGML / CUDA 后端）。托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，默认宽度是可用核心数的一半（`TS_CPU_THREADS` 及下文其余 `TS_CPU_*` 开关）；在 direct 视频网络（Wan、MiniMax-H3）上，量化权重直接以 GGUF 存储类型参与乘法，而不再在加载时展开成 F32（`TS_DIRECT_QUANT_WEIGHTS=0` 恢复展开）。DeepSeek V4.1 Flash 与下文的 DeepSeek V4 Flash 一样，在这里也走自己的整模型执行器——100% 纯 C# 的 `DeepSeek4CpuExecutor`，它是正确性与可移植性路径，而非服务路径，其计算宽度来自 `TS_DSV4_THREADS`（这个后端上默认取全部处理器）而不是 `TS_CPU_THREADS`。 |
 
 **嵌入编码器使用独立执行器。** `cpu` 路径持有紧凑的量化数组与模型专属线程池，通过 `--embedding-threads` 配置（默认四个线程）；原生嵌入后端可能复制或重排权重。该路径的存储与线程策略见[嵌入执行](docs/embeddings_zh-cn.md#c-api-与实现)。
 
@@ -438,7 +438,7 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--lora-config <path>` | 前一个 `--lora` 的伴随配置：TensorSharp LoRA 配置、PEFT `adapter_config.json` 或 VideoX-Fun `pdd_config.json`。默认：无（PDD 包的 `pdd_config.json`，以及与 `adapter_model.safetensors` 同目录的 PEFT `adapter_config.json`，会在权重旁自动找到）。 |
 | `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
 | `--penalty-last-n` / `--paged-kv-cache` / `--no-paged-kv-cache` | **已移除，启动时（包括作为配置文件键时）直接拒绝**（退出码 1，`Configuration error: --penalty-last-n was removed: …`）。`--penalty-last-n` 是 CLI 独有的重复惩罚窗口名：请改用 `--repeat-last-n <N>`，即两个宿主与请求字段 `repeat_last_n` 共用的拼写。`--paged-kv-cache` / `--no-paged-kv-cache` 是 `--paged-kv` / `--no-paged-kv` 的第二种拼写。 |
-| `--width <px>` / `--height <px>` | Qwen-Image-2.1 与视频生成的输出尺寸。默认 `0` —— 自动（Qwen-Image-2.1：生成为 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸，显式尺寸须为 32 的倍数；MiniMax-H3：640×384，有条件图时按该面积取图片宽高比，并向上取整到 32 的倍数；Wan：按输入图的宽高比取模型原生面积，TI2V-5B 为 1280×704，其余为 832×480）。 |
+| `--width <px>` / `--height <px>` | Qwen-Image-2.1 与视频生成的输出尺寸。默认 `0` —— 自动（Qwen-Image-2.1：生成为 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸——在纯 C# 的 `cpu` 后端上为 1024×1024（1 百万像素）——显式尺寸须为 32 的倍数；MiniMax-H3：640×384，有条件图时按该面积取图片宽高比，并向上取整到 32 的倍数；Wan：按输入图的宽高比取模型原生面积，TI2V-5B 为 1280×704，其余为 832×480）。 |
 | `--video-frames <N>` | 视频帧数，会对齐到模型自己的时间网格（Wan 为 `4k+1`；MiniMax-H3 为 `17k+5` —— 5、22、39、56、73、90…）。默认：33；Wan2.2-TI2V 为 49，MiniMax-H3 为 22。`1` 生成一张静态图（配合 `--output out.png`）。 |
 | `--fps <N>` | 保存的 MP4 的播放帧率（默认：16；Wan2.2-TI2V 为 24）。以固定帧率训练的模型（MiniMax-H3，24 fps）会覆盖任何其他取值。 |
 | `--flow-shift <F>` | FlowMatch 时间步 shift（默认：模型官方配方 —— Wan 2.2 为 5.0，A14B T2V 为 12.0，Wan 2.1 为 8.0/3.0/5.0，MiniMax-H3 为 12.0）。在带联合音频流的模型上，该 shift 只作用于视频流。 |
@@ -702,7 +702,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--video-dit2 <path>` | 双专家模型的第二个扩散专家（Wan 2.2 A14B 中与 `--model` 配对的 high/low-noise 搭档）。两者同目录时按文件名自动解析。环境变量：`TS_VIDEO_DIT2`；`--wan-dit2` 仍然兼容。 |
 | `--audio-vae <path>` | 与视频联合生成音轨的模型所用的音频 VAE（`minimax_h3_audio_vae_fp32.safetensors`）。不提供时该类模型仍能出图，只是没有音频。环境变量：`TS_VIDEO_AUDIO_VAE`。 |
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | 覆盖服务端原本在 DiT GGUF 旁找到的 Qwen-Image-2.1 伴随文件：VAE、Qwen3-VL-8B 文本编码器及其视觉投影器（编辑时需要）。启动时检查。环境变量：`TS_QWEN_IMAGE_VAE`、`TS_QWEN_IMAGE_TE`、`TS_QWEN_IMAGE_MMPROJ`。 |
-| `--width <px>` / `--height <px>` | 图像请求既未指定尺寸也未指定面积时（Web UI 从不指定）Qwen-Image-2.1 的默认输出尺寸；请求自己设置了宽高或目标面积时保留它自己的几何设置。默认尺寸需要两个值都给出。不是 32 倍数的边会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING`；只给出一边、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸（2048×2048 面积）。Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝启动。请求本身设置的宽高仍必须是 32 的正整数倍。环境变量：`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`。它们同时也是 `--video-width` / `--video-height` 的别名。 |
+| `--width <px>` / `--height <px>` | 图像请求既未指定尺寸也未指定面积时（Web UI 从不指定）Qwen-Image-2.1 的默认输出尺寸；请求自己设置了宽高或目标面积时保留它自己的几何设置。默认尺寸需要两个值都给出。不是 32 倍数的边会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING`；只给出一边、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸（2048×2048 面积；`cpu` 后端上为 1024×1024）。Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝启动。请求本身设置的宽高仍必须是 32 的正整数倍。环境变量：`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`。它们同时也是 `--video-width` / `--video-height` 的别名。 |
 | `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | Qwen-Image-2.1 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 `--lora` 可叠加；强度与配置绑定到前一个 `--lora`）。文件在启动时检查，这组插件作用于每个图像请求；请求中的 `steps` / `cfg` 仍会覆盖插件的采样配方。其他模型会忽略它们（启动日志会说明这些插件只作用于 Qwen-Image-2.1 模型）。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)。 |
 | `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
 | `--temperature <f>` | 采样温度（`0` = 贪心） |
@@ -1991,11 +1991,29 @@ Radix。CLI 的普通生成现在使用共享调度器，其报告的 prefill �
 #### 纯 C# CPU 后端（`--backend cpu`）
 
 托管矩阵乘跑在一个常驻的"自旋后挂起"工作线程池上，而不是每次矩阵乘一个 `Parallel.For`。
-它**刻意不占满**所有核心：CPU 路径的其余部分仍然使用 ThreadPool，而池内线程在两次任务之间
-自旋，占满每个核心会把那部分工作饿死。在 122 个 CPU 的配额上用 gemma-4-E4B-it-Q8_0 实测
+它**刻意不占满**所有核心。这个默认值是在 CPU 路径的其余部分仍使用 ThreadPool 时调出来的：池内线程
+在两次任务之间自旋，占满每个核心会把那部分工作饿死。在 122 个 CPU 的配额上用 gemma-4-E4B-it-Q8_0 实测
 （prefill / decode tok/s，每格为两次交替运行）：关闭池 21.7,21.0 / 2.0,2.4；32 线程 24.9,24.1 / 4.9,5.0；48 线程 25.6,28.5 / 5.4,6.0；
 61 线程 24.2,24.9 / 6.3,5.9；122 线程 13.5 / 4.8——即默认宽度下 prefill 约 +15%，decode 约
 2.8 倍。122 线程时只有 prefill 回退，解码仍优于关闭池的基线。
+
+同一个线程池也运行 Core 的 CPU 内核：`TensorSharp.Models` 在模块加载时把 Core 的 `CpuParallel`
+钩子绑定到它上面，因此 `Ops.Addmm` 背后的 packed F32 SGEMM、SIMD 逐元素 / norm / softmax / RoPE
+内核、DiffusionGemma 与 Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的文本编码器与视觉塔
+共用一组工作线程（Qwen-Image 的 VAE 另有一个更宽的专用池，`TS_CPU_GEMM_THREADS`）。这些都上池之后，
+在 8 核 16 线程的 i7-11800H 上用 16 线程替代默认的 8 线程，Qwen-Image 的 Transformer 步变快，但其文本编码器前向
+与 DiffusionGemma 对新提示的读取变慢，因此默认宽度保持不变。量化权重（Q4_K、
+Q5_K、Q6_K、Q4_0、Q5_0、Q8_0）走多行 int8 GEMM，F16/BF16/F32 以及只能反量化的类型走浮点面板 GEMM。
+它们各有一个取 `0` 的开关，可在同一个二进制里恢复旧代码（见下表）；带默认值与实测数据的完整列表见
+[环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md#矩阵外的纯-c-cpu-后端变量)。要在 AVX-512 机器上测试
+AVX2 内核，用 `TS_CPU_DISABLE_AVX512=1`；要模拟只有 AVX2 的主机，用 `DOTNET_EnableAVX512=0` 启动进程
+（.NET 10 会忽略旧的 `DOTNET_EnableAVX512F=0`）。所有内核都从同一个判定取得指令集：AVX-512 要求
+AVX-512 F/BW/DQ 且运行时对 `Vector512` 做了硬件加速，因此不会有一类内核用 AVX-512、另一类用 AVX2。
+例外是 `TS_CPU_QGEMM=0` 所回到的旧逐行 Q4_0 / Q8_0 点积：它们沿用原来的判定（具备 AVX-512 F/BW），
+因此在运行时没有对 `Vector512` 做硬件加速的主机上，它们照旧运行。
+要回到引入这些内核之前这个后端的算术，四个开关都要设置：`TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0
+TS_CPU_SIMD_ELEMENTWISE=0`，DiffusionGemma 另加 `DIFFUSION_CPU_LEGACY=1`；只设置某一方面的开关时，共享内核
+仍然是新代码。
 
 上面这些 tok/s 只属于 gemma-4-E4B-it-Q8_0 上的通用托管逐算子路径，不代表别的东西。
 **DeepSeek V4.1 Flash 根本不走那条路径——与 DeepSeek V4 Flash 一样，它在这个后端上跑
@@ -2008,10 +2026,17 @@ fixture 上由 PyTorch 参照实现 `eng/dsv41-reference.py` 在 `atol=rtol=2e-5
 
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
-| 工作线程池宽度 | 8 核及以下取全部核心；8 核以上取一半，且不低于 8 | `TS_CPU_THREADS=N` | — |
-| 是否启用工作线程池 | 启用 | `TS_CPU_POOL=0` 回退到旧的 ThreadPool `Parallel.For` 行为，便于在同一个二进制里做 A/B | — |
+| 工作线程池宽度（托管 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image 内核） | 8 核及以下取全部核心；8 核以上取一半，且不低于 8 | `TS_CPU_THREADS=N` | — |
+| 是否启用工作线程池 | 启用 | `TS_CPU_POOL=0` 让所有分派并行任务的托管内核——量化 matmul、Core 的 CPU 内核、DiffusionGemma / Qwen-Image-2.1 的 Transformer 内核，以及 Qwen-Image 的 VAE、文本编码器与视觉塔（VAE 的宽度上限为 `TS_CPU_GEMM_THREADS`）——回退到 ThreadPool 的 `Parallel.For`，用于负担不起自旋线程的主机，也便于在同一个二进制里做 A/B；结果不变。Direct 视频网络的行循环仍在线程池上 | — |
 | 工作线程挂起前的自旋次数 | `4096` | `TS_CPU_SPIN=N` —— 在这个宽度下挂起才是最贵的部分，所以默认自旋次数足够多，使稳态下根本不会挂起 | — |
 | 单次托管矩阵乘的任务切分 | 每个工作项 `131072` 字节权重，每个线程最多 `4` 个工作项 | `TS_CPU_TASK_BYTES`、`TS_CPU_TASKS_PER_WORKER` —— 按**工作量**而不是线程数来切 | — |
+| 多行量化 GEMM（Q4_K、Q5_K、Q6_K、Q4_0、Q5_0、Q8_0） | 有 AVX2+FMA 时启用 | `TS_CPU_QGEMM=0` 恢复旧的逐行托管 matmul；`TS_CPU_QGEMM_VERIFY=1` 让每次 GEMM 与它对照（很慢）；`TS_CPU_QGEMM_MIN_ROWS`、`TS_CPU_QGEMM_TASK_MACS`、`TS_CPU_QGEMM_L2_BYTES` 用于诊断与调优 | — |
+| 浮点面板 GEMM（F16、BF16、F32 与只能反量化的类型） | 启用 | `TS_CPU_FGEMM=0` 恢复旧的"反量化再点积"循环 | — |
+| `Ops.Addmm` 与 Direct 网络背后的 packed F32 SGEMM | 启用（AVX-512 8x32、AVX2 6x16 或可移植内核） | `TS_CPU_SGEMM=0` 恢复旧循环；`TS_CPU_SGEMM_KERNEL`、`TS_CPU_SGEMM_KC` / `_MC` / `_NC`、`TS_CPU_SGEMM_DOT_MAXN` 用于调优 | — |
+| SIMD 逐元素、norm、softmax 与 RoPE 内核 | 启用 | `TS_CPU_SIMD_ELEMENTWISE=0` 恢复旧循环 | — |
+| AVX-512 内核 | CPU 支持 AVX-512 F/BW/DQ 且运行时对 `Vector512` 做了硬件加速时启用（旧的逐行 Q4_0 / Q8_0 点积：CPU 支持 AVX-512 F/BW 时启用） | `TS_CPU_DISABLE_AVX512=1` 让所有手写内核以 AVX2 形式运行；`DOTNET_EnableAVX512=0`（不是 `DOTNET_EnableAVX512F`）让整个运行时只用到 AVX2 | — |
+| `cpu` 上的 DiffusionGemma | prompt-KV 缓存、批量 MoE、融合的 Q/K/V 与 gate/up 投影 | `DIFFUSION_NO_PKV=1` 关闭 prompt-KV 缓存；`DIFFUSION_CPU_LEGACY=1` 用一个开关恢复 DiffusionGemma 专有的旧阶段（按阶段：`DIFFUSION_CPU_LEGACY_MOE`、`_PROJ`、`_ATTN`、`_ROUTER`），它们下面的 matmul 仍走新的共享内核——要回到之前的算术，还需设置 `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0`；`DIFFUSION_CPU_ATTN_FAST=1`、`DIFFUSION_CPU_MOE_CHUNK` | — |
+| `cpu` 上的 Qwen-Image-2.1 | 托管 DiT 与文本编码器使用 8 位激活、在多行整数 GEMM 上计算，VAE 与视觉塔走 packed GEMM；未指定尺寸的请求输出 1024×1024（1 百万像素）——`ggml_cpu` 与 GPU 后端保持 2048×2048 | `TS_QWEN21_CPU_MATMUL=f32` 与 `TS_QWEN_TE_CPU_MATMUL=f32` 保留 F32 激活乘以反量化权重分块（更慢，数值更稳定）；`TS_QWEN_VAE_CPU=scalar`、`TS_QWEN_TE_CPU_GEMM=0`、`TS_QWEN_TE_CPU_ATTN=0`、`TS_QWEN35_VENC_CPU_GEMM=0`、`TS_QWEN35_VENC_CPU_ATTN=0` 恢复旧的各阶段；`TS_CPU_GEMM_THREADS` 设置 VAE 专用池的宽度（每个逻辑 CPU 一个线程，最多 64）；`TS_QWEN_IMAGE_CPU_MEMORY_CHECK=0` 跳过对内存放不下的尺寸的预先拒绝；`TS_QWEN21_CPU_PROFILE=1`、`TS_QWEN_VAE_PROFILE=1`、`TS_QWEN_TE_PROFILE=1` 打印各阶段耗时 | — |
 | DeepSeek V4.1 Flash 的整模型执行器 | 纯 C#（`DeepSeek4CpuExecutor`）——在这个后端上走整模型执行器，而不是通用逐算子路径 | 它的计算宽度由 `TS_DSV4_THREADS=N` 决定（默认取全部处理器），而不是 `TS_CPU_THREADS` | — |
 | direct 视频网络（Wan、MiniMax-H3）上的量化权重 | 保持 GGUF 存储类型，直接参与乘法 | `TS_DIRECT_QUANT_WEIGHTS=0` 改回加载时一次性展开成 F32 再做普通 GEMM（旧行为，权重内存为 4 倍）。Wan 在 256x160x5f、单步下，就地路径实测 80.9 秒，展开路径 121.4 秒 | — |
 

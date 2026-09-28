@@ -697,7 +697,17 @@ if (!hostingOptions.EmbeddingsEnabled && hostingOptions.PrefixCacheEnabled
     // Image/video diffusion models have no autoregressive chat prefix to prefill.
     // Calling their chat adapter would emit a false startup failure before image serving.
     && app.Services.GetRequiredService<ModelService>().Model is not
-        (TensorSharp.Models.QwenImage.QwenImageModel or TensorSharp.Models.Video.IVideoGenerationModel))
+        (TensorSharp.Models.QwenImage.QwenImageModel or TensorSharp.Models.Video.IVideoGenerationModel)
+    // DiffusionGemma keeps nothing across requests either: every turn gets a fresh sequence
+    // state whose prompt K/V are recomputed per block, and diffusion turns record no cache
+    // scope - yet its one-token warm-up is a full 48-step, 256-token canvas denoise, twice
+    // (measured 252.8 s each on the cpu backend) before the port opens. On the CPU backends
+    // that buys almost nothing: ggml_cpu runs only the unified forward the load-time
+    // WarmUpKernels already ran, and the pure-C# cpu kernels need no more than JIT. The GPU
+    // backends keep it: it builds their prefill, fused-decode and lm_head graphs and device
+    // buffers before the first real request instead of during it.
+    && !(app.Services.GetRequiredService<ModelService>().Model is TensorSharp.Models.DiffusionGemmaModel
+        && app.Services.GetRequiredService<ModelService>().LoadedBackend is "cpu" or "ggml_cpu"))
 {
     var warmupAdapter = app.Services.GetRequiredService<WebUiAdapter>();
     var warmupSessions = app.Services.GetRequiredService<SessionManager>();

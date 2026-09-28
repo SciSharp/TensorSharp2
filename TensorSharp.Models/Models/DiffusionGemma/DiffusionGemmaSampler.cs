@@ -380,11 +380,44 @@ namespace TensorSharp.Models
         /// sequence's current prefix, denoises all canvases together (batched forward per step), and commits
         /// each sequence's trimmed block tokens via <see cref="DiffusionSeqRun.CommitBlock"/>. A sequence that
         /// converges early (or whose request is cancelled) freezes its canvas and is dropped from the batch
-        /// for the remaining steps so it doesn't waste GPU work on the slower sequences.</summary>
-        public void RunBlockBatched(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken = default)
+        /// for the remaining steps so it doesn't waste GPU work on the slower sequences.
+        ///
+        /// <para><paramref name="beforeForward"/> runs before every model forward of the block (each
+        /// sequence's prefill, each denoising decode). The server scheduler passes
+        /// <see cref="DiffusionComputeTurns.Yield"/>, so a Jev read or an image encode waiting for the
+        /// compute lock runs there instead of after the whole block. That is output-neutral because, at
+        /// those points, everything the block carries from one forward to the next lives in this method's
+        /// locals (canvases, RNGs, the self-conditioning copies in <c>scBuffer</c> or the device top-K
+        /// buffers, convergence state) and in each sequence's own <see cref="DiffusionSeqState"/>, which
+        /// nothing else writes. The model state another job touches is either keyed caches that are rebuilt
+        /// from their key (masks, RoPE tables, positions; the image-span version is part of the mask key),
+        /// or the pooled logits buffers, which the previous forward's sampling has already consumed. A job
+        /// can also latch one of the model's fallback switches (a fused kernel rejecting the job's layout);
+        /// <see cref="DiffusionBlockHandoff"/> keeps that from the block until it ends, so the block
+        /// finishes on the path it started on, as it would have with the job after it.</para></summary>
+        public void RunBlockBatched(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken = default,
+            Action beforeForward = null)
+        {
+            if (active.Count == 0) return;
+            if (beforeForward == null)
+            {
+                RunBlock(active, stopToken, null);
+                return;
+            }
+            var handoff = new DiffusionBlockHandoff(_model, beforeForward);
+            try
+            {
+                RunBlock(active, stopToken, handoff.BeforeForward);
+            }
+            finally
+            {
+                handoff.EndBlock();
+            }
+        }
+
+        private void RunBlock(IReadOnlyList<DiffusionSeqRun> active, CancellationToken stopToken, Action beforeForward)
         {
             int A = active.Count;
-            if (A == 0) return;
             int C = _canvasLength;
             int vocab = _vocab;
 
@@ -399,9 +432,10 @@ namespace TensorSharp.Models
             var prevTempInv = new float[A];
             int Smax = 1;
 
-            // Prompt-KV caching (device-glue backends): prefill each sequence's prefix K/V once, then each
-            // step decodes only its canvas. CPU backends have no prompt-KV store, so each step runs the
-            // unified [prefix|canvas] forward per sequence instead — the same fallback DenoiseBlock uses.
+            // Prompt-KV caching (device-glue backends and the pure-C# cpu backend): prefill each sequence's
+            // prefix K/V once, then each step decodes only its canvas. Backends without a prompt-KV store
+            // (ggml_cpu, or DIFFUSION_NO_PKV=1) run the unified [prefix|canvas] forward per sequence
+            // instead — the same fallback DenoiseBlock uses.
             bool usePkv = _model.SupportsPromptKvCache;
             var unifiedTokens = usePkv ? null : new int[A][];   // per-seq [prefix|canvas] buffer
             var promptLen = usePkv ? null : new int[A];
@@ -410,6 +444,7 @@ namespace TensorSharp.Models
             // sampled/top-K directly, so no full [vocab,C] logits cross PCIe. Each sequence keeps its own
             // double-buffered top-K (for self-conditioning), argmax/sampled, mirroring DenoiseBlock.
             bool useDeviceSample = usePkv && _model.SupportsDeviceSampling;
+            bool deviceFellBack = false;
             int K = _model.SelfCondTopK;
             int[][][] dTopTok = useDeviceSample ? new int[A][][] : null;
             float[][][] dTopPrb = useDeviceSample ? new float[A][][] : null;
@@ -424,6 +459,7 @@ namespace TensorSharp.Models
                 seqs[a] = run.State;
                 if (usePkv)
                 {
+                    beforeForward?.Invoke();
                     _model.PrefillSeq(run.State, run.Prefix.ToArray());
                 }
                 else
@@ -500,6 +536,7 @@ namespace TensorSharp.Models
                         subCanvas[j] = canvas[a];
                         subPrevTempInv[j] = prevTempInv[a];
                     }
+                    beforeForward?.Invoke();
                     float[][] logits = _model.DecodeCanvasBatched(subSeqs, subCanvas, subScPrev, subScUse, subPrevTempInv);
                     for (int j = 0; j < L; j++)
                     {
@@ -518,10 +555,12 @@ namespace TensorSharp.Models
                     // DEFAULT: decode each live sequence with the fast FUSED single-canvas kernel, then sample
                     // immediately (the kernel returns the model's shared readback buffer, so its logits must be
                     // consumed before the next sequence's decode overwrites it). Time-slices the GPU across the
-                    // active requests at full fused speed. Without prompt-KV (CPU backends) each sequence runs
-                    // the unified [prefix|canvas] forward instead, which has the same shared-buffer contract.
+                    // active requests at full fused speed. Without prompt-KV (ggml_cpu, DIFFUSION_NO_PKV=1) each
+                    // sequence runs the unified [prefix|canvas] forward instead, which has the same
+                    // shared-buffer contract.
                     for (int j = 0; j < L; j++)
                     {
+                        beforeForward?.Invoke();
                         int a = live[j];
                         var run = active[a];
                         int S = Math.Max(1, run.Params.MaxDenoisingSteps);
@@ -547,6 +586,7 @@ namespace TensorSharp.Models
                                 continue;
                             }
                             useDeviceSample = false;   // kernel rejected: fall back to the host path for the rest
+                            deviceFellBack = true;
                             WarnDeviceSampleFallback();
                         }
 
@@ -558,8 +598,20 @@ namespace TensorSharp.Models
                         else
                         {
                             Array.Copy(canvas[a], 0, unifiedTokens[a], promptLen[a], C);
-                            lg = _model.ForwardCanvas(unifiedTokens[a], promptLen[a], scBuffer[a], scUse, prevTempInv[a]);
+                            // The scheduler parks a request's image spans on ITS sequence state, and the
+                            // unified forward re-embeds the whole prompt every step, so scope the spans to
+                            // this forward exactly as PrefillSeq does - otherwise the image rows would be
+                            // forwarded as their filler token ids on the non-prompt-KV backends. For a
+                            // text-only sequence on a model with no retained spans the scope is a no-op, so
+                            // the span version (part of the mask cache key) does not move every step.
+                            using (_model.UseSequenceVision(seqs[a]))
+                                lg = _model.ForwardCanvas(unifiedTokens[a], promptLen[a], scBuffer[a], scUse, prevTempInv[a]);
                         }
+                        // A block that started on device sampling has no host self-conditioning buffer (its
+                        // top-K carried SC). After a fall back it starts here, so SC resumes from the next
+                        // step, as in DenoiseBlock, instead of staying off for the rest of the block.
+                        if (deviceFellBack && scBuffer[a] == null && _model.SelfConditioningEnabled)
+                            scBuffer[a] = new float[(long)C * vocab];
                         if (scBuffer[a] != null) Array.Copy(lg, scBuffer[a], (long)C * vocab);
                         bool seqFinished = DenoiseStep(lg, tempInv, rng[a], run.Params,
                             canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u, renoise);

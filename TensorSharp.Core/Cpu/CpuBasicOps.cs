@@ -179,7 +179,9 @@ namespace TensorSharp.Cpu
 
 
 
-        private static bool UseCpuOpsNative => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        // CpuOps.dll entry points are native; with the SIMD kernels enabled the ops that have a
+        // managed implementation stay managed, so the pure-C# backend never P/Invokes.
+        private static bool UseCpuOpsNative => RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && !CpuKernels.Enabled;
 
         private readonly MethodInfo abs_func = NativeWrapper.GetMethod("TS_Abs");
         [RegisterOpStorageType("abs", typeof(CpuStorage))]
@@ -463,7 +465,14 @@ namespace TensorSharp.Cpu
 
         private readonly MethodInfo sub_func = NativeWrapper.GetMethod("TS_Sub");
         [RegisterOpStorageType("subv", typeof(CpuStorage))]
-        public Tensor Sub(Tensor result, Tensor lhs, float rhs) { return NativeWrapper.InvokeNullableResultElementwise(sub_func, result, lhs, rhs); }
+        public Tensor Sub(Tensor result, Tensor lhs, float rhs)
+        {
+            if (!CpuKernels.Enabled) return NativeWrapper.InvokeNullableResultElementwise(sub_func, result, lhs, rhs);
+            // x - r and x + (-r) are the same IEEE operation.
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, lhs, false, lhs.Sizes);
+            TensorApplyCPU.Add(writeTarget, lhs, -rhs);
+            return writeTarget;
+        }
 
 
         [RegisterOpStorageType("rsubv", typeof(CpuStorage))]
@@ -500,7 +509,13 @@ namespace TensorSharp.Cpu
 
         private readonly MethodInfo rdiv_func = NativeWrapper.GetMethod("TS_Rdiv");
         [RegisterOpStorageType("rdivv", typeof(CpuStorage))]
-        public Tensor Div(Tensor result, float lhs, Tensor rhs) { return NativeWrapper.InvokeNullableResultElementwise(rdiv_func, result, rhs, lhs); }
+        public Tensor Div(Tensor result, float lhs, Tensor rhs)
+        {
+            if (!CpuKernels.Enabled) return NativeWrapper.InvokeNullableResultElementwise(rdiv_func, result, rhs, lhs);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, rhs, false, rhs.Sizes);
+            TensorApplyCPU.RDiv(writeTarget, lhs, rhs);
+            return writeTarget;
+        }
 
         private readonly MethodInfo mod_func = NativeWrapper.GetMethod("TS_Mod");
 

@@ -35,12 +35,12 @@ public sealed class QwenVaeConvTilingTests
         for (int i = 0; i < bias.Length; i++) bias[i] = (float)(rng.NextDouble() * 2 - 1) * 0.1f;
         int ho = (h + pt + pb - kh) / sh + 1, wo = (w + pl + pr - kw) / sw + 1;
 
-        bool savedGpu = VaeReferenceMath.UseGpuConv;
         string savedBudget = Environment.GetEnvironmentVariable(BudgetVariable);
         try
         {
-            VaeReferenceMath.UseGpuConv = false;
-            Feature reference = VaeReferenceMath.Conv2d(x, weight, oc, ic, kh, kw, bias, sh, sw, pt, pb, pl, pr);
+            // The direct scalar loop, not Conv2d: off the device Conv2d now runs the packed-GEMM
+            // convolution (VaeCpuOps), which is a third implementation rather than the oracle.
+            Feature reference = VaeReferenceMath.Conv2dScalar(x, weight, oc, ic, kh, kw, bias, sh, sw, pt, pb, pl, pr);
 
             // TryGpuConv2dMaybeTiled never falls back to the managed loop: false means a
             // device call failed, so a true result proves both paths ran on the device.
@@ -71,7 +71,6 @@ public sealed class QwenVaeConvTilingTests
         finally
         {
             Environment.SetEnvironmentVariable(BudgetVariable, savedBudget);
-            VaeReferenceMath.UseGpuConv = savedGpu;
         }
     }
 

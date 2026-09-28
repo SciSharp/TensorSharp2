@@ -87,18 +87,17 @@ namespace TensorSharp.Cli
             // backend buffer that outlives the run (e.g. the reusable prefill
             // compute buffer) must be freed first. Mirror the server's shutdown
             // wiring so the CLI exits cleanly on the GGML/Metal backend.
-            AppDomain.CurrentDomain.ProcessExit += static (_, _) =>
-            {
-                try { TensorSharp.GGML.GgmlBasicOps.Shutdown(); }
-                catch { /* native lib may be absent for non-GGML backends */ }
-            };
+            // Only when GGML is in play (ShouldShutdownGgml): the teardown is itself a
+            // P/Invoke, so on the pure-C# cpu backend it used to load GgmlOps at exit
+            // just to tear down a backend the run never created.
+            string selectedBackend = SelectedBackend(args);
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => ShutdownGgmlIfUsed(selectedBackend);
 
             try
             {
                 MainCore(args);
                 _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed exitCode={ExitCode}", Environment.ExitCode);
-                try { TensorSharp.GGML.GgmlBasicOps.Shutdown(); }
-                catch { /* native lib may be absent for non-GGML backends */ }
+                ShutdownGgmlIfUsed(selectedBackend);
 
                 // ggml-vulkan on Linux: the NVIDIA driver's worker threads
                 // ("[vkrt] Analysis") race the C++ static destructors that tear
@@ -107,7 +106,7 @@ namespace TensorSharp.Cli
                 // has completed. Nothing is left to clean up (backends, caches
                 // and graphs were freed by Shutdown), so skip the destructors:
                 // flush what buffers output and leave through _exit.
-                if (OperatingSystem.IsLinux() && SelectedBackend(args) == "ggml_vulkan")
+                if (OperatingSystem.IsLinux() && selectedBackend == "ggml_vulkan")
                 {
                     loggerFactory.Dispose();
                     Console.Out.Flush();
@@ -171,6 +170,30 @@ namespace TensorSharp.Cli
                     backend = args[i + 1].ToLowerInvariant();
             }
             return backend;
+        }
+
+        /// <summary>
+        /// Whether the exit path calls <see cref="TensorSharp.GGML.GgmlBasicOps.Shutdown"/>. Always
+        /// for a GGML backend - a <c>ggml_*</c> / <c>ggml-*</c> spelling, or no <c>--backend</c> at
+        /// all, since the CLI defaults to ggml_cpu - so their teardown is exactly what it was. For
+        /// <c>cpu</c>, <c>cuda</c> and <c>mlx</c> only when this process already bound the native
+        /// library (a host fallback such as the native dequantizer can): the teardown is a
+        /// P/Invoke, and on a run that never touched GGML it would load GgmlOps only to find
+        /// nothing to free.
+        /// </summary>
+        internal static bool ShouldShutdownGgml(string selectedBackend, bool nativeLibraryLoaded)
+            => nativeLibraryLoaded || selectedBackend == null
+                || selectedBackend.StartsWith("ggml_", StringComparison.Ordinal)
+                || selectedBackend.StartsWith("ggml-", StringComparison.Ordinal);
+
+        private static void ShutdownGgmlIfUsed(string selectedBackend)
+        {
+            try
+            {
+                if (ShouldShutdownGgml(selectedBackend, TensorSharp.GGML.GgmlBasicOps.IsNativeLibraryLoaded))
+                    TensorSharp.GGML.GgmlBasicOps.Shutdown();
+            }
+            catch { /* native lib may be absent on a host without the GGML build */ }
         }
 
         /// <summary>

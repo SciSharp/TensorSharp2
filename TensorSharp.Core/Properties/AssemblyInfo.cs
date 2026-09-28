@@ -42,3 +42,10 @@ using System.Runtime.InteropServices;
 // [assembly: AssemblyVersion("1.0.*")]
 [assembly: AssemblyVersion("2.3.2.0")]
 [assembly: AssemblyFileVersion("2.3.2.0")]
+
+// The managed CPU kernels (CpuSgemm, CpuKernels, CpuParallel, CpuIsa) are internal: they are
+// implementation details of the pure-C# backend, not part of the published TensorSharp.Tensors
+// API. TensorSharp.Models calls them directly and binds its worker pool into CpuParallel.
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("TensorSharp.Models")]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("InferenceWeb.Tests")]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("CpuFloatBench")]

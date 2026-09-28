@@ -78,43 +78,79 @@ namespace TensorSharp.Models.QwenImage
         internal static readonly float[] Qwen21Mean = { 0.5126f, 0.7721f, -0.0631f, 1.3506f, -0.7855f, -2.1025f, -0.3458f, 1.3722f, 1.8873f, -1.7177f, -0.6510f, 0.2732f, 0.7562f, -0.6163f, -1.0277f, 3.8363f, 2.0210f, 0.0472f, 0.9320f, 2.0087f, 2.4954f, -0.1391f, -1.4249f, 1.8464f, -0.5236f, 1.2826f, 3.7046f, -1.3035f, 2.7286f, -1.4518f, -1.9036f, -1.9955f, -0.0342f, -1.0265f, -0.7636f, 3.0555f, 0.0746f, -3.0751f, -0.1076f, 1.7376f, -1.0914f, -1.9435f, -0.2784f, -1.3680f, 0.4809f, -0.4433f, 0.3764f, 0.5729f, -2.0595f, 1.0960f, -1.3260f, -2.0211f, -5.0179f, 0.5275f, 4.0162f, 1.8505f, 0.3026f, 1.9373f, 1.4937f, 0.2632f, 0.5547f, -1.7121f, -0.1562f, 0.0304f };
         internal static readonly float[] Qwen21Std = { 3.2001f, 3.2936f, 3.4321f, 3.0091f, 3.1061f, 4.0379f, 4.0705f, 3.7910f, 3.0785f, 3.6500f, 3.9308f, 3.0904f, 2.8778f, 3.7675f, 3.7320f, 5.0756f, 3.2864f, 4.0397f, 3.1317f, 4.0443f, 2.9249f, 3.9454f, 3.0988f, 4.2489f, 3.4896f, 3.8513f, 3.9323f, 3.4719f, 3.7498f, 4.2830f, 3.5694f, 4.2467f, 3.9037f, 3.2947f, 5.0770f, 3.5075f, 3.2700f, 3.4767f, 2.8063f, 5.1125f, 3.5327f, 4.7833f, 3.1286f, 4.1819f, 3.8527f, 3.8312f, 3.5605f, 4.3875f, 3.9624f, 4.0168f, 3.5643f, 4.0550f, 5.5614f, 4.2963f, 4.4080f, 3.4959f, 3.8747f, 3.7608f, 3.5735f, 3.1490f, 3.7662f, 3.6746f, 3.4563f, 3.8161f };
 
-        private static Feature Conv21(VaeWeights w, string prefix, Feature x, int pad)
+        // Causal conv on T=1 (see LastTemporalSlice). The managed fast path convolves with the
+        // layer's packed kernel; with upsample2x it reads x through the decoder's nearest 2x
+        // upsample instead of materializing the 4x larger map.
+        private static Feature Conv21(VaeWeights w, string prefix, Feature x, int pad, bool upsample2x = false)
         {
             var shape = w.Shape(prefix + ".weight");
             int oc = (int)shape[0], ic = (int)shape[1];
             int kh = (int)shape[^2], kw = (int)shape[^1];
             int kd = shape.Length == 5 ? (int)shape[2] : 1;
-            float[] weight = w.Get(prefix + ".weight"), bias = w.Get(prefix + ".bias");
+            float[] bias = w.Get(prefix + ".bias");
             Trace21(prefix + ".input", x.D);
-            Trace21(prefix + ".weight", weight);
-            Trace21(prefix + ".bias", bias);
-            var result = CausalConv3dT1(x, weight, oc, ic, kd, kh, kw, bias, pad);
+            Feature result;
+            if (FastCpu)
+            {
+                if (TraceVae21) Trace21(prefix + ".weight", w.KernelSlice(prefix + ".weight", oc, ic, kd, kh, kw));
+                Trace21(prefix + ".bias", bias);
+                result = Conv2dCpu(x, w.PackedKernel(prefix + ".weight", oc, ic, kd, kh * kw), bias, oc, kh, kw,
+                    1, 1, pad, pad, pad, pad, upsample2x);
+            }
+            else
+            {
+                float[] weight = w.KernelSlice(prefix + ".weight", oc, ic, kd, kh, kw);
+                Trace21(prefix + ".weight", weight);
+                Trace21(prefix + ".bias", bias);
+                result = Conv2d(upsample2x ? NearestUpsample2x(x) : x, weight, oc, ic, kh, kw, bias, 1, 1, pad, pad, pad, pad);
+            }
             Trace21(prefix + ".output", result.D);
             return result;
         }
 
-        private static Feature Residual21(VaeWeights w, string prefix, Feature x)
+        // Norm then SiLU: one fused pass on the managed fast path (vectorized exp), the exact
+        // scalar SiLU elsewhere and whenever tracing needs the pre-activation tensor. With
+        // inPlace (x is dead afterwards) the fast path overwrites x instead of allocating a map;
+        // the result is either x or a new map, and the caller releases accordingly.
+        private static Feature NormSilu21(VaeWeights w, string gammaName, string traceName, Feature x, bool inPlace = false)
         {
-            var residual = w.Has(prefix + ".shortcut.weight") ? Conv21(w, prefix + ".shortcut", x, 0) : x;
-            var t = RmsNormChannel(x, w.Get(prefix + ".residual.0.gamma"));
-            Trace21(prefix + ".residual.0.output", t.D);
+            if (FastCpu && !TraceVae21) return RmsNormChannelFast(x, w.Get(gammaName), silu: true, inPlace);
+            var t = RmsNormChannel(x, w.Get(gammaName));
+            Trace21(traceName, t.D);
             SiluInPlace(t.D);
-            t = Conv21(w, prefix + ".residual.2", t, 1);
-            t = RmsNormChannel(t, w.Get(prefix + ".residual.3.gamma"));
-            Trace21(prefix + ".residual.3.output", t.D);
-            SiluInPlace(t.D);
-            t = Conv21(w, prefix + ".residual.6", t, 1);
-            var result = AddInPlace(t, residual);
+            return t;
+        }
+
+        // Every map below is released (VaeFeaturePool.Release) as soon as its last reader is
+        // done; that is a no-op off the managed fast path. ownsInput says whether x may be
+        // released here: the first block of a decoder stage reads the stage input, which the
+        // stage still needs for its shortcut.
+        private static Feature Residual21(VaeWeights w, string prefix, Feature x, bool ownsInput)
+        {
+            bool hasShortcut = w.Has(prefix + ".shortcut.weight");
+            var residual = hasShortcut ? Conv21(w, prefix + ".shortcut", x, 0) : x;
+            // With a shortcut conv, x has no reader after the first norm: normalize it in place.
+            bool inputDead = ownsInput && hasShortcut;
+            var t = NormSilu21(w, prefix + ".residual.0.gamma", prefix + ".residual.0.output", x, inPlace: inputDead);
+            var u = Conv21(w, prefix + ".residual.2", t, 1);
+            if (!ReferenceEquals(t, x)) VaeFeaturePool.Release(t);
+            if (inputDead) VaeFeaturePool.Release(x);
+            var v = NormSilu21(w, prefix + ".residual.3.gamma", prefix + ".residual.3.output", u, inPlace: true);
+            var result = Conv21(w, prefix + ".residual.6", v, 1);
+            VaeFeaturePool.Release(v);
+            if (!ReferenceEquals(v, u)) VaeFeaturePool.Release(u);
+            AddInPlace(result, residual);
+            if (hasShortcut || ownsInput) VaeFeaturePool.Release(residual);
             Trace21(prefix + ".output", result.D);
             return result;
         }
 
         private static Feature Mid21(VaeWeights w, string prefix, Feature x)
         {
-            x = Residual21(w, prefix + ".0", x);
+            x = Residual21(w, prefix + ".0", x, ownsInput: true);
             x = AttentionBlock(w, prefix + ".1", x);
             Trace21(prefix + ".1.output", x.D);
-            return Residual21(w, prefix + ".2", x);
+            return Residual21(w, prefix + ".2", x, ownsInput: true);
         }
 
         // Wan2.2's shortcut rearranges [C,T,H,W] -> [OC,group,T',H',W'] and
@@ -123,9 +159,13 @@ namespace TensorSharp.Models.QwenImage
         internal static Feature AverageDown21(Feature x, int outChannels, int timeFactor, int spatialFactor)
         {
             int group = x.C * timeFactor * spatialFactor * spatialFactor / outChannels;
+            long t0 = VaeCpuProfile.Start();
             var y = new Feature(outChannels, x.H / spatialFactor, x.W / spatialFactor);
             int sf2 = spatialFactor * spatialFactor;
-            for (int oc = 0; oc < outChannels; oc++)
+            // Output channels are independent and each keeps its sequential group order, so the
+            // parallel pass is bit-identical to the serial one.
+            CpuPackedGemm.ForEach(outChannels, (long)x.D.Length >= 1 << 16, oc =>
+            {
                 for (int g = 0; g < group; g++)
                 {
                     int packed = oc * group + g;
@@ -134,9 +174,15 @@ namespace TensorSharp.Models.QwenImage
                     if (t != timeFactor - 1) continue;
                     int dy = packed / spatialFactor % spatialFactor, dx = packed % spatialFactor;
                     for (int h = 0; h < y.H; h++)
+                    {
+                        int dst = (oc * y.H + h) * y.W;
+                        int src = (ic * x.H + h * spatialFactor + dy) * x.W + dx;
                         for (int v = 0; v < y.W; v++)
-                            y.D[(oc * y.H + h) * y.W + v] += x.D[(ic * x.H + h * spatialFactor + dy) * x.W + v * spatialFactor + dx] / group;
+                            y.D[dst + v] += x.D[src + v * spatialFactor] / group;
+                    }
                 }
+            }, CpuPool);
+            VaeCpuProfile.Stop(VaeCpuProfile.Resample, t0);
             return y;
         }
 
@@ -144,17 +190,55 @@ namespace TensorSharp.Models.QwenImage
         // the first chunk retains only the final temporal sample.
         internal static Feature DuplicateUp21(Feature x, int outChannels, int timeFactor, int spatialFactor)
         {
+            long t0 = VaeCpuProfile.Start();
             int repeats = outChannels * timeFactor * spatialFactor * spatialFactor / x.C;
-            var y = new Feature(outChannels, x.H * spatialFactor, x.W * spatialFactor);
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int h = 0; h < y.H; h++)
-                    for (int v = 0; v < y.W; v++)
-                    {
-                        int packed = ((oc * timeFactor + timeFactor - 1) * spatialFactor + h % spatialFactor) * spatialFactor + v % spatialFactor;
-                        int ic = packed / repeats;
-                        y.D[(oc * y.H + h) * y.W + v] = x.D[(ic * x.H + h / spatialFactor) * x.W + v / spatialFactor];
-                    }
+            var y = Feature.Uninitialized(outChannels, x.H * spatialFactor, x.W * spatialFactor);
+            CpuPackedGemm.ForEach(outChannels * y.H, (long)y.D.Length >= 1 << 16, row =>
+            {
+                int oc = row / y.H, h = row - oc * y.H;
+                int dst = row * y.W;
+                // Output column v = u*s + j reads input column u of channel ic(j): the source
+                // channel depends only on v % s, so each output row interleaves s input rows.
+                for (int j = 0; j < spatialFactor; j++)
+                {
+                    int packed = ((oc * timeFactor + timeFactor - 1) * spatialFactor + h % spatialFactor) * spatialFactor + j;
+                    int src = (packed / repeats * x.H + h / spatialFactor) * x.W;
+                    for (int u = 0; u < x.W; u++) y.D[dst + u * spatialFactor + j] = x.D[src + u];
+                }
+            }, CpuPool);
+            VaeCpuProfile.Stop(VaeCpuProfile.Resample, t0);
             return y;
+        }
+
+        /// <summary>
+        /// a += DuplicateUp21(x, a.C, timeFactor, spatialFactor), without materializing the
+        /// duplicated map (at 2048x2048 the decoder's last shortcut is 4.8 GB, twice the stage
+        /// input it is read from). Every element is the same single float addition as
+        /// AddInPlace(a, DuplicateUp21(...)), so the result is bit-identical.
+        /// </summary>
+        internal static Feature AddDuplicateUp21InPlace(Feature a, Feature x, int timeFactor, int spatialFactor)
+        {
+            int outChannels = a.C;
+            if (a.H != x.H * spatialFactor || a.W != x.W * spatialFactor ||
+                (long)outChannels * timeFactor * spatialFactor * spatialFactor % x.C != 0)
+                throw new ArgumentException($"cannot add the {spatialFactor}x duplicate of [{x.C}, {x.H}, {x.W}] to [{a.C}, {a.H}, {a.W}]");
+            long t0 = VaeCpuProfile.Start();
+            int repeats = outChannels * timeFactor * spatialFactor * spatialFactor / x.C;
+            // DuplicateUp21's index math: output column v = u*s + j reads input column u of the
+            // channel selected by (oc, h % s, j), row h / s.
+            CpuPackedGemm.ForEach(outChannels * a.H, (long)a.D.Length >= 1 << 16, row =>
+            {
+                int oc = row / a.H, h = row - oc * a.H;
+                int dst = row * a.W;
+                for (int j = 0; j < spatialFactor; j++)
+                {
+                    int packed = ((oc * timeFactor + timeFactor - 1) * spatialFactor + h % spatialFactor) * spatialFactor + j;
+                    int src = (packed / repeats * x.H + h / spatialFactor) * x.W;
+                    for (int u = 0; u < x.W; u++) a.D[dst + u * spatialFactor + j] += x.D[src + u];
+                }
+            }, CpuPool);
+            VaeCpuProfile.Stop(VaeCpuProfile.Resample, t0);
+            return a;
         }
 
         internal static VaeLatent Encode21(VaeWeights w, RgbImage image)
@@ -170,32 +254,46 @@ namespace TensorSharp.Models.QwenImage
             }
             Trace21("encoder.input", x.D);
             var fused = FusedGraph21(w);
+            using var pool = VaeFeaturePool.Enter(FastCpu);
             if (fused != null && fused.TryEncode(x.D, x.H, x.W, out var moments, out int lh, out int lw))
                 x = new Feature(128, lh, lw, moments);
             else
             {
-                x = Conv21(w, "encoder.conv1", x, 1);
-                int[] channels = {96,192,384,768,768};
+                x = Consume(Conv21(w, "encoder.conv1", x, 1), x);
                 for (int stage = 0; stage < 5; stage++)
                 {
                     string prefix = $"encoder.downsamples.{stage}.downsamples";
-                    var shortcut = AverageDown21(x, channels[stage], stage is >= 1 and <= 3 ? 2 : 1, stage < 4 ? 2 : 1);
-                    x = Residual21(w, prefix + ".0", x);
-                    x = Residual21(w, prefix + ".1", x);
-                    if (stage < 4) x = Downsample(w, prefix + ".2", x, channels[stage]);
+                    // The stage's output width (96, 192, 384, 768, 768 in the released VAE).
+                    int channels = (int)w.Shape(prefix + ".0.residual.6.weight")[0];
+                    var shortcut = AverageDown21(x, channels, stage is >= 1 and <= 3 ? 2 : 1, stage < 4 ? 2 : 1);
+                    x = Residual21(w, prefix + ".0", x, ownsInput: true);
+                    x = Residual21(w, prefix + ".1", x, ownsInput: true);
+                    if (stage < 4) x = Consume(Downsample(w, prefix + ".2", x, x.C), x);
                     x = AddInPlace(x, shortcut);
+                    VaeFeaturePool.Release(shortcut);
                 }
                 x = Mid21(w, "encoder.middle", x);
-                x = RmsNormChannel(x, w.Get("encoder.head.0.gamma"));
-                SiluInPlace(x.D);
-                x = Conv21(w, "encoder.head.2", x, 1);
-                x = Conv21(w, "conv1", x, 0);
+                var normalized = NormSilu21(w, "encoder.head.0.gamma", "encoder.head.0.output", x, inPlace: true);
+                if (!ReferenceEquals(normalized, x)) VaeFeaturePool.Release(x);
+                x = Consume(Conv21(w, "encoder.head.2", normalized, 1), normalized);
+                x = Consume(Conv21(w, "conv1", x, 0), x);
             }
+            VaeCpuProfile.Report($"encode {image.Width}x{image.Height}");
+            if (pool != null && VaeCpuProfile.Enabled) Console.WriteLine("  [vae21-profile] encode " + pool.Describe());
             int pixels = x.H * x.W;
             var latent = new float[64 * pixels];
             for (int c = 0; c < 64; c++)
                 for (int i = 0; i < pixels; i++) latent[c * pixels + i] = (x.D[c * pixels + i] - Qwen21Mean[c]) / Qwen21Std[c];
+            VaeFeaturePool.Release(x);
             return new VaeLatent(64, x.H, x.W, latent);
+        }
+
+        /// <summary>Returns <paramref name="result"/> after releasing the map it was computed
+        /// from (<paramref name="input"/> has no other reader).</summary>
+        private static Feature Consume(Feature result, Feature input)
+        {
+            if (!ReferenceEquals(result, input)) VaeFeaturePool.Release(input);
+            return result;
         }
 
         internal static RgbImage Decode21(VaeWeights w, VaeLatent latent)
@@ -208,29 +306,37 @@ namespace TensorSharp.Models.QwenImage
                 for (int i = 0; i < pixels; i++) x.D[c * pixels + i] = latent.Data[c * pixels + i] * Qwen21Std[c] + Qwen21Mean[c];
             Trace21("decoder.input", x.D);
             var fused = FusedGraph21(w);
+            using var pool = VaeFeaturePool.Enter(FastCpu);
             if (fused != null && fused.TryDecode(x.D, x.H, x.W, out var rgba, out int oh, out int ow))
                 x = new Feature(4, oh, ow, rgba);
             else
             {
-                x = Conv21(w, "conv2", x, 0);
-                x = Conv21(w, "decoder.conv1", x, 1);
+                x = Consume(Conv21(w, "conv2", x, 0), x);
+                x = Consume(Conv21(w, "decoder.conv1", x, 1), x);
                 x = Mid21(w, "decoder.middle", x);
-                int[] channels = {1152,1152,576,288,144};
                 for (int stage = 0; stage < 5; stage++)
                 {
                     string prefix = $"decoder.upsamples.{stage}.upsamples";
-                    var shortcut = stage < 4 ? DuplicateUp21(x, channels[stage], stage < 3 ? 2 : 1, 2) : null;
-                    for (int j = 0; j < 3; j++) x = Residual21(w, prefix + $".{j}", x);
-                    if (stage < 4)
+                    // The stage shortcut duplicates the stage input up to the upsampled output.
+                    // It is added straight from the input at the end (AddDuplicateUp21InPlace)
+                    // instead of being materialized up front: the input is kept alive, half to a
+                    // quarter the size of the duplicated map.
+                    var stageInput = x;
+                    bool upsample = stage < 4;
+                    for (int j = 0; j < 3; j++) x = Residual21(w, prefix + $".{j}", x, ownsInput: j > 0 || !upsample);
+                    if (upsample)
                     {
-                        x = Conv21(w, prefix + ".3.resample.1", NearestUpsample2x(x), 1);
-                        x = AddInPlace(x, shortcut);
+                        var up = Consume(Conv21(w, prefix + ".3.resample.1", x, 1, upsample2x: true), x);
+                        x = AddDuplicateUp21InPlace(up, stageInput, stage < 3 ? 2 : 1, 2);
+                        VaeFeaturePool.Release(stageInput);
                     }
                 }
-                x = RmsNormChannel(x, w.Get("decoder.head.0.gamma"));
-                SiluInPlace(x.D);
-                x = Conv21(w, "decoder.head.2", x, 1);
+                var normalized = NormSilu21(w, "decoder.head.0.gamma", "decoder.head.0.output", x, inPlace: true);
+                if (!ReferenceEquals(normalized, x)) VaeFeaturePool.Release(x);
+                x = Consume(Conv21(w, "decoder.head.2", normalized, 1), normalized);
             }
+            VaeCpuProfile.Report($"decode {latent.Width * 16}x{latent.Height * 16}");
+            if (pool != null && VaeCpuProfile.Enabled) Console.WriteLine("  [vae21-profile] decode " + pool.Describe());
             if (Array.Exists(x.D, v => !float.IsFinite(v)))
                 throw new InvalidOperationException("Qwen-Image-2.1 VAE produced non-finite RGBA values.");
             pixels = x.H * x.W;
@@ -241,6 +347,7 @@ namespace TensorSharp.Models.QwenImage
                 alpha[i] = Math.Clamp((x.D[3 * pixels + i] + 1f) * .5f, 0f, 1f);
                 for (int c = 0; c < 3; c++) rgb[i * 3 + c] = Math.Clamp((x.D[c * pixels + i] + 1f) * .5f, 0f, 1f);
             }
+            VaeFeaturePool.Release(x);
             return new RgbImage(x.W, x.H, rgb, alpha);
         }
     }

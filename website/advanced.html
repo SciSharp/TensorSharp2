@@ -117,7 +117,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model DeepSeek-
   <ul>
     <li><strong>CLI</strong> — <code>--diffusion-steps</code> (denoising steps per block), <code>--diffusion-seed</code>, and <code>--diffusion-blocks</code>.</li>
     <li><strong>Web UI</strong> — streams whole-message <code>replace</code> events so you watch the answer denoise live, and batches concurrent diffusion requests at block boundaries via <code>DiffusionBatchScheduler</code>.</li>
-    <li><strong>Optimizations</strong> — on GPU backends the prompt side of <code>[prompt | canvas]</code> is prefetched once per block and reused across steps; GGML backends use a fused whole-model diffusion decode plus a fused lm-head tail.</li>
+    <li><strong>Optimizations</strong> — on the GPU backends and the pure-C# <code>cpu</code> backend the prompt side of <code>[prompt | canvas]</code> is prefetched once per block and reused across steps; GGML backends use a fused whole-model diffusion decode plus a fused lm-head tail.</li>
   </ul>
 
   <h2 id="perf">Performance optimizations</h2>

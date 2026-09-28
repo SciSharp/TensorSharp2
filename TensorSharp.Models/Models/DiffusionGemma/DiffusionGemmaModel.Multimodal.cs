@@ -112,8 +112,17 @@ namespace TensorSharp.Models
 
         private static readonly List<(Tensor Embeddings, int Position)> EmptyVisionList = new();
 
-        /// <summary>Run one prefill against <paramref name="seq"/>'s own image spans.</summary>
-        internal VisionScope UseSequenceVision(DiffusionSeqState seq) => new(this, seq);
+        /// <summary>Run one prefill against <paramref name="seq"/>'s own image spans. A no-op scope when
+        /// neither the sequence nor the model has any: swapping one empty set for another changes nothing
+        /// the forward reads, but the version bump would discard the span-keyed caches (the attention mask
+        /// the unified forward otherwise rebuilds every denoising step, and the Jev prompt K/V).</summary>
+        internal VisionScope UseSequenceVision(DiffusionSeqState seq)
+        {
+            bool seqHasSpans = seq.HasVision || (seq.VisionSpans != null && seq.VisionSpans.Length != 0);
+            if (!seqHasSpans && ActiveVisionList.Count == 0 && _visionSpans.Length == 0)
+                return default;
+            return new(this, seq);
+        }
 
         /// <summary>
         /// Attach already-encoded image spans to ONE sequence. This is the concurrency-safe entry

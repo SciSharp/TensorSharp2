@@ -30,9 +30,17 @@ namespace TensorSharp.Models.QwenImage
         public Feature(int c, int h, int w) { C = c; H = h; W = w; D = new float[(long)c * h * w]; }
         public Feature(int c, int h, int w, float[] d) { C = c; H = h; W = w; D = d; }
         public int Idx(int c, int y, int x) => (c * H + y) * W + x;
+        /// <summary>A feature whose every element the caller overwrites: skips the zeroing pass
+        /// (hundreds of MB per decoder map at 1024 px and above), and inside a managed encode or
+        /// decode recycles a released map of the same size (<see cref="VaeFeaturePool"/>).</summary>
+        public static Feature Uninitialized(int c, int h, int w)
+        {
+            int length = checked(c * h * w);
+            return new(c, h, w, VaeFeaturePool.Current is { } pool ? pool.Rent(length) : GC.AllocateUninitializedArray<float>(length));
+        }
     }
 
-    internal static partial class VaeReferenceMath
+    internal static unsafe partial class VaeReferenceMath
     {
         // When set (by QwenImage21Vae on a GGML backend), the conv stack runs on the
         // device via TSGgml_Conv2dF32 instead of the pure-C# scalar loops. Disable with
@@ -72,50 +80,15 @@ namespace TensorSharp.Models.QwenImage
             });
         }
 
-        // RMS norm over the channel dimension (F.normalize(dim=1) * sqrt(C) * gamma).
-        internal static Feature RmsNormChannel(Feature x, float[] gamma)
-        {
-            int C = x.C, H = x.H, W = x.W, hw = H * W;
-            var outp = new Feature(C, H, W);
-            float scale = MathF.Sqrt(C);
-            // Visit contiguous spatial tiles within each channel. Per-pixel channel
-            // walks skip whole image planes, thrashing caches and TLBs at 2K.
-            // Keep double accumulation in the original channel order and retain
-            // the original float multiplication order for numerical equivalence.
-            const int tileSize = 256;
-            int tiles = (int)(((long)hw + tileSize - 1) / tileSize);
-            Parallel.For(0, tiles, tile =>
-            {
-                int start = tile * tileSize;
-                int count = Math.Min(tileSize, hw - start);
-                Span<double> sums = stackalloc double[tileSize];
-                Span<float> inverses = stackalloc float[tileSize];
-                sums.Clear();
-                for (int c = 0; c < C; c++)
-                {
-                    ReadOnlySpan<float> source = x.D.AsSpan(c * hw + start, count);
-                    for (int p = 0; p < count; p++)
-                    {
-                        float v = source[p];
-                        sums[p] += (double)v * v;
-                    }
-                }
-                for (int p = 0; p < count; p++)
-                    inverses[p] = (float)(1.0 / Math.Sqrt(sums[p] + 1e-12));
-                for (int c = 0; c < C; c++)
-                {
-                    ReadOnlySpan<float> source = x.D.AsSpan(c * hw + start, count);
-                    Span<float> destination = outp.D.AsSpan(c * hw + start, count);
-                    float channelGamma = gamma[c];
-                    for (int p = 0; p < count; p++)
-                        destination[p] = source[p] * inverses[p] * scale * channelGamma;
-                }
-            });
-            return outp;
-        }
+        // RMS norm over the channel dimension (F.normalize(dim=1) * sqrt(C) * gamma). Double
+        // accumulation in channel order and the original float multiplication order, vectorized
+        // across pixels: bit-identical to the scalar definition (see RmsNormChannelFast).
+        internal static Feature RmsNormChannel(Feature x, float[] gamma) => RmsNormChannelFast(x, gamma, silu: false);
 
         // General 2D convolution. weight is OC*IC*KH*KW row-major (oc,ic,kh,kw).
-        // Internal (with TryGpuConv2dMaybeTiled) for QwenVaeConvTilingTests.
+        // Internal (with TryGpuConv2dMaybeTiled) for QwenVaeConvTilingTests. Off the device it
+        // runs the packed-GEMM convolution (VaeCpuOps), or the scalar loop with
+        // TS_QWEN_VAE_CPU=scalar.
         internal static Feature Conv2d(Feature x, float[] weight, int OC, int IC, int KH, int KW,
             float[] bias, int strideH, int strideW, int padT, int padB, int padL, int padR)
         {
@@ -128,6 +101,20 @@ namespace TensorSharp.Models.QwenImage
                     strideH, strideW, padT, padB, padL, padR, Ho, Wo, out Feature gpu))
                 return gpu;
 
+            if (!UseScalarCpu)
+                return Conv2dCpu(x, PackConvWeight(weight, OC, IC * KH * KW), bias, OC, KH, KW,
+                    strideH, strideW, padT, padB, padL, padR);
+            return Conv2dScalar(x, weight, OC, IC, KH, KW, bias, strideH, strideW, padT, padB, padL, padR);
+        }
+
+        // The original direct convolution: the oracle for the GEMM path.
+        internal static Feature Conv2dScalar(Feature x, float[] weight, int OC, int IC, int KH, int KW,
+            float[] bias, int strideH, int strideW, int padT, int padB, int padL, int padR)
+        {
+            if (x.C != IC) throw new ArgumentException($"conv IC {IC} != input C {x.C}");
+            int H = x.H, W = x.W;
+            int Hp = H + padT + padB, Wp = W + padL + padR;
+            int Ho = (Hp - KH) / strideH + 1, Wo = (Wp - KW) / strideW + 1;
             var outp = new Feature(OC, Ho, Wo);
             int hw = H * W;
             Parallel.For(0, OC, oc =>
@@ -263,43 +250,18 @@ namespace TensorSharp.Models.QwenImage
             return ok;
         }
 
-        // Causal Conv3d on T=1: use the last temporal slice (kd = KD-1) of the 5D
-        // weight (oc,ic,kd,kh,kw), reducing to a KH x KW 2D conv with spatial padding.
-        private static Feature CausalConv3dT1(Feature x, float[] w5d, int OC, int IC, int KD, int KH, int KW,
-            float[] bias, int pad)
+        // Causal Conv3d on T=1 uses the last temporal slice (kd = KD-1) of the 5D weight
+        // (oc,ic,kd,kh,kw): a KH x KW 2D conv with spatial padding. VaeWeights extracts that
+        // slice once per layer (KernelSlice / PackedKernel), not on every call.
+        internal static float[] LastTemporalSlice(float[] w5d, int OC, int IC, int KD, int KH, int KW)
         {
-            // Extract the kd = KD-1 slice into a (OC,IC,KH,KW) kernel.
+            if (KD == 1) return w5d;   // the (oc,ic,1,kh,kw) weight already is the 2D kernel
             var slice = new float[(long)OC * IC * KH * KW];
             int khw = KH * KW, kdhw = KD * KH * KW;
-            Parallel.For(0, OC, oc =>
-            {
+            for (int oc = 0; oc < OC; oc++)
                 for (int ic = 0; ic < IC; ic++)
-                {
-                    long src = ((long)oc * IC + ic) * kdhw + (long)(KD - 1) * khw;
-                    long dst = ((long)oc * IC + ic) * khw;
-                    Array.Copy(w5d, src, slice, dst, khw);
-                }
-            });
-            return Conv2d(x, slice, OC, IC, KH, KW, bias, 1, 1, pad, pad, pad, pad);
-        }
-
-        private static Feature AddInPlace(Feature a, Feature b)
-        {
-            for (long i = 0; i < a.D.Length; i++) a.D[i] += b.D[i];
-            return a;
-        }
-
-        private static Feature NearestUpsample2x(Feature x)
-        {
-            int C = x.C, H = x.H, W = x.W, Ho = H * 2, Wo = W * 2;
-            var outp = new Feature(C, Ho, Wo);
-            Parallel.For(0, C, c =>
-            {
-                for (int oy = 0; oy < Ho; oy++)
-                    for (int ox = 0; ox < Wo; ox++)
-                        outp.D[(c * Ho + oy) * Wo + ox] = x.D[(c * H + oy / 2) * W + ox / 2];
-            });
-            return outp;
+                    Array.Copy(w5d, ((long)oc * IC + ic) * kdhw + (long)(KD - 1) * khw, slice, ((long)oc * IC + ic) * khw, khw);
+            return slice;
         }
 
         // ---- composite blocks -------------------------------------------------
@@ -309,6 +271,19 @@ namespace TensorSharp.Models.QwenImage
             int C = x.C, H = x.H, W = x.W, hw = H * W;
             var identity = x;
             var xn = RmsNormChannel(x, w.Get(prefix + ".norm.gamma"));
+            if (FastCpu)
+            {
+                // Each map is released to the decode's pool once read (the caller hands x over).
+                var qkvFast = ConvLayer(w, prefix + ".to_qkv", xn, 3 * C, C, 1, 1, 1, 1, 0, 0, 0, 0);
+                VaeFeaturePool.Release(xn);
+                var attended = AttentionCpu(qkvFast.D, C, H, W);
+                VaeFeaturePool.Release(qkvFast);
+                var projected = ConvLayer(w, prefix + ".proj", attended, C, C, 1, 1, 1, 1, 0, 0, 0, 0);
+                VaeFeaturePool.Release(attended);
+                AddInPlace(projected, identity);
+                VaeFeaturePool.Release(identity);
+                return projected;
+            }
             // to_qkv: 1x1 conv C -> 3C
             var qkv = Conv2d(xn, w.Get(prefix + ".to_qkv.weight"), 3 * C, C, 1, 1,
                 w.Get(prefix + ".to_qkv.bias"), 1, 1, 0, 0, 0, 0);
@@ -354,8 +329,8 @@ namespace TensorSharp.Models.QwenImage
         // Downsample (encoder): ZeroPad2d((0,1,0,1)) + Conv2d(dim,dim,3,stride2,pad0).
         private static Feature Downsample(VaeWeights w, string prefix, Feature x, int dim)
         {
-            return Conv2d(x, w.Get(prefix + ".resample.1.weight"), dim, dim, 3, 3,
-                w.Get(prefix + ".resample.1.bias"), 2, 2, /*padT*/0, /*padB*/1, /*padL*/0, /*padR*/1);
+            return ConvLayer(w, prefix + ".resample.1", x, dim, dim, 3, 3,
+                2, 2, /*padT*/0, /*padB*/1, /*padL*/0, /*padR*/1);
         }
     }
 }

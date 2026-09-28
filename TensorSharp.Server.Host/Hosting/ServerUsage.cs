@@ -402,7 +402,8 @@ namespace TensorSharp.Server.Host.Hosting
                     "TS_QWEN_IMAGE_HEIGHT) for image requests that name neither a size nor an area: that " +
                     "default needs BOTH, and Qwen-Image-2.1 works on multiples of 32, so a value off that grid " +
                     "is snapped down to a multiple of 32 (never below 32). With only one given, or without " +
-                    "either, such requests keep the automatic size (a 2048x2048 area, at the reference image's " +
+                    "either, such requests keep the automatic size (a 2048x2048 area, 1024x1024 on the cpu " +
+                    "backend, at the reference image's " +
                     "aspect ratio for an edit). A Qwen-Image server warns once " +
                     "at startup about either case.",
                     "--video-width 640"),
