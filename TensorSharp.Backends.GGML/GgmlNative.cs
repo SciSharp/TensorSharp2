@@ -1423,6 +1423,20 @@ internal enum GgmlIndexReductionOp
     Argmax = 2,
 }
 
+    /// <summary>
+    /// Whether GgmlNative's import resolver has bound the GgmlOps library in this process. A
+    /// type of its own, so reading it never runs GgmlNative's static constructor (whose early
+    /// tunables may P/Invoke, i.e. load the very library the caller is asking about).
+    /// </summary>
+    internal static class GgmlNativeLibraryState
+    {
+        private static int s_loaded;
+
+        internal static bool IsLoaded => Volatile.Read(ref s_loaded) != 0;
+
+        internal static void MarkLoaded() => Volatile.Write(ref s_loaded, 1);
+    }
+
     internal static partial class GgmlNative
     {
         private const string DllName = "GgmlOps";
@@ -6988,6 +7002,7 @@ internal enum GgmlIndexReductionOp
                 // executable (GgmlOps.xcframework via NativeReference with
                 // ForceLoad), so every TSGgml_*/ggml_* symbol lives in the main
                 // program image - there is no separate library to probe for.
+                GgmlNativeLibraryState.MarkLoaded();
                 return NativeLibrary.GetMainProgramHandle();
             }
 
@@ -6997,8 +7012,17 @@ internal enum GgmlIndexReductionOp
             {
                 if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out IntPtr handle))
                 {
+                    GgmlNativeLibraryState.MarkLoaded();
                     return handle;
                 }
+            }
+
+            // The runtime's own DllImport probing, which it would run next anyway: done here so
+            // a library found that way is recorded as loaded too (GgmlBasicOps.IsNativeLibraryLoaded).
+            if (NativeLibrary.TryLoad(libraryName, assembly, searchPath, out IntPtr probed))
+            {
+                GgmlNativeLibraryState.MarkLoaded();
+                return probed;
             }
 
             return IntPtr.Zero;

@@ -126,7 +126,8 @@ namespace TensorSharp.Models.QwenImage
                 return weights.Count - 1;
             }
             // Causal Conv3d on T=1 uses only the last temporal slice (kd = KD-1) of the
-            // 5D (oc,ic,kd,kh,kw) weight — same slicing as VaeReferenceMath.CausalConv3dT1.
+            // 5D (oc,ic,kd,kh,kw) weight — same slicing as VaeReferenceMath.LastTemporalSlice
+            // (which the managed decoder reads once per layer through VaeWeights.KernelSlice / PackedKernel).
             int RegSlice(string name, int OC, int IC, int KD, int KH, int KW)
             {
                 float[] w5d = w.Get(name);

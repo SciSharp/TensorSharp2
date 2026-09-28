@@ -39,8 +39,8 @@ dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-d
 ```
 
 该[配置](../../config/jev-diffusiongemma-q4.json)绑定回环地址的 5000 端口并使用 `ggml_cuda`。
-CPU 执行可覆盖为 `--backend ggml_cpu`，受支持的 Mac 上可用 `--backend ggml_metal`。这些只是执行
-选项，并不表示每个后端都做过基准测试。本地文件不存在时，配置会从 Hugging Face 上的
+CPU 执行可覆盖为 `--backend cpu`（纯 C#）或 `--backend ggml_cpu`，受支持的 Mac 上可用 `--backend ggml_metal`。
+这些只是执行选项，并不表示每个后端都做过基准测试；CPU 上的实测见[在 CPU 上运行](#在-cpu-上运行)。本地文件不存在时，配置会从 Hugging Face 上的
 `unsloth/diffusiongemma-26B-A4B-it-GGUF` 下载 `diffusiongemma-26B-A4B-it-Q4_K_M.gguf`，之后的启动
 直接复用。它默认使用仓库的 `models` 目录；把 `TENSORSHARP_MODELS` 设为绝对路径即可使用其他位置。
 同一服务端上的普通聊天端点仍然可用。
@@ -53,6 +53,35 @@ CPU 执行可覆盖为 `--backend ggml_cpu`，受支持的 Mac 上可用 `--back
 这份配置方案在 16 GiB CUDA GPU 上为激活保留 4 GiB 显存。更大的保留量会让常驻的权重更少，但可以
 避免较长提示下的严重换页。请针对设备与负载调整 `DIFFUSION_VRAM_HEADROOM_MB`；模型默认值为
 2048 MiB。4096 token 的准入上限并不保证该规模的每种 schema 与提示都能放进设备内存。
+
+### 在 CPU 上运行
+
+没有 GPU 时，使用 `--backend cpu`：
+
+```powershell
+$env:TENSORSHARP_MODELS = 'C:/Works/models'
+$env:MAX_CONTEXT = '4096'
+dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json --backend cpu
+```
+
+`DIFFUSION_VRAM_HEADROOM_MB` 在那里不起作用。纯 C# 后端把 prompt K/V 保存在主机内存中，因此对同一提示的重复读取
+（固定 `samples` 或自适应追加读取）会跳过提示部分的计算（拆成多个分块的 schema 每个分块各有一个提示，而模型只保留一份 prompt 缓存）。
+最后一层只为所请求的标签行计算。在 `cpu` 与 `ggml_cpu` 上，服务端还会对该模型跳过启动时的共享提示预热，
+因此权重加载完成后端口即会打开。
+
+在 i7-11800H（8 核 16 线程、AVX-512）、32 GB、Windows 上，用 `eng/JevProbe`、
+`diffusiongemma-26B-A4B-it-Q4_K_M.gguf` 与一个 54 token 的 state 实测：
+
+| 结构化读取 | `cpu` | `cpu`，旧构建 | `ggml_cpu` |
+|---|---:|---:|---:|
+| 宽度 16，新提示 | 0.92 s | 9.5 s | 1.57 s |
+| 宽度 16，同一提示再次读取 | 0.22–0.25 s | 9.5 s | 1.57 s |
+| 宽度 64，新提示 | 1.42 s | 未测 | 2.68 s |
+| 宽度 64，同一提示再次读取 | 0.63–0.73 s | 未测 | 2.68 s |
+
+在探针的 `--quality` 集合（9 个双问题提示，分别以宽度 16 与 64 读取）上，两个后端都选中了全部 36 个预期
+标签，每次的首选标签都相同，概率之差最大为 0.049。这些是不经过 HTTP 服务端、内容提取与分词的探针耗时；
+实现与开关见 [DiffusionGemma 模型卡](diffusiongemma_zh-cn.md#纯-c-cpu-后端--backend-cpu)。
 
 在启动进程之前设置 `MAX_CONTEXT`，以限制分词后的提示与答案 canvas 的总长度。不设置这个环境变量时，
 使用模型 GGUF 中的上下文上限。该设置只能通过环境变量提供；配置中的 `max-tokens: 256` 限制的是普通
@@ -152,7 +181,7 @@ tokenIds)`，其中 positions 是从零开始的 canvas 下标，`tokenIds` 的�
 
 自适应模式先做一次读取，只要任一问题的条件熵超过阈值，就总共做 `auto_max` 次读取。固定次数的读取
 按分布取平均。需要固定的最小工作量时使用 `samples: 1`；示例中显式设置了它。启用 prompt 缓存时，多次
-读取在 GGML CUDA 与 Metal 上复用同一份 prompt K/V。每个模型只保留一份 prompt 缓存与标签投影；切换
+读取在 GGML CUDA、Metal 与纯 C# 的 `cpu` 后端上复用同一份 prompt K/V。每个模型只保留一份 prompt 缓存与标签投影；切换
 state 或 schema 会替换该缓存。
 
 请求最多支持 64 个问题，每个问题 2 到 26 个备选项。问题 ID 必须为 1 到 128 个字符，不能包含冒号、控制
@@ -445,8 +474,9 @@ ASR 准确率属于端到端判定质量的一部分：需要在目标语言和�
 
 答案 canvas 按 schema 确定大小，在模型最大 canvas 宽度之内向上取整到 16 token 的边界。多个问题共享
 transformer 前向。输出头只作用于所请求的标签行，而不分配完整的 canvas × 词表 logits 张量。`ggml_cuda`
-与 `ggml_metal` 使用现有的 DiffusionGemma prompt K/V 与融合 decode 路径；其他后端（包括 `ggml_vulkan`、
-`mlx` 与 `cuda`）使用统一的 prompt 加 canvas 前向。
+与 `ggml_metal` 使用现有的 DiffusionGemma prompt K/V 与融合 decode 路径，`cpu` 使用它自己的主机 prompt K/V，
+并且最后一层只为所请求的标签行计算；其他后端（包括 `ggml_cpu`、`ggml_vulkan`、`mlx` 与 `cuda`）使用统一的
+prompt 加 canvas 前向。
 模型执行锁使其与普通扩散聊天请求串行访问共享的 GPU 状态。
 
 GGML CUDA 默认使用融合的 prompt 注意力，把注意力运算保留在一张原生图内，以减少中间传输与显式的 KV head
@@ -507,6 +537,11 @@ python eng/jev-extended-smoke.py --endpoint http://127.0.0.1:5000 --image --outp
 
 # Stop the server first: this probe loads its own copy of the weights.
 dotnet run --project eng/JevProbe -c Release -- --model C:/Works/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggmlcuda --iterations 5 --warmup 1 --widths 16,64,256 --output artifacts/jev/projection.json
+
+# CPU：以 ggml_cpu 为参照检查 cpu 的标签判定，以及同一提示的重复读取。
+dotnet run --project eng/JevProbe -c Release -- --model C:/Works/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_cpu --quality --widths 16,64 --output artifacts/jev/quality-ggmlcpu.json
+dotnet run --project eng/JevProbe -c Release -- --model C:/Works/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend cpu --quality --widths 16,64 --reference artifacts/jev/quality-ggmlcpu.json --output artifacts/jev/quality-cpu.json
+dotnet run --project eng/JevProbe -c Release -- --model C:/Works/models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend cpu --repeat-reads 4 --widths 16,64 --output artifacts/jev/repeat-cpu.json
 ```
 
 基准原有的带标注样例已检入

@@ -161,6 +161,35 @@ prefill against the 48-wide one for equal-or-better decode. Tune with `TS_CPU_TH
 `TS_CPU_SPIN`, `TS_CPU_TASK_BYTES` and `TS_CPU_TASKS_PER_WORKER`
 ([env var matrix](docs/env_var_feature_matrix.md)).
 
+**GEMM and SIMD kernels.** Quantized weights (Q4_K, Q5_K, Q6_K, Q4_0, Q5_0, Q8_0)
+now go through a multi-row int8 GEMM that decodes each pair of weight rows once for
+every activation row (AVX-512BW 8x2 and AVX2 4x1 register tiles), and F16 / BF16 /
+F32 or dequantize-only types through a float-panel GEMM. F32 matmuls behind
+`Ops.Addmm` use a packed, cache-blocked SGEMM (AVX-512 8x32, AVX2 6x16, portable
+fallback), and elementwise, norm, softmax and RoPE ops use Vector512 / Vector256
+kernels; `TensorSharp.Models` binds Core's parallel loops to the same worker pool.
+DiffusionGemma gained a host prompt-KV cache and batched MoE on this backend, and
+Qwen-Image-2.1 a managed pipeline (below). Measured on an i7-11800H (8 cores / 16
+threads, AVX-512, 32 GB):
+
+| Workload | `cpu` before | `cpu` now | `ggml_cpu` |
+|---|---:|---:|---:|
+| DiffusionGemma-26B-A4B Jev read, new 54-token prompt, width 16 | 9.5 s | 0.92 s | 1.57 s |
+| same, further reads of the same prompt | 9.5 s | 0.22–0.25 s | 1.57 s |
+| Qwen-Image-2.1 256×256, 2 steps | refused | 24.6 s | 36.1 s |
+| Qwen-Image-2.1 512×512, Pruna 5-step LoRA | refused | 169.6 s | 295.7 s |
+
+Jev label decisions matched `ggml_cpu` on all 36 labels of the probe's quality set.
+The Qwen-Image images are 42.0 dB (256×256) and 31.4 dB (512×512) PSNR from the
+`ggml_cpu` ones, which quantize activations to 8 bits where the managed transformer
+does not. Every kernel family has a switch that restores the previous code in the
+same binary (`TS_CPU_QGEMM=0`, `TS_CPU_FGEMM=0`, `TS_CPU_SGEMM=0`,
+`TS_CPU_SIMD_ELEMENTWISE=0`, `DIFFUSION_CPU_LEGACY=1`). `TS_CPU_DISABLE_AVX512=1`
+runs the AVX2 kernels on an AVX-512 host; to emulate an AVX2-only host use
+`DOTNET_EnableAVX512=0` (.NET 10 ignores `DOTNET_EnableAVX512F=0`). The AVX2 kernels
+were not run on AVX2-only hardware, and the portable paths that ARM64 and x64
+without AVX2 take were not run on such hosts either.
+
 **Zero-copy quantized weights in the `ModelBase` loader.** `BackendType.Cpu` was the only backend missing
 from `CanUseFileMappedQuantizedWeights`, so it alone copied every quantized
 tensor into fresh anonymous memory at load instead of binding it straight from
@@ -291,9 +320,11 @@ has one now: `MiniMaxH3Direct{DiT, TextEncoder, VideoVae, AudioVae, VisionEncode
 VideoVaeEncoder3D, AudioVaeEncoder}`, selected by one predicate
 (`MiniMaxH3Model.UsesDirectBackend`). t2v, i2v, fl2v and reference conditioning
 (images, clips, soundtracks) all work there. Wan and DiffusionGemma
-already had pure C# CPU paths and did not change in coverage. Qwen-Image-2.1 has no
-managed path: it runs whole GGML graphs and needs `ggml_metal`, `ggml_cuda`,
-`ggml_vulkan` or `ggml_cpu`.
+already had pure C# CPU paths and did not change in coverage. Qwen-Image-2.1 has one
+too now: `--backend cpu` runs its transformer, text encoder, vision encoder, VAE,
+LoRA plug-ins and prefix KV cache in managed code
+([card](docs/models/qwenimage21.md#pure-c-cpu-backend---backend-cpu)); on the GGML
+backends it runs whole GGML graphs.
 
 Parity against the GGML path on identical inputs with a fixed `--diffusion-seed`
 (256x160, 5 frames, 1 step). The *control* column is GGML measured against

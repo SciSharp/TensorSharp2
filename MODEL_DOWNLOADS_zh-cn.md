@@ -269,7 +269,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 
 **Qwen-Image-2.1**（提示词 → 图像，或提示词 + 一张或多张参考图 → 编辑后的图像；需要 DiT、专用 2.1 VAE 与 Qwen3-VL-8B 文本编码器，编辑时还需要它的 mmproj）：
 
-最短路径是现成的配置文件：它固定修订版本与 SHA-256 校验，缺什么下什么（共四个文件，约 10.29 GiB），存放到 `$TENSORSHARP_MODELS/qwen-image-2.1/`；未设置 `TENSORSHARP_MODELS` 时为 `models/qwen-image-2.1/`。配置默认选择 `ggml_metal`；在 NVIDIA 机器上追加 `--backend ggml_cuda`。
+最短路径是现成的配置文件：它固定修订版本与 SHA-256 校验，缺什么下什么（共四个文件，约 10.29 GiB），存放到 `$TENSORSHARP_MODELS/qwen-image-2.1/`；未设置 `TENSORSHARP_MODELS` 时为 `models/qwen-image-2.1/`。配置默认选择 `ggml_metal`；在 NVIDIA 机器上追加 `--backend ggml_cuda`，或用 `--backend cpu` 走纯 C# 路径（不需要 GPU；速度与内存见[模型卡](docs/models/qwenimage21_zh-cn.md#纯-c-cpu-后端--backend-cpu)）。
 
 ```bash
 dotnet run --project TensorSharp.Cli -c Release --no-build -- \

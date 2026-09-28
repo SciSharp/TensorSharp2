@@ -31,7 +31,9 @@ weights. Larger images and multiple references increase that requirement.
 
 Run these commands from the TensorSharp repository root. The configuration
 selects `ggml_metal` for Apple Silicon. On an NVIDIA machine with the CUDA backend
-built, append `--backend ggml_cuda`; the native CPU backend is `ggml_cpu`.
+built, append `--backend ggml_cuda`; the native CPU backend is `ggml_cpu`, and
+`--backend cpu` runs the whole pipeline in pure C#
+([Pure C# CPU backend](#pure-c-cpu-backend---backend-cpu)).
 Missing models download automatically at startup. Set `TENSORSHARP_MODELS` to an
 absolute directory to choose where they are stored; files go in its
 `qwen-image-2.1` subdirectory. Without this variable, the configuration resolves
@@ -194,10 +196,113 @@ run this diffusion model. Existing `/api/image-edit` requests still require
 at least one reference; generation has its own endpoint.
 Previews decode the estimated clean latent from the current flow prediction.
 
-The 2.1 diffusion transformer runs a complete GGML graph with resident quantized
-weights; there is no CPU weight-streaming mode. Start with smaller dimensions if
-available memory is insufficient. CUDA and Vulkan were exercised on NVIDIA A40s; the
-measurements below record where.
+On the GGML backends the 2.1 diffusion transformer runs a complete GGML graph with
+resident quantized weights; on `cpu` it runs a managed forward over the same
+file-mapped weights. There is no weight-streaming mode on either. Start with smaller
+dimensions if available memory is insufficient. CUDA and Vulkan were exercised on
+NVIDIA A40s; the measurements below record where.
+
+## Pure C# CPU backend (`--backend cpu`)
+
+`--backend cpu` runs the whole pipeline in managed C#: the diffusion transformer,
+the Qwen3-VL text encoder, the vision encoder used for editing, the VAE, LoRA
+plug-ins and the prefix KV cache. No GGML graph is built and the pipeline makes no
+call into the native GgmlOps library; the CLI also skips its GGML teardown at exit on
+this backend unless something else in the process loaded the library. Weights are
+read from the memory-mapped GGUF and safetensors files in their stored types.
+Previously the model refused `cpu` and needed a GGML backend.
+
+```bash
+TENSORSHARP_MODELS="$PWD/models" dotnet run --project TensorSharp.Cli -c Release --no-build -- \
+  --config config/qwen-image-2.1.json --backend cpu \
+  --lora config/lora/qwen-image-2.1-pruna-5step.json \
+  --prompt 'A small orange cat beside a blue ceramic vase, soft daylight, detailed photograph' \
+  --width 512 --height 512 --diffusion-seed 42 --output cat-cpu.png
+```
+
+The server takes the same `--backend cpu`. Set `--width` and `--height` on a CPU:
+the 2048×2048 default was not run on this backend (see the limitations below).
+
+What runs where:
+
+- **Transformer** (`QwenImage21ManagedDiT`): the operations of the native graph,
+  in the same order and from the same weight descriptors. The projections multiply
+  F32 activations by dequantized weight tiles, where ggml-cpu quantizes the
+  activations to 8 bits; attention is a tiled flash attention; LoRA factors
+  (stacked shrinks, DoRA row scales) are applied unmerged as on the GGML backends.
+  `TS_QWEN21_CPU_MATMUL=q8` selects 8-bit activations through the managed
+  quantized matmul instead.
+- **Prefix KV cache**: a managed cache in host memory with the same types
+  (`auto`/`f32` store what attention reads, so cached steps reproduce uncached
+  ones bit for bit; `f16`, `q8_0`, `q8_0_v`) and the same rule: at most half of the
+  free physical memory, and `TS_QWEN21_PREFIX_CACHE_MAX_MIB`.
+- **Text encoder**: every projection runs a packed F32 GEMM on dequantized Q4_K /
+  Q6_K tiles (exact F32 activations), with a managed causal grouped-query
+  attention.
+- **Vision encoder** (editing): packed-GEMM linear layers and a managed multi-head
+  attention.
+- **VAE**: every convolution is an implicit-im2col packed SGEMM against weights
+  packed once per layer, the decoder's 2x upsample is folded into the convolution
+  that reads it, and it runs on a pool with one thread per logical CPU
+  (`TS_CPU_GEMM_THREADS`).
+
+All of these have AVX-512 and AVX2 kernels (`TS_CPU_DISABLE_AVX512=1` selects the
+AVX2 ones) and a portable fallback; the environment variable matrix lists
+[every switch](../env_var_feature_matrix.md#out-of-matrix-qwen-image-21-knobs),
+including the `0` / `scalar` settings that restore each previous stage.
+
+### Measured on an 8-core laptop
+
+i7-11800H (8 cores / 16 threads, AVX-512), 32 GB, Windows. DiT
+`qwen_image_2.1_Q4_K_M.gguf`, text encoder `Qwen3VL-8B-Instruct-Q4_K_M.gguf`,
+VAE BF16; text-to-image, CFG 1, seed 42, one run each. `ggml_cpu` was
+measured on the same machine with the build before this change; its path is native
+and was not modified. PSNR / SSIM compare the `cpu` image with the `ggml_cpu` one.
+
+| Run | Stage | `cpu` | `ggml_cpu` |
+|---|---|---:|---:|
+| 256×256, 2 steps | text and vision encode | 4.2 s | 4.2 s |
+| | step 1 / step 2 (prefix cached) | 10.1 / 7.4 s | 12.1 / 8.7 s |
+| | VAE decode | 2.8 s | 11.2 s |
+| | total | **24.6 s** | 36.1 s |
+| | PSNR / SSIM | 42.0 dB / 0.984 | reference |
+| 512×512, Pruna 5-step LoRA | text and vision encode | 3.4 s | 3.3 s |
+| | steady step (prefix cached) | 30.7–31.6 s | 43.9–61.4 s |
+| | denoise, 5 steps | 158.4 s | 242.1 s |
+| | VAE decode | 7.8 s | 50.3 s |
+| | total | **169.6 s** | 295.7 s |
+| | PSNR / SSIM | 31.4 dB / 0.96 | reference |
+
+The two backends do not produce the same pixels, and neither is the reference:
+ggml-cpu rounds the activations to 8 bits before every projection, and the managed
+transformer does not. On single forwards (`benchmarks/QwenImageDiTBench`, 256×256)
+the managed velocity has cosine 0.99994 to ggml-cpu at sigma 1 and 0.9978 at
+sigma 0.02, while a 1e-4 relative change of the timestep alone moves ggml-cpu's own
+velocity by 4.7e-2 (cosine 0.9989). The 512×512 images were compared visually and
+show the same picture. Editing on `cpu` is covered by unit tests of the managed
+transformer (edit layouts, several references) and by stage benchmarks
+(`benchmarks/QwenImageStagesBench`); no end-to-end edit timing was recorded. In the
+stage benchmark a 1024×1024 reference image took 12–13 s through the vision
+encoder, and a 256×256 one 0.72 s against 5.0 s on `ggml_cpu`.
+
+### Limitations on `cpu`
+
+- **Tensor parallelism is GPU-only.** `--tp N` with `--backend cpu` is refused at
+  load (exit code 2) with a message naming `ggml_cuda` / `ggml_vulkan`; the managed
+  pipeline runs in one process.
+- **Memory.** The DiT and text-encoder weights are file-mapped (4.2 GB for the
+  Q4_K_M DiT, 5.0 GB for the Q4_K_M text encoder), but activations, the prefix
+  cache and the VAE feature maps are ordinary process memory. Encoding and then
+  decoding a 1024×1024 image with the VAE in one process peaked at 14.8 GB.
+  2048×2048, the default size, has not been run on this backend and is not
+  verified to fit a 32 GB machine; pass `--width` and `--height` explicitly.
+- **Speed.** At 512×512 one step takes about 31 s on the 8-core laptop above, and a
+  2K square has 16 times the image tokens of 512×512, with attention growing
+  faster than that. Use a step-distillation LoRA and a small size for anything
+  interactive.
+- The GGML-only switches (`TS_QWEN21_GRAPH_REUSE`, `TS_QWEN21_FLASH`,
+  `TS_QWEN21_PAD_MASK`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no
+  effect on `cpu`.
 
 ## LoRA plug-ins
 
@@ -308,8 +413,8 @@ survived such a merge had a cosine similarity of 0.07 with the intended delta.
   attention output, gate, up and down.
 
 This runs on every backend the model runs on: `ggml_metal`, `ggml_cuda`,
-`ggml_vulkan` and `ggml_cpu`. The load logs the plug-in count and the size of the
-packed factors (`Qwen-Image-2.1 LoRA: N plug-in(s), applied unmerged (... MiB of
+`ggml_vulkan`, `ggml_cpu` and the pure-C# `cpu`. The load logs the plug-in count
+and the size of the packed factors (`Qwen-Image-2.1 LoRA: N plug-in(s), applied unmerged (... MiB of
 factors, ...)`), then one line per file with its update count, ranks and scales.
 
 **Prefix KV cache.** The cache stays on. The first step runs the whole sequence
@@ -547,9 +652,9 @@ is small because each step's kernels are large: 1.5% per step at 256×256 on one
 GPU (0.0662 s against 0.0672 s), 2.6% on two, and nothing measurable at 1024²
 (1.112 s both ways).
 
-**Tensor parallelism.** With `--tp N` on `ggml_cuda` or `ggml_vulkan`, the
-diffusion transformer is sharded Megatron-style over N GPUs, following
-vLLM-Omni's layout for 2.1:
+**Tensor parallelism.** With `--tp N` on `ggml_cuda` or `ggml_vulkan` (`cpu`
+refuses it at load), the diffusion transformer is sharded Megatron-style over N
+GPUs, following vLLM-Omni's layout for 2.1:
 
 - Each GPU holds 32/N whole attention heads: its Q, K and V rows and the matching
   `to_out` input columns.

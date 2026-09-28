@@ -157,6 +157,27 @@ ThreadPool，因此一个占满每个核的池会把它自己正在等的那部�
 `TS_CPU_TASK_BYTES` 与 `TS_CPU_TASKS_PER_WORKER` 调节（见
 [环境变量矩阵](docs/env_var_feature_matrix_zh-cn.md)）。
 
+**GEMM 与 SIMD 内核。** 量化权重（Q4_K、Q5_K、Q6_K、Q4_0、Q5_0、Q8_0）现在走多行 int8 GEMM：每两行权重
+只解码一次，供所有激活行使用（AVX-512BW 8x2 与 AVX2 4x1 寄存器分块）；F16 / BF16 / F32 以及只能反量化的
+类型走浮点面板 GEMM。`Ops.Addmm` 背后的 F32 matmul 使用打包、按缓存分块的 SGEMM（AVX-512 8x32、AVX2 6x16、
+可移植回退），逐元素、norm、softmax 与 RoPE 算子使用 Vector512 / Vector256 内核；`TensorSharp.Models` 把
+Core 的并行循环绑定到同一个工作线程池。DiffusionGemma 在这个后端上获得了主机 prompt-KV 缓存与批量 MoE，
+Qwen-Image-2.1 获得了托管流水线（见下文）。在 i7-11800H（8 核 16 线程、AVX-512、32 GB）上实测：
+
+| 负载 | 此前的 `cpu` | 现在的 `cpu` | `ggml_cpu` |
+|---|---:|---:|---:|
+| DiffusionGemma-26B-A4B Jev 读取，54 token 新提示，宽度 16 | 9.5 s | 0.92 s | 1.57 s |
+| 同上，对同一提示的后续读取 | 9.5 s | 0.22–0.25 s | 1.57 s |
+| Qwen-Image-2.1 256×256、2 步 | 拒绝加载 | 24.6 s | 36.1 s |
+| Qwen-Image-2.1 512×512、Pruna 5 步 LoRA | 拒绝加载 | 169.6 s | 295.7 s |
+
+在探针的质量集合上，Jev 的全部 36 个标签判定与 `ggml_cpu` 一致。Qwen-Image 图像与 `ggml_cpu` 的图像相比，
+PSNR 为 42.0 dB（256×256）与 31.4 dB（512×512）；`ggml_cpu` 会把激活量化到 8 位，托管 Transformer 不会。
+每类内核都有一个开关，可在同一个二进制里恢复旧代码（`TS_CPU_QGEMM=0`、`TS_CPU_FGEMM=0`、`TS_CPU_SGEMM=0`、
+`TS_CPU_SIMD_ELEMENTWISE=0`、`DIFFUSION_CPU_LEGACY=1`）。`TS_CPU_DISABLE_AVX512=1` 在 AVX-512 主机上运行
+AVX2 内核；要模拟只有 AVX2 的主机，请用 `DOTNET_EnableAVX512=0`（.NET 10 会忽略 `DOTNET_EnableAVX512F=0`）。
+AVX2 内核没有在只有 AVX2 的硬件上跑过；ARM64 与不支持 AVX2 的 x64 走可移植路径，也没有在这类主机上跑过。
+
 **`ModelBase` 加载器中的零拷贝量化权重。** `BackendType.Cpu` 曾是 `CanUseFileMappedQuantizedWeights` 里唯一
 缺席的后端，因此只有它在加载时把每一个量化张量都复制进一块新申请的匿名内存，而不是像
 所有 GGML 后端那样直接绑定 GGUF 的映射。现在它也是零拷贝绑定——`ManagedQuantizedOps`
@@ -259,8 +280,9 @@ F16/BF16/F32 权重仍走普通 GEMM；`TS_DIRECT_QUANT_WEIGHTS=0` 可恢复旧�
 `MiniMaxH3Direct{DiT, TextEncoder, VideoVae, AudioVae, VisionEncoder,
 VideoVaeEncoder3D, AudioVaeEncoder}`，由一个谓词（`MiniMaxH3Model.UsesDirectBackend`）
 选中。t2v、i2v、fl2v 以及参考条件（图片、片段、音轨）在那里都能跑。Wan 与
-DiffusionGemma 本来就有纯 C# CPU 路径，覆盖面没有变化。Qwen-Image-2.1 没有托管路径：
-它运行整张 GGML 计算图，需要 `ggml_metal`、`ggml_cuda`、`ggml_vulkan` 或 `ggml_cpu`。
+DiffusionGemma 本来就有纯 C# CPU 路径，覆盖面没有变化。Qwen-Image-2.1 现在也有了：`--backend cpu`
+用托管代码运行它的 Transformer、文本编码器、视觉编码器、VAE、LoRA 插件与前缀 KV 缓存
+（[模型卡](docs/models/qwenimage21_zh-cn.md#纯-c-cpu-后端--backend-cpu)）；在 GGML 后端上它运行整张 GGML 计算图。
 
 在相同输入、固定 `--diffusion-seed`（256x160、5 帧、1 步）下与 GGML 路径对比。其中
 *对照*一列是 GGML **和它自己**比——它自带的 flash 内核对上它的显式 softmax 回退
