@@ -463,15 +463,20 @@ namespace TensorSharp.Models.QwenImage
             return result;
         }
 
-        // gate = silu(gate) * up. Chunked (one delegate per 16K values, not per value) and
-        // vectorized on the pure-C# backend; the vectorized exp is within an ulp or two of
-        // MathF.Exp. Other backends keep the scalar formula.
         // Pure-C# backend: every projection runs on the packed F32 GEMM, reading the quantized
         // weight through QuantRowsPanelSource (each tile dequantized once per forward, with
         // exact F32 activations). The generic path (ManagedQuantizedOps) instead quantizes the
         // activations to 8 bits and re-decodes every weight block for each activation row.
-        // TS_QWEN_TE_CPU_GEMM=0 restores it.
+        // TS_QWEN_TE_CPU_GEMM=0 restores it, and the scalar SiLU with it, so that
+        // TS_QWEN_TE_CPU_GEMM=0 TS_QWEN_TE_CPU_ATTN=0 reproduce the previous per-op path bit for
+        // bit (the RoPE tables and the per-token QK norm are bit-identical to what they replaced).
         private static readonly bool CpuGemmOn = Environment.GetEnvironmentVariable("TS_QWEN_TE_CPU_GEMM") != "0";
+
+        // Parity reference for the harness (QwenImageStagesBench text --f64-linear), never set in
+        // production: every projection the packed GEMM would run is instead summed in double over
+        // the exactly dequantized weights, so a whole forward can be compared with one whose
+        // matmuls carry neither F32 accumulation nor 8-bit activation rounding.
+        internal static bool ReferenceF64Linear;
 
         // TS_QWEN_TE_PROFILE=1: per-forward split of the per-op path (linear / attention / norms).
         private static readonly bool ProfileOn = Environment.GetEnvironmentVariable("TS_QWEN_TE_PROFILE") == "1";
@@ -493,6 +498,11 @@ namespace TensorSharp.Models.QwenImage
                 return LinearForward(input, weightName);
             int seq = (int)input.Sizes[0], inDim = (int)qw.Ne0, outDim = (int)qw.Ne1;
             var result = new Tensor(_allocator, DType.Float32, seq, outDim);
+            if (ReferenceF64Linear)
+            {
+                ReferenceLinearF64(GetFloatPtr(input), seq, inDim, qw, GetFloatPtr(result), outDim);
+                return result;
+            }
             var packedInput = CpuPackedGemm.PackA(GetFloatPtr(input), seq, inDim, inDim, 1, CpuPackedGemm.Isa);
             CpuPackedGemm.Gemm(packedInput, new QuantRowsPanelSource(qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1),
                 outDim, GetFloatPtr(result), outDim);
@@ -501,11 +511,50 @@ namespace TensorSharp.Models.QwenImage
             return result;
         }
 
+        private static unsafe void ReferenceLinearF64(float* x, int seq, int inDim, QuantizedWeight qw, float* y, int outDim)
+        {
+            nint xL = (nint)x, yL = (nint)y, wL = qw.Data;
+            long rowBytes = ManagedQuantizedOps.RowSize(qw.GgmlType, inDim);
+            int type = qw.GgmlType;
+            double scale = qw.Scale;
+            Parallel.For(0, outDim, () => new float[inDim], (o, _, w) =>
+            {
+                fixed (float* wp = w)
+                {
+                    ManagedQuantizedOps.DequantizeRowToFloat32(type, wL + (nint)(o * rowBytes), wp, inDim);
+                    for (int r = 0; r < seq; r++)
+                        ((float*)yL)[(long)r * outDim + o] = (float)(DotF64((float*)xL + (long)r * inDim, wp, inDim) * scale);
+                }
+                return w;
+            }, _ => { });
+        }
+
+        // float x float is exact in double, so only the (double) additions round.
+        private static unsafe double DotF64(float* a, float* b, int n)
+        {
+            Vector256<double> s0 = default, s1 = default, s2 = default, s3 = default;
+            int i = 0;
+            for (; i + 16 <= n; i += 16)
+            {
+                var (a0, a1) = Vector256.Widen(Vector256.Load(a + i));
+                var (b0, b1) = Vector256.Widen(Vector256.Load(b + i));
+                var (a2, a3) = Vector256.Widen(Vector256.Load(a + i + 8));
+                var (b2, b3) = Vector256.Widen(Vector256.Load(b + i + 8));
+                s0 += a0 * b0; s1 += a1 * b1; s2 += a2 * b2; s3 += a3 * b3;
+            }
+            double acc = Vector256.Sum((s0 + s1) + (s2 + s3));
+            for (; i < n; i++) acc += (double)a[i] * b[i];
+            return acc;
+        }
+
+        // gate = silu(gate) * up. Chunked (one delegate per 16K values, not per value) and, with
+        // the packed GEMM on the pure-C# backend, vectorized: the vectorized exp is within an ulp
+        // or two of MathF.Exp. Other backends (and TS_QWEN_TE_CPU_GEMM=0) keep the scalar formula.
         private unsafe void SiluMulInPlace(Tensor gate, Tensor up)
         {
             int n = (int)gate.ElementCount();
             nint gL = (nint)GetFloatPtr(gate), uL = (nint)GetFloatPtr(up);
-            bool vectorized = _backend == BackendType.Cpu;
+            bool vectorized = _backend == BackendType.Cpu && CpuGemmOn;
             const int Chunk = 16 * 1024;
             Parallel.For(0, (n + Chunk - 1) / Chunk, c =>
             {

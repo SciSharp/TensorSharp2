@@ -963,6 +963,34 @@ namespace TensorSharp.Models
                 return LinearForwardWithBias(flat, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
             }
 
+            if (UseCpuAttention)
+            {
+                // Pure-C# backend: attention straight from the seq-major projections on the
+                // packed GEMM (QwenImage.CpuFullAttention) - no head-first copies and no
+                // [heads, n, n] scores (at 4096 patches the generic path below was ~70% of
+                // the whole encode).
+                var merged = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
+                try
+                {
+                    try
+                    {
+                        QwenImage.CpuFullAttention.Run(GetFloatPtr(q), GetFloatPtr(k), GetFloatPtr(v), GetFloatPtr(merged),
+                            numPatches, _numHeads, headDim, scale, _cpuAttentionWorkspace);
+                    }
+                    finally
+                    {
+                        q.Dispose();
+                        k.Dispose();
+                        v.Dispose();
+                    }
+                    return LinearForwardWithBias(merged, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
+                }
+                finally
+                {
+                    merged.Dispose();
+                }
+            }
+
             using var qR = q.View(numPatches, _numHeads, headDim);
             using var kR = k.View(numPatches, _numHeads, headDim);
             using var vR = v.View(numPatches, _numHeads, headDim);
@@ -1157,11 +1185,17 @@ namespace TensorSharp.Models
             return result;
         }
 
-        // TS_QWEN35_VENC_CPU_GEMM=0 keeps the Ops.Addmm linear on the pure-C# backend (A/B).
+        // A/B knobs of the pure-C# backend. TS_QWEN35_VENC_CPU_GEMM=0 restores the previous
+        // path as a whole (Ops.Addmm linears, the host GELU loop, the Ops-based attention);
+        // TS_QWEN35_VENC_CPU_ATTN=0 restores only the attention.
         private static readonly bool s_cpuGemmEnabled =
             Environment.GetEnvironmentVariable("TS_QWEN35_VENC_CPU_GEMM") != "0";
+        private static readonly bool s_cpuAttentionEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_VENC_CPU_ATTN") != "0";
         private bool UseCpuLinear => _cpuManaged && s_cpuGemmEnabled;
+        private bool UseCpuAttention => UseCpuLinear && s_cpuAttentionEnabled;
         private readonly Dictionary<string, QwenImage.PackedPanels> _cpuPackedWeights = new();
+        private readonly QwenImage.CpuAttentionWorkspace _cpuAttentionWorkspace = new();
 
         /// <summary>
         /// y[seq, out] = x[seq, in] W^T + b on the pure-C# backend: the packed SGEMM with W
@@ -1437,6 +1471,7 @@ namespace TensorSharp.Models
             _ropeCache.Clear();
             _blockOrderCache.Clear();
             _cpuPackedWeights.Clear();
+            _cpuAttentionWorkspace.K = _cpuAttentionWorkspace.Vt = Array.Empty<QwenImage.PackedPanels>();
         }
     }
 }

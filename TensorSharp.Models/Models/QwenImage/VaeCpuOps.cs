@@ -10,7 +10,10 @@
 // mid-block attention is two GEMMs per query block with a streaming softmax in between, and
 // the channel norm, SiLU, residual add and resampling passes are vectorized and spread over
 // a worker pool. The scalar loops in VaeReferenceMath stay the oracle: TS_QWEN_VAE_CPU=scalar
-// runs them instead (A/B), and the tests compare the two.
+// runs them instead (A/B), and the tests compare the two. That switch restores the original
+// convolution, attention and SiLU loops, i.e. the original numerics bit for bit; the norm, add
+// and resampling passes are shared by both modes (they are bit-identical to the loops they
+// replaced, only faster), so a scalar-mode timing slightly understates the old path's.
 //
 // Numerics: the GEMM accumulates each output with one FMA per k in k order (~1e-6 relative
 // to the scalar loop per layer, 130+ dB PSNR for a whole decode), and that order does not
@@ -27,8 +30,8 @@ namespace TensorSharp.Models.QwenImage
 {
     internal static unsafe partial class VaeReferenceMath
     {
-        // TS_QWEN_VAE_CPU=scalar restores the original scalar convolution / attention /
-        // elementwise loops on the managed path (A/B switch and oracle).
+        // TS_QWEN_VAE_CPU=scalar restores the original scalar convolution / attention / SiLU
+        // loops on the managed path (A/B switch and oracle; see the file header).
         internal static bool UseScalarCpu = Environment.GetEnvironmentVariable("TS_QWEN_VAE_CPU") == "scalar";
 
         /// <summary>The managed fast path is active: no device convolution, not forced scalar.
@@ -45,6 +48,11 @@ namespace TensorSharp.Models.QwenImage
 
         internal static PackedPanels PackConvWeight(float[] weight, int oc, int k)
         {
+            // The pack reads the array through a raw pointer: check its length here, where the
+            // scalar loop's bounds checks used to catch a mismatched weight.
+            ArgumentNullException.ThrowIfNull(weight);
+            if (weight.LongLength < (long)oc * k)
+                throw new ArgumentException($"conv weight has {weight.LongLength} values, expected {oc} x {k}.", nameof(weight));
             CpuGemmIsa isa = CpuPackedGemm.Isa;
             if (s_packedWeights.TryGetValue(weight, out var packed) && packed.Isa == isa && packed.Rows == oc && packed.K == k)
                 return packed;
@@ -64,6 +72,11 @@ namespace TensorSharp.Models.QwenImage
             int H = upsample2x ? 2 * x.H : x.H, W = upsample2x ? 2 * x.W : x.W;
             if (weight.Rows != OC || weight.K != x.C * KH * KW)
                 throw new ArgumentException($"packed conv weight [{weight.Rows}, {weight.K}] does not match OC {OC} x {x.C}*{KH}*{KW}");
+            // The GEMM reads x and the bias through raw pointers (bias[0..OC), x[0..C*H*W)).
+            if (bias != null && bias.Length < OC)
+                throw new ArgumentException($"conv bias has {bias.Length} values, expected {OC}.", nameof(bias));
+            if (x.D.LongLength < (long)x.C * x.H * x.W)
+                throw new ArgumentException($"feature holds {x.D.LongLength} values, expected {x.C} x {x.H} x {x.W}.", nameof(x));
             int Ho = (H + padT + padB - KH) / strideH + 1, Wo = (W + padL + padR - KW) / strideW + 1;
             long t0 = VaeCpuProfile.Start();
             var outp = Feature.Uninitialized(OC, Ho, Wo);
@@ -241,6 +254,8 @@ namespace TensorSharp.Models.QwenImage
         {
             long t0 = VaeCpuProfile.Start();
             int hw = H * W;
+            if (qkv.LongLength < 3L * C * hw)
+                throw new ArgumentException($"qkv holds {qkv.LongLength} values, expected 3 x {C} x {hw}.", nameof(qkv));
             float scale = 1f / MathF.Sqrt(C);
             var outp = Feature.Uninitialized(C, H, W);
             CpuGemmIsa isa = CpuPackedGemm.Isa;

@@ -38,6 +38,10 @@ namespace TensorSharp.Models.QwenImage
     internal unsafe interface IGemmPanelSource
     {
         float* Panels(int k0, int kc, int n0, int count, int nr, float* scratch, out long panelStride);
+
+        /// <summary>Every K chunk the driver asks for starts and ends on a multiple of this
+        /// (a quantized row decodes whole blocks); K itself must be a multiple of it.</summary>
+        int KAlignment { get; }
     }
 
     /// <summary>A matrix packed into MR-row (A) or NR-column (B) panels, 64-byte aligned on the
@@ -52,12 +56,17 @@ namespace TensorSharp.Models.QwenImage
         internal readonly int Panels;
         internal readonly CpuGemmIsa Isa;
 
-        internal PackedPanels(int rows, int k, int panel, CpuGemmIsa isa)
+        /// <summary>A pack of the given shape. With <paramref name="reuse"/> the storage of that
+        /// earlier pack is taken over when it is large enough (a per-layer operand repacked
+        /// every call); the earlier pack must no longer be read.</summary>
+        internal PackedPanels(int rows, int k, int panel, CpuGemmIsa isa, PackedPanels reuse = null)
         {
             Rows = rows; K = k; Panel = panel; Isa = isa;
             Panels = (rows + panel - 1) / panel;
             long floats = (long)Panels * panel * k;
-            _raw = GC.AllocateUninitializedArray<float>(checked((int)(floats + 16)), pinned: true);
+            _raw = reuse != null && reuse._raw.LongLength >= floats + 16
+                ? reuse._raw
+                : GC.AllocateUninitializedArray<float>(checked((int)(floats + 16)), pinned: true);
             nint p = (nint)Unsafe.AsPointer(ref _raw[0]);
             Base = (p + 63) & ~(nint)63;
         }
@@ -92,9 +101,12 @@ namespace TensorSharp.Models.QwenImage
 
         // KC x NT floats of B are packed per task: 256 x 256 x 4 B = 256 KB sits in the 1.25 MB L2
         // next to the streamed A panels, and a KC of 256 keeps an A panel (12 x 256 x 4 = 12 KB)
-        // plus one B panel (32 KB) inside the 48 KB L1 for the micro-kernel.
-        private static readonly int KcBlock = EnvInt("TS_CPU_GEMM_KC", 256);
-        private static readonly int NtBlock = EnvInt("TS_CPU_GEMM_NT", 256);
+        // plus one B panel (32 KB) inside the 48 KB L1 for the micro-kernel. The overrides are
+        // A/B knobs, clamped so a stray value cannot size a multi-GB scratch. KcBlock is settable
+        // for tests; the result never depends on it (C round-trips through memory as the same
+        // float between K chunks).
+        internal static int KcBlock { get; set; } = Math.Clamp(EnvInt("TS_CPU_GEMM_KC", 256), 16, 4096);
+        private static readonly int NtBlock = Math.Clamp(EnvInt("TS_CPU_GEMM_NT", 256), 32, 2048);
 
         // Worker pools. By default the kernels run on CpuWorkerPool.Shared (cores/2 here), like
         // the rest of the pure-C# backend. A caller whose whole pipeline is these kernels (the
@@ -103,22 +115,30 @@ namespace TensorSharp.Models.QwenImage
         // single 512-bit FMA port busier (512x512 decode 7.9 -> 7.0 s on the 8-core/16-thread
         // i7-11800H). Mixed with ThreadPool work (text encoder, vision tower) the extra spinning
         // workers cost more than they give (TE 1.6 -> 1.8 s, vision 0.72 -> 0.97 s), so those
-        // stay on the shared pool. TS_CPU_GEMM_THREADS sets the wide pool's width (cap 64).
+        // stay on the shared pool. Default width: every logical CPU, at most 64;
+        // TS_CPU_GEMM_THREADS overrides it within the pool's own limit (1..512).
         private static readonly Lazy<CpuWorkerPool> s_widePool = new(() => new CpuWorkerPool(
-            EnvInt("TS_CPU_GEMM_THREADS", Math.Clamp(Environment.ProcessorCount, 1, 64))));
+            Math.Clamp(EnvInt("TS_CPU_GEMM_THREADS", Math.Min(Environment.ProcessorCount, 64)), 1, 512)));
 
         internal static CpuWorkerPool WidePool => s_widePool.Value;
+
+        // Times the driver packed all of B once and shared it between row blocks (a test hook:
+        // the path only runs at shapes a unit test has to aim for).
+        private static long s_sharedPrepackRuns;
+        internal static long SharedPrepackRuns => System.Threading.Interlocked.Read(ref s_sharedPrepackRuns);
 
         private static int EnvInt(string name, int fallback)
             => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v > 0 ? v : fallback;
 
         // ---- packing -----------------------------------------------------------------
 
-        /// <summary>Pack A[m, k] (element (i, j) at src[i*strideM + j*strideK]) into MR-row panels.</summary>
+        /// <summary>Pack A[m, k] (element (i, j) at src[i*strideM + j*strideK]) into MR-row panels
+        /// (into <paramref name="reuse"/>'s storage when it is large enough; see PackedPanels).
+        /// With <paramref name="serial"/> the pack runs on the calling thread (a pool task).</summary>
         internal static PackedPanels PackA(float* src, int m, int k, long strideM, long strideK, CpuGemmIsa isa,
-            CpuWorkerPool pool = null)
+            CpuWorkerPool pool = null, PackedPanels reuse = null, bool serial = false)
         {
-            var packed = new PackedPanels(m, k, Mr(isa), isa);
+            var packed = new PackedPanels(m, k, Mr(isa), isa, reuse);
             int mr = packed.Panel;
             nint srcL = (nint)src, dstL = packed.Base;
             void PackPanel(int p)
@@ -149,7 +169,7 @@ namespace TensorSharp.Models.QwenImage
                     }
                 }
             }
-            ForEach(packed.Panels, (long)m * k >= 1 << 18, PackPanel, pool);
+            ForEach(packed.Panels, !serial && (long)m * k >= 1 << 18, PackPanel, pool);
             return packed;
         }
 
@@ -176,10 +196,13 @@ namespace TensorSharp.Models.QwenImage
         /// <paramref name="c"/> points at the first of those rows (row stride ldc). init: the
         /// existing C when <paramref name="accumulate"/>, else biasM[row] (per absolute A row),
         /// biasN[col] (per column) or zero. The row sub-range lets a caller block over A.
+        /// <paramref name="serial"/> runs the whole product on the calling thread with no shared
+        /// state, for callers that parallelize over many small GEMMs themselves (attention heads).
         /// </summary>
         internal static void Gemm<TSource>(PackedPanels a, TSource b, int n, float* c, long ldc,
             float* biasM = null, float* biasN = null, bool accumulate = false,
-            int panel0 = 0, int panelCount = -1, CpuWorkerPool pool = null) where TSource : struct, IGemmPanelSource
+            int panel0 = 0, int panelCount = -1, CpuWorkerPool pool = null, bool serial = false)
+            where TSource : struct, IGemmPanelSource
         {
             pool ??= CpuWorkerPool.Shared;
             CpuGemmIsa isa = a.Isa;
@@ -199,10 +222,10 @@ namespace TensorSharp.Models.QwenImage
             int ntPanels = Math.Max(1, NtBlock / nr);
             int nPanels = (n + nr - 1) / nr;
             int nTiles = (nPanels + ntPanels - 1) / ntPanels;
-            int threads = pool.ThreadCount;
+            int threads = serial ? 1 : pool.ThreadCount;
             // Narrow the column tiles when even the widest row split leaves threads idle
             // (a 1024-wide projection of a 40-token prompt is 4 tiles of 256 and one row block).
-            while (ntPanels > 1 && nTiles * Math.Max(1, panelCount / 4) < 2 * threads)
+            while (!serial && ntPanels > 1 && nTiles * Math.Max(1, panelCount / 4) < 2 * threads)
             {
                 ntPanels = (ntPanels + 1) / 2;
                 nTiles = (nPanels + ntPanels - 1) / ntPanels;
@@ -212,15 +235,23 @@ namespace TensorSharp.Models.QwenImage
             // panels per task so a B tile is shared by 48+ rows.
             int mBlocks = 1;
             int wanted = threads * 3;
-            if (nTiles < wanted)
+            if (!serial && nTiles < wanted)
                 mBlocks = Math.Max(1, Math.Min((wanted + nTiles - 1) / nTiles, panelCount / 4));
             int mbPanels = (panelCount + mBlocks - 1) / mBlocks;
             mBlocks = (panelCount + mbPanels - 1) / mbPanels;
             int tasks = nTiles * mBlocks;
             // Even K chunks: 1296 = 5 x 256 + 16 would pay a whole chunk's C traffic for 16 k.
+            // Then rounded up to the source's block alignment (a quantized row decodes whole
+            // 256-value super-blocks, whatever TS_CPU_GEMM_KC says).
             int kChunks = (k + KcBlock - 1) / KcBlock;
             int kc = (k + kChunks - 1) / kChunks;
-            bool parallel = tasks > 1 && (long)panelCount * mr * n * k >= 1L << 21;
+            int align = Math.Max(1, b.KAlignment);
+            if (align > 1)
+            {
+                kc = (int)Math.Min(k, ((long)kc + align - 1) / align * align);
+                kChunks = (k + kc - 1) / kc;
+            }
+            bool parallel = !serial && tasks > 1 && (long)panelCount * mr * n * k >= 1L << 21;
 
             // When several row blocks share each B tile, pack all of B once, in parallel, and let
             // every task read the shared copy: re-packing per row block made the pack cost more
@@ -231,6 +262,7 @@ namespace TensorSharp.Models.QwenImage
                 long floats = (long)nPanels * nr * k;
                 if (floats * sizeof(float) <= PrepackBudgetBytes)
                 {
+                    System.Threading.Interlocked.Increment(ref s_sharedPrepackRuns);
                     shared = RentShared(floats);
                     nint sharedBase = Align64(shared);
                     TSource packer = b;
@@ -591,6 +623,8 @@ namespace TensorSharp.Models.QwenImage
             _b = (nint)b; _strideK = strideK; _strideN = strideN; _n = n;
         }
 
+        public int KAlignment => 1;
+
         public float* Panels(int k0, int kc, int n0, int count, int nr, float* scratch, out long panelStride)
         {
             panelStride = (long)kc * nr;
@@ -640,6 +674,8 @@ namespace TensorSharp.Models.QwenImage
         internal PrepackedPanelSource(PackedPanels packed) { _base = packed.Base; _k = packed.K; }
         internal PrepackedPanelSource(nint panels, int k) { _base = panels; _k = k; }
 
+        public int KAlignment => 1;
+
         public float* Panels(int k0, int kc, int n0, int count, int nr, float* scratch, out long panelStride)
         {
             panelStride = (long)_k * nr;
@@ -666,6 +702,8 @@ namespace TensorSharp.Models.QwenImage
             _kh = kh; _kw = kw; _sh = sh; _sw = sw; _padT = padT; _padL = padL;
             _wo = wo; _n = ho * wo;
         }
+
+        public int KAlignment => 1;
 
         public float* Panels(int k0, int kc, int n0, int count, int nr, float* scratch, out long panelStride)
         {

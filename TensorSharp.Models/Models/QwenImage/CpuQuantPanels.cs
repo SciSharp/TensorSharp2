@@ -37,8 +37,10 @@ namespace TensorSharp.Models.QwenImage
             _rowBytes = ManagedQuantizedOps.RowSize(ggmlType, ne0);
         }
 
-        /// <summary>The weight can feed the GEMM: a managed-dequant type whose block tiles every
-        /// K chunk (the driver's chunks are 256-element multiples when K is).</summary>
+        /// <summary>The weight can feed the GEMM: a managed-dequant type whose block divides
+        /// 256 and a row length that is a whole number of 256-value super-blocks. The driver
+        /// rounds its K chunks up to <see cref="KAlignment"/>, so every chunk decodes whole
+        /// blocks whatever TS_CPU_GEMM_KC is.</summary>
         internal static bool Supports(int ggmlType, long ne0)
         {
             var type = (GgmlTensorType)ggmlType;
@@ -48,15 +50,25 @@ namespace TensorSharp.Models.QwenImage
             return block > 0 && QK_K % block == 0 && ne0 % QK_K == 0;
         }
 
+        // Whole blocks per chunk, and at least 8 so the transposes below always apply (the F32 /
+        // F16 / BF16 "block" is one value; Supports keeps K a multiple of 256 for every type).
+        public int KAlignment => Math.Max(8, _blockElements);
+
+        // Eight dequantized rows of one K chunk; on the heap, since a large TS_CPU_GEMM_KC
+        // would not fit a pool thread's 512 KB stack.
+        [ThreadStatic] private static float[] t_rows;
+
         public float* Panels(int k0, int kc, int n0, int count, int nr, float* scratch, out long panelStride)
         {
             if (k0 % _blockElements != 0 || kc % _blockElements != 0)
                 throw new InvalidOperationException($"K chunk [{k0}, +{kc}) is not aligned to {_blockElements}-element blocks.");
             panelStride = (long)kc * nr;
+            if (t_rows == null || t_rows.Length < 8 * kc)
+                t_rows = GC.AllocateUninitializedArray<float>(8 * kc, pinned: true);
             // Eight weight rows at a time: dequantize them contiguously, then write them into the
             // [kc][nr] panel with 8x8 register transposes (one 32-byte store per 8 values) rather
             // than one strided scalar store per value.
-            float* rows = stackalloc float[8 * kc];
+            float* rows = (float*)Unsafe.AsPointer(ref t_rows[0]);
             byte* blocks0 = (byte*)_w + (long)(k0 / _blockElements) * _blockBytes;
             for (int q = 0; q * nr < count; q++)
             {

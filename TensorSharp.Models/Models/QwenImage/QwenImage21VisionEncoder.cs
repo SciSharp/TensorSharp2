@@ -52,7 +52,8 @@ namespace TensorSharp.Models
                 GgmlBasicOps.GELUErf(tensor, tensor);
                 return;
             }
-            if (_cpuManaged && tensor.IsContiguous())
+            // Tied to the linear switch, so TS_QWEN35_VENC_CPU_GEMM=0 restores the host loop below.
+            if (UseCpuLinear && tensor.IsContiguous())
             {
                 GeluErfInPlace(tensor);
                 return;

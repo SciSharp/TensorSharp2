@@ -1,5 +1,6 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
+using System.Runtime.Intrinsics;
 using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Models;
@@ -161,12 +162,12 @@ public sealed unsafe class QwenImageCpuKernelTests
         }
     }
 
-    [Fact]
+    [Avx512AndAvx2Fact]
     public void KernelWidthDoesNotChangeTheBits()
     {
         // Every output accumulates one FMA per k in k order whatever the tile shape, so the
-        // AVX-512 and AVX2 kernels (and any thread count) must agree exactly.
-        if (!CpuPackedGemm.IsaSupported(CpuGemmIsa.Avx512) || !CpuPackedGemm.IsaSupported(CpuGemmIsa.Avx2)) return;
+        // AVX-512 and AVX2 kernels must agree exactly (PoolWidthDoesNotChangeTheBits covers
+        // the thread count).
         var rng = new Random(41);
         var x = new Feature(40, 21, 35, Random(rng, 40 * 21 * 35));
         float[] weight = Random(rng, 50 * 40 * 9, 0.2f), bias = Random(rng, 50);
@@ -391,6 +392,119 @@ public sealed unsafe class QwenImageCpuKernelTests
         }
     }
 
+    // The row-block split, the shared B pack and the K chunking all change with the pool width
+    // and TS_CPU_GEMM_KC; none may change a bit (C round-trips through memory as the same float).
+    [Theory]
+    [MemberData(nameof(Isas))]
+    public void QuantizedRowGemmKeepsItsBitsThroughTheSharedPackAndAnyKChunk(string isaName)
+    {
+        var isa = Enum.Parse<CpuGemmIsa>(isaName);
+        // 150 rows x 64 outputs: few column tiles, many row panels, so a 4-thread pool splits
+        // rows into >= 3 blocks and packs B once for all of them (the path attn_k / attn_v take
+        // for a 133+ token prompt); the single-block serial run is the reference.
+        int outDim = 64, inDim = 512, seq = 150;
+        using var pool = new CpuWorkerPool(4);
+        int savedKc = CpuPackedGemm.KcBlock;
+        try
+        {
+            foreach (var type in new[] { GgmlTensorType.Q4_K, GgmlTensorType.Q6_K, GgmlTensorType.Q8_0 })
+            {
+                var rng = new Random(100 + (int)type);
+                byte[] weights = RandomQuantRows(rng, type, outDim, inDim);
+                float[] x = Random(rng, (long)seq * inDim);
+                long rowBytes = ManagedQuantizedOps.RowSize((int)type, inDim);
+                var dense = new float[outDim * inDim];
+                fixed (byte* wp = weights)
+                fixed (float* dp = dense)
+                    for (int o = 0; o < outDim; o++)
+                        ManagedQuantizedOps.DequantizeRowToFloat32((int)type, (IntPtr)(wp + o * rowBytes), dp + o * inDim, inDim);
+                var expected = new float[seq * outDim];
+                for (int r = 0; r < seq; r++)
+                    for (int o = 0; o < outDim; o++)
+                    {
+                        double acc = 0;
+                        for (int k = 0; k < inDim; k++) acc += (double)x[r * inDim + k] * dense[o * inDim + k];
+                        expected[r * outDim + o] = (float)acc;
+                    }
+
+                float[] Run(bool serial)
+                {
+                    var y = new float[seq * outDim];
+                    fixed (byte* wp = weights)
+                    fixed (float* xp = x, yp = y)
+                        CpuPackedGemm.Gemm(CpuPackedGemm.PackA(xp, seq, inDim, inDim, 1, isa),
+                            new QuantRowsPanelSource((IntPtr)wp, (int)type, inDim, outDim), outDim, yp, outDim,
+                            pool: pool, serial: serial);
+                    return y;
+                }
+
+                CpuPackedGemm.KcBlock = 256;
+                float[] reference = Run(serial: true);
+                AssertClose(expected, reference, 1e-5, 1e-5, $"{isa} {type} serial");
+                long sharedBefore = CpuPackedGemm.SharedPrepackRuns;
+                Assert.Equal(reference, Run(serial: false));
+                Assert.True(CpuPackedGemm.SharedPrepackRuns > sharedBefore, $"{isa} {type}: the shared B pack did not run");
+                // TS_CPU_GEMM_KC values whose balanced chunk is not block-aligned (128, and 384,
+                // which balances K = 512 to 256 + 256 only after rounding) used to throw from the
+                // quantized panel source.
+                foreach (int kc in new[] { 16, 128, 384, 4096 })
+                {
+                    CpuPackedGemm.KcBlock = kc;
+                    Assert.Equal(reference, Run(serial: false));
+                    Assert.Equal(reference, Run(serial: true));
+                }
+                CpuPackedGemm.KcBlock = savedKc;
+            }
+        }
+        finally
+        {
+            CpuPackedGemm.KcBlock = savedKc;
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(Isas))]
+    public void PoolWidthDoesNotChangeTheBits(string isaName)
+    {
+        var isa = Enum.Parse<CpuGemmIsa>(isaName);
+        var rng = new Random(43);
+        // A 3x3 conv through the implicit im2col, and a strided linear with more row panels
+        // than column tiles (row blocks and the shared B pack at 3+ threads).
+        int ic = 24, oc = 96, h = 20, w = 30;
+        float[] x = Random(rng, (long)ic * h * w), weight = Random(rng, (long)oc * ic * 9, 0.2f), bias = Random(rng, oc);
+        int m = 200, n = 40, k = 300;
+        float[] a = Random(rng, (long)m * k), b = Random(rng, (long)k * n);
+        using var pool3 = new CpuWorkerPool(3);
+        using var pool4 = new CpuWorkerPool(4);
+        fixed (float* xp = x, wp = weight, bp = bias, ap = a, bbp = b)
+        {
+            var packedW = CpuPackedGemm.PackA(wp, oc, ic * 9, ic * 9, 1, isa);
+            var packedA = CpuPackedGemm.PackA(ap, m, k, k, 1, isa);
+            nint xL = (nint)xp, bL = (nint)bp, bbL = (nint)bbp;
+            float[] Conv(CpuWorkerPool p, bool serial)
+            {
+                var y = new float[oc * h * w];
+                fixed (float* yp = y)
+                    CpuPackedGemm.Gemm(packedW, new Im2colPanelSource((float*)xL, h, w, 3, 3, 1, 1, 1, 1, h, w), h * w, yp, h * w,
+                        biasM: (float*)bL, pool: p, serial: serial);
+                return y;
+            }
+            float[] Linear(CpuWorkerPool p, bool serial)
+            {
+                var y = new float[m * n];
+                fixed (float* yp = y)
+                    CpuPackedGemm.Gemm(packedA, new StridedPanelSource((float*)bbL, n, 1, n), n, yp, n, pool: p, serial: serial);
+                return y;
+            }
+            float[] conv = Conv(pool3, serial: true), linear = Linear(pool3, serial: true);
+            foreach (var p in new[] { pool3, pool4, CpuWorkerPool.Shared })
+            {
+                Assert.Equal(conv, Conv(p, serial: false));
+                Assert.Equal(linear, Linear(p, serial: false));
+            }
+        }
+    }
+
     // ---- text encoder / vision tower pieces ----------------------------------------
 
     [Theory]
@@ -449,6 +563,102 @@ public sealed unsafe class QwenImageCpuKernelTests
             }
     }
 
+    [Theory]
+    [MemberData(nameof(Isas))]
+    public void VisionAttentionMatchesSoftmaxReference(string isaName)
+    {
+        var isa = Enum.Parse<CpuGemmIsa>(isaName);
+        var rng = new Random(37);
+        using var pool = new CpuWorkerPool(3);
+        var workspace = new CpuAttentionWorkspace();
+        // 72 is the Qwen3-VL vision head dim; 130 and 37 leave partial query blocks and partial
+        // row panels, 13 a dim that is no whole number of panels; the workspace is reused across
+        // the growing, then shrinking, calls.
+        foreach (var (n, heads, dim) in new[] { (1, 2, 8), (37, 3, 72), (130, 4, 72), (64, 2, 13) })
+        {
+            float[] q = Random(rng, (long)n * heads * dim, 2f), k = Random(rng, (long)n * heads * dim, 2f),
+                v = Random(rng, (long)n * heads * dim);
+            float scale = 1f / MathF.Sqrt(dim);
+            int stride = heads * dim;
+            var expected = new float[n * stride];
+            for (int h = 0; h < heads; h++)
+                for (int i = 0; i < n; i++)
+                {
+                    var s = new double[n];
+                    double mx = double.NegativeInfinity, sum = 0;
+                    for (int j = 0; j < n; j++)
+                    {
+                        double dot = 0;
+                        for (int d = 0; d < dim; d++) dot += (double)q[i * stride + h * dim + d] * k[j * stride + h * dim + d];
+                        s[j] = dot * scale; mx = Math.Max(mx, s[j]);
+                    }
+                    for (int j = 0; j < n; j++) { s[j] = Math.Exp(s[j] - mx); sum += s[j]; }
+                    for (int d = 0; d < dim; d++)
+                    {
+                        double acc = 0;
+                        for (int j = 0; j < n; j++) acc += s[j] * v[j * stride + h * dim + d];
+                        expected[i * stride + h * dim + d] = (float)(acc / sum);
+                    }
+                }
+            var actual = new float[expected.Length];
+            WithIsa(isa, () =>
+            {
+                fixed (float* pq = q, pk = k, pv = v, po = actual)
+                    CpuFullAttention.Run(pq, pk, pv, po, n, heads, dim, scale, workspace, pool);
+                return 0;
+            });
+            AssertClose(expected, actual, 3e-6, 3e-5, $"{isa} vision attention n={n} heads={heads} dim={dim}");
+        }
+    }
+
+    [Fact]
+    public void SoftmaxExpStaysWithinAFewUlpOfMathFExp()
+    {
+        // The attention softmax's polynomial exp over its whole domain (x <= 0), both widths.
+        double worst = 0;
+        var lanes = new float[16];
+        for (int step = 0; step <= 1_000_000; step += 16)
+        {
+            for (int l = 0; l < 16; l++) lanes[l] = -87f * Math.Min(step + l, 1_000_000) / 1_000_000f;   // [-87, 0]
+            fixed (float* lp = lanes)
+            {
+                var e256 = CpuFullAttention.ExpNonPositive(Vector256.Load(lp));
+                var e512 = CpuFullAttention.ExpNonPositive(Vector512.Load(lp));
+                for (int l = 0; l < 16; l++)
+                {
+                    double exact = Math.Exp(lanes[l]);
+                    worst = Math.Max(worst, Math.Abs(e512.GetElement(l) - exact) / exact);
+                    if (l < 8) worst = Math.Max(worst, Math.Abs(e256.GetElement(l) - exact) / exact);
+                }
+            }
+        }
+        Assert.True(worst < 4e-7, $"worst relative error {worst:E2}");
+        // Saturation: far below the range it stays a tiny normal float, 0 maps to exactly 1,
+        // and NaN propagates.
+        var edge = CpuFullAttention.ExpNonPositive(Vector256.Create(-1000f, -88f, -87f, 0f, -0f, float.NaN, -1e-30f, -20f));
+        Assert.InRange(edge.GetElement(0), 0f, 2e-38f);
+        Assert.InRange(edge.GetElement(1), 0f, 2e-38f);
+        Assert.Equal(1f, edge.GetElement(3));
+        Assert.Equal(1f, edge.GetElement(4));
+        Assert.True(float.IsNaN(edge.GetElement(5)));
+        Assert.Equal(1f, edge.GetElement(6));
+    }
+
+    [Fact]
+    public void RawArrayConvolutionRejectsMismatchedWeightsAndBias()
+    {
+        // The packed path reads these arrays through raw pointers, so a short weight, bias,
+        // feature or qkv must fail loudly (as the bounds-checked scalar loops did).
+        var x = new Feature(4, 5, 6, new float[4 * 5 * 6]);
+        Assert.Throws<ArgumentException>(() => VaeReferenceMath.PackConvWeight(new float[8 * 4 * 9 - 1], 8, 4 * 9));
+        var packed = VaeReferenceMath.PackConvWeight(new float[8 * 4 * 9], 8, 4 * 9);
+        Assert.Throws<ArgumentException>(() => VaeReferenceMath.Conv2dCpu(x, packed, new float[7], 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.Throws<ArgumentException>(() => VaeReferenceMath.Conv2dCpu(new Feature(4, 5, 6, new float[4 * 5 * 6 - 1]),
+            packed, new float[8], 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.Equal(8 * 5 * 6, VaeReferenceMath.Conv2dCpu(x, packed, null, 8, 3, 3, 1, 1, 1, 1, 1, 1).D.Length);
+        Assert.Throws<ArgumentException>(() => VaeReferenceMath.AttentionCpu(new float[3 * 4 * 30 - 1], 4, 5, 6));
+    }
+
     [Fact]
     public void VectorizedErfGeluMatchesHostLoop()
     {
@@ -485,3 +695,13 @@ public sealed unsafe class QwenImageCpuKernelTests
 
 [CollectionDefinition("CpuPackedGemmIsa", DisableParallelization = true)]
 public sealed class CpuPackedGemmIsaCollection { }
+
+/// <summary>Skipped (reported as such, not passed) on hardware without both AVX-512 and AVX2+FMA.</summary>
+public sealed class Avx512AndAvx2FactAttribute : FactAttribute
+{
+    public Avx512AndAvx2FactAttribute()
+    {
+        if (!CpuPackedGemm.IsaSupported(CpuGemmIsa.Avx512) || !CpuPackedGemm.IsaSupported(CpuGemmIsa.Avx2))
+            Skip = "Compares the AVX-512 and AVX2 GEMM kernels; this CPU lacks one of them.";
+    }
+}

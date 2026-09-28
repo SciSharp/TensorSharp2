@@ -19,9 +19,11 @@ static void Usage()
 {
     Console.Error.WriteLine("conv [avx512|avx2|portable|all] [reps=3] [--scalar]       VAE conv layers: packed GEMM vs scalar");
     Console.Error.WriteLine("vae <vae.safetensors> <cpu|scalar|ggml_cpu> <decode|encode|roundtrip> <W> <H> <outPrefix> [--image png] [--reps N]");
-    Console.Error.WriteLine("text <Qwen3VL.gguf> <cpu|ggml_cpu> <out.f32> [--prompt text] [--reps N]");
+    Console.Error.WriteLine("text <Qwen3VL.gguf> <cpu|ggml_cpu> <out.f32> [--prompt text] [--reps N] [--f64-linear]");
+    Console.Error.WriteLine("     --f64-linear (cpu): every projection summed in double over exact weights - the parity reference");
     Console.Error.WriteLine("vision <mmproj.gguf> <cpu|ggml_cpu> <outPrefix> [--image png] [--size WxH] [--reps N]");
     Console.Error.WriteLine("compare <reference.f32> <actual.f32> [--image]              cosine, relL2, max error (PSNR for [0,1] images)");
+    Console.Error.WriteLine("vattn [patches=4096] [reps=3] [avx512|avx2|portable|all]     vision attention kernel (16 heads x 72) alone");
 }
 
 static string Opt(string[] a, string name, string fallback)
@@ -105,6 +107,7 @@ string json;
 switch (args[0])
 {
     case "conv": return ConvBench.Run(args);
+    case "vattn": return VisionAttentionBench.Run(args);
     case "te-linear": return QuantLinearCheck.Run(args);
     case "compare":
     {
@@ -176,6 +179,7 @@ switch (args[0])
         string output = Path.GetFullPath(args[3]);
         string prompt = Opt(args, "--prompt", "A small orange cat beside a blue ceramic vase, soft daylight, detailed photograph");
         int reps = int.Parse(Opt(args, "--reps", "1"));
+        QwenImageTextEncoder.ReferenceF64Linear = args.Contains("--f64-linear");
         var load = Stopwatch.StartNew();
         using var encoder = new QwenImageTextEncoder(args[1], backend);
         double loadSeconds = load.Elapsed.TotalSeconds;
@@ -194,7 +198,8 @@ switch (args[0])
         // The DiT conditioning, as QwenImage21Conditioner hands it over: the system prompt dropped.
         int drop = encoder.Tokenizer.Encode(QwenImage21Conditioner.SystemPrompt, addSpecial: false).Count;
         WriteFloats(Path.ChangeExtension(output, ".cond.f32"), hidden[(drop * encoder.HiddenSize)..]);
-        json = JsonSerializer.Serialize(new { scenario = "text", backend = backend.ToString(), tokens = tokens.Length, loadSeconds, seconds,
+        json = JsonSerializer.Serialize(new { scenario = "text", backend = backend.ToString(), f64Linear = QwenImageTextEncoder.ReferenceF64Linear,
+            tokens = tokens.Length, loadSeconds, seconds,
             nonFinite = hidden.Count(v => !float.IsFinite(v)), peakWorkingSetMb = PeakMb(), output });
         Console.WriteLine(json);
         if (backend == BackendType.GgmlCpu) { GgmlBasicOps.ReleaseReuseComputeBuffers(); GgmlBasicOps.ClearHostBufferCache(); GgmlBasicOps.Shutdown(); }
@@ -328,6 +333,49 @@ static unsafe class QuantLinearCheck
         double s = 0, r = 0;
         for (int i = 0; i < e.Length; i++) { double d = a[i] - e[i]; s += d * d; r += (double)e[i] * e[i]; }
         return Math.Sqrt(s / r);
+    }
+}
+
+/// <summary>The pure-C# vision attention (CpuFullAttention) alone at the Qwen3-VL tower's shape
+/// (16 heads x 72, one layer), per ISA, on the shared pool the encoder uses.</summary>
+static unsafe class VisionAttentionBench
+{
+    public static int Run(string[] args)
+    {
+        int n = args.Length > 1 ? int.Parse(args[1]) : 4096;
+        int reps = args.Length > 2 ? int.Parse(args[2]) : 3;
+        string which = args.Length > 3 ? args[3] : "native";
+        var isas = which switch
+        {
+            "all" => new[] { CpuGemmIsa.Avx512, CpuGemmIsa.Avx2, CpuGemmIsa.Portable },
+            "avx512" => new[] { CpuGemmIsa.Avx512 },
+            "avx2" => new[] { CpuGemmIsa.Avx2 },
+            "portable" => new[] { CpuGemmIsa.Portable },
+            _ => new[] { CpuPackedGemm.Isa },
+        };
+        const int heads = 16, dim = 72;
+        var rng = new Random(5);
+        float[] q = new float[(long)n * heads * dim], k = new float[q.Length], v = new float[q.Length], o = new float[q.Length];
+        for (int i = 0; i < q.Length; i++) { q[i] = (float)(rng.NextDouble() * 4 - 2); k[i] = (float)(rng.NextDouble() * 4 - 2); v[i] = (float)(rng.NextDouble() * 2 - 1); }
+        double flops = 4.0 * heads * n * (double)n * dim;
+        var workspace = new CpuAttentionWorkspace();
+        Console.WriteLine($"patches={n} heads={heads} dim={dim} threads={CpuWorkerPool.Shared.ThreadCount} ({flops / 1e9:F1} GFLOP per call)");
+        foreach (var isa in isas)
+        {
+            if (!CpuPackedGemm.IsaSupported(isa)) continue;
+            CpuPackedGemm.Isa = isa;
+            double best = double.MaxValue;
+            fixed (float* qp = q, kp = k, vp = v, op = o)
+                for (int r = 0; r <= reps; r++)   // rep 0 warms the JIT and the workspace
+                {
+                    var watch = Stopwatch.StartNew();
+                    CpuFullAttention.Run(qp, kp, vp, op, n, heads, dim, 1f / MathF.Sqrt(dim), workspace);
+                    if (r > 0) best = Math.Min(best, watch.Elapsed.TotalMilliseconds);
+                }
+            Console.WriteLine($"{isa,-8} {best,8:F1} ms {flops / best / 1e6,7:F1} GF/s");
+        }
+        CpuPackedGemm.Isa = CpuPackedGemm.DetectIsa();
+        return 0;
     }
 }
 
