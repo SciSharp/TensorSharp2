@@ -18,6 +18,7 @@
 // fast quantized matmul / ggml primitives.
 // ============================================================================
 using System;
+using System.Runtime.Intrinsics;
 using System.Threading.Tasks;
 using TensorSharp.Core;
 using TensorSharp.Runtime;
@@ -83,12 +84,15 @@ namespace TensorSharp.Models.QwenImage
             int seq = tokens.Length;
             if (imgs != null && imgs.Length == 0) imgs = null;
             _mropePos = BuildPositions(tokens.Length, imgs);
+            _ropeCos = _ropeSin = null;
 
             // Fused whole-trunk path (TSGgml_QwenTeTrunk): all layers in ONE device graph
             // instead of ~10 host round-trips per layer. Falls back to the per-op loop below.
             if (TryFusedEncode(tokens, imgs, out float[] fusedOut))
                 return fusedOut;
 
+            long profileStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            _profileLinear = _profileAttention = _profileNorm = 0;
             Tensor hidden = Embedding(tokens);             // [seq, hidden]
             if (imgs != null)
             {
@@ -106,7 +110,10 @@ namespace TensorSharp.Models.QwenImage
             {
                 string p = $"blk.{layer}";
                 TraceTensor(layer, "input", hidden);
-                using (Tensor normed = RMSNormOp(hidden, $"{p}.attn_norm.weight"))
+                long normStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                Tensor normedAttn = RMSNormOp(hidden, $"{p}.attn_norm.weight");
+                _profileNorm += System.Diagnostics.Stopwatch.GetTimestamp() - normStart;
+                using (Tensor normed = normedAttn)
                 using (Tensor attnOut = Attention(normed, p, seq, layer))
                 {
                     TraceTensor(layer, "attn_out", attnOut);
@@ -114,7 +121,10 @@ namespace TensorSharp.Models.QwenImage
                     if (!ReferenceEquals(res, hidden)) { hidden.Dispose(); hidden = res; }
                 }
                 TraceTensor(layer, "attn_residual", hidden);
-                using (Tensor normed2 = RMSNormOp(hidden, $"{p}.ffn_norm.weight"))
+                normStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                Tensor normedFfn = RMSNormOp(hidden, $"{p}.ffn_norm.weight");
+                _profileNorm += System.Diagnostics.Stopwatch.GetTimestamp() - normStart;
+                using (Tensor normed2 = normedFfn)
                 using (Tensor ffnOut = SwiGluFfn(normed2, p, layer))
                 {
                     Tensor res = Ops.Add(hidden, hidden, ffnOut);
@@ -137,6 +147,14 @@ namespace TensorSharp.Models.QwenImage
             }
             var output = TensorToHostFloat(hidden, (long)seq * Config.HiddenSize);
             hidden.Dispose();
+            if (ProfileOn)
+            {
+                double ms(long ticks) => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                double total = ms(System.Diagnostics.Stopwatch.GetTimestamp() - profileStart);
+                Console.WriteLine($"  [te-profile] {seq} tokens: total {total:F0} ms, linear {ms(_profileLinear):F0} ms, " +
+                    $"attention {ms(_profileAttention):F0} ms, rms norms {ms(_profileNorm):F0} ms, " +
+                    $"other {total - ms(_profileLinear) - ms(_profileAttention) - ms(_profileNorm):F0} ms");
+            }
             return output; // Qwen-Image-2.1 uses the last block before output_norm.
         }
 
@@ -185,6 +203,20 @@ namespace TensorSharp.Models.QwenImage
             ApplyMRoPE(k, _numKVHeads, seq);
             TraceTensor(layer, "qrope", q); TraceTensor(layer, "krope", k);
 
+            if (UseManagedAttention)
+            {
+                // Pure-C# backend: causal GQA straight from the [seq, heads*dim] projections.
+                // No head-first copies, no group-expanded K/V and no seq x seq score tensors.
+                var merged = new Tensor(_allocator, DType.Float32, seq, qDim);
+                long attentionStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                CausalGqaAttention(q, k, v, merged, seq, scale);
+                _profileAttention += System.Diagnostics.Stopwatch.GetTimestamp() - attentionStart;
+                q.Dispose(); k.Dispose(); v.Dispose();
+                TraceTensor(layer, "merged", merged);
+                using (merged)
+                    return Linear(merged, $"{prefix}.attn_output.weight");
+            }
+
             Tensor qHeads = ReshapeToHeads(q, _numHeads, seq, _headDim); q.Dispose();
             Tensor kHeads = ReshapeToHeads(k, _numKVHeads, seq, _headDim); k.Dispose();
             Tensor vHeads = ReshapeToHeads(v, _numKVHeads, seq, _headDim); v.Dispose();
@@ -225,15 +257,15 @@ namespace TensorSharp.Models.QwenImage
         private Tensor SwiGluFfn(Tensor input, string prefix, int layer)
         {
             TraceTensor(layer, "norm2", input);
-            Tensor gate = LinearForward(input, $"{prefix}.ffn_gate.weight");
+            Tensor gate = Linear(input, $"{prefix}.ffn_gate.weight");
             TraceTensor(layer, "gate", gate);
-            using (Tensor up = LinearForward(input, $"{prefix}.ffn_up.weight"))
+            using (Tensor up = Linear(input, $"{prefix}.ffn_up.weight"))
             {
                 TraceTensor(layer, "up", up);
                 SiluMulInPlace(gate, up);
             }
             TraceTensor(layer, "activated", gate);
-            Tensor down = LinearForward(gate, $"{prefix}.ffn_down.weight");
+            Tensor down = Linear(gate, $"{prefix}.ffn_down.weight");
             TraceTensor(layer, "down", down);
             gate.Dispose();
             return down;
@@ -243,30 +275,147 @@ namespace TensorSharp.Models.QwenImage
         // headDim/2 frequency indices is assigned a t/h/w axis by the interleaved layout
         // (InterleavedRopeAxis); the rotation angle uses that axis's 3D position component.
         // Text tokens have all three components equal, so this is identical to standard 1D RoPE.
+        // The cos/sin of every (token, frequency) are built once per EncodeHidden and shared by
+        // q and k of all layers (72 applications): the per-element Math.Pow + sincos was the
+        // cost of this pass. The table holds exactly the values the old inline code computed,
+        // and the rotation keeps its multiply/add order, so the result is bit-identical.
+        private float[] _ropeCos, _ropeSin;
+
         private unsafe void ApplyMRoPE(Tensor data, int numHeads, int seq)
         {
             int half = _headDim / 2;     // 64
-            int[] pos = _mropePos;       // [3*seq]
+            if (_ropeCos == null) (_ropeCos, _ropeSin) = BuildRopeTables(_mropePos, seq, _headDim, _ropeBase);
             float* p = GetFloatPtr(data);
+            int headDim = _headDim;
+            fixed (float* cosBase = _ropeCos, sinBase = _ropeSin)
+            {
+                nint pL = (nint)p, cL = (nint)cosBase, sL = (nint)sinBase;
+                Parallel.For(0, seq, s =>
+                {
+                    float* cs = (float*)cL + (long)s * half, sn = (float*)sL + (long)s * half;
+                    for (int hh = 0; hh < numHeads; hh++)
+                    {
+                        float* head = (float*)pL + (long)s * (numHeads * headDim) + (long)hh * headDim;
+                        int i = 0;
+                        for (; i + 8 <= half; i += 8)
+                        {
+                            var x1 = Vector256.Load(head + i);
+                            var x2 = Vector256.Load(head + half + i);
+                            var c = Vector256.Load(cs + i);
+                            var si = Vector256.Load(sn + i);
+                            Vector256.Store(x1 * c - x2 * si, head + i);
+                            Vector256.Store(x2 * c + x1 * si, head + half + i);
+                        }
+                        for (; i < half; i++)
+                        {
+                            float x1 = head[i], x2 = head[half + i];
+                            head[i] = x1 * cs[i] - x2 * sn[i];
+                            head[half + i] = x2 * cs[i] + x1 * sn[i];
+                        }
+                    }
+                });
+            }
+            InvalidateTensorDeviceCache(data);
+        }
+
+        /// <summary>cos/sin tables [seq, headDim/2] of the interleaved M-RoPE angles.</summary>
+        internal static (float[] Cos, float[] Sin) BuildRopeTables(int[] pos, int seq, int headDim, float ropeBase)
+        {
+            int half = headDim / 2;
+            var freq = new float[half];
+            var axis = new int[half];
+            for (int i = 0; i < half; i++)
+            {
+                freq[i] = (float)Math.Pow(ropeBase, -2.0 * i / headDim);
+                axis[i] = InterleavedRopeAxis(i);
+            }
+            var cos = new float[(long)seq * half];
+            var sin = new float[(long)seq * half];
             Parallel.For(0, seq, s =>
             {
-                for (int hh = 0; hh < numHeads; hh++)
+                for (int i = 0; i < half; i++)
                 {
-                    float* head = p + (long)s * (numHeads * _headDim) + (long)hh * _headDim;
-                    for (int i = 0; i < half; i++)
-                    {
-                        int comp = InterleavedRopeAxis(i); // 0/1/2 -> t/h/w
-                        int position = pos[comp * seq + s];
-                        float freq = (float)Math.Pow(_ropeBase, -2.0 * i / _headDim);
-                        float ang = position * freq;
-                        float c = MathF.Cos(ang), sn = MathF.Sin(ang);
-                        float x1 = head[i], x2 = head[half + i];
-                        head[i] = x1 * c - x2 * sn;
-                        head[half + i] = x2 * c + x1 * sn;
-                    }
+                    float ang = pos[axis[i] * seq + s] * freq[i];
+                    cos[(long)s * half + i] = MathF.Cos(ang);
+                    sin[(long)s * half + i] = MathF.Sin(ang);
                 }
             });
-            InvalidateTensorDeviceCache(data);
+            return (cos, sin);
+        }
+
+        // The managed attention below reads raw host pointers, so it is limited to the
+        // pure-C# backend; every other backend keeps the tensor-op sequence.
+        private bool UseManagedAttention => _backend == BackendType.Cpu &&
+            Environment.GetEnvironmentVariable("TS_QWEN_TE_CPU_ATTN") != "0";
+
+        /// <summary>
+        /// Causal grouped-query attention over the row-major projections: q [seq, H*D],
+        /// k and v [seq, KV*D] -> out [seq, H*D]. Query head h reads KV head h / (H/KV) by
+        /// index (the RepeatInterleave expansion, without the copy), and each query row
+        /// stops at its own position, so no score matrix and no mask are materialized.
+        /// Same formula as scale*QK^T + causal -inf mask + softmax + PV.
+        /// </summary>
+        private unsafe void CausalGqaAttention(Tensor q, Tensor k, Tensor v, Tensor output, int seq, float scale) =>
+            CausalGqaAttention(GetFloatPtr(q), GetFloatPtr(k), GetFloatPtr(v), GetFloatPtr(output),
+                seq, _numHeads, _numKVHeads, _headDim, scale);
+
+        internal static unsafe void CausalGqaAttention(float* q, float* k, float* v, float* output,
+            int seq, int heads, int kvHeads, int dim, float scale)
+        {
+            int group = heads / kvHeads;
+            long qStride = (long)heads * dim, kvStride = (long)kvHeads * dim;
+            nint qL = (nint)q, kL = (nint)k, vL = (nint)v, oL = (nint)output;
+            const int QueryBlock = 16;
+            int blocks = (seq + QueryBlock - 1) / QueryBlock;
+            CpuWorkerPool.Shared.For(heads * blocks, task =>
+            {
+                int h = task / blocks, b = task - h * blocks;
+                int kvh = h / group;
+                float* kBase = (float*)kL + (long)kvh * dim, vBase = (float*)vL + (long)kvh * dim;
+                float[] rented = seq > 4096 ? System.Buffers.ArrayPool<float>.Shared.Rent(seq) : null;
+                Span<float> scores = rented != null ? rented.AsSpan(0, seq) : stackalloc float[seq];
+                Span<float> acc = stackalloc float[dim];
+                fixed (float* sp = scores, ap = acc)
+                {
+                    for (int i = b * QueryBlock; i < Math.Min(seq, (b + 1) * QueryBlock); i++)
+                    {
+                        float* qi = (float*)qL + i * qStride + (long)h * dim;
+                        float mx = float.NegativeInfinity;
+                        for (int j = 0; j <= i; j++)
+                        {
+                            float sc = Dot(qi, kBase + j * kvStride, dim) * scale;
+                            sp[j] = sc;
+                            if (sc > mx) mx = sc;
+                        }
+                        float sum = 0f;
+                        for (int j = 0; j <= i; j++) { float e = MathF.Exp(sp[j] - mx); sp[j] = e; sum += e; }
+                        float inv = 1f / sum;
+                        new Span<float>(ap, dim).Clear();
+                        for (int j = 0; j <= i; j++) Axpy(sp[j] * inv, vBase + j * kvStride, ap, dim);
+                        float* oi = (float*)oL + i * qStride + (long)h * dim;
+                        Buffer.MemoryCopy(ap, oi, dim * sizeof(float), dim * sizeof(float));
+                    }
+                }
+                if (rented != null) System.Buffers.ArrayPool<float>.Shared.Return(rented);
+            });
+        }
+
+        private static unsafe float Dot(float* a, float* b, int n)
+        {
+            var acc = Vector256<float>.Zero;
+            int i = 0;
+            for (; i + 8 <= n; i += 8) acc += Vector256.Load(a + i) * Vector256.Load(b + i);
+            float sum = Vector256.Sum(acc);
+            for (; i < n; i++) sum += a[i] * b[i];
+            return sum;
+        }
+
+        private static unsafe void Axpy(float alpha, float* x, float* y, int n)
+        {
+            var va = Vector256.Create(alpha);
+            int i = 0;
+            for (; i + 8 <= n; i += 8) Vector256.Store(Vector256.Load(y + i) + va * Vector256.Load(x + i), y + i);
+            for (; i < n; i++) y[i] += alpha * x[i];
         }
 
         internal static int InterleavedRopeAxis(int frequency) =>
@@ -276,20 +425,28 @@ namespace TensorSharp.Models.QwenImage
         {
             float* data = GetFloatPtr(x);
             float* gamma = GetFloatPtr(_weights[weight]);
-            Parallel.For(0, seq * heads, row =>
+            int headDim = _headDim;
+            float eps = _eps;
+            nint dL = (nint)data, gL = (nint)gamma;
+            // One delegate per token (all its heads), not per head row.
+            Parallel.For(0, seq, s =>
             {
-                float* p = data + (long)row * _headDim;
-                double ss = 0;
-                for (int d = 0; d < _headDim; d++) ss += (double)p[d] * p[d];
-                float inv = 1f / MathF.Sqrt((float)(ss / _headDim) + _eps);
-                for (int d = 0; d < _headDim; d++) p[d] *= inv * gamma[d];
+                for (int hh = 0; hh < heads; hh++)
+                {
+                    float* p = (float*)dL + ((long)s * heads + hh) * headDim;
+                    float* g = (float*)gL;
+                    double ss = 0;
+                    for (int d = 0; d < headDim; d++) ss += (double)p[d] * p[d];
+                    float inv = 1f / MathF.Sqrt((float)(ss / headDim) + eps);
+                    for (int d = 0; d < headDim; d++) p[d] *= inv * g[d];
+                }
             });
             InvalidateTensorDeviceCache(x);
         }
 
         private unsafe Tensor LinearWithBias(Tensor input, string weightName, string biasName)
         {
-            Tensor result = LinearForward(input, weightName);
+            Tensor result = Linear(input, weightName);
             if (_weights.TryGetValue(biasName, out var bias))
             {
                 int seq = (int)result.Sizes[0], outDim = (int)result.Sizes[1];
@@ -306,15 +463,114 @@ namespace TensorSharp.Models.QwenImage
             return result;
         }
 
+        // Pure-C# backend: every projection runs on the packed F32 GEMM, reading the quantized
+        // weight through QuantRowsPanelSource (each tile dequantized once per forward, with
+        // exact F32 activations). The generic path (ManagedQuantizedOps) instead quantizes the
+        // activations to 8 bits and re-decodes every weight block for each activation row.
+        // TS_QWEN_TE_CPU_GEMM=0 restores it, and the scalar SiLU with it, so that
+        // TS_QWEN_TE_CPU_GEMM=0 TS_QWEN_TE_CPU_ATTN=0 reproduce the previous per-op path bit for
+        // bit (the RoPE tables and the per-token QK norm are bit-identical to what they replaced).
+        private static readonly bool CpuGemmOn = Environment.GetEnvironmentVariable("TS_QWEN_TE_CPU_GEMM") != "0";
+
+        // Parity reference for the harness (QwenImageStagesBench text --f64-linear), never set in
+        // production: every projection the packed GEMM would run is instead summed in double over
+        // the exactly dequantized weights, so a whole forward can be compared with one whose
+        // matmuls carry neither F32 accumulation nor 8-bit activation rounding.
+        internal static bool ReferenceF64Linear;
+
+        // TS_QWEN_TE_PROFILE=1: per-forward split of the per-op path (linear / attention / norms).
+        private static readonly bool ProfileOn = Environment.GetEnvironmentVariable("TS_QWEN_TE_PROFILE") == "1";
+        private long _profileLinear, _profileAttention, _profileNorm;
+
+        private Tensor Linear(Tensor input, string weightName)
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            Tensor result = LinearCore(input, weightName);
+            _profileLinear += System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            return result;
+        }
+
+        private unsafe Tensor LinearCore(Tensor input, string weightName)
+        {
+            if (_backend != BackendType.Cpu || !CpuGemmOn || !input.IsContiguous() ||
+                !_quantWeights.TryGetValue(weightName, out var qw) || !qw.HasHostData ||
+                !QuantRowsPanelSource.Supports(qw.GgmlType, qw.Ne0) || input.Sizes[1] != qw.Ne0)
+                return LinearForward(input, weightName);
+            int seq = (int)input.Sizes[0], inDim = (int)qw.Ne0, outDim = (int)qw.Ne1;
+            var result = new Tensor(_allocator, DType.Float32, seq, outDim);
+            if (ReferenceF64Linear)
+            {
+                ReferenceLinearF64(GetFloatPtr(input), seq, inDim, qw, GetFloatPtr(result), outDim);
+                return result;
+            }
+            var packedInput = CpuPackedGemm.PackA(GetFloatPtr(input), seq, inDim, inDim, 1, CpuPackedGemm.Isa);
+            CpuPackedGemm.Gemm(packedInput, new QuantRowsPanelSource(qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1),
+                outDim, GetFloatPtr(result), outDim);
+            if (qw.Scale != 1.0f)
+                Ops.Mul(result, result, qw.Scale);
+            return result;
+        }
+
+        private static unsafe void ReferenceLinearF64(float* x, int seq, int inDim, QuantizedWeight qw, float* y, int outDim)
+        {
+            nint xL = (nint)x, yL = (nint)y, wL = qw.Data;
+            long rowBytes = ManagedQuantizedOps.RowSize(qw.GgmlType, inDim);
+            int type = qw.GgmlType;
+            double scale = qw.Scale;
+            Parallel.For(0, outDim, () => new float[inDim], (o, _, w) =>
+            {
+                fixed (float* wp = w)
+                {
+                    ManagedQuantizedOps.DequantizeRowToFloat32(type, wL + (nint)(o * rowBytes), wp, inDim);
+                    for (int r = 0; r < seq; r++)
+                        ((float*)yL)[(long)r * outDim + o] = (float)(DotF64((float*)xL + (long)r * inDim, wp, inDim) * scale);
+                }
+                return w;
+            }, _ => { });
+        }
+
+        // float x float is exact in double, so only the (double) additions round.
+        private static unsafe double DotF64(float* a, float* b, int n)
+        {
+            Vector256<double> s0 = default, s1 = default, s2 = default, s3 = default;
+            int i = 0;
+            for (; i + 16 <= n; i += 16)
+            {
+                var (a0, a1) = Vector256.Widen(Vector256.Load(a + i));
+                var (b0, b1) = Vector256.Widen(Vector256.Load(b + i));
+                var (a2, a3) = Vector256.Widen(Vector256.Load(a + i + 8));
+                var (b2, b3) = Vector256.Widen(Vector256.Load(b + i + 8));
+                s0 += a0 * b0; s1 += a1 * b1; s2 += a2 * b2; s3 += a3 * b3;
+            }
+            double acc = Vector256.Sum((s0 + s1) + (s2 + s3));
+            for (; i < n; i++) acc += (double)a[i] * b[i];
+            return acc;
+        }
+
+        // gate = silu(gate) * up. Chunked (one delegate per 16K values, not per value) and, with
+        // the packed GEMM on the pure-C# backend, vectorized: the vectorized exp is within an ulp
+        // or two of MathF.Exp. Other backends (and TS_QWEN_TE_CPU_GEMM=0) keep the scalar formula.
         private unsafe void SiluMulInPlace(Tensor gate, Tensor up)
         {
             int n = (int)gate.ElementCount();
-            float* g = GetFloatPtr(gate);
-            float* u = GetFloatPtr(up);
-            Parallel.For(0, n, i =>
+            nint gL = (nint)GetFloatPtr(gate), uL = (nint)GetFloatPtr(up);
+            bool vectorized = _backend == BackendType.Cpu && CpuGemmOn;
+            const int Chunk = 16 * 1024;
+            Parallel.For(0, (n + Chunk - 1) / Chunk, c =>
             {
-                float x = g[i];
-                g[i] = (x / (1f + MathF.Exp(-x))) * u[i];
+                float* g = (float*)gL, u = (float*)uL;
+                int i = c * Chunk, end = Math.Min(n, i + Chunk);
+                if (vectorized)
+                    for (; i + 8 <= end; i += 8)
+                    {
+                        var x = Vector256.Load(g + i);
+                        Vector256.Store(x / (Vector256<float>.One + Vector256.Exp(-x)) * Vector256.Load(u + i), g + i);
+                    }
+                for (; i < end; i++)
+                {
+                    float x = g[i];
+                    g[i] = (x / (1f + MathF.Exp(-x))) * u[i];
+                }
             });
             InvalidateTensorDeviceCache(gate);
         }
