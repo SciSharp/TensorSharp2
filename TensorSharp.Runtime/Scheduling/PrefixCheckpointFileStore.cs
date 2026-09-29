@@ -27,11 +27,11 @@ namespace TensorSharp.Runtime.Scheduling;
 /// from a copy of the model's state at the end of the prompt every conversation shares
 /// (<see cref="IPrefixCheckpointStore"/>), but that state has to exist first, and in
 /// a fresh process it does not: the warm-up after a load prefills it, which on the
-/// phone is forty seconds for Qwen 9B and two and a half minutes for Bonsai 27B, and
-/// a message sent before the warm-up is done pays the same. Measured on the iPhone 17
-/// Pro Max: first-message time to first token 36-48 s (Qwen3.5 9B), 152 s (Bonsai
-/// 27B). Written once, read back at the next load, the checkpoint costs the size of
-/// a read from flash instead -- a hundred to a few hundred megabytes.
+/// phone is forty seconds for Qwen 9B, and a message sent before the warm-up is done
+/// pays the same. Measured on the iPhone 17 Pro Max: first-message time to first
+/// token 36-48 s (Qwen3.5 9B). Written once, read back at the next load, the
+/// checkpoint costs the size of a read from flash instead -- a hundred to a few
+/// hundred megabytes.
 /// </para>
 ///
 /// <para>

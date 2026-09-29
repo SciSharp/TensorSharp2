@@ -1,5 +1,5 @@
 {
-  "_comment": "Multi-GPU (tensor-parallel) benchmark config, written for a 4-GPU Linux box (validated on 4x NVIDIA A40 48 GB). TensorSharp vs llama.cpp on the same GGUFs, across text / multi-turn / tool / structured / image / audio / video scenarios, at --tp 1, 2 and 4. Select it with: python run_matrix.py --config benchmark_config_multigpu.json --tp 1,2,4 (report.py takes the same --config). TENSOR PARALLELISM: defaults.tp_devices lists the GPU ids the harness may use; every launched server is pinned to the first N of them (CUDA_VISIBLE_DEVICES), so a --tp N cell really occupies N GPUs and the tp=1 baseline really occupies one. TensorSharp splits with `--tp N`, llama.cpp with `--split-mode tensor`. A model too big for one GPU declares `min_tp` (DeepSeek V4 Flash UD-Q8_K_XL is ~154 GB, so it only runs at tp=4 on this box) and its smaller-degree cells are recorded as skipped instead of OOMing. MODEL PROVISIONING: every model declares its Hugging Face `source`, so any missing file is downloaded into ${model_root} on the first run and reused afterwards (`--download never` to require local files, `--download force` to re-fetch); files whose remote name differs from the local one carry their own `url`. Retarget with BENCH_MODEL_ROOT / BENCH_LLAMA_SERVER / BENCH_TS_SERVER_DLL / BENCH_RESULTS / BENCH_TP_DEVICES / BENCH_IMAGE / BENCH_AUDIO / BENCH_VIDEO.",
+  "_comment": "Tensor-parallel models only; DeepSeek V4 whole-layer placement moved to benchmark_config_deepseek4_layer.json. Multi-GPU (tensor-parallel) benchmark config, written for a 4-GPU Linux box (validated on 4x NVIDIA A40 48 GB). TensorSharp vs llama.cpp on the same GGUFs, across text / multi-turn / tool / structured / image / audio / video scenarios, at --tp 1, 2 and 4. Select it with: python run_matrix.py --config benchmark_config_multigpu.json --tp 1,2,4 (report.py takes the same --config). TENSOR PARALLELISM: defaults.tp_devices lists the GPU ids the harness may use; every launched server is pinned to the first N of them (CUDA_VISIBLE_DEVICES), so a --tp N cell really occupies N GPUs and the tp=1 baseline really occupies one. TensorSharp splits with `--tp N`, llama.cpp with `--split-mode tensor`. A model too big for one GPU declares `min_tp`, and its smaller-degree cells are recorded as skipped instead of OOMing. MODEL PROVISIONING: every model declares its Hugging Face `source`, so any missing file is downloaded into ${model_root} on the first run and reused afterwards (`--download never` to require local files, `--download force` to re-fetch); files whose remote name differs from the local one carry their own `url`. Retarget with BENCH_MODEL_ROOT / BENCH_LLAMA_SERVER / BENCH_TS_SERVER_DLL / BENCH_RESULTS / BENCH_TP_DEVICES / BENCH_IMAGE / BENCH_AUDIO / BENCH_VIDEO.",
 
   "paths": {
     "model_root": "/workspace/models",
@@ -87,18 +87,6 @@
       "mmproj": null,
       "modalities": ["text"],
       "size_class": "medium"
-    },
-    "dsv4-flash": {
-      "display": "DeepSeek V4 Flash 0731 (UD-Q8_K_XL, ~154 GB — 4 GPUs)",
-      "family": "deepseek4",
-      "source": "unsloth/DeepSeek-V4-Flash-GGUF",
-      "gguf": {"path": "${model_root}/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
-               "url": "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf"},
-      "mmproj": null,
-      "modalities": ["text"],
-      "size_class": "large",
-      "min_tp": 4,
-      "_tp_note": "DeepSeek V4 has its own whole-model executor and passes tpDegree=1 to ModelBase, so --tp N here is NOT the ggml tensor-parallel path (no AllReduce): N is reinterpreted as the number of GPUs its executor LAYER-splits the 150.7 GiB of weights across. That is what makes the model hostable at all; it is capacity parallelism, not a throughput axis, so read its tp4 row as the only configuration that runs rather than as a scaling point."
     }
   },
 
@@ -149,7 +137,7 @@
 
   "defaults": {
     "engines": ["tensorsharp", "llamacpp"],
-    "models": ["gemma4-e4b", "gemma4-26b-a4b", "qwen35-9b", "qwen35-35b-a3b", "nemotron3-omni-30b", "gpt-oss-20b", "dsv4-flash"],
+    "models": ["gemma4-e4b", "gemma4-26b-a4b", "qwen35-9b", "qwen35-35b-a3b", "nemotron3-omni-30b", "gpt-oss-20b"],
     "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video"],
     "backends": ["ggml_cuda"],
     "thinking": false,

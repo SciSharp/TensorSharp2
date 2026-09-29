@@ -269,7 +269,7 @@ def run_case(url, model, engine, name, tag, thinking=False, stream=True, timeout
     result = {"scenario": name, "tag": tag, "status": "fail",
               "input_sha256": digest(initial), "turns": []}
     messages = list(spec["messages"])
-    started = time.monotonic()
+    started = time.perf_counter()
     try:
         count = {"multi_turn": 2, "tool_round_trip": 2, "agentic": 3}.get(name, 1)
         for step in range(count):
@@ -324,7 +324,7 @@ def run_case(url, model, engine, name, tag, thinking=False, stream=True, timeout
         result["detail"] = f"{type(error).__name__}: {error}"
     if accept_fenced_json:
         result.setdefault("lenient_status", result["status"])
-    result["total_wall_ms"] = (time.monotonic() - started) * 1000
+    result["total_wall_ms"] = (time.perf_counter() - started) * 1000
     return result
 
 
@@ -467,7 +467,7 @@ def main():
     for name in names:
         for concurrency in degrees:
             for repeat in range(args.repeats):
-                start = time.monotonic()
+                start = time.perf_counter()
                 with ThreadPoolExecutor(max_workers=concurrency) as pool:
                     jobs = [pool.submit(run_case, args.url, args.model, args.engine,
                             name, f"{name}-c{concurrency}-r{repeat}-i{i}", args.thinking,
@@ -475,7 +475,7 @@ def main():
                             args.max_tokens, args.serial_tool_workflows,
                             args.accept_fenced_json) for i in range(concurrency)]
                     cases = [job.result() for job in jobs]
-                wall = time.monotonic() - start
+                wall = time.perf_counter() - start
                 for case in cases:
                     case.update(concurrency=concurrency, repeat=repeat)
                 report["cases"].extend(cases)

@@ -393,7 +393,7 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
             Assert.True(probe.BindSequenceCache("probe"));
             // Bound the number of real holders needed for a 1 MB budget; other
             // fixtures exercise growth from the required initial capacity of 8.
-            probe.SpecEnsureCapacity(128);
+            probe.SpecEnsureCapacity(256);
             probe.ForwardRefill(Prompt);
             Assert.True(probe.RetainSequenceCache("probe"));
             holderBytes = probe.RetainedCacheBytes("probe");
@@ -417,7 +417,7 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
                 {
                     string id = $"conv-{i}";
                     Assert.True(model.BindSequenceCache(id));
-                    model.SpecEnsureCapacity(128);
+                    model.SpecEnsureCapacity(256);
                     model.ForwardRefill(Prompt.Select(t => t + i).ToArray());
                     Assert.True(model.RetainSequenceCache(id), $"{id} was not retained");
                 }
@@ -707,10 +707,13 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
             using var engine = new InferenceEngine(model, config, NullLogger.Instance);
 
             // Round one: two concurrent conversations, each in its own fused holder.
-            var promptA = Prompt.Concat(Media).ToList();
-            var promptB = Other.Concat(AfterMedia).ToList();
-            var handleA = engine.SubmitRequest(new SequenceState("A1", promptA, newTokens, blockSize, SamplingConfig.Greedy));
-            var handleB = engine.SubmitRequest(new SequenceState("B1", promptB, newTokens, blockSize, SamplingConfig.Greedy));
+            // The radix cache retains end states only after 32 computed tokens.
+            // Keep these conversations above that policy threshold so this test
+            // exercises donation/rebinding rather than the short-prompt bypass.
+            var promptA = Prompt.Concat(Media).Concat(Prompt).Concat(Media).Concat(Prompt).ToList();
+            var promptB = Other.Concat(AfterMedia).Concat(Other).Concat(AfterMedia).Concat(Other).ToList();
+            var handleA = engine.SubmitRequest(new SequenceState("A1", promptA, newTokens, blockSize, SamplingConfig.Greedy, cacheScope: "conversation-a"));
+            var handleB = engine.SubmitRequest(new SequenceState("B1", promptB, newTokens, blockSize, SamplingConfig.Greedy, cacheScope: "conversation-b"));
             var drainA = DrainAsync(handleA);
             var drainB = DrainAsync(handleB);
             await Task.WhenAll(drainA, drainB);
@@ -725,39 +728,47 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
             // continuation gives.
             var followA = promptA.Concat(outA).Concat(Suffix).ToList();
             var (completionA2, outA2) = await DrainAsync(engine.SubmitRequest(
-                new SequenceState("A2", followA, newTokens, blockSize, SamplingConfig.Greedy)));
+                new SequenceState("A2", followA, newTokens, blockSize, SamplingConfig.Greedy, cacheScope: "conversation-a")));
             output.WriteLine($"A1 out={string.Join(',', outA)} A2 reused={completionA2.PrefixCacheReusedTokens} of {followA.Count} out={string.Join(',', outA2)}");
             Assert.True(completionA2.PrefixCacheReusedTokens >= promptA.Count + outA.Count - 1,
                 $"follow-up reused {completionA2.PrefixCacheReusedTokens} tokens; expected the retained conversation ({promptA.Count + outA.Count - 1}+)");
             Assert.True(completionA2.PrefixCacheReusedTokens <= followA.Count - 1);
             Assert.True(outA2.Count > 0);
-            var expectedA2 = Greedy(cold, cold.ForwardRefill(followA.ToArray()), outA2.Count);
+            // Completion is published before the worker finishes retaining the
+            // cache. Finish that native work before running a second model's
+            // cold reference against the process-wide GGML graph caches.
+            List<int> expectedA2;
+            lock (model.GpuComputeLock)
+                expectedA2 = Greedy(cold, cold.ForwardRefill(followA.ToArray()), outA2.Count);
             Assert.Equal(expectedA2, outA2);
 
             // New chats sharing a prefix: the first one is checkpointed at the
             // boundary, every later one starts from a clone of it.
-            var shared = Other.Concat(Prompt).ToList();
+            var shared = Other.Concat(Prompt).Concat(Other).Concat(Prompt).ToList();
             var chat1 = shared.Concat(new[] { 151, 157, 163, 167 }).ToList();
             var chat2 = shared.Concat(new[] { 173, 179, 181, 191 }).ToList();
             var chat3 = shared.Concat(new[] { 193, 197, 199, 211 }).ToList();
             var (c1, out1) = await DrainAsync(engine.SubmitRequest(
-                new SequenceState("chat-1", chat1, newTokens, blockSize, SamplingConfig.Greedy, sharedPrefixTokens: shared.Count)));
+                new SequenceState("chat-1", chat1, newTokens, blockSize, SamplingConfig.Greedy, sharedPrefixTokens: shared.Count, cacheScope: "new-chat-1")));
             Assert.Equal(0, c1.PrefixCacheReusedTokens);
             Assert.True(model.RetainedCacheCount >= 1, "no checkpoint was taken at the shared-prefix boundary");
             var (c2, out2) = await DrainAsync(engine.SubmitRequest(
-                new SequenceState("chat-2", chat2, newTokens, blockSize, SamplingConfig.Greedy, sharedPrefixTokens: shared.Count)));
+                new SequenceState("chat-2", chat2, newTokens, blockSize, SamplingConfig.Greedy, sharedPrefixTokens: shared.Count, cacheScope: "new-chat-2")));
             var (c3, out3) = await DrainAsync(engine.SubmitRequest(
-                new SequenceState("chat-3", chat3, newTokens, blockSize, SamplingConfig.Greedy, sharedPrefixTokens: shared.Count)));
+                new SequenceState("chat-3", chat3, newTokens, blockSize, SamplingConfig.Greedy, sharedPrefixTokens: shared.Count, cacheScope: "new-chat-3")));
             output.WriteLine($"chat-1 out={string.Join(',', out1)} chat-2 reused={c2.PrefixCacheReusedTokens} out={string.Join(',', out2)} chat-3 reused={c3.PrefixCacheReusedTokens} out={string.Join(',', out3)}");
             Assert.Equal(shared.Count, c2.PrefixCacheReusedTokens);
             Assert.Equal(shared.Count, c3.PrefixCacheReusedTokens);
             Assert.True(out2.Count > 0 && out3.Count > 0);
-            cold.ResetKVCache();
-            Assert.Equal(Greedy(cold, cold.ForwardRefill(chat2.ToArray()), out2.Count), out2);
-            cold.ResetKVCache();
-            Assert.Equal(Greedy(cold, cold.ForwardRefill(chat3.ToArray()), out3.Count), out3);
-            cold.ResetKVCache();
-            Assert.Equal(Greedy(cold, cold.ForwardRefill(chat1.ToArray()), out1.Count), out1);
+            lock (model.GpuComputeLock)
+            {
+                cold.ResetKVCache();
+                Assert.Equal(Greedy(cold, cold.ForwardRefill(chat2.ToArray()), out2.Count), out2);
+                cold.ResetKVCache();
+                Assert.Equal(Greedy(cold, cold.ForwardRefill(chat3.ToArray()), out3.Count), out3);
+                cold.ResetKVCache();
+                Assert.Equal(Greedy(cold, cold.ForwardRefill(chat1.ToArray()), out1.Count), out1);
+            }
         }
         finally
         {

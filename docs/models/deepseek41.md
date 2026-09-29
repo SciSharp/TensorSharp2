@@ -1,5 +1,7 @@
 # DeepSeek V4.1 Flash (`deepseek41`)
 
+> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Older commands and measurements below predate that default: migrate multi-GPU launches by adding `--layer-split N`. An explicit legacy `TS_DSV4_NGPU=0` still selects automatic placement over visible GPUs; unset it when using an explicit degree, or set it to that same count. Layer split is single-node only.
+
 [← back to model index](README.md) | [中文](deepseek41_zh-cn.md)
 
 TensorSharp has a dedicated **V4.1 inference graph on `ggml_cuda`**, with an
@@ -22,21 +24,43 @@ one shared expert, and a 2304-wide expert intermediate. It declares a
 1,048,576-token context. V4.1 differs from V4 in ways that affect every forward
 pass; changing the GGUF architecture name to `deepseek4` is invalid.
 
-## Download the Q2_K checkpoint
+## Download the repaired Q2_K/Q5_K checkpoint
 
-Use the seven-part Q2_K release from
-[vcruz305/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/main).
-The commands below pin the repository's current revision,
-`58d8ac86298fdf85a2440defee08b1abcad32e45`. Keep all seven shards in one
-directory and give TensorSharp the first shard. Q2_K contains mixed Q2_K/Q3_K
-tensors and needs approximately 246.35 GiB of disk space.
+For new downloads, use `Q2_K-Q5/` from
+[smalinin/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/tree/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5),
+pinned to `d1de55c19f95172c882906cc83c0e55932d26a63`. Keep all ten shards
+together and give TensorSharp the first shard. The files total **335,382,014,624
+bytes (312.349 GiB)**: mixed Q2_K/Q3_K backbone and experts, Q5_K Engram tables,
+80 F32 mHC matrices and four BF16 Engram gates.
+
+The original seven-shard `vcruz305` Q2_K artifact quantized those 84 sensitive
+tensors to Q2_K. It is no longer recommended for quality validation; the
+[publisher's repair report](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/blob/2c525d63b9ba5319185c93637f00d70fea55b44f/Q2_K/Q2_REPAIR_REPORT.md)
+explains the affected tensors. Adding Engram metadata to an old shard does not
+repair its tensor precision.
+
+The repaired package's headers have been checked for all 1,046 tensor names and
+shapes, the sensitive tensor types, and matching tokenizer/Engram metadata.
+All ten downloaded shards passed full-file SHA-256 verification. Bounded plain
+and DSpark HTTP probes passed with both `--layer-split 2` and experimental
+routed-expert TP (`--tp 2` plus `TS_DSV41_TP=2`) on `ggml_cuda`. Each of the four
+processes passed three text checks and one image OCR/color check through EOS,
+then shut down cleanly. Separate plain/DSpark text and image pairs matched all 24
+token IDs and `max_tokens` finishes in both modes, with active DSpark and clean
+exit. These bounded continuations are separate from the HTTP EOS checks. Image
+DSpark was slower in both measured pairs. Short repeated warm text controls
+(one warmup and three measured 69-prompt/24-output-token pairs per mode) also
+completed with exact token IDs and finishes, active DSpark, and clean exit.
+**These small-sample, paging-constrained checks do not establish broad quality or
+performance qualification, a speedup, multi-node execution, or full-model TP.**
+The historical measurements below do not qualify this quantization. Local evidence
+is under `docs/validation/model-matrix-20260927/deepseek41/`
+(not committed). Verify the hashes below for each new download.
 
 **The GGUF already includes Engram.** TensorSharp reads its token map, hash
 multipliers, bucket primes and offsets, and padding ID directly from the GGUF
 metadata, alongside the learned Engram weight tensors. No Engram generation,
 separate Engram file, or tokenizer/config download is needed for text inference.
-The publisher [added the embedded constants to the first Q2_K shard](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/commit/259692f97dad8bf9c59726f5e401f986898ca551);
-use the current release when upgrading an older download.
 
 The loader validates the embedded layout against the Engram tensor dimensions
 and rejects missing or malformed constants. There is no legacy file fallback or
@@ -48,26 +72,49 @@ From the repository root, on the machine storing the model:
 ```bash
 python3 -m venv /workspace/dsv41-tools
 /workspace/dsv41-tools/bin/python -m pip install huggingface_hub
-/workspace/dsv41-tools/bin/hf download vcruz305/DeepSeek-V4.1-Flash-GGUF \
-  --revision 58d8ac86298fdf85a2440defee08b1abcad32e45 \
-  --include "DeepSeek-V4.1-Flash-Q2_K-*.gguf" \
-  --local-dir /workspace/models/deepseek41-q2
+/workspace/dsv41-tools/bin/hf download smalinin/DeepSeek-V4.1-Flash-GGUF \
+  --revision d1de55c19f95172c882906cc83c0e55932d26a63 \
+  --include "Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-*.gguf" \
+  --local-dir /workspace/models/deepseek41-q2-q5
 ```
 
-The same repository also provides eleven Q4_K_M shards (approximately 415 GiB)
-with embedded Engram constants. Change the include pattern to
-`DeepSeek-V4.1-Flash-Q4_K_M-*.gguf` and use its first shard. The two Q4_K_M
-Engram tables are approximately 51.5 GiB each. On eight 46 GB cards they remain
-host mappings, and routed experts need CPU offload. The quantization report
-`docs/validation/deepseek41-quants/README.md` (local validation evidence, not committed) records the historical tests
-of that placement.
+`hf download` preserves the `Q2_K-Q5/` subdirectory. Verify every complete file
+before inference; the SHA-256 values below are the pinned publisher LFS identities.
+Run this outside timed benchmarks, since it reads all 312.349 GiB:
 
-Earlier results in this card and the complete-file SHA-256 record
+```bash
+(cd /workspace/models/deepseek41-q2-q5/Q2_K-Q5 && sha256sum --check - <<'SHA256'
+8126b49dfcfde02cb3db24b6f98d56b031f0a34eaca2509fc7b2b9d362cf0ac8  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf
+22bb293aee509a348ce32a739e006fa41f2348c6bcfafa3be76a3ee079eadf96  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00002-of-00010.gguf
+db894848b4f14d42c39e18faa907c737cd4850f2fcb9deff9d5ebd86f580aaf7  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00003-of-00010.gguf
+655a3400f2c092d6e3c11b8b18bf319b29563e59b960337115266574321953e3  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00004-of-00010.gguf
+4b9378c6819d1130517e8719026b34e5257f1f73bd1d50cf6f30243982100bac  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00005-of-00010.gguf
+04f161084d82032c65247c02e6169784a757be7db9e068b0baba6833125b6bb8  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00006-of-00010.gguf
+b1b1bf3cfbbc7388ce49b5ced69c42a13c7c5c5d3d609ac86902897a08d3c88a  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00007-of-00010.gguf
+fae7f35123ae3557034a541507bb9fc24fb62c2e16ff8441c32e8e0477743d5d  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00008-of-00010.gguf
+781fd69e9dd17c09676865830523a2d077a97544d6a004429aab95d2570f8534  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00009-of-00010.gguf
+fa5affb1f971cd6e7effad5684b73780472b486a46330cd7c5776f87c38fea97  DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00010-of-00010.gguf
+SHA256
+)
+```
+
+Stop if any hash fails. `eng/dsv41-verify-download.py` is a historical verifier
+for the original seven-shard layout; it does not verify this ten-shard package.
+The two Q5_K Engram tables total about 125.889 GiB. They cannot stay resident in
+a 57.74 GiB RAM allowance, even before CPU experts; use
+`TS_DSV41_ENGRAM_DEVICE=0 TS_DSV41_ENGRAM_WARM=0` on such a host and report
+paging costs. Choose CPU expert offload from actual device capacity, including
+the optional drafter and vision encoder.
+
+**Historical benchmark provenance:** earlier results in this card and the complete-file SHA-256 record
 `docs/validation/deepseek41/checkpoint-sha256.json` (local validation evidence, not committed)
 refer to revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5` and its older
-first shard. Those hashes and performance results must not be attributed to the
-current files without rerunning the checks. Record the repository revision and
-all shard hashes with new validation results.
+first shard in the original `vcruz305` release. Later seven-shard examples used
+`58d8ac86298fdf85a2440defee08b1abcad32e45`; the old Q4_K_M placement evidence is
+also separate. Retained historical launch commands identify those files, not
+the repaired package. Do not attribute their hashes, 246.35 GiB size, approximately
+60 GiB Engram warming, quality results or throughput to Q2_K-Q5. Record the
+revision and all shard hashes with every new validation result.
 
 ## Prepare the optional vision companion
 
@@ -79,8 +126,8 @@ can be prepared without downloading the original text weights:
 ```bash
 /workspace/dsv41-tools/bin/python -m pip install numpy==2.0.2 gguf
 /workspace/dsv41-tools/bin/python eng/dsv41-prepare-vision.py \
-  /workspace/models/deepseek41-q2 \
-  --parent-model /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  /workspace/models/deepseek41-q2-q5/Q2_K-Q5 \
+  --parent-model /workspace/models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
   --repository deepseek-ai/DeepSeek-V4.1-Flash \
   --revision dba1be0a40aa45a94ad051997016db3960a90277
 ```
@@ -97,7 +144,7 @@ entire original text shards. The companion provenance record
 contains all 306 tensors, source revisions, ranges, and the output digest.
 The native loader checks the parent tokenizer fingerprint and model
 dimensions before attachment. To enable images, add
-`--mmproj /workspace/models/deepseek41-q2/deepseek41.vision.gguf` to the server
+`--mmproj /workspace/models/deepseek41-q2-q5/Q2_K-Q5/deepseek41.vision.gguf` to the server
 command below. Image capability remains disabled without an attached companion.
 
 Vision uses dense F32 attention by default, matching the official tower's
@@ -166,11 +213,61 @@ Streaming and non-streaming requests returned JSON 400 without SSE for remote
 image URLs, malformed image base64, and valid-shaped or malformed audio parts.
 The earlier CPU-offload host's eight image checks remain preserved separately.
 
+## Prepare the optional DSpark companion
+
+V4.1 requires a `deepseek41-dspark` artifact; V4 drafters are incompatible.
+The official revision below isolates DSpark in shards 44–46 (7,933,129,808 bytes),
+so the original text model need not be downloaded:
+
+```bash
+/workspace/dsv41-tools/bin/hf download deepseek-ai/DeepSeek-V4.1-Flash \
+  --revision dba1be0a40aa45a94ad051997016db3960a90277 \
+  --include config.json model.safetensors.index.json \
+    model-00044-of-00048.safetensors model-00045-of-00048.safetensors \
+    model-00046-of-00048.safetensors \
+  --local-dir /workspace/models/deepseek41-source/DeepSeek-V4.1-Flash
+
+(cd /workspace/models/deepseek41-source/DeepSeek-V4.1-Flash && sha256sum --check - <<'SHA256'
+8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879  config.json
+74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8  model.safetensors.index.json
+9a6b39fb88a2510487a8efaef77aa7864e8061f6b62c95a0f010e9dd538f3b05  model-00044-of-00048.safetensors
+0cc9d5f6ca3a2158ccc63ce2c70c76aeda8177d54913340481af566680329eb5  model-00045-of-00048.safetensors
+e625902027b9d23d416f8818c665fab4704e0b96dc1bc778321601b700475a9d  model-00046-of-00048.safetensors
+SHA256
+)
+```
+
+Only after all five checks pass, convert the companion:
+
+```bash
+/workspace/dsv41-tools/bin/python -m pip install numpy==2.0.2
+mkdir -p /workspace/models/deepseek41-dspark
+/workspace/dsv41-tools/bin/python eng/dsv4-dspark-to-gguf.py \
+  --checkpoint /workspace/models/deepseek41-source/DeepSeek-V4.1-Flash \
+  --expert-type mxfp4 \
+  --out /workspace/models/deepseek41-dspark/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+```
+
+The audited conversion has 81 tensors, including all three visual routing biases,
+and occupies 7,940,628,416 bytes. Source identity and conversion checks are
+complete. Initial trained DSpark text/image HTTP probes passed with two-GPU
+layer split and experimental routed-expert TP on `ggml_cuda`, including complete
+image answers and clean shutdown. Broad quality and throughput remain unqualified
+under heavy paging. Separate 24-token text/image pairs matched plain token IDs
+and `max_tokens` finishes in both modes with active DSpark and clean exit; these
+are bounded continuations. No speedup, multi-node execution, or full-model TP is
+claimed.
+Add `--draft-model /workspace/models/deepseek41-dspark/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --spec`
+to a launch using the repaired ten-shard text checkpoint. Keep the same loaded
+companion and use `--no-spec` for a plain-decode comparison. The head occupies
+the output-head GPU and affects placement; vision needs additional space.
+
 ## Run the implemented path
 
 Install the .NET 10 SDK, CMake, a C++ compiler, and the CUDA toolkit with `nvcc`
-on `PATH`. Build from the repository root. These commands target the requested
-A40 VM (CUDA architecture 8.6); adjust both architecture values for other GPUs:
+on `PATH`. Build from the repository root. This example uses A40 CUDA architecture
+8.6; adjust both architecture values for other GPUs. It references the repaired
+download, whose capacity and inference behavior must be checked on your hardware:
 
 ```bash
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON \
@@ -181,21 +278,22 @@ dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release \
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   TS_CPU_MOE_THREADS=32 TS_DSV41_TP=0 TS_DSV4_UBATCH=256 \
-  TS_DSV41_ENGRAM_WARM=1 \
+  TS_DSV41_ENGRAM_WARM=0 \
   TS_DSV41_COMPACT_RAW_GATHER=0 KV_CACHE_DTYPE=f16 \
   TS_SCHED_MAX_RUNNING_SEQS=4 TS_SCHED_MAX_BATCHED_TOKENS=4096 \
   TS_SCHED_PREFILL_CHUNK=256 TS_SCHED_SOLO_PREFILL_CHUNK=8192 \
   dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
-  --backend ggml_cuda --tp 8 --port 5000
+  --model /workspace/models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
+  --backend ggml_cuda --layer-split 8 --port 5000
 ```
 
 The host build copies the native library beside the server DLL. This launch
-uses the conservative benchmark matrix's microbatch and scheduler settings;
-the optimized profiles in the validation report use different settings.
+uses explicit microbatch and scheduler settings. It is a launch example, not a
+measured repaired-checkpoint profile. The historical profiles in the validation
+report used different weights and sometimes different settings.
 Sparse prefill attention needs no flag: it is the default on this path, and
-`TS_DSV41_SPARSE_FA=0` turns it off. `TS_DSV4_UBATCH=256` pins the width that
-matrix measured; leave it unset to let the loader choose (see
+`TS_DSV41_SPARSE_FA=0` turns it off. `TS_DSV4_UBATCH=256` pins the example's width;
+leave it unset to let the loader choose (see
 [Backends](#backends)). Choose `TS_CPU_MOE_THREADS` for the available CPU quota
 and record it for each run.
 Set it in the launch environment, including for GPU-only placements: native
@@ -203,9 +301,9 @@ CPU graph work and host reduction can still affect latency. The current CLI
 also accepts `--cpu-moe-threads N`; use the same value if supplying both, since
 the positive environment value takes precedence in the native loader.
 
-To select the final measured eight-A40 layer profile instead, use this optional
-launch after preparing the vision companion. It sets the optimized flags
-explicitly; the conservative example above and the defaults remain unchanged:
+**Historical reproduction only:** the following eight-A40 launch preserves the
+original seven-shard checkpoint paths and measured settings. It is not the
+recommended new download or a measurement of Q2_K-Q5:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
@@ -218,7 +316,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --model /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
   --mmproj /workspace/models/deepseek41-q2/deepseek41.vision.gguf \
-  --backend ggml_cuda --tp 8 --n-cpu-moe 0 --cpu-moe-threads 32 \
+  --backend ggml_cuda --layer-split 8 --n-cpu-moe 0 --cpu-moe-threads 32 \
   --host 127.0.0.1 --port 5000 --max-tokens 2048
 ```
 
@@ -245,15 +343,17 @@ environment override, and the VM override probe. That original host did not
 expose a pool-width getter, so 32 was not measured directly there. Keep that
 baseline distinct from later explicit-thread experiments.
 
-For this architecture, `--tp 8` requests **eight GPUs using layer split**. The
+`--layer-split 8` requests **eight GPUs using layer split**. The
 startup diagnostic states the placement mode. TensorSharp distributes whole
 layers according to available VRAM by default.
-`TS_DSV4_NGPU` overrides the GPU count. Set `CUDA_VISIBLE_DEVICES` to the exact
+An explicit `--layer-split` count must agree with any `TS_DSV4_NGPU` override. Set `CUDA_VISIBLE_DEVICES` to the exact
 devices intended for the run. An explicit `TS_DSV4_NGPU=0` selects visible
 devices automatically and defers rank-count validation to the native loader.
 
-`TS_DSV41_TP=8` additionally enables experimental **routed-MoE tensor
-parallelism** on those eight GPUs. This setting accepts `0` (disabled) or a
+`--tp 8` together with `TS_DSV41_TP=8` enables experimental **routed-MoE tensor
+parallelism** on eight GPUs. `--tp` alone is refused because full-model tensor
+parallelism is not implemented. Do not combine `--layer-split` with
+`TS_DSV41_TP>0`; a pure layer split must keep that setting at `0`. This setting accepts `0` (disabled) or a
 rank count from `2` through `8`, which must equal the GPU count selected by
 `--tp` or `TS_DSV4_NGPU`. With automatic GPU selection, the native loader
 checks the count after enumerating visible devices. An invalid value or count
@@ -273,7 +373,7 @@ Independent numerical fixtures passed on 2/4/8 GPUs, including quantized
 expert shards and complete-model oracle checks. Those small fixtures do not
 establish that the full Q2_K checkpoint fits on two or four A40s. The VM example
 uses eight; smaller placements require enough CPU expert offload to fit.
-When the Q2_K Engram tables use host mappings, synchronous warming consumes
+When the historical seven-shard Q2_K Engram tables use host mappings, synchronous warming consumes
 approximately 60 GiB of host page cache before readiness. GPU-resident tables
 skip this warm. Record cold-load and warming time separately from warm throughput.
 
@@ -319,7 +419,7 @@ after model loading and before starting the timed requests:
 
 ```bash
 /workspace/dsv41-tools/bin/python eng/dsv41-warm-experts.py \
-  /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  /workspace/models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
   --layers 4 \
   --report cpu-expert-warming.json
 ```
@@ -876,7 +976,7 @@ V4.1-specific op running the scalar CPU implementation in
 
 **This is a correctness and portability path, not a serving path.** Every
 decoded token reads six of 384 routed experts in each of 40 layers, out of a
-246 GiB Q2_K checkpoint, on general-purpose cores. Those reference kernels run
+selected checkpoint, on general-purpose cores. Those reference kernels run
 one worker per node (the V4.1 quantize, candidate-score and candidate-mask
 kernels are the exceptions), and the wrapping backend of
 [One backend per GPU](#one-backend-per-gpu) is a CUDA object that is not built
@@ -904,7 +1004,7 @@ been measured, so CPU/CUDA parity on the real weights is not established here.
 
 ```bash
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model /models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+  --model /models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
   --backend ggml_cpu --port 5000
 ```
 
@@ -925,10 +1025,7 @@ The options that name GPUs behave as follows:
 - `TS_DSV4_NGPU` selects how many GPUs to enumerate. There are none to
   enumerate here, so the loader never reads it; it is neither an error nor a
   way to get more than the one CPU device.
-- `--tp N` finds no second device to split layers across, so the multi-GPU
-  gate degrades it to a single device with a warning. That warning is written
-  for GPU hosts and says "Running on ONE GPU"; on this backend read it as one
-  CPU device.
+- Multi-GPU `--tp N` and `--layer-split N` requests are refused on CPU backends.
 - The Engram tables stay host-mapped: the GPU-resident placement described
   above needs a device to place them on. `TS_DSV41_ENGRAM_DEVICE=1` is
   therefore refused here before the checkpoint is opened rather than accepted
@@ -1144,9 +1241,12 @@ original output limit retain precedence.
 - V4.1 DSpark speculative decoding is experimental. The loader accepts a
   `deepseek41-dspark` drafter (`--draft-model` / `TS_DSV4_DSPARK`) on
   `ggml_cuda` and `ggml_cpu` only, refuses it on every other executor, and
-  rejects V4 drafters. It is validated only on synthetic fixtures
-  (`DeepSeek41DsparkIntegrationTests`); no trained V4.1 drafter has been
-  measured, so there is no acceptance or throughput figure for it. While a
+  rejects V4 drafters. Synthetic integration tests
+  (`DeepSeek41DsparkIntegrationTests`) and initial trained text/image HTTP
+  probes with two-GPU layer split and experimental routed-expert TP on
+  `ggml_cuda` passed. Broad quality and throughput remain unqualified under
+  heavy paging. Separate 24-token text/image pairs matched plain token IDs and
+  `max_tokens` finishes in both modes with active DSpark and clean exit. While a
   drafter is loaded, token-batched decode and the retained cache are off.
   Without a drafter, `--spec` (including `--spec-type ngram`) serves standard
   decode.
@@ -1286,18 +1386,15 @@ local validation evidence, not committed) passed 39/75 cases and introduced no f
 in that run; separate Unicode JSON coverage passed 15/15. The subsequent
 repeated JSON comparison
 (`docs/validation/deepseek41/json-performance/completed-r2/README.md`, local
-validation evidence, not committed) exposed an additional Qwen3 failure for an identical request and recorded slower
+validation evidence, not committed) exposed an additional failure for an identical request and recorded slower
 Qwen3.5 first-token latency despite faster short-answer decode. Those results
 remain separate from the earlier run's zero-introduced-failure observation.
 They do not establish a blanket absence of regressions.
 
-A matched chunk control
-(`docs/validation/deepseek41/existing-model-regressions/qwen3-json-chunks/README.md`)
-reproduced the Qwen3 response change in both builds; the original concurrent
-chunk partitions were not recorded. Qwen3.5's shorter alternating control
+Qwen3.5's shorter alternating control
 (`docs/validation/deepseek41/json-performance/qwen35-alternating/README.md`)
 also showed slower final latency. A later 72-request control
-(`docs/validation/deepseek41/json-performance/qwen35-solo72/README.md`; all three
+(`docs/validation/deepseek41/json-performance/qwen35-solo72/README.md`; both
 are local validation evidence, not committed) held the native library fixed, passed every answer and did not reproduce the
 slowdown. No production fix was made from these diagnostics; the differing
 results and their limits remain in the validation report.

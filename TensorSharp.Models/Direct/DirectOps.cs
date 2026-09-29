@@ -352,14 +352,24 @@ namespace TensorSharp.Models.Direct
         }
 
         // ---- CPU GEMM --------------------------------------------------------------
-        // The managed BLAS fallback (netlib SGEMM port) is single-threaded; these
-        // parallel SIMD kernels cover the two orientations the direct Wan path
-        // needs. Both parallelize over output rows (hundreds to thousands here).
+        // Both orientations the direct paths need (the VAE im2col convs, attention)
+        // run on the packed register-tiled CpuSgemm, which takes the operands'
+        // row strides as they are (narrowed/head views need no copy). TS_CPU_SGEMM=0
+        // restores the previous row-parallel dot/saxpy loops below for A/B runs.
 
         /// <summary>C[m,n] = beta*C + alpha * A[m,k] x B[n,k]^T (dot form; both row-major;
         /// C may be a contiguous-row view — row stride taken from its Strides).</summary>
         public static unsafe void CpuGemmABt(Tensor a, Tensor b, Tensor c, float alpha, float beta)
         {
+            if (CpuSgemm.Enabled && a.Strides[1] == 1 && b.Strides[1] == 1 && c.Strides[1] == 1)
+            {
+                CpuSgemm.Gemm(checked((int)a.Sizes[0]), checked((int)b.Sizes[0]), checked((int)a.Sizes[1]), alpha,
+                    (float*)CpuNativeHelpers.GetBufferStart(a), a.Strides[0], 1,
+                    (float*)CpuNativeHelpers.GetBufferStart(b), 1, b.Strides[0],
+                    beta, (float*)CpuNativeHelpers.GetBufferStart(c), c.Strides[0]);
+                return;
+            }
+
             long m = a.Sizes[0], k = a.Sizes[1], n = b.Sizes[0];
             long aStride = a.Strides[0], cStride = c.Strides[0];
             float* pa = (float*)CpuNativeHelpers.GetBufferStart(a);
@@ -389,6 +399,15 @@ namespace TensorSharp.Models.Direct
         /// <summary>C[m,n] = beta*C + alpha * A[m,k] x B[k,n] (saxpy form; both row-major).</summary>
         public static unsafe void CpuGemmAB(Tensor a, Tensor b, Tensor c, float alpha, float beta)
         {
+            if (CpuSgemm.Enabled && a.Strides[1] == 1 && b.Strides[1] == 1 && c.Strides[1] == 1)
+            {
+                CpuSgemm.Gemm(checked((int)a.Sizes[0]), checked((int)b.Sizes[1]), checked((int)a.Sizes[1]), alpha,
+                    (float*)CpuNativeHelpers.GetBufferStart(a), a.Strides[0], 1,
+                    (float*)CpuNativeHelpers.GetBufferStart(b), b.Strides[0], 1,
+                    beta, (float*)CpuNativeHelpers.GetBufferStart(c), c.Strides[0]);
+                return;
+            }
+
             long m = a.Sizes[0], k = a.Sizes[1], n = b.Sizes[1];
             long aStride = a.Strides[0], cStride = c.Strides[0];
             float* pa = (float*)CpuNativeHelpers.GetBufferStart(a);
@@ -438,9 +457,11 @@ namespace TensorSharp.Models.Direct
             long rows = t.Sizes[0], cols = t.Sizes[1];
             float* p = (float*)CpuNativeHelpers.GetBufferStart(t);
             float* b = (float*)CpuNativeHelpers.GetBufferStart(bias);
+            bool simd = CpuKernels.Enabled;
             RowsParallel(rows, r =>
             {
                 float* row = p + r * cols;
+                if (simd) { RowAddSimd(row, row, b, cols); return; }
                 for (long c = 0; c < cols; c++) row[c] += b[c];
             });
         }
@@ -463,11 +484,13 @@ namespace TensorSharp.Models.Direct
                 float* py = (float*)CpuNativeHelpers.GetBufferStart(y);
                 float* ps = (float*)CpuNativeHelpers.GetBufferStart(shift);
                 float* pc = (float*)CpuNativeHelpers.GetBufferStart(scale);
+                bool simd = CpuKernels.Enabled;
                 RowsParallel(rowCount, rr =>
                 {
                     long r = rowFrom + rr;
                     float* rx = px + r * cols;
                     float* ry = py + r * cols;
+                    if (simd) { ModulateRowSimd(ry, rx, pc, ps, cols); return; }
                     for (long c = 0; c < cols; c++) ry[c] = rx[c] * (1f + pc[c]) + ps[c];
                 });
             }
@@ -489,11 +512,13 @@ namespace TensorSharp.Models.Direct
                 float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
                 float* pv = (float*)CpuNativeHelpers.GetBufferStart(v);
                 float* pg = (float*)CpuNativeHelpers.GetBufferStart(gate);
+                bool simd = CpuKernels.Enabled;
                 RowsParallel(rowCount, rr =>
                 {
                     long r = rowFrom + rr;
                     float* rx = px + r * cols;
                     float* rv = pv + r * cols;
+                    if (simd) { GateAddRowSimd(rx, rv, pg, cols); return; }
                     for (long c = 0; c < cols; c++) rx[c] += rv[c] * pg[c];
                 });
             }
@@ -514,12 +539,72 @@ namespace TensorSharp.Models.Direct
                 long rows = x.Sizes[0], cols = x.Sizes[1];
                 float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
                 float* pg = (float*)CpuNativeHelpers.GetBufferStart(gain);
+                bool simd = CpuKernels.Enabled;
                 RowsParallel(rows, r =>
                 {
                     float* rx = px + r * cols;
+                    if (simd) { RowMulSimd(rx, pg, cols); return; }
                     for (long c = 0; c < cols; c++) rx[c] *= pg[c];
                 });
             }
+        }
+
+        // Vector forms of the row loops above (TS_CPU_SIMD_ELEMENTWISE=0 keeps the scalar
+        // loops). Same operations in the same order and no FMA contraction, so bit-identical.
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+        private static unsafe void RowAddSimd(float* dst, float* x, float* b, long cols)
+        {
+            int w = System.Numerics.Vector<float>.Count;
+            long c = 0;
+            for (; c + w <= cols; c += w)
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(dst + c,
+                    System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(x + c) +
+                    System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(b + c));
+            for (; c < cols; c++) dst[c] = x[c] + b[c];
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+        private static unsafe void RowMulSimd(float* x, float* g, long cols)
+        {
+            int w = System.Numerics.Vector<float>.Count;
+            long c = 0;
+            for (; c + w <= cols; c += w)
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(x + c,
+                    System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(x + c) *
+                    System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(g + c));
+            for (; c < cols; c++) x[c] *= g[c];
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+        private static unsafe void ModulateRowSimd(float* y, float* x, float* scale, float* shift, long cols)
+        {
+            int w = System.Numerics.Vector<float>.Count;
+            var one = System.Numerics.Vector<float>.One;
+            long c = 0;
+            for (; c + w <= cols; c += w)
+            {
+                var vx = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(x + c);
+                var vs = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(scale + c);
+                var vh = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(shift + c);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(y + c, vx * (one + vs) + vh);
+            }
+            for (; c < cols; c++) y[c] = x[c] * (1f + scale[c]) + shift[c];
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+        private static unsafe void GateAddRowSimd(float* x, float* v, float* gate, long cols)
+        {
+            int w = System.Numerics.Vector<float>.Count;
+            long c = 0;
+            for (; c + w <= cols; c += w)
+            {
+                var vx = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(x + c);
+                var vv = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(v + c);
+                var vg = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(gate + c);
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(x + c, vx + vv * vg);
+            }
+            for (; c < cols; c++) x[c] += v[c] * gate[c];
         }
 
         // ---- norms -------------------------------------------------------------------
@@ -626,6 +711,9 @@ namespace TensorSharp.Models.Direct
         private static void GenericAttention(DirectContext ctx, Tensor outT, Tensor q, Tensor k, Tensor v,
                                              Tensor bias, int heads, int sq, int sk, int headDim, float scale)
         {
+            if (!ctx.IsCuda && TryCpuBlockedAttention(outT, q, k, v, bias, heads, sq, sk, headDim, scale))
+                return;
+
             long budget = ctx.IsCuda ? 64L << 20 : 16L << 20;   // score elements per chunk
             int qChunk = (int)Math.Max(1, Math.Min(sq, budget / Math.Max(1, sk)));
 
@@ -660,6 +748,109 @@ namespace TensorSharp.Models.Direct
                     Ops.Copy(dst, oh);
                 }
             }
+        }
+
+        /// <summary>Fewest query rows per block of <see cref="TryCpuBlockedAttention"/> (tuning;
+        /// CpuFloatBench 'attnlong' sweeps it).</summary>
+        internal static int CpuAttentionMinQBlock { get; set; } = 128;
+
+        /// <summary>
+        /// CPU attention on the packed SGEMM without per-head copies: Q/K/V head slices are
+        /// passed as strided views (row stride heads*hd), and the work is cut into independent
+        /// (head, query-block) blocks - S = scale*Q_blk K^T into a per-block scratch sized to stay
+        /// in L2, + bias, row softmax, then O_blk = P V written straight into the output columns.
+        /// With enough blocks for the pool each runs single-threaded (no barriers between the
+        /// GEMMs and the softmax); otherwise the blocks run in turn on the parallel GEMM. Same
+        /// arithmetic as the chunked path it replaces. TS_CPU_SGEMM=0 keeps that path.
+        /// </summary>
+        private static unsafe bool TryCpuBlockedAttention(Tensor outT, Tensor q, Tensor k, Tensor v, Tensor bias,
+                                                          int heads, int sq, int sk, int hd, float scale)
+        {
+            if (!CpuSgemm.Enabled || !CpuKernels.Enabled ||
+                q.DimensionCount != 2 || k.DimensionCount != 2 || v.DimensionCount != 2 ||
+                q.Strides[1] != 1 || k.Strides[1] != 1 || v.Strides[1] != 1 || outT.Strides[1] != 1 ||
+                (bias != null && (bias.DimensionCount != 3 || bias.Strides[2] != 1)))
+            {
+                return false;
+            }
+
+            // Raw pointers below, so extents are checked here: shapes the chunked path's
+            // Narrow/Select would reject (or read past, for V rows != sk) fail fast instead of
+            // reading out of bounds. A broadcast bias (stride 0 over heads or rows) is fine.
+            long width = (long)heads * hd;
+            if (q.Sizes[1] < width || k.Sizes[1] < width || v.Sizes[1] < width || v.Sizes[0] != sk)
+            {
+                throw new ArgumentException(
+                    $"Attention shapes q[{q.Sizes[0]},{q.Sizes[1]}] k[{k.Sizes[0]},{k.Sizes[1]}] v[{v.Sizes[0]},{v.Sizes[1]}] " +
+                    $"do not hold {heads} heads x {hd} with {sk} keys.");
+            }
+            if (bias != null && (bias.Sizes[0] < heads || bias.Sizes[1] < sq || bias.Sizes[2] != sk))
+            {
+                throw new ArgumentException(
+                    $"Attention bias [{bias.Sizes[0]},{bias.Sizes[1]},{bias.Sizes[2]}] does not cover [{heads},{sq},{sk}].");
+            }
+            if (sq == 0 || heads == 0 || hd == 0) return true;   // nothing to write
+
+            float* qp = (float*)CpuNativeHelpers.GetBufferStart(q);
+            float* kp = (float*)CpuNativeHelpers.GetBufferStart(k);
+            float* vp = (float*)CpuNativeHelpers.GetBufferStart(v);
+            float* op = (float*)CpuNativeHelpers.GetBufferStart(outT);
+            float* bp = bias != null ? (float*)CpuNativeHelpers.GetBufferStart(bias) : null;
+            long qs = q.Strides[0], ks = k.Strides[0], vs = v.Strides[0], os = outT.Strides[0];
+            long bh = bias != null ? bias.Strides[0] : 0, br = bias != null ? bias.Strides[1] : 0;
+
+            // Query rows per block: a <= 1 MB score block (L2) when the keys allow it, but at least
+            // 128 rows. Every block re-packs its head's K^T and V panels (one packed float per qn
+            // FMAs): against a 16-row floor, 128 measured ~6% faster at 4K keys (24 heads) and
+            // 11-22% at 8K-16K, although the score block then outgrows L2 (8 MB at 16K keys).
+            int qBlock = (int)Math.Clamp((256L * 1024) / Math.Max(1, sk), Math.Clamp(CpuAttentionMinQBlock, 8, 256), 256);
+            qBlock = Math.Min(sq, (qBlock + 7) / 8 * 8);
+            int qBlocks = (sq + qBlock - 1) / qBlock;
+            int items = heads * qBlocks;
+            bool blockParallel = items >= CpuParallel.DegreeOfParallelism;
+
+            void Block(int item, bool parallelInside)
+            {
+                int h = item / qBlocks;
+                int q0 = (item - h * qBlocks) * qBlock;
+                int qn = Math.Min(qBlock, sq - q0);
+                float[] rented = System.Buffers.ArrayPool<float>.Shared.Rent(qn * sk);
+                try
+                {
+                    fixed (float* s = rented)
+                    {
+                        CpuSgemm.Gemm(qn, sk, hd, scale,
+                            qp + q0 * qs + (long)h * hd, qs, 1,
+                            kp + (long)h * hd, 1, ks,
+                            0f, s, sk, parallelInside);
+                        if (bp != null)
+                        {
+                            for (int i = 0; i < qn; i++)
+                                CpuKernels.Binary(CpuKernels.BinaryOp.Add, s + (long)i * sk, s + (long)i * sk, bp + h * bh + (q0 + i) * br, sk);
+                        }
+                        if (parallelInside) CpuKernels.SoftmaxRows(s, s, qn, sk);
+                        else for (int i = 0; i < qn; i++) CpuKernels.SoftmaxRow(s + (long)i * sk, s + (long)i * sk, sk);
+                        CpuSgemm.Gemm(qn, hd, sk, 1f,
+                            s, sk, 1,
+                            vp + (long)h * hd, vs, 1,
+                            0f, op + q0 * os + (long)h * hd, os, parallelInside);
+                    }
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<float>.Shared.Return(rented);
+                }
+            }
+
+            if (blockParallel)
+            {
+                CpuParallel.For(items, item => Block(item, false));
+            }
+            else
+            {
+                for (int item = 0; item < items; item++) Block(item, true);
+            }
+            return true;
         }
 
         // ---- misc ----------------------------------------------------------------------

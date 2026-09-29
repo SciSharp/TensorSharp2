@@ -20,7 +20,7 @@ namespace TensorSharp.Runtime
     /// Minimal Jinja2 template renderer for LLM chat templates loaded from GGUF files.
     /// Supports: for/endfor, if/elif/else/endif, set, {{ output }}, {# comments #},
     /// whitespace control ({%- / -%}), dict/array access, comparisons, boolean logic,
-    /// filters (trim, length, default, first, last, upper, lower), method calls (.items(), .get()),
+    /// filters (trim, length, default, first, last, upper, lower, capitalize), method calls (.items(), .get()),
     /// string concatenation, loop variables (loop.first, loop.last, loop.index, loop.index0),
     /// array slicing, 'in' operator, 'is defined' / 'is not defined', ternary expressions.
     /// </summary>
@@ -1400,6 +1400,9 @@ namespace TensorSharp.Runtime
                     return val is string su ? su.ToUpperInvariant() : val;
                 case "lower":
                     return val is string slo ? slo.ToLowerInvariant() : val;
+                case "capitalize":
+                    if (val is not string capitalized || capitalized.Length == 0) return val;
+                    return char.ToUpperInvariant(capitalized[0]) + capitalized.Substring(1).ToLowerInvariant();
                 case "first":
                     if (val is IList<object> fl && fl.Count > 0) return fl[0];
                     return null;

@@ -44,6 +44,51 @@ public sealed class QwenImageResolutionTests : IDisposable
             new QwenImageParams { TargetArea = 1024L * 1024 }, null));
     }
 
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    public void AutomaticSizeOnTheCpuBackendIsOneMegapixel(BackendType backend)
+    {
+        // Hours per image at 2048x2048 on a CPU; the automatic size there is the 1 MP area.
+        Assert.Equal((1024, 1024), QwenImage21Pipeline.ResolveDimensions(new QwenImageParams(), null, backend));
+        Assert.True(QwenImage21Pipeline.UsesHostCpuAutomaticSize(new QwenImageParams(), backend));
+        // The server resolves an omitted targetArea to the native area before the pipeline.
+        var resolved = new QwenImageParams();
+        resolved.TargetArea = resolved.ResolveTargetArea();
+        Assert.Equal((1024, 1024), QwenImage21Pipeline.ResolveDimensions(resolved, null, backend));
+        Assert.True(QwenImage21Pipeline.UsesHostCpuAutomaticSize(resolved, backend));
+        // An edit keeps the first reference's aspect ratio at that area.
+        var reference = new RgbImage(4, 3, new float[4 * 3 * 3]);
+        Assert.Equal((1184, 896), QwenImage21Pipeline.ResolveDimensions(new QwenImageParams(), reference, backend));
+    }
+
+    // ggml_cpu keeps the native area it always had: the 1 MP default belongs to the pure-C#
+    // cpu backend it was introduced with.
+    [Theory]
+    [InlineData(BackendType.GgmlCpu)]
+    [InlineData(BackendType.GgmlCuda)]
+    [InlineData(BackendType.GgmlMetal)]
+    [InlineData(BackendType.GgmlVulkan)]
+    public void AutomaticSizeOnOtherBackendsStaysNative(BackendType backend)
+    {
+        Assert.Equal((2048, 2048), QwenImage21Pipeline.ResolveDimensions(new QwenImageParams(), null, backend));
+        Assert.False(QwenImage21Pipeline.UsesHostCpuAutomaticSize(new QwenImageParams(), backend));
+    }
+
+    [Fact]
+    public void ExplicitSizeAreaAndServerDefaultStillWinOnTheCpuBackend()
+    {
+        var explicitSize = new QwenImageParams { Width = 2048, Height = 2048 };
+        Assert.Equal((2048, 2048), QwenImage21Pipeline.ResolveDimensions(explicitSize, null, BackendType.Cpu));
+        Assert.False(QwenImage21Pipeline.UsesHostCpuAutomaticSize(explicitSize, BackendType.Cpu));
+        var area = new QwenImageParams { TargetArea = 1536L * 1536 };
+        Assert.Equal((1536, 1536), QwenImage21Pipeline.ResolveDimensions(area, null, BackendType.Cpu));
+        Assert.False(QwenImage21Pipeline.UsesHostCpuAutomaticSize(area, BackendType.Cpu));
+        Environment.SetEnvironmentVariable("TS_QWEN_IMAGE_WIDTH", "1536");
+        Environment.SetEnvironmentVariable("TS_QWEN_IMAGE_HEIGHT", "1024");
+        Assert.Equal((1536, 1024), QwenImage21Pipeline.ResolveDimensions(new QwenImageParams(), null, BackendType.Cpu));
+        Assert.False(QwenImage21Pipeline.UsesHostCpuAutomaticSize(new QwenImageParams(), BackendType.Cpu));
+    }
+
     [Fact]
     public void ExplicitGeometryWinsOverAreaAndEnvironment()
     {

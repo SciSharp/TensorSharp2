@@ -131,7 +131,7 @@ Console.WriteLine();
 Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
   <p><code>DiffusionEbParams</code> 的关键参数：<code>MaxDenoisingSteps</code>（48）、<code>TMin</code>/<code>TMax</code> 温度调度（0.4 / 0.8）、<code>EntropyBound</code>（0.1）、<code>StabilityThreshold</code> / <code>ConfidenceThreshold</code> 早停、<code>Seed</code> 与 <code>MaxBlocks</code>。<code>model.CanvasLength</code> 给出每块的 canvas 大小。</p>
   <p><strong>图像输入与类型化决策。</strong><code>model.LoadVisionEncoder(path)</code> 从 mmproj GGUF，或直接从 Hugging Face 分片 <code>model-00011-of-00011.safetensors</code> 加载 Gemma 4 视觉塔；音频与视频会被拒绝。加载视觉塔后，在用户消息上设置 <code>ImagePaths</code>，并在 <code>Generate</code> 之前让分词后的提示词依次经过 <code>model.MultimodalInjector.ProcessPromptTokens(messages, tokens)</code> 与 <code>QueuePromptEmbeddings(0)</code>，做法与 CLI 相同。要做 Jev 风格的类型化决策，请引用 <code>TensorSharp.Chat</code> 并调用 <code>ModelService.JevAsync(JevRequest.Parse(json.RootElement))</code>（命名空间 <code>TensorSharp.Server</code> 与 <code>TensorSharp.Server.Jev</code>）——这正是 <code>POST /v1/systemone</code> 背后经过校验的路径。底层读取是 <code>DiffusionGemmaModel.ReadStructured(promptTokens, seedCanvas, positions, tokenIds)</code>，调用期间需持有 <code>GpuComputeLock</code>。见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev_zh-cn.md" target="_blank" rel="noopener">docs/models/jev_zh-cn.md</a>。</p>
-  <div class="callout note"><div class="ic">🌫️</div><p>在 GPU 后端上，prompt 的 K/V 每块缓存一次并在各去噪步间复用；GGML 后端默认使用融合的整模型解码加融合 lm-head 尾。调优开关（<code>DIFFUSION_STEPS</code>、<code>DIFFUSION_NO_SC</code> 等）见<a href="advanced_zh-cn.html">高级</a>页。</p></div>
+  <div class="callout note"><div class="ic">🌫️</div><p>在 GPU 后端与纯 C# 的 <code>cpu</code> 后端上，prompt 的 K/V 每块缓存一次并在各去噪步间复用；GGML 后端默认使用融合的整模型解码加融合 lm-head 尾。调优开关（<code>DIFFUSION_STEPS</code>、<code>DIFFUSION_NO_SC</code> 等）见<a href="advanced_zh-cn.html">高级</a>页。</p></div>
 
   <h2 id="imagegen">Qwen-Image-2.1 — 图像生成与编辑</h2>
   <p>Qwen-Image-2.1 可以把<strong>提示词</strong>变成图像，也可以把<strong>提示词 + 一张或多张参考图</strong>变成编辑后的图像。所加载的 <code>qwen_image</code> GGUF 是扩散 Transformer；模型还会在 DiT 文件同目录解析伴随文件（或通过 <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> 环境变量指定）：专用 2.1 VAE、Qwen3-VL-8B 文本编码器，以及编辑时必需的 <code>mmproj</code> 视觉编码器。与 DiffusionGemma 一样，它<em>不是</em>自回归文本模型——自回归入口会抛异常，图像由 <code>GenerateImage()</code> 与 <code>EditImage()</code> 产生。</p>
@@ -141,7 +141,7 @@ using TensorSharp.Runtime;
 
 // 加载 Qwen-Image-2.1 DiT GGUF（架构 = qwen_image）。2.1 VAE 与 Qwen3-VL-8B
 // 文本编码器 + mmproj 从同一目录解析（或用 TS_QWEN_IMAGE_* 环境变量）。
-// Qwen-Image-2.1 需要 GGML 后端。
+// 任意 GGML 后端都可以，BackendType.Cpu（纯 C#）也可以。
 using var model = (QwenImageModel)ModelBase.Create("qwen_image_2.1_Q4_K_M.gguf", BackendType.GgmlMetal);
 
 var p = new QwenImageParams

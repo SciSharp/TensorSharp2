@@ -700,6 +700,7 @@ namespace TensorSharp.Runtime.Scheduling
                 var r = results[i];
                 var seq = r.Sequence;
                 var handle = _handles.TryGetValue(seq.RequestId, out var h) ? h : null;
+                handle?.RecordForwardTime(r);
 
                 if (r.Error != null)
                 {

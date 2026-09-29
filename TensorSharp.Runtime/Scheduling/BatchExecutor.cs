@@ -560,6 +560,7 @@ namespace TensorSharp.Runtime.Scheduling
                 SequenceCount = count,
                 MultimodalPendingCount = multimodalPending,
                 SoloHasPendingMultimodal = soloMm,
+                SoloIsDecode = count == 1 && !output.ScheduledWork[0].IsPrefill,
                 SoloKvInPagedStorage = soloPaged,
                 SoloHasFusedCache = soloFused,
                 SoloRequiresOwnershipSwap = soloSwap,
@@ -1333,7 +1334,10 @@ namespace TensorSharp.Runtime.Scheduling
                         // this step's logits); it is stashed on the sequence and
                         // consumed by TakePendingOrSample at the next step.
                         var nextTokens = new int[dn];
-                        if (fused.TryForwardBatchedFusedDecodeSampled(reqIds, btokens, bpositions, nextTokens))
+                        long batchStarted = Stopwatch.GetTimestamp();
+                        bool sampledBatchSucceeded = fused.TryForwardBatchedFusedDecodeSampled(reqIds, btokens, bpositions, nextTokens);
+                        long batchTicksPerSequence = (Stopwatch.GetTimestamp() - batchStarted) / dn;
+                        if (sampledBatchSucceeded)
                         {
                             ReportBatchedFusedDecodeSuccess(dn);
                             for (int i = 0; i < dn; i++)
@@ -1352,6 +1356,7 @@ namespace TensorSharp.Runtime.Scheduling
                                     SampledToken = btokens[i],
                                     IsPrefill = false,
                                     FullBlocksCaptured = 0,
+                                    ForwardElapsedTicks = batchTicksPerSequence,
                                 });
                             }
                             if (dn == n)
@@ -1363,7 +1368,10 @@ namespace TensorSharp.Runtime.Scheduling
                     if (handledBatched == null)
                     {
                         var outLogits = new float[dn][];
-                        if (fused.TryForwardBatchedFusedDecode(reqIds, btokens, bpositions, outLogits))
+                        long batchStarted = Stopwatch.GetTimestamp();
+                        bool logitsBatchSucceeded = fused.TryForwardBatchedFusedDecode(reqIds, btokens, bpositions, outLogits);
+                        long batchTicksPerSequence = (Stopwatch.GetTimestamp() - batchStarted) / dn;
+                        if (logitsBatchSucceeded)
                         {
                             ReportBatchedFusedDecodeSuccess(dn);
                             for (int i = 0; i < dn; i++)
@@ -1381,6 +1389,7 @@ namespace TensorSharp.Runtime.Scheduling
                                     SampledToken = btokens[i],
                                     IsPrefill = false,
                                     FullBlocksCaptured = 0,
+                                    ForwardElapsedTicks = batchTicksPerSequence,
                                 });
                             }
                             if (dn == n)
@@ -1844,9 +1853,11 @@ namespace TensorSharp.Runtime.Scheduling
                 return null;
             if (spec is IBatchedSpeculativeTarget batchedSpec && batchedSpec.SupportsBatchedSpecTrunk)
                 return null;
-            // Multimodal prefill needs Forward's embedding-inject hook, which
-            // SpecForward doesn't have.
-            if (_model.MultimodalInjector != null
+            // Prepared spans remain available for retry throughout the request.
+            // Only prefill requires injection, and a trunk must explicitly opt in
+            // before its speculative forward may consume those embeddings.
+            if (work.IsPrefill && !spec.SpecSupportsMultimodalPrefill
+                && _model.MultimodalInjector != null
                 && _model.MultimodalInjector.HasPendingEmbeddings(seq.RequestId))
             {
                 return null;
@@ -2141,6 +2152,9 @@ namespace TensorSharp.Runtime.Scheduling
             if (work.IsPrefill)
             {
                 int[] chunk = BuildPrefillChunk(seq, work);
+                if (!batchedTrunk && _model is ISpeculativeTarget { SpecSupportsMultimodalPrefill: true })
+                    _model.MultimodalInjector?.QueuePromptEmbeddingsForSlice(
+                        prevComputed, chunk.Length, seq.RequestId);
                 var swPrefill = Stopwatch.StartNew();
                 float[] logits = context.Exec.PrefillStep(chunk, prevComputed);
                 swPrefill.Stop();
@@ -2342,8 +2356,8 @@ namespace TensorSharp.Runtime.Scheduling
             // A batched-trunk model keeps its own paged route.
             if (spec is IBatchedSpeculativeTarget batchedSpec && batchedSpec.SupportsBatchedSpecTrunk)
                 return false;
-            if (_model.MultimodalInjector != null && _model.MultimodalInjector.HasPendingEmbeddings(seq.RequestId))
-                return false;
+            // This is decode: any prepared media spans belong to the already
+            // computed prompt and are retained only for replay/retry.
             // The bound holder must agree with the scheduler about the position.
             if (spec.CacheSeqLen != prevComputed)
                 return false;
@@ -4131,7 +4145,13 @@ namespace TensorSharp.Runtime.Scheduling
                     _model.MultimodalInjector.QueuePromptEmbeddingsForSlice(
                         start, Math.Min(n, promptTokens - start), seq.RequestId);
                 }
+                long forwardStarted = Stopwatch.GetTimestamp();
                 lastLogits = _model.Forward(tokens);
+                long forwardTicks = Stopwatch.GetTimestamp() - forwardStarted;
+                if (start < promptTokens)
+                    seq.ReplayPrefillElapsedTicks += forwardTicks;
+                else
+                    seq.ReplayDecodeElapsedTicks += forwardTicks;
                 seq.AdvanceComputedTokens(n);
                 start += n;
             }

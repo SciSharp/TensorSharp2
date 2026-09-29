@@ -2,7 +2,9 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using TensorSharp.GGML;
+using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.QwenImage
 {
@@ -28,7 +30,7 @@ namespace TensorSharp.Models.QwenImage
             if (inputs.Length > 0 && _model.MmprojPath == null)
                 throw new InvalidOperationException("Qwen-Image-2.1 editing requires the Qwen3-VL-8B vision projector; set --qwen-image-mmproj or TS_QWEN_IMAGE_MMPROJ.");
 
-            var (width, height) = ResolveDimensions(p, inputs.Length > 0 ? inputs[0] : null);
+            var (width, height) = ResolveDimensions(p, inputs.Length > 0 ? inputs[0] : null, _model.Backend);
             // A LoRA plug-in's recipe (a step-distilled adapter's trained schedule) supplies
             // the defaults; explicit steps / CFG still win.
             var recipe = _model.Loras?.Recipe;
@@ -41,14 +43,21 @@ namespace TensorSharp.Models.QwenImage
             float[] sigmas = recipe is { HasSchedule: true } ? recipe.Sigmas(steps, sequence) : QwenImage21Sampling.Sigmas(steps, sequence);
             if (_model.Loras is { OutputHeads.Length: > 0 } bundle && bundle.OutputHeads.Length != steps)
                 throw new ArgumentException($"The LoRA bundle has one output head per trained step ({bundle.OutputHeads.Length}); it cannot run {steps} steps.");
+            // Refuse a size this machine cannot hold before any encoder, transformer or VAE work.
+            if (_model.Backend == BackendType.Cpu) CheckCpuMemory(width, height, inputs);
             var total = Stopwatch.StartNew();
             var phase = Stopwatch.StartNew();
             void Phase(string name)
             {
                 Console.WriteLine($"  [qwen21-timing] {name}: {phase.Elapsed.TotalMilliseconds:F0}ms");
+                if (ReportMemory) Console.WriteLine($"  [qwen21-memory] after {name}: {MemoryLine()}");
                 phase.Restart();
             }
             Console.WriteLine($"Qwen-Image-2.1: {width}x{height}, {steps} steps, CFG {cfg}, seed {p.Seed}, {inputs.Length} reference(s)");
+            if (UsesHostCpuAutomaticSize(p, _model.Backend))
+                Console.WriteLine($"  automatic size on the cpu backend: {width}x{height} (about " +
+                    $"{HostCpuAutomaticArea / (1024 * 1024)} MP). The native 2048x2048 area has four times the tokens and takes " +
+                    "about 5x longer per step on a CPU; pass --width/--height (width/height in an API request) for another size.");
             if (recipe is { HasSchedule: true })
                 Console.WriteLine($"  [lora] sampling recipe ({System.IO.Path.GetFileName(recipe.Source)}): {recipe.Describe(steps, sequence)}");
 
@@ -83,8 +92,11 @@ namespace TensorSharp.Models.QwenImage
                         (negative, negativeLength, negativeSlots) = conditioner.EncodePrompt(p.NegativePrompt ?? "", refs);
                 }
                 Phase("text and vision encode");
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
-                GgmlBasicOps.ClearHostBufferCache();
+                ReleaseComputeBuffers();
+                // On the cpu backend the conditioner's packed vision weights and working buffers
+                // are managed arrays (GBs for an edit). Nothing during the denoise allocates
+                // managed memory, so without a collection they stay committed until the VAE.
+                if (!_model.UsesGgml) GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: false);
 
                 float[] latents = ToTokens(QwenImage21Sampling.Noise(checked(sequence * 64), p.Seed), h, w);
                 // Text and reference tokens are modulated at t=0, so their K/V are the
@@ -145,10 +157,11 @@ namespace TensorSharp.Models.QwenImage
                     negativeCache?.Dispose();
                 }
                 Phase("denoise");
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
-                // Denoising is finished; release resident DiT weights before
-                // allocating the much larger full-resolution VAE feature maps.
-                GgmlBasicOps.ClearHostBufferCache();
+                // Denoising is finished; release resident DiT weights (on the cpu
+                // backend, the transformer's activation scratch) before allocating the
+                // much larger full-resolution VAE feature maps.
+                ReleaseComputeBuffers();
+                _dit?.ReleaseScratch();
                 var output = Vae.Decode(new VaeLatent(64, h, w, ToChannels(latents, h, w)));
                 Phase("VAE decode");
                 Console.WriteLine($"  [qwen21-timing] total: {total.Elapsed.TotalSeconds:F3}s");
@@ -156,9 +169,62 @@ namespace TensorSharp.Models.QwenImage
             }
             finally
             {
-                GgmlBasicOps.ReleaseReuseComputeBuffers();
-                GgmlBasicOps.ClearHostBufferCache();
+                ReleaseComputeBuffers();
+                _dit?.ReleaseScratch();
             }
+        }
+
+        // TS_QWEN21_MEMORY=1 prints the process memory after every phase (working set, commit,
+        // and their peaks so far), for sizing a machine or checking the estimate.
+        private static readonly bool ReportMemory = Environment.GetEnvironmentVariable("TS_QWEN21_MEMORY") == "1";
+
+        private static string MemoryLine()
+        {
+            using var self = Process.GetCurrentProcess();
+            self.Refresh();
+            static string Mib(long bytes) => (bytes / (1024.0 * 1024.0)).ToString("F0", CultureInfo.InvariantCulture);
+            return $"working set {Mib(self.WorkingSet64)} MiB (peak {Mib(self.PeakWorkingSet64)}), " +
+                $"private {Mib(self.PrivateMemorySize64)} MiB (peak commit {Mib(self.PeakPagedMemorySize64)}), " +
+                $"GC heap {Mib(GC.GetTotalMemory(false))} MiB";
+        }
+
+        /// <summary>
+        /// Refuses (ArgumentException, a 400 on the server) a size whose estimated peak does not fit in
+        /// this machine's memory (<see cref="QwenImage21CpuMemory"/>), and warns when it exceeds the
+        /// memory free right now (other processes may give it back, so that is not a refusal).
+        /// </summary>
+        private void CheckCpuMemory(int width, int height, RgbImage[] inputs)
+        {
+            // The joint sequence's prefix: the prompt (a few hundred tokens at most) and, per
+            // reference, its /16 VAE tokens plus about a quarter as many vision slots.
+            long prefix = 256;
+            foreach (var input in inputs)
+            {
+                var (rw, rh) = ResolveReferenceDimensions(input, width, height);
+                prefix += (long)(rw / 16) * (rh / 16) * 5 / 4;
+            }
+            int prefixTokens = (int)Math.Min(int.MaxValue, prefix);
+            long transformerBytes = 0;
+            try { transformerBytes = new System.IO.FileInfo(_model.DitGgufPath).Length; }
+            catch (Exception e) when (e is System.IO.IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { }
+            if (Environment.GetEnvironmentVariable(QwenImage21CpuMemory.CheckVariable) != "0" &&
+                QwenImage21CpuMemory.Refusal(width, height, prefixTokens, transformerBytes, QwenImage21CpuMemory.TotalMemoryBytes()) is string refusal)
+                throw new ArgumentException(refusal);
+            long needed = QwenImage21CpuMemory.EstimatePeakBytes(width, height, prefixTokens, transformerBytes);
+            long free = QwenImage21CpuMemory.FreeMemoryBytes();
+            if (free > 0 && needed > free)
+                Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"  [qwen21] WARNING: {width}x{height} needs about {QwenImage21CpuMemory.Gib(needed):F1} GiB at its peak, " +
+                    $"but only {QwenImage21CpuMemory.Gib(free):F1} GiB is free right now; close other programs or expect paging."));
+        }
+
+        /// <summary>Releases GGML scratch and resident weights between stages. The pure-C# cpu
+        /// backend has neither, and must not call into the native library at all.</summary>
+        private void ReleaseComputeBuffers()
+        {
+            if (!_model.UsesGgml) return;
+            GgmlBasicOps.ReleaseReuseComputeBuffers();
+            GgmlBasicOps.ClearHostBufferCache();
         }
 
         private static void ReportPrefixCache(QwenImage21DiT.PrefixCache cache, string branch, int ranks)
@@ -208,7 +274,22 @@ namespace TensorSharp.Models.QwenImage
         // The default-size configuration last warned about, so each one is reported once.
         private static string _defaultSizeWarnedFor;
 
-        internal static (int Width, int Height) ResolveDimensions(QwenImageParams p, RgbImage reference)
+        /// <summary>
+        /// The automatic output area on the pure-C# cpu backend: 1024x1024, the area the references
+        /// are conditioned at. The native 2048x2048 area has 16384 image tokens against 4096, so a
+        /// denoising step takes about 5x as long (attention grows with the square): many minutes
+        /// per step on a CPU, hours per image at the default 40 steps. Explicit sizes, an explicit
+        /// area and the server's --width/--height are unaffected. ggml_cpu keeps the native area,
+        /// as it always has: only the backend this default was introduced with changes behaviour.
+        /// </summary>
+        internal const long HostCpuAutomaticArea = 1024L * 1024;
+
+        internal static bool IsHostCpu(BackendType backend) => backend == BackendType.Cpu;
+
+        /// <summary>Output geometry. <paramref name="backend"/> selects the automatic area: the
+        /// native 2048x2048 one, or <see cref="HostCpuAutomaticArea"/> on the cpu backend (null
+        /// keeps the native area).</summary>
+        internal static (int Width, int Height) ResolveDimensions(QwenImageParams p, RgbImage reference, BackendType? backend = null)
         {
             int width = p.Width, height = p.Height;
             if (width != 0 || height != 0)
@@ -219,12 +300,18 @@ namespace TensorSharp.Models.QwenImage
             }
             // The server's default size (--width/--height) stands in only for a request that
             // named neither a size nor an area; an explicit area keeps its own geometry.
-            bool areaRequested = p.TargetArea > 0 && p.TargetArea != AutomaticTargetArea;
+            bool areaRequested = AreaRequested(p);
             if (!areaRequested && DefaultSize() is { } size)
                 return size;
-            long area = p.ResolveTargetArea();
+            long area = !areaRequested && backend is { } b && IsHostCpu(b) ? HostCpuAutomaticArea : p.ResolveTargetArea();
             return DimensionsForArea(reference?.Width ?? 1, reference?.Height ?? 1, area);
         }
+
+        private static bool AreaRequested(QwenImageParams p) => p.TargetArea > 0 && p.TargetArea != AutomaticTargetArea;
+
+        /// <summary>Whether <see cref="ResolveDimensions"/> picks <see cref="HostCpuAutomaticArea"/>.</summary>
+        internal static bool UsesHostCpuAutomaticSize(QwenImageParams p, BackendType backend) =>
+            IsHostCpu(backend) && p.Width == 0 && p.Height == 0 && !AreaRequested(p) && DefaultSize() == null;
 
         /// <summary>The operator's default output size (TS_QWEN_IMAGE_WIDTH/HEIGHT, which the
         /// server's --width/--height set), or null when there is none usable. It is a fallback
@@ -241,7 +328,8 @@ namespace TensorSharp.Models.QwenImage
 
             string configuration = rawWidth + "x" + rawHeight;
             const string automatic = "requests that name no size keep the automatic size " +
-                "(the native 2048x2048 area, following the first reference image's aspect ratio on an edit).";
+                "(the native 2048x2048 area, 1024x1024 on the cpu backend, following the first reference " +
+                "image's aspect ratio on an edit).";
             if (hasWidth != hasHeight)
             {
                 string set = hasWidth ? DefaultWidthVariable : DefaultHeightVariable;

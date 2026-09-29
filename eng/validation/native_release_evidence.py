@@ -68,7 +68,7 @@ def inventory_models(inventory):
 def expected_placement(model_id, profile):
     if not profile['gpus']:
         return 'cpu'
-    if profile.get('native_layer_split') or (model_id == 'qwen38' and profile['gpus'] > 1):
+    if profile.get('layer_split'):
         return 'layer-split'
     return 'tensor-parallel' if profile['gpus'] > 1 else 'single-gpu'
 

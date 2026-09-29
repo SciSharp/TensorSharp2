@@ -13,7 +13,7 @@
 //
 // Hunyuan-specific details, identical to the single-sequence path in
 // HunyuanDenseModel.cs:
-//   * NeoX RoPE (mode 2) FIRST, then per-head Q/K RMSNorm. Qwen 3 normalises
+//   * NeoX RoPE (mode 2) FIRST, then per-head Q/K RMSNorm. Qwen 3.5 normalises
 //     before rotating; copying its order gives fluent but wrong output.
 //   * Q/K/V may be fused (attn_qkv) or separate, per layer.
 //   * FFN gate/up may be fused (ffn_gate_up) or separate, per layer.

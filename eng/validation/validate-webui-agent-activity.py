@@ -61,7 +61,7 @@ def fixture():
             elif self.path in ("/images/assistant_logo.png", "/images/banner_1.png"):
                 self.respond((PAGE.parent / self.path.lstrip("/")).read_bytes(), "image/png")
             elif self.path == "/api/models":
-                self.respond(json.dumps({"loaded": "Browser regression fixture", "architecture": "qwen3"}).encode())
+                self.respond(json.dumps({"loaded": "Browser regression fixture", "architecture": "qwen35"}).encode())
             elif self.path == "/api/queue/status":
                 self.respond(b'{"processing":0,"pending_requests":0}')
             elif self.path == "/api/skills":

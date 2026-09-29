@@ -122,7 +122,8 @@ namespace TensorSharp.Runtime.Scheduling
                     else if (features.SoloKvInPagedStorage)
                         rejections.Add(new ExecutionPathRejection(
                             ExecutionPathKind.SpeculativePerSequence, "sequence K/V lives in paged storage; linear cache would be empty"));
-                    else if (features.SoloHasPendingMultimodal)
+                    else if (features.SoloHasPendingMultimodal && !features.SoloIsDecode
+                             && !caps.SupportsSpeculativeMultimodalPrefill)
                         rejections.Add(new ExecutionPathRejection(
                             ExecutionPathKind.SpeculativePerSequence, "pending multimodal embeddings need Forward's inject hook"));
                     else if (fusedResident)

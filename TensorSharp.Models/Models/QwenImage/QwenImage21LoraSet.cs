@@ -43,6 +43,10 @@ internal sealed class QwenImage21LoraSet : IDisposable
 
     private readonly List<IntPtr> _buffers = new();
     private IntPtr[] _adapters = Array.Empty<IntPtr>();
+    // The pure-C# cpu backend dequantizes checkpoint weights (DoRA row norms, diff bases) with
+    // the managed kernels: it must not reach the native library whatever the process-global
+    // NativeDequant route says.
+    private bool _managedDequant;
 
     /// <summary>The sampling recipe of the plug-in that carries one, or null.</summary>
     internal QwenImage21LoraRecipe Recipe { get; private set; }
@@ -94,7 +98,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
     internal static QwenImage21LoraSet Load(IReadOnlyList<LoraSpec> specs, GgufFile dit, string prefix,
         BackendType backend, int ranks)
     {
-        var set = new QwenImage21LoraSet();
+        var set = new QwenImage21LoraSet { _managedDequant = backend == BackendType.Cpu };
         try
         {
             var lines = new List<string>();
@@ -287,7 +291,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
                 update.DoraName = doraName;
                 // Here rather than in the parallel pass: the GGUF reader is not thread-safe
                 // (RowNorms parallelizes internally).
-                update.BaseNorms = BaseRowNorms(dit, prefix, module, block, local, fusedCheckpoint, output);
+                update.BaseNorms = BaseRowNorms(dit, prefix, module, block, local, fusedCheckpoint, output, _managedDequant);
                 doras++;
             }
 
@@ -448,18 +452,20 @@ internal sealed class QwenImage21LoraSet : IDisposable
     /// <summary>Row norms of the checkpoint weight a DoRA magnitude normalizes: gate_layer and
     /// proj are the halves of a fused gate_up, and a fused gate_up LoRA spans both halves of
     /// an unfused checkpoint.</summary>
-    private static float[] BaseRowNorms(GgufFile dit, string prefix, string module, int block, string local, bool fused, long rows)
+    private static float[] BaseRowNorms(GgufFile dit, string prefix, string module, int block, string local, bool fused, long rows,
+        bool managed)
     {
         string mlp = $"{prefix}transformer_blocks.{block}.img_mlp.";
         if (fused && local is "img_mlp.gate_layer" or "img_mlp.proj")
-            return RowNorms(dit, mlp + "gate_up.weight", local == "img_mlp.proj" ? rows : 0, rows);
+            return RowNorms(dit, mlp + "gate_up.weight", local == "img_mlp.proj" ? rows : 0, rows, managed);
         if (!fused && local == "img_mlp.gate_up")
-            return RowNorms(dit, mlp + "gate_layer.weight", 0, rows / 2).Concat(RowNorms(dit, mlp + "proj.weight", 0, rows / 2)).ToArray();
-        return RowNorms(dit, prefix + module + ".weight", 0, rows);
+            return RowNorms(dit, mlp + "gate_layer.weight", 0, rows / 2, managed)
+                .Concat(RowNorms(dit, mlp + "proj.weight", 0, rows / 2, managed)).ToArray();
+        return RowNorms(dit, prefix + module + ".weight", 0, rows, managed);
     }
 
     /// <summary>Euclidean norms of rows [first, first + count) of a GGUF weight, dequantized.</summary>
-    private static float[] RowNorms(GgufFile dit, string tensor, long first, long count)
+    private static float[] RowNorms(GgufFile dit, string tensor, long first, long count, bool managed)
     {
         var info = dit.Tensors[tensor];
         long input = (long)info.Shape[0], rows = (long)info.Shape[1];
@@ -483,7 +489,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
                 var row = new float[input];
                 for (long i = 0; i < n; i++)
                 {
-                    NativeDequant.DequantizeToFloat32((int)info.Type, data + (nint)((first + start + i) * rowBytes), row, 0, input);
+                    Dequantize(managed, (int)info.Type, data + (nint)((first + start + i) * rowBytes), row, input);
                     result[start + i] = TensorPrimitives.Norm(row);
                 }
             });
@@ -551,7 +557,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
                 try
                 {
                     dit.ReadTensorDataToNative(info, src, dit.GetTensorByteCount(info));
-                    NativeDequant.DequantizeToFloat32((int)info.Type, src, basis, 0, length);
+                    Dequantize(_managedDequant, (int)info.Type, src, basis, length);
                 }
                 finally { QuantizedWeight.FreeBuffer(src); }
             }
@@ -563,6 +569,12 @@ internal sealed class QwenImage21LoraSet : IDisposable
         else NormK[block] = copy;
         _gainOwners[module] = (file, !isDiff);
         return 1;
+    }
+
+    private static void Dequantize(bool managed, int type, IntPtr source, float[] destination, long count)
+    {
+        if (managed) ManagedQuantizedOps.DequantizeToFloat32(type, source, destination, 0, count);
+        else NativeDequant.DequantizeToFloat32(type, source, destination, 0, count);
     }
 
     private unsafe IntPtr Copy(ReadOnlySpan<float> values)

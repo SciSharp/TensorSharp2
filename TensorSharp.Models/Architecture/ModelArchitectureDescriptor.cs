@@ -28,9 +28,7 @@ namespace TensorSharp.Models.Architecture
         /// <summary>The architecture cannot use a second GPU through the shared
         /// machinery at all. <see cref="ModelArchitectureDescriptor.MultiGpuLimitation"/>
         /// says why, and is printed instead of silently idling the extra devices.
-        /// (An architecture that drives several GPUs through its OWN executor - DeepSeek
-        /// V4 sized by TS_DSV4_NGPU - is not this: it is TensorParallel as far as the
-        /// shared gate is concerned, because the gate must not interfere.)</summary>
+        /// Requests for either multi-GPU mode are refused.</summary>
         SingleDevice,
     }
 
@@ -93,6 +91,24 @@ namespace TensorSharp.Models.Architecture
 
         /// <summary>How this architecture uses several GPUs. See <see cref="MultiGpuMode"/>.</summary>
         public MultiGpuMode MultiGpu { get; init; } = MultiGpuMode.TensorParallel;
+
+        /// <summary>Whether a tensor-parallel architecture also implements explicit
+        /// whole-layer placement. LayerSplit architectures support it inherently.</summary>
+        public bool SupportsLayerSplit { get; init; }
+
+        /// <summary>Optional native partial-TP mode, for an otherwise layer-split
+        /// executor. True only when its explicit native settings enable real sharding
+        /// for the requested degree and backend.</summary>
+        public Func<int, BackendType, bool> SupportsNativeTensorParallel { get; init; }
+
+        /// <summary>Whether the tensor-parallel executor consumes cross-node
+        /// collectives. Only applies to TensorParallel architectures; native
+        /// executors that own local ranks must set this to false.</summary>
+        public bool SupportsDistributedTensorParallel { get; init; } = true;
+
+        /// <summary>Backends implementing this architecture's whole-layer placement.</summary>
+        public IReadOnlyList<BackendType> LayerSplitBackends { get; init; } =
+            new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan };
 
         /// <summary>
         /// Why the shared tensor-parallel path is unavailable. REQUIRED for

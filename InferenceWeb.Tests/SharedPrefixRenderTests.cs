@@ -95,14 +95,14 @@ public sealed class SharedPrefixRenderTests : IDisposable
         var profiles = new[] { new MultiAgentPromptProfile(root, rootTools), new MultiAgentPromptProfile(child, childTools) };
         List<int> rootPrompt = Render(model, root, rootTools, "Parent private task.");
         List<int> childPrompt = Render(model, child, childTools, "Child private task.");
-        int rootShared = _pipeline.ComputeSharedPrefixTokens(model, root, rootPrompt, "qwen3", rootTools, false);
-        int childShared = _pipeline.ComputeSharedPrefixTokens(model, child, childPrompt, "qwen3", childTools, false);
+        int rootShared = _pipeline.ComputeSharedPrefixTokens(model, root, rootPrompt, "qwen35", rootTools, false);
+        int childShared = _pipeline.ComputeSharedPrefixTokens(model, child, childPrompt, "qwen35", childTools, false);
         int expected = CommonPrefix(rootPrompt, childPrompt);
 
         int rootBoundary = Assert.Single(_pipeline.ComputePublicCheckpointBoundaries(
-            model, rootPrompt, rootShared, profiles, "qwen3", false));
+            model, rootPrompt, rootShared, profiles, "qwen35", false));
         int childBoundary = Assert.Single(_pipeline.ComputePublicCheckpointBoundaries(
-            model, childPrompt, childShared, profiles, "qwen3", false));
+            model, childPrompt, childShared, profiles, "qwen35", false));
         Assert.Equal(expected, rootBoundary);
         Assert.Equal(rootBoundary, childBoundary);
         Assert.InRange(rootBoundary, ChatGenerationPipeline.MinSharedPrefixTokens, Math.Min(rootShared, childShared) - 1);
@@ -118,11 +118,11 @@ public sealed class SharedPrefixRenderTests : IDisposable
         var longer = new List<ChatMessage> { new() { Role = "system", Content = new string('s', 150) + "worker" } };
         var shorter = new List<ChatMessage> { new() { Role = "system", Content = new string('s', 90) + "reviewer" } };
         List<int> prompt = Render(model, root, [], "Private parent task.");
-        int shared = _pipeline.ComputeSharedPrefixTokens(model, root, prompt, "qwen3", [], false);
+        int shared = _pipeline.ComputeSharedPrefixTokens(model, root, prompt, "qwen35", [], false);
         int expected = CommonPrefix(prompt, Render(model, shorter, [], "Private child task."));
         var profiles = new[] { new MultiAgentPromptProfile(longer, []), new MultiAgentPromptProfile(shorter, []) };
         Assert.Equal(expected, Assert.Single(_pipeline.ComputePublicCheckpointBoundaries(
-            model, prompt, shared, profiles, "qwen3", false)));
+            model, prompt, shared, profiles, "qwen35", false)));
     }
 
     [Fact]
@@ -135,13 +135,13 @@ public sealed class SharedPrefixRenderTests : IDisposable
             new() { Role = "user", Content = new string('p', 200) },
         };
         List<int> prompt = _renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate, messages,
-            "qwen3", addGenerationPrompt: true);
+            "qwen35", addGenerationPrompt: true);
         var profiles = new[] { new MultiAgentPromptProfile(messages, []) };
-        int shared = _pipeline.ComputeSharedPrefixTokens(model, messages, prompt, "qwen3", [], false);
+        int shared = _pipeline.ComputeSharedPrefixTokens(model, messages, prompt, "qwen35", [], false);
         Assert.True(shared < prompt.Count - 200);
-        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, shared, profiles, "qwen3", false));
-        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, 64, profiles, "qwen3", false));
-        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, 0, profiles, "qwen3", false));
+        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, shared, profiles, "qwen35", false));
+        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, 64, profiles, "qwen35", false));
+        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, 0, profiles, "qwen35", false));
     }
 
     [Fact]
@@ -150,19 +150,19 @@ public sealed class SharedPrefixRenderTests : IDisposable
         ModelBase model = Model(new CharTokenizer());
         var root = new List<ChatMessage> { new() { Role = "system", Content = new string('s', 100) } };
         List<int> prompt = Render(model, root, [], "Parent task.");
-        int shared = _pipeline.ComputeSharedPrefixTokens(model, root, prompt, "qwen3", [], false);
+        int shared = _pipeline.ComputeSharedPrefixTokens(model, root, prompt, "qwen35", [], false);
         var mismatched = new[] { new MultiAgentPromptProfile(
             [new() { Role = "system", Content = "A different system prompt." }], []) };
-        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, shared, mismatched, "qwen3", false));
+        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, shared, mismatched, "qwen35", false));
         var media = new[] { new MultiAgentPromptProfile(
             [new() { Role = "system", Content = new string('s', 100), ImagePaths = new() { "image.png" } }], []) };
-        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, shared, media, "qwen3", false));
+        Assert.Empty(_pipeline.ComputePublicCheckpointBoundaries(model, prompt, shared, media, "qwen35", false));
     }
 
     private List<int> Render(ModelBase model, List<ChatMessage> governing, List<ToolFunction> tools, string user) =>
         _renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate,
             new List<ChatMessage>(governing) { new() { Role = "user", Content = user } },
-            "qwen3", addGenerationPrompt: true, tools: tools);
+            "qwen35", addGenerationPrompt: true, tools: tools);
 
     private static int CommonPrefix(IReadOnlyList<int> a, IReadOnlyList<int> b)
     {
@@ -180,10 +180,10 @@ public sealed class SharedPrefixRenderTests : IDisposable
         };
         var history = new List<ChatMessage>(shared) { new() { Role = "user", Content = user } };
         List<int> prompt = _renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate, history,
-            "qwen3", addGenerationPrompt: true, tools: tools);
+            "qwen35", addGenerationPrompt: true, tools: tools);
         List<int> expected = _renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate, shared,
-            "qwen3", addGenerationPrompt: false, tools: tools);
-        int measured = _pipeline.ComputeSharedPrefixTokens(model, history, prompt, "qwen3", tools, false);
+            "qwen35", addGenerationPrompt: false, tools: tools);
+        int measured = _pipeline.ComputeSharedPrefixTokens(model, history, prompt, "qwen35", tools, false);
         Assert.True(expected.Count >= ChatGenerationPipeline.MinSharedPrefixTokens);
         Assert.Equal(expected.Count, measured);
         Assert.True(measured < prompt.Count);
@@ -192,10 +192,10 @@ public sealed class SharedPrefixRenderTests : IDisposable
 
     private static ModelBase Model(ITokenizer tokenizer)
     {
-        var model = (Qwen3Model)RuntimeHelpers.GetUninitializedObject(typeof(Qwen3Model));
+        var model = (Qwen35Model)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35Model));
         typeof(ModelBase).GetProperty(nameof(ModelBase.Tokenizer))!.SetValue(model, tokenizer);
         typeof(ModelBase).GetField("<Config>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .SetValue(model, new ModelConfig { Architecture = "qwen3", ChatTemplate = "first-template" });
+            .SetValue(model, new ModelConfig { Architecture = "qwen35", ChatTemplate = "first-template" });
         return model;
     }
 

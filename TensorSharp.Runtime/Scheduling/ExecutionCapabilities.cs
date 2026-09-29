@@ -90,6 +90,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// (<see cref="NGramSpeculator"/>) needs.</summary>
         public bool SupportsSpeculativeTrunk { get; init; }
 
+        /// <summary>The linear speculative trunk consumes queued media embeddings
+        /// and their position metadata during prefill.</summary>
+        public bool SupportsSpeculativeMultimodalPrefill { get; init; }
+
         /// <summary>Loaded weights contain a usable learned draft head (a
         /// NextN/MTP block, a DSpark/DFlash block drafter). Algorithms that
         /// need trained speculator weights require this; n-gram does not.</summary>
@@ -132,6 +136,7 @@ namespace TensorSharp.Runtime.Scheduling
                 MaxReusablePrefixTokens = model.MaxReusablePrefixTokens,
                 HasMultimodalInjector = model.MultimodalInjector != null,
                 SupportsSpeculativeTrunk = specTrunk,
+                SupportsSpeculativeMultimodalPrefill = spec?.SpecSupportsMultimodalPrefill == true,
                 HasDraftHead = draftHead,
                 SpeculationProfitable = spec != null && spec.SpeculationRefusal == null && spec.SpeculationProfitable,
                 SpeculationRefusal = spec?.SpeculationRefusal,
@@ -163,6 +168,7 @@ namespace TensorSharp.Runtime.Scheduling
                 sb.Append(", draftHead=").Append(Flag(HasDraftHead));
                 sb.Append(", specProfitable=").Append(Flag(SpeculationProfitable));
                 sb.Append(", specBatchedTrunk=").Append(Flag(SupportsBatchedSpecTrunk));
+                sb.Append(", specMultimodalPrefill=").Append(Flag(SupportsSpeculativeMultimodalPrefill));
             }
             return sb.ToString();
         }

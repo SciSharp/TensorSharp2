@@ -81,4 +81,27 @@ public sealed class GlmDsaNativeMtpRequestTests : IDisposable
 
         Assert.Equal(expected, GlmDsaModel.NativeMtpRequested());
     }
+
+    [Theory]
+    [InlineData("ngram")]
+    [InlineData("NGRAM")]
+    [InlineData(" ngram ")]
+    public void NgramSpeculation_DoesNotLoadUnusedLearnedDraftWeights(string algorithm)
+    {
+        _env.Set(SpeculationEnvVars.Enabled, "1");
+        _env.Set(SpeculationEnvVars.Type, algorithm);
+
+        Assert.True(SchedulerConfig.FromEnvironment().Speculation.Enabled);
+        Assert.False(GlmDsaModel.NativeMtpRequested());
+    }
+
+    [Fact]
+    public void ExplicitNativeMtpOverride_CanStillLoadTheHeadWithNgramSelected()
+    {
+        _env.Set(SpeculationEnvVars.Enabled, "1");
+        _env.Set(SpeculationEnvVars.Type, "ngram");
+        _env.Set("TS_GLM_MTP", "1");
+
+        Assert.True(GlmDsaModel.NativeMtpRequested());
+    }
 }

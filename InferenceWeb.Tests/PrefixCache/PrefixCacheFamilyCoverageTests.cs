@@ -36,14 +36,13 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(MuseGlimmerModel))]
     [InlineData(typeof(NemotronModel))]
     [InlineData(typeof(Qwen35Model))]
-    [InlineData(typeof(Qwen3Model))]
     [InlineData(typeof(Qwen4ExpModel))]
     public void EveryEngineServedFamily_EnablesTreeWithoutAdvertisingUnavailableEndStates(Type family)
     {
         // Capabilities describe construction-time geometry and backend availability.
         // An unloaded CPU instance must enable the owner while refusing operations
-        // that need GPU holders or native slots. Block-quantized K/V also avoids
-        // Qwen3's paged path, whose availability inspects loaded projection weights.
+        // that need GPU holders or native slots. K/V is block-quantized, which also
+        // keeps batched paths that refuse it (Hunyuan Dense's) out of the check.
         var model = (ModelBase)RuntimeHelpers.GetUninitializedObject(family);
         typeof(ModelBase).GetField("<Config>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(model, new ModelConfig
@@ -90,7 +89,7 @@ public sealed class PrefixCacheFamilyCoverageTests
         }
         Assert.Equal(
             new[] { "DeepSeek41Model", "DeepSeek4Model", "Gemma4Model", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
-                    "Mistral3Model", "MuseGlimmerModel", "NemotronModel", "Qwen35Model", "Qwen3Model", "Qwen4ExpModel" },
+                    "Mistral3Model", "MuseGlimmerModel", "NemotronModel", "Qwen35Model", "Qwen4ExpModel" },
             engineServed.Select(t => t.Name).ToArray());
     }
 
@@ -103,7 +102,6 @@ public sealed class PrefixCacheFamilyCoverageTests
         => Assert.True(typeof(IHolderPrefixCacheModel).IsAssignableFrom(family), $"{family.Name} is not an IHolderPrefixCacheModel");
 
     [Theory]
-    [InlineData(typeof(Qwen3Model))]
     [InlineData(typeof(GptOssModel))]
     [InlineData(typeof(Mistral3Model))]
     [InlineData(typeof(HunyuanDenseModel))]

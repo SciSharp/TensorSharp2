@@ -396,16 +396,15 @@ public sealed class WebUiRoutesTests : IDisposable
     }
 
     [Fact]
-    public async Task BonsaiCardsAdvertiseLocalImportAndCannotStartAnEmptyUrlDownload()
+    public async Task TheBonsai2CardIsADownloadForSixteenGigabyteDevices()
     {
-        JsonElement body = await BodyOf(await _client.GetAsync("/api/agent/catalog/bonsai-8b-q1-0"));
-        Assert.True(body.GetProperty("sideloadOnly").GetBoolean());
+        JsonElement body = await BodyOf(await _client.GetAsync("/api/agent/catalog/bonsai-2-27b-ptq1-0"));
+        Assert.Equal("Bonsai", body.GetProperty("family").GetString());
+        Assert.False(body.GetProperty("sideloadOnly").GetBoolean());
+        Assert.Equal(16, body.GetProperty("minDeviceMemoryGB").GetInt32());
         Assert.Equal("NotInstalled", body.GetProperty("state").GetString());
-
-        HttpResponseMessage response = await _client.PostAsync(
-            "/api/agent/catalog/bonsai-8b-q1-0/download", content: null);
-        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-        Assert.Contains("import", (await response.Content.ReadAsStringAsync()).ToLowerInvariant());
+        // The optional vision projector is not part of the required download.
+        Assert.Equal(5_946_648_928, body.GetProperty("totalBytes").GetInt64());
     }
 
     [Fact]

@@ -752,26 +752,6 @@ namespace TensorSharp.Runtime
     }
 
     // ========================================================================
-    // Qwen2 / Qwen2.5(-VL) Parser: ChatML with <tool_call> JSON, NO thinking
-    // channel. Wraps the ChatML parser with thinking pinned off: initialized
-    // with enableThinking=true it would misread the whole answer as thought
-    // while waiting for a </think> these models never emit.
-    // ========================================================================
-
-    public class Qwen25OutputParser : IOutputParser
-    {
-        private readonly ChatMlOutputParser _inner = new();
-
-        public bool HasThinkingSupport => false;
-        public bool HasToolSupport => true;
-        public bool AlwaysRequired => false;
-
-        public void Init(bool enableThinking, List<ToolFunction>? tools) => _inner.Init(false, tools);
-
-        public ParsedOutput Add(string text, bool done) => _inner.Add(text, done);
-    }
-
-    // ========================================================================
     // Gemma4 Parser: <|channel>thought\n...<channel|> for thinking,
     //                <|tool_call>call:NAME{args}<tool_call|> for tool calls
     // ========================================================================

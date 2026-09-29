@@ -9,7 +9,7 @@
 // used to keep the descriptor's default TensorParallel mode, so the shared gate
 // stepped aside: --tp N was dropped without a word and a distributed group was
 // handed to a model that would never issue its collectives. Declaring them
-// SingleDevice routes both cases through the gate's warning and refusal.
+// SingleDevice routes both cases through the gate's explicit refusal.
 using System;
 using System.IO;
 using TensorSharp;
@@ -45,28 +45,16 @@ public sealed class SingleDeviceArchitectureGateTests
 
     [Theory]
     [MemberData(nameof(SingleDeviceFamilies))]
-    public void LocalTp_IsIgnoredWithAWarning(string id)
+    public void LocalTp_IsRefusedWithoutFallingBack(string id)
     {
         var arch = Arch(id);
         ITensorParallelGroup group = null;
-        var captured = new StringWriter();
-        TextWriter saved = Console.Error;
-        int tp;
-        int layerSplit;
-        try
-        {
-            Console.SetError(captured);
-            tp = TensorSharp.Models.ModelBase.ResolveTensorParallelSupport(
-                arch, BackendType.GgmlCuda, 2, ref group, out layerSplit);
-        }
-        finally { Console.SetError(saved); }
-
-        Assert.Equal(1, tp);
-        Assert.Equal(1, layerSplit);
+        var error = Assert.Throws<NotSupportedException>(() =>
+            TensorSharp.Models.ModelBase.ResolveTensorParallelSupport(
+                arch, BackendType.GgmlCuda, 2, ref group, out _));
         Assert.Null(group);
-        string warning = captured.ToString();
-        Assert.Contains("--tp 2 ignored", warning, StringComparison.Ordinal);
-        Assert.Contains(id, warning, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("--tp 2", error.Message, StringComparison.Ordinal);
+        Assert.Contains(id, error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]

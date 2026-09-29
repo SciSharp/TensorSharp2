@@ -1423,6 +1423,20 @@ internal enum GgmlIndexReductionOp
     Argmax = 2,
 }
 
+    /// <summary>
+    /// Whether GgmlNative's import resolver has bound the GgmlOps library in this process. A
+    /// type of its own, so reading it never runs GgmlNative's static constructor (whose early
+    /// tunables may P/Invoke, i.e. load the very library the caller is asking about).
+    /// </summary>
+    internal static class GgmlNativeLibraryState
+    {
+        private static int s_loaded;
+
+        internal static bool IsLoaded => Volatile.Read(ref s_loaded) != 0;
+
+        internal static void MarkLoaded() => Volatile.Write(ref s_loaded, 1);
+    }
+
     internal static partial class GgmlNative
     {
         private const string DllName = "GgmlOps";
@@ -1564,55 +1578,6 @@ internal enum GgmlIndexReductionOp
         {
             return TSGgml_SetNativeEnvironmentVariable(name, value, overwrite ? 1 : 0) != 0;
         }
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_TransformerModelDecode(
-            IntPtr hiddenData, int hiddenSize, int numLayers,
-            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
-            IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
-            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
-            IntPtr[] qkvBiasArr,
-            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
-            int[] splitTypeArr, long[] splitBytesArr,
-            int[] qkvTypeArr, long[] qkvBytesArr,
-            int[] oTypeArr, long[] oBytesArr,
-            int[] guTypeArr, long[] guBytesArr,
-            int[] downTypeArr, long[] downBytesArr,
-            int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            int oType, long oNe0, long oNe1, long oBytes,
-            int guType, long guNe0, long guNe1, long guBytes,
-            int downType, long downNe0, long downNe1, long downBytes,
-            int headDim, int numHeads, int numKvHeads,
-            int maxSeqLen, int position,
-            float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode,
-            int kvCacheType,
-            int ropeOriginalContext,
-            float ropeExtFactor, float ropeAttnFactor,
-            float ropeBetaFast, float ropeBetaSlow);
-
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int TSGgml_TransformerLayerDecode(
-            IntPtr hiddenData, int hiddenSize,
-            IntPtr attnNormData,
-            IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            IntPtr qkvBiasData,
-            IntPtr qNormData, IntPtr kNormData, int headDim,
-            IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
-            IntPtr ffnNormData,
-            IntPtr guData, int guType, long guNe0, long guNe1, long guBytes,
-            IntPtr downData, int downType, long downNe0, long downNe1, long downBytes,
-            IntPtr kCacheData, IntPtr vCacheData,
-            int numHeads, int numKvHeads,
-            int maxSeqLen, int position,
-            float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode,
-            int kvCacheType,
-            int ropeOriginalContext,
-            float ropeExtFactor, float ropeAttnFactor,
-            float ropeBetaFast, float ropeBetaSlow);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -5625,56 +5590,6 @@ internal enum GgmlIndexReductionOp
                 "rope_ex_ff");
         }
 
-        /// <summary>
-        /// Single-token flash attention decode kernel. Appends the new K/V to the persistent
-        /// KV cache at <paramref name="position"/>, then runs <c>ggml_flash_attn_ext</c> on the
-        /// device against the populated portion of the cache. Q, K, V, and the output buffer
-        /// must point to F32 contiguous memory in (heads, head_dim) row-major layout.
-        /// </summary>
-        /// <param name="qkvBiasData">
-        /// Optional fused Q|K|V bias vector (IntPtr.Zero when the architecture has none).
-        /// Qwen2 / Qwen2.5-VL carry a QKV bias and no QK norm; Qwen3 is the reverse.
-        /// <paramref name="qNormData"/>/<paramref name="kNormData"/> may likewise be Zero.
-        /// </param>
-        public static void TransformerLayerDecode(
-            IntPtr hiddenData, int hiddenSize,
-            IntPtr attnNormData,
-            IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            IntPtr qkvBiasData,
-            IntPtr qNormData, IntPtr kNormData, int headDim,
-            IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
-            IntPtr ffnNormData,
-            IntPtr guData, int guType, long guNe0, long guNe1, long guBytes,
-            IntPtr downData, int downType, long downNe0, long downNe1, long downBytes,
-            IntPtr kCacheData, IntPtr vCacheData,
-            int numHeads, int numKvHeads,
-            int maxSeqLen, int position,
-            float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode,
-            int kvCacheType = 0,
-            int ropeOriginalContext = 0,
-            float ropeExtFactor = 0.0f, float ropeAttnFactor = 1.0f,
-            float ropeBetaFast = 0.0f, float ropeBetaSlow = 0.0f)
-        {
-            CheckResult(TSGgml_TransformerLayerDecode(
-                hiddenData, hiddenSize,
-                attnNormData,
-                qkvData, qkvType, qkvNe0, qkvNe1, qkvBytes,
-                qkvBiasData,
-                qNormData, kNormData, headDim,
-                oData, oType, oNe0, oNe1, oBytes,
-                ffnNormData,
-                guData, guType, guNe0, guNe1, guBytes,
-                downData, downType, downNe0, downNe1, downBytes,
-                kCacheData, vCacheData,
-                numHeads, numKvHeads,
-                maxSeqLen, position,
-                eps, ropeBase, ropeFreqScale,
-                intermediateSize, ropeMode, kvCacheType,
-                ropeOriginalContext, ropeExtFactor, ropeAttnFactor,
-                ropeBetaFast, ropeBetaSlow), "transformer_layer_decode");
-        }
-
         public static void FusedPrefillAttention(
             IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
             int numHeads, int numKvHeads, int headDim,
@@ -6000,55 +5915,6 @@ internal enum GgmlIndexReductionOp
                 numHeads, numKvHeads,
                 maxSeqLen, position,
                 eps, ropeBase, ropeFreqScale, ropeNDims, ropeMode, kvCacheType), "qwen35_attention_layer_decode");
-        }
-
-        public static void TransformerModelDecode(
-            IntPtr hiddenData, int hiddenSize, int numLayers,
-            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
-            IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
-            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
-            IntPtr[] qkvBiasArr,
-            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
-            int[] splitTypeArr, long[] splitBytesArr,
-            int[] qkvTypeArr, long[] qkvBytesArr,
-            int[] oTypeArr, long[] oBytesArr,
-            int[] guTypeArr, long[] guBytesArr,
-            int[] downTypeArr, long[] downBytesArr,
-            int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            int oType, long oNe0, long oNe1, long oBytes,
-            int guType, long guNe0, long guNe1, long guBytes,
-            int downType, long downNe0, long downNe1, long downBytes,
-            int headDim, int numHeads, int numKvHeads,
-            int maxSeqLen, int position,
-            float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode,
-            int kvCacheType = 0,
-            int ropeOriginalContext = 0,
-            float ropeExtFactor = 0.0f, float ropeAttnFactor = 1.0f,
-            float ropeBetaFast = 0.0f, float ropeBetaSlow = 0.0f)
-        {
-            CheckResult(TSGgml_TransformerModelDecode(
-                hiddenData, hiddenSize, numLayers,
-                attnNormArr, qkvArr, qNormArr, kNormArr,
-                oArr, ffnNormArr, guArr, downArr,
-                kCacheArr, vCacheArr,
-                qkvBiasArr,
-                qArr, kArr, vArr,
-                splitTypeArr, splitBytesArr,
-                qkvTypeArr, qkvBytesArr,
-                oTypeArr, oBytesArr,
-                guTypeArr, guBytesArr,
-                downTypeArr, downBytesArr,
-                qkvType, qkvNe0, qkvNe1, qkvBytes,
-                oType, oNe0, oNe1, oBytes,
-                guType, guNe0, guNe1, guBytes,
-                downType, downNe0, downNe1, downBytes,
-                headDim, numHeads, numKvHeads,
-                maxSeqLen, position,
-                eps, ropeBase, ropeFreqScale,
-                intermediateSize, ropeMode, kvCacheType,
-                ropeOriginalContext, ropeExtFactor, ropeAttnFactor,
-                ropeBetaFast, ropeBetaSlow), "transformer_model_decode");
         }
 
         public static void Gemma4ModelDecode(
@@ -6988,6 +6854,7 @@ internal enum GgmlIndexReductionOp
                 // executable (GgmlOps.xcframework via NativeReference with
                 // ForceLoad), so every TSGgml_*/ggml_* symbol lives in the main
                 // program image - there is no separate library to probe for.
+                GgmlNativeLibraryState.MarkLoaded();
                 return NativeLibrary.GetMainProgramHandle();
             }
 
@@ -6997,8 +6864,17 @@ internal enum GgmlIndexReductionOp
             {
                 if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out IntPtr handle))
                 {
+                    GgmlNativeLibraryState.MarkLoaded();
                     return handle;
                 }
+            }
+
+            // The runtime's own DllImport probing, which it would run next anyway: done here so
+            // a library found that way is recorded as loaded too (GgmlBasicOps.IsNativeLibraryLoaded).
+            if (NativeLibrary.TryLoad(libraryName, assembly, searchPath, out IntPtr probed))
+            {
+                GgmlNativeLibraryState.MarkLoaded();
+                return probed;
             }
 
             return IntPtr.Zero;

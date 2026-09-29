@@ -380,7 +380,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 
 ### 聊天 + 思维链 / 推理模式
 
-支持思维链的架构（例如 Qwen 3、包括 Qwen 3.8 Flash Next 在内的 Qwen 3.5 / 3.6 / 3.8 系列、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer、DeepSeek V4 / V4.1 与 GLM 5.x）可接受 `"think": true`，并将思考过程与可见回答分开返回：
+支持思维链的架构（例如包括 Qwen 3.8 Flash Next 在内的 Qwen 3.5 / 3.6 / 3.8 系列、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer、DeepSeek V4 / V4.1 与 GLM 5.x）可接受 `"think": true`，并将思考过程与可见回答分开返回：
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \

@@ -791,7 +791,7 @@ namespace TensorSharp.Runtime
                         template, preprocessed, architecture);
                     var jinja = new Jinja2Template(effectiveTemplate);
                     var context = BuildJinja2Context(
-                        preprocessed, addGenerationPrompt, tools, enableThinking, architecture);
+                        preprocessed, addGenerationPrompt, tools, enableThinking, architecture, reasoningEffort);
                     string result = jinja.Render(context);
                     // Gemma's generation boundary is part of its published template:
                     // preserve its newline and any channel prefix exactly. Adding an
@@ -834,7 +834,7 @@ namespace TensorSharp.Runtime
             }
 
             Console.Error.WriteLine($"[ChatTemplate] Using hardcoded template for '{architecture}'");
-            return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, null, template);
+            return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template);
         }
 
         // (architecture, reason-kind) pairs whose Jinja→hardcoded fallback has
@@ -1018,11 +1018,19 @@ namespace TensorSharp.Runtime
         /// </list>
         /// </summary>
         public static string RenderGlm5Next(List<ChatMessage> messages, bool addGenerationPrompt = true,
-            bool enableThinking = true, List<ToolFunction>? tools = null)
+            bool enableThinking = true, List<ToolFunction>? tools = null, string? reasoningEffort = null)
         {
             var sb = new StringBuilder();
             sb.Append("[gMASK]<sop>");
-            sb.Append("<|system|>Reasoning Effort: Max");
+            // The published template supports low/high and maps every other
+            // value (including medium or an omitted value) to max.
+            string effort = reasoningEffort?.Trim().ToLowerInvariant() switch
+            {
+                "low" => "Low",
+                "high" => "High",
+                _ => "Max",
+            };
+            sb.Append("<|system|>Reasoning Effort: ").Append(effort);
 
             if (tools != null && tools.Count > 0)
             {
@@ -1491,7 +1499,7 @@ namespace TensorSharp.Runtime
         private static Dictionary<string, object> BuildJinja2Context(
             List<ChatMessage> messages, bool addGenerationPrompt,
             List<ToolFunction>? tools = null, bool enableThinking = false,
-            string? architecture = null)
+            string? architecture = null, string? reasoningEffort = null)
         {
             // Whether this family's template re-renders an assistant turn's reasoning,
             // and therefore whether handing it over is correct rather than a change in
@@ -1574,8 +1582,8 @@ namespace TensorSharp.Runtime
 
             // Always defined, whichever way it is set. Templates written against
             // HF's apply_chat_template(enable_thinking=...) test the flag with
-            // `enable_thinking is defined and enable_thinking is false` (Qwen 3 and
-            // 3.5 among them): leaving it out when false took the ELSE branch, which
+            // `enable_thinking is defined and enable_thinking is false` (Qwen 3.5
+            // among them): leaving it out when false took the ELSE branch, which
             // is thinking ON, so a request with thinking off rendered exactly the
             // same prompt as one with it on and the model reasoned anyway. The
             // purpose-built Qwen 3.5 renderer had to be substituted for the off case
@@ -1583,6 +1591,10 @@ namespace TensorSharp.Runtime
             // toggling thinking between two turns of one chat diverged the prompt at
             // the tool block and re-prefilled the whole conversation.
             ctx["enable_thinking"] = enableThinking;
+            // Keep an omitted setting undefined so each published template can
+            // apply its own default, rather than imposing Harmony's default.
+            if (!string.IsNullOrWhiteSpace(reasoningEffort))
+                ctx["reasoning_effort"] = reasoningEffort.Trim().ToLowerInvariant();
 
             if (tools != null && tools.Count > 0)
             {

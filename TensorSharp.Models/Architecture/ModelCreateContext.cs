@@ -48,15 +48,16 @@ namespace TensorSharp.Models.Architecture
         /// the architecture actually shards weights.</summary>
         public int TpDegree { get; }
 
-        /// <summary>Live tensor-parallel group, or null for single-device runs.</summary>
+        /// <summary>Live tensor-parallel group, or null for single-device, layer-split,
+        /// and architecture-owned native executors.</summary>
         public ITensorParallelGroup TpGroup { get; }
 
         /// <summary>Optional speculative-decoding draft model GGUF; null when the run
         /// asked for none. Architectures without a drafter ignore it.</summary>
         public string DraftModelPath { get; }
 
-        /// <summary>Number of GPUs to spread whole layers across, for architectures
-        /// whose multi-GPU mode is <see cref="MultiGpuMode.LayerSplit"/>; 1 otherwise.</summary>
+        /// <summary>Explicit number of GPUs to spread whole layers across, for
+        /// architectures that implement layer placement; 1 when not requested.</summary>
         public int LayerSplitDegree { get; }
 
         /// <summary>Rebuild with a different tensor-parallel / layer-split resolution.</summary>

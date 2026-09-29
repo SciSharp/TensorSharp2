@@ -96,6 +96,65 @@ public class HostLoadRefusalProcessTests : IDisposable
         Assert.DoesNotContain("Unhandled exception", run.Stdout + run.Stderr, StringComparison.Ordinal);
     }
 
+    public static IEnumerable<object[]> InvalidParallelismLines() => new[]
+    {
+        new object[] { new[] { "--layer-split" }, "--layer-split" },
+        new object[] { new[] { "--layer-split=0" }, "--layer-split" },
+        new object[] { new[] { "--tp=two" }, "--tp" },
+        new object[] { new[] { "--tp=2", "--layer-split=2" }, "cannot both" },
+        new object[] { new[] { "--tp-node-id=0" }, "--tp-peers" },
+        new object[] { new[] { "--layer-split=2", "--tp-node-id=0",
+            "--tp-peers=127.0.0.1:9500,127.0.0.1:9501" }, "one node only" },
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidParallelismLines))]
+    public void BothHosts_RejectInvalidParallelismBeforeLoadingOrConnecting(string[] args, string reason)
+    {
+        string missing = Path.Combine(_dir, "must-not-be-loaded.gguf");
+        foreach (HostRun run in new[] { RunCliWith(missing, args), RunServerWith(missing, args) })
+        {
+            Assert.Equal(ConfigurationErrorExitCode, run.ExitCode);
+            Assert.Contains("Configuration error:", run.Stderr);
+            Assert.Contains(reason, run.Stderr);
+            Assert.DoesNotContain("Unhandled exception", run.Stderr);
+            Assert.DoesNotContain(ErrorPrefix, run.Stderr);
+        }
+    }
+
+    [Fact]
+    public void BothHosts_RefuseLocalOnlyArchitectureWithoutWaitingForPeers()
+    {
+        string model = GlmDsaSyntheticModelBuilder.Write(Path.Combine(_dir, "local-glm.gguf"));
+        string[] args = { "--backend", "ggml_cuda", "--tp", "2", "--tp-node-id", "0",
+            "--tp-peers", "127.0.0.1:49500,127.0.0.1:49501" };
+        foreach (HostRun run in new[] { RunCliWith(model, args), RunServerWith(model, args) })
+        {
+            Assert.Equal(ModelLoadRefusedExitCode, run.ExitCode);
+            Assert.Contains("does not implement distributed tensor parallelism", run.Stderr);
+            Assert.DoesNotContain("waiting for rank", run.Stdout);
+            Assert.DoesNotContain("Unhandled exception", run.Stderr);
+        }
+    }
+
+    [Theory]
+    [InlineData("--tp=2")]
+    [InlineData("--layer-split=2")]
+    [InlineData("--tp-node-id=0")]
+    public void BothHosts_KeepPlacementLookingStopValuesAsText(string literal)
+    {
+        string model = WriteJunkModel();
+        foreach (HostRun run in new[] { RunCliWith(model, new[] { "--stop", literal }),
+            RunServerWith(model, new[] { "--stop", literal }) })
+            AssertRefused(run, "Not a GGUF file");
+    }
+
+    [Theory]
+    [InlineData("--tp=2")]
+    [InlineData("--layer-split")]
+    public void Cli_KeepsPlacementLookingSystemPromptAsText(string literal)
+        => AssertRefused(RunCliWith(WriteJunkModel(), new[] { "--system", literal }), "Not a GGUF file");
+
     // ---- the Qwen-Image-Edit-2511 pipeline's options and checkpoints ----------------
     // Removed with the pipeline. Each host must stop at startup with one line saying why,
     // never ignore the flag (the CLI's switch has no unknown-flag trap) and never answer
@@ -284,7 +343,9 @@ public class HostLoadRefusalProcessTests : IDisposable
         startInfo.Environment["TENSORSHARP_LOG_LEVEL"] = logLevel;
         startInfo.Environment["TENSORSHARP_LOG_DIR"] = Path.Combine(_dir, "logs");
         // Nothing inherited from the test run may change what the host loads.
-        foreach (string name in new[] { "KV_CACHE_DTYPE", "MAX_CONTEXT", "TENSORSHARP_TP_DEGREE", "TS_SPEC_DRAFT_MODEL", "TS_MTP_DRAFT_MODEL" })
+        foreach (string name in new[] { "KV_CACHE_DTYPE", "MAX_CONTEXT", "TENSORSHARP_TP_DEGREE",
+                     "TENSORSHARP_LAYER_SPLIT_DEGREE", "TENSORSHARP_TP_NODE_ID", "TENSORSHARP_TP_PEERS",
+                     "TS_SPEC_DRAFT_MODEL", "TS_MTP_DRAFT_MODEL" })
             startInfo.Environment.Remove(name);
 
         using var process = new Process { StartInfo = startInfo };

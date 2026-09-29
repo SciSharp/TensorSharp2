@@ -44,7 +44,7 @@ public sealed class DeepSeek41ResponsesAudioTests : IDisposable
     [Theory]
     [InlineData(null)]
     [InlineData("gemma4")]
-    [InlineData("qwen2")]
+    [InlineData("qwen35")]
     public void OtherArchitecturesAndDefaultCallerKeepExistingAudioParsing(string? architecture)
     {
         var uploads = new UploadStoragePolicy(_directory);

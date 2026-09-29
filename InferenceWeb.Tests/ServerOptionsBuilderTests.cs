@@ -30,6 +30,8 @@ public class ServerOptionsBuilderTests : IDisposable
     public ServerOptionsBuilderTests()
     {
         _env.ClearSpeculationVars();
+        foreach (string variable in new[] { "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE", "TENSORSHARP_TP_NODE_ID", "TENSORSHARP_TP_PEERS" })
+            _env.Set(variable, null);
         // Build needs a writable base directory because it creates an
         // "uploads" folder under it. Use a temp dir per test instance to keep
         // the workspace clean.
@@ -521,7 +523,7 @@ public class ServerOptionsBuilderTests : IDisposable
         string[] flags =
         {
             "--model", "--mmproj", "--backend", "--gpu-device", "--list-gpus",
-            "--tp", "--tp-node-id", "--tp-peers",
+            "--tp", "--layer-split", "--tp-node-id", "--tp-peers",
             "--max-tokens", "--temperature", "--top-k", "--top-p", "--min-p",
             "--video-frames", "--fps",
             "--repeat-penalty", "--presence-penalty", "--frequency-penalty",
@@ -978,6 +980,25 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.Equal("2", Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"));
     }
 
+    [Theory]
+    [InlineData("--tp=2")]
+    [InlineData("--layer-split=2")]
+    [InlineData("--tp-node-id=0")]
+    public void PlacementLookingStopValuesStayLiteralInBothServerPasses(string literal)
+    {
+        var args = new[] { "--stop", literal };
+        Assert.False(ServerOptionsBuilder.ApplyTensorParallelCliFlags(args));
+        Assert.Null(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"));
+        Assert.Null(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"));
+        var options = ServerOptionsBuilder.Build(args, _baseDir);
+        Assert.Contains(literal, options.DefaultSamplingConfig.StopSequences);
+
+        // Literal placement-looking text must not hide a separate real option.
+        var withPlacement = args.Concat(new[] { "--layer-split=2" }).ToArray();
+        Assert.True(ServerOptionsBuilder.ApplyTensorParallelCliFlags(withPlacement));
+        Assert.Equal("2", Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"));
+    }
+
     [Fact]
     public void ApplyTensorParallelCliFlags_RejectsZeroNegativeAndNonInteger()
     {
@@ -1070,6 +1091,20 @@ public class ServerOptionsBuilderTests : IDisposable
             "--tp-peers", "10.0.0.1:9500,10.0.0.2:9500",
         }, _baseDir);
         Assert.NotNull(options);
+    }
+
+    [Theory]
+    [InlineData("--layer-split", "2")]
+    [InlineData("--layer-split=2", null)]
+    public void LayerSplit_ReachesTheLoaderAndIsAcceptedByTheServer(string flag, string? value)
+    {
+        string[] args = value == null ? new[] { flag } : new[] { flag, value };
+        Assert.True(ServerOptionsBuilder.ApplyTensorParallelCliFlags(args));
+        Assert.Equal("2", Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"));
+        Assert.Null(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"));
+        Assert.NotNull(ServerOptionsBuilder.Build(args, _baseDir));
+        Assert.Contains("--layer-split", TensorSharp.Cli.CliUsage.DocumentedFlags());
+        Assert.Contains("--layer-split", ServerUsage.DocumentedFlags());
     }
 
     // ----- speculative-decoding CLI flags -----

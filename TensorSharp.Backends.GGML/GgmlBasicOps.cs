@@ -1544,6 +1544,14 @@ namespace TensorSharp.GGML
         public static void Shutdown() => GgmlNative.Shutdown();
 
         /// <summary>
+        /// True once this process has bound the GgmlOps native library, i.e. some code made its
+        /// first P/Invoke into it. Reading it never loads the library (unlike <see cref="Shutdown"/>,
+        /// itself a P/Invoke), so an exit path on a non-GGML backend can skip the teardown when
+        /// no GGML code ran.
+        /// </summary>
+        public static bool IsNativeLibraryLoaded => GgmlNativeLibraryState.IsLoaded;
+
+        /// <summary>
         /// Set an environment variable as the NATIVE library sees it. Managed
         /// <c>Environment.SetEnvironmentVariable</c> does not reach native getenv on
         /// every platform, and some ggml tunables are read once at device probe, so
@@ -1775,99 +1783,6 @@ namespace TensorSharp.GGML
         /// <summary>Release every rank's parked tensor-parallel Muse-Glimmer graph.
         /// Call on dispose and on KV reset.</summary>
         public static void MuseGlimmerReleaseTpGraphs() => GgmlNative.MuseGlimmerReleaseTpGraphs();
-
-
-        public static void TransformerModelDecode(
-            IntPtr hiddenData, int hiddenSize, int numLayers,
-            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
-            IntPtr[] oArr, IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr,
-            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
-            IntPtr[] qkvBiasArr,
-            IntPtr[] qArr, IntPtr[] kArr, IntPtr[] vArr,
-            int[] splitTypeArr, long[] splitBytesArr,
-            int[] qkvTypeArr, long[] qkvBytesArr,
-            int[] oTypeArr, long[] oBytesArr,
-            int[] guTypeArr, long[] guBytesArr,
-            int[] downTypeArr, long[] downBytesArr,
-            int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            int oType, long oNe0, long oNe1, long oBytes,
-            int guType, long guNe0, long guNe1, long guBytes,
-            int downType, long downNe0, long downNe1, long downBytes,
-            int headDim, int numHeads, int numKvHeads,
-            int maxSeqLen, int position,
-            float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode,
-            int kvCacheType = 0,
-            int ropeOriginalContext = 0,
-            float ropeExtFactor = 0.0f, float ropeAttnFactor = 1.0f,
-            float ropeBetaFast = 0.0f, float ropeBetaSlow = 0.0f)
-        {
-            GgmlNative.TransformerModelDecode(
-                hiddenData, hiddenSize, numLayers,
-                attnNormArr, qkvArr, qNormArr, kNormArr,
-                oArr, ffnNormArr, guArr, downArr,
-                kCacheArr, vCacheArr,
-                qkvBiasArr,
-                qArr, kArr, vArr,
-                splitTypeArr, splitBytesArr,
-                qkvTypeArr, qkvBytesArr,
-                oTypeArr, oBytesArr,
-                guTypeArr, guBytesArr,
-                downTypeArr, downBytesArr,
-                qkvType, qkvNe0, qkvNe1, qkvBytes,
-                oType, oNe0, oNe1, oBytes,
-                guType, guNe0, guNe1, guBytes,
-                downType, downNe0, downNe1, downBytes,
-                headDim, numHeads, numKvHeads,
-                maxSeqLen, position,
-                eps, ropeBase, ropeFreqScale,
-                intermediateSize, ropeMode, kvCacheType,
-                ropeOriginalContext, ropeExtFactor, ropeAttnFactor,
-                ropeBetaFast, ropeBetaSlow);
-        }
-
-        /// <summary>
-        /// Full transformer layer decode (seqLen=1) in a single GGML graph.
-        /// Updates hidden state in-place and writes new K/V to the KV cache.
-        /// </summary>
-        public static void TransformerLayerDecode(
-            IntPtr hiddenData, int hiddenSize,
-            IntPtr attnNormData,
-            IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
-            IntPtr qkvBiasData,
-            IntPtr qNormData, IntPtr kNormData, int headDim,
-            IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
-            IntPtr ffnNormData,
-            IntPtr guData, int guType, long guNe0, long guNe1, long guBytes,
-            IntPtr downData, int downType, long downNe0, long downNe1, long downBytes,
-            IntPtr kCacheData, IntPtr vCacheData,
-            int numHeads, int numKvHeads,
-            int maxSeqLen, int position,
-            float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode,
-            int kvCacheType = 0,
-            int ropeOriginalContext = 0,
-            float ropeExtFactor = 0.0f, float ropeAttnFactor = 1.0f,
-            float ropeBetaFast = 0.0f, float ropeBetaSlow = 0.0f)
-        {
-            GgmlNative.TransformerLayerDecode(
-                hiddenData, hiddenSize,
-                attnNormData,
-                qkvData, qkvType, qkvNe0, qkvNe1, qkvBytes,
-                qkvBiasData,
-                qNormData, kNormData, headDim,
-                oData, oType, oNe0, oNe1, oBytes,
-                ffnNormData,
-                guData, guType, guNe0, guNe1, guBytes,
-                downData, downType, downNe0, downNe1, downBytes,
-                kCacheData, vCacheData,
-                numHeads, numKvHeads,
-                maxSeqLen, position,
-                eps, ropeBase, ropeFreqScale,
-                intermediateSize, ropeMode, kvCacheType,
-                ropeOriginalContext, ropeExtFactor, ropeAttnFactor,
-                ropeBetaFast, ropeBetaSlow);
-        }
 
         /// <summary>KV-cache dtypes the native kernels accept (kv_cache_type is a raw
         /// ggml_type id: F32=0, F16=1, Q4_0=2, Q8_0=8 — must match ggml.h).</summary>

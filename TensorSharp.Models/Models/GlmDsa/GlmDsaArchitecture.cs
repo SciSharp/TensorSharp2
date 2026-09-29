@@ -21,6 +21,13 @@ namespace TensorSharp.Models
             DisplayName = "GLM-5.x (DeepSeek Sparse Attention) and GLM-5.3-Flash",
             Aliases = new[] { "glm-dsa", "glm_dsa", "glm5next" },
             Factory = Create,
+            SupportsLayerSplit = true,
+            SupportsDistributedTensorParallel = false,
+            // Explicit CPU loopback fixture mode exercises native sharding; it is
+            // never evidence of multi-GPU execution or performance.
+            SupportsNativeTensorParallel = (_, backend) => backend == BackendType.GgmlCpu &&
+                Environment.GetEnvironmentVariable("TS_GLM_NATIVE") != "0" &&
+                Environment.GetEnvironmentVariable("TS_GLM_TP_OVERSUBSCRIBE") == "1",
             ProjectorFileHints = new[] { "*mmproj*.gguf" },
         };
 
@@ -37,7 +44,8 @@ namespace TensorSharp.Models
                     "--tp-node-id/--tp-peers. Use --tp N without the node options.");
             }
 
-            return new GlmDsaModel(context.GgufPath, context.Backend, context.TpDegree);
+            return new GlmDsaModel(context.GgufPath, context.Backend, context.TpDegree,
+                layerSplitDegree: context.LayerSplitDegree);
         }
     }
 }

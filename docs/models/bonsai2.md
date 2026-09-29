@@ -3,10 +3,10 @@
 [← back to model index](README.md) | [中文](bonsai2_zh-cn.md)
 
 Bonsai2 uses the dense Qwen 3.5 hybrid architecture with PRISM's signed
-Hadamard rotations and custom low-bit GGUF encodings. It is distinct from
-the earlier [Bonsai Q1_0 models](bonsai.md). Merely interpreting its weights
-as ordinary ternary numbers produces the wrong network: projection inputs
-and embedding outputs must also receive the declared transforms.
+Hadamard rotations and custom low-bit GGUF encodings. Merely interpreting
+its weights as ordinary ternary numbers produces the wrong network:
+projection inputs and embedding outputs must also receive the declared
+transforms.
 
 ## Local artifacts and architecture
 
@@ -82,8 +82,16 @@ The initial integration requires a single-device GGML backend. Pure managed
 CPU, direct CUDA, MLX, and tensor-parallel configurations are rejected instead
 of silently omitting the rotations. Device-specific end-to-end validation is
 separate from that loader eligibility; see the validation procedure below.
-Bonsai2 has no TensorAgent catalog entry; the app's two Bonsai entries are the
-[Q1_0 files](bonsai.md#tensoragent-sideload).
+
+[TensorAgent](../../TensorAgent/README.md) lists Bonsai2 as the experimental
+`bonsai-2-27b-ptq1-0` catalog entry. It downloads the PTQ1_0 file and, as an
+optional projector, the Q8_0 mmproj from
+[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/b072e1d3b35a0a630cece372c2127528e0994386)
+(Apache-2.0) and verifies their hashes. The entry is offered only on the 16 GB
+device tier: repacked to Q2_0, the 5.95 GB download occupies about 7.7 GB, which
+with the K/V cache and compute buffers exceeds what a 12 GB iPhone grants. PQ2_0
+holds the same ternary weights and repacks to about the same size, so the entry
+uses the smaller PTQ1_0 download. Bonsai2 execution on iOS has not been validated.
 
 Use an explicit context cap rather than allocating for the entire advertised
 262k window:

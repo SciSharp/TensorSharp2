@@ -324,7 +324,7 @@ namespace TensorSharp.Models
                 throw new NotSupportedException(
                     "qwen4exp: the token-span path declined while a layer split is active. "
                     + "The per-layer fallback is single-GPU only, so it cannot run here. "
-                    + "Re-run without --tp to use the fallback.");
+                    + "Re-run without --layer-split to use the fallback.");
             }
             if (!spanDone && _pendingMRoPEPositions != null)
             {
@@ -1214,7 +1214,7 @@ namespace TensorSharp.Models
                         + (!_spanAttnEnabled
                             ? "TS_Q4E_SPAN_ATTN=0 cuts attention out of the span"
                             : "the PLE block could not be built into the span")
-                        + ". These per-layer paths are single-GPU only. Re-run without --tp, "
+                        + ". These per-layer paths are single-GPU only. Re-run without --layer-split, "
                         + "or without TS_Q4E_SPAN_ATTN=0.");
                 }
 

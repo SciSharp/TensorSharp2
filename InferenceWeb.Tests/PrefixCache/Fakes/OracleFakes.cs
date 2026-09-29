@@ -13,7 +13,7 @@ namespace InferenceWeb.Tests.PrefixCache.Fakes;
 /// <summary>The seven oracle fakes of DESIGN §12.3, one per family behaviour the tree must respect.</summary>
 internal static class OracleFakes
 {
-    /// <summary>Qwen3 / GptOss after M7a: holders with capture, clone and donate; any rewind;
+    /// <summary>GptOss after M7a: holders with capture, clone and donate; any rewind;
     /// A1 pages on the primary and A2 pages on the batched route; A2 → holder copies.</summary>
     internal static OracleModel P(int blockSize = 16) => new(new OracleTraits
     {

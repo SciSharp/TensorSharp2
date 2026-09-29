@@ -91,7 +91,9 @@ def run_case(args, scenario, tag, index):
         for step in range(2 if scenario == "image_follow_up" else 1):
             request = {"messages": messages, "response_format": {"type": "json_object"},
                        "extra_body": {**SAMPLING, **engines.thinking_body("tensorsharp", False)},
-                       "max_tokens": 256, "stream": not args.blocking}
+                       "max_tokens": args.max_tokens, "stream": not args.blocking}
+            if args.reasoning_effort:
+                request["extra_body"]["reasoning_effort"] = args.reasoning_effort
             metrics = engines.run_openai_chat(args.url, args.model, timeout_s=1200, **request)
             result["turns"].append({"request_sha256": digest(request), "metrics": metrics,
                                     "expected": expected})
@@ -128,7 +130,11 @@ def main():
     parser.add_argument("--concurrency", default="1,4")
     parser.add_argument("--scenarios", default="image_ocr,multi_image,image_follow_up,video_order,video_timestamp")
     parser.add_argument("--blocking", action="store_true")
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"))
     args = parser.parse_args()
+    if args.max_tokens < 1:
+        parser.error("max-tokens must be positive")
     if args.prepare:
         prepare(args.fixtures)
         return 0
@@ -150,6 +156,7 @@ def main():
                                               Path(__file__).with_name("validate_inference.py"))},
               "profile": args.profile, "model": args.model, "stream": not args.blocking,
               "sampling": SAMPLING, "fixtures": fixture_manifest,
+              "reasoning_effort": args.reasoning_effort,
               "execution_plan": {"scenarios": scenarios, "concurrency": degrees,
                                  "expected_cases": len(scenarios) * sum(degrees)},
               "run_complete": False,

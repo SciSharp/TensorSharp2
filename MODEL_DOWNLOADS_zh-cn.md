@@ -18,10 +18,8 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Qwen 3.5 | Qwen3.5-35B-A3B | [ggml-org/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF)，投影器 `mmproj-Qwen3.5-35B-A3B-Q8_0.gguf` |
 | Qwen 3.6 | Qwen3.6-35B-A3B（保留 NextN） | [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)，投影器 `mmproj-F16.gguf`。**注意不要下载基础仓库** [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)：它的文件名完全相同，但剥离了 NextN 块，`--spec` 会静默回落到普通解码 |
 | Qwen 3.8 | Qwen3.8-27B（稠密混合，内嵌 NextN MTP，支持图像） | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)，如 `Qwen3.8-27B-UD-Q4_K_XL.gguf`，即 [`config/agent-qwen3.8-27b.json`](config/agent-qwen3.8-27b.json) 以提交与 SHA-256 固定的文件；它保留 `--spec` 所需的 NextN 块，同仓库有投影器 `mmproj-BF16.gguf`（需用 `--mmproj` 指定）。它与 Qwen 3.5 走同一条 `Qwen35Model` 路径。可选提速产物：DFlash2 分块 draft [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF)，用 `--draft-model` 加载（挂上后取代 NextN 块）；收益取决于负载，见 [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md) §12.4 |
-| Qwen 3.8 Flash Next | Qwen3.8-Flash-Next（混合 MoE，支持图像） | [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)；每种量化一个子目录（`UD-Q2_K_XL/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。同仓库的 `mmproj-BF16.gguf` 启用图像输入，多图提示与多轮图像会话都可用：CLI 会在模型旁边找到它，服务端需用 `--mmproj` 指定。`general.architecture` 为 `qwen4exp`。多卡机器上 `--tp N` 走的是**按层切分**——整层落在单卡，也是 llama.cpp 对这个架构唯一提供的多卡模式——买到的是容量而不是速度，见 [USAGE_zh-cn.md](USAGE_zh-cn.md#张量并行与分布式推理)。可选的提速产物：共享 MTP 头 `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`（选带 `-shared-` 的那个，而不是旁边其他 `MTP/mtp-*` 头：加载器只接受共享目标张量的 NextN 块；2,786,568,256 字节；`eng/validation/qwen38_mtp_followup/` 中的验证包记录它来自本仓库的 revision `38bb39ee97821de2c9009abb7e93950eec396e66`），是单个 GGUF，在 GGML 后端上用 `--draft-model` 加载。在三张 A40 上以 UD-Q2_K_XL 实测，它在大量照抄的输出上有收益（采用 2026-09-17 加入的精确 verify 行 kernel 后，192 token 代码照抄流约 1.7 倍：83.2 对普通 49.1 tok/s；此前为 1.75-1.96 倍），但 512 token 散文的解码反而变慢（44-46 对 52 tok/s，测于该改动之前）；见 [qwen38-flash-next_zh-cn.md](docs/models/qwen38-flash-next_zh-cn.md#共享-mtp-头的投机解码) |
-| Qwen 3 / Qwen 2 / Qwen 2.5-VL | `qwen3`、`qwen2`、`qwen2vl` 检查点（仅文本） | 这里不固定任何仓库：任何 `general.architecture` 为 `qwen3`、`qwen2`、`qwen2vl` 或 `qwen2_vl` 的 GGUF 都经 `Qwen3Model` 加载。仅文本：不加载投影器，Qwen 2.5-VL 文件在没有视觉塔的情况下对话。没有草稿模型，n-gram 投机解码也不适用。下面的 Bonsai-8B 就是一个 `qwen3` 文件。见 [docs/models/README_zh-cn.md](docs/models/README_zh-cn.md) |
-| Bonsai Q1_0 | Bonsai-8B / Bonsai-27B | [prism-ml/Bonsai-8B-gguf](https://huggingface.co/prism-ml/Bonsai-8B-gguf/tree/48516770dd04643643e9f9019a2a349cf26c5dbd) 和 [prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf/tree/f10afb355f104535e3e3e98cf7ab7795c72bd292) 提供与本文档 SHA-256 完全一致的发布方文件；两个模型卡均声明 Apache-2.0。下载 `Q1_0` 文件后校验哈希。两者架构不同（8B 为 `qwen3`，27B 为 `qwen35`）；固定版本、下载命令和已有实测数据见 [bonsai_zh-cn.md](docs/models/bonsai_zh-cn.md)。TensorAgent 目录仍使用手动导入。 |
-| Bonsai2 | Ternary-Bonsai-2-27B（PQ2_0 / PTQ1_0，支持图像） | 这里没有记录下载仓库：请自备 `Ternary-Bonsai-2-27B-PQ2_0.gguf`（7.21 GB）或 `Ternary-Bonsai-2-27B-PTQ1_0.gguf`（5.95 GB），并按 [bonsai2_zh-cn.md](docs/models/bonsai2_zh-cn.md) 中的 SHA-256 校验。两者都声明 `general.architecture` = `qwen35`，带 PRISM 带符号 Hadamard 元数据（`prism.hadamard.*`）和自定义张量类型 PQ2_0 / PTQ1_0，TensorSharp 在加载时把它们无损转码为 GGML Q2_0（在内存中比存储的数据分别多占约 6% / 29%）。配套投影器 `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `-mmproj-Q8_0.gguf` 启用图像输入：CLI 会在模型旁边找到它们，服务端需用 `--mmproj` 指定。仅支持单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `--tp` 会被拒绝）；目前的端到端验证只在 Metal（M5 Pro）上完成。不在 TensorAgent 目录中 |
+| Qwen 3.8 Flash Next | Qwen3.8-Flash-Next（混合 MoE，支持图像） | [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)；每种量化一个子目录（`UD-Q2_K_XL/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。同仓库的 `mmproj-BF16.gguf` 启用图像输入，多图提示与多轮图像会话都可用：CLI 会在模型旁边找到它，服务端需用 `--mmproj` 指定。`general.architecture` 为 `qwen4exp`。多卡机器上 `--layer-split N` 走的是**按层切分**——整层落在单卡，也是 llama.cpp 对这个架构唯一提供的多卡模式——买到的是容量而不是速度，见 [USAGE_zh-cn.md](USAGE_zh-cn.md#张量并行与分布式推理)。可选的提速产物：共享 MTP 头 `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`（选带 `-shared-` 的那个，而不是旁边其他 `MTP/mtp-*` 头：加载器只接受共享目标张量的 NextN 块；2,786,568,256 字节；`eng/validation/qwen38_mtp_followup/` 中的验证包记录它来自本仓库的 revision `38bb39ee97821de2c9009abb7e93950eec396e66`），是单个 GGUF，在 GGML 后端上用 `--draft-model` 加载。在三张 A40 上以 UD-Q2_K_XL 实测，它在大量照抄的输出上有收益（采用 2026-09-17 加入的精确 verify 行 kernel 后，192 token 代码照抄流约 1.7 倍：83.2 对普通 49.1 tok/s；此前为 1.75-1.96 倍），但 512 token 散文的解码反而变慢（44-46 对 52 tok/s，测于该改动之前）；见 [qwen38-flash-next_zh-cn.md](docs/models/qwen38-flash-next_zh-cn.md#共享-mtp-头的投机解码) |
+| Bonsai2 | Ternary-Bonsai-2-27B（PQ2_0 / PTQ1_0，支持图像） | [prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/b072e1d3b35a0a630cece372c2127528e0994386)，revision `b072e1d3b35a0a630cece372c2127528e0994386`（Apache-2.0）——`Ternary-Bonsai-2-27B-PQ2_0.gguf`（7.21 GB）或 `Ternary-Bonsai-2-27B-PTQ1_0.gguf`（5.95 GB）；请按 [bonsai2_zh-cn.md](docs/models/bonsai2_zh-cn.md) 中的 SHA-256 校验。两者都声明 `general.architecture` = `qwen35`，带 PRISM 带符号 Hadamard 元数据（`prism.hadamard.*`）和自定义张量类型 PQ2_0 / PTQ1_0，TensorSharp 在加载时把它们无损转码为 GGML Q2_0（在内存中比存储的数据分别多占约 6% / 29%）。同仓库的配套投影器 `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `-mmproj-Q8_0.gguf` 启用图像输入：CLI 会在模型旁边找到它们，服务端需用 `--mmproj` 指定。仅支持单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `--tp` 会被拒绝）；目前的端到端验证只在 Metal（M5 Pro）上完成。TensorAgent 的实验性条目从这个 revision 下载 PTQ1_0 文件，以及可选的 Q8_0 投影器，且只面向 16 GB 设备档位 |
 | GPT OSS | gpt-oss-20b（MoE） | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF)，文件 `gpt-oss-20b-MXFP4.gguf`（注意 `MXFP4` 为大写）；纯文本，无伴随文件 |
 | Nemotron-H | Nemotron-H-8B / 47B Reasoning | [8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) / [47B](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron 3 Nano Omni 30B-A3B | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF)，图像输入需 `mmproj-BF16.gguf`。除非加载了单独转换的音频配套 GGUF，音频输入会被拒绝（HTTP 400 / CLI 错误）：这些 GGUF 不带音频塔，见 [nemotron_zh-cn.md §4.6-4.7](docs/models/nemotron_zh-cn.md) |
@@ -30,11 +28,11 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF)，Pixtral 投影器 `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` |
 | Hunyuan Dense | 腾讯稠密 Hunyuan 检查点（`hunyuan-dense`） | 任何 `general.architecture` 为 `hunyuan-dense` 的 GGUF 均可加载，例如 Hy-MT2 系列（参考对话模板取自 `tencent/Hy-MT2-1.8B`）。仅文本、单设备，没有投影器也没有草稿模型。见 [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | Muse-Glimmer | Muse-Glimmer-30B（稠密，支持图像） | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)，如 `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` 或 `Muse-Glimmer-30B-Q8_0.gguf`；`general.architecture` 为 `muse-glimmer` / `muse_glimmer`。图像输入需同仓库的 `mmproj-Muse-Glimmer-30B-Q8_0.gguf`：传 `--image` 时 CLI 会在模型旁边找到它，服务端则需用 `--mmproj` 指定。可选提速产物：同仓库的 DFlash 分块 draft `dflash-kquant.gguf`，或更新的 DFlash2 draft [z-lab/Muse-Glimmer-30B-DFlash2-GGUF](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2-GGUF)（16 GB 显卡上优先选 `-Q4_K_M`，见 [speculative_decoding.md](docs/speculative_decoding.md#what-to-expect) 中关于 draft 大小的说明），用 `--draft-model` 加载即可无损推测解码——不要传任何采样参数，它只在纯贪心下生效 |
-| DeepSeek V4.1 | DeepSeek-V4.1-Flash（`deepseek41`，384 个路由专家） | [vcruz305/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/58d8ac86298fdf85a2440defee08b1abcad32e45)，固定 revision `58d8ac86298fdf85a2440defee08b1abcad32e45`——七个 Q2_K 分片（246.35 GiB，张量类型混合 Q2_K/Q3_K）需放在同一目录，`--model` 指向第一个分片。GGUF 已包含 Engram 权重与哈希常量，无需生成 Engram 或单独的 Engram 文件。`eng/dsv41-prepare-vision.py` 生成约 970 MB 的可选视觉伴随文件，图像与视频经 `--mmproj` 使用。服务后端为 `ggml_cuda`；`ggml_cpu` 与 `cpu` 是正确性与可移植性路径，而非服务路径——`--backend cpu` 用纯 C# 执行器 `DeepSeek4CpuExecutor` 跑完整的 V4.1 计算图，不依赖 ggml、原生库与 GPU；它同样直接读取内嵌的 Engram 元数据，而视觉伴随文件不会跟到这个后端上（`LoadVisionEncoder` 会抛异常），因此该后端上没有图像也没有视频。V4 的草稿模型会被拒绝；`deepseek41-dspark` 草稿模型可在 `ggml_cuda` / `ggml_cpu` 上经 `--draft-model` 加载，属于实验性路径，只在合成测试夹具上验证过——尚未实测任何训练好的 V4.1 草稿模型。完整流程与校验哈希见 [deepseek41](docs/models/deepseek41_zh-cn.md) |
+| DeepSeek V4.1 | DeepSeek-V4.1-Flash（`deepseek41`，384 个路由专家） | [smalinin/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/tree/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5)，固定 revision `d1de55c19f95172c882906cc83c0e55932d26a63`——`Q2_K-Q5/` 下十个分片，共 335,382,014,624 字节（312.349 GiB），Engram 表为 Q5_K，并恢复 F32 mHC 与 BF16 Engram 门控张量。所有分片放在同一目录，`--model` 指向第一个分片。原七分片 vcruz Q2 存在敏感张量量化问题，不再推荐。修复版头部与十个完整文件哈希均已校验，双卡按层切分与实验性路由专家 TP 下的有限普通/DSpark 文本/图像 HTTP 检查均已通过，回答以 EOS 完成，服务正常退出。另行进行的 24-token 普通/DSpark 文本/图像配对检查，在两种模式下均匹配 token ID 与 `max_tokens` 结束原因，DSpark 实际参与解码且进程正常退出；这些有限续写与 HTTP 的 EOS 检查分开记录。两个图像配对中 DSpark 都更慢。简短的重复文本预热对照也已完成：每种模式一次预热、三次计时，每对输入 69 token、输出 24 token，token ID 与结束原因完全一致，DSpark 实际参与解码且进程正常退出。小样本与大量磁盘换页限制了这些结果，不声明通用质量/性能、提速、跨节点执行或完整模型 TP 通过。每次重新下载仍须校验哈希。GGUF 已包含 Engram 权重与哈希常量，无需生成 Engram 或单独的 Engram 文件。`eng/dsv41-prepare-vision.py` 生成约 970 MB 的可选视觉伴随文件，图像与视频经 `--mmproj` 使用。服务后端为 `ggml_cuda`；`ggml_cpu` 与 `cpu` 是正确性与可移植性路径，而非服务路径——`--backend cpu` 用纯 C# 执行器 `DeepSeek4CpuExecutor` 跑完整的 V4.1 计算图，不依赖 ggml、原生库与 GPU；它同样直接读取内嵌的 Engram 元数据，而视觉伴随文件不会跟到这个后端上（`LoadVisionEncoder` 会抛异常），因此该后端上没有图像也没有视频。V4 的草稿模型会被拒绝；`deepseek41-dspark` 草稿模型可在 `ggml_cuda` / `ggml_cpu` 上经 `--draft-model` 加载，属于实验性路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分与实验性路由专家 TP 下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。完整流程与校验哈希见 [deepseek41](docs/models/deepseek41_zh-cn.md) |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731（284B MoE） | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)；每种量化一个子目录（`UD-Q8_K_XL/`、`UD-IQ4_XS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。仅文本 |
 | GLM 5.x | GLM-5.2（744B-A40B MoE，内嵌 NextN MTP） | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF)；每种量化一个子目录（`UD-Q4_K_XL/`、`UD-IQ2_XXS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。**仅文本**——再往下两行的 GLM-5.3-Flash 才是支持图像的那个；中间那行的 GLM-5.3 同样仅文本。这些 GGUF 已带有 `--spec` 所需的 NextN 块——与 Qwen 3.6 不同，不存在需要挑选的独立 MTP 仓库 |
-| GLM 5.x | GLM-5.3（`glm-dsa`，256 个路由专家，仅文本） | [unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)；每种量化一个子目录（`UD-Q2_K_XL/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。`general.architecture` 为 `glm-dsa`，层结构与 GLM-5.2 一致（79 个 block —— 78 层主干加 1 个 NextN ——256 个路由专家 top-8、带 lightning indexer 的 MLA、rope base 8e6），因此直接走现有的 GLM-5.2 路径，无需额外开关。**仅文本**——与下面的 Flash 仓库不同，这个仓库完全没有发布 mmproj。它确实带着供 `--spec` 使用的 NextN 块，但 `blk.78` 没有自己的 `nextn.shared_head_head.weight`，draft 块只能借用主干的 LM head——而在 `--tp N` 下该 head 是按列切分的。加载器拒绝用某个 rank 上的词表切片来 draft，并在 stderr 上明说，所以只有**不带** `--tp`（即默认按层切分到所有可见 GPU）运行时 `--spec` 才会真正生效 |
-| GLM 5.x | GLM-5.3-Flash（320B，288 个路由专家，文本 + 图像） | [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)；每种量化一个子目录（`UD-Q2_K_XL/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。`general.architecture` 为 `glm5next`，与 GLM-5.2 走同一个原生执行器。与 5.2 不同，它**支持图像**：同仓库的 `mmproj-BF16.gguf`（GLM-OCR ViT）启用 `--image`、多图提示与多轮图像会话。它的 NextN 块尚未接入，因此这里没有 `--spec`。不传 `--tp` 时默认按层切分到所有可见 GPU；在 GGML GPU 后端上，传入 `--tp N` 则选择仅支持本地单进程的原生张量并行 |
+| GLM 5.x | GLM-5.3（`glm-dsa`，256 个路由专家，仅文本） | [unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)；每种量化一个子目录（`UD-Q2_K_XL/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。`general.architecture` 为 `glm-dsa`，层结构与 GLM-5.2 一致（79 个 block —— 78 层主干加 1 个 NextN ——256 个路由专家 top-8、带 lightning indexer 的 MLA、rope base 8e6），因此直接走现有的 GLM-5.2 路径，无需额外开关。**仅文本**——与下面的 Flash 仓库不同，这个仓库完全没有发布 mmproj。它确实带着供 `--spec` 使用的 NextN 块，但 `blk.78` 没有自己的 `nextn.shared_head_head.weight`，draft 块只能借用主干的 LM head——而在 `--tp N` 下该 head 是按列切分的。加载器拒绝用某个 rank 上的词表切片来 draft，并在 stderr 上明说，所以 `--spec` 在**单设备或按层切分模式**下生效；用 `--layer-split N` 指定 N 张本地 GPU，不启用张量并行 |
+| GLM 5.x | GLM-5.3-Flash（320B，288 个路由专家，文本 + 图像） | [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)；每种量化一个子目录（`UD-Q2_K_XL/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。`general.architecture` 为 `glm5next`，与 GLM-5.2 走同一个原生执行器。与 5.2 不同，它**支持图像**：同仓库的 `mmproj-BF16.gguf`（GLM-OCR ViT）启用 `--image`、多图提示与多轮图像会话。它的 NextN/MTP 块尚未接入；无需训练权重的 n-gram 推测使用 `--spec --spec-type ngram`。用 `--layer-split N` 将整层放到 N 张本地 GPU；在 GGML GPU 后端上，传入 `--tp N` 则选择仅支持本地单进程的原生张量并行 |
 | DeepSeek V4 | DSpark 推测解码 draft（可选，仅提速） | 见下方 [DSpark draft 模型](#dspark-draft-模型)，用 `--draft-model` 加载，解码约 1.3-1.4 倍 |
 | DiffusionGemma | diffusiongemma-26B-A4B-it | [unsloth/diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF)，如 `diffusiongemma-26B-A4B-it-Q4_K_M.gguf`；unsloth 没有发布的更小 Q3_K_M 在 [DevQuasar/google.diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/DevQuasar/google.diffusiongemma-26B-A4B-it-GGUF)。所有已发布的 GGUF 都只含文本部分。图像输入还需下载 Gemma-4 视觉塔：TensorSharp 直接读取 [google/diffusiongemma-26B-A4B-it](https://huggingface.co/google/diffusiongemma-26B-A4B-it) 中的上游分片 `model-00011-of-00011.safetensors`（2.84 GB），用 `--mmproj` 指定（这个系列没有投影器自动探测）。音频会被拒绝；没有视频路径：OpenAI 的 `video_url` 会被拒绝，Web UI 上传的视频只以抽出的帧（当作普通图像）送入模型。`config/diffusiongemma-26b-a4b-*.json` 会把两者都下载好；见 [diffusiongemma_zh-cn.md](docs/models/diffusiongemma_zh-cn.md) |
 | Qwen-Image-2.1 | 扩散 Transformer（即 `--model` GGUF） | [Abiray/Qwen-Image-2.1-GGUF](https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF)，文件 `qwen_image_2.1_Q4_K_M.gguf`。[`config/qwen-image-2.1.json`](config/qwen-image-2.1.json) 会以固定修订版本和 SHA-256 校验下载它以及下面三个伴随文件（共四个文件，约 10.29 GiB）。Unsloth 不含元数据的 `qwen-image-2.1-Q8_0.gguf`（GGUF 元数据为零，张量混合 BF16/F32/Q8_0）同样可以加载：架构由张量布局识别，包括 `model.diffusion_model.` 前缀；它的 `mmproj-BF16.gguf` 匹配不上伴随文件扫描，需用 `--qwen-image-mmproj` 指定。更早的 Qwen-Image / Qwen-Image-Edit checkpoint 会被拒绝。详见 [qwenimage21_zh-cn.md](docs/models/qwenimage21_zh-cn.md) |
@@ -90,8 +88,8 @@ draft，社区亦有 GGUF 转换，但它们是另一种 draft 结构：5 层 Tr
 | Gemma-4-31B | — | [williamliao/dspark_gemma4_31b-it-GGUF](https://huggingface.co/williamliao/dspark_gemma4_31b-it-GGUF) |
 
 Gemma 4 目前已有可用的推测解码路径：上表中的 `gemma4-assistant` MTP draft（
-`--draft-model`）；Qwen 3.6、GLM 5.2 与 GLM-5.3 则内置 NextN 块（GLM-5.3 只在默认按层切分、
-即不传 `--tp` 时才会真正 draft）。它们与 DSpark 是不同的 draft。
+`--draft-model`）；Qwen 3.6、GLM 5.2 与 GLM-5.3 则内置 NextN 块（GLM-5.3 在单设备或显式 `--layer-split N` 放置下真正 draft，
+不启用张量并行）。它们与 DSpark 是不同的 draft。
 
 ### 按模型下载并运行
 
@@ -104,37 +102,40 @@ echo "列出三条关于月球的事实。" > prompt.txt
 **DeepSeek V4.1 Flash**（384 个路由专家，服务后端为 `ggml_cuda`，直接读取 GGUF 内嵌的 Engram 元数据）：
 
 ```bash
-# 七个分片共 246 GiB Q2_K 权重。主机映射的 Engram 表预热需要约 60 GiB 页缓存；
-# 驻留 GPU 的表无需这一步预热。
+# 修复版 Q2_K/Q5_K：十个分片共 312.349 GiB。头部与十个完整文件哈希均已校验；
+# 双卡按层切分与实验性路由专家 TP2 下的有限普通/DSpark 文本/图像 HTTP 检查已通过，
+# 回答以 EOS 完成，服务正常退出。另行进行的 24-token 文本/图像配对检查在两种模式下均
+# 匹配 token ID 与 max_tokens 结束原因，DSpark 实际参与解码且进程正常退出；这些是有限续写。
+# 两个图像配对中 DSpark 都更慢。文本预热对照已完成：每种模式一次预热、三次计时，
+# 每对输入 69 token、输出 24 token，token ID 与结束原因完全一致，DSpark 实际参与且正常退出。
+# 小样本与大量磁盘换页下不声明通用质量/性能、提速、跨节点执行或完整模型 TP 通过。
 python3 -m venv /tmp/dsv41-tools
 /tmp/dsv41-tools/bin/python -m pip install huggingface_hub
-/tmp/dsv41-tools/bin/hf download vcruz305/DeepSeek-V4.1-Flash-GGUF \
-    --revision 58d8ac86298fdf85a2440defee08b1abcad32e45 \
-    --include "DeepSeek-V4.1-Flash-Q2_K-*.gguf" --local-dir models/deepseek41-q2
+/tmp/dsv41-tools/bin/hf download smalinin/DeepSeek-V4.1-Flash-GGUF \
+    --revision d1de55c19f95172c882906cc83c0e55932d26a63 \
+    --include "Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-*.gguf" --local-dir models/deepseek41-q2-q5
 
-# 也可以改用 Q4_K_M：十一个分片共 415 GiB。它的两张 Engram 表各 51.5 GiB；
-# 在 8x46 GB 上，这些表留在主机内存映射中，路由专家需要卸载到 CPU，
-# 加载器会打印它需要的 --n-cpu-moe N。
-#   --include "DeepSeek-V4.1-Flash-Q4_K_M-*.gguf" --local-dir models/deepseek41-q4
-# 两种量化均内嵌 Engram 常量，无需另行准备 Engram。
+# 继续之前，按 docs/models/deepseek41_zh-cn.md 中的十项 SHA-256
+# 校验全部完整文件（使用上方实际下载目录）。
+# Engram 常量已内嵌，无需另行准备。
 
 # 可选：约 970 MB 的视觉伴随文件，--mmproj 用它启用图像与视频
 /tmp/dsv41-tools/bin/python -m pip install numpy==2.0.2 gguf
-/tmp/dsv41-tools/bin/python eng/dsv41-prepare-vision.py models/deepseek41-q2 \
-    --parent-model models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
+/tmp/dsv41-tools/bin/python eng/dsv41-prepare-vision.py models/deepseek41-q2-q5/Q2_K-Q5 \
+    --parent-model models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
     --repository deepseek-ai/DeepSeek-V4.1-Flash \
     --revision dba1be0a40aa45a94ad051997016db3960a90277
 
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-    --model models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
-    --mmproj models/deepseek41-q2/deepseek41.vision.gguf \
-    --backend ggml_cuda --tp 8 --port 5000
+    --model models/deepseek41-q2-q5/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf \
+    --mmproj models/deepseek41-q2-q5/Q2_K-Q5/deepseek41.vision.gguf \
+    --backend ggml_cuda --layer-split 8 --port 5000
 ```
 
-这里的 `--tp N` 表示在 N 张 GPU 上**按层切分**，不是张量并行；`TS_DSV41_TP=N` 才会打开实验性的
-routed-MoE TP，而它目前实测比按层切分更慢。权重与上下文放不下时加 `--n-cpu-moe N`。
+`--layer-split N` 选择 N 张本地 GPU 上的整层放置。实验性 routed-MoE TP 则需改用
+`--tp N` 并设置相同度数的 `TS_DSV41_TP=N`。历史七分片基准比按层切分更慢，但不代表修复版量化的性能。权重与上下文放不下时加 `--n-cpu-moe N`。
 Python 用于 Hugging Face 下载 CLI 与可选的视觉准备；推理无需 Python。仅提供文本服务时，
-省略视觉准备命令与 `--mmproj`。
+省略视觉准备命令与 `--mmproj`。[模型卡片](docs/models/deepseek41_zh-cn.md#准备可选的-dspark-伴随文件)另提供固定官方版本的 V4.1 DSpark 转换步骤及其验证限制。
 
 `--backend cpu` 不是上面“换后端”提示里的 `ggml_cpu`：它用纯 C# 执行器 `DeepSeek4CpuExecutor`
 跑完整的 V4.1 计算图——不依赖 ggml、原生库与 GPU，凡是 .NET 能跑的地方它都能跑——定位是正确性
@@ -148,13 +149,13 @@ prefill，并发请求只能串行。
 **DeepSeek V4 Flash**（284B MoE，纯文本，支持 DSpark 推测解码）：
 
 ```bash
-# 约 160 GB 权重：需要多张 GPU（自动按层切分），draft 另需约 7 GB
+# 约 160 GB 权重：需要多张 GPU（此处使用 --layer-split 4），draft 另需约 7 GB
 hf download unsloth/DeepSeek-V4-Flash-0731-GGUF --include "UD-Q8_K_XL/*" --local-dir models
 hf download bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF DSpark-drafter-Q2K-Q8-0731.gguf --local-dir models
 
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
-    --backend ggml_cuda --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf \
+    --backend ggml_cuda --layer-split 4 --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf \
     --input prompt.txt --max-tokens 200 --temperature 0
 ```
 
@@ -170,12 +171,12 @@ hf download unsloth/GLM-5.3-GGUF --include "UD-Q2_K_XL/*" --local-dir models
 
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --model models/UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00001-of-00007.gguf \
-    --backend ggml_cuda --spec --port 5000
+    --backend ggml_cuda --layer-split 8 --spec --port 5000
 ```
 
 这里没有 `--mmproj`：该仓库在任何量化下都没有发布 mmproj，而给 `glm-dsa` 模型传 `--mmproj`
 只会告警并被忽略，不会报错退出，所以无论如何都是仅文本的运行。`--spec` 必须在加载之前就写在
-命令行上，并且只在上面这种**默认按层切分**下生效——不传 `--tp` 时会用上所有可见 GPU。
+命令行上，并且在**单设备或按层切分模式**下生效——用 `--layer-split N` 选择 N 张本地 GPU。
 `--tp N` 在 GGML GPU 后端上可以接受，但仅限本地单进程（`--tp-node-id` / `--tp-peers` 对整个
 GLM 系列都会在构建模型之前被拒绝），而且会在每个 rank 上复制一份 KV cache；它对 GLM-5.3 并不是
 已验证的配置，并且在它之下加载器会放弃 draft——`blk.78` 借用的主干 LM head 是按列切分的——
@@ -266,7 +267,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B
 
 **Qwen-Image-2.1**（提示词 → 图像，或提示词 + 一张或多张参考图 → 编辑后的图像；需要 DiT、专用 2.1 VAE 与 Qwen3-VL-8B 文本编码器，编辑时还需要它的 mmproj）：
 
-最短路径是现成的配置文件：它固定修订版本与 SHA-256 校验，缺什么下什么（共四个文件，约 10.29 GiB），存放到 `$TENSORSHARP_MODELS/qwen-image-2.1/`；未设置 `TENSORSHARP_MODELS` 时为 `models/qwen-image-2.1/`。配置默认选择 `ggml_metal`；在 NVIDIA 机器上追加 `--backend ggml_cuda`。
+最短路径是现成的配置文件：它固定修订版本与 SHA-256 校验，缺什么下什么（共四个文件，约 10.29 GiB），存放到 `$TENSORSHARP_MODELS/qwen-image-2.1/`；未设置 `TENSORSHARP_MODELS` 时为 `models/qwen-image-2.1/`。配置默认选择 `ggml_metal`；在 NVIDIA 机器上追加 `--backend ggml_cuda`，或用 `--backend cpu` 走纯 C# 路径（不需要 GPU；速度与内存见[模型卡](docs/models/qwenimage21_zh-cn.md#纯-c-cpu-后端--backend-cpu)）。
 
 ```bash
 dotnet run --project TensorSharp.Cli -c Release --no-build -- \

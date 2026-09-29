@@ -12,13 +12,14 @@ namespace TensorSharp.Runtime
     /// The OpenAI <c>reasoning_effort</c> levels, as a chat template reads them.
     ///
     /// <para>
-    /// Only Harmony (GPT-OSS) renders the level today: its system message carries a
-    /// <c>Reasoning: low|medium|high</c> line the model was trained on, and it is the
-    /// ONLY lever over that family's chain of thought. GPT-OSS cannot be asked not to
+    /// Harmony (GPT-OSS) renders a <c>Reasoning: low|medium|high</c> system line;
+    /// GLM-5.3 Flash renders its trained <c>Reasoning Effort: Low|High|Max</c> line,
+    /// mapping medium or an absent value to Max. GPT-OSS cannot be asked not to
     /// reason - it always opens the <c>analysis</c> channel before its answer - so a
     /// request that explicitly turns thinking off and names no effort is rendered at
     /// <see cref="Low"/> instead (see <see cref="ForRequest"/>). Families without such
-    /// a line ignore the value.
+    /// a line ignore the value. GLM-5.3 Flash also retains its thinking boundary;
+    /// its effort line controls the requested reasoning level.
     /// </para>
     /// </summary>
     public static class ReasoningEffort

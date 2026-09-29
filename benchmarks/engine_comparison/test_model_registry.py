@@ -170,6 +170,28 @@ class ConfigRegistryTests(unittest.TestCase):
                                     "it declares no tp range that would explain the gate")
 
 
+class ExplicitPlacementConfigTests(unittest.TestCase):
+    def test_deepseek4_is_separate_from_tensor_only_matrix(self):
+        tensor = load_config(HERE / "benchmark_config_multigpu.json")
+        layer = load_config(HERE / "benchmark_config_deepseek4_layer.json")
+        self.assertNotIn("dsv4-flash", tensor.MODELS)
+        self.assertIn("dsv4-flash", layer.MODELS)
+        self.assertEqual(layer.DEFAULT_TP_DEGREES, [4])
+        for spec in layer.BACKENDS.values():
+            self.assertEqual(spec.ts_tp_arg, "--layer-split")
+            if spec.llama_ngl is not None:
+                self.assertEqual(tuple(spec.llama_tp_extra_args), ("--split-mode", "layer"))
+
+    def test_deepseek41_distinguishes_whole_layers_and_expert_shards(self):
+        cfg = load_config(HERE / "benchmark_config_deepseek41.json")
+        for name in ("ggml_cuda_layer", "ggml_cuda_layer_cpu_moe4"):
+            self.assertEqual(cfg.BACKENDS[name].ts_tp_arg, "--layer-split")
+            self.assertEqual(cfg.BACKENDS[name].ts_env["TS_DSV41_TP"], "0")
+        tensor = cfg.BACKENDS["ggml_cuda_true_tp"]
+        self.assertEqual(tensor.ts_tp_arg, "--tp")
+        self.assertEqual(tensor.ts_env["TS_DSV41_TP"], "{tp}")
+
+
 class Glm53Qwen38ConfigTests(unittest.TestCase):
     """Drift guards for the 8xA40 GLM-5.3 / Qwen3.8-Flash-Next matrix.
 
@@ -194,7 +216,7 @@ class Glm53Qwen38ConfigTests(unittest.TestCase):
 
     def test_qwen38_declares_the_tp_it_cannot_run_without(self):
         # qwen4exp is spread by the SHARED loader, which reads the degree from
-        # `--tp N` (ModelBase.ResolveTensorParallelSupport). Without one it is a
+        # `--layer-split N`. Without one it is a
         # single-device load of 175.3 GiB. `min_tp` turns that into a recorded
         # skip instead of an OOM.
         self.assertGreater(self.cfg.MODELS["qwen38-flash-next"].min_tp, 1)
@@ -209,24 +231,26 @@ class Glm53Qwen38ConfigTests(unittest.TestCase):
 
     def test_the_two_columns_differ_in_whether_a_degree_is_passed(self):
         layer = self.cfg.BACKENDS["ggml_cuda_layer"]
-        tp = self.cfg.BACKENDS["ggml_cuda_tp"]
+        tp = self.cfg.BACKENDS["ggml_cuda_split"]
+        self.assertEqual(layer.ts_env["TS_GLM_NGPU"], "0")
         self.assertFalse(self.cfg.ts_tp_supported(layer),
                          "the layer column must pass no --tp: it is the GLM placement")
         self.assertTrue(self.cfg.ts_tp_supported(tp),
                         "the tp column is the only one qwen38-flash-next can run on")
         # Layer placement on both engines is what makes the qwen column
         # comparable: `--split-mode layer` is the only multi-GPU mode llama.cpp
-        # has for qwen4exp, and TensorSharp's `--tp N` is a layer split too.
+        # has for qwen4exp, and TensorSharp explicitly selects `--layer-split N`.
+        self.assertEqual(tp.ts_tp_arg, "--layer-split")
         self.assertEqual(tuple(tp.llama_tp_extra_args), ("--split-mode", "layer"))
 
-    def test_qwen38_runs_on_the_tp_column_and_nowhere_else(self):
+    def test_qwen38_runs_on_the_explicit_layer_split_column_and_nowhere_else(self):
         model = self.cfg.MODELS["qwen38-flash-next"]
         scenario = self.cfg.SCENARIOS["text_short"]
         live = [(backend_id, tp)
                 for backend_id in self.cfg.BACKENDS
                 for tp in self.cfg.DEFAULT_TP_DEGREES
                 if self.cfg.applies("tensorsharp", backend_id, model, scenario, tp=tp)[0]]
-        self.assertEqual(live, [("ggml_cuda_tp", 8)])
+        self.assertEqual(live, [("ggml_cuda_split", 8)])
 
     def test_llama_context_matches_the_tensorsharp_window_per_slot(self):
         # llama-server divides `-c` across its `--parallel` slots, so the two

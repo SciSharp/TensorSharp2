@@ -10,7 +10,7 @@
 
 ## 支持的模型家族一览
 
-- **文本、推理与多模态 LLM：** [DeepSeek V4 Flash](docs/models/deepseek4_zh-cn.md) / [V4.1 Flash](docs/models/deepseek41_zh-cn.md)、[GLM 5.x](docs/models/glm_zh-cn.md)、[Gemma 4](docs/models/gemma4_zh-cn.md)、[Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35_zh-cn.md)、[Qwen 3.8 Flash Next](docs/models/qwen38-flash-next_zh-cn.md)、[Bonsai](docs/models/bonsai_zh-cn.md) 与 [Bonsai2](docs/models/bonsai2_zh-cn.md)（Qwen 家族）、[GPT OSS](docs/models/gptoss_zh-cn.md)、[Nemotron-H](docs/models/nemotron_zh-cn.md)、[Mistral 3](docs/models/mistral3_zh-cn.md)、[Hunyuan Dense](docs/models/hunyuan-dense_zh-cn.md) 与 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md)。
+- **文本、推理与多模态 LLM：** [DeepSeek V4 Flash](docs/models/deepseek4_zh-cn.md) / [V4.1 Flash](docs/models/deepseek41_zh-cn.md)、[GLM 5.x](docs/models/glm_zh-cn.md)、[Gemma 4](docs/models/gemma4_zh-cn.md)、[Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35_zh-cn.md)、[Qwen 3.8 Flash Next](docs/models/qwen38-flash-next_zh-cn.md)、[Bonsai2](docs/models/bonsai2_zh-cn.md)（Qwen 家族）、[GPT OSS](docs/models/gptoss_zh-cn.md)、[Nemotron-H](docs/models/nemotron_zh-cn.md)、[Mistral 3](docs/models/mistral3_zh-cn.md)、[Hunyuan Dense](docs/models/hunyuan-dense_zh-cn.md) 与 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md)。
 - **文本扩散：** [DiffusionGemma](docs/models/diffusiongemma_zh-cn.md)，包含 `/v1/systemone` 上的 [Jev 类型化判定](docs/models/jev_zh-cn.md)（支持文本、图像、上传文档、抽样视频帧，以及通过已配置 ASR 配套服务得到的语音转录）。
 - **图像生成/编辑与视频生成：** [Qwen-Image-2.1](docs/models/qwenimage21_zh-cn.md)、[MiniMax-H3（视频 + 立体声音频）](docs/models/minimax-h3_zh-cn.md) 与 [Wan 2.1 / 2.2](docs/models/wan_zh-cn.md)。
 - **文本与代码嵌入：** BERT / XLM-R 编码器——[Snowflake Arctic Embed L v2.0 与 all-MiniLM-L6-v2](docs/embeddings_zh-cn.md)。
@@ -89,8 +89,12 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 
 张量并行把一个模型切分到 N 张 GPU 上，可运行在 Direct `cuda` 后端以及 GGML CUDA /
 Vulkan 后端（`--backend ggml_cuda`、`ggml_vulkan`）。Qwen 3.8 Flash Next 与
-DeepSeek V4 / V4.1 会把同一参数用于按层切分：每张 GPU 拿一段连续的完整层。GLM 5.x
-不传参数时也默认按层切分，而 GGML GPU 后端上的 `--tp N` 会选择其原生本地张量并行路径。
+DeepSeek V4 / V4.1 的按层切分改用独立的 `--layer-split N` 参数：每张 GPU 拿一段连续的完整层。
+`--tp N` 仅表示张量并行，两种模式互斥；不支持的请求会在启动时失败。
+按层切分仅支持单节点，不能与 `--tp-node-id` / `--tp-peers` 组合。
+现有按层切分命令需将 `--tp N` 改为 `--layer-split N`，或设置
+`TENSORSHARP_LAYER_SPLIT_DEGREE=N`。未配置两种模式时默认使用单设备。GLM 5.x 的 `--layer-split N` 选择整层放置，
+GGML GPU 后端上的 `--tp N` 则选择原生本地张量并行路径。
 对 Qwen-Image-2.1，`--tp N` 只切分扩散 Transformer（DiT），文本 / 视觉编码器与 VAE 留在第一张 GPU 上。请先安装 CUDA 工具包，然后：
 
 ```bash
@@ -198,7 +202,6 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 | Qwen 3.8 Flash Next | [Qwen3.8-Flash-Next](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)（GDN + 注意力混合 MoE，512 专家，分片 GGUF，+ mmproj） | ✅ / ✅（`video_url`） / — | ✅ | ✅ | [qwen38-flash-next](docs/models/qwen38-flash-next_zh-cn.md) |
 | Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)（另有 12B、31B、26B-A4B MoE） | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4](docs/models/gemma4_zh-cn.md) |
 | Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（另有 35B-A3B MoE、Qwen3.8-27B） | ✅ / — / — | ✅ | ✅ | [qwen35](docs/models/qwen35_zh-cn.md) |
-| Bonsai Q1_0 | 本地哈希钉住的 `Bonsai-8B-Q1_0.gguf`（稠密 Qwen 3）与 `Bonsai-27B-Q1_0.gguf`（稠密 Qwen 3.5 混合）；其 GGUF 元数据未声明来源或 license，但哈希完全一致的发布方文件见 [prism-ml/Bonsai-8B-gguf](https://huggingface.co/prism-ml/Bonsai-8B-gguf/tree/48516770dd04643643e9f9019a2a349cf26c5dbd) 与 [prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf/tree/f10afb355f104535e3e3e98cf7ab7795c72bd292)（Apache-2.0） | — / — / — | 8B：不支持（固定空块）；27B：✅ | ✅ | [bonsai](docs/models/bonsai_zh-cn.md) |
 | Bonsai2 | 本地哈希钉住的 `Ternary-Bonsai-2-27B-PQ2_0.gguf` / `-PTQ1_0.gguf`（采用 PRISM 带符号 Hadamard 变换的稠密 Qwen 3.5 混合，+ mmproj）；仅支持单设备 GGML 后端，已在 Metal 上验证 | ✅ / — / — | ✅ | ✅ | [bonsai2](docs/models/bonsai2_zh-cn.md) |
 | GPT OSS | [gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF)（MoE） | — / — / — | ✅ | ✅ | [gptoss](docs/models/gptoss_zh-cn.md) |
 | Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF)（另有 47B、Omni） | ✅（Omni） / — / — | ✅ | ✅ | [nemotron](docs/models/nemotron_zh-cn.md) |
@@ -226,13 +229,12 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 | 架构 | GGUF 架构标识 | 示例模型 | 多模态 | 思维链 | 工具调用 | MTP 投机 | 卡片 |
 |---|---|---|---|---|---|---|---|
 | BERT / XLM-R 嵌入 | `bert` | Snowflake Arctic Embed L v2.0、all-MiniLM-L6-v2 | 文本 → 向量 | — | — | — | [嵌入指南](docs/embeddings_zh-cn.md) |
-| DeepSeek V4.1 Flash | `deepseek41` | DeepSeek-V4.1-Flash（40 层，384 个路由专家 top-6 加一个共享专家，四条残差流与延迟 hyper-connection 混合，Engram n-gram 特征，声明 1M 上下文） | 文本；配合准备好的视觉伴随文件（`--mmproj`）支持图像与视频，音频请求被拒绝 | 支持 | 支持（带空格的 DSML，受语法约束） | 实验性：可在 `ggml_cuda`/`ggml_cpu` 上通过 `--draft-model` 加载 `deepseek41-dspark` 草稿模型；仅在合成夹具上验证，尚无训练好的草稿模型实测（V4 的草稿模型会被拒绝） | [deepseek41](docs/models/deepseek41_zh-cn.md) |
+| DeepSeek V4.1 Flash | `deepseek41` | DeepSeek-V4.1-Flash（40 层，384 个路由专家 top-6 加一个共享专家，四条残差流与延迟 hyper-connection 混合，Engram n-gram 特征，声明 1M 上下文） | 文本；配合准备好的视觉伴随文件（`--mmproj`）支持图像与视频，音频请求被拒绝 | 支持 | 支持（带空格的 DSML，受语法约束） | 实验性：可在 `ggml_cuda`/`ggml_cpu` 上通过 `--draft-model` 加载 `deepseek41-dspark` 草稿模型；训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证（V4 的草稿模型会被拒绝） | [deepseek41](docs/models/deepseek41_zh-cn.md) |
 | DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash（284B MoE，256 专家，压缩稀疏注意力，1M 上下文） | 仅文本 | 支持 | 支持（DSML） | 支持（DSpark 块级草稿，独立 GGUF） | [deepseek4](docs/models/deepseek4_zh-cn.md) |
-| GLM 5.x | `glm-dsa`、`glm_dsa`、`glm5next` | GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文）、[GLM-5.3](docs/models/glm_zh-cn.md#glm-53glm-dsa)（与 5.2 完全相同的 79 层 `glm-dsa` 形态——78 层主干加 1 个 NextN，256 个路由专家 top-8 外加 1 个共享专家，带 lightning indexer 的 MLA，rope base 8e6——因此直接走 GLM-5.2 的加载路径，既不需要新代码也不需要新开关；仅文本）、GLM-5.3-Flash（320B MoE，288 专家，KDA 线性注意力 + NoPE MLA 与池化索引器） | 仅文本（5.2 与 5.3）、图像（5.3-Flash） | 支持 | 支持（XML 工具调用） | GLM-5.2 与 GLM-5.3 支持（内嵌 NextN 块；5.3 上投机在默认的按层切分下生效，即不传 `--tp` 时） | [glm](docs/models/glm_zh-cn.md) |
+| GLM 5.x | `glm-dsa`、`glm_dsa`、`glm5next` | GLM-5.2（744B-A40B MoE，256 专家，MLA + DeepSeek 稀疏注意力，1M 上下文）、[GLM-5.3](docs/models/glm_zh-cn.md#glm-53glm-dsa)（与 5.2 完全相同的 79 层 `glm-dsa` 形态——78 层主干加 1 个 NextN，256 个路由专家 top-8 外加 1 个共享专家，带 lightning indexer 的 MLA，rope base 8e6——因此直接走 GLM-5.2 的加载路径，既不需要新代码也不需要新开关；仅文本）、GLM-5.3-Flash（320B MoE，288 专家，KDA 线性注意力 + NoPE MLA 与池化索引器） | 仅文本（5.2 与 5.3）、图像（5.3-Flash） | 支持 | 支持（XML 工具调用） | GLM-5.2 与 GLM-5.3 支持（内嵌 NextN 块；5.3 上投机在单设备或显式 `--layer-split N` 模式下生效，不启用张量并行） | [glm](docs/models/glm_zh-cn.md) |
 | Qwen 3.8 Flash Next | `qwen4exp` | Qwen3.8-Flash-Next（混合 MoE，512 专家 / 激活 10 个，48 层中 36 层为 GatedDeltaNet 并与 QSA 索引的全注意力层交错，PLE n-gram 块，×4 超连接） | 图像、视频（`video_url`） | 支持 | 支持（Qwen XML / JSON 工具调用） | 支持（共享 MTP 头，独立 GGUF，经 `--draft-model` 加载；需 GGML 后端） | [qwen38-flash-next](docs/models/qwen38-flash-next_zh-cn.md) |
 | Gemma 4 | `gemma4` | gemma-4-E4B、gemma-4-12B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 | 支持（独立草稿 GGUF） | [gemma4](docs/models/gemma4_zh-cn.md) |
 | Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5/3.6-35B-A3B（MoE）、Qwen3.8-27B（稠密混合） | 图像 | 支持 | 支持 | 支持：Qwen 3.6 与 Qwen 3.8 27B 内嵌 NextN（`--spec`）；Qwen 3.8 27B 另可经 `--draft-model` 加载 DFlash2 块级草稿（独立 GGUF） | [qwen35](docs/models/qwen35_zh-cn.md) |
-| Bonsai（Qwen 家族） | `qwen3`（8B）、`qwen35`（27B） | Bonsai-8B（36 层稠密 GQA）、Bonsai-27B（48 层 GatedDeltaNet + 16 层全注意力），均为 Q1_0 | 仅文本 | 27B 支持；8B 模板输出固定的空 think 块 | 支持 | — | [bonsai](docs/models/bonsai_zh-cn.md) |
 | Bonsai2（Qwen 家族） | 带 `prism.hadamard.*` 元数据与 PQ2_0 / PTQ1_0 张量的 `qwen35` | Ternary-Bonsai-2-27B PQ2_0 / PTQ1_0（64 层稠密 Qwen 3.5 混合；加载时无损重打包为 GGML Q2_0；仅支持单设备 GGML 后端） | 图像（伴随 mmproj） | 支持 | 支持 | — | [bonsai2](docs/models/bonsai2_zh-cn.md) |
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持（始终） | 支持 | — | [gptoss](docs/models/gptoss_zh-cn.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe`, `nemotron_h_omni` | Nemotron-H-8B/47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni、Nemotron 3.5 Lightning 30B-A3B（23 Mamba-2 + 23 MoE + 6 注意力） | 图像（Omni）；音频仅在加载自行转换的 Parakeet 音频伴随 GGUF（`--mmproj` 或 `TS_NEMOTRON_AUDIO_MMPROJ`）时可用，否则拒绝 | 支持 | 支持 | 不支持（拒绝：verify 与 decode 内核不同，投机会改变输出） | [nemotron](docs/models/nemotron_zh-cn.md) |
@@ -243,8 +245,6 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 | Qwen-Image-2.1 | `qwen_image`、`qwen-image`（通过张量键识别 2.1；更早的 Qwen-Image / Edit-2511 checkpoint 会在加载时被拒绝） | Qwen-Image-2.1 DiT GGUF（+ 专用 2.1 VAE 与 Qwen3-VL-8B） | 文本→图像与图像编辑，RGBA 输出；LoRA 插件；前缀 KV 缓存默认开启；DiT 张量并行（`--tp`，GGML CUDA/Vulkan；Vulkan 上实测双卡比单卡更慢） | 不支持 | 不支持 | — | [qwenimage21](docs/models/qwenimage21_zh-cn.md) |
 | MiniMax-H3 | `minimax-h3`、`minimax_h3`（官方发布的 GGUF 完全没有元数据，因此靠张量表识别） | MiniMax-H3 FL2VA / Ref2VA（193 亿参数的打包音视频 DiT + Qwen3-VL-32B 文本编码器、视频 VAE、音频 VAE） | 视频输出 **+ 32 kHz 立体声音频**（文本→视频、图像→视频、首尾帧、参考→视频） | 不支持 | 不支持 | — | [minimax-h3](docs/models/minimax-h3_zh-cn.md) |
 | Wan 视频 | `wan`、`wan2.1`、`wan2.2` | Wan 2.1 T2V 1.3B/14B、Wan 2.2 TI2V-5B、Wan 2.2 A14B T2V/I2V（双专家） | 视频输出（文本→视频、图像→视频） | 不支持 | 不支持 | — | [wan](docs/models/wan_zh-cn.md) |
-
-运行 Bonsai 8B 的 `qwen3` 插件同时注册了 `qwen2`、`qwen2vl` 与 `qwen2_vl`，因此稠密的 Qwen 3（`qwen3`）、Qwen 2 / 2.5（`qwen2`）与 Qwen 2.5-VL（`qwen2vl`）GGUF 可作为纯文本聊天加载（不使用 Qwen 2.5-VL 的视觉塔；Qwen 2 / 2.5 渲染工具但没有思维链通道）。`qwen3moe` / `qwen2moe` 等 MoE 变体未注册，会被拒绝。这些文件没有对应的卡片；该插件上有文档化验证的只有 Bonsai 8B。
 
 各架构的端到端文档（前向图、组件、参数、prefill/decode 优化）见[按模型架构卡片](docs/models/README_zh-cn.md)。
 

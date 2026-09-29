@@ -263,45 +263,6 @@ public class ToolCallProgressStreamingTests
         Assert.Contains("atem:invoke", progress.ToString(), StringComparison.Ordinal);
     }
 
-    // ---- Qwen2 / Qwen2.5 ----------------------------------------------------
-
-    [Fact]
-    public void Qwen25Parser_NeverTreatsContentAsThinking_EvenWhenThinkingRequested()
-    {
-        // Qwen2.5 has no <think> channel. A parser initialized thinking-on would
-        // swallow the whole answer as thought while waiting for a </think> that
-        // never comes — the reason this family gets its own wrapper.
-        var parser = new Qwen25OutputParser();
-        parser.Init(enableThinking: true, null);
-
-        ParsedOutput delta = parser.Add("The answer is 42.", true);
-
-        Assert.Equal("The answer is 42.", delta.Content);
-        Assert.Empty(delta.Thinking);
-        Assert.False(parser.HasThinkingSupport);
-    }
-
-    [Fact]
-    public void Qwen25Parser_ReadsToolCalls_AndStreamsTheirBodies()
-    {
-        var parser = new Qwen25OutputParser();
-        parser.Init(enableThinking: true, null);
-
-        var progress = new System.Text.StringBuilder();
-        List<ToolCall> calls = null;
-        for (int i = 0; i < QwenJsonCall.Length; i += 5)
-        {
-            ParsedOutput delta = parser.Add(QwenJsonCall.Substring(i, Math.Min(5, QwenJsonCall.Length - i)), false);
-            progress.Append(delta.ToolCallText);
-            if (delta.ToolCalls != null) calls = delta.ToolCalls;
-        }
-        calls ??= parser.Add(string.Empty, true).ToolCalls;
-
-        ToolCall call = Assert.Single(calls);
-        Assert.Equal("shell", call.Name);
-        Assert.Contains("python3 solve.py", progress.ToString(), StringComparison.Ordinal);
-    }
-
     [Fact]
     public void TwoCallsInOneRound_DoNotBleedProgressIntoEachOther()
     {

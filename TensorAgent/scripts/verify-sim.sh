@@ -153,17 +153,24 @@ expected_ids = [
     'gemma-4-e2b-q8',
     'gemma-4-e4b-iq4xs',
     'gemma-4-12b-iq2m',
-    'bonsai-8b-q1-0',
-    'bonsai-27b-q1-0',
+    'bonsai-2-27b-ptq1-0',
     'qwen3.5-9b-iq4xs',
 ]
+# The catalog is filtered by the device's memory tier, and Bonsai 2 27B is a 16 GB
+# entry: the simulator lists it exactly when the host Mac reports 16 GB or more.
 actual_ids = [model['id'] for model in models]
+if 'bonsai-2-27b-ptq1-0' not in actual_ids:
+    expected_ids.remove('bonsai-2-27b-ptq1-0')
 if actual_ids != expected_ids:
     print(f'catalog ids are {actual_ids}, expected {expected_ids}', file=sys.stderr)
     sys.exit(1)
+if any(model['minDeviceMemoryGB'] != (16 if model['id'] == 'bonsai-2-27b-ptq1-0' else 12) for model in models):
+    print(f'catalog device tiers are {[(m["id"], m["minDeviceMemoryGB"]) for m in models]}', file=sys.stderr)
+    sys.exit(1)
 families = {model['family'] for model in models}
 kinds = {model['kind'] for model in models}
-if families != {'Gemma4', 'Qwen35', 'Bonsai'}:
+expected_families = {'Gemma4', 'Qwen35'} | ({'Bonsai'} if 'bonsai-2-27b-ptq1-0' in actual_ids else set())
+if families != expected_families:
     print(f'catalog families are {families}', file=sys.stderr)
     sys.exit(1)
 if kinds != {'Dense'}:

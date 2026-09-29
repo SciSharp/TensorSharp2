@@ -12,6 +12,18 @@ namespace InferenceWeb.Tests;
 [Collection("DeepSeek V4.1 DSpark integration")]
 public sealed class DeepSeek4NativeSpecBoundaryTests(ITestOutputHelper output)
 {
+    [Theory]
+    [InlineData(true, 512, 5, 5)]
+    [InlineData(true, 4, 5, 3)]
+    [InlineData(true, 1, 5, 0)]
+    [InlineData(true, 512, 0, 0)]
+    [InlineData(false, 32, 5, 31)]
+    [InlineData(false, 32, 0, 31)]
+    [InlineData(false, 1, 0, 0)]
+    public void VerificationDraftLimitRespectsNativeMicrobatchAndV41RingCapacity(
+        bool isV41, int ubatch, int draftBlockSize, int expected)
+        => Assert.Equal(expected, DeepSeek4Model.ResolveSpecMaxDraftTokens(isV41, ubatch, draftBlockSize));
+
     [Fact]
     public void NullArraysFailBeforeNativeEntry()
     {

@@ -1,0 +1,203 @@
+{
+  "_comment": "DeepSeek V4 Flash whole-layer placement benchmark. Uses the harness historical --tp GPU-count sweep but launches TensorSharp --layer-split N and llama.cpp --split-mode layer. This is single-node capacity validation, not tensor parallelism or a guaranteed throughput gain. Model source/path and test scenarios are inherited from the previous multi-GPU matrix.",
+  "paths": {
+    "model_root": "/workspace/models",
+    "results_dir": "${here}/results_multigpu",
+    "tensorsharp_server_dll": null,
+    "tensorsharp_port": 5000,
+    "llama_server_exe": "/root/llama.cpp/build/bin/llama-server",
+    "llama_port": 5001,
+    "media": {
+      "image": {
+        "path": "/workspace/bench_media/test.jpg",
+        "env": "BENCH_IMAGE"
+      },
+      "audio": {
+        "path": "/workspace/bench_media/speech.wav",
+        "env": "BENCH_AUDIO"
+      },
+      "video": {
+        "path": "/workspace/bench_media/clip.mp4",
+        "env": "BENCH_VIDEO"
+      }
+    }
+  },
+  "scenarios": {
+    "text_short": {
+      "kind": "text",
+      "description": "Short single-turn text prompt (~2k-token context preamble)",
+      "max_tokens": 256
+    },
+    "text_long": {
+      "kind": "text",
+      "description": "Long-context single-turn text prompt (~2k-token context preamble + passage)",
+      "max_tokens": 256
+    },
+    "multi_turn": {
+      "kind": "multi_turn",
+      "description": "3-turn conversation (~2k-token context preamble), timed on the final turn",
+      "max_tokens": 256
+    },
+    "function_call": {
+      "kind": "function_call",
+      "description": "Tool/function-calling (get_weather) with ~2k-token context preamble",
+      "max_tokens": 256
+    },
+    "json_mode": {
+      "kind": "json_mode",
+      "description": "Structured output (response_format json_object) with ~2k-token context preamble",
+      "max_tokens": 256
+    },
+    "image": {
+      "kind": "image",
+      "description": "Image understanding",
+      "modality": "image",
+      "max_tokens": 256
+    },
+    "audio": {
+      "kind": "audio",
+      "description": "Audio understanding (speech clip)",
+      "modality": "audio",
+      "max_tokens": 256
+    },
+    "video": {
+      "kind": "video",
+      "description": "Video understanding (sampled frames)",
+      "modality": "video",
+      "max_tokens": 256
+    },
+    "prefill_2k": {
+      "kind": "text",
+      "description": "Prefill throughput @ ~2k prompt tokens",
+      "max_tokens": 8
+    },
+    "prefill_8k": {
+      "kind": "text",
+      "description": "Prefill throughput @ ~8k prompt tokens",
+      "max_tokens": 8
+    },
+    "prefill_16k": {
+      "kind": "text",
+      "description": "Prefill throughput @ ~16k prompt tokens",
+      "max_tokens": 8
+    }
+  },
+  "engines": {
+    "tensorsharp": {
+      "display": "TensorSharp",
+      "transport": "server",
+      "backends": [
+        "gpu",
+        "cpu"
+      ]
+    },
+    "llamacpp": {
+      "display": "llama.cpp",
+      "transport": "server",
+      "backends": [
+        "gpu",
+        "cpu"
+      ]
+    }
+  },
+  "llama": {
+    "context_size": 24576,
+    "extra_args": [
+      "--jinja"
+    ]
+  },
+  "ready_timeout_s": {
+    "small": 900,
+    "medium": 1200,
+    "large": 3600
+  },
+  "models": {
+    "dsv4-flash": {
+      "display": "DeepSeek V4 Flash 0731 (UD-Q8_K_XL, ~154 GB — 4 GPUs)",
+      "family": "deepseek4",
+      "source": "unsloth/DeepSeek-V4-Flash-GGUF",
+      "gguf": {
+        "path": "${model_root}/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf",
+        "url": "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf"
+      },
+      "mmproj": null,
+      "modalities": [
+        "text"
+      ],
+      "size_class": "large",
+      "min_tp": 4,
+      "_tp_note": "Whole-layer placement only: --layer-split N on TensorSharp; --split-mode layer on llama.cpp. min_tp remains the harness GPU-count capacity gate. This profile is a capacity configuration, not a tensor-parallel scaling result."
+    }
+  },
+  "backends": {
+    "ggml_cuda_layer": {
+      "display": "CUDA layer split",
+      "kind": "gpu",
+      "visible_devices_env": "CUDA_VISIBLE_DEVICES",
+      "tensorsharp": {
+        "backend": "ggml_cuda",
+        "tp": true,
+        "tp_arg": "--layer-split"
+      },
+      "llamacpp": {
+        "ngl": 999,
+        "tp": true,
+        "tp_extra_args": [
+          "--split-mode",
+          "layer"
+        ]
+      }
+    },
+    "cuda_layer": {
+      "display": "Direct CUDA layer split",
+      "kind": "gpu",
+      "visible_devices_env": "CUDA_VISIBLE_DEVICES",
+      "tensorsharp": {
+        "backend": "cuda",
+        "tp": true,
+        "tp_arg": "--layer-split"
+      }
+    }
+  },
+  "defaults": {
+    "engines": [
+      "tensorsharp",
+      "llamacpp"
+    ],
+    "models": [
+      "dsv4-flash"
+    ],
+    "scenarios": [
+      "text_short",
+      "text_long",
+      "multi_turn",
+      "function_call",
+      "json_mode",
+      "image",
+      "audio",
+      "video"
+    ],
+    "backends": [
+      "ggml_cuda_layer"
+    ],
+    "thinking": false,
+    "mtp_modes": [
+      false
+    ],
+    "tp_degrees": [
+      4
+    ],
+    "tp_devices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "concurrency": [
+      1
+    ],
+    "max_tokens": 256,
+    "warmup": 1,
+    "server_max_tokens": 512
+  }
+}

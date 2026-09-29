@@ -28,7 +28,6 @@ namespace TensorSharp.Models.Architecture
             ModelArchitectureRegistry.Register(MiniMaxH3.MiniMaxH3Architecture.Descriptor);
 
             // Text / multimodal language models.
-            ModelArchitectureRegistry.Register(Qwen3Architecture.Descriptor);
             ModelArchitectureRegistry.Register(Qwen35Architecture.Descriptor);
             ModelArchitectureRegistry.Register(Qwen4ExpArchitecture.Descriptor);
             ModelArchitectureRegistry.Register(Gemma4Architecture.Descriptor);

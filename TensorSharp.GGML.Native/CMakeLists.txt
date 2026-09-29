@@ -275,8 +275,6 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_fused.cpp
     ggml_ops_transformer.cpp
     ggml_ops_transformer_prefill.cpp
-    ggml_ops_qwen3_decode.cpp
-    ggml_ops_qwen3_prefill.cpp
     ggml_ops_gptoss_decode.cpp
     ggml_ops_gptoss_batched.cpp
     ggml_ops_qwen35_batched_arena.cpp
@@ -518,6 +516,9 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv4FileWarmTest tests/dsv4_file_warm_test.cpp)
     target_link_libraries(GgmlOpsDsv4FileWarmTest PRIVATE Threads::Threads)
     add_test(NAME deepseek41-host-file-warm COMMAND GgmlOpsDsv4FileWarmTest)
+
+    add_executable(GgmlOpsGlmFileStripTest tests/glm_file_strip_test.cpp)
+    add_test(NAME glm-checkpoint-strips COMMAND GgmlOpsGlmFileStripTest)
     set_tests_properties(deepseek41-host-file-warm PROPERTIES TIMEOUT 120)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # Explicit host-only storage measurement on a real checkpoint shard; it

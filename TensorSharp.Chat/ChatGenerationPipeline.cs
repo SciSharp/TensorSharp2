@@ -54,8 +54,8 @@ namespace TensorSharp.Server
     /// <param name="EvalTokens">Tokens generated. Terminal update only.</param>
     /// <param name="KvCacheReusedTokens">Prompt tokens served from the prefix cache. Terminal update only.</param>
     /// <param name="TotalNs">Wall-clock nanoseconds for the whole request. Terminal update only.</param>
-    /// <param name="PromptNs">Nanoseconds spent rendering and preparing the prompt. Terminal update only.</param>
-    /// <param name="EvalNs">Nanoseconds spent decoding. Terminal update only.</param>
+    /// <param name="PromptNs">Nanoseconds spent in prompt forwards, excluding rendering, media encoding and scheduler waiting. Terminal update only.</param>
+    /// <param name="EvalNs">Nanoseconds spent in decode forwards, including speculative draft/verify/replay. Shared batch time is apportioned per sequence. Terminal update only.</param>
     /// <param name="FinishReason">Why generation stopped — <c>max_tokens</c>, <c>stop_sequence</c>,
     /// <c>cancelled</c>, or whatever the engine reported (<c>eos</c>, <c>aborted</c>, <c>error</c>).
     /// Null on non-terminal updates. This is the pipeline's own vocabulary, NOT any protocol's:
@@ -336,6 +336,11 @@ namespace TensorSharp.Server
                 yield break;
             }
 
+            // Total latency includes preparation and scheduler waiting. Prompt and
+            // decode compute times come from the worker's actual forward phases;
+            // timing channel reads would charge all prefill to decode and include
+            // client backpressure in the reported token generation speed.
+            var totalSw = Stopwatch.StartNew();
             var engine = _engineHost.TryGetEngine()
                 ?? throw new InvalidOperationException(
                     "Continuous-batching engine is unavailable for this model " +
@@ -377,7 +382,6 @@ namespace TensorSharp.Server
             try
             {
 
-            var promptSw = Stopwatch.StartNew();
             int effectiveMaxTokens;
             List<int> explicitBreakpoints = null;
             IReadOnlyList<PromptMediaSpan> mediaSpans = null;
@@ -629,14 +633,10 @@ namespace TensorSharp.Server
                 cacheScope: cacheScope,
                 publicCheckpointBoundaries: publicCheckpointBoundaries);
 
-            promptSw.Stop();
-            long promptNs = InferenceTelemetry.ToNanos(promptSw.ElapsedTicks);
-
             string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking);
             if (SignalsOpenThoughtChannel(arch, recordedSuffix))
                 yield return ChatStreamUpdate.Text(string.Empty) with { RawGenerationSuffix = recordedSuffix };
 
-            var evalSw = Stopwatch.StartNew();
             var handle = engine.SubmitRequest(seq, cancellationToken);
             var generatedTokens = new List<int>();
             var rawBytes = new List<byte>();
@@ -671,7 +671,6 @@ namespace TensorSharp.Server
             int kvCacheReusedTokens = 0;
             long timeToFirstTokenMs = 0;
             bool firstTokenSampled = false;
-            var totalSw = Stopwatch.StartNew();
 
             // Stream tokens off the engine handle, doing UTF-8-valid piece
             // accumulation and stop-sequence detection in this layer.
@@ -777,7 +776,7 @@ namespace TensorSharp.Server
                 stopped = new OperationCanceledException(cancellationToken);
             }
 
-            InferenceCompletion completion;
+            InferenceCompletion completion = null;
             try
             {
                 completion = await handle.Completion.ConfigureAwait(false);
@@ -811,7 +810,6 @@ namespace TensorSharp.Server
             }
 
             string assistantText = Encoding.UTF8.GetString(rawBytes.ToArray());
-            evalSw.Stop();
             totalSw.Stop();
 
             // Record this turn for the next request of the same conversation: the raw
@@ -844,7 +842,9 @@ namespace TensorSharp.Server
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(stopped).Throw();
             }
 
-            double evalSeconds = evalSw.Elapsed.TotalSeconds;
+            long promptNs = InferenceTelemetry.ToNanos(completion?.PrefillElapsedTicks ?? 0);
+            long evalNs = InferenceTelemetry.ToNanos(completion?.DecodeElapsedTicks ?? 0);
+            double evalSeconds = evalNs / 1_000_000_000.0;
             double tokensPerSecond = (evalSeconds > 0 && generatedTokens.Count > 0)
                 ? generatedTokens.Count / evalSeconds
                 : 0;
@@ -857,7 +857,6 @@ namespace TensorSharp.Server
                 kvCacheReusePercent, timeToFirstTokenMs, totalSw.Elapsed.TotalMilliseconds,
                 tokensPerSecond, finishReason, assistantText);
 
-            long evalNs = InferenceTelemetry.ToNanos(evalSw.ElapsedTicks);
             long totalNs = InferenceTelemetry.ToNanos(totalSw.ElapsedTicks);
             yield return new ChatStreamUpdate("", true, promptTokenCount, generatedTokens.Count,
                                              kvCacheReusedTokens, totalNs, promptNs, evalNs, finishReason)
@@ -951,10 +950,17 @@ namespace TensorSharp.Server
                 }
 
                 // The vision tower runs many GGML ops; take the model-wide compute lock
-                // so it cannot race the scheduler's denoising worker.
-                lock (model.GpuComputeLock)
+                // so it cannot race the scheduler's denoising worker. As a registered turn,
+                // the scheduler hands it over before its next forward rather than after its
+                // whole block.
+                DiffusionComputeTurns turns = model.ComputeTurns;
+                turns.Enter(cancellationToken);
+                try
+                {
                     inputTokens = model.MultimodalInjector.ProcessPromptTokens(
                         renderHistory, inputTokens, mediaRequestId);
+                }
+                finally { turns.Exit(); }
             }
 
             inputTokens = TruncatePromptToContext(
@@ -1349,8 +1355,8 @@ namespace TensorSharp.Server
                 if (tail.EndsWith(suffix, StringComparison.Ordinal))
                     return suffix;
                 // Every Jinja render is TrimEnd()ed, and only some families put the
-                // trailing newline back (Gemma 4, Qwen 3.5). For the rest (Qwen 3,
-                // Bonsai, Qwen3.8-Flash-Next) the prompt ends on `</think>` without the
+                // trailing newline back (Gemma 4, Qwen 3.5). For the rest (such as
+                // Qwen3.8-Flash-Next) the prompt ends on `</think>` without the
                 // suffix's `\n\n`. The framing is still there, so it is the framing that
                 // is recorded; the exact boundary whitespace travels separately as
                 // RawPromptTrailingWhitespace and is restored by the renderer.

@@ -87,18 +87,17 @@ namespace TensorSharp.Cli
             // backend buffer that outlives the run (e.g. the reusable prefill
             // compute buffer) must be freed first. Mirror the server's shutdown
             // wiring so the CLI exits cleanly on the GGML/Metal backend.
-            AppDomain.CurrentDomain.ProcessExit += static (_, _) =>
-            {
-                try { TensorSharp.GGML.GgmlBasicOps.Shutdown(); }
-                catch { /* native lib may be absent for non-GGML backends */ }
-            };
+            // Only when GGML is in play (ShouldShutdownGgml): the teardown is itself a
+            // P/Invoke, so on the pure-C# cpu backend it used to load GgmlOps at exit
+            // just to tear down a backend the run never created.
+            string selectedBackend = SelectedBackend(args);
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => ShutdownGgmlIfUsed(selectedBackend);
 
             try
             {
                 MainCore(args);
                 _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed exitCode={ExitCode}", Environment.ExitCode);
-                try { TensorSharp.GGML.GgmlBasicOps.Shutdown(); }
-                catch { /* native lib may be absent for non-GGML backends */ }
+                ShutdownGgmlIfUsed(selectedBackend);
 
                 // ggml-vulkan on Linux: the NVIDIA driver's worker threads
                 // ("[vkrt] Analysis") race the C++ static destructors that tear
@@ -107,7 +106,7 @@ namespace TensorSharp.Cli
                 // has completed. Nothing is left to clean up (backends, caches
                 // and graphs were freed by Shutdown), so skip the destructors:
                 // flush what buffers output and leave through _exit.
-                if (OperatingSystem.IsLinux() && SelectedBackend(args) == "ggml_vulkan")
+                if (OperatingSystem.IsLinux() && selectedBackend == "ggml_vulkan")
                 {
                     loggerFactory.Dispose();
                     Console.Out.Flush();
@@ -171,6 +170,30 @@ namespace TensorSharp.Cli
                     backend = args[i + 1].ToLowerInvariant();
             }
             return backend;
+        }
+
+        /// <summary>
+        /// Whether the exit path calls <see cref="TensorSharp.GGML.GgmlBasicOps.Shutdown"/>. Always
+        /// for a GGML backend - a <c>ggml_*</c> / <c>ggml-*</c> spelling, or no <c>--backend</c> at
+        /// all, since the CLI defaults to ggml_cpu - so their teardown is exactly what it was. For
+        /// <c>cpu</c>, <c>cuda</c> and <c>mlx</c> only when this process already bound the native
+        /// library (a host fallback such as the native dequantizer can): the teardown is a
+        /// P/Invoke, and on a run that never touched GGML it would load GgmlOps only to find
+        /// nothing to free.
+        /// </summary>
+        internal static bool ShouldShutdownGgml(string selectedBackend, bool nativeLibraryLoaded)
+            => nativeLibraryLoaded || selectedBackend == null
+                || selectedBackend.StartsWith("ggml_", StringComparison.Ordinal)
+                || selectedBackend.StartsWith("ggml-", StringComparison.Ordinal);
+
+        private static void ShutdownGgmlIfUsed(string selectedBackend)
+        {
+            try
+            {
+                if (ShouldShutdownGgml(selectedBackend, TensorSharp.GGML.GgmlBasicOps.IsNativeLibraryLoaded))
+                    TensorSharp.GGML.GgmlBasicOps.Shutdown();
+            }
+            catch { /* native lib may be absent on a host without the GGML build */ }
         }
 
         /// <summary>
@@ -327,9 +350,7 @@ namespace TensorSharp.Cli
             // GgmlNative reads when the ggml_vulkan backend initializes.
             int? gpuDeviceOverride = null;
             bool listGpus = false;
-            int tpDegree = 1;
-            int tpNodeId = -1;          // -1 = not set; distributed mode requires >= 0
-            string tpPeers = null;      // comma-separated host:port list for distributed TP
+            var parallelismArgs = new List<string>();
             string systemPrompt = null;
             int warmupInferenceRuns = 0;
             // DiffusionGemma sampler knobs (used only for the diffusion-gemma architecture).
@@ -380,6 +401,10 @@ namespace TensorSharp.Cli
 
             for (int i = 0; i < args.Length; i++)
             {
+                // Only inspect option boundaries: --system/--stop and other
+                // value options consume their literal operands in this loop.
+                if (TensorSharp.Distributed.ModelParallelismOptions.TryCollect(args, ref i, parallelismArgs))
+                    continue;
                 switch (args[i])
                 {
                     case "--model": modelPath = args[++i]; break;
@@ -420,9 +445,6 @@ namespace TensorSharp.Cli
                     case "--max-tokens": maxTokens = int.Parse(args[++i]); break;
                     case "--test": runTest = true; break;
                     case "--backend": backendStr = args[++i].ToLowerInvariant(); break;
-                    case "--tp": tpDegree = int.Parse(args[++i]); break;
-                    case "--tp-node-id": tpNodeId = int.Parse(args[++i]); break;
-                    case "--tp-peers": tpPeers = args[++i]; break;
                     case "--gpu-device":
                     {
                         string gpuStr = args[++i];
@@ -572,6 +594,10 @@ namespace TensorSharp.Cli
                         break;
                 }
             }
+
+            var parallelism = TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray());
+            parallelism.ApplyEnvironment();
+            int tpDegree = parallelism.TpDegree;
 
             // `--mmproj none` is the server's spelling for "no projector", and a config
             // file's keys ARE flags: without this the CLI handed "none" to LoadProjectors
@@ -775,19 +801,9 @@ namespace TensorSharp.Cli
                 pagedKvRamMbOverride, pagedKvSsdDirOverride, pagedKvSsdMbOverride,
                 pagedKvQuantBitsOverride);
 
-            // A NextN block with no LM head of its own borrows the trunk's, which is
-            // column-parallel under tensor parallelism — the draft would read one
-            // rank's strip of the vocabulary. The loaders refuse it (and say so on
-            // stderr), but the refusal is easy to miss in a long load, and the
-            // operator has meanwhile lost the VRAM they were budgeting for context.
-            // Say it up front, where the two flags were typed.
-            if (tpDegree > 1 && SchedulerConfig.FromEnvironment().Speculation.Enabled)
-            {
-                _log.LogWarning(LogEventIds.HostConfiguration,
-                    "--spec with --tp {Degree}: a draft block that borrows the trunk's LM head cannot draft "
-                    + "under tensor parallelism (GLM-5.2 is one such checkpoint) and speculation will be refused "
-                    + "at load. Drop --tp to speculate, or --no-spec to keep the split.", tpDegree);
-            }
+            // Draft-head compatibility depends on the loaded architecture and weights.
+            // The model loader reports its specific limitation; TP alone does not
+            // imply that a learned drafter (for example DSpark) is unavailable.
 
             if (gpuDeviceOverride.HasValue)
             {
@@ -891,25 +907,29 @@ namespace TensorSharp.Cli
                 Path.GetFileName(modelPath), backend, requestedDtype, modelPath);
             var modelLoadSw = Stopwatch.StartNew();
 
-            // Build a distributed TP group when --tp-node-id and --tp-peers are provided.
             ITensorParallelGroup tpGroup = null;
-            if (tpNodeId >= 0 && !string.IsNullOrEmpty(tpPeers))
-            {
-                var peerEndpoints = TensorSharp.Distributed.DistributedTpConfig.ParsePeers(tpPeers);
-                int localDegree = tpDegree > 1 ? tpDegree : 1;
-                // The on-node group has to match the backend: direct CUDA drives
-                // CudaAllocators, the ggml backends drive per-rank ggml backends.
-                tpGroup = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
-                    ? new TensorSharp.Distributed.DistributedTensorParallelGroup(
-                        ModelBase.CreateGgmlLocalTpGroup(backend, localDegree), tpNodeId, peerEndpoints)
-                    : new TensorSharp.Distributed.DistributedTensorParallelGroup(localDegree, tpNodeId, peerEndpoints);
-                tpDegree = localDegree;
-            }
-
             ModelBase createdModel;
             try
             {
-                createdModel = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath);
+                if (parallelism.Distributed is { } distributed)
+                {
+                    ModelBase.ValidateDistributedTensorParallelism(modelPath, backend);
+                    if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+                        throw new ArgumentException("Distributed --tp requires cuda, ggml_cuda, or ggml_vulkan.");
+                    var peerEndpoints = distributed.PeerEndpoints;
+                    int tpNodeId = distributed.NodeId;
+                    int localDegree = distributed.LocalDegree;
+                    // The on-node group has to match the backend: direct CUDA drives
+                    // CudaAllocators, the ggml backends drive per-rank ggml backends.
+                    tpGroup = backend is BackendType.GgmlCuda or BackendType.GgmlVulkan
+                        ? new TensorSharp.Distributed.DistributedTensorParallelGroup(
+                            ModelBase.CreateGgmlLocalTpGroup(backend, localDegree), tpNodeId, peerEndpoints)
+                        : new TensorSharp.Distributed.DistributedTensorParallelGroup(localDegree, tpNodeId, peerEndpoints);
+                    tpDegree = localDegree;
+                }
+
+                createdModel = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath,
+                    layerSplitDegree: parallelism.LayerSplitDegree);
             }
             catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string loadRefusal))
             {

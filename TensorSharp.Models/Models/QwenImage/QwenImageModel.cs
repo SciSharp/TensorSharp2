@@ -42,6 +42,8 @@ namespace TensorSharp.Models.QwenImage
         internal string MmprojPath => _mmprojPath;
         internal string TePath => _tePath;
         internal BackendType Backend => _backend;
+        /// <summary>False on the pure-C# cpu backend, which must never call into native GGML.</summary>
+        internal bool UsesGgml => IsGgmlBackend;
 
         internal static bool IsSafetensorsPath(string p) =>
             p != null && (p.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
@@ -92,8 +94,14 @@ namespace TensorSharp.Models.QwenImage
                         $"'{Path.GetFileName(ggufPath)}' is not a Qwen-Image-2.1 diffusion transformer (no txt_in.text_norm.weight tensor). " +
                         "Earlier Qwen-Image / Qwen-Image-Edit checkpoints such as Qwen-Image-Edit-2511 are no longer supported; " +
                         "use a Qwen-Image-2.1 GGUF (see docs/models/qwenimage21.md).");
-                if (!IsGgmlBackend)
-                    throw new NotSupportedException("Qwen-Image-2.1 requires a GGML backend (ggml_metal, ggml_cuda, ggml_vulkan or ggml_cpu).");
+                if (!IsGgmlBackend && backend != BackendType.Cpu)
+                    throw new NotSupportedException("Qwen-Image-2.1 requires a GGML backend (ggml_metal, ggml_cuda, ggml_vulkan or ggml_cpu) or the pure-C# cpu backend.");
+                // The cpu backend has no device group to shard over; say so instead of
+                // silently running on one process.
+                if (backend == BackendType.Cpu && (tpDegree > 1 || tpGroup != null))
+                    throw new ModelLoadRefusedException(
+                        $"Qwen-Image-2.1 on the pure-C# cpu backend runs in one process; --tp {Math.Max(tpDegree, tpGroup?.Degree ?? 1)} " +
+                        "shards the transformer over the GPUs of a GGML backend (ggml_cuda, ggml_vulkan). Remove --tp or choose a GGML GPU backend.");
                 if (IsTensorParallel && (TpNodeCount > 1 || GlobalTpDegree != TpDegree))
                     throw new ModelLoadRefusedException(
                         "Qwen-Image-2.1 tensor parallelism shards over the GPUs of one machine; a multi-node --tp group is not supported.");

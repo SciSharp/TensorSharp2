@@ -275,7 +275,11 @@ namespace TensorSharp.Models
         protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1,
             ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1)
         {
-            LayerSplitDegree = Math.Max(1, layerSplitDegree);
+            if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
+            if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
+            if (layerSplitDegree > 1 && (tpDegree > 1 || tpGroup != null))
+                throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
+            LayerSplitDegree = layerSplitDegree;
             _backend = backend;
             UseFloatKvCacheOnMlx();
             // The pure-C# CPU backend must never touch native (ggml P/Invoke) dequant — route
@@ -376,19 +380,22 @@ namespace TensorSharp.Models
             if (tpDegree <= 1)
                 return new GgmlContext(new[] { 0 }, backendType);
 
-            int[] devices = ParseTpDevices(tpDegree);
+            int[] devices = ParseDeviceIds(tpDegree, enableCollectives
+                ? "TENSORSHARP_TP_DEVICES" : "TENSORSHARP_LAYER_SPLIT_DEVICES");
             int available = GgmlBasicOps.GetGpuDeviceCount(backendType);
             if (available < tpDegree)
             {
                 throw new InvalidOperationException(
                     $"Requested {tpDegree} GPU(s) but the GGML {backendType} backend sees only {available}.");
             }
+            if (devices.Any(device => device >= available))
+                throw new ArgumentException($"A selected device is outside the GGML {backendType} device range 0..{available - 1}.");
             return new GgmlContext(devices, backendType, enableCollectives);
         }
 
-        private static int[] ParseTpDevices(int tpDegree)
+        internal static int[] ParseDeviceIds(int tpDegree, string variable)
         {
-            string raw = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEVICES");
+            string raw = Environment.GetEnvironmentVariable(variable);
             if (string.IsNullOrWhiteSpace(raw))
             {
                 var seq = new int[tpDegree];
@@ -400,13 +407,15 @@ namespace TensorSharp.Models
             if (parts.Length != tpDegree)
             {
                 throw new ArgumentException(
-                    $"TENSORSHARP_TP_DEVICES lists {parts.Length} device(s) but the tensor-parallel degree is {tpDegree}.");
+                    $"{variable} lists {parts.Length} device(s) but the requested degree is {tpDegree}.");
             }
             var devices = new int[tpDegree];
             for (int i = 0; i < tpDegree; i++)
             {
                 if (!int.TryParse(parts[i].Trim(), out devices[i]) || devices[i] < 0)
-                    throw new ArgumentException($"Invalid device index '{parts[i]}' in TENSORSHARP_TP_DEVICES.");
+                    throw new ArgumentException($"Invalid device index '{parts[i]}' in {variable}.");
+                if (Array.IndexOf(devices, devices[i], 0, i) >= 0)
+                    throw new ArgumentException($"{variable} contains duplicate device index {devices[i]}.");
             }
             return devices;
         }
@@ -1037,8 +1046,8 @@ namespace TensorSharp.Models
             "<turn|>",
             "<|tool_response>",
             // llama.cpp treats the FIM padding/repository/separator controls as
-            // EOG too. Qwen3/Bonsai exposes the Qwen spellings even though the
-            // GGUF only declares <|im_end|> as eos_token_id.
+            // EOG too. Qwen 3.5-family vocabularies carry the Qwen spellings
+            // even though their GGUFs only declare <|im_end|> as eos_token_id.
             "<|fim_pad|>",
             "<|repo_name|>",
             "<|file_sep|>",
@@ -2819,79 +2828,99 @@ namespace TensorSharp.Models
         /// model (DeepSeek V4's DSpark support GGUF, Muse-Glimmer's DFlash block);
         /// ignored by architectures that have no drafter.</param>
         public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            string draftModelPath = null)
+            string draftModelPath = null, int layerSplitDegree = 1)
         {
             if (tpGroup == null && tpDegree <= 1)
-            {
-                string envTp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE");
-                if (int.TryParse(envTp, out int envTpDegree) && envTpDegree > 1)
-                    tpDegree = envTpDegree;
-            }
+                tpDegree = ReadParallelDegree("TENSORSHARP_TP_DEGREE", tpDegree);
+            if (layerSplitDegree <= 1)
+                layerSplitDegree = ReadParallelDegree("TENSORSHARP_LAYER_SPLIT_DEGREE", layerSplitDegree);
 
             using var probe = new GgufFile(ggufPath);
             var architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
 
-            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath);
+            tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
+                out int layerSplit, layerSplitDegree);
+            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit);
             architecture.ApplyNativeTunables?.Invoke(context);
-
-            tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup, out int layerSplit);
-
-            ModelBase model = architecture.Factory(context.With(tpDegree, tpGroup, layerSplit));
-            model.WarnIfTensorParallelShardedNothing(architecture.Id);
+            ModelBase model = architecture.Factory(context);
+            model.VerifyTensorParallelShardedWeights(architecture.Id);
             return model;
+        }
+
+        private static int ReadParallelDegree(string variable, int fallback)
+        {
+            string raw = Environment.GetEnvironmentVariable(variable);
+            if (string.IsNullOrWhiteSpace(raw)) return fallback;
+            if (!int.TryParse(raw, out int degree) || degree < 1)
+                throw new ArgumentException($"{variable} must be a positive integer.");
+            return degree;
+        }
+
+        /// <summary>Read architecture metadata and reject unsupported distributed
+        /// execution before callers allocate GPU ranks or connect to peer nodes.</summary>
+        public static void ValidateDistributedTensorParallelism(string ggufPath, BackendType backend)
+        {
+            using var probe = new GgufFile(ggufPath);
+            var architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
+            ValidateDistributedTensorParallelism(architecture, backend);
+        }
+
+        internal static void ValidateDistributedTensorParallelism(ModelArchitectureDescriptor architecture, BackendType backend)
+        {
+            ArgumentNullException.ThrowIfNull(architecture);
+            if (architecture.MultiGpu != MultiGpuMode.TensorParallel || !architecture.SupportsDistributedTensorParallel)
+                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed tensor parallelism. " +
+                    "Remove --tp-node-id/--tp-peers; its native or single-device executor cannot consume cross-node collectives.");
+            if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+                throw new NotSupportedException($"Distributed tensor parallelism requires a multi-device GPU backend; {backend} cannot honor --tp-node-id/--tp-peers.");
         }
 
         /// <summary>
         /// Decide whether the requested tensor-parallel degree can actually be
-        /// honoured for <paramref name="architecture"/>. A single-node request degrades
-        /// (to a layer split where the architecture supports one, otherwise to a single
-        /// GPU) with a loud explanation, so an existing <c>--tp N</c> script keeps
-        /// working, just honestly; a DISTRIBUTED group throws, because one node quietly
-        /// dropping to a single rank desynchronises the collective.
-        ///
-        /// The mode and its explanation come from the architecture's own descriptor, so
-        /// the next family that lands without tensor parallelism declares that fact
-        /// beside its model instead of in a table here. Silence plus a banner asserting
-        /// the opposite is the worst possible outcome; be explicit instead.
+        /// honoured for <paramref name="architecture"/>. Tensor parallelism and layer
+        /// placement are independent, explicit requests; neither can fall back to the
+        /// other or to one GPU. Validate before applying native settings or loading weights.
         /// </summary>
         internal static int ResolveTensorParallelSupport(ModelArchitectureDescriptor architecture,
-            BackendType backend, int tpDegree, ref ITensorParallelGroup tpGroup, out int layerSplitDegree)
+            BackendType backend, int tpDegree, ref ITensorParallelGroup tpGroup, out int layerSplitDegree,
+            int requestedLayerSplitDegree = 1)
         {
             ArgumentNullException.ThrowIfNull(architecture);
 
-            layerSplitDegree = 1;
+            if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
+            if (requestedLayerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(requestedLayerSplitDegree));
+            if (tpGroup?.NodeCount > 1)
+                ValidateDistributedTensorParallelism(architecture, backend);
+            layerSplitDegree = requestedLayerSplitDegree;
             bool wantsTp = tpDegree > 1 || tpGroup != null;
-            if (!wantsTp || architecture.MultiGpu == MultiGpuMode.TensorParallel)
-                return tpDegree;
-
-            string why = architecture.MultiGpuLimitation;
-
-            if (tpGroup != null)
+            if (requestedLayerSplitDegree > 1)
             {
-                throw new NotSupportedException(
-                    why + " A distributed tensor-parallel group cannot be downgraded on one node without " +
-                    "desynchronising the others, so this run is refused. Start the node without --tp-node-id/--tp-peers.");
-            }
-
-            // Native executors own their placement and any optional reductions;
-            // pass the device count without creating the shared TP group.
-            if (architecture.MultiGpu == MultiGpuMode.LayerSplit
-                && ModelArchitectureDescriptor.BackendHasSeveralDevices(backend))
-            {
-                layerSplitDegree = tpDegree;
-                Console.WriteLine(
-                    architecture.DescribeMultiGpuPlacement?.Invoke(tpDegree) ??
-                    ($"  Multi-GPU: {tpDegree} GPUs by LAYER SPLIT (each GPU holds a contiguous run of whole " +
-                    "layers), not tensor parallelism - this architecture shards no weights. Same mode " +
-                    "llama.cpp uses for it. This raises capacity; it is not expected to raise decode speed."));
+                if (tpGroup != null)
+                    throw new NotSupportedException("--layer-split supports GPUs in one node only; distributed layer " +
+                        "execution is not implemented. Remove --tp-node-id/--tp-peers and the tensor-parallel group.");
+                if (wantsTp)
+                    throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
+                if (architecture.MultiGpu != MultiGpuMode.LayerSplit && !architecture.SupportsLayerSplit)
+                    throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement --layer-split. " +
+                        (architecture.MultiGpu == MultiGpuMode.TensorParallel
+                            ? "Use --tp for tensor parallelism." : architecture.MultiGpuLimitation));
+                if (!architecture.LayerSplitBackends.Contains(backend))
+                    throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement --layer-split on {backend}.");
+                Console.WriteLine(architecture.DescribeMultiGpuPlacement?.Invoke(requestedLayerSplitDegree) ??
+                    $"  Layer split: {requestedLayerSplitDegree} GPUs hold contiguous runs of whole layers; no tensor-parallel collectives.");
                 return 1;
             }
-
-            Console.Error.WriteLine(
-                $"WARNING: --tp {tpDegree} ignored. {why} Running on ONE GPU; the extra GPUs would have been " +
-                "given a CUDA context and NCCL buffers and then left idle. To choose WHICH GPU, set " +
-                "CUDA_VISIBLE_DEVICES (e.g. CUDA_VISIBLE_DEVICES=1).");
-            return 1;
+            if (!wantsTp) return tpDegree;
+            if (architecture.MultiGpu != MultiGpuMode.TensorParallel &&
+                architecture.SupportsNativeTensorParallel?.Invoke(tpDegree, backend) != true)
+                throw new NotSupportedException($"--tp {tpDegree} requests tensor parallelism. " +
+                    architecture.MultiGpuLimitation +
+                    (architecture.MultiGpu == MultiGpuMode.LayerSplit ? " Use --layer-split N for whole-layer placement." : "") +
+                    (tpGroup != null ? " Distributed --tp-node-id/--tp-peers cannot be used with this architecture." : ""));
+            if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan) &&
+                architecture.SupportsNativeTensorParallel?.Invoke(tpDegree, backend) != true)
+                throw new NotSupportedException($"--tp requires a multi-device GPU backend; {backend} cannot honor this request.");
+            return tpDegree;
         }
 
         /// <summary>
@@ -2900,16 +2929,17 @@ namespace TensorSharp.Models
         /// no weights at all, so every rank but 0 is idle. Costs one dictionary
         /// count and only ever runs on a TP load.
         /// </summary>
-        private void WarnIfTensorParallelShardedNothing(string arch)
+        private void VerifyTensorParallelShardedWeights(string arch)
         {
             if (!IsTensorParallel || ShardsWeightsInComponents)
                 return;
             if (_tpQuantWeights.Count > 0 || _tpWeights.Count > 0)
                 return;
-            Console.Error.WriteLine(
-                $"WARNING: tensor parallelism is active ({_tpGroup.Degree} ranks) but architecture '{arch}' " +
-                "sharded 0 weights - the whole model is resident on rank 0 and the other GPUs are idle. " +
-                "This architecture has no tensor-parallel implementation; run without --tp.");
+            int degree = _tpGroup.Degree;
+            Dispose();
+            throw new NotSupportedException(
+                $"Tensor parallelism requested {degree} ranks but architecture '{arch}' sharded no weights. " +
+                "Refusing to run with idle GPUs; this model/backend combination cannot honor --tp.");
         }
     }
 }

@@ -163,7 +163,7 @@ namespace TensorSharp.Models
                     // shard and the TP forward died with an unhandled "TP
                     // column-parallel weight 'blk.29.attn_qkv.weight' not found".
                     // Build each rank's [Q_r|K_r|V_r] slice from the separate
-                    // tensors under the fused name, as Qwen3 and gpt-oss do.
+                    // tensors under the fused name, as gpt-oss does.
                     ShardSeparateColumnParallel(qkvName,
                         new[]
                         {

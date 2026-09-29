@@ -80,19 +80,26 @@ def expected_gguf(capture,config,index):
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output',type=Path,required=True);args=ap.parse_args()
-    capture_path=DOC/'deepseek41-dspark-discovery/headers/capture.json'
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--output',type=Path,required=True)
+    ap.add_argument('--capture',type=Path,default=DOC/'deepseek41-dspark-discovery/headers/capture.json')
+    ap.add_argument('--metadata',type=Path,default=ROOT/'TestResults/ggml-no-patch-2026-09-15/deepseek41-draft-metadata')
+    args=ap.parse_args()
+    capture_path=args.capture
     capture=json.loads(capture_path.read_text())
     assert capture['revision']==REVISION and capture['status']=='captured-header-only'
-    metadata=ROOT/'TestResults/ggml-no-patch-2026-09-15/deepseek41-draft-metadata'
-    config=metadata/'deepseek-ai--DeepSeek-V4.1-Flash.config.json'
-    index=metadata/'deepseek-ai--DeepSeek-V4.1-Flash.model.safetensors.index.json'
+    metadata=args.metadata
+    def metadata_file(name):
+        standard=metadata/name
+        return standard if standard.is_file() else metadata/('deepseek-ai--DeepSeek-V4.1-Flash.'+name)
+    config=metadata_file('config.json')
+    index=metadata_file('model.safetensors.index.json')
     assert sha(config)=='8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879'
     assert sha(index)=='74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8'
     expected=expected_gguf(capture,json.loads(config.read_text()),json.loads(index.read_text()))
     out=args.output;out.mkdir(parents=True,exist_ok=False);(out/'metadata').mkdir();(out/'headers').mkdir()
     for source,destination in [(config,out/'metadata/config.json'),(index,out/'metadata/model.safetensors.index.json'),
-        (metadata/'deepseek-ai--DeepSeek-V4.1-Flash.api.json',out/'metadata/repository-api.json'),
+        (metadata_file('repository-api.json') if (metadata/'repository-api.json').is_file() else metadata/'deepseek-ai--DeepSeek-V4.1-Flash.api.json',out/'metadata/repository-api.json'),
         (capture_path,out/'headers/capture.json'),(Path(__file__),out/Path(__file__).name),
         (ROOT/'eng/validation/download-convert-deepseek41-dspark.py',out/'download-convert-deepseek41-dspark.py'),
         (ROOT/'eng/validation/tests/test_deepseek41_dspark_preparation.py',out/'test_deepseek41_dspark_preparation.py'),

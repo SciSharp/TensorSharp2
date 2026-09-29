@@ -506,7 +506,7 @@ public sealed class DeepSeek41ToolGrammarTests
         first.Grammar!.Accept(tokenizer.LookupToken(Open));
         Assert.True(first.Grammar.IsActive);
         Assert.False(second.Grammar!.IsActive || original.Grammar.IsActive);
-        Assert.Same(codingDefaults, ModelService.SamplingForDeepSeek41SkillRound("qwen3", codingDefaults, original));
+        Assert.Same(codingDefaults, ModelService.SamplingForDeepSeek41SkillRound("qwen35", codingDefaults, original));
     }
 
     [Theory]

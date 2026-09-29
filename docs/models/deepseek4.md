@@ -1,5 +1,7 @@
 # DeepSeek V4 Flash (`deepseek4`)
 
+> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Older commands and measurements below predate that default: migrate multi-GPU launches by adding `--layer-split N`. An explicit legacy `TS_DSV4_NGPU=0` still selects automatic placement over visible GPUs; unset it when using an explicit degree, or set it to that same count. Layer split is single-node only.
+
 [← back to model index](README.md) | [中文](deepseek4_zh-cn.md)
 
 DeepSeek V4 Flash is a 284B-parameter MoE (256 routed experts, top-6 + 1 shared)
@@ -16,8 +18,8 @@ DeepSeek V4 has three whole-model executors, reached through `--backend`:
 - **`--backend cuda`**: a **direct-CUDA whole-model engine**
   (`TensorSharp.Backends.Cuda/Dsv4/Dsv4CudaEngine.cs`), independent of ggml.
   Quantized weights stream from the GGUF shards straight into per-device
-  arenas and are layer-split across every visible GPU, so a model larger than
-  one GPU's VRAM is hosted across several.
+  arenas; `--layer-split N` places whole layers across N local GPUs, so a model
+  larger than one GPU's VRAM is hosted across several. The default is one device.
 - **GPU backends** (`--backend ggml_cuda` / `ggml_vulkan`): the native ggml
   executor described below. ggml ships DeepSeek-V4's four architecture-specific
   ops (the three hyper-connection ops and the lightning indexer) for CPU and
@@ -59,13 +61,11 @@ sink attention, and the grouped MoE kernels — lives in the DeepSeek V4 files.
 The native whole-model executor
 (`TensorSharp.GGML.Native/ggml_ops_deepseek4.cpp`):
 
-- Loads the (split) GGUF directly and **layer-splits the weights across every
-  visible CUDA GPU** — a model larger than one GPU's VRAM is hosted across all
-  of them (the 128 GiB IQ4_XS build needs 2×80GB). This happens **by default,
-  with no flag**: `--tp` is not what puts DSV4 on several cards, and it does
-  not shard inside a layer either. On this family `--tp N` only caps the layer
-  split at N devices, exactly like `TS_DSV4_NGPU`, which wins when both are
-  set.
+- Loads the (split) GGUF directly. `--layer-split N` distributes whole layers
+  across N local GPUs, allowing weights larger than one device's VRAM (the
+  128 GiB IQ4_XS build needs 2×80GB). With no placement setting the default is
+  one device. Legacy `TS_DSV4_NGPU=0` explicitly selects all visible GPUs; any
+  override must match an explicit layer-split count.
 - Owns all DSV4 KV state on-device: raw SWA ring, CSA/HCA compressed-K caches,
   lightning-indexer cache, and the compressor state rings.
 - Executes prefill/decode ubatches as single ggml graphs via
@@ -177,16 +177,16 @@ to the CPUs the process may actually use, not to `nproc`** — see
 ## Usage
 
 ```bash
-# point --model at the FIRST shard of the split GGUF
+# point --model at the FIRST shard; this IQ4_XS example needs 2x80 GB GPUs
 TensorSharp.Cli --model DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf \
-    --backend ggml_cuda --chat
+    --backend ggml_cuda --layer-split 2 --chat
 ```
 
 ```bash
 # direct-CUDA engine (no ggml): weights stream into per-GPU arenas, layer-split
-# across every visible device
+# across 2 local GPUs (2x80 GB for this IQ4_XS example)
 TensorSharp.Cli --model DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf \
-    --backend cuda --chat
+    --backend cuda --layer-split 2 --chat
 ```
 
 Multi-turn chat reuses the KV cache across turns (pure append); prompts that
@@ -231,7 +231,7 @@ TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
 # Interactive chat, 4 GPUs
 TensorSharp.Cli --model DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --backend ggml_cuda --draft-model DSpark-drafter-Q2K-Q8-0731.gguf \
-    --interactive --think --tp 4 --max-tokens 20000
+    --interactive --think --layer-split 4 --max-tokens 20000
 ```
 
 On the CLI, verification draws each row with whatever sampler the run
@@ -250,7 +250,7 @@ the drafter enables speculation by itself (an explicit `--no-spec` vetoes it):
 
 ```bash
 TensorSharp.Server.Host --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
-    --backend ggml_cuda --tp 4 \
+    --backend ggml_cuda --layer-split 4 \
     --draft-model DSpark-drafter-Q2K-Q8-0731.gguf
 ```
 
@@ -268,7 +268,7 @@ request is in flight the planner logs
 per-sequence slots serve the batch at normal decode speed. Concurrency is safe,
 it just isn't speculative.
 
-Measured on 4×A40 (`--tp 4`, 300-token OpenAI chat completion):
+Measured on 4×A40 (`--layer-split 4`, 300-token OpenAI chat completion):
 
 | Config | tok/s |
 |---|---|
@@ -373,7 +373,7 @@ Multi-turn decode benefits most (2.2x on the third turn of the sample
 conversation, 93% acceptance): a turn that continues an established context is
 exactly where the drafter is confident.
 
-Same box, `--interactive --think --tp 4` with the 7 GB Q2K-Q8 0731 drafter, a
+Same box, `--interactive --think --layer-split 4` with the 7 GB Q2K-Q8 0731 drafter, a
 5-turn chat: short answer, long explanation, follow-up summary, then a 10K-token
 document with two questions about it.
 
@@ -404,7 +404,7 @@ confidence gate is what keeps that trade positive.
 |---|---|---|
 | `MAX_CONTEXT` | 65536 | Context window (caches scale with it; metadata allows 1M) |
 | `TS_DSV4_UBATCH` | 512 on `cpu` / 1024 otherwise | Prefill micro-batch |
-| `TS_DSV4_NGPU` | all | Number of GPUs to layer-split across (GPU backends) |
+| `TS_DSV4_NGPU` | 1 | Number of GPUs to layer-split across (GPU backends) |
 | `TS_DSV4_VRAM_RESERVE_MB` | estimated per load (at least 2048); 2048 on `cuda` | GPU backends: overrides the VRAM held back per device for the scheduler's compute buffers. Unset, the ggml executor uses 2 GiB plus the lightning-indexer top-k transient and one ubatch of activations, so it grows with `MAX_CONTEXT` and `TS_DSV4_UBATCH`; `--backend cuda` uses a flat 2048. Lower it to offload fewer expert layers; raise it if a long prompt fails to allocate its graph |
 | `TS_N_CPU_MOE` / `TS_CPU_MOE` | 0 (off) | Leading layers whose routed experts stay in system RAM (same as `--n-cpu-moe` / `--cpu-moe`). Off by default; a model that does not fit is refused with the number that would work |
 | `TS_CPU_MOE_THREADS` | all usable CPUs (when offloading) | Worker threads for the host expert matmul on the ggml executors. With offload on, the pool takes `hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota — not the halved default the other MoE architectures use, because a DSV4 offloaded layer reads far more expert bytes per token than theirs do and keeps scaling past that point. `--cpu-moe-threads N` overrides it, and an inherited `TS_CPU_MOE_THREADS` has the final say. Size it to the quota, not to `nproc`: 96 threads on a 23.8-CPU quota measured **25x** slower than 23. On a hosted server, leave the other threads room: the shared MoE pool on gemma-4-26B-A4B (not DSV4) ran 8.2 tok/s at 71 threads against 20.7 at 64 on a 95-CPU quota, so pass `--cpu-moe-threads` below the quota there |

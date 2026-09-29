@@ -13,6 +13,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime;
 using TensorSharp.Server.Hosting;
 
@@ -571,7 +572,7 @@ public class ConfigFileArgsTests : IDisposable
     [Fact]
     public void Expand_AccumulatingOptions_KeepTheConfigEntries()
     {
-        // Every --stop, --skills-dir and --lora counts, so the command line adds to the
+        // Every --stop, --skill and --lora counts, so the command line adds to the
         // file's values instead of replacing them -- and a --lora's download still runs.
         using var server = new TinyHttpServer();
         server.AddFile("/style.safetensors", new byte[] { 7, 8, 9 });
@@ -579,7 +580,7 @@ public class ConfigFileArgsTests : IDisposable
         string cfg = WriteConfig($$"""
         {
           "stop": ["</s>"],
-          "skills-dir": "skills-a",
+          "skill": "skill-a",
           "lora": { "path": {{JsonQuote(lora)}}, "urls": [ {{JsonQuote(server.UrlFor("/style.safetensors"))}} ] },
           "lora-scale": 0.7
         }
@@ -590,15 +591,15 @@ public class ConfigFileArgsTests : IDisposable
             new[]
             {
                 "--config", cfg,
-                "--stop", "<|eot|>", "--skills-dir", "skills-b", "--lora", "other.safetensors", "--lora-scale", "0.5",
+                "--stop", "<|eot|>", "--skill", "skill-b", "--lora", "other.safetensors", "--lora-scale", "0.5",
             },
             sink, interactiveProgress: false);
 
         Assert.Equal(
             new[]
             {
-                "--stop", "</s>", "--skills-dir", "skills-a", "--lora", Path.GetFullPath(lora), "--lora-scale", "0.7",
-                "--stop", "<|eot|>", "--skills-dir", "skills-b", "--lora", "other.safetensors", "--lora-scale", "0.5",
+                "--stop", "</s>", "--skill", "skill-a", "--lora", Path.GetFullPath(lora), "--lora-scale", "0.7",
+                "--stop", "<|eot|>", "--skill", "skill-b", "--lora", "other.safetensors", "--lora-scale", "0.5",
             },
             result);
         Assert.Equal(1, server.RequestCount("/style.safetensors"));
@@ -865,6 +866,101 @@ public class ConfigFileArgsTests : IDisposable
         var options = ServerOptionsBuilder.Build(merged, baseDir);
 
         Assert.Equal(0.9f, options.DefaultSamplingConfig.Temperature);
+    }
+
+    [Theory]
+    [InlineData("--skills-dir", false, false)]
+    [InlineData("--skills-dir", true, true)]
+    [InlineData("--SKILLS-DIR", false, true)]
+    [InlineData("--SKILLS-DIR", true, false)]
+    public void Build_SkillsDirectory_CommandLineReplacesMissingConfiguredRoot(
+        string flag, bool equalsForm, bool commandLineFirst)
+    {
+        string missing = Path.Combine(_dir, "missing-configured-skills");
+        string local = Directory.CreateDirectory(Path.Combine(_dir, "local skills")).FullName;
+        string cfg = WriteConfig($$"""
+        { "variables": { "skillsRoot": {{JsonQuote(missing)}} }, "skills-dir": "${skillsRoot}" }
+        """);
+        string[] cli = equalsForm ? new[] { flag + "=" + local } : new[] { flag, local };
+        string[] config = { "--config", cfg };
+        string[] args = commandLineFirst ? cli.Concat(config).ToArray() : config.Concat(cli).ToArray();
+        var sink = new StringWriter();
+
+        string[] merged = ConfigFileArgs.Expand(args, sink, interactiveProgress: false);
+        var options = ServerOptionsBuilder.Build(merged, _dir);
+
+        Assert.Equal(cli, merged);
+        Assert.Equal(new[] { local }, options.SkillDirectories);
+        Assert.Contains("command-line value is used instead", sink.ToString(), StringComparison.Ordinal);
+        Assert.False(Directory.Exists(missing));
+    }
+
+    [Fact]
+    public void Build_SkillsDirectory_RepeatedCommandLineRootsReplaceAllConfigFiles()
+    {
+        string missing = Path.Combine(_dir, "missing-configured-skills");
+        string configured = Directory.CreateDirectory(Path.Combine(_dir, "configured-skills")).FullName;
+        string first = Directory.CreateDirectory(Path.Combine(_dir, "first-skills")).FullName;
+        string second = Directory.CreateDirectory(Path.Combine(_dir, "second-skills")).FullName;
+        string a = WriteConfig($$"""{ "skills-dir": [{{JsonQuote(missing)}}, {{JsonQuote(configured)}}] }""", "a.json");
+        string b = WriteConfig($$"""{ "skills-dir": {{JsonQuote(configured)}} }""", "b.json");
+
+        string[] merged = ConfigFileArgs.Expand(
+            new[] { "--config", a, "--skills-dir", first, "--config", b, "--skills-dir=" + second });
+
+        Assert.Equal(new[] { "--skills-dir", first, "--skills-dir=" + second }, merged);
+        Assert.Equal(new[] { first, second }, ServerOptionsBuilder.Build(merged, _dir).SkillDirectories);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Build_SkillsDirectory_ConfigArrayIsPreservedInWinningFile(bool earlierConfig)
+    {
+        string missing = Path.Combine(_dir, "missing-configured-skills");
+        string first = Directory.CreateDirectory(Path.Combine(_dir, "first-skills")).FullName;
+        string second = Directory.CreateDirectory(Path.Combine(_dir, "second-skills")).FullName;
+        string a = WriteConfig($$"""{ "skills-dir": {{JsonQuote(missing)}} }""", "a.json");
+        string b = WriteConfig($$"""{ "skills-dir": [{{JsonQuote(first)}}, {{JsonQuote(second)}}] }""", "b.json");
+        string[] args = earlierConfig ? new[] { "--config", a, "--config", b } : new[] { "--config", b };
+
+        string[] merged = ConfigFileArgs.Expand(args);
+
+        Assert.Equal(new[] { "--skills-dir", first, "--skills-dir", second }, merged);
+        Assert.Equal(new[] { first, second }, ServerOptionsBuilder.Build(merged, _dir).SkillDirectories);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Build_SkillsDirectory_MissingWinningRootIsStillRejected(bool commandLineOverride)
+    {
+        using var env = new EnvScope();
+        env.Set(SkillHostOptions.DisableEnvVar, null);
+        string missing = Path.Combine(_dir, "missing-skills");
+        string configured = commandLineOverride ? _dir : missing;
+        string cfg = WriteConfig($$"""{ "skills-dir": {{JsonQuote(configured)}} }""");
+        string[] args = commandLineOverride
+            ? new[] { "--config", cfg, "--skills-dir", missing }
+            : new[] { "--config", cfg };
+
+        var ex = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.Build(ConfigFileArgs.Expand(args), _dir));
+
+        Assert.Contains($"Invalid value for --skills-dir: '{missing}' is not an existing directory.", ex.Message);
+        Assert.False(Directory.Exists(missing));
+    }
+
+    [Fact]
+    public void Expand_SkillsDirectory_OverrideDoesNotResolveConfiguredVariables()
+    {
+        using var env = new EnvScope();
+        env.Set("TS_CFG_MISSING_SKILLS_ROOT_67890", null);
+        string cfg = WriteConfig("""{ "skills-dir": "${TS_CFG_MISSING_SKILLS_ROOT_67890}/skills" }""");
+
+        string[] merged = ConfigFileArgs.Expand(new[] { "--config", cfg, "--skills-dir", _dir });
+
+        Assert.Equal(new[] { "--skills-dir", _dir }, merged);
     }
 
     // ----- Variables -----

@@ -16,6 +16,9 @@ namespace TensorSharp.Models
         public int SpecPreferredDraftWindow => 3;
         public bool SpecVerifyPersistsAcceptedKv => false;
         public bool SpecPlainStepUsesForward => true;
+        // SpecForward delegates to Forward's image injection and captures each
+        // chunk's MRoPE positions before Forward consumes them for MTP catch-up.
+        public bool SpecSupportsMultimodalPrefill => true;
         public bool SpecTrunkFollowsBoundCache => true;
         public bool SpeculationProfitable => !_specStateFailed && IsGgmlBackend && _tokenGraphEnabled
             && !_tokenGraphUnsupported && _spanAttnEnabled && !_fusedGateUpExperts

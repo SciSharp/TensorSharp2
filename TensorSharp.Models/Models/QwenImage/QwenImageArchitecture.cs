@@ -20,6 +20,7 @@ namespace TensorSharp.Models.QwenImage
             // --tp shards the diffusion transformer (heads and MLP columns per GPU);
             // the text encoder and VAE stay on the first GPU.
             Factory = c => new QwenImageModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+            SupportsDistributedTensorParallel = false,
             DetectFromTensors = LooksLikeVersion21,
         };
 

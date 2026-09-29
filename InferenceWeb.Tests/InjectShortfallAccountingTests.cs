@@ -18,6 +18,7 @@
 //
 // The fake model folds every (position, token) it holds into its logits, so any
 // state that differs from a cold run changes the greedy stream.
+using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Runtime;
@@ -45,6 +46,8 @@ public sealed class InjectShortfallAccountingTests
 
         // Block 2 (tokens 16..23) is refused when B's cached prefix is injected.
         model.RefuseInjectAt = 2 * BlockSize;
+        var timing = new ForwardTiming(promptB.Length);
+        model.Timings.Add(promptB[0], timing);
         var b = new SequenceState("b", promptB.ToList(), 6, BlockSize, SamplingConfig.Greedy);
         var completion = await engine.SubmitRequest(b).Completion.WaitAsync(TimeSpan.FromSeconds(20));
 
@@ -56,6 +59,9 @@ public sealed class InjectShortfallAccountingTests
         Assert.Contains(model.Forwards, f => f.Start == 2 * BlockSize && f.Count == BlockSize);
         Assert.Equal(coldB, b.OutputTokens.ToArray());
         Assert.Equal(promptB.Length + b.OutputTokens.Count, b.NumComputedTokens);
+        AssertIncludesAllForwardTime(completion, timing);
+        Assert.True(b.ReplayPrefillElapsedTicks > 0);
+        Assert.Equal(0, b.ReplayDecodeElapsedTicks);
     }
 
     [Fact]
@@ -94,13 +100,14 @@ public sealed class InjectShortfallAccountingTests
         int[] coldB = await RunColdAsync(promptB, maxNew);
 
         // Control: the same concurrent run with every inject accepted.
-        var (controlModel, _, _) = await RunConcurrentAsync(promptA, promptB, maxNew, refuseInjectAt: null);
+        var (controlModel, _, _, _, _) = await RunConcurrentAsync(promptA, promptB, maxNew, refuseInjectAt: null);
         Assert.Equal(0, controlModel.RefusedInjects);
         Assert.True(controlModel.InjectCalls > 0, "the control run never swapped ownership, so nothing was injected");
 
         // The first inject of block 2 (tokens 16..23) that happens is refused: neither
         // prompt reaches it, so what it held is always generated output.
-        var (model, a, b) = await RunConcurrentAsync(promptA, promptB, maxNew, refuseInjectAt: 2 * BlockSize);
+        var (model, a, b, completionA, completionB) = await RunConcurrentAsync(
+            promptA, promptB, maxNew, refuseInjectAt: 2 * BlockSize, measureTiming: true);
 
         Assert.Equal(1, model.RefusedInjects);
         Assert.Equal(coldA, a.OutputTokens.ToArray());
@@ -110,6 +117,10 @@ public sealed class InjectShortfallAccountingTests
         int extra = model.Forwards.Sum(f => f.Count) - controlModel.Forwards.Sum(f => f.Count);
         Assert.True(extra >= 1, $"expected the lost tail to be re-forwarded, forwarded {extra} extra tokens");
         Assert.Contains(model.Forwards, f => f.Start == 2 * BlockSize && f.Count == extra);
+        AssertIncludesAllForwardTime(completionA, model.Timings[promptA[0]]);
+        AssertIncludesAllForwardTime(completionB, model.Timings[promptB[0]]);
+        Assert.Equal(0, a.ReplayPrefillElapsedTicks + b.ReplayPrefillElapsedTicks);
+        Assert.True(a.ReplayDecodeElapsedTicks + b.ReplayDecodeElapsedTicks > 0);
     }
 
     [Fact]
@@ -127,6 +138,8 @@ public sealed class InjectShortfallAccountingTests
         int[] coldC = await RunColdFusedAsync(promptC, maxNewC);
 
         var model = new FusedHistoryHashModel();
+        var timing = new ForwardTiming(promptB.Length);
+        model.Timings.Add("b", timing);
         using var engine = new InferenceEngine(model, FusedConfig(prefixCaching: true), NullLogger.Instance);
         await RunAsync(engine, "a", promptA, maxNew: 4);
 
@@ -149,6 +162,9 @@ public sealed class InjectShortfallAccountingTests
         Assert.Equal(2 * BlockSize, completionB.PrefixCacheReusedTokens);
         Assert.Equal(coldB, b.OutputTokens.ToArray());
         Assert.Equal(coldC, c.OutputTokens.ToArray());
+        AssertIncludesAllForwardTime(completionB, timing);
+        Assert.True(b.ReplayPrefillElapsedTicks > 0);
+        Assert.Equal(0, b.ReplayDecodeElapsedTicks);
     }
 
     [Fact]
@@ -197,9 +213,10 @@ public sealed class InjectShortfallAccountingTests
         const int maxNew = 10;
         int[] coldA = await RunColdAsync(promptA, maxNew);
         int[] coldB = await RunColdAsync(promptB, maxNew);
-        var (controlModel, _, _) = await RunConcurrentAsync(promptA, promptB, maxNew, refuseInjectAt: null);
+        var (controlModel, _, _, _, _) = await RunConcurrentAsync(promptA, promptB, maxNew, refuseInjectAt: null);
 
-        var (model, a, b) = await RunConcurrentAsync(promptA, promptB, maxNew, refuseInjectAt: BlockSize, refuseSkip: 2);
+        var (model, a, b, completionA, completionB) = await RunConcurrentAsync(
+            promptA, promptB, maxNew, refuseInjectAt: BlockSize, refuseSkip: 2, measureTiming: true);
 
         Assert.Equal(1, model.RefusedInjects);
         Assert.Equal(coldA, a.OutputTokens.ToArray());
@@ -209,22 +226,64 @@ public sealed class InjectShortfallAccountingTests
         int extra = model.Forwards.Sum(f => f.Count) - controlModel.Forwards.Sum(f => f.Count);
         Assert.True(extra > first.Count, $"the refused inject lost no generated tokens (extra {extra}, first {first.Count})");
         Assert.Contains(first.Start + first.Count, new[] { promptA.Length, promptB.Length });
+        AssertIncludesAllForwardTime(completionA, model.Timings[promptA[0]]);
+        AssertIncludesAllForwardTime(completionB, model.Timings[promptB[0]]);
+        Assert.True(a.ReplayPrefillElapsedTicks + b.ReplayPrefillElapsedTicks > 0);
+        Assert.True(a.ReplayDecodeElapsedTicks + b.ReplayDecodeElapsedTicks > 0);
     }
 
-    private static async Task<(HistoryHashModel Model, SequenceState A, SequenceState B)> RunConcurrentAsync(
-        int[] promptA, int[] promptB, int maxNew, int? refuseInjectAt, int refuseSkip = 0)
+    private static async Task<(HistoryHashModel Model, SequenceState A, SequenceState B,
+        InferenceCompletion CompletionA, InferenceCompletion CompletionB)> RunConcurrentAsync(
+        int[] promptA, int[] promptB, int maxNew, int? refuseInjectAt, int refuseSkip = 0, bool measureTiming = false)
     {
         var model = new HistoryHashModel { RefuseInjectAt = refuseInjectAt, RefuseInjectSkip = refuseSkip };
+        if (measureTiming)
+        {
+            model.Timings.Add(promptA[0], new ForwardTiming(promptA.Length));
+            model.Timings.Add(promptB[0], new ForwardTiming(promptB.Length));
+        }
         using var engine = new InferenceEngine(model, Config(prefixCaching: false, decodeQuantum: 1), NullLogger.Instance);
         var a = new SequenceState("a", promptA.ToList(), maxNew, BlockSize, SamplingConfig.Greedy);
         var b = new SequenceState("b", promptB.ToList(), maxNew, BlockSize, SamplingConfig.Greedy);
         var ha = engine.SubmitRequest(a);
         var hb = engine.SubmitRequest(b);
-        await Task.WhenAll(ha.Completion, hb.Completion).WaitAsync(TimeSpan.FromSeconds(30));
-        return (model, a, b);
+        var completions = await Task.WhenAll(ha.Completion, hb.Completion).WaitAsync(TimeSpan.FromSeconds(30));
+        return (model, a, b, completions[0], completions[1]);
     }
 
     // ------------------------------------------------------------------ helpers
+
+    private static void AssertIncludesAllForwardTime(InferenceCompletion completion, ForwardTiming timing)
+    {
+        // Model-internal measurements include every actual forward, including
+        // cache replay. Delays make omitted forwards visible above timer overhead.
+        Assert.True(timing.PrefillTicks > 0);
+        Assert.True(timing.DecodeTicks > 0);
+        Assert.True(completion.PrefillElapsedTicks >= timing.PrefillTicks,
+            "Prompt timing omitted a model forward during cache recovery.");
+        Assert.True(completion.DecodeElapsedTicks >= timing.DecodeTicks,
+            "Decode timing omitted a model forward during cache recovery.");
+    }
+
+    private sealed class ForwardTiming(int promptLength)
+    {
+        public long PrefillTicks { get; private set; }
+        public long DecodeTicks { get; private set; }
+
+        public long Start()
+        {
+            long started = Stopwatch.GetTimestamp();
+            Thread.Sleep(5);
+            return started;
+        }
+
+        public void Record(int position, long started)
+        {
+            long elapsed = Stopwatch.GetTimestamp() - started;
+            if (position < promptLength) PrefillTicks += elapsed;
+            else DecodeTicks += elapsed;
+        }
+    }
 
     private static SchedulerConfig Config(bool prefixCaching, int decodeQuantum = BlockSize, int prefillChunk = 64) => new()
     {
@@ -290,6 +349,7 @@ public sealed class InjectShortfallAccountingTests
         public int RefusedInjects { get; private set; }
         public int InjectCalls { get; private set; }
         public List<(int Start, int Count)> Forwards { get; } = new();
+        public Dictionary<int, ForwardTiming> Timings { get; } = new();
 
         public ModelConfig Config { get; } = new() { VocabSize = VocabSize };
         public ITokenizer Tokenizer { get; } = new NumberTokenizerPublic();
@@ -303,6 +363,9 @@ public sealed class InjectShortfallAccountingTests
         {
             lock (_gate)
             {
+                int position = _rows.Count;
+                Timings.TryGetValue(position > 0 ? _rows[0] : tokens[0], out var timing);
+                long started = timing?.Start() ?? 0;
                 Forwards.Add((_rows.Count, tokens.Length));
                 _rows.AddRange(tokens);
                 ulong h = 1469598103934665603UL;
@@ -313,6 +376,7 @@ public sealed class InjectShortfallAccountingTests
                 }
                 var logits = new float[VocabSize];
                 logits[(int)(h % (ulong)(VocabSize - 1)) + 1] = 10f;
+                timing?.Record(position, started);
                 return logits;
             }
         }
@@ -413,6 +477,7 @@ public sealed class InjectShortfallAccountingTests
         public int? RefuseInjectAt { get; set; }
         public int RefusedInjects { get; private set; }
         public string RefusedInjectCache { get; private set; }
+        public Dictionary<string, ForwardTiming> Timings { get; } = new();
 
         private int _decodeForwardCount;
 
@@ -431,6 +496,9 @@ public sealed class InjectShortfallAccountingTests
         {
             lock (_gate)
             {
+                int position = _active.Count;
+                Timings.TryGetValue(_activeKey ?? "<primary>", out var timing);
+                long started = timing?.Start() ?? 0;
                 if (tokens.Length == 1)
                 {
                     Interlocked.Increment(ref _decodeForwardCount);
@@ -441,7 +509,9 @@ public sealed class InjectShortfallAccountingTests
                 _active.AddRange(tokens);
                 ulong h = Seed;
                 for (int p = 0; p < _active.Count; p++) h = Fold(h, p, _active[p]);
-                return PeakLogits(h);
+                var logits = PeakLogits(h);
+                timing?.Record(position, started);
+                return logits;
             }
         }
 

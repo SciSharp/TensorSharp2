@@ -39,9 +39,9 @@ public sealed class RequestWorkspaceLeaseTests : IDisposable
         string firstRoot;
         string secondRoot;
         using (RequestWorkspaceLease first = Assert.IsType<RequestWorkspaceLease>(
-                   RequestWorkspaceLease.Acquire(manager, runner, "qwen2")))
+                   RequestWorkspaceLease.Acquire(manager, runner, "qwen35")))
         using (RequestWorkspaceLease second = Assert.IsType<RequestWorkspaceLease>(
-                   RequestWorkspaceLease.Acquire(manager, runner, "qwen2")))
+                   RequestWorkspaceLease.Acquire(manager, runner, "qwen35")))
         {
             firstRoot = first.Workspace.Root;
             secondRoot = second.Workspace.Root;
@@ -61,7 +61,7 @@ public sealed class RequestWorkspaceLeaseTests : IDisposable
         var manager = new SessionWorkspaceManager(_root);
         var runner = new AvailableRunner();
 
-        Assert.Null(RequestWorkspaceLease.Acquire(manager, runner, "qwen2", allowTools: false));
+        Assert.Null(RequestWorkspaceLease.Acquire(manager, runner, "qwen35", allowTools: false));
         Assert.Null(RequestWorkspaceLease.Acquire(manager, runner, "mistral3"));
         Assert.False(Directory.Exists(_root));
     }
@@ -72,14 +72,14 @@ public sealed class RequestWorkspaceLeaseTests : IDisposable
         var manager = new SessionWorkspaceManager(_root);
         var runner = new AvailableRunner();
         using RequestWorkspaceLease lease = Assert.IsType<RequestWorkspaceLease>(
-            RequestWorkspaceLease.Acquire(manager, runner, "qwen2"));
+            RequestWorkspaceLease.Acquire(manager, runner, "qwen35"));
         var registry = new SkillRegistry(new SkillRegistryOptions { Roots = Array.Empty<string>() });
         ServerHostingOptions options = ServerOptionsBuilder.Build(
             new[] { "--model", "x.gguf", "--no-skills" }, _root);
 
         SkillRequestPlan plan = SkillRequestPlan.Create(
             registry, Array.Empty<string>(), discovery: false, clientTools: null,
-            architecture: "qwen2", contextTokens: 32768, options,
+            architecture: "qwen35", contextTokens: 32768, options,
             out IReadOnlyList<string> unknown,
             codeRunner: runner,
             workspace: lease.Workspace);
@@ -105,7 +105,7 @@ public sealed class RequestWorkspaceLeaseTests : IDisposable
     {
         var manager = new SessionWorkspaceManager(_root);
         using RequestWorkspaceLease lease = Assert.IsType<RequestWorkspaceLease>(
-            RequestWorkspaceLease.Acquire(manager, new AvailableRunner(), "qwen2"));
+            RequestWorkspaceLease.Acquire(manager, new AvailableRunner(), "qwen35"));
         using var fileTools = new ShellRunner(new CodeExecOptions
         {
             Enabled = true,

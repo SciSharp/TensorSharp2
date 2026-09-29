@@ -42,6 +42,43 @@ namespace TensorSharp.Models.QwenImage
         /// <summary>Logical row-major shape (outermost dim first) of a named tensor.</summary>
         public long[] Shape(string name) => _src.TensorShape(name);
 
+        private readonly Dictionary<string, float[]> _slices = new();
+        private readonly Dictionary<string, PackedPanels> _packed = new();
+
+        /// <summary>The T=1 2-D kernel (OC, IC*KH*KW) of a causal conv weight: its last temporal
+        /// slice, extracted once per layer (the weight itself when KD == 1).</summary>
+        public float[] KernelSlice(string name, int oc, int ic, int kd, int kh, int kw)
+        {
+            if (kd == 1) return Get(name);
+            if (!_slices.TryGetValue(name, out var slice))
+                _slices[name] = slice = VaeReferenceMath.LastTemporalSlice(Get(name), oc, ic, kd, kh, kw);
+            return slice;
+        }
+
+        /// <summary>
+        /// The T=1 kernel packed for the managed GEMM convolution, built once per layer. The pack
+        /// is the only copy that path reads, so the raw F32 weight is dropped from the cache (a
+        /// device path that needs it later re-reads it): the managed decoder holds one copy of
+        /// its ~1.1 GB of weights, not two.
+        /// </summary>
+        internal unsafe PackedPanels PackedKernel(string name, int oc, int ic, int kd, int khw)
+        {
+            CpuGemmIsa isa = CpuPackedGemm.Isa;
+            if (_packed.TryGetValue(name, out var packed) && packed.Isa == isa) return packed;
+            long t0 = VaeCpuProfile.Start();
+            float[] raw = _cache.TryGetValue(name, out var cached) ? cached : _src.ReadFloat32(name);
+            int k = ic * khw;
+            float[] slice = kd == 1 ? raw : VaeReferenceMath.LastTemporalSlice(raw, oc, ic, kd, khw, 1);
+            if (slice.LongLength != (long)oc * k)
+                throw new ArgumentException($"VAE weight {name} has {slice.LongLength} values, expected {oc} x {k}.");
+            fixed (float* w = slice) packed = CpuPackedGemm.PackA(w, oc, k, k, 1, isa, VaeReferenceMath.CpuPool);
+            _packed[name] = packed;
+            _cache.Remove(name);
+            _slices.Remove(name);
+            VaeCpuProfile.Stop(VaeCpuProfile.Weights, t0);
+            return packed;
+        }
+
         /// <summary>Fused whole-VAE device graph, built lazily on first encode/decode
         /// (null after a failed build → the per-conv path is used). Holds the weights in
         /// stable unmanaged buffers for resident binding; lives as long as the weights.</summary>

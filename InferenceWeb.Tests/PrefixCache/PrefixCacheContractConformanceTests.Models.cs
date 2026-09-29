@@ -36,7 +36,7 @@ public sealed partial class PrefixCacheContractConformanceTests
     internal const string Qwen35_9B = "qwen3.5-9b-q8_0";
     private const string GptOss20B = "gpt-oss-20b-q8_0";
     // A40: the whole Qwen 3.8 Flash Next GGUF directory, loaded as a layer split over the GPUs in
-    // CUDA_VISIBLE_DEVICES with TENSORSHARP_TP_DEGREE set to their count.
+    // CUDA_VISIBLE_DEVICES with TENSORSHARP_LAYER_SPLIT_DEGREE set to their count.
     private const string EnvQwen38Dir = "TS_TEST_QWEN38_DIR";
     // The first shard of a split GGUF (the loader follows the rest).
     private const string Qwen38FlashNext = "qwen3.8-flash-next-ud-q2_k_xl-00001";

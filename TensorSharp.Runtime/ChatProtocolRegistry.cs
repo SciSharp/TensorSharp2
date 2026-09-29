@@ -128,39 +128,6 @@ namespace TensorSharp.Runtime
             // ---- Qwen -------------------------------------------------------
             Register(new ChatProtocol
             {
-                Id = "qwen3",
-                Architectures = new[] { "qwen3" },
-                CreateOutputParser = () => new ChatMlOutputParser(),
-                // Qwen3 generation prompts place the reasoning boundary after the
-                // assistant marker. Thinking-capable templates open it; the Bonsai
-                // 8B template deliberately emits the closed/empty form every time.
-                // Past-turn rendering may omit that boundary, so raw-token replay
-                // must put back exactly what the live KV cache saw.
-                AssistantGenerationSuffix = thinking => thinking
-                    ? "<think>\n"
-                    : "<think>\n\n</think>\n\n",
-                EmitsEmptyThinkBlockForPastTurns = _ => true,
-                // Tool results are rendered solely from role=tool; the preceding
-                // structured call is not needed, making lossless raw replay safe.
-                ToolCallRawSplicing = ToolCallRawSplicing.Always,
-            });
-
-            // Qwen2 / Qwen2.5(-VL): ChatML tool syntax without a thinking
-            // channel. Without this entry the family fell through to the passthrough
-            // parser, which can never read a tool call back — so skills and run_code
-            // were silently withheld from a model that handles them fine. The GGUF's
-            // own template renders the prompt; the hardcoded ChatML renderer (thinking
-            // off) stands in when that template is missing or misrenders.
-            Register(new ChatProtocol
-            {
-                Id = "qwen25",
-                Architectures = new[] { "qwen2", "qwen2vl", "qwen2_vl", "qwen25vl" },
-                Render = r => ChatTemplate.RenderChatMl(r.Messages, r.AddGenerationPrompt, r.Tools, enableThinking: false),
-                CreateOutputParser = () => new Qwen25OutputParser(),
-            });
-
-            Register(new ChatProtocol
-            {
                 Id = "qwen35",
                 Architectures = new[] { "qwen35", "qwen35moe", "qwen3next", "qwen3vl", "qwen3vlmoe" },
                 Render = r => ChatTemplate.RenderQwen35(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools),
@@ -389,7 +356,8 @@ namespace TensorSharp.Runtime
                 // branch; stripping that restores the half the cache actually holds.
                 AssistantGenerationSuffix = _ => "<think>",
                 EmitsEmptyThinkBlockForPastTurns = _ => true,
-                Render = r => ChatTemplate.RenderGlm5Next(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools),
+                Render = r => ChatTemplate.RenderGlm5Next(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools, r.ReasoningEffort),
+                RendersReasoningEffort = true,
                 AppendMediaPlaceholders = (msg, sb) =>
                 {
                     // The template's emit_image() macro. The host later expands the

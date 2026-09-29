@@ -69,7 +69,7 @@ from the result JSONs alone.
 | `benchmark_config_prefill.json` | **prefill-only** variant — the same long-prompt sweep (2k/4k/8k/16k/32k/64k/128k tokens) but with the multimodal / diffusion scenarios and models stripped out, for a focused prefill run; select with `--config` |
 | `benchmark_config_multigpu.json` | **multi-GPU** variant — a 4-GPU Linux box (validated on 4×A40), tensor-parallel degrees 1/2/4, including a model that only fits across 4 GPUs (`min_tp`); select with `--config` |
 | `benchmark_config_ci.json` | **CI** variant used by `.github/workflows/test-matrix.yml` — TensorSharp vs llama.cpp only, `ggml_cuda` only, text + prefill scenarios |
-| `benchmark_config_glm53_qwen38.json` | **GLM-5.3 / GLM-5.3-Flash / Qwen3.8-Flash-Next** on an 8×A40 box — two columns, because the families disagree about multi-GPU placement: the GLM native executor takes every visible GPU with no `--tp` (default column), while `qwen4exp` is spread by the shared loader and needs `--tp N` (second column, `min_tp`-gated out of the default one). TensorSharp-only by default: that host's llama.cpp has no `glm5next`. Select with `--config` |
+| `benchmark_config_glm53_qwen38.json` | **GLM-5.3 / GLM-5.3-Flash / Qwen3.8-Flash-Next** on an 8×A40 box — two whole-layer placement columns: GLM automatic placement explicitly sets `TS_GLM_NGPU=0`; the other column passes `--layer-split N` and pins N GPUs. Qwen3.8 requires the explicit column. The harness retains `--tp` / `min_tp` as GPU-count selectors; neither column requests inference tensor parallelism. TensorSharp-only by default: that host's llama.cpp has no `glm5next`. Select with `--config` |
 | `download_models.py` | pre-fetches the selected models from the `source` URLs in the config (optional — `run_matrix.py` already downloads what is missing) |
 
 ## Configuration
@@ -87,8 +87,9 @@ max-tokens, warmup count, server max-tokens headroom).
 Each model entry also declares **where its files come from** (`source`, plus
 per-file `url` overrides) so a fresh host provisions itself — see
 [Model provisioning](#model-provisioning-automatic-downloads) — and, for weights
-that do not fit one GPU, the smallest tensor-parallel degree that can host them
-(`min_tp`).
+that do not fit one GPU, the minimum configured GPU count (`min_tp`). The
+backend column determines whether that count selects tensor parallelism or
+whole-layer placement.
 
 Values resolve with this precedence (highest first):
 
@@ -327,14 +328,13 @@ and is not bound by it, so its column still fills in.
 **Tensor parallelism** section with decode/prefill at every degree plus the
 scaling factor over the smallest degree that ran.
 
-Not every model reaches multiple GPUs the same way. A model with its own
-whole-model executor (DeepSeek V4 Flash) passes `tpDegree = 1` down to
-`ModelBase` and reinterprets `--tp N` as "spread my weights over N GPUs",
-**layer-split, with no AllReduce** — that is capacity parallelism (it is what
-makes a 150 GiB model hostable on 4×46 GB at all), not the per-layer tensor
-split the other architectures do. Its row in the tensor-parallelism table is
-therefore the one configuration that runs, not a scaling point; the config
-entry says so in a `_tp_note`.
+Whole-layer placement uses the inference option **`--layer-split N`**. For
+example, `benchmark_config_deepseek4_layer.json` maps the harness's historical
+GPU-count selector `--tp N` to TensorSharp's `--layer-split N` and llama.cpp's
+`--split-mode layer`. These capacity measurements do not establish
+tensor-parallel scaling. The inference option `--tp N` now exclusively selects
+tensor parallelism; unsupported architectures refuse it. Old inference
+commands that used `--tp` for whole-layer placement must migrate.
 
 Two field notes from the 4×A40 validation host:
 
@@ -817,3 +817,34 @@ python -m unittest test_validate_deepseek41_tools test_validate_inference \
 resolve (defaults name real models/engines/backends, every model file has a
 download URL, nothing that is exported to a server process is a comment), plus
 the per-matrix facts that decide whether a cell can run at all.
+
+### Explicit layer placement
+
+The inference CLI and server use `--layer-split N` for whole-layer placement
+and reserve `--tp N` for tensor parallelism. In this benchmark harness,
+`run_matrix.py --tp 1,2,4` remains the historical GPU-count sweep argument;
+a backend mapping chooses the actual engine option. Layer-placement columns
+set `tensorsharp.tp_arg` to `--layer-split` and llama.cpp's `tp_extra_args` to
+`["--split-mode", "layer"]`. They must not be labelled as tensor parallelism.
+The DeepSeek V4.1 layer columns and `ggml_cuda_split` in the GLM/Qwen matrix
+use that mapping. The DeepSeek V4.1 routed-MoE TP column uses `--tp N` together
+with `TS_DSV41_TP=N` and remains an experimental partial TP path.
+
+```bash
+python run_matrix.py --config benchmark_config_glm53_qwen38.json \
+    --models qwen38-flash-next --backends ggml_cuda_split --tp 8
+```
+
+The command launches TensorSharp with `--layer-split 8`. Layer split is
+single-node only; this matrix does not validate distributed layer splitting.
+
+DeepSeek V4 Flash now has a dedicated layer-placement configuration:
+
+```bash
+python run_matrix.py --config benchmark_config_deepseek4_layer.json --tp 4
+```
+
+It was removed from `benchmark_config_multigpu.json`, whose backend columns
+select tensor parallelism. The automatic GLM layer column explicitly sets
+`TS_GLM_NGPU=0`; with no placement configuration the runtime now defaults to
+one device.

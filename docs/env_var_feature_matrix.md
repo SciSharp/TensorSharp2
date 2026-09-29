@@ -48,7 +48,7 @@ results as part of the standard matrix.
 | `TS_GEMMA4_BATCHED` | Gemma 4 | Batched paged forward vs per-sequence fallback | ON | `0`, `1` | yes |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | Native batched Mamba2 step | OFF | `0`, `1` | no |
 | `TS_BATCHED_N1_FAST_PATH` | all | Fused N=1 fast-path decode for solo sequences; `0` forces those steps onto the fully-batched path | ON | `0`, `1` | yes |
-| `TS_PER_SEQ_FUSED` | fused-capable models (Gemma 4, GPT OSS, Qwen 3 / Qwen 2 and Qwen 3.8 Flash Next on GGML backends; Qwen 3.5/3.6/3.8 on `ggml_cuda` / `ggml_metal`; DeepSeek V4 / V4.1 and GLM 5.x on their native executors) | Per-request fused Forward for concurrent (N>=2) sequences; `0` forces the op-by-op batched paged path | ON | not registered | no |
+| `TS_PER_SEQ_FUSED` | fused-capable models (Gemma 4, GPT OSS and Qwen 3.8 Flash Next on GGML backends; Qwen 3.5/3.6/3.8 on `ggml_cuda` / `ggml_metal`; DeepSeek V4 / V4.1 and GLM 5.x on their native executors) | Per-request fused Forward for concurrent (N>=2) sequences; `0` forces the op-by-op batched paged path | ON | not registered | no |
 | `TS_BATCHED_FUSED_DECODE` | models with a token-batched fused decode (Gemma 4, Qwen 3.5/3.6/3.8, GPT OSS, GLM 5.x, DeepSeek V4 / V4.1) | True token-batched fused decode inside the per-seq fused path (one graph for all N). On GLM 5.x this is 1.81x aggregate decode at 4 concurrent requests; on DeepSeek V4.1 Flash at Q4_K_M it is 2.0x (24.3 → 48.9 tok/s), bounded by routing because each token picks its own 6 of 384 experts. Batching changes GEMM shapes and a 2-bit MoE can turn that into different expert picks; set `0` for a serial-path A/B. | ON | not registered | no |
 | `TS_GEMMA4_BATCHED_CAPS` | Gemma 4 token-batched fused decode | Overrides the capability bits the native kernel reports (1 PLE, 2 KV donor, 4 SWA wrap, 8 per-sequence cache capacities, the `TSGgml_Gemma4ModelDecodeBatchedEx2` entry). `0` forces the v1 gates, so E2B/E4B decode round-robin; `7` restores the uniform-capacity gate. Diagnostic only, not needed to enable batching | native probe | not registered | no |
 | `TS_BATCHED_FUSED_MOE` | Gemma 4 MoE | `1` lets Gemma 4 MoE checkpoints take the token-batched fused decode. Off by default: its capture-safe graph, next to the KV holders, filled a 16 GB card and was not faster than round-robin there | OFF | not registered | no |
@@ -56,14 +56,14 @@ results as part of the standard matrix.
 | `TS_GPTOSS_BATCHED_ARENA` | GPT OSS on `ggml_cuda` / `ggml_vulkan` | `0` replaces the slot-stable arena of the batched decode with the per-sequence-window graph (the path backends without persistent graphs always take) | ON | not registered | no |
 | `TS_RETAINED_FUSED_CACHE` | models with retainable request-owned fused holders (Gemma 4; Qwen 3.5/3.6/3.8; Qwen 3.8 Flash Next, which also has `TS_Q4E_RETAINED_CACHE`; DeepSeek V4.1 only with `TS_DSV41_RETAINED_CACHE=1`); under the Radix prefix cache also GLM 5.x on its native executor (one donated native slot) | Retain a finished holder for exact-prefix continuation. Qwen's holder includes attention K/V and matching GatedDeltaNet recurrent state | ON | not registered | no |
 | `TS_RETAINED_FUSED_CACHE_MAX` | models with retainable request-owned fused holders | LRU budget of retained holders (VRAM cap; includes recurrent state where applicable). Under the Radix prefix cache it is the budget of retained per-conversation end states | `4` | n/a | no |
-| `TS_PREFIX_CHECKPOINTS` | Gemma 4 on GGML backends; Qwen 3.5/3.6/3.8 on `ggml_cuda` / `ggml_metal` / `mlx`, the backends where it runs per-request holders (not under TP); Qwen 3.8 Flash Next on its GGML token-span path, including under the `--tp N` layer split. Needs `TS_PER_SEQ_FUSED` on, and in legacy mode `TS_RETAINED_FUSED_CACHE` too | Checkpoint the model's complete state where the prompt every conversation shares ends (system prompt, tools, skills) and start each NEW chat from a clone of it, so a new chat re-prefills only its own message | ON | not registered | no |
+| `TS_PREFIX_CHECKPOINTS` | Gemma 4 on GGML backends; Qwen 3.5/3.6/3.8 on `ggml_cuda` / `ggml_metal` / `mlx`, the backends where it runs per-request holders (not under TP); Qwen 3.8 Flash Next on its GGML token-span path, including under the `--layer-split N` layer split. Needs `TS_PER_SEQ_FUSED` on, and in legacy mode `TS_RETAINED_FUSED_CACHE` too | Checkpoint the model's complete state where the prompt every conversation shares ends (system prompt, tools, skills) and start each NEW chat from a clone of it, so a new chat re-prefills only its own message | ON | not registered | no |
 | `TS_PREFIX_CHECKPOINTS_MAX` | same | How many distinct shared prefixes stay checkpointed (each holds one copy of the prefix's K/V and, for Qwen, recurrent state). Under the Radix prefix cache it is the budget of public checkpoints; a prompt publishes one per boundary (system instructions, whole shared prefix), so 4 covers a host that warms both thinking modes | `4` | n/a | no |
 | `TS_KV_INITIAL_TOKENS` | families that size their cache through `ModelBase.ResolveInitialCacheAllocationLength` (Qwen 3.5/3.6, Gemma 4, GPT-OSS and the other ModelBase families; not DeepSeek V4 / GLM 5.x, which size their own) | Tokens of K/V a cache is given when created (the primary cache at load, every per-request holder) before any request declares a budget; `0` keeps the engine policy (whole window when `MAX_CONTEXT` is explicit, else a backend default). The cache still grows on demand. Memory-constrained devices set this small because every kept holder is paid at this size, host and device mirror both | `0` | n/a | no |
 | `TS_KV_GENERATION_RESERVE_MAX` | all | Cap on the generation share of the K/V a request reserves up front (prompt + max_new_tokens); a reply limit at or above the window otherwise reserves the whole window per request. Past the cap the cache grows on demand. `0` = no cap | `0` | n/a | no |
 | `TS_KV_HOLDER_POOL_MAX` | models with per-request fused holders (Qwen 3.5/3.6/3.8, Gemma 4, GPT-OSS) | How many released holders may be parked for reuse instead of freed; each parked holder costs its whole K/V allocation | `64` | n/a | no |
 | `TS_SCHED_DISABLE_BATCHED` | all | Global per-sequence KV-swap fallback | OFF | `0`, `1` | yes |
 | `TS_SCHED_PREFIX_CACHE` | all autoregressive models | `0` disables every form of admission-time prompt reuse, in either prefix-cache mode. `--no-prefix-cache` (CLI and server) sets it and also skips the startup warm-up of the shared prompt and, on the server, the checkpoint files | ON (`1`) | not registered | no |
-| `TS_PREFIX_CACHE_MODE` | families with a Radix prefix-cache contract (Qwen 3.5/3.6/3.8 incl. `qwen3next`, Gemma 4, GLM 5.x, Qwen 3.8 Flash Next, DeepSeek V4 / V4.1, Qwen 3 / Qwen 2, GPT OSS, Mistral 3, Hunyuan Dense, Muse-Glimmer, Nemotron-H; not DiffusionGemma or the image/video models) | `tree` keeps pages, retained end states and public checkpoints in one radix index; `legacy` selects the older block-hash sharing with separate live-cache, retained-holder and checkpoint paths, for diagnosis. Any other value is rejected | `tree` | not registered | no |
+| `TS_PREFIX_CACHE_MODE` | families with a Radix prefix-cache contract (Qwen 3.5/3.6/3.8 incl. `qwen3next`, Gemma 4, GLM 5.x, Qwen 3.8 Flash Next, DeepSeek V4 / V4.1, GPT OSS, Mistral 3, Hunyuan Dense, Muse-Glimmer, Nemotron-H; not DiffusionGemma or the image/video models) | `tree` keeps pages, retained end states and public checkpoints in one radix index; `legacy` selects the older block-hash sharing with separate live-cache, retained-holder and checkpoint paths, for diagnosis. Any other value is rejected | `tree` | not registered | no |
 | `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | all | Scheduler budgets: per-step tokens, in-flight sequences, prefill chunk while a decode runs (server `--prefill-chunk-size`), solo prefill chunk, pool blocks, tokens per block, decode quantum. See the [configuration table](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md#configuration) | `4096` / `16` / `256` / `8192` / `256` / `256` / `256` | not registered | no |
 | `TS_SCHED_STOP_REPETITION` | all | `0` lets a generation that has locked into a loop run to its token limit instead of ending with finish reason `repetition` | ON (`1`) | not registered | no |
 
@@ -148,16 +148,75 @@ catalog entry or the user's setting. The iOS app (`TensorAgent.Maui`) also defau
 
 ## Out-of-Matrix Pure-C# CPU Backend Knobs
 
-These tune the persistent worker pool and the quantized-weight handling
-behind `--backend cpu`. They are real runtime knobs but are not registered
-in `EnvVarMatrix.All` and are not swept by the default TestMatrix config.
+These tune the persistent worker pool, the quantized-weight handling and the
+managed SIMD kernels behind `--backend cpu`. They are real runtime knobs but are
+not registered in `EnvVarMatrix.All` and are not swept by the default TestMatrix
+config. The `0` switches restore the previous code path in the same binary, for
+A/B runs; none of them is needed for correct output. Measurements quoted below
+were taken on an i7-11800H (8 cores / 16 threads, AVX-512, 32 GB) unless a row
+names another machine.
+
+**Which instruction sets run.** Every hand-written kernel of this backend takes
+its instruction set from one decision (`TensorSharp.Cpu.CpuIsa`), so a host never
+runs AVX-512 in one kernel family and AVX2 in another: AVX-512 where the CPU has
+AVX-512 F/BW/DQ and the runtime accelerates `Vector512` (the JIT leaves that off on
+some parts where 512-bit vectors are slower, and under `DOTNET_EnableAVX512=0`),
+AVX2+FMA otherwise, and the portable Vector128 / scalar code without AVX2 (ARM64
+included, where the quantized matmuls keep the per-row path). The one exception is
+the per-row Q4_0 / Q8_0 dots of the managed matmul (the path `TS_CPU_QGEMM=0`
+restores), which predate these kernels: they keep their
+original test, AVX-512 F/BW present, so where the runtime does not accelerate
+`Vector512` they still run their AVX-512 form, as before. `TS_CPU_DISABLE_AVX512=1`
+switches them too.
+
+**Testing the AVX2 path.** `TS_CPU_DISABLE_AVX512=1` runs the hand-written
+AVX-512 kernels in their AVX2 form on an AVX-512 host. It does not narrow the
+.NET runtime itself (`TensorPrimitives`, plain copies,
+`Vector512.IsHardwareAccelerated`). To emulate an AVX2-only host, start the
+process with `DOTNET_EnableAVX512=0`; on .NET 10 the older
+`DOTNET_EnableAVX512F=0` is ignored. `DOTNET_EnableAVX2=0` (or
+`DOTNET_EnableHWIntrinsic=0`) leaves only the portable tier; the unit tests that
+compare the GEMM kernels report themselves as skipped there instead of passing
+with nothing to compare. The AVX2 kernels have been exercised this way on an
+AVX-512 machine, not on AVX2-only hardware.
+
+**Rolling back to the previous arithmetic.** Each `0` switch below restores one
+area. The arithmetic the `cpu` backend had before these kernels needs all four:
+`TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0`, plus
+`DIFFUSION_CPU_LEGACY=1` for DiffusionGemma; with those set, a regression run on
+the i7-11800H reproduced the previous build's outputs bit for bit. Because the
+per-row dots those switches fall back to keep their original instruction-set test
+(above), the recipe also holds where AVX-512 exists but `Vector512` is not
+accelerated; that case has not been run. A per-area switch on its own
+(`DIFFUSION_CPU_LEGACY=1`, `TS_QWEN_VAE_CPU=scalar`, ...) is not enough: the
+shared quantized, SGEMM and elementwise kernels stay on the new code.
+`TS_CPU_POOL` is not part of it - it changes which threads run the work, not the
+results. Qwen-Image-2.1 did not run on `cpu` before, so it has no previous
+arithmetic to return to.
+
+**What stays native.** With `--backend cpu` the model compute loads no native
+library (no GgmlOps, no CUDA). Outside the model compute, image files are read
+and written through Magick.NET on desktop (a native ImageMagick build), and the
+server probes the GGML and CUDA backends at startup to list what the machine can
+run, whatever `--backend` says; both predate these kernels.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_CPU_THREADS` | `cpu` backend (100% pure C#) | Width of the persistent worker pool that runs the managed matmuls. Default is HALF the usable CPUs, deliberately not all of them: the rest of the CPU path still uses the ThreadPool, and pool workers spin between jobs, so taking every core starves that other work. Measured on a 122-CPU quota, two interleaved runs per cell (prefill / decode tok/s): pool off 21.7,21.0 / 2.0,2.4; 32 threads 24.9,24.1 / 4.9,5.0; 48 threads 25.6,28.5 / 5.4,6.0; 61 threads 24.2,24.9 / 6.3,5.9; 122 threads 13.5 / 4.8. At 122 only prefill regresses - decode still beats the pool-off baseline | every core at <=8 CPUs, else max(8, usable/2) | not registered | no |
-| `TS_CPU_POOL` | `cpu` backend | `0` reverts to the pre-pool behaviour - ThreadPool `Parallel.For` with thread-count-scaled chunks - so the two can be A/B-ed in one binary | ON | not registered | no |
+| `TS_CPU_THREADS` | `cpu` backend (100% pure C#) | Width of the persistent worker pool that runs the managed matmuls; the Core CPU kernels (F32 SGEMM, elementwise, norm, softmax, RoPE on `CpuStorage` tensors, through the `CpuParallel` hook `TensorSharp.Models` installs at module load); the DiffusionGemma and Qwen-Image-2.1 transformer kernels; and the Qwen-Image text encoder and vision tower. The Qwen-Image VAE has a wider pool of its own (`TS_CPU_GEMM_THREADS`). Default is HALF the usable CPUs above 8, deliberately not all of them. That width was tuned when the pool ran only the quantized matmuls and the rest of the CPU path used the ThreadPool: pool workers spin between jobs, so taking every core starved that other work. Measured on a 122-CPU quota, two interleaved runs per cell (prefill / decode tok/s): pool off 21.7,21.0 / 2.0,2.4; 32 threads 24.9,24.1 / 4.9,5.0; 48 threads 25.6,28.5 / 5.4,6.0; 61 threads 24.2,24.9 / 6.3,5.9; 122 threads 13.5 / 4.8. At 122 only prefill regresses - decode still beats the pool-off baseline. Re-measured with everything on the pool, 16 threads against the default 8 on the 8-core / 16-thread i7-11800H, two runs each: Qwen-Image-2.1 256x256 in 2 steps 15.7 / 16.5 s against 16.9 / 17.1 s (the transformer steps faster, 9.2-9.9 s against 11.0-11.1 s; the text and vision encode phase, which includes loading the text encoder, slower, 3.4-3.6 s against 3.1 s; the text-encoder forward alone, a 37-token prompt in `QwenImageStagesBench`, 1.65-2.26 s against 1.24-1.26 s on its first call and 0.72-1.42 s against 0.68-0.72 s after that, with identical outputs); a DiffusionGemma Jev read of a new prompt 1.80 s against 1.54-1.62 s on average; a read of a cached prompt 209-223 ms against 218-231 ms. No clear win, so the default stays | every core at <=8 CPUs, else max(8, usable/2) | not registered | no |
+| `TS_CPU_POOL` | `cpu` backend | `0` reverts to ThreadPool `Parallel.For`, for hosts that cannot afford dedicated spinning threads and to A/B the two in one binary. It covers every managed kernel that forks through `CpuWorkers`, the quantized matmuls' `RunParallelBlocks` or the Core `CpuParallel` hook (whose binding is skipped): the quantized and float-panel GEMMs, the Core CPU kernels, the DiffusionGemma and Qwen-Image-2.1 transformer kernels, and the Qwen-Image packed GEMM behind the VAE, text encoder and vision tower (the VAE's wide pool becomes `Parallel.For` capped at `TS_CPU_GEMM_THREADS`). The kernels do not change results with the split, so outputs are the same either way. Still on a pool: the row loops of the Direct video networks (`DirectOps`, MiniMax-H3's own loops); DeepSeek V4's executor has threads of its own (`TS_DSV4_THREADS`) | ON | not registered | no |
 | `TS_CPU_SPIN` | `cpu` backend | Spin iterations a pool worker takes before parking. Parking is the expensive part at this width (waking N workers costs more than the ~60 us of work being handed out), so the default spins long enough that the steady state never parks: at 256 the same model measured 0.1 tok/s against 7.0 at 4096 | `4096` | not registered | no |
 | `TS_CPU_TASK_BYTES` / `TS_CPU_TASKS_PER_WORKER` | `cpu` backend | Chunking of a managed matmul: weight bytes per work item, and the cap on work items per worker. Sized from the WORK rather than the thread count - the old thread-count-scaled rule built 1024 tiny tasks per matmul at 122 threads and stopped scaling past 8 | `131072` / `4` | not registered | no |
+| `TS_CPU_QGEMM` | quantized matmuls on `cpu`; also the other callers of the managed matmul (DeepSeek V4's host-MoE offload on CUDA, the CUDA/MLX "no device kernel" fallback) | Multi-row int8 GEMM for Q4_K, Q5_K, Q6_K, Q4_0, Q5_0 and Q8_0 weights: each pair of weight rows is decoded once into an L1-resident scratch and run against every activation row with register tiles (8 rows x 2 columns on AVX-512BW, 4 x 1 on AVX2). Activations are quantized to the same Q8_K / Q8_0 values as before and the per-sub-block integer sums are exact; only the float scaling is re-associated. `0` restores the whole pre-GEMM managed matmul: the per-row dots, `DequantMatMulColumns`, and the scalar activation quantizer, Q5_0 dot and F16/BF16 dequant that were vectorized with it. Hosts without AVX2+FMA, and ARM64, keep the per-row path | ON | not registered | no |
+| `TS_CPU_FGEMM` | `cpu` backend, F16 / BF16 / F32 weights and quant types that only have a dequantizer (Q3_K, IQ*) | Float-panel GEMM: four weight rows are dequantized into an L2-resident F32 panel and multiplied with 4x4 (AVX-512) or 2x4 (AVX2) register tiles. The math is the same F32 product as before, summed in another order. `0` (or `TS_CPU_QGEMM=0`) restores `DequantMatMulColumns` | ON | not registered | no |
+| `TS_CPU_QGEMM_MIN_ROWS` | same (diagnostic) | Calls and batch jobs with fewer rows take the per-row path. Unset, every row count takes the GEMM, which makes a row's result independent of how many rows share the call (decode, speculative verify, continuous batching and MoE batches all give the same bits); a value above 1 gives that up | unset (1) | not registered | no |
+| `TS_CPU_QGEMM_TASK_MACS` / `TS_CPU_QGEMM_L2_BYTES` | same (tuning) | Minimum multiply-accumulates per parallel task (about 50 us on one core), and the activation bytes one row block may hold; the block is re-read once per decoded column pair, so it has to stay in L2 | `1048576` / `524288` | not registered | no |
+| `TS_CPU_QGEMM_VERIFY` | same (diagnostic) | `1` re-runs every GEMM through the per-row path and prints the largest relative difference seen so far to stderr, which checks the kernels on a real model's weights and activations. Slow | OFF | not registered | no |
+| `TS_CPU_SGEMM` | F32 matmuls on `cpu` (`Ops.Addmm` / `AddmmBatch`, the Direct video networks' GEMMs) | Packed, cache-blocked SGEMM (BLIS structure) with AVX-512 8x32, AVX2+FMA 6x16 or portable `Vector<T>` micro-kernels; skinny products (M <= 4) and narrow dot-layout products skip packing. `0` routes `MatrixMultiplication` and `DirectOps` back to their previous loops. Not used when the allocator selects MKL | ON | not registered | no |
+| `TS_CPU_SGEMM_KERNEL` | same | Pins a micro-kernel: `avx512`, `avx2wide` (8x24 on the 32 EVEX registers, AVX-512 hardware only), `avx2` or `portable`. An unsupported choice falls back to the default | widest supported | not registered | no |
+| `TS_CPU_SGEMM_KC` / `TS_CPU_SGEMM_MC` / `TS_CPU_SGEMM_NC` | same (tuning) | Cache-blocking overrides; MC and NC are rounded up to the register tile | 256 / 144 / 1024 (AVX-512, AVX2) | not registered | no |
+| `TS_CPU_SGEMM_DOT_MAXN` | same | Widest N routed to the narrow dot path (small N, A rows and B columns contiguous along K); `0` turns the path off | 64 (AVX-512, AVX2), 40 (`avx2wide`) | not registered | no |
+| `TS_CPU_SIMD_ELEMENTWISE` | elementwise, norm, softmax and RoPE ops on `cpu` (`TensorApplyCPU`, `DirectOps` row loops) | Vector512 / Vector256 kernels split by element count over the pool. Formulas and operation order match the scalar loops, so apart from the vectorized exp and tanh (a few ULP) results are bit-identical. `0` restores the previous loops, which on Windows includes the `CpuOps.dll` entry points the old path called | ON | not registered | no |
+| `TS_CPU_DISABLE_AVX512` | every hand-written AVX-512 kernel of the pure-C# CPU path (quantized GEMM and its quantizer, per-row Q4_0 / Q8_0 dots, SGEMM, elementwise, DiffusionGemma attention, Qwen-Image DiT / VAE / text-encoder / vision kernels) | `1` runs their AVX2 form, so the AVX2 path can be tested on an AVX-512 host (see "Which instruction sets run" and "Testing the AVX2 path" above). All of them read it through the same decision, so none keeps AVX-512 while another drops it | OFF | not registered | no |
 
 ## Out-of-Matrix DiffusionGemma Knobs
 
@@ -169,7 +228,11 @@ These variables are real runtime knobs, but they are not registered in
 | `DIFFUSION_STEPS` | DiffusionGemma Web UI | Denoising steps per block in the server path | `48` | not registered | no |
 | `DIFFUSION_MAX_BATCH` | DiffusionGemma Web UI | Max active requests in `DiffusionBatchScheduler` | `2` | not registered | no |
 | `DIFFUSION_BATCHED_FORWARD` | DiffusionGemma | True batched canvas decode vs time-sliced fused single-canvas decode | OFF | not registered | no |
-| `DIFFUSION_NO_PKV` | DiffusionGemma | Disable prompt-KV caching on device-glue backends | OFF | not registered | no |
+| `DIFFUSION_NO_PKV` | DiffusionGemma | Disable prompt-KV caching (the device-glue backends and `cpu`): every read and every denoising step then runs the unified `[prompt\|canvas]` forward | OFF | not registered | no |
+| `DIFFUSION_CPU_LEGACY` | DiffusionGemma on `cpu` | `1` restores the previous DiffusionGemma-specific stages in one switch: no prompt-KV cache and the old implementation of the projections, attention, router and MoE. The matmuls under them stay on the new shared kernels; for the previous arithmetic also set `TS_CPU_QGEMM=0 TS_CPU_FGEMM=0 TS_CPU_SGEMM=0 TS_CPU_SIMD_ELEMENTWISE=0` (see "Rolling back to the previous arithmetic") | OFF | not registered | no |
+| `DIFFUSION_CPU_LEGACY_MOE` / `_PROJ` / `_ATTN` / `_ROUTER` | DiffusionGemma on `cpu` | Restore one stage each: `_MOE` the per-expert reference loop (with its router), `_PROJ` the separate Q/K/V and gate/up projections, `_ROUTER` only the router scores, `_ATTN` the previous attention. `_ATTN` applies to the unified forward only (prompt prefill and canvas decode always use the fused norm+RoPE and blocked attention), so an attention A/B also needs `DIFFUSION_NO_PKV=1` | OFF | not registered | no |
+| `DIFFUSION_CPU_ATTN_FAST` | DiffusionGemma on `cpu` | `1` selects FMA attention tiles (Vector512 when accelerated) and a vectorized softmax. The default kernel reproduces the previous arithmetic exactly, because a last-bit change can flip the top-8-of-128 expert routing; attention is a fraction of a percent of a forward at Jev and chat prompt lengths | OFF | not registered | no |
+| `DIFFUSION_CPU_MOE_CHUNK` | DiffusionGemma on `cpu` | Tokens per batched-MoE pass; bounds the gathered per-route scratch (a 4k-token prefill would otherwise hold about 1 GB of routed rows) | `512` | not registered | no |
 | `DIFFUSION_NO_SC` / `DIFFUSION_SC_TOPK` | DiffusionGemma | Self-conditioning enablement and experimental top-K cutoff | ON / `32` | not registered | no |
 | `DIFFUSION_NO_FUSED_DECODE` / `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | DiffusionGemma on GGML backends | Disable fused whole-model diffusion decode or fused lm-head tail | OFF | not registered | no |
 | `DIFFUSION_LMHEAD_BATCH_CAP_MB` | DiffusionGemma | Transient lm-head logits memory cap before per-sequence fallback | `300` | not registered | no |
@@ -186,7 +249,10 @@ These variables are real runtime knobs, but they are not registered in
 
 These tune Qwen-Image-2.1 generation and editing on the CLI and the server. The
 matrix feature catalog has no image-generation feature, so none of them is
-registered in `EnvVarMatrix.All`. The [Qwen-Image-2.1 card](models/qwenimage21.md)
+registered in `EnvVarMatrix.All`. On the pure-C# `cpu` backend a request that
+names no size renders at the 1 MP automatic area (1024x1024, the first
+reference's aspect ratio for an edit) rather than the native 2048x2048; `ggml_cpu`
+and the GPU backends keep 2048x2048. The [Qwen-Image-2.1 card](models/qwenimage21.md)
 has the measurements and the remaining diagnostic switches.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
@@ -198,6 +264,25 @@ has the measurements and the remaining diagnostic switches.
 | `TS_QWEN21_FLASH` / `TS_QWEN21_PAD_MASK` | Qwen-Image-2.1 DiT | Diagnostic switches: `TS_QWEN21_FLASH=0` disables flash attention; on `ggml_cuda`, `TS_QWEN21_PAD_MASK=1` restores the padded-mask attention path (other backends ignore it) | ON / OFF | not registered | no |
 | `TS_QWEN21_VAE_FUSED` | Qwen-Image-2.1 VAE | Whole-VAE graph, the default on CUDA and Metal. `0` selects the per-convolution path; `1` forces the graph on another GGML backend except Vulkan, where it is ignored with a warning | ON on CUDA / Metal | not registered | no |
 | `TS_QWEN21_VISION_FUSED` | Qwen-Image-2.1 vision encoder on `ggml_cuda` | `0` restores the previous per-block vision path for A/B runs | ON | not registered | no |
+| `TS_QWEN21_CPU_MATMUL` | Qwen-Image-2.1 DiT on `cpu` | Unset (or `q8`), the quantized projections quantize their activations to Q8_K / Q8_0 as ggml-cpu does and run the multi-row integer GEMM in `ManagedQuantizedOps`: the faster route with those kernels (a cached step 4.0 s against 7.2-9.0 s at 256x256, 17.6-21.7 s against 29-38 s at 512x512) and closer to ggml_cpu's image (512x512 Pruna-5 LoRA: PSNR 32.9 dB against 31.4). `f32`, the default before, multiplies F32 activations by dequantized weight tiles instead: slower, but numerically steadier - a 1e-6 relative change of the input latents moves the integer pipeline's velocity by about 2.5e-2 relative L2 (ggml-cpu's own by about 1e-2) and the F32 one by about 1e-5 | integer (Q8) activations | not registered | no |
+| `TS_QWEN21_CPU_PROFILE` | same | `1` prints one line per forward with the time of each stage | OFF | not registered | no |
+| `TS_QWEN21_CPU_GATHER_V` / `TS_QWEN21_CPU_MLP_ROWS` / `TS_QWEN21_CPU_DEPTH` | same (tuning) | Attention reads each head's values from a head-major copy (`0` reads the token-major V in place); rows per MLP chunk, which bounds its `[rows, 2 * ff]` activation; depth of one pass of the dot tiles (a multiple of 16) | ON / `1024` / `1024` | not registered | no |
+| `TS_QWEN21_CPU_GELU_FP16` / `TS_QWEN21_CPU_ROUND_ACTIVATIONS` | same (parity) | Reproduce ggml-cpu's rounding for A/B comparisons: its F16 GELU table, and BF16-rounded inputs to the F16/BF16 `img_in` / `txt_in` weights. The defaults are the F32 tanh GELU (as CUDA and Metal compute it) and F32 inputs | OFF / OFF | not registered | no |
+| `TS_QWEN_VAE_CPU` | Qwen-Image-2.1 VAE on `cpu` | Unset, every convolution is an implicit-im2col packed SGEMM against weights packed once per layer (the decoder's nearest 2x upsample is folded into the convolution's input read), the mid-block attention is blocked, and the norm, SiLU, add and resampling passes are vectorized. `scalar` restores the original scalar convolution, attention and SiLU loops bit for bit | packed GEMM | not registered | no |
+| `TS_QWEN_VAE_PROFILE` | same | `1` prints the time per op class (conv, norm, add, attention, resample, weight packing) of one encode or decode | OFF | not registered | no |
+| `TS_QWEN_IMAGE_CPU_MEMORY_CHECK` | Qwen-Image-2.1 on `cpu` | Before any work, a size whose estimated peak (the VAE decode: 2304 bytes per output pixel plus about 1.8 GiB; the denoise: 128 KiB per token plus 2.5 GiB and the mapped transformer) exceeds the machine's memory is refused with the largest square size that fits; one that only exceeds the memory free right now gets a warning. `0` skips the refusal | ON | not registered | no |
+| `TS_CPU_GEMM_THREADS` | Qwen-Image-2.1 VAE on `cpu` | Width of the dedicated pool the managed VAE runs on. One thread per logical CPU by default: the convolutions are FMA-bound, and two SMT threads per core keep the single 512-bit FMA port busier (512x512 decode 7.9 -> 7.0 s). The text encoder and vision tower stay on the shared pool, where the extra spinning workers cost more than they give. Under `TS_CPU_POOL=0` the VAE runs `Parallel.For` capped at this width instead of its own pool | logical CPUs, at most 64 (clamped 1-512) | not registered | no |
+| `TS_CPU_GEMM_KC` / `TS_CPU_GEMM_NT` | Qwen-Image packed GEMM on `cpu` (VAE, text encoder, vision) | K chunk and N tile of the packed GEMM, for tuning; the result does not depend on them | `256` / `256` (clamped 16-4096 / 32-2048) | not registered | no |
+| `TS_QWEN_TE_CPU_GEMM` / `TS_QWEN_TE_CPU_ATTN` | Qwen-Image-2.1 text encoder (Qwen3-VL-8B) on `cpu` | Unset, attention is a managed causal GQA kernel, the SiLU is vectorized and the projections follow `TS_QWEN_TE_CPU_MATMUL`. `TS_QWEN_TE_CPU_GEMM=0` turns the packed GEMM and the vectorized SiLU off (projections through the generic `ManagedQuantizedOps` path with 8-bit activations, scalar SiLU); with `TS_QWEN_TE_CPU_ATTN=0` as well, the encoder's earlier per-op path is reproduced bit for bit | ON / ON | not registered | no |
+| `TS_QWEN_TE_CPU_MATMUL` | same | Unset, the projections quantize their activations to 8 bits as ggml-cpu does and run the multi-row integer GEMM: 0.76-0.88 s for the 37-token default prompt against 1.8-1.9 s for the packed F32 GEMM (ggml_cpu about 1.4 s). `f32` selects the packed F32 GEMM on dequantized weight tiles (exact F32 activations: about 1e-6 relative to a double-precision reference per projection, against about 4e-3 for the 8-bit route). No effect under `TS_QWEN_TE_CPU_GEMM=0` | integer (Q8) activations | not registered | no |
+| `TS_QWEN_TE_PROFILE` | same | `1` prints a per-forward split of the per-op path (linear / attention / norms) | OFF | not registered | no |
+| `TS_QWEN35_VENC_CPU_GEMM` / `TS_QWEN35_VENC_CPU_ATTN` | Qwen3-VL vision encoder on `cpu` (Qwen 3.5-family image input and the Qwen-Image-2.1 edit tower) | Packed-GEMM linears, vectorized erf-GELU and a managed multi-head attention. `GEMM=0` restores the previous path as a whole (`Ops.Addmm` linears, host GELU loop, Ops-based attention); `ATTN=0` restores only the attention | ON / ON | not registered | no |
+
+On `cpu`, the prefix KV cache settings above apply to the managed cache, which
+lives in host memory: "free memory" is the physical memory not in use. The
+GGML-only switches (`TS_QWEN21_GRAPH_REUSE`, `TS_QWEN21_FLASH`,
+`TS_QWEN21_PAD_MASK`, `TS_QWEN21_VAE_FUSED`, `TS_QWEN21_VISION_FUSED`) have no
+effect there.
 
 ## Out-of-Matrix Speculative-Decoding Knobs
 
@@ -206,14 +291,14 @@ These gate the optional speculative decode path in `TensorSharp.Cli` and
 and GLM-5.3; Gemma 4's separate `gemma4-assistant` draft GGUF; Qwen 3.8 Flash
 Next's shared MTP head GGUF; DeepSeek V4 DSpark and DFlash / DFlash2 block
 drafters for Muse-Glimmer and the Qwen 3.5 family; the experimental DeepSeek V4.1
-DSpark path, validated only on synthetic fixtures; the weight-free n-gram
+DSpark path; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified; the weight-free n-gram
 speculator). Speculation engages only for solo (non-concurrent) sequences and only
 where the model declares it profitable, which is decided per model: Qwen
 3.5/3.6/3.8 and GLM 5.2 / GLM-5.3 on every backend, GLM-5.3-Flash (n-gram only)
 where its KDA rollback is available, Gemma 4 on the ggml backends and `cuda`, Qwen
 3.8 Flash Next on its GGML token-graph path, DeepSeek V4 / V4.1 and Muse-Glimmer
 only with their drafter loaded. Nemotron-H refuses every speculator, and GPT OSS,
-Mistral 3, Qwen 3 / Qwen 2 and Hunyuan Dense have no speculative trunk, so not even
+Mistral 3 and Hunyuan Dense have no speculative trunk, so not even
 n-gram runs there. They are not registered in `EnvVarMatrix.All` and are not
 swept by the default TestMatrix config — the matrix feature catalog has no
 speculative-decode feature today, so use explicit runs to exercise these.
@@ -291,12 +376,12 @@ them. The full context is in the [V4 card](models/deepseek4.md) and the
 
 | Variable | Applies to | Effect | Baseline | In matrix |
 |---|---|---|---|---|
-| `TS_DSV4_NGPU` | V4 and V4.1 | How many GPUs the layer split spreads whole layers over — the same thing `--tp N` sets for these architectures. `0` selects every visible device | `0` (all visible) | no |
+| `TS_DSV4_NGPU` | V4 and V4.1 | How many GPUs the layer split spreads whole layers over — the same thing `--layer-split N` sets for these architectures. `0` selects every visible device | `1` (explicit `0`: all visible) | no |
 | `TS_DSV4_UBATCH` | V4 and V4.1 | Prefill micro-batch width. Unset, V4.1 on a ggml GPU backend lets the native loader choose 1024, 512 or 256: the widest that needs no more routed-expert CPU layers than 256 would (or than an explicit `--n-cpu-moe`), logged as `[dsv4] prefill ubatch: N (auto; ...)`. A resident routed-expert layer costs about the same per chunk at each width, so wider is cheaper per prefill token. Any explicit positive value is used verbatim and turns the choice off; `256` restores the previous fixed V4.1 default | V4.1: auto on ggml GPU backends, `256` on the CPU executors and direct CUDA; V4: `1024` (`512` on the pure-C# executor) | no |
 | `TS_DSV4_THREADS` | V4 and V4.1 | Native thread pool for GPU-only loads. CPU expert offload uses the detected available parallelism instead, and `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` sets that. On the pure-C# `--backend cpu` executor it sizes that executor's own worker pool and defaults to `ProcessorCount` rather than min(cores, 32) | min(cores, 32) | no |
 | `TS_DSV4_PERF` | V4 and V4.1 | `1` prints per-stage timing | off | no |
 | `TS_DSV4_VRAM_RESERVE_MB` / `TS_DSV4_GRAPH_CACHE` / `TS_DSV4_LOAD_THREADS` / `TS_DSV4_LOAD_CHUNK_MB` / `TS_DSV4_MOE_MMAP` | V4 and V4.1 | Placement headroom, graph-cache depth, weight-load parallelism, and whether host-resident experts are multiplied in place out of the GGUF mapping | see the cards | no |
-| `TS_DSV4_DSPARK` | V4 and V4.1 | DSpark drafter GGUF, used when `--draft-model` is not given. V4.1 accepts only a `deepseek41-dspark` drafter (V4 drafters are rejected) and only on `ggml_cuda` / `ggml_cpu`; that path is experimental, validated only on synthetic fixtures, with no trained V4.1 drafter measured | unset | no |
+| `TS_DSV4_DSPARK` | V4 and V4.1 | DSpark drafter GGUF, used when `--draft-model` is not given. V4.1 accepts only a `deepseek41-dspark` drafter (V4 drafters are rejected) and only on `ggml_cuda` / `ggml_cpu`; that path is experimental; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified | unset | no |
 | `TS_DSV41_RETAINED_CACHE` / `TS_DSV41_RETAINED_CACHE_MB` | V4.1, native executor | `1` opts in to retaining a finished conversation's native slot and re-binding it to the turn that extends it (not while a DSpark drafter is loaded); the MB value is the budget for retained slots, and `0` or an invalid value declines retention | off / `2048` | no |
 | `TS_DSV41_TP` | V4.1 | `0` disables it; `2`-`8` enables **experimental routed-MoE tensor parallelism** over exactly that many GPUs, which must equal the count `--tp` / `TS_DSV4_NGPU` selected. Gate/up split along the FFN intermediate, down along its input, partials reduced through host-staged F32 buffers. Measured slower than the layer split on the first full Q2_K run | `0` | no |
 | `TS_DSV41_ENGRAM_DEVICE` | V4.1 | `1` requires GPU-resident Engram tables and fails if they do not fit; `0` forces host mappings, which is also what a bit-exact CPU-oracle comparison needs. Unset is automatic and conservative: GPU-resident unless that would force routed-expert CPU offload | auto (GPU-resident when it fits) | no |
@@ -328,7 +413,7 @@ The tensor-parallel knobs (`TS_GLM_TP_SHARD`, `TS_GLM_TP_OVERSUBSCRIBE`,
 | Variable | Applies to | Effect | Baseline | Values swept | In matrix |
 |---|---|---|---|---|---|
 | `TS_GLM_NATIVE` | GLM 5.x | `0` runs the managed per-op path on a GGML backend instead of the native whole-model graph — the A/B that proves the two agree | `1` (native) | `0`, `1` | no |
-| `TS_GLM_NGPU` | GLM 5.x on GGML | How many GPUs the layer split spreads the trunk layers over | `0` (all visible) | `1`, `2`, `3` | no |
+| `TS_GLM_NGPU` | GLM 5.x on GGML | How many GPUs the layer split spreads the trunk layers over | `1` (explicit `0`: all visible) | `1`, `2`, `3` | no |
 | `TS_GLM_UBATCH` | GLM 5.x | Prefill micro-batch. `2048` is faster on long prompts when VRAM allows: pp2048 1145.8 vs 918.9 t/s on 3x RTX PRO 6000 | `1024` | `512`, `1024`, `2048` | no |
 | `TS_GLM_THREADS` | GLM 5.x on `ggml_cpu` | CPU-backend thread count; every usable CPU instead with `--n-cpu-moe` / `--cpu-moe` or no GPU, and `--cpu-moe-threads` (then an inherited `TS_CPU_MOE_THREADS`) overrides either | min(cores, 32) | — | no |
 | `TS_GLM_FA` | GLM 5.x | `0` disables flash attention and falls back to an explicit `soft_max` chain | `1` (flash) | `0`, `1` | no |
@@ -362,6 +447,8 @@ Vulkan backends (`ggml_cuda`, `ggml_vulkan`). `TENSORSHARP_TP_DEGREE`,
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
 | `TENSORSHARP_TP_DEGREE` | all autoregressive models; `cuda`, `ggml_cuda`, `ggml_vulkan` backends | Number of local GPUs to split the model across (Megatron-LM column/row-parallel) | `1` (single GPU) | not registered | no |
+| `TENSORSHARP_LAYER_SPLIT_DEGREE` | architectures supporting layer split | Local whole-layer placement GPU count, equivalent to `--layer-split N`; mutually exclusive with TP | `1` | not registered | no |
+| `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next shared GGML layer executor | Comma-separated device ordinals, e.g. `0,2`; independent of `TENSORSHARP_TP_DEVICES`; native GLM/DeepSeek use `CUDA_VISIBLE_DEVICES` | `0..N-1` | not registered | no |
 | `TENSORSHARP_TP_DEVICES` | local TP on the GGML backends | Comma-separated GPU ordinals the ranks map to (e.g. `0,2`) | `0..tp-1` | not registered | no |
 | `TENSORSHARP_TP_NODE_ID` | all autoregressive models; `cuda`, `ggml_cuda`, `ggml_vulkan` backends | This node's 0-based ID for multi-node distributed TP; must be set with `TENSORSHARP_TP_PEERS` | unset (disabled) | not registered | no |
 | `TENSORSHARP_TP_PEERS` | all autoregressive models; `cuda`, `ggml_cuda`, `ggml_vulkan` backends | Comma-separated `host:port` list of all nodes in the distributed TP cluster; must be set with `TENSORSHARP_TP_NODE_ID` | unset (disabled) | not registered | no |
@@ -377,7 +464,7 @@ Vulkan backends (`ggml_cuda`, `ggml_vulkan`). `TENSORSHARP_TP_DEGREE`,
 | `TS_GLM_TP_SHARD` | GLM 5.x under TP on GGML | Which halves of the split are applied: `1` heads, `2` routed experts, `3` both. The experts are split row-wise inside every expert rather than by expert id, because `ggml_mul_mat_id` needs a token's selected expert ids to stay distinct | `3` (both) | `1`, `2`, `3` | no |
 | `TS_GLM_TP_OVERSUBSCRIBE` | GLM 5.x under TP on GGML | `1` packs several ranks onto one GPU so the split can be checked for correctness on a single-GPU machine | `0` (one rank per GPU) | `0`, `1` | no |
 | `TS_GLM_TP_FUSED` | GLM-5.3-Flash local TP on GGML | `0` forces the combined scheduler diagnostic fallback instead of concurrent segmented rank-local graphs. The fallback is also selected automatically by CPU MoE, tensor tracing, partial `TS_GLM_TP_SHARD`, oversubscribed ranks, or a backend without native hyper-connection kernels | auto (segmented when eligible) | `0`, `1` | no |
-| `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next (`qwen4exp`) multi-GPU layer split under `--tp N` | Explicit layer counts per GPU, comma-separated (e.g. `20,28`), instead of the automatic VRAM balance; throws rather than silently ignoring a value it cannot honour. `--tp N` on this architecture is a layer split, not tensor parallelism — `qwen4exp` shards no weights | automatic (layers bin-packed to each device's free VRAM) | not registered | no |
+| `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next (`qwen4exp`) multi-GPU layer split under `--layer-split N` | Explicit layer counts per GPU, comma-separated (e.g. `20,28`), instead of the automatic VRAM balance; throws rather than silently ignoring a value it cannot honour. `--layer-split N` on this architecture is a layer split, not tensor parallelism — `qwen4exp` shards no weights | automatic (layers bin-packed to each device's free VRAM) | not registered | no |
 | `TS_Q4E_RETAINED_CACHE` | Qwen 3.8 Flash Next (`qwen4exp`) on the complete GGML token-span path | `0` disables retained-conversation reuse and shared-prefix checkpoints (exact-prefix only) | ON | not registered | no |
 | `TS_Q4E_RETAINED_CACHE_MB` | Qwen 3.8 Flash Next (`qwen4exp`) retained reuse | Byte budget in MiB for retained conversations plus shared-prefix checkpoints, clamped by measured memory headroom. Under the default Radix prefix cache the tree owns eviction and a holder that does not fit is refused (reported once); with `TS_PREFIX_CACHE_MODE=legacy` the oldest retained conversation is evicted first. `0` or an unparsable value declines every retention | `4096` | not registered | no |
 | `GGML_CUDA_ALLREDUCE` | local TP, `ggml_cuda` | `nccl` / `internal` / `none` — passed through to ggml's collective selection; setting it explicitly also skips the pre-flight probe | auto (NCCL when the build finds it and it passes the probe) | not registered | no |

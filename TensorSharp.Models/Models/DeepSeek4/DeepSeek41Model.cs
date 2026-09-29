@@ -25,8 +25,8 @@ namespace TensorSharp.Models
         private readonly BackendType _requestedBackend;
 
         public DeepSeek41Model(string ggufPath, BackendType backend, int tpDegree = 1,
-            ITensorParallelGroup tpGroup = null, string draftModelPath = null)
-            : base(ggufPath, backend, tpDegree, tpGroup, draftModelPath)
+            ITensorParallelGroup tpGroup = null, string draftModelPath = null, int layerSplitDegree = 1)
+            : base(ggufPath, backend, tpDegree, tpGroup, draftModelPath, layerSplitDegree)
             => _requestedBackend = backend;
 
         /// <summary>

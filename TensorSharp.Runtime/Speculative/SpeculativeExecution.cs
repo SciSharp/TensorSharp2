@@ -100,8 +100,9 @@ namespace TensorSharp.Runtime.Speculative
         /// <c>Enabled = false</c> to force drafting on for A/B measurement.</summary>
         public SpeculationCostGovernor Governor { get; }
 
-        /// <summary>Maximum tokens drafted per speculative step (llama.cpp n_max).</summary>
-        public int MaxDraftTokens => _speculator.MaxDraftTokens;
+        /// <summary>Maximum tokens drafted per step, bounded by the trunk's
+        /// verification capacity even when the algorithm was constructed directly.</summary>
+        public int MaxDraftTokens { get; }
 
         /// <summary>The drafter's confidence gate; see
         /// <see cref="ISpeculator.MinDraftProb"/> for what the number means for
@@ -145,7 +146,8 @@ namespace TensorSharp.Runtime.Speculative
             _hidden = model.SpecFeatureSize;
             _vocab = model.Config.VocabSize;
 
-            int k = speculator.MaxDraftTokens;
+            int k = Math.Min(speculator.MaxDraftTokens, Math.Max(0, model.SpecMaxDraftTokens));
+            MaxDraftTokens = k;
             _verifyLogits = new float[(k + 1) * (long)_vocab];
             _stepLogits = new float[_vocab];
             _rowLogits = new float[_vocab];
@@ -366,6 +368,10 @@ namespace TensorSharp.Runtime.Speculative
                         AdjustLogits = adjustDraftLogits,
                     },
                     _draftTokens);
+                if (_draftTokens.Count > kMax)
+                    throw new InvalidOperationException(
+                        $"The {_speculator.Name} speculator proposed {_draftTokens.Count} tokens "
+                        + $"for a verification window limited to {kMax} drafts.");
                 Stats.DraftTicks += Stopwatch.GetTimestamp() - tDraft0;
             }
 

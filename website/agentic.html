@@ -41,7 +41,7 @@
     </tbody>
   </table>
   </div>
-  <p>The app targets iPhone and iPad (arm64, iOS 17.0 or later). It uses the scene lifecycle, which a build against the iOS 27 SDK needs in order to launch; the recorded physical-device runs are on iOS 26.6.1. Its built-in catalog — Gemma 4 E2B, E4B and 12B, Qwen3.5 9B, and the sideload-only, experimental Bonsai 8B and 27B — is offered on devices in the 12 GB memory tier and above. Several behaviors differ from the desktop hosts:</p>
+  <p>The app targets iPhone and iPad (arm64, iOS 17.0 or later). It uses the scene lifecycle, which a build against the iOS 27 SDK needs in order to launch; the recorded physical-device runs are on iOS 26.6.1. Its built-in catalog — Gemma 4 E2B, E4B and 12B and Qwen3.5 9B — is offered on devices in the 12 GB memory tier and above; the experimental Bonsai 2 27B needs the 16 GB tier (iPads and Macs). Several behaviors differ from the desktop hosts:</p>
   <ul>
     <li><strong>Speculative decoding is on by default</strong> — a draft head for Gemma 4 E4B and 12B when one was downloaded, n-gram lookup otherwise where the model supports speculation. Changing the setting applies to the running engine from the next reply.</li>
     <li><strong>Sub-agent delegation is on by default, with a switch</strong> (<a href="#sub-agents">see below</a>). Settings &gt; Sandbox &gt; "Sub-agents" turns it off from the next message, withholding the coordination tools as <code>--no-multi-agent</code> does; the limits stay at the host defaults, and the phone page shows no sub-agent panel.</li>

@@ -12,10 +12,11 @@ namespace TensorAgent.Core.Catalog;
 
 /// <summary>
 /// The built-in model list. Downloadable entries' sizes and hashes were read from the
-/// Hugging Face tree API (LFS object ids) on 2026-09-01, so a download is verified
-/// against the exact bytes the publisher uploaded. A sideload-only entry carries the
-/// same immutable size/hash identity but deliberately no URL when its GGUF embeds no
-/// publisher repository; the app verifies a user-selected local file instead.
+/// Hugging Face tree API (LFS object ids) on 2026-09-01 (Bonsai 2 27B on 2026-09-28),
+/// so a download is verified against the exact bytes the publisher uploaded. A
+/// sideload-only entry would carry the same immutable size/hash identity but
+/// deliberately no URL, for a GGUF that embeds no publisher repository; the app then
+/// verifies a user-selected local file instead. No built-in entry needs that today.
 ///
 /// <para>
 /// Sizing rule (why these quantizations): on GGML Metal the quantized weights are wrapped
@@ -153,61 +154,44 @@ public static class ModelCatalog
         },
         new CatalogModel
         {
-            Id = "bonsai-8b-q1-0",
-            DisplayName = "Bonsai 8B",
-            Family = CatalogFamily.Bonsai,
-            Kind = CatalogArchitectureKind.Dense,
-            Parameters = "8.2B",
-            Quantization = "Q1_0",
-            Files = new[]
-            {
-                // This exact artifact carries no general.repo_url/source URL. Keep the
-                // immutable identity, but do not invent a place to download it from.
-                new CatalogFile(CatalogFileRole.Weights, "Bonsai-8B-Q1_0.gguf", string.Empty,
-                    1_158_654_496, "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54"),
-            },
-            Modalities = CatalogModalities.Text,
-            MinDeviceMemoryGB = 12,
-            // The checkpoint's native YaRN window starts at 16k. Staying at that native
-            // window avoids spending a phone's memory on extrapolated positions by default.
-            ContextLength = 16384,
-            KvCacheDtype = "q8_0",
-            Sampling = new CatalogSampling(0.5f, 20, 0.85f, 0.0f),
-            // This artifact's embedded template unconditionally appends an empty
-            // <think></think> block; it does not consume enable_thinking.
-            SupportsThinking = false,
-            SideloadOnly = true,
-            Experimental = true,
-            License = "Not embedded in GGUF",
-            Notes = "Local import only: choose the exact hash-pinned Bonsai-8B-Q1_0.gguf file. "
-                + "The checkpoint does not identify a publisher repository or license, so verify its terms before use.",
-        },
-        new CatalogModel
-        {
-            Id = "bonsai-27b-q1-0",
-            DisplayName = "Bonsai 27B",
+            Id = "bonsai-2-27b-ptq1-0",
+            DisplayName = "Bonsai 2 27B",
             Family = CatalogFamily.Bonsai,
             Kind = CatalogArchitectureKind.Dense,
             Parameters = "27B",
-            Quantization = "Q1_0",
+            Quantization = "PTQ1_0",
             Files = new[]
             {
-                // qwen35 hybrid (48 Gated DeltaNet + 16 full-attention layers).
-                new CatalogFile(CatalogFileRole.Weights, "Bonsai-27B-Q1_0.gguf", string.Empty,
-                    3_803_452_480, "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0"),
+                // qwen35 hybrid (48 Gated DeltaNet + 16 full-attention layers) with ternary
+                // g128 weights in PRISM's rotated basis. Sizes and LFS ids were read from
+                // the tree API on 2026-09-28 (revision b072e1d3b35a0a630cece372c2127528e0994386).
+                // PTQ1_0 and PQ2_0 hold the same trits, and the loader repacks either one
+                // losslessly to GGML Q2_0, so the dense PTQ1_0 packing is simply the
+                // smaller download (5.95 GB against 7.21 GB) for the same resident model.
+                new CatalogFile(CatalogFileRole.Weights, "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+                    Hf("prism-ml/Ternary-Bonsai-2-27B-gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"),
+                    5_946_648_928, "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"),
+                new CatalogFile(CatalogFileRole.Projector, "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+                    Hf("prism-ml/Ternary-Bonsai-2-27B-gguf", "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"),
+                    629_246_976, "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903", Optional: true),
             },
-            Modalities = CatalogModalities.Text,
-            MinDeviceMemoryGB = 12,
+            Modalities = CatalogModalities.Image,
+            // 16, not 12: unlike the entries above, these weights are not served from the
+            // GGUF mapping. The Q2_0 repack lives in anonymous memory, ~7.7 GB for this
+            // file (PTQ1_0 grows by about 29%), which with the KV cache and compute
+            // buffers is more than the ~8.5 GB a 12 GB iPhone grants the app.
+            MinDeviceMemoryGB = 16,
             ContextLength = 32768,
             KvCacheDtype = "q8_0",
-            // The GGUF does not publish min_p; zero is the neutral/default value.
-            Sampling = new CatalogSampling(1.0f, 20, 0.95f, 0.0f),
+            // The publisher's thinking-mode recommendation (the GGUF does not carry min_p).
+            Sampling = new CatalogSampling(1.0f, 20, 0.95f, 0.05f),
             SupportsThinking = true,
-            SideloadOnly = true,
+            // Bonsai2 is validated on desktop Metal/CPU, not yet on an iPad.
             Experimental = true,
-            License = "Not embedded in GGUF",
-            Notes = "Local import only: choose the exact hash-pinned Bonsai-27B-Q1_0.gguf file. "
-                + "The checkpoint does not identify a publisher repository or license, so verify its terms before use.",
+            License = ApacheLicense,
+            Notes = "PrismML's ternary Qwen 3.5 hybrid with Hadamard-rotated weights. The 5.9 GB download is "
+                + "repacked losslessly to about 7.7 GB when it loads, so it is offered only on 16 GB devices. "
+                + "Vision is an optional download.",
         },
         new CatalogModel
         {

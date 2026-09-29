@@ -69,13 +69,14 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
 # DSpark 块级投机解码（DeepSeek V4）：--model 指向分片 GGUF 的第一片，
 # --draft-model 指向独立的 DSpark 草稿器（仅限 cuda / ggml_cuda）。
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
-    --model &lt;DeepSeek-V4-Flash-...-00001-of-00005.gguf&gt; --backend ggml_cuda \
+    --model &lt;DeepSeek-V4-Flash-...-00001-of-00005.gguf&gt; --backend ggml_cuda --layer-split 4 \
     --draft-model &lt;DSpark-drafter.gguf&gt; --input prompt.txt --max-tokens 200 --temperature 0
 
 # GLM 5.x：--model 指向第一个分片，同一组的其余分片由 GgufFile 自行找到。
-# 权重会按层切分到所有可见 GPU，自报的 1M 上下文则按权重落盘后剩余的显存缩定。
+# --layer-split 3 将整层放到 3 张本地 GPU（例如 3×96 GB）；
+# 自报的 1M 上下文则按权重放置后剩余的显存缩定。
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
-    --model &lt;GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf&gt; --backend ggml_cuda \
+    --model &lt;GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf&gt; --backend ggml_cuda --layer-split 3 \
     --input prompt.txt --max-tokens 200 --think
 
 # GLM-5.3（非 Flash）与 GLM-5.2 是同一套 79 块 glm-dsa 结构 —— 256 个路由专家取
@@ -84,7 +85,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
 # 各占一个子目录，每个都是多分片的一组（UD-Q2_K_XL 为七个分片、236.4 GiB）；它仅
 # 文本：该仓库任何量化都没有发布 mmproj，在 glm-dsa 上传 --mmproj 只会告警并忽略。
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
-    --model &lt;UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00001-of-00007.gguf&gt; --backend ggml_cuda \
+    --model &lt;UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00001-of-00007.gguf&gt; --backend ggml_cuda --layer-split 8 \
     --input prompt.txt --max-tokens 200 --think</code></pre>
 
   <h3>多模态</h3>
@@ -296,7 +297,8 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--code-exec</code></td><td>启用 TensorSharp 内置智能体代码工具。默认关闭；完整说明见<a href="#code-exec">智能体工作与代码执行</a>。</td></tr>
       <tr><td><code>--spec</code> · <code>--spec-type &lt;name&gt;</code> · <code>--draft-model &lt;path&gt;</code></td><td>投机解码：由草稿器提议接下来的若干 token，主干用一次批量前向完成验证。默认关闭，且必须在模型加载之前出现在命令行上 —— 完整参数见下方的<a href="#spec">投机解码</a>。</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>渲染提示词 + 分词后退出（不生成）。</td></tr>
-      <tr><td><code>--tp &lt;N&gt;</code></td><td>多 GPU 度 —— 在单个进程内把模型跑在 N 张 GPU 上（默认：1）。需要 <code>--backend cuda</code>、<code>ggml_cuda</code> 或 <code>ggml_vulkan</code>；用 <code>TENSORSHARP_TP_DEVICES</code> 指定使用哪几张卡。在多数架构上它是<strong>张量并行</strong>：每一层都被切分到各 rank 上。在走整模型执行器的架构上它另有含义 —— 在 <strong>Qwen 3.8 Flash Next</strong> 上是<strong>按层切分</strong>（每张 GPU 拿一段连续的完整层，不切分任何权重；买的是容量而不是速度 —— 贪心输出与吞吐都不变，只是权重不必再挤进一张卡，<code>TS_Q4E_LAYER_SPLIT=20,28</code> 可覆盖均衡结果），在 <strong>DeepSeek V4 Flash</strong> 上只是限制其自动按层切分使用几张卡。GLM 5.x 不传该参数时使用自动按层切分；在 GGML GPU 后端上，<strong>GLM-5.2</strong>、<strong>GLM-5.3</strong> 与 <strong>GLM-5.3-Flash</strong> 都用该参数启用仅支持本地单进程的原生张量并行 —— 在 GLM-5.3（非 Flash）上请把它读作一种被接受的模式、KV 缓存按 rank 复制，而不是一份已验证的配置，因为它从未留下过 <code>--tp N&gt;1</code> 的运行记录。整个 GLM 5.x 家族都会在模型构建之前直接拒绝 <code>--tp-node-id</code> 与 <code>--tp-peers</code>。在 <strong>Qwen-Image-2.1</strong> 上它只切分扩散 Transformer，且只能用同一台机器上、数量能整除其 32 个注意力头的 GPU；文本编码器、视觉编码器与 VAE 留在第一张 GPU 上。两种模式都不支持的架构会在 stderr 上打印提示并只用一张 GPU（DiffusionGemma、Wan 与 MiniMax-H3 也是如此），这类架构上的分布式组则在加载时被拒绝。→ <a href="distributed_zh-cn.html#vs-layer-split">TP 与按层切分</a></td></tr>
+      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度，仅用于层内权重切分；默认 1，环境变量 <code>TENSORSHARP_TP_DEGREE</code>。模型与 GPU 后端必须支持此模式。与 <code>--layer-split</code> 互斥；不支持的请求在启动时失败。</td></tr>
+      <tr><td><code>--layer-split &lt;N&gt;</code></td><td>支持按层切分的架构使用的本地 GPU 数；环境变量 <code>TENSORSHARP_LAYER_SPLIT_DEGREE</code>。整层放到不同设备，仅支持单节点；不能与 TP 或分布式 TP 参数组合。</td></tr>
       <tr><td><code>--tp-node-id &lt;N&gt;</code></td><td>多节点分布式张量并行中本节点的 0 起始编号。需与 <code>--tp-peers</code> 一起使用。</td></tr>
       <tr><td><code>--tp-peers &lt;list&gt;</code></td><td>集群中所有节点的 <code>host:port</code> 列表，逗号分隔（例如 <code>192.168.1.10:9500,192.168.1.11:9500</code>）。所有节点必须完全一致；端口没有默认值，且需在节点之间可达。</td></tr>
       <tr><td><code>--no-prefix-cache</code></td><td>关闭 Radix 前缀缓存（单次、交互式、JSONL 与技能/工具运行默认开启），同时关闭交互式系统/工具提示词预热；它也会设置 <code>TS_SCHED_PREFIX_CACHE=0</code>。CLI 只在内存中保留该缓存，重启后从冷状态开始。</td></tr>
@@ -329,11 +331,11 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
   <table>
     <thead><tr><th>选项</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td><code>--spec</code> / <code>--no-spec</code></td><td>开启 / 关闭投机解码 —— 对内嵌在主干 checkpoint 里的草稿器（GLM-5.2、GLM-5.3、Qwen 3.6 NextN），这是显式的开启开关，因为加载它们会把额外权重调入显存；用 <code>--draft-model</code> 指定的草稿器无需它即可生效，而 <code>--no-spec</code> 同样可以将其否决。在草稿块借用主干 LM head 的权重上（其中包括 GLM-5.2 与 GLM-5.3 —— 它们位于 <code>blk.78</code> 的完整 NextN 块自己并不带 <code>nextn.shared_head_head.weight</code>），<code>--tp N&gt;1</code> 下不可用，投机只在不传 <code>--tp</code> 的默认按层切分下生效。默认关闭；环境变量 <code>TS_SPEC</code>（或 <code>TS_MTP_SPEC</code>；glm-dsa 还认 <code>TS_GLM_MTP=1/0</code>，它会覆盖前两者）。</td></tr>
-      <tr><td><code>--spec-type &lt;name&gt;</code></td><td>用哪种投机<em>算法</em>起草。<code>auto</code>（默认）使用权重自带的草稿器 —— 逐 token 的 NextN/MTP 头（内嵌于 Qwen 3.6、Qwen 3.8 27B、GLM-5.2 与 GLM-5.3；Gemma 4 的独立 assistant GGUF；Qwen 3.8 Flash Next 的共享 MTP GGUF），或块级草稿器（DeepSeek V4 DSpark、Muse-Glimmer 与 Qwen 3.8 的 DFlash / DFlash2）。<code>draft-head</code> 与 <code>block</code> 用于显式钉住其中之一。<code>ngram</code> <strong>完全不需要训练权重</strong>：它在上下文里回找最近几个 token 曾经出现过的位置，把当时的后续内容提议出来。但它仍需要主干支持投机验证，因此无法在 GPT-OSS、Mistral 3、Qwen 3 / Qwen 2（含 Bonsai 8B）与 Hunyuan Dense 上运行；DeepSeek V4 / V4.1 与 Muse-Glimmer 只能通过各自的块级草稿器验证，因此只有用 <code>--draft-model</code> 加载了该草稿器时它才会运行；而 Nemotron-H 会拒绝所有投机方式。<code>--spec-type</code> 只选择算法 —— 开启 n-gram 要写 <code>--spec --spec-type ngram</code>；若没有 <code>--spec</code> 或 <code>--draft-model</code>（且未设置 <code>TS_SPEC</code>），它与 <code>--spec-draft</code>、<code>--spec-pmin</code> 都不会开启投机，启动时会警告投机保持关闭。环境变量：<code>TS_SPEC_TYPE</code>。</td></tr>
+      <tr><td><code>--spec</code> / <code>--no-spec</code></td><td>开启 / 关闭投机解码 —— 对内嵌在主干 checkpoint 里的草稿器（GLM-5.2、GLM-5.3、Qwen 3.6 NextN），这是显式的开启开关，因为加载它们会把额外权重调入显存；用 <code>--draft-model</code> 指定的草稿器无需它即可生效，而 <code>--no-spec</code> 同样可以将其否决。在草稿块借用主干 LM head 的权重上（其中包括 GLM-5.2 与 GLM-5.3 —— 它们位于 <code>blk.78</code> 的完整 NextN 块自己并不带 <code>nextn.shared_head_head.weight</code>），<code>--tp N&gt;1</code> 下不可用，投机只在单设备或显式 <code>--layer-split N</code> 放置模式（不启用张量并行）下生效。默认关闭；环境变量 <code>TS_SPEC</code>（或 <code>TS_MTP_SPEC</code>；glm-dsa 还认 <code>TS_GLM_MTP=1/0</code>，它会覆盖前两者）。</td></tr>
+      <tr><td><code>--spec-type &lt;name&gt;</code></td><td>用哪种投机<em>算法</em>起草。<code>auto</code>（默认）使用权重自带的草稿器 —— 逐 token 的 NextN/MTP 头（内嵌于 Qwen 3.6、Qwen 3.8 27B、GLM-5.2 与 GLM-5.3；Gemma 4 的独立 assistant GGUF；Qwen 3.8 Flash Next 的共享 MTP GGUF），或块级草稿器（DeepSeek V4 DSpark、Muse-Glimmer 与 Qwen 3.8 的 DFlash / DFlash2）。<code>draft-head</code> 与 <code>block</code> 用于显式钉住其中之一。<code>ngram</code> <strong>完全不需要训练权重</strong>：它在上下文里回找最近几个 token 曾经出现过的位置，把当时的后续内容提议出来。但它仍需要主干支持投机验证，因此无法在 GPT-OSS、Mistral 3 与 Hunyuan Dense 上运行；DeepSeek V4 / V4.1 与 Muse-Glimmer 只能通过各自的块级草稿器验证，因此只有用 <code>--draft-model</code> 加载了该草稿器时它才会运行；而 Nemotron-H 会拒绝所有投机方式。<code>--spec-type</code> 只选择算法 —— 开启 n-gram 要写 <code>--spec --spec-type ngram</code>；若没有 <code>--spec</code> 或 <code>--draft-model</code>（且未设置 <code>TS_SPEC</code>），它与 <code>--spec-draft</code>、<code>--spec-pmin</code> 都不会开启投机，启动时会警告投机保持关闭。环境变量：<code>TS_SPEC_TYPE</code>。</td></tr>
       <tr><td><code>--spec-draft &lt;N&gt;</code></td><td>每个投机步最多起草的 token 数。它同时在加载时决定原生计算图缓存的大小，因此必须与 <code>--spec</code> 写在<em>同一条</em>命令行上。取值 1–64，默认 <code>8</code> —— 块级草稿器则默认取自己训练时的块大小，并会把取值压到该块大小（DSpark 为 5）；环境变量 <code>TS_SPEC_DRAFT</code>（或 <code>TS_MTP_DRAFT</code>）。</td></tr>
       <tr><td><code>--spec-pmin &lt;f&gt;</code></td><td>低于该置信度就停止起草。这个数<em>代表什么</em>由算法自己定义，所以各算法各有默认值而不共用一个：逐 token 头为 <code>0.15</code>（其 top-10 logits 上的 top-1 概率），块级草稿器为 <code>0.35</code>（<em>累积</em>前缀概率，因此同一个数字要严格得多），n-gram 为 <code>0</code>（在那里它改为缩放所需的匹配长度）。调低会起草更远、回滚更多；调高则更早退回普通 decode。取值 0.0–1.0；<code>0</code> 也被接受，表示完全不设门限。环境变量 <code>TS_SPEC_PMIN</code>。</td></tr>
-      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>所有以独立文件发布的草稿器共用的 GGUF 参数 —— DeepSeek V4 的 DSpark 支持模块、Muse-Glimmer 与 Qwen 3.8 的 DFlash / DFlash2 草稿器、Gemma 4 的 <code>gemma4-assistant</code> 草稿头，以及 Qwen 3.8 Flash Next 的共享 MTP 头（GGML 后端）。由文件自身的 <code>general.architecture</code> 决定加载方式（操作者从不需要选择机制），而指定这个文件<strong>本身</strong>就是请求：它自己就会启用投机，无需 <code>--spec</code>（显式的 <code>--no-spec</code> 可将其否决）。块级草稿器必须在模型分层切分<em>之前</em>就驻留，且 DeepSeek V4 的 DSpark 只存在于 <code>--backend cuda</code> 与 <code>ggml_cuda</code> 上。DeepSeek V4.1 仅在 <code>ggml_cuda</code> / <code>ggml_cpu</code> 上接受 <code>deepseek41-dspark</code> 草稿器；这条路径属于实验性质，只在合成测试夹具上验证过，尚无训练好的草稿器实测数据。DFlash / DFlash2 草稿器只用一张 GPU：在 <code>--tp N</code> &gt; 1 下，CLI 会拒绝挂载它、打印警告并按标准解码服务。Qwen 3.6、Qwen 3.8 27B、GLM-5.2 与 GLM-5.3 把 NextN 块嵌在主干 GGUF 内，不需要这个参数 —— GLM-5.3 在 <code>blk.78</code> 上带的是完整的一块，没有额外文件要下载 —— 但在 Qwen 3.6 上只有<em>保留</em>了该块的 GGUF 才算数，请用像 <a href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF" target="_blank" rel="noopener">unsloth/Qwen3.6-35B-A3B-MTP-GGUF</a> 这样保留 MTP 的导出；官方仓库用同样的文件名发布的版本已经把这个块剥掉了。环境变量：<code>TS_DSV4_DSPARK</code>、<code>TS_SPEC_DRAFT_MODEL</code>。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
+      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>所有以独立文件发布的草稿器共用的 GGUF 参数 —— DeepSeek V4 的 DSpark 支持模块、Muse-Glimmer 与 Qwen 3.8 的 DFlash / DFlash2 草稿器、Gemma 4 的 <code>gemma4-assistant</code> 草稿头，以及 Qwen 3.8 Flash Next 的共享 MTP 头（GGML 后端）。由文件自身的 <code>general.architecture</code> 决定加载方式（操作者从不需要选择机制），而指定这个文件<strong>本身</strong>就是请求：它自己就会启用投机，无需 <code>--spec</code>（显式的 <code>--no-spec</code> 可将其否决）。块级草稿器必须在模型分层切分<em>之前</em>就驻留，且 DeepSeek V4 的 DSpark 只存在于 <code>--backend cuda</code> 与 <code>ggml_cuda</code> 上。DeepSeek V4.1 仅在 <code>ggml_cuda</code> / <code>ggml_cpu</code> 上接受 <code>deepseek41-dspark</code> 草稿器；这条路径属于实验性质，训练模型已在 <code>ggml_cuda</code> 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。DFlash / DFlash2 草稿器只用一张 GPU：在 <code>--tp N</code> &gt; 1 下，CLI 会拒绝挂载它、打印警告并按标准解码服务。Qwen 3.6、Qwen 3.8 27B、GLM-5.2 与 GLM-5.3 把 NextN 块嵌在主干 GGUF 内，不需要这个参数 —— GLM-5.3 在 <code>blk.78</code> 上带的是完整的一块，没有额外文件要下载 —— 但在 Qwen 3.6 上只有<em>保留</em>了该块的 GGUF 才算数，请用像 <a href="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF" target="_blank" rel="noopener">unsloth/Qwen3.6-35B-A3B-MTP-GGUF</a> 这样保留 MTP 的导出；官方仓库用同样的文件名发布的版本已经把这个块剥掉了。环境变量：<code>TS_DSV4_DSPARK</code>、<code>TS_SPEC_DRAFT_MODEL</code>。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
     </tbody>
   </table>
   </div>
@@ -395,7 +397,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     </tbody>
   </table>
   </div>
-  <p>在视频家族中，Wan 可运行于 <code>ggml_cuda</code>、<code>ggml_vulkan</code>、<code>ggml_metal</code>、<code>ggml_cpu</code>、<code>cuda</code> 与 <code>cpu</code> —— 它是唯一会直接拒绝 <code>--backend mlx</code> 的模型族。Wan 与 MiniMax-H3 都没有多卡路径：<code>--tp N</code> 会被忽略并打印警告，运行只用一张 GPU；分布式组则在加载时被拒绝。→ <a href="benchmarks_zh-cn.html#minimax-h3">MiniMax-H3 实测数据</a> · <a href="benchmarks_zh-cn.html#wan">Wan 后端耗时与成本模型</a></p>
+  <p>在视频家族中，Wan 可运行于 <code>ggml_cuda</code>、<code>ggml_vulkan</code>、<code>ggml_metal</code>、<code>ggml_cpu</code>、<code>cuda</code> 与 <code>cpu</code> —— 它是唯一会直接拒绝 <code>--backend mlx</code> 的模型族。Wan 与 MiniMax-H3 都没有多卡路径：不支持的 <code>--tp N</code> / <code>--layer-split N</code> 请求与分布式组均在加载时被拒绝。→ <a href="benchmarks_zh-cn.html#minimax-h3">MiniMax-H3 实测数据</a> · <a href="benchmarks_zh-cn.html#wan">Wan 后端耗时与成本模型</a></p>
   <p class="page-foot-note">完整参考（含 <code>--test</code>、<code>--test-templates</code> 与分块 prefill 正确性检查）见 <a href="api-reference_zh-cn.html#cli-flags">API 参考</a> 页。</p>
 
   <h2 id="skills">Agent Skills（智能体技能）</h2>

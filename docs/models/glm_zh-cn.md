@@ -1,5 +1,7 @@
 # GLM-5.x（`glm-dsa`、`glm5next`）
 
+> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。下面的历史命令与测量早于这项默认值变更；多 GPU 启动请加 `--layer-split N`。显式旧变量 `TS_GLM_NGPU=0` 仍表示全部可见 GPU 自动放置；使用明确并行度时请取消该变量，或设为相同卡数。按层切分仅限单节点。
+
 [← 返回模型索引](README_zh-cn.md) | [English](glm.md)
 
 GLM-5.2 是一个 744B 参数的 MoE 模型（256 个路由专家，top-8，外加 1 个共享专家），
@@ -31,8 +33,9 @@ head 尺寸，而不是 576 宽的缓存行。
 
 - **GGML 后端**（`--backend ggml_cuda` / `ggml_vulkan` / `ggml_cpu` / `ggml_metal`）
   走**原生整模型执行器**（`TensorSharp.GGML.Native/ggml_ops_glm_dsa.cpp`）。它自己
-  加载分片 GGUF，把权重按层切分到每一张可见 GPU（226 GiB 放不进单卡），在设备上
-  持有 MLA 与 indexer 缓存，并通过 `ggml_backend_sched` 每个 ubatch 只提交**一张**
+  加载分片 GGUF；在 CUDA 或 Vulkan 上通过 `--layer-split N` 将整层放到 N 张本地
+  GPU（226 GiB 放不进单卡）。未配置两种并行模式时默认单设备。它在设备上持有
+  MLA 与 indexer 缓存，并通过 `ggml_backend_sched` 每个 ubatch 只提交**一张**
   ggml 图；再配一个按形状索引的 LRU 图缓存，于是稳定态 decode 只是重放一张已分配
   好（在 CUDA 上还是已捕获）的图。
 - **`--backend cpu`（100% 托管）和 `--backend cuda`** 走
@@ -100,11 +103,9 @@ GLM-5.3-Flash GGUF 可作对照。请把托管路径当作用于 A/B 的参考�
 
 ### 张量并行
 
-**不加 `--tp` 时，多卡机器本来就会用满每一张卡**：加载器会测量每张卡的空闲显存，
-把 78 层装箱摊到它们上面，于是设备 0 跑第 0..k 层、把隐状态交给下一张，依此类推。
-这是默认行为，没有对应的开关——226 GiB 的权重也没有别的办法装下。`TS_GLM_NGPU`
-用来限制使用几张卡；即便用满所有卡也装不下时，加载会被拒绝，并给出正好能装下的
-`--n-cpu-moe N`。
+**用 `--layer-split N` 将整层分配到 N 张本地 GPU。** 加载器测量空闲显存并均衡各设备占用。
+未配置时默认单设备；旧变量 `TS_GLM_NGPU=0` 显式选择全部可见 GPU。若还指定新的并行度，
+环境变量必须与其取值一致。所选设备装不下模型时，加载器会拒绝并给出所需的 `--n-cpu-moe N`。
 
 `--tp N`（或 `TENSORSHARP_TP_DEGREE`）是另一种模式：让**每一层都跑在每一张 GPU 上**，
 切分的是层*内部*的权重，于是 decode 时每张卡只需要读 1/N 的权重，而不是依次走完全部。
@@ -335,7 +336,7 @@ golden 校验贪心续写。
 
 ### 张量并行的实测数字
 
-同样 3 张 GPU、GLM-5.2-UD-IQ2_XXS，`--tp 3`（head + 专家行）对比默认的按层切分：
+同样 3 张 GPU、GLM-5.2-UD-IQ2_XXS，`--tp 3`（head + 专家行）对比按层切分模式：
 
 | 测试 | 按层切分 | `--tp 3` |
 |---|---:|---:|
@@ -379,10 +380,10 @@ llama.cpp 那几个百分点就来自这里。decode 受显存带宽限制，两
 ## 怎么跑
 
 ```bash
-# 3 张 GPU，按层切分（默认行为：用上每一张可见 GPU）；--input 从文件读取提示词
+# 3 张 GPU，显式按层切分；--input 从文件读取提示词
 echo "用一段话解释 MLA。" > prompt.txt
 dotnet run --project TensorSharp.Cli -- --model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
-    --backend ggml_cuda --input prompt.txt
+    --backend ggml_cuda --layer-split 3 --input prompt.txt
 
 # 指定 GPU 数量
 TS_GLM_NGPU=2 dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda
@@ -396,7 +397,7 @@ dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --n-cpu-
 ```
 
 offload 是让放不下的 checkpoint 能跑起来的手段，不是提速开关——模型本来就放得下时，
-把专家挪到主机只会多出总线往返。同样 3 张卡、同一轮：默认按层切分 pp2048 **915.9** /
+把专家挪到主机只会多出总线往返。同样 3 张卡、同一轮：按层切分模式 pp2048 **915.9** /
 tg64 **43.9** tok/s，`--n-cpu-moe 30` 为 **94.7** / **16.4**，`--tp 3` 为 **505.6** /
 **17.6**。只有在"否则根本跑不起来"时才该用 `--n-cpu-moe`。
 
@@ -416,7 +417,7 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 行加上 indexer 的那一行约 93 KiB，1M 上下文就是约 93 GiB 的 KV——相当于在权重之外再多占一整张卡，而且还没
 算计算图。所以宣称的数字被当作**上限**而不是请求：加载器会用权重落盘后设备上真正剩下
 的显存（再扣掉一张 `n_ubatch` 计算图里 DSA 掩码与 LM head 所需的部分）来定上下文，并把
-选中的数字打出来。在上面那三张卡上按默认的层切分，选出的是 342,272 token，`--n-cpu-moe 30` 则抬到 646,400。下面这行来自 `--tp 3` 的运行——那时每个 rank 都持有一份完整长度的缓存，所以选出的值会低得多：
+选中的数字打出来。在上面那三张卡上按按层切分模式，选出的是 342,272 token，`--n-cpu-moe 30` 则抬到 646,400。下面这行来自 `--tp 3` 的运行——那时每个 rank 都持有一份完整长度的缓存，所以选出的值会低得多：
 
 ```
 [glm] context 91136 tokens (the GGUF advertises 1048576): 18.3 GiB free per rank
@@ -521,7 +522,8 @@ NextN），256 个路由专家 top-8 外加 1 个共享专家，带 lightning in
         column-parallel under --tp 8; serving standard decode
   ```
 
-  因此投机解码是在**默认按层切分**（不传 `--tp`，用上每一张可见 GPU）时生效的。
+  因此投机解码是在**单设备或按层切分模式**下生效的（用 `--layer-split N`
+  指定 N 张本地 GPU，不启用张量并行）。
   在相信某次 `--spec` 运行真的 draft 过之前，先看加载横幅——而且要看你实际跑的那个
   执行器打出来的那一条：在 GGML 后端上跑的是原生执行器，它的横幅是
 
@@ -592,7 +594,7 @@ KDA 递归状态（卷积尾部 + delta-net 状态，每序列约 150 MB）无�
 
 ### 原生本地张量并行
 
-不传 `--tp` 时，仍使用跨所有可见 GPU 的自动按层切分。在 GGML GPU 后端上，
+用 `--layer-split N` 将整层分配到 N 张本地 GPU。在 GGML GPU 后端上，
 `--tp N` 则使 GLM-5.3-Flash 走原生执行器的本地单进程张量并行计划：
 
 | 部件 | 本地 TP 策略 |
@@ -615,9 +617,10 @@ GLM-5.3-Flash 在默认的完整切分（head 与路由专家隐藏行都切）�
 
 ### 目前能跑什么
 
-- **跨所有可见 GPU 的层切分**（默认）：UD-Q2_K_XL 约 99 GiB，2×96 GB 上热缓存
-  约 17 秒装载。
-- **原生本地张量并行**：在 GGML GPU 后端上，传入 `--tp N`；省略该参数仍走默认按层切分。
+- **跨 N 张本地 GPU 的层切分**：传入 `--layer-split N`。历史测量中，约 99 GiB
+  的 UD-Q2_K_XL 在 2×96 GB 上热缓存约 17 秒装载；现在用 `--layer-split 2`
+  选择同样的放置方式。未配置两种并行模式时默认单设备。
+- **原生本地张量并行**：在 GGML GPU 后端上，传入 `--tp N`；整层放置改用 `--layer-split N`。
 - **`--cpu-moe` / `--n-cpu-moe N`** 专家驻留主机内存：可用（前 10 层专家在主机时
   实测解码约 35–40 t/s）。
 - **服务化**：原生逐序列 slot，外加 fused 批量解码（见[连续批处理（glm5next）](#连续批处理glm5next)）；
@@ -643,8 +646,10 @@ GLM-5.2 的投机路径是位置回退：MLA 行与 indexer key 都按位置存�
 1. 验证之前，执行器把每个 KDA 层的卷积尾部与 delta-net 状态（`--tp` 下每个 rank 各自的）
    拷到它所在设备上的快照区（`TSGgml_GlmKdaStateCapture`；约 150 MB，设备内拷贝，
    每个模型只有一块快照区，因为一步之内就完成快照与恢复），并记下位置；
-2. 验证是一张覆盖 `[last, d1..dK]` 的主干图，LM head 跑在每一行上
-   （`TSGgml_GlmSpecForward`，未改动）；
+2. 验证处理 `[last, d1..dK]`，LM head 跑在每一行上
+   （`TSGgml_GlmSpecForward`）。原生验证沿用逐 token 解码的投影、专家与注意力计算方式，
+   每行使用其自身补齐后的 key 长度。带快照的窗口超过八行时拆成多个有界计算图；
+   prompt prefill 仍使用配置的 micro-batch；
 3. 部分被拒时，把快照拷回去并把 slot 回退到记录的位置（`TSGgml_GlmKdaStateRestore`），
    运行时再重跑已接受前缀，于是状态等于对这些 token 的普通解码
    （`SpecVerifyPersistsAcceptedKv = false`）。回退到其它任何位置都会报错拒绝，而不是
@@ -666,8 +671,21 @@ GLM-5.2 的投机路径是位置回退：MLA 行与 indexer key 都按位置存�
 CUDA 设备）：n-gram 投机贪心与普通贪心逐 token
 一致，且确有草稿被提出、有窗口被部分拒绝；每个窗口末尾都必错的草稿器仍然得到普通
 解码的 token 流；回滚之后下一个 token 的 logits 在整个词表上与普通解码一致；验证各行
-等于逐 token 解码；托管与原生的 `SpecForward` 逐行一致，隐状态也一致。真实
-GLM-5.3-Flash checkpoint 上尚无投机解码实测，因此没有吞吐结论。
+等于逐 token 解码；托管与原生的 `SpecForward` 逐行一致，隐状态也一致。真实 IQ1_S
+checkpoint 暴露了另一处由验证宽度引起的舍入误差：第一次四行验证就在回滚前改变了 logits。
+修正后的原生路径在两张 RTX PRO 4000 Blackwell、29 层专家卸载到 CPU 的配置下，
+全部 72 个 teacher-forced logits 向量完全一致，其中包含四次回滚。这项针对性的数值检查
+不构成通用质量或吞吐优势的证明。生成证据保存在
+`docs/validation/model-matrix-20260927/`，不提交到 Git。
+
+同一 Flash IQ1_S 检查点随后在 `--layer-split 2` 与 `--tp 2` 下通过文本及完整图像回答的
+普通/ngram 逐 token 一致性检查，且确有草稿被接受。两种放置模式各运行普通/ngram HTTP
+服务，共通过 12/12 文本请求和 6/6 图像场景（七次图像请求），四个服务均正常退出。
+匹配的原生 CLI 基准使用上下文 2048、28 层 CPU 专家、20 线程、ubatch 32，三轮
+128-token prefill / 32-token decode 的 decode 中位数为按层切分 4.14 token/s、TP 3.90。
+CPU 卸载走组合 TP 调度器，没有覆盖分段 NCCL 路径，也未显示 TP 提速。这些针对性的
+量化模型检查不代表学习型 NextN、跨节点执行或非 Flash GLM-5.3 的验证。本地证据：
+`docs/validation/model-matrix-20260927/glm53/SUMMARY.md`（不提交）。
 
 C ABI 上的失败会被隔离而不是向外传播。抛异常的捕获（arena 分配、后端拷贝）返回失败并保持
 活动状态不变。只拷贝了部分层之后才抛异常的恢复会把该 slot 标记为不可用：forward、投机 forward、
@@ -702,8 +720,10 @@ llama.cpp 自己的 top-2 边距也只有约 0.13 logit，候选集完全相同�
 
 ### 对话格式
 
-GLM-5.3-Flash 的模板始终思考：`<|system|>Reasoning Effort: Max` 无条件出现，生成提示
-总是以 `<think>` 开启，历史轮次保留思考内容（`clear_thinking` 默认 false）。
+GLM-5.3-Flash 的模板始终思考。系统前缀将 `reasoning_effort: "low"` 或 `"high"`
+渲染为 `Reasoning Effort: Low` 或 `High`；省略或指定 `"medium"` 时使用 `Max`，
+与发布的模板一致。生成提示总是以 `<think>` 开启，历史轮次保留思考内容
+（`clear_thinking` 默认 false）。
 由于提示无法关闭思考，`"think": false` 只决定客户端看到什么：回复在 `</think>` 之前
 都按思考内容解析，之后的部分才是答案。流式客户端仍会在生成时收到这段思考
 （`reasoning_content` / `thinking` 增量，与其他始终思考的系列一致），因此若
@@ -727,11 +747,11 @@ decode**：一张图在每步为 2-16 个序列各解码一个 token，逐 token
 [`benchmark_config_glm53_qwen38.json`](../../benchmarks/engine_comparison/benchmark_config_glm53_qwen38.json)
 把 `glm53` 与 `glm53-flash`（连同 Qwen3.8-Flash-Next）注册到固定的 Hugging Face
 revision 上，并逐条记录了实测的分片大小以及上面这些模态 / MTP 事实。它的默认后端
-不传 `--tp`、也不设置 `CUDA_VISIBLE_DEVICES`：对这两个模型来说，原生 glm 执行器会
+显式设置 `TS_GLM_NGPU=0`，不传 `--tp`、也不设置 `CUDA_VISIBLE_DEVICES`：对这两个模型来说，原生 glm 执行器会
 接管每一张可见 GPU 并按整层放置——这是 236 GiB checkpoint 唯一装得下的放置方式，也
 是 GLM-5.3 的 NextN 块唯一会被加载的放置方式。这是这一系列执行器的性质，而不是基准
 框架的性质：该配置里的第三个模型（`qwen4exp`）由**共享**加载器切分，因此必须显式传
-`--tp N`，它落在第二个后端列上，默认矩阵里它的格子会被记为跳过。llama.cpp 那一列只
+`--layer-split N`，它落在 `ggml_cuda_split` 后端列上，默认矩阵里它的格子会被记为跳过。llama.cpp 那一列只
 对 `glm53` 可用：那台机器上的
 llama.cpp（ggml 0.23.0）架构表里有 `glm-dsa`，也有 `src/models/glm-dsa.cpp`，但
 `glm5next` 这个字符串在它的源码里一处都找不到——在假定有参照列之前先确认这一点。

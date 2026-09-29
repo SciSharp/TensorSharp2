@@ -76,20 +76,16 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
-        /// How the collective is actually being carried, for the startup banner.
-        /// Naming the transport matters on hosts where the native side had to
-        /// take peer access away from NCCL: "device collective" alone would hide
-        /// that the reduction is going over shared memory rather than NVLink/PCIe
-        /// peer traffic, and the two differ by a lot of tokens per second.
+        /// The capability probe reports a working backend collective, which may
+        /// use NCCL, P2P, or the pinned-host pipeline. Native startup diagnostics
+        /// identify that transport; managed environment variables may not reflect
+        /// native fallback decisions made after process startup.
         /// </summary>
-        private static string DescribeAllReduce(bool onDevice)
+        private static string DescribeAllReduce(bool backendCollective)
         {
-            if (!onDevice)
-                return "host reduction";
-            return string.Equals(Environment.GetEnvironmentVariable("NCCL_P2P_DISABLE"), "1",
-                                 StringComparison.Ordinal)
-                ? "device collective (NCCL, shared-memory transport — peer access unusable on this host)"
-                : "device collective (NCCL / P2P)";
+            return backendCollective
+                ? "backend collective (transport reported by native startup diagnostics)"
+                : "host reduction";
         }
 
         /// <summary>Number of GPUs in this group (local to this process).</summary>

@@ -37,6 +37,51 @@ public class ExecutionPlannerTests
 
     private static ExecutionStepFeatures Seqs(int count) => new() { SequenceCount = count };
 
+    [Theory]
+    [InlineData(false, false, ExecutionPathKind.PerSequence)]
+    [InlineData(true, false, ExecutionPathKind.SpeculativePerSequence)]
+    [InlineData(false, true, ExecutionPathKind.SpeculativePerSequence)]
+    public void LinearSpeculation_MediaPrefillRequiresOptIn_ButDecodeDoesNot(
+        bool supportsMediaPrefill, bool isDecode, ExecutionPathKind expected)
+    {
+        var caps = new ExecutionCapabilities
+        {
+            SupportsSpeculativeTrunk = true,
+            HasDraftHead = true,
+            SpeculationProfitable = true,
+            SupportsSpeculativeMultimodalPrefill = supportsMediaPrefill,
+        };
+        var features = Seqs(1) with
+        {
+            MultimodalPendingCount = 1,
+            SoloHasPendingMultimodal = true,
+            SoloIsDecode = isDecode,
+        };
+
+        var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, SpecConfig, features);
+
+        Assert.Equal(expected, plan.Selected);
+    }
+
+    [Fact]
+    public void LinearMediaCapability_DoesNotEnableBatchedSpeculativeMediaPrefill()
+    {
+        var caps = new ExecutionCapabilities
+        {
+            SupportsSpeculativeTrunk = true,
+            SupportsBatchedSpecTrunk = true,
+            SupportsSpeculativeMultimodalPrefill = true,
+            HasDraftHead = true,
+            SpeculationProfitable = true,
+        };
+        var features = Seqs(1) with { MultimodalPendingCount = 1, SoloHasPendingMultimodal = true };
+
+        var plan = ExecutionPlanner.PlanStep(caps, ExecutionOptions.Default, SpecConfig, features);
+
+        Assert.Equal(ExecutionPathKind.PerSequence, plan.Selected);
+        Assert.Contains(plan.Rejections, r => r.Path == ExecutionPathKind.SpeculativeBatchedTrunk);
+    }
+
     // ----- batched vs fallback -----
 
     [Fact]
